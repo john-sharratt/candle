@@ -1367,7 +1367,7 @@ mod tests {
 
     #[test]
     fn ensure_substrate_dir_is_used() {
-        // Guards the doc-comment claim that the log lives under .substrate/.
+        // Guards the doc-comment claim that the log lives under substrate/.
         let dir = tmp_dir("dir_check");
         SubstratePersistence::open_in(&dir).unwrap();
         assert!(dir.join(SUBSTRATE_DIR).exists());

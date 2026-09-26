@@ -5,7 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{FileError, Paging};
+use super::{stores_for, FileError, Paging};
+use crate::state::vfs::GrepOutcome;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Matching lines per page.
@@ -21,7 +22,8 @@ pub const MAX_TOTAL_HITS: usize = 600;
 
 /// Longest line returned intact. A minified bundle is one 200 KB line, and a
 /// single hit on it would otherwise be larger than the whole rest of the result.
-const MAX_LINE_CHARS: usize = 400;
+/// `git_grep` clips with the same rule, so the two searches read alike.
+pub(crate) const MAX_LINE_CHARS: usize = 400;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct GrepRequest {
@@ -29,8 +31,13 @@ pub struct GrepRequest {
     /// `foo|bar`, `^fn `). A plain string works as itself. Required.
     #[validate(length(min = 1))]
     pub pattern: String,
-    /// Restrict the search to paths beginning with this prefix (e.g.
-    /// `candle-nn/src/`). Omit to search the whole project.
+    /// The repository to search, or `*` to search every repository in the
+    /// workspace. Required.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// Restrict the search to paths beginning with this prefix, relative to
+    /// each repository searched (e.g. `candle-nn/src/`). Omit to search whole
+    /// repositories.
     pub prefix: Option<String>,
     /// Match without regard to case. Defaults to false (case-sensitive), which
     /// is what searching for a Rust identifier wants.
@@ -42,6 +49,7 @@ pub struct GrepRequest {
 
 #[derive(Serialize)]
 pub struct GrepMatch {
+    pub repo: String,
     pub path: String,
     /// 1-based line number — `(line - 1) / PAGE_LINES` is the page to pass
     /// `file_read` to see the surrounding code.
@@ -63,8 +71,10 @@ pub struct GrepResponse {
     /// files and this pattern is genuinely absent" from "the prefix matched
     /// nothing, so nothing was searched".
     pub files_searched: usize,
-    /// `true` when the scan hit its ceiling and the project may hold more
-    /// matches than are reported. Narrow with `prefix` or a tighter pattern.
+    /// `true` when the scan hit a ceiling and the workspace may hold more
+    /// matches than are reported. Across every repository (`*`) each gets a
+    /// share of the ceiling, so each is represented; narrow with one `repo`,
+    /// `prefix` or a tighter pattern to see the rest.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
@@ -74,17 +84,18 @@ pub struct FileGrep;
 impl Tool for FileGrep {
     const NAME: &'static str = "file_grep";
     const DESCRIPTION: &'static str =
-        "Search the CONTENTS of every file in the project for a string or regular \
-         expression, and return the matching lines with their file paths and line \
-         numbers. Use for: finding where a function, type, constant or error \
+        "Search the CONTENTS of every file in the workspace for a string or regular \
+         expression, and return the matching lines with their repo, file path and \
+         line number. `repo` is required: name one repository, or pass `*` to \
+         search them all. Use for: finding where a function, type, constant or error \
          message is defined or used; checking whether something exists in the \
          codebase at all; tracing callers of an API; locating a config key, a magic \
          string, or a TODO. Triggered by \"where is X defined\", \"who calls\", \
          \"find all uses of\", \"search the code for\", \"does the codebase \
          contain\", \"grep for\", \"which file has\", \"find the string\". Takes a \
          regex (`^pub fn `, `Error::\\w+`, `foo|bar`), an optional path prefix to \
-         narrow the search, and optional ignore_case. Returns path, line number and \
-         the matching line, paged, with files_searched so an empty result is \
+         narrow the search, and optional ignore_case. Returns repo, path, line number \
+         and the matching line, paged, with files_searched so an empty result is \
          unambiguous. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it \
          before guessing at directory names with file_list. Use file_search to find \
          a file by its NAME; use file_read with the line number this returns to see \
@@ -109,27 +120,48 @@ impl Tool for FileGrep {
             .map_err(|e| FileError::InvalidArguments(format!("invalid regex: {e}")))?;
 
         let prefix = req.prefix.as_deref().unwrap_or("");
-        let outcome = ctx.vfs.grep(&re, prefix, MAX_HITS_PER_FILE, MAX_TOTAL_HITS);
-
-        let paging = Paging::of(outcome.hits.len(), req.page.unwrap_or(0), GREP_PAGE_HITS);
-        let matches = outcome
-            .hits
-            .into_iter()
-            .skip(paging.skipped())
-            .take(GREP_PAGE_HITS)
-            .map(|h| GrepMatch {
+        // One ceiling across the whole call, shared fairly between the
+        // repositories it covers: each store scans with an even share of what
+        // is left, so a budget an earlier repository did not use flows on to
+        // the later ones. Filled first-come instead, a repository early in the
+        // manifest with many matches took the whole ceiling and every later
+        // one went unsearched — a workspace grep reported a word as absent
+        // from a repository that held it 2,413 times.
+        let stores = stores_for(ctx, &req.repo)?;
+        let mut hits: Vec<GrepMatch> = Vec::new();
+        let mut files_searched = 0usize;
+        let mut truncated = false;
+        for (i, (repo, store)) in stores.iter().enumerate() {
+            let left = MAX_TOTAL_HITS - hits.len();
+            let share = left / (stores.len() - i);
+            let GrepOutcome {
+                hits: found,
+                files_searched: searched,
+                truncated: clipped,
+            } = store.grep(&re, prefix, MAX_HITS_PER_FILE, share);
+            files_searched += searched;
+            truncated |= clipped;
+            hits.extend(found.into_iter().map(|h| GrepMatch {
+                repo: repo.clone(),
                 path: h.path,
                 line: h.line_no,
                 text: truncate(&h.line),
                 modified: h.modified,
-            })
+            }));
+        }
+
+        let paging = Paging::of(hits.len(), req.page.unwrap_or(0), GREP_PAGE_HITS);
+        let matches = hits
+            .into_iter()
+            .skip(paging.skipped())
+            .take(GREP_PAGE_HITS)
             .collect();
 
         Ok(GrepResponse {
             matches,
             paging,
-            files_searched: outcome.files_searched,
-            truncated: outcome.truncated,
+            files_searched,
+            truncated,
         })
     }
 }
@@ -138,7 +170,7 @@ impl Tool for FileGrep {
 ///
 /// Counts characters rather than bytes and cuts on a character boundary: a
 /// byte-wise cut through a multi-byte character would panic on the slice.
-fn truncate(line: &str) -> String {
+pub(crate) fn truncate(line: &str) -> String {
     if line.chars().count() <= MAX_LINE_CHARS {
         return line.to_string();
     }

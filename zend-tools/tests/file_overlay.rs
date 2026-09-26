@@ -14,18 +14,21 @@ use serde_json::json;
 use tempfile::TempDir;
 use zend_tools::ToolContext;
 
-/// A workspace with a small, predictable tree.
+use harness::REPO;
+
+/// A workspace with a small, predictable tree, under the single repository
+/// [`REPO`]'s folder.
 fn workspace() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    write_disk(root, "README.md", "# project\n");
+    let root = harness::repo_root(dir.path());
+    write_disk(&root, "README.md", "# project\n");
     write_disk(
-        root,
+        &root,
         "src/main.rs",
         "fn main() {\n    println!(\"hi\");\n}\n",
     );
-    write_disk(root, "src/lib.rs", "pub mod util;\n");
-    write_disk(root, "docs/guide.md", "guide\n");
+    write_disk(&root, "src/lib.rs", "pub mod util;\n");
+    write_disk(&root, "docs/guide.md", "guide\n");
     dir
 }
 
@@ -36,11 +39,11 @@ fn write_disk(root: &Path, rel: &str, body: &str) {
 }
 
 fn read_disk(root: &Path, rel: &str) -> String {
-    std::fs::read_to_string(root.join(rel)).unwrap()
+    std::fs::read_to_string(harness::repo_root(root).join(rel)).unwrap()
 }
 
 fn ctx_for(dir: &TempDir) -> ToolContext {
-    ToolContext::with_workspace(dir.path())
+    harness::workspace_ctx(dir.path())
 }
 
 /// The source lines out of a rendered `file_read` excerpt, with the header,
@@ -78,7 +81,7 @@ fn read_falls_through_to_the_workspace() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
         &ctx,
     ));
     assert_eq!(
@@ -89,22 +92,22 @@ fn read_falls_through_to_the_workspace() {
     );
 }
 
-/// The `/workspace` mount point the tool definitions document resolves to the
-/// same entry as a bare relative path.
+/// A leading slash and a `.`/`..` detour both normalise to the same entry as
+/// the bare relative path — plain path normalisation (no segment, including a
+/// folder that happened to be named `workspace`, is special).
 #[test]
-fn workspace_mount_prefix_is_an_alias_for_the_root() {
+fn alternate_spellings_of_a_path_resolve_to_the_same_entry() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
     for path in [
         "src/main.rs",
         "/src/main.rs",
-        "workspace/src/main.rs",
-        "/workspace/src/main.rs",
-        "/workspace/src/../src/main.rs",
+        "./src/main.rs",
+        "src/../src/main.rs",
     ] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_read",
-            json!({ "path": path, "page": 0 }),
+            json!({ "repo": REPO, "path": path, "page": 0 }),
             &ctx,
         ));
         assert!(
@@ -118,8 +121,11 @@ fn workspace_mount_prefix_is_an_alias_for_the_root() {
 fn read_of_a_missing_workspace_path_is_not_found() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let resp =
-        harness::invoke_with_ctx("file_read", json!({"path": "src/nope.rs", "page": 0}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": "src/nope.rs", "page": 0}),
+        &ctx,
+    );
     harness::expect_error(&resp, "not_found");
 }
 
@@ -130,7 +136,7 @@ fn parent_traversal_cannot_escape_the_workspace() {
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "../../../../etc/passwd", "page": 0}),
+        json!({"repo": REPO, "path": "../../../../etc/passwd", "page": 0}),
         &ctx,
     );
     harness::expect_error(&resp, "not_found");
@@ -139,9 +145,17 @@ fn parent_traversal_cannot_escape_the_workspace() {
 #[test]
 fn non_utf8_workspace_file_is_unreadable_not_missing() {
     let dir = workspace();
-    std::fs::write(dir.path().join("blob.bin"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+    std::fs::write(
+        harness::repo_root(dir.path()).join("blob.bin"),
+        [0xffu8, 0xfe, 0x00, 0x01],
+    )
+    .unwrap();
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx("file_read", json!({"path": "blob.bin", "page": 0}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": "blob.bin", "page": 0}),
+        &ctx,
+    );
     harness::expect_error(&resp, "unreadable");
 }
 
@@ -153,7 +167,7 @@ fn list_enumerates_the_workspace_one_level_from_the_root() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "/"}),
+        json!({"repo": REPO, "path": "/"}),
         &ctx,
     ));
     assert_eq!(paths(&resp), vec!["README.md", "docs", "src"]);
@@ -173,10 +187,10 @@ fn list_enumerates_the_workspace_one_level_from_the_root() {
 fn list_narrows_the_workspace_by_directory() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    for path in ["src", "src/", "/workspace/src"] {
+    for path in ["src", "src/", "/src"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "path": path }),
+            json!({ "repo": REPO, "path": path }),
             &ctx,
         ));
         assert_eq!(
@@ -190,13 +204,14 @@ fn list_narrows_the_workspace_by_directory() {
 #[test]
 fn list_omits_gitignored_and_hidden_paths() {
     let dir = workspace();
-    write_disk(dir.path(), ".gitignore", "target/\nsecret.txt\n");
-    write_disk(dir.path(), "target/debug/huge.bin", "x");
-    write_disk(dir.path(), "secret.txt", "shh");
+    let root = harness::repo_root(dir.path());
+    write_disk(&root, ".gitignore", "target/\nsecret.txt\n");
+    write_disk(&root, "target/debug/huge.bin", "x");
+    write_disk(&root, "secret.txt", "shh");
     let ctx = ctx_for(&dir);
     let listed = paths(&harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": ""}),
+        json!({"repo": REPO, "path": ""}),
         &ctx,
     )));
     assert!(
@@ -207,10 +222,10 @@ fn list_omits_gitignored_and_hidden_paths() {
     // Hidden files are excluded from listings the way `ls` excludes them...
     assert!(!listed.contains(&".gitignore".to_string()), "{listed:?}");
     // ...but still resolve by exact path, which is what file_read's own examples
-    // (`/workspace/.gitignore`) depend on.
+    // depend on.
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "/workspace/.gitignore", "page": 0}),
+        json!({"repo": REPO, "path": ".gitignore", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), "target/\nsecret.txt");
@@ -222,12 +237,12 @@ fn list_marks_session_written_entries_as_modified() {
     let ctx = ctx_for(&dir);
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "src/main.rs", "content": "fn main() {}\n"}),
+        json!({"repo": REPO, "path": "src/main.rs", "content": "fn main() {}\n"}),
         &ctx,
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "src"}),
+        json!({"repo": REPO, "path": "src"}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -257,6 +272,7 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
     harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
         json!({
+            "repo": REPO,
             "path": "src/main.rs",
             "patch": "@@ -2 +2 @@\n-    println!(\"hi\");\n+    println!(\"hello\");\n"
         }),
@@ -266,7 +282,7 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
     // The session now sees the edited copy...
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
         &ctx,
     ));
     assert_eq!(
@@ -280,18 +296,18 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
 #[test]
 fn edit_of_a_workspace_file_is_ambiguous_when_the_hunk_matches_twice() {
     let dir = workspace();
-    write_disk(dir.path(), "dup.txt", "aa\nbb\naa\n");
+    write_disk(&harness::repo_root(dir.path()), "dup.txt", "aa\nbb\naa\n");
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "dup.txt", "patch": "@@ -2 +2 @@\n-aa\n+cc\n"}),
+        json!({"repo": REPO, "path": "dup.txt", "patch": "@@ -2 +2 @@\n-aa\n+cc\n"}),
         &ctx,
     );
     harness::expect_error(&resp, "ambiguous");
     // A rejected edit must not leave a copy-up behind that shadows the original.
     let listed = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": ""}),
+        json!({"repo": REPO, "path": ""}),
         &ctx,
     ));
     let entries = listed["entries"].as_array().unwrap();
@@ -308,7 +324,7 @@ fn write_over_a_workspace_file_reports_overwrite_not_creation() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "write",
-        json!({"path": "README.md", "content": "# replaced\n"}),
+        json!({"repo": REPO, "path": "README.md", "content": "# replaced\n"}),
         &ctx,
     ));
     assert_eq!(resp["created"], false, "the path already resolved on disk");
@@ -316,7 +332,7 @@ fn write_over_a_workspace_file_reports_overwrite_not_creation() {
 
     let fresh = harness::expect_success(harness::invoke_with_ctx(
         "write",
-        json!({"path": "NOTES.md", "content": "new\n"}),
+        json!({"repo": REPO, "path": "NOTES.md", "content": "new\n"}),
         &ctx,
     ));
     assert_eq!(fresh["created"], true);
@@ -330,7 +346,7 @@ fn delete_hides_a_workspace_file_without_erasing_it() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_delete",
-        json!({"path": "docs/guide.md"}),
+        json!({"repo": REPO, "path": "docs/guide.md"}),
         &ctx,
     ));
     assert_eq!(resp["deleted"], true);
@@ -339,14 +355,14 @@ fn delete_hides_a_workspace_file_without_erasing_it() {
     harness::expect_error(
         &harness::invoke_with_ctx(
             "file_read",
-            json!({"path": "docs/guide.md", "page": 0}),
+            json!({"repo": REPO, "path": "docs/guide.md", "page": 0}),
             &ctx,
         ),
         "not_found",
     );
     let listed = paths(&harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "docs"}),
+        json!({"repo": REPO, "path": "docs"}),
         &ctx,
     )));
     assert!(!listed.contains(&"docs/guide.md".to_string()), "{listed:?}");
@@ -361,11 +377,15 @@ fn deleting_twice_reports_not_found_the_second_time() {
     let ctx = ctx_for(&dir);
     harness::expect_success(harness::invoke_with_ctx(
         "file_delete",
-        json!({"path": "README.md"}),
+        json!({"repo": REPO, "path": "README.md"}),
         &ctx,
     ));
     harness::expect_error(
-        &harness::invoke_with_ctx("file_delete", json!({"path": "README.md"}), &ctx),
+        &harness::invoke_with_ctx(
+            "file_delete",
+            json!({"repo": REPO, "path": "README.md"}),
+            &ctx,
+        ),
         "not_found",
     );
 }
@@ -376,12 +396,12 @@ fn writing_over_a_whiteout_resurrects_the_path_as_a_creation() {
     let ctx = ctx_for(&dir);
     harness::expect_success(harness::invoke_with_ctx(
         "file_delete",
-        json!({"path": "README.md"}),
+        json!({"repo": REPO, "path": "README.md"}),
         &ctx,
     ));
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "write",
-        json!({"path": "README.md", "content": "# back\n"}),
+        json!({"repo": REPO, "path": "README.md", "content": "# back\n"}),
         &ctx,
     ));
     assert_eq!(
@@ -390,7 +410,7 @@ fn writing_over_a_whiteout_resurrects_the_path_as_a_creation() {
     );
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "README.md", "page": 0}),
+        json!({"repo": REPO, "path": "README.md", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), "# back");
@@ -402,13 +422,14 @@ fn edit_after_delete_reports_not_found() {
     let ctx = ctx_for(&dir);
     harness::expect_success(harness::invoke_with_ctx(
         "file_delete",
-        json!({"path": "src/lib.rs"}),
+        json!({"repo": REPO, "path": "src/lib.rs"}),
         &ctx,
     ));
     harness::expect_error(
         &harness::invoke_with_ctx(
             "file_edit",
             json!({
+                "repo": REPO,
                 "path": "src/lib.rs",
                 "patch": "@@ -1 +1 @@\n-pub mod util;\n+pub mod helper;\n"
             }),
@@ -426,10 +447,10 @@ fn present_resolves_workspace_files_and_reports_the_rest_missing() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_present",
-        json!({"paths": ["/workspace/README.md", "src/absent.rs"]}),
+        json!({"repo": REPO, "paths": ["README.md", "src/absent.rs"]}),
         &ctx,
     ));
-    assert_eq!(resp["presented"], json!(["/workspace/README.md"]));
+    assert_eq!(resp["presented"], json!(["README.md"]));
     assert_eq!(resp["missing"], json!(["src/absent.rs"]));
 }
 
@@ -441,14 +462,15 @@ fn present_resolves_workspace_files_and_reports_the_rest_missing() {
 #[test]
 fn list_caps_a_large_directory_to_one_page() {
     let dir = tempfile::tempdir().unwrap();
+    let root = harness::repo_root(dir.path());
     for i in 0..175 {
-        write_disk(dir.path(), &format!("src/f{i:03}.rs"), "fn a() {}\n");
+        write_disk(&root, &format!("src/f{i:03}.rs"), "fn a() {}\n");
     }
-    let ctx = ToolContext::with_workspace(dir.path());
+    let ctx = harness::workspace_ctx(dir.path());
 
     let first = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "src"}),
+        json!({"repo": REPO, "path": "src"}),
         &ctx,
     ));
     assert_eq!(first["entries"].as_array().unwrap().len(), 50);
@@ -461,7 +483,7 @@ fn list_caps_a_large_directory_to_one_page() {
     // The advertised next page continues exactly where the first stopped.
     let second = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "src", "page": 1}),
+        json!({"repo": REPO, "path": "src", "page": 1}),
         &ctx,
     ));
     assert_eq!(paths(&second)[0], "src/f050.rs");
@@ -470,7 +492,7 @@ fn list_caps_a_large_directory_to_one_page() {
     // The last page is partial and terminates the chain.
     let last = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "src", "page": 3}),
+        json!({"repo": REPO, "path": "src", "page": 3}),
         &ctx,
     ));
     assert_eq!(last["entries"].as_array().unwrap().len(), 25);
@@ -483,13 +505,14 @@ fn list_caps_a_large_directory_to_one_page() {
 #[test]
 fn list_page_past_the_end_clamps_to_the_last_page() {
     let dir = tempfile::tempdir().unwrap();
+    let root = harness::repo_root(dir.path());
     for i in 0..60 {
-        write_disk(dir.path(), &format!("a/f{i:02}.txt"), "x\n");
+        write_disk(&root, &format!("a/f{i:02}.txt"), "x\n");
     }
-    let ctx = ToolContext::with_workspace(dir.path());
+    let ctx = harness::workspace_ctx(dir.path());
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "a", "page": 99}),
+        json!({"repo": REPO, "path": "a", "page": 99}),
         &ctx,
     ));
     assert_eq!(resp["paging"]["page"], 1, "clamped to the last page");
@@ -504,7 +527,7 @@ fn list_within_one_page_reports_no_next_page() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": ""}),
+        json!({"repo": REPO, "path": ""}),
         &ctx,
     ));
     assert_eq!(resp["paging"]["pages"], 1);
@@ -523,12 +546,12 @@ fn list_entries_omit_the_modified_flag_when_unchanged() {
     let ctx = ctx_for(&dir);
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "src/main.rs", "content": "fn main() {}\n"}),
+        json!({"repo": REPO, "path": "src/main.rs", "content": "fn main() {}\n"}),
         &ctx,
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "src"}),
+        json!({"repo": REPO, "path": "src"}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -541,31 +564,34 @@ fn list_entries_omit_the_modified_flag_when_unchanged() {
 // ── file_read excerpt format ─────────────────────────────────────────────────
 
 /// A read returns the same shape the `code_reading` ingest prefills: header with
-/// path, page, and absolute line range, then a language-tagged fence with
+/// path, repo, page, and absolute line range, then a language-tagged fence with
 /// `cat -n` numbering. Not JSON — the runner places a string result verbatim.
 #[test]
 fn read_returns_a_numbered_fenced_excerpt() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let resp =
-        harness::invoke_with_ctx("file_read", json!({"path": "src/main.rs", "page": 0}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
+        &ctx,
+    );
     let text = resp.as_str().expect("file_read returns a rendered string");
     assert_eq!(
         text,
-        "\nsrc/main.rs (page 0 of 1, lines 1-3 of 3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n3  }\n```\n",
+        "\nsrc/main.rs in proj (page 0 of 1, lines 1-3 of 3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n3  }\n```\n",
     );
 }
 
-/// Without a page a read returns page 0 — the top 200 lines, however long the
-/// file is — and the header states the total so the model knows to keep going.
+/// Without a page a read is rejected — a page is required, and the header
+/// states the total so the model knows to keep going.
 #[test]
 fn read_without_a_page_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
-    write_disk(dir.path(), "big.rs", &body);
-    let ctx = ToolContext::with_workspace(dir.path());
+    write_disk(&harness::repo_root(dir.path()), "big.rs", &body);
+    let ctx = harness::workspace_ctx(dir.path());
 
-    let resp = harness::invoke_with_ctx("file_read", json!({"path": "big.rs"}), &ctx);
+    let resp = harness::invoke_with_ctx("file_read", json!({"repo": REPO, "path": "big.rs"}), &ctx);
     harness::expect_error(&resp, "invalid_arguments");
 }
 
@@ -575,24 +601,38 @@ fn read_without_a_page_is_rejected() {
 fn read_returns_the_requested_page_and_clamps_one_past_the_end() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
-    write_disk(dir.path(), "big.rs", &body);
-    let ctx = ToolContext::with_workspace(dir.path());
+    write_disk(&harness::repo_root(dir.path()), "big.rs", &body);
+    let ctx = harness::workspace_ctx(dir.path());
 
-    let middle = harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 1}), &ctx);
+    let middle = harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": "big.rs", "page": 1}),
+        &ctx,
+    );
     let numbered: String = (201..=400).map(|i| format!("{i}  line {i}\n")).collect();
     assert_eq!(
         middle.as_str().unwrap(),
-        format!("\nbig.rs (page 1 of 5, lines 201-400 of 900):\n\n```rust\n{numbered}```\n"),
+        format!(
+            "\nbig.rs in proj (page 1 of 5, lines 201-400 of 900):\n\n```rust\n{numbered}```\n"
+        ),
     );
 
     // 900 lines is 5 pages of 200, so page 4 is both the last real page
     // (100 lines) and where an out-of-range request (page 99) clamps to.
-    let last = harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 4}), &ctx);
-    let clamped =
-        harness::invoke_with_ctx("file_read", json!({"path": "big.rs", "page": 99}), &ctx);
+    let last = harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": "big.rs", "page": 4}),
+        &ctx,
+    );
+    let clamped = harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": "big.rs", "page": 99}),
+        &ctx,
+    );
     let numbered: String = (801..=900).map(|i| format!("{i}  line {i}\n")).collect();
-    let expected =
-        format!("\nbig.rs (page 4 of 5, lines 801-900 of 900):\n\n```rust\n{numbered}```\n");
+    let expected = format!(
+        "\nbig.rs in proj (page 4 of 5, lines 801-900 of 900):\n\n```rust\n{numbered}```\n"
+    );
     assert_eq!(last.as_str().unwrap(), expected);
     assert_eq!(clamped.as_str().unwrap(), expected, "clamps to page 4");
 }
@@ -605,12 +645,12 @@ fn read_past_the_end_clamps_into_the_file() {
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "page": 9999}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 9999}),
         &ctx,
     );
     let text = resp.as_str().unwrap();
     assert!(
-        text.starts_with("\nsrc/main.rs (page 0 of 1, lines 1-3 of 3):\n"),
+        text.starts_with("\nsrc/main.rs in proj (page 0 of 1, lines 1-3 of 3):\n"),
         "{text:.60}"
     );
 }
@@ -624,6 +664,7 @@ fn read_past_the_end_clamps_into_the_file() {
 #[test]
 fn the_read_header_reports_the_files_true_length() {
     let dir = tempfile::tempdir().unwrap();
+    let root = harness::repo_root(dir.path());
     // Each shape that has ever made a line count ambiguous.
     let cases = [
         ("trailing.rs", "a\nb\n", 2),
@@ -634,14 +675,18 @@ fn the_read_header_reports_the_files_true_length() {
         ("crlf.rs", "a\r\nb\r\n", 2),
     ];
     for (name, body, _) in cases {
-        write_disk(dir.path(), name, body);
+        write_disk(&root, name, body);
     }
-    let ctx = ToolContext::with_workspace(dir.path());
+    let ctx = harness::workspace_ctx(dir.path());
 
     for (name, _, expected) in cases {
         // Every case fits on page 0, so this is always the whole file — the
         // header's `of N` is stated unconditionally either way.
-        let resp = harness::invoke_with_ctx("file_read", json!({"path": name, "page": 0}), &ctx);
+        let resp = harness::invoke_with_ctx(
+            "file_read",
+            json!({"repo": REPO, "path": name, "page": 0}),
+            &ctx,
+        );
         let text = resp.as_str().unwrap();
         // The header is "(page P of N, lines a-b of total)" — the LAST " of "
         // before the closing paren names the file's true length.
@@ -661,11 +706,15 @@ fn the_read_header_reports_the_files_true_length() {
 #[test]
 fn read_of_an_empty_file_reports_empty() {
     let dir = workspace();
-    write_disk(dir.path(), "blank.rs", "");
+    write_disk(&harness::repo_root(dir.path()), "blank.rs", "");
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx("file_read", json!({"path": "blank.rs", "page": 0}), &ctx);
+    let resp = harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": "blank.rs", "page": 0}),
+        &ctx,
+    );
     assert_eq!(
         resp.as_str().unwrap(),
-        "\nblank.rs (empty):\n\n```rust\n```\n"
+        "\nblank.rs in proj (empty):\n\n```rust\n```\n"
     );
 }

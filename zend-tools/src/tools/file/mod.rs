@@ -19,10 +19,16 @@
 //! of that path sees it. Deleting a workspace-backed file records a whiteout — the
 //! path stops resolving and stops listing, the file on disk is untouched.
 //!
-//! # Path semantics
+//! # Repositories and paths
 //!
-//! Paths are normalised before use (see [`crate::state::VfsStore`]). `/workspace`
-//! is the mount point of the working directory, so `/workspace/src/main.rs`,
+//! Every call names a `repo` — one of the repositories the workspace lists —
+//! and its paths are relative to that repository's folder
+//! ([`crate::state::RepoFiles`]). `file_list`, `file_search` and `file_grep`
+//! also take [`ALL_REPOS`] (`"*"`) to cover every repository at once; their
+//! results then name the repository each entry came from. The scope is always
+//! stated: a call that means the whole workspace says so.
+//!
+//! Paths are normalised before use (see [`crate::state::VfsStore`]), so
 //! `./src/../src/main.rs`, `/src/main.rs`, and `src/main.rs` are all one entry.
 //!
 //! # `file_edit` patches
@@ -59,13 +65,38 @@
 //! | `unreadable` | Workspace file is above the read limit or is not UTF-8 text |
 //! | `invalid_arguments` | The `file_edit` patch is not a readable unified diff, a `file_grep` pattern is not a valid regex, or a `file_read` path is a web address |
 //! | `forbidden` | The path is under a `secrets/` directory — see [`crate::state::vfs`] |
+//! | `unknown_repo` | `repo` names no repository in the workspace; the message lists the ones it does |
+
+use std::sync::Arc;
 
 use serde::Serialize;
 use thiserror::Error;
 
 use self::patch::PatchError;
 use crate::state::vfs::VfsError;
-use crate::ToolError;
+use crate::state::{UnknownRepo, VfsStore, ALL_REPOS};
+use crate::tools::code::UNKNOWN_REPO;
+use crate::{ToolContext, ToolError};
+
+/// The stores a call covers: the named repository's alone, or — for
+/// [`ALL_REPOS`] — every repository's, in manifest order.
+pub(crate) fn stores_for(
+    ctx: &ToolContext,
+    repo: &str,
+) -> Result<Vec<(String, Arc<VfsStore>)>, FileError> {
+    if repo == ALL_REPOS {
+        return Ok(ctx.files.all());
+    }
+    Ok(vec![(repo.to_string(), ctx.files.repo(repo)?)])
+}
+
+/// A file somewhere in the workspace: the repository it is in and its path
+/// inside that repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoPath {
+    pub repo: String,
+    pub path: String,
+}
 
 /// Which slice of a larger listing a response carries, and how to get the rest.
 ///
@@ -184,6 +215,8 @@ pub enum FileError {
     /// A write to the workspace on disk (the Mutable tools mode) failed.
     #[error("{0}")]
     Unwritable(String),
+    #[error(transparent)]
+    UnknownRepo(#[from] UnknownRepo),
 }
 
 impl ToolError for FileError {
@@ -199,6 +232,7 @@ impl ToolError for FileError {
             FileError::InvalidArguments(_) | FileError::IsUrl(_) => "invalid_arguments",
             FileError::Forbidden(_) => "forbidden",
             FileError::Unwritable(_) => "unwritable",
+            FileError::UnknownRepo(_) => UNKNOWN_REPO,
         }
     }
 }

@@ -100,7 +100,7 @@ pub struct IngestBacklogBody {
 /// drives the GUI's compaction indicator (§11).
 #[derive(Serialize)]
 pub struct MaintenanceBody {
-    /// Total segment files in `.substrate/` (sealed + the one active).
+    /// Total segment files in `substrate/` (sealed + the one active).
     pub segments: usize,
     /// Human label of the last maintenance op (e.g. `"dropped segment 3"`),
     /// or `null` if none has run this session.

@@ -70,7 +70,7 @@ const FAST_POISON_WINDOW: Duration = Duration::from_secs(300);
 /// signal a real supervisor would give.
 const MAX_FAST_RELAUNCHES: u32 = 5;
 
-/// File under the daemon's `.substrate` recording how many *consecutive*
+/// File under the daemon's `substrate` recording how many *consecutive*
 /// fast (within [`FAST_POISON_WINDOW`]) relaunches have happened — plain
 /// decimal text, no format to version. Absent or unparseable reads as 0, the
 /// same as a fresh burst; [`relaunch_decision`] is what actually resets it
@@ -185,7 +185,7 @@ fn mark_resume(substrate_dir: &Path) {
 
 /// Spawn the background thread that polls `candle::gpu_poison::is_gpu_poisoned`
 /// and, on the transition, relaunches an identical process before exiting
-/// this one. `substrate_dir` is the daemon's `.substrate` directory (where the
+/// this one. `substrate_dir` is the daemon's `substrate` directory (where the
 /// restart marker and the log both live).
 pub fn spawn_watchdog(spec: LaunchSpec, substrate_dir: PathBuf) {
     let started = Instant::now();

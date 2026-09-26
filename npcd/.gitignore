@@ -52,4 +52,4 @@ state/
 # `/v1/substrate/storage` reports on. An engine running here writes it into the
 # data directory, which defaults to this one. Segments reach hundreds of MB and
 # rewrite continuously, so they are the worst possible thing to have tracked.
-.substrate/
+substrate/

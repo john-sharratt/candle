@@ -32,10 +32,8 @@ struct Harness {
 /// workspace + log bus are kept alive by the returned guard.
 async fn boot() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config = DaemonConfig {
-        workspace: tmp.path().to_path_buf(),
-        ..Default::default()
-    };
+    let config =
+        DaemonConfig::new(zend::workspace::single_repo(tmp.path(), "project").expect("workspace"));
     let log = LogBus::new();
     let session = Arc::new(ZendSession::new(config, log.clone()));
     let app = api::router(session);

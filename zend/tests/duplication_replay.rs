@@ -35,7 +35,7 @@ mod replay {
     use candle_conversation::{OptionalState, SamplingConfig, SelectionState, NO_THINK_SELECTOR};
     use futures::StreamExt;
 
-    use crate::common::{needs_compaction, production_workspace};
+    use crate::common::{needs_compaction, production_workspace, served};
     use zend::config::DaemonConfig;
     use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
@@ -73,7 +73,6 @@ mod replay {
         let log = LogBus::new();
         let config = DaemonConfig {
             compact_substrate: needs_compaction(&workspace),
-            workspace,
             port: 0,
             // Bring the daemon up without the workspace ingest sweep — this test
             // exercises decode replay, not retrieval.
@@ -81,7 +80,7 @@ mod replay {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            ..Default::default()
+            ..DaemonConfig::new(served(&workspace))
         };
         // NOTE: caller must invoke `session.start_loading()` from WITHIN the Tokio
         // runtime (inside `block_on`) — the workspace watcher spawns onto the

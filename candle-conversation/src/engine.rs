@@ -366,14 +366,14 @@ impl ConversationEngine {
         // substrate.
         //
         // Mandatory substrate persistence — the redo log under the
-        // workspace's `.substrate/` directory (or the process CWD).
+        // workspace's `substrate/` directory (or the process CWD).
         // Open persistence and drive every record straight into the
         // substrate's in-RAM state in one walker pass — no manifest
         // mirror, no `reconstruct → collected_*` second pass.
         //
         // A host that writes its own record classes into this same log opens it
         // first and hands the open pair over ([`SharedSubstrate`]) — one
-        // `.substrate/` admits exactly one writable handle per process. Everyone
+        // `substrate/` admits exactly one writable handle per process. Everyone
         // else names a directory and the engine opens it here. Resolved once,
         // into the same pair either way, so nothing downstream knows which.
         let open_start = std::time::Instant::now();
@@ -387,7 +387,7 @@ impl ConversationEngine {
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
                     }
                 };
-                // A read-only open writes nothing under `.substrate/` and
+                // A read-only open writes nothing under `substrate/` and
                 // requires the store to exist — see
                 // `EngineConfig::read_only_substrate`.
                 let opened = if config.read_only_substrate {

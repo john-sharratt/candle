@@ -1,0 +1,66 @@
+name: git_refs
+questions:
+- what branches exist in this repository
+- list the tags in that repo
+- am I up to date with my upstream
+- do I have unpushed commits on this branch
+- which remotes are configured and where do they point
+- what versions have we released so far
+- show me the remote-tracking branches from the last fetch
+- how far ahead of origin is my current branch
+- where does this repository push to
+- is there a tag for the last release
+- list every local branch with the commit it points at
+- which branch is checked out at the moment
+- was that tag annotated or lightweight
+- how many branches does this repo have
+- what is the url of origin
+- does origin still have that feature branch
+- I need the tag names before cutting a new release
+- show the upstream each branch tracks
+- enumerate the refs under refs/remotes
+- do we have a branch named after that ticket
+category: Git
+description: '**The one way to ask what branches, tags or remotes a repository has, and how many.** Never read `.git/` to find out — its refs are a database, not a list (loose refs, packed refs and symbolic refs together), and hand-parsing it gives confidently wrong counts; the tools refuse that folder anyway. `kind` picks which: `branches` gives the local branches with the commit each points at, which one is checked out, and how far ahead or behind its upstream each is — so "do I have unpushed commits" and "am I up to date with origin" are answered here; `tags` gives the tags with the commit each finally points at and whether it is annotated or lightweight; `remotes` gives the configured remotes and their URLs, with any credentials redacted — so "where does this push to" and "what is the url of origin" are answered here, never from a README or a guess; `remote_branches` gives the remote-tracking branches as of the last fetch, along with their remotes'' URLs. A `count` comes back with every listing, so "how many branches are there" is READ off the number rather than counted from the entries. Use for "what branches exist", "am I up to date with origin", "do I have unpushed commits", "what versions have been released", "where does this push to". Contacts no server — it reads what this repository already knows, so run git_fetch first if the remote may have moved. `page` is required, 40 refs a page: pass 0 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    RefKind:
+      description: 'Which kind of ref to list: `branches` (local branches, with upstream tracking where configured), `tags` (annotated and lightweight), `remotes` (configured remotes and their URLs — where the repository pushes to), `remote_branches` (remote-tracking branches, as of the last fetch, with their remotes'' URLs).'
+      enum:
+      - branches
+      - tags
+      - remotes
+      - remote_branches
+      type: string
+  properties:
+    kind:
+      allOf:
+      - $ref: '#/definitions/RefKind'
+      description: Which refs to list. Required.
+    page:
+      description: Zero-based page, 40 refs a page. Required — pass 0 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
+      format: uint32
+      minimum: 0.0
+      type: integer
+    repo:
+      description: The repository to read. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - kind
+  - page
+  title: RefsRequest
+  type: object
+examples:
+- what branches are there in candle<|im_end|>
+- list the tags in that repository<|im_end|>
+- am I ahead of origin on this branch<|im_end|>
+- which remotes are configured and what are their urls<|im_end|>
+- show me the remote-tracking branches as of the last fetch<|im_end|>
+- what was the most recent version we tagged<|im_end|>
+- does my branch have an upstream set<|im_end|>
+- do I have commits that have not been pushed yet<|im_end|>
+- what url does the mind repository send its commits to<|im_end|>

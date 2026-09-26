@@ -50,7 +50,7 @@
 //!
 //! # What stops a restart re-ingesting everything
 //!
-//! The **content-hash ledger**, persisted inside `.substrate/` so that wiping the
+//! The **content-hash ledger**, persisted inside `substrate/` so that wiping the
 //! substrate wipes the ledger with it. A second boot finds every hash unchanged
 //! and writes nothing.
 

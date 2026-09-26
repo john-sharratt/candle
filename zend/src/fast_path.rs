@@ -25,6 +25,7 @@ use std::sync::Mutex;
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
 use serde_json::json;
+use zend_tools::state::Workspace;
 
 use crate::code_read::file_content_hash;
 use crate::tool_round::Step;
@@ -65,14 +66,15 @@ fn fits_fast_path(bytes: usize) -> bool {
 /// either as a red card (`is_error`, `zend/web/index.html`) and the model reads
 /// a failure as grounds to try again, which here means doing the very read the
 /// fast path just avoided.
-fn served_response(path: &str, lines: usize) -> serde_json::Value {
+fn served_response(repo: &str, path: &str, lines: usize) -> serde_json::Value {
     json!({
         "status": "already_read",
+        "repo": repo,
         "path": path,
         "lines": lines,
         "note": format!(
-            "`{path}` is unchanged since it was read, and its full contents \
-             ({lines} lines) are already in this conversation's context — \
+            "`{path}` in {repo} is unchanged since it was read, and its full \
+             contents ({lines} lines) are already in this conversation's context — \
              including any lines this call asked for. Read it from there \
              rather than calling file_read for it again."
         ),
@@ -82,35 +84,51 @@ fn served_response(path: &str, lines: usize) -> serde_json::Value {
 /// One call the fast path answered, for the caller to log and report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Served {
+    /// The file's workspace-relative key (`candle/src/lib.rs`).
     pub path: String,
     pub timeline: TimelineId,
 }
 
-/// The workspace-relative form `code_reading` hashes under.
+/// The repository-relative form of a `path` argument.
 ///
 /// The hash is path-qualified, so a call that names the same file differently —
 /// a leading `./`, a backslash separator, an absolute path inside the
-/// workspace — hashes to something else and misses every time, silently and
+/// repository — hashes to something else and misses every time, silently and
 /// forever. Normalising here is what keeps the two sides addressing the same
 /// content.
-pub fn normalise(path: &str, workspace: &Path) -> String {
+pub fn normalise(path: &str, repo_dir: &Path) -> String {
     let cleaned = path.replace('\\', "/");
     let cleaned = cleaned.trim_start_matches("./");
-    let ws = workspace.to_string_lossy().replace('\\', "/");
-    let ws = ws.trim_end_matches('/');
+    let dir = repo_dir.to_string_lossy().replace('\\', "/");
+    let dir = dir.trim_end_matches('/');
     cleaned
-        .strip_prefix(&format!("{ws}/"))
+        .strip_prefix(&format!("{dir}/"))
         .unwrap_or(cleaned)
         .trim_start_matches('/')
         .to_string()
 }
 
-/// The `path` argument of a `file_read` call, when it has one.
-fn read_path(step: &Step) -> Option<&str> {
+/// The `repo` and `path` arguments of a `file_read` call, when it has both.
+fn read_target(step: &Step) -> Option<(&str, &str)> {
     match step {
-        Step::Run(call) if call.name == FILE_READ => call.arguments.get("path")?.as_str(),
+        Step::Run(call) if call.name == FILE_READ => Some((
+            call.arguments.get("repo")?.as_str()?,
+            call.arguments.get("path")?.as_str()?,
+        )),
         _ => None,
     }
+}
+
+/// The workspace-relative key `code_reading` hashes a `file_read`'s file
+/// under — the repository, then the normalised path inside it — with the
+/// repository and inner path beside it. `None` for a repository the workspace
+/// does not list: the call then runs for real and the tool refuses it, rather
+/// than this reading whatever an unchecked name joins to.
+fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, String)> {
+    let (repo, path) = read_target(step)?;
+    let dir = &workspace.repo(repo)?.dir;
+    let rel = normalise(path, dir);
+    Some((format!("{repo}/{rel}"), repo.to_string(), rel))
 }
 
 /// Replace every `file_read` in `steps` whose content the corpus has already
@@ -127,7 +145,7 @@ fn read_path(step: &Step) -> Option<&str> {
 pub fn screen(
     engine: &Mutex<ConversationEngine>,
     target: TimelineId,
-    workspace: &Path,
+    workspace: &Workspace,
     budget_tokens: usize,
     steps: Vec<Step>,
 ) -> (Vec<Step>, Vec<Served>) {
@@ -138,23 +156,22 @@ pub fn screen(
     let out = steps
         .into_iter()
         .map(|step| {
-            let Some(raw_path) = read_path(&step) else {
+            let Some((key, repo, rel)) = read_key(&step, workspace) else {
                 return step;
             };
-            let rel = normalise(raw_path, workspace);
-            let Ok(bytes) = std::fs::read(workspace.join(&rel)) else {
+            let Ok(bytes) = std::fs::read(workspace.root().join(&key)) else {
                 return step;
             };
             if !fits_fast_path(bytes.len()) {
                 tracing::debug!(
                     target: "zend::fast_path",
-                    path = %rel,
+                    path = %key,
                     bytes = bytes.len(),
                     "file is past the fast-path size cap — reading it for real",
                 );
                 return step;
             }
-            let hash = file_content_hash(&rel, &bytes);
+            let hash = file_content_hash(&key, &bytes);
             let looked_up = {
                 let e = engine.lock().unwrap();
                 e.find_conversations_by_metadata(HASH_KEY, &hash)
@@ -168,21 +185,21 @@ pub fn screen(
             let Some(timeline) = looked_up else {
                 tracing::debug!(
                     target: "zend::fast_path",
-                    path = %rel,
+                    path = %key,
                     "no admitted conversation carries this file — reading it for real",
                 );
                 return step;
             };
             let lines = bytes.iter().filter(|b| **b == b'\n').count() + 1;
             let Step::Run(call) = step else {
-                unreachable!("read_path matched a Run step")
+                unreachable!("read_target matched a Run step")
             };
             served.push(Served {
-                path: rel.clone(),
+                path: key,
                 timeline,
             });
             Step::Served(ToolResult {
-                response: served_response(&rel, lines),
+                response: served_response(&repo, &rel, lines),
                 call,
             })
         })
@@ -207,7 +224,7 @@ pub fn screen(
 pub fn rebuild(
     engine: &Mutex<ConversationEngine>,
     target: TimelineId,
-    workspace: &Path,
+    workspace: &Workspace,
     budget_tokens: usize,
 ) -> usize {
     if budget_tokens == 0 {
@@ -221,17 +238,16 @@ pub fn rebuild(
     let mut admitted = 0usize;
     for text in texts {
         for step in crate::tool_round::plan(&text) {
-            let Some(raw_path) = read_path(&step) else {
+            let Some((key, _, _)) = read_key(&step, workspace) else {
                 continue;
             };
-            let rel = normalise(raw_path, workspace);
-            let Ok(bytes) = std::fs::read(workspace.join(&rel)) else {
+            let Ok(bytes) = std::fs::read(workspace.root().join(&key)) else {
                 continue;
             };
             if !fits_fast_path(bytes.len()) {
                 continue;
             }
-            let hash = file_content_hash(&rel, &bytes);
+            let hash = file_content_hash(&key, &bytes);
             let e = engine.lock().unwrap();
             if let Some(tl) = e
                 .find_conversations_by_metadata(HASH_KEY, &hash)
@@ -259,8 +275,43 @@ pub fn rebuild(
 mod tests {
     use super::*;
 
+    use zend_tools::state::RepoSpec;
+
+    /// A repository's folder, the base [`normalise`] strips.
     fn ws() -> &'static Path {
         Path::new("D:/prog/candle")
+    }
+
+    fn workspace() -> Workspace {
+        Workspace::new("D:/prog", vec![RepoSpec::named("candle")]).unwrap()
+    }
+
+    /// **A read's key is its repository plus the normalised path** — the
+    /// workspace-relative key the ingest hashed the file under.
+    #[test]
+    fn a_read_is_keyed_by_its_repository_and_path() {
+        let step = call(
+            FILE_READ,
+            json!({"repo": "candle", "path": "./zend/src/main.rs"}),
+        );
+        assert_eq!(
+            read_key(&step, &workspace()),
+            Some((
+                "candle/zend/src/main.rs".to_string(),
+                "candle".to_string(),
+                "zend/src/main.rs".to_string()
+            ))
+        );
+    }
+
+    /// **An unlisted repository is never joined onto the workspace.** The call
+    /// runs for real and the tool refuses it; the fast path reads nothing.
+    #[test]
+    fn an_unlisted_repository_is_not_a_candidate() {
+        for repo in ["other", "..", ""] {
+            let step = call(FILE_READ, json!({"repo": repo, "path": "x.rs"}));
+            assert_eq!(read_key(&step, &workspace()), None, "{repo:?}");
+        }
     }
 
     #[test]
@@ -281,7 +332,7 @@ mod tests {
     /// The model often answers with the absolute path a listing showed it; that
     /// has to hash the same as the walker's relative form or it misses forever.
     #[test]
-    fn an_absolute_path_inside_the_workspace_becomes_relative() {
+    fn an_absolute_path_inside_the_repository_becomes_relative() {
         assert_eq!(
             normalise("D:/prog/candle/zend/src/main.rs", ws()),
             "zend/src/main.rs"
@@ -297,10 +348,10 @@ mod tests {
         assert_eq!(normalise("/zend/src/main.rs", ws()), "zend/src/main.rs");
     }
 
-    /// A path outside the workspace keeps its shape — it will simply find no
+    /// A path outside the repository keeps its shape — it will simply find no
     /// conversation, which is the correct outcome rather than a false hit.
     #[test]
-    fn a_path_outside_the_workspace_is_left_alone() {
+    fn a_path_outside_the_repository_is_left_alone() {
         assert_eq!(normalise("C:/elsewhere/x.rs", ws()), "C:/elsewhere/x.rs");
     }
 
@@ -320,10 +371,11 @@ mod tests {
     /// for its prose and showed up as an error in the GUI.
     #[test]
     fn the_served_response_carries_no_failure_marker() {
-        let response = served_response("Cargo.toml", 18);
+        let response = served_response("candle", "Cargo.toml", 18);
         assert!(response.get("error").is_none(), "{response}");
         assert!(response.get("detail").is_none(), "{response}");
         assert_eq!(response["status"], "already_read");
+        assert_eq!(response["repo"], "candle");
         assert_eq!(response["path"], "Cargo.toml");
         assert!(
             response["note"].as_str().unwrap().contains("18 lines"),
@@ -343,23 +395,31 @@ mod tests {
     }
 
     #[test]
-    fn a_file_read_offers_its_path() {
-        let step = call(FILE_READ, json!({"path": "zend/src/main.rs"}));
-        assert_eq!(read_path(&step), Some("zend/src/main.rs"));
+    fn a_file_read_offers_its_repository_and_path() {
+        let step = call(
+            FILE_READ,
+            json!({"repo": "candle", "path": "zend/src/main.rs"}),
+        );
+        assert_eq!(read_target(&step), Some(("candle", "zend/src/main.rs")));
     }
 
     /// Only `file_read` is content-addressed. Another tool naming a `path` —
     /// `write`, say — must never be served from an earlier read of that file.
     #[test]
     fn another_tool_with_a_path_is_not_a_candidate() {
-        let step = call("write", json!({"path": "zend/src/main.rs"}));
-        assert_eq!(read_path(&step), None);
+        let step = call(
+            "write",
+            json!({"repo": "candle", "path": "zend/src/main.rs"}),
+        );
+        assert_eq!(read_target(&step), None);
     }
 
     #[test]
-    fn a_file_read_without_a_path_is_not_a_candidate() {
+    fn a_file_read_without_a_path_or_repo_is_not_a_candidate() {
         let step = call(FILE_READ, json!({"start": 1, "end": 200}));
-        assert_eq!(read_path(&step), None);
+        assert_eq!(read_target(&step), None);
+        let step = call(FILE_READ, json!({"path": "zend/src/main.rs"}));
+        assert_eq!(read_target(&step), None);
     }
 
     /// An already-answered step is never re-examined — it has no file to read.
@@ -368,10 +428,10 @@ mod tests {
         let step = Step::Served(ToolResult {
             call: crate::tools::ToolCall {
                 name: FILE_READ.to_string(),
-                arguments: json!({"path": "a.rs"}),
+                arguments: json!({"repo": "candle", "path": "a.rs"}),
             },
             response: json!({}),
         });
-        assert_eq!(read_path(&step), None);
+        assert_eq!(read_target(&step), None);
     }
 }

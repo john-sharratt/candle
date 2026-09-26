@@ -70,7 +70,7 @@ impl Format {
 /// A named part of the corpus. Fixed: a client cannot address anything else.
 ///
 /// This is the whole of what the mind directory is allowed to expose. A folder
-/// that is not one of these — `node_modules`, the daemon's own `.substrate`, a
+/// that is not one of these — `node_modules`, the daemon's own `substrate`, a
 /// scratch directory somebody left — is not addressable, so it cannot be
 /// listed, opened or written by mistake. The old path-shaped API had to filter
 /// those out by name; this one cannot name them in the first place.
@@ -607,7 +607,7 @@ mod tests {
     }
 
     /// Only these nine, so nothing else in the mind directory is addressable —
-    /// `node_modules` and the daemon's own `.substrate` cannot be *named*,
+    /// `node_modules` and the daemon's own `substrate` cannot be *named*,
     /// which is a stronger guarantee than filtering them out of a listing.
     #[test]
     fn only_the_named_sections_exist() {
@@ -624,7 +624,7 @@ mod tests {
         ] {
             assert!(Address::parse(good).is_ok(), "{good}");
         }
-        for bad in ["layers", "node_modules", ".substrate", "scratchpad", "etc"] {
+        for bad in ["layers", "node_modules", "substrate", "scratchpad", "etc"] {
             assert_eq!(
                 Address::parse(bad),
                 Err(AddressError::UnknownSection(bad.to_owned())),

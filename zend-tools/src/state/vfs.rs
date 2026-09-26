@@ -1,13 +1,18 @@
-//! Overlay filesystem backing the `file_*` tools.
+//! Overlay filesystem backing the `file_*` tools — one store per repository.
+//!
+//! A workspace holds several repositories ([`super::workspace`]), and each has
+//! its own store: [`super::files::RepoFiles`] routes a call's `repo` argument to
+//! it. Inside a store every path is relative to that repository's folder, which
+//! this module calls the *root*.
 //!
 //! Two layers, in the union-mount sense:
 //!
 //! * **Upper** — an in-memory `HashMap<String, String>` (normalised path → UTF-8
 //!   content) holding everything the session has written, plus a set of
 //!   *whiteouts* marking lower-layer paths the session has deleted.
-//! * **Lower** — the daemon's working directory, read-only. Present only when a
-//!   workspace root is configured ([`VfsStore::with_workspace`]); without one the
-//!   store degenerates to the upper layer alone.
+//! * **Lower** — the repository's folder on disk, read-only. Present only when a
+//!   root is configured ([`VfsStore::with_root`]); without one the store
+//!   degenerates to the upper layer alone.
 //!
 //! A read resolves upper-first and falls through to the workspace, so a tool call
 //! sees the real project without the session having to load it. A write always
@@ -23,13 +28,10 @@
 //! # Path normalisation
 //!
 //! Paths are normalised to one canonical key before use: a leading `/` is
-//! stripped, `.` and empty segments collapse, `..` pops the stack (it can never
-//! escape the root — popping an empty stack is a no-op), and a leading
-//! `workspace/` segment is dropped because `/workspace` is the mount point the
-//! tool definitions document for the working directory. So `/workspace/src/main.rs`,
-//! `workspace/src/main.rs`, `./src/main.rs`, and `src/main.rs` are all the same
-//! key, `src/main.rs`, in both layers. A project containing a genuine top-level
-//! `workspace/` directory cannot address it through these tools.
+//! stripped, `.` and empty segments collapse, and `..` pops the stack (it can
+//! never escape the root — popping an empty stack is a no-op). So
+//! `/src/main.rs`, `./src/main.rs`, `src/util/../main.rs`, and `src/main.rs` are
+//! all the same key, `src/main.rs`, in both layers.
 //!
 //! # Lower-layer rules
 //!
@@ -44,10 +46,21 @@
 //!
 //! # Protected paths
 //!
-//! Any path with a [`PROTECTED_SEGMENT`] component is refused outright, in both
-//! layers and by every operation: [`VfsError::Forbidden`]. That covers
-//! `secrets/tools.yaml`, `web/secrets/auth.yaml`, and anything else a deployment
-//! keeps in a `secrets/` directory.
+//! Any path with a component in [`PROTECTED_SEGMENTS`] is refused outright, in
+//! both layers and by every operation: [`VfsError::Forbidden`]. Two segments
+//! are protected.
+//!
+//! [`PROTECTED_SEGMENT`] — `secrets/` — covers the gateway's
+//! `web/secrets/auth.yaml` and anything else a repository keeps there. The
+//! daemon's own keys live outside every repository
+//! ([`Secrets`](crate::state::Secrets)); this guard is what protects the ones
+//! that do not.
+//!
+//! [`PROTECTED_GIT_DIR`] — `.git/` — covers a repository's git database, for
+//! reasons set out on the constant: it holds remote URLs with their
+//! credentials intact, which the git layer redacts and this would not, and
+//! hand-parsing it produces confidently wrong answers where the `git_*` tools
+//! give right ones.
 //!
 //! **This is not the same protection as `.gitignore`, and the difference is the
 //! whole point.** The ignore rules are consulted by the listing walk and by
@@ -61,7 +74,7 @@
 //! lower-layer read goes through, rather than at each call site — a guard that
 //! has to be remembered at N call sites is a guard that is missing at one of
 //! them. Normalisation runs first, so alternate spellings (`/secrets/x`,
-//! `a/../secrets/x`, `workspace/secrets/x`, backslashes) all collapse onto the
+//! `a/../secrets/x`, backslashes) all collapse onto the
 //! same key before the check sees it.
 //!
 //! # Size cap
@@ -98,18 +111,33 @@ const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 /// Listing is unaffected — an oversize file still shows up with its true size.
 pub const MAX_LOWER_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 
-/// The mount-point segment the tool definitions use for the working directory.
-/// Stripped during normalisation so `/workspace/src` and `src` are one key.
-const MOUNT_SEGMENT: &str = "workspace";
-
 /// Path segment marking a directory the tools may not touch.
 ///
-/// A deployment's secrets live in a `secrets/` directory — `secrets/tools.yaml`
-/// for the daemon's own API keys, `web/secrets/auth.yaml` for the gateway's
-/// sign-in config. One name, matched at any depth, so a new secrets directory is
+/// A repository's secrets live in a `secrets/` directory — `web/secrets/auth.yaml`
+/// for the gateway's sign-in config, `npcd/secrets/` for npcd's. One name, matched at any depth, so a new secrets directory is
 /// protected the day it is created rather than the day someone remembers to add
 /// it to a list.
 pub const PROTECTED_SEGMENT: &str = "secrets";
+
+/// A repository's git database, protected for two separate reasons.
+///
+/// **It leaks what the git layer redacts.** `.git/config` holds a remote's URL
+/// verbatim, credentials and all — `url = https://user:token@host` — and
+/// `zend_git` redacts exactly that before any remote reaches a tool response.
+/// A `file_read` of the same file hands the token over whole, so leaving
+/// `.git` readable makes the redaction decorative.
+///
+/// **And reading it gives wrong answers.** Measured on a live turn: asked how
+/// many branches and tags a repository had, the model bypassed `git_refs`,
+/// read `.git/packed-refs` and `.git/refs/heads` itself, and answered 53 and
+/// 23 where the truth was 56 and 24 — loose refs, packed refs and symbolic
+/// refs are a database, not a list, and hand-parsing them is wrong in ways
+/// that look plausible. The git tools exist to answer those questions; this
+/// closes the shortcut around them.
+pub const PROTECTED_GIT_DIR: &str = ".git";
+
+/// Every path segment the tools may not touch, matched at any depth.
+pub const PROTECTED_SEGMENTS: [&str; 2] = [PROTECTED_SEGMENT, PROTECTED_GIT_DIR];
 
 #[derive(Debug)]
 pub enum VfsError {
@@ -133,8 +161,11 @@ impl std::fmt::Display for VfsError {
             VfsError::Unreadable(why) => write!(f, "{why}"),
             VfsError::Forbidden(path) => write!(
                 f,
-                "{path} is under a {PROTECTED_SEGMENT}/ directory and cannot be \
-                 read, written or listed by tools"
+                "{path} is under a protected directory ({PROTECTED_SEGMENT}/ or \
+                 {PROTECTED_GIT_DIR}/) and cannot be read, written or listed by \
+                 tools; for a repository's branches, tags, history or file \
+                 contents at a revision, use the git_* tools rather than its \
+                 {PROTECTED_GIT_DIR}/ folder"
             ),
             VfsError::Unwritable(why) => write!(f, "{why}"),
         }
@@ -241,53 +272,54 @@ enum Layering {
     Direct,
 }
 
-/// Union-mount of a session-private in-memory layer over the read-only workspace
-/// — or, built with [`VfsStore::direct`], the workspace itself.
+/// Union-mount of a session-private in-memory layer over a read-only
+/// repository folder — or, built with [`VfsStore::direct`], the folder itself.
 #[derive(Default)]
 pub struct VfsStore {
     upper: RwLock<Upper>,
-    /// Lower layer root. `None` leaves the store upper-only.
-    workspace: Option<PathBuf>,
+    /// Lower layer root: the repository's folder. `None` leaves the store
+    /// upper-only.
+    root: Option<PathBuf>,
     layering: Layering,
 }
 
 impl VfsStore {
-    /// Upper layer only — no workspace fall-through.
+    /// Upper layer only — no fall-through to disk.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Overlay the upper layer on `root`, the daemon's working directory.
-    pub fn with_workspace(root: impl Into<PathBuf>) -> Self {
+    /// Overlay the upper layer on `root`, a repository's folder.
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             upper: RwLock::new(Upper::default()),
-            workspace: Some(root.into()),
+            root: Some(root.into()),
             layering: Layering::Overlay,
         }
     }
 
-    /// The workspace at `root` with no overlay: writes and deletes change the
+    /// The folder at `root` with no overlay: writes and deletes change the
     /// files on disk. See the module's "Direct mode".
     ///
     /// Takes the [`DiskWriteGrant`] only [`Grants::disk_write`](crate::Grants::disk_write)
     /// makes, so a store that writes the disk exists only where that capability
     /// was granted.
-    pub fn direct(root: impl Into<PathBuf>, _grant: DiskWriteGrant) -> Self {
+    pub fn direct(root: impl Into<PathBuf>, _grant: &DiskWriteGrant) -> Self {
         Self {
             upper: RwLock::new(Upper::default()),
-            workspace: Some(root.into()),
+            root: Some(root.into()),
             layering: Layering::Direct,
         }
     }
 
-    /// Whether writes and deletes change the workspace on disk.
+    /// Whether writes and deletes change the files on disk.
     pub fn is_direct(&self) -> bool {
         self.layering == Layering::Direct
     }
 
     /// The configured lower-layer root, if any.
-    pub fn workspace(&self) -> Option<&Path> {
-        self.workspace.as_deref()
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     /// Write into the upper layer, clearing any whiteout on the path. Returns
@@ -341,6 +373,35 @@ impl VfsStore {
         self.read_lower(&norm)
     }
 
+    /// A file's bytes, resolved through the overlay the same way
+    /// [`Self::read`] is, for a caller that records content rather than
+    /// showing it — `git_commit`'s `take`. Neither the UTF-8 requirement nor
+    /// [`MAX_LOWER_FILE_BYTES`] applies, since nothing here reaches a tool
+    /// response; every rule on which file a path may open does, because it
+    /// goes through [`Self::lower_path`] like every other read.
+    pub fn read_bytes(&self, path: &str) -> Result<Option<Vec<u8>>, VfsError> {
+        let norm = Self::normalize(path);
+        Self::guard(&norm)?;
+        {
+            let guard = self.upper.read().unwrap();
+            if let Some(v) = guard.files.get(&norm) {
+                return Ok(Some(v.as_bytes().to_vec()));
+            }
+            if guard.whiteouts.contains(&norm) {
+                return Ok(None);
+            }
+        }
+        let Some(abs) = self.lower_path(&norm) else {
+            return Ok(None);
+        };
+        if !std::fs::metadata(&abs).is_ok_and(|m| m.is_file()) {
+            return Ok(None);
+        }
+        std::fs::read(&abs)
+            .map(Some)
+            .map_err(|e| VfsError::Unreadable(format!("{norm} could not be read: {e}")))
+    }
+
     /// One [`PAGE_LINES`]-line page of a file, resolved through the overlay the
     /// same way [`Self::read`] is. `Ok(None)` means the path does not exist in
     /// either layer.
@@ -375,6 +436,11 @@ impl VfsStore {
     /// layer — a missing path, or one that names a file.
     pub fn list_dir(&self, dir: &str) -> Result<Option<Vec<ListEntry>>, VfsError> {
         let norm = Self::normalize(dir);
+        // A protected folder named directly lists as empty — never an error
+        // that would confirm or deny it, and never its contents.
+        if Self::is_protected(&norm) {
+            return Ok(Some(Vec::new()));
+        }
         // `norm` resolving as a file rules out a directory listing outright —
         // checked first, and independently of the walk below, because a
         // conflicting write elsewhere in the upper layer (e.g. a file at
@@ -561,7 +627,7 @@ impl VfsStore {
     /// Absolute path of `norm` under the workspace, or `None` when there is no
     /// lower layer or the key is empty (the root itself is not a file).
     fn lower_path(&self, norm: &str) -> Option<PathBuf> {
-        let root = self.workspace.as_ref()?;
+        let root = self.root.as_ref()?;
         if norm.is_empty() {
             return None;
         }
@@ -572,7 +638,45 @@ impl VfsStore {
         if Self::is_protected(norm) {
             return None;
         }
-        Self::under(root, norm)
+        Self::contained(root, norm)
+    }
+
+    /// [`Self::under`], and then the same question asked of where the path
+    /// really leads: with every symlink and junction on the way resolved, it
+    /// must still be under `root` and outside every protected folder.
+    ///
+    /// The spelling checks alone are not enough. A symlink committed to a
+    /// repository — `notes.md -> ~/.zend/secrets.yaml`, or a folder junction
+    /// to the user's home — spells a plain workspace path and opens a file
+    /// outside every repository, which is exactly where the daemon's secrets
+    /// live; one pointing at the repository's own `secrets/` folder opens it
+    /// under an unprotected name. A path that does not exist yet (a direct
+    /// write creating it) is judged by its deepest existing ancestor, so a
+    /// new file under a linked folder is refused too.
+    fn contained(root: &Path, norm: &str) -> Option<PathBuf> {
+        let joined = Self::under(root, norm)?;
+        let real_root = root.canonicalize().ok()?;
+        let mut probe = joined.clone();
+        let real = loop {
+            match probe.canonicalize() {
+                Ok(real) => break real,
+                Err(_) => {
+                    if !probe.pop() {
+                        return None;
+                    }
+                }
+            }
+        };
+        let rel = real.strip_prefix(&real_root).ok()?;
+        let key = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if Self::is_protected(&key) {
+            return None;
+        }
+        Some(joined)
     }
 
     /// `root.join(norm)`, only when the result stays under `root`.
@@ -611,7 +715,7 @@ impl VfsStore {
     /// store cannot open. A Linux workspace can hold `logs/12:00.txt` or
     /// `notes~2.md`; listed but refused by every read, the model was shown a
     /// file it could name and never read.
-    fn addressable(norm: &str) -> bool {
+    pub(crate) fn addressable(norm: &str) -> bool {
         !norm
             .split('/')
             .any(|s| s.contains(':') || s.ends_with('.') || s.ends_with(' ') || is_short_name(s))
@@ -624,8 +728,8 @@ impl VfsStore {
     /// `secrets./` are the directory they open, not three unprotected ones.
     pub fn is_protected(norm: &str) -> bool {
         norm.split('/').any(|s| {
-            s.trim_end_matches(['.', ' '])
-                .eq_ignore_ascii_case(PROTECTED_SEGMENT)
+            let s = s.trim_end_matches(['.', ' ']);
+            PROTECTED_SEGMENTS.iter().any(|p| s.eq_ignore_ascii_case(p))
         })
     }
 
@@ -777,16 +881,16 @@ impl VfsStore {
         })
     }
 
-    /// `true` when `norm` names a real directory in the workspace — the empty
-    /// path (the root) always does, when there is a workspace at all.
+    /// `true` when `norm` names a real directory under the root — the empty
+    /// path (the root itself) always does, when there is a root at all.
     fn lower_dir_exists(&self, norm: &str) -> bool {
-        let Some(root) = self.workspace.as_ref() else {
+        let Some(root) = self.root.as_ref() else {
             return false;
         };
         if norm.is_empty() {
             root.is_dir()
         } else {
-            Self::under(root, norm).is_some_and(|p| p.is_dir())
+            Self::contained(root, norm).is_some_and(|p| p.is_dir())
         }
     }
 
@@ -806,13 +910,13 @@ impl VfsStore {
     /// refuses (a `:` in the name, an 8.3 short-name tail, …) is dropped too —
     /// a listing never shows a file the store cannot open.
     fn list_lower_dir(&self, norm: &str) -> Vec<(String, Option<usize>, bool)> {
-        let Some(root) = self.workspace.as_ref() else {
+        let Some(root) = self.root.as_ref() else {
             return Vec::new();
         };
         let walk_root = if norm.is_empty() {
             root.clone()
         } else {
-            let Some(p) = Self::under(root, norm) else {
+            let Some(p) = Self::contained(root, norm) else {
                 return Vec::new();
             };
             p
@@ -878,7 +982,7 @@ impl VfsStore {
     /// `src/ma` needs — and what a prefix naming somewhere outside the root
     /// gets, so it lists nothing rather than walking another drive.
     fn walk_start<'p>(root: &Path, norm_prefix: &'p str) -> (PathBuf, Option<&'p str>) {
-        match Self::under(root, norm_prefix) {
+        match Self::contained(root, norm_prefix) {
             Some(dir) if !norm_prefix.is_empty() && dir.is_dir() => (dir, None),
             _ => (root.to_path_buf(), Some(norm_prefix)),
         }
@@ -889,7 +993,7 @@ impl VfsStore {
     /// Deliberately stats nothing and reads nothing: this backs path search and
     /// the candidate list for a content search, which need only the names.
     fn walk_lower_paths(&self, norm_prefix: &str) -> Vec<String> {
-        let Some(root) = self.workspace.as_ref() else {
+        let Some(root) = self.root.as_ref() else {
             return Vec::new();
         };
         let (walk_root, filter) = Self::walk_start(root, norm_prefix);
@@ -1061,10 +1165,6 @@ impl VfsStore {
                 s => parts.push(s),
             }
         }
-        // `/workspace` is the documented mount point of the working directory.
-        if parts.first() == Some(&MOUNT_SEGMENT) {
-            parts.remove(0);
-        }
         parts.join("/")
     }
 }
@@ -1095,7 +1195,7 @@ mod tests {
         put(dir.path(), "README.md", "# project\n");
         put(dir.path(), "src/main.rs", "fn main() {}\n");
         put(dir.path(), "src/util/helper.rs", "pub fn h() {}\n");
-        let store = VfsStore::with_workspace(dir.path());
+        let store = VfsStore::with_root(dir.path());
         (dir, store)
     }
 
@@ -1121,12 +1221,156 @@ mod tests {
         Grants::ALL.disk_write().unwrap()
     }
 
+    // ── links ────────────────────────────────────────────────────────────────
+
+    /// Link folder `link` to `target`: a symlink on Unix, a junction on
+    /// Windows, which needs no privilege to create.
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// **A linked folder leading outside the root is invisible and
+    /// unwritable.** The daemon's secrets live outside every repository, so a
+    /// link from a repository to them is the one way the file tools could
+    /// reach them.
+    #[test]
+    fn a_folder_link_leading_outside_the_root_is_not_read_listed_searched_or_written() {
+        let outside = tempfile::tempdir().unwrap();
+        put(
+            outside.path(),
+            "secrets.yaml",
+            "tavily_api_key: tvly-live\n",
+        );
+        let root = tempfile::tempdir().unwrap();
+        put(root.path(), "src/lib.rs", "fn f() {}\n");
+        link_dir(outside.path(), &root.path().join("escape"));
+
+        let s = VfsStore::with_root(root.path());
+        assert_eq!(s.read("escape/secrets.yaml").unwrap(), None);
+        assert_eq!(s.read_bytes("escape/secrets.yaml").unwrap(), None);
+        assert!(s.read_page("escape/secrets.yaml", 0).unwrap().is_none());
+        assert_eq!(s.list_dir("escape").unwrap(), None);
+        assert!(!listed(&s, "").contains(&"escape".to_string()));
+        assert!(s.paths("escape").is_empty());
+        let re = regex::Regex::new("tvly").unwrap();
+        assert!(s.grep(&re, "", 10, 10).hits.is_empty());
+
+        let d = VfsStore::direct(root.path(), &granted());
+        assert_eq!(d.read("escape/secrets.yaml").unwrap(), None);
+        assert!(d.write("escape/planted.txt", "x".into()).is_err());
+        assert!(!outside.path().join("planted.txt").exists());
+        assert!(!d.delete("escape/secrets.yaml"));
+        assert!(outside.path().join("secrets.yaml").exists());
+    }
+
+    /// A link into the repository's own protected folder is refused too —
+    /// the protection is on where a path leads, not how it is spelled.
+    #[test]
+    fn a_folder_link_into_a_protected_folder_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        put(
+            root.path(),
+            "secrets/tools.yaml",
+            "tavily_api_key: tvly-live\n",
+        );
+        link_dir(&root.path().join("secrets"), &root.path().join("innocent"));
+        let s = VfsStore::with_root(root.path());
+        assert_eq!(s.read("innocent/tools.yaml").unwrap(), None);
+        assert_eq!(s.read_bytes("innocent/tools.yaml").unwrap(), None);
+        assert_eq!(s.list_dir("innocent").unwrap(), None);
+    }
+
+    /// **Bytes read the way text does, minus the text rules.** A binary file
+    /// comes back whole; a drive-qualified path, a protected path and a
+    /// folder do not come back at all.
+    #[test]
+    fn read_bytes_returns_any_file_and_only_a_file_under_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("logo.bin"), [0u8, 159, 146, 150, 255]).unwrap();
+        put(root.path(), "src/lib.rs", "fn f() {}\n");
+        put(root.path(), "secrets/key.yaml", "k: v\n");
+        let outside = tempfile::tempdir().unwrap();
+        put(outside.path(), "id_rsa", "private\n");
+        let s = VfsStore::with_root(root.path());
+
+        assert_eq!(
+            s.read_bytes("logo.bin").unwrap(),
+            Some(vec![0u8, 159, 146, 150, 255])
+        );
+        assert!(s.read("logo.bin").is_err(), "text reads still refuse it");
+        assert_eq!(s.read_bytes("src").unwrap(), None);
+        assert!(matches!(
+            s.read_bytes("secrets/key.yaml"),
+            Err(VfsError::Forbidden(_))
+        ));
+        let abs = outside.path().join("id_rsa");
+        let spelled = abs.to_string_lossy().replace('\\', "/");
+        assert_eq!(s.read_bytes(&spelled).unwrap(), None, "{spelled}");
+    }
+
+    /// A link that stays inside the root, and out of protected folders,
+    /// still works.
+    #[test]
+    fn a_folder_link_inside_the_root_still_reads() {
+        let root = tempfile::tempdir().unwrap();
+        put(root.path(), "real/a.txt", "hello\n");
+        link_dir(&root.path().join("real"), &root.path().join("alias"));
+        let s = VfsStore::with_root(root.path());
+        assert_eq!(s.read("alias/a.txt").unwrap().as_deref(), Some("hello\n"));
+    }
+
+    /// File symlinks, which Windows only creates with privilege.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_symlink_to_outside_or_to_a_protected_file_is_refused() {
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        put(
+            outside.path(),
+            "secrets.yaml",
+            "tavily_api_key: tvly-live\n",
+        );
+        let root = tempfile::tempdir().unwrap();
+        put(root.path(), "secrets/tools.yaml", "key: live\n");
+        put(root.path(), "ok.txt", "fine\n");
+        symlink(
+            outside.path().join("secrets.yaml"),
+            root.path().join("notes.md"),
+        )
+        .unwrap();
+        symlink(
+            root.path().join("secrets/tools.yaml"),
+            root.path().join("cfg.yaml"),
+        )
+        .unwrap();
+        symlink(root.path().join("ok.txt"), root.path().join("ok-link.txt")).unwrap();
+        let s = VfsStore::with_root(root.path());
+        assert_eq!(s.read("notes.md").unwrap(), None);
+        assert_eq!(s.read("cfg.yaml").unwrap(), None);
+        assert_eq!(s.read("ok-link.txt").unwrap().as_deref(), Some("fine\n"));
+    }
+
     /// **A direct write is a file on disk**, created with its directories, and
     /// every read — this store's and the filesystem's — sees it.
     #[test]
     fn a_direct_write_lands_on_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let s = VfsStore::direct(dir.path(), granted());
+        let s = VfsStore::direct(dir.path(), &granted());
         assert!(s.is_direct());
 
         assert!(
@@ -1144,9 +1388,7 @@ mod tests {
         assert_eq!(s.total_bytes(), 0, "nothing is held in memory");
 
         // Overwriting is not a creation, and replaces the content.
-        assert!(!s
-            .write("/workspace/docs/new/note.md", "bye\n".into())
-            .unwrap());
+        assert!(!s.write("/docs/new/note.md", "bye\n".into()).unwrap());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("docs/new/note.md")).unwrap(),
             "bye\n"
@@ -1164,7 +1406,7 @@ mod tests {
     fn a_direct_delete_removes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         put(dir.path(), "gone.txt", "x");
-        let s = VfsStore::direct(dir.path(), granted());
+        let s = VfsStore::direct(dir.path(), &granted());
         assert!(s.delete("gone.txt"));
         assert!(!dir.path().join("gone.txt").exists());
         assert!(!s.delete("gone.txt"), "nothing left to delete");
@@ -1178,7 +1420,7 @@ mod tests {
         let outer = tempfile::tempdir().unwrap();
         let root = outer.path().join("ws");
         put(&root, "secrets/tools.yaml", "key: real\n");
-        let s = VfsStore::direct(&root, granted());
+        let s = VfsStore::direct(&root, &granted());
 
         assert!(matches!(
             s.write("secrets/tools.yaml", "key: planted\n".into()),
@@ -1208,7 +1450,7 @@ mod tests {
         let outside = outer.path().join("outside.txt");
         let planted = outer.path().join("planted.txt");
 
-        let overlay = VfsStore::with_workspace(&root);
+        let overlay = VfsStore::with_root(&root);
         assert_eq!(
             overlay.read(&outside.to_string_lossy()).unwrap(),
             None,
@@ -1216,7 +1458,7 @@ mod tests {
         );
         assert!(listed(&overlay, &outer.path().to_string_lossy()).is_empty());
 
-        let direct = VfsStore::direct(&root, granted());
+        let direct = VfsStore::direct(&root, &granted());
         assert_eq!(direct.read(&outside.to_string_lossy()).unwrap(), None);
         let _ = direct.write(&planted.to_string_lossy(), "x".into());
         assert!(!planted.exists(), "a direct write left the workspace");
@@ -1243,7 +1485,7 @@ mod tests {
         let outer = tempfile::tempdir().unwrap();
         let root = outer.path().join("ws");
         put(&root, "secrets/tools.yaml", "key: real\n");
-        let s = VfsStore::direct(&root, granted());
+        let s = VfsStore::direct(&root, &granted());
         for path in [
             "Secrets/tools.yaml",
             "SECRETS/tools.yaml",
@@ -1265,6 +1507,68 @@ mod tests {
             "key: real\n"
         );
         assert!(!VfsStore::is_protected("docs/secretsauce.md"));
+    }
+
+    /// **A repository's `.git` is protected, at any depth and by any spelling.**
+    ///
+    /// Two independent reasons, both measured. `.git/config` holds a remote's
+    /// URL with its credentials intact — the git layer redacts exactly that, so
+    /// leaving this readable would make the redaction decorative. And on a live
+    /// turn the model bypassed `git_refs`, hand-parsed `.git/packed-refs`, and
+    /// answered 53 branches and 23 tags where the truth was 56 and 24.
+    #[test]
+    fn a_repositorys_git_database_is_protected() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        put(
+            &root,
+            ".git/config",
+            "[remote \"origin\"]\n\turl = https://u:ghp_secrettoken@example.com/a.git\n",
+        );
+        put(&root, ".git/packed-refs", "abc refs/heads/main\n");
+        put(&root, "src/lib.rs", "pub fn ok() {}\n");
+        let s = VfsStore::direct(&root, &granted());
+
+        for path in [
+            ".git/config",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+            ".GIT/config",
+            ".git./config",
+            "nested/repo/.git/config",
+        ] {
+            assert!(
+                VfsStore::is_protected(&VfsStore::normalize(path)),
+                "{path:?} is not protected"
+            );
+            assert!(
+                !matches!(s.read(path), Ok(Some(_))),
+                "{path:?} was readable"
+            );
+            assert!(
+                s.write(path, "planted".into()).is_err(),
+                "{path:?} was written"
+            );
+        }
+
+        // The token never reaches a caller by any route.
+        assert!(s.read(".git/config").is_err());
+        let listed = s.list_dir("").unwrap().unwrap_or_default();
+        assert!(
+            !format!("{listed:?}").contains(".git"),
+            "a listing named the git database: {listed:?}"
+        );
+        let re = regex::Regex::new("ghp_secrettoken").unwrap();
+        let hits = s.grep(&re, "", 50, 20);
+        assert!(
+            !format!("{hits:?}").contains("ghp_secrettoken"),
+            "grep reached into .git: {hits:?}"
+        );
+
+        // A file merely *called* something gitish is untouched.
+        assert!(!VfsStore::is_protected("docs/.gitignore"));
+        assert!(!VfsStore::is_protected("src/gitmodules.rs"));
+        assert!(matches!(s.read("src/lib.rs"), Ok(Some(_))));
     }
 
     /// **A listing shows only files a read can open.** `notes~2.md` has the
@@ -1296,7 +1600,7 @@ mod tests {
     fn a_direct_write_over_a_directory_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         put(dir.path(), "src/main.rs", "fn main() {}\n");
-        let s = VfsStore::direct(dir.path(), granted());
+        let s = VfsStore::direct(dir.path(), &granted());
         assert!(matches!(
             s.write("src", "x".into()),
             Err(VfsError::Unwritable(_))
@@ -1331,9 +1635,7 @@ mod tests {
             "src/./main.rs",
             "src//main.rs",
             "src/util/../main.rs",
-            "/workspace/src/main.rs",
-            "workspace/src/main.rs",
-            "/workspace/./src/../src/main.rs",
+            "/./src/../src/main.rs",
         ] {
             assert_eq!(
                 VfsStore::normalize(spelling),
@@ -1348,10 +1650,7 @@ mod tests {
     #[test]
     fn normalize_accepts_backslash_separators() {
         assert_eq!(VfsStore::normalize(r"src\main.rs"), "src/main.rs");
-        assert_eq!(
-            VfsStore::normalize(r"\workspace\src\main.rs"),
-            "src/main.rs"
-        );
+        assert_eq!(VfsStore::normalize(r"\src\main.rs"), "src/main.rs");
     }
 
     /// `..` can never climb above the root: popping an empty stack is a no-op, so
@@ -1363,20 +1662,15 @@ mod tests {
         assert_eq!(VfsStore::normalize(".."), "");
     }
 
-    /// Only a *leading* `workspace` segment is the mount point; one nested deeper
-    /// is an ordinary directory name.
+    /// **No segment is special.** A folder named `workspace` is an ordinary
+    /// folder wherever it sits, and the root spells as the empty key.
     #[test]
-    fn normalize_strips_only_the_leading_mount_segment() {
+    fn normalize_treats_every_segment_as_a_plain_name() {
         assert_eq!(
-            VfsStore::normalize("src/workspace/a.rs"),
-            "src/workspace/a.rs"
+            VfsStore::normalize("workspace/src/a.rs"),
+            "workspace/src/a.rs"
         );
-        assert_eq!(
-            VfsStore::normalize("workspace/workspace/a.rs"),
-            "workspace/a.rs"
-        );
-        // The mount point on its own is the root, not a file.
-        assert_eq!(VfsStore::normalize("/workspace"), "");
+        assert_eq!(VfsStore::normalize("/workspace"), "workspace");
         assert_eq!(VfsStore::normalize("/"), "");
         assert_eq!(VfsStore::normalize(""), "");
     }
@@ -1425,7 +1719,7 @@ mod tests {
     fn upper_only_store_round_trips_and_accounts_bytes() {
         let s = VfsStore::new();
         assert_eq!(s.total_bytes(), 0);
-        assert!(s.workspace().is_none());
+        assert!(s.root().is_none());
 
         assert!(
             s.write("a.txt", "hello".into()).unwrap(),
@@ -1462,7 +1756,7 @@ mod tests {
     #[test]
     fn different_spellings_address_one_entry() {
         let s = VfsStore::new();
-        s.write("/workspace/src/main.rs", "one".into()).unwrap();
+        s.write("/src/main.rs", "one".into()).unwrap();
         s.write("src/main.rs", "two".into()).unwrap();
         assert_eq!(
             s.read("./src/../src/main.rs").unwrap().as_deref(),
@@ -1532,7 +1826,7 @@ mod tests {
             Some("fn main() {}\n")
         );
         assert_eq!(
-            s.read("/workspace/src/util/helper.rs").unwrap().as_deref(),
+            s.read("/src/util/helper.rs").unwrap().as_deref(),
             Some("pub fn h() {}\n"),
         );
         assert_eq!(s.total_bytes(), 0, "reading through retains nothing");
@@ -1705,7 +1999,7 @@ mod tests {
     fn list_is_sorted_and_one_level_deep() {
         let (_dir, s) = store_with_tree();
         assert_eq!(listed(&s, ""), vec!["README.md", "src"]);
-        for dir in ["src", "src/", "/workspace/src"] {
+        for dir in ["src", "src/", "/src"] {
             assert_eq!(
                 listed(&s, dir),
                 vec!["src/main.rs", "src/util"],
@@ -1833,7 +2127,7 @@ mod tests {
     #[test]
     fn a_whiteout_applies_to_every_spelling_of_the_path() {
         let (_dir, s) = store_with_tree();
-        s.delete("/workspace/src/main.rs");
+        s.delete("/src/main.rs");
         assert_eq!(s.read("src/main.rs").unwrap(), None);
         assert_eq!(s.read("./src/main.rs").unwrap(), None);
     }

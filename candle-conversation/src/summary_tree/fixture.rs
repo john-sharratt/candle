@@ -1,12 +1,12 @@
 //! Tier 2 substrate-fixture loader (§10.3).
 //!
-//! A *fixture* is a committed substrate directory (`.substrate/`) plus
+//! A *fixture* is a committed substrate directory (`substrate/`) plus
 //! a `manifest.yaml` describing the planted facts, pre-recorded probe
 //! Q vectors, and expected algorithm outputs:
 //!
 //! ```text
 //!   tests/fixtures/conv-fixture-N/
-//!   ├── .substrate/
+//!   ├── substrate/
 //!   │   ├── substrate.log         (real redo log, produced by Tier 3)
 //!   │   ├── manifest.json
 //!   │   └── provenance/
@@ -33,6 +33,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::persistence::SUBSTRATE_DIR;
 
 /// Top-level fixture metadata, persisted as `manifest.yaml`.
 ///
@@ -128,14 +130,14 @@ pub struct SubstrateFixture {
 
 impl SubstrateFixture {
     /// Load the fixture directory at `path`.  Reads `manifest.yaml`
-    /// and validates that the `.substrate/` subdirectory exists.
+    /// and validates that the `substrate/` subdirectory exists.
     /// Doesn't open the substrate log — that's the engine's job.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, FixtureError> {
         let root = path.as_ref().to_path_buf();
         if !root.is_dir() {
             return Err(FixtureError::NotFound(root));
         }
-        let substrate_dir = root.join(".substrate");
+        let substrate_dir = root.join(SUBSTRATE_DIR);
         if !substrate_dir.is_dir() {
             return Err(FixtureError::MissingSubstrate(substrate_dir));
         }
@@ -150,7 +152,7 @@ impl SubstrateFixture {
         Ok(Self { manifest, root })
     }
 
-    /// Path to the fixture root (containing `.substrate/`,
+    /// Path to the fixture root (containing `substrate/`,
     /// `manifest.yaml`, etc.).  Open the engine with this as the
     /// workspace directory.
     pub fn workspace_path(&self) -> &Path {
@@ -167,7 +169,7 @@ impl SubstrateFixture {
 pub enum FixtureError {
     #[error("fixture directory not found: {0}")]
     NotFound(PathBuf),
-    #[error("fixture is missing the .substrate/ subdirectory at {0}")]
+    #[error("fixture is missing the substrate/ subdirectory at {0}")]
     MissingSubstrate(PathBuf),
     #[error("failed to read manifest at {0}: {1}")]
     ManifestRead(PathBuf, String),
@@ -190,7 +192,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn write_test_fixture(root: &Path, debug_id: &str) {
-        std::fs::create_dir_all(root.join(".substrate")).unwrap();
+        std::fs::create_dir_all(root.join(SUBSTRATE_DIR)).unwrap();
         let manifest = FixtureManifest {
             debug_id: debug_id.to_string(),
             schema_version: 1,
@@ -240,7 +242,7 @@ mod tests {
     #[test]
     fn missing_substrate_subdir_errors() {
         let tmp = TempDir::new().unwrap();
-        // Write manifest WITHOUT the .substrate/ subdir.
+        // Write manifest WITHOUT the substrate/ subdir.
         std::fs::write(
             tmp.path().join("manifest.yaml"),
             "debug_id: x\nschema_version: 1\ncreated_by: t\nmodel: m\n\
@@ -254,7 +256,7 @@ mod tests {
     #[test]
     fn unsupported_schema_rejected() {
         let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".substrate")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(SUBSTRATE_DIR)).unwrap();
         std::fs::write(
             tmp.path().join("manifest.yaml"),
             "debug_id: x\nschema_version: 999\ncreated_by: t\nmodel: m\n\
@@ -268,7 +270,7 @@ mod tests {
     #[test]
     fn write_manifest_round_trips_through_load() {
         let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".substrate")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(SUBSTRATE_DIR)).unwrap();
         let m = FixtureManifest {
             debug_id: "two-topics-100".to_string(),
             schema_version: 1,

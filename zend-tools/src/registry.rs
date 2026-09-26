@@ -1,4 +1,4 @@
-//! Static registry of all 93 tool implementations.
+//! Static registry of all 104 tool implementations.
 //!
 //! # How a tool is registered
 //!
@@ -60,6 +60,17 @@ pub struct RegisteredTool {
     /// ([`Tool::replay`]). Consulted only on the resume path; a live turn runs
     /// every call it asks for.
     pub replay: fn(&Value) -> Replay,
+    /// The JSON Schema `schemars` derives from this tool's `Request` type.
+    ///
+    /// The schema a model is *shown* is the hand-written one in the tool's
+    /// bundled definition (`zend::tool_def`), not this — the two are separate
+    /// on purpose, because the definition carries trigger-rich prose the
+    /// derive could never produce. This exists so the two can be compared: a
+    /// definition that names a field the request does not have is a parameter
+    /// the model is told to send and the tool silently ignores, and one that
+    /// omits a required field is a call the grammar can never complete.
+    /// Neither shows up until a call fails at run time.
+    pub schema: fn() -> Value,
 }
 
 impl RegisteredTool {
@@ -71,6 +82,7 @@ impl RegisteredTool {
             requires: &[],
             confirmation: tool_confirmation::<T>,
             replay: tool_replay::<T>,
+            schema: tool_schema::<T>,
         }
     }
 
@@ -135,6 +147,12 @@ fn tool_confirmation<T: Tool>(args: &Value) -> Option<ConfirmationDetails> {
         return None;
     }
     T::confirmation(&req)
+}
+
+/// The schema `schemars` derives from `T::Request`.
+fn tool_schema<T: Tool>() -> Value {
+    let root = schemars::gen::SchemaGenerator::default().into_root_schema_for::<T::Request>();
+    serde_json::to_value(root).unwrap_or(Value::Null)
 }
 
 fn tool_replay<T: Tool>(args: &Value) -> Replay {
@@ -382,6 +400,114 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
     (
         "file_present",
         &["show_file", "present_file", "display_file"],
+    ),
+    (
+        "git_status",
+        &["git_state", "repo_status", "working_tree_status", "git_st"],
+    ),
+    (
+        "git_log",
+        &[
+            "git_history",
+            "commit_log",
+            "commit_history",
+            "list_commits",
+        ],
+    ),
+    // `git_diff`, `git_blame` and the like are what a model reaches for by
+    // habit, and each is one of git_show's modes: the name lands on the tool
+    // that does the job, and the mode is picked from `what` inside it.
+    (
+        "git_show",
+        &[
+            "git_diff",
+            "git_file",
+            "git_blame",
+            "git_patch",
+            "show_commit",
+            "commit_patch",
+            "commit_diff",
+            "git_changes",
+            "changed_files",
+            "blame",
+            "annotate",
+            "line_history",
+            "git_cat_file",
+            "file_at_revision",
+            "show_file_at",
+            "git_show_file",
+            "git_ls_tree",
+        ],
+    ),
+    (
+        "git_grep",
+        &["grep_revision", "search_history", "grep_at_revision"],
+    ),
+    // Remote lookups land here rather than on git_fetch. `git_remote_update`
+    // is a fetch in git itself, but measured live the model reached for it to
+    // learn where a repository pushes — was refused for want of `disk_write`,
+    // and burned a round. A name about a remote is, for the model, a question
+    // about the remote, so it resolves to the tool that answers one.
+    (
+        "git_refs",
+        &[
+            "git_branches",
+            "git_tags",
+            "git_remotes",
+            "list_branches",
+            "branches",
+            "show_branches",
+            "list_tags",
+            "tags",
+            "show_tags",
+            "list_remotes",
+            "remotes",
+            "show_remotes",
+            "git_remote",
+            "git_remote_show",
+            "git_remote_update",
+            "git_remote_get_url",
+            "remote_url",
+            "get_remote_url",
+        ],
+    ),
+    (
+        "git_commit",
+        &[
+            "commit",
+            "make_commit",
+            "record_commit",
+            "git_ci",
+            "git_apply",
+            "apply_patch",
+            "land_patch",
+            "apply_diff",
+            "git_pick",
+            "cherry_pick",
+            "git_cherry_pick",
+            "git_revert",
+            "revert_commit",
+            "backport",
+        ],
+    ),
+    (
+        "git_ref",
+        &[
+            "git_branch",
+            "git_tag",
+            "create_branch",
+            "delete_branch",
+            "move_branch",
+            "new_branch",
+            "create_tag",
+            "delete_tag",
+            "make_tag",
+        ],
+    ),
+    ("git_fetch", &["fetch_remote", "fetch_origin"]),
+    (
+        "git_push",
+        &["push", "publish_branch", "push_branch", "git_publish"],
     ),
     (
         "notes_write",
@@ -822,6 +948,9 @@ use crate::tools::{
         FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_LIST, FILE_PRESENT, FILE_READ, FILE_SEARCH,
         FILE_WRITE,
     },
+    git::{
+        GIT_COMMIT, GIT_FETCH, GIT_GREP, GIT_LOG, GIT_PUSH, GIT_REF, GIT_REFS, GIT_SHOW, GIT_STATUS,
+    },
     hash::{HASH_COMPUTE, HASH_SCAN},
     hash_state::{HASH_STATE_FINALIZE, HASH_STATE_INIT, HASH_STATE_UPDATE},
     http_session::{
@@ -875,6 +1004,8 @@ fn register_all() -> &'static [RegisteredTool] {
     // files from any session, `:memory:` included — so the whole family is a
     // disk writer.
     const DISK: &[Capability] = &[DiskWrite];
+    // A git fetch or push both reaches a remote and writes refs locally.
+    const NET_DISK: &[Capability] = &[Network, DiskWrite];
 
     // Which tools Restricted mode offers is decided in `zend` from each
     // definition's `high_risk` flag and these declarations together; the
@@ -897,6 +1028,32 @@ fn register_all() -> &'static [RegisteredTool] {
         FILE_GREP,
         FILE_DELETE,
         FILE_PRESENT,
+        // Git tools (9) — the split that decides the whole family.
+        //
+        // The readers declare nothing and are not high-risk, so Comprehensive
+        // offers them: they answer questions about the repository's history
+        // and change none of it. Running the `git` program is deliberately
+        // not `Exec` — see the family's module docs — because every argument
+        // is built by the layer from values validated at their type boundary,
+        // never a command the model composed.
+        //
+        // Four tools rather than a dozen readers: `git_show`'s `what` and
+        // `git_refs`' `kind` carry distinctions that used to be separate
+        // tools, where the choice between them was made in the projection's
+        // top-k and went wrong. Inside a call, the grammar decides them.
+        GIT_STATUS,
+        GIT_LOG,
+        GIT_SHOW,
+        GIT_GREP,
+        GIT_REFS,
+        // The writers declare DiskWrite, which Comprehensive's grants
+        // withhold — so changing a repository is Mutable's alone, and a call
+        // that arrives anyway is refused before its arguments are parsed.
+        // Fetch and push also reach a remote.
+        GIT_COMMIT.requires(DISK),
+        GIT_REF.requires(DISK),
+        GIT_FETCH.requires(NET_DISK),
+        GIT_PUSH.requires(NET_DISK),
         // Notes tools (4) — reads safe, write high-risk
         NOTES_WRITE,
         NOTES_READ,
@@ -1088,6 +1245,78 @@ mod capability_tests {
         }
         for name in ["file_read", "file_write", "calculator", "notes_read"] {
             assert!(needs(name).is_empty(), "{name}");
+        }
+    }
+
+    /// **The git family's whole safety story, as one assertion.**
+    ///
+    /// Reading a repository is available wherever tools are; changing one is
+    /// not. The mechanism is `DiskWrite`, which `zend::access::grants`
+    /// withholds from Comprehensive and gives only to Mutable — so declaring
+    /// it here is what confines a writer to Mutable, both in what is offered
+    /// and in what would run.
+    ///
+    /// A new git tool must land in one of these two lists, and the final
+    /// assertion makes forgetting a compile-time-visible test failure rather
+    /// than a tool that quietly escapes the split.
+    #[test]
+    fn git_reads_are_open_and_every_git_write_needs_disk_write() {
+        let needs = |name: &str| find(name).unwrap_or_else(|| panic!("{name}")).requires;
+
+        const READERS: [&str; 5] = ["git_status", "git_log", "git_show", "git_grep", "git_refs"];
+        const WRITERS: [&str; 4] = ["git_commit", "git_ref", "git_fetch", "git_push"];
+
+        for name in READERS {
+            assert!(
+                needs(name).is_empty(),
+                "{name} is a read and must need no capability",
+            );
+        }
+        for name in WRITERS {
+            assert!(
+                needs(name).contains(&Capability::DiskWrite),
+                "{name} changes a repository and must declare DiskWrite",
+            );
+        }
+        // Reaching a remote is declared on top of the disk write.
+        for name in ["git_fetch", "git_push"] {
+            assert!(needs(name).contains(&Capability::Network), "{name}");
+        }
+        // Nothing here is `Exec`: the layer runs `git` with arguments it
+        // built itself, never a command the model composed.
+        for name in READERS.iter().chain(WRITERS.iter()) {
+            assert!(
+                !needs(name).contains(&Capability::Exec),
+                "{name} must not declare Exec",
+            );
+        }
+
+        let registered: Vec<&str> = all_tools()
+            .iter()
+            .map(|t| t.name)
+            .filter(|n| n.starts_with("git_"))
+            .collect();
+        assert_eq!(
+            registered.len(),
+            READERS.len() + WRITERS.len(),
+            "a git tool was registered without being placed on the read/write \
+             split: {registered:?}",
+        );
+    }
+
+    /// **A writer is refused before its arguments are parsed.** The context
+    /// here holds everything Comprehensive holds and still cannot commit, so
+    /// the refusal is the capability and not a missing workspace.
+    #[test]
+    fn a_comprehensive_grant_set_refuses_every_git_writer() {
+        let comprehensive = Grants::NONE
+            .with(Capability::Network)
+            .with(Capability::Sandbox)
+            .with(Capability::Secrets);
+        let ctx = ToolContext::new().granting(comprehensive);
+        for name in ["git_commit", "git_ref", "git_fetch", "git_push"] {
+            let out = find(name).unwrap().call(&ctx, &json!({"repo": "app"}));
+            assert_eq!(out["error"], NotPermitted::CODE, "{name} ran: {out}");
         }
     }
 }

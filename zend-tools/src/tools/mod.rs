@@ -47,6 +47,7 @@ pub mod credentials;
 pub mod crypto;
 pub mod datetime;
 pub mod file;
+pub mod git;
 pub mod hash;
 pub mod hash_state;
 pub mod http_session;

@@ -64,7 +64,7 @@ mod tool_scenarios {
 
     use futures::StreamExt;
 
-    use crate::common::{needs_compaction, production_workspace, run_conv_id};
+    use crate::common::{needs_compaction, production_workspace, run_conv_id, served};
     use candle::vram::host_pinned_bytes;
     use candle_conversation::models::Model;
     use candle_conversation::projection::{SectionLoads, SystemItem};
@@ -230,11 +230,10 @@ mod tool_scenarios {
         apply_tools_dial(&mut selection, ToolMode::Comprehensive);
         let log = LogBus::new();
         let config = DaemonConfig {
-            workspace,
             port: 0,
             model,
             compact_substrate,
-            ..Default::default()
+            ..DaemonConfig::new(served(&workspace))
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();
@@ -377,11 +376,10 @@ mod tool_scenarios {
         let workspace = workspace();
         let compact_substrate = needs_compaction(&workspace);
         let config = DaemonConfig {
-            workspace,
             port: 0,
             model: ModelChoice::Preset(Box::new(MODEL)),
             compact_substrate,
-            ..Default::default()
+            ..DaemonConfig::new(served(&workspace))
         };
         let session = Arc::new(ZendSession::new(config, LogBus::new()));
         session.start_loading();

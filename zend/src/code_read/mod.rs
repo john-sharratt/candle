@@ -45,6 +45,7 @@ use zend_tools::ToolContext;
 use crate::ingest_report::Failures;
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
+use crate::repo_path::split;
 use crate::repo_scan::{is_binary_sample, FileEntry, Language, RepoMap, MAX_FILE_BYTES};
 use crate::tool_round;
 use crate::tools::format_tool_responses;
@@ -172,13 +173,17 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// `ingest_bases`, `resolver.rs`'s `score_belief_groups` target exemption,
 /// and `code_reading`'s `window` in `projection.yaml`). With those fixed,
 /// the model correctly recalls its own earlier rounds without being told to.
-fn opening_prompt(path: &str) -> String {
+///
+/// `key` is workspace-relative; the prompt names the repository and the path
+/// inside it separately, the two arguments the call it asks for takes.
+fn opening_prompt(key: &str) -> String {
+    let (repo, path) = split(key);
     format!(
-        "Read the entire contents of `{path}` — and only this file — using \
-         {FILE_READ_TOOL}, calling it as many times as needed to see all of it if \
-         it's long. Once you've read the whole thing, summarize what it contains: \
-         its purpose, its main structures or functions, and how it fits into the \
-         codebase."
+        "Read the entire contents of `{path}` in the `{repo}` repository — and only \
+         this file — using {FILE_READ_TOOL}, calling it as many times as needed to see \
+         all of it if it's long. Once you've read the whole thing, summarize what it \
+         contains: its purpose, its main structures or functions, and how it fits into \
+         the codebase."
     )
 }
 
@@ -435,12 +440,13 @@ pub(crate) fn ingest_chain_file(
     Ok(found)
 }
 
-/// Whether a workspace-relative `path` (with `/` separators) lives under the
-/// daemon's top-level `uploads/` dir. Matched on the FIRST segment only, and
-/// case-insensitively (the win32 FS is case-insensitive, so an existing
-/// `Uploads/` dir still resolves to the daemon's uploads dir) — so a nested
-/// `src/uploads/…` in a real project is NOT matched. Keeps `reconcile_deleted`
-/// in step with [`crate::repo_scan::walk_workspace`]'s uploads exclusion:
+/// Whether a workspace-relative `path` (with `/` separators) lives in the
+/// daemon's `uploads` repository ([`crate::workspace::UPLOADS_REPO`]). Matched
+/// on the FIRST segment only, and case-insensitively (the win32 FS is
+/// case-insensitive, so an existing `Uploads/` dir still resolves to the
+/// daemon's uploads dir) — so an `uploads/` folder inside a repository is NOT
+/// matched. Keeps `reconcile_deleted` in step with
+/// [`crate::repo_scan::walk_workspace`], which never walks that repository:
 /// uploads are endpoint-managed and deliberately absent from the walk, so they
 /// must never be tombstoned merely for being absent from `present_paths`.
 pub(crate) fn is_upload_path(path: &str) -> bool {
@@ -1251,8 +1257,10 @@ mod tests {
 
     #[test]
     fn opening_prompt_names_the_path_and_the_one_tool() {
-        let p = opening_prompt("src/lib.rs");
-        assert!(p.contains("src/lib.rs"));
+        let p = opening_prompt("candle/src/lib.rs");
+        assert!(
+            p.starts_with("Read the entire contents of `src/lib.rs` in the `candle` repository")
+        );
         assert!(p.contains(FILE_READ_TOOL));
     }
 
@@ -1262,7 +1270,7 @@ mod tests {
     /// reading the file, not merely permit it.
     #[test]
     fn opening_prompt_requires_reading_the_whole_file() {
-        let p = opening_prompt("CHANGELOG.md");
+        let p = opening_prompt("candle/CHANGELOG.md");
         assert!(
             p.contains("entire") || p.contains("whole"),
             "must ask for the whole file, not an unspecified amount: {p:?}",

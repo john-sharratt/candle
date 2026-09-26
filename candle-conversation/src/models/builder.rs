@@ -124,7 +124,7 @@ pub struct ModelBuilder {
     /// Maximum Hot-tier turns before triggering Hot → Warm eviction.
     /// `0` = auto-compute from arena geometry in [`engine()`](Self::engine).
     max_hot_turns: usize,
-    /// Workspace root whose `.substrate/` directory backs the persistence
+    /// Workspace root whose `substrate/` directory backs the persistence
     /// redo log. `None` falls back to the process working directory.
     ///
     /// Ignored when [`Self::substrate`] handed over an already-open one.
@@ -134,7 +134,7 @@ pub struct ModelBuilder {
     /// `None` — the ordinary case — means the engine opens the directory
     /// [`Self::workspace_path`] names. A host that appends its own record
     /// classes to the same log must pass one instead, because a second writable
-    /// handle to one `.substrate/` silently drops records; see
+    /// handle to one `substrate/` silently drops records; see
     /// [`SharedSubstrate`].
     substrate: Option<SharedSubstrate>,
     /// Open the workspace's substrate read-only — forwarded to
@@ -304,7 +304,7 @@ impl ModelBuilder {
         self
     }
 
-    /// Set the workspace root whose `.substrate/` directory backs the
+    /// Set the workspace root whose `substrate/` directory backs the
     /// persistence redo log.
     ///
     /// Has no effect once [`Self::substrate`] has handed over an open one —
@@ -318,7 +318,7 @@ impl ModelBuilder {
     /// path to open its own at.
     ///
     /// Required of any host that writes its own records into the same redo log:
-    /// one `.substrate/` admits exactly one writable handle per process, and a
+    /// one `substrate/` admits exactly one writable handle per process, and a
     /// second one loses records rather than failing. See [`SharedSubstrate`].
     pub fn substrate(mut self, shared: SharedSubstrate) -> Self {
         self.substrate = Some(shared);
@@ -329,7 +329,7 @@ impl ModelBuilder {
     ///
     /// For a tool that inspects a workspace a running daemon owns: the engine
     /// resumes, prefills and decodes entirely in RAM and writes nothing under
-    /// `.substrate/` from start through shutdown. The store must already exist.
+    /// `substrate/` from start through shutdown. The store must already exist.
     ///
     /// Has no effect once [`Self::substrate`] has handed over an open one —
     /// that handle's own mode rules. See [`EngineConfig::read_only_substrate`].

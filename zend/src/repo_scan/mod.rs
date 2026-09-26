@@ -22,7 +22,6 @@ pub mod types;
 pub mod walk;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +29,7 @@ use candle_conversation::memory_report::MemoryReport;
 use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::stencil::{ThinkMode, ToolCallEnvelope, TriggerRegistry};
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
+use zend_tools::state::Workspace;
 use zend_tools::ToolContext;
 
 use crate::ingest_report::{Failures, IngestReport};
@@ -38,7 +38,7 @@ use crate::refresh_ctx::RefreshContext;
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
 pub use binary_sniff::is_binary_sample;
-pub use dir_unit::{build_units, DirRecord, DirState, DirUnit};
+pub use dir_unit::{all_units, build_units, workspace_unit, DirRecord, DirState, DirUnit};
 pub use types::{FileEntry, Language, RepoMap};
 pub use walk::{walk_workspace, MAX_FILE_BYTES};
 
@@ -498,14 +498,14 @@ pub enum RefreshOutcome {
 /// pool — never across a decode — so chat consumers keep running throughout.
 pub fn refresh_repo_map(
     ctx: &RefreshContext<'_>,
-    workspace: &Path,
+    workspace: &Workspace,
     map: &RepoMap,
     prior: &DirState,
     progress: &Arc<LoadProgress>,
     layer_name: &str,
     base: &Mutex<Sequence>,
 ) -> anyhow::Result<RefreshOutcome> {
-    let units = build_units(map, workspace);
+    let units = all_units(map, workspace.root());
     let prior = prior.without_frozen(map);
     if prior.equivalent_to(&units) {
         tracing::trace!("repo map refresh: no directory hash changed, skipping refresh");
@@ -543,20 +543,23 @@ pub fn refresh_repo_map(
     })
 }
 
-/// Ingest just the workspace root's own directory unit (`dir == "."`) —
-/// the priming chain's `root ls` link (`crate::priming_chain`). Resume-cache
-/// aware, exactly like a pool worker's own check: a "." conversation already
-/// tagged with the current content hash is reused as-is rather than
-/// re-ingested. `None` when the workspace has no top-level files at all, so
-/// there is no root unit to build.
-pub(crate) fn ingest_root_unit(
+/// Ingest one directory unit, `dir`, as a link of the priming chain
+/// (`crate::priming_chain`): the workspace root (`"."`, the chain's head, with
+/// no `parent`) or a repository's root folder (`"candle/"`, parented on the
+/// link before it). Resume-cache aware, exactly like a pool worker's own
+/// check: a conversation already tagged with the unit's current content hash
+/// is reused as-is rather than re-ingested. `None` when `map` builds no unit
+/// for `dir` — no walked file under it.
+pub(crate) fn ingest_chain_unit(
     ctx: &RefreshContext<'_>,
-    workspace: &Path,
+    workspace: &Workspace,
     map: &RepoMap,
+    dir: &str,
+    parent: Option<TimelineId>,
     base: &Mutex<Sequence>,
 ) -> anyhow::Result<Option<TimelineId>> {
-    let units = build_units(map, workspace);
-    let Some(root) = units.into_iter().find(|u| u.dir == ".") else {
+    let units = all_units(map, workspace.root());
+    let Some(unit) = units.into_iter().find(|u| u.dir == dir) else {
         return Ok(None);
     };
     let present_hashes = ctx
@@ -564,16 +567,15 @@ pub(crate) fn ingest_root_unit(
         .lock()
         .unwrap()
         .conversation_metadata_values(HASH_KEY);
-    if !present_hashes.contains(&root.content_hash) {
+    if !present_hashes.contains(&unit.content_hash) {
         let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, "repo_map")?;
-        let tool_ctx = ToolContext::with_workspace(workspace);
+        let tool_ctx = ToolContext::with_workspace(workspace.clone());
         let failures = Failures::new();
-        // Root ls is the HEAD of the chain — it has no parent of its own.
-        process_one_dir(ctx.engine, base, None, &plan, &tool_ctx, &root, &failures)?;
+        process_one_dir(ctx.engine, base, parent, &plan, &tool_ctx, &unit, &failures)?;
         let report = failures.into_report(1);
         if report.is_incomplete() {
             anyhow::bail!(
-                "priming chain: root ls ingest failed: {}",
+                "priming chain: `{dir}` listing ingest failed: {}",
                 report
                     .failures
                     .first()
@@ -582,11 +584,11 @@ pub(crate) fn ingest_root_unit(
             );
         }
     }
-    // The good (content_sha256-tagged) generation for "." — present whether
+    // The good (content_sha256-tagged) generation for `dir` — present whether
     // this call just minted it or it was already there.
     let e = ctx.engine.lock().unwrap();
     let found = e
-        .find_conversations_by_metadata(DIR_KEY, ".")
+        .find_conversations_by_metadata(DIR_KEY, dir)
         .into_iter()
         .find(|tl| {
             e.conversation_metadata(*tl)
@@ -835,7 +837,7 @@ fn run_dir_pool(
     base: &Mutex<Sequence>,
     parent: Option<TimelineId>,
     plan: &IngestPlan,
-    workspace: &Path,
+    workspace: &Workspace,
     units: &[DirUnit],
     progress: &Arc<LoadProgress>,
 ) -> IngestReport {
@@ -908,7 +910,7 @@ fn run_dir_pool(
                 // One overlay context per worker: the prefilled `file_list`
                 // response is produced by RUNNING the tool, so the listing the
                 // model sees can never drift from the live tool's output.
-                let ctx = ToolContext::with_workspace(workspace);
+                let ctx = ToolContext::with_workspace(workspace.clone());
                 loop {
                     // Stop before claiming the next directory on a first-error
                     // abort OR a shutdown cancel. The in-flight conversation

@@ -5,7 +5,7 @@
 //! under it, the anchor excerpt that says what it is (see [`super::anchor`]),
 //! and a content hash driving the resume cache and the refresh decision.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -73,6 +73,40 @@ impl DirUnit {
     pub fn module_hint(&self) -> Option<&ModuleHint> {
         self.files.iter().find_map(|f| f.module_hint.as_ref())
     }
+}
+
+/// Every unit a `repo_map` pass ingests: the workspace root's
+/// ([`workspace_unit`]) followed by one per directory ([`build_units`]).
+pub fn all_units(map: &RepoMap, workspace: &Path) -> Vec<DirUnit> {
+    let dirs = build_units(map, workspace);
+    let root = workspace_unit(map).filter(|_| !dirs.iter().any(|u| u.dir == "."));
+    root.into_iter().chain(dirs).collect()
+}
+
+/// The workspace root's unit (`"."`), when anything was walked.
+///
+/// The workspace root holds repositories, never walked files, so its unit is
+/// built from the repositories instead: `listed` is each repository the walk
+/// reached (`candle/`), and its listing turn is `file_list` with no arguments,
+/// which lists the repositories. It is what the whole map hangs from — the
+/// priming chain's head.
+pub fn workspace_unit(map: &RepoMap) -> Option<DirUnit> {
+    let repos: BTreeSet<String> = map
+        .files
+        .iter()
+        .filter_map(|f| f.path.split_once('/').map(|(repo, _)| format!("{repo}/")))
+        .collect();
+    if repos.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = repos.into_iter().collect();
+    Some(DirUnit {
+        dir: ".".to_string(),
+        files: Vec::new(),
+        content_hash: hash_unit(&listed, None),
+        listed,
+        anchor: None,
+    })
 }
 
 /// Build one unit per directory that holds at least one walked file.
@@ -256,6 +290,9 @@ impl DirState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zend_tools::state::{RepoSpec, Workspace};
+    use zend_tools::ToolContext;
+
     use crate::repo_scan::types::Language;
     use crate::repo_scan::walk_workspace;
 
@@ -441,7 +478,8 @@ mod tests {
         std::fs::write(d.path().join("k/decode.cu"), "__global__ void d() {}\n").unwrap();
         std::fs::write(d.path().join("k/LICENSE"), "MIT\n").unwrap();
 
-        let walked = walk_workspace(d.path(), None);
+        let workspace = Workspace::new(d.path(), vec![RepoSpec::named("k")]).unwrap();
+        let walked = walk_workspace(&workspace, "", None);
         let units = build_units(&walked, d.path());
         let k = units.iter().find(|u| u.dir == "k/").expect("k/ has a unit");
         assert_eq!(
@@ -450,8 +488,8 @@ mod tests {
             "the kernel now reaches the hash; the extensionless file still does not",
         );
 
-        let ctx = zend_tools::ToolContext::with_workspace(d.path());
-        let shown = zend_tools::run("file_list", "test", &serde_json::json!({"path": "k"}), &ctx);
+        let ctx = ToolContext::with_workspace(workspace);
+        let shown = zend_tools::run("file_list", "test", &serde_json::json!({"repo": "k"}), &ctx);
         let listed_by_tool: Vec<&str> = shown["entries"]
             .as_array()
             .expect("entries array")
@@ -460,8 +498,29 @@ mod tests {
             .collect();
         assert_eq!(
             listed_by_tool,
-            vec!["k/LICENSE", "k/api.rs", "k/decode.cu"],
+            vec!["LICENSE", "api.rs", "decode.cu"],
             "the turn the model reads lists all three — the two sets still differ",
+        );
+    }
+
+    /// **The workspace root's unit lists the repositories the walk reached**,
+    /// comes first, and moves its hash when a repository joins or leaves.
+    #[test]
+    fn the_workspace_unit_heads_the_pass_and_lists_the_repositories() {
+        let d = empty_workspace();
+        let m = map(&["candle/src/a.rs", "mind/x.rs", "candle/b.rs"]);
+        let units = all_units(&m, d.path());
+        let dirs: Vec<&str> = units.iter().map(|u| u.dir.as_str()).collect();
+        assert_eq!(dirs, vec![".", "candle/", "candle/src/", "mind/"]);
+        assert_eq!(units[0].listed, vec!["candle/", "mind/"]);
+        assert!(units[0].files.is_empty() && units[0].anchor.is_none());
+        assert_eq!(units[0].list_path(), "");
+
+        let fewer = workspace_unit(&map(&["candle/b.rs"])).unwrap();
+        assert_ne!(fewer.content_hash, units[0].content_hash);
+        assert!(
+            workspace_unit(&map(&[])).is_none(),
+            "nothing walked, no head"
         );
     }
 

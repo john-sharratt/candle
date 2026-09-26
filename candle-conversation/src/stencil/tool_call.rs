@@ -18,9 +18,13 @@
 //!   properties) — written by the grammar too: `[`, then per element a branch
 //!   between another element (`, {`) and `]`, unrolled to
 //!   [`MAX_ARRAY_ELEMENTS`]. An array inside such an array decodes free.
-//! - `integer`/`number`, and any array or object the above does not cover
-//!   (no schema, nullable, scalar elements) — emitted as any structurally-valid
-//!   JSON value (`Terminator::JsonValue`), lookahead-terminated at the enclosing
+//! - `integer` — digit by digit under the mask, unrolled to
+//!   [`MAX_INTEGER_DIGITS`], with `-` only where the schema's `minimum` allows
+//!   a negative; the last arm of each digit carries what follows the value. A
+//!   string, a `null` or a commit id cannot be decoded there.
+//! - `number`, and any array or object the above does not cover (no schema,
+//!   nullable, scalar elements) — emitted as any structurally-valid JSON value
+//!   (`Terminator::JsonValue`), lookahead-terminated at the enclosing
 //!   `,`/`}`/`]`. The session pushes that delimiter back to the next node when
 //!   the next node continues with it, and drops it when it does not, so the
 //!   grammar writes the structure the model got wrong. This guarantees valid
@@ -91,6 +95,10 @@ pub struct Param {
     /// `null` is also a value: the grammar offers it beside the typed value.
     #[serde(default)]
     pub nullable: bool,
+    /// `integer`: the schema's `minimum`. At or above zero, the grammar offers
+    /// no `-`; absent or negative, the value may be signed.
+    #[serde(default)]
+    pub minimum: Option<f64>,
 }
 
 /// One tool: a name and an ordered parameter list.
@@ -134,14 +142,133 @@ impl ToolSpec {
     pub fn from_json_schema(name: &str, schema: &Value) -> ToolSpec {
         ToolSpec {
             name: name.to_string(),
-            params: fields_of(schema),
+            params: fields_of(schema, schema),
         }
     }
 }
 
+/// How far a `$ref` chain is followed before the schema is treated as opaque.
+/// A schema that refers to itself — a tree node whose children are the same
+/// node — is legal JSON Schema and has no finite parameter tree, so the
+/// recursion has to stop somewhere rather than hang the builder.
+const MAX_REF_DEPTH: usize = 8;
+
+/// A schema with its `$ref` and single-member `allOf` indirection followed.
+///
+/// `schemars` writes a named type as `{"$ref": "#/definitions/Name"}`, and a
+/// named type that also carries a description as
+/// `{"allOf": [{"$ref": …}], "description": …}`. Neither carries a `type`, so
+/// without resolving them every named type in the catalog — a credential kind,
+/// a revision, a push action — reaches [`parse_param_type`] as an unrecognized
+/// schema and becomes "any JSON value", losing exactly the `enum` the grammar
+/// exists to enforce.
+fn resolve<'a>(schema: &'a Value, root: &'a Value, depth: usize) -> &'a Value {
+    if depth >= MAX_REF_DEPTH {
+        return schema;
+    }
+    // `allOf` of a single member is that member; siblings are metadata.
+    if let Some([only]) = schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .map(|a| &a[..])
+    {
+        return resolve(only, root, depth + 1);
+    }
+    let Some(pointer) = schema.get("$ref").and_then(Value::as_str) else {
+        return schema;
+    };
+    // Only local pointers; a remote `$ref` is not fetched.
+    let Some(rest) = pointer.strip_prefix("#/") else {
+        return schema;
+    };
+    let mut at = root;
+    for segment in rest.split('/') {
+        // JSON Pointer escapes, in the order the spec requires.
+        let key = segment.replace("~1", "/").replace("~0", "~");
+        match at.get(&key) {
+            Some(next) => at = next,
+            None => return schema,
+        }
+    }
+    resolve(at, root, depth + 1)
+}
+
+/// Merge a discriminated `oneOf` over objects into one object schema.
+///
+/// A tagged union — `{"kind":"branch","name":…}` or `{"kind":"commit","id":…}`
+/// — has no representation in [`Param`], which carries one shape per value.
+/// Leaving it unresolved costs the whole structure: the model gets "any JSON
+/// value" and can write any key at all. Merging keeps most of it. The result
+/// offers the union of every arm's fields, requires only what every arm
+/// requires (the discriminator), and gives the discriminator the union of the
+/// arms' constant values — so the tag is constrained to the tags that exist
+/// and the keys to the keys that exist.
+///
+/// What it does not keep is the dependency between them: the grammar will let
+/// `{"kind":"head","id":…}` through, a combination no arm allows. That is
+/// caught one layer later, when the call deserializes into the tool's request
+/// type and comes back `invalid_arguments` naming the field — a far better
+/// outcome than an unconstrained object, where the model can invent key names
+/// that match nothing at all.
+fn merge_variants(arms: &[&Value], root: &Value, depth: usize) -> Option<Param> {
+    let objects: Vec<&Value> = arms.iter().map(|a| resolve(a, root, depth)).collect();
+    // Every arm must be an object schema with properties, or there is nothing
+    // structural to merge and the value stays opaque.
+    if !objects
+        .iter()
+        .all(|o| o.get("properties").is_some_and(Value::is_object))
+    {
+        return None;
+    }
+    let mut merged: Vec<Param> = Vec::new();
+    for object in &objects {
+        for field in fields_of(object, root) {
+            match merged.iter_mut().find(|m| m.name == field.name) {
+                None => merged.push(field),
+                Some(existing) => {
+                    // A field two arms share keeps the union of their allowed
+                    // values, so a discriminator ends up listing every tag.
+                    match (&mut existing.enum_values, field.enum_values) {
+                        (Some(have), Some(more)) => {
+                            for v in more {
+                                if !have.contains(&v) {
+                                    have.push(v);
+                                }
+                            }
+                        }
+                        // One arm leaves it open, so the merged field is open.
+                        (slot, _) => *slot = None,
+                    }
+                    existing.nullable |= field.nullable;
+                }
+            }
+        }
+    }
+    // Required only where every arm requires it.
+    for field in &mut merged {
+        field.required = objects.iter().all(|o| {
+            o.get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(field.name.as_str())))
+        });
+    }
+    // The discriminator first, then the rest in first-seen order.
+    merged.sort_by_key(|f| !f.required);
+    Some(Param {
+        name: String::new(),
+        ty: ParamType::Object,
+        required: false,
+        enum_values: None,
+        items: None,
+        properties: Some(merged),
+        nullable: false,
+        minimum: None,
+    })
+}
+
 /// An object schema's properties as parameters, required first in the
 /// `required` list's order, then optionals in declared order.
-fn fields_of(schema: &Value) -> Vec<Param> {
+fn fields_of(schema: &Value, root: &Value) -> Vec<Param> {
     let required: Vec<&str> = schema
         .get("required")
         .and_then(|r| r.as_array())
@@ -154,7 +281,7 @@ fn fields_of(schema: &Value) -> Vec<Param> {
             params.push(Param {
                 name: pname.clone(),
                 required: required.contains(&pname.as_str()),
-                ..param_of(pschema)
+                ..param_of(pschema, root)
             });
         }
     }
@@ -169,21 +296,28 @@ fn fields_of(schema: &Value) -> Vec<Param> {
 }
 
 /// One value schema as an unnamed, optional [`Param`].
-fn param_of(schema: &Value) -> Param {
+fn param_of(schema: &Value, root: &Value) -> Param {
+    let schema = resolve(schema, root, 0);
     // One schema or `null`: the schema, nullable.
     let alternatives = schema
         .get("anyOf")
         .or_else(|| schema.get("oneOf"))
         .and_then(Value::as_array);
     if let Some(alternatives) = alternatives {
-        let is_null = |s: &&Value| s.get("type").and_then(Value::as_str) == Some("null");
+        let is_null =
+            |s: &&Value| resolve(s, root, 0).get("type").and_then(Value::as_str) == Some("null");
         let others: Vec<&Value> = alternatives.iter().filter(|s| !is_null(s)).collect();
+        let nullable = others.len() < alternatives.len();
         if let [only] = others.as_slice() {
-            let inner = param_of(only);
+            let inner = param_of(only, root);
             return Param {
-                nullable: inner.nullable || others.len() < alternatives.len(),
+                nullable: inner.nullable || nullable,
                 ..inner
             };
+        }
+        // Several real alternatives: a tagged union, if they are all objects.
+        if let Some(merged) = merge_variants(&others, root, 0) {
+            return Param { nullable, ..merged };
         }
     }
     let enum_members = schema.get("enum").and_then(Value::as_array);
@@ -199,11 +333,11 @@ fn param_of(schema: &Value) -> Param {
         || enum_members.is_some_and(|a| a.iter().any(Value::is_null))
         || schema.get("nullable").and_then(Value::as_bool) == Some(true);
     let items = match (ty, schema.get("items")) {
-        (ParamType::Array, Some(items @ Value::Object(_))) => Some(Box::new(param_of(items))),
+        (ParamType::Array, Some(items @ Value::Object(_))) => Some(Box::new(param_of(items, root))),
         _ => None,
     };
     let properties = match (ty, schema.get("properties")) {
-        (ParamType::Object, Some(Value::Object(_))) => Some(fields_of(schema)),
+        (ParamType::Object, Some(Value::Object(_))) => Some(fields_of(schema, root)),
         _ => None,
     };
     Param {
@@ -214,6 +348,7 @@ fn param_of(schema: &Value) -> Param {
         items,
         properties,
         nullable,
+        minimum: schema.get("minimum").and_then(Value::as_f64),
     }
 }
 
@@ -778,6 +913,11 @@ pub fn compile_action_loop(
 /// the bound needs — so the last level offers only the close.
 pub const MAX_ARRAY_ELEMENTS: usize = 64;
 
+/// How many digits an integer value may have — enough for any `i64`
+/// (`9223372036854775807` is nineteen). Unrolled one level per digit, as an
+/// array is per element, for the same reason: the compiler rejects cycles.
+pub const MAX_INTEGER_DIGITS: usize = 19;
+
 struct ToolTreeBuilder<'a> {
     spec: TreeSpec,
     env: &'a ToolCallEnvelope,
@@ -983,7 +1123,14 @@ impl<'a> ToolTreeBuilder<'a> {
             });
             return Ok((String::new(), span));
         }
-        match self.value_arms(p, next)? {
+        // An enum field's arms carry the first step of what follows the field
+        // — the next key, or the close — so the value's closing quote and the
+        // separator after it are one arm's text. See [`Self::continuations`].
+        let arms = self.value_arms(p, next)?.map(|arms| match p.enum_values {
+            Some(_) => self.with_continuations(arms),
+            None => arms,
+        });
+        match arms {
             // One way to begin — an object's `{`, an array's `[`, a one-value
             // enum: it is the lead-in, folded into the key (`"filter": {`).
             Some(mut arms) if arms.len() == 1 => Ok(arms.remove(0)),
@@ -1053,12 +1200,117 @@ impl<'a> ToolTreeBuilder<'a> {
                 }
                 _ => return Ok(None),
             },
-            (None, ParamType::Integer | ParamType::Number) => return Ok(None),
+            (None, ParamType::Integer) => match self.integer_arms(p, next) {
+                Some(arms) => arms,
+                None => return Ok(None),
+            },
+            (None, ParamType::Number) => return Ok(None),
         };
         if p.nullable {
             arms.push(("null".into(), next));
         }
         Ok(Some(arms))
+    }
+
+    /// **An integer is written digit by digit under the mask**, so nothing but
+    /// an integer can be decoded there.
+    ///
+    /// ```text
+    ///   ─┬─ "0" ──────────────── <end>
+    ///    ├─ "1".."9" ─ D₁₈ ─┬─ "0".."9" ─ D₁₇ ─ … ─ D₀ ─ <end>
+    ///    └─ "-" ─ "1".."9" ─┘  └─ <end>
+    /// ```
+    ///
+    /// `<end>` is what follows the value — the next key, the close — taken as
+    /// each arm's text ([`Self::continuations`]), so the digit the model does
+    /// not write and the separator it does are one choice. `-` is offered only
+    /// when the schema's `minimum` allows a negative, and a leading `0` ends the
+    /// number, as JSON requires.
+    ///
+    /// It was a free JSON value, which guarantees structure and not type: live,
+    /// a `git_show` call decoded `"page": "7eb876659c1b…"` — a commit id in an
+    /// integer field — and was refused a layer later. Under the mask the `"`
+    /// that opens it is never a candidate.
+    ///
+    /// `None` when what follows the value cannot be written as arm text — its
+    /// first step is free text, not a key or a close — and the value stays a
+    /// free JSON value.
+    fn integer_arms(&mut self, p: &Param, next: SpecId) -> Option<Vec<(String, SpecId)>> {
+        const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+        let ends = self.continuations(next);
+        if ends.iter().any(|(text, _)| text.is_empty()) {
+            return None;
+        }
+        let finished = self.choice(ends.clone());
+        // Built back to front: after the last admitted digit only the end
+        // remains, and each level before it offers one more digit or the end.
+        let mut more = finished;
+        for _ in 1..MAX_INTEGER_DIGITS {
+            let mut arms: Vec<(String, SpecId)> =
+                DIGITS.iter().map(|d| (d.to_string(), more)).collect();
+            arms.extend(ends.iter().cloned());
+            more = self.spec.push(NodeSpec::Branch { arms });
+        }
+        let leading: Vec<(String, SpecId)> =
+            DIGITS[1..].iter().map(|d| (d.to_string(), more)).collect();
+        let mut first = vec![("0".to_string(), finished)];
+        first.extend(leading.iter().cloned());
+        if p.minimum.is_none_or(|m| m < 0.0) {
+            let negative = self.spec.push(NodeSpec::Branch { arms: leading });
+            first.push(("-".to_string(), negative));
+        }
+        Some(first)
+    }
+
+    /// A node offering `arms`: a static when there is only one way on, which is
+    /// no choice at all.
+    fn choice(&mut self, mut arms: Vec<(String, SpecId)>) -> SpecId {
+        match arms.len() {
+            1 => {
+                let (text, next) = arms.remove(0);
+                self.spec.push(NodeSpec::Static { text, next })
+            }
+            _ => self.spec.push(NodeSpec::Branch { arms }),
+        }
+    }
+
+    /// The first step of `next`, as `(text, successor)` arms an enum value's
+    /// arm can carry on its end: a static's text, each arm of a branch, or —
+    /// for anything the grammar does not write itself — nothing.
+    ///
+    /// **Why an enum value takes its successor's first step with it.** Its
+    /// closing quote is the grammar's, and the next thing written is a
+    /// separator or a close the model chooses (`, "path":` against `}`). A
+    /// tokenizer writes those two together — Qwen's `",` and `"}` are single
+    /// tokens — so a quote committed on its own leaves the model to choose from
+    /// a boundary its encoding never produces, holding a lone `,` it is never
+    /// trained to write after `"`. Measured live: a `file_list` whose `repo` is
+    /// an enum closed its arguments after the repository three times running,
+    /// the model's reasoning each time saying it meant to pass `path`. With
+    /// the separator on the arm, the value and what follows it are one choice
+    /// the model writes in its own tokens.
+    ///
+    /// Object fields only. An array element's successor is the next element's
+    /// own separator branch, so folding there compounds across every element
+    /// of the array; a field's successor is a key or the close, one step deep.
+    fn continuations(&self, next: SpecId) -> Vec<(String, SpecId)> {
+        match self.spec.node(next) {
+            NodeSpec::Static { text, next } => vec![(text.clone(), *next)],
+            NodeSpec::Branch { arms } => arms.clone(),
+            NodeSpec::FreeText { .. } | NodeSpec::End => vec![(String::new(), next)],
+        }
+    }
+
+    /// `arms` with each one's successor's first step appended
+    /// ([`Self::continuations`]).
+    fn with_continuations(&self, arms: Vec<(String, SpecId)>) -> Vec<(String, SpecId)> {
+        arms.into_iter()
+            .flat_map(|(text, next)| {
+                self.continuations(next)
+                    .into_iter()
+                    .map(move |(tail, after)| (format!("{text}{tail}"), after))
+            })
+            .collect()
     }
 
     /// Any structurally-valid JSON value, lookahead-terminated at the enclosing
@@ -1669,7 +1921,7 @@ mod tests {
     /// it qualifies is kept.
     #[test]
     fn every_spelling_of_nullable_is_read() {
-        let param = |schema: serde_json::Value| param_of(&schema);
+        let param = |schema: serde_json::Value| param_of(&schema, &schema);
         for (schema, ty) in [
             (json!({"type": ["boolean", "null"]}), ParamType::Boolean),
             (json!({"type": ["null", "string"]}), ParamType::String),
@@ -1709,6 +1961,241 @@ mod tests {
         assert_eq!(object.properties.map(|f| f.len()), Some(1));
     }
 
+    /// **A named type is followed to its definition.** `schemars` writes one as
+    /// a bare `$ref`, or as an `allOf` of a single `$ref` when it also carries
+    /// a description. Both must reach the definition, or the `enum` the
+    /// grammar exists to enforce is lost and the value becomes any JSON at all.
+    #[test]
+    fn a_named_type_is_resolved_to_its_definition() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {
+                "CredType": {"type": "string", "enum": ["ssh_key", "http_bearer"]}
+            },
+            "properties": {
+                "bare": {"$ref": "#/definitions/CredType"},
+                "described": {
+                    "allOf": [{"$ref": "#/definitions/CredType"}],
+                    "description": "Credential type."
+                },
+                "optional": {
+                    "anyOf": [{"$ref": "#/definitions/CredType"}, {"type": "null"}]
+                }
+            },
+            "required": ["bare", "described"]
+        });
+        let spec = ToolSpec::from_json_schema("credential_save", &schema);
+        let by_name = |n: &str| spec.params.iter().find(|p| p.name == n).unwrap();
+        for name in ["bare", "described", "optional"] {
+            let p = by_name(name);
+            assert_eq!(p.ty, ParamType::String, "{name}");
+            assert_eq!(
+                p.enum_values.as_deref(),
+                Some(&["ssh_key".to_string(), "http_bearer".to_string()][..]),
+                "{name} lost its enum",
+            );
+        }
+        assert!(by_name("optional").nullable);
+        assert!(!by_name("bare").nullable);
+    }
+
+    /// A `$ref` that leads nowhere, or in a circle, leaves the value opaque
+    /// rather than hanging the builder or panicking.
+    #[test]
+    fn an_unresolvable_or_circular_ref_is_left_opaque() {
+        let dangling = json!({
+            "type": "object",
+            "properties": {"x": {"$ref": "#/definitions/Missing"}}
+        });
+        assert_eq!(
+            ToolSpec::from_json_schema("t", &dangling).params[0].ty,
+            ParamType::Object
+        );
+
+        let circular = json!({
+            "type": "object",
+            "definitions": {"Loop": {"$ref": "#/definitions/Loop"}},
+            "properties": {"x": {"$ref": "#/definitions/Loop"}}
+        });
+        assert_eq!(
+            ToolSpec::from_json_schema("t", &circular).params[0].ty,
+            ParamType::Object
+        );
+
+        // A remote pointer is not fetched.
+        let remote = json!({
+            "type": "object",
+            "properties": {"x": {"$ref": "https://example.com/s.json#/A"}}
+        });
+        assert_eq!(
+            ToolSpec::from_json_schema("t", &remote).params[0].ty,
+            ParamType::Object
+        );
+    }
+
+    /// **A tagged union is merged into one object whose discriminator lists
+    /// every tag.** Without this a revision argument reaches the grammar as
+    /// "any JSON value" and the model may write any key at all; with it the
+    /// tag is one of the five that exist and the keys are the keys that exist.
+    ///
+    /// The merge is deliberately permissive about *combinations* — `kind` and
+    /// every arm's field are offered together — because `Param` carries one
+    /// shape per value. A combination no arm allows is refused when the call
+    /// deserializes, which names the offending field.
+    #[test]
+    fn a_tagged_union_merges_into_one_object_listing_every_tag() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {
+                "RevArg": {
+                    "oneOf": [
+                        {"type": "object", "properties": {
+                            "kind": {"type": "string", "enum": ["head"]}},
+                         "required": ["kind"]},
+                        {"type": "object", "properties": {
+                            "kind": {"type": "string", "enum": ["commit"]},
+                            "id": {"type": "string"}},
+                         "required": ["kind", "id"]},
+                        {"type": "object", "properties": {
+                            "kind": {"type": "string", "enum": ["branch"]},
+                            "name": {"type": "string"}},
+                         "required": ["kind", "name"]}
+                    ]
+                }
+            },
+            "properties": {
+                "rev": {"anyOf": [{"$ref": "#/definitions/RevArg"}, {"type": "null"}]}
+            }
+        });
+        let spec = ToolSpec::from_json_schema("git_log", &schema);
+        let rev = &spec.params[0];
+        assert_eq!(rev.ty, ParamType::Object);
+        assert!(rev.nullable, "the field itself is optional");
+        let fields = rev.properties.as_ref().expect("the union keeps its fields");
+
+        let kind = fields.iter().find(|f| f.name == "kind").unwrap();
+        assert_eq!(
+            kind.enum_values.as_deref(),
+            Some(
+                &[
+                    "head".to_string(),
+                    "commit".to_string(),
+                    "branch".to_string()
+                ][..]
+            ),
+            "the discriminator must list every arm's tag",
+        );
+        assert!(kind.required, "every arm requires the discriminator");
+
+        // The arms' own fields are offered, and none is required, because no
+        // single one is required by every arm.
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["kind", "id", "name"], "discriminator first");
+        for f in fields.iter().filter(|f| f.name != "kind") {
+            assert!(!f.required, "{} is required by only one arm", f.name);
+            assert_eq!(f.ty, ParamType::String);
+        }
+    }
+
+    /// A union whose arms are not all objects stays opaque — there is no
+    /// single shape to merge them into.
+    #[test]
+    fn a_union_of_unlike_arms_stays_opaque() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "x": {"oneOf": [
+                    {"type": "object", "properties": {"a": {"type": "string"}}},
+                    {"type": "string"}
+                ]}
+            }
+        });
+        let x = &ToolSpec::from_json_schema("t", &schema).params[0];
+        assert_eq!(x.ty, ParamType::Object);
+        assert!(x.properties.is_none(), "no single shape, so no fields");
+    }
+
+    /// A union nested inside an array's elements resolves too — `git_push`
+    /// takes an array of tagged push items.
+    #[test]
+    fn a_union_inside_an_array_resolves() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {
+                "PushItem": {
+                    "oneOf": [
+                        {"type": "object", "properties": {
+                            "action": {"type": "string", "enum": ["update_branch"]},
+                            "branch": {"type": "string"}},
+                         "required": ["action", "branch"]},
+                        {"type": "object", "properties": {
+                            "action": {"type": "string", "enum": ["delete_tag"]},
+                            "tag": {"type": "string"}},
+                         "required": ["action", "tag"]}
+                    ]
+                }
+            },
+            "properties": {
+                "pushes": {"type": "array", "items": {"$ref": "#/definitions/PushItem"}}
+            },
+            "required": ["pushes"]
+        });
+        let spec = ToolSpec::from_json_schema("git_push", &schema);
+        let element = spec.params[0]
+            .items
+            .as_ref()
+            .expect("elements keep a schema");
+        let fields = element
+            .properties
+            .as_ref()
+            .expect("the element is an object");
+        let action = fields.iter().find(|f| f.name == "action").unwrap();
+        assert_eq!(
+            action.enum_values.as_deref(),
+            Some(&["update_branch".to_string(), "delete_tag".to_string()][..])
+        );
+        assert!(fields.iter().any(|f| f.name == "branch"));
+        assert!(fields.iter().any(|f| f.name == "tag"));
+    }
+
+    /// **An enum field's arm spells the separator after it, so the model writes
+    /// the quote and the separator as its own token.** `repo` is an optional
+    /// enum ahead of the optional `path`: after the value, the arms go on to
+    /// the next key or to the close, never stopping at a lone closing quote —
+    /// the boundary that left a live model unable to write `",` and closing its
+    /// arguments instead of naming the path it meant to.
+    #[test]
+    fn an_enum_field_arm_carries_the_separator_after_it() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "enum": ["a", "b"]},
+                "path": {"type": "string"}
+            }
+        });
+        let spec = compile_tool_call_tree(
+            &[ToolSpec::from_json_schema("t", &schema)],
+            &ToolCallEnvelope::qwen3(),
+        )
+        .unwrap();
+        let all = arms(&spec);
+        for want in [
+            " \"a\", \"path\":",
+            " \"b\", \"path\":",
+            " \"a\"}}\n</tool_call>",
+            " \"b\"}}\n</tool_call>",
+        ] {
+            assert!(
+                all.iter().any(|a| a == want),
+                "{want:?} missing from {all:?}"
+            );
+        }
+        assert!(
+            !all.iter().any(|a| a == " \"a\"" || a == " \"b\""),
+            "an enum arm must not end on its bare closing quote: {all:?}"
+        );
+    }
+
     /// A closed set compiles to a choice, with `null` among the arms exactly
     /// when the schema allows it. A string is not a closed set.
     #[test]
@@ -1730,11 +2217,21 @@ mod tests {
             arms_for(json!({"type": ["boolean", "null"]})),
             [" false", " null", " true"]
         );
+        // An enum arm carries what follows the value — here the call's close —
+        // so the value's closing quote and the close are one arm's text.
+        let close = "}}\n</tool_call>";
         assert_eq!(
             arms_for(json!({"enum": ["x", "y", null]})),
-            [" \"x\"", " \"y\"", " null"]
+            [
+                format!(" \"x\"{close}"),
+                format!(" \"y\"{close}"),
+                format!(" null{close}")
+            ]
         );
-        assert_eq!(arms_for(json!({"enum": ["x", "y"]})), [" \"x\"", " \"y\""]);
+        assert_eq!(
+            arms_for(json!({"enum": ["x", "y"]})),
+            [format!(" \"x\"{close}"), format!(" \"y\"{close}")]
+        );
         // A nullable string is not a closed set: it is a free value, so the
         // model's own ` ""` and ` null` tokens are both reachable and no arm
         // prefills its opening quote.
@@ -1742,7 +2239,10 @@ mod tests {
         // An enum value is written as JSON, escapes and all.
         assert_eq!(
             arms_for(json!({"enum": ["say \"x\"", "b"]})),
-            [" \"b\"", " \"say \\\"x\\\"\""]
+            [
+                format!(" \"b\"{close}"),
+                format!(" \"say \\\"x\\\"\"{close}")
+            ]
         );
         // An array of booleans chooses at every element.
         let a = arms_for(json!({"type": "array", "items": {"type": "boolean"}}));

@@ -41,7 +41,7 @@ src/
 │   ├── credentials.rs   CredentialStore
 │   ├── hash_state.rs    HashStateStore
 │   ├── notes.rs         NotesStore
-│   ├── secrets.rs       ToolSecrets (deployment API keys, read from secrets/tools.yaml)
+│   ├── secrets.rs       Secrets (API keys and tokens, read from ~/.zend/secrets.yaml)
 │   ├── sessions.rs      SessionRegistry (all protocol entries)
 │   └── vfs.rs           VfsStore (overlay filesystem; refuses `secrets/` paths)
 └── tools/           — 95 tool implementations

@@ -1,0 +1,109 @@
+name: git_commit
+questions:
+- commit the file I just edited exactly as it stands on disk
+- save this fix as a commit on the feature branch
+- can you cherry-pick that commit onto main
+- revert the commit that broke the parser
+- apply this patch and commit it
+- backport that fix to the release branch
+- commit the deletion of the obsolete script
+- I want the edits already written to disk recorded in history
+- record a commit with the message fix the timeout
+- put these three edited files into a single commit
+- undo that change by committing its inverse
+- commit this unified diff onto my branch
+- commit
+- replay the upstream fix onto our stable branch
+- land the new module and remove the old one in one commit
+- take the working tree copy of that file into a commit
+- why is nothing committed after I edited the file
+- commit only if the branch tip has not moved since I looked
+- create a commit that adds the new config file
+- roll back that bad commit without touching my checkout
+category: Git
+description: 'Record one commit on a branch. `from` says where the content comes from. `files` takes a list of `changes`, each tagged by `action` — `take` commits the file EXACTLY as it stands on disk and needs no `content`, so prefer it whenever the edit is already written and never reproduce a file from memory; `write` replaces the file with `content`, which must be its COMPLETE new text, not a diff; `delete` removes it. `patch` applies the unified diff given in `patch`. `cherry_pick` replays the commit named in `commit` onto the branch, keeping its author and message. `revert` applies that commit backwards, undoing it. `message` is required for `files` and `patch`; `cherry_pick` keeps the message it replays and `revert` writes its own. The commit is built directly as git objects and the branch is moved onto it — the working tree, the index and the checked-out files are never touched, and a branch checked out in any worktree is refused. A patch that does not apply, or a replay that conflicts, reports why and commits nothing. `expected_head` is optional: omit it and the branch tip is read here, still swapped atomically; give it to refuse the commit if the branch moved since you looked. The branch must already exist — create one with git_ref. Writes to the repository.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    ChangeAction:
+      description: 'What to do to one file: `take` commits it exactly as it stands in the working tree (no `content` needed — prefer this whenever the edit is already on disk), `write` replaces it with `content`, `delete` removes it.'
+      enum:
+      - take
+      - write
+      - delete
+      type: string
+    CommitFrom:
+      description: 'Where the commit''s content comes from: `files` (the `changes` list), `patch` (a unified diff), `cherry_pick` (replay another commit forwards), `revert` (apply another commit backwards).'
+      enum:
+      - files
+      - patch
+      - cherry_pick
+      - revert
+      type: string
+    FileChange:
+      description: One file's change, with `action` saying how the content is supplied.
+      properties:
+        action:
+          allOf:
+          - $ref: '#/definitions/ChangeAction'
+          description: 'How this file changes. `take` reads the file from the working tree as it stands — the right choice when the edit is already written, because there is then nothing to reproduce and nothing to get wrong. `write` needs `content`. `delete` needs only `path`.'
+        content:
+          description: The file's complete new text — the entire content it should hold after the commit, not a diff and not only the changed part. Required for `write`, ignored otherwise.
+          type: string
+        executable:
+          description: Mark the file executable. Defaults to the mode it already has.
+          type: boolean
+        path:
+          description: Repository-relative path.
+          type: string
+      required:
+      - action
+      - path
+      type: object
+  properties:
+    branch:
+      description: The branch to commit on. It must already exist — create one with git_ref — and it must not be checked out. Required.
+      minLength: 1
+      type: string
+    changes:
+      description: 'For `from: files` — the files this commit changes, at least one. Use `take` for a file whose new content is already on disk, `write` with the complete new text otherwise, `delete` to remove one.'
+      items:
+        $ref: '#/definitions/FileChange'
+      maxItems: 200
+      type: array
+    commit:
+      description: 'For `cherry_pick` and `revert` — the full object id of the commit to replay, as git_log reports it.'
+      type: string
+    expected_head:
+      description: The commit the branch must currently point at. Leave it out and the tip is read here, still swapped atomically; give it to refuse the commit if the branch moved since you looked.
+      type: string
+    from:
+      allOf:
+      - $ref: '#/definitions/CommitFrom'
+      description: Where the content comes from. Required.
+    message:
+      description: 'The commit message. Required for `files` and `patch`; `cherry_pick` keeps the message it replays and `revert` writes its own.'
+      type: string
+    patch:
+      description: 'For `from: patch` — a unified diff, as `git diff` produces it.'
+      type: string
+    repo:
+      description: The repository to commit in. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - branch
+  - from
+  title: CommitRequest
+  type: object
+examples:
+- commit the file I just edited, take it as it is on disk<|im_end|>
+- save this with the message fix the parser crash<|im_end|>
+- cherry-pick that commit onto the release branch<|im_end|>
+- revert the commit that broke decoding<|im_end|>
+- apply this diff to my branch and commit it<|im_end|>
+- commit the deletion of the dead module<|im_end|>
+- put all three edited files into one commit<|im_end|>
+- backport that fix onto the stable branch<|im_end|>

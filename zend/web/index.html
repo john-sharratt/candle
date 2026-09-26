@@ -88,6 +88,7 @@
   .zmd .tool-call-arg.dflt .tool-call-arg-key, .zmd .tool-call-arg.dflt .tool-call-arg-val { color: #6f6a64; }
   .zmd .tool-call-arg.dflt .tool-call-arg-val { font-style: italic; }
   .zmd .tool-call-name, .zmd .tool-call-badge { flex-shrink: 0; }
+  .zmd .tool-call-repo { color: #9a9490; font-size: .74rem; padding: 0 .35rem; border: 1px solid #3a3632; border-radius: 3px; white-space: nowrap; flex-shrink: 0; }
   .zmd .tool-call-subject { color: #c7bdb0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .zmd .tool-call-detail { color: #7d766e; font-size: .76rem; white-space: nowrap; flex-shrink: 0; }
   .zmd details.tool-call-card > summary.tool-call-header { cursor: pointer; list-style: none; user-select: none; }
@@ -705,7 +706,10 @@ import { estateSwitcher } from './common/lib/estate.js';
   // file or folder it named, then what came back — the excerpt's page and line
   // range for a read, the entry count for a listing. Any other tool shows its
   // first string argument. Either part is empty when there is nothing to say.
+  // A read or a listing also names its repository: a workspace holds several,
+  // and `src/lib.rs` alone does not say which one's was read.
   function toolSubject(name, args, resp) {
+    const repo = (name === 'file_read' || name === 'file_list') && typeof args.repo === 'string' ? args.repo : '';
     let subject = '';
     if (name === 'file_list') {
       // Only file_list gives an empty path a meaning of its own ("the
@@ -736,7 +740,7 @@ import { estateSwitcher } from './common/lib/estate.js';
       const p = resp.obj.paging;
       detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + (p.page + 1) + '/' + p.pages : '');
     }
-    return { subject, detail };
+    return { repo, subject, detail };
   }
   // Every parameter the tool takes: the ones the call passed, in call order,
   // then the ones it left out — dimmed, with the default they took (the schema's
@@ -824,7 +828,8 @@ import { estateSwitcher } from './common/lib/estate.js';
         '</div><pre class="tool-call-out-body">' + esc(resp.raw) + '</pre></div>'
       : '';
     const sub = toolSubject(name, args, resp);
-    const subHtml = (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
+    const subHtml = (sub.repo ? '<span class="tool-call-repo">' + esc(sub.repo) + '</span>' : '') +
+      (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
       (sub.detail ? '<span class="tool-call-detail">' + esc(sub.detail) + '</span>' : '');
     return '<details class="tool-call-card">' +
       '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + subHtml + badge +

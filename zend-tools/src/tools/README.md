@@ -31,7 +31,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | `calculator` | `calculator.rs` | evalexpr; no eval code path |
 | `unit_convert` | `unit_convert.rs` | Static dimension table; affine temperature |
 | `random` | `random.rs` | rand crate; integer/float/choice/shuffle/dice |
-| `web_search` | `web_search.rs` | Tavily API; key from `secrets/tools.yaml` |
+| `web_search` | `web_search.rs` | Tavily API; key from `~/.zend/secrets.yaml` (or `--secrets`) |
 | `web_fetch` | `web_fetch.rs` | reqwest + readability extractor; SSRF guard |
 | `weather` | `weather.rs` | Open-Meteo geocoding + forecast APIs |
 
@@ -47,6 +47,39 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | `file_grep` | `file/grep.rs` | Regex over file contents; path + line number per hit |
 | `file_delete` | `file/delete.rs` | Idempotent; returns `deleted` flag |
 | `file_present` | `file/present.rs` | Foreground presentation gesture |
+
+### Git (17 tools)
+
+Typed access to the workspace's repositories through `zend-git`. Nothing in
+this crate spawns or parses git; each tool is a request/response shell over
+that layer. The family splits by capability, and that split is the design:
+**the readers declare nothing, the writers declare `DiskWrite`**, which
+Comprehensive's grants withhold — so changing a repository is Mutable's alone.
+Running `git` is deliberately not `Exec`; see `git/mod.rs` for why.
+
+Tests live in `tests/git_tools/`, not beside the code: they need real
+repositories on disk, and the `exec`/`disk` guards hold every line under
+`src/tools` to the capability-checked primitives.
+
+| Tool | File | Notes |
+|------|------|-------|
+| `git_status` | `git/status.rs` | Uncommitted paths (a side with no change left out); upstream ahead/behind |
+| `git_log` | `git/log.rs` | History as subjects, 20 a page; `since` + `count` for "how far ahead"; `follow_renames`; `lines` for the commits behind a span of one file's lines (`git/line_history.rs`) |
+| `git_show` | `git/show.rs` | `what`: changes / patch / file / tree / blame; first page carries the full message |
+| `git_grep` | `git/grep.rs` | Search a revision's tracked content; long lines clipped as `file_grep` clips |
+| `git_refs` | `git/refs.rs` | `kind`: branches / tags / remotes / remote_branches (with their remotes' URLs) |
+| `git_commit` | `git/commit.rs` | `from`: files (`take`/`write`/`delete`) / patch / cherry_pick / revert → branch move (CAS) |
+| `git_ref` | `git/reference.rs` | Branch or tag × create / move / delete, each a compare-and-swap |
+| `git_fetch` | `git/fetch.rs` | Tracking refs only; never moves a local branch |
+| `git_push` | `git/push.rs` | Atomic, leased; no unconditional force |
+
+Every reader takes a **required** `page`, sized so a page costs about what a
+`file_read` page does, and no field in the family admits `null` — an optional
+field is left out, never nulled.
+
+Shared pieces: `git/mod.rs` (error mapping, repo resolution, the flat `RevArg`
+revision, protected-path rules) and `git/wire.rs` (the response shapes — full
+object ids, ISO dates, binary reported rather than mangled).
 
 ### Notes (4 tools) — web chat only
 

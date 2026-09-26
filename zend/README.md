@@ -9,7 +9,7 @@ The Zen Code daemon: a persistent AI coding assistant server built on `candle-co
 - **`zen-vscode`** — a Continue fork VS Code extension. It passes its own `tools` array; `zend` treats those as client-executed (emits `tool_calls` in the response and returns immediately, letting Continue post results back as `role: "tool"` messages).
 - **The embedded web chat** (served from `web/`, no client tooling — no Node, no build step, assets embedded via `include_dir!`) — passes no tools, so `zend` injects its own server-registered tool catalog (`zend-tools`), executes any tool calls itself in a loop, and streams only the final assistant text.
 
-On startup `zend` resolves a **workspace** directory (see `--working-dir` below), opens (or creates) `<workspace>/.substrate/` — the mandatory redo-log persistence layer `candle-conversation` requires — replays it into a `Substrate`, loads the model, installs the tool catalog and any calibrated system-prompt sections, then runs **ingest**: walking the workspace to populate the projection schema's turn-sink layers. A background filesystem watcher (`watcher.rs`) debounces edits into incremental re-ingest. Only once loading finishes does the daemon accept `/v1/chat/completions` traffic (`GET /v1/status` reports the loading-state machine's progress to the frontend in the meantime).
+On startup `zend` resolves a **workspace** directory (see `--working-dir` below), opens (or creates) `<workspace>/substrate/` — the mandatory redo-log persistence layer `candle-conversation` requires — replays it into a `Substrate`, loads the model, installs the tool catalog and any calibrated system-prompt sections, then runs **ingest**: walking the workspace to populate the projection schema's turn-sink layers. A background filesystem watcher (`watcher.rs`) debounces edits into incremental re-ingest. Only once loading finishes does the daemon accept `/v1/chat/completions` traffic (`GET /v1/status` reports the loading-state machine's progress to the frontend in the meantime).
 
 Every layer the projection schema declares is filled by convention rather than annotation — `src/ingest.rs` derives the load plan from the schema's shape, not from extra YAML metadata:
 
@@ -101,9 +101,19 @@ In `mutable` mode the file tools run against `VfsStore::direct`: writes go to di
 
 ## Running it
 
+zend serves a **workspace**: a folder holding a `workspace.yaml` that lists the repositories in scope, each a folder directly beside it. The daemon's `substrate/` lives in the workspace folder too, and it adds an `uploads` repository of its own. Every file tool requires a `repo` argument (constrained at decode time to these names; `file_list`, `file_search` and `file_grep` also take `*` for every repository) and a path relative to that repository. See `docs/zend_workspace_execution.md`.
+
+```yaml
+# <workspace>/workspace.yaml
+repos:
+  - name: candle
+  - name: battle-cities
+  - name: mind
+```
+
 ```bash
 zend                                # workspace = current directory, port 8080
-zend /path/to/project               # explicit workspace path
+zend /path/to/workspace             # explicit workspace path
 zend --port 9090                    # custom port
 zend --working-dir ../mind          # separate substrate + schema, cwd untouched
 zend -v                             # DEBUG logging (-vv = TRACE)
@@ -113,19 +123,20 @@ CLI flags (`src/main.rs`, `clap`-derived):
 
 | Flag | Effect |
 |---|---|
-| `workspace` (positional, default `.`) | Root of the project to analyse |
-| `--working-dir <path>` | Overrides the workspace: where `.substrate/` and an optional `projection.yaml` live, without `chdir`-ing the process. Takes precedence over the positional path. Use it to run a separate "mind" (its own substrate + tuned schema) alongside a normal coding workspace |
+| `workspace` (positional, default `.`) | The workspace folder — it must hold a `workspace.yaml` |
+| `--working-dir <path>` | Overrides the workspace: where `substrate/` and an optional `projection.yaml` live, without `chdir`-ing the process. Takes precedence over the positional path. Use it to run a separate "mind" (its own substrate + tuned schema) alongside a normal coding workspace |
 | `--port <u16>` (default `8080`) | TCP port |
 | `--host <ip>` (default `127.0.0.1`) | Bind address; the daemon is **unauthenticated**, so binding non-loopback (e.g. `0.0.0.0`) logs a warning. Identity headers from this address (and loopback) are believed |
 | `--gateway <ip>` (repeatable) | Another peer whose `x-tokera-*` identity headers are believed — a gateway on a different machine. Every other peer is anonymous |
 | `-v` / `-vv` | DEBUG / TRACE logging |
 | `--disable-layer <NAME>` (repeatable) | Take a projection layer (or section collection) **out of service** by schema name: not populated at boot, not refreshed by the watcher, excluded from the provenance gather, not normalization-warmed, not swept for crashed partials. Its turns stay in the substrate untouched — dropping the flag restores them — but while it is set they cannot be selected into any projection. An explicit upload into a disabled per-file layer is the one exception and still reads |
 | `--skip-layer <NAME>` (repeatable) | Keep a turn-sink layer fully **in service** — gathered, warmed, and swept for crashed partials — but read nothing from disk for it this boot (no startup ingest, no watcher-driven refresh). The flag for "the corpus is built, stop re-reading the disk". A layer named by both flags is simply disabled |
-| `--ingest-dir <layer>=<path>` (repeatable) | Override the content root a derived ingest layer reads from |
-| `--max-depth <N>` | Bound how deep the `repo_map` and `code_reading` layers read, in path components below each layer's content root (`1` = the root's own files, `2` = one folder down, like `find -maxdepth`). Covers the startup ingest, the watcher-driven refresh and the watcher's event filter. Content already ingested from deeper is **frozen**: kept and retrievable, but never re-read and never retired by the deleted-file sweep. Changing or dropping the bound changes the listing of the root and of every folder with subfolders, so those folders are re-summarised once |
+| `--ingest-dir <layer>=<path>` (repeatable) | Narrow a derived ingest layer to one workspace-relative folder (for the code layers, a folder inside one repository, e.g. `code_reading=candle/zend/src`) |
+| `--max-depth <N>` | Bound how deep the `repo_map` and `code_reading` layers read, in path components below each repository's root or `--ingest-dir` folder (`1` = the root's own files, `2` = one folder down, like `find -maxdepth`). Covers the startup ingest, the watcher-driven refresh and the watcher's event filter. Content already ingested from deeper is **frozen**: kept and retrievable, but never re-read and never retired by the deleted-file sweep. Changing or dropping the bound changes the listing of the root and of every folder with subfolders, so those folders are re-summarised once |
 | `--compact-substrate` | Force a whole-store redo-log compaction on load |
+| `--secrets <PATH>` | The secrets file holding the API keys and tokens zend presents to third-party services (`tavily_api_key`, `github_token`). Defaults to `~/.zend/secrets.yaml`; a named file that does not exist fails the launch |
 | `--summarize` | Let conversations launch background tree summaries — of every eight turns, of accumulated segments, and at each UTC day boundary. **Off by default**: each summary re-reads its window as a fresh prefill on the same scheduler, ahead of the live turn, so a conversation's next tool round waits behind it |
-| `--wipe-substrate` | **Destructive** — delete `<workspace>/.substrate` before loading |
+| `--wipe-substrate` | **Destructive** — delete `<workspace>/substrate` before loading |
 | `--model <PRESET>` | Run this model preset, by its variant name (e.g. `Qwen35_0_8B_Q8`, `Qwen38_FlashNext_Q4KO`), instead of choosing one from the card's measured VRAM. A substrate holds one model's K/V, so pair a different model with its own `--working-dir` |
 
 Continue (`zen-vscode`) configuration points at the daemon as an OpenAI provider:

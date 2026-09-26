@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
+use zend_tools::state::Workspace;
 
 /// Time we wait after the first relevant event before firing the
 /// refresh.  Subsequent events inside the window extend the deadline
@@ -96,17 +97,23 @@ fn without_cur_dir(root: &Path) -> PathBuf {
 /// alive for the daemon's lifetime; dropping it stops the watch.
 /// The dispatch task runs detached on the global executor.
 ///
+/// Watched are `workspace`'s repositories — each folder recursively, the
+/// `uploads` repository among them — and the `extra` folders (a mind's raw
+/// layer folders), never the workspace folder itself: it may hold other
+/// checkouts whose churn no walk reads.
+///
 /// `depth` is the `--max-depth` filter ([`WatchDepth`]); `None` lets every
 /// non-ignored source path through.
 pub fn spawn(
-    workspace: &Path,
+    workspace: &Workspace,
+    extra: &[PathBuf],
     depth: Option<WatchDepth>,
     on_refresh: Arc<dyn Fn() + Send + Sync + 'static>,
     on_uploads_changed: Arc<dyn Fn() + Send + Sync + 'static>,
 ) -> anyhow::Result<RecommendedWatcher> {
     let (src_tx, src_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (up_tx, up_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let root = workspace.to_path_buf();
+    let root = workspace.root().to_path_buf();
     let max_depth = depth.as_ref().map(|d| d.max);
     let mut watcher = notify::recommended_watcher(move |res: NotifyResult<Event>| {
         let Ok(event) = res else {
@@ -127,8 +134,8 @@ pub fn spawn(
         //    tombstoning-if-absent (a no-op for still-present files, so create /
         //    modify events during an in-flight upload are harmless).
         //
-        // The daemon's own `.substrate/` redo-log writes and build/VCS churn are
-        // ignored entirely (see `is_ignored_path`), so they drive neither.
+        // Build/VCS churn is ignored entirely (see `is_ignored_path`), so it
+        // drives neither.
         let Signal { source, uploads } = classify(&event.paths, &root, depth.as_ref());
         if source {
             let _ = src_tx.send(());
@@ -137,8 +144,15 @@ pub fn spawn(
             let _ = up_tx.send(());
         }
     })?;
-    watcher.watch(workspace, RecursiveMode::Recursive)?;
-    tracing::info!(workspace = %workspace.display(), max_depth = ?max_depth, "repo-map watcher armed");
+    for dir in workspace.repos().iter().map(|r| &r.dir).chain(extra) {
+        watcher.watch(dir, RecursiveMode::Recursive)?;
+    }
+    tracing::info!(
+        workspace = %workspace.root().display(),
+        repos = %workspace.names().join(", "),
+        max_depth = ?max_depth,
+        "repo-map watcher armed",
+    );
 
     spawn_debounced(src_rx, on_refresh);
     spawn_debounced(up_rx, on_uploads_changed);
@@ -184,28 +198,28 @@ fn spawn_debounced(
     });
 }
 
-/// Whether a path lives under a directory the watcher must ignore: the
-/// daemon's own substrate store (self-trigger feedback), the build output, or
-/// the VCS / dependency dirs. Matched on any path component so it catches the
-/// dir itself and everything beneath it.
+/// Whether a path lives under a directory the watcher must ignore: the build
+/// output, or the VCS / dependency dirs. Matched on any path component so it
+/// catches the dir itself and everything beneath it. The daemon's own
+/// `substrate/` sits in the workspace folder, outside every watched folder.
 ///
-/// The top-level `uploads/` dir is handled separately by [`is_top_level_uploads`]
+/// The `uploads` repository is handled separately by [`is_top_level_uploads`]
 /// (a root-relative, first-component match) rather than here — an any-component
 /// match would also suppress a legitimate nested `src/uploads/` source dir,
 /// diverging from [`crate::repo_scan::walk_workspace`], which excludes only the
-/// top-level dir.
+/// `uploads` repository.
 fn is_ignored_path(path: &Path) -> bool {
     path.components().any(|c| {
         matches!(
             c.as_os_str().to_str(),
-            Some(".substrate") | Some(".git") | Some("target") | Some("node_modules")
+            Some(".git") | Some("target") | Some("node_modules")
         )
     })
 }
 
-/// Whether `path` is under the daemon's TOP-LEVEL `uploads/` dir (first
-/// component of the workspace-relative path, case-insensitively — the win32 FS
-/// is case-insensitive). Uploaded files are ingested (and measured) exclusively
+/// Whether `path` is in the daemon's `uploads` repository (the first component
+/// of the workspace-relative path, case-insensitively — the win32 FS is
+/// case-insensitive). Uploaded files are ingested (and measured) exclusively
 /// by the upload endpoint; a watcher-driven background refresh would race it and
 /// make the endpoint's measured read_file stage cache-hit ("instant, 0 tokens").
 /// Matched precisely so a nested `src/uploads/` source dir keeps its watch —
@@ -231,8 +245,8 @@ struct Signal {
 }
 
 /// Route a burst's `paths` (relative to workspace `root`) to the refresh signal,
-/// the uploads-reconcile signal, or neither. Ignored paths (`.substrate/`,
-/// `.git/`, `target/`, `node_modules/`) contribute to neither, and neither does a
+/// the uploads-reconcile signal, or neither. Ignored paths (`.git/`, `target/`,
+/// `node_modules/`) contribute to neither, and neither does a
 /// source path the `--max-depth` filter (`depth`) does not admit. A path-less
 /// event is backend-specific noise we can't localise — treated conservatively
 /// as a source change so a real edit is never missed.
@@ -341,9 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn ignores_daemon_managed_and_noise_dirs() {
+    fn ignores_build_and_vcs_dirs() {
         for p in [
-            "ws/.substrate/substrate.log",
             "ws/.git/index",
             "ws/target/debug/x",
             "ws/node_modules/pkg/i.js",
@@ -415,10 +428,10 @@ mod tests {
 
     #[test]
     fn classify_ignored_only_burst_drives_neither() {
-        // `.substrate/` self-writes and build/VCS churn must move nothing.
+        // Build/VCS churn must move nothing.
         let root = Path::new("ws");
         let s = classify(
-            &paths(&["ws/.substrate/substrate.log", "ws/target/debug/x"]),
+            &paths(&["ws/r/.git/index", "ws/r/target/debug/x"]),
             root,
             None,
         );
@@ -459,41 +472,41 @@ mod tests {
         );
     }
 
-    /// `--max-depth 2` over the default content root (`ws/.`): the root's own
+    /// `--max-depth 2` over a repository's root (`ws/r`): the repository's own
     /// files and one folder down drive a refresh; deeper paths are frozen, so
     /// their events drive nothing. Unbounded, everything counts.
     #[test]
     fn a_depth_bound_drops_events_past_it() {
         let root = Path::new("ws");
-        let depth = WatchDepth::new(2, [PathBuf::from("ws/.")], Vec::new());
+        let depth = WatchDepth::new(2, [PathBuf::from("ws/r")], Vec::new());
         let source = |list: &[&str], d: Option<&WatchDepth>| classify(&paths(list), root, d).source;
-        assert!(source(&["ws/a.rs"], Some(&depth)));
-        assert!(source(&["ws/src/b.rs"], Some(&depth)));
-        assert!(!source(&["ws/src/deep/c.rs"], Some(&depth)));
+        assert!(source(&["ws/r/a.rs"], Some(&depth)));
+        assert!(source(&["ws/r/src/b.rs"], Some(&depth)));
+        assert!(!source(&["ws/r/src/deep/c.rs"], Some(&depth)));
         assert!(
-            source(&["ws/src/deep/c.rs", "ws/a.rs"], Some(&depth)),
+            source(&["ws/r/src/deep/c.rs", "ws/r/a.rs"], Some(&depth)),
             "a burst with one shallow path still refreshes"
         );
-        assert!(source(&["ws/src/deep/c.rs"], None));
+        assert!(source(&["ws/r/src/deep/c.rs"], None));
         // Uploads are routed as before, whatever the bound.
         assert!(classify(&paths(&["ws/uploads/a/b/c.py"]), root, Some(&depth)).uploads);
     }
 
-    /// The bound is measured from each layer's own root (`--ingest-dir
-    /// code_reading=zend/src`); a path under no walked root is out of reach, and
-    /// an unbounded (raw) layer's folder admits any depth.
+    /// The bound is measured from each walk's own start (`--ingest-dir
+    /// code_reading=candle/zend/src`); a path under no walked root is out of
+    /// reach, and an unbounded (raw) layer's folder admits any depth.
     #[test]
     fn a_depth_bound_is_measured_from_each_layer_root() {
         let root = Path::new("ws");
         let depth = WatchDepth::new(
             1,
-            [PathBuf::from("ws/zend/src")],
+            [PathBuf::from("ws/candle/zend/src")],
             [PathBuf::from("ws/responses")],
         );
         let source = |list: &[&str]| classify(&paths(list), root, Some(&depth)).source;
-        assert!(source(&["ws/zend/src/main.rs"]));
-        assert!(!source(&["ws/zend/src/api/mod.rs"]));
-        assert!(!source(&["ws/README.md"]));
+        assert!(source(&["ws/candle/zend/src/main.rs"]));
+        assert!(!source(&["ws/candle/zend/src/api/mod.rs"]));
+        assert!(!source(&["ws/candle/README.md"]));
         assert!(source(&["ws/responses/greet/hello.chatml"]));
     }
 

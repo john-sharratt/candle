@@ -15,7 +15,7 @@
 //!
 //! # One handle to the substrate, shared with the engine
 //!
-//! [`Npcs::load`] performs the process's **only** open of `--data/.substrate/`,
+//! [`Npcs::load`] performs the process's **only** open of `--data/substrate/`,
 //! and the engine adopts that same handle via [`Npcs::substrate`]. A second
 //! `SubstratePersistence` over one directory is a second unlocked append cursor
 //! and a second record index, and the compactor carries forward only what its
@@ -37,7 +37,7 @@ use std::path::Path;
 use candle_conversation::persistence::record::{
     AuthoredBelief, AuthoredRelationship, AuthoredStrategy, Modulation, NpcPayload, RecordType,
 };
-use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence};
+use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence, SUBSTRATE_DIR};
 use candle_conversation::substrate::Substrate;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -206,7 +206,7 @@ pub struct Npcs {
 }
 
 impl Npcs {
-    /// Open the substrate at `dir/.substrate/` and rebuild the cast from it.
+    /// Open the substrate at `dir/substrate/` and rebuild the cast from it.
     ///
     /// The one read of the log. Records arrive in append order, so inserting
     /// each into the map *is* last-writer-wins — no ordering pass, no revision
@@ -241,7 +241,7 @@ impl Npcs {
             "cast: {live} characters ({} records, {} tombstoned) from {}",
             by_id.len(),
             by_id.len() - live,
-            dir.join(".substrate").display()
+            dir.join(SUBSTRATE_DIR).display()
         );
 
         Ok(Self {
@@ -375,7 +375,7 @@ impl Npcs {
     /// The substrate handle, for the engine to adopt.
     ///
     /// **The engine must take this rather than open `--data` itself.** One
-    /// `.substrate/` admits exactly one writable handle per process: the log
+    /// `substrate/` admits exactly one writable handle per process: the log
     /// file is opened read-write and unlocked, so a second
     /// `SubstratePersistence` is a second append cursor *and* a second view of
     /// which character records exist. Compaction carries forward only what the
@@ -1225,7 +1225,7 @@ mod tests {
     /// maintenance.**
     ///
     /// The regression guard for the bug that lost Makers overnight. The engine
-    /// used to open `--data/.substrate/` for itself, so it held a second
+    /// used to open `--data/substrate/` for itself, so it held a second
     /// writable handle whose record index had been built before the character
     /// existed — and its next compaction carried forward only what that index
     /// knew, dropping every character created since. Characters present at boot

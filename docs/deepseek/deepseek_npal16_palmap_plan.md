@@ -257,7 +257,7 @@ compression ratio vs identity-16 and vs the 8-band 2.12×/2.7× baselines.
 - On-disk format is length-prefixed (`record.rs:404-559`) so it is structurally
   agnostic; **old 8-band/2-bit images are incompatible** — bump the persistence
   version and reject/skip stale latent chunks (this is a research codebase; no
-  back-compat shim — fresh `.substrate`). Document in the redo-log version note.
+  back-compat shim — fresh `substrate`). Document in the redo-log version note.
 
 ---
 

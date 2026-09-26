@@ -373,6 +373,7 @@ fn call_tree(
                 items: None,
                 properties: None,
                 nullable: false,
+                minimum: None,
             })
             .collect(),
     };

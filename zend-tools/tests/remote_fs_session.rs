@@ -2,6 +2,8 @@ mod harness;
 
 use serde_json::json;
 
+use harness::REPO;
+
 #[test]
 fn remote_fs_session_not_sftp() {
     // The scheme is rejected before the credential is ever looked up, so an
@@ -86,7 +88,7 @@ fn remote_fs_list_dir_session_not_found() {
 fn remote_fs_get_session_not_found() {
     let resp = harness::invoke(
         "remote_fs_session_get",
-        json!({"session_id": "sess_missing", "remote_path": "/etc/passwd"}),
+        json!({"session_id": "sess_missing", "remote_path": "/etc/passwd", "repo": REPO}),
     );
     harness::expect_error(&resp, "session_not_found");
 }

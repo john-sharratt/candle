@@ -8,8 +8,8 @@ use super::render::{fence_tag_for_path, numbered_excerpt};
 use super::FileError;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
-/// A page names itself. `path` and `page` are both required — that is the
-/// order the `required` list declares them in, and so the order the
+/// A page names itself. `repo`, `path` and `page` are all required — that is
+/// the order the `required` list declares them in, and so the order the
 /// constrained decoder offers them in, which is also the order a call reads
 /// in.
 ///
@@ -27,7 +27,10 @@ use crate::{RegisteredTool, Replay, Tool, ToolContext};
 /// for, with no clamp-and-explain step to get there.
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {
-    /// Path of the file to read — a project file from the working directory, or one this session created (e.g. `src/main.rs`, or `/workspace/src/main.rs`). Required.
+    /// The repository the file belongs to. Required.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// Path of the file to read, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
     /// Zero-based page of the file to return, 200 lines a page. Required —
@@ -43,12 +46,13 @@ impl Tool for FileRead {
     const NAME: &'static str = "file_read";
     const DESCRIPTION: &'static str =
         "Read a file, one 200-line page at a time. Resolves against this session's \
-         edits first, then falls through to the project's working directory, so \
-         real project files can be read directly. Both path and page are required \
-         — pass page 0 to read the top of the file; it is zero-based, so page 1 is \
-         lines 201-400. Returns the page as numbered source in a fenced block, \
-         headed by the path, the page and total page count, and the line range \
-         covered — `(page 1 of 5, lines 201-400 of 1420)`. Keep incrementing page \
+         edits first, then falls through to the repository on disk, so real \
+         project files can be read directly. The repo, the path within it, and \
+         the page are all required — pass page 0 to read the top of the file; it \
+         is zero-based, so page 1 is lines 201-400. Returns the page as numbered \
+         source in a fenced block, headed by the path, the repo, the page and \
+         total page count, and the line range covered — `src/lib.rs in candle \
+         (page 1 of 5, lines 201-400 of 1420)`. Keep incrementing page \
          until the header's page number stops advancing; a short file is entirely \
          on page 0. There is no need to find a file's length first: read page 0 \
          and the header reports it. To find the page worth reading, use file_grep \
@@ -73,10 +77,12 @@ impl Tool for FileRead {
             return Err(FileError::IsUrl(req.path));
         }
         let page = ctx
-            .vfs
+            .files
+            .repo(&req.repo)?
             .read_page(&req.path, req.page)?
             .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
         Ok(numbered_excerpt(
+            &req.repo,
             &req.path,
             page.page,
             page.total_pages,

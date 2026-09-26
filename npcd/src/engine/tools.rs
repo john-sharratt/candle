@@ -1780,6 +1780,7 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
                     items: None,
                     properties: None,
                     nullable: false,
+                    minimum: None,
                 })
                 .collect(),
         })

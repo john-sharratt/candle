@@ -37,6 +37,7 @@ use zend::code_read::{CodeReadState, RefreshOutcome as CodeReadOutcome};
 use zend::loading::LoadProgress;
 use zend::refresh_ctx::RefreshContext;
 use zend::repo_scan::{DirState, RefreshOutcome as RepoMapOutcome};
+use zend_tools::state::Secrets;
 
 const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
 
@@ -65,9 +66,12 @@ fn init_tracing() {
     });
 }
 
+/// The fixture workspace's one repository, where every file is planted.
+const FIXTURE_REPO: &str = "demo-app";
+
 fn build_fixture_workspace() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
+    let root = dir.path().join(FIXTURE_REPO);
     write(
         &root,
         "Cargo.toml",
@@ -185,7 +189,8 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         Some(ts) => ts.registry_for(&tool_stencil, ThinkMode::Quick),
         None => std::sync::Arc::clone(&tool_stencil),
     };
-    let tool_host = zend::tools::ToolHost::new(workspace);
+    let served = zend::workspace::single_repo(workspace, FIXTURE_REPO).expect("workspace");
+    let tool_host = zend::tools::ToolHost::new(&served, Arc::new(Secrets::empty()));
     let tool_ctx = std::sync::Arc::clone(tool_host.context_for(zend::types::ToolMode::Restricted));
     let dialogue = engine
         .new_conversation_with_projection(
@@ -242,7 +247,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // prior state standing in for a fresh install's seeded-but-empty
     // registry entry.
     let engine = Mutex::new(engine);
-    let walked = zend::repo_scan::walk_workspace(workspace, None);
+    let walked = zend::repo_scan::walk_workspace(&served, "", None);
     let repo_map_ctx = RefreshContext {
         engine: &engine,
         proj_builder: proj_builder_repo_map,
@@ -254,7 +259,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     };
     let repo_map_state = match zend::repo_scan::refresh_repo_map(
         &repo_map_ctx,
-        workspace,
+        &served,
         &walked,
         &DirState::default(),
         &progress,

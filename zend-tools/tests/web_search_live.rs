@@ -8,45 +8,36 @@
 //! cargo test -p zend-tools --test web_search_live -- --ignored --nocapture
 //! ```
 //!
-//! It reads the key the daemon reads, from `secrets/tools.yaml` at the
-//! repository root, rather than taking one from the test. That is the point: a
-//! green run here says *this machine's configured key works against the live
-//! API*, which is the thing no amount of parsing coverage can establish.
+//! It reads the key the daemon reads by default, from `~/.zend/secrets.yaml`,
+//! rather than taking one from the test. That is the point: a green run here
+//! says *this machine's configured key works against the live API*, which is
+//! the thing no amount of parsing coverage can establish.
 //!
 //! The unconfigured case below is NOT ignored — it reaches no network and holds
 //! the contract that matters when a deployment has no key.
 
 mod harness;
 
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::json;
-use zend_tools::state::ToolSecrets;
+use zend_tools::state::Secrets;
 use zend_tools::{Grants, ToolContext};
-
-/// The repository root: `zend-tools` sits one level below it, and it is the
-/// daemon's working directory, so `secrets/tools.yaml` resolves under it.
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("zend-tools sits one level below the workspace root")
-        .to_path_buf()
-}
 
 /// A context carrying this machine's real key, or a panic naming the file to
 /// edit. A live test that silently passed with no key would be worthless.
 fn ctx_with_real_key() -> ToolContext {
-    let root = workspace_root();
-    let path = ToolSecrets::path_in(&root);
-    let secrets = ToolSecrets::load_from_workspace(&root)
+    let path = Secrets::default_path().expect("this machine reports a home folder");
+    let secrets = Secrets::load(&path)
         .unwrap_or_else(|e| panic!("{} could not be read: {e}", path.display()));
     assert!(
         secrets.tavily_api_key().is_some(),
         "no tavily_api_key in {} — this live test needs the deployment's key",
         path.display(),
     );
-    ToolContext::with_workspace(&root)
-        .with_secrets(secrets)
+    // `web_search` never touches `ctx.files`, so no workspace is needed.
+    ToolContext::new()
+        .with_secrets(Arc::new(secrets))
         .granting(Grants::ALL)
 }
 
@@ -114,7 +105,8 @@ fn a_live_question_style_query_also_returns_results() {
     );
 }
 
-/// **Unconfigured is a clean refusal that names the file, and leaks nothing.**
+/// **Unconfigured is a clean refusal that leaks nothing** — no key, and no
+/// hint of where the secrets file lives.
 ///
 /// Not ignored: it reaches no network. A context built without secrets is what
 /// every test and every non-daemon caller gets, so this is also the assertion
@@ -125,8 +117,9 @@ fn without_a_key_the_tool_reports_itself_unconfigured() {
     let resp = harness::invoke("web_search", json!({"query": "anything"}));
     let detail = harness::expect_error(&resp, "search_unavailable");
     assert!(
-        detail.contains(ToolSecrets::RELATIVE_PATH),
-        "the refusal should name the file to edit, got: {detail}"
+        detail.contains("no tavily_api_key configured")
+            && !detail.contains(Secrets::DEFAULT_RELATIVE_PATH),
+        "the refusal says what is missing and never where secrets live: {detail}"
     );
     assert!(
         !detail.contains("tvly-"),

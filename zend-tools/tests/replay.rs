@@ -13,6 +13,8 @@ mod harness;
 
 use zend_tools::Replay;
 
+use harness::REPO;
+
 /// A patch is located by its context and a hunk already present is reported
 /// rather than applied twice, so the same patch re-sent leaves the same file.
 /// This is the whole reason `file_edit` takes a diff instead of a
@@ -20,6 +22,7 @@ use zend_tools::Replay;
 #[test]
 fn a_file_patch_may_be_re_issued() {
     let args = serde_json::json!({
+        "repo": REPO,
         "path": "src/main.rs",
         "patch": "@@ -1 +1 @@\n-old\n+new\n",
     });
@@ -29,7 +32,7 @@ fn a_file_patch_may_be_re_issued() {
 /// Reads change nothing, so a resumed turn simply reads again.
 #[test]
 fn a_read_may_be_re_issued() {
-    let args = serde_json::json!({ "path": "src/main.rs" });
+    let args = serde_json::json!({ "repo": REPO, "path": "src/main.rs", "page": 0 });
     assert_eq!(harness::replay("file_read", args), Replay::Safe);
 }
 

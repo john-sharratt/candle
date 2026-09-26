@@ -2,12 +2,12 @@
 //!
 //! The substrate persistence layer (`docs/archived/kv_tier_migration.md`) stores a
 //! conversation workspace as an append-only log of content-addressed
-//! records under `<workspace>/.substrate/substrate.log`. This tool opens
+//! records under `<workspace>/substrate/substrate.log`. This tool opens
 //! such a log read-only and renders it from several angles.
 //!
 //! ```text
 //! cargo run -p candle-conversation --example substrate_inspect -- \
-//!     .substrate/substrate.log summary
+//!     substrate/substrate.log summary
 //!
 //! Commands:
 //!   summary               file + superblock overview, record histogram, live/dead
@@ -75,9 +75,9 @@ use tokenizers::Tokenizer;
     about = "Read-only inspector for a substrate redo log"
 )]
 struct Cli {
-    /// Path to inspect: the `.substrate` **directory** (the segmented redo
+    /// Path to inspect: the `substrate` **directory** (the segmented redo
     /// log) or a single `seg-*.log` / `seg-*.active` segment file. Defaults to
-    /// `.substrate` under the current directory. For a directory, `summary`
+    /// `substrate` under the current directory. For a directory, `summary`
     /// aggregates every segment; the other views open the active segment (pass
     /// a segment file to inspect a specific sealed segment).
     #[arg(short, long, global = true)]
@@ -86,7 +86,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-/// The default inspect target — `<cwd>/.substrate`, the segmented redo-log
+/// The default inspect target — `<cwd>/substrate`, the segmented redo-log
 /// directory the daemon writes.
 fn default_log_path() -> PathBuf {
     use candle_conversation::persistence::SUBSTRATE_DIR;
@@ -1018,13 +1018,13 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Summary => summary(&log_path, &mut log)?,
         Cmd::ExportReplay { .. } => {
-            anyhow::bail!("export-replay requires the segmented `.substrate` DIRECTORY target")
+            anyhow::bail!("export-replay requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Orphans => {
-            anyhow::bail!("orphans requires the segmented `.substrate` DIRECTORY target")
+            anyhow::bail!("orphans requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Couplings { .. } => {
-            anyhow::bail!("couplings requires the segmented `.substrate` DIRECTORY target")
+            anyhow::bail!("couplings requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Headers => headers(&mut log)?,
         Cmd::Validate { layers } => validate(&mut log, layers)?,
@@ -5122,10 +5122,10 @@ fn validate(log: &mut LogFile, layers_override: Option<usize>) -> Result<()> {
     // boundary has only part of its chunks here and reads as a torn write.
     // Measured: two turns reported torn in BOTH seg-320 and seg-323 with
     // *different* partial counts (233 vs 295) — a real torn write exists once.
-    // Point the tool at the `.substrate` DIRECTORY for the answer that counts.
+    // Point the tool at the `substrate` DIRECTORY for the answer that counts.
     println!(
         "note: single-segment scope — a turn whose chunks straddle a segment boundary \
-         will read as a torn write here; run against the .substrate directory for the \
+         will read as a torn write here; run against the substrate directory for the \
          whole-substrate answer"
     );
     let substrate = build_substrate(log)?;
@@ -5723,7 +5723,7 @@ fn tokens(log: &mut LogFile, stream_id: StreamId, as_ids: bool) -> Result<()> {
 /// Load the tokenizer embedded in the log's `Tokenizer` record. Returns
 /// `Ok(None)` when the log has no such record — the substrate is then
 /// opaque to text decoding and the caller should fall back to `--ids`.
-/// The segmented store's directory, set in `main` when the target is a `.substrate`
+/// The segmented store's directory, set in `main` when the target is a `substrate`
 /// dir. Lets [`load_log_tokenizer`] fall back to sibling segments: the `Tokenizer`
 /// record is a singleton written ONCE at engine init (deduped by SHA), so on a
 /// segmented store it lives in an early sealed segment — NOT the active segment a

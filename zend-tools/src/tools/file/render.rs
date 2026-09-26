@@ -10,7 +10,7 @@
 //!   conditioned on.
 //!
 //! ````text
-//! src/auth/handler.rs (page 0 of 3, lines 1-300 of 620):
+//! src/auth/handler.rs in server (page 0 of 3, lines 1-300 of 620):
 //!
 //! ```rust
 //!      1  impl AuthHandler {
@@ -20,7 +20,8 @@
 //! ````
 //!
 //! `cat -n` numbering, right-aligned to the widest line number, two spaces, then
-//! the source verbatim. The header names the file, which page this is (0-based,
+//! the source verbatim. The header names the file and the repository it is in —
+//! a path alone is ambiguous across a workspace of several — which page this is (0-based,
 //! matching `file_read`'s own request parameter and `file_list`'s paging), and
 //! the absolute line range the page covers — absolute so a follow-up read
 //! lands on a page boundary without the model having to track one itself.
@@ -37,6 +38,7 @@
 /// a bare fence.
 #[allow(clippy::too_many_arguments)]
 pub fn numbered_excerpt(
+    repo: &str,
     path: &str,
     page: u32,
     total_pages: u32,
@@ -74,7 +76,7 @@ pub fn numbered_excerpt(
     } else {
         format!("```{fence_tag}\n")
     };
-    format!("\n{path} ({range}):\n\n{fence_open}{numbered}```\n")
+    format!("\n{path} in {repo} ({range}):\n\n{fence_open}{numbered}```\n")
 }
 
 /// Markdown fence tag for a path's extension. Mirrors `zend`'s
@@ -126,10 +128,10 @@ mod tests {
 
     #[test]
     fn numbers_right_aligned_and_fenced() {
-        let out = numbered_excerpt("a.rs", 0, 1, 8, 10, 10, "rust", "one\ntwo\nthree\n");
+        let out = numbered_excerpt("r", "a.rs", 0, 1, 8, 10, 10, "rust", "one\ntwo\nthree\n");
         assert_eq!(
             out,
-            "\na.rs (page 0 of 1, lines 8-10 of 10):\n\n```rust\n 8  one\n 9  two\n10  three\n```\n",
+            "\na.rs in r (page 0 of 1, lines 8-10 of 10):\n\n```rust\n 8  one\n 9  two\n10  three\n```\n",
         );
     }
 
@@ -137,46 +139,46 @@ mod tests {
     /// to ask for `page + 1` without being told the stride.
     #[test]
     fn a_partial_page_reports_the_total() {
-        let out = numbered_excerpt("a.rs", 0, 3, 1, 2, 900, "rust", "one\ntwo\n");
+        let out = numbered_excerpt("r", "a.rs", 0, 3, 1, 2, 900, "rust", "one\ntwo\n");
         assert!(
-            out.starts_with("\na.rs (page 0 of 3, lines 1-2 of 900):\n"),
+            out.starts_with("\na.rs in r (page 0 of 3, lines 1-2 of 900):\n"),
             "{out}"
         );
     }
 
     #[test]
     fn a_trailing_newline_does_not_invent_a_line() {
-        let out = numbered_excerpt("a.txt", 0, 1, 1, 1, 1, "", "only\n");
+        let out = numbered_excerpt("r", "a.txt", 0, 1, 1, 1, 1, "", "only\n");
         assert_eq!(
             out,
-            "\na.txt (page 0 of 1, lines 1-1 of 1):\n\n```\n1  only\n```\n"
+            "\na.txt in r (page 0 of 1, lines 1-1 of 1):\n\n```\n1  only\n```\n"
         );
     }
 
     #[test]
     fn an_empty_file_says_so_instead_of_an_impossible_range() {
-        let out = numbered_excerpt("a.rs", 0, 0, 1, 0, 0, "rust", "");
-        assert_eq!(out, "\na.rs (empty):\n\n```rust\n```\n");
+        let out = numbered_excerpt("r", "a.rs", 0, 0, 1, 0, 0, "rust", "");
+        assert_eq!(out, "\na.rs in r (empty):\n\n```rust\n```\n");
     }
 
     /// A range whose last line is legitimately blank keeps it — the count, not a
     /// trailing-newline heuristic, decides how many lines an excerpt has.
     #[test]
     fn a_blank_last_line_inside_the_range_is_kept() {
-        let out = numbered_excerpt("a.rs", 0, 1, 1, 2, 2, "rust", "a\n");
+        let out = numbered_excerpt("r", "a.rs", 0, 1, 1, 2, 2, "rust", "a\n");
         assert_eq!(
             out,
-            "\na.rs (page 0 of 1, lines 1-2 of 2):\n\n```rust\n1  a\n2  \n```\n"
+            "\na.rs in r (page 0 of 1, lines 1-2 of 2):\n\n```rust\n1  a\n2  \n```\n"
         );
     }
 
     /// A body whose last line has no trailing newline keeps that line.
     #[test]
     fn a_body_without_a_trailing_newline_keeps_its_last_line() {
-        let out = numbered_excerpt("a.rs", 0, 1, 1, 2, 2, "rust", "one\ntwo");
+        let out = numbered_excerpt("r", "a.rs", 0, 1, 1, 2, 2, "rust", "one\ntwo");
         assert_eq!(
             out,
-            "\na.rs (page 0 of 1, lines 1-2 of 2):\n\n```rust\n1  one\n2  two\n```\n"
+            "\na.rs in r (page 0 of 1, lines 1-2 of 2):\n\n```rust\n1  one\n2  two\n```\n"
         );
     }
 

@@ -15,12 +15,26 @@ use candle_conversation::stencil::{
     Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec, Vocab, WalkError,
     MAX_TOOL_CALLS_PER_TURN,
 };
+use zend_tools::state::{RepoSpec, Workspace};
 
 // ── Building the tree from the live registry ────────────────────────────────
 
+/// The repositories the test catalog's `repo` parameters are constrained to —
+/// this machine's workspace, as the daemon would serve it.
+const REPOS: [&str; 3] = ["candle", "battle-cities", "mind"];
+
 /// The catalog the daemon compiles its stencil from — canonical names and
-/// every alias.
+/// every alias — with every `repo` constrained to a workspace of [`REPOS`] plus
+/// uploads, exactly as `tool_def::init` constrains it at startup.
 fn catalog() -> Vec<ToolSpec> {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let repos = REPOS.iter().map(|r| RepoSpec::named(r)).collect();
+        let workspace = Workspace::new("test-workspace", repos)
+            .and_then(|ws| ws.with_repo("uploads"))
+            .expect("the test workspace");
+        zend::tool_def::init(&workspace);
+    });
     zend::tools::tool_catalog().to_vec()
 }
 
@@ -682,8 +696,8 @@ fn unknown_tool_name_is_masked() {
 fn an_alias_name_drives_to_its_tools_arguments() {
     let (tree, vocab) = build_tree();
     let target = format!(
-        "<tool_call>\n{{\"name\": \"file_write\", \"arguments\": {{\"path\": \"a.txt\", \
-         \"content\": \"hi\"}}}}\n</tool_call>{TURN_CLOSE}"
+        "<tool_call>\n{{\"name\": \"file_write\", \"arguments\": {{\"repo\": \"candle\", \
+         \"path\": \"a.txt\", \"content\": \"hi\"}}}}\n</tool_call>{TURN_CLOSE}"
     );
     let out = drive(tree, &target, &vocab).expect("an alias must not be masked");
     assert!(out.contains("\"file_write\""), "{out}");
@@ -741,31 +755,62 @@ fn hallucinated_parameter_is_masked() {
 
 // ── file_read's page is mandatory ───────────────────────────────────────────
 
-/// `file_read` always names both `path` and `page` — the grammar forces both,
-/// the same way it forces any other required field.
+/// `file_read` always names `repo`, `path` and `page` — the grammar forces all
+/// three, in that order, the same way it forces any other required field.
 #[test]
-fn file_read_always_drives_path_and_page() {
+fn file_read_always_drives_repo_path_and_page() {
     let (tree, vocab) = build_tree();
     for page in [0, 3] {
         let target = format!(
-            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"a.rs\", \
-             \"page\": {page}}}}}\n</tool_call><|im_end|>"
+            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
+             \"path\": \"a.rs\", \"page\": {page}}}}}\n</tool_call><|im_end|>"
         );
         let out = drive(Arc::clone(&tree), &target, &vocab)
             .unwrap_or_else(|e| panic!("page {page} must drive, got {e:?}"));
         let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
         let arguments = &parsed["arguments"];
+        assert_eq!(arguments["repo"], "candle");
         assert_eq!(arguments["path"], "a.rs");
         assert_eq!(arguments["page"], page);
     }
+}
+
+/// **A repository the workspace does not list cannot be decoded** — the enum
+/// is a choice between the listed names, so `app` is masked at its first byte.
+#[test]
+fn a_repo_outside_the_workspace_is_masked() {
+    let (tree, vocab) = build_tree();
+    let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"repo\": \"app\", \
+                  \"path\": \"a.rs\", \"page\": 0}}\n</tool_call>";
+    let err = drive(tree, target, &vocab).unwrap_err();
+    assert!(
+        matches!(err, DriveErr::MaskRejected { byte: b'a', .. }),
+        "got {err:?}"
+    );
+}
+
+/// Omitting `repo` cannot be expressed — it is the first required field.
+#[test]
+fn file_read_rejects_a_call_missing_repo() {
+    let (tree, vocab) = build_tree();
+    let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\", \
+                  \"page\": 0}}\n</tool_call>";
+    let err = drive(tree, target, &vocab).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DriveErr::PrefillMismatch { .. } | DriveErr::MaskRejected { .. }
+        ),
+        "got {err:?}"
+    );
 }
 
 /// Omitting `page` cannot be expressed — it is forced exactly like `path`.
 #[test]
 fn file_read_rejects_a_call_missing_page() {
     let (tree, vocab) = build_tree();
-    let target =
-        "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>";
+    let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"repo\": \"candle\", \
+                  \"path\": \"a.rs\"}}\n</tool_call>";
     let err = drive(tree, target, &vocab).unwrap_err();
     assert!(
         matches!(
@@ -846,6 +891,40 @@ fn enum_value_is_constrained() {
     let bad = "<tool_call>\n{\"name\": \"set_level\", \"arguments\": {\"level\": \"medium\"}}\n</tool_call>";
     let err = drive(tree, bad, &vocab).unwrap_err();
     assert!(matches!(err, DriveErr::MaskRejected { .. }), "got {err:?}");
+}
+
+/// **An optional enum parameter does not end the arguments.** `file_list`'s
+/// `repo` is an optional enum of the workspace's repositories followed by the
+/// optional `path` and `page`; a call naming the repository and then a path
+/// must drive, as must each alone and neither.
+#[test]
+fn an_optional_enum_is_followed_by_the_remaining_optionals() {
+    let tools = vec![ToolSpec::from_json_schema(
+        "file_list",
+        &serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": { "type": ["string", "null"], "enum": ["candle", "battle-cities", "mind"] },
+                "path": { "type": ["string", "null"] },
+                "page": { "type": ["integer", "null"], "format": "uint32", "minimum": 0.0 }
+            }
+        }),
+    )];
+    let (tree, vocab) = synthetic_tree(&tools);
+    for args in [
+        r#"{"repo": "battle-cities", "path": "crates"}"#,
+        r#"{"repo": "battle-cities", "path": "crates", "page": 1}"#,
+        r#"{"repo": "mind"}"#,
+        r#"{"path": "crates"}"#,
+        r#"{}"#,
+    ] {
+        let target = format!(
+            "<tool_call>\n{{\"name\": \"file_list\", \"arguments\": {args}}}\n</tool_call>{TURN_CLOSE}"
+        );
+        if let Err(e) = drive(Arc::clone(&tree), &target, &vocab) {
+            panic!("{args} must drive, got {e:?}");
+        }
+    }
 }
 
 // ── Negative: a required field cannot be skipped ────────────────────────────
@@ -1007,8 +1086,8 @@ fn escaped_token_bails_and_terminates() {
 #[test]
 fn an_empty_string_argument_drives() {
     let (tree, vocab) = build_tree();
-    let target = "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"path\": \"\"}}\n\
-                  </tool_call><|im_end|>";
+    let target = "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"candle\", \
+                  \"path\": \"\"}}\n</tool_call><|im_end|>";
     let out = drive(Arc::clone(&tree), target, &vocab)
         .unwrap_or_else(|e| panic!("an empty path must drive, got {e:?}"));
     let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
@@ -1051,8 +1130,8 @@ fn each_call_level_adds_one_catalog_of_grammar() {
 /// One `file_read` call on `path`, as the tree formats it.
 fn read_call(path: &str) -> String {
     format!(
-        "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{path}\", \
-         \"page\": 0}}}}\n</tool_call>"
+        "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
+         \"path\": \"{path}\", \"page\": 0}}}}\n</tool_call>"
     )
 }
 
@@ -1186,12 +1265,41 @@ fn drive_natural(
     tok: &tokenizers::Tokenizer,
     target: &str,
 ) -> Result<(), String> {
+    walk_natural(tree, tok, target, false)
+}
+
+/// [`drive_natural`], stricter at every masked decision inside the arguments:
+/// the grammar must allow the natural encoding's OWN token there, not merely
+/// some token that spells the same text. A re-split is what a model is forced
+/// into when the grammar commits part of its token for it — a closing quote
+/// prefilled on its own leaves it to choose a bare `,` its encoding never
+/// writes after `"`, and a live model closed its arguments instead. The
+/// lenient walk cannot see that.
+///
+/// The tool name is exempt: its arm ends on its quote and the comma after it
+/// is prefilled, a re-split with no choice after it — see the lenient walk.
+fn drive_natural_strict(
+    tree: Arc<StencilTree>,
+    tok: &tokenizers::Tokenizer,
+    target: &str,
+) -> Result<(), String> {
+    walk_natural(tree, tok, target, true)
+}
+
+fn walk_natural(
+    tree: Arc<StencilTree>,
+    tok: &tokenizers::Tokenizer,
+    target: &str,
+    strict: bool,
+) -> Result<(), String> {
     // The first marker is the model's: decoding it is what fires the stencil,
     // so the walk starts after it and the natural encoding is of the rest.
     let body = target
         .strip_prefix(MARKER)
         .ok_or("target must open with the marker")?;
     let bytes = body.as_bytes();
+    // Where the strict walk starts checking: the first call's arguments.
+    let arguments_at = body.find("\"arguments\"").unwrap_or(0);
     let ids = tok.encode(body, false).map_err(|e| e.to_string())?;
     let pieces: Vec<(u32, Vec<u8>)> = ids
         .get_ids()
@@ -1214,6 +1322,10 @@ fn drive_natural(
 
     let mut session = StencilSession::new(tree);
     let mut b = 0usize;
+    // How far the model's own tokens reach. A free span that closes inside a
+    // token replays the rest of it into the next node; those bytes are the
+    // model's own writing, not a boundary the grammar imposed.
+    let mut written_to = 0usize;
     for _ in 0..100_000 {
         match session.next_action() {
             StencilAction::Prefill(toks) => {
@@ -1233,6 +1345,27 @@ fn drive_natural(
             // `"`, with the comma prefilled, and there is no choice in that. The
             // separator bug was different in kind: the allowed tokens spelled
             // other text, so the model had to choose something it did not mean.
+            StencilAction::MaskedDecode(set) if strict && b >= arguments_at && b >= written_to => {
+                let (id, p) = token_at(b).ok_or_else(|| {
+                    format!(
+                        "a masked decision starts INSIDE a natural token, after {:?} — the \
+                         grammar committed part of a token the model writes whole",
+                        before(b)
+                    )
+                })?;
+                if !set.tokens().contains(id) {
+                    return Err(format!(
+                        "the natural token {:?} after {:?} is masked out",
+                        String::from_utf8_lossy(p),
+                        before(b)
+                    ));
+                }
+                session
+                    .observe(*id, &bytes[b..b + p.len()])
+                    .map_err(|e| format!("{e:?}"))?;
+                b += p.len();
+                written_to = b;
+            }
             StencilAction::MaskedDecode(set) => {
                 let (id, len) = set
                     .tokens()
@@ -1264,6 +1397,7 @@ fn drive_natural(
                         before(b)
                     )
                 })?;
+                written_to = b + p.len();
                 match session.observe(*id, p).map_err(|e| format!("{e:?}"))? {
                     Observe::TokenClosedDrop => {
                         return Err(format!(
@@ -1294,6 +1428,46 @@ fn drive_natural(
     Err("runaway walk".into())
 }
 
+/// **A repository enum followed by a path drives with the live tokenizer.**
+/// The daemon writes the workspace's repositories into `file_list`'s `repo`
+/// as an enum; a model naming a repository and then a folder writes the
+/// enum value's closing quote and the next key's comma the way its tokenizer
+/// joins them, and the grammar must accept that text.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json"]
+fn a_repo_enum_then_a_path_drives_the_live_grammar() {
+    let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
+    let tok = tokenizers::Tokenizer::from_file(&path).unwrap();
+    let im_end = tok.token_to_id(TURN_CLOSE).unwrap();
+    let vocab = HfVocab::new(tok.clone(), &[im_end], 0);
+    // The daemon's own catalog, `repo` constrained as `tool_def::init` does it.
+    let spec = compile_tool_call_loop(
+        &catalog(),
+        &production_envelope(),
+        MAX_TOOL_CALLS_PER_TURN,
+        TURN_CLOSE,
+    )
+    .unwrap();
+    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let mut failures = Vec::new();
+    for call in [
+        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "path": "crates"}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "battle-cities"}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "mind", "path": "personalities", "page": 1}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "*"}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*"}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "candle", "prefix": "zend/"}}"#,
+        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "battle-cities"}}"#,
+        r#"{"name": "file_read", "arguments": {"repo": "battle-cities", "path": "crates/client/src/main.rs", "page": 0}}"#,
+    ] {
+        let target = format!("{MARKER}\n{call}\n</tool_call>{TURN_CLOSE}");
+        if let Err(e) = drive_natural_strict(Arc::clone(&tree), &tok, &target) {
+            failures.push(format!("{call}\n    {e}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 /// The daemon's grammar compiled against the live checkpoint's tokenizer.
 fn live_tree() -> (Arc<StencilTree>, tokenizers::Tokenizer) {
     let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
@@ -1317,11 +1491,12 @@ fn live_tree() -> (Arc<StencilTree>, tokenizers::Tokenizer) {
 fn natural_calls_drive_the_live_grammar() {
     let (tree, tok) = live_tree();
     let calls = [
-        r#"{"name": "file_list", "arguments": {"path": ""}}"#,
-        r#"{"name": "file_list", "arguments": {}}"#,
-        r#"{"name": "file_list", "arguments": {"path": "zend/src"}}"#,
-        r#"{"name": "file_read", "arguments": {"path": "src/main.rs", "page": 0}}"#,
-        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "prefix": "zend/"}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "candle", "path": ""}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "*"}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "candle", "path": "zend/src"}}"#,
+        r#"{"name": "file_read", "arguments": {"repo": "candle", "path": "src/main.rs", "page": 0}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*", "prefix": "zend/"}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "candle", "prefix": "zend/"}}"#,
         r#"{"name": "calculator", "arguments": {"expression": "2 + 2"}}"#,
     ];
     let mut failures = Vec::new();
@@ -1336,8 +1511,8 @@ fn natural_calls_drive_the_live_grammar() {
         .iter()
         .map(|p| {
             format!(
-                "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{p}\", \
-                 \"page\": 0}}}}\n</tool_call>"
+                "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
+                 \"path\": \"{p}\", \"page\": 0}}}}\n</tool_call>"
             )
         })
         .collect::<Vec<_>>()
@@ -1371,8 +1546,8 @@ fn the_natural_drive_rejects_both_live_failures() {
         .iter()
         .map(|p| {
             format!(
-                "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{p}\", \
-                 \"page\": 0}}}}\n</tool_call>"
+                "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
+                 \"path\": \"{p}\", \"page\": 0}}}}\n</tool_call>"
             )
         })
         .collect::<Vec<_>>()

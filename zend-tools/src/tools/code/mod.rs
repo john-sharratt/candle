@@ -41,11 +41,18 @@
 //! | `session_not_found` | session ID not in registry |
 //! | `session_full` | the session already holds [`session_exec::MAX_SESSION_SNIPPETS`] snippets |
 //! | `not_permitted` | the context lacks the `sandbox` capability; no VM was created |
+//! | `unknown_repo` | `repo` names no repository in the workspace |
+//!
+//! # Files
+//!
+//! Every run names a `repo`; the script's `vfs` global is that repository's
+//! file store, and `require('./x')` resolves inside it (see [`files`]).
 //!
 //! A thrown JS exception or a hit VM limit is **not** an error envelope: the
 //! call succeeds with `ok: false` and the message in `error`, mirroring how a
 //! REPL reports a runtime fault.
 
+use crate::state::UnknownRepo;
 use crate::{NotPermitted, ToolError};
 use thiserror::Error;
 
@@ -94,6 +101,8 @@ pub enum CodeError {
     SessionFull(String, usize),
     #[error(transparent)]
     NotPermitted(#[from] NotPermitted),
+    #[error(transparent)]
+    UnknownRepo(#[from] UnknownRepo),
 }
 
 impl ToolError for CodeError {
@@ -104,9 +113,14 @@ impl ToolError for CodeError {
             CodeError::SessionNotFound(_) => "session_not_found",
             CodeError::SessionFull(..) => "session_full",
             CodeError::NotPermitted(_) => NotPermitted::CODE,
+            CodeError::UnknownRepo(_) => UNKNOWN_REPO,
         }
     }
 }
+
+/// The error code for a `repo` argument the workspace does not list — shared
+/// by every tool that takes one.
+pub const UNKNOWN_REPO: &str = "unknown_repo";
 
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()

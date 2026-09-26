@@ -1,0 +1,122 @@
+name: git_show
+questions:
+- show me what that commit changed
+- which files differ between main and my branch
+- show me Cargo.toml as the release tag has it
+- who last changed line 40 of that source file
+- what did this file look like before the rename
+- print the config as it was two commits ago
+- give me the diff for the most recent commit
+- list the files that commit touched
+- what is in the src directory on that branch
+- show the changed lines with a few lines of context
+- annotate that function with who wrote each line
+- compare the feature branch against main file by file
+- what did the previous commit do
+- read that file as the release branch holds it
+- did anything get renamed between those revisions
+- show me the hunks for that fix so I can port it
+- what files does the tag add compared to the one before
+- blame the top of that header file
+- what was the content of the manifest at that commit
+- list the entries of the docs folder in that revision
+- which commit last touched each line of this function
+- who wrote the header comment in that file
+- attribute the lines of this config to the people who wrote them
+- whose change is that block of code from
+category: Git
+description: 'Show repository content at, or between, revisions — five views, picked by `what`: what a commit changed (`changes`, `patch`), what a file or directory held (`file`, `tree`), and who last changed each line of a file (`blame`). In detail: `changes` lists the files that differ, with how each changed; `patch` gives the changed lines hunk by hunk; `file` returns a file''s full contents as that revision holds them; `tree` lists a directory''s entries; `blame` attributes each line of a file to the commit that last changed it, following it back through renames. `rev` chooses the revision and defaults to HEAD — the LAST COMMIT, not the files on disk — and for `changes` and `patch` `from` defaults to `rev`''s first parent, so those two show what one commit did; give `from` to compare two branches or tags instead. A root commit is shown against the empty tree, so everything in it reads as an addition. `path` names the file for `file` and `blame` or the directory for `tree`; `paths` narrows `changes` and `patch`. The first page of `changes` and `patch` also carries the commit''s full message, which git_log does not. Everything pages and `page` is required — pass 0 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Use for "show me that commit", "what exactly did this change", "show me this file as of that tag", "who wrote this line", "what is in that directory". For the file as it stands on disk right now, uncommitted edits included, use file_read. Reads only.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    RevArg:
+      description: 'A revision. `kind` picks the form and `name` carries its value.'
+      properties:
+        back:
+          description: For `parent` only — how many commits back. Defaults to 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        kind:
+          description: 'Which form: `head` (what is checked out, needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or HEAD''s upstream when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          enum:
+          - head
+          - branch
+          - tag
+          - ref
+          - commit
+          - remote_branch
+          - upstream
+          - parent
+          type: string
+        name:
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to HEAD. Omit for `head`.
+          type: string
+      required:
+      - kind
+      type: object
+    ShowWhat:
+      description: 'Which view to return: `changes` (which files differ), `patch` (the changed lines), `file` (a file''s contents at the revision), `tree` (a directory listing), `blame` (per-line attribution).'
+      enum:
+      - changes
+      - patch
+      - file
+      - tree
+      - blame
+      type: string
+  properties:
+    context:
+      description: Unchanged lines around each change, for `patch` (0–25). Defaults to 3.
+      format: uint32
+      maximum: 25.0
+      minimum: 0.0
+      type: integer
+    from:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: The older side, for `changes` and `patch`. Leave it out for `rev`'s first parent, so those modes show what one commit did.
+    page:
+      description: Zero-based page to return. Required in every mode — pass 0 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
+      format: uint32
+      minimum: 0.0
+      type: integer
+    path:
+      description: The file for `file` and `blame`, or the directory for `tree` (an empty string is the repository root). Ignored by `changes` and `patch`, which take `paths`.
+      type: string
+    paths:
+      description: Limit `changes` and `patch` to these repository-relative paths.
+      items:
+        type: string
+      type: array
+    repo:
+      description: The repository to read. Required.
+      minLength: 1
+      type: string
+    rev:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: The revision to read, or the newer side of a comparison. Leave it out for the checked-out HEAD — the last commit, not the files on disk.
+    what:
+      allOf:
+      - $ref: '#/definitions/ShowWhat'
+      description: Which view to return. Required.
+  required:
+  - repo
+  - what
+  - page
+  title: ShowRequest
+  type: object
+examples:
+- show me what the last commit in candle changed<|im_end|>
+- which files differ between main and this branch<|im_end|>
+- show me Cargo.toml as the release tag has it<|im_end|>
+- who last changed the top of that source file<|im_end|>
+- what did that config look like before the previous commit<|im_end|>
+- give me the diff hunks for that fix so I can port it<|im_end|>
+- list what is in the src directory on the release branch<|im_end|>
+- did anything get renamed between those two revisions<|im_end|>
+- which commit introduced line 120 of the scheduler module, and who wrote it<|im_end|>
+- who is responsible for the import block at the start of main.rs in battle-cities<|im_end|>
+- find out who authored lines 30 to 45 of the settings file<|im_end|>
+- when was each line of that function last touched, and by whom<|im_end|>

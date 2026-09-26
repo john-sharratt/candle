@@ -53,6 +53,18 @@ base64 = { workspace = true }
 scraper = "0.21"
 byteorder = { workspace = true }
 boa_engine = "0.21.1"
+# The typed git layer. Nothing else in this crate spawns or parses git.
+zend-git = { path = "../zend-git" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [dev-dependencies]
 tokio     = { version = "1", features = ["macros", "rt"] }

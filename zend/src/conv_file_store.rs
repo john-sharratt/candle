@@ -1,7 +1,7 @@
 //! Persistent conversation-files store (docs/zend_ui_redesign.md §2.5).
 //!
 //! Backs the GUI files pane: upload / list / get / delete of files attached to a
-//! conversation. Stored under `<workspace>/.substrate/conv-files/` — a metadata
+//! conversation. Stored under `<workspace>/substrate/conv-files/` — a metadata
 //! index (`index.json`) plus one blob per file — so it survives restarts and is
 //! available **without the model loaded** (the store is independent of the
 //! inference engine, so the routes and the harness exercise it model-less).
@@ -17,6 +17,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use candle_conversation::persistence::SUBSTRATE_DIR;
 
 use crate::conv_files::{decode_from_storage, encode_for_storage, ext_badge, fmt_bytes, kind_for};
 
@@ -55,9 +57,9 @@ pub struct ConvFileStore {
 }
 
 impl ConvFileStore {
-    /// Open (or create) the store under `<workspace>/.substrate/conv-files`.
+    /// Open (or create) the store under `<workspace>/substrate/conv-files`.
     pub fn open(workspace: &Path) -> Self {
-        let root = workspace.join(".substrate").join("conv-files");
+        let root = workspace.join(SUBSTRATE_DIR).join("conv-files");
         let inner = load_index(&root).unwrap_or_default();
         Self {
             root,

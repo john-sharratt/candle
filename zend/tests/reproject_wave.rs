@@ -19,6 +19,7 @@ mod wave {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use candle_conversation::persistence::SUBSTRATE_DIR;
     use futures::StreamExt;
 
     use zend::config::DaemonConfig;
@@ -58,7 +59,7 @@ mod wave {
     /// Isolated workspace (one-time substrate copy). `(workspace, needs_priming)`.
     ///
     /// **Copies the segment SET, not a single file.** The persistence layer
-    /// writes `.substrate/seg-*.log` plus one `seg-*.active`; `substrate.log` is
+    /// writes `substrate/seg-*.log` plus one `seg-*.active`; `substrate.log` is
     /// the legacy monolithic name, and opening a substrate that still has one
     /// *renames* it to `seg-0000000001.log`. So a fixture that copied
     /// `substrate.log` could only ever work against a substrate no current build
@@ -69,7 +70,7 @@ mod wave {
         if std::env::var("REPRIME").is_ok() {
             let _ = std::fs::remove_dir_all(&dst_root);
         }
-        let dst_sub = dst_root.join(".substrate");
+        let dst_sub = dst_root.join(SUBSTRATE_DIR);
         let sentinel = dst_root.join(".wave_primed");
 
         if segment_bytes(&dst_sub) > 0 {
@@ -80,7 +81,7 @@ mod wave {
             );
             return (dst_root, !primed);
         }
-        let src_sub = root.join(".substrate");
+        let src_sub = root.join(SUBSTRATE_DIR);
         let src_bytes = segment_bytes(&src_sub);
         assert!(
             src_bytes > 0,
@@ -101,7 +102,7 @@ mod wave {
         (dst_root, true)
     }
 
-    /// Bytes of segment files in a `.substrate` directory, 0 when there are none.
+    /// Bytes of segment files in a `substrate` directory, 0 when there are none.
     fn segment_bytes(sub: &Path) -> u64 {
         let Ok(entries) = std::fs::read_dir(sub) else {
             return 0;
@@ -200,13 +201,14 @@ mod wave {
     async fn run(workspace: PathBuf, needs_priming: bool) {
         let log = LogBus::new();
         let config = DaemonConfig {
-            workspace,
             port: 0,
             disabled_layers: ["repo_map", "code_reading"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            ..Default::default()
+            ..DaemonConfig::new(
+                zend::workspace::single_repo(&workspace, "project").expect("workspace"),
+            )
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();

@@ -5,6 +5,9 @@
 //! turn shape the daemon will prefill is asserted end-to-end with no model load.
 //! The engine-bound half (conversation minting, the summary decode, the resume
 //! cache) is covered by the live daemon run; everything up to the turns is here.
+//!
+//! Every workspace here holds one repository, [`REPO`], so every key and tag is
+//! workspace-relative (`demo/src/`).
 
 use std::fs;
 use std::path::Path;
@@ -12,20 +15,29 @@ use std::path::Path;
 use candle_conversation::models::Dialect;
 use candle_conversation::stencil::ToolCallEnvelope;
 use zend::repo_scan::render::{render_chain, CHAIN_TOOLS};
-use zend::repo_scan::{build_units, walk_workspace, DirState, DirUnit};
+use zend::repo_scan::{all_units, walk_workspace, DirState, DirUnit};
 use zend::turn_sink::{InsertTurnSink, RecordingTurnSink};
+use zend_tools::state::{RepoSpec, Workspace};
 use zend_tools::ToolContext;
 
 /// Same budget the daemon passes; irrelevant to a model-less sink but keeps the
 /// call identical to the production one.
 const SUMMARY_TOKENS: usize = 200;
 
+/// The one repository each test workspace holds.
+const REPO: &str = "demo";
+
 fn write(root: &Path, rel: &str, body: &[u8]) {
-    let path = root.join(rel);
+    let path = root.join(REPO).join(rel);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, body).unwrap();
+}
+
+fn workspace_of(root: &Path) -> Workspace {
+    fs::create_dir_all(root.join(REPO)).unwrap();
+    Workspace::new(root, vec![RepoSpec::named(REPO)]).unwrap()
 }
 
 fn small_workspace() -> tempfile::TempDir {
@@ -50,13 +62,13 @@ fn small_workspace() -> tempfile::TempDir {
 
 /// Walk + build the units the daemon would ingest.
 fn units_of(root: &Path) -> Vec<DirUnit> {
-    build_units(&walk_workspace(root, None), root)
+    all_units(&walk_workspace(&workspace_of(root), "", None), root)
 }
 
 /// Run every unit's chain through a recording sink, exactly as
 /// `process_one_dir` runs it through the live one.
 fn record(root: &Path) -> RecordingTurnSink {
-    let ctx = ToolContext::with_workspace(root);
+    let ctx = ToolContext::with_workspace(workspace_of(root));
     let force: Vec<String> = CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
     let mut sink = RecordingTurnSink::new();
     // ChatML's envelope, matching this suite's existing JSON-shaped
@@ -81,9 +93,17 @@ fn record(root: &Path) -> RecordingTurnSink {
 fn one_unit_per_directory_holding_files() {
     let dir = small_workspace();
     let dirs: Vec<String> = units_of(dir.path()).into_iter().map(|u| u.dir).collect();
-    // The root (Cargo.toml, README.md, .gitignore) and `src/`. `target/` is
+    // The workspace root (listing the repository), the repository's root
+    // (Cargo.toml, README.md, .gitignore) and its `src/`. `target/` is
     // gitignored, so it contributes no unit at all.
-    assert_eq!(dirs, vec![".".to_string(), "src/".to_string()]);
+    assert_eq!(
+        dirs,
+        vec![
+            ".".to_string(),
+            "demo/".to_string(),
+            "demo/src/".to_string()
+        ]
+    );
 }
 
 /// One chain per folder: request → list → read → DECODE. It lists BEFORE it
@@ -96,16 +116,48 @@ fn each_directory_lists_before_it_reads() {
     let src = sink
         .turns
         .iter()
-        .filter(|(_, _, tags)| tags[1] == "src/")
+        .filter(|(_, _, tags)| tags[1] == "demo/src/")
         .collect::<Vec<_>>();
     assert_eq!(src.len(), 3, "request+list, listing+read, excerpt+summary");
 
-    assert!(src[0].0.starts_with("Summarize the `src/` folder"));
-    assert!(src[0].1.contains("\"name\": \"file_list\""));
+    assert!(src[0]
+        .0
+        .starts_with("Summarize the `src/` folder in the `demo` repository"));
+    assert!(src[0].1.contains(
+        "{\"name\": \"file_list\", \"arguments\": {\"repo\": \"demo\", \"path\": \"src\"}}"
+    ));
     assert!(src[1].0.starts_with("<tool_response>{"), "the listing");
-    assert!(src[1].1.contains("\"name\": \"file_read\""));
+    assert!(src[1].1.contains(
+        "{\"name\": \"file_read\", \"arguments\": {\"repo\": \"demo\", \"path\": \"src/lib.rs\", \
+         \"page\": 0}}"
+    ));
     assert!(src[2].0.contains("```rust"), "the anchor excerpt");
     assert!(src[2].1.is_empty(), "the folder summary is DECODED");
+}
+
+/// The workspace root's chain lists the repositories — `file_list` with repo
+/// `*` — and summarises from that listing alone.
+#[test]
+fn the_workspace_root_lists_the_repositories() {
+    let dir = small_workspace();
+    let sink = record(dir.path());
+    let root = sink
+        .turns
+        .iter()
+        .filter(|(_, _, tags)| tags[1] == ".")
+        .collect::<Vec<_>>();
+    assert_eq!(root.len(), 2, "request+list, then listing+summary");
+    assert!(root[0]
+        .0
+        .starts_with("Summarize the workspace and the repositories it holds"));
+    assert!(root[0]
+        .1
+        .contains("{\"name\": \"file_list\", \"arguments\": {\"repo\": \"*\"}}"));
+    assert!(
+        root[1].0.contains("{\"repo\":\"demo\",\"dir\":true}"),
+        "{}",
+        root[1].0
+    );
 }
 
 /// `src/lib.rs` carries a `//!` block, so the anchor is placed at it — the
@@ -118,11 +170,11 @@ fn the_anchor_excerpt_is_the_module_docs_page() {
     let excerpt = sink
         .turns
         .iter()
-        .find(|(u, _, tags)| tags[1] == "src/" && u.contains("```"))
+        .find(|(u, _, tags)| tags[1] == "demo/src/" && u.contains("```"))
         .map(|(u, _, _)| u.clone())
         .expect("the excerpt turn");
     assert!(
-        excerpt.contains("src/lib.rs (page 0 of 1, lines 1-3 of 3):"),
+        excerpt.contains("src/lib.rs in demo (page 0 of 1, lines 1-3 of 3):"),
         "{excerpt}"
     );
     assert!(excerpt.contains("//! The demo crate."));
@@ -173,10 +225,15 @@ fn a_directory_with_no_anchor_still_ingests() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "src/thing.rs", b"pub fn t() {}\n");
     let sink = record(dir.path());
-    assert_eq!(sink.turns.len(), 2, "request+list, then listing+summary");
-    assert!(sink.turns[0].1.contains("\"name\": \"file_list\""));
-    assert!(sink.turns[1].0.starts_with("<tool_response>{"));
-    assert!(sink.turns[1].1.is_empty(), "the summary is decoded");
+    let src: Vec<_> = sink
+        .turns
+        .iter()
+        .filter(|(_, _, tags)| tags[1] == "demo/src/")
+        .collect();
+    assert_eq!(src.len(), 2, "request+list, then listing+summary");
+    assert!(src[0].1.contains("\"name\": \"file_list\""));
+    assert!(src[1].0.starts_with("<tool_response>{"));
+    assert!(src[1].1.is_empty(), "the summary is decoded");
 }
 
 // ── DirState: what re-ingests and what does not ──────────────────────────────
@@ -204,12 +261,13 @@ fn state_moves_when_the_anchor_text_changes() {
     );
     let after = units_of(dir.path());
     assert!(!before.equivalent_to(&after));
-    assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
+    assert_eq!(before.changed_dirs(&after), vec!["demo/src/".to_string()]);
 }
 
 /// `file_list` is one level deep, so a folder's listing is only its own direct
-/// files — a file added under `src/` changes only `src/`'s hash. The root
-/// never showed `src/`'s files directly, so it has nothing to re-ingest.
+/// files — a file added under `src/` changes only `src/`'s hash. Neither the
+/// repository's root nor the workspace root ever showed `src/`'s files, so
+/// they have nothing to re-ingest.
 #[test]
 fn state_moves_when_a_file_is_added() {
     let dir = small_workspace();
@@ -217,18 +275,18 @@ fn state_moves_when_a_file_is_added() {
     write(dir.path(), "src/new_module.rs", b"pub fn n() {}\n");
     let after = units_of(dir.path());
     assert!(!before.equivalent_to(&after));
-    assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
+    assert_eq!(before.changed_dirs(&after), vec!["demo/src/".to_string()]);
 }
 
 #[test]
 fn a_removed_directory_is_reported_as_changed() {
     let dir = small_workspace();
     let before = DirState::from_units(&units_of(dir.path()));
-    fs::remove_dir_all(dir.path().join("src")).unwrap();
+    fs::remove_dir_all(dir.path().join(REPO).join("src")).unwrap();
     let after = units_of(dir.path());
-    // `src/`'s unit vanishes entirely; the root's own hash is untouched since
-    // it never listed `src/`'s files in the first place.
-    assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
+    // `src/`'s unit vanishes entirely; the roots' own hashes are untouched
+    // since they never listed `src/`'s files in the first place.
+    assert_eq!(before.changed_dirs(&after), vec!["demo/src/".to_string()]);
 }
 
 #[test]

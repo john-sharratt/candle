@@ -1,16 +1,23 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use candle_conversation::models::Model;
 use web::auth::Roles;
+use zend_tools::state::{Secrets, Workspace};
 
 use crate::access::Gateways;
 
 /// Runtime configuration for the zend daemon.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DaemonConfig {
-    /// Absolute path to the root of the workspace being served.
-    pub workspace: PathBuf,
+    /// The workspace being served: its folder (absolute) — where `substrate/`
+    /// and an optional `projection.yaml` live — and its repositories, the
+    /// uploads repository included ([`crate::workspace::open`]).
+    pub workspace: Workspace,
+    /// The API keys and tokens the tools and the git layer present, read once
+    /// at launch from `~/.zend/secrets.yaml` or the file `--secrets` names
+    /// ([`crate::secrets::load`]). Every context the daemon builds shares it.
+    pub secrets: Arc<Secrets>,
     /// TCP port the HTTP server listens on.
     pub port: u16,
     /// Projection layers taken OUT OF SERVICE (`--disable-layer <name>`,
@@ -51,15 +58,17 @@ pub struct DaemonConfig {
     /// also named by [`Self::disabled_layers`] is not wiped — a disabled layer
     /// gets no cleanup of any kind. `Raw` layers are not wipeable this way.
     pub wiped_layers: HashSet<String>,
-    /// Content-root overrides for derived ingest layers (`--ingest-dir
+    /// Folder overrides for derived ingest layers (`--ingest-dir
     /// <layer>=<path>`, repeatable), keyed by layer name. Each replaces the
-    /// folder that layer ingests from — relative to the workspace, or absolute.
-    /// Scopes a rebuild to a subtree (e.g. `code_reading=zend/src`) so the
-    /// substrate stays small instead of absorbing the whole workspace.
+    /// folder that layer ingests from, relative to the workspace folder — for
+    /// the code layers, one folder inside a repository. Scopes a rebuild to a
+    /// subtree (e.g. `code_reading=candle/zend/src`) so the substrate stays
+    /// small instead of absorbing every repository.
     pub ingest_dirs: HashMap<String, String>,
-    /// `--max-depth <N>`: how deep, in path components below each layer's
-    /// content root, the `repo_map` and `code_reading` walks and the watcher
-    /// read (`1` = the root's own files, `2` = one folder down). Content already
+    /// `--max-depth <N>`: how deep, in path components below each repository's
+    /// root (or a layer's `--ingest-dir` folder), the `repo_map` and
+    /// `code_reading` walks and the watcher read (`1` = the root's own files,
+    /// `2` = one folder down). Content already
     /// ingested from deeper is FROZEN — kept and still retrievable, but never
     /// re-read and never retired by the deleted-path sweeps. `None` = unbounded.
     pub max_depth: Option<usize>,
@@ -108,6 +117,32 @@ pub struct DaemonConfig {
     /// forwarded `x-tokera-*` headers is recognized as — see
     /// [`crate::access::role`]. `None` unless the daemon was started with it.
     pub local_signin: Option<String>,
+}
+
+impl DaemonConfig {
+    /// A config serving `workspace` with every flag at its default: no
+    /// secrets, port 0, no layer flags, no depth bound, the measured-VRAM
+    /// model, nobody an admin, loopback the only trusted peer.
+    pub fn new(workspace: Workspace) -> Self {
+        Self {
+            workspace,
+            secrets: Arc::new(Secrets::empty()),
+            port: 0,
+            disabled_layers: HashSet::new(),
+            skipped_layers: HashSet::new(),
+            wiped_layers: HashSet::new(),
+            ingest_dirs: HashMap::new(),
+            max_depth: None,
+            compact_substrate: false,
+            read_only_substrate: false,
+            model: ModelChoice::default(),
+            qsa_selection_budget: None,
+            summarize: false,
+            roles: Roles::default(),
+            gateways: Gateways::default(),
+            local_signin: None,
+        }
+    }
 }
 
 /// Which model a daemon runs.

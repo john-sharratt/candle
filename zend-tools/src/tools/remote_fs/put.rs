@@ -15,8 +15,11 @@ pub struct PutRequest {
     /// The session id returned by the remote_fs_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
-    /// VFS path of the file to upload. Must already exist in the VFS (write it
-    /// with the `write` tool first).
+    /// The repository the file to upload is in.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// VFS path of the file to upload, relative to the repository. Must
+    /// already exist in the VFS (write it with the `write` tool first).
     #[validate(length(min = 1))]
     pub local_vfs_path: String,
     /// Destination path on the remote host.
@@ -43,7 +46,9 @@ impl Tool for RemoteFsSessionPut {
 
     fn run(ctx: &ToolContext, req: PutRequest) -> Result<PutResponse, RemoteFsError> {
         let content = ctx
-            .vfs
+            .files
+            .repo(&req.repo)
+            .map_err(|e| RemoteFsError::VfsError(e.to_string()))?
             .read(&req.local_vfs_path)
             .map_err(|e| RemoteFsError::VfsError(e.to_string()))?
             .ok_or_else(|| RemoteFsError::VfsError(format!("{} not in VFS", req.local_vfs_path)))?;

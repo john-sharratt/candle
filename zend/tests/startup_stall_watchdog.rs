@@ -30,15 +30,17 @@
 //!     -- --ignored --nocapture
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use candle_conversation::persistence::SUBSTRATE_DIR;
 use zend::config::DaemonConfig;
 use zend::log_broadcast::LogBus;
 use zend::session::ZendSession;
+use zend_tools::state::{RepoSpec, Workspace};
 
 /// How long we tolerate identical snapshots before declaring a
 /// stall.  Picked to be safely longer than the slowest legitimate
@@ -60,17 +62,27 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// loop below).
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24);
 
-/// The candle workspace root — the parent of zend's package dir.
-/// `CARGO_MANIFEST_DIR` is the zend crate's manifest directory;
-/// `..` walks up to the workspace root where the production
-/// projection.yaml + the full source tree the daemon would scan
-/// live.
+/// The daemon workspace the test serves: the folder holding the candle
+/// checkout, with the checkout as its one repository — the full source tree
+/// the daemon would scan. `CARGO_MANIFEST_DIR` is the zend crate's manifest
+/// directory; `..` is the candle checkout and `../..` the folder beside it.
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()
-        .expect("zend's parent directory is the candle workspace root")
+        .and_then(Path::parent)
+        .expect("the candle checkout sits in a folder")
         .to_path_buf()
+}
+
+/// The repository name of the candle checkout — its folder's name.
+fn candle_repo() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::file_name)
+        .expect("the candle checkout has a folder name")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// `loading == None` and `detail` empty means the daemon's loading
@@ -139,19 +151,19 @@ fn zend_startup_completes_without_stall() {
     // produces cascading "missing turn" warnings that ultimately
     // hang the scheduler.  A clean substrate exercises the same
     // startup path a fresh `cargo run -p zend` would.
-    let substrate_dir = workspace.join(".substrate");
+    let substrate_dir = workspace.join(SUBSTRATE_DIR);
     if substrate_dir.exists() {
         match std::fs::remove_dir_all(&substrate_dir) {
-            Ok(()) => eprintln!("  wiped existing .substrate/ for hermetic run"),
-            Err(e) => eprintln!("  warning: could not wipe .substrate/: {e}"),
+            Ok(()) => eprintln!("  wiped existing substrate/ for hermetic run"),
+            Err(e) => eprintln!("  warning: could not wipe substrate/: {e}"),
         }
     }
 
-    let config = DaemonConfig {
-        workspace: workspace.clone(),
-        port: 0,
-        ..Default::default()
-    };
+    let served = zend::workspace::with_uploads(
+        Workspace::new(&workspace, vec![RepoSpec::named(&candle_repo())]).expect("workspace"),
+    )
+    .expect("uploads repository");
+    let config = DaemonConfig::new(served);
     let log = LogBus::new();
 
     // Build the session and kick off the loading machine the same

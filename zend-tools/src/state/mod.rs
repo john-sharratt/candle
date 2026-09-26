@@ -7,27 +7,34 @@
 //!
 //! | Module | Store | Used by |
 //! |--------|-------|---------|
-//! | [`vfs`] | [`VfsStore`] | `file_*` tools — in-memory virtual filesystem |
+//! | [`files`] | [`RepoFiles`] | `file_*` tools — one [`VfsStore`] per repository |
+//! | [`vfs`] | [`VfsStore`] | One repository's in-memory overlay over its folder |
+//! | [`workspace`] | [`Workspace`] | The repositories the `file_*` tools resolve against |
 //! | [`credentials`] | [`CredentialStore`] | `credential_*` tools, session opens |
 //! | [`notes`] | [`NotesStore`] | `notes_*` tools — cross-conversation KV store |
 //! | [`sessions`] | [`SessionRegistry`] | All session tool groups |
 //! | [`hash_state`] | [`HashStateStore`] | `hash_state_*` streaming hash tools |
-//! | [`secrets`] | [`ToolSecrets`] | `web_search` — deployment API keys |
+//! | [`secrets`] | [`Secrets`] | `web_search`, git — the daemon's API keys and tokens |
 //!
-//! [`ToolSecrets`] is the one store that is not in-memory-only and not
+//! [`Secrets`] is the one store that is not in-memory-only and not
 //! conversation-scoped: it is read once from a per-user file on disk, outside
 //! the workspace, and is the same for every conversation the daemon serves.
 
 pub mod credentials;
+pub mod files;
 pub mod hash_state;
 pub mod notes;
 pub mod secrets;
+mod secrets_exposure;
 pub mod sessions;
 pub mod vfs;
+pub mod workspace;
 
 pub use credentials::CredentialStore;
+pub use files::{RepoFiles, UnknownRepo};
 pub use hash_state::HashStateStore;
 pub use notes::NotesStore;
-pub use secrets::{SecretsError, ToolSecrets};
+pub use secrets::{Secrets, SecretsError};
 pub use sessions::SessionRegistry;
 pub use vfs::VfsStore;
+pub use workspace::{Repo, RepoSpec, Workspace, WorkspaceError, ALL_REPOS, MANIFEST_FILE};

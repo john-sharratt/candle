@@ -26,7 +26,6 @@
 
 use std::collections::HashSet;
 use std::iter;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::models::Dialect;
@@ -39,7 +38,7 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
-use zend_tools::state::ToolSecrets;
+use zend_tools::state::{Secrets, Workspace};
 use zend_tools::{registry, replay, Replay, ToolContext};
 
 use crate::access;
@@ -718,7 +717,7 @@ pub fn tool_round_text(text: &str) -> TurnText {
 ///
 /// One host serves the whole daemon, so the `file_*` overlay's session layer is
 /// shared across conversations: a file written in one chat is visible in the
-/// next. The lower layer is the daemon's working directory, read-only.
+/// next. The lower layer is each of the workspace's repositories, read-only.
 ///
 /// It holds one context per tools mode. They share every store and differ only
 /// in their [`Grants`](zend_tools::Grants) ([`access::grants`]) and, for
@@ -731,14 +730,12 @@ pub struct ToolHost {
 }
 
 impl ToolHost {
-    /// Build a host whose file tools overlay `workspace` — the daemon's working
-    /// directory, which reads fall through to when the session layer has no entry.
-    ///
-    /// The deployment's secrets are read from that same directory, once, here.
-    pub fn new(workspace: impl Into<PathBuf>) -> Self {
-        let workspace = workspace.into();
-        let secrets = load_tool_secrets(&workspace);
-        let base = ToolContext::with_workspace(workspace).with_secrets(secrets);
+    /// Build a host whose file tools overlay `workspace`'s repositories, which
+    /// reads fall through to when the session layer has no entry, and whose
+    /// every context carries `secrets` — read once by the daemon at launch
+    /// ([`crate::secrets::load`]).
+    pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> Self {
+        let base = ToolContext::with_workspace(workspace.clone()).with_secrets(secrets);
         let contexts = ToolMode::ALL.map(|mode| {
             let ctx = base.clone().granting(access::grants(mode));
             let ctx = if mode.writes_disk() {
@@ -759,65 +756,53 @@ impl ToolHost {
     }
 }
 
-/// Read `secrets/tools.yaml` from the workspace, reporting what was found.
-///
-/// A malformed document does not stop the daemon: web search is one tool among
-/// ninety-odd, and refusing to boot over a stray character in a file that most
-/// deployments do not even have would be wildly out of proportion. It is a WARN
-/// with the parse error, and every secret reads as unset.
-///
-/// Only the *presence* of a key is logged, never its value — a log line is the
-/// one place a secret reliably escapes a process.
-fn load_tool_secrets(workspace: &Path) -> ToolSecrets {
-    let path = ToolSecrets::path_in(workspace);
-    match ToolSecrets::load(&path) {
-        Ok(secrets) => {
-            tracing::info!(
-                path = %path.display(),
-                tavily = secrets.tavily_api_key().is_some(),
-                "tool secrets loaded"
-            );
-            secrets
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "tool secrets could not be read; every secret reads as unset"
-            );
-            ToolSecrets::empty()
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── The daemon's tool secrets ───────────────────────────────────────────
+    use zend_tools::state::RepoSpec;
 
-    /// **`ToolHost::new` hands the workspace's secrets to the tool context.**
+    /// `dir` as a workspace holding one repository, `r`.
+    fn workspace_in(dir: &tempfile::TempDir) -> Workspace {
+        std::fs::create_dir_all(dir.path().join("r")).unwrap();
+        Workspace::new(dir.path(), vec![RepoSpec::named("r")]).unwrap()
+    }
+
+    /// No secrets: what every test host that is not about secrets gets.
+    fn no_secrets() -> Arc<Secrets> {
+        Arc::new(Secrets::empty())
+    }
+
+    // ── The daemon's secrets ────────────────────────────────────────────────
+
+    /// **`ToolHost::new` hands the daemon's secrets to every mode's context.**
     ///
-    /// The document's parsing is covered in `zend-tools`; what is asserted here
-    /// is the wiring, which nothing else would catch. Dropping the
-    /// `.with_secrets(..)` call leaves every crate compiling and every other
-    /// test passing, and shows up only as `web_search` reporting itself
-    /// unconfigured on a machine whose key is sitting right there in the file.
+    /// The document's parsing is covered in `zend-tools` and the choice of file
+    /// in `crate::secrets`; what is asserted here is the wiring, which nothing
+    /// else would catch. Dropping the `.with_secrets(..)` call leaves every
+    /// crate compiling and every other test passing, and shows up only as
+    /// `web_search` reporting itself unconfigured on a machine whose key is
+    /// sitting right there in the file.
     #[test]
-    fn the_tool_host_loads_the_workspaces_secrets() {
+    fn the_tool_host_carries_the_daemons_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        let path = ToolSecrets::path_in(dir.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = dir.path().join("secrets.yaml");
         std::fs::write(&path, "tavily_api_key: tvly-wired-through\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let secrets = Arc::new(Secrets::load(&path).unwrap());
 
-        let host = ToolHost::new(dir.path());
+        let host = ToolHost::new(&workspace_in(&dir), secrets);
         for mode in ToolMode::ALL {
             assert_eq!(
                 host.context_for(mode).secrets.tavily_api_key(),
                 Some("tvly-wired-through"),
-                "the daemon must read secrets/tools.yaml from its working directory ({})",
+                "{} lost the daemon's secrets",
                 mode.id()
             );
         }
@@ -829,11 +814,11 @@ mod tests {
     #[test]
     fn each_modes_context_carries_its_grants() {
         let dir = tempfile::tempdir().unwrap();
-        let host = ToolHost::new(dir.path());
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets());
         for mode in ToolMode::ALL {
             let ctx = host.context_for(mode);
             assert_eq!(ctx.grants(), access::grants(mode), "{}", mode.id());
-            assert_eq!(ctx.vfs.is_direct(), mode.writes_disk(), "{}", mode.id());
+            assert_eq!(ctx.files.is_direct(), mode.writes_disk(), "{}", mode.id());
         }
         let restricted = host.context_for(ToolMode::Restricted);
         for (name, arguments) in [
@@ -843,7 +828,7 @@ mod tests {
             ),
             (
                 "code_run",
-                serde_json::json!({ "language": "js", "code": "1" }),
+                serde_json::json!({ "repo": "r", "language": "js", "code": "1" }),
             ),
             ("sql_session_open", serde_json::json!({})),
         ] {
@@ -864,7 +849,7 @@ mod tests {
     #[test]
     fn a_workspace_without_secrets_still_builds_a_host() {
         let dir = tempfile::tempdir().unwrap();
-        let host = ToolHost::new(dir.path());
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets());
         assert_eq!(
             host.context_for(ToolMode::Restricted)
                 .secrets

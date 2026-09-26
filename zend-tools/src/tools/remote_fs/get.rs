@@ -18,14 +18,18 @@ pub struct GetRequest {
     /// Path of the file to download on the remote host.
     #[validate(length(min = 1))]
     pub remote_path: String,
-    /// VFS path to write the downloaded content to. Defaults to the basename of
-    /// `remote_path`.
+    /// The repository to save the downloaded file into.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// VFS path to write the downloaded content to, relative to the
+    /// repository. Defaults to the basename of `remote_path`.
     pub local_vfs_path: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct GetResponse {
     pub remote_path: String,
+    pub repo: String,
     pub local_vfs_path: String,
     pub bytes: usize,
 }
@@ -35,13 +39,17 @@ pub struct RemoteFsSessionGet;
 impl Tool for RemoteFsSessionGet {
     const NAME: &'static str = "remote_fs_session_get";
     const DESCRIPTION: &'static str =
-        "Download a file from the remote SFTP filesystem into the session VFS. \
-         Returns the VFS path where content was written.";
+        "Download a file from the remote SFTP filesystem into the session VFS, in the \
+         named repo. Returns the repo and VFS path where content was written.";
     type Request = GetRequest;
     type Response = GetResponse;
     type Error = RemoteFsError;
 
     fn run(ctx: &ToolContext, req: GetRequest) -> Result<GetResponse, RemoteFsError> {
+        let store = ctx
+            .files
+            .repo(&req.repo)
+            .map_err(|e| RemoteFsError::VfsError(e.to_string()))?;
         let entry = ctx
             .sessions
             .get_remote_fs(&req.session_id)
@@ -67,11 +75,12 @@ impl Tool for RemoteFsSessionGet {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "downloaded_file".into())
         });
-        ctx.vfs
+        store
             .write(&vfs_path, contents)
             .map_err(|e| RemoteFsError::VfsError(format!("{e:?}")))?;
         Ok(GetResponse {
             remote_path: req.remote_path,
+            repo: req.repo,
             local_vfs_path: vfs_path,
             bytes,
         })

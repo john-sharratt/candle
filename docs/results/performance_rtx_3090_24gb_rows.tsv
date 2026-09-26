@@ -1,0 +1,277 @@
+test	label	depth	prompt_tokens	mode	int8	contexts	valid	prefill_tps	decode_tps	quantized_pct	compress	peak_tokens
+models::quantized_qwen2::tests::test_parallel_batched_forwarding	Qwen2-0.5B		~700	F32	off	1	-	15018.2	241.5	-	-	308
+models::quantized_qwen2::tests::test_parallel_batched_forwarding	Qwen2-0.5B		~700	BF16	off	1	-	15752.4	247.2	-	-	308
+models::quantized_qwen2::tests::test_parallel_batched_forwarding	Qwen2-0.5B		~700	F16	off	1	-	15642.9	240.2	-	-	308
+models::quantized_qwen2::tests::test_parallel_batched_forwarding	Qwen2-0.5B		~700	F16	off	4	-	23762.6	902.6	-	-	1272
+models::quantized_qwen2::tests::test_parallel_batched_forwarding	Qwen2-0.5B		~700	F16	off	60	-	22018.4	4455.0	-	-	18612
+models::quantized_qwen2::tests::test_parallel_batched_forwarding	Qwen2-0.5B		~700	BF16	off	60	-	21985.8	4951.2	-	-	18612
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	F16	prec	1	✓	14961.7	103.4	-	-	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	BF16	prec	1	✓	15114.3	134.6	-	-	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	BF16	prec	16	✓	17779.6	897.6	-	-	10618
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	Q8_0	prec	4	✓	15875.2	232.5	100.0%	1.88x	2678
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C0	prec	2	✓	17615.3	324.0	100.0%	1.85x	1358
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C1	prec	2	✓	17639.0	324.5	100.0%	2.01x	1358
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C2	prec	2	✓	17659.5	318.5	100.0%	2.26x	1358
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C3	prec	2	✓	17445.2	315.0	100.0%	2.40x	1358
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C4	prec	2	✓	17613.2	323.5	100.0%	2.58x	1358
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C5	prec	2	✓	17640.2	317.9	100.0%	2.76x	1358
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C6	prec	2	✓	17603.8	325.2	100.0%	2.86x	1358
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C7	prec	2	✓	17500.3	326.9	100.0%	3.61x	1358
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C8	prec	32	✓	17632.3	772.4	100.0%	3.83x	21202
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C9	prec	5	✓	18468.5	728.0	100.0%	4.08x	3337
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_0_8b	Qwen3.5-0.8B		~700	C10	prec	10	✓	17796.4	1149.9	100.0%	4.11x	6640
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	F32	prec	1	✓	5261.6	130.3	-	-	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	F16	prec	1	✓	5279.1	130.7	-	-	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	F16	prec	4	✓	4980.5	375.3	-	-	2658
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	R16	prec	1	✓	5320.5	130.8	0.0%	-	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	Q8_0	prec	1	✓	5297.1	135.3	100.0%	1.88x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	Q8_Q4	prec	1	✓	5326.9	128.5	100.0%	2.29x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	BF16	prec	4	✓	4972.2	373.4	-	-	2658
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	Q8_1	prec	4	✓	4968.3	313.1	100.0%	1.78x	2658
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	Q8_KS	prec	4	✓	4968.6	348.0	100.0%	1.78x	2658
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	Q8_Q4	prec	4	✓	4946.9	312.0	100.0%	2.29x	2658
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	Q4_0	prec	4	-	4928.2	354.6	100.0%	3.56x	2658
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	Q4_1	prec	4	-	4932.4	317.1	100.0%	3.20x	2658
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	Q4_KS	prec	4	-	4968.1	339.7	100.0%	3.20x	2658
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C0	prec	1	✓	5288.7	133.5	100.0%	1.87x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C1	prec	1	✓	5240.4	132.0	100.0%	2.19x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C2	prec	1	✓	5252.0	133.3	100.0%	2.37x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C3	prec	1	✓	5211.1	132.3	100.0%	2.75x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C4	prec	1	✓	5253.5	132.4	100.0%	3.07x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C5	prec	1	✓	5281.4	132.2	100.0%	3.28x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C6	prec	1	✓	5257.8	131.4	100.0%	3.44x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C7	prec	1	✓	5270.8	131.8	100.0%	3.80x	654
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C8	prec	10	✓	4179.3	542.7	100.0%	3.90x	6590
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C9	prec	10	✓	4171.5	482.6	100.0%	4.22x	6590
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama3	Llama-3.2-3B		~700	C10	prec	5	✓	4790.5	402.3	100.0%	4.27x	3312
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	F32	perf	1	-	2952.9	87.7	-	-	283
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	F16	perf	1	-	2929.5	88.0	-	-	283
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	F16	perf	4	-	2909.6	244.4	-	-	1176
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	F16	perf	8	-	2555.7	359.4	-	-	2316
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	BF16	perf	1	-	2894.8	90.9	-	-	283
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	BF16	perf	8	-	2556.8	360.8	-	-	2316
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	BF16	perf	16	-	1998.9	466.3	-	-	4624
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	BF16	perf	48	-	1433.0	547.6	-	-	13796
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	Q8_0	perf	32	-	1813.8	464.7	100.0%	1.88x	9220
+models::quantized_llama::tests::test_parallel_batched_forwarding_llama2	Llama-2-7B		~700	Q4_0	perf	32	-	1813.4	445.8	100.0%	3.56x	9220
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	BF16	perf	1	✓	2697.4	69.2	-	-	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	F16	perf	1	✓	2707.2	69.8	-	-	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	F16	perf	2	✓	2675.7	114.4	-	-	1312
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	BF16	perf	4	✓	2351.2	213.3	-	-	2586
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	Q8_0	perf	4	✓	2355.2	208.8	100.0%	1.88x	2586
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C0	perf	1	✓	2662.8	71.5	100.0%	1.90x	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C1	perf	1	✓	2661.9	71.5	100.0%	2.54x	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C2	perf	1	✓	2663.9	71.6	100.0%	2.67x	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C3	perf	1	✓	2652.9	71.8	100.0%	2.92x	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C4	perf	1	✓	2653.6	71.3	100.0%	3.31x	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C5	perf	1	✓	2653.7	71.3	100.0%	3.67x	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C6	perf	1	✓	2652.9	70.6	100.0%	4.31x	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C7	perf	1	✓	2656.2	70.5	100.0%	4.49x	636
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C8	perf	10	✓	2262.6	303.4	100.0%	4.85x	6410
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C9	perf	5	✓	2260.9	222.8	100.0%	5.47x	3222
+models::quantized_qwen3::tests::test_parallel_batched_forwarding	Qwen3-8B		~700	C10	perf	5	✓	2266.2	225.1	100.0%	5.84x	3222
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	F16	prec	1	✓	2879.6	93.8	-	-	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	BF16	prec	1	✓	2907.7	93.7	-	-	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	BF16	prec	4	✓	2573.9	311.8	-	-	2678
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	Q8_0	prec	4	✓	2566.4	337.3	100.0%	1.88x	2678
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C0	prec	1	✓	2899.5	108.2	100.0%	2.12x	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C1	prec	1	✓	2895.6	107.5	100.0%	2.43x	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C2	prec	1	✓	2889.7	105.6	100.0%	2.82x	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C3	prec	1	✓	2893.4	106.8	100.0%	3.12x	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C4	prec	1	✓	2885.8	106.3	100.0%	3.45x	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C5	prec	1	✓	2895.9	106.8	100.0%	3.62x	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C6	prec	1	✓	2897.4	109.4	100.0%	3.95x	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C7	prec	1	✓	2872.1	107.6	100.0%	4.03x	659
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C8	prec	20	✓	2555.7	295.3	100.0%	4.49x	13278
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C9	prec	5	✓	2458.3	381.2	100.0%	5.00x	3337
+models::quantized_qwen35::tests::test_parallel_batched_forwarding_9b	Qwen3.5-9B		~700	C10	prec	10	✓	2598.1	491.3	100.0%	5.13x	6640
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	BF16	perf	1	✓	940.5	50.6	-	-	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	BF16	perf	4	✓	860.8	179.8	-	-	2678
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	Q8_0	perf	4	✓	855.8	175.7	100.0%	1.88x	2678
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C0	perf	1	✓	934.6	66.2	100.0%	2.11x	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C1	perf	1	✓	933.1	65.2	100.0%	2.33x	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C2	perf	1	✓	932.2	65.5	100.0%	2.69x	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C3	perf	1	✓	933.6	65.7	100.0%	3.05x	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C4	perf	1	✓	931.2	65.6	100.0%	3.38x	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C5	perf	1	✓	931.0	65.3	100.0%	3.56x	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C6	perf	1	✓	930.7	65.8	100.0%	3.78x	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C7	perf	1	✓	929.6	65.6	100.0%	3.84x	659
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C8	perf	20	✓	828.2	101.6	100.0%	4.27x	13278
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C9	perf	5	✓	842.2	198.9	100.0%	4.70x	3337
+models::quantized_qwen38::tests::test_parallel_batched_forwarding_27b	Qwen3.8-27B		~700	C10	perf	10	✓	823.4	196.6	100.0%	4.78x	6640
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	F16	perf	1	✓	1914.8	33.8	-	-	626
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	BF16	perf	1	✓	2987.2	40.3	-	-	626
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	BF16	perf	10	✓	3886.6	256.6	-	-	6310
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Q8_0	perf	20	✓	3873.0	274.5	100.0%	1.88x	12620
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Q4_0	perf	4	-	3883.1	107.7	100.0%	3.56x	2546
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C0	perf	2	✓	3590.5	74.2	100.0%	1.98x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C1	perf	2	✓	3598.7	74.5	100.0%	2.54x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C2	perf	2	✓	3596.8	72.7	100.0%	2.74x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C3	perf	2	✓	3581.9	74.3	100.0%	2.99x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C4	perf	2	✓	3580.8	73.0	100.0%	3.41x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C5	perf	2	✓	3574.1	73.5	100.0%	3.67x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C6	perf	2	✓	3587.1	72.2	100.0%	4.17x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C7	perf	2	✓	3566.3	66.4	100.0%	4.24x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	C9	perf	2	✓	3584.1	70.8	100.0%	5.31x	1292
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	BF16	perf	1	✓	3281.3	42.4	-	-	626
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Q4_0	perf	20	-	3874.9	268.5	100.0%	3.56x	12620
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Expert hits	600	2641	1217	358	182	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Expert misses	889	72	17	6	2	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Hit rate	40.3%	97.3%	98.6%	98.4%	98.9%	100.0%	100.0%	100.0%
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	DMA loads (H2D)	889	72	17	6	2	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Hot VRAM (resident)	15415 MiB	16270 MiB	16317 MiB	16333 MiB	16339 MiB	16339 MiB	16339 MiB	16339 MiB
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Zone cedeable	15927 MiB	15927 MiB	15927 MiB	15927 MiB	15927 MiB	15927 MiB	15927 MiB	15927 MiB
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Warm tier slots	5888 (96%)	5888 (96%)	5888 (96%)	5888 (96%)	5888 (96%)	5888 (96%)	5888 (96%)	5888 (96%)
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	MoE dispatch	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Warm loads (RAM)	943	72	17	6	2	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Cold loads (pack)	0	0	0	0	0	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Evictions	830	0	0	0	0	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Prefetch loads	54	0	0	0	0	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Hint loads	0	0	0	0	0	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Predicted loads	54	0	0	0	0	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Prediction prec.	50.0%	0.0%	0.0%	0.0%	0.0%	0.0%	0.0%	0.0%
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Late loads	3	0	0	0	0	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Load-ahead N	1	1	1	1	1	1	1	1
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Streamed loads	0	0	0	0	0	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Fence stalls	61	32	16	5	2	0	0	0
+models::quantized_qwen3_moe::tests::test_parallel_batched_forwarding	Qwen3-30B-A3B		~700	Work requests	528	672	912	576	528	528	528	528
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	BF16	perf	1	✓	1267.1	41.8	-	-	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	BF16	perf	4	✓	3066.1	256.7	-	-	2678
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Q8_0	perf	2	✓	3508.7	127.2	100.0%	1.88x	1358
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C0	perf	1	✓	3525.8	80.5	100.0%	2.20x	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C1	perf	1	✓	3528.6	81.8	100.0%	2.85x	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C2	perf	1	✓	3532.7	81.3	100.0%	3.26x	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C3	perf	1	✓	3483.6	81.2	100.0%	3.41x	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C4	perf	1	✓	3539.2	79.7	100.0%	3.72x	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C5	perf	1	✓	3538.0	80.6	100.0%	3.83x	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C6	perf	1	✓	3516.2	80.2	100.0%	4.51x	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C7	perf	1	✓	3521.2	79.9	100.0%	4.61x	659
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C8	perf	5	✓	3492.9	292.5	100.0%	5.13x	3337
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C9	perf	2	✓	3527.1	147.5	100.0%	5.89x	1358
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C10	perf	8	✓	3391.9	342.6	100.0%	6.23x	5316
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	C10	perf	16	✓	2848.5	375.9	100.0%	6.20x	10618
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Expert hits	996	5126	601	0	17	7	48	7
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Expert misses	3622	40	7	0	1	1	4	1
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Hit rate	21.6%	99.2%	98.8%	100.0%	94.4%	87.5%	92.3%	87.5%
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	DMA loads (H2D)	3622	40	7	0	1	1	4	1
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Hot VRAM (resident)	14563 MiB	17853 MiB	17865 MiB	17865 MiB	17867 MiB	17871 MiB	17878 MiB	17880 MiB
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Zone cedeable	16097 MiB	16676 MiB	16676 MiB	16676 MiB	16676 MiB	16676 MiB	16676 MiB	16676 MiB
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Warm tier slots	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	MoE dispatch	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Warm loads (RAM)	3810	40	7	0	1	1	4	1
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Cold loads (pack)	0	0	0	0	0	0	0	0
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Evictions	3512	0	0	0	0	0	0	0
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Prefetch loads	188	0	0	0	0	0	0	0
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Hint loads	0	0	0	0	0	0	0	0
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Predicted loads	188	0	0	0	0	0	0	0
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Prediction prec.	48.9%	0.0%	0.0%	0.0%	0.0%	0.0%	0.0%	0.0%
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Late loads	7	0	0	0	0	0	0	0
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Load-ahead N	1	1	1	1	1	1	1	1
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Streamed loads	0	0	0	0	0	0	0	0
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Fence stalls	90	30	7	0	1	1	4	1
+models::quantized_qwen35_moe::tests::test_parallel_batched_forwarding_35b	Qwen3.5-35B-A3B		~700	Work requests	246	286	246	246	246	246	246	246
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	BF16	perf	1	✓	1339.8	41.7	-	-	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	BF16	perf	4	✓	3181.4	263.0	-	-	2678
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Q8_0	perf	1	✓	3621.2	62.0	100.0%	1.88x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C0	perf	1	✓	3639.9	76.6	100.0%	2.20x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C1	perf	1	✓	3603.7	82.2	100.0%	2.79x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C2	perf	1	✓	3602.4	78.4	100.0%	3.23x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C3	perf	1	✓	3662.1	81.2	100.0%	3.39x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C4	perf	1	✓	3641.8	80.3	100.0%	3.72x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C5	perf	1	✓	3652.9	81.7	100.0%	3.81x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C6	perf	1	✓	3646.3	78.0	100.0%	4.42x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C7	perf	1	✓	3647.6	78.0	100.0%	4.51x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C8	perf	5	✓	3604.3	296.5	100.0%	5.04x	3337
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C9	perf	2	✓	3629.5	119.1	100.0%	5.75x	1358
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C10	perf	8	✓	3510.2	347.6	100.0%	6.05x	5316
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	C10	perf	16	✓	3115.7	388.6	100.0%	6.04x	10618
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Expert hits	901	2041	7	0	0	15	50	38
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Expert misses	3429	22	1	0	0	1	4	6
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Hit rate	20.8%	98.9%	87.5%	100.0%	100.0%	93.8%	92.6%	86.4%
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	DMA loads (H2D)	3429	22	1	0	0	1	4	6
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Hot VRAM (resident)	14552 MiB	17701 MiB	17703 MiB	17703 MiB	17703 MiB	17709 MiB	17716 MiB	17727 MiB
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Zone cedeable	16097 MiB	16676 MiB	16676 MiB	16676 MiB	16676 MiB	16676 MiB	16676 MiB	16676 MiB
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Warm tier slots	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	MoE dispatch	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Warm loads (RAM)	3605	22	1	0	0	1	4	6
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Cold loads (pack)	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Evictions	3313	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Prefetch loads	176	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Hint loads	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Predicted loads	176	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Prediction prec.	48.3%	0.0%	0.0%	0.0%	0.0%	0.0%	0.0%	0.0%
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Late loads	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Load-ahead N	1	1	1	1	1	1	1	1
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Streamed loads	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Fence stalls	86	16	1	0	0	1	4	4
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b	Qwen3.6-35B-A3B		~700	Work requests	246	246	246	246	246	246	246	246
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	BF16	prec	1	✓	1021.8	36.8	-	-	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	BF16	prec	4	✓	2303.9	221.6	-	-	2678
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Q8_0	prec	1	✓	2620.8	68.9	100.0%	1.88x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C0	prec	1	✓	2752.8	77.1	100.0%	2.21x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C1	prec	1	✓	2857.5	76.3	100.0%	2.79x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C2	prec	1	✓	2960.0	74.6	100.0%	3.24x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C3	prec	1	✓	3112.0	78.5	100.0%	3.40x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C4	prec	1	✓	3234.3	77.6	100.0%	3.72x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C5	prec	1	✓	3340.1	79.5	100.0%	3.82x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C6	prec	1	✓	3453.2	75.9	100.0%	4.46x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C7	prec	1	✓	3463.1	78.7	100.0%	4.55x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C8	prec	5	✓	3236.1	266.0	100.0%	5.06x	3337
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C9	prec	2	✓	3254.2	112.3	100.0%	5.79x	1358
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C10	prec	8	✓	3161.3	275.1	100.0%	6.09x	5316
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	C10	prec	16	✓	2371.2	351.6	100.0%	6.08x	10618
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Expert hits	984	5904	5231	5130	4841	3525	3252	3010
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Expert misses	4354	363	301	250	208	82	67	49
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Hit rate	18.4%	94.2%	94.6%	95.4%	95.9%	97.7%	98.0%	98.4%
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	DMA loads (H2D)	4354	364	302	250	209	83	67	49
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Hot VRAM (resident)	15209 MiB	18494 MiB	18494 MiB	18494 MiB	18494 MiB	18494 MiB	18494 MiB	18494 MiB
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Zone cedeable	16306 MiB	16884 MiB	16884 MiB	16884 MiB	16884 MiB	16884 MiB	16884 MiB	16884 MiB
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Warm tier slots	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	MoE dispatch	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Warm loads (RAM)	4588	369	306	252	212	84	68	50
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Cold loads (pack)	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Evictions	4209	369	306	252	212	84	68	50
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Prefetch loads	234	5	4	2	3	1	1	1
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Hint loads	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Predicted loads	234	5	4	2	3	1	1	1
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Prediction prec.	47.4%	60.0%	50.0%	50.0%	33.3%	100.0%	0.0%	100.0%
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Late loads	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Load-ahead N	1	1	1	1	1	1	1	1
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Streamed loads	0	1	1	0	1	1	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Fence stalls	99	60	51	51	46	30	38	30
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune	Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)		~700	Work requests	246	246	246	246	246	246	246	246
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	BF16	perf	1	✓	1476.5	43.3	-	-	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	BF16	perf	4	✓	3305.0	252.4	-	-	2678
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Q8_0	perf	1	✓	3719.1	73.0	100.0%	1.88x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C0	perf	1	✓	3739.4	81.7	100.0%	2.21x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C1	perf	1	✓	3741.0	83.1	100.0%	2.80x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C2	perf	1	✓	3725.4	82.1	100.0%	3.23x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C3	perf	1	✓	3739.7	77.3	100.0%	3.40x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C4	perf	1	✓	3728.6	82.6	100.0%	3.72x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C5	perf	1	✓	3740.0	83.4	100.0%	3.82x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C6	perf	1	✓	3724.6	81.7	100.0%	4.44x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C7	perf	1	✓	3742.3	81.8	100.0%	4.54x	659
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C8	perf	5	✓	3691.7	295.7	100.0%	5.05x	3337
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C9	perf	2	✓	3731.4	148.5	100.0%	5.77x	1358
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C10	perf	8	✓	3738.5	346.7	100.0%	6.10x	5316
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	C10	perf	16	✓	3384.8	399.0	100.0%	6.07x	10618
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Expert hits	877	1574	0	19	16	14	65	41
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Expert misses	2970	16	0	1	1	1	5	3
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Hit rate	22.8%	99.0%	100.0%	95.0%	94.1%	93.3%	92.9%	93.2%
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	DMA loads (H2D)	2970	16	0	1	1	1	5	3
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Hot VRAM (resident)	15006 MiB	17744 MiB	17744 MiB	17746 MiB	17747 MiB	17755 MiB	17764 MiB	17770 MiB
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Zone cedeable	16610 MiB	17189 MiB	17189 MiB	17189 MiB	17189 MiB	17189 MiB	17189 MiB	17189 MiB
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Warm tier slots	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)	9984 (95%)
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	MoE dispatch	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)	host (readback)
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Warm loads (RAM)	3109	16	0	1	1	1	5	3
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Cold loads (pack)	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Evictions	2849	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Prefetch loads	139	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Hint loads	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Predicted loads	139	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Prediction prec.	49.6%	0.0%	0.0%	0.0%	0.0%	0.0%	0.0%	0.0%
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Late loads	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Load-ahead N	1	1	1	1	1	1	1	1
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Streamed loads	0	0	0	0	0	0	0	0
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Fence stalls	77	12	0	1	1	1	5	3
+models::quantized_qwen36_moe::tests::test_parallel_batched_forwarding_36_35b_antiloop_styletune_performance	Qwen3.6-35B AntiLoop+StyleTune (Performance)		~700	Work requests	246	246	246	246	246	246	246	246

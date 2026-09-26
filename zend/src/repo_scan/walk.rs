@@ -1,18 +1,23 @@
 //! `ignore`-driven workspace enumeration plus per-file metadata.
 //!
-//! `walk_workspace` is a pure function — given a workspace root it
-//! returns a [`RepoMap`].  The walker respects every ignore file
-//! `ripgrep` does (`.gitignore`, `.ignore`, the global git ignore, and
-//! `.git/info/exclude`).  Hidden files and symlinks are skipped by
-//! default.
+//! `walk_workspace` is a pure function — given a [`Workspace`] it returns a
+//! [`RepoMap`] of every repository's files, each keyed by its path relative to
+//! the workspace folder (`candle/src/lib.rs`). Only the listed repositories are
+//! walked: anything else in the workspace folder — other checkouts, the
+//! daemon's `substrate/` — is never visited. The walker respects every ignore
+//! file `ripgrep` does (`.gitignore`, `.ignore`, the global git ignore, and
+//! `.git/info/exclude`). Hidden files and symlinks are skipped by default.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
+use zend_tools::state::Workspace;
 
 use super::binary_sniff::is_binary_sample;
 use super::types::{FileEntry, Language, ModuleHint, RepoMap};
+use crate::code_read::is_upload_path;
+use crate::repo_path::split;
 
 /// Hard size ceiling for any single file the walker accepts.  Above
 /// this we silently skip; values are bounded by RAM during the read
@@ -24,21 +29,58 @@ use super::types::{FileEntry, Language, ModuleHint, RepoMap};
 /// typically far larger).
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Walk `root` and produce a [`RepoMap`].  Never panics — I/O errors
-/// during the walk are downgraded to skips and reported via the
+/// Walk `workspace`'s repositories and produce a [`RepoMap`]. Never panics —
+/// I/O errors during the walk are downgraded to skips and reported via the
 /// `files_skipped_*` counters on the returned map.
 ///
-/// `max_depth` (`--max-depth`) bounds the walk in path components below
-/// `root`: `1` is the root's own files, `2` adds one folder down. Nothing
-/// deeper is visited, and the map records the bound so the deleted-path
+/// `scope` narrows the walk to one workspace-relative folder inside a
+/// repository (`--ingest-dir`, e.g. `candle/zend/src`); empty walks every
+/// repository. Keys stay workspace-relative either way. A scope outside every
+/// repository walks nothing. The daemon's `uploads` repository is never walked
+/// — see [`is_upload_path`].
+///
+/// `max_depth` (`--max-depth`) bounds the walk in path components below each
+/// walk's start — a repository's root, or the scope folder: `1` is its own
+/// files, `2` adds one folder down. Nothing deeper is visited, and the map
+/// records the bound in workspace-relative components so the deleted-path
 /// sweeps can tell "not walked" from "gone" ([`RepoMap::is_frozen_file`]).
-pub fn walk_workspace(root: &Path, max_depth: Option<usize>) -> RepoMap {
+pub fn walk_workspace(workspace: &Workspace, scope: &str, max_depth: Option<usize>) -> RepoMap {
+    let root = workspace.root();
+    let scope = scope.trim_matches('/');
+    // Each walk's start, and how many workspace-relative components deep it is.
+    let starts: Vec<(PathBuf, usize)> = if scope.is_empty() || scope == "." {
+        workspace
+            .repos()
+            .iter()
+            .filter(|r| !is_upload_path(&r.name))
+            .map(|r| (r.dir.clone(), 1))
+            .collect()
+    } else {
+        let (repo, _) = split(scope);
+        match workspace.repo(repo) {
+            Some(_) if !is_upload_path(repo) => {
+                vec![(root.join(scope), scope.split('/').count())]
+            }
+            _ => Vec::new(),
+        }
+    };
+    // One offset for the whole map: every start of an unscoped walk is a
+    // repository root, one component deep.
+    let offset = starts.first().map_or(1, |(_, d)| *d);
     let mut map = RepoMap {
-        max_depth,
+        max_depth: max_depth.map(|d| d + offset),
         ..RepoMap::default()
     };
+    for (start, _) in &starts {
+        walk_one(root, start, max_depth, &mut map);
+    }
+    map.files.sort_by(|a, b| a.path.cmp(&b.path));
+    map
+}
 
-    let walker = WalkBuilder::new(root)
+/// Walk `start` (inside `root`) into `map`, keying each file relative to `root`.
+fn walk_one(root: &Path, start: &Path, max_depth: Option<usize>, map: &mut RepoMap) {
+    let walker = WalkBuilder::new(start)
         .max_depth(max_depth)
         .hidden(true) // skip dotfiles
         .git_ignore(true)
@@ -48,7 +90,8 @@ pub fn walk_workspace(root: &Path, max_depth: Option<usize>) -> RepoMap {
         .require_git(false) // honour .gitignore even outside a git repo
         .follow_links(false)
         // Prune nested git repositories / submodules. Any directory below the
-        // walk root that holds a `.git` entry (a submodule uses a `.git` FILE
+        // walk's start (a repository's own `.git` sits AT the start, depth 0,
+        // and is not pruned) that holds a `.git` entry (a submodule uses a `.git` FILE
         // pointing into the superproject's modules dir; a nested clone a `.git`
         // DIR) is a SEPARATE project — its contents are vendored third-party
         // code and generated artifacts (e.g. the cutlass submodule's thousands
@@ -76,20 +119,6 @@ pub fn walk_workspace(root: &Path, max_depth: Option<usize>) -> RepoMap {
         let path = entry.path();
         // Directories themselves don't contribute entries; only files do.
         if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        // Always exclude the daemon's own outputs.
-        if path
-            .components()
-            .any(|c| c.as_os_str() == ".zend" || c.as_os_str() == ".substrate")
-        {
-            continue;
-        }
-        // Uploaded files are DELIBERATELY invisible to the RepoMap — explicitly
-        // excluded here (see `is_upload_dir`). They are endpoint-managed, not
-        // part of the project tree, so they must never appear in name-based
-        // (repo_map) retrieval.
-        if is_upload_dir(path, root) {
             continue;
         }
         map.files_scanned += 1;
@@ -156,38 +185,6 @@ pub fn walk_workspace(root: &Path, max_depth: Option<usize>) -> RepoMap {
             module_hint,
         });
     }
-
-    map.files.sort_by(|a, b| a.path.cmp(&b.path));
-    map
-}
-
-/// Whether `path` is under the daemon's TOP-LEVEL `uploads/` dir, which
-/// [`walk_workspace`] explicitly excludes.
-///
-/// **Design decision — uploads are invisible to the `RepoMap`.** Uploaded files
-/// are owned by the upload endpoint, not the workspace: the endpoint ingests
-/// each one into the `code_reading` (content) layer itself and measures the
-/// work, and the bytes live under `<workspace>/uploads/`, outside the project
-/// tree. They must therefore NOT appear in name-based (repo_map) retrieval, and
-/// the workspace walk must not touch them at all:
-///   * walking them would pre-ingest an upload on the startup pass or a
-///     watcher-driven refresh, racing the endpoint and making its measured
-///     read_file stage cache-hit ("instant, 0 tokens"); and
-///   * paired with the `uploads/` skip in [`crate::code_read`]'s
-///     `reconcile_deleted`, excluding them here keeps the walk from tombstoning
-///     freshly-uploaded content — uploads are absent from the walk's
-///     `present_paths` precisely because of this exclusion.
-///
-/// Matched on the FIRST workspace-relative component only, case-insensitively
-/// (the win32 FS is case-insensitive), so a nested `src/uploads/` in a real
-/// project is untouched. Mirrors `watcher::is_top_level_uploads` and
-/// `code_read::is_upload_path` so all three agree on what "an upload" is.
-fn is_upload_dir(path: &Path, root: &Path) -> bool {
-    path.strip_prefix(root)
-        .ok()
-        .and_then(|rel| rel.components().next())
-        .and_then(|c| c.as_os_str().to_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("uploads"))
 }
 
 /// Count lines + extract any manifest hint from a file's already-read `bytes`.
@@ -326,30 +323,172 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use zend_tools::state::RepoSpec;
+
+    /// The repository every single-repository test below lays its files out in.
+    const REPO: &str = "r";
+
     fn fixture(name: &str) -> tempfile::TempDir {
         let _ = name;
         tempfile::tempdir().expect("tempdir")
     }
 
-    /// `--max-depth` counts path components: 1 is the root's own files, 2 adds
-    /// one folder down. Nothing past the bound is walked, and the map records
-    /// the bound so the sweeps can freeze what lies beyond it.
+    /// `dir` as a workspace holding the listed repositories.
+    fn workspace_of(dir: &tempfile::TempDir, repos: &[&str]) -> Workspace {
+        for repo in repos {
+            fs::create_dir_all(dir.path().join(repo)).unwrap();
+        }
+        Workspace::new(
+            dir.path(),
+            repos.iter().map(|r| RepoSpec::named(r)).collect(),
+        )
+        .unwrap()
+    }
+
+    /// Walk the single-repository workspace in `dir`, with each key's `r/`
+    /// prefix dropped so a test asserts the path inside the repository. The
+    /// prefix itself is asserted by the multi-repository tests.
+    fn walk(dir: &tempfile::TempDir, max_depth: Option<usize>) -> RepoMap {
+        let mut map = walk_workspace(&workspace_of(dir, &[REPO]), "", max_depth);
+        for f in &mut map.files {
+            f.path = f
+                .path
+                .strip_prefix("r/")
+                .expect("every key starts with its repository")
+                .to_string();
+        }
+        map
+    }
+
+    /// **A repository's git database is never ingested.**
+    ///
+    /// `.hidden(true)` is what excludes it, which is easy to change for an
+    /// unrelated reason and would silently pull the whole object store into
+    /// the corpus. Two things make that worth a test of its own rather than
+    /// trust in a flag: `.git/config` holds remote URLs with their credentials
+    /// intact, and the packed-refs and object files are megabytes of content
+    /// that answer no question a developer asks. `VfsStore` refuses the same
+    /// paths on an explicit read; this covers the walk.
+    #[test]
+    fn a_repositorys_git_database_is_never_ingested() {
+        let dir = fixture("git_dir");
+        let root = dir.path().join(REPO);
+        write(&root, "src/lib.rs", b"pub fn ok() {}\n");
+        write(
+            &root,
+            ".git/config",
+            b"[remote \"origin\"]\n\turl = https://u:ghp_secrettoken@example.com/a.git\n",
+        );
+        write(&root, ".git/packed-refs", b"abc refs/heads/main\n");
+        write(&root, ".git/objects/ab/cdef", b"binary-ish\n");
+
+        let map = walk(&dir, None);
+        let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"src/lib.rs"), "{paths:?}");
+        for p in &paths {
+            assert!(!p.starts_with(".git"), "the git database was ingested: {p}");
+        }
+        assert!(
+            !format!("{map:?}").contains("ghp_secrettoken"),
+            "a credential from .git/config reached the repo map"
+        );
+    }
+
+    /// `--max-depth` counts path components below each repository's root: 1
+    /// is the repository's own files, 2 adds one folder down. Nothing past the
+    /// bound is walked, and the map records the bound in workspace-relative
+    /// components — one more, for the repository segment — so the sweeps can
+    /// freeze what lies beyond it.
     #[test]
     fn walk_stops_at_max_depth() {
         let dir = fixture("max_depth");
-        let root = dir.path();
-        write(root, "a.rs", b"fn a() {}\n");
-        write(root, "src/b.rs", b"fn b() {}\n");
-        write(root, "src/deep/c.rs", b"fn c() {}\n");
+        let root = dir.path().join(REPO);
+        write(&root, "a.rs", b"fn a() {}\n");
+        write(&root, "src/b.rs", b"fn b() {}\n");
+        write(&root, "src/deep/c.rs", b"fn c() {}\n");
 
         let paths = |m: &RepoMap| m.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
-        assert_eq!(paths(&walk_workspace(root, Some(1))), vec!["a.rs"]);
-        let bounded = walk_workspace(root, Some(2));
+        assert_eq!(paths(&walk(&dir, Some(1))), vec!["a.rs"]);
+        let bounded = walk(&dir, Some(2));
         assert_eq!(paths(&bounded), vec!["a.rs", "src/b.rs"]);
-        assert_eq!(bounded.max_depth, Some(2));
-        let open = walk_workspace(root, None);
+        assert_eq!(bounded.max_depth, Some(3));
+        assert!(!bounded.is_frozen_file("r/src/b.rs"));
+        assert!(bounded.is_frozen_file("r/src/deep/c.rs"));
+        let open = walk(&dir, None);
         assert_eq!(paths(&open), vec!["a.rs", "src/b.rs", "src/deep/c.rs"]);
         assert_eq!(open.max_depth, None);
+    }
+
+    /// **Every listed repository is walked, and nothing else is.** Keys are
+    /// workspace-relative, so the same inner path in two repositories is two
+    /// keys; a folder beside the repositories — another checkout, the daemon's
+    /// `substrate/` — never appears.
+    #[test]
+    fn every_listed_repository_is_walked_and_keyed_by_it() {
+        let dir = fixture("multi");
+        let ws = workspace_of(&dir, &["alpha", "beta"]);
+        write(&dir.path().join("alpha"), "src/lib.rs", b"// a\n");
+        write(&dir.path().join("beta"), "src/lib.rs", b"// b\n");
+        write(dir.path(), "other/src/lib.rs", b"// not listed\n");
+        write(dir.path(), "substrate/zend.log", b"x\n");
+        write(dir.path(), "top.rs", b"// beside the repositories\n");
+
+        let map = walk_workspace(&ws, "", None);
+        let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["alpha/src/lib.rs", "beta/src/lib.rs"]);
+    }
+
+    /// **A repository's own `.git` does not prune it.** Each repository is
+    /// its walk's start, so its `.git` sits at depth 0.
+    #[test]
+    fn a_repository_that_is_a_git_checkout_is_walked() {
+        let dir = fixture("checkout");
+        let ws = workspace_of(&dir, &["alpha"]);
+        write(
+            &dir.path().join("alpha"),
+            ".git/HEAD",
+            b"ref: refs/heads/main\n",
+        );
+        write(&dir.path().join("alpha"), "src/lib.rs", b"// keep\n");
+        let map = walk_workspace(&ws, "", None);
+        let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["alpha/src/lib.rs"]);
+    }
+
+    /// A scope narrows the walk to one folder and keeps keys workspace-relative;
+    /// the depth bound counts from the scope folder.
+    #[test]
+    fn a_scope_walks_one_folder_inside_a_repository() {
+        let dir = fixture("scope");
+        let ws = workspace_of(&dir, &["alpha", "beta"]);
+        write(&dir.path().join("alpha"), "src/lib.rs", b"// in\n");
+        write(&dir.path().join("alpha"), "src/deep/x.rs", b"// deeper\n");
+        write(&dir.path().join("alpha"), "docs/a.md", b"out\n");
+        write(&dir.path().join("beta"), "src/lib.rs", b"// out\n");
+
+        let map = walk_workspace(&ws, "alpha/src", None);
+        let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["alpha/src/deep/x.rs", "alpha/src/lib.rs"]);
+
+        let bounded = walk_workspace(&ws, "alpha/src/", Some(1));
+        let paths: Vec<&str> = bounded.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["alpha/src/lib.rs"]);
+        assert_eq!(bounded.max_depth, Some(3));
+
+        assert!(walk_workspace(&ws, "other/src", None).files.is_empty());
+    }
+
+    /// The daemon's `uploads` repository is endpoint-managed and never walked.
+    #[test]
+    fn the_uploads_repository_is_never_walked() {
+        let dir = fixture("uploads_repo");
+        let ws = workspace_of(&dir, &["alpha", "uploads"]);
+        write(&dir.path().join("alpha"), "a.rs", b"// keep\n");
+        write(&dir.path().join("uploads"), "notes.py", b"print(1)\n");
+        let map = walk_workspace(&ws, "", None);
+        let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["alpha/a.rs"]);
+        assert!(walk_workspace(&ws, "uploads", None).files.is_empty());
     }
 
     fn write(root: &Path, rel: &str, body: &[u8]) {
@@ -363,13 +502,13 @@ mod tests {
     #[test]
     fn walk_respects_gitignore() {
         let dir = fixture("gitignore");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(&root, ".gitignore", b"target/\nignored.rs\n");
         write(&root, "src/lib.rs", b"// keep\n");
         write(&root, "target/junk.rs", b"// drop\n");
         write(&root, "ignored.rs", b"// drop\n");
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/lib.rs"));
         assert!(!paths.iter().any(|p| p.starts_with("target/")));
@@ -379,8 +518,8 @@ mod tests {
     #[test]
     fn walk_prunes_nested_git_repos_and_submodules() {
         let dir = fixture("submodule");
-        let root = dir.path().to_path_buf();
-        // The workspace root is itself a git repo (`.git` DIR) — the depth-0
+        let root = dir.path().join(REPO);
+        // The repository is itself a git repo (`.git` DIR) — the depth-0
         // guard must NOT prune it, or nothing would scan.
         write(&root, ".git/HEAD", b"ref: refs/heads/main\n");
         // The workspace's own source is kept.
@@ -398,7 +537,7 @@ mod tests {
         write(&root, "nested/.git/HEAD", b"ref: refs/heads/main\n");
         write(&root, "nested/main.rs", b"// separate project\n");
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/lib.rs"));
         assert!(
@@ -414,13 +553,13 @@ mod tests {
     #[test]
     fn walk_filters_by_extension_allowlist() {
         let dir = fixture("ext");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(&root, "src/lib.rs", b"// keep\n");
         write(&root, "data/blob.bin", b"\x00\x01\x02");
         write(&root, "README.md", b"# title\n");
         write(&root, "shape.svg", b"<svg/>");
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"src/lib.rs"));
         assert!(paths.contains(&"README.md"));
@@ -432,13 +571,13 @@ mod tests {
     #[test]
     fn walk_skips_oversize_files() {
         let dir = fixture("oversize");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(&root, "tiny.rs", b"// small\n");
         // 17 MB > MAX_FILE_BYTES (16 MB).
         let big: Vec<u8> = vec![b'a'; 17 * 1024 * 1024];
         write(&root, "huge.rs", &big);
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"tiny.rs"));
         assert!(!paths.contains(&"huge.rs"));
@@ -448,7 +587,7 @@ mod tests {
     #[test]
     fn walk_skips_binary_content_despite_allowlisted_extension() {
         let dir = fixture("binary_txt");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         // A genuine text file with an allowlisted extension — kept.
         write(&root, "notes.txt", b"plain prose, no NULs here\n");
         // A compiled fatbin dump checked in as `*.txt`: allowlisted extension,
@@ -460,7 +599,7 @@ mod tests {
             b"\x7fELF\x00\x00fatbin\x00code",
         );
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"notes.txt"), "real text kept: {paths:?}");
         assert!(
@@ -473,78 +612,58 @@ mod tests {
     #[test]
     fn walk_accepts_files_just_under_size_cap() {
         let dir = fixture("just_under");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         // 12 MB — comfortably under the 16 MB cap.  This file should
         // survive the walk; oversize counters stay at zero.
         let body: Vec<u8> = vec![b'a'; 12 * 1024 * 1024];
         write(&root, "doc.md", &body);
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         assert!(map.files.iter().any(|f| f.path == "doc.md"));
         assert_eq!(map.files_skipped_oversize, 0);
     }
 
+    /// Hidden folders inside a repository — an editor's or a tool's own
+    /// state — are never walked.
     #[test]
-    fn walk_excludes_zend_dir() {
-        let dir = fixture("zend");
-        let root = dir.path().to_path_buf();
+    fn walk_excludes_hidden_dirs() {
+        let dir = fixture("hidden");
+        let root = dir.path().join(REPO);
         write(&root, "src/lib.rs", b"// keep\n");
         write(&root, ".zend/config.yaml", b"x: 1\n");
-        write(&root, ".substrate/something.log", b"x");
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
-        assert!(paths.contains(&"src/lib.rs"));
-        assert!(!paths.iter().any(|p| p.starts_with(".zend/")));
-        assert!(!paths.iter().any(|p| p.starts_with(".substrate/")));
+        assert_eq!(paths, vec!["src/lib.rs"]);
     }
 
+    /// A folder named `uploads` inside a repository is the repository's own
+    /// source, not the daemon's uploads.
     #[test]
-    fn is_upload_dir_matches_top_level_uploads_only() {
-        let root = Path::new("ws");
-        // Top-level uploads/ (any case — win32 FS is case-insensitive).
-        assert!(is_upload_dir(Path::new("ws/uploads/notes.py"), root));
-        assert!(is_upload_dir(Path::new("ws/uploads/nested/a.rs"), root));
-        assert!(is_upload_dir(Path::new("ws/Uploads/notes.py"), root));
-        // A nested `src/uploads/` in a real project keeps its visibility.
-        assert!(!is_upload_dir(Path::new("ws/src/uploads/real.rs"), root));
-        assert!(!is_upload_dir(Path::new("ws/src/main.rs"), root));
-        assert!(!is_upload_dir(Path::new("other/uploads/a"), root));
-    }
-
-    #[test]
-    fn walk_excludes_top_level_uploads_but_keeps_nested() {
+    fn an_uploads_folder_inside_a_repository_is_walked() {
         let dir = fixture("uploads");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(&root, "src/main.rs", b"// keep\n");
-        // Top-level uploads/ is endpoint-managed and DELIBERATELY invisible to
-        // the RepoMap — the walk must skip it (no name-based retrieval).
         write(&root, "uploads/notes.py", b"print(1)\n");
-        // A nested `src/uploads/` in a real project is NOT the daemon's dir.
         write(&root, "src/uploads/real.rs", b"// keep\n");
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
-        assert!(paths.contains(&"src/main.rs"));
-        assert!(
-            paths.contains(&"src/uploads/real.rs"),
-            "nested uploads/ is real source"
-        );
-        assert!(
-            !paths.iter().any(|p| p.starts_with("uploads/")),
-            "top-level uploads/ must be excluded"
+        assert_eq!(
+            paths,
+            vec!["src/main.rs", "src/uploads/real.rs", "uploads/notes.py"]
         );
     }
 
     #[test]
     fn walk_metadata_counts_lines_correctly() {
         let dir = fixture("lines");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(&root, "trailing_nl.rs", b"a\nb\nc\n"); // 3 lines, trailing NL
         write(&root, "no_trailing.rs", b"a\nb\nc"); // 3 lines, no trailing NL
         write(&root, "empty.rs", b""); // 0 lines
         write(&root, "single.rs", b"hello"); // 1 line, no NL
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let by_name: std::collections::HashMap<&str, u32> = map
             .files
             .iter()
@@ -559,7 +678,7 @@ mod tests {
     #[test]
     fn walk_extracts_cargo_workspace_hint() {
         let dir = fixture("cargo_ws");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(
             &root,
             "Cargo.toml",
@@ -568,7 +687,7 @@ members = ["a", "b", "c"]
 "#,
         );
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let entry = map.files.iter().find(|f| f.path == "Cargo.toml").unwrap();
         assert_eq!(
             entry.module_hint,
@@ -579,7 +698,7 @@ members = ["a", "b", "c"]
     #[test]
     fn walk_extracts_cargo_package_hint() {
         let dir = fixture("cargo_pkg");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(
             &root,
             "Cargo.toml",
@@ -589,7 +708,7 @@ version = "0.1.0"
 "#,
         );
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let entry = map.files.iter().find(|f| f.path == "Cargo.toml").unwrap();
         assert_eq!(
             entry.module_hint,
@@ -602,14 +721,14 @@ version = "0.1.0"
     #[test]
     fn walk_extracts_node_package_hint() {
         let dir = fixture("node");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(
             &root,
             "package.json",
             br#"{"name":"my-app","version":"1.0.0"}"#,
         );
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let entry = map.files.iter().find(|f| f.path == "package.json").unwrap();
         assert_eq!(
             entry.module_hint,
@@ -622,10 +741,10 @@ version = "0.1.0"
     #[test]
     fn walk_extracts_go_module_hint() {
         let dir = fixture("go");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(&root, "go.mod", b"module example.com/me/widget\ngo 1.22\n");
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let entry = map.files.iter().find(|f| f.path == "go.mod").unwrap();
         assert_eq!(
             entry.module_hint,
@@ -638,12 +757,12 @@ version = "0.1.0"
     #[test]
     fn walk_is_sorted_and_deterministic() {
         let dir = fixture("sort");
-        let root = dir.path().to_path_buf();
+        let root = dir.path().join(REPO);
         write(&root, "z/last.rs", b"//\n");
         write(&root, "a/first.rs", b"//\n");
         write(&root, "m/middle.rs", b"//\n");
 
-        let map = walk_workspace(&root, None);
+        let map = walk(&dir, None);
         let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["a/first.rs", "m/middle.rs", "z/last.rs"]);
     }

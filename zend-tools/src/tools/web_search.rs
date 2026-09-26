@@ -1,7 +1,7 @@
 //! `web_search` tool — search the web via Tavily API.
 //!
 //! The API key comes from the daemon's secrets document
-//! ([`ToolSecrets`](crate::state::ToolSecrets)), read once at startup from a
+//! ([`Secrets`](crate::state::Secrets)), read once at startup from a
 //! per-user file outside the workspace. It is deliberately not read from the
 //! process environment: the key would then have to be exported by whatever
 //! launches the daemon, and every child process would inherit it.
@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::state::ToolSecrets;
 use crate::{RegisteredTool, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
@@ -45,6 +44,12 @@ pub struct Response {
     pub searched_on: String,
     pub results: Vec<SearchResult>,
 }
+
+/// Why search is unavailable. The model reads this, so it names no path: where
+/// the daemon's secrets live is the operator's business, and the daemon logs
+/// the file it read at startup.
+const UNCONFIGURED: &str =
+    "no tavily_api_key configured; the daemon's operator sets it in the daemon's secrets file";
 
 /// `now` as the `YYYY-MM-DD` date [`Response::searched_on`] carries.
 fn search_date(now: DateTime<Utc>) -> String {
@@ -90,11 +95,7 @@ impl Tool for WebSearchTool {
         // reads "search unavailable" can say something useful to the user with
         // this, and an operator reading the log is told the fix.
         let Some(api_key) = ctx.secrets.tavily_api_key() else {
-            return Err(SearchError::SearchUnavailable(format!(
-                "no tavily_api_key configured (set it in {} under the daemon's \
-                 working directory)",
-                ToolSecrets::RELATIVE_PATH
-            )));
+            return Err(SearchError::SearchUnavailable(UNCONFIGURED.to_string()));
         };
 
         let max_results = req.max_results.unwrap_or(5);
@@ -150,9 +151,13 @@ pub const REGISTRATION: RegisteredTool = RegisteredTool::new::<WebSearchTool>();
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::TimeZone;
 
     use super::*;
+    use crate::state::Secrets;
+    use crate::Grants;
 
     /// The date leads the response, so it is read before the results it dates.
     #[test]
@@ -172,5 +177,36 @@ mod tests {
             json.starts_with(r#"{"searched_on":"2026-09-03","results":["#),
             "{json}"
         );
+    }
+
+    /// **The refusal the model reads names no path** — not the file the
+    /// daemon read, not the default — so the model is never told where the
+    /// secrets live.
+    #[test]
+    fn the_refusal_names_no_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("elsewhere.yaml");
+        let secrets = Arc::new(Secrets::load(&path).unwrap());
+        let ctx = ToolContext::new()
+            .with_secrets(secrets)
+            .granting(Grants::ALL);
+        let Err(err) = WebSearchTool::run(
+            &ctx,
+            Request {
+                query: "x".into(),
+                max_results: None,
+            },
+        ) else {
+            panic!("an unconfigured search must be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("no tavily_api_key configured"), "{err}");
+        for leak in [
+            path.to_string_lossy().into_owned(),
+            Secrets::DEFAULT_RELATIVE_PATH.to_string(),
+            ".zend".to_string(),
+        ] {
+            assert!(!err.contains(&leak), "{err} names {leak}");
+        }
     }
 }

@@ -38,6 +38,7 @@ use candle_conversation::{
 };
 use serde_json::Value;
 use web::auth::Roles;
+use zend_tools::state::{Secrets, Workspace};
 
 use crate::access::Gateways;
 use crate::api::chat::{
@@ -71,6 +72,7 @@ use crate::tools::{
 };
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
 use crate::watcher::WatchDepth;
+use crate::workspace::UPLOADS_REPO;
 
 mod replay;
 pub use replay::{
@@ -483,9 +485,9 @@ struct InferenceState {
     /// display label), resolved once at load. Drives the refresh dispatch —
     /// each entry names how to re-ingest the matching [`IngestConv`].
     ingest_layers: Vec<IngestLayer>,
-    /// Workspace root captured at startup — the refresh path
-    /// re-walks from here on every filesystem event.
-    workspace: PathBuf,
+    /// The workspace captured at startup — its folder and repositories. The
+    /// refresh path re-walks its repositories on every filesystem event.
+    workspace: Workspace,
     /// `--max-depth`: the path-component bound the `repo_map` / `code_reading`
     /// walks run under, and the watcher's event filter. `None` = unbounded.
     max_depth: Option<usize>,
@@ -853,7 +855,8 @@ impl InferenceState {
         model: Model,
         model_path: PathBuf,
         tokenizer_path: PathBuf,
-        workspace: PathBuf,
+        workspace: Workspace,
+        secrets: Arc<Secrets>,
         disabled_layers: HashSet<String>,
         skipped_layers: HashSet<String>,
         wiped_layers: HashSet<String>,
@@ -866,6 +869,11 @@ impl InferenceState {
         progress: Arc<LoadProgress>,
         status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
+        // The workspace folder: where the substrate, the schema override and a
+        // mind's section folders live. Repositories are reached through
+        // `workspace` itself.
+        let root = workspace.root().to_path_buf();
+
         // Step 1: model. Engine ctor also reloads the substrate
         // internally, so the visible boundary between Model and
         // Substrate steps below is best-effort — the substrate has
@@ -927,6 +935,7 @@ impl InferenceState {
         // Resolve the effective tool catalog before any consumer touches it: a
         // `<workspace>/tools/` folder (a mind/game's own tools) overrides the
         // bundled built-ins; absent it, the built-in coding-assistant catalog.
+        // Every `repo` parameter is constrained to the workspace's repositories.
         crate::tool_def::init(&workspace);
         let tool_sections = install_tool_catalog(&mut proj_builder)
             .map_err(|e| anyhow::anyhow!("tool catalog install: {e}"))?;
@@ -946,14 +955,14 @@ impl InferenceState {
         // provenance currently comes from each template's own prefill (the
         // calibration phase below calibrates tool selection only). For the
         // coding-assistant schema there are no such collections, so this is a no-op.
-        let identity = crate::response_section::Identity::load(&workspace);
+        let identity = crate::response_section::Identity::load(&root);
         for sink in crate::ingest::section_sinks(proj_builder.schema()) {
             if disabled_layers.contains(&sink.collection) {
                 tracing::info!(collection = %sink.collection, "--disable-layer: section collection suppressed");
                 continue;
             }
             let sections =
-                crate::response_section::load_sections(&workspace.join(&sink.folder), &identity);
+                crate::response_section::load_sections(&root.join(&sink.folder), &identity);
             if sections.is_empty() {
                 continue;
             }
@@ -979,10 +988,8 @@ impl InferenceState {
         // projection time (see `IdentityBuilders`). No-op when the schema declares
         // neither collection (the coding-assistant schema) or `identities/` is
         // absent.
-        let identity_sections = crate::response_section::load_identity_sections(
-            &workspace.join("identities"),
-            &identity,
-        );
+        let identity_sections =
+            crate::response_section::load_identity_sections(&root.join("identities"), &identity);
         for (collection, sections) in [
             ("identity_anchor", &identity_sections.anchors),
             ("identity", &identity_sections.facets),
@@ -1075,7 +1082,7 @@ impl InferenceState {
             .system_prompt(&before_text)
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
-            .workspace_path(workspace.clone())
+            .workspace_path(root.clone())
             .read_only_substrate(read_only_substrate)
             .qsa_selection_budget(qsa_selection_budget)
             .max_response_tokens(MAX_TURN_TOKENS)
@@ -2052,12 +2059,12 @@ impl InferenceState {
         // Structure-derived ingestion. The load plan is derived from the declared
         // schema (see `crate::ingest`), not annotated in it: each turn-sink layer
         // is populated here, in schema order, skipping any named by
-        // `--disable-layer`. Each reads from its content folder
-        // (`workspace/<folder>`); folder/file walks are cached per folder so
-        // co-located sinks pay for a single walk. A projection with no turn-sinks
-        // (a pure conversational mind) does no filesystem reading here.
+        // `--disable-layer`. The folder and file layers walk every repository
+        // (or the `--ingest-dir` scope inside one); a raw layer reads its
+        // content folder under the workspace. A projection with no turn-sinks (a
+        // pure conversational mind) does no filesystem reading here.
         let ingest_layers =
-            crate::ingest::ingest_layers(proj_builder_refresh.schema(), &workspace, &ingest_dirs);
+            crate::ingest::ingest_layers(proj_builder_refresh.schema(), &root, &ingest_dirs);
         // Mark EVERY ingest layer append-only UP FRONT — deterministically, before
         // any ingest AND before `warm_ingest_normalization` runs — using the SAME
         // builder (`proj_builder_refresh`) whose layer ids the warm-up checks. The
@@ -2235,7 +2242,7 @@ impl InferenceState {
         // of visible work. Folded into the tail of `CalibratingSections` it
         // left that bar reading 100% for 203 of its 210 seconds.
         progress.set_step(LoadStep::Priming);
-        let priming_tool_host = ToolHost::new(&workspace);
+        let priming_tool_host = ToolHost::new(&workspace, Arc::clone(&secrets));
         let priming_ctx = RefreshContext {
             engine: &engine,
             proj_builder: proj_builder_refresh.clone(),
@@ -2293,7 +2300,7 @@ impl InferenceState {
                 tracing::info!(layer = %il.name, "--skip-layer: layer live, startup ingest skipped");
                 continue;
             }
-            let content_root = workspace.join(&il.folder);
+            let content_root = root.join(&il.folder);
             match il.mode {
                 // Folder-scan and per-file ingestion no longer run on the load
                 // path at all: the registry above is already seeded from the
@@ -2396,7 +2403,7 @@ impl InferenceState {
             identity_builders,
             think_closer_phrase,
             tokenizer,
-            tool_host: ToolHost::new(&workspace),
+            tool_host: ToolHost::new(&workspace, secrets),
             workspace,
             tool_stencil,
             think_steering,
@@ -2461,8 +2468,9 @@ impl InferenceState {
     ///  * **raw** — re-read the folder's ChatML records; on a content-hash change
     ///    mint a fresh timeline, re-prefill, tombstone the old, and swap it in.
     ///
-    /// Each layer reads from its own `folder` (`workspace/<folder>`); walks are
-    /// cached per folder so co-located layers share one walk. Stale-better-than-
+    /// The folder and file layers walk the repositories within their `folder`
+    /// scope; a raw layer reads `<workspace>/<folder>`. Walks are cached per
+    /// scope so co-located layers share one walk. Stale-better-than-
     /// missing holds throughout: the old timeline stays alive (and is what the
     /// resolver picks) until its replacement's tombstone fires. Returns
     /// `Ok(true)` if any layer was replaced. No ingest layers → a cheap no-op.
@@ -2485,7 +2493,7 @@ impl InferenceState {
             if candle_conversation::ingest_cancelled() {
                 break;
             }
-            let content_root = self.workspace.join(&il.folder);
+            let root = self.workspace.root();
             match il.mode {
                 IngestMode::Folders => {
                     let prior_state = {
@@ -2499,12 +2507,12 @@ impl InferenceState {
                         continue;
                     };
                     let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
-                        crate::repo_scan::walk_workspace(&content_root, max_depth)
+                        crate::repo_scan::walk_workspace(&self.workspace, &il.folder, max_depth)
                     });
                     let ctx = self.refresh_ctx();
                     let outcome = crate::repo_scan::refresh_repo_map(
                         &ctx,
-                        &content_root,
+                        &self.workspace,
                         map,
                         &prior_state,
                         &progress,
@@ -2532,12 +2540,12 @@ impl InferenceState {
                         continue;
                     };
                     let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
-                        crate::repo_scan::walk_workspace(&content_root, max_depth)
+                        crate::repo_scan::walk_workspace(&self.workspace, &il.folder, max_depth)
                     });
                     let ctx = self.refresh_ctx();
                     let outcome = crate::code_read::refresh_code_reading(
                         &ctx,
-                        &content_root,
+                        root,
                         map,
                         &prior_state,
                         &progress,
@@ -2568,7 +2576,7 @@ impl InferenceState {
                     let ctx = self.refresh_ctx();
                     let outcome = crate::raw_read::refresh_raw(
                         &ctx,
-                        &content_root,
+                        &root.join(&il.folder),
                         &prior_state,
                         old_timeline,
                         &progress,
@@ -2589,21 +2597,44 @@ impl InferenceState {
         Ok(any)
     }
 
-    /// The watcher's `--max-depth` filter: the bound, measured from the content
-    /// root of each layer whose walk it bounds (`repo_map`, `code_reading`),
-    /// with every raw layer's folder left unbounded. `None` when no bound was
-    /// given — every event counts.
+    /// The folders the raw layers read, which the watcher watches beside the
+    /// repositories.
+    fn raw_layer_folders(&self) -> Vec<PathBuf> {
+        self.ingest_layers
+            .iter()
+            .filter(|il| il.mode == IngestMode::Raw)
+            .map(|il| self.workspace.root().join(&il.folder))
+            .collect()
+    }
+
+    /// The watcher's `--max-depth` filter: the bound, measured from each walk's
+    /// start — every repository's root, or a layer's `--ingest-dir` scope — for
+    /// the layers whose walk it bounds (`repo_map`, `code_reading`), with every
+    /// raw layer's folder left unbounded. `None` when no bound was given —
+    /// every event counts.
     fn watch_depth(&self) -> Option<WatchDepth> {
         let max = self.max_depth?;
-        let root_of = |il: &IngestLayer| self.workspace.join(&il.folder);
+        let root = self.workspace.root();
         let walked = |il: &&IngestLayer| matches!(il.mode, IngestMode::Folders | IngestMode::Files);
+        let starts = |il: &IngestLayer| -> Vec<PathBuf> {
+            if il.folder.is_empty() {
+                self.workspace
+                    .repos()
+                    .iter()
+                    .filter(|r| !crate::code_read::is_upload_path(&r.name))
+                    .map(|r| r.dir.clone())
+                    .collect()
+            } else {
+                vec![root.join(&il.folder)]
+            }
+        };
         Some(WatchDepth::new(
             max,
-            self.ingest_layers.iter().filter(walked).map(root_of),
+            self.ingest_layers.iter().filter(walked).flat_map(starts),
             self.ingest_layers
                 .iter()
                 .filter(|il| !walked(il))
-                .map(root_of),
+                .map(|il| root.join(&il.folder)),
         ))
     }
 
@@ -2639,7 +2670,7 @@ impl InferenceState {
         let ctx = self.refresh_ctx();
         let (state, n_failed) = crate::code_read::ingest_files(
             &ctx,
-            &self.workspace,
+            self.workspace.root(),
             rel_paths,
             progress,
             &files_layer.name,
@@ -2692,7 +2723,7 @@ impl InferenceState {
             }
             // `path` is workspace-relative with `/` separators; `Path::join`
             // accepts them on win32, and `exists()` is case-insensitive there.
-            if self.workspace.join(&path).exists() {
+            if self.workspace.root().join(&path).exists() {
                 continue;
             }
             match engine.tombstone_timeline(tl) {
@@ -4573,15 +4604,19 @@ impl ZendSession {
     }
 
     pub fn new(config: DaemonConfig, log: Arc<LogBus>) -> Self {
-        let projection_builder = build_projection_builder(&config.workspace);
-        tracing::info!(workspace = %config.workspace.display(), "session initialised");
+        let projection_builder = build_projection_builder(config.workspace.root());
+        tracing::info!(
+            workspace = %config.workspace.root().display(),
+            repos = %config.workspace.names().join(", "),
+            "session initialised",
+        );
         let (ready_tx, _) = tokio::sync::watch::channel(false);
         let (status_tx, _) = tokio::sync::watch::channel(String::new());
         let started_at_ms = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let file_store = ConvFileStore::open(&config.workspace);
+        let file_store = ConvFileStore::open(config.workspace.root());
         Self {
             inference: Arc::new(RwLock::new(None)),
             watcher: Mutex::new(None),
@@ -4603,11 +4638,11 @@ impl ZendSession {
         &self.file_store
     }
 
-    /// The `uploads/` directory in the daemon's workspace — raw uploaded
-    /// files are written here so the workspace watcher and `code_read`
-    /// pick them up like any other source file. Created on demand.
+    /// The uploads repository's folder in the daemon's workspace — raw
+    /// uploaded files are written here, and the model reads them as
+    /// `repo: uploads`. Created when the workspace is opened.
     pub fn uploads_dir(&self) -> PathBuf {
-        self.config.workspace.join("uploads")
+        self.config.workspace.root().join(UPLOADS_REPO)
     }
 
     /// **Phase 1 of the upload pipeline** — write `bytes` to
@@ -4634,7 +4669,7 @@ impl ZendSession {
     /// upload event — a portable, workspace-relative reference, not an
     /// absolute host path.
     pub fn workspace_relative(&self, path: &std::path::Path) -> String {
-        path.strip_prefix(&self.config.workspace)
+        path.strip_prefix(self.config.workspace.root())
             .ok()
             .and_then(|p| p.to_str())
             .map(|s| s.replace('\\', "/"))
@@ -4698,7 +4733,7 @@ impl ZendSession {
     /// on-disk redo log still existing**.
     ///
     /// The gate exists because the dev workflow of wiping the
-    /// `.substrate/` dir behind a running daemon used to leave ghost
+    /// `substrate/` dir behind a running daemon used to leave ghost
     /// conversations in the sidebar: the daemon's in-RAM substrate
     /// kept the old `known_conversations` snapshot even though disk
     /// was empty. With the gate, deleting the log forces the next
@@ -5218,7 +5253,7 @@ impl ZendSession {
     /// is the active one), plus their total byte size. Pure `fs` stat — no lock,
     /// available whether or not the model has finished loading.
     fn substrate_segment_files(&self) -> (Vec<SegmentView>, u64) {
-        let dir = self.config.workspace.join(SUBSTRATE_DIR);
+        let dir = self.config.workspace.root().join(SUBSTRATE_DIR);
         let mut segs: Vec<(u64, u64)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
@@ -5255,9 +5290,9 @@ impl ZendSession {
 
     pub fn list_conversations(&self, include_archived: bool) -> Vec<ConvEntry> {
         // On-disk gate: if the workspace's redo log is gone (no segment files
-        // in `.substrate/`), return empty regardless of the in-RAM cache. The
+        // in `substrate/`), return empty regardless of the in-RAM cache. The
         // daemon keeps running and any new turn re-mints the segment set.
-        let sub_dir = self.config.workspace.join(SUBSTRATE_DIR);
+        let sub_dir = self.config.workspace.root().join(SUBSTRATE_DIR);
         let has_segments = std::fs::read_dir(&sub_dir)
             .ok()
             .map(|rd| {
@@ -5728,6 +5763,7 @@ impl ZendSession {
         let status_tx = self.status_tx.clone();
         let load_progress = Arc::clone(&self.load_progress);
         let workspace = self.config.workspace.clone();
+        let secrets = Arc::clone(&self.config.secrets);
         let disabled_layers = self.config.disabled_layers.clone();
         let skipped_layers = self.config.skipped_layers.clone();
         let wiped_layers = self.config.wiped_layers.clone();
@@ -5821,6 +5857,7 @@ impl ZendSession {
                     model_path,
                     tok_path,
                     workspace,
+                    secrets,
                     disabled_layers,
                     skipped_layers,
                     wiped_layers,
@@ -5908,6 +5945,7 @@ impl ZendSession {
                         if !read_only_substrate {
                             match crate::watcher::spawn(
                                 &state.workspace,
+                                &state.raw_layer_folders(),
                                 state.watch_depth(),
                                 on_refresh,
                                 on_uploads_changed,
@@ -6736,8 +6774,8 @@ mod projection_schema_tests {
 
     /// The turn-sink load plan is DERIVED from the embedded schema's structure —
     /// no `ingest:` annotations: the built-in `repo_map` (folder scan) and
-    /// `code_reading` (file carve) at the workspace root, the live `dialogue`
-    /// layer excluded.
+    /// `code_reading` (file read) over every repository — an empty scope — the
+    /// live `dialogue` layer excluded.
     #[test]
     fn embedded_turn_sinks_are_derived_from_structure() {
         use crate::ingest::IngestMode;
@@ -6756,8 +6794,8 @@ mod projection_schema_tests {
         assert_eq!(
             got,
             vec![
-                ("repo_map", IngestMode::Folders, "."),
-                ("code_reading", IngestMode::Files, "."),
+                ("repo_map", IngestMode::Folders, ""),
+                ("code_reading", IngestMode::Files, ""),
             ],
             "derived turn-sinks: {got:?}"
         );
@@ -6782,7 +6820,7 @@ mod projection_schema_tests {
         use crate::ingest::IngestMode;
         let builder = build_projection_builder(Path::new("demo-project"));
         let mut dirs = HashMap::new();
-        dirs.insert("code_reading".to_string(), "zend/src".to_string());
+        dirs.insert("code_reading".to_string(), "candle/zend/src".to_string());
 
         let layers =
             crate::ingest::ingest_layers(builder.schema(), Path::new("demo-project"), &dirs);
@@ -6790,21 +6828,21 @@ mod projection_schema_tests {
             .iter()
             .find(|l| l.name == "code_reading")
             .expect("code_reading derives");
-        assert_eq!(code.folder, "zend/src", "content root is the override");
+        assert_eq!(code.folder, "candle/zend/src", "the scope is the override");
         assert_eq!(code.mode, IngestMode::Files, "mode is unchanged");
         assert!(
-            code.display.contains("zend/src"),
+            code.display.contains("candle/zend/src"),
             "the scoped root shows in the loading phase label: {:?}",
             code.display
         );
 
-        // An un-overridden layer keeps its derived root.
+        // An un-overridden layer keeps its derived scope: every repository.
         let repo = layers
             .iter()
             .find(|l| l.name == "repo_map")
             .expect("repo_map derives");
-        assert_eq!(repo.folder, ".");
-        assert_eq!(repo.display, "Scanning repository");
+        assert_eq!(repo.folder, "");
+        assert_eq!(repo.display, "Scanning repositories");
     }
 
     /// A coding-agent workspace with a folder matching a declared-but-pipeline-fed

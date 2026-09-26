@@ -3,6 +3,8 @@ mod harness;
 use serde_json::json;
 use zend_tools::ToolContext;
 
+use harness::REPO;
+
 fn ctx() -> ToolContext {
     ToolContext::new()
 }
@@ -29,12 +31,12 @@ fn file_write_unicode() {
     let content = "こんにちは 🌍 — Unicode test";
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "uni.txt", "content": content}),
+        json!({"repo": REPO, "path": "uni.txt", "content": content}),
         &ctx,
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "uni.txt", "page": 0}),
+        json!({"repo": REPO, "path": "uni.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), content);
@@ -44,7 +46,7 @@ fn file_write_unicode() {
 fn file_edit_not_found() {
     let resp = harness::invoke(
         "file_edit",
-        json!({"path": "nonexistent.txt", "patch": "@@ -1 +1 @@\n-x\n+y\n"}),
+        json!({"repo": REPO, "path": "nonexistent.txt", "patch": "@@ -1 +1 @@\n-x\n+y\n"}),
     );
     let detail = harness::expect_error(&resp, "not_found");
     // The refusal names the way to create the file, not only the fault.
@@ -58,7 +60,7 @@ fn file_edit_not_found() {
 fn file_read_of_a_url_points_to_web_fetch() {
     let resp = harness::invoke(
         "file_read",
-        json!({"path": "https://docs.rs/serde/latest/serde/", "page": 0}),
+        json!({"repo": REPO, "path": "https://docs.rs/serde/latest/serde/", "page": 0}),
     );
     let detail = harness::expect_error(&resp, "invalid_arguments");
     assert!(
@@ -73,18 +75,22 @@ fn file_list_within_a_directory() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "alpha/a.txt", "content": "1"}),
+        json!({"repo": REPO, "path": "alpha/a.txt", "content": "1"}),
         &ctx,
     );
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "alpha/b.txt", "content": "2"}),
+        json!({"repo": REPO, "path": "alpha/b.txt", "content": "2"}),
         &ctx,
     );
-    harness::invoke_with_ctx("write", json!({"path": "beta/c.txt", "content": "3"}), &ctx);
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "beta/c.txt", "content": "3"}),
+        &ctx,
+    );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "alpha"}),
+        json!({"repo": REPO, "path": "alpha"}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -97,13 +103,21 @@ fn file_list_within_a_directory() {
 #[test]
 fn file_delete_idempotent() {
     let ctx = ctx();
-    harness::invoke_with_ctx("write", json!({"path": "idem.txt", "content": "x"}), &ctx);
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "idem.txt", "content": "x"}),
+        &ctx,
+    );
     harness::expect_success(harness::invoke_with_ctx(
         "file_delete",
-        json!({"path": "idem.txt"}),
+        json!({"repo": REPO, "path": "idem.txt"}),
         &ctx,
     ));
-    let r2 = harness::invoke_with_ctx("file_delete", json!({"path": "idem.txt"}), &ctx);
+    let r2 = harness::invoke_with_ctx(
+        "file_delete",
+        json!({"repo": REPO, "path": "idem.txt"}),
+        &ctx,
+    );
     harness::expect_error(&r2, "not_found");
 }
 
@@ -112,19 +126,19 @@ fn file_write_overwrite_created_false() {
     let ctx = ctx();
     let r1 = harness::expect_success(harness::invoke_with_ctx(
         "write",
-        json!({"path": "ow.txt", "content": "v1"}),
+        json!({"repo": REPO, "path": "ow.txt", "content": "v1"}),
         &ctx,
     ));
     assert_eq!(r1["created"], true);
     let r2 = harness::expect_success(harness::invoke_with_ctx(
         "write",
-        json!({"path": "ow.txt", "content": "v2"}),
+        json!({"repo": REPO, "path": "ow.txt", "content": "v2"}),
         &ctx,
     ));
     assert_eq!(r2["created"], false);
     let rd = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "ow.txt", "page": 0}),
+        json!({"repo": REPO, "path": "ow.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&rd), "v2");
@@ -135,17 +149,17 @@ fn file_edit_round_trip() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "rt.txt", "content": "hello world"}),
+        json!({"repo": REPO, "path": "rt.txt", "content": "hello world"}),
         &ctx,
     );
     harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "rt.txt", "patch": "@@ -1 +1 @@\n-hello world\n+hello Rust\n"}),
+        json!({"repo": REPO, "path": "rt.txt", "patch": "@@ -1 +1 @@\n-hello world\n+hello Rust\n"}),
         &ctx,
     ));
     let rd = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "rt.txt", "page": 0}),
+        json!({"repo": REPO, "path": "rt.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&rd), "hello Rust");
@@ -156,12 +170,12 @@ fn file_write_read_roundtrip() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "hello.txt", "content": "hello world"}),
+        json!({"repo": REPO, "path": "hello.txt", "content": "hello world"}),
         &ctx,
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "hello.txt", "page": 0}),
+        json!({"repo": REPO, "path": "hello.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), "hello world");
@@ -172,13 +186,13 @@ fn file_write_creates_vs_overwrites() {
     let ctx = ctx();
     let r1 = harness::expect_success(harness::invoke_with_ctx(
         "write",
-        json!({"path": "a.txt", "content": "v1"}),
+        json!({"repo": REPO, "path": "a.txt", "content": "v1"}),
         &ctx,
     ));
     assert_eq!(r1["created"], true);
     let r2 = harness::expect_success(harness::invoke_with_ctx(
         "write",
-        json!({"path": "a.txt", "content": "v2"}),
+        json!({"repo": REPO, "path": "a.txt", "content": "v2"}),
         &ctx,
     ));
     assert_eq!(r2["created"], false);
@@ -186,7 +200,10 @@ fn file_write_creates_vs_overwrites() {
 
 #[test]
 fn file_read_not_found() {
-    let resp = harness::invoke("file_read", json!({"path": "nosuchfile.txt", "page": 0}));
+    let resp = harness::invoke(
+        "file_read",
+        json!({"repo": REPO, "path": "nosuchfile.txt", "page": 0}),
+    );
     harness::expect_error(&resp, "not_found");
 }
 
@@ -195,12 +212,13 @@ fn file_edit_success() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "edit.txt", "content": "foo bar baz"}),
+        json!({"repo": REPO, "path": "edit.txt", "content": "foo bar baz"}),
         &ctx,
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
         json!({
+            "repo": REPO,
             "path": "edit.txt",
             "patch": "@@ -1 +1 @@\n-foo bar baz\n+foo qux baz\n"
         }),
@@ -211,7 +229,7 @@ fn file_edit_success() {
     assert_eq!(resp["hunks_already_applied"], 0);
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "edit.txt", "page": 0}),
+        json!({"repo": REPO, "path": "edit.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), "foo qux baz");
@@ -222,7 +240,7 @@ fn file_edit_ambiguous() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "dup.txt", "content": "aa\nbb\naa\n"}),
+        json!({"repo": REPO, "path": "dup.txt", "content": "aa\nbb\naa\n"}),
         &ctx,
     );
     // `aa` stands one line either side of the hunk's stated position, so the
@@ -230,6 +248,7 @@ fn file_edit_ambiguous() {
     let resp = harness::invoke_with_ctx(
         "file_edit",
         json!({
+            "repo": REPO,
             "path": "dup.txt",
             "patch": "@@ -2 +2 @@\n-aa\n+xx\n"
         }),
@@ -244,17 +263,19 @@ fn file_edit_ambiguous() {
 #[test]
 fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let repo_dir = harness::repo_root(dir.path());
+    std::fs::create_dir_all(repo_dir.join("src")).unwrap();
     let on_disk = "fn main() {\n    let retries = 3;\n    run(retries);\n}\n";
-    std::fs::write(dir.path().join("src/main.rs"), on_disk).unwrap();
-    let ctx = ToolContext::with_workspace(dir.path());
+    std::fs::write(repo_dir.join("src/main.rs"), on_disk).unwrap();
+    let ctx = harness::workspace_ctx(dir.path());
 
     let patch = "@@ -1,3 +1,3 @@\n fn main() {\n-    let retries = 3;\n+    let retries = 30;\n     run(retries);\n";
     let first = harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "src/main.rs", "patch": patch}),
+        json!({"repo": REPO, "path": "src/main.rs", "patch": patch}),
         &ctx,
     ));
+    assert_eq!(first["repo"], REPO);
     assert_eq!(first["path"], "src/main.rs");
     assert_eq!(first["hunks_applied"], 1);
     assert_eq!(first["hunks_already_applied"], 0);
@@ -263,12 +284,12 @@ fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
     let patched = "fn main() {\n    let retries = 30;\n    run(retries);\n}\n";
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), patched.trim_end());
     assert_eq!(
-        std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+        std::fs::read_to_string(repo_dir.join("src/main.rs")).unwrap(),
         on_disk,
         "the file on disk must be byte-for-byte what it was",
     );
@@ -277,7 +298,7 @@ fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
     // substring-replacing edit would leave `retries = 300` here.
     let second = harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "src/main.rs", "patch": patch}),
+        json!({"repo": REPO, "path": "src/main.rs", "patch": patch}),
         &ctx,
     ));
     assert_eq!(second["hunks_applied"], 0);
@@ -285,12 +306,12 @@ fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
     assert_eq!(second["bytes"], 54);
     let reread = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&reread), patched.trim_end());
     assert_eq!(
-        std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+        std::fs::read_to_string(repo_dir.join("src/main.rs")).unwrap(),
         on_disk,
     );
 }
@@ -300,12 +321,15 @@ fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
 #[test]
 fn file_edit_already_applied_does_not_copy_the_file_up() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "[net]\nport = 9090\n").unwrap();
-    let ctx = ToolContext::with_workspace(dir.path());
+    let repo_dir = harness::repo_root(dir.path());
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(repo_dir.join("config.toml"), "[net]\nport = 9090\n").unwrap();
+    let ctx = harness::workspace_ctx(dir.path());
 
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
         json!({
+            "repo": REPO,
             "path": "config.toml",
             "patch": "@@ -1,2 +1,2 @@\n [net]\n-port = 8080\n+port = 9090\n"
         }),
@@ -314,7 +338,11 @@ fn file_edit_already_applied_does_not_copy_the_file_up() {
     assert_eq!(resp["hunks_applied"], 0);
     assert_eq!(resp["hunks_already_applied"], 1);
 
-    let listed = harness::expect_success(harness::invoke_with_ctx("file_list", json!({}), &ctx));
+    let listed = harness::expect_success(harness::invoke_with_ctx(
+        "file_list",
+        json!({"repo": REPO}),
+        &ctx,
+    ));
     let entry = listed["entries"]
         .as_array()
         .unwrap()
@@ -333,10 +361,15 @@ fn file_edit_already_applied_does_not_copy_the_file_up() {
 fn file_edit_writes_nothing_when_one_hunk_fails() {
     let ctx = ctx();
     let before = "alpha\nbeta\ngamma\ndelta\n";
-    harness::invoke_with_ctx("write", json!({"path": "all.txt", "content": before}), &ctx);
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "all.txt", "content": before}),
+        &ctx,
+    );
     let resp = harness::invoke_with_ctx(
         "file_edit",
         json!({
+            "repo": REPO,
             "path": "all.txt",
             "patch": "@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n@@ -3,2 +3,2 @@\n gamma\n-absent\n+new\n"
         }),
@@ -349,7 +382,7 @@ fn file_edit_writes_nothing_when_one_hunk_fails() {
     );
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "all.txt", "page": 0}),
+        json!({"repo": REPO, "path": "all.txt", "page": 0}),
         &ctx,
     ));
     assert_eq!(
@@ -363,10 +396,14 @@ fn file_edit_writes_nothing_when_one_hunk_fails() {
 #[test]
 fn file_edit_rejects_a_patch_that_is_not_a_diff() {
     let ctx = ctx();
-    harness::invoke_with_ctx("write", json!({"path": "p.txt", "content": "a\n"}), &ctx);
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "p.txt", "content": "a\n"}),
+        &ctx,
+    );
     let resp = harness::invoke_with_ctx(
         "file_edit",
-        json!({"path": "p.txt", "patch": "just change a into b"}),
+        json!({"repo": REPO, "path": "p.txt", "patch": "just change a into b"}),
         &ctx,
     );
     harness::expect_error(&resp, "invalid_arguments");
@@ -375,11 +412,19 @@ fn file_edit_rejects_a_patch_that_is_not_a_diff() {
 #[test]
 fn file_list() {
     let ctx = ctx();
-    harness::invoke_with_ctx("write", json!({"path": "a/b.txt", "content": "1"}), &ctx);
-    harness::invoke_with_ctx("write", json!({"path": "a/c.txt", "content": "2"}), &ctx);
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "a/b.txt", "content": "1"}),
+        &ctx,
+    );
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "a/c.txt", "content": "2"}),
+        &ctx,
+    );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"path": "a"}),
+        json!({"repo": REPO, "path": "a"}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -393,10 +438,10 @@ fn file_list() {
 #[test]
 fn file_list_root_is_empty_until_something_is_written() {
     let ctx = ctx();
-    for path in ["", "/", "/workspace/"] {
+    for path in ["", "/"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "path": path }),
+            json!({ "repo": REPO, "path": path }),
             &ctx,
         ));
         assert_eq!(
@@ -413,29 +458,34 @@ fn file_list_root_is_empty_until_something_is_written() {
 #[test]
 fn file_list_of_an_unwritten_directory_is_not_found() {
     let ctx = ctx();
-    for path in ["/workspace/src", "candle-examples/"] {
-        let resp = harness::invoke_with_ctx("file_list", json!({ "path": path }), &ctx);
+    for path in ["src", "candle-examples/"] {
+        let resp =
+            harness::invoke_with_ctx("file_list", json!({ "repo": REPO, "path": path }), &ctx);
         harness::expect_error(&resp, "not_found");
     }
 }
 
-/// `/` normalizes to the empty path, so it lists the workspace root rather
+/// `/` normalizes to the empty path, so it lists the repository root rather
 /// than erroring or resolving to a real filesystem root. One level deep: the
 /// root-level file lists directly, the nested file's directory collapses to
 /// its own entry rather than reaching all the way down to the leaf.
 #[test]
 fn file_list_root_path_lists_one_level() {
     let ctx = ctx();
-    harness::invoke_with_ctx("write", json!({"path": "a.txt", "content": "1"}), &ctx);
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "nested/deep/b.txt", "content": "22"}),
+        json!({"repo": REPO, "path": "a.txt", "content": "1"}),
+        &ctx,
+    );
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "nested/deep/b.txt", "content": "22"}),
         &ctx,
     );
     for path in ["/", ""] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "path": path }),
+            json!({ "repo": REPO, "path": path }),
             &ctx,
         ));
         let entries = resp["entries"].as_array().unwrap();
@@ -452,29 +502,26 @@ fn file_list_root_path_lists_one_level() {
     }
 }
 
-/// `/workspace` is the mount point of the working directory, so it normalises
-/// away: a path written as `/workspace/src/main.rs` and one written as
-/// `src/main.rs` are the same entry, and either spelling of the directory
-/// path selects it. This is what lets the tool definitions' `/workspace/...`
-/// examples address the same files as the bare repo-relative paths a model
-/// infers from a repo map.
+/// A leading slash and a `.` segment both normalise to the same entry as the
+/// bare relative path — plain path normalisation, not a special mount alias
+/// (no segment is special; see `VfsStore::normalize`).
 #[test]
-fn workspace_mount_path_normalises_to_the_same_entry() {
+fn leading_slash_and_dot_segments_normalise_to_the_same_entry() {
     let ctx = ctx();
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "/workspace/src/main.rs", "content": "fn main() {}\n"}),
+        json!({"repo": REPO, "path": "src/main.rs", "content": "fn main() {}\n"}),
         &ctx,
     );
     harness::invoke_with_ctx(
         "write",
-        json!({"path": "README.md", "content": "# hi\n"}),
+        json!({"repo": REPO, "path": "README.md", "content": "# hi\n"}),
         &ctx,
     );
-    for path in ["/workspace/src", "src/", "/src"] {
+    for path in ["src", "src/", "/src", "./src", "src/../src"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "path": path }),
+            json!({ "repo": REPO, "path": path }),
             &ctx,
         ));
         let entries = resp["entries"].as_array().unwrap();
@@ -484,7 +531,7 @@ fn workspace_mount_path_normalises_to_the_same_entry() {
     // The same file resolves under either spelling.
     let bare = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&bare), "fn main() {}");
@@ -493,24 +540,37 @@ fn workspace_mount_path_normalises_to_the_same_entry() {
 #[test]
 fn file_delete() {
     let ctx = ctx();
-    harness::invoke_with_ctx("write", json!({"path": "del.txt", "content": "bye"}), &ctx);
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "del.txt", "content": "bye"}),
+        &ctx,
+    );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_delete",
-        json!({"path": "del.txt"}),
+        json!({"repo": REPO, "path": "del.txt"}),
         &ctx,
     ));
     assert_eq!(resp["deleted"], true);
-    let r2 = harness::invoke_with_ctx("file_delete", json!({"path": "del.txt"}), &ctx);
+    let r2 = harness::invoke_with_ctx(
+        "file_delete",
+        json!({"repo": REPO, "path": "del.txt"}),
+        &ctx,
+    );
     harness::expect_error(&r2, "not_found");
 }
 
 #[test]
 fn file_present_found_and_missing() {
     let ctx = ctx();
-    harness::invoke_with_ctx("write", json!({"path": "p.txt", "content": "hi"}), &ctx);
+    harness::invoke_with_ctx(
+        "write",
+        json!({"repo": REPO, "path": "p.txt", "content": "hi"}),
+        &ctx,
+    );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_present",
         json!({
+            "repo": REPO,
             "paths": ["p.txt", "missing.txt"]
         }),
         &ctx,
@@ -523,6 +583,6 @@ fn file_present_found_and_missing() {
 
 #[test]
 fn file_present_all_missing() {
-    let resp = harness::invoke("file_present", json!({"paths": ["nope.txt"]}));
+    let resp = harness::invoke("file_present", json!({"repo": REPO, "paths": ["nope.txt"]}));
     harness::expect_error(&resp, "no_files_found");
 }

@@ -26,12 +26,16 @@ questions:
 - read back the notes file from this session
 category: Files
 mandatory: true
-description: 'Read a file, one 200-line page at a time. Resolves against this session''s edits first, then falls through to the project''s working directory, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Both path and page are required — pass page 0 to read the top of the file (and a short file''s whole content). Page is zero-based, so page 1 is lines 201-400, page 2 is 401-600, and so on. Returns the page as numbered source in a fenced block, headed by the path, the page and total page count, and the line range covered — `(page 1 of 5, lines 201-400 of 940)`. Keep incrementing page until the header''s page number stops advancing. There is no need to find a file''s length before reading it: read page 0 and the header reports it. To find the line worth reading, use file_grep rather than paging a large file looking for it. For remote filesystems use remote_fs_session_get to download first, then file_read.'
+description: 'Read a file, one 200-line page at a time. Resolves against this session''s edits first, then falls through to the repository on disk, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. The repo, the path within it, and the page are all required — pass page 0 to read the top of the file (and a short file''s whole content). Page is zero-based, so page 1 is lines 201-400, page 2 is 401-600, and so on. Returns the page as numbered source in a fenced block, headed by the path, the repo, the page and total page count, and the line range covered — `src/lib.rs in candle (page 1 of 5, lines 201-400 of 940)`. Keep incrementing page until the header''s page number stops advancing. There is no need to find a file''s length before reading it: read page 0 and the header reports it. To find the line worth reading, use file_grep rather than paging a large file looking for it. For remote filesystems use remote_fs_session_get to download first, then file_read. **This reads the file as it stands on disk right now, uncommitted edits included.** For the file as a COMMIT, BRANCH or TAG holds it — "show me this file as of that commit", "what did it look like on the release branch" — use git_show with `what: file`. **A repository''s `.git/` folder is refused outright**: for branches, tags, remotes or counts of them use git_refs, for history git_log, and for a file at a revision git_show — never `.git/packed-refs`, `.git/refs/…` or `.git/config`, which are a database rather than text and give wrong answers when read as files.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
+    repo:
+      description: The repository the file belongs to. Required.
+      minLength: 1
+      type: string
     path:
-      description: Path of the file to read — a project file from the working directory, or one this session created (e.g. `src/main.rs`, or `/workspace/src/main.rs`). Required.
+      description: Path of the file to read, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
       minLength: 1
       type: string
     page:
@@ -40,187 +44,188 @@ parameters:
       minimum: 0.0
       type: integer
   required:
+  - repo
   - path
   - page
   title: ReadRequest
   type: object
 examples:
 - |-
-  show me the contents of /workspace/Cargo.toml<|im_end|>
+  show me the contents of Cargo.toml<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants to see /workspace/Cargo.toml. No specific location was named, so I start at page 0 — the top of the file, and all of it if it's short.<|projection|> file_read requires both path and page, so I pass 0 explicitly. The header states the page and the lines it covers.
+  The user wants to see Cargo.toml. No repository was named, so the workspace's generic app repository is where a bare Cargo.toml at the root would live. No specific location was named either, so I start at page 0 — the top of the file, and all of it if it's short.<|projection|> file_read requires repo, path and page, so I pass 0 explicitly. The header states the repo, the page and the lines it covers.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/Cargo.toml", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "Cargo.toml", "page": 0}}
   </tool_call><|projection|>
 - |-
-  read the file /workspace/src/main.rs<|im_end|>
+  read the file src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A direct read of /workspace/src/main.rs. No location was named, so I start at page 0,<|projection|> numbered so I can point at specific lines. If the header says there's more than one page I'll ask for the next.
+  A direct read of src/main.rs. No repository was named, so the workspace's app repository holds the generic src/main.rs entry point. No page location was named either, so I start at page 0,<|projection|> numbered so I can point at specific lines. If the header says there's more than one page I'll ask for the next.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/src/main.rs", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
-  what's in /workspace/.gitignore<|im_end|>
+  what's in .gitignore<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user asks what /workspace/.gitignore contains. That's a page-0 read, so file_read with path and page 0 — a .gitignore<|projection|> is short, and it's all on the first page.
+  The user asks what .gitignore contains, without naming a repository — the workspace's app repository is the generic one a bare root file like this belongs to. That's a page-0 read, so file_read with repo, path and page 0 — a .gitignore<|projection|> is short, and it's all on the first page.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/.gitignore", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": ".gitignore", "page": 0}}
   </tool_call><|projection|>
 - |-
-  cat /workspace/docs/architecture.md for me<|im_end|>
+  cat docs/architecture.md for me<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  "cat" means show the file, which is what file_read returns a page of. The call names /workspace/docs/architecture.md<|projection|> and page 0, since no specific spot was named.
+  "cat" means show the file, which is what file_read returns a page of. No repository was named, so the workspace's generic app repository is where this docs/architecture.md sits. The call names repo app, path docs/architecture.md,<|projection|> and page 0, since no specific spot was named.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "/workspace/docs/architecture.md", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "docs/architecture.md", "page": 0}}
   </tool_call><|projection|>
 - |-
   read src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants the contents of src/main.rs. file_read resolves a path against this session's edits first and then falls through to the project's working directory, so it will return the<|projection|> real file's page 0. No location was named, so path plus page 0, and the top of the file comes back.
+  The user wants the contents of src/main.rs, without naming a repository — the workspace's app repository holds the generic src/main.rs. file_read resolves a path against this session's edits first and then falls through to the repository on disk, so it will return the<|projection|> real file's page 0. No location was named, so repo plus path plus page 0, and the top of the file comes back.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
   what does the README say<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user is asking about the README's contents. That means actually reading it rather than guessing, so file_read on README.md.<|projection|> Page 0, since nothing narrower was named — that's the whole README unless the header says there's more.
+  The user is asking about the README's contents, without naming a repository — the workspace's app repository is the generic one holding a root README. That means actually reading it rather than guessing, so file_read on README.md.<|projection|> Page 0, since nothing narrower was named — that's the whole README unless the header says there's more.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "README.md", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "README.md", "page": 0}}
   </tool_call><|projection|>
 - |-
   show me the first 30 lines of src/lib.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Only the top of src/lib.rs is wanted. Lines 1-30 sit inside page 0, which covers lines 1-200,<|projection|> so the call names path and page 0, and I'll read the first 30 numbered lines out of what comes back.
+  Only the top of src/lib.rs is wanted, and no repository was named — the workspace's app repository is where this generic src/lib.rs belongs. Lines 1-30 sit inside page 0, which covers lines 1-200,<|projection|> so the call names repo, path and page 0, and I'll read the first 30 numbered lines out of what comes back.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/lib.rs", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/lib.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
   read lines 47 to 93 of src/auth/handler.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user named a range. Lines 47-93 both fall inside page 0 — the first 200 lines — so page 0 covers them; file_read pages, it doesn't take an arbitrary range.<|projection|> The numbered lines in the response let me point at exactly 47-93 when I answer.
+  The user named a range but no repository — the workspace's app repository holds this generic src/auth/handler.rs. Lines 47-93 both fall inside page 0 — the first 200 lines — so page 0 covers them; file_read pages, it doesn't take an arbitrary range.<|projection|> The numbered lines in the response let me point at exactly 47-93 when I answer.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
   what does line 450 of zend/src/prompts/projection.yaml do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Line 450 is past the first 200-line page. Page 0 is lines 1-200, page 1 is lines 201-400, page 2 is lines 401-600 — 450 falls in page 2,<|projection|> so I ask for that page directly rather than paging through pages 0 and 1 first.
+  The path names zend/src/prompts, which is this candle codebase's daemon crate, so the repo is candle. Line 450 is past the first 200-line page. Page 0 is lines 1-200, page 1 is lines 201-400, page 2 is lines 401-600 — 450 falls in page 2,<|projection|> so I ask for that page directly rather than paging through pages 0 and 1 first.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/prompts/projection.yaml", "page": 2}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/prompts/projection.yaml", "page": 2}}
   </tool_call><|projection|>
 - |-
   the error mentions line 240 of src/server.rs, let me see it<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The error points at line 240, which is inside page 1 (lines 201-400),<|projection|> so reading page 1 shows the failing line with plenty of context around it.
+  No repository was named, so the workspace's generic app repository holds this src/server.rs. The error points at line 240, which is inside page 1 (lines 201-400),<|projection|> so reading page 1 shows the failing line with plenty of context around it.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "page": 1}}
   </tool_call><|projection|>
 - |-
   what's around line 850 in that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Line 850 is well past the first few pages: page 0 covers 1-200, page 1 covers 201-400, page 2 covers 401-600, page 3 covers 601-800, page 4 covers 801-1000 — 850 is in page 4.<|projection|>
+  "That file" is still src/server.rs in the app repo from the read above. Line 850 is well past the first few pages: page 0 covers 1-200, page 1 covers 201-400, page 2 covers 401-600, page 3 covers 601-800, page 4 covers 801-1000 — 850 is in page 4.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/server.rs", "page": 4}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "page": 4}}
   </tool_call><|projection|>
 - |-
   show me the rest of that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The previous read was page 0 of src/auth/handler.rs and its header reported more pages after it, so "the rest" means the next page.<|projection|> I increment page by one and keep doing that until a response's own page number stops advancing.
+  The previous read was page 0 of src/auth/handler.rs in the app repo and its header reported more pages after it, so "the rest" means the next page.<|projection|> I increment page by one and keep doing that until a response's own page number stops advancing.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/auth/handler.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "page": 1}}
   </tool_call><|projection|>
 - |-
   what does zend/src/session.rs set up at startup<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Nobody named a page, so I choose one from what the question is about. session.rs is one of the largest modules in the daemon and startup lives at the top — the module doc,<|projection|> the imports and the constants — so page 0 is where the answer should be. The header reports the file's total pages, so if it is not there I know how much is left and can read on.
+  The path names zend/src, which is the candle workspace's daemon crate, so the repo is candle. Nobody named a page, so I choose one from what the question is about. session.rs is one of the largest modules in the daemon and startup lives at the top — the module doc,<|projection|> the imports and the constants — so page 0 is where the answer should be. The header reports the file's total pages, so if it is not there I know how much is left and can read on.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/session.rs", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/session.rs", "page": 0}}
   </tool_call><|projection|>
 - |-
   so what does that function actually do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The search above put reconcile_wave_offsets at line 412 of candle-conversation/src/wave/stager.rs. (412 - 1) / 200 is page 2, so that page catches the signature and the body<|projection|> — page 0 or 1 would miss it entirely. If the body runs past the page the header's total will say so and I can read on.
+  The search above put reconcile_wave_offsets at line 412 of candle-conversation/src/wave/stager.rs, in the candle repo. (412 - 1) / 200 is page 2, so that page catches the signature and the body<|projection|> — page 0 or 1 would miss it entirely. If the body runs past the page the header's total will say so and I can read on.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "candle-conversation/src/wave/stager.rs", "page": 2}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "candle-conversation/src/wave/stager.rs", "page": 2}}
   </tool_call><|projection|>
 - |-
   that page cut off before the match arm, show me more<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Page 2 covered lines 401-600 of 1,240 and the match it belongs to continues past line 600, so the arm is on the next page.<|projection|> Pages are fixed strides, not a range I can widen, so I read on rather than re-asking for a wider window.
+  Page 2 of candle-conversation/src/wave/stager.rs in the candle repo covered lines 401-600 of 1,240 and the match it belongs to continues past line 600, so the arm is on the next page.<|projection|> Pages are fixed strides, not a range I can widen, so I read on rather than re-asking for a wider window.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "candle-conversation/src/wave/stager.rs", "page": 3}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "candle-conversation/src/wave/stager.rs", "page": 3}}
   </tool_call><|projection|>
 - |-
   compare src/main.rs, src/lib.rs and Cargo.toml for me<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Three files, all named, and none of the reads depends on another's result — so they are one reply with three calls, not three replies. Each is likely short, so page 0 of each;<|projection|> any header that reports more pages tells me where to read on.
+  Three files, all named, none pointing at a specific repository, so the workspace's generic app repository is where these generic root paths belong. None of the reads depends on another's result — so they are one reply with three calls, not three replies. Each is likely short, so page 0 of each;<|projection|> any header that reports more pages tells me where to read on.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "src/main.rs", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "page": 0}}
   </tool_call>
   <tool_call>
-  {"name": "file_read", "arguments": {"path": "src/lib.rs", "page": 0}}
+  {"name": "file_read", "arguments": {"repo": "app", "path": "src/lib.rs", "page": 0}}
   </tool_call>
   <tool_call>
-  {"name": "file_read", "arguments": {"path": "Cargo.toml", "page": 0}}
+  {"name": "file_read", "arguments": {"repo": "app", "path": "Cargo.toml", "page": 0}}
   </tool_call><|projection|>
 - |-
   so how do the two parsers in that listing differ<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The listing above named zend/src/code_read/parsers/rust.rs and zend/src/code_read/parsers/python.rs. Comparing them needs both, and I already know both paths, so I read them together rather than one now and the other next turn.<|projection|> The top of each file is where the parser's entry point and its types are declared, so page 0 of each.
+  The listing above named zend/src/code_read/parsers/rust.rs and zend/src/code_read/parsers/python.rs, both in the candle repo. Comparing them needs both, and I already know both paths, so I read them together rather than one now and the other next turn.<|projection|> The top of each file is where the parser's entry point and its types are declared, so page 0 of each.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"path": "zend/src/code_read/parsers/rust.rs", "page": 0}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/code_read/parsers/rust.rs", "page": 0}}
   </tool_call>
   <tool_call>
-  {"name": "file_read", "arguments": {"path": "zend/src/code_read/parsers/python.rs", "page": 0}}
+  {"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/code_read/parsers/python.rs", "page": 0}}
   </tool_call><|projection|>

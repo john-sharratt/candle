@@ -1,4 +1,4 @@
-//! The segmented redo log — the on-disk file set under `.substrate/`.
+//! The segmented redo log — the on-disk file set under `substrate/`.
 //!
 //! The redo log is a set of ~4 GB **segment** files, not one monolithic
 //! file (`docs/archived/segmented_substrate_log.md`). Every segment is a `seg-<id>.log`
@@ -279,7 +279,7 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Scan `.substrate/` for segment files. First **adopts** any legacy
+/// Scan `substrate/` for segment files. First **adopts** any legacy
 /// `seg-<id>.active` into the single `.log` naming (a `.active` file predates
 /// the active/sealed rename being retired — the active is now just the
 /// highest-id `.log`). Returns every segment id, ascending; the caller takes
@@ -714,7 +714,7 @@ impl SegmentedLog {
         Ok(())
     }
 
-    /// The `.substrate/` directory this segment set lives in.
+    /// The `substrate/` directory this segment set lives in.
     pub fn dir(&self) -> &Path {
         &self.dir
     }

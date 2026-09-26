@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use candle_conversation::persistence::SUBSTRATE_DIR;
 use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use sha2::{Digest, Sha256};
@@ -59,10 +60,10 @@ pub const MAX_DEBOUNCE_HOLD: Duration = Duration::from_secs(5);
 /// of startup. In memory only, that half hour was paid **on every boot**, for
 /// work already in the substrate.
 ///
-/// It lives *inside* `.substrate/`, deliberately: the ledger's claim is "this
+/// It lives *inside* `substrate/`, deliberately: the ledger's claim is "this
 /// document is already a turn in there", so wiping the substrate has to wipe the
 /// ledger with it. Beside the substrate rather than inside, a `rm -rf
-/// .substrate` would leave a ledger asserting turns that no longer exist, and
+/// substrate` would leave a ledger asserting turns that no longer exist, and
 /// the next boot would skip every document and stand up a cast that knows
 /// nothing — with a green loading screen.
 #[derive(Debug, Default)]
@@ -104,7 +105,7 @@ pub enum Reconcile {
 
 /// The ledger's file, inside the substrate directory it describes.
 pub fn ledger_path(data: &Path) -> PathBuf {
-    data.join(".substrate").join("ingest-ledger.json")
+    data.join(SUBSTRATE_DIR).join("ingest-ledger.json")
 }
 
 impl Ledger {
@@ -306,7 +307,7 @@ fn hash(content: &str) -> String {
 pub fn is_ingestible(path: &Path) -> bool {
     if path
         .components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some(".git") | Some(".substrate")))
+        .any(|c| matches!(c.as_os_str().to_str(), Some(".git") | Some(SUBSTRATE_DIR)))
     {
         return false;
     }
@@ -349,7 +350,7 @@ pub fn walk(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 fn is_ingestible_dir(path: &Path) -> bool {
     !matches!(
         path.file_name().and_then(|n| n.to_str()),
-        Some(".git") | Some(".substrate") | Some("node_modules") | Some("target")
+        Some(".git") | Some(SUBSTRATE_DIR) | Some("node_modules") | Some("target")
     )
 }
 
@@ -533,9 +534,9 @@ mod tests {
     /// itself — which grows without bound and is very confusing to watch.
     #[test]
     fn the_substrate_and_git_are_never_ingested() {
-        assert!(!is_ingestible(Path::new(".substrate/seg-1.log")));
+        assert!(!is_ingestible(Path::new("substrate/seg-1.log")));
         assert!(!is_ingestible(Path::new("mind/.git/config.yaml")));
-        assert!(!is_ingestible(Path::new(".substrate/x.yaml")));
+        assert!(!is_ingestible(Path::new("substrate/x.yaml")));
     }
 
     /// The common case during an editing session is that nothing moved, and it
@@ -793,8 +794,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    /// It lives *inside* `.substrate/`, so wiping the substrate wipes the
-    /// ledger. Beside it, a `rm -rf .substrate` would leave a ledger asserting
+    /// It lives *inside* `substrate/`, so wiping the substrate wipes the
+    /// ledger. Beside it, a `rm -rf substrate` would leave a ledger asserting
     /// turns that no longer exist and the next boot would skip every document —
     /// standing up a cast that knows nothing, behind a green loading screen.
     #[test]
@@ -802,9 +803,9 @@ mod tests {
         let data = Path::new("/data");
         assert_eq!(
             ledger_path(data),
-            Path::new("/data/.substrate/ingest-ledger.json")
+            Path::new("/data/substrate/ingest-ledger.json")
         );
-        assert!(ledger_path(data).starts_with(data.join(".substrate")));
+        assert!(ledger_path(data).starts_with(data.join(SUBSTRATE_DIR)));
     }
 
     /// A ledger with no path is in-memory and must not try to write.

@@ -111,8 +111,10 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 
 /// The name of the per-working-directory persistence subdirectory. Holds the
 /// segmented redo log (`seg-*.log` sealed, one `seg-*.active`) — see
-/// [`segmented_log`].
-pub const SUBSTRATE_DIR: &str = ".substrate";
+/// [`segmented_log`]. It is visible, not a dot-directory: it sits in a
+/// workspace folder beside the repositories it serves, not inside one of them.
+/// Every path to it is built from this constant, never from a literal.
+pub const SUBSTRATE_DIR: &str = "substrate";
 
 /// A plain character record, for the tests in this module and in
 /// [`maintenance`] that need one to survive something.
@@ -177,7 +179,7 @@ pub(crate) fn dir_fingerprint(dir: &Path) -> Vec<(String, u64, [u8; 32])> {
 /// A substrate the host process opened, for the engine to adopt rather than
 /// open a second time.
 ///
-/// **One process, one writable handle per `.substrate/`.** [`log_file::LogFile::open`]
+/// **One process, one writable handle per `substrate/`.** [`log_file::LogFile::open`]
 /// takes the file read-write and takes no lock, so a second
 /// [`SubstratePersistence`] over the same directory is a second append cursor
 /// *and* a second [`SubstratePersistence::npc_locs`] view. The two writers
@@ -245,7 +247,7 @@ impl SharedSubstrate {
     ///
     /// For a tool that reads a workspace another process — the daemon — may be
     /// writing to at the same time. The store must already exist, and nothing
-    /// under `dir/.substrate/` is created, renamed, deleted, truncated, grown or
+    /// under `dir/substrate/` is created, renamed, deleted, truncated, grown or
     /// written for as long as the pair lives. Everything in RAM behaves as it
     /// does on a writable substrate; only the durable side is absent — see
     /// [`SubstratePersistence::open_in_with_substrate_read_only`].
@@ -262,12 +264,12 @@ impl SharedSubstrate {
 ///
 /// Persistence is mandatory: a substrate cannot exist without one.
 ///
-/// **Exactly one of these may exist per `.substrate/` directory in a process.**
+/// **Exactly one of these may exist per `substrate/` directory in a process.**
 /// See [`SharedSubstrate`] for what a second one costs and how a host that
 /// needs its own writes avoids opening it.
 pub struct SubstratePersistence {
     /// The segmented redo log — the active append segment plus the sealed
-    /// segment set under `.substrate/`. Replaces the single monolithic log:
+    /// segment set under `substrate/`. Replaces the single monolithic log:
     /// reads route to the segment holding each record by `(segment, offset)`.
     segments: SegmentedLog,
     manifest: Manifest,
@@ -508,7 +510,7 @@ pub const COMPACTION_DEAD_RATIO_THRESHOLD: f32 = 0.5;
 pub const COMPACTION_MIN_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 impl SubstratePersistence {
-    /// Open the persistence layer at `<cwd>/.substrate/substrate.log`,
+    /// Open the persistence layer at `<cwd>/substrate/substrate.log`,
     /// creating the directory and file if absent and recovering the
     /// manifest if present.
     pub fn open() -> Result<SubstratePersistence> {
@@ -516,7 +518,7 @@ impl SubstratePersistence {
         SubstratePersistence::open_in(&cwd)
     }
 
-    /// Open the persistence layer at `<dir>/.substrate/` (the segment set).
+    /// Open the persistence layer at `<dir>/substrate/` (the segment set).
     pub fn open_in(dir: &Path) -> Result<SubstratePersistence> {
         Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, |_| {})
     }
@@ -544,7 +546,7 @@ impl SubstratePersistence {
 
     /// As [`Self::open_in_with_substrate`], but **read-only**: the segment set
     /// is opened with [`SegmentedLog::open_read_only_with_sink`], so nothing
-    /// under `<dir>/.substrate/` is ever created, renamed, deleted, truncated,
+    /// under `<dir>/substrate/` is ever created, renamed, deleted, truncated,
     /// grown or written through this handle, and the store must already exist.
     ///
     /// Every durable operation keeps its signature and answers without
@@ -589,7 +591,7 @@ impl SubstratePersistence {
     }
 
     /// Open over an ordered list of paths. The last entry is the active,
-    /// writable **segment directory** (`.substrate/`); every earlier entry is
+    /// writable **segment directory** (`substrate/`); every earlier entry is
     /// an inherited read-only single-file log, loaded through the shared
     /// cache (§13.5).
     pub fn open_concat(logs: &[PathBuf]) -> Result<SubstratePersistence> {
@@ -599,7 +601,7 @@ impl SubstratePersistence {
         Self::from_dir_with_sink(active_dir, inherited, false, |_| {})
     }
 
-    /// Open the segment set in `dir` (the `.substrate/` directory) with the
+    /// Open the segment set in `dir` (the `substrate/` directory) with the
     /// listed inherited single-file logs, driving every recovered record
     /// through `sink` in the same pass that builds the manifest and the
     /// dead-weight accounting. `read_only` opens the segment set with
@@ -1059,7 +1061,7 @@ impl SubstratePersistence {
 
     /// Every character's current record location, keyed by `npc_id`.
     ///
-    /// The `.substrate/` directory this store's segments live in.
+    /// The `substrate/` directory this store's segments live in.
     pub fn dir(&self) -> &Path {
         self.segments.dir()
     }

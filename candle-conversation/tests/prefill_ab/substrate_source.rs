@@ -13,9 +13,9 @@
 //! (finite output, determinism across a reset-and-rerun).
 //!
 //! Gated behind the `ZEN_PREFILL_AB_SUBSTRATE` env var — the **workspace**
-//! directory (the parent that CONTAINS `.substrate/`; `open_in_with_
-//! substrate` appends `.substrate/substrate.log` itself, and will silently
-//! create an empty log if handed the `.substrate` dir directly). The tests
+//! directory (the parent that CONTAINS `substrate/`; `open_in_with_
+//! substrate` appends `substrate/substrate.log` itself, and will silently
+//! create an empty log if handed the `substrate` dir directly). The tests
 //! are `#[ignore]`d so CI without a substrate skips them:
 //!
 //! ```text

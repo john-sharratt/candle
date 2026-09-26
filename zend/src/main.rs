@@ -1,10 +1,11 @@
 //! `zend` — Zen Code daemon.
 //!
-//! Run from the root of your workspace:
+//! Run from a workspace folder — one holding a `workspace.yaml` that lists the
+//! repositories (folders beside it) in scope:
 //!
 //! ```text
 //! zend                        # workspace = cwd, port 8080
-//! zend /path/to/project       # explicit workspace path
+//! zend /path/to/workspace     # explicit workspace path
 //! zend --port 9090            # custom port
 //! ```
 //!
@@ -28,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use candle_conversation::models::Model;
+use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::relief_trace;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -48,16 +50,19 @@ use zend::session::ZendSession;
     long_about = None,
 )]
 struct Cli {
-    /// Root of the workspace to analyse.  Defaults to the current directory.
+    /// The workspace folder: it holds `workspace.yaml`, which lists the
+    /// repositories in scope (folders beside it), and the daemon's `substrate/`.
+    /// Defaults to the current directory.
     #[arg(default_value = ".")]
     workspace: PathBuf,
 
-    /// Override the daemon's working directory — where `.substrate` and an
-    /// optional `projection.yaml` live. The daemon operates against this dir
-    /// WITHOUT changing the terminal's cwd (paths are config-scoped, not a
-    /// process `chdir`). Created if it doesn't exist. Takes precedence over the
-    /// positional workspace. Use it to run a separate, uncommitted "mind" with
-    /// its own substrate + tuned projection schema, e.g. `--working-dir ../mind`.
+    /// Override the daemon's working directory — the workspace folder, where
+    /// `workspace.yaml`, `substrate/` and an optional `projection.yaml` live.
+    /// The daemon operates against this dir WITHOUT changing the terminal's cwd
+    /// (paths are config-scoped, not a process `chdir`). Created if it doesn't
+    /// exist. Takes precedence over the positional workspace. Use it to run a
+    /// separate "mind" with its own substrate + tuned projection schema, e.g.
+    /// `--working-dir ../mind`.
     #[arg(long)]
     working_dir: Option<PathBuf>,
 
@@ -121,19 +126,20 @@ struct Cli {
     #[arg(long = "wipe-layer", value_name = "NAME")]
     wipe_layer: Vec<String>,
 
-    /// Override the content root a derived ingest layer reads from, as
-    /// `<layer>=<path>`. Repeatable (e.g. `--ingest-dir code_reading=zend/src
-    /// --ingest-dir repo_map=zend`). The path is relative to the workspace, or
-    /// absolute. Scopes an ingest to a subtree so a rebuilt substrate stays
-    /// small instead of absorbing the whole workspace; pair with
-    /// `--disable-layer` to skip a layer outright.
+    /// Override the folder a derived ingest layer reads from, as
+    /// `<layer>=<path>`. Repeatable (e.g. `--ingest-dir
+    /// code_reading=candle/zend/src --ingest-dir repo_map=candle/zend`). The
+    /// path is relative to the workspace folder; for `repo_map` and
+    /// `code_reading` it names a folder inside one repository. Scopes an ingest
+    /// to a subtree so a rebuilt substrate stays small instead of absorbing
+    /// every repository; pair with `--disable-layer` to skip a layer outright.
     #[arg(long = "ingest-dir", value_name = "LAYER=PATH")]
     ingest_dir: Vec<String>,
 
     /// Bound how deep the `repo_map` and `code_reading` layers read, in path
-    /// components below each layer's content root — `1` is the root's own
-    /// files, `2` adds one folder down (`src/main.rs`), and so on, like
-    /// `find -maxdepth`. Applies to the startup ingest, the watcher-driven
+    /// components below each repository's root (or a layer's `--ingest-dir`
+    /// folder) — `1` is the root's own files, `2` adds one folder down
+    /// (`src/main.rs`), and so on, like `find -maxdepth`. Applies to the startup ingest, the watcher-driven
     /// refresh and the watcher itself: nothing deeper is read, and filesystem
     /// events deeper down are ignored.
     ///
@@ -153,7 +159,7 @@ struct Cli {
     #[arg(long)]
     compact_substrate: bool,
 
-    /// DESTRUCTIVE: delete the working dir's `.substrate` directory (redo-log
+    /// DESTRUCTIVE: delete the working dir's `substrate` directory (redo-log
     /// segments, logs — the daemon's entire persistent memory) before loading,
     /// so this run starts from a blank substrate. Exists precisely so scripts
     /// and test harnesses never have to `rm -rf` a substrate path themselves —
@@ -222,6 +228,13 @@ struct Cli {
     /// email while it is set.
     #[arg(long, value_name = "EMAIL")]
     local_signin: Option<String>,
+
+    /// The secrets file holding the API keys and tokens zend presents to
+    /// third-party services (`tavily_api_key`, `github_token`). Defaults to
+    /// `~/.zend/secrets.yaml`; name another file to keep it elsewhere. A named
+    /// file that does not exist fails the launch.
+    #[arg(long, value_name = "PATH")]
+    secrets: Option<PathBuf>,
 }
 
 /// A `--model` value: the preset whose variant name it is.
@@ -299,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // `--working-dir` (if given) is the workspace; otherwise the positional path.
-    // Create it first so a fresh mind directory has somewhere for `.substrate` and
+    // Create it first so a fresh mind directory has somewhere for `substrate` and
     // `projection.yaml` to land, then canonicalize to an absolute path.
     let ws_arg = cli
         .working_dir
@@ -311,15 +324,15 @@ async fn main() -> anyhow::Result<()> {
             ws_arg.display()
         );
     }
-    let workspace = ws_arg.canonicalize().unwrap_or(ws_arg);
+    let root = ws_arg.canonicalize().unwrap_or(ws_arg);
 
     // ── `--wipe-substrate`: explicit-flag-only substrate deletion ─────────────
     //
-    // Runs BEFORE logging init (the file layer writes into `.substrate/`), so
+    // Runs BEFORE logging init (the file layer writes into `substrate/`), so
     // the wipe is complete before anything re-creates the directory. Only the
-    // resolved working dir's own `.substrate` is touched.
+    // resolved working dir's own `substrate` is touched.
     if cli.wipe_substrate {
-        wipe_substrate(&workspace)?;
+        wipe_substrate(&root)?;
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
@@ -327,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
     // Three fmt layers sharing the same filter:
     //  • stdout    — ANSI colours for the terminal
     //  • broadcast — plain text piped to the web log pane via WebSocket
-    //  • file      — the full configured stream to <workspace>/.substrate/zend.log,
+    //  • file      — the full configured stream to <workspace>/substrate/zend.log,
     //                fresh per run, size-capped with rotation (see `log_file`).
 
     let log = LogBus::new();
@@ -368,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Checked BEFORE `RotatingFileLog::new`, which consumes the marker — see
     // `log_file::is_resuming`.
-    let substrate_dir = workspace.join(".substrate");
+    let substrate_dir = root.join(SUBSTRATE_DIR);
     let resumed_after_self_heal = log_file::is_resuming(&substrate_dir);
 
     // None (open failure) degrades to the stdout + bus sinks rather than
@@ -392,6 +405,25 @@ async fn main() -> anyhow::Result<()> {
              line in the preserved log for why =========================================="
         );
     }
+
+    // ── Workspace ─────────────────────────────────────────────────────────────
+    //
+    // The manifest names the repositories in scope; the uploads repository is
+    // added beside them. Read before anything expensive, so a missing or bad
+    // manifest fails the launch in a second rather than after the model loads.
+    let workspace = zend::workspace::open(&root).map_err(|e| {
+        tracing::error!("{e:#}");
+        e
+    })?;
+
+    // ── Secrets ───────────────────────────────────────────────────────────────
+    //
+    // Read once, before the model loads, so a `--secrets` path that names no
+    // file fails the launch in a second.
+    let secrets = zend::secrets::load(cli.secrets.as_deref()).map_err(|e| {
+        tracing::error!("{e:#}");
+        e
+    })?;
 
     // ── `--download-deepseek`: fetch the model + DSpark drafter, then exit ─────
     //
@@ -451,13 +483,13 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("invalid --ingest-dir {spec:?}: both <layer> and <path> are required");
         }
         let path = path.trim();
-        // Fail fast on a bad path — every ingest mode reads this root, and a typo
-        // would otherwise silently ingest nothing (folder/file scans) rather than
-        // erroring. Relative paths resolve under the workspace; absolute replace it.
-        if !workspace.join(path).is_dir() {
+        // Fail fast on a bad path — every ingest mode reads this folder, and a
+        // typo would otherwise silently ingest nothing (folder/file scans) rather
+        // than erroring. The path is relative to the workspace folder.
+        if !root.join(path).is_dir() {
             anyhow::bail!(
                 "invalid --ingest-dir {spec:?}: {} is not a directory",
-                workspace.join(path).display(),
+                root.join(path).display(),
             );
         }
         ingest_dirs.insert(layer.trim().to_string(), path.to_string());
@@ -486,7 +518,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = DaemonConfig {
-        workspace: workspace.clone(),
+        workspace,
+        secrets,
         port: cli.port,
         disabled_layers: disabled_layers.clone(),
         skipped_layers: skipped_layers.clone(),
@@ -555,7 +588,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("--compact-substrate: forcing a whole-store redo-log compaction on load");
     }
 
-    tracing::info!(workspace = %workspace.display(), port = cli.port, "starting zend");
+    tracing::info!(
+        workspace = %root.display(),
+        repos = %config.workspace.names().join(", "),
+        port = cli.port,
+        "starting zend",
+    );
 
     // ── Session + router ──────────────────────────────────────────────────────
 
@@ -580,16 +618,6 @@ async fn main() -> anyhow::Result<()> {
         "ready — API: http://{addr}/v1/chat/completions \
                — web: http://{addr}/",
     );
-
-    // ── Background: workspace scan ────────────────────────────────────────────
-
-    tokio::spawn(async move {
-        tracing::info!("scanning workspace...");
-        tokio::task::spawn_blocking(move || scan_workspace(&workspace))
-            .await
-            .ok();
-        tracing::info!("scan complete");
-    });
 
     // ── Serve, with graceful shutdown ─────────────────────────────────────────
     //
@@ -658,28 +686,14 @@ async fn shutdown_signal() {
     });
 }
 
-// ── Workspace scan ────────────────────────────────────────────────────────────
-
-fn scan_workspace(root: &std::path::Path) {
-    let file_count = std::fs::read_dir(root)
-        .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
-        .unwrap_or(0);
-
-    tracing::info!(
-        root = %root.display(),
-        top_level_files = file_count,
-        "workspace scan placeholder",
-    );
-}
-
-/// Delete `workspace/.substrate` — the daemon's entire persistent memory —
-/// scoped strictly to the RESOLVED working dir's own `.substrate`. The only
+/// Delete `workspace/substrate` — the daemon's entire persistent memory —
+/// scoped strictly to the RESOLVED working dir's own `substrate`. The only
 /// caller is the explicit `--wipe-substrate` flag; scripts and harnesses go
 /// through it so no shell ever `rm -rf`s a substrate path itself. Missing
 /// directory is a no-op (a fresh mind dir), failure aborts boot rather than
 /// half-deleting.
 fn wipe_substrate(workspace: &std::path::Path) -> anyhow::Result<()> {
-    let substrate_dir = workspace.join(".substrate");
+    let substrate_dir = workspace.join(SUBSTRATE_DIR);
     if substrate_dir.exists() {
         eprintln!(
             "--wipe-substrate: deleting {} (persistent substrate)",
@@ -702,23 +716,23 @@ fn wipe_substrate(workspace: &std::path::Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod wipe_tests {
-    use super::wipe_substrate;
+    use super::{wipe_substrate, SUBSTRATE_DIR};
 
     #[test]
     fn wipes_only_the_workspaces_own_substrate() {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("mind");
-        std::fs::create_dir_all(ws.join(".substrate")).unwrap();
-        std::fs::write(ws.join(".substrate").join("seg-0.log"), b"data").unwrap();
+        std::fs::create_dir_all(ws.join(SUBSTRATE_DIR)).unwrap();
+        std::fs::write(ws.join(SUBSTRATE_DIR).join("seg-0.log"), b"data").unwrap();
         // A sibling workspace's substrate must be untouched.
         let other = root.path().join("other");
-        std::fs::create_dir_all(other.join(".substrate")).unwrap();
-        std::fs::write(other.join(".substrate").join("seg-0.log"), b"keep").unwrap();
+        std::fs::create_dir_all(other.join(SUBSTRATE_DIR)).unwrap();
+        std::fs::write(other.join(SUBSTRATE_DIR).join("seg-0.log"), b"keep").unwrap();
 
         wipe_substrate(&ws).unwrap();
-        assert!(!ws.join(".substrate").exists(), "own substrate deleted");
+        assert!(!ws.join(SUBSTRATE_DIR).exists(), "own substrate deleted");
         assert!(
-            other.join(".substrate").join("seg-0.log").exists(),
+            other.join(SUBSTRATE_DIR).join("seg-0.log").exists(),
             "sibling substrate untouched"
         );
         // Idempotent: a second wipe of the now-missing dir is a no-op.

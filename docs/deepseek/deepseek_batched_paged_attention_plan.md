@@ -851,7 +851,7 @@ rung 2 *before* any live data. Substrate enters only at rung 4. This is why the 
 
 ## J. Substrate hosting for tests (temp-file, Zend-less)
 
-`ConversationBuilder::workspace_path(dir)` roots persistence at `dir/.substrate/` (builder.rs:71).
+`ConversationBuilder::workspace_path(dir)` roots persistence at `dir/substrate/` (builder.rs:71).
 For tests, point it at a `TempDir` under the scratchpad: a `deepseek_test_conversation(tmp)` helper
 builds a no-daemon `Conversation` with a real-or-tiny model (gated on file presence, like the existing
 `#[ignore]` goldens) and a throwaway substrate. Persistence stays mandatory (CLAUDE.md) — it is simply
@@ -859,7 +859,7 @@ rooted in a directory dropped at test end, so we get full persist/reboot/resume 
 Only rung 4 uses it; rungs 1–3 never construct a `Conversation` at all (they are kernel/engine tests
 below candle-conversation). **Never pass `workspace_path = None` in a test:** `None` does not disable
 persistence — the engine falls back to the *current directory* (engine.rs:262-265) and would silently
-write `.substrate/` into the repo checkout. Rung 4 always passes an explicit `TempDir`.
+write `substrate/` into the repo checkout. Rung 4 always passes an explicit `TempDir`.
 
 ## K. Per-step plan — implement / test / gate
 

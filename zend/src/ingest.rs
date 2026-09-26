@@ -10,9 +10,10 @@
 //! * **Turn-sinks** ([`ingest_layers`]) — a layer whose group takes loaded turns.
 //!   The live conversation layer (identified by a `Sequence`-rule group) is
 //!   excluded. The rest resolve by convention: the built-in `repo_map`
-//!   (folder-scan of the workspace root) and `code_reading` (per-file carve of the
-//!   workspace root) pipelines are recognised by name; every other turn-sink layer
-//!   reads ChatML records from a folder named after it (`<name>/`).
+//!   (folder-scan of every repository) and `code_reading` (per-file read of every
+//!   repository) pipelines are recognised by name; every other turn-sink layer
+//!   reads ChatML records from a folder named after it (`<name>/`) in the
+//!   workspace folder.
 //! * **Section-collection sinks** ([`section_sinks`]) — an empty collection in a
 //!   layer's system prompt, other than the registry-backed `tools`. Each is filled
 //!   with calibrated sections from a folder named after it (`<name>s/`).
@@ -51,13 +52,16 @@ pub enum IngestMode {
 }
 
 /// One turn-sink layer resolved from the schema: identity, the group it populates,
-/// how to populate it, the content folder (relative to the workspace), and the
-/// loading-overlay label.
+/// how to populate it, the content folder, and the loading-overlay label.
 #[derive(Clone, Debug)]
 pub struct IngestLayer {
     pub name: String,
     pub group: String,
     pub mode: IngestMode,
+    /// Workspace-relative. For [`IngestMode::Folders`] and [`IngestMode::Files`]
+    /// it is the walk's scope — empty for every repository, or one folder inside
+    /// a repository (`candle/zend/src`); for [`IngestMode::Raw`] it is the
+    /// folder the records are read from.
     pub folder: String,
     pub display: String,
     /// Noun for the startup loading screen's absolute readout ("N / M <unit>").
@@ -103,11 +107,11 @@ fn is_live_conversation(layer: &LayerSchema) -> bool {
 }
 
 /// Derive the turn-sink load plan from the declared schema + the content present
-/// under `workspace`, in schema order. Skips the live conversation layer and any
-/// layer with no group to populate. The built-in `repo_map` / `code_reading`
-/// pipelines always resolve (they read the workspace root); every other non-live
-/// layer is a raw ChatML sink **only in a mind, and only if a folder named after
-/// it exists**.
+/// under `workspace` (the workspace folder), in schema order. Skips the live
+/// conversation layer and any layer with no group to populate. The built-in
+/// `repo_map` / `code_reading` pipelines always resolve (they walk the
+/// repositories); every other non-live layer is a raw ChatML sink **only in a
+/// mind, and only if a folder named after it exists**.
 ///
 /// The mind gate matters: a coding-agent workspace is an arbitrary user project
 /// whose directories (`bug_analysis/`, `daily_history/`, …) must never be read as
@@ -118,8 +122,8 @@ fn is_live_conversation(layer: &LayerSchema) -> bool {
 /// generic: no per-layer allow/deny list, just built-ins plus the mind gate.
 ///
 /// `dirs` holds `--ingest-dir <layer>=<path>` overrides: each replaces the
-/// derived content root for that layer, so a rebuild can be scoped to a subtree
-/// (e.g. `code_reading=zend/src`) instead of sweeping the whole workspace.
+/// derived folder for that layer, so a rebuild can be scoped to a subtree
+/// (e.g. `code_reading=candle/zend/src`) instead of sweeping every repository.
 pub fn ingest_layers(
     schema: &Schema,
     workspace: &Path,
@@ -136,8 +140,8 @@ pub fn ingest_layers(
         };
         let override_dir = dirs.get(&layer.name);
         let (mode, default_folder, base_display) = match layer.name.as_str() {
-            "repo_map" => (IngestMode::Folders, ".", "Scanning repository"),
-            "code_reading" => (IngestMode::Files, ".", "Reading code"),
+            "repo_map" => (IngestMode::Folders, "", "Scanning repositories"),
+            "code_reading" => (IngestMode::Files, "", "Reading code"),
             other => {
                 if !is_mind {
                     continue;
@@ -145,9 +149,8 @@ pub fn ingest_layers(
                 (IngestMode::Raw, other, "Loading")
             }
         };
-        // An `--ingest-dir <layer>=<path>` override replaces the derived content
-        // root. Relative paths resolve under the workspace; an absolute path
-        // replaces it outright (`Path::join` semantics).
+        // An `--ingest-dir <layer>=<path>` override replaces the derived folder,
+        // relative to the workspace folder.
         let folder = override_dir
             .cloned()
             .unwrap_or_else(|| default_folder.to_string());

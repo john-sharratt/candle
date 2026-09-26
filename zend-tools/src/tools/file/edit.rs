@@ -10,7 +10,10 @@ use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct EditRequest {
-    /// Path of the file to edit — a project file from the working directory, or one this session created (e.g. `src/main.rs`). Required.
+    /// The repository the file belongs to. Required.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// Path of the file to edit, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
     /// Unified-diff body: one or more `@@ -old,count +new,count @@` hunks whose lines are prefixed with a space (context), `-` (removed) or `+` (added). Hunks are located by their context rather than by the line numbers, and a hunk whose change is already in the file is reported as already applied instead of applied twice. Give every hunk at least one context or removed line. Required.
@@ -20,6 +23,7 @@ pub struct EditRequest {
 
 #[derive(Serialize)]
 pub struct EditResponse {
+    pub repo: String,
     pub path: String,
     /// Hunks that changed the file.
     pub hunks_applied: usize,
@@ -44,7 +48,7 @@ impl Tool for FileEdit {
          whose change is already in the file is reported as already applied rather than applied \
          twice, so re-sending the same patch is safe. Either every hunk lands or none does. \
          Triggered by \"change X to Y in the file\", \"apply this diff\", \"update these \
-         lines\", \"fix the value of\". Returns path, how many hunks applied, how many were \
+         lines\", \"fix the value of\". Returns repo, path, how many hunks applied, how many were \
          already applied, and the new byte count. For full rewrites use write.";
 
     type Request = EditRequest;
@@ -62,8 +66,8 @@ impl Tool for FileEdit {
         // Read through the overlay, so a file that lives only in the workspace is
         // editable. The write below is what copies it up — doing it here instead
         // would leave a rejected patch having dirtied the file for no reason.
-        let content = ctx
-            .vfs
+        let store = ctx.files.repo(&req.repo)?;
+        let content = store
             .read(&req.path)?
             .ok_or_else(|| FileError::NothingToEdit(req.path.clone()))?;
 
@@ -73,9 +77,10 @@ impl Tool for FileEdit {
         // must therefore write nothing: a copy-up here would shadow a workspace
         // file on account of an edit that did not happen.
         if patched.applied > 0 {
-            ctx.vfs.write(&req.path, patched.content)?;
+            store.write(&req.path, patched.content)?;
         }
         Ok(EditResponse {
+            repo: req.repo,
             path: req.path,
             hunks_applied: patched.applied,
             hunks_already_applied: patched.already_applied,

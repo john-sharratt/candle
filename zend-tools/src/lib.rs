@@ -20,7 +20,7 @@
 //!   or opens a database, and each refuses without its capability
 //! - [`state`] — the individual stores: [`state::VfsStore`], [`state::CredentialStore`],
 //!   [`state::NotesStore`], [`state::SessionRegistry`], [`state::HashStateStore`],
-//!   [`state::ToolSecrets`]
+//!   [`state::Secrets`]
 //! - [`tools`] — all 95 tool implementations, one module per tool group
 //!
 //! # Authoring a tool

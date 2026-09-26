@@ -1,0 +1,26 @@
+[package]
+name = "zend-git"
+version = "0.1.0"
+edition = "2021"
+description = "Typed interface over the git command line for the Zen Code daemon's workspace repositories."
+
+[lib]
+name = "zend_git"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

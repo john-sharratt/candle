@@ -39,7 +39,7 @@ These are the **recorded** side of `selection-replay --compare-recorded`
 
 The startup integrity repair tombstones the damaged conversations, and
 background maintenance then compacts their records away — so the live
-`.substrate` loses the exact pre-repair gallery state shortly after the first
+`substrate` loses the exact pre-repair gallery state shortly after the first
 post-repair boot. A raw snapshot was taken before that restart:
 
 ```
