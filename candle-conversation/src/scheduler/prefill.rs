@@ -398,12 +398,30 @@ impl Scheduler {
                     unwitnessed = report.unwitnessed,
                     patch_no_record = report.patch_no_record,
                     patch_dup_record = report.patch_dup_record,
+                    // Read/write collisions declined before the launch. Non-zero is
+                    // the guard working: a collision suffered corrupts a chunk
+                    // silently, and this is the only line that says it was there.
+                    source_collisions = report.source_collisions,
                     "kv compaction packed the pools and handed the ground back",
                 );
             }
             Ok(_) => {}
             Err(candle_nn::kv_cache::CompactionRefused::WaveInFlight) => {
                 // Ordinary contention. The next pass tries again.
+            }
+            // **The pass is switched off because it corrupts K/V** — see
+            // `compact_backings`. Fragmentation therefore stands: the frontier stays
+            // where the high-water mark put it and the weight side does not get that
+            // ground back, which costs expert residency and so decode rate. That is
+            // the trade being made deliberately, and it is logged at `debug` rather
+            // than `warn` because the gate above fires every 150 ms and a warning
+            // repeated four hundred times a minute trains the reader to skip it.
+            Err(candle_nn::kv_cache::CompactionRefused::Disabled) => {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    "kv compaction is disabled; fragmentation stands and the weight \
+                     side keeps whatever the frontier denies it",
+                );
             }
             // **A fault is reported, not declined.** Every other arm here is "not
             // now" and belongs at `debug`, which is why this one cannot share the

@@ -74,6 +74,7 @@
 //! barrier at between-forwards cadence and it removes the whole overlap failure
 //! domain, including side streams this module does not know about.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use candle::Result;
@@ -93,6 +94,12 @@ pub struct CompactionReport {
     pub allocations_rewritten: usize,
     /// Device pointer words the patch kernel stored.
     pub patched_words: usize,
+    /// Moves this pass declined because the slot claimed for them was one it had
+    /// already planned to read.
+    ///
+    /// **Non-zero is the guard working, not a fault.** It counts a read/write
+    /// collision refused before the launch; suffering one corrupts a chunk silently.
+    pub source_collisions: usize,
     /// Relocated slots **no holder this sweep reached names** — the pass's
     /// completeness gap, and the one figure here that is a defect rather than a
     /// measurement.
@@ -204,10 +211,20 @@ pub struct CompactionTally {
     pub regions_reclaimed: u64,
     /// Passes the time budget stopped with work left.
     pub clipped: u64,
+    /// Moves dropped because the slot claimed for them was one this pass had already
+    /// planned to read.
+    ///
+    /// **The one that was corrupting K/V.** The census is a snapshot, so a slot it
+    /// saw occupied is planned as a source and can be freed before the claims run —
+    /// after which the allocator hands it out, correctly, as another move's
+    /// destination. Both halves are legitimate and the result is a read/write race
+    /// between two concurrent blocks of one launch. Non-zero is expected and healthy:
+    /// it counts collisions declined, not collisions suffered.
+    pub source_collisions: u64,
 }
 
-static TALLY: [std::sync::atomic::AtomicU64; 11] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+static TALLY: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 fn note(idx: usize, add: u64) {
     TALLY[idx].fetch_add(add, std::sync::atomic::Ordering::Relaxed);
@@ -252,6 +269,7 @@ pub fn compaction_tally() -> CompactionTally {
         clipped: v(8),
         step_failed: v(9),
         migrate_in_flight: v(10),
+        source_collisions: v(11),
     }
 }
 
@@ -261,6 +279,10 @@ pub fn compaction_tally() -> CompactionTally {
 /// rewritten, nothing freed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionRefused {
+    /// **The pass is switched off, because it corrupts K/V.** See
+    /// [`compact_backings`] for the evidence and for what has to be true before it
+    /// runs again.
+    Disabled,
     /// A forward owns the partition. Ordinary between-forwards contention; the
     /// caller notes it and comes back.
     WaveInFlight,
@@ -336,6 +358,15 @@ struct CopyRecords {
     srcs: Vec<i64>,
     dsts: Vec<i64>,
     lens: Vec<i64>,
+    /// Moves dropped because the slot claimed for them was one this pass had already
+    /// planned to read — see the note in [`ChunkedKvBacking::claim_moves`].
+    ///
+    /// Carried here rather than counted only in the global tally so a single pass's
+    /// line says whether the collision it declined was real. Without that the
+    /// disappearance of a fault is unattributable: the guard that would have caught
+    /// the collision downstream finds nothing precisely *because* this declined it,
+    /// so silence proves both "it fired" and "there was nothing to fire at".
+    source_collisions: usize,
 }
 
 /// Pack every GPU KV pool toward the lowest addresses, within `budget`.
@@ -360,12 +391,58 @@ struct CopyRecords {
 /// A caller with provably no holders of its own (a batched session, whose only
 /// block tables are these backings') passes a closure that does nothing. That is a
 /// statement about that caller, not a default.
+///
+/// # The pass does not run: it corrupts K/V
+///
+/// Every call returns [`CompactionRefused::Disabled`] before touching anything. The
+/// machinery below is complete and is kept whole deliberately — it is what the fix
+/// has to be made against, and it carries the instrumentation that found the fault.
+///
+/// **What goes wrong.** A chunk's location is written down twice: in the `ChunkGid`,
+/// which holds the arena slot's refcount, and in the `KvHead` record's band-pointer
+/// word, which is the address the paged kernels dereference. This pass rewrites both,
+/// and leaves behind records whose pointer names a slot no gid holds. Only the gid
+/// keeps a slot alive, so that slot is free: the allocator reissues it, correctly, as
+/// a later pass's destination and writes another chunk's K/V into it. The band then
+/// reads finite, plausibly-shaped, wrong values.
+///
+/// **The measurements**, from Qwen3.8-Flash-Next with compaction on and the
+/// `tensor-assert` harness in place. Zero orphaned gids against eight orphaned
+/// records, so the gid side is sound and the record side is not. Seven of seven
+/// clobbered addresses were written by the pass itself as destinations, five of those
+/// seven with the record's pointer unchanged across the pass. The pool is
+/// self-consistent throughout — no slot is double-allocated — which is why nothing
+/// faults and nothing downstream of the pass can see it.
+///
+/// **Why it is fatal on a recurrent model and survivable elsewhere.** Wrong K/V puts
+/// a NaN in the first full-attention layer; a DeltaNet layer then computes its
+/// recurrent state from that NaN and the state is *persisted*, so the next wave's
+/// logits are entirely NaN and the model emits `!!!!!!!!` forever. The 30B survives
+/// the identical wrong K/V because it has no recurrent state to persist it into.
+///
+/// **What re-enabling requires.** Not a repair at a call site: the two recordings have
+/// to stop being able to disagree. `KvHead` records need to move into an arena so they
+/// are walkable and relocatable, and the patch has to be driven from that walk rather
+/// than from a per-holder sweep that can visit a record twice or not at all — the
+/// design is in `docs/vram_span_partition.md`. The gate for turning this back on is
+/// the check already wired here: `kv_integrity::report_boundary` must report zero
+/// orphaned records and an unchanged content hash across a pass, over a run long
+/// enough to compact many times.
 #[cfg(feature = "cuda")]
 pub fn compact_backings(
     backings: &[super::backing::ChunkedKvBacking],
     budget: Duration,
     sweep: &mut dyn FnMut(&mut Sweep<'_>) -> Result<()>,
 ) -> std::result::Result<CompactionReport, CompactionRefused> {
+    /// Whether the pass may run. **False, because it corrupts K/V** — the header
+    /// above has the evidence and the condition for flipping it back.
+    const ENABLED: bool = false;
+    // Refused before the attempt is counted: a pass that is switched off is not an
+    // attempt that failed, and tallying it would put a denominator under a rate
+    // nothing is measuring.
+    if !ENABLED {
+        return Err(CompactionRefused::Disabled);
+    }
     note(0, 1);
     let Some(first) = backings.first() else {
         note(4, 1);
@@ -394,6 +471,9 @@ pub fn compact_backings(
         Err(CompactionRefused::MigrateInFlight) => note(10, 1),
         Err(CompactionRefused::AlreadyPacked) => note(3, 1),
         Err(CompactionRefused::NoDevice) => note(4, 1),
+        // `compact_with` never produces this: the switch at the top of this function
+        // returns before the pass is attempted, so nothing reaches the tally.
+        Err(CompactionRefused::Disabled) => {}
         Err(
             CompactionRefused::ClaimsLost
             | CompactionRefused::CopyFailed
@@ -592,6 +672,13 @@ impl super::backing::ChunkedKvBacking {
         // so the record count drifts from the plan position and using it to slice
         // `pool_of` would pair later moves with the wrong pool's size class — a
         // wrong `byte_lens` for the copy and a wrong stride for the address.
+        // Every slot this pass plans to read, so a claim cannot hand one of them back
+        // as a destination — see the note in `claim_moves`. Built from the whole plan
+        // rather than per batch, because the collision is across batches: the plan is
+        // complete before the first claim, and a destination claimed in the last batch
+        // can name a source planned in the first.
+        let planned_sources: HashSet<(usize, u32)> =
+            pending.iter().map(|m| (m.from.0, m.from.1)).collect();
         let mut planned = 0usize;
         for batch in pending.chunks(MOVES_PER_BATCH) {
             // **The first batch is unconditional.** Planning has already spent part of
@@ -615,13 +702,52 @@ impl super::backing::ChunkedKvBacking {
             // that recur on the next pass and whose implied addresses land in
             // another tenant's region. So the soft handling caught none of the
             // cases it was for and absorbed every case it was not.
-            if let Err(e) = self.claim_moves(batch, keys, &mut map, &mut records) {
+            if let Err(e) = self.claim_moves(batch, keys, &planned_sources, &mut map, &mut records)
+            {
                 return Err(CompactionRefused::Fault(e.to_string()));
             }
         }
         if map.is_empty() {
             return Err(CompactionRefused::ClaimsLost);
         }
+        // From here until the pass ends, the slots it is about to move are declared
+        // immutable and any instrumented write into them names its writer. See
+        // [`ReadonlySources`] for why it is the sources and not the whole band.
+        #[cfg(feature = "tensor-assert")]
+        let _sources = ReadonlySources::declare(self.device(), &records);
+
+        // **Everything here that costs a readback is behind `tensor-assert`, and the
+        // reason is a measurement it invalidated.**
+        //
+        // Left unconditional, these checks read from the device per chunk and compared
+        // both ends of every copied record — megabytes off the device per pass. A run
+        // then completed ONE compaction pass where an uninstrumented run completed
+        // twenty, so the workload under observation was not the workload being
+        // debugged, and "no faults found" meant "no passes ran". That is the harness's
+        // own first danger: an instrument that fences suppresses the race it hunts.
+        //
+        // What stays unconditional is what costs nothing to be right about: the
+        // read/write overlap refusal (host arithmetic), the band-pointer verify (one
+        // four-byte readback), the source-collision rejection (a host set lookup) and
+        // the pool's ownership guard (one indexed bool).
+        //
+        // **Every reference every live slot holds, and one content hash per slot.**
+        //
+        // Complete rather than sampled. A gid or a record pointer naming a slot the
+        // refcount tables call free is ground the allocator will reissue while that band
+        // still points there; reported here so the first boundary at which a slot's
+        // references go bad names the operation that broke them. The hash is what the
+        // closing boundary compares against: this pass rewrites addresses and must leave
+        // every slot's bytes exactly as they are, so any slot whose hash moves across the
+        // pass has a party naming another chunk's K/V.
+        //
+        // Not free — it walks every band of every slot of every backing, reads each
+        // chunk's resident record back, and launches the hash — which is why it is behind
+        // the harness rather than standing in the pass.
+        #[cfg(feature = "tensor-assert")]
+        let entering =
+            super::kv_integrity::report_boundary(backings, "entering a compaction", 0, 0, 0, None);
+
         report.timings.claim = phase.elapsed();
         phase = Instant::now();
         // One launch for every relocated slot, whatever the pool or the rung —
@@ -639,6 +765,7 @@ impl super::backing::ChunkedKvBacking {
             return Err(CompactionRefused::CopyFailed);
         }
         report.moves = records.srcs.len();
+        report.source_collisions = records.source_collisions;
         report.timings.copy = phase.elapsed();
         phase = Instant::now();
 
@@ -670,11 +797,12 @@ impl super::backing::ChunkedKvBacking {
         // holding the wrong bytes decodes to finite, plausibly-shaped, wrong values
         // and surfaces as a NaN several layers later.
         //
-        // A sample rather than the lot: at pass cadence, sixteen slots is a few KB
-        // over the bus against a pass that already synchronises the device twice, and
-        // a copy that corrupts does not corrupt one slot in a thousand. Cheap enough
-        // to be unconditional, which matters because the fault it hunts does not
-        // reproduce in every build.
+        // Behind the feature because it reads BOTH ENDS OF EVERY RECORD — megabytes
+        // off the device per pass, which is what starved a run down to a single
+        // compaction. Full coverage is the point (a 16-slot sample cannot tell "the
+        // copy is correct" from "the corruption missed my sample"), and full coverage
+        // is exactly what makes it too expensive to leave on.
+        #[cfg(feature = "tensor-assert")]
         if let Err(e) = self.verify_copied_bytes(&records) {
             tracing::error!(
                 target: "candle_nn::kv_cache::compact",
@@ -843,6 +971,22 @@ impl super::backing::ChunkedKvBacking {
             );
         }
 
+        // **Every reference the pass leaves behind, re-checked now that it has
+        // published, and every slot's content against what it held on the way in.** An
+        // orphan count that rose across the pass means it rewrote gids and did not update
+        // every record that named them, which is the fault that frees a slot while a
+        // record still points at it. A content hash that moved means that fault has
+        // already been cashed in: some party is reading ground another chunk now owns.
+        #[cfg(feature = "tensor-assert")]
+        super::kv_integrity::report_boundary(
+            backings,
+            "after a compaction",
+            report.moves,
+            report.patch_no_record,
+            report.patch_dup_record,
+            Some(&entering),
+        );
+
         // The old slots' gids died with the replacements installed above, so the
         // arenas they emptied are tombstoneable now.
         report.arenas_released = self.release_empty_arenas().unwrap_or(0);
@@ -922,12 +1066,12 @@ impl super::backing::ChunkedKvBacking {
         &self,
         moves: &[ChunkMove],
         keys: &[ArenaKey],
+        planned_sources: &HashSet<(usize, u32)>,
         map: &mut CompactionMap,
         records: &mut CopyRecords,
     ) -> Result<()> {
         // Resolve only the arenas this batch touches, both ends.
-        let needed: std::collections::HashSet<usize> =
-            moves.iter().flat_map(|m| [m.from.0, m.to.0]).collect();
+        let needed: HashSet<usize> = moves.iter().flat_map(|m| [m.from.0, m.to.0]).collect();
         let info = self.resolve_arena_info_for(&needed)?;
 
         for (m, key) in moves.iter().zip(keys) {
@@ -940,6 +1084,36 @@ impl super::backing::ChunkedKvBacking {
             // most room — so the better a pass worked the more likely each next
             // chunk would land back where it came from.
             debug_assert_eq!(new_gid.arena_idx(), m.to.0);
+            // **A destination may not be one of this pass's own sources.**
+            //
+            // The census is a snapshot, and this is the mirror of the case the
+            // comment above records. A slot it saw OCCUPIED is planned as a source;
+            // if its chunk is freed before the claims run, the slot is genuinely free
+            // and the allocator hands it out — correctly — as some other move's
+            // destination. Nothing downstream notices, because both halves are
+            // individually legitimate.
+            //
+            // What it produces is a read/write race *inside one launch*. Every record
+            // is a concurrent block, so the record copying INTO the slot runs against
+            // the record copying OUT of it, and the second one's chunk arrives as a
+            // mixture or as the first one's data entire. Its holder is then rewritten
+            // to name ground holding another sequence's K/V — finite, plausibly
+            // shaped, and wrong, which is why it surfaces as a NaN in the first
+            // attention layer rather than as a fault.
+            //
+            // The byte check after the copy cannot see it: by the time it compares,
+            // the source has been overwritten with the same bytes the destination
+            // holds, so the two agree.
+            //
+            // Skipped rather than repaired, because there is nothing to repair. The
+            // claim is dropped with `new_gid` at the `continue`, which frees the slot
+            // again, and the move is simply left for the next pass — by which time
+            // the census will see the slot as free and never plan it as a source.
+            if planned_sources.contains(&(new_gid.arena_idx(), new_gid.chunk_idx() as u32)) {
+                note(11, 1);
+                records.source_collisions += 1;
+                continue;
+            }
             // **A slot index past its arena's capacity is an invariant breach, and
             // must be told apart from the ordinary skips below.**
             //
@@ -1030,6 +1204,10 @@ impl super::backing::ChunkedKvBacking {
         if records.srcs.is_empty() {
             return Ok(());
         }
+        // Before the launch, because after it the evidence is gone: the racing pair
+        // leaves the source holding the destination's bytes, so every after-the-fact
+        // comparison agrees.
+        disjoint_ends(records)?;
         let candle::Device::Cuda(cuda) = self.device() else {
             return Ok(());
         };
@@ -1078,7 +1256,28 @@ impl super::backing::ChunkedKvBacking {
         Ok(())
     }
 
-    /// Compare a sample of the pass's destinations against their sources.
+    /// One resident `KvHead` record, as the device holds it.
+    ///
+    /// The whole record in one transfer rather than a word per band: the integrity
+    /// check reads every band pointer of every chunk, and a chunk's record is a couple
+    /// of kilobytes against `n_kv_head * n_palette * 2` separate synchronous reads.
+    #[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+    pub(super) fn read_record(&self, addr: u64, bytes: usize) -> Option<Vec<u8>> {
+        let candle::Device::Cuda(cuda) = self.device() else {
+            return None;
+        };
+        cuda.bind_to_thread().ok()?;
+        let mut out = vec![0u8; bytes];
+        // SAFETY: `addr` is a resident record's base address, taken from the chunk's
+        // own `MetaGid`, and `bytes` is that record's serialized length computed from
+        // the same geometry the serializer used.
+        unsafe {
+            candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync(&mut out, addr).ok()?;
+        }
+        Some(out)
+    }
+
+    /// Compare every one of the pass's destinations against its source.
     ///
     /// Called after the copy's fence, while both ends are still live — the sources are
     /// not released until the end of the pass, so this is the one window in which the
@@ -1087,7 +1286,7 @@ impl super::backing::ChunkedKvBacking {
     /// Reads raw device addresses rather than tensors because that is what the records
     /// are: `srcs`/`dsts` are the addresses the migrate kernel was given, and checking
     /// anything else would be checking a different claim.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "tensor-assert")]
     fn verify_copied_bytes(&self, records: &CopyRecords) -> Result<()> {
         /// Bytes this check may pull back per pass, over both ends.
         ///
@@ -1154,6 +1353,55 @@ impl super::backing::ChunkedKvBacking {
                     .zip(&dst_buf)
                     .position(|(a, b)| a != b)
                     .unwrap_or(0);
+                // **Which end moved?** A mismatch after the fence has two readings
+                // and they call for opposite fixes: the copy did not land, or the
+                // SOURCE was mutated after it did — in which case the destination is
+                // correct and the bug is a concurrent writer. Reading both a second
+                // time separates them, because a value that changes between two host
+                // reads is being written now, and one that does not was already
+                // wrong when the copy retired.
+                let mut src2 = vec![0u8; len];
+                let mut dst2 = vec![0u8; len];
+                // SAFETY: as the reads above — same two addresses, same length.
+                unsafe {
+                    let _ = candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync(
+                        &mut src2,
+                        records.srcs[i] as u64,
+                    );
+                    let _ = candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync(
+                        &mut dst2,
+                        records.dsts[i] as u64,
+                    );
+                }
+                let src_moved = src2 != src_buf;
+                let dst_moved = dst2 != dst_buf;
+                let verdict = match (src_moved, dst_moved) {
+                    (false, false) => {
+                        "both ends stable across two reads — the copy \
+                                       did not land"
+                    }
+                    (true, false) => {
+                        "the SOURCE changed between two reads — a \
+                                      concurrent writer, and the destination may be \
+                                      correct"
+                    }
+                    (false, true) => {
+                        "the DESTINATION changed between two reads — \
+                                      something is writing the slot this pass just \
+                                      filled"
+                    }
+                    (true, true) => {
+                        "both ends changed between two reads — the pass \
+                                     is running against live writers"
+                    }
+                };
+                tracing::error!(
+                    target: "candle_nn::kv_cache::compact",
+                    record = i, of = n, len, %verdict,
+                    src = format_args!("{:#x}", records.srcs[i]),
+                    dst = format_args!("{:#x}", records.dsts[i]),
+                    "compaction copy verification: {verdict}",
+                );
                 candle::bail!(
                     "record {i} of {n}: {len} B from {:#x} to {:#x} differ at byte \
                      {at} (source {:#04x}, destination {:#04x}). The destination does \
@@ -1276,6 +1524,148 @@ impl super::backing::ChunkedKvBacking {
             )
         }
         Ok(())
+    }
+}
+
+/// Refuse a copy plan in which any slot is both read and written.
+///
+/// **The kernel is one concurrent block per record, so this is the whole safety
+/// condition.** A record writing a slot another record reads races it, and the loser
+/// copies a mixture or the winner's chunk entire — then has its holder rewritten to
+/// name that ground. Nothing faults and the bytes are plausible; it arrives as a NaN
+/// in the first attention layer many launches later.
+///
+/// `plan_pool` guarantees disjointness and a test pins it, but the guarantee does not
+/// survive the claim: `claim_moves` asks the allocator for *any* free slot in the
+/// destination arena rather than the one the plan named, and a slot the census saw
+/// occupied — and therefore planned as a source — is genuinely free by then if its
+/// chunk was released in between. Both halves are legitimate, which is why this was
+/// invisible.
+///
+/// Checked on address *ranges*, not on `(arena, slot)` or on bare addresses. Ranges
+/// are what the kernel dereferences, so a length is part of the collision: two slots
+/// of different classes can intersect without sharing a start address, and a wrong
+/// stride makes that the normal case rather than the exotic one.
+///
+/// Every written range must be disjoint from every other range in the plan. Two
+/// *reads* of the same bytes are harmless — both records copy the same content out —
+/// so only a write makes a pair a collision. That covers three distinct faults with
+/// one comparison:
+///
+/// - a destination that is also a source (the census-snapshot case above),
+/// - two records writing one slot, where the loser's holder ends up naming the
+///   winner's chunk,
+/// - a destination overlapping a *different* slot part-way, which is what a wrong
+///   length or stride produces.
+fn disjoint_ends(records: &CopyRecords) -> Result<()> {
+    // (start, end, record, is_write)
+    let mut ranges: Vec<(i64, i64, usize, bool)> =
+        Vec::with_capacity(records.srcs.len() + records.dsts.len());
+    for i in 0..records.srcs.len() {
+        let len = records.lens[i].max(0);
+        if len == 0 {
+            continue;
+        }
+        ranges.push((records.srcs[i], records.srcs[i] + len, i, false));
+        ranges.push((records.dsts[i], records.dsts[i] + len, i, true));
+    }
+    ranges.sort_unstable_by_key(|&(start, _, _, _)| start);
+    for pair in ranges.windows(2) {
+        let (a_start, a_end, a_rec, a_write) = pair[0];
+        let (b_start, _b_end, b_rec, b_write) = pair[1];
+        // Sorted by start, so the only way two ranges meet is the earlier one
+        // reaching into the later one.
+        if b_start >= a_end {
+            continue;
+        }
+        // Two reads of the same bytes are fine: both records copy the same content.
+        if !a_write && !b_write {
+            continue;
+        }
+        let what = match (a_write, b_write) {
+            (true, true) => {
+                "two records WRITE overlapping ranges, so one chunk lands \
+                             on top of the other and the loser's holder is rewritten \
+                             to name it"
+            }
+            _ => {
+                "one record READS a range another WRITES, so they race and whichever \
+                  loses copies the other's chunk"
+            }
+        };
+        candle::bail!(
+            "compaction planned overlapping ranges: record {a_rec} \
+             [{a_start:#x}, {a_end:#x}) and record {b_rec} at {b_start:#x} — {what}. \
+             The migrate kernel runs one concurrent block per record, and every \
+             address involved is mapped, so nothing faults and the bytes decode to \
+             plausible, wrong values."
+        )
+    }
+    Ok(())
+}
+
+/// Declares this pass's **source** slots immutable for the rest of the pass, and
+/// gives them back on the way out however the pass ends.
+///
+/// # Why the sources, and only the sources
+///
+/// Every other check in this module verifies a *result* — an address is in bounds, a
+/// pointer word holds what it was given, a destination holds what its source held.
+/// None of them can answer "who", and by the time a byte is wrong the writer is
+/// gone. This one asks the question the other way round: for the window in which
+/// nothing at all is supposed to write K/V, declare the bytes this pass is about to
+/// move and let `forbid_write` name any writer at the moment of the write.
+///
+/// Not the whole K/V band, though that is the stronger claim, because this pass
+/// writes the band itself: `copy_records` fills every destination and already calls
+/// `forbid_write` on each one, so declaring the band makes the pass panic on its own
+/// copy. The sources are the half nothing should touch — the copy only reads them,
+/// and they stay live until the holders naming them have been rewritten.
+///
+/// A guard rather than a pair of calls because the pass has several early returns,
+/// and a declaration left standing past any of them reports the next legitimate K/V
+/// write as a violation. That failure mode is in the harness's own notes: a stale
+/// declared region blames an innocent allocation, which is worse than not checking,
+/// because a guard that cries wolf is one you stop reading.
+///
+/// `release_below(weight_floor)` is the release, the same idiom `set_weight_floor`
+/// uses: the floor is the top of the K/V side, so it clears exactly what was
+/// declared while the expert zone above keeps its own declaration.
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+struct ReadonlySources {
+    floor: u64,
+}
+
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+impl ReadonlySources {
+    fn declare(device: &candle::Device, records: &CopyRecords) -> Option<Self> {
+        let candle::DeviceLocation::Cuda { gpu_id } = device.location() else {
+            return None;
+        };
+        let layout = super::region_pool::span_layout(gpu_id)?;
+        let mut spans: Vec<(u64, usize)> = records
+            .srcs
+            .iter()
+            .zip(&records.lens)
+            .map(|(&s, &l)| (s as u64, l.max(0) as usize))
+            .collect();
+        if spans.is_empty() {
+            return None;
+        }
+        // Merged, because the sources of one pass are thousands of slots that sit end
+        // to end inside a handful of arenas: declared individually they would both
+        // overflow the table and turn the check into a thousands-entry scan.
+        candle::readonly_regions::declare_merged("kv compaction source", &mut spans);
+        Some(Self {
+            floor: layout.weight_floor,
+        })
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+impl Drop for ReadonlySources {
+    fn drop(&mut self) {
+        candle::readonly_regions::release_below(self.floor);
     }
 }
 
@@ -1418,6 +1808,92 @@ mod tests {
                 addr + len as u64,
             );
         }
+    }
+
+    /// A plan that reads a slot another record writes is refused before the launch.
+    ///
+    /// **This is the corruption, reduced to arithmetic.** The migrate kernel is one
+    /// concurrent block per record, so a slot appearing on both sides is a
+    /// read/write race and the losing record copies the other's chunk — which is then
+    /// installed under the losing chunk's holder. It reached production because the
+    /// two halves are separately legitimate: `plan_pool` keeps its sources and
+    /// destinations disjoint, and `claim_moves` then asks the allocator for any free
+    /// slot in the destination arena, which is allowed to be a planned source whose
+    /// chunk was released after the census sampled it.
+    ///
+    /// Asserted on the records rather than on the plan, because the records are what
+    /// the kernel is handed and the plan's own disjointness is already pinned
+    /// elsewhere — it was true, and not enough.
+    #[test]
+    fn a_plan_that_reads_what_it_writes_is_refused() {
+        // Disjoint: three moves packing downward, nothing read and written.
+        let ok = CopyRecords {
+            srcs: vec![0x3000, 0x3800, 0x4000],
+            dsts: vec![0x1000, 0x1800, 0x2000],
+            lens: vec![0x800, 0x800, 0x800],
+            source_collisions: 0,
+        };
+        assert!(disjoint_ends(&ok).is_ok());
+
+        // Record 0 reads 0x2000 while record 2 writes it — the collision the census
+        // snapshot allows.
+        let racy = CopyRecords {
+            srcs: vec![0x2000, 0x3800, 0x4000],
+            dsts: vec![0x1000, 0x1800, 0x2000],
+            lens: vec![0x800, 0x800, 0x800],
+            source_collisions: 0,
+        };
+        let err = disjoint_ends(&racy).expect_err("a slot read and written must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("READS a range another WRITES"),
+            "the refusal must say a read raced a write, got: {msg}",
+        );
+
+        // Two records writing one slot: the same hazard with both ends inverted, and
+        // the case a source-only check cannot see.
+        let double_write = CopyRecords {
+            srcs: vec![0x3000, 0x3800],
+            dsts: vec![0x1000, 0x1000],
+            lens: vec![0x800, 0x800],
+            source_collisions: 0,
+        };
+        let err = disjoint_ends(&double_write).expect_err("one slot written twice must refuse");
+        assert!(
+            err.to_string()
+                .contains("two records WRITE overlapping ranges"),
+            "got: {err}",
+        );
+
+        // A destination landing PART-way into another slot — what a wrong length or
+        // stride produces, and what an equality test on bare addresses misses.
+        let partial = CopyRecords {
+            srcs: vec![0x3000, 0x3800],
+            dsts: vec![0x1000, 0x1400],
+            lens: vec![0x800, 0x800],
+            source_collisions: 0,
+        };
+        assert!(
+            disjoint_ends(&partial).is_err(),
+            "overlap is about ranges, not equal start addresses"
+        );
+
+        // Two records reading the same bytes is harmless — both copy the same content
+        // out — so it must NOT be refused.
+        let shared_read = CopyRecords {
+            srcs: vec![0x3000, 0x3000],
+            dsts: vec![0x1000, 0x1800],
+            lens: vec![0x800, 0x800],
+            source_collisions: 0,
+        };
+        assert!(
+            disjoint_ends(&shared_read).is_ok(),
+            "two reads of one range are not a collision"
+        );
+
+        // An empty plan is trivially disjoint — a pass that moves nothing is not a
+        // pass that races.
+        assert!(disjoint_ends(&CopyRecords::default()).is_ok());
     }
 
     /// A pass that moved nothing reads empty, so a caller can skip its log line and

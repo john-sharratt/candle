@@ -62,6 +62,12 @@ pub mod guard;
 mod guest_stage_cpu;
 mod head_gids;
 mod io;
+/// Whether a slot's K/V is still the K/V it was, and whether everything that
+/// references it still legitimately does. Part of the `tensor-assert` harness — it
+/// reads resident records back over the bus and hashes the arenas on the device, so
+/// it compiles to nothing in a production build.
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+pub mod kv_integrity;
 mod meta_pool;
 pub mod migrate;
 pub mod migrate_flight;

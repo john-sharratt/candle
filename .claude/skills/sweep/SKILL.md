@@ -23,8 +23,9 @@ nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nouni
 - `memory.total` **> 65536 MiB (64 GiB) → full sweep**: every gate.
 - Otherwise **→ partial sweep**: skip the gates that cannot fit — `deepseek4`
   (DeepSeek-V4-Flash, 284B) and `quantized_qwen38_moe` (Qwen3.8-Flash-Next, ~124 GB
-  GGUF) — plus any newly found gate whose checkpoint is that class of size (judge from its
-  `#[ignore]` text and model file). Name the skipped gates in the report.
+  GGUF) — plus the `qwen38_flash_next_q4ko` engine probe of step 4b, and any newly found
+  gate whose checkpoint is that class of size (judge from its `#[ignore]` text and model
+  file). Name the skipped gates in the report.
 
 ## 2. Discover the gates — never use a remembered list
 
@@ -92,6 +93,73 @@ cargo test --release --features cuda -p candle-transformers --lib \
   `test result: ok. 1 passed`. A filter that matches nothing also exits 0 with
   `0 passed` — that is a broken sweep, not a pass.
 
+### 4b. Then the engine probes — the rows the gates above cannot reach
+
+The gates above drive `forward_wave` from a clean slate. They never construct a
+`ConversationEngine`, so **nothing in them exercises admission, per-turn projection, the
+persistence thread or KV compaction** — their tables print `-` for `Frontier`/`Eff%` and
+their logs contain no compaction line at all. A change to any of that machinery can break
+every daemon while all twelve gates stay green.
+
+`candle-conversation/tests/kv_fragmentation.rs` is where those rows live. Discover them the
+way step 2 discovers gates — `Grep` the file for `#[test]` and read each one's `#[ignore]`
+text — rather than trusting this table, which is orientation only. Run them serially, after
+the gates and under the same "card to itself" rule. The 30B probe holds ~17 GB resident and
+runs anywhere; the Flash-Next probe is ~56 GB and is **full sweep only**, skipped by the same
+rule as its gate:
+
+| # | probe | model | ~time |
+|---|---|---|---|
+| 13 | `qwen3_30b_a3b_q4` | Qwen3-30B-A3B, engine probe | 185 s |
+| 14 | `qwen38_flash_next_q4ko` | Qwen3.8-Flash-Next, engine probe | 187 s |
+
+```bash
+cargo test --release -p candle-conversation --features hub --test kv_fragmentation \
+  <probe_fn> -- --exact --ignored --nocapture --test-threads=1 \
+  > <scratchpad>/sweep/<NN>_<probe_fn>.log 2>&1; echo "EXIT=$?"
+```
+
+`--features hub` is not optional: without it the probe is not built and the filter reports
+`0 passed` while exiting 0.
+
+**Run these in the foreground, or read the `EXIT=` line.** A `; echo "EXIT=$?"` chain makes
+the *shell's* status `echo`'s, which is always 0 — so a backgrounded probe is announced as
+"completed (exit code 0)" while `cargo` exited 101 and two gates failed. That happened on
+2026-09-27 and was reported as a pass. The `EXIT=` line in the task's own output file is the
+real status; the notification's is not.
+
+Each probe runs **three gates** and its panic message names which failed
+(`N of 3 probe gates failed:`). Read them separately, because they fail for unrelated
+reasons and only one of them is about numerics:
+
+- **the story** (`story N/N`) — correctness. Anything below full is corruption, and on
+  Flash-Next it is the recurrent-state case: that model is the only arch here carrying
+  per-sequence state outside the paged K/V, so a pass that treads on it shows up as
+  non-finite recurrent layers and an all-NaN logits row, which no 30B row can catch.
+- **VRAM efficiency** (`worst sustained efficiency N%`) — how much of the ground below the
+  arena frontier is actually holding KV.
+- **weight uptake** — whether the weight side took the ground the frontier gave up, judged
+  against `weight grow: asked=…` in the same block.
+
+**The efficiency gate fails by construction while KV compaction is switched off** (see
+`compact_backings`), and must be reported as the standing cost of that, not tuned: the
+number is correct and the mechanism it measures is off on purpose. Measured 2026-09-27 with
+it off — 30B 40% and Flash-Next 2%, against a 90% threshold.
+
+**The uptake gate is a different question and is not compaction-gated.**
+`reclaim_spare_ground` runs between forwards from the wave loop, and the growth policy's own
+refusal (`Refusal::Pressure`, when KV demand is rising or the KV side asked since the last
+negotiation) is a KV-pressure gate. On the 30B it passed at 100% with compaction off. On
+Flash-Next it read **0%** with `weight grow: asked=0` for an unrelated reason: the `qwen4exp`
+wave loop never calls `reclaim_spare_ground()` on its `ExpertCache`, though
+`qwen4exp/engine.rs` holds one — the `latent_moe` loop does call it and `quantized_qwen3_moe`
+wires it through `BatchedModelCore`. So read the two gates separately and attribute uptake to
+the model's own wiring, not to the disable.
+
+The story gate is the one that is about numerics, and it is the one that must stay green:
+`story N/N` with no `non-finite` line and no `!!!!` in the log is what says K/V and the
+recurrent state are intact.
+
 ## 5. After each gate, report its table
 
 Parse the log's `=== Performance Comparison ===` box (read it with Read/Grep). Columns:
@@ -122,8 +190,20 @@ Numbers exactly as the log prints them. Mark every failing row.
 - **result** — PASS / FAIL (and SKIPPED for gates a partial sweep excluded).
 - **best prefill / decode** — max over that gate's rows; name the mode × ctx it came from.
 - **best compression** — max `Compress` over rows whose validation passed, with its mode.
-- Then one line: **SWEEP PASS** only if every run gate passed; otherwise **SWEEP FAIL** and
-  the list of failing gate × mode × ctx.
+
+Then a second table for step 4b's engine probes, because none of those columns describes
+them — they run one workload, not a ladder, and what they measure is delivery rather than
+ceiling:
+
+| # | probe | story | worst sustained eff% | weight uptake | result | time |
+|---|---|---:|---:|---:|---|---:|
+
+- **result** — PASS only when all three of that probe's gates passed. When the only failure
+  is the efficiency gate and KV compaction is switched off, write `FAIL (efficiency —
+  compaction disabled)` so the reason is in the table and nobody re-derives it.
+- Then one line: **SWEEP PASS** only if every run gate **and every engine probe** passed;
+  otherwise **SWEEP FAIL** and the list of failing gate × mode × ctx and failing probe ×
+  gate.
 
 ## 7. Restart what step 3 stopped
 

@@ -901,6 +901,9 @@ impl SequenceState {
     /// The chunk keeps its `MetaGid`: the device record is *patched* through the
     /// words the sweep accumulates, not rebuilt, which is sound because a
     /// compaction moves each slot once for every holder at once.
+    ///
+    /// Only the compaction pass sweeps, and there is no host compaction.
+    #[cfg(feature = "cuda")]
     pub(super) fn rewrite_for_compaction(
         &mut self,
         sweep: &mut super::compact_map::Sweep<'_>,

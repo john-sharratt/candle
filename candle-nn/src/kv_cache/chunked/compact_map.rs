@@ -125,6 +125,9 @@ impl CompactionMap {
     }
 
     /// Every destination gid this pass claimed, as a raw id.
+    ///
+    /// Only the compaction pass asks, and there is no host compaction.
+    #[cfg(feature = "cuda")]
     pub(super) fn destinations(&self) -> impl Iterator<Item = i64> + '_ {
         self.new_addr.keys().copied()
     }
@@ -178,7 +181,7 @@ pub struct Sweep<'m> {
     memo: AHashMap<usize, HeadGids>,
     /// Records already patched, so a chunk shared by several holders contributes
     /// its words once.
-    records_done: AHashSet<u64>,
+    records_done: AHashSet<(u64, usize)>,
     /// The words the patch kernel must store, in insertion order.
     patch: Vec<PatchWord>,
     /// Allocations rewritten — the sweep's own progress figure.
@@ -228,6 +231,9 @@ impl<'m> Sweep<'m> {
 
     /// Moved bands that produced no patch word, split by cause: holders with no
     /// device record, and records an earlier holder had already emitted.
+    ///
+    /// Only the compaction pass asks, and there is no host compaction.
+    #[cfg(feature = "cuda")]
     pub(super) fn patch_skips(&self) -> (usize, usize) {
         (self.no_record, self.dup_record)
     }
@@ -247,6 +253,9 @@ impl<'m> Sweep<'m> {
     ///
     /// Empty is the only sound answer: every slot the pass moved and is about to
     /// free must be named by a holder it rewrote.
+    ///
+    /// Only the compaction pass asks, and there is no host compaction.
+    #[cfg(feature = "cuda")]
     pub(super) fn unwitnessed(&self, map: &CompactionMap) -> Vec<i64> {
         map.destinations()
             .filter(|raw| !self.witnessed.contains(raw))
@@ -305,7 +314,22 @@ impl<'m> Sweep<'m> {
             self.no_record += 1;
             return;
         }
-        if !self.records_done.insert(record_addr) {
+        // **Keyed by record AND by the allocation whose bands it is describing.**
+        //
+        // It was keyed by record address alone, on the reasoning that two holders
+        // sharing a record describe the same chunk and therefore hold identical gids,
+        // so the second emission would be a duplicate. If that reasoning fails — two
+        // holders sharing a record whose allocations have diverged — the second
+        // holder's moved bands are never emitted, and the record keeps pointing at the
+        // slots this pass just vacated. Those slots then lose their last refcount, the
+        // allocator reissues them, and a record still held and still pointing there
+        // reads another chunk's K/V.
+        //
+        // Keying by the pair costs one `usize` in the tuple and cannot skip a holder
+        // that has anything of its own to say. A genuine duplicate — same record, same
+        // allocation — is still skipped, which is what the dedupe was for: one record
+        // describes one chunk however many holders name it.
+        if !self.records_done.insert((record_addr, next.alloc_id())) {
             self.dup_record += 1;
             return;
         }

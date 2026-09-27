@@ -1350,6 +1350,27 @@ impl ChunkedKvBacking {
     }
 }
 
+/// One band a live slot names, as the refcount tables are keyed.
+///
+/// Carries the `(arena, slot)` pair rather than an address because that is the form
+/// the occupancy tables answer in, and the address is derivable from it while the
+/// reverse needs the arena extents. `record` is the chunk's coresident record, so a
+/// caller can check what *it* names as well as what the gid names — the two are
+/// independent recordings of one location and either can be the stale one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveBand {
+    pub arena: usize,
+    pub slot_in_arena: usize,
+    pub record: Option<u64>,
+    /// Position in the chunk's `HeadGids` grid, which is the index the record's
+    /// pointer words are laid out by — `h * n_palette * 2 + p * 2 + is_value`.
+    ///
+    /// Carried because holes are skipped: a caller counting the bands it was handed
+    /// would attribute each one to the wrong record word as soon as any gid in the
+    /// grid is absent, and then report every band after the hole as disagreeing.
+    pub band: usize,
+}
+
 impl BackingInner {
     /// Validate a selection batch's gids against the CURRENT storage arenas
     /// before any per-head table is uploaded and the selection kernel launched.
@@ -1610,6 +1631,89 @@ impl ChunkedKvBacking {
     /// Get the number of arenas in backing storage.
     pub fn arena_count(&self) -> Result<usize> {
         self.inner.storage.arena_count()
+    }
+
+    /// Occupied slots per arena for one pool, from the refcount tables.
+    ///
+    /// The authority on whether a slot is free, exposed because the integrity checks
+    /// must not reconstruct that from holders — every attempt to do so has missed one
+    /// (arenas pool globally across same-config layers, and sealed sequences hold
+    /// slots too), and an incomplete reference set reports faults that are not there.
+    pub fn pool_occupancy(&self, key: ArenaKey) -> Vec<(usize, usize, Vec<u32>)> {
+        self.inner.pool.pool_occupancy(key)
+    }
+
+    /// Every band every live slot names, for the integrity checks.
+    ///
+    /// Host-only and complete: it walks the block tables rather than sampling them, so
+    /// a gid naming ground nothing holds cannot hide in the part that was not looked
+    /// at. Returns the band's `(arena, slot)` — which is what the refcount tables are
+    /// keyed by — together with the chunk's record address, so a caller that wants to
+    /// check the record's pointer as well knows where to read it.
+    ///
+    /// `record` is `None` for a chunk with no coresident record: a freshly-allocated
+    /// float writer window, or one whose record was dropped when its gids were
+    /// replaced. Both are ordinary and neither needs checking.
+    pub fn live_bands(&self) -> Result<Vec<(usize, Vec<LiveBand>)>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let mut out = Vec::new();
+        for (slot, entry) in state.sequences.iter().enumerate() {
+            let Some(seq) = entry.as_ref() else { continue };
+            let mut bands = Vec::new();
+            for cw in seq.chunks_slice().iter() {
+                let record = cw
+                    .meta
+                    .as_ref()
+                    .map(|m| m.device_addr())
+                    .filter(|a| *a != 0);
+                for (band, g) in cw.gids.as_slice().iter().enumerate() {
+                    if g.raw() < 0 {
+                        continue;
+                    }
+                    bands.push(LiveBand {
+                        arena: g.arena_idx(),
+                        slot_in_arena: g.chunk_idx(),
+                        record,
+                        band,
+                    });
+                }
+            }
+            if !bands.is_empty() {
+                out.push((slot, bands));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Each GPU arena's base address, slot stride and capacity.
+    ///
+    /// What a caller needs to turn a raw device address back into the `(arena, slot)`
+    /// the refcount tables are keyed by — the inverse of `slot_addr`, which is the
+    /// direction an orphaned *record pointer* has to be checked in.
+    pub fn arena_extents(&self) -> Result<Vec<(usize, u64, i64, u32)>> {
+        let mut needed = std::collections::HashSet::new();
+        for class in SizeClass::all() {
+            let key = ArenaKey::new(class, ArenaLocation::Gpu);
+            for (arena, _, _) in self.inner.pool.pool_arena_load(key) {
+                needed.insert(arena);
+            }
+        }
+        let info = self.resolve_arena_info_for(&needed)?;
+        Ok(needed
+            .into_iter()
+            .filter_map(|a| {
+                let r = info.get(a)?;
+                (r.base_ptr != 0 && r.chunk_byte_stride > 0).then_some((
+                    a,
+                    r.base_ptr,
+                    r.chunk_byte_stride,
+                    r.chunk_capacity,
+                ))
+            })
+            .collect())
     }
 
     /// `(arenas_held, arenas_if_packed)` for one pool, from the refcount tables' live
