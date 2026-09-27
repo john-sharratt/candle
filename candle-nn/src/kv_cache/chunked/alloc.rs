@@ -461,7 +461,7 @@ impl BackingInner {
     fn claim_slab(&self, key: ArenaKey, index: usize, arena_bytes: usize) -> Result<Arena> {
         if key.location == ArenaLocation::Cpu {
             let data = Tensor::zeros(arena_bytes, DType::U8, &Device::Cpu)?;
-            return Ok(Arena::new(data, key.class, key.location, index));
+            return Ok(Arena::new(data, key, index));
         }
         let Device::Cuda(cuda) = &self.device else {
             candle::bail!("a GPU arena needs a CUDA device, not {:?}", self.device)
@@ -525,7 +525,7 @@ impl BackingInner {
                 LeaseOrigin::Foreign,
             )?
         };
-        Ok(Arena::new(data, key.class, key.location, index).in_region(region))
+        Ok(Arena::new(data, key, index).in_region(region))
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -535,7 +535,7 @@ impl BackingInner {
             ArenaLocation::Cpu => &Device::Cpu,
         };
         let data = Tensor::zeros(arena_bytes, DType::U8, device)?;
-        Ok(Arena::new(data, key.class, key.location, index))
+        Ok(Arena::new(data, key, index))
     }
 }
 

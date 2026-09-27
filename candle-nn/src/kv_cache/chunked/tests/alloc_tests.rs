@@ -629,8 +629,10 @@ mod tests {
             let data = Tensor::zeros(bytes, DType::U8, &Device::Cpu).unwrap();
             let mut arena = crate::kv_cache::chunked::Arena::new(
                 data,
-                class,
-                crate::kv_cache::arena_table::ArenaLocation::Cpu,
+                crate::kv_cache::chunked::ArenaKey::new(
+                    class,
+                    crate::kv_cache::arena_table::ArenaLocation::Cpu,
+                ),
                 0,
             );
 

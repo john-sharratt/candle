@@ -7,52 +7,28 @@
 //! re-upload it per layer per forward, the record lives once in a device-resident
 //! slab and travels with the chunk.
 //!
-//! This module owns the pool: a reference-counted, free-on-drop handle
-//! ([`MetaGid`]) into a slab of fixed-size records, modeled on
-//! [`super::gid_pool::ChunkGid`] but at structural-event cadence (seal / inject /
-//! migrate), not the decode hot path — so the allocator is a simple guarded
-//! forward-scan rather than the lock-free bitmap the chunk pool needs.
+//! **A record is an arena slot** (`docs/vram_span_partition.md` §8), so this module no
+//! longer owns storage or an allocator. [`MetaGid`] wraps a
+//! [`ChunkGid`](super::gid_pool::ChunkGid): cloning bumps the slot's refcount so every
+//! holder of a chunk resolves to the same record, and the last drop frees it. What is
+//! left here is the record *layout* — [`chunk_record_bytes`], [`band_ptr_offset`] and
+//! [`serialize_kv_heads`] — plus the handle.
 //!
-//! A [`MetaGid`] is an `i64` id plus an `Arc` to its slab's refcount table. The
-//! id packs `(slab_idx, record_idx)` against [`META_SLAB_STRIDE`] exactly as a
-//! `ChunkGid` packs `(arena_idx, chunk_idx)` against `GID_STRIDE`, so the
-//! record's device address resolves as `slab_base_ptr + record_idx * record_bytes`.
-//! Clone bumps the slot refcount (every slot that references the chunk shares one
-//! record); drop releases it; the record's slot frees when the last holder drops.
+//! It used to own growable `CudaSlice<u8>` slabs with a refcount table per slab: a
+//! second allocator, over ground the span partition could not account for, whose records
+//! were serialized on the host and uploaded per run. The bytes are now written on the
+//! device by `backing::fill_records_on_device` from a descriptor table.
 //!
-//! Records are built at quantize / cold-load / warm→hot elevate and read by the
-//! attention kernels via each slice's `kvheads_ptr`. A few helpers
-//! (`device_addr`, `live_records`, `slab_count`) are CPU-build- or test-only and
-//! carry their own `#[allow(dead_code)]`.
-
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+//! [`serialize_kv_heads`] remains the **reference**: it still builds the inline
+//! per-slice heads in `gpu_chunks`, and the fill kernel is held against it byte-for-byte
+//! by test. The layout is encoded in four places already (§8) and must not gain a fifth
+//! opinion.
 
 use candle::Device;
 
 use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo, N_PALETTE};
+use crate::kv_cache::chunked::gid_pool::ChunkGid;
 use crate::kv_cache::chunked::head_gids::HeadGids;
-
-#[cfg(feature = "cuda")]
-use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-#[cfg(feature = "cuda")]
-use candle::cuda_backend::WrapErr;
-
-/// Records per metadata slab. One slab holds this many `KvHead[n_kv_head]`
-/// records; the pool grows by appending slabs. Chosen so a slab is a modest
-/// fixed allocation and growth is rare.
-pub(crate) const META_SLAB_RECORDS: usize = 4096;
-
-/// Stride that packs `(slab_idx, record_idx)` into one `i64` id:
-/// `id = slab_idx * META_SLAB_STRIDE + record_idx`. Must exceed
-/// [`META_SLAB_RECORDS`] so record indices never collide across slabs. Mirrors
-/// the role of `GID_STRIDE` for the chunk-gid namespace.
-pub(crate) const META_SLAB_STRIDE: usize = 1 << 20;
-
-const _: () = assert!(
-    META_SLAB_STRIDE >= META_SLAB_RECORDS,
-    "META_SLAB_STRIDE must cover a slab's record count",
-);
 
 /// Bytes of one head's serialized `KvHead` record at `head_dim`, matching the
 /// CUDA layout in `slot_types.cuh` (`kv_head_byte_size`): `head_dim/2 + 104`.
@@ -113,6 +89,11 @@ pub(crate) fn band_ptr_offset(
 /// its stride, so it can no longer say how to decode a slot and the chunk must
 /// (`docs/archived/arena_unification.md` principle 8). The arena is consulted only for
 /// the band's *address*.
+/// Read only on CUDA: without a device there are no records, so `build_meta_records`
+/// returns `None` for every chunk and nothing consumes these fields. The struct itself
+/// still has to exist — it is in that function's signature, and its non-CUDA caller
+/// (`alloc_sealed_blocks_bulk`) is not gated.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) struct ChunkRecordSrc<'a> {
     /// The chunk's `(head, palette, K/V)` gid grid.
@@ -141,6 +122,10 @@ pub(crate) struct ChunkRecordSrc<'a> {
 /// `arena_info` as `base_ptr + chunk_idx·chunk_byte_stride` — the
 /// location-dependent bytes a migration/defrag re-patches. The format tags
 /// beside them come from `src`, not from `arena_info`.
+/// CUDA-only, for the same reason [`ChunkRecordSrc`] is: its consumers are the inline
+/// per-slice header builder in `gpu_chunks` and the test that holds the fill kernel
+/// against it, both of which need a device.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn serialize_kv_heads(
     dst: &mut [u8],
     src: &ChunkRecordSrc<'_>,
@@ -275,119 +260,38 @@ pub(crate) fn serialize_kv_heads(
     }
 }
 
-/// Per-slab refcount table. Lives behind an `Arc` shared by every [`MetaGid`]
-/// allocated from this slab. `counts[i] == 0` means the record slot is free;
-/// `≥ 1` means it is held by that many references (slots sharing the chunk).
-#[derive(Debug)]
-struct MetaSlabRefcounts {
-    counts: Vec<AtomicU16>,
-    first_free: AtomicUsize,
-    live: AtomicUsize,
-    slab_idx: usize,
-}
-
-impl MetaSlabRefcounts {
-    fn new(slab_idx: usize) -> Self {
-        let mut counts = Vec::with_capacity(META_SLAB_RECORDS);
-        for _ in 0..META_SLAB_RECORDS {
-            counts.push(AtomicU16::new(0));
-        }
-        Self {
-            counts,
-            first_free: AtomicUsize::new(0),
-            live: AtomicUsize::new(0),
-            slab_idx,
-        }
-    }
-
-    fn try_claim_one(&self) -> Option<usize> {
-        let start = self.first_free.load(Ordering::Acquire);
-        for i in start..META_SLAB_RECORDS {
-            if self.counts[i]
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                let _ = self.first_free.compare_exchange(
-                    start,
-                    i + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-                self.live.fetch_add(1, Ordering::Relaxed);
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    #[inline]
-    fn inc(&self, record_idx: usize) {
-        self.counts[record_idx].fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn dec(&self, record_idx: usize) {
-        let prev = self.counts[record_idx].fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            self.live.fetch_sub(1, Ordering::Relaxed);
-            let mut cur = self.first_free.load(Ordering::Acquire);
-            while record_idx < cur {
-                match self.first_free.compare_exchange_weak(
-                    cur,
-                    record_idx,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => cur = actual,
-                }
-            }
-        } else if prev == 0 {
-            panic!(
-                "MetaSlabRefcounts::dec: refcount underflow at slab {} record {}",
-                self.slab_idx, record_idx
-            );
-        }
-    }
-
-    #[inline]
-    fn load(&self, record_idx: usize) -> u16 {
-        self.counts[record_idx].load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    #[allow(dead_code)] // diagnostics + test assertions
-    fn live_count(&self) -> usize {
-        self.live.load(Ordering::Relaxed)
-    }
-}
-
-/// Backing of a [`MetaGid`]: either a real pooled slot (shares the slab's
-/// refcount table) or a detached test/diagnostic record with no pool.
-#[derive(Clone, Debug)]
-enum MetaBacking {
-    Pooled(Arc<MetaSlabRefcounts>),
-    Detached(Arc<AtomicU16>),
-}
-
 /// RAII handle to one per-chunk KV-head metadata record.
 ///
-/// Carries the record's `id` (packing `(slab_idx, record_idx)`) and a shared
-/// reference to its slab's refcount table. Cloning bumps the slot refcount so
-/// every slot referencing the same physical chunk resolves to the **same**
-/// record; dropping the last clone frees the slot. Stored alongside `HeadGids`
-/// on `ChunkWindow` / `SealedChunk` so a chunk's record shares the chunk's
-/// lifetime automatically through `#[derive(Clone)]`.
-#[derive(Debug)]
+/// **A record is an arena slot, so the handle is an arena gid.** The semantics a
+/// record needs are the ones [`ChunkGid`] already has: cloning bumps the slot's
+/// refcount, so every slot referencing the same physical chunk resolves to the
+/// *same* record, and dropping the last clone frees it. That is why `Clone` and
+/// `Drop` are derived here rather than written — the refcount table this used to
+/// keep of its own (`MetaSlabRefcounts` over `CudaSlice<u8>` slabs) was a second
+/// implementation of the allocator's, in ground the span partition could not see.
+/// See `docs/vram_span_partition.md` §8.
+///
+/// Stored alongside `HeadGids` on `ChunkWindow` / `SealedChunk`, so a chunk's
+/// record shares the chunk's lifetime through `#[derive(Clone)]`.
+#[derive(Clone, Debug)]
 pub struct MetaGid {
+    /// The record's arena slot, which is what refcounts it. A detached record holds
+    /// a detached gid rather than nothing, so cloning and dropping are counted the
+    /// same way on both — an `Option` here silently made `strong_count` a constant
+    /// for detached records and stopped counting their clones.
+    gid: ChunkGid,
     id: i64,
-    /// Cached device address of this record (`slab_base_ptr + record_idx ·
-    /// record_bytes`), computed at allocation. The slab's device buffer never
-    /// moves, so this is stable for the handle's life. `0` ⇒ no device residence
-    /// (CPU/host-only pool). Lets a chunk's `kvheads_ptr` be resolved straight
-    /// from the handle without a pool lookup.
+    /// Cached device address of this record — `arena_base + slot · stride`,
+    /// resolved at allocation.
+    ///
+    /// **Stable for the handle's life, and every paged kernel depends on that.**
+    /// It is written raw into each slice header's `kvheads_ptr` word and
+    /// dereferenced by `reinterpret_cast` with no indirection
+    /// (`paged-decode/slot_types.cuh`), so nothing may relocate a held record —
+    /// which is exactly why the record arenas are excluded from the compaction
+    /// census. `0` ⇒ no device residence (a host-only pool), in which case the
+    /// chunk has no record at all.
     device_addr: u64,
-    backing: MetaBacking,
 }
 
 impl MetaGid {
@@ -402,207 +306,65 @@ impl MetaGid {
         self.device_addr
     }
 
+    /// The arena slot this record occupies.
     #[inline]
-    pub fn slab_idx(&self) -> usize {
-        self.id as usize / META_SLAB_STRIDE
-    }
-
-    #[inline]
-    pub fn record_idx(&self) -> usize {
-        self.id as usize % META_SLAB_STRIDE
+    pub fn gid(&self) -> &ChunkGid {
+        &self.gid
     }
 
     /// Current number of holders of this record's slot. `1` = uniquely owned
-    /// (safe to rewrite in place); `> 1` = shared across slots. Detached
-    /// records always report their own refcount.
+    /// (safe to rewrite in place); `> 1` = shared across slots.
     #[inline]
-    pub fn strong_count(&self) -> u16 {
-        match &self.backing {
-            MetaBacking::Pooled(t) => t.load(self.record_idx()),
-            MetaBacking::Detached(c) => c.load(Ordering::Relaxed),
-        }
+    pub fn strong_count(&self) -> usize {
+        self.gid.strong_count()
     }
 
-    /// A detached record with no pool backing, for tests and diagnostic chunks
+    /// A detached record with no arena backing, for tests and diagnostic chunks
     /// that never resolve a real device record. Mirrors `ChunkGid::detached`.
     pub fn detached(id: i64) -> Self {
         Self {
+            gid: ChunkGid::detached(id),
             id,
             device_addr: 0,
-            backing: MetaBacking::Detached(Arc::new(AtomicU16::new(1))),
+        }
+    }
+
+    /// Wrap a freshly allocated record slot.
+    pub(super) fn from_slot(gid: ChunkGid, device_addr: u64) -> Self {
+        Self {
+            id: gid.raw(),
+            gid,
+            device_addr,
         }
     }
 }
 
-impl Clone for MetaGid {
-    fn clone(&self) -> Self {
-        match &self.backing {
-            MetaBacking::Pooled(t) => {
-                t.inc(self.record_idx());
-                Self {
-                    id: self.id,
-                    device_addr: self.device_addr,
-                    backing: MetaBacking::Pooled(Arc::clone(t)),
-                }
-            }
-            MetaBacking::Detached(c) => {
-                c.fetch_add(1, Ordering::Relaxed);
-                Self {
-                    id: self.id,
-                    device_addr: self.device_addr,
-                    backing: MetaBacking::Detached(Arc::clone(c)),
-                }
-            }
-        }
-    }
-}
-
-impl Drop for MetaGid {
-    fn drop(&mut self) {
-        match &self.backing {
-            MetaBacking::Pooled(t) => t.dec(self.record_idx()),
-            MetaBacking::Detached(c) => {
-                c.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-/// One slab's parallel host-refcount + device-buffer pair, kept index-aligned
-/// (`refs[i]` describes the same slab as `device[i]`).
-struct SlabSet {
-    refs: Vec<Arc<MetaSlabRefcounts>>,
-    #[cfg(feature = "cuda")]
-    device: Vec<DeviceSlab>,
-}
-
-/// Device-resident bytes of one slab and its cached base pointer (`base_ptr` is
-/// read by `device_addr` when resolving a record's address for a `kvheads_ptr`).
-#[cfg(feature = "cuda")]
-struct DeviceSlab {
-    gpu: CudaSlice<u8>,
-    base_ptr: u64,
-}
-
-/// Host-side allocator + device residence for per-chunk KV-head records.
+/// The record geometry for one backing group, and whether records are resident.
 ///
-/// Owns growable slabs: each slab is a host refcount table plus (on CUDA) a
-/// device byte buffer of `META_SLAB_RECORDS · record_bytes`. Allocation scans
-/// existing slabs for a free record slot and appends a new slab when full —
-/// the same growth model the KV arenas use, at far lower cadence. The record's
-/// device address is `slab_base_ptr + record_idx · record_bytes`.
+/// **No storage and no allocator.** Records are arena slots now
+/// (`docs/vram_span_partition.md` §8), so the gid pool allocates them and the arena
+/// owns their bytes; what is left here is the one number both sides have to agree on
+/// — the serialized record size — and the device it is resident on. It used to own
+/// growable `CudaSlice<u8>` slabs with a refcount table per slab, which was a second
+/// allocator over ground the span partition could not account for.
 #[derive(Debug)]
 pub struct MetaPool {
-    slabs: Mutex<SlabSet>,
-    // record_bytes/device are only read on CUDA (device addressing + upload).
-    // Atomic so `set_record_bytes` can resize the record stride once, before any
-    // slab is allocated (the single-latent path flips to 8-band records after
-    // construction but before its first chunk — see `set_single_latent`).
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    record_bytes: std::sync::atomic::AtomicUsize,
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     device: Device,
 }
 
-impl std::fmt::Debug for SlabSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlabSet")
-            .field("n_slabs", &self.refs.len())
-            .finish()
-    }
-}
-
 impl MetaPool {
-    /// Create an empty pool whose records are `record_bytes` each, resident on
-    /// `device`. Slabs are allocated lazily on first `allocate`.
-    pub fn new(record_bytes: usize, device: Device) -> Self {
-        Self {
-            slabs: Mutex::new(SlabSet {
-                refs: Vec::new(),
-                #[cfg(feature = "cuda")]
-                device: Vec::new(),
-            }),
-            record_bytes: std::sync::atomic::AtomicUsize::new(record_bytes),
-            device,
-        }
-    }
-
-    /// Resize the per-record stride. Valid only before any slab is allocated
-    /// (all slabs share one stride); the single-latent path calls this from
-    /// `set_single_latent`, which runs before its first chunk allocation.
-    pub fn set_record_bytes(&self, record_bytes: usize) {
-        debug_assert!(
-            self.slabs
-                .lock()
-                .expect("meta pool lock poisoned")
-                .refs
-                .is_empty(),
-            "set_record_bytes must run before any record is allocated"
-        );
-        self.record_bytes
-            .store(record_bytes, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[cfg(feature = "cuda")]
-    fn record_bytes(&self) -> usize {
-        self.record_bytes.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn cuda_stream(&self) -> Option<Arc<CudaStream>> {
-        match &self.device {
-            Device::Cuda(cd) => Some(cd.cuda_stream()),
-            _ => None,
-        }
-    }
-
-    /// Allocate a fresh record slot, returning its RAII handle (with the record's
-    /// device address cached). Scans existing slabs first; appends a new slab
-    /// (host refcounts + device buffer) when all are full. At structural cadence,
-    /// so a single lock for the whole claim is fine.
-    pub fn allocate(&self) -> candle::Result<MetaGid> {
-        let mut s = self.slabs.lock().expect("meta pool lock poisoned");
-        for slab_idx in 0..s.refs.len() {
-            if let Some(record_idx) = s.refs[slab_idx].try_claim_one() {
-                let addr = self.slab_record_addr(&s, slab_idx, record_idx);
-                return Ok(Self::handle_for(&s.refs[slab_idx], record_idx, addr));
-            }
-        }
-        // All slabs full (or none): append one.
-        let slab_idx = s.refs.len();
-        let slab = Arc::new(MetaSlabRefcounts::new(slab_idx));
-        let record_idx = slab
-            .try_claim_one()
-            .expect("fresh meta slab must have a free record");
-        #[cfg(feature = "cuda")]
-        {
-            // Back the slab with device memory only on a real CUDA device. A CPU
-            // device (unit tests; warm/cold-tier pools) keeps host refcounts only:
-            // records are never read on the CPU, so device_addr stays 0.
-            if self.cuda_stream().is_some() {
-                let dev_slab = self.alloc_device_slab()?;
-                s.device.push(dev_slab);
-                debug_assert_eq!(s.device.len(), slab_idx + 1);
-            }
-        }
-        let addr = self.slab_record_addr(&s, slab_idx, record_idx);
-        let handle = Self::handle_for(&slab, record_idx, addr);
-        s.refs.push(slab);
-        Ok(handle)
-    }
-
-    /// Device address of record `record_idx` in slab `slab_idx`: the slab's
-    /// device base pointer plus the record's byte offset. `0` when the slab has
-    /// no device buffer (CPU/host-only pool).
-    #[allow(unused_variables)]
-    fn slab_record_addr(&self, s: &SlabSet, slab_idx: usize, record_idx: usize) -> u64 {
-        #[cfg(feature = "cuda")]
-        {
-            if let Some(dev) = s.device.get(slab_idx) {
-                return dev.base_ptr + (record_idx * self.record_bytes()) as u64;
-            }
-        }
-        0
+    /// The record residence for one backing. Storage is the arena's and nothing is
+    /// allocated here, so the only thing left to hold is the device.
+    ///
+    /// **There is no stored record size any more.** There used to be one, resized after
+    /// construction by `set_single_latent` because the single latent carries twice GQA's
+    /// bands. `build_meta_records` now derives the size from the backing's *live*
+    /// `n_palette()` on every call and hands it to `ArenaKey::for_records`, so the
+    /// resize has nothing to update and the value it would have cached cannot go stale
+    /// against the geometry.
+    pub fn new(device: Device) -> Self {
+        Self { device }
     }
 
     /// True when this pool backs records with device memory (a real CUDA
@@ -611,134 +373,11 @@ impl MetaPool {
     pub fn is_device_resident(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
-            self.cuda_stream().is_some()
+            matches!(self.device, Device::Cuda(_))
         }
         #[cfg(not(feature = "cuda"))]
         {
             false
-        }
-    }
-
-    /// Upload many records, coalescing the device copies. Records that occupy
-    /// consecutive slots in a slab (the common case — a batch allocated together)
-    /// collapse to a single `memcpy_htod` per run, versus one tiny copy per
-    /// record. No-op without CUDA / on a host-only pool.
-    #[allow(unused_variables)]
-    pub fn write_records_batched(&self, items: &[(MetaGid, Vec<u8>)]) -> candle::Result<()> {
-        #[cfg(feature = "cuda")]
-        {
-            if items.is_empty() {
-                return Ok(());
-            }
-            let stream = match self.cuda_stream() {
-                Some(s) => s,
-                None => return Ok(()),
-            };
-            let rb = self.record_bytes();
-            use std::collections::HashMap;
-            let mut by_slab: HashMap<usize, Vec<(usize, &[u8])>> = HashMap::new();
-            for (gid, bytes) in items {
-                debug_assert_eq!(bytes.len(), rb, "record byte-size mismatch");
-                by_slab
-                    .entry(gid.slab_idx())
-                    .or_default()
-                    .push((gid.record_idx(), bytes.as_slice()));
-            }
-            // Build every run's staging buffer BEFORE taking the lock. Coalescing
-            // records into runs, allocating the staging vec and gathering the
-            // bytes into it is pure host-side CPU work that needs no exclusion —
-            // only reaching `s.device[slab_idx]` does. The lock previously
-            // covered all of it, so every concurrent meta-record write serialised
-            // behind another writer's memcpy *and* its buffer construction.
-            struct Run {
-                slab_idx: usize,
-                off: usize,
-                staging: Vec<u8>,
-            }
-            let mut runs: Vec<Run> = Vec::new();
-            for (slab_idx, mut recs) in by_slab {
-                recs.sort_unstable_by_key(|(i, _)| *i);
-                let mut i = 0;
-                while i < recs.len() {
-                    let run_start = recs[i].0;
-                    let mut j = i;
-                    while j + 1 < recs.len() && recs[j + 1].0 == recs[j].0 + 1 {
-                        j += 1;
-                    }
-                    let run_len = j - i + 1;
-                    let mut staging = vec![0u8; run_len * rb];
-                    for (k, (_, bytes)) in recs[i..=j].iter().enumerate() {
-                        staging[k * rb..(k + 1) * rb].copy_from_slice(bytes);
-                    }
-                    runs.push(Run {
-                        slab_idx,
-                        off: run_start * rb,
-                        staging,
-                    });
-                    i = j + 1;
-                }
-            }
-
-            // The copies themselves stay under the lock: issuing one needs
-            // `&mut` on the destination slab. Their ORDER and stream are
-            // unchanged — this moves host work out of the critical section, it
-            // does not reorder or defer any GPU operation. Each `staging` now
-            // outlives its copy by construction (it lives in `runs` until the
-            // function returns), which is strictly safer than the previous
-            // per-iteration temporary.
-            let mut s = self.slabs.lock().expect("meta pool lock poisoned");
-            for run in &runs {
-                let Some(dev) = s.device.get_mut(run.slab_idx) else {
-                    continue;
-                };
-                let len = run.staging.len();
-                stream
-                    .memcpy_htod(&run.staging, &mut dev.gpu.slice_mut(run.off..run.off + len))
-                    .w()?;
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn live_records(&self) -> usize {
-        let s = self.slabs.lock().expect("meta pool lock poisoned");
-        s.refs.iter().map(|r| r.live_count()).sum()
-    }
-
-    #[allow(dead_code)]
-    pub fn slab_count(&self) -> usize {
-        self.slabs
-            .lock()
-            .expect("meta pool lock poisoned")
-            .refs
-            .len()
-    }
-
-    #[cfg(feature = "cuda")]
-    fn alloc_device_slab(&self) -> candle::Result<DeviceSlab> {
-        let stream = self
-            .cuda_stream()
-            .ok_or_else(|| candle::Error::Msg("meta pool: no cuda stream".into()))?;
-        let byte_len = META_SLAB_RECORDS * self.record_bytes();
-        // SAFETY: untyped alloc; zeroed below so an unwritten slot reads as
-        // null pointers / zero scales rather than garbage.
-        let mut gpu = unsafe { stream.alloc::<u8>(byte_len).w()? };
-        let zeros = vec![0u8; byte_len];
-        stream.memcpy_htod(&zeros, &mut gpu).w()?;
-        let base_ptr = {
-            let (p, _g) = gpu.device_ptr(&stream);
-            p
-        };
-        Ok(DeviceSlab { gpu, base_ptr })
-    }
-
-    fn handle_for(slab: &Arc<MetaSlabRefcounts>, record_idx: usize, device_addr: u64) -> MetaGid {
-        let id = (slab.slab_idx * META_SLAB_STRIDE + record_idx) as i64;
-        MetaGid {
-            id,
-            device_addr,
-            backing: MetaBacking::Pooled(Arc::clone(slab)),
         }
     }
 }
@@ -749,65 +388,73 @@ mod tests {
     use crate::kv_cache::arena_table::ArenaFormatTag;
     use crate::kv_cache::chunked::gid_pool::ChunkGid;
 
-    const REC_BYTES: usize = 2 * 168; // 2 heads, HD128
-
-    fn cpu_pool() -> MetaPool {
-        MetaPool::new(REC_BYTES, Device::Cpu)
-    }
-
+    /// A record's lifetime **is** its arena slot's.
+    ///
+    /// The allocator itself is the gid pool's and is tested there; what is this
+    /// module's to prove is that wrapping a `ChunkGid` preserved the semantics the
+    /// hand-rolled refcount table used to provide — a clone shares one slot so every
+    /// holder of a chunk resolves to the same record, and the slot survives until the
+    /// last clone goes. Asserted on `ChunkGid::detached`, which carries the same
+    /// refcount machinery without needing a device.
     #[test]
-    fn allocate_returns_distinct_ids() {
-        let pool = cpu_pool();
-        let a = pool.allocate().unwrap();
-        let b = pool.allocate().unwrap();
-        let c = pool.allocate().unwrap();
-        assert_ne!(a.raw(), b.raw());
-        assert_ne!(b.raw(), c.raw());
-        assert_eq!((a.record_idx(), b.record_idx(), c.record_idx()), (0, 1, 2));
-        assert_eq!(a.slab_idx(), 0);
-        assert_eq!(pool.live_records(), 3);
-    }
+    fn a_clone_shares_the_record_slot_and_the_last_drop_releases_it() {
+        let a = MetaGid::from_slot(ChunkGid::detached(7), 0xdead_0000);
+        assert_eq!(a.raw(), 7, "the handle's id is its slot's");
+        assert_eq!(a.device_addr(), 0xdead_0000);
+        assert_eq!(a.strong_count(), 1);
 
-    #[test]
-    fn clone_shares_one_record_slot() {
-        let pool = cpu_pool();
-        let a = pool.allocate().unwrap();
-        let a2 = a.clone();
-        let a3 = a.clone();
-        assert_eq!(a.raw(), a2.raw());
-        assert_eq!(a.raw(), a3.raw());
+        let b = a.clone();
+        let c = a.clone();
+        assert_eq!((b.raw(), c.raw()), (7, 7), "a clone names the same slot");
+        assert_eq!(
+            (b.device_addr(), c.device_addr()),
+            (0xdead_0000, 0xdead_0000),
+            "and carries the same address — the kvheads_ptr every kernel dereferences",
+        );
         assert_eq!(a.strong_count(), 3);
-        assert_eq!(pool.live_records(), 1);
+
+        drop(b);
+        assert_eq!(a.strong_count(), 2);
+        drop(c);
+        assert_eq!(a.strong_count(), 1, "the slot is still held by `a`");
     }
 
+    /// **Every geometry in the model table must land on a record-stride rung that holds
+    /// its record.** `ArenaKey::for_records` panics when none does, so this is the test
+    /// that would catch a new checkpoint outgrowing `RECORD_STRIDES` — at build time in
+    /// CI rather than at the first seal on the box that loads it.
+    ///
+    /// The stride properties themselves (power of two, inside the gid namespace) belong
+    /// to the key and are asserted in `arena_tests`; what is this module's concern is
+    /// that the *record sizes it computes* are covered.
     #[test]
-    fn slot_frees_only_on_last_drop() {
-        let pool = cpu_pool();
-        let a = pool.allocate().unwrap();
-        let id = a.raw();
-        let a2 = a.clone();
-        drop(a);
-        assert_eq!(pool.live_records(), 1);
-        assert_eq!(a2.strong_count(), 1);
-        drop(a2);
-        assert_eq!(pool.live_records(), 0);
-        let reused = pool.allocate().unwrap();
-        assert_eq!(reused.raw(), id);
-    }
+    fn every_production_geometry_fits_a_record_stride_rung() {
+        use crate::kv_cache::arena_table::ArenaLocation;
+        use crate::kv_cache::chunked::arena::ArenaKey;
 
-    #[test]
-    fn grows_across_slabs_when_full() {
-        let pool = cpu_pool();
-        let mut held = Vec::new();
-        for _ in 0..META_SLAB_RECORDS {
-            held.push(pool.allocate().unwrap());
+        // (n_kv_head, head_dim, n_palette): GQA at both head dims, the smallest
+        // geometry the packing allows, and the single latent's 16-band width.
+        for (n_kv_head, head_dim, n_palette) in [
+            (2usize, 128usize, 4usize),
+            (8, 128, 4),
+            (8, 256, 4),
+            (1, 4, 4),
+            (8, 128, 16),
+            (64, 512, 16),
+        ] {
+            let rb = chunk_record_bytes(n_kv_head, head_dim, n_palette);
+            let key = ArenaKey::for_records(ArenaLocation::Gpu, rb);
+            assert!(
+                key.slot_stride() >= rb,
+                "a {n_kv_head}x{head_dim}x{n_palette} record is {rb} B but its slot is \
+                 {} B — every record would overrun its slot",
+                key.slot_stride(),
+            );
+            assert!(
+                key.chunks() > 0,
+                "a {rb} B record leaves no slots in a region",
+            );
         }
-        assert_eq!(pool.slab_count(), 1);
-        let overflow = pool.allocate().unwrap();
-        assert_eq!(pool.slab_count(), 2);
-        assert_eq!(overflow.slab_idx(), 1);
-        assert_eq!(overflow.record_idx(), 0);
-        assert_eq!(overflow.raw(), META_SLAB_STRIDE as i64);
     }
 
     #[test]
@@ -1064,5 +711,377 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), n_kv_head * N_PALETTE * 2);
+    }
+
+    /// **The fill kernel must produce byte-for-byte what the host serializer produces.**
+    ///
+    /// This is the test the whole device-side fill rests on. A record is a table of raw
+    /// device pointers that thirteen CUDA kernels dereference with `reinterpret_cast`
+    /// and no bounds check, so a single wrong byte is another chunk's K/V read as this
+    /// one's — finite, plausible, and wrong, surfacing as a NaN many layers later. The
+    /// record layout is already encoded in four places (`docs/vram_span_partition.md`
+    /// §8); holding the kernel against [`serialize_kv_heads`] is what stops it becoming
+    /// a fifth opinion that drifts.
+    ///
+    /// Covered deliberately: both palette sources (populated bytes and the derived
+    /// identity map), both scale sources (populated and unity), several head counts and
+    /// band widths, and gids spread across two arenas with *different* strides so a
+    /// pointer computed from the wrong extent cannot coincide with the right answer.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_fill_kernel_matches_the_host_serializer_byte_for_byte() {
+        use crate::kv_cache::chunked::size_class::GID_STRIDE;
+        use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+        use candle::cuda_backend::kernels::simple::kv_record_fill as krf;
+
+        let guard = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
+        let Ok(dev @ Device::Cuda(_)) = Device::cuda_if_available(0) else {
+            return;
+        };
+        let Device::Cuda(cuda) = &dev else { return };
+        let _ = &guard;
+
+        // Two arenas with unlike strides: a pointer resolved against the wrong one is
+        // then numerically distinguishable, which a single-arena fixture cannot show.
+        let arena_info = vec![
+            ResolvedArenaInfo {
+                base_ptr: 0x1_0000,
+                chunk_byte_stride: 512,
+                chunk_capacity: u32::MAX,
+            },
+            ResolvedArenaInfo {
+                base_ptr: 0x9_0000,
+                chunk_byte_stride: 1088,
+                chunk_capacity: u32::MAX,
+            },
+        ];
+
+        // Every geometry here is 8-byte aligned in its record layout, because the kernel
+        // stores band pointers as `uint64_t` and CUDA faults on an unaligned address —
+        // `head_dim % 16 == 0` keeps `head_dim / 2` aligned and `n_palette % 4 == 0`
+        // keeps the per-head size aligned. `head_dim = 4` (which the host golden test
+        // uses, where unaligned writes are legal) puts a pointer at offset 2 and raises
+        // `CUDA_ERROR_MISALIGNED_ADDRESS`; `fill_records_on_device` now refuses such a
+        // geometry outright rather than faulting mid-seal. 16 is the smallest head_dim
+        // that qualifies.
+        for (n_kv_head, head_dim, n_palette, with_pal, with_scale) in [
+            (1usize, 16usize, N_PALETTE, false, false),
+            (2, 128, N_PALETTE, false, false),
+            (2, 128, N_PALETTE, true, true),
+            (4, 128, N_PALETTE, true, false),
+            (3, 256, N_PALETTE, false, true),
+            (2, 128, 16, true, true),
+        ] {
+            let rb = chunk_record_bytes(n_kv_head, head_dim, n_palette);
+            let pal_bytes = head_dim / 4;
+            let tags = n_kv_head * n_palette;
+
+            // Gids alternate between the two arenas and walk chunk indices, so every
+            // band resolves to a distinct address.
+            let raws: Vec<i64> = (0..n_kv_head * n_palette * 2)
+                .map(|i| {
+                    let arena = (i % 2) as i64;
+                    let chunk = (i / 2) as i64 + 1;
+                    arena * GID_STRIDE as i64 + chunk
+                })
+                .collect();
+            let gids = HeadGids::from_vec(raws.iter().map(|&r| ChunkGid::detached(r)).collect());
+
+            let k_pal: Vec<u8> = if with_pal {
+                (0..n_kv_head * pal_bytes)
+                    .map(|i| (i * 7 + 1) as u8)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let v_pal: Vec<u8> = if with_pal {
+                (0..n_kv_head * pal_bytes)
+                    .map(|i| (i * 13 + 5) as u8)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let k_scale: Vec<f32> = if with_scale {
+                (0..tags).map(|i| 0.5 + i as f32).collect()
+            } else {
+                Vec::new()
+            };
+            let v_scale: Vec<f32> = if with_scale {
+                (0..tags).map(|i| 1.5 + i as f32 * 2.0).collect()
+            } else {
+                Vec::new()
+            };
+            let k_fmt: Vec<u8> = (0..tags)
+                .map(|i| ArenaFormatTag::Q8_0.as_u8() + (i % 2) as u8)
+                .collect();
+            let v_fmt: Vec<u8> = (0..tags)
+                .map(|i| ArenaFormatTag::Q4_0.as_u8() + (i % 3) as u8)
+                .collect();
+
+            let src = ChunkRecordSrc {
+                gids: &gids,
+                k_pal: &k_pal,
+                v_pal: &v_pal,
+                k_scale: &k_scale,
+                v_scale: &v_scale,
+                k_fmt: &k_fmt,
+                v_fmt: &v_fmt,
+            };
+
+            // The reference.
+            let mut want = vec![0u8; rb];
+            serialize_kv_heads(&mut want, &src, n_kv_head, head_dim, n_palette, &arena_info);
+
+            // The kernel, into a device buffer poisoned first so an unwritten byte is a
+            // failure rather than an accidental match against the reference's zeros.
+            let mut d_rec = cuda.memcpy_stod(&vec![0xABu8; rb]).unwrap();
+            let addr_stream = cuda.cuda_stream();
+            let rec_addr = {
+                let (p, _g) = d_rec.device_ptr_mut(&addr_stream);
+                p
+            };
+            let descs: Vec<i64> = vec![
+                rec_addr as i64,
+                0,
+                if with_pal { 0 } else { -1 },
+                0,
+                if with_scale { 0 } else { -1 },
+            ];
+            let extents: Vec<i64> = arena_info
+                .iter()
+                .flat_map(|r| [r.base_ptr as i64, r.chunk_byte_stride])
+                .collect();
+            let d_descs = cuda.memcpy_stod(&descs).unwrap();
+            let d_gids = cuda.memcpy_stod(&raws).unwrap();
+            let d_kpal = cuda.memcpy_stod(&pad_u8(&k_pal)).unwrap();
+            let d_vpal = cuda.memcpy_stod(&pad_u8(&v_pal)).unwrap();
+            let d_kfmt = cuda.memcpy_stod(&k_fmt).unwrap();
+            let d_vfmt = cuda.memcpy_stod(&v_fmt).unwrap();
+            let d_kscale = cuda.memcpy_stod(&pad_f32(&k_scale)).unwrap();
+            let d_vscale = cuda.memcpy_stod(&pad_f32(&v_scale)).unwrap();
+            let d_ext = cuda.memcpy_stod(&extents).unwrap();
+            let stream = cuda.cuda_stream();
+            {
+                let (p_d, _a) = d_descs.device_ptr(&stream);
+                let (p_g, _b) = d_gids.device_ptr(&stream);
+                let (p_kp, _c) = d_kpal.device_ptr(&stream);
+                let (p_vp, _e) = d_vpal.device_ptr(&stream);
+                let (p_kf, _f) = d_kfmt.device_ptr(&stream);
+                let (p_vf, _h) = d_vfmt.device_ptr(&stream);
+                let (p_ks, _i) = d_kscale.device_ptr(&stream);
+                let (p_vs, _j) = d_vscale.device_ptr(&stream);
+                let (p_x, _k) = d_ext.device_ptr(&stream);
+                // SAFETY: every array is device-resident and long enough for the single
+                // descriptor's offsets; `rec_addr` names `rb` writable bytes.
+                unsafe {
+                    krf::run_kv_record_fill(
+                        p_d as *const std::ffi::c_void,
+                        p_g as *const i64,
+                        p_kp as *const u8,
+                        p_vp as *const u8,
+                        p_kf as *const u8,
+                        p_vf as *const u8,
+                        p_ks as *const f32,
+                        p_vs as *const f32,
+                        p_x as *const std::ffi::c_void,
+                        arena_info.len() as i32,
+                        1,
+                        n_kv_head as i32,
+                        head_dim as i32,
+                        n_palette as i32,
+                        GID_STRIDE as i32,
+                        ArenaFormatTag::Invalid.as_u8() as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                    );
+                }
+            }
+            let got = cuda.memcpy_dtov(&d_rec).unwrap();
+
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{n_kv_head}x{head_dim}x{n_palette}: record length"
+            );
+            if got != want {
+                let at = got
+                    .iter()
+                    .zip(&want)
+                    .position(|(a, b)| a != b)
+                    .expect("lengths match and contents differ, so a byte differs");
+                panic!(
+                    "{n_kv_head}x{head_dim}x{n_palette} pal={with_pal} scale={with_scale}: the \
+                     kernel and the host serializer disagree at byte {at} of {rb} (kernel \
+                     {:#04x}, reference {:#04x}). A record is a table of raw pointers the \
+                     attention kernels dereference unchecked, so this is another chunk's K/V \
+                     read as this one's.",
+                    got[at], want[at],
+                );
+            }
+        }
+    }
+
+    /// **Microbench and `ncu` target for the record fill.**
+    ///
+    /// ```text
+    /// cargo test -p candle-nn --features cuda --release --lib \
+    ///   kv_cache::chunked::meta_pool::tests::bench_record_fill -- --exact --ignored --nocapture
+    ///
+    /// ncu --set full --kernel-name kv_record_fill_kernel -o kvrec \
+    ///   target/release/deps/candle_nn-<hash>.exe \
+    ///   kv_cache::chunked::meta_pool::tests::bench_record_fill --exact --ignored
+    /// ```
+    ///
+    /// What to read, and what the kernel was shaped for:
+    ///
+    /// - **Occupancy** — the grid is `min(work / 256, 8 × SM)` blocks over a grid-stride
+    ///   loop, so achieved occupancy should be near the theoretical limit at every batch
+    ///   size. A batch of a few records used to be a few blocks (one per record) and left
+    ///   the machine idle; if occupancy is low at large batch sizes now, the cap in
+    ///   `kv_record_fill_blocks` is the thing to move.
+    /// - **Registers per thread** — `__launch_bounds__(256)` bounds it. If ncu reports
+    ///   occupancy limited by registers, the bound is being exceeded and nvcc is spilling.
+    /// - **Warp execution efficiency** — the two phases are flattened into one item space
+    ///   so a warp is not half-idle in the band phase, which it was when the phases were
+    ///   separate loops over different item counts.
+    /// - **Store efficiency** — palette bytes go out as `uchar4`. Sub-4-byte sectors here
+    ///   mean the vector path is not being taken.
+    ///
+    /// Bench-only, so `#[ignore]`: it needs the card and says nothing about correctness —
+    /// that is
+    /// [`the_fill_kernel_matches_the_host_serializer_byte_for_byte`](the_fill_kernel_matches_the_host_serializer_byte_for_byte)'s
+    /// job, and the numbers below mean nothing if that one is red.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "microbench / ncu target; needs the card to itself"]
+    fn bench_record_fill() {
+        use crate::kv_cache::chunked::size_class::GID_STRIDE;
+        use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+        use candle::cuda_backend::kernels::simple::kv_record_fill as krf;
+
+        let guard = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
+        let Ok(dev @ Device::Cuda(_)) = Device::cuda_if_available(0) else {
+            return;
+        };
+        let Device::Cuda(cuda) = &dev else { return };
+        let _ = &guard;
+
+        // Production GQA geometry, and the single latent's wider band count.
+        for (n_kv_head, head_dim, n_palette) in [(8usize, 128usize, 4usize), (8, 128, 16)] {
+            let rb = chunk_record_bytes(n_kv_head, head_dim, n_palette);
+            let bands = n_kv_head * n_palette * 2;
+            let tags = n_kv_head * n_palette;
+            println!(
+                "\n=== record fill: {n_kv_head} heads x HD{head_dim} x {n_palette} bands \
+                 ({rb} B/record) ==="
+            );
+            // A batch of one is the latency case; the wide ones are what a seal pass or a
+            // warm→hot elevate actually submits.
+            for n_records in [1usize, 8, 64, 512, 4096] {
+                let extents: Vec<i64> = vec![0x1_0000, 512, 0x9_0000, 1088];
+                let raws: Vec<i64> = (0..n_records * bands)
+                    .map(|i| ((i % 2) as i64) * GID_STRIDE as i64 + (i / 2) as i64 % 4096 + 1)
+                    .collect();
+                let fmt: Vec<u8> = vec![ArenaFormatTag::Q8_0.as_u8(); n_records * tags];
+                let mut d_recs = cuda.memcpy_stod(&vec![0u8; n_records * rb]).unwrap();
+                let s0 = cuda.cuda_stream();
+                let base = {
+                    let (p, _g) = d_recs.device_ptr_mut(&s0);
+                    p
+                };
+                // Identity palette and unity scales: the common float-chunk case, and the
+                // one the kernel derives instead of shipping.
+                let descs: Vec<i64> = (0..n_records)
+                    .flat_map(|r| {
+                        [
+                            (base + (r * rb) as u64) as i64,
+                            (r * bands) as i64,
+                            -1,
+                            (r * tags) as i64,
+                            -1,
+                        ]
+                    })
+                    .collect();
+                let d_descs = cuda.memcpy_stod(&descs).unwrap();
+                let d_gids = cuda.memcpy_stod(&raws).unwrap();
+                let d_pad = cuda.memcpy_stod(&vec![0u8; 1]).unwrap();
+                let d_fmt = cuda.memcpy_stod(&fmt).unwrap();
+                let d_fpad = cuda.memcpy_stod(&vec![0.0f32; 1]).unwrap();
+                let d_ext = cuda.memcpy_stod(&extents).unwrap();
+                let stream = cuda.cuda_stream();
+
+                let launch = || {
+                    let (p_d, _a) = d_descs.device_ptr(&stream);
+                    let (p_g, _b) = d_gids.device_ptr(&stream);
+                    let (p_p, _c) = d_pad.device_ptr(&stream);
+                    let (p_f, _e) = d_fmt.device_ptr(&stream);
+                    let (p_s, _h) = d_fpad.device_ptr(&stream);
+                    let (p_x, _i) = d_ext.device_ptr(&stream);
+                    // SAFETY: as the byte-exact test — every array outlives the launch and
+                    // covers the offsets the descriptors name.
+                    unsafe {
+                        krf::run_kv_record_fill(
+                            p_d as *const std::ffi::c_void,
+                            p_g as *const i64,
+                            p_p as *const u8,
+                            p_p as *const u8,
+                            p_f as *const u8,
+                            p_f as *const u8,
+                            p_s as *const f32,
+                            p_s as *const f32,
+                            p_x as *const std::ffi::c_void,
+                            2,
+                            n_records as i32,
+                            n_kv_head as i32,
+                            head_dim as i32,
+                            n_palette as i32,
+                            GID_STRIDE as i32,
+                            ArenaFormatTag::Invalid.as_u8() as i32,
+                            stream.cu_stream() as *mut std::ffi::c_void,
+                        );
+                    }
+                };
+
+                // Warm up, then time. `synchronize` only at the ends, so the figure is the
+                // kernel's and not a fence per iteration.
+                for _ in 0..10 {
+                    launch();
+                }
+                dev.synchronize().unwrap();
+                const ITERS: usize = 200;
+                let t0 = std::time::Instant::now();
+                for _ in 0..ITERS {
+                    launch();
+                }
+                dev.synchronize().unwrap();
+                let us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+                let bytes = (n_records * rb) as f64;
+                println!(
+                    "  {n_records:>5} records  {us:>8.2} us/call  {:>8.2} GB/s written  \
+                     {:>10.0} records/s",
+                    bytes / (us * 1e3),
+                    n_records as f64 / (us * 1e-6),
+                );
+            }
+        }
+    }
+
+    /// `memcpy_stod` needs something to copy; a derived-only input is never read by the
+    /// kernel because its descriptor offset is -1.
+    #[cfg(feature = "cuda")]
+    fn pad_u8(v: &[u8]) -> Vec<u8> {
+        if v.is_empty() {
+            vec![0u8]
+        } else {
+            v.to_vec()
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn pad_f32(v: &[f32]) -> Vec<f32> {
+        if v.is_empty() {
+            vec![0.0f32]
+        } else {
+            v.to_vec()
+        }
     }
 }

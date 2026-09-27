@@ -21,6 +21,9 @@ here. This document explains the machine those rules protect.
 ---
 
 ## 1. One span, four tenants
+<!-- Five kinds of allocation: the KV side holds both band arenas and the KvHead
+     record arenas of §8, which share its region pool and its boundary. -->
+
 
 At model load the governor measures real resident capacity and reserves **one
 contiguous device span**. Every tenant lives inside it, at a known offset. There
@@ -53,7 +56,10 @@ Reading it left to right:
   fixed, also below `region_base`.
 - **KV regions** — the paged KV cache. `REGION_BYTES` each (`= TARGET_ARENA_BYTES`,
   16 MiB), indexed `[0, total)`, handed out one region per arena. **Fills from the
-  left.**
+  left.** Two *kinds* of arena draw from this pool: the band arenas holding K/V
+  payload, and the record arenas holding the `KvHead` records the paged kernels
+  dereference (§8). Both are inside `[0, total)` and so below `weight_floor` by
+  construction; they differ in what may move them.
 - **wave transient tier** — activations for the forward currently running. Exists
   *only* during a forward. **Placed per forward**, not reserved.
 - **expert weights** — equal-sized expert slots. **Fills from the right.**
@@ -406,3 +412,110 @@ partition before the kernel.** `candle::readonly_regions` (behind `tensor-assert
 exists for this: declare a tenant's ground immutable and the guard names the writer
 at the moment of the write, instead of leaving a wrong number to be found
 downstream.
+
+---
+
+## 8. `KvHead` records: the second arena kind
+
+### Why they move into the span
+
+A `KvHead` record is what a paged kernel actually dereferences: per `(head, palette,
+K/V)` band it holds the band's absolute device address, plus the palette tag bytes
+that say how to decode it. One record describes one chunk, and every slot referencing
+that chunk resolves to the same record.
+
+They begin outside the reservation, in `CudaSlice<u8>` slabs taken straight from the
+CUDA allocator. That contradicts §1's first claim — *there is no second allocator
+competing for the card* — and it costs three things that matter here:
+
+- **A host serialize and an upload per write.** `serialize_kv_heads` builds each
+  record into a `Vec<u8>` on the host, and `write_records_batched` coalesces those
+  into runs and issues one `memcpy_htod` **per run, under a lock**. The record's
+  entire content is derivable on the device from data the device already has, so
+  every one of those bytes crosses the bus needlessly.
+- **No walk.** A slab is reachable only through the handles pointing into it, so
+  "every live record" is not a question the pool can answer, and neither is "does
+  this record still name ground something holds".
+- **Ground the partition cannot see.** The slabs are real VRAM that `weight_floor`
+  arithmetic knows nothing about, so the two sides of the boundary are sized against
+  a capacity that is already spoken for.
+
+### Shape
+
+One arena kind, distinct from the band arenas, drawing regions from the same pool:
+
+- **Stride is the record size rounded up to a power of two.** A record is
+  `n_kv_head × (head_dim / 2 + 26 × n_palette)` bytes; rounding up makes slot decode
+  `chunks_per_region` exact, and keeps the stride space to the dozen discrete rungs of
+  `RECORD_STRIDES` — which is what lets the gid pool preallocate every record pool it
+  could ever be asked for and stay lock-free.
+  **Derived per call, not cached.** `n_palette` changes after the backing exists —
+  `set_single_latent` gives the single latent four times GQA's bands — so a record size
+  taken once at construction would be the GQA one and every record would overrun its
+  slot. `build_meta_records` therefore recomputes it from the live `n_palette()` on
+  every call and picks the key from that, leaving nothing to keep in step.
+  > The padding is **not** free, and the "shift and a mask" is not currently cashed in:
+  > nothing decodes a record slot from an address — the kernel is handed absolute
+  > destinations and `record_slot_addr` multiplies. At the GQA geometry a 1,344 B record
+  > sits in a 2,048 B slot, so ~34% of every record slot is pad, now inside the
+  > reservation and subtracted from `weight_floor`'s arithmetic (~144 MiB at 48 layers
+  > and 128K context). A non-power-of-two rung list would remove it at no cost.
+- **The handle is the existing arena gid.** A record is an arena slot, so `ChunkGid`
+  and the arena refcount tables give refcounting, cloning across every holder of the
+  chunk, and free-on-last-drop with no new lifetime machinery. This is the one place
+  the existing design is reused rather than re-derived: the semantics wanted for a
+  record — shared by every referencing slot, released when the last one goes — are
+  exactly `ChunkGid`'s.
+- **Records are now enumerable, though nothing enumerates them yet.** Being arena slots,
+  the refcount tables *can* list every live record, which is the precondition for the
+  record walk that re-enabling record compaction needs. `kv_integrity::check_records`
+  does not use it: it still walks the block tables per holder and reads each record back
+  over the bus, exactly as it did when records lived in slabs. Driving that check — and
+  the pointer patch — from the refcount walk instead is the work this migration makes
+  possible, not work it did.
+
+### Filling them: one batched launch, nothing on the host
+
+The write becomes a scatter/gather kernel, not a serialize-and-copy. Per batch the
+host uploads **one** descriptor table — the gid grid, the palette tags, and the
+destination record addresses — and the arena extent table; the kernel is grid-strided
+over a work space flattened across records, palette bytes and bands, and each band's
+thread computes its address as `base[arena] + slot × stride` and stores the 8-byte
+pointer at `band_ptr_offset`.
+
+> One qualification on "nothing on the host": the descriptor is smaller than the records
+> for a *batch*, but the extent table is the dense arena-indexed vector, so a
+> single-record seal at a few hundred arenas uploads several KB to write ~1.3 KB of
+> record, across nine `memcpy_stod` calls. Batching amortises it; a persistent extent
+> buffer patched on arena change would remove it.
+
+**The layout is defined in four places and the kernel must not become a fifth.**
+`serialize_kv_heads` and `band_ptr_offset` in `meta_pool.rs`, `kv_head_size` in
+`models/slot_state.rs`, the hand-rolled record writer in `latent_moe/paged.rs`, and
+the device-side accessors in `paged-decode/slot_types.cuh` all encode the same byte
+offsets independently. A fill kernel that derived them a fifth time would be one more
+copy to drift, so it computes its offsets from the same arithmetic and is held against
+the host serializer byte-for-byte by test — which is what makes the host serializer
+worth keeping as the reference implementation once it is off the hot path.
+
+Four properties this is required to have, and the reason each is not an optimisation:
+
+1. **One launch for the whole batch**, per invariant 2b: the kernel takes a
+   descriptor table, so no caller has to pack records together to satisfy it.
+2. **No host loop over records or bands.** The host builds the descriptor and stops;
+   addresses are computed where the data already is.
+3. **No avoidable host→device copy.** The descriptor is strictly smaller than the
+   records it produces, and the records themselves never cross the bus.
+4. **No synchronisation.** The upload and the launch are both async on the wave's
+   stream and nothing is read back. A fill that fenced would put a device-wide wait
+   between every pair of chunk allocations.
+
+### What is deliberately not done yet
+
+**The record arenas are excluded from the compaction census.** Relocating a record
+changes the address every holder's gid resolves to, which is the same class of defect
+that had the band-side pass switched off (§6, and `compact_backings`). Records may be
+compacted only once the pointer patch is driven from the record walk itself rather
+than from a per-holder sweep that can visit a record twice or miss it — at which
+point the walk makes that patch straightforward, which is half the reason for moving
+them here. Until then a record arena is allocated from and released, never packed.

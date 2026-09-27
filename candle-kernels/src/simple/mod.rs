@@ -111,6 +111,10 @@ pub mod rows_scatter;
 // primitive the compaction boundaries compare across
 pub mod kv_hash;
 
+// KvHead record construction on the device: one grid-strided launch per batch, band
+// addresses computed from an arena extent table rather than serialized on the host
+pub mod kv_record_fill;
+
 // NVTX3 range shim, so an nsys trace names the pipeline span that launched each
 // kernel (header-only NVTX3; nothing to link against)
 pub mod nvtx;

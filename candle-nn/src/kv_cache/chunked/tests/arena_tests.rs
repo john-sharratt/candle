@@ -131,6 +131,78 @@ mod tests {
             assert!(set.contains(&key(KvFormat::Float(DType::F16), ArenaLocation::Gpu)));
         }
 
+        /// Every record stride's slot count must stay **below** `GID_STRIDE`.
+        ///
+        /// A gid packs `arena_idx * GID_STRIDE + chunk_idx`, so a pool whose arenas hold
+        /// `GID_STRIDE` slots or more lets the last chunk index collide with the next
+        /// arena's namespace — the gid decodes to a different arena entirely, which is a
+        /// silent wrong-address read, not a fault. At 16 MiB regions and `1 << 16` that
+        /// makes 256 B the first stride that breaks, which is why `RECORD_STRIDES`
+        /// starts at 512. Asserted rather than commented because the two constants that
+        /// decide it live in different modules.
+        #[test]
+        fn record_strides_fit_the_gid_namespace() {
+            use crate::kv_cache::chunked::arena::RECORD_STRIDES;
+            use crate::kv_cache::chunked::size_class::GID_STRIDE;
+
+            assert!(!RECORD_STRIDES.is_empty());
+            for stride in RECORD_STRIDES {
+                assert!(
+                    stride.is_power_of_two(),
+                    "stride {stride} is not a power of two, so slot decode is not a mask",
+                );
+                let key = ArenaKey::for_record_stride(ArenaLocation::Gpu, stride);
+                assert_eq!(key.slot_stride(), stride);
+                assert!(
+                    key.chunks() > 0,
+                    "stride {stride} leaves no slots in a region",
+                );
+                assert!(
+                    key.chunks() < GID_STRIDE,
+                    "stride {stride} gives {} slots per arena, which reaches GID_STRIDE \
+                     ({GID_STRIDE}) — chunk indices would collide with the next arena",
+                    key.chunks(),
+                );
+            }
+        }
+
+        /// A key built from a record *size* and one built from its *stride* must be the
+        /// same key, or a caller looks up a pool the eager table never created — which
+        /// is exactly the `register_arena: missing preallocated pool for key` panic.
+        #[test]
+        fn a_record_size_and_its_stride_agree_on_the_key() {
+            for (bytes, want) in [(1usize, 512usize), (512, 512), (513, 1024), (1344, 2048)] {
+                let by_size = ArenaKey::for_records(ArenaLocation::Gpu, bytes);
+                let by_stride = ArenaKey::for_record_stride(ArenaLocation::Gpu, want);
+                assert_eq!(
+                    by_size, by_stride,
+                    "a {bytes} B record must resolve to the {want} B rung",
+                );
+                assert!(
+                    by_size.slot_stride() >= bytes,
+                    "the slot must hold the record",
+                );
+            }
+        }
+
+        /// A record key and a band key never collide, however their classes compare —
+        /// which is what keeps record arenas out of every walk that enumerates
+        /// `SizeClass::all()` against a band key, the compaction census included.
+        #[test]
+        fn a_record_key_is_never_a_band_key() {
+            use std::collections::HashSet;
+
+            let rec = ArenaKey::for_records(ArenaLocation::Gpu, 1344);
+            let mut band_keys = HashSet::new();
+            for class in SizeClass::all() {
+                band_keys.insert(ArenaKey::new(class, ArenaLocation::Gpu));
+            }
+            assert!(
+                !band_keys.contains(&rec),
+                "the record key collides with a band pool, so the census would walk it",
+            );
+        }
+
         /// A format the ladder does not cover is a configuration error, and it
         /// is reported as one rather than silently landing in the top class.
         #[test]
@@ -207,7 +279,7 @@ mod tests {
         fn slab(class: SizeClass, location: ArenaLocation, index: usize) -> Arena {
             let bytes = class.chunks_per_region() * class.bytes();
             let data = Tensor::zeros(bytes, DType::U8, &Device::Cpu).unwrap();
-            Arena::new(data, class, location, index)
+            Arena::new(data, ArenaKey::new(class, location), index)
         }
 
         fn small() -> SizeClass {
@@ -408,8 +480,10 @@ mod tests {
                 .write(|s| {
                     for idx in 0..2 {
                         let data = Tensor::zeros(bytes, DType::U8, &Device::Cpu).unwrap();
-                        s.arenas_mut()
-                            .insert(idx, Arena::new(data, class, ArenaLocation::Cpu, idx));
+                        s.arenas_mut().insert(
+                            idx,
+                            Arena::new(data, ArenaKey::new(class, ArenaLocation::Cpu), idx),
+                        );
                     }
                 })
                 .unwrap();

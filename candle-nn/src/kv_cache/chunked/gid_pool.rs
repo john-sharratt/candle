@@ -63,7 +63,7 @@ use std::{
 };
 use strum::IntoEnumIterator;
 
-use super::arena::ArenaKey;
+use super::arena::{ArenaKey, ArenaKind, RECORD_STRIDES};
 use super::size_class::SizeClass;
 use crate::kv_cache::chunked::types::{GID_STRIDE, TARGET_ARENA_BYTES};
 use crate::kv_cache::ArenaLocation;
@@ -706,11 +706,20 @@ struct ArenaPool {
 
 impl ArenaPool {
     fn new(class: SizeClass) -> Self {
+        Self::with_chunks(class.chunks_per_region())
+    }
+
+    /// A pool whose arenas hold `arena_chunks` slots.
+    ///
+    /// Split out because a record arena's capacity comes from its stride, not from its
+    /// size class — `ArenaKey::chunks()` is the authority for both kinds, and taking it
+    /// from the class for a record pool would size every refcount table wrongly.
+    fn with_chunks(arena_chunks: usize) -> Self {
         Self {
             tables: RwLock::new(BTreeMap::new()),
             total_arenas: AtomicUsize::new(0),
             total_live: Arc::new(AtomicUsize::new(0)),
-            arena_chunks: class.chunks_per_region(),
+            arena_chunks,
             alloc_gate: Mutex::new(()),
             capacity: Arc::new(CapacityBitmap::new()),
         }
@@ -1055,10 +1064,22 @@ fn preallocated_pool_table() -> AHashMap<ArenaKey, ArenaPool> {
     // pools. That collapse is the whole point: every format sharing a class
     // now shares one pool and one free list, so a slot freed by any of them is
     // allocatable by all of them (`docs/archived/arena_unification.md` §3.4).
-    let mut pools = AHashMap::with_capacity(ArenaLocation::iter().count() * SizeClass::COUNT);
+    let mut pools = AHashMap::with_capacity(
+        ArenaLocation::iter().count() * (SizeClass::COUNT + RECORD_STRIDES.len()),
+    );
     for location in ArenaLocation::iter() {
         for class in SizeClass::all() {
             pools.insert(ArenaKey::new(class, location), ArenaPool::new(class));
+        }
+        // **The `KvHead` record pools, preallocated for the same reason.** A record
+        // arena's stride is a power of two, so the strides it can ask for are the dozen
+        // rungs of `RECORD_STRIDES` — which is what keeps this table complete at
+        // construction and the lookup lock-free. A record pool sizes its refcount
+        // tables from the key's own capacity, not from a size class, because a record's
+        // slot count comes from its stride (`docs/vram_span_partition.md` §8).
+        for stride in RECORD_STRIDES {
+            let key = ArenaKey::for_record_stride(location, stride);
+            pools.insert(key, ArenaPool::with_chunks(key.chunks()));
         }
     }
     pools
@@ -1532,6 +1553,17 @@ impl ChunkGidPool {
         }
         for (key, pool) in self.inner.pools.iter() {
             if key.location != ArenaLocation::Gpu {
+                continue;
+            }
+            // **Record arenas are not a size class and must not be counted as one.**
+            // This walk is over `pools.iter()`, not over band keys, so unlike the census
+            // in `compact` it does see the record pools — and a record key carries
+            // `SizeClass::at(0)` only to keep the key one shape, so all twelve record
+            // rungs would land in the smallest class's row. That row then reports arenas
+            // it does not own, reserved bytes for regions that are not its, and
+            // `live_bytes` accumulated at strides up to 1 MiB against a 320 B
+            // `slot_bytes` — and it feeds the fragmentation and relief decisions.
+            if !matches!(key.kind, ArenaKind::Band) {
                 continue;
             }
             let arenas = pool.total_arenas.load(Ordering::Relaxed);

@@ -997,10 +997,7 @@ impl ChunkedKvBacking {
                 let new_gids = chunk.gids.map_unique(|gid| {
                     let cpu_key = self.inner.storage.read(|s| {
                         s.arena_key(gid.arena_idx())
-                            .map(|k| ArenaKey {
-                                class: k.class,
-                                location: ArenaLocation::Cpu,
-                            })
+                            .map(|k| k.at(ArenaLocation::Cpu))
                             .ok_or_else(|| {
                                 candle::Error::Msg(format!(
                                     "migrate_sealed_to_cpu: arena {} not found",
@@ -1101,10 +1098,7 @@ impl ChunkedKvBacking {
                             "migrate_sealed_to_cpu_batch: arena {arena_idx} not found"
                         ))
                     })?;
-                let cpu_key = ArenaKey {
-                    class: key.class,
-                    location: ArenaLocation::Cpu,
-                };
+                let cpu_key = key.at(ArenaLocation::Cpu);
                 src_keys.insert(raw, key);
                 new_gids.insert(raw, self.alloc_chunk_for_key(cpu_key)?);
             }
@@ -1132,10 +1126,7 @@ impl ChunkedKvBacking {
                     )));
                 }
                 let src_key = src_keys[&raw];
-                let cpu_key = ArenaKey {
-                    class: src_key.class,
-                    location: ArenaLocation::Cpu,
-                };
+                let cpu_key = src_key.at(ArenaLocation::Cpu);
                 let new_gid = new_gids[&raw].clone();
                 // Same class either side — the destination key only swaps the
                 // location — so this is a byte-verbatim slot relocation.
@@ -1402,10 +1393,7 @@ impl ChunkedKvBacking {
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
             for &raw in &unique_raws {
                 let src_key = &src_keys[&raw];
-                let cpu_key = ArenaKey {
-                    class: src_key.class,
-                    location: ArenaLocation::Cpu,
-                };
+                let cpu_key = src_key.at(ArenaLocation::Cpu);
                 new_gids.insert(raw, self.alloc_chunk_for_key(cpu_key)?);
             }
         }
@@ -1742,10 +1730,7 @@ impl ChunkedKvBacking {
                         .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
                     for &raw in &resolve.unique_raws {
                         let src_key = &resolve.src_keys[&raw];
-                        let cpu_key = ArenaKey {
-                            class: src_key.class,
-                            location: ArenaLocation::Cpu,
-                        };
+                        let cpu_key = src_key.at(ArenaLocation::Cpu);
                         new_gids.insert(raw, backing.alloc_chunk_for_key(cpu_key)?);
                     }
                 }
@@ -2023,10 +2008,7 @@ impl ChunkedKvBacking {
                             {
                                 continue;
                             }
-                            let gpu_key = ArenaKey {
-                                class: first_key.class,
-                                location: ArenaLocation::Gpu,
-                            };
+                            let gpu_key = first_key.at(ArenaLocation::Gpu);
                             let run = self.alloc_chunk_run_for_key(gpu_key, raws.len())?;
                             for (raw, gid) in raws.into_iter().zip(run) {
                                 new_gids.insert(raw, gid);
@@ -2040,10 +2022,7 @@ impl ChunkedKvBacking {
                     continue;
                 }
                 let src_key = &src_keys[&raw];
-                let gpu_key = ArenaKey {
-                    class: src_key.class,
-                    location: ArenaLocation::Gpu,
-                };
+                let gpu_key = src_key.at(ArenaLocation::Gpu);
                 new_gids.insert(raw, self.alloc_chunk_for_key(gpu_key)?);
             }
         }
@@ -2205,10 +2184,7 @@ impl ChunkedKvBacking {
                 let new_gids = chunk.gids.map_unique(|gid| {
                     let gpu_key = self.inner.storage.read(|s| {
                         s.arena_key(gid.arena_idx())
-                            .map(|k| ArenaKey {
-                                class: k.class,
-                                location: hot,
-                            })
+                            .map(|k| k.at(hot))
                             .ok_or_else(|| {
                                 candle::Error::Msg(format!(
                                     "migrate_sealed_to_gpu: arena {} not found",
