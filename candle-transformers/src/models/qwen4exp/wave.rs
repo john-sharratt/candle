@@ -2107,6 +2107,21 @@ impl WaveSweep for Qwen4ExpBatched {
         if let Device::Cuda(d) = &m.device {
             end_wave_transient(&d.cuda_stream());
         }
+
+        // The KV↔expert boundary's GROWING direction, in the one gap it is legal
+        // in: between forwards, on the line after the transient tier goes back, so
+        // no tier stands and the region ceiling is the pool's own size — which is
+        // what `growth_policy`'s occupancy arithmetic is written against.
+        //
+        // Without this the boundary only ever moves toward KV (`request_kv_ground`
+        // buys on the spot) and expert residency ratchets down across a long run:
+        // spare KV regions above the KV side's recent high-water never come back as
+        // resident-expert slots. The shrink direction needs no call here — a KV claim
+        // that runs out buys its own ground. Mirrors `latent_moe`'s wave and the
+        // blanket `BatchedModel` wave's phase 0; Flash-Next runs its own engine
+        // rather than `BatchedModelCore`, so it does not inherit either.
+        m.experts.reclaim_spare_ground();
+
         let n_glue = seq_ids.len() - n_decode - n_prefill;
         if n_glue > 0 || pending_glue.is_some() {
             candle::bail!(
