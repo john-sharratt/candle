@@ -50,7 +50,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 
 ### Git (17 tools)
 
-Typed access to the workspace's repositories through `zend-git`. Nothing in
+Typed access to the workspace's repositories through `zend-vfs`. Nothing in
 this crate spawns or parses git; each tool is a request/response shell over
 that layer. The family splits by capability, and that split is the design:
 **the readers declare nothing, the writers declare `DiskWrite`**, which

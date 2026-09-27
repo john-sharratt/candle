@@ -24,7 +24,7 @@ use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json::Value;
 use zend_tools::registry;
-use zend_tools::state::Workspace;
+use zend_vfs::Workspace;
 
 use crate::access;
 use crate::types::ToolMode;
@@ -173,7 +173,7 @@ pub const REPO_PARAM: &str = "repo";
 /// deployment, so the tool YAML does not carry them and this writes them in.
 /// What the YAML *does* declare stays after them: the tools that can cover
 /// the whole workspace declare `enum: ["*"]`
-/// ([`ALL_REPOS`](zend_tools::state::ALL_REPOS)), so their choice
+/// ([`ALL_REPOS`](zend_vfs::ALL_REPOS)), so their choice
 /// is a repository or `*`, and every other tool's is a repository alone.
 ///
 /// One schema feeds both readers: [`ToolDef::json_line`] renders it into the
@@ -314,7 +314,7 @@ mod tests {
     use super::*;
     use candle_conversation::stencil::{Param, ToolSpec};
 
-    use zend_tools::state::ALL_REPOS;
+    use zend_vfs::ALL_REPOS;
 
     /// The folder-metadata pass leaves a `.substrate.yaml` in the tools folder
     /// itself, and the compile-time embed carries it along; read as a tool it

@@ -23,7 +23,7 @@ use crate::{RegisteredTool, Replay, Tool, ToolContext};
 /// asked for whole files. The schema does, because a call with no page cannot
 /// be decoded against this stencil at all — and a fixed page, rather than an
 /// arbitrary caller-chosen range, means every call costs the same
-/// [`crate::state::vfs::PAGE_LINES`] lines regardless of what the model asks
+/// [`zend_vfs::vfs::PAGE_LINES`] lines regardless of what the model asks
 /// for, with no clamp-and-explain step to get there.
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {

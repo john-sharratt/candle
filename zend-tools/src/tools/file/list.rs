@@ -3,9 +3,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
+use zend_vfs::ALL_REPOS;
 
 use super::{FileError, Paging};
-use crate::state::ALL_REPOS;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Entries per page. A listing goes into the conversation verbatim, so an
@@ -40,7 +40,7 @@ pub struct FileEntry {
     pub path: String,
     /// Size from the directory entry's metadata — the only measure of a file a
     /// listing can give without opening it. There is deliberately no line count
-    /// beside it: see [`crate::state::vfs::ListEntry`]. Omitted for a
+    /// beside it: see [`zend_vfs::vfs::ListEntry`]. Omitted for a
     /// subdirectory entry — a directory has no size of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<usize>,

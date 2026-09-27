@@ -48,7 +48,7 @@ repos:
   - name: mind
 ```
 
-Rules, enforced when the workspace is built (`zend-tools/src/state/workspace.rs`):
+Rules, enforced when the workspace is built (`zend-vfs/src/workspace.rs`):
 
 - At least one repository.
 - A name is one plain folder name: no separators, no `.`/`..`, nothing Windows would open as another name (a `:`, a trailing dot or space, an 8.3 `~N` tail), and not `secrets`. Names are unique, so no two repositories share a folder and none nests in another.
@@ -100,7 +100,7 @@ The model cannot reach the file: the `file_*` tools mount only the listed reposi
 
 ### 4.1 One store per repository
 
-`ToolContext.files` is a `RepoFiles` (`zend-tools/src/state/files.rs`): one `VfsStore` per repository, each rooted at the repository's folder. A tool resolves `repo` to its store and the path inside it; `..` stops at the repository's root, so a path cannot reach a sibling repository or anything else in the workspace folder. The overlay/direct distinction, the `secrets/` refusal and the Windows spelling guards hold per store exactly as they did for the single root. A context built without a workspace (`ToolContext::new`, tests) is *detached*: each repository name gets an upper-only store on first use.
+`ToolContext.files` is a `RepoFiles` (`zend-vfs/src/files.rs`): one `VfsStore` per repository, each rooted at the repository's folder. A tool resolves `repo` to its store and the path inside it; `..` stops at the repository's root, so a path cannot reach a sibling repository or anything else in the workspace folder. The overlay/direct distinction, the `secrets/` refusal and the Windows spelling guards hold per store exactly as they did for the single root. A context built without a workspace (`ToolContext::new`, tests) is *detached*: each repository name gets an upper-only store on first use.
 
 ### 4.2 Arguments
 

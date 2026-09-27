@@ -1,6 +1,6 @@
 # Zend: Git Layer
 
-**Status:** The library (§3–§8) is built and tested (§11) as the `zend-git` crate, and the model-facing tools (§10) are built and tested as the `git_*` family in `zend-tools`. The VFS purge (§9) is designed, not built.
+**Status:** The library (§3–§8) is built and tested (§11) as the git layer of the `zend-vfs` crate, and the model-facing tools (§10) are built and tested as the `git_*` family in `zend-tools`. The VFS purge (§9) is designed, not built.
 **Scope:** A strongly typed Rust interface over the `git` command line, for the repositories a zend workspace lists (`docs/zend_workspace_execution.md` §3). It reads repository state, writes commits and branches **without touching the user's checkout**, and fetches from and pushes to origin. Its first consumer is the VFS purge (§9): turning a repository's session overlay into a commit on a branch.
 
 ---
@@ -11,7 +11,7 @@ Every repository in the workspace is already a git working tree on disk. The git
 
 Three rules shape the whole interface:
 
-1. **The user's checkout is never touched.** No operation writes the working tree, the index or `HEAD`. A commit is written as objects — blobs through `hash-object`, then tree and commit through one `fast-import` run — and a branch moves by reference transaction. No step involves an index at all. The user can be mid-edit in the same repository while zend commits beside them.
+1. **The user's checkout is never touched.** No operation writes the working tree, the index or `HEAD`. A commit is written as objects — blobs through `hash-object`, then tree and commit through one `fast-import` run — and a branch moves by reference transaction. No step involves an index at all. The user can be mid-edit in the same repository while zend commits beside them. The single exception is a checkout the daemon owns for running tools (§7.7), which is never a developer's.
 2. **Every ref move is a compare-and-swap.** A local ref update names the value it expects to replace; a push names the value it expects origin to hold. A concurrent change is a typed refusal, never an overwrite.
 3. **Values are validated at the type boundary.** An `Oid`, a `BranchName`, a `RepoPath`, a `Rev` cannot be constructed from a string git would misread. An argument therefore cannot become a flag, a path cannot leave the repository, and a branch name cannot be `-x` or `HEAD`.
 
@@ -39,11 +39,12 @@ Three rules shape the whole interface:
 
 ## 3. Placement
 
-The `zend-git` crate, depending on nothing else in the workspace. One concern per file:
+The `zend-vfs` crate, depending on nothing else in the workspace. The git layer is the crate's base; the file layer (the workspace manifest, a conversation's changes as deltas, the overlay the `file_*` tools work through, the `file_edit` patch engine) and the execution checkout (materialise a conversation's deltas onto a checkout, capture what a tool changed) sit on top of it in the same crate. One concern per file; the git layer's files are:
 
 ```
-zend-git/src/
+zend-vfs/src/
   lib.rs              Repo: open (top-level check), dir, format, write lock
+  execution.rs        force_checkout_branch, restore_paths, read_checked_out (§7.7)
   version.rs          GitVersion, MINIMUM, installed()
   runner.rs           Invocation: args, -c overrides, env, stdin, timeout
   kill_tree.rs        Process-tree kill (Job Object / process group)
@@ -330,6 +331,26 @@ A `BlameLine` is `{ commit, orig_line, final_line, orig_path, author, committer,
 
 `init`, `clone` and `add_worktree` take an absolute path that does not exist or is an empty folder; a worktree path may hold no control character, since `worktree list` is read line by line. A linked worktree shares the repository's object store and branches but is a separate checkout: a build can run there without touching the user's. `clone` always passes `--no-local`, `--no-hardlinks` and `--no-recurse-submodules` (§4.7). `init` points the new unborn `HEAD` at the branch with `symbolic-ref`.
 
+### 7.7 An execution checkout
+
+A tool that runs on the machine needs a conversation's files on disk: its branch checked out with its changes laid over the branch's commit, the tool run there, and what the tool changed read back as deltas. That happens on one checkout the daemon owns, one run at a time, so a build cache over it stays warm across conversations. `zend-vfs/src/checkout/` drives it; the layer supplies three operations, the only ones that change a working tree:
+
+| Method | Does | Plumbing |
+|---|---|---|
+| `force_checkout_branch(branch)` | `HEAD` on `branch`, tracked files and index at its commit — a hard reset and a switch in one step — no branch moved; untracked and ignored files left alone; a file already at the commit's content not rewritten | `checkout --force --no-recurse-submodules <branch> --` |
+| `force_branch_tip(branch, from, to)` | `branch` put at `to` as a compare-and-swap against `from` (`None`: absent), whether or not it is checked out — the one ref move that ignores a checkout, for taking back a branch a tool moved; index and working tree untouched | `update-ref --no-deref --stdin -z` |
+| `attach_head(branch)` | `HEAD` pointed at `branch`, index and working tree untouched | `symbolic-ref HEAD refs/heads/<branch>` |
+| `restore_paths(commit, paths)` | the named tracked files back to `commit`'s content, nothing else touched; batched under the command-line limit | `checkout --force <commit> -- <paths>` |
+| `read_checked_out(rev, path)` | a file's bytes as a checkout writes them — `core.autocrlf`, `.gitattributes` and `smudge` applied; `None` for a missing path or a folder | `cat-file --filters`, one per file |
+
+`read_checked_out_all(rev, paths)` reads many files as a checkout writes them in three processes per call, by the checkout's own code: `ls-tree` for which exist, `read-tree` of `rev` into a private index, and `checkout-index` of those files into a private folder under the git folder, read back and removed — so conversions, attributes and filters apply exactly as a checkout's, and nothing only an archive applies (`export-ignore`, `export-subst`) does. `files_at(rev, paths)` answers only which exist. `materialize` and `capture` read the base through these, and only where it is needed: a conversation's chain that opens with a write or a delete replaces the base, and a path status reports untracked (and nothing else) has no base copy. `status_with_head` gives status and `HEAD` in one process (`--branch --no-ahead-behind`), which each pass asks for together.
+
+`read_checked_out` is one process per file rather than a batch reader because `cat-file --batch --filters` reports the stored blob's size in its header while sending the converted bytes, and a conversion that adds carriage returns makes those longer.
+
+On top of these, `materialize` reaches what `reset --hard` plus writing every changed file would leave while touching only files whose bytes are wrong: it resets onto the branch only when `HEAD` is not on it at its commit or the index was changed, otherwise restores the tracked files `status` names and removes the untracked ones a previous run added, and writes a conversation's file only when its content differs — dating it by the conversation's latest change to it, not by the write. A ledger of each written file's content and stamp (size and modification time) lets a later pass trust a file without reading it, unless the stamp is within the racy window of when it was taken. `capture` first takes back the checkout's git state — a tool that committed, switched branch, detached or deleted the branch has the branch put back at the run's commit and `HEAD` back on it, so its commits read as changes like any other — then reads back every file `status` names plus every file the ledger names, skips those whose stamp the ledger vouches for, and turns the rest into deltas against the conversation's own state; ignored files the conversation never wrote are the tool's by-products and are not captured. A file the tool replaced with a folder or a link, or put behind a link, reads as deleted; nothing is ever read or removed through a link — clearing a tool's link removes the link, and the folders a run's files left empty go with them.
+
+`zend-vfs/src/sandbox/` is the whole round trip for one repository, whose working folder is the repository itself: lock the checkout, `materialize` the conversation onto its branch, check the command against the sandbox's `CommandPolicy` (git run directly — as the program, behind a wrapper such as `env` or `timeout`, or as a command in a shell's script, read per dialect with its quotes, escapes, comments and here-documents — is refused with an error naming the `git_*` tools to use instead, while the word `git` that runs no git passes; then an allow-list of programs, and no absolute or escaping path and no `.git`/`secrets` component in any argument), run it asynchronously with both streams read and its process tree killed on exit or timeout, `capture` what it changed, `materialize` the branch alone again, record the captured deltas in the conversation's `VfsStore`, and unlock. Recording comes after the second reset because the store's lower layer is the repository's folder: a delta is checked against the file as the store reads it, which is only the conversation's state again once the folder is back at the branch.
+
 ---
 
 ## 8. Writing commits without the checkout
@@ -438,9 +459,9 @@ A patch is held to `ChangeSet`'s rules (§8.1), judged by what it actually chang
 
 ## 9. First consumer: the VFS purge (not built)
 
-A repository's overlay store (`zend-tools/src/state/vfs.rs`) holds session writes in `Upper.files` and deletions in `Upper.whiteouts`. A purge publishes them and empties the overlay:
+A repository's overlay store (`zend-vfs/src/vfs.rs`) holds one conversation's changes as deltas (`zend-vfs/src/file_delta.rs`): per path, a chain of `Replace` (a whole-file write), `Edit` (only the changed lines, as splices against the text before it) and `Delete`. A purge publishes them and empties the overlay:
 
-1. **Snapshot.** Take the overlay's writes and whiteouts as a `ChangeSet` — writes as `Change::Write` (UTF-8 bytes of the stored text), whiteouts as `Change::Delete`.
+1. **Snapshot.** Take the overlay's changed paths as a `ChangeSet` — each path's chain replayed to its resulting text as `Change::Write` (its UTF-8 bytes), a chain ending deleted as `Change::Delete`.
 2. **Filter.** Drop paths `ignored()` reports; they are listed back to the caller, not committed.
 3. **Base.** `head()` of the repository. `Unborn` or `Detached` is reported, not guessed around.
 4. **Warn on divergence.** `diff_worktree(base)` names any overlay path the user also changed on disk. Overlay content for such a path was read through the user's uncommitted edit, so the commit would carry that edit too; the purge reports the paths and its caller decides.
@@ -448,7 +469,7 @@ A repository's overlay store (`zend-tools/src/state/vfs.rs`) holds session write
 6. **Branch.** `create_branch(zen/<name>, commit)` locally, then `push` with `Lease::Absent` — or `Lease::Expect` of the last pushed head when the branch already exists, rebuilding through §8.5 when origin moved — and `set_upstream` so the user can check the branch out, pull and push it like one they pushed themselves.
 7. **Empty.** Only after the push succeeds are the purged paths removed from the overlay, and only those whose content is unchanged since the snapshot. A failure at any step leaves the overlay as it was.
 
-The overlay is currently one per repository for the whole daemon, shared across conversations (`zend/src/tools.rs`, `ToolHost`). Branch naming and per-conversation purges therefore depend on §12, question 1.
+Each conversation has its own overlay per repository (`zend/src/tools.rs`, `ToolHost::conversation_files`), and its own branch per repository recorded in its state (`zend/src/conv_branches.rs`), so a purge is per conversation and lands on that conversation's branch.
 
 ---
 
@@ -487,7 +508,7 @@ Adding these changes the tool catalog, which recalibrates only the tools whose d
 
 ## 11. Testing
 
-`cargo test -p zend-git`: CPU only, offline, 175 tests. The suite passes against Git for Windows 2.24.1 (the minimum), 2.45.1 and 2.55.0, each put first on `PATH` for the run; the portable builds are unpacked from Git for Windows' signed releases. Every repository a test uses is created with `git init` inside `zend-git/scratch/` — nested in the candle checkout and ignored by it (`zend-git/.gitignore`) — and deleted when the test ends. Setup asserts each test repository is its own top level, so no test can reach the candle repository around it. "Origin" is a bare repository in the same folder, reached over `file://` so fetch and push use git's smart transport. Setup commits use fixed identities and dates, so their ids are reproducible.
+`cargo test -p zend-vfs`: CPU only, offline, 464 tests across the crate's layers. The suite passes against Git for Windows 2.24.1 (the minimum), 2.45.1 and 2.55.0, each put first on `PATH` for the run; the portable builds are unpacked from Git for Windows' signed releases. Every repository a test uses is a copy, inside `zend-vfs/scratch/`, of an empty repository built with `git init` once per test process (no sample hooks, no background maintenance) — nested in the candle checkout and ignored by it (`zend-vfs/.gitignore`) — and deleted when the test ends. Setup asserts each test repository is its own top level, so no test can reach the candle repository around it. "Origin" is a bare repository in the same folder, reached over `file://` so fetch and push use git's smart transport. Setup commits use fixed identities and dates, so their ids are reproducible.
 
 **Types and wire formats (exact bytes, no tolerances)**
 - `Oid`, `RefName` / `BranchName` / `RemoteName` / `TagName`, `RemoteUrl`, `RepoPath`, `FileMode`, `GitTime` / `Signature` accept and refuse exactly the documented sets; the ref-name table agrees with `git check-ref-format` name for name.

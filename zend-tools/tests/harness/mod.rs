@@ -18,8 +18,8 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use zend_tools::state::{RepoSpec, Workspace};
 use zend_tools::{Grants, ToolContext};
+use zend_vfs::{RepoSpec, Workspace};
 
 /// A fresh context granted every capability — these tests exercise what a
 /// tool does, not whether it may; the refusals are tested beside the grants.

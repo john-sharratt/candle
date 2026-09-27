@@ -97,14 +97,40 @@ pub struct ConvMeta {
     pub custom: BTreeMap<String, String>,
 }
 
-/// Per-timeline lifecycle flags persisted in `RecordType::ConvState`.
-/// Today: just the `archived` flag (hide-from-sidebar without losing
-/// the conversation). Future fields slot in alongside — serde's
+/// A conversation's state, persisted whole in `RecordType::ConvState`.
+///
+/// Every record carries the complete state, never a delta, so the newest
+/// record for a timeline is the whole truth and replay is last-writer-wins.
+/// The record's header carries the timeline id as its `stream_id`, so the
+/// accounting sees each new record supersede the last the way it does for
+/// `Npc` and `Snapshot`; compaction and maintenance re-emit the live state
+/// in full from the substrate. Fields added here slot in alongside —
 /// `#[serde(default)]` covers both omit-on-write and ignore-on-read.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvState {
+    /// Hidden from the sidebar without losing the conversation.
     #[serde(default)]
     pub archived: bool,
+    /// The branch this conversation works on in each repository, keyed by
+    /// the repository's workspace name — its own line of work, whatever the
+    /// developer has checked out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branches: BTreeMap<String, String>,
+    /// The changes this conversation has made to each repository's files,
+    /// keyed by the repository's workspace name, in the form the daemon's
+    /// file layer records them — kept and replayed here, never read. What
+    /// lets a conversation's own copy of the workspace outlive the daemon's
+    /// in-memory state of it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, serde_json::Value>,
+}
+
+impl ConvState {
+    /// Whether this is the state an untouched conversation has, which needs
+    /// no record.
+    pub fn is_default(&self) -> bool {
+        *self == ConvState::default()
+    }
 }
 
 /// Wire-format `Label` payload: `{timeline_id, conv_id, label}`.
@@ -120,13 +146,13 @@ struct LabelPayload {
     custom: BTreeMap<String, String>,
 }
 
-/// Wire-format `ConvState` payload: `{timeline_id, archived}`.
+/// Wire-format `ConvState` payload: `{timeline_id, archived, branches}`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ConvStatePayload {
     #[serde(default)]
     timeline_id: u64,
-    #[serde(default)]
-    archived: bool,
+    #[serde(flatten)]
+    state: ConvState,
 }
 
 impl Manifest {
@@ -288,10 +314,10 @@ pub fn decode_label_payload(payload: &[u8]) -> Result<(u64, ConvMeta)> {
 }
 
 /// Encode a `ConvState` record's payload — JSON.
-pub fn encode_conv_state_payload(timeline_id: u64, state: ConvState) -> Vec<u8> {
+pub fn encode_conv_state_payload(timeline_id: u64, state: &ConvState) -> Vec<u8> {
     let p = ConvStatePayload {
         timeline_id,
-        archived: state.archived,
+        state: state.clone(),
     };
     serde_json::to_vec(&p).expect("ConvState payload JSON encoding is infallible")
 }
@@ -303,12 +329,7 @@ pub fn encode_conv_state_payload(timeline_id: u64, state: ConvState) -> Vec<u8> 
 pub fn decode_conv_state_payload(payload: &[u8]) -> Result<(u64, ConvState)> {
     let p: ConvStatePayload = serde_json::from_slice(payload)
         .map_err(|e| PersistenceError::Corrupt(format!("ConvState payload JSON decode: {e}")))?;
-    Ok((
-        p.timeline_id,
-        ConvState {
-            archived: p.archived,
-        },
-    ))
+    Ok((p.timeline_id, p.state))
 }
 
 #[cfg(test)]
@@ -386,57 +407,91 @@ mod tests {
         );
     }
 
-    /// `ConvState` payload encodes / decodes correctly with the
-    /// `archived` flag both set and clear.
-    #[test]
-    fn conv_state_payload_round_trip() {
-        let archived = encode_conv_state_payload(42, ConvState { archived: true });
-        let (tl, st) = decode_conv_state_payload(&archived).unwrap();
-        assert_eq!(tl, 42);
-        assert!(st.archived);
-
-        let unarchived = encode_conv_state_payload(7, ConvState { archived: false });
-        let (tl, st) = decode_conv_state_payload(&unarchived).unwrap();
-        assert_eq!(tl, 7);
-        assert!(!st.archived);
+    fn state(archived: bool, branches: &[(&str, &str)]) -> ConvState {
+        ConvState {
+            archived,
+            branches: branches
+                .iter()
+                .map(|(r, b)| (r.to_string(), b.to_string()))
+                .collect(),
+            files: BTreeMap::new(),
+        }
     }
 
-    /// Multiple `ConvState` records for the same timeline collapse
-    /// to the latest one in the manifest — last-writer-wins.
+    /// **The `ConvState` payload is exactly these bytes**, and decodes back
+    /// to the state it was made from. An empty branch map is left out.
+    #[test]
+    fn conv_state_payload_is_exactly_these_bytes() {
+        let full = state(true, &[("candle", "main"), ("battle-cities", "master")]);
+        let bytes = encode_conv_state_payload(42, &full);
+        assert_eq!(
+            bytes,
+            br#"{"timeline_id":42,"archived":true,"branches":{"battle-cities":"master","candle":"main"}}"#
+        );
+        assert_eq!(decode_conv_state_payload(&bytes).unwrap(), (42, full));
+
+        let bare = encode_conv_state_payload(7, &ConvState::default());
+        assert_eq!(bare, br#"{"timeline_id":7,"archived":false}"#);
+        assert_eq!(
+            decode_conv_state_payload(&bare).unwrap(),
+            (7, ConvState::default())
+        );
+        // A record written before `branches` existed reads as no branches.
+        assert_eq!(
+            decode_conv_state_payload(br#"{"timeline_id":7,"archived":true}"#).unwrap(),
+            (7, state(true, &[]))
+        );
+    }
+
+    /// **File changes ride in the payload as the daemon recorded them** —
+    /// carried through byte for byte, never interpreted.
+    #[test]
+    fn conv_state_payload_carries_files_verbatim() {
+        let mut with_files = state(false, &[("candle", "main")]);
+        with_files.files.insert(
+            "candle".to_string(),
+            serde_json::json!({ "a.txt": { "deltas": [], "size": null } }),
+        );
+        let bytes = encode_conv_state_payload(3, &with_files);
+        assert_eq!(
+            bytes,
+            br#"{"timeline_id":3,"archived":false,"branches":{"candle":"main"},"files":{"candle":{"a.txt":{"deltas":[],"size":null}}}}"#
+        );
+        assert_eq!(decode_conv_state_payload(&bytes).unwrap(), (3, with_files));
+    }
+
+    /// Multiple `ConvState` records for the same timeline collapse to the
+    /// latest one — last-writer-wins on the WHOLE state, so a branch the
+    /// newest record does not name is gone, not merged back from an older
+    /// record.
     #[test]
     fn conv_state_last_writer_wins_in_manifest() {
         let mut blob = Vec::new();
-        blob.extend_from_slice(&record(
-            RecordType::ConvState,
-            0,
-            0,
-            &encode_conv_state_payload(99, ConvState { archived: true }),
-        ));
-        blob.extend_from_slice(&record(
-            RecordType::ConvState,
-            0,
-            0,
-            &encode_conv_state_payload(99, ConvState { archived: false }),
-        ));
-        blob.extend_from_slice(&record(
-            RecordType::ConvState,
-            0,
-            0,
-            &encode_conv_state_payload(99, ConvState { archived: true }),
-        ));
+        for s in [
+            state(true, &[("candle", "old"), ("mind", "main")]),
+            state(false, &[]),
+            state(true, &[("candle", "zen/work")]),
+        ] {
+            blob.extend_from_slice(&record(
+                RecordType::ConvState,
+                99,
+                0,
+                &encode_conv_state_payload(99, &s),
+            ));
+        }
         let mut mem = MemLog::with_records(&blob);
         let (_, mut substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
         // Timeline 99 isn't registered during the walk; the three
         // ConvState records are stashed pending registration.  Drain
         // them by registering the timeline, then verify the
-        // last-writer-wins archive flag (the final `true` here)
-        // lands on the TimelineEntry.
+        // last-writer-wins state lands on the TimelineEntry.
         let tl = TimelineId::from_raw(99).unwrap();
         substrate.register_timeline(tl, LayerId::for_test(1), GroupId::for_test(1));
-        assert!(
-            substrate.is_archived(tl),
-            "last ConvState (archived=true) must win after registration drains the stash"
+        assert_eq!(
+            substrate.conv_state(tl),
+            Some(state(true, &[("candle", "zen/work")])),
+            "the last ConvState must win whole after registration drains the stash"
         );
     }
 

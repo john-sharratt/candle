@@ -6,16 +6,22 @@
 //! is repository-relative and cannot reach another repository or anything else
 //! in the workspace folder.
 //!
+//! A set belongs to one conversation. Its overlay stores hold that
+//! conversation's changes and no one else's, so each conversation is given its
+//! own — [`RepoFiles::fresh`] makes one — and a file one conversation writes is
+//! never what another one reads.
+//!
 //! A [`RepoFiles::detached`] set has no workspace behind it: there is no disk,
 //! so there is nothing to scope a name against, and each repository name gets
 //! an upper-only store the first time a call uses it. That is the shape a
 //! context built without a workspace — a test, a scratch interpreter — has.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use super::vfs::VfsStore;
+use super::vfs::{Snapshot, VfsStore};
 use super::workspace::{Workspace, ALL_REPOS};
-use crate::grants::DiskWriteGrant;
+use crate::DiskWriteGrant;
 
 /// A `repo` argument the workspace does not list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +93,25 @@ impl RepoFiles {
         }
     }
 
+    /// A set of the same kind with none of this one's session changes — what
+    /// a new conversation starts from. An overlay set gets fresh overlays over
+    /// the same workspace, a detached set a fresh detached one. A direct set
+    /// holds no session changes — its writes are on disk — so the new set
+    /// shares its stores.
+    pub fn fresh(&self) -> Self {
+        if self.direct {
+            return Self {
+                workspace: self.workspace.clone(),
+                stores: RwLock::new(self.all()),
+                direct: true,
+            };
+        }
+        match &self.workspace {
+            Some(workspace) => Self::overlay(workspace.clone()),
+            None => Self::detached(),
+        }
+    }
+
     /// The workspace behind these stores, if any.
     pub fn workspace(&self) -> Option<&Workspace> {
         self.workspace.as_ref()
@@ -133,6 +158,33 @@ impl RepoFiles {
             .collect()
     }
 
+    /// Every repository's session changes, by name — those with any, to be
+    /// saved with the conversation they belong to.
+    pub fn snapshots(&self) -> BTreeMap<String, Snapshot> {
+        self.all()
+            .into_iter()
+            .map(|(name, store)| (name, store.snapshot()))
+            .filter(|(_, snapshot)| !snapshot.is_empty())
+            .collect()
+    }
+
+    /// Put back each repository's saved changes. A repository the set does
+    /// not have, or whose store refuses its changes, is named in the result
+    /// with the reason; the others are restored all the same.
+    pub fn restore(&self, saved: BTreeMap<String, Snapshot>) -> Vec<(String, String)> {
+        let mut refused = Vec::new();
+        for (name, snapshot) in saved {
+            let result = self
+                .repo(&name)
+                .map_err(|e| e.to_string())
+                .and_then(|store| store.restore(snapshot).map_err(|e| e.to_string()));
+            if let Err(why) = result {
+                refused.push((name, why));
+            }
+        }
+        refused
+    }
+
     /// Bytes held in every store's upper layer together.
     pub fn total_bytes(&self) -> usize {
         self.stores
@@ -161,8 +213,7 @@ impl Default for RepoFiles {
 mod tests {
     use super::*;
 
-    use crate::grants::Grants;
-    use crate::state::workspace::RepoSpec;
+    use crate::workspace::RepoSpec;
 
     fn two_repos() -> (tempfile::TempDir, Workspace) {
         let dir = tempfile::tempdir().unwrap();
@@ -249,10 +300,87 @@ mod tests {
         assert_eq!(files.total_bytes(), 1);
     }
 
+    /// **A fresh set shares no session changes with the one it came from** —
+    /// what keeps one conversation's writes out of another's reads — while
+    /// still reading the same workspace underneath.
+    #[test]
+    fn a_fresh_set_starts_without_the_others_changes() {
+        let (_dir, ws) = two_repos();
+        let first = RepoFiles::overlay(ws);
+        first
+            .repo("a")
+            .unwrap()
+            .write("one.txt", "mine".into())
+            .unwrap();
+        first.repo("b").unwrap().delete("two.txt");
+
+        let second = first.fresh();
+        assert!(!second.is_direct());
+        assert_eq!(second.names(), first.names());
+        assert_eq!(
+            second
+                .repo("a")
+                .unwrap()
+                .read("one.txt")
+                .unwrap()
+                .as_deref(),
+            Some("a"),
+            "the workspace's copy, not the first set's write"
+        );
+        assert_eq!(
+            second
+                .repo("b")
+                .unwrap()
+                .read("two.txt")
+                .unwrap()
+                .as_deref(),
+            Some("b"),
+            "the first set's delete hides nothing here"
+        );
+        assert_eq!(second.total_bytes(), 0);
+        assert_eq!(
+            first.repo("a").unwrap().read("one.txt").unwrap().as_deref(),
+            Some("mine")
+        );
+    }
+
+    /// **A set's changes survive into a fresh set** — only the repositories
+    /// with changes are saved, and a repository the fresh set does not have
+    /// is reported rather than dropped silently.
+    #[test]
+    fn a_sets_changes_restore_into_a_fresh_set() {
+        let (_dir, ws) = two_repos();
+        let first = RepoFiles::overlay(ws);
+        first
+            .repo("a")
+            .unwrap()
+            .write("one.txt", "mine".into())
+            .unwrap();
+        let mut saved = first.snapshots();
+        assert_eq!(saved.keys().collect::<Vec<_>>(), ["a"], "b has no changes");
+
+        let second = first.fresh();
+        saved.insert("gone".to_string(), first.repo("a").unwrap().snapshot());
+        let refused = second.restore(saved);
+        assert_eq!(
+            refused.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["gone"]
+        );
+        assert_eq!(
+            second
+                .repo("a")
+                .unwrap()
+                .read("one.txt")
+                .unwrap()
+                .as_deref(),
+            Some("mine")
+        );
+    }
+
     #[test]
     fn a_direct_set_writes_each_repository_on_disk() {
         let (dir, ws) = two_repos();
-        let files = RepoFiles::direct(ws, Grants::ALL.disk_write().unwrap());
+        let files = RepoFiles::direct(ws, DiskWriteGrant::issue());
         assert!(files.is_direct());
         files
             .repo("b")

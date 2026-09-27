@@ -10,8 +10,9 @@
 //! Keys are derived from the record header alone: `Chunk` is keyed by
 //! `(stream_id, chunk_index)`; the per-stream last-writer-wins types
 //! (`Tokens`, `StreamDecl`, `Commit`, `ProjectionEvents`, `WideQSig`)
-//! by `stream_id`; the workspace singletons by type. The timeline-keyed
-//! metadata types (`Label`, `ConvState`, `TreeMetadata`, `DebugId`,
+//! by `stream_id`; the workspace singletons by type. `ConvState` carries its
+//! timeline in the header's `stream_id` and is keyed by it. The other
+//! timeline-keyed metadata types (`Label`, `TreeMetadata`, `DebugId`,
 //! `Tombstone`) carry their key inside the payload, which the header
 //! scan doesn't decode — they are sector-sized records whose dead
 //! weight is negligible next to chunk bytes, so they are left out and
@@ -70,7 +71,11 @@ impl RecordAccounting {
             // A section tombstone is keyed by the section's `StreamId` in the
             // header too — one live marker per section, same mechanical
             // supersession as `Npc` and the branch checkpoint.
-            | RecordType::SectionTombstone => (header.record_type, header.stream_id, 0),
+            | RecordType::SectionTombstone
+            // A conversation's state carries its timeline id in the header's
+            // `stream_id` and is written whole every time, so the newest record
+            // supersedes the last by the same rule.
+            | RecordType::ConvState => (header.record_type, header.stream_id, 0),
             RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => {
                 (header.record_type, 0, 0)
             }
@@ -80,7 +85,6 @@ impl RecordAccounting {
             // compaction. `Distilled` markers are payload-keyed and
             // consumed by the next compaction pass.
             RecordType::Label
-            | RecordType::ConvState
             | RecordType::TreeMetadata
             | RecordType::DebugId
             | RecordType::Tombstone
@@ -155,6 +159,18 @@ mod tests {
         acc.record(&header(RecordType::Commit, 9, 3), 4096);
         acc.record(&header(RecordType::Commit, 9, 7), 4096);
         assert_eq!(acc.dead_bytes(), 4096);
+    }
+
+    /// **A conversation's new state supersedes its last**, keyed by the
+    /// timeline in the header, and never another conversation's.
+    #[test]
+    fn conv_state_supersedes_per_timeline() {
+        let mut acc = RecordAccounting::new();
+        acc.record(&header(RecordType::ConvState, 11, 0), 4096);
+        acc.record(&header(RecordType::ConvState, 12, 0), 4096);
+        assert_eq!(acc.dead_bytes(), 0, "two conversations, both live");
+        acc.record(&header(RecordType::ConvState, 11, 0), 4096);
+        assert_eq!(acc.dead_bytes(), 4096, "11's first state is dead");
     }
 
     /// Payload-keyed metadata types and the derived `HeaderIndex`

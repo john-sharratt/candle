@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use zend_git::{GitError, LogRange};
+use zend_vfs::{GitError, LogRange};
 
 use super::line_history::{line_history, LineRun, LineSpan};
 use super::wire::WireCommit;

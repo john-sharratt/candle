@@ -1,15 +1,14 @@
 //! Every way a tool opens host storage outside the file store, refused without
 //! [`Capability::DiskWrite`](crate::Capability::DiskWrite).
 //!
-//! The workspace files go through [`VfsStore`](crate::state::VfsStore), which
+//! The workspace files go through [`VfsStore`](zend_vfs::VfsStore), which
 //! writes the disk only when built with a [`DiskWriteGrant`]. A SQLite
 //! connection is a second route to the disk that the store never sees — a path
 //! opens or creates a file, and even `:memory:` can `ATTACH` or `VACUUM INTO`
 //! one — so opening any connection takes the same proof.
 
 use rusqlite::{Connection, Result};
-
-use crate::grants::DiskWriteGrant;
+use zend_vfs::DiskWriteGrant;
 
 /// A SQLite connection to `path` (or `:memory:`).
 pub fn sqlite_open(_grant: &DiskWriteGrant, path: &str) -> Result<Connection> {
@@ -61,6 +60,10 @@ mod tests {
             "symlink",
             "set_permissions",
             "set_len",
+            // The proof of the disk-write capability is issued by
+            // `Grants::disk_write` alone; a tool minting its own would skip the
+            // check it stands for.
+            "DiskWriteGrant::issue",
         ])
         .into_iter()
         .filter(|(file, _, _)| !KEY_FILE_WRITERS.contains(&file.replace('\\', "/").as_str()))

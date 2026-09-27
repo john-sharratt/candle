@@ -29,8 +29,8 @@ use candle_conversation::memory_report::MemoryReport;
 use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::stencil::{ThinkMode, ToolCallEnvelope, TriggerRegistry};
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
-use zend_tools::state::Workspace;
 use zend_tools::ToolContext;
+use zend_vfs::Workspace;
 
 use crate::ingest_report::{Failures, IngestReport};
 use crate::loading::LoadProgress;

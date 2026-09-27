@@ -9,7 +9,7 @@
 //! eighteen turns and 360 KB of context doing exactly that, and the largest
 //! file it read was the wrong one.
 //!
-//! All operations target the overlay filesystem ([`crate::state::VfsStore`]): an
+//! All operations target the overlay filesystem ([`VfsStore`]): an
 //! in-memory session layer stacked over the daemon's working directory. Reads
 //! resolve session-first and fall through to the real project; writes, edits, and
 //! deletes stay in memory. **Nothing here ever modifies a file on disk.**
@@ -23,12 +23,12 @@
 //!
 //! Every call names a `repo` — one of the repositories the workspace lists —
 //! and its paths are relative to that repository's folder
-//! ([`crate::state::RepoFiles`]). `file_list`, `file_search` and `file_grep`
+//! ([`zend_vfs::RepoFiles`]). `file_list`, `file_search` and `file_grep`
 //! also take [`ALL_REPOS`] (`"*"`) to cover every repository at once; their
 //! results then name the repository each entry came from. The scope is always
 //! stated: a call that means the whole workspace says so.
 //!
-//! Paths are normalised before use (see [`crate::state::VfsStore`]), so
+//! Paths are normalised before use (see [`VfsStore`]), so
 //! `./src/../src/main.rs`, `/src/main.rs`, and `src/main.rs` are all one entry.
 //!
 //! # `file_edit` patches
@@ -40,7 +40,7 @@
 //! makes sending the same patch twice a no-op; a hunk that matches nowhere is
 //! `not_found`, and a patch that is not a readable diff is `invalid_arguments`.
 //! Either every hunk lands or the file is left exactly as it was. The engine is
-//! [`patch`], where the format and each failure are documented.
+//! [`zend_vfs::patch`], where the format and each failure are documented.
 //!
 //! # `file_present`
 //!
@@ -64,7 +64,7 @@
 //! | `no_files_found` | All requested paths are missing (`file_present`) |
 //! | `unreadable` | Workspace file is above the read limit or is not UTF-8 text |
 //! | `invalid_arguments` | The `file_edit` patch is not a readable unified diff, a `file_grep` pattern is not a valid regex, or a `file_read` path is a web address |
-//! | `forbidden` | The path is under a `secrets/` directory — see [`crate::state::vfs`] |
+//! | `forbidden` | The path is under a `secrets/` directory — see [`zend_vfs::vfs`] |
 //! | `unknown_repo` | `repo` names no repository in the workspace; the message lists the ones it does |
 
 use std::sync::Arc;
@@ -72,9 +72,9 @@ use std::sync::Arc;
 use serde::Serialize;
 use thiserror::Error;
 
-use self::patch::PatchError;
-use crate::state::vfs::VfsError;
-use crate::state::{UnknownRepo, VfsStore, ALL_REPOS};
+use zend_vfs::patch::PatchError;
+use zend_vfs::{UnknownRepo, VfsError, VfsStore, ALL_REPOS};
+
 use crate::tools::code::UNKNOWN_REPO;
 use crate::{ToolContext, ToolError};
 
@@ -106,7 +106,7 @@ pub struct RepoPath {
 /// back.
 ///
 /// `file_read` is bounded too, but carries no `Paging`: its page is required and
-/// fixed at [`crate::state::vfs::PAGE_LINES`] lines, and the excerpt header is
+/// fixed at [`zend_vfs::vfs::PAGE_LINES`] lines, and the excerpt header is
 /// its own paging record — `(page P of N, lines a-b of total)` — in the
 /// `code_reading` ingest's format. The header serves the model directly, in the
 /// text it is already reading, where a structured field beside a rendered
@@ -153,7 +153,6 @@ pub mod delete;
 pub mod edit;
 pub mod grep;
 pub mod list;
-pub mod patch;
 pub mod present;
 pub mod read;
 pub mod render;
@@ -215,6 +214,10 @@ pub enum FileError {
     /// A write to the workspace on disk (the Mutable tools mode) failed.
     #[error("{0}")]
     Unwritable(String),
+    /// The conversation edited a file whose copy on disk has since changed, so
+    /// its edit no longer fits. The detail names the way out.
+    #[error("{0}")]
+    Diverged(String),
     #[error(transparent)]
     UnknownRepo(#[from] UnknownRepo),
 }
@@ -232,6 +235,7 @@ impl ToolError for FileError {
             FileError::InvalidArguments(_) | FileError::IsUrl(_) => "invalid_arguments",
             FileError::Forbidden(_) => "forbidden",
             FileError::Unwritable(_) => "unwritable",
+            FileError::Diverged(_) => "diverged",
             FileError::UnknownRepo(_) => UNKNOWN_REPO,
         }
     }
@@ -249,6 +253,7 @@ impl From<VfsError> for FileError {
                 FileError::Forbidden(VfsError::Forbidden(path).to_string())
             }
             VfsError::Unwritable(why) => FileError::Unwritable(why),
+            VfsError::Diverged(why) => FileError::Diverged(why),
         }
     }
 }

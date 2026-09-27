@@ -290,8 +290,8 @@ impl DirState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zend_tools::state::{RepoSpec, Workspace};
     use zend_tools::ToolContext;
+    use zend_vfs::{RepoSpec, Workspace};
 
     use crate::repo_scan::types::Language;
     use crate::repo_scan::walk_workspace;

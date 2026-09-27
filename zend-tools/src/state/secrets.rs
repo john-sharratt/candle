@@ -27,7 +27,7 @@
 //! The document sits outside every workspace, so no repository the `file_*`
 //! tools mount can reach it, and the code sandbox reaches nothing but those
 //! mounts. The VFS's refusal of any `secrets` path segment
-//! ([`PROTECTED_SEGMENT`](crate::state::vfs::PROTECTED_SEGMENT)) stays as a
+//! ([`PROTECTED_SEGMENT`](zend_vfs::vfs::PROTECTED_SEGMENT)) stays as a
 //! second guard for a secrets folder someone keeps inside a repository.
 //!
 //! A document that is not private to the daemon's user is refused, the rule

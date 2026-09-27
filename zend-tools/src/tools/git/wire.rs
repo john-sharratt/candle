@@ -13,7 +13,7 @@
 use serde::Serialize;
 
 use crate::tools::file::grep::truncate;
-use zend_git::{
+use zend_vfs::{
     BlameLine, Branch, CommitInfo, DiffEntry, DiffStatus, FileMode, GitTime, GrepHit, ObjectKind,
     Remote, Signature, StatusCode, StatusEntry, Tag, TreeEntry, Upstream, Xy,
 };

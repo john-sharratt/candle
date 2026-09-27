@@ -677,7 +677,7 @@ Apply a unified diff to an existing VFS file. The patch is one or more `@@ -old,
 {"path": "src/main.rs", "hunks_applied": 2, "hunks_already_applied": 0, "bytes": 1289}
 ```
 
-**Implementation.** `zend-tools`' `tools/file/patch.rs`, which parses the diff and applies it to the file read through the overlay. A hunk is found by its **pre-image** — its context and removed lines, matched as a run of whole lines, with no fuzz and never as a substring of a line. The `@@` numbers are a hint used only to choose between equal matches; the occurrence nearest the hinted position wins and a tie returns `{"error": "ambiguous", "detail": "hunk 1 (@@ -3 +3 @@) matches in more than one place..."}`. When a pre-image is absent the engine looks for the hunk's **post-image** (its context and added lines): finding it means the change is already in the file, so the hunk counts as already applied and nothing is written for it. That is what makes re-sending a patch a no-op — and why `-retries = 3` / `+retries = 30` cannot compound into `retries = 300`, since whole-line matching does not see `retries = 3` inside `retries = 30`. A hunk that is neither applicable nor already applied returns `{"error": "not_found", "detail": "hunk 2 (@@ -3,2 +3,2 @@) does not apply..."}` and **nothing is written at all**: the patched copy is built to one side and stored only once every hunk has landed, so a half-patched file never reaches the VFS. Locating by content rather than by line number is the point — it is what lets a model patch a file whose line numbers have moved since it read it, and what makes a retry after an unclear result safe.
+**Implementation.** `zend-vfs/src/patch.rs`, which parses the diff and applies it to the file read through the overlay. A hunk is found by its **pre-image** — its context and removed lines, matched as a run of whole lines, with no fuzz and never as a substring of a line. The `@@` numbers are a hint used only to choose between equal matches; the occurrence nearest the hinted position wins and a tie returns `{"error": "ambiguous", "detail": "hunk 1 (@@ -3 +3 @@) matches in more than one place..."}`. When a pre-image is absent the engine looks for the hunk's **post-image** (its context and added lines): finding it means the change is already in the file, so the hunk counts as already applied and nothing is written for it. That is what makes re-sending a patch a no-op — and why `-retries = 3` / `+retries = 30` cannot compound into `retries = 300`, since whole-line matching does not see `retries = 3` inside `retries = 30`. A hunk that is neither applicable nor already applied returns `{"error": "not_found", "detail": "hunk 2 (@@ -3,2 +3,2 @@) does not apply..."}` and **nothing is written at all**: the patched copy is built to one side and stored only once every hunk has landed, so a half-patched file never reaches the VFS. Locating by content rather than by line number is the point — it is what lets a model patch a file whose line numbers have moved since it read it, and what makes a retry after an unclear result safe.
 
 ---
 
@@ -924,7 +924,7 @@ The `missing` array lists any paths that did not exist in the VFS at call time, 
 
 ### Lifecycle and bounds
 
-The VFS is scoped to a single chat session and lives entirely in memory alongside the message history. When the session ends, the VFS is gone. Total content is capped at 10 MiB per session (enforced on `file_write`); individual files are uncapped within that overall budget but in practice nothing should approach the limit.
+The VFS is scoped to a single conversation — each has its own overlay per repository, and what one conversation writes, edits or deletes is never what another reads — and lives in memory. What it holds is the conversation's changes as deltas, never a copy of the result: a whole-file write is one replace, an edit is only the lines it changed (or, when it changes more than half the file's lines, a replace of the whole file), a delete is a marker, and a read replays them onto the repository's file. The deltas are capped at 10 MiB per repository per conversation (enforced on every write and edit); the unchanged part of an edited file costs nothing against it.
 
 User uploads (drag-and-drop into the web chat) are inserted into the VFS automatically at a path like `uploads/<filename>`, and a system message is appended to the conversation noting the new file's existence so the model knows it can read it.
 
@@ -937,7 +937,7 @@ VFS tools cover editing only — there is no `code_run` operation from inside th
 ## Git
 
 Nine `git_*` tools work on the repositories a workspace lists, through
-`zend-git` — the typed layer over the git command line specified in
+`zend-vfs`'s git layer — the typed layer over the git command line specified in
 `docs/zend_git.md`. Nothing in `zend-tools` spawns or parses git itself; every
 one of these tools is a thin request/response shell over that crate.
 
@@ -989,7 +989,7 @@ pins the split, and fails if a new git tool is registered without being placed
 on one side of it.
 
 **Running `git` is deliberately not `exec`.** `exec` means a program the model
-chose with arguments it wrote. Nothing here is that: `zend-git` builds every
+chose with arguments it wrote. Nothing here is that: `zend-vfs` builds every
 argument vector itself out of values validated at their type boundary, so a
 model-supplied string can never become a flag and a path can never leave the
 repository. The program is fixed, the environment is scrubbed, hooks point at

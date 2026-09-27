@@ -1,8 +1,12 @@
 //! Working-tree status, from `status --porcelain=v2 -z`.
 
 use crate::error::GitError;
-use crate::types::{FileMode, Oid, RepoPath};
+use crate::read::head::Head;
+use crate::types::{BranchName, FileMode, Oid, RepoPath};
 use crate::Repo;
+
+/// Porcelain v2's `# key value` header lines.
+type Headers = Vec<(String, String)>;
 
 /// One side of a status code: what changed between `HEAD` and the index, or
 /// between the index and the working tree.
@@ -105,13 +109,48 @@ fn fields(record: &str, n: usize) -> Result<Vec<&str>, GitError> {
 
 /// Parse `status --porcelain=v2 -z` output.
 pub(crate) fn parse_status(out: &[u8]) -> Result<Vec<StatusEntry>, GitError> {
+    parse_status_with_headers(out).map(|(_, entries)| entries)
+}
+
+/// Parse `status --porcelain=v2 --branch -z` output: `HEAD`, from the
+/// `# branch.oid` and `# branch.head` headers, and the entries.
+pub(crate) fn parse_status_with_head(out: &[u8]) -> Result<(Head, Vec<StatusEntry>), GitError> {
+    let (headers, entries) = parse_status_with_headers(out)?;
+    let header = |key: &str| {
+        headers
+            .iter()
+            .find_map(|(k, v)| (k == key).then_some(v.as_str()))
+            .ok_or_else(|| GitError::malformed("status", format!("no {key} header")))
+    };
+    let (oid, name) = (header("branch.oid")?, header("branch.head")?);
+    let head = match (oid, name) {
+        ("(initial)", name) => Head::Unborn(BranchName::parse(name)?),
+        (oid, "(detached)") => Head::Detached(Oid::parse(oid)?),
+        (oid, name) => Head::Branch {
+            branch: BranchName::parse(name)?,
+            oid: Oid::parse(oid)?,
+        },
+    };
+    Ok((head, entries))
+}
+
+/// The `# key value` headers and the entries of porcelain v2 output.
+fn parse_status_with_headers(out: &[u8]) -> Result<(Headers, Vec<StatusEntry>), GitError> {
     let text =
         std::str::from_utf8(out).map_err(|e| GitError::malformed("status", e.to_string()))?;
     let mut records = text.split('\0').filter(|r| !r.is_empty());
+    let mut headers = Vec::new();
     let mut entries = Vec::new();
     while let Some(record) = records.next() {
         let kind = record.as_bytes()[0];
         match kind {
+            b'#' => {
+                let (key, value) = record[1..]
+                    .trim_start()
+                    .split_once(' ')
+                    .ok_or_else(|| GitError::malformed("status", record.to_string()))?;
+                headers.push((key.to_string(), value.to_string()));
+            }
             b'1' => {
                 // 1 XY sub mH mI mW hH hI path
                 let f = fields(record, 9)?;
@@ -157,11 +196,11 @@ pub(crate) fn parse_status(out: &[u8]) -> Result<Vec<StatusEntry>, GitError> {
                     path: RepoPath::parse(f[1].strip_suffix('/').unwrap_or(f[1]))?,
                 });
             }
-            // Headers (`#`) and ignored entries (`!`) are not requested.
+            // Ignored entries (`!`) are not requested.
             _ => return Err(GitError::malformed("status", record.to_string())),
         }
     }
-    Ok(entries)
+    Ok((headers, entries))
 }
 
 impl Repo {
@@ -182,6 +221,25 @@ impl Repo {
             .run_ok()?;
         parse_status(&out)
     }
+
+    /// [`Self::status`] and [`Self::head`] from one process — what a checkout
+    /// pass asks for together. `--no-ahead-behind` spares the comparison with
+    /// the upstream that `--branch` would otherwise make.
+    pub fn status_with_head(&self) -> Result<(Head, Vec<StatusEntry>), GitError> {
+        let out = self
+            .git("status")
+            .args([
+                "--porcelain=v2",
+                "--branch",
+                "--no-ahead-behind",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=no",
+            ])
+            .read_only()
+            .run_ok()?;
+        parse_status_with_head(&out)
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +249,55 @@ mod tests {
 
     const A: &str = "ce013625030ba8dba906f756967f9e9ca394464a";
     const B: &str = "7898192261b8b8d7ab18ee7faa5b2d26fd8b35cc";
+
+    /// **`HEAD` is read from the branch headers** — on a branch, detached,
+    /// and on a branch with no commits — with the entries after them intact.
+    #[test]
+    fn head_is_read_from_the_branch_headers() {
+        let branch = |n: &str| BranchName::parse(n).unwrap();
+        let raw = format!("# branch.oid {A}\0# branch.head main\0? new.txt\0");
+        let (head, entries) = parse_status_with_head(raw.as_bytes()).unwrap();
+        assert_eq!(
+            head,
+            Head::Branch {
+                branch: branch("main"),
+                oid: Oid::parse(A).unwrap()
+            }
+        );
+        assert_eq!(entries.len(), 1);
+        let raw = format!("# branch.oid {A}\0# branch.head (detached)\0");
+        assert_eq!(
+            parse_status_with_head(raw.as_bytes()).unwrap().0,
+            Head::Detached(Oid::parse(A).unwrap())
+        );
+        let raw = "# branch.oid (initial)\0# branch.head main\0";
+        assert_eq!(
+            parse_status_with_head(raw.as_bytes()).unwrap().0,
+            Head::Unborn(branch("main"))
+        );
+        assert!(parse_status_with_head(b"? x\0").is_err(), "no headers");
+        // Plain status passes headers over.
+        assert_eq!(parse_status(raw.as_bytes()).unwrap(), vec![]);
+    }
+
+    /// **One process gives what `head` and `status` give apart**, in every
+    /// state `HEAD` can be in.
+    #[test]
+    fn status_with_head_agrees_with_head_and_status() {
+        let t = TestRepo::init();
+        let repo = t.repo();
+        let unborn = repo.status_with_head().unwrap();
+        assert_eq!(unborn.0, repo.head().unwrap());
+        t.write("a.txt", b"a\n");
+        t.commit_all("first");
+        t.write("b.txt", b"b\n");
+        let on_branch = repo.status_with_head().unwrap();
+        assert_eq!(on_branch, (repo.head().unwrap(), repo.status().unwrap()));
+        t.git(&["checkout", "-q", "--detach"]);
+        let detached = repo.status_with_head().unwrap();
+        assert_eq!(detached, (repo.head().unwrap(), repo.status().unwrap()));
+        assert!(matches!(detached.0, Head::Detached(_)));
+    }
 
     #[test]
     fn every_record_kind_parses_from_raw_bytes() {
@@ -254,7 +361,9 @@ mod tests {
 
     #[test]
     fn an_unknown_record_is_malformed() {
-        assert!(parse_status(b"# branch.oid x\0").is_err());
+        assert!(parse_status(b"! ignored.txt\0").is_err());
+        assert!(parse_status(b"x something\0").is_err());
+        assert!(parse_status(b"#nospace\0").is_err());
         assert!(parse_status(b"1 .M\0").is_err());
     }
 

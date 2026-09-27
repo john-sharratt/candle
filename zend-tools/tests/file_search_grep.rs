@@ -5,6 +5,7 @@ mod harness;
 use serde_json::json;
 use tempfile::TempDir;
 use zend_tools::ToolContext;
+use zend_vfs::vfs::PAGE_LINES;
 
 use harness::REPO;
 
@@ -167,7 +168,7 @@ fn the_line_number_feeds_a_file_read_page() {
     let path = r["matches"][0]["path"].as_str().unwrap().to_string();
     let line = r["matches"][0]["line"].as_u64().unwrap();
     assert_eq!(line, 3);
-    let page = (line - 1) / u64::from(zend_tools::state::vfs::PAGE_LINES);
+    let page = (line - 1) / u64::from(PAGE_LINES);
 
     let excerpt = harness::expect_success(harness::invoke_with_ctx(
         "file_read",

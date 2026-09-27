@@ -7,7 +7,7 @@
 //! code, rather than weakening a guard that protects the production path.
 //!
 //! Setup drives the `git` program directly rather than going through the
-//! layer under test, the same convention `zend_git`'s own tests follow, so a
+//! layer under test, the same convention `zend_vfs`'s own tests follow, so a
 //! fixture can never be shaped by the bug it is hunting. The identity and
 //! dates are fixed, so commit ids are reproducible.
 
@@ -17,8 +17,8 @@ use std::process::Command;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use zend_tools::registry::find;
-use zend_tools::state::{RepoSpec, Workspace};
 use zend_tools::{Capability, Grants, ToolContext};
+use zend_vfs::{RepoSpec, Workspace};
 
 /// A workspace holding one git repository called `app`.
 pub struct GitWorkspace {

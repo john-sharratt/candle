@@ -4,9 +4,9 @@ use regex::RegexBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
+use zend_vfs::vfs::GrepOutcome;
 
 use super::{stores_for, FileError, Paging};
-use crate::state::vfs::GrepOutcome;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Matching lines per page.

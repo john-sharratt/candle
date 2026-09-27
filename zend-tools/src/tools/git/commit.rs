@@ -9,12 +9,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use zend_git::{
+use zend_vfs::{
     ApplyOutcome, BranchName, ChangeSet, FileMode, GitError, Oid, PickOutcome, Repo as GitRepo,
+    VfsStore,
 };
 
 use super::{open, path_arg, GitToolError};
-use crate::state::VfsStore;
 use crate::{RegisteredTool, Tool, ToolContext};
 
 /// Where the commit's content comes from.

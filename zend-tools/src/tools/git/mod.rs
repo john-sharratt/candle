@@ -1,4 +1,4 @@
-//! `git_*` tools — the typed git layer ([`zend_git`]) over the workspace's
+//! `git_*` tools — the typed git layer ([`zend_vfs`]) over the workspace's
 //! repositories.
 //!
 //! # Nine tools, split by capability
@@ -69,7 +69,7 @@ pub use status::GIT_STATUS;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zend_git::{
+use zend_vfs::{
     Ancestor, BranchName, GitError, Oid, RefName, Repo as GitRepo, RepoPath, Rev, TagName,
 };
 

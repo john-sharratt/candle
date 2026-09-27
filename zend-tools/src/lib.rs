@@ -18,9 +18,10 @@
 //! - [`grants`] — the capabilities a call may use; [`net`], [`exec`] and
 //!   [`disk`] are the only ways tool code reaches the network, starts a program
 //!   or opens a database, and each refuses without its capability
-//! - [`state`] — the individual stores: [`state::VfsStore`], [`state::CredentialStore`],
+//! - [`state`] — the individual stores: [`state::CredentialStore`],
 //!   [`state::NotesStore`], [`state::SessionRegistry`], [`state::HashStateStore`],
-//!   [`state::Secrets`]
+//!   [`state::Secrets`]; the file stores the `file_*` tools work through are
+//!   `zend_vfs`'s
 //! - [`tools`] — all 95 tool implementations, one module per tool group
 //!
 //! # Authoring a tool

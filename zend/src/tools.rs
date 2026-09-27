@@ -38,8 +38,9 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
-use zend_tools::state::{Secrets, Workspace};
+use zend_tools::state::Secrets;
 use zend_tools::{registry, replay, Replay, ToolContext};
+use zend_vfs::{RepoFiles, Workspace};
 
 use crate::access;
 use crate::tool_guidance;
@@ -715,17 +716,20 @@ pub fn tool_round_text(text: &str) -> TurnText {
 /// — subagent loops aren't wired yet).  Cloned cheaply (Arc-shared
 /// stores).
 ///
-/// One host serves the whole daemon, so the `file_*` overlay's session layer is
-/// shared across conversations: a file written in one chat is visible in the
-/// next. The lower layer is each of the workspace's repositories, read-only.
+/// One host serves the whole daemon, but the `file_*` overlay does not: each
+/// conversation has its own file stores ([`Self::conversation_files`]), and a
+/// round runs in a context bound to them ([`Self::context_for`]), so what one
+/// conversation writes, edits or deletes is never what another one reads. The
+/// lower layer is each of the workspace's repositories, read-only.
 ///
-/// It holds one context per tools mode. They share every store and differ only
-/// in their [`Grants`](zend_tools::Grants) ([`access::grants`]) and, for
+/// It holds one context per tools mode. They share every other store and differ
+/// only in their [`Grants`](zend_tools::Grants) ([`access::grants`]) and, for
 /// Mutable, in a file store that writes the disk — so what a round may do is
 /// fixed by the context it is handed, not by which tools its prompt offered.
 #[derive(Clone)]
 pub struct ToolHost {
-    /// Indexed by [`ToolMode::level`].
+    /// Indexed by [`ToolMode::level`]. Each overlay mode's own file stores are
+    /// never handed to a round — a round gets its conversation's.
     contexts: [Arc<ToolContext>; 4],
 }
 
@@ -750,9 +754,26 @@ impl ToolHost {
         Self { contexts }
     }
 
-    /// The context a round of tools in `mode` runs in.
-    pub fn context_for(&self, mode: ToolMode) -> &Arc<ToolContext> {
-        &self.contexts[mode.level() as usize]
+    /// A new conversation's own file stores: an overlay over each repository
+    /// with no changes yet.
+    pub fn conversation_files(&self) -> Arc<RepoFiles> {
+        Arc::new(
+            self.contexts[ToolMode::Restricted.level() as usize]
+                .files
+                .fresh(),
+        )
+    }
+
+    /// The context a round of tools in `mode` runs in, for the conversation
+    /// whose file stores are `files`. Mutable works on the disk itself, which
+    /// every conversation shares; every other mode works on `files`.
+    pub fn context_for(&self, mode: ToolMode, files: &Arc<RepoFiles>) -> Arc<ToolContext> {
+        let ctx = &self.contexts[mode.level() as usize];
+        if mode.writes_disk() {
+            Arc::clone(ctx)
+        } else {
+            Arc::new(ctx.with_files(Arc::clone(files)))
+        }
     }
 }
 
@@ -762,7 +783,7 @@ impl ToolHost {
 mod tests {
     use super::*;
 
-    use zend_tools::state::RepoSpec;
+    use zend_vfs::RepoSpec;
 
     /// `dir` as a workspace holding one repository, `r`.
     fn workspace_in(dir: &tempfile::TempDir) -> Workspace {
@@ -798,9 +819,10 @@ mod tests {
         let secrets = Arc::new(Secrets::load(&path).unwrap());
 
         let host = ToolHost::new(&workspace_in(&dir), secrets);
+        let files = host.conversation_files();
         for mode in ToolMode::ALL {
             assert_eq!(
-                host.context_for(mode).secrets.tavily_api_key(),
+                host.context_for(mode, &files).secrets.tavily_api_key(),
                 Some("tvly-wired-through"),
                 "{} lost the daemon's secrets",
                 mode.id()
@@ -815,12 +837,13 @@ mod tests {
     fn each_modes_context_carries_its_grants() {
         let dir = tempfile::tempdir().unwrap();
         let host = ToolHost::new(&workspace_in(&dir), no_secrets());
+        let files = host.conversation_files();
         for mode in ToolMode::ALL {
-            let ctx = host.context_for(mode);
+            let ctx = host.context_for(mode, &files);
             assert_eq!(ctx.grants(), access::grants(mode), "{}", mode.id());
             assert_eq!(ctx.files.is_direct(), mode.writes_disk(), "{}", mode.id());
         }
-        let restricted = host.context_for(ToolMode::Restricted);
+        let restricted = host.context_for(ToolMode::Restricted, &files);
         for (name, arguments) in [
             (
                 "web_fetch",
@@ -837,7 +860,7 @@ mod tests {
                 arguments,
             };
             assert_eq!(
-                run_tool(restricted, &call)["error"],
+                run_tool(&restricted, &call)["error"],
                 "not_permitted",
                 "{name} ran in Restricted"
             );
@@ -851,11 +874,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = ToolHost::new(&workspace_in(&dir), no_secrets());
         assert_eq!(
-            host.context_for(ToolMode::Restricted)
+            host.context_for(ToolMode::Restricted, &host.conversation_files())
                 .secrets
                 .tavily_api_key(),
             None
         );
+    }
+
+    /// **A file one conversation writes is never what another reads.** Two
+    /// conversations' rounds run in contexts bound to their own file stores;
+    /// Mutable, which works on the disk itself, is the one mode they share.
+    #[test]
+    fn each_conversation_has_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("r")).unwrap();
+        std::fs::write(dir.path().join("r/shared.txt"), "disk\n").unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets());
+        let (a, b) = (host.conversation_files(), host.conversation_files());
+        let in_a = host.context_for(ToolMode::Comprehensive, &a);
+        let in_b = host.context_for(ToolMode::Comprehensive, &b);
+
+        in_a.files
+            .repo("r")
+            .unwrap()
+            .write("shared.txt", "conversation a\n".into())
+            .unwrap();
+        in_a.files
+            .repo("r")
+            .unwrap()
+            .write("only_a.txt", "a\n".into())
+            .unwrap();
+        let b_store = in_b.files.repo("r").unwrap();
+        assert_eq!(
+            b_store.read("shared.txt").unwrap().as_deref(),
+            Some("disk\n")
+        );
+        assert_eq!(b_store.read("only_a.txt").unwrap(), None);
+        // A later round of the same conversation sees its own change.
+        let again = host.context_for(ToolMode::Comprehensive, &a);
+        assert_eq!(
+            again
+                .files
+                .repo("r")
+                .unwrap()
+                .read("shared.txt")
+                .unwrap()
+                .as_deref(),
+            Some("conversation a\n")
+        );
+        assert!(host.context_for(ToolMode::Mutable, &a).files.is_direct());
     }
 
     // ── Resuming a tool round after a restart ───────────────────────────────

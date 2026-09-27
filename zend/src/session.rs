@@ -38,7 +38,8 @@ use candle_conversation::{
 };
 use serde_json::Value;
 use web::auth::Roles;
-use zend_tools::state::{Secrets, Workspace};
+use zend_tools::state::Secrets;
+use zend_vfs::{RepoFiles, Workspace};
 
 use crate::access::Gateways;
 use crate::api::chat::{
@@ -52,7 +53,9 @@ use crate::api::substrate::{
 };
 use crate::coding_sampling;
 use crate::config::DaemonConfig;
+use crate::conv_branches::{self, BaseBranches};
 use crate::conv_file_store::ConvFileStore;
+use crate::conv_overlay;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
@@ -184,6 +187,13 @@ struct ConvState {
     /// fork, overridden when a request carries an explicit `identity`, and used
     /// each turn to scope the projection's identity collection.
     identity: Option<String>,
+    /// This conversation's own file stores: what its `file_*` calls write,
+    /// edit and delete, kept as deltas over each repository and seen by no other
+    /// conversation. Every round of its tools runs against these
+    /// ([`ToolHost::context_for`]); each round's changes are saved with the
+    /// conversation and restored when this state is built again
+    /// ([`conv_overlay`]).
+    files: Arc<RepoFiles>,
 }
 
 /// Metadata keys carrying the composer dials a conversation last ran under.
@@ -488,6 +498,12 @@ struct InferenceState {
     /// The workspace captured at startup — its folder and repositories. The
     /// refresh path re-walks its repositories on every filesystem event.
     workspace: Workspace,
+    /// The branch a conversation starts on in each git repository — `main`,
+    /// else `master`, else the checkout — read once at startup. A
+    /// conversation is given these for every repository it has no branch in
+    /// yet: every live one at startup, and each new one as it is created.
+    /// See [`conv_branches`].
+    base_branches: BaseBranches,
     /// `--max-depth`: the path-component bound the `repo_map` / `code_reading`
     /// walks run under, and the watcher's event filter. `None` = unbounded.
     max_depth: Option<usize>,
@@ -2252,7 +2268,10 @@ impl InferenceState {
                 Some(ts) => ts.registry_for(&tool_stencil, ThinkMode::Quick),
                 None => Arc::clone(&tool_stencil),
             },
-            tool_ctx: Arc::clone(priming_tool_host.context_for(ToolMode::Restricted)),
+            tool_ctx: priming_tool_host.context_for(
+                ToolMode::Restricted,
+                &priming_tool_host.conversation_files(),
+            ),
             priming_chain_end: None,
         };
         let priming_chain_end = match (
@@ -2381,6 +2400,12 @@ impl InferenceState {
             .encode(THINK_CLOSER_PHRASE, false)
             .map(|e| e.get_ids().to_vec())
             .unwrap_or_default();
+        // Every conversation keeps its own branch per repository; one with none
+        // yet starts on the repository's base.
+        let base_branches = conv_branches::base_branches(&workspace);
+        let seeded =
+            conv_branches::seed_live(&engine.lock().unwrap(), &base_branches, titler_timeline);
+        tracing::info!(seeded, "conversations given their base branches");
         let state = Arc::new(Self {
             decoder,
             engine,
@@ -2405,6 +2430,7 @@ impl InferenceState {
             tokenizer,
             tool_host: ToolHost::new(&workspace, secrets),
             workspace,
+            base_branches,
             tool_stencil,
             think_steering,
             passthrough: PassthroughCache::new(),
@@ -2432,7 +2458,9 @@ impl InferenceState {
             // and guessing a summary from the filename — see `code_read`'s
             // `opening_prompt` doc.
             think_triggers: turn_triggers(self, ThinkMode::Quick),
-            tool_ctx: Arc::clone(self.tool_host.context_for(ToolMode::Restricted)),
+            tool_ctx: self
+                .tool_host
+                .context_for(ToolMode::Restricted, &self.tool_host.conversation_files()),
             priming_chain_end: *self.priming_chain_end.lock().unwrap(),
         }
     }
@@ -3064,6 +3092,9 @@ fn run_inference_stream(
         // Set when this request is the one that actually mints the
         // conversation, so its lineage is recorded once, after the guard drops.
         let mut minted = false;
+        // A minted conversation's file stores, restored from its saved state
+        // once the map guard is released.
+        let mut minted_files: Option<Arc<RepoFiles>> = None;
         let forked: anyhow::Result<Arc<ConvLock<ConvState>>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {
@@ -3077,9 +3108,12 @@ fn run_inference_stream(
                 // (§16.12). An unknown conv_id simply forks empty.
                 match state.base_conv.lock().unwrap().fork_resuming(timeline) {
                     Ok(conv) => {
+                        let files = state.tool_host.conversation_files();
+                        minted_files = Some(Arc::clone(&files));
                         let arc = Arc::new(ConvLock::new(ConvState {
                             conv,
                             identity: stored_identity.clone(),
+                            files,
                         }));
                         map.insert(conv_id.clone(), Arc::clone(&arc));
                         minted = true;
@@ -3111,6 +3145,11 @@ fn run_inference_stream(
                     "recording fork lineage failed, conversation starts unprimed: {e}",
                 );
             }
+        }
+        // A conversation built again — after an eviction, after a restart —
+        // gets back the changes its tool rounds made to the workspace's files.
+        if let Some(files) = minted_files {
+            conv_overlay::restore(&state.engine.lock().unwrap(), timeline, &files);
         }
         let conv_arc = match forked {
             Ok(arc) => arc,
@@ -3171,13 +3210,15 @@ fn run_inference_stream(
         // `set_conv_id` no-ops in-RAM and the sidebar wouldn't see this
         // conversation until the next daemon restart. Idempotent on
         // repeat calls (no-op when the substrate already has it).
-        if let Err(e) = state
-            .engine
-            .lock()
-            .unwrap()
-            .set_conversation_conv_id(timeline, &conv_id)
         {
-            tracing::warn!(conv_id = %conv_id, "persist conv_id failed: {e}");
+            let engine = state.engine.lock().unwrap();
+            if let Err(e) = engine.set_conversation_conv_id(timeline, &conv_id) {
+                tracing::warn!(conv_id = %conv_id, "persist conv_id failed: {e}");
+            }
+            // A new conversation — or one unarchived since startup — starts on
+            // each repository's base; one already working somewhere keeps it,
+            // and then this writes nothing.
+            conv_branches::seed(&engine, timeline, &state.base_branches);
         }
 
         // An explicit request `identity` overrides and is persisted, so later
@@ -3328,11 +3369,12 @@ fn run_inference_stream(
                 return;
             }
             // The round is finished where it was started: on disk when the
-            // conversation was held at Mutable.
-            let ctx = Arc::clone(state.tool_host.context_for(tools_mode));
+            // conversation was held at Mutable, over its own files otherwise.
+            let ctx = state.tool_host.context_for(tools_mode, &cs.files);
             let dispatched =
                 tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, Dispatch::Resumed))
                     .await;
+            conv_overlay::save(&state.engine.lock().unwrap(), timeline, &cs.files);
             let text = match dispatched {
                 Ok(results) => format_tool_responses(&results),
                 Err(e) => {
@@ -3842,6 +3884,7 @@ fn run_inference_stream(
             // On the blocking pool, like the dispatch below: it hashes each
             // candidate file from disk, and this task's every wait is an await.
             let screen_state = Arc::clone(&state);
+            let screen_files = Arc::clone(&cs.files);
             let unscreened = round.clone();
             let round = match tokio::task::spawn_blocking(move || {
                 let budget = screen_state
@@ -3855,6 +3898,7 @@ fn run_inference_stream(
                     &screen_state.engine,
                     timeline,
                     &screen_state.workspace,
+                    &screen_files,
                     budget,
                     round,
                 )
@@ -3893,12 +3937,11 @@ fn run_inference_stream(
             // and carries each result so the cards resolve immediately, before
             // the post-stream hydrate.
             let n_calls = round.len();
-            let tool_state = Arc::clone(&state);
-            let mut results = match tokio::task::spawn_blocking(move || {
-                tool_round::run(tool_state.tool_host.context_for(tools_mode), round)
-            })
-            .await
-            {
+            let ctx = state.tool_host.context_for(tools_mode, &cs.files);
+            let ran = tokio::task::spawn_blocking(move || tool_round::run(&ctx, round)).await;
+            // Whatever the round changed outlives this conversation's state.
+            conv_overlay::save(&state.engine.lock().unwrap(), timeline, &cs.files);
+            let mut results = match ran {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(conv_id = %conv_id, iteration, "tool dispatch panicked: {e}");
@@ -5519,6 +5562,18 @@ impl ZendSession {
         (!label.is_empty()).then_some(label)
     }
 
+    /// The branch the conversation works on in each repository, by repository
+    /// name — see [`conv_branches`]. Empty when the model isn't loaded or the
+    /// conversation is unknown.
+    pub fn conversation_branches(&self, conv_id: &str) -> BTreeMap<String, String> {
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return BTreeMap::new();
+        };
+        let timeline = passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id));
+        let state = state.engine.lock().unwrap().conversation_state(timeline);
+        state.map(|s| s.branches).unwrap_or_default()
+    }
+
     /// Record a batch of just-uploaded files as an event in the substrate,
     /// so they recover with the conversation and can be replayed inline in
     /// its history. Each file is stamped with `turn_index` — the number of
@@ -5546,6 +5601,7 @@ impl ZendSession {
         if let Err(e) = engine.set_conversation_conv_id(timeline, conv_id) {
             tracing::warn!(conv_id = %conv_id, "record_uploads: set conv_id failed: {e}");
         }
+        conv_branches::seed(&engine, timeline, &state.base_branches);
         // Give it a provisional label from the file(s) if it has none yet, so it
         // shows a sensible name in the sidebar before any chat turn — the titler
         // refines it once the user actually talks. Never overwrite an existing

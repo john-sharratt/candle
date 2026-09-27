@@ -104,9 +104,17 @@ impl Repo {
                 }
             }
         }
+        self.write_refs(txn)
+    }
+
+    /// Apply `txn` with no check on which branches are checked out — for the
+    /// execution checkout, which owns its branch for the length of a run.
+    /// The caller holds the write lock.
+    pub(crate) fn write_refs(&self, txn: &RefTransaction) -> Result<(), GitError> {
         // `--no-deref`: an op changes the ref it names and never the one a
-        // symbolic ref points at, so the check above — which compares names —
-        // cannot be walked around through an alias of a checked-out branch.
+        // symbolic ref points at, so the check in `update_refs_locked` —
+        // which compares names — cannot be walked around through an alias of
+        // a checked-out branch.
         self.git("update-ref")
             .args(["--no-deref", "--stdin", "-z"])
             .stdin(txn.to_bytes())

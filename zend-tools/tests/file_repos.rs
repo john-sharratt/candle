@@ -9,8 +9,8 @@ mod harness;
 
 use serde_json::json;
 use tempfile::TempDir;
-use zend_tools::state::{RepoSpec, Workspace};
 use zend_tools::ToolContext;
+use zend_vfs::{RepoSpec, Workspace};
 
 /// A workspace with two repositories, `a` and `b`, each holding a file at the
 /// same path (`shared.txt`) with different content, plus one file unique to

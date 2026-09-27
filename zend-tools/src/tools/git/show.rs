@@ -11,7 +11,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use zend_git::{FilePatch, GitError, LineKind, LineRange, LogRange, ObjectFormat, Oid, Rev};
+use zend_vfs::{FilePatch, GitError, LineKind, LineRange, LogRange, ObjectFormat, Oid, Rev};
 
 use super::line_history::line_count;
 use super::wire::{WireBlameLine, WireChange, WireTreeEntry};
@@ -441,7 +441,7 @@ fn missing(commit: &str, path: &str) -> GitToolError {
     .into()
 }
 
-fn touches_protected(e: &zend_git::DiffEntry) -> bool {
+fn touches_protected(e: &zend_vfs::DiffEntry) -> bool {
     [&e.old, &e.new]
         .into_iter()
         .flatten()

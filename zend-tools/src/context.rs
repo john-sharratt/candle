@@ -8,7 +8,7 @@
 //!
 //! | Field | Type | Purpose |
 //! |-------|------|---------|
-//! | `files` | [`state::RepoFiles`] | Overlay filesystem for `file_*` tools — one store per repository, session writes over each |
+//! | `files` | [`RepoFiles`] | Overlay filesystem for `file_*` tools — one store per repository, one conversation's changes over each |
 //! | `credentials` | [`state::CredentialStore`] | Named auth material for session opens — reached only through [`ToolContext::credentials`] |
 //! | `notes` | [`state::NotesStore`] | Cross-conversation persistent key-value store |
 //! | `sessions` | [`state::SessionRegistry`] | All open protocol sessions (SSH, TCP, …) |
@@ -28,7 +28,8 @@
 //!
 //! In production the daemon calls [`ToolContext::with_workspace`] once at startup,
 //! passing its [`Workspace`] so the `file_*` tools resolve real project files in
-//! each repository through the VFS overlay. [`ToolContext::new`] leaves every
+//! each repository through the VFS overlay, and gives each conversation its own
+//! overlay with [`ToolContext::with_files`]. [`ToolContext::new`] leaves every
 //! repository's store upper-only ([`RepoFiles::detached`]), which is what most
 //! tests want; a test needing the lower layer builds a `Workspace` over a temp
 //! dir.
@@ -36,9 +37,8 @@
 use std::sync::Arc;
 
 use crate::grants::{Capability, Grants, NotPermitted};
-use crate::state::{
-    CredentialStore, HashStateStore, NotesStore, RepoFiles, Secrets, SessionRegistry, Workspace,
-};
+use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
+use zend_vfs::{RepoFiles, Workspace};
 
 /// Read-only handle bundle passed by the runner into each tool invocation.
 /// All stores are wrapped in `Arc` so cloning the context is cheap.
@@ -113,6 +113,16 @@ impl ToolContext {
         Ok(&self.credentials)
     }
 
+    /// This context with `files` as its file stores — one conversation's own,
+    /// so the changes its tool calls make are its alone. Every other store is
+    /// shared with `self`.
+    pub fn with_files(&self, files: Arc<RepoFiles>) -> Self {
+        Self {
+            files,
+            ..self.clone()
+        }
+    }
+
     /// This context with its `file_*` tools working on each repository on disk
     /// ([`RepoFiles::direct`]) instead of through the overlay. Every other
     /// store is shared with `self` — sessions, notes and credentials stay one
@@ -155,7 +165,7 @@ impl Default for ToolContext {
 mod tests {
     use super::*;
 
-    use crate::state::RepoSpec;
+    use zend_vfs::RepoSpec;
 
     #[test]
     fn a_new_context_grants_nothing_and_cannot_reach_the_network() {

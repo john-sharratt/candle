@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use zend_tools::state::vfs::PAGE_LINES;
+use zend_vfs::vfs::PAGE_LINES;
 
 use crate::code_read::carve::{file_header_end, split_long_lines};
 use crate::code_read::{compute_line_offsets, slice_lines};
@@ -44,7 +44,7 @@ const ANCHOR_NAMES: &[&str] = &["readme.md", "lib.rs", "main.rs", "mod.rs"];
 /// A directory's chosen anchor excerpt, ready to render.
 ///
 /// `start_line`/`end_line`/`body` are the CONTAINING PAGE's bounds
-/// ([`zend_tools::state::vfs::PAGE_LINES`]-line stride), not the narrower
+/// ([`PAGE_LINES`]-line stride), not the narrower
 /// meaningful excerpt [`pick`] found — `file_read` only ever returns a whole
 /// page, and a prefilled response has to be what a live call would actually
 /// return. In practice the excerpt (capped at [`MAX_ANCHOR_LINES`], almost

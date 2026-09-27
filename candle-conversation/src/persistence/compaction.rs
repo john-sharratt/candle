@@ -28,7 +28,7 @@ use std::path::Path;
 use super::content_hash::snapshot_stream_id;
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use super::log_file::LogFile;
-use super::manifest::{encode_conv_state_payload, ConvState, Manifest, RecordLoc};
+use super::manifest::{encode_conv_state_payload, Manifest, RecordLoc};
 use super::record::{
     encode_record, DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType,
     SectionTombstonePayload, TombstonePayload, TurnCouplingPayload,
@@ -566,7 +566,7 @@ pub fn collect_live_records(
     // the substrate's live state.  Tombstoned timelines are
     // skipped so retired conversations don't leave dangling
     // sidebar entries on disk.
-    for (timeline_id, conv_id, label, archived, custom) in substrate.live_conv_meta() {
+    for (timeline_id, conv_id, label, custom) in substrate.live_conv_meta() {
         // A tombstoned timeline that is ALSO distilled is the provenance corpus
         // (calibration exemplars: archived, distilled, then tombstoned out of the
         // live gather while their signatures keep answering the belief scan).
@@ -589,21 +589,27 @@ pub fn collect_live_records(
             },
             payload,
         ));
-        if archived {
-            let cs_payload = encode_conv_state_payload(timeline_id, ConvState { archived: true });
-            out.push(CompactItem::synth(
-                RecordHeader {
-                    record_type: RecordType::ConvState,
-                    format: 0,
-                    payload_len: cs_payload.len() as u64,
-                    crc: 0,
-                    stream_id: 0,
-                    chunk_index: 0,
-                    token_count: 0,
-                },
-                cs_payload,
-            ));
+    }
+    // Per-timeline conversation state — the whole state, archived flag and
+    // branches alike, keyed in the header by timeline like every other
+    // `ConvState` record. Same retirement rule as the labels above.
+    for (timeline_id, state) in substrate.live_conv_states() {
+        if tombstoned.contains(&timeline_id) && !distilled.contains_key(&timeline_id) {
+            continue;
         }
+        let payload = encode_conv_state_payload(timeline_id, &state);
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: RecordType::ConvState,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id: timeline_id,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            payload,
+        ));
     }
     // Per-(timeline, turn) summary-tree metadata — emit one record
     // per live tree node directly from substrate state.
@@ -859,6 +865,7 @@ pub fn write_compacted_log(
 mod tests {
     use super::*;
     use crate::persistence::log_file::{read_record_at, LogSource, MemLog, SUPERBLOCK_SIZE};
+    use crate::persistence::manifest::ConvState;
     use crate::persistence::record::encode_record;
 
     /// True iff any record of type `rt` carries `payload` (only `Synth` items
@@ -2308,8 +2315,9 @@ mod tests {
                 128,
             )]),
         ));
-        // Per-timeline metadata. `ConvState` is emitted only for an archived
-        // timeline, so archive this one.
+        // Per-timeline metadata. `ConvState` is emitted only for a state that
+        // differs from an untouched one, so archive this one and give it a
+        // branch.
         blob.extend_from_slice(&record(
             RecordType::Label,
             0,
@@ -2318,9 +2326,16 @@ mod tests {
         ));
         blob.extend_from_slice(&record(
             RecordType::ConvState,
+            live_tl,
             0,
-            0,
-            &encode_conv_state_payload(live_tl, ConvState { archived: true }),
+            &encode_conv_state_payload(
+                live_tl,
+                &ConvState {
+                    archived: true,
+                    branches: [("candle".to_string(), "zen/work".to_string())].into(),
+                    files: [("candle".to_string(), serde_json::json!({ "a.txt": 1 }))].into(),
+                },
+            ),
         ));
         blob.extend_from_slice(&record(
             RecordType::TreeMetadata,
@@ -2430,6 +2445,23 @@ mod tests {
                 Survival::NeverWritten => unreachable!("{rt:?} is in WRITTEN_RECORD_TYPES"),
             }
         }
+
+        // The conversation state comes through whole — its branches and file
+        // changes too, not just the archived flag — keyed in the header by its
+        // timeline.
+        let state = ConvState {
+            archived: true,
+            branches: [("candle".to_string(), "zen/work".to_string())].into(),
+            files: [("candle".to_string(), serde_json::json!({ "a.txt": 1 }))].into(),
+        };
+        assert!(has_synth(
+            &live,
+            RecordType::ConvState,
+            &encode_conv_state_payload(live_tl, &state)
+        ));
+        assert!(live.iter().any(|it| {
+            it.header().record_type == RecordType::ConvState && it.header().stream_id == live_tl
+        }));
     }
 
     /// Turn-scoped tombstones survive. The reload's placeholder logic keys off

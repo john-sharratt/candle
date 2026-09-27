@@ -63,9 +63,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
 use super::content_hash::section_stream_id;
-use super::manifest::{
-    encode_conv_state_payload, encode_label_payload, ChunkLoc, ConvState, RecordLoc,
-};
+use super::manifest::{encode_conv_state_payload, encode_label_payload, ChunkLoc, RecordLoc};
 use super::record::{
     DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, SectionTombstonePayload,
     TombstonePayload, TurnCouplingPayload,
@@ -488,7 +486,7 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             });
         }
     }
-    for (tl, conv, label, archived, custom) in substrate.live_conv_meta() {
+    for (tl, conv, label, custom) in substrate.live_conv_meta() {
         // A tombstoned timeline that is ALSO distilled is the provenance corpus
         // (calibration exemplars: archived, distilled, then tombstoned out of the
         // live gather while their signatures keep answering the belief scan).
@@ -504,14 +502,19 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             chunk_index: 0,
             payload: encode_label_payload(tl, &conv, &label, &custom),
         });
-        if archived {
-            out.push(Resident {
-                rt: RecordType::ConvState,
-                stream_id: 0,
-                chunk_index: 0,
-                payload: encode_conv_state_payload(tl, ConvState { archived: true }),
-            });
+    }
+    // The whole conversation state, keyed in the header by timeline — see
+    // `ConvState`. Same retirement rule as the labels above.
+    for (tl, state) in substrate.live_conv_states() {
+        if tombstoned.contains(&tl) && !distilled.contains_key(&tl) {
+            continue;
         }
+        out.push(Resident {
+            rt: RecordType::ConvState,
+            stream_id: tl,
+            chunk_index: 0,
+            payload: encode_conv_state_payload(tl, &state),
+        });
     }
     for p in substrate.live_tree_metadata_payloads() {
         if tombstoned.contains(&p.timeline_id) {

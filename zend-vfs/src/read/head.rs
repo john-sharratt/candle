@@ -34,7 +34,37 @@ impl Head {
 }
 
 impl Repo {
+    /// What `HEAD` points at. One `rev-parse` for a `HEAD` with a commit —
+    /// the commit and the branch name together — and a second look only for
+    /// a branch with no commits yet.
     pub fn head(&self) -> Result<Head, GitError> {
+        let both = self
+            .git("rev-parse")
+            .args(["HEAD^{commit}", "--symbolic-full-name", "HEAD"])
+            .read_only()
+            .run_accepting(&[0, 128])?;
+        if both.status != Some(0) {
+            return self.head_without_commit();
+        }
+        let text = utf8("rev-parse", both.stdout)?;
+        let mut lines = text.lines();
+        let (Some(oid), Some(name)) = (lines.next(), lines.next()) else {
+            return Err(GitError::malformed("rev-parse", text.clone()));
+        };
+        let oid = Oid::parse(oid)?;
+        if name == "HEAD" {
+            return Ok(Head::Detached(oid));
+        }
+        let name = RefName::parse(name)?;
+        let branch = name
+            .branch()
+            .ok_or_else(|| GitError::malformed("rev-parse", format!("HEAD points at {name}")))?;
+        Ok(Head::Branch { branch, oid })
+    }
+
+    /// `HEAD` when it resolves to no commit: a branch with none yet, read as
+    /// the symbolic ref and its (absent) target separately.
+    fn head_without_commit(&self) -> Result<Head, GitError> {
         let symbolic = self
             .git("symbolic-ref")
             .args(["-q", "HEAD"])

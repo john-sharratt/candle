@@ -52,9 +52,9 @@
 //! call succeeds with `ok: false` and the message in `error`, mirroring how a
 //! REPL reports a runtime fault.
 
-use crate::state::UnknownRepo;
 use crate::{NotPermitted, ToolError};
 use thiserror::Error;
+use zend_vfs::UnknownRepo;
 
 pub mod engine;
 pub mod files;

@@ -45,7 +45,8 @@ pub struct RefreshContext<'a> {
     /// Tool-execution context a hidden ingest conversation's real `file_read`
     /// calls run against — read-only grants, the daemon's own workspace
     /// (`ToolMode::Restricted`'s context, the same one an unprivileged live
-    /// dialogue turn runs tools in).
+    /// dialogue turn runs tools in). Each unit's conversation runs in a copy
+    /// of it with file stores of its own, as every conversation does.
     pub tool_ctx: Arc<ToolContext>,
     /// The priming chain's final link (`priming_chain::build`'s result), or
     /// `None` when no anchor file was found. Every unit a `refresh_*` pass

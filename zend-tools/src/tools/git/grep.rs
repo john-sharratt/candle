@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use zend_git::GrepQuery;
+use zend_vfs::GrepQuery;
 
 use super::wire::WireGrepHit;
 use super::{is_protected, open, path_args, rev_or_head, GitToolError, RevArg};

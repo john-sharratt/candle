@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use boa_engine::gc::{Gc, GcRefCell};
 use boa_engine::{js_string, Context, JsValue, NativeFunction, Source};
+use zend_vfs::VfsStore;
 
 use super::files::Files;
 use crate::grants::{Capability, Grants, NotPermitted};
-use crate::state::VfsStore;
 
 /// Loop-iteration ceiling before the VM aborts a script. Generous for real
 /// computation (~sub-second to a few seconds) while still killing `while(true)`.

@@ -30,7 +30,7 @@
 /// caller frames it in `<tool_response>` tags.
 ///
 /// `total_pages` and `total_lines` are always known by the time this is
-/// called — [`super::super::state::vfs::VfsStore::read_page`] streams the
+/// called — [`zend_vfs::VfsStore::read_page`] streams the
 /// whole file to compute them — so the header always states them, rather than
 /// only when the excerpt stops short of the end.
 ///

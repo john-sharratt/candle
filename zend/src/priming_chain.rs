@@ -46,7 +46,8 @@ use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::Sequence;
-use zend_tools::state::{Repo, Workspace};
+use zend_vfs::workspace::Repo;
+use zend_vfs::Workspace;
 
 use crate::code_read;
 use crate::loading::LoadProgress;
@@ -203,7 +204,7 @@ pub(crate) fn build(
 mod tests {
     use super::*;
 
-    use zend_tools::state::RepoSpec;
+    use zend_vfs::RepoSpec;
 
     /// **The chain walks the repositories in manifest order**, each with the
     /// anchors present at its own root as workspace-relative keys, in anchor

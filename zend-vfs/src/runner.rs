@@ -381,18 +381,19 @@ mod tests {
         let t = TestRepo::init();
         let started = Instant::now();
         let result = Invocation::new(&t.path, "slow")
-            .config("alias.slow", "!sleep 3 && echo late > marker.txt")
-            .timeout(Duration::from_millis(500))
+            .config("alias.slow", "!sleep 1 && echo late > marker.txt")
+            .timeout(Duration::from_millis(200))
             .run();
         assert!(
             matches!(result, Err(GitError::Timeout { .. })),
             "{result:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(1),
             "returned at the timeout"
         );
-        thread::sleep(Duration::from_secs(4));
+        // Past the moment the grandchild would have written.
+        thread::sleep(Duration::from_millis(1300));
         assert!(
             !t.path.join("marker.txt").exists(),
             "a grandchild outlived the timeout"

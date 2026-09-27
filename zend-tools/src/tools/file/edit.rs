@@ -3,8 +3,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
+use zend_vfs::patch::apply;
 
-use super::patch::apply;
 use super::FileError;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
@@ -64,8 +64,8 @@ impl Tool for FileEdit {
 
     fn run(ctx: &ToolContext, req: EditRequest) -> Result<EditResponse, FileError> {
         // Read through the overlay, so a file that lives only in the workspace is
-        // editable. The write below is what copies it up — doing it here instead
-        // would leave a rejected patch having dirtied the file for no reason.
+        // editable. Nothing is recorded until every hunk has landed: a rejected
+        // patch leaves the file as it was.
         let store = ctx.files.repo(&req.repo)?;
         let content = store
             .read(&req.path)?
@@ -74,10 +74,10 @@ impl Tool for FileEdit {
         let patched = apply(&content, &req.patch)?;
         let bytes = patched.content.len();
         // A patch every hunk of which was already applied changes nothing, and
-        // must therefore write nothing: a copy-up here would shadow a workspace
-        // file on account of an edit that did not happen.
+        // must therefore record nothing. One that did is recorded as an edit —
+        // the changed lines only, not the file they landed in.
         if patched.applied > 0 {
-            store.write(&req.path, patched.content)?;
+            store.edit(&req.path, patched.content)?;
         }
         Ok(EditResponse {
             repo: req.repo,

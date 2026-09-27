@@ -838,12 +838,15 @@ fn process_one_file(
         }
     }
 
-    let summary = match run_file_conversation(
-        &mut conv,
-        &file.path,
-        &ctx.think_triggers,
-        &ctx.tool_ctx,
-    ) {
+    // Each file's conversation is a conversation like any other, with file
+    // stores of its own: nothing another unit — or a live dialogue — changed
+    // is what it reads.
+    let unit_ctx = Arc::new(
+        ctx.tool_ctx
+            .with_files(Arc::new(ctx.tool_ctx.files.fresh())),
+    );
+    let summary = match run_file_conversation(&mut conv, &file.path, &ctx.think_triggers, &unit_ctx)
+    {
         Ok(text) => text,
         Err(e) => {
             // The deferred tombstone is the safety net here: the prior good

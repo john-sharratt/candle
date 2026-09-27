@@ -2,7 +2,7 @@
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -26,7 +26,7 @@ use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
-use crate::persistence::manifest::{self, RecordLoc};
+use crate::persistence::manifest::{self, ConvState, RecordLoc};
 use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SnapshotPayload,
     TreeMetadataPayload,
@@ -340,6 +340,14 @@ pub struct Conversation {
     /// turn or chunk stays RAM-resident. Read once from the handle at
     /// construction; a handle's mode never changes.
     read_only: bool,
+    /// Serialises conversation-state writes, from the in-RAM change to the
+    /// enqueue of the record carrying it. A `ConvState` record holds the whole
+    /// state, so two updates enqueued in the opposite order to the one they
+    /// changed RAM in would leave the older state winning on replay — a
+    /// branch set, then lost to an archive that read the state before it.
+    /// Held only by these writes, never by the writer thread, so holding it
+    /// across an enqueue that waits on backpressure cannot deadlock.
+    conv_state_writes: Arc<Mutex<()>>,
     /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
     /// in, removed when the last clone of that conversation drops.
     ///
@@ -488,6 +496,7 @@ impl Conversation {
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
             read_only: false,
+            conv_state_writes: Arc::default(),
             // The directory goes when the last clone of this conversation does.
             // See the field's own note for what it cost not to have this.
             ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
@@ -535,6 +544,7 @@ impl Conversation {
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
             read_only,
+            conv_state_writes: Arc::default(),
         }
     }
 
@@ -3311,32 +3321,83 @@ impl Conversation {
         self.read().live_timeline_ids()
     }
 
-    /// Set a conversation's `archived` lifecycle flag and persist it
-    /// as a `RecordType::ConvState` record. Idempotent: if the
-    /// substrate already holds the requested state, the record is
-    /// not written and the call returns `Ok(())` without touching the
-    /// log.
-    ///
-    /// Last-write-wins on replay — toggling archive↔unarchive each
-    /// appends one small record (~ 16 bytes payload + framing); a
-    /// subsequent compaction collapses the chain to one record per
-    /// timeline.
+    /// Set a conversation's `archived` lifecycle flag and persist its
+    /// state. Idempotent: if the substrate already holds the requested
+    /// flag, nothing is written.
     pub fn set_conversation_archived(
         &self,
         timeline: TimelineId,
         archived: bool,
     ) -> candle::Result<()> {
-        let changed = self.write().set_archived(timeline, archived);
-        if !changed {
-            return Ok(());
-        }
-        let state = crate::persistence::manifest::ConvState { archived };
-        let payload = manifest::encode_conv_state_payload(timeline.raw(), state);
-        self.writer.enqueue(WriteJob::ConvMeta {
-            record: RecordType::ConvState,
-            payload,
-        });
+        self.update_conv_state(timeline, |sub| sub.set_archived(timeline, archived));
         Ok(())
+    }
+
+    /// Set the branch `timeline` works on in each repository `branches`
+    /// names — repository name to branch — leaving any other repository's as
+    /// it is, and persist the state once. Idempotent: when nothing changes,
+    /// nothing is written.
+    pub fn set_conversation_branches(
+        &self,
+        timeline: TimelineId,
+        branches: &BTreeMap<String, String>,
+    ) {
+        self.update_conv_state(timeline, |sub| {
+            let mut changed = false;
+            for (repo, branch) in branches {
+                changed |= sub.set_branch(timeline, repo, branch);
+            }
+            changed
+        });
+    }
+
+    /// Set the file changes `timeline` has made — repository name to the
+    /// daemon's record of its changes, the whole map — and persist the state
+    /// once. Idempotent: when nothing changes, nothing is written.
+    pub fn set_conversation_files(
+        &self,
+        timeline: TimelineId,
+        files: &BTreeMap<String, serde_json::Value>,
+    ) {
+        self.update_conv_state(timeline, |sub| sub.set_files(timeline, files));
+    }
+
+    /// `timeline`'s whole conversation state — archived flag, branches and
+    /// file changes — or `None` for an unregistered timeline.
+    pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.read().conv_state(timeline)
+    }
+
+    /// Apply `change` to the substrate and, when it reports a change, persist
+    /// `timeline`'s whole resulting state as a `RecordType::ConvState` record.
+    ///
+    /// Every record carries the complete state, so replay is last-writer-wins
+    /// on the whole of it and a later compaction keeps one record per
+    /// timeline. The state is read in the same write-lock hold that changed
+    /// it, and `conv_state_writes` keeps the enqueue order equal to that
+    /// order — see the field.
+    fn update_conv_state(&self, timeline: TimelineId, change: impl FnOnce(&mut Substrate) -> bool) {
+        let _ordered = self
+            .conv_state_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = {
+            let mut sub = self.write();
+            if !change(&mut sub) {
+                return;
+            }
+            sub.conv_state(timeline)
+        };
+        let Some(state) = state else {
+            return;
+        };
+        if self.read_only {
+            return;
+        }
+        self.writer.enqueue(WriteJob::ConvState {
+            timeline: timeline.raw(),
+            payload: manifest::encode_conv_state_payload(timeline.raw(), &state),
+        });
     }
 
     /// Whether `timeline` is currently archived. Untouched / unknown
@@ -4570,9 +4631,11 @@ mod tests {
         warmable, Conversation, Observe,
     };
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use crate::persistence::content_hash::turn_stream_id;
+    use crate::persistence::manifest::ConvState;
     use crate::persistence::{dir_fingerprint, SharedSubstrate, SubstratePersistence};
     use crate::projection::{GroupId, LayerId, TimelineId};
     use crate::substrate::{Substrate, TurnPartWrite};
@@ -4793,6 +4856,64 @@ mod tests {
             dir.is_dir(),
             "a workspace conversation deleted the directory it was opened on"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A conversation's state survives a reopen whole.** Branches set, file
+    /// changes recorded, an archive after them, then one branch moved: each
+    /// record carries the whole state, so the archive keeps the branches and
+    /// files, the move keeps the archive, and the log replays to exactly the
+    /// state RAM held.
+    #[test]
+    fn conversation_state_survives_a_reopen_whole() {
+        let dir = std::env::temp_dir().join(format!(
+            "candle-conv-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let tl = TimelineId::from_raw(7).expect("timeline id");
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(r, b)| (r.to_string(), b.to_string()))
+                .collect()
+        };
+        let files: BTreeMap<String, serde_json::Value> = [(
+            "candle".to_string(),
+            serde_json::json!({ "src/lib.rs": { "deltas": [], "size": 3 } }),
+        )]
+        .into();
+        let expected = ConvState {
+            archived: true,
+            branches: map(&[("candle", "zen/work"), ("mind", "master")]),
+            files: files.clone(),
+        };
+        {
+            let mut substrate = Substrate::new();
+            let p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let conv = Conversation::from_parts(substrate, p);
+            conv.register_timeline(tl, layer, group);
+            conv.set_conversation_branches(tl, &map(&[("candle", "main"), ("mind", "master")]));
+            conv.set_conversation_files(tl, &files);
+            conv.set_conversation_archived(tl, true).unwrap();
+            conv.set_conversation_branches(tl, &map(&[("candle", "zen/work")]));
+            assert_eq!(conv.conversation_state(tl), Some(expected.clone()));
+            conv.flush_writer();
+            conv.commit_persistence().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let conv = Conversation::from_parts(substrate, p);
+            conv.register_timeline(tl, layer, group);
+            assert_eq!(conv.conversation_state(tl), Some(expected));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

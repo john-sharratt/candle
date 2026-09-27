@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
-use zend_tools::state::Workspace;
+use zend_vfs::Workspace;
 
 use super::binary_sniff::is_binary_sample;
 use super::types::{FileEntry, Language, ModuleHint, RepoMap};
@@ -323,7 +323,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use zend_tools::state::RepoSpec;
+    use zend_vfs::RepoSpec;
 
     /// The repository every single-repository test below lays its files out in.
     const REPO: &str = "r";

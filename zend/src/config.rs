@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use candle_conversation::models::Model;
 use web::auth::Roles;
-use zend_tools::state::{Secrets, Workspace};
+use zend_tools::state::Secrets;
+use zend_vfs::Workspace;
 
 use crate::access::Gateways;
 

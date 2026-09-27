@@ -40,7 +40,7 @@ use candle_conversation::persistence::SUBSTRATE_DIR;
 use zend::config::DaemonConfig;
 use zend::log_broadcast::LogBus;
 use zend::session::ZendSession;
-use zend_tools::state::{RepoSpec, Workspace};
+use zend_vfs::{RepoSpec, Workspace};
 
 /// How long we tolerate identical snapshots before declaring a
 /// stall.  Picked to be safely longer than the slowest legitimate

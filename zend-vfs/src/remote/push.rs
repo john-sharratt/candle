@@ -507,6 +507,7 @@ mod tests {
     fn hooks_in_the_repository_do_not_run() {
         let s = setup();
         let hooks = s.t.path.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
         for hook in ["pre-push", "reference-transaction"] {
             let marker = s.t.path.join(format!("{hook}.ran"));
             let script = format!(

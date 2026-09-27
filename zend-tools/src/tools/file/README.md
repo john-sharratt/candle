@@ -52,7 +52,7 @@ true size but fail to read with `unreadable`.
 ## `file_read` paging
 
 `path` and `page` are both required — there is no whole-file read. `page` is
-0-based and every page is [`PAGE_LINES`](../../state/vfs.rs) lines
+0-based and every page is [`PAGE_LINES`](../../../../zend-vfs/src/vfs.rs) lines
 (currently 200); a page past the end clamps to the last one rather than
 failing. The header reads `(page P of N, lines a-b of total)`, which names
 both the page just returned and the total page count, so the model reads it
@@ -61,7 +61,7 @@ straight to know whether to keep going.
 ## `file_edit` patches
 
 `file_edit` takes a unified diff: one or more `@@` hunks of `' '` context, `-`
-removed and `+` added lines. `patch.rs` is the engine, and its module docs are
+removed and `+` added lines. `zend-vfs/src/patch.rs` is the engine, and its module docs are
 the reference for the format.
 
 Hunks are located by their **content**, never by the `@@` line numbers. A

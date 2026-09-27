@@ -6,7 +6,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use zend_git::{BranchName, GitError, Oid, Repo as GitRepo, TagAnnotation, TagName};
+use zend_vfs::{BranchName, GitError, Oid, Repo as GitRepo, TagAnnotation, TagName};
 
 use super::{open, GitToolError, RevArg};
 use crate::{RegisteredTool, Tool, ToolContext};
@@ -85,7 +85,7 @@ pub struct RefResponse {
 /// established rather than one the model had to be holding.
 fn current(
     repo: &GitRepo,
-    name: &zend_git::RefName,
+    name: &zend_vfs::RefName,
     expected: &Option<String>,
 ) -> Result<Oid, GitToolError> {
     let held = repo
@@ -132,7 +132,7 @@ impl Tool for GitRef {
         let at = || -> Result<Oid, GitToolError> {
             let rev = match &req.at {
                 Some(r) => r.resolve(&repo)?,
-                None => zend_git::Rev::Head,
+                None => zend_vfs::Rev::Head,
             };
             Ok(repo.resolve(&rev)?)
         };

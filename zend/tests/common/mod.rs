@@ -36,7 +36,7 @@ use candle_conversation::persistence::record::SnapshotPayload;
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, SequenceConfig};
-use zend_tools::state::Workspace as ServedWorkspace;
+use zend_vfs::Workspace as ServedWorkspace;
 
 const PROJECTION_YAML: &str = include_str!("../../src/prompts/projection.yaml");
 

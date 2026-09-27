@@ -5,7 +5,7 @@ use std::fmt;
 use crate::error::GitError;
 
 /// The path segment a repository keeps its secrets under. The file tools
-/// refuse it (`zend_tools::state::vfs::PROTECTED_SEGMENT`), and a
+/// refuse it (`crate::vfs::PROTECTED_SEGMENT`), and a
 /// [`ChangeSet`](crate::ChangeSet) refuses it too, so nothing the model cannot
 /// read can be committed on its behalf.
 pub const PROTECTED_SEGMENT: &str = "secrets";

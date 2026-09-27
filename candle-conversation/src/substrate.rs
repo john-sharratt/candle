@@ -1232,6 +1232,14 @@ pub struct TimelineEntry {
     /// them back in. Persisted as `RecordType::ConvState`,
     /// last-write-wins.
     pub archived: bool,
+    /// The branch this conversation works on in each repository, keyed by
+    /// the repository's workspace name. Persisted with `archived` in the same
+    /// `RecordType::ConvState` record — see [`ConvState`].
+    pub branches: BTreeMap<String, String>,
+    /// The changes this conversation has made to each repository's files, as
+    /// the daemon's file layer records them. Persisted in the same
+    /// `RecordType::ConvState` record — see [`ConvState`].
+    pub files: BTreeMap<String, serde_json::Value>,
     /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
@@ -1403,6 +1411,8 @@ impl TimelineEntry {
             order: 0,
             custom: BTreeMap::new(),
             archived: false,
+            branches: BTreeMap::new(),
+            files: BTreeMap::new(),
             turns: BTreeMap::new(),
             tree_meta: BTreeMap::new(),
             debug_id: None,
@@ -2763,7 +2773,7 @@ impl Substrate {
             }
         }
         if let Some(state) = self.pending_conv_state.remove(&timeline.raw()) {
-            let _ = self.set_archived(timeline, state.archived);
+            self.replace_conv_state(timeline, state);
         }
     }
 
@@ -3546,6 +3556,7 @@ impl Substrate {
             tl.label = None;
             tl.conv_id = None;
             tl.archived = false;
+            tl.branches.clear();
             tl.debug_id = None;
             tl.tree_meta.clear();
             tl.pending_summary_queue.clear();
@@ -3553,10 +3564,10 @@ impl Substrate {
         }
     }
 
-    /// Emit `(timeline_id, conv_id, label, archived, custom)` tuples for
-    /// every timeline that holds non-default values.  Used by compaction
-    /// to re-emit live `Label` / `ConvState` records.
-    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, bool, BTreeMap<String, String>)> {
+    /// Emit `(timeline_id, conv_id, label, custom)` tuples for every timeline
+    /// that holds non-default values.  Used by compaction to re-emit live
+    /// `Label` records; the `ConvState` side is [`Self::live_conv_states`].
+    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, BTreeMap<String, String>)> {
         // Emit in creation `order`, not `timelines` (HashMap) iteration order:
         // the compactor writes these as `Label` records, and reload re-derives
         // each timeline's `order` from the order its `conv_id` Label replays
@@ -3564,31 +3575,22 @@ impl Substrate {
         // sidebar's creation-order sort on every compaction. `order` is 0 for
         // timelines that never got a conv_id (label/custom only); they sort
         // first and their relative order is immaterial.
-        let mut out: Vec<(u64, u64, String, String, bool, BTreeMap<String, String>)> = self
+        let mut out: Vec<(u64, u64, String, String, BTreeMap<String, String>)> = self
             .timelines
             .iter()
             .filter_map(|(tid, tl)| {
                 let conv_id = tl.conv_id.clone().unwrap_or_default();
                 let label = tl.label.clone().unwrap_or_default();
-                if conv_id.is_empty() && label.is_empty() && !tl.archived && tl.custom.is_empty() {
+                if conv_id.is_empty() && label.is_empty() && tl.custom.is_empty() {
                     None
                 } else {
-                    Some((
-                        tl.order,
-                        tid.raw(),
-                        conv_id,
-                        label,
-                        tl.archived,
-                        tl.custom.clone(),
-                    ))
+                    Some((tl.order, tid.raw(), conv_id, label, tl.custom.clone()))
                 }
             })
             .collect();
         out.sort_by_key(|(order, tid, ..)| (*order, *tid));
         out.into_iter()
-            .map(|(_, tid, conv_id, label, archived, custom)| {
-                (tid, conv_id, label, archived, custom)
-            })
+            .map(|(_, tid, conv_id, label, custom)| (tid, conv_id, label, custom))
             .collect()
     }
 
@@ -3775,17 +3777,27 @@ impl Substrate {
         }
     }
 
-    /// Apply a decoded `ConvState` payload.  Same stash-and-drain
-    /// pattern as [`Self::apply_conv_meta`] for unregistered
-    /// timelines.
+    /// Apply a decoded `ConvState` payload — the whole state, replacing
+    /// whatever an earlier record set. Same stash-and-drain pattern as
+    /// [`Self::apply_conv_meta`] for unregistered timelines, except that a
+    /// later stashed state replaces an earlier one rather than merging.
     pub fn apply_conv_state(&mut self, timeline_raw: u64, state: ConvState) {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
         if self.timelines.contains_key(&timeline) {
-            let _ = self.set_archived(timeline, state.archived);
+            self.replace_conv_state(timeline, state);
         } else {
             self.pending_conv_state.insert(timeline_raw, state);
+        }
+    }
+
+    /// Install `state` as `timeline`'s whole conversation state.
+    fn replace_conv_state(&mut self, timeline: TimelineId, state: ConvState) {
+        if let Some(entry) = self.timelines.get_mut(&timeline) {
+            entry.archived = state.archived;
+            entry.branches = state.branches;
+            entry.files = state.files;
         }
     }
 
@@ -5386,6 +5398,65 @@ impl Substrate {
         }
         entry.archived = archived;
         true
+    }
+
+    /// `timeline`'s whole conversation state — what its `ConvState` record
+    /// carries — or `None` for an unregistered timeline.
+    pub fn conv_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.timelines.get(&timeline).map(|e| ConvState {
+            archived: e.archived,
+            branches: e.branches.clone(),
+            files: e.files.clone(),
+        })
+    }
+
+    /// Set the file changes `timeline` has made — the whole map, repository
+    /// name to changes, replacing the last. No-op when the timeline isn't
+    /// registered. Returns `true` when they actually changed, so the caller
+    /// can skip the persistence write when nothing did.
+    pub fn set_files(
+        &mut self,
+        timeline: TimelineId,
+        files: &BTreeMap<String, serde_json::Value>,
+    ) -> bool {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            return false;
+        };
+        if &entry.files == files {
+            return false;
+        }
+        entry.files = files.clone();
+        true
+    }
+
+    /// Set the branch `timeline` works on in `repo`. No-op when the timeline
+    /// isn't registered. Returns `true` when the branch actually changed, so
+    /// the caller can skip the persistence write when nothing did.
+    pub fn set_branch(&mut self, timeline: TimelineId, repo: &str, branch: &str) -> bool {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            return false;
+        };
+        if entry.branches.get(repo).map(String::as_str) == Some(branch) {
+            return false;
+        }
+        entry.branches.insert(repo.to_string(), branch.to_string());
+        true
+    }
+
+    /// Every live timeline's conversation state that differs from an
+    /// untouched one, as `(timeline_id, state)` in timeline order — what
+    /// compaction and maintenance re-emit as `ConvState` records.
+    pub fn live_conv_states(&self) -> Vec<(u64, ConvState)> {
+        let mut out: Vec<(u64, ConvState)> = self
+            .timelines
+            .keys()
+            .filter_map(|tl| {
+                let state = self.conv_state(*tl)?;
+                (!state.is_default()).then_some((tl.raw(), state))
+            })
+            .collect();
+        out.sort_by_key(|(tl, _)| *tl);
+        out
     }
 
     /// Every recovered timeline that has a `conv_id` recorded, paired
@@ -8984,7 +9055,7 @@ mod tests {
             custom: Default::default(),
         };
         sub.apply_conv_meta(timeline.raw(), &meta);
-        sub.apply_conv_state(timeline.raw(), super::ConvState { archived: false });
+        sub.apply_conv_state(timeline.raw(), super::ConvState::default());
         assert!(
             sub.known_conversations().is_empty(),
             "pre-registration: meta stashed, not visible yet"
@@ -9120,7 +9191,59 @@ mod tests {
             .iter()
             .find(|e| e.0 == tl.raw())
             .expect("timeline in live meta");
-        assert_eq!(entry.4.get("path").map(String::as_str), Some("src/lib.rs"));
+        assert_eq!(entry.3.get("path").map(String::as_str), Some("src/lib.rs"));
+    }
+
+    // ── Conversation state (archived + branches) ────────────────────────
+
+    /// **A branch is set per repository, and only a change counts.** The
+    /// state carries it beside `archived`, and `live_conv_states` — what
+    /// compaction and maintenance re-emit — carries every non-default state
+    /// whole, so a branch survives a rewrite of the log.
+    #[test]
+    fn branches_are_set_per_repository_and_re_emitted_whole() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let (a, b) = (alloc.next(), alloc.next());
+        let mut sub = Substrate::new();
+        sub.register_timeline(a, layer, group);
+        sub.register_timeline(b, layer, group);
+
+        assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
+        assert!(sub.set_branch(a, "candle", "main"));
+        assert!(!sub.set_branch(a, "candle", "main"), "no change, no write");
+        assert!(sub.set_branch(a, "mind", "master"));
+        assert!(sub.set_branch(a, "candle", "zen/work"));
+        assert!(sub.set_archived(b, true));
+        assert!(
+            !sub.set_branch(alloc.next(), "candle", "main"),
+            "unregistered"
+        );
+
+        let a_state = super::ConvState {
+            archived: false,
+            branches: [("candle", "zen/work"), ("mind", "master")]
+                .into_iter()
+                .map(|(r, b)| (r.to_string(), b.to_string()))
+                .collect(),
+            files: Default::default(),
+        };
+        assert_eq!(sub.conv_state(a), Some(a_state.clone()));
+        let b_state = super::ConvState {
+            archived: true,
+            branches: Default::default(),
+            files: Default::default(),
+        };
+        assert_eq!(
+            sub.live_conv_states(),
+            vec![(a.raw(), a_state), (b.raw(), b_state)]
+        );
+
+        // A replayed record replaces the state whole.
+        sub.apply_conv_state(a.raw(), super::ConvState::default());
+        assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
+        assert_eq!(sub.live_conv_states().len(), 1, "a is untouched again");
     }
 
     #[test]

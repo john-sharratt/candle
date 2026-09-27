@@ -27,7 +27,7 @@
 //!    ([`crate::net`], [`crate::exec`], [`crate::disk`],
 //!    [`ToolContext::credentials`](crate::ToolContext::credentials),
 //!    [`ToolContext::http`](crate::ToolContext::http),
-//!    [`VfsStore::direct`](crate::state::VfsStore::direct)). A tool whose
+//!    [`VfsStore::direct`](zend_vfs::VfsStore::direct)). A tool whose
 //!    declaration is wrong or missing still cannot perform the action.
 //!
 //! Source-scanning tests hold the second layer in place: no tool module may
@@ -39,6 +39,8 @@
 //! caller's role and tools mode); this crate only enforces them.
 
 use std::fmt;
+
+use zend_vfs::DiskWriteGrant;
 
 /// One class of action with effects outside the conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -137,19 +139,13 @@ impl Grants {
     }
 
     /// The proof of [`Capability::DiskWrite`] a disk-writing file store is
-    /// built from — see [`VfsStore::direct`](crate::state::VfsStore::direct).
+    /// built from — see [`VfsStore::direct`](zend_vfs::VfsStore::direct). This
+    /// is the one place a [`DiskWriteGrant`] is issued; the tool-source scan in
+    /// `disk.rs` holds every tool to that.
     pub fn disk_write(self) -> Result<DiskWriteGrant, NotPermitted> {
         self.require(Capability::DiskWrite)?;
-        Ok(DiskWriteGrant { _private: () })
+        Ok(DiskWriteGrant::issue())
     }
-}
-
-/// Proof that [`Capability::DiskWrite`] was granted. Only
-/// [`Grants::disk_write`] can make one, so a store that writes the disk cannot
-/// be built by code that was not granted the capability.
-#[derive(Debug)]
-pub struct DiskWriteGrant {
-    _private: (),
 }
 
 /// A call refused for want of a capability.

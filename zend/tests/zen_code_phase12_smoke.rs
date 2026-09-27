@@ -191,7 +191,10 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     };
     let served = zend::workspace::single_repo(workspace, FIXTURE_REPO).expect("workspace");
     let tool_host = zend::tools::ToolHost::new(&served, Arc::new(Secrets::empty()));
-    let tool_ctx = std::sync::Arc::clone(tool_host.context_for(zend::types::ToolMode::Restricted));
+    let tool_ctx = tool_host.context_for(
+        zend::types::ToolMode::Restricted,
+        &tool_host.conversation_files(),
+    );
     let dialogue = engine
         .new_conversation_with_projection(
             &formatted_prompt,

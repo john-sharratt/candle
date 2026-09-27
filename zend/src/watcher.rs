@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
-use zend_tools::state::Workspace;
+use zend_vfs::Workspace;
 
 /// Time we wait after the first relevant event before firing the
 /// refresh.  Subsequent events inside the window extend the deadline

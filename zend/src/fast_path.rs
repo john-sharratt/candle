@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
 use serde_json::json;
-use zend_tools::state::Workspace;
+use zend_vfs::{RepoFiles, Workspace};
 
 use crate::code_read::file_content_hash;
 use crate::tool_round::Step;
@@ -136,8 +136,9 @@ fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, Strin
 /// projection.
 ///
 /// A call is left alone — and so runs for real — whenever anything is unsure:
-/// the file cannot be read from disk, no conversation carries its hash, or the
-/// read does not fit `budget_tokens`.
+/// the conversation has changed the file in `files` (so its copy is not the one
+/// on disk the corpus read), the file cannot be read from disk, no conversation
+/// carries its hash, or the read does not fit `budget_tokens`.
 /// Takes the engine's `Mutex` rather than a locked engine: the file reads and
 /// hashing below are disk work, and holding the engine across them would stall
 /// every other conversation and the ingest worker for the length of a round.
@@ -146,6 +147,7 @@ pub fn screen(
     engine: &Mutex<ConversationEngine>,
     target: TimelineId,
     workspace: &Workspace,
+    files: &RepoFiles,
     budget_tokens: usize,
     steps: Vec<Step>,
 ) -> (Vec<Step>, Vec<Served>) {
@@ -159,6 +161,10 @@ pub fn screen(
             let Some((key, repo, rel)) = read_key(&step, workspace) else {
                 return step;
             };
+            // The conversation's own copy is what its read must return.
+            if files.repo(&repo).is_ok_and(|store| store.is_modified(&rel)) {
+                return step;
+            }
             let Ok(bytes) = std::fs::read(workspace.root().join(&key)) else {
                 return step;
             };
@@ -275,7 +281,7 @@ pub fn rebuild(
 mod tests {
     use super::*;
 
-    use zend_tools::state::RepoSpec;
+    use zend_vfs::RepoSpec;
 
     /// A repository's folder, the base [`normalise`] strips.
     fn ws() -> &'static Path {

@@ -170,8 +170,15 @@ struct ConvRow {
     /// Winning `archived` flag — the last `ConvState` in ascending
     /// (segment, offset) order, exactly as the substrate reconstruct resolves it.
     archived: bool,
+    /// Winning branch per repository, from the same `ConvState` record — each
+    /// record carries the whole state, so these come from the winner alone.
+    branches: BTreeMap<String, String>,
     /// `(segment_id, offset)` of the `ConvState` that set the winning flag.
     state_loc: Option<(u64, u64)>,
+    /// The winning `ConvState`'s header `stream_id` — the timeline it is
+    /// keyed by for supersession accounting; `0` on a record written before
+    /// the key moved into the header.
+    state_key: u64,
     /// Total `ConvState` records seen for this timeline (across all segments).
     state_count: usize,
     /// Distill mode + `(segment_id, offset)` of the most recent `Distilled` marker.
@@ -201,7 +208,9 @@ fn fold_conversations(
                 let (tl, st) = decode_conv_state_payload(&e.record.payload)?;
                 let row = rows.entry(tl).or_default();
                 row.archived = st.archived;
+                row.branches = st.branches;
                 row.state_loc = Some((seg_id, e.offset));
+                row.state_key = e.record.header.stream_id;
                 row.state_count += 1;
             }
             RecordType::Distilled => {
@@ -252,6 +261,19 @@ fn print_conversations(rows: &BTreeMap<u64, ConvRow>, filter: Option<&str>) {
             "tl={tl:<18} {arch}  conv={:<38}  convstate={state:<22}  distill={distill:<26}  {label}",
             if row.conv_id.is_empty() { "-" } else { &row.conv_id },
         );
+        if !row.branches.is_empty() {
+            let branches: Vec<String> = row
+                .branches
+                .iter()
+                .map(|(repo, branch)| format!("{repo}={branch}"))
+                .collect();
+            let keyed = if row.state_key == *tl {
+                "keyed by timeline".to_string()
+            } else {
+                format!("header key {:#x}", row.state_key)
+            };
+            println!("    branches: {}  ({keyed})", branches.join(", "));
+        }
         shown += 1;
     }
     println!("\n{shown} conversation timeline(s)");
@@ -495,7 +517,8 @@ enum Cmd {
     /// for every timeline carrying a `Label` / `ConvState` / `Distilled` record,
     /// show conv_id, label, the winning `archived` flag with the exact
     /// `(segment,offset)` of the ConvState that set it (and how many ConvState
-    /// records exist), and the distill mode if any. Last-writer-wins across
+    /// records exist), the branch it works on in each repository with the
+    /// record's header key, and the distill mode if any. Last-writer-wins across
     /// segments in ascending id order — so this answers "why does the reload
     /// think this conversation is archived, and where does that record live".
     Conversations {

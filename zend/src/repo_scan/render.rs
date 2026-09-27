@@ -52,9 +52,10 @@
 use candle_conversation::stencil::ToolCallEnvelope;
 use candle_conversation::TurnText;
 use serde_json::{json, Map, Value};
-use zend_tools::state::ALL_REPOS;
 use zend_tools::tools::file::render::numbered_excerpt;
 use zend_tools::ToolContext;
+use zend_vfs::vfs::PAGE_LINES;
+use zend_vfs::ALL_REPOS;
 
 use super::anchor::Anchor;
 use super::dir_unit::DirUnit;
@@ -161,7 +162,7 @@ pub fn render_read_call(env: &ToolCallEnvelope, anchor: &Anchor) -> String {
 /// page's own bounds (see its doc), so this is just the same page arithmetic
 /// `file_read`/`anchor::pick` use, inverted from the line back to the index.
 fn anchor_page(anchor: &Anchor) -> u32 {
-    anchor.start_line.saturating_sub(1) / zend_tools::state::vfs::PAGE_LINES
+    anchor.start_line.saturating_sub(1) / PAGE_LINES
 }
 
 /// User-side `<tool_response>` for the listing — produced by running the real
@@ -186,9 +187,7 @@ pub fn render_read_response(anchor: &Anchor) -> TurnText {
     let total_pages = if anchor.total_lines == 0 {
         0
     } else {
-        anchor
-            .total_lines
-            .div_ceil(zend_tools::state::vfs::PAGE_LINES)
+        anchor.total_lines.div_ceil(PAGE_LINES)
     };
     let (repo, path) = split(&anchor.path);
     let excerpt = numbered_excerpt(
@@ -281,7 +280,7 @@ mod tests {
     use crate::repo_scan::types::{FileEntry, Language, ModuleHint, RepoMap};
     use candle_conversation::models::Dialect;
     use std::path::Path;
-    use zend_tools::state::{RepoSpec, Workspace};
+    use zend_vfs::{RepoSpec, Workspace};
 
     /// A tool context over `d` as a workspace whose repositories are its
     /// top-level folders — every test here keys its files under repository `a`.

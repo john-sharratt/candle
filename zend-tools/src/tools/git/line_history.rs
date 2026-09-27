@@ -10,7 +10,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use zend_git::{CommitInfo, GitError, LineRange, LogRange, Oid, Repo, RepoPath, Rev};
+use zend_vfs::{CommitInfo, GitError, LineRange, LogRange, Oid, Repo, RepoPath, Rev};
 
 use super::GitToolError;
 

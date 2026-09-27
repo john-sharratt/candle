@@ -1,29 +1,60 @@
-//! A strongly typed interface over the `git` command line, for the
-//! repositories a zend workspace lists. Design: `docs/zend_git.md`.
+//! The daemon's view of its workspace repositories: what is in them, what each
+//! conversation has changed in them, and the checkout tools run on.
+//!
+//! Three layers, each built on the one before:
+//!
+//! - **The git layer** — a strongly typed interface over the `git` command line
+//!   ([`Repo`] and everything on it). Design: `docs/zend_git.md`.
+//! - **The file layer** — the [`workspace`] manifest; a conversation's changes
+//!   as deltas ([`file_delta`], [`file_changes`]); the overlay the `file_*`
+//!   tools read and write through ([`vfs`], one store per repository gathered in
+//!   [`files`]); and the unified-diff engine behind `file_edit` ([`patch`]).
+//! - **The execution checkout** ([`checkout`]) — a conversation's changes
+//!   materialised onto a real checkout for a tool to run on, and what the tool
+//!   changed captured back as deltas.
+//! - **The sandbox** ([`sandbox`]) — one repository's whole command run as a
+//!   conversation: lock, reset onto its branch, lay its changes down, check
+//!   and run the command, read back and record what it changed, reset,
+//!   unlock.
+//!
+//! Writing the disk takes a [`DiskWriteGrant`], which only the tool layer's
+//! capability check issues.
 //!
 //! Nothing outside this crate spawns `git`, formats a git argument or parses
-//! git output. Three rules hold for every operation:
+//! git output. Three rules hold for every git operation:
 //!
 //! - **The user's checkout is never touched.** No operation writes the working
 //!   tree, the index or `HEAD`: commits are written as objects
 //!   ([`Repo::commit_changes`]) and branches move by reference transaction
-//!   ([`Repo::update_refs`]).
+//!   ([`Repo::update_refs`]). The one exception is
+//!   [`Repo::force_checkout_branch`] and [`Repo::restore_paths`], for a
+//!   checkout the daemon owns and runs tools in, never a developer's.
 //! - **Every ref move is a compare-and-swap.** A local update names the value
 //!   it replaces; a push names the value origin must hold ([`Lease`]).
 //! - **Values are validated at the type boundary** ([`types`]), so an argument
 //!   can never become a flag and a path can never leave the repository.
 
 mod changeset;
+pub mod checkout;
 mod classify;
+mod disk_grant;
 mod error;
+mod execution;
+pub mod file_changes;
+pub mod file_delta;
+pub mod files;
 mod kill_tree;
+pub mod patch;
 mod read;
 mod redact;
 mod remote;
 mod runner;
+pub mod sandbox;
 mod setup;
 pub mod types;
 pub mod version;
+pub mod vfs;
+pub mod workspace;
 mod worktrees;
 mod write;
 
@@ -34,7 +65,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 pub use changeset::{Change, ChangeSet};
+pub use disk_grant::DiskWriteGrant;
 pub use error::GitError;
+pub use file_changes::FileChanges;
+pub use file_delta::{FileDelta, FileTimes, Splice, TimedDelta};
+pub use files::{RepoFiles, UnknownRepo};
 pub use read::blame::{BlameLine, LineRange};
 pub use read::blob_reader::BlobReader;
 pub use read::diff::{DiffEntry, DiffSide, DiffStatus};
@@ -53,11 +88,14 @@ pub use remote::manage::UrlKind;
 pub use remote::push::{
     Lease, PushAction, PushOutcome, PushResult, PushSpec, PushTarget, Rejection,
 };
+pub use sandbox::{CommandPolicy, RunOutcome, Sandbox, SandboxCommand, SandboxError};
 pub use setup::clone::CloneOptions;
 pub use types::{
     BranchName, FileMode, GitTime, ObjectFormat, Oid, RefName, RemoteName, RemoteUrl, RepoPath,
     Rev, Signature, TagName,
 };
+pub use vfs::{Snapshot, VfsError, VfsStore};
+pub use workspace::{RepoSpec, Workspace, WorkspaceError, ALL_REPOS, MANIFEST_FILE};
 pub use worktrees::{Worktree, WorktreeCheckout};
 pub use write::apply::ApplyOutcome;
 pub use write::merge_tree::MergeOutcome;
@@ -106,15 +144,27 @@ impl Repo {
         if !dir.is_dir() {
             return Err(not_a_repo());
         }
-        let top = Invocation::new(dir, "rev-parse")
-            .arg("--show-toplevel")
+        // The top level, this working tree's git folder and the repository's
+        // hash, in one process.
+        let located = Invocation::new(dir, "rev-parse")
+            .args([
+                "--show-toplevel",
+                "--absolute-git-dir",
+                "--show-object-format",
+            ])
             .run_ok()
             .map_err(|e| match e {
                 GitError::Unclassified { .. } => not_a_repo(),
                 other => other,
             })?;
-        let top = utf8("rev-parse", top)?;
-        let top = PathBuf::from(top.trim_end_matches(['\n', '\r']));
+        let located = utf8("rev-parse", located)?;
+        let mut lines = located.lines();
+        let (Some(top), Some(git_dir)) = (lines.next(), lines.next()) else {
+            return Err(GitError::malformed("rev-parse", located.clone()));
+        };
+        let reported_format = lines.next().and_then(|f| ObjectFormat::parse(f).ok());
+        let top = PathBuf::from(top);
+        let git_dir = PathBuf::from(git_dir);
         let same = match (top.canonicalize(), dir.canonicalize()) {
             (Ok(a), Ok(b)) => a == b,
             _ => false,
@@ -122,20 +172,21 @@ impl Repo {
         if !same {
             return Err(not_a_repo());
         }
-        // The repository's hash, from its config: absent means SHA-1. Read
-        // this way rather than with `rev-parse --show-object-format`, which
-        // older releases lack.
-        let format = Invocation::new(dir, "config")
-            .args(["--get", "extensions.objectformat"])
-            .run_accepting(&[0, 1])?;
-        let format = match format.status {
-            Some(0) => ObjectFormat::parse(utf8("config", format.stdout)?.trim())?,
-            _ => ObjectFormat::Sha1,
+        let format = match reported_format {
+            Some(format) => format,
+            // Releases before 2.25 lack `--show-object-format` and echo it
+            // back instead: the hash is then read from the config, where
+            // absent means SHA-1.
+            None => {
+                let format = Invocation::new(dir, "config")
+                    .args(["--get", "extensions.objectformat"])
+                    .run_accepting(&[0, 1])?;
+                match format.status {
+                    Some(0) => ObjectFormat::parse(utf8("config", format.stdout)?.trim())?,
+                    _ => ObjectFormat::Sha1,
+                }
+            }
         };
-        let git_dir = Invocation::new(dir, "rev-parse")
-            .arg("--absolute-git-dir")
-            .run_ok()?;
-        let git_dir = PathBuf::from(utf8("rev-parse", git_dir)?.trim_end_matches(['\n', '\r']));
         Ok(Self {
             dir: dir.to_path_buf(),
             git_dir,

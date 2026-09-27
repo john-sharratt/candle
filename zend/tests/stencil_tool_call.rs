@@ -15,7 +15,7 @@ use candle_conversation::stencil::{
     Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec, Vocab, WalkError,
     MAX_TOOL_CALLS_PER_TURN,
 };
-use zend_tools::state::{RepoSpec, Workspace};
+use zend_vfs::{RepoSpec, Workspace};
 
 // ── Building the tree from the live registry ────────────────────────────────
 

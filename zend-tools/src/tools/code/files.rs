@@ -27,8 +27,7 @@ use std::sync::Arc;
 use boa_engine::{
     js_string, Context, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source,
 };
-
-use crate::state::VfsStore;
+use zend_vfs::VfsStore;
 
 /// Most paths one `vfs.list` returns.
 pub const LIST_LIMIT: usize = 200;

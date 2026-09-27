@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use zend_git::{BranchName, FetchFlag, FetchSpec, RemoteName};
+use zend_vfs::{BranchName, FetchFlag, FetchSpec, RemoteName};
 
 use super::{open, GitToolError};
 use crate::{RegisteredTool, Tool, ToolContext};

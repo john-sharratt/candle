@@ -14,7 +14,7 @@ members = [
     "web",
     "tensor-tools",
     "zend-tools",
-    "zend-git",
+    "zend-vfs",
     "target-prune",
 ]
 exclude = [

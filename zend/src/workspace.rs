@@ -1,6 +1,6 @@
 //! The daemon's workspace: the manifest's repositories plus `uploads`.
 //!
-//! The manifest ([`zend_tools::state::workspace`]) lists the repositories a
+//! The manifest ([`zend_vfs::workspace`]) lists the repositories a
 //! deployment works on. The daemon adds one of its own: [`UPLOADS_REPO`], the
 //! folder the upload endpoint writes a user's files into. As a repository, an
 //! uploaded file is addressed like every other file — `repo: uploads, path:
@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use zend_tools::state::{RepoSpec, Workspace, WorkspaceError};
+use zend_vfs::{RepoSpec, Workspace, WorkspaceError};
 
 /// The daemon-owned repository uploaded files are written into.
 pub const UPLOADS_REPO: &str = "uploads";
@@ -49,7 +49,7 @@ pub fn with_uploads(workspace: Workspace) -> anyhow::Result<Workspace> {
 mod tests {
     use super::*;
 
-    use zend_tools::state::MANIFEST_FILE;
+    use zend_vfs::MANIFEST_FILE;
 
     #[test]
     fn open_adds_the_uploads_repository_and_creates_its_folder() {

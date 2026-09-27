@@ -1,8 +1,9 @@
-//! Killing a git process together with everything it started.
+//! Killing a process together with everything it started.
 //!
 //! `git push` runs `ssh`, and a hook or alias runs a shell: killing only the
 //! `git` process on a timeout would leave those running, holding the
-//! connection or the lock. On Windows the child is put in a Job Object that
+//! connection or the lock. A sandboxed command is killed the same way, so
+//! nothing it started outlives its run on the checkout. On Windows the child is put in a Job Object that
 //! kills its members when terminated and when the job's handle is closed; on
 //! Unix the child leads its own process group, and the group is signalled.
 //!
@@ -46,8 +47,21 @@ mod imp {
 
     impl Tree {
         pub fn adopt(child: &Child) -> io::Result<Self> {
+            Self::adopt_handle(child.as_raw_handle() as HANDLE)
+        }
+
+        pub fn adopt_async(child: &tokio::process::Child) -> io::Result<Self> {
+            let handle = child.raw_handle().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "the child has already exited")
+            })?;
+            Self::adopt_handle(handle as HANDLE)
+        }
+
+        /// Put the process behind `process` — a handle its owner keeps open —
+        /// into a new job.
+        fn adopt_handle(process: HANDLE) -> io::Result<Self> {
             // SAFETY: plain Win32 calls on a handle this function owns, and on
-            // the child's process handle, which `child` keeps open.
+            // the child's process handle, which the caller keeps open.
             unsafe {
                 let job = CreateJobObjectW(null(), null());
                 if job.is_null() {
@@ -65,7 +79,7 @@ mod imp {
                 {
                     return Err(io::Error::last_os_error());
                 }
-                if AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) == 0 {
+                if AssignProcessToJobObject(job, process) == 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(tree)
@@ -112,6 +126,13 @@ mod imp {
             })
         }
 
+        pub fn adopt_async(child: &tokio::process::Child) -> io::Result<Self> {
+            let id = child.id().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "the child has already exited")
+            })?;
+            Ok(Self { group: id as i32 })
+        }
+
         pub fn kill(&self) {
             // SAFETY: signalling a process group this process created.
             unsafe {
@@ -132,6 +153,12 @@ pub(crate) struct ProcessTree(imp::Tree);
 impl ProcessTree {
     pub(crate) fn adopt(child: &Child) -> io::Result<Self> {
         imp::Tree::adopt(child).map(Self)
+    }
+
+    /// [`Self::adopt`] for a child started by tokio. Fails once the child has
+    /// been reaped.
+    pub(crate) fn adopt_async(child: &tokio::process::Child) -> io::Result<Self> {
+        imp::Tree::adopt_async(child).map(Self)
     }
 
     /// Kill every process in the tree.

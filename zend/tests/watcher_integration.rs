@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use zend_tools::state::{RepoSpec, Workspace};
+use zend_vfs::{RepoSpec, Workspace};
 
 /// A workspace in `dir` holding one repository, returning the workspace and
 /// the repository's folder.

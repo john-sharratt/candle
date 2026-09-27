@@ -17,8 +17,8 @@ use candle_conversation::stencil::ToolCallEnvelope;
 use zend::repo_scan::render::{render_chain, CHAIN_TOOLS};
 use zend::repo_scan::{all_units, walk_workspace, DirState, DirUnit};
 use zend::turn_sink::{InsertTurnSink, RecordingTurnSink};
-use zend_tools::state::{RepoSpec, Workspace};
 use zend_tools::ToolContext;
+use zend_vfs::{RepoSpec, Workspace};
 
 /// Same budget the daemon passes; irrelevant to a model-less sink but keeps the
 /// call identical to the production one.

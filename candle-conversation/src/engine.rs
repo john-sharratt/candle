@@ -4,6 +4,7 @@ use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
+use crate::persistence::manifest::ConvState;
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
 use crate::persistence::SharedSubstrate;
@@ -28,6 +29,7 @@ use crate::turn_text::literal_tokenizer;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use flume::{Receiver, Sender};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -1045,6 +1047,40 @@ impl ConversationEngine {
     /// `npc-<id>-day-*` conversations this way.
     pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
         self.conversation.conversations_with_conv_id_prefix(prefix)
+    }
+
+    /// Set the branch a conversation works on in each repository `branches`
+    /// names (repository workspace name → branch), leaving any other
+    /// repository's as it is. Persisted with the rest of the conversation's
+    /// state as one `RecordType::ConvState` record (last-writer-wins); a call
+    /// that changes nothing writes nothing.
+    pub fn set_conversation_branches(
+        &self,
+        timeline: TimelineId,
+        branches: &BTreeMap<String, String>,
+    ) {
+        self.conversation
+            .set_conversation_branches(timeline, branches)
+    }
+
+    /// Set the changes a conversation has made to each repository's files —
+    /// repository workspace name to the daemon's record of them, the whole
+    /// map, replacing the last. Persisted with the rest of the conversation's
+    /// state as one `RecordType::ConvState` record (last-writer-wins); a call
+    /// that changes nothing writes nothing.
+    pub fn set_conversation_files(
+        &self,
+        timeline: TimelineId,
+        files: &BTreeMap<String, serde_json::Value>,
+    ) {
+        self.conversation.set_conversation_files(timeline, files)
+    }
+
+    /// A conversation's whole state — archived flag, the branch it works on
+    /// in each repository, and its changes to their files — or `None` for an
+    /// unknown timeline.
+    pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.conversation.conversation_state(timeline)
     }
 
     /// Toggle the archived lifecycle flag for a conversation. Persists

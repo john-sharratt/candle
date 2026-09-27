@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use zend_git::{
+use zend_vfs::{
     BranchName, Lease, Oid, PushOutcome, PushSpec, PushTarget, Rejection, RemoteName,
     Repo as GitRepo, TagName,
 };
@@ -189,7 +189,7 @@ impl Tool for GitPush {
                     let branch = BranchName::parse(&item.name)?;
                     let rev = match &item.source {
                         Some(r) => r.resolve(&repo)?,
-                        None => zend_git::Rev::Branch(branch.clone()),
+                        None => zend_vfs::Rev::Branch(branch.clone()),
                     };
                     let source = repo.resolve(&rev)?;
                     PushSpec::branch(source, branch.clone(), lease(&repo, &branch)?)
@@ -200,7 +200,7 @@ impl Tool for GitPush {
                     let tag = TagName::parse(&item.name)?;
                     let rev = match &item.source {
                         Some(r) => r.resolve(&repo)?,
-                        None => zend_git::Rev::Tag(tag.clone()),
+                        None => zend_vfs::Rev::Tag(tag.clone()),
                     };
                     PushSpec::tag(repo.resolve_object(&rev)?, tag)
                 }
@@ -211,7 +211,7 @@ impl Tool for GitPush {
                         None => match lease_from_tracking(&repo, &remote, &branch)? {
                             Lease::Expect(oid) => oid,
                             Lease::Absent => {
-                                return Err(zend_git::GitError::invalid(format!(
+                                return Err(zend_vfs::GitError::invalid(format!(
                                     "nothing is known about {} on {}: run git_fetch, or \
                                      name what it holds in `expected`",
                                     item.name, req.remote
@@ -226,7 +226,7 @@ impl Tool for GitPush {
                     let tag = TagName::parse(&item.name)?;
                     let held = match &item.expected {
                         Some(e) => Oid::parse(e)?,
-                        None => repo.resolve_object(&zend_git::Rev::Tag(tag.clone()))?,
+                        None => repo.resolve_object(&zend_vfs::Rev::Tag(tag.clone()))?,
                     };
                     PushSpec::delete_tag(tag, held)
                 }
