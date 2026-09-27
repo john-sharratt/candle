@@ -67,7 +67,7 @@ impl Base {
 /// A [`Base`] as a conversation saves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SavedBase {
+pub struct SavedBase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tree: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

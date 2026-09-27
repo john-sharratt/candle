@@ -54,8 +54,8 @@ Typed access to the workspace's repositories through `zend-vfs`. Nothing in
 this crate spawns or parses git; each tool is a request/response shell over
 that layer. The family splits by capability, and that split is the design:
 **the readers declare nothing, the writers declare `DiskWrite` and
-`Network`**, which Comprehensive's grants withhold — so changing a repository
-is Mutable's alone. Running `git` is deliberately not `Exec`; see `git/mod.rs`
+`Network`**, which Restricted's grants withhold — so changing a repository
+is Comprehensive's alone. Running `git` is deliberately not `Exec`; see `git/mod.rs`
 for why.
 
 Each conversation is on one branch per repository, its file store's, at its

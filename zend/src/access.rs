@@ -1,10 +1,10 @@
 //! Who may use which tools mode.
 //!
-//! The tools dial decides how far a conversation's tools reach, and its top two
-//! settings reach a long way: Comprehensive offers the high-risk tools, and
-//! Mutable lets the file tools change the project on disk. Both are for the
-//! estate's admins. Everyone else — signed in or not — gets Restricted by
-//! default and may go no further than it.
+//! The tools dial decides how far a conversation's tools reach, and its top
+//! setting reaches a long way: Comprehensive offers the high-risk tools — the
+//! network, credentials, code, the git writers and programs on this host. It is
+//! for the estate's admins. Everyone else — signed in or not — gets Restricted
+//! by default and may go no further than it.
 //!
 //! # Where the caller comes from
 //!
@@ -17,10 +17,10 @@
 //!
 //! # A mode the caller may not use
 //!
-//! Asked for by a non-admin, Comprehensive or Mutable is **served as
-//! Restricted**, not refused: the turn still runs, on the tools the caller is
-//! entitled to. A refusal would cost the whole turn for a dial set too high,
-//! and the GUI never offers those modes to a non-admin in the first place.
+//! Asked for by a non-admin, Comprehensive is **served as Restricted**, not
+//! refused: the turn still runs, on the tools the caller is entitled to. A
+//! refusal would cost the whole turn for a dial set too high, and the GUI never
+//! offers that mode to a non-admin in the first place.
 //!
 //! # `--local-signin` — standing in for a gateway that isn't there
 //!
@@ -64,7 +64,7 @@ pub fn roles() -> Roles {
 /// The gateway strips any identity a client sends and sets its own, but that
 /// protects only requests that pass through it. zend listens on a LAN address,
 /// and any machine that can reach that port directly could otherwise send
-/// `x-tokera-email` naming an admin and be served Mutable. The gateway on this
+/// `x-tokera-email` naming an admin and be served Comprehensive. The gateway on this
 /// box connects from the bound address itself, so that is trusted by default.
 #[derive(Debug, Clone, Default)]
 pub struct Gateways(Vec<IpAddr>);
@@ -183,7 +183,7 @@ pub fn role(
 pub fn allows(role: Role, mode: ToolMode) -> bool {
     match mode {
         ToolMode::None | ToolMode::Restricted => true,
-        ToolMode::Comprehensive | ToolMode::Mutable => role.at_least(Role::Admin),
+        ToolMode::Comprehensive => role.at_least(Role::Admin),
     }
 }
 
@@ -210,21 +210,16 @@ pub fn default_mode(role: Role) -> ToolMode {
 /// disk primitives check again where the action happens.
 ///
 /// - None and Restricted grant nothing: their tools answer from the
-///   conversation, the overlay and the workspace as read.
-/// - Comprehensive grants the network, stored credentials and the JS sandbox.
-///   Its file changes stay in the overlay, so it grants neither the disk nor
-///   execution on this host: a program that runs here reaches the real
-///   filesystem, which no overlay can stand in front of. The sandbox can —
-///   its only filesystem is the context's file store, the overlay itself.
-/// - Mutable grants everything, the disk and execution included.
+///   conversation and the workspace as read, and their file changes stay in
+///   the conversation's overlay, which needs no grant — it never writes the
+///   disk. No git writer and no program on this host runs without one.
+/// - Comprehensive grants everything: the network, stored credentials, the JS
+///   sandbox, the disk (which the git writers' checkout runs and SQLite need)
+///   and programs on this host.
 pub fn grants(mode: ToolMode) -> Grants {
     match mode {
         ToolMode::None | ToolMode::Restricted => Grants::NONE,
-        ToolMode::Comprehensive => Grants::NONE
-            .with(Capability::Network)
-            .with(Capability::Sandbox)
-            .with(Capability::Secrets),
-        ToolMode::Mutable => Grants::ALL,
+        ToolMode::Comprehensive => Grants::ALL,
     }
 }
 
@@ -236,7 +231,7 @@ pub fn offers(mode: ToolMode, requires: &[Capability], high_risk: bool) -> bool 
     match mode {
         ToolMode::None => false,
         ToolMode::Restricted => within && !high_risk,
-        ToolMode::Comprehensive | ToolMode::Mutable => within,
+        ToolMode::Comprehensive => within,
     }
 }
 
@@ -277,45 +272,35 @@ mod tests {
             assert_eq!(default_mode(role), ToolMode::Comprehensive);
             assert_eq!(effective_mode(role, None), ToolMode::Comprehensive);
             assert_eq!(
-                effective_mode(role, Some(ToolMode::Mutable)),
-                ToolMode::Mutable
+                effective_mode(role, Some(ToolMode::Restricted)),
+                ToolMode::Restricted
             );
         }
     }
 
     /// **Everyone else gets Restricted, and cannot climb above it.** Asking for
-    /// Comprehensive or Mutable runs the turn restricted rather than refusing it.
+    /// Comprehensive runs the turn restricted rather than refusing it.
     #[test]
     fn everyone_else_defaults_to_restricted_and_is_held_there() {
         for role in OTHERS {
             assert_eq!(allowed_modes(role), [ToolMode::None, ToolMode::Restricted]);
             assert_eq!(effective_mode(role, None), ToolMode::Restricted);
-            for above in [ToolMode::Comprehensive, ToolMode::Mutable] {
-                assert_eq!(effective_mode(role, Some(above)), ToolMode::Restricted);
-            }
+            assert_eq!(
+                effective_mode(role, Some(ToolMode::Comprehensive)),
+                ToolMode::Restricted
+            );
             assert_eq!(effective_mode(role, Some(ToolMode::None)), ToolMode::None);
         }
     }
 
-    /// **Only Mutable may touch the disk or run code here, and nothing below
-    /// Comprehensive may reach past the conversation.** A non-admin is held to
-    /// Restricted, so a non-admin's round runs with no grant at all.
+    /// **Comprehensive holds everything, and nothing below it may reach past
+    /// the conversation.** A non-admin is held to Restricted, so a non-admin's
+    /// round runs with no grant at all.
     #[test]
     fn each_mode_grants_what_it_offers_and_no_more() {
         assert_eq!(grants(ToolMode::None), Grants::NONE);
         assert_eq!(grants(ToolMode::Restricted), Grants::NONE);
-        let comprehensive = grants(ToolMode::Comprehensive);
-        for cap in [Capability::DiskWrite, Capability::Exec] {
-            assert!(!comprehensive.has(cap), "comprehensive holds {cap}");
-        }
-        for cap in [
-            Capability::Network,
-            Capability::Sandbox,
-            Capability::Secrets,
-        ] {
-            assert!(comprehensive.has(cap), "comprehensive lacks {cap}");
-        }
-        assert_eq!(grants(ToolMode::Mutable), Grants::ALL);
+        assert_eq!(grants(ToolMode::Comprehensive), Grants::ALL);
         for role in OTHERS {
             for asked in ToolMode::ALL {
                 assert_eq!(grants(effective_mode(role, Some(asked))), Grants::NONE);
@@ -324,17 +309,16 @@ mod tests {
         }
     }
 
-    /// A mode offers exactly the tools its grants cover: code execution only
-    /// in Mutable, the network from Comprehensive up, high-risk tools never
-    /// in Restricted, and nothing at all in None.
+    /// A mode offers exactly the tools its grants cover: everything in
+    /// Comprehensive, no tool needing a grant and no high-risk tool in
+    /// Restricted, and nothing at all in None.
     #[test]
     fn a_mode_offers_only_what_it_would_run() {
-        let exec = [Capability::Exec];
-        let net = [Capability::Network];
-        assert!(offers(ToolMode::Mutable, &exec, true));
-        assert!(!offers(ToolMode::Comprehensive, &exec, true));
-        assert!(offers(ToolMode::Comprehensive, &net, true));
-        assert!(!offers(ToolMode::Restricted, &net, false));
+        for cap in Capability::ALL {
+            assert!(offers(ToolMode::Comprehensive, &[cap], true), "{cap}");
+            assert!(!offers(ToolMode::Restricted, &[cap], false), "{cap}");
+        }
+        assert!(offers(ToolMode::Comprehensive, &[], false));
         assert!(offers(ToolMode::Restricted, &[], false));
         assert!(!offers(ToolMode::Restricted, &[], true));
         assert!(!offers(ToolMode::None, &[], false));

@@ -211,7 +211,8 @@ pub enum FileError {
     /// rather than as "wrong path" and tries six more spellings.
     #[error("{0}")]
     Forbidden(String),
-    /// A write to the workspace on disk (the Mutable tools mode) failed.
+    /// A change the store cannot make — the file's base moved on a store that
+    /// reads no branch.
     #[error("{0}")]
     Unwritable(String),
     /// The conversation edited a file whose copy on disk has since changed, so

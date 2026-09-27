@@ -16,12 +16,6 @@ pub enum SandboxError {
         store: Option<PathBuf>,
         repo: PathBuf,
     },
-    /// The conversation's store writes the disk directly, so its changes are
-    /// on disk already and a run's reset would destroy them.
-    #[error(
-        "the conversation's files are written to disk directly; a sandbox runs over an overlay"
-    )]
-    DirectStore,
     /// The conversation's store reads another branch than the job's — or the
     /// repository's folder rather than a branch at all.
     #[error("the conversation's files read {reads:?}, not the job's branch {branch}")]

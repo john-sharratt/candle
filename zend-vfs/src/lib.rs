@@ -110,7 +110,7 @@ pub use types::{
     Rev, Signature, TagName,
 };
 pub use vfs::git_source::GitSource;
-pub use vfs::{has_markers, Base, FileState, Snapshot, VfsError, VfsStore};
+pub use vfs::{has_markers, Base, FileState, SavedBase, SavedChain, Snapshot, VfsError, VfsStore};
 pub use work::{merge_into, Committing, Landed, Merged, NotCommitted};
 pub use workspace::{RepoSpec, Workspace, WorkspaceError, ALL_REPOS, MANIFEST_FILE};
 pub use worktrees::{Worktree, WorktreeCheckout};

@@ -26,8 +26,8 @@ questions:
 - overwrite the existing file with this version
 category: Files
 mandatory: true
-description: 'Create a new file or overwrite an existing one — the tool for any file that does not exist yet, in the named repo. Unless the conversation''s tools mode writes to disk, the result is held in this session: a project file of the same path is shadowed, not modified. Use for: drafting code, writing notes, saving intermediate output the model wants to reference later, creating files the user will download or transfer, replacing a file''s full content. Triggered by "create a file", "save this as", "write to", "put this in a file called", "make a file with". Returns repo, path, byte count, and whether the file was newly created vs overwritten. For partial edits use file_edit; for pushing files to a real remote system use remote_fs_session_put.'
-high_risk: true
+description: 'Create a new file or overwrite an existing one — the tool for any file that does not exist yet, in the named repo. The result is held in this conversation: a project file of the same path is shadowed, not modified. Use for: drafting code, writing notes, saving intermediate output the model wants to reference later, creating files the user will download or transfer, replacing a file''s full content. Triggered by "create a file", "save this as", "write to", "put this in a file called", "make a file with". Returns repo, path, byte count, and whether the file was newly created vs overwritten. For partial edits use file_edit; for pushing files to a real remote system use remote_fs_session_put.'
+high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:

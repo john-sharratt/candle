@@ -29,7 +29,7 @@ A conversation reads a git repository **through its branch, never its folder**. 
 
 ### Non-goals (for now)
 
-- **Git inside this document.** Reading repository state, committing the session overlay to a branch and pushing it to origin are the git layer's, designed in `docs/zend_git.md`. The working trees here are edited on disk (Mutable mode) or through the session overlay.
+- **Git inside this document.** Reading repository state, committing the session overlay to a branch and pushing it to origin are the git layer's, designed in `docs/zend_git.md`. The working trees here are edited only through the conversation's overlay, never on disk.
 - **Repositories outside the workspace folder, or nested ones.** A repository is exactly `<workspace>/<name>`.
 - **Cluster execution.** Designed in §7–§8, not built.
 
@@ -101,14 +101,14 @@ The model cannot reach the file: the `file_*` tools mount only the listed reposi
 
 ### 4.1 One store per repository
 
-`ToolContext.files` is a `RepoFiles` (`zend-vfs/src/files.rs`): one `VfsStore` per repository. A tool resolves `repo` to its store and the path inside it; `..` stops at the repository's root, so a path cannot reach a sibling repository or anything else in the workspace folder. The overlay/direct distinction, the `secrets/` refusal and the Windows spelling guards hold per store. A context built without a workspace (`ToolContext::new`, tests) is *detached*: each repository name gets an upper-only store on first use.
+`ToolContext.files` is a `RepoFiles` (`zend-vfs/src/files.rs`): one `VfsStore` per repository. A tool resolves `repo` to its store and the path inside it; `..` stops at the repository's root, so a path cannot reach a sibling repository or anything else in the workspace folder. Every store is an overlay — a conversation's changes are held in memory and recorded in the substrate, never written to the folder — and the `secrets/` refusal and the Windows spelling guards hold per store. A context built without a workspace (`ToolContext::new`, tests) is *detached*: each repository name gets an upper-only store on first use.
 
 What a store reads beneath the conversation's changes (`zend-vfs/src/vfs/`):
 
 - **A git repository — at the conversation's base.** The store reads a pinned commit's tree, never the folder and never a moving branch: `RepoFiles::set_branches` gives each store the conversation's branch when its state is built (`conv_overlay::restore`), and until then it reads the branch checked out when the daemon started. The first read pins the base — the commit the branch holds then, read over one long-running `cat-file --batch` per repository that every conversation's store shares (`GitSource`); a tree is listed once with `ls-tree -r` and kept, so listings, searches and existence checks run in memory. Only regular and executable files are there — a link or a submodule is not a file a tool reads — and hidden entries are left out of listings and searches and still read by exact path, as before.
-- **Any other folder — as it stands on disk.** The uploads repository, a scratch workspace, and every direct (Mutable) store.
+- **Any other folder — as it stands on disk.** The uploads repository and a scratch workspace.
 
-**A branch moving does not move a conversation.** Anyone's push, or another conversation's commit, changes nothing this conversation reads. Its base moves only when the conversation moves it — its own `git_commit`, `git_merge`, `git_switch` or `git_reset` — through `VfsStore::move_base`, which carries each uncommitted change onto the new tree (`vfs/carry.rs`, `docs/zend_git.md` §7.9): a change the new tree already holds is dropped, one whose edits still fit the new copy is kept as it is, and one that no longer fits is merged three ways, with overlaps left between markers and the path flagged as in conflict. A flag outlives later moves and clears only when a write or edit leaves the file without markers. A saved `Snapshot` names the base — its tree and parents — so a conversation restored after a restart reads exactly what it read before. `git_status` reports the commits the branch has gained beyond the base, which `git_merge` brings in.
+**A branch moving does not move a conversation.** Anyone's push, or another conversation's commit, changes nothing this conversation reads. Its base moves only when the conversation moves it — its own `git_commit`, `git_merge`, `git_switch` or `git_reset` — through `VfsStore::move_base`, which carries each uncommitted change onto the new tree (`vfs/carry.rs`, `docs/zend_git.md` §7.9): a change the new tree already holds is dropped, one whose edits still fit the new copy is kept as it is, and one that no longer fits is merged three ways, with overlaps left between markers and the path flagged as in conflict. A flag outlives later moves and clears only when a write or edit leaves the file without markers. The base is kept with the conversation's changes, as events on its timeline in the substrate (`docs/zend_vfs_events.md`) — its tree and parents — so a conversation restored after a restart reads exactly what it read before. `git_status` reports the commits the branch has gained beyond the base, which `git_merge` brings in.
 
 ### 4.2 Arguments
 

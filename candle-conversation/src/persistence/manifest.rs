@@ -116,13 +116,6 @@ pub struct ConvState {
     /// developer has checked out.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub branches: BTreeMap<String, String>,
-    /// The changes this conversation has made to each repository's files,
-    /// keyed by the repository's workspace name, in the form the daemon's
-    /// file layer records them — kept and replayed here, never read. What
-    /// lets a conversation's own copy of the workspace outlive the daemon's
-    /// in-memory state of it.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub files: BTreeMap<String, serde_json::Value>,
 }
 
 impl ConvState {
@@ -228,6 +221,10 @@ impl Manifest {
             // manifest's singleton hints. They reach it through the same walker
             // sink every other per-entity record uses.
             | RecordType::Npc
+            // A conversation's file events are located by the persistence
+            // layer's `VfsIndex`.
+            | RecordType::VfsEvent
+            | RecordType::VfsTombstone
             | RecordType::WideQSig
             | RecordType::Snapshot
             | RecordType::BranchCheckpoint
@@ -414,7 +411,6 @@ mod tests {
                 .iter()
                 .map(|(r, b)| (r.to_string(), b.to_string()))
                 .collect(),
-            files: BTreeMap::new(),
         }
     }
 
@@ -443,21 +439,16 @@ mod tests {
         );
     }
 
-    /// **File changes ride in the payload as the daemon recorded them** —
-    /// carried through byte for byte, never interpreted.
+    /// **A record that carried file changes reads as its flag and branches**
+    /// — a conversation's files are events of their own now
+    /// (`docs/zend_vfs_events.md`), and the old key is ignored.
     #[test]
-    fn conv_state_payload_carries_files_verbatim() {
-        let mut with_files = state(false, &[("candle", "main")]);
-        with_files.files.insert(
-            "candle".to_string(),
-            serde_json::json!({ "a.txt": { "deltas": [], "size": null } }),
-        );
-        let bytes = encode_conv_state_payload(3, &with_files);
+    fn a_conv_state_with_files_reads_without_them() {
+        let bytes = br#"{"timeline_id":3,"archived":false,"branches":{"candle":"main"},"files":{"candle":{"a.txt":{"deltas":[],"size":null}}}}"#;
         assert_eq!(
-            bytes,
-            br#"{"timeline_id":3,"archived":false,"branches":{"candle":"main"},"files":{"candle":{"a.txt":{"deltas":[],"size":null}}}}"#
+            decode_conv_state_payload(bytes).unwrap(),
+            (3, state(false, &[("candle", "main")]))
         );
-        assert_eq!(decode_conv_state_payload(&bytes).unwrap(), (3, with_files));
     }
 
     /// Multiple `ConvState` records for the same timeline collapse to the

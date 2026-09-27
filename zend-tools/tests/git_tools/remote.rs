@@ -91,7 +91,7 @@ fn fetching_an_unconfigured_remote_is_refused() {
 }
 
 #[test]
-fn a_comprehensive_context_cannot_fetch() {
+fn a_restricted_context_cannot_fetch() {
     let ws = GitWorkspace::new();
     ws.with_origin();
     let out = ws.read("git_fetch", json!({"repo": "app", "remote": "origin"}));
@@ -341,9 +341,9 @@ fn a_branch_can_be_published_from_another_revision() {
     assert_eq!(remote_oid(&origin, "release"), ws.oid("main"));
 }
 
-/// The one tool whose effect leaves the machine is Mutable's alone.
+/// The one tool whose effect leaves the machine is Comprehensive's alone.
 #[test]
-fn a_comprehensive_context_cannot_push() {
+fn a_restricted_context_cannot_push() {
     let ws = GitWorkspace::new();
     let origin = ws.with_origin();
     let out = ws.read(

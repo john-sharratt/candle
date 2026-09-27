@@ -252,6 +252,25 @@ pub enum RecordType {
     /// compaction pass; this marker survives it (it is what makes the drop
     /// permanent across reloads).
     SectionTombstone = 24,
+    /// One change a conversation made to a repository's files — a child of
+    /// the conversation's timeline. JSON payload
+    /// [`super::vfs::VfsEventPayload`], whose `body` is its owner's and never
+    /// read here. Keyed in the **header**: the timeline in `stream_id`, the
+    /// event's sequence number in `chunk_index`, so the log opens without
+    /// reading a single body.
+    ///
+    /// Dies two ways: explicitly, by a [`Self::VfsTombstone`] naming its
+    /// sequence number, or implicitly, with its timeline — a tombstoned
+    /// conversation's events are orphans that no rewrite carries. Relocated
+    /// verbatim by location ([`super::vfs::VfsIndex`]). See
+    /// `docs/zend_vfs_events.md`.
+    VfsEvent = 25,
+    /// Kills a set of a timeline's [`Self::VfsEvent`]s — every event of one
+    /// path, up to the last. JSON payload [`super::vfs::VfsTombstonePayload`],
+    /// keyed in the header like the events, by timeline and its own sequence
+    /// number. Relocated while its timeline lives, so it stays after every
+    /// copy of the events it killed.
+    VfsTombstone = 26,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -294,6 +313,8 @@ impl RecordType {
             22 => RecordType::Npc,
             23 => RecordType::TurnIndexPage,
             24 => RecordType::SectionTombstone,
+            25 => RecordType::VfsEvent,
+            26 => RecordType::VfsTombstone,
             _ => RecordType::Unknown,
         }
     }

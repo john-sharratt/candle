@@ -9,14 +9,12 @@
 //!    disjoint and minimal at their edges, survive their wire form, and refuse
 //!    a text they were not made against.
 //! 2. **Through the patch engine into a store**: unified diffs are generated
-//!    for each edit, applied by `file_edit`'s engine, and recorded — in an
-//!    overlay, where they are held as deltas and the disk is untouched, and in
-//!    a direct store, where they land on the file on disk. Both must hold the
-//!    same text after every step.
+//!    for each edit, applied by `file_edit`'s engine, and recorded in an
+//!    overlay, where they are held as deltas and the disk is untouched. The
+//!    overlay must hold the engine's text after every step.
 //! 3. **Stored deltas applied elsewhere**: a conversation's recorded chain,
-//!    applied to a direct store over a pristine copy of the workspace, puts
-//!    exactly the conversation's text on disk; applied to a fresh overlay, it
-//!    reproduces the conversation's view.
+//!    applied to a fresh overlay over a pristine copy of the workspace,
+//!    reproduces the conversation's view there.
 //!
 //! The generator is a fixed-seed LCG, so a failure names its case and
 //! reproduces.
@@ -25,7 +23,7 @@ use std::path::Path;
 
 use similar::TextDiff;
 use zend_vfs::file_delta::{self, Diverged, FileDelta, FileTimes, ReplayError, Splice, TimedDelta};
-use zend_vfs::{patch, DiskWriteGrant, VfsStore};
+use zend_vfs::{patch, VfsStore};
 
 // ── The generator ────────────────────────────────────────────────────────────
 
@@ -361,7 +359,7 @@ fn replay_follows_replace_and_delete() {
     );
 }
 
-// ── 2 and 3. Through the patch engine, into a store, and onto disk ──────────
+// ── 2 and 3. Through the patch engine, into a store, and elsewhere ──────────
 
 fn put(root: &Path, rel: &str, text: &str) {
     let p = root.join(rel);
@@ -371,10 +369,6 @@ fn put(root: &Path, rel: &str, text: &str) {
 
 fn on_disk(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap()
-}
-
-fn direct(root: &Path) -> VfsStore {
-    VfsStore::direct(root, &DiskWriteGrant::issue())
 }
 
 /// A file the patch engine can take hunks for without ambiguity: distinct,
@@ -429,33 +423,28 @@ fn unified(old: &str, new: &str) -> String {
         .to_string()
 }
 
-/// **Patches built, stored and applied — into the overlay and onto disk.**
+/// **Patches built, stored and applied — into the overlay and elsewhere.**
 ///
 /// For each case a workspace file is edited eight times. Each edit is a
 /// unified diff generated against the file as it stands, applied by
-/// `file_edit`'s patch engine, and recorded twice: in an overlay store, which
-/// holds deltas and never touches its disk, and in a direct store, which
-/// writes the existing file on disk. After every step both hold the patch
+/// `file_edit`'s patch engine, and recorded in an overlay store, which holds
+/// deltas and never touches its disk. After every step it holds the patch
 /// engine's result.
 ///
-/// Then the overlay's recorded chain is applied elsewhere: to a direct store
-/// over a pristine copy of the workspace, putting exactly the conversation's
-/// text on disk, and to a fresh overlay over another pristine copy,
-/// reproducing the conversation's view there.
+/// Then the overlay's recorded chain is applied to a fresh overlay over a
+/// pristine copy of the workspace, reproducing the conversation's view there.
 #[test]
-fn patches_are_built_stored_and_applied_to_the_overlay_and_to_disk() {
+fn patches_are_built_stored_and_applied_to_the_overlay_and_elsewhere() {
     let mut rng = Lcg(0x9a7c4);
     let mut unique = 0;
     for case in 0..60 {
         let mut doc = patchable_doc(&mut rng, &mut unique);
         let original = doc.text();
-        let [overlay_root, direct_root, replay_root, fresh_root] =
-            [(); 4].map(|_| tempfile::tempdir().unwrap());
-        for root in [&overlay_root, &direct_root, &replay_root, &fresh_root] {
+        let [overlay_root, fresh_root] = [(); 2].map(|_| tempfile::tempdir().unwrap());
+        for root in [&overlay_root, &fresh_root] {
             put(root.path(), "src/file.rs", &original);
         }
         let overlay = VfsStore::with_root(overlay_root.path());
-        let disk = direct(direct_root.path());
         let mut doc_text = original.clone();
 
         for step in 0..8 {
@@ -476,16 +465,10 @@ fn patches_are_built_stored_and_applied_to_the_overlay_and_to_disk() {
             overlay
                 .edit("src/file.rs", patched.content.clone())
                 .unwrap();
-            disk.edit("src/file.rs", patched.content.clone()).unwrap();
             assert_eq!(
                 overlay.read("src/file.rs").unwrap().as_deref(),
                 Some(patched.content.as_str()),
                 "case {case} step {step}: overlay"
-            );
-            assert_eq!(
-                on_disk(direct_root.path(), "src/file.rs"),
-                patched.content,
-                "case {case} step {step}: disk"
             );
             doc_text = patched.content;
             doc = next;
@@ -498,21 +481,8 @@ fn patches_are_built_stored_and_applied_to_the_overlay_and_to_disk() {
             .expect("the overlay recorded the edits");
         let held: usize = chain.iter().map(|t| t.delta.bytes()).sum();
         assert_eq!(overlay.total_bytes(), held, "case {case}");
-        assert!(
-            disk.deltas("src/file.rs").is_none(),
-            "a direct store holds none"
-        );
 
-        // The stored chain applied onto disk puts the conversation's text there.
-        let onto_disk = direct(replay_root.path());
-        onto_disk.apply("src/file.rs", &chain).unwrap();
-        assert_eq!(
-            on_disk(replay_root.path(), "src/file.rs"),
-            doc_text,
-            "case {case}: stored deltas applied to disk"
-        );
-
-        // And applied to a fresh overlay it reproduces the view.
+        // Applied to a fresh overlay the stored chain reproduces the view.
         let fresh = VfsStore::with_root(fresh_root.path());
         fresh.apply("src/file.rs", &chain).unwrap();
         assert_eq!(
@@ -524,8 +494,9 @@ fn patches_are_built_stored_and_applied_to_the_overlay_and_to_disk() {
     }
 }
 
-/// **Deltas that do not fit are refused, in both kinds of store, and change
-/// nothing** — the file on disk and the overlay's view both stay as they were.
+/// **Deltas that do not fit are refused and change nothing** — over an
+/// untouched file and over one the overlay has changed, the file on disk and
+/// the overlay's view both stay as they were.
 #[test]
 fn deltas_that_do_not_fit_are_refused_everywhere() {
     let root = tempfile::tempdir().unwrap();
@@ -537,8 +508,9 @@ fn deltas_that_do_not_fit_are_refused_everywhere() {
         },
     )];
 
-    let disk = direct(root.path());
-    assert!(disk.apply("a.txt", &stale).is_err());
+    let untouched = VfsStore::with_root(root.path());
+    assert!(untouched.apply("a.txt", &stale).is_err());
+    assert_eq!(untouched.deltas("a.txt"), None);
     assert_eq!(on_disk(root.path(), "a.txt"), "one\ntwo\nthree\n");
 
     let overlay = VfsStore::with_root(root.path());
@@ -559,8 +531,8 @@ fn timed(at_ns: i64, delta: FileDelta) -> TimedDelta {
 }
 
 /// Applied deltas behave as the calls that made them would: a replace
-/// supersedes the chain, a delete on a direct store removes the file, and a
-/// delete of a file only the overlay made leaves nothing recorded. Each keeps
+/// supersedes the chain, a delete hides the file while the disk keeps it, and
+/// a delete of a file only the overlay made leaves nothing recorded. Each keeps
 /// the moment it was made, and the file's times come from them.
 #[test]
 fn applied_replace_and_delete_behave_as_write_and_delete() {
@@ -608,10 +580,6 @@ fn applied_replace_and_delete_behave_as_write_and_delete() {
         .unwrap();
     assert_eq!(overlay.deltas("made.txt"), None);
     assert_eq!(overlay.times("made.txt"), None);
-
-    let disk = direct(root.path());
-    disk.apply("a.txt", &[timed(3, FileDelta::Delete)]).unwrap();
-    assert!(!root.path().join("a.txt").exists());
 }
 
 /// **Every VFS operation is stamped with the moment it executed**: a write

@@ -1,12 +1,10 @@
-//! The proof a disk-writing store or checkout is built from.
+//! The proof a checkout run is built from.
 
 /// Proof that the caller was granted the right to change files on disk.
 ///
-/// A store that writes the disk ([`VfsStore::direct`](crate::VfsStore::direct),
-/// [`RepoFiles::direct`](crate::RepoFiles::direct)) and a checkout run
-/// ([`materialize`](crate::checkout::materialize())) each take one, so the
-/// right is decided once, where the capability is checked, and carried from
-/// there rather than assumed.
+/// A checkout run ([`materialize`](crate::checkout::materialize())) and the
+/// sandbox that makes one take it, so the right is decided once, where the
+/// capability is checked, and carried from there rather than assumed.
 ///
 /// [`DiskWriteGrant::issue`] is public because the check that decides it lives
 /// in the tool layer, outside this crate: `zend_tools::Grants::disk_write` is

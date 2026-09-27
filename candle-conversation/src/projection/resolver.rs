@@ -33,6 +33,7 @@ use crate::persistence::record::{
 };
 use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
+use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::{SharedSubstrate, SubstratePersistence};
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
@@ -3351,19 +3352,36 @@ impl Conversation {
         });
     }
 
-    /// Set the file changes `timeline` has made — repository name to the
-    /// daemon's record of its changes, the whole map — and persist the state
-    /// once. Idempotent: when nothing changes, nothing is written.
-    pub fn set_conversation_files(
+    /// Stage `write` — a set of `timeline`'s changes to its files — as
+    /// events on the timeline, events before tombstones, for the persistence
+    /// thread's group commit to make durable. Returns the sequence numbers
+    /// the events took. A read-only substrate refuses: the
+    /// caller mirrors what was written, and nothing was.
+    pub fn write_conversation_files(
         &self,
         timeline: TimelineId,
-        files: &BTreeMap<String, serde_json::Value>,
-    ) {
-        self.update_conv_state(timeline, |sub| sub.set_files(timeline, files));
+        write: &VfsWrite,
+    ) -> candle::Result<Vec<u64>> {
+        if self.read_only {
+            return Err(candle::Error::Msg(
+                "write_conversation_files: the substrate is read-only".to_string(),
+            ));
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_vfs(timeline.raw(), write)
+            .map_err(|e| candle::Error::Msg(format!("write_conversation_files: {e}")))
     }
 
-    /// `timeline`'s whole conversation state — archived flag, branches and
-    /// file changes — or `None` for an unregistered timeline.
+    /// Every live event of `timeline`'s files, read back in
+    /// `(repo, key, seq)` order.
+    pub fn conversation_files(&self, timeline: TimelineId) -> candle::Result<Vec<VfsEventPayload>> {
+        let mut p = self.persistence.lock().unwrap();
+        p.vfs_events(timeline.raw())
+            .map_err(|e| candle::Error::Msg(format!("conversation_files: {e}")))
+    }
+
+    /// `timeline`'s conversation state — archived flag and branches — or
+    /// `None` for an unregistered timeline.
     pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
         self.read().conv_state(timeline)
     }
@@ -4636,6 +4654,7 @@ mod tests {
 
     use crate::persistence::content_hash::turn_stream_id;
     use crate::persistence::manifest::ConvState;
+    use crate::persistence::vfs::{VfsAppend, VfsWrite};
     use crate::persistence::{dir_fingerprint, SharedSubstrate, SubstratePersistence};
     use crate::projection::{GroupId, LayerId, TimelineId};
     use crate::substrate::{Substrate, TurnPartWrite};
@@ -4859,11 +4878,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **A conversation's state survives a reopen whole.** Branches set, file
-    /// changes recorded, an archive after them, then one branch moved: each
-    /// record carries the whole state, so the archive keeps the branches and
-    /// files, the move keeps the archive, and the log replays to exactly the
-    /// state RAM held.
+    /// **A conversation's state survives a reopen whole.** Branches set, a
+    /// file event written, an archive after them, then one branch moved: each
+    /// record carries the whole state, so the archive keeps the branches, the
+    /// move keeps the archive, and the log replays to exactly the state RAM
+    /// held — and the file event reads back beside it.
     #[test]
     fn conversation_state_survives_a_reopen_whole() {
         let dir = std::env::temp_dir().join(format!(
@@ -4884,15 +4903,17 @@ mod tests {
                 .map(|(r, b)| (r.to_string(), b.to_string()))
                 .collect()
         };
-        let files: BTreeMap<String, serde_json::Value> = [(
-            "candle".to_string(),
-            serde_json::json!({ "src/lib.rs": { "deltas": [], "size": 3 } }),
-        )]
-        .into();
         let expected = ConvState {
             archived: true,
             branches: map(&[("candle", "zen/work"), ("mind", "master")]),
-            files: files.clone(),
+        };
+        let write = VfsWrite {
+            tombstones: Vec::new(),
+            events: vec![VfsAppend {
+                repo: "candle".into(),
+                key: "src/lib.rs".into(),
+                body: serde_json::json!({ "kind": "state", "size": 3, "conflict": false }),
+            }],
         };
         {
             let mut substrate = Substrate::new();
@@ -4900,7 +4921,7 @@ mod tests {
             let conv = Conversation::from_parts(substrate, p);
             conv.register_timeline(tl, layer, group);
             conv.set_conversation_branches(tl, &map(&[("candle", "main"), ("mind", "master")]));
-            conv.set_conversation_files(tl, &files);
+            assert_eq!(conv.write_conversation_files(tl, &write).unwrap(), vec![0]);
             conv.set_conversation_archived(tl, true).unwrap();
             conv.set_conversation_branches(tl, &map(&[("candle", "zen/work")]));
             assert_eq!(conv.conversation_state(tl), Some(expected.clone()));
@@ -4913,6 +4934,10 @@ mod tests {
             let conv = Conversation::from_parts(substrate, p);
             conv.register_timeline(tl, layer, group);
             assert_eq!(conv.conversation_state(tl), Some(expected));
+            let files = conv.conversation_files(tl).unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].key, "src/lib.rs");
+            assert_eq!(files[0].body, write.events[0].body);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

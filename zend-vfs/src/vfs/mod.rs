@@ -115,21 +115,6 @@
 //! workspace costs nothing against the cap because nothing is retained, and
 //! neither does the unchanged part of an edited file; a change that would not
 //! fit returns [`VfsError::Full`] and records nothing.
-//!
-//! # Direct mode
-//!
-//! [`VfsStore::direct`] is the same store with no upper layer over a folder: a
-//! write lands in the workspace on disk, a delete removes the file, and every
-//! read therefore sees what is on disk. It backs the daemon's Mutable tools
-//! mode, for a caller
-//! entitled to change the project itself rather than a session copy of it.
-//! Everything else holds unchanged — path normalisation (so `..` still cannot
-//! leave the root) and the protected-path refusal in particular, which in this
-//! mode is what stops a tool overwriting a deployment's secrets.
-//!
-//! A direct write goes to a sibling temporary file first and is renamed over
-//! the target, so a write interrupted partway leaves the old file whole rather
-//! than truncated.
 
 mod base;
 mod carry;
@@ -146,15 +131,14 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-pub use self::base::Base;
-use self::base::SavedBase;
+pub use self::base::{Base, SavedBase};
 pub use self::carry::{Carried, Resolved, Resolver, Side};
 pub use self::conflict::has_markers;
 use self::git_source::GitSource;
 use self::tree::Tree;
 use self::view::View;
 use super::file_delta::{self, FileDelta, FileTimes, ReplayError, TimedDelta};
-use crate::{BranchName, DiskWriteGrant, FileChanges, Rev};
+use crate::{BranchName, FileChanges, Rev};
 
 const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
@@ -200,8 +184,8 @@ pub enum VfsError {
     /// not it exists: saying "not found" for a real file and "forbidden" for a
     /// missing one would turn the error into an oracle for what is there.
     Forbidden(String),
-    /// A [`VfsStore::direct`] write could not reach the disk — a permission, a
-    /// full volume, a path that names a directory.
+    /// A change this store cannot make — a base moved on a store that reads
+    /// no branch.
     Unwritable(String),
     /// The session edited the workspace's copy of a file, and that copy has
     /// since changed on disk so the edit no longer fits it.
@@ -401,30 +385,39 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// A snapshot of `base` and `chains` — what a saved form other than this
+    /// one's own serialisation is read back into.
+    pub fn new(base: Option<SavedBase>, chains: BTreeMap<String, SavedChain>) -> Self {
+        Self { base, chains }
+    }
+
     /// Whether there is nothing to save: no base taken, no path changed.
     pub fn is_empty(&self) -> bool {
         self.base.is_none() && self.chains.is_empty()
     }
+
+    /// What the chains are made on; `None` before the store first read its
+    /// branch.
+    pub fn base(&self) -> Option<&SavedBase> {
+        self.base.as_ref()
+    }
+
+    /// Every changed path's chain, by path.
+    pub fn chains(&self) -> &BTreeMap<String, SavedChain> {
+        &self.chains
+    }
 }
 
-/// One path's saved chain — see [`Snapshot`].
+/// One path's saved chain — see [`Snapshot`]: every delta with the moment it
+/// was made, the size it leaves the file at (`None` once deleted), and
+/// whether it is in conflict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SavedChain {
-    deltas: Vec<TimedDelta>,
-    size: Option<usize>,
+pub struct SavedChain {
+    pub deltas: Vec<TimedDelta>,
+    pub size: Option<usize>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    conflict: bool,
-}
-
-/// Where a store's writes land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Layering {
-    /// In the in-memory upper layer, over a read-only workspace.
-    #[default]
-    Overlay,
-    /// On disk, in the workspace itself — see the module's "Direct mode".
-    Direct,
+    pub conflict: bool,
 }
 
 /// What a store reads beneath its session's changes.
@@ -444,12 +437,11 @@ enum Lower {
 }
 
 /// Union-mount of a session-private in-memory layer over a read-only
-/// repository — or, built with [`VfsStore::direct`], a folder itself.
+/// repository.
 #[derive(Default)]
 pub struct VfsStore {
     upper: RwLock<Upper>,
     lower: Lower,
-    layering: Layering,
 }
 
 impl VfsStore {
@@ -464,7 +456,6 @@ impl VfsStore {
         Self {
             upper: RwLock::new(Upper::default()),
             lower: Lower::Folder(root.into()),
-            layering: Layering::Overlay,
         }
     }
 
@@ -477,27 +468,7 @@ impl VfsStore {
                 source,
                 rev: RwLock::new(rev),
             },
-            layering: Layering::Overlay,
         }
-    }
-
-    /// The folder at `root` with no overlay: writes and deletes change the
-    /// files on disk. See the module's "Direct mode".
-    ///
-    /// Takes the [`DiskWriteGrant`] only the tool layer's capability check
-    /// issues, so a store that writes the disk exists only where that
-    /// capability was granted.
-    pub fn direct(root: impl Into<PathBuf>, _grant: &DiskWriteGrant) -> Self {
-        Self {
-            upper: RwLock::new(Upper::default()),
-            lower: Lower::Folder(root.into()),
-            layering: Layering::Direct,
-        }
-    }
-
-    /// Whether writes and deletes change the files on disk.
-    pub fn is_direct(&self) -> bool {
-        self.layering == Layering::Direct
     }
 
     /// The folder of the repository beneath this store — the one it reads,
@@ -695,19 +666,11 @@ impl VfsStore {
     /// a deletion included. Returns whether this created a path that did not
     /// previously resolve: replacing a workspace file for the first time is an
     /// overwrite, and writing over a deletion is a creation.
-    ///
-    /// On a [`direct`](Self::direct) store the file is written on disk instead,
-    /// and `true` means it did not exist there before.
     pub fn write(&self, path: &str, content: String) -> Result<bool, VfsError> {
         let norm = Self::normalize(path);
-        // Refused in both modes. On an overlay nothing reaches disk, so this
-        // stops a session planting a decoy at a protected path that later reads
-        // would then find; on a direct store it is what keeps a tool from
-        // overwriting the deployment's secrets.
+        // Nothing reaches disk, but a session planting a decoy at a protected
+        // path would have later reads find it: refused like a read.
         Self::guard(&norm)?;
-        if self.is_direct() {
-            return self.write_disk(&norm, &content);
-        }
         let view = self.view()?;
         let created = !self.resolves_as_file(&view, &norm);
         let size = content.len();
@@ -729,8 +692,6 @@ impl VfsStore {
     /// lines, as the whole file, exactly as a [`Self::write`] records it. The
     /// file must exist. Returns whether anything changed: an edit that leaves
     /// the file as it was records nothing.
-    ///
-    /// On a [`direct`](Self::direct) store the file is written on disk instead.
     pub fn edit(&self, path: &str, content: String) -> Result<bool, VfsError> {
         let norm = Self::normalize(path);
         Self::guard(&norm)?;
@@ -754,10 +715,6 @@ impl VfsStore {
                     }
                 }
                 return Ok(false);
-            }
-            if self.is_direct() {
-                self.write_disk(&norm, &content)?;
-                return Ok(true);
             }
             let size = Some(content.len());
             let delta = TimedDelta::now(file_delta::delta(&current, &content));
@@ -840,8 +797,7 @@ impl VfsStore {
 
     /// The deltas this store holds for `path` — the session's chain, oldest
     /// first, each with the moment its operation executed — or `None` when the
-    /// session has not changed it. A direct store holds none: its changes are
-    /// on disk.
+    /// session has not changed it.
     pub fn deltas(&self, path: &str) -> Option<Vec<TimedDelta>> {
         let norm = Self::normalize(path);
         self.upper
@@ -860,11 +816,8 @@ impl VfsStore {
     }
 
     /// Apply `deltas` — made against the file as this store holds it now — to
-    /// `path`, in order. On an overlay they are recorded, extending the path's
-    /// chain exactly as the edits and writes that made them would have; on a
-    /// [`direct`](Self::direct) store they are replayed onto the file on disk
-    /// and the result written there, or the file removed when they end in a
-    /// deletion.
+    /// `path`, in order, recorded as extending the path's chain exactly as the
+    /// edits and writes that made them would have.
     ///
     /// Each delta keeps the moment it was made. Checked before anything
     /// changes: deltas that do not fit the file as it stands are refused as
@@ -886,17 +839,6 @@ impl VfsStore {
                 )),
                 ReplayError::NotText => Self::not_text(&norm),
             })?;
-            if self.is_direct() {
-                match result {
-                    Some(text) => {
-                        self.write_disk(&norm, &text)?;
-                    }
-                    None => {
-                        self.delete(&norm);
-                    }
-                }
-                return Ok(());
-            }
             let in_lower = view.is_file(&norm);
             let mut guard = self.upper.write().unwrap();
             if !seen.stands(&guard, &norm) {
@@ -927,8 +869,7 @@ impl VfsStore {
     /// The session's state as it is saved: every changed path's chain, each
     /// delta with its moment, the size it leaves the file at and whether it
     /// is in conflict, with the base they are made on — what
-    /// [`Self::restore`] puts back exactly, with nothing replayed. A direct
-    /// store holds none.
+    /// [`Self::restore`] puts back exactly, with nothing replayed.
     pub fn snapshot(&self) -> Snapshot {
         Self::saved(&self.upper.read().unwrap())
     }
@@ -955,13 +896,12 @@ impl VfsStore {
     /// session layer holds — how a conversation's own copy of a repository
     /// outlives the store that held it, reading the base it read before. A
     /// protected path is refused, and so is a set past the size cap or a base
-    /// that does not name objects; any of these leaves the store as it was. A
-    /// direct store holds no session changes and takes none.
+    /// that does not name objects; any of these leaves the store as it was.
     pub fn restore(&self, snapshot: Snapshot) -> Result<(), VfsError> {
         if snapshot.is_empty() {
             return Ok(());
         }
-        let restored = self.upper_of(snapshot)?;
+        let restored = Self::upper_of(snapshot)?;
         *self.upper.write().unwrap() = restored;
         Ok(())
     }
@@ -971,7 +911,7 @@ impl VfsStore {
     /// whether it did: a change of the conversation's that landed since is
     /// never undone by rolling back another.
     pub fn roll_back(&self, after: &Snapshot, before: Snapshot) -> Result<bool, VfsError> {
-        let restored = self.upper_of(before)?;
+        let restored = Self::upper_of(before)?;
         let mut upper = self.upper.write().unwrap();
         if Self::saved(&upper) != *after {
             return Ok(false);
@@ -982,12 +922,7 @@ impl VfsStore {
 
     /// The session layer `snapshot` saved, checked: no protected path, within
     /// the size cap, a base naming objects.
-    fn upper_of(&self, snapshot: Snapshot) -> Result<Upper, VfsError> {
-        if self.is_direct() {
-            return Err(VfsError::Unwritable(
-                "a store that writes the disk directly holds no session changes to restore".into(),
-            ));
-        }
+    fn upper_of(snapshot: Snapshot) -> Result<Upper, VfsError> {
         let base = snapshot.base.as_ref().map(SavedBase::parse).transpose()?;
         let mut chains = HashMap::with_capacity(snapshot.chains.len());
         for (path, saved) in snapshot.chains {
@@ -1011,8 +946,7 @@ impl VfsStore {
 
     /// Every change the session holds, path by path, made against its base's
     /// tree — what a checkout replays onto a repository's files to put this
-    /// conversation on disk (see [`crate::checkout`]). A direct store holds
-    /// none: its changes are on disk already.
+    /// conversation on disk (see [`crate::checkout`]).
     pub fn changes(&self) -> Result<FileChanges, VfsError> {
         self.view()?;
         let upper = self.upper.read().unwrap();
@@ -1189,18 +1123,10 @@ impl VfsStore {
     /// deltas, so it stops resolving; a file only the session made just loses
     /// its deltas. Returns whether the path resolved before the call. The
     /// lower layer is never touched.
-    ///
-    /// On a [`direct`](Self::direct) store the file is removed from disk, and the
-    /// result is whether it existed and was removed.
     pub fn delete(&self, path: &str) -> bool {
         let norm = Self::normalize(path);
         if Self::is_protected(&norm) {
             return false;
-        }
-        if self.is_direct() {
-            return self
-                .disk_path(&norm)
-                .is_some_and(|abs| abs.is_file() && std::fs::remove_file(abs).is_ok());
         }
         let Ok(view) = self.view() else {
             return false;
@@ -1250,7 +1176,7 @@ impl VfsStore {
 
     /// Drop every change the session holds: every path reads as the lower
     /// layer holds it again. What a hard reset does to the conversation's
-    /// uncommitted work. A direct store holds none.
+    /// uncommitted work.
     pub fn discard(&self) {
         let mut upper = self.upper.write().unwrap();
         upper.chains.clear();
@@ -1275,50 +1201,6 @@ impl VfsStore {
         }
         upper.chains.insert(norm, chain);
         Ok(())
-    }
-
-    // ── Direct-mode helpers ──────────────────────────────────────────────────
-
-    /// Write `content` to `norm` on disk, creating its parent directories.
-    /// Returns whether the file did not exist before.
-    ///
-    /// Through a sibling temporary file renamed over the target: a rename
-    /// replaces the file in one step, so a write cut short leaves the old
-    /// content whole rather than a truncated file.
-    fn write_disk(&self, norm: &str, content: &str) -> Result<bool, VfsError> {
-        let abs = self.disk_path(norm).ok_or_else(|| {
-            VfsError::Unwritable(format!("{norm:?} does not name a file in the workspace"))
-        })?;
-        let fail = |what: &str, e: std::io::Error| {
-            VfsError::Unwritable(format!("{norm} could not be written ({what}: {e})"))
-        };
-        let existed = abs.is_file();
-        if abs.is_dir() {
-            return Err(VfsError::Unwritable(format!("{norm} is a directory")));
-        }
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| fail("creating its directory", e))?;
-        }
-        let file_name = abs
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let temp = abs.with_file_name(format!(".{file_name}.zend-write"));
-        std::fs::write(&temp, content).map_err(|e| fail("writing", e))?;
-        if let Err(e) = std::fs::rename(&temp, &abs) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(fail("replacing the file", e));
-        }
-        Ok(!existed)
-    }
-
-    /// Where a direct store's `norm` is on disk — through the folder layer's
-    /// one funnel, so a write is refused exactly what a read is.
-    fn disk_path(&self, norm: &str) -> Option<PathBuf> {
-        match &self.lower {
-            Lower::Folder(root) => folder::path(root, norm),
-            _ => None,
-        }
     }
 
     // ── Path rules ───────────────────────────────────────────────────────────
@@ -1637,7 +1519,7 @@ mod tests {
 
     /// **`changes` is every chain the session holds, delta for delta** — and
     /// replayed onto the workspace's copies it gives exactly what the store
-    /// reads. A direct store holds none.
+    /// reads.
     #[test]
     fn changes_are_every_chain_and_replay_to_what_the_store_reads() {
         let (dir, store) = store_with_tree();
@@ -1660,9 +1542,6 @@ mod tests {
             );
         }
         assert!(VfsStore::new().changes().unwrap().is_empty());
-        let direct = VfsStore::direct(dir.path(), &granted());
-        direct.write("x.txt", "x".into()).unwrap();
-        assert!(direct.changes().unwrap().is_empty());
     }
 
     // ── saving and restoring ─────────────────────────────────────────────────
@@ -1723,10 +1602,10 @@ mod tests {
     }
 
     /// **A snapshot naming a protected path, or past the cap, is refused**
-    /// and the store is left as it was; a direct store takes none.
+    /// and the store is left as it was.
     #[test]
     fn a_bad_snapshot_is_refused_whole() {
-        let (dir, store) = store_with_tree();
+        let (_dir, store) = store_with_tree();
         store.write("kept.txt", "kept\n".into()).unwrap();
         let protected: Snapshot =
             serde_json::from_str(r#"{"chains":{"secrets/key.txt":{"deltas":[],"size":1}}}"#)
@@ -1763,16 +1642,6 @@ mod tests {
             store.is_modified("kept.txt"),
             "the store was left as it was"
         );
-
-        let direct = VfsStore::direct(dir.path(), &granted());
-        assert!(direct.restore(store.snapshot()).is_err());
-        direct.restore(Snapshot::default()).unwrap();
-    }
-
-    // ── direct mode ──────────────────────────────────────────────────────────
-
-    fn granted() -> DiskWriteGrant {
-        DiskWriteGrant::issue()
     }
 
     // ── links ────────────────────────────────────────────────────────────────
@@ -1824,11 +1693,9 @@ mod tests {
         let re = regex::Regex::new("tvly").unwrap();
         assert!(s.grep(&re, "", 10, 10).hits.is_empty());
 
-        let d = VfsStore::direct(root.path(), &granted());
-        assert_eq!(d.read("escape/secrets.yaml").unwrap(), None);
-        assert!(d.write("escape/planted.txt", "x".into()).is_err());
+        let _ = s.write("escape/planted.txt", "x".into());
         assert!(!outside.path().join("planted.txt").exists());
-        assert!(!d.delete("escape/secrets.yaml"));
+        assert!(!s.delete("escape/secrets.yaml"));
         assert!(outside.path().join("secrets.yaml").exists());
     }
 
@@ -1919,62 +1786,15 @@ mod tests {
         assert_eq!(s.read("ok-link.txt").unwrap().as_deref(), Some("fine\n"));
     }
 
-    /// **A direct write is a file on disk**, created with its directories, and
-    /// every read — this store's and the filesystem's — sees it.
+    /// **The guards hold.** A protected path is refused and left untouched,
+    /// and `..` cannot climb out of the workspace — normalisation pins it to
+    /// the root, so the write lands on the root's own key.
     #[test]
-    fn a_direct_write_lands_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = VfsStore::direct(dir.path(), &granted());
-        assert!(s.is_direct());
-
-        assert!(
-            s.write("docs/new/note.md", "hello\n".into()).unwrap(),
-            "created"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("docs/new/note.md")).unwrap(),
-            "hello\n"
-        );
-        assert_eq!(
-            s.read("docs/new/note.md").unwrap().as_deref(),
-            Some("hello\n")
-        );
-        assert_eq!(s.total_bytes(), 0, "nothing is held in memory");
-
-        // Overwriting is not a creation, and replaces the content.
-        assert!(!s.write("/docs/new/note.md", "bye\n".into()).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("docs/new/note.md")).unwrap(),
-            "bye\n"
-        );
-        // No temporary file is left beside it.
-        let names: Vec<String> = std::fs::read_dir(dir.path().join("docs/new"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["note.md"]);
-    }
-
-    /// A direct delete removes the file from disk; a missing one reports false.
-    #[test]
-    fn a_direct_delete_removes_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        put(dir.path(), "gone.txt", "x");
-        let s = VfsStore::direct(dir.path(), &granted());
-        assert!(s.delete("gone.txt"));
-        assert!(!dir.path().join("gone.txt").exists());
-        assert!(!s.delete("gone.txt"), "nothing left to delete");
-    }
-
-    /// **The guards hold on disk.** A protected path is refused and left
-    /// untouched, and `..` cannot climb out of the workspace — normalisation
-    /// pins it to the root, so the write lands inside it.
-    #[test]
-    fn a_direct_store_cannot_touch_secrets_or_leave_the_root() {
+    fn a_store_cannot_touch_secrets_or_leave_the_root() {
         let outer = tempfile::tempdir().unwrap();
         let root = outer.path().join("ws");
         put(&root, "secrets/tools.yaml", "key: real\n");
-        let s = VfsStore::direct(&root, &granted());
+        let s = VfsStore::with_root(&root);
 
         assert!(matches!(
             s.write("secrets/tools.yaml", "key: planted\n".into()),
@@ -1988,7 +1808,7 @@ mod tests {
 
         s.write("../../escaped.txt", "x".into()).unwrap();
         assert!(!outer.path().join("escaped.txt").exists());
-        assert!(root.join("escaped.txt").exists());
+        assert_eq!(s.read("escaped.txt").unwrap().as_deref(), Some("x"));
     }
 
     /// **A host path is not a workspace path.** An absolute path to a file
@@ -2011,11 +1831,8 @@ mod tests {
             "an absolute host path reads nothing"
         );
         assert!(listed(&overlay, &outer.path().to_string_lossy()).is_empty());
-
-        let direct = VfsStore::direct(&root, &granted());
-        assert_eq!(direct.read(&outside.to_string_lossy()).unwrap(), None);
-        let _ = direct.write(&planted.to_string_lossy(), "x".into());
-        assert!(!planted.exists(), "a direct write left the workspace");
+        let _ = overlay.write(&planted.to_string_lossy(), "x".into());
+        assert!(!planted.exists(), "a write left the workspace");
         for path in [
             "C:x.txt",
             "C:/x.txt",
@@ -2025,8 +1842,8 @@ mod tests {
             "docs~2/x.md",
         ] {
             assert!(
-                matches!(direct.write(path, "x".into()), Err(VfsError::Unwritable(_))),
-                "{path:?} was written"
+                !matches!(overlay.read(path), Ok(Some(_))),
+                "{path:?} read through to the host"
             );
         }
     }
@@ -2039,7 +1856,7 @@ mod tests {
         let outer = tempfile::tempdir().unwrap();
         let root = outer.path().join("ws");
         put(&root, "secrets/tools.yaml", "key: real\n");
-        let s = VfsStore::direct(&root, &granted());
+        let s = VfsStore::with_root(&root);
         for path in [
             "Secrets/tools.yaml",
             "SECRETS/tools.yaml",
@@ -2081,7 +1898,7 @@ mod tests {
         );
         put(&root, ".git/packed-refs", "abc refs/heads/main\n");
         put(&root, "src/lib.rs", "pub fn ok() {}\n");
-        let s = VfsStore::direct(&root, &granted());
+        let s = VfsStore::with_root(&root);
 
         for path in [
             ".git/config",
@@ -2148,25 +1965,11 @@ mod tests {
         assert!(!is_short_name("plain.rs"));
     }
 
-    /// Writing where a directory stands is an error the model can read, not a
-    /// silent success.
+    /// **A store never touches the disk** — a write, an overwrite and a
+    /// delete all land in the session's own layer.
     #[test]
-    fn a_direct_write_over_a_directory_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        put(dir.path(), "src/main.rs", "fn main() {}\n");
-        let s = VfsStore::direct(dir.path(), &granted());
-        assert!(matches!(
-            s.write("src", "x".into()),
-            Err(VfsError::Unwritable(_))
-        ));
-    }
-
-    /// The overlay, by contrast, never touches the disk — the property Mutable
-    /// is the explicit exception to.
-    #[test]
-    fn an_overlay_write_never_reaches_disk() {
+    fn a_write_never_reaches_disk() {
         let (dir, s) = store_with_tree();
-        assert!(!s.is_direct());
         s.write("new.txt", "x".into()).unwrap();
         s.write("README.md", "changed".into()).unwrap();
         assert!(s.delete("src/main.rs"));
@@ -2980,19 +2783,5 @@ mod tests {
             s.edit("README.md", "back".into()),
             Err(VfsError::Unreadable(_))
         ));
-    }
-
-    /// On a direct store an edit is a write to disk and holds nothing.
-    #[test]
-    fn a_direct_edit_lands_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        put(dir.path(), "a.txt", "one\ntwo\n");
-        let s = VfsStore::direct(dir.path(), &granted());
-        assert!(s.edit("a.txt", "one\n2\n".into()).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "one\n2\n"
-        );
-        assert_eq!(s.total_bytes(), 0);
     }
 }

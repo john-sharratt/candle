@@ -71,6 +71,7 @@ use super::record::{
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
 use super::survival::RecordCensus;
+use super::vfs::carried as vfs_carried;
 use super::{PersistenceError, Result, SubstratePersistence};
 use crate::substrate::Substrate;
 
@@ -324,8 +325,23 @@ pub struct MaintenancePlan {
     /// while `Compact` and `Combine` qualify on a dead *ratio* and retire the
     /// segment just the same.
     npc_relocs: Vec<(StreamId, RecordLoc)>,
+    /// A live conversation's file events and tombstones to relocate —
+    /// carried by location for the reason characters are: their bodies are
+    /// not in this process's RAM. A tombstone is carried as long as its
+    /// conversation lives, because copies of the events it killed can sit in
+    /// segments this op leaves alone, and it has to stay after them.
+    vfs_relocs: Vec<VfsReloc>,
     /// `(type, source_loc)` singleton records to relocate.
     singleton_relocs: Vec<(RecordType, RecordLoc)>,
+}
+
+/// One file event or tombstone to relocate, keyed as the index keys it.
+#[derive(Clone, Copy, Debug)]
+struct VfsReloc {
+    rt: RecordType,
+    timeline: u64,
+    seq: u64,
+    loc: RecordLoc,
 }
 
 impl MaintenancePlan {
@@ -742,6 +758,7 @@ impl SubstratePersistence {
             singleton_relocs,
         ) = self.gather_relocations(substrate, &op.targets());
         let npc_relocs = self.npc_relocations(&op.targets());
+        let vfs_relocs = self.vfs_relocations(substrate, &op.targets());
         // What this op carries off the target segments, by type. The incremental
         // path is the one that actually runs on a busy store — the 143 GB store
         // burned through ~370 segment generations without a single full
@@ -782,6 +799,7 @@ impl SubstratePersistence {
             branches = branch_checkpoint_relocs.len(),
             singletons = singleton_relocs.len(),
             npcs = npc_relocs.len(),
+            vfs = vfs_relocs.len(),
             "maintenance {:?}: re-emitting {}",
             op,
             resident_census.summary()
@@ -795,6 +813,7 @@ impl SubstratePersistence {
             branch_checkpoint_relocs,
             singleton_relocs,
             npc_relocs,
+            vfs_relocs,
         }))
     }
 
@@ -999,6 +1018,62 @@ impl SubstratePersistence {
             self.relocate_raw_from_segment(source, &items)?;
         }
 
+        // A conversation's file events and tombstones — carried verbatim, and
+        // behind the same check characters take: the plan was read without the
+        // persistence lock, so a tombstone written since may have killed a
+        // planned event, or a conversation been tombstoned since. The index
+        // names only what is still live where the plan found it; relocating
+        // anything else would put a dead record after the tombstone that
+        // killed it.
+        let still_live = |r: &VfsReloc| {
+            self.vfs_index.timeline(r.timeline).is_some_and(|tl| {
+                let at = if r.rt == RecordType::VfsEvent {
+                    tl.events()
+                } else {
+                    tl.tombstones()
+                };
+                at.get(&r.seq) == Some(&r.loc)
+            })
+        };
+        let mut vfs_by_seg: BTreeMap<SegmentId, Vec<VfsReloc>> = BTreeMap::new();
+        for r in plan.vfs_relocs.iter().filter(|r| still_live(r)) {
+            vfs_by_seg.entry(r.loc.segment).or_default().push(*r);
+        }
+        for (source, recs) in vfs_by_seg {
+            let items: Vec<RawReloc> = recs
+                .iter()
+                .map(|r| RawReloc {
+                    offset: r.loc.offset,
+                    record_size: r.loc.record_size,
+                    header: RecordHeader {
+                        record_type: r.rt,
+                        format: 0,
+                        payload_len: r.loc.payload_len,
+                        crc: 0,
+                        stream_id: r.timeline,
+                        chunk_index: r.seq,
+                        token_count: 0,
+                    },
+                })
+                .collect();
+            let new = self.relocate_raw_from_segment(source, &items)?;
+            for (r, (segment, offset, record_size)) in recs.into_iter().zip(new) {
+                let moved = RecordLoc {
+                    segment,
+                    offset,
+                    payload_len: r.loc.payload_len,
+                    record_size,
+                };
+                if r.rt == RecordType::VfsEvent {
+                    self.vfs_index
+                        .repoint_event(r.timeline, r.seq, r.loc, moved);
+                } else {
+                    self.vfs_index
+                        .repoint_tombstone(r.timeline, r.seq, r.loc, moved);
+                }
+            }
+        }
+
         // Durability barrier: relocated copies are fsynced before any source is
         // unlinked (in `finish_maintenance`).
         self.commit()?;
@@ -1161,6 +1236,7 @@ impl SubstratePersistence {
             branch_checkpoint_relocs,
             singleton_relocs,
             npc_relocs: self.npc_relocations(&op.targets()),
+            vfs_relocs: self.vfs_relocations(substrate, &op.targets()),
         };
         let result = self.execute_maintenance(&plan)?;
         result.apply_to_substrate(substrate);
@@ -1188,6 +1264,32 @@ impl SubstratePersistence {
             .collect();
         // Deterministic, so the same store plans the same work twice running.
         out.sort_unstable_by_key(|(sid, _)| sid.0);
+        out
+    }
+
+    /// The file events and tombstones of live conversations physically inside
+    /// a target segment — by the one rule compaction and liveness read
+    /// ([`vfs_carried`]). In timeline and sequence order, so the same store plans
+    /// the same work twice running.
+    fn vfs_relocations(&self, substrate: &Substrate, targets: &[SegmentId]) -> Vec<VfsReloc> {
+        let mut out = Vec::new();
+        for (timeline, tl) in vfs_carried(substrate, &self.vfs_index) {
+            for (rt, at) in [
+                (RecordType::VfsEvent, tl.events()),
+                (RecordType::VfsTombstone, tl.tombstones()),
+            ] {
+                for (&seq, &loc) in at {
+                    if targets.contains(&loc.segment) {
+                        out.push(VfsReloc {
+                            rt,
+                            timeline,
+                            seq,
+                            loc,
+                        });
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -1427,6 +1529,14 @@ impl SubstratePersistence {
         // whole cast forward on every pass, and the log churns.
         for loc in self.npc_locs.values() {
             *live.entry(loc.segment).or_default() += loc.record_size;
+        }
+        // A live conversation's file events and tombstones — exactly what
+        // `vfs_relocations` carries, so a segment holding only a retired
+        // conversation's, or only events a tombstone killed, reads as dead.
+        for (_, tl) in vfs_carried(substrate, &self.vfs_index) {
+            for loc in tl.events().values().chain(tl.tombstones().values()) {
+                *live.entry(loc.segment).or_default() += loc.record_size;
+            }
         }
         live
     }

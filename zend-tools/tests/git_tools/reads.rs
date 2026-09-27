@@ -1,7 +1,7 @@
 //! The readers: git_status, git_log, git_show, git_grep, git_refs.
 //!
 //! None changes the repository, and each runs here on the read-only context —
-//! Comprehensive's grants, which hold no `DiskWrite` at all.
+//! Restricted's grants, which hold nothing at all.
 
 use serde_json::{json, Value};
 use zend_tools::registry::find;

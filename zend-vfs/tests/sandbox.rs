@@ -391,11 +391,6 @@ async fn a_store_over_anything_else_is_refused() {
         try_run(&f, "main", &VfsStore::with_root(&f.root), &command).await,
         Err(SandboxError::WrongBranch { .. })
     ));
-    let direct = VfsStore::direct(&f.root, &grant());
-    assert!(matches!(
-        try_run(&f, "main", &direct, &command).await,
-        Err(SandboxError::DirectStore)
-    ));
 }
 
 // ── Several conversations ────────────────────────────────────────────────────

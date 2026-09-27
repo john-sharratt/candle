@@ -249,9 +249,6 @@ impl Sandbox {
     /// `branch` at the commit the branch holds — the base its changes are
     /// made on, which the checkout is put on. Returns that commit.
     fn check_store(&self, files: &VfsStore, branch: &BranchName) -> Result<Oid, SandboxError> {
-        if files.is_direct() {
-            return Err(SandboxError::DirectStore);
-        }
         let same = files
             .root()
             .is_some_and(|root| same_folder(root, self.repo.dir()));

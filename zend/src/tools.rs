@@ -122,7 +122,7 @@ pub fn install_tool_catalog(
     }
     // This function only lays down the per-tool sections. The tool-catalog
     // *overview* is sealed separately into the `ToolSummaryRestricted` /
-    // `ToolSummary` / `ToolSummaryMutable` reserved sections at session startup and associated
+    // `ToolSummary` reserved sections at session startup and associated
     // with this collection per mode in `build_mode_builder` (via
     // `set_collection_summary_section`), so projection emits the full name listing
     // ahead of the provenance-selected subset.
@@ -723,14 +723,14 @@ pub fn tool_round_text(text: &str) -> TurnText {
 /// lower layer is each of the workspace's repositories, read-only.
 ///
 /// It holds one context per tools mode. They share every other store and differ
-/// only in their [`Grants`](zend_tools::Grants) ([`access::grants`]) and, for
-/// Mutable, in a file store that writes the disk — so what a round may do is
-/// fixed by the context it is handed, not by which tools its prompt offered.
+/// only in their [`Grants`](zend_tools::Grants) ([`access::grants`]) — so what
+/// a round may do is fixed by the context it is handed, not by which tools its
+/// prompt offered.
 #[derive(Clone)]
 pub struct ToolHost {
-    /// Indexed by [`ToolMode::level`]. Each overlay mode's own file stores are
-    /// never handed to a round — a round gets its conversation's.
-    contexts: [Arc<ToolContext>; 4],
+    /// Indexed by [`ToolMode::level`]. Each mode's own file stores are never
+    /// handed to a round — a round gets its conversation's.
+    contexts: [Arc<ToolContext>; ToolMode::ALL.len()],
 }
 
 impl ToolHost {
@@ -740,17 +740,8 @@ impl ToolHost {
     /// ([`crate::secrets::load`]).
     pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> Self {
         let base = ToolContext::with_workspace(workspace.clone()).with_secrets(secrets);
-        let contexts = ToolMode::ALL.map(|mode| {
-            let ctx = base.clone().granting(access::grants(mode));
-            let ctx = if mode.writes_disk() {
-                ctx.with_direct_files()
-                    .expect("the mode that writes the disk is granted it")
-                    .expect("a context built on a workspace has one to work on directly")
-            } else {
-                ctx
-            };
-            Arc::new(ctx)
-        });
+        let contexts =
+            ToolMode::ALL.map(|mode| Arc::new(base.clone().granting(access::grants(mode))));
         Self { contexts }
     }
 
@@ -765,15 +756,9 @@ impl ToolHost {
     }
 
     /// The context a round of tools in `mode` runs in, for the conversation
-    /// whose file stores are `files`. Mutable works on the disk itself, which
-    /// every conversation shares; every other mode works on `files`.
+    /// whose file stores are `files`.
     pub fn context_for(&self, mode: ToolMode, files: &Arc<RepoFiles>) -> Arc<ToolContext> {
-        let ctx = &self.contexts[mode.level() as usize];
-        if mode.writes_disk() {
-            Arc::clone(ctx)
-        } else {
-            Arc::new(ctx.with_files(Arc::clone(files)))
-        }
+        Arc::new(self.contexts[mode.level() as usize].with_files(Arc::clone(files)))
     }
 }
 
@@ -830,8 +815,9 @@ mod tests {
         }
     }
 
-    /// **Each mode's context carries that mode's grants, and only Mutable's
-    /// file store writes the disk.** A Restricted round handed a gated call
+    /// **Each mode's context carries that mode's grants, over the
+    /// conversation's own files.** A Restricted round handed a gated call —
+    /// the network, code, a database, a git writer, a program on this host —
     /// refuses it at dispatch, whatever the prompt offered.
     #[test]
     fn each_modes_context_carries_its_grants() {
@@ -841,7 +827,7 @@ mod tests {
         for mode in ToolMode::ALL {
             let ctx = host.context_for(mode, &files);
             assert_eq!(ctx.grants(), access::grants(mode), "{}", mode.id());
-            assert_eq!(ctx.files.is_direct(), mode.writes_disk(), "{}", mode.id());
+            assert!(Arc::ptr_eq(&ctx.files, &files), "{}", mode.id());
         }
         let restricted = host.context_for(ToolMode::Restricted, &files);
         for (name, arguments) in [
@@ -854,6 +840,11 @@ mod tests {
                 serde_json::json!({ "repo": "r", "language": "js", "code": "1" }),
             ),
             ("sql_session_open", serde_json::json!({})),
+            (
+                "git_commit",
+                serde_json::json!({ "repo": "r", "message": "m" }),
+            ),
+            ("ping_icmp", serde_json::json!({ "host": "127.0.0.1" })),
         ] {
             let call = ToolCall {
                 name: name.to_string(),
@@ -882,8 +873,8 @@ mod tests {
     }
 
     /// **A file one conversation writes is never what another reads.** Two
-    /// conversations' rounds run in contexts bound to their own file stores;
-    /// Mutable, which works on the disk itself, is the one mode they share.
+    /// conversations' rounds run in contexts bound to their own file stores,
+    /// and neither ever changes the file on disk.
     #[test]
     fn each_conversation_has_its_own_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -922,7 +913,10 @@ mod tests {
                 .as_deref(),
             Some("conversation a\n")
         );
-        assert!(host.context_for(ToolMode::Mutable, &a).files.is_direct());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("r/shared.txt")).unwrap(),
+            "disk\n"
+        );
     }
 
     // ── Resuming a tool round after a restart ───────────────────────────────

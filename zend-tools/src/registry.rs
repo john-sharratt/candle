@@ -1017,8 +1017,8 @@ fn register_all() -> &'static [RegisteredTool] {
     use Capability::{DiskWrite, Exec, Network, Sandbox, Secrets};
     // What each family needs from the context — see `crate::grants`. A tool
     // with no entry needs nothing: it computes, or works on the in-memory
-    // stores. The file tools need nothing here because the disk guard is the
-    // store itself — only a store built from a `DiskWrite` grant writes disk.
+    // stores. The file tools need nothing here because the store never writes
+    // the disk: their changes stay in the conversation's overlay.
     const NET: &[Capability] = &[Network];
     const NET_EXEC: &[Capability] = &[Network, Exec];
     const NET_SECRETS: &[Capability] = &[Network, Secrets];
@@ -1044,7 +1044,7 @@ fn register_all() -> &'static [RegisteredTool] {
         WEB_SEARCH.requires(NET),
         WEB_FETCH.requires(NET),
         WEATHER.requires(NET),
-        // File tools (8) — reads safe, mutations high-risk
+        // File tools (8) — all safe: every change is held in the overlay
         FILE_WRITE,
         FILE_READ,
         FILE_EDIT,
@@ -1055,7 +1055,7 @@ fn register_all() -> &'static [RegisteredTool] {
         FILE_PRESENT,
         // Git tools (9) — the split that decides the whole family.
         //
-        // The readers declare nothing and are not high-risk, so Comprehensive
+        // The readers declare nothing and are not high-risk, so every mode
         // offers them: they answer questions about the repository's history
         // and change none of it. Running the `git` program is deliberately
         // not `Exec` — see the family's module docs — because every argument
@@ -1071,9 +1071,9 @@ fn register_all() -> &'static [RegisteredTool] {
         GIT_SHOW,
         GIT_GREP,
         GIT_REFS,
-        // The writers declare DiskWrite, which Comprehensive's grants
-        // withhold — so changing a repository is Mutable's alone, and a call
-        // that arrives anyway is refused before its arguments are parsed.
+        // The writers declare DiskWrite, which Restricted's grants withhold —
+        // so changing a repository is Comprehensive's alone, and a call that
+        // arrives anyway is refused before its arguments are parsed.
         // Every one of them also reaches origin: a branch write is kept only
         // once origin has it.
         GIT_COMMIT.requires(NET_DISK),
@@ -1281,9 +1281,9 @@ mod capability_tests {
     ///
     /// Reading a repository is available wherever tools are; changing one is
     /// not. The mechanism is `DiskWrite`, which `zend::access::grants`
-    /// withholds from Comprehensive and gives only to Mutable — so declaring
-    /// it here is what confines a writer to Mutable, both in what is offered
-    /// and in what would run.
+    /// withholds from Restricted and gives to Comprehensive — so declaring it
+    /// here is what confines a writer to Comprehensive, both in what is
+    /// offered and in what would run.
     ///
     /// A new git tool must land in one of these two lists, and the final
     /// assertion makes forgetting a compile-time-visible test failure rather
@@ -1343,15 +1343,16 @@ mod capability_tests {
     }
 
     /// **A writer is refused before its arguments are parsed.** The context
-    /// here holds everything Comprehensive holds and still cannot commit, so
+    /// here holds every capability but `DiskWrite` and still cannot commit, so
     /// the refusal is the capability and not a missing workspace.
     #[test]
-    fn a_comprehensive_grant_set_refuses_every_git_writer() {
-        let comprehensive = Grants::NONE
+    fn a_grant_set_without_disk_write_refuses_every_git_writer() {
+        let all_but_disk = Grants::NONE
             .with(Capability::Network)
+            .with(Capability::Exec)
             .with(Capability::Sandbox)
             .with(Capability::Secrets);
-        let ctx = ToolContext::new().granting(comprehensive);
+        let ctx = ToolContext::new().granting(all_but_disk);
         for name in [
             "git_commit",
             "git_merge",

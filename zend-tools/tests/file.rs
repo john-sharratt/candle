@@ -316,13 +316,11 @@ fn file_edit_patches_through_the_overlay_and_leaves_disk_untouched() {
     );
 }
 
-/// **`file_edit` records the lines it changed, not the file**, and lands the
-/// same patch on the existing file on disk when the context works on the disk
-/// (Mutable). One two-hunk patch to a 200-line workspace file: the overlay
-/// holds one edit of two splices, the disk copy under it is untouched, and the
-/// direct context's disk file ends up exactly as the overlay reads.
+/// **`file_edit` records the lines it changed, not the file**, under every
+/// grant set. One two-hunk patch to a 200-line workspace file: the overlay
+/// holds one edit of two splices and the disk copy under it is untouched.
 #[test]
-fn file_edit_records_only_the_changed_lines_and_lands_on_disk_when_direct() {
+fn file_edit_records_only_the_changed_lines() {
     use zend_tools::grants::Grants;
     use zend_vfs::{FileDelta, TimedDelta};
 
@@ -333,33 +331,19 @@ fn file_edit_records_only_the_changed_lines_and_lands_on_disk_when_direct() {
         .replace("line 10\n", "line ten\n")
         .replace("line 190\n", "line 190\nline 190½\n");
 
-    // Two workspaces holding the same file. Sharing one would have the direct
-    // edit change the disk under the overlay's edit, which the overlay rightly
-    // refuses to replay onto.
-    let workspace = || {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_dir = harness::repo_root(dir.path());
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        std::fs::write(repo_dir.join("big.txt"), &original).unwrap();
-        (dir, repo_dir)
-    };
-    let (overlay_dir, overlay_repo) = workspace();
-    let (direct_dir, repo_dir) = workspace();
-    let overlay = harness::workspace_ctx(overlay_dir.path()).granting(Grants::ALL);
-    let direct = harness::workspace_ctx(direct_dir.path())
-        .granting(Grants::ALL)
-        .with_direct_files()
-        .unwrap()
-        .expect("a workspace context can work on its disk");
-    for ctx in [&overlay, &direct] {
-        let out = harness::expect_success(harness::invoke_with_ctx(
-            "file_edit",
-            json!({"repo": REPO, "path": "big.txt", "patch": patch}),
-            ctx,
-        ));
-        assert_eq!(out["hunks_applied"], 2);
-        assert_eq!(out["bytes"], expected.len());
-    }
+    let dir = tempfile::tempdir().unwrap();
+    let overlay_repo = harness::repo_root(dir.path());
+    std::fs::create_dir_all(&overlay_repo).unwrap();
+    std::fs::write(overlay_repo.join("big.txt"), &original).unwrap();
+    // Every capability granted: a file edit still never reaches the disk.
+    let overlay = harness::workspace_ctx(dir.path()).granting(Grants::ALL);
+    let out = harness::expect_success(harness::invoke_with_ctx(
+        "file_edit",
+        json!({"repo": REPO, "path": "big.txt", "patch": patch}),
+        &overlay,
+    ));
+    assert_eq!(out["hunks_applied"], 2);
+    assert_eq!(out["bytes"], expected.len());
 
     let store = overlay.files.repo(REPO).unwrap();
     assert_eq!(
@@ -381,16 +365,10 @@ fn file_edit_records_only_the_changed_lines_and_lands_on_disk_when_direct() {
     let second = "line 191\n".len() + "line 190½\nline 191\n".len();
     assert_eq!(store.total_bytes(), first + second);
     assert_eq!(
-        std::fs::read_to_string(repo_dir.join("big.txt")).unwrap(),
-        expected,
-        "the direct context patched the existing file on disk"
-    );
-    assert_eq!(
         std::fs::read_to_string(overlay_repo.join("big.txt")).unwrap(),
         original,
         "the overlay's disk is untouched"
     );
-    assert!(direct.files.repo(REPO).unwrap().deltas("big.txt").is_none());
 }
 
 /// A patch that is entirely already applied writes nothing at all — a workspace

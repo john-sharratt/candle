@@ -78,26 +78,23 @@ GET    /ws/logs                          WebSocket log tail (backlog replay + li
 
 Anything not matched falls back to the embedded `web/` frontend (`GET /`, `/perf`, `/substrate`, `/project`, resolved to their `.html` files).
 
-`POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: `conv_id`, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`/`mutable`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
+`POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: `conv_id`, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
 
 ### Tools modes and who may use them
 
-| Mode | Tools | File writes and deletes | Grants |
-|---|---|---|---|
-| `none` | none | — | none |
-| `restricted` | the safe subset: not high-risk, needing no grant | the session's in-memory overlay | none |
-| `comprehensive` | every tool except those that run a program on this host (`ping_icmp`, `trace_route`, `sub_run`) | the session's in-memory overlay | network, sandbox, secrets |
-| `mutable` | every tool | **the workspace on disk** | all, disk write and exec included |
+| Mode | Tools | Grants |
+|---|---|---|
+| `none` | none | none |
+| `restricted` | the safe subset, needing no grant and not high-risk: the file tools (reads, writes, edits, deletes) and the git readers | none |
+| `comprehensive` | every tool: the network, credentials, the `code_*` JS sandbox, the git writers, SQLite, and programs on this host (`ping_icmp`, `trace_route`, `sub_run`) | all |
 
-Host execution is Mutable-only because no overlay can stand in front of it: a program that runs here reaches the real filesystem. The `code_*` tools run JavaScript in the embedded boa sandbox instead — no network, no processes, and its only filesystem is the conversation's file store through a `vfs` global — so they are offered in `comprehensive`, reading and writing the overlay. SSH and telnet stay in `comprehensive` too: their commands run on the remote host. Each mode projects, and summarises, exactly the tools its grants cover.
+In every mode the file tools work on the conversation's own overlay: a write, edit or delete is held in memory, recorded in the substrate as VFS events, and never reaches the workspace on disk. A conversation's changes reach a repository only through `git_commit`, which is Comprehensive's. So Restricted may write files and still runs nothing — no command line, no code, no network. Each mode projects, and summarises, exactly the tools its grants cover.
 
-`comprehensive` and `mutable` are for admins. The caller's role comes from the gateway's `x-tokera-*` identity headers, resolved against `zend.roles.yaml` (embedded at build time; same shape as `npcd/npcd.web.yaml`'s `roles`). An admin defaults to `comprehensive`; everyone else — signed in or not — defaults to `restricted`, and a request asking for a mode above its role runs as `restricted` rather than failing (`src/access.rs`). The GUI asks `GET /v1/me` and offers only the allowed modes.
+`comprehensive` is for admins. The caller's role comes from the gateway's `x-tokera-*` identity headers, resolved against `zend.roles.yaml` (embedded at build time; same shape as `npcd/npcd.web.yaml`'s `roles`). An admin defaults to `comprehensive`; everyone else — signed in or not — defaults to `restricted`, and a request asking for a mode above its role runs as `restricted` rather than failing (`src/access.rs`). The GUI asks `GET /v1/me` and offers only the allowed modes.
 
 The identity headers are believed only from a trusted peer: loopback, the `--host` address (the gateway on this box connects from it), and each `--gateway <ip>`. From any other peer they are ignored and the caller is anonymous, so a machine that reaches zend's port directly cannot claim to be an admin.
 
-**What a mode may do is enforced below the prompt.** Each mode's tool round runs in a `ToolContext` carrying that mode's grants (`access::grants`), and `zend-tools` refuses a call twice over when the grant is missing: at dispatch, from the tool's declared capabilities, and again at the primitive — every socket, DNS lookup, HTTP client, subprocess, JS VM, SQLite connection, credential read and disk-writing file store is reached only through a function that checks the grant. A call the model makes for a tool its mode never offered is answered `{"error":"not_permitted"}` and nothing is done. See `zend-tools/src/grants.rs`.
-
-In `mutable` mode the file tools run against `VfsStore::direct`: writes go to disk (via a temporary file renamed over the target), deletes remove the file, and the `secrets/` refusal and `..` normalisation still apply.
+**What a mode may do is enforced below the prompt.** Each mode's tool round runs in a `ToolContext` carrying that mode's grants (`access::grants`), and `zend-tools` refuses a call twice over when the grant is missing: at dispatch, from the tool's declared capabilities, and again at the primitive — every socket, DNS lookup, HTTP client, subprocess, JS VM, SQLite connection, credential read and checkout run is reached only through a function that checks the grant. A call the model makes for a tool its mode never offered is answered `{"error":"not_permitted"}` and nothing is done. See `zend-tools/src/grants.rs`.
 
 ## Running it
 

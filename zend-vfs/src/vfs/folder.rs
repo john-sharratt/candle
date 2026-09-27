@@ -1,8 +1,8 @@
 //! A folder on disk as a store's lower layer.
 //!
 //! What a store reads when its repository is not under git — the daemon's
-//! uploads folder, a scratch workspace — and what a direct store both reads
-//! and writes. A repository under git is read through its branch instead
+//! uploads folder, a scratch workspace. The store only reads it: every change
+//! is held in the overlay. A repository under git is read through its branch instead
 //! ([`super::git_source`]).
 //!
 //! Every function takes the folder, `root`, and a normalised key, and every
@@ -25,8 +25,8 @@ pub(super) fn path(root: &Path, norm: &str) -> Option<PathBuf> {
         return None;
     }
     // The single funnel for lower-layer access. Guarding here rather than at
-    // each caller is what makes the protection total: every read, existence
-    // check and direct write inherits it without knowing it exists.
+    // each caller is what makes the protection total: every read, listing and
+    // existence check inherits it without knowing it exists.
     if VfsStore::is_protected(norm) {
         return None;
     }
@@ -42,9 +42,9 @@ pub(super) fn path(root: &Path, norm: &str) -> Option<PathBuf> {
 /// the user's home — spells a plain workspace path and opens a file outside
 /// every repository, which is exactly where the daemon's secrets live; one
 /// pointing at the repository's own `secrets/` folder opens it under an
-/// unprotected name. A path that does not exist yet (a direct write creating
-/// it) is judged by its deepest existing ancestor, so a new file under a
-/// linked folder is refused too.
+/// unprotected name. A path that does not exist (yet, or any longer) is
+/// judged by its deepest existing ancestor, so a missing file under a linked
+/// folder is refused too rather than reported absent.
 pub(super) fn contained(root: &Path, norm: &str) -> Option<PathBuf> {
     let joined = under(root, norm)?;
     let real_root = root.canonicalize().ok()?;
@@ -76,8 +76,7 @@ pub(super) fn contained(root: &Path, norm: &str) -> Option<PathBuf> {
 /// Normalisation removes `..` and leading separators, but not a Windows
 /// drive or device prefix: `C:/Users/x/.ssh/id_rsa` normalises to itself,
 /// and joining a path that carries a prefix *replaces* the root — so a
-/// `file_read`, a script's `vfs.read`, or a direct write reached any file on
-/// the host. A segment with a `:` in it is a drive (`C:`), a device path
+/// `file_read` or a script's `vfs.read` reached any file on the host. A segment with a `:` in it is a drive (`C:`), a device path
 /// (`\\?\C:\`), or an NTFS alternate stream (`notes.txt:hidden`), and none
 /// of those names a workspace file; the component check refuses anything
 /// else that is not a plain name.

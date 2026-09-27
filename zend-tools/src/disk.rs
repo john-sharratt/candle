@@ -2,8 +2,9 @@
 //! [`Capability::DiskWrite`](crate::Capability::DiskWrite).
 //!
 //! The workspace files go through [`VfsStore`](zend_vfs::VfsStore), which
-//! writes the disk only when built with a [`DiskWriteGrant`]. A SQLite
-//! connection is a second route to the disk that the store never sees — a path
+//! never writes the disk: its changes reach a repository only through a git
+//! writer, whose checkout run takes a [`DiskWriteGrant`]. A SQLite
+//! connection is a route to the disk that the store never sees — a path
 //! opens or creates a file, and even `:memory:` can `ATTACH` or `VACUUM INTO`
 //! one — so opening any connection takes the same proof.
 

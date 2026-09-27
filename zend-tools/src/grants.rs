@@ -27,7 +27,7 @@
 //!    ([`crate::net`], [`crate::exec`], [`crate::disk`],
 //!    [`ToolContext::credentials`](crate::ToolContext::credentials),
 //!    [`ToolContext::http`](crate::ToolContext::http),
-//!    [`VfsStore::direct`](zend_vfs::VfsStore::direct)). A tool whose
+//!    [`Grants::disk_write`]). A tool whose
 //!    declaration is wrong or missing still cannot perform the action.
 //!
 //! Source-scanning tests hold the second layer in place: no tool module may
@@ -138,10 +138,10 @@ impl Grants {
         caps.iter().try_for_each(|c| self.require(*c))
     }
 
-    /// The proof of [`Capability::DiskWrite`] a disk-writing file store is
-    /// built from — see [`VfsStore::direct`](zend_vfs::VfsStore::direct). This
-    /// is the one place a [`DiskWriteGrant`] is issued; the tool-source scan in
-    /// `disk.rs` holds every tool to that.
+    /// The proof of [`Capability::DiskWrite`] a disk-changing action is built
+    /// from — a checkout run, a sandbox, a database file. This is the one place
+    /// a [`DiskWriteGrant`] is issued; the tool-source scan in `disk.rs` holds
+    /// every tool to that.
     pub fn disk_write(self) -> Result<DiskWriteGrant, NotPermitted> {
         self.require(Capability::DiskWrite)?;
         Ok(DiskWriteGrant::issue())

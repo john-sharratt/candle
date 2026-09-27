@@ -25,8 +25,8 @@ questions:
 - remove the file to free up session space
 - discard the file I wrote by mistake
 category: Files
-description: 'Remove a file from this session''s view, in the named repo. Use for: removing a draft that''s no longer needed, cleaning up before exporting, getting rid of an uploaded file the user wants gone, freeing space within the 10 MiB session budget. Triggered by "delete the file", "remove", "rm", "get rid of the file called". Returns the repo, the path and a deleted flag. Unless the conversation''s tools mode writes to disk, a project file is NOT erased — it is only hidden from this session. For removing files on remote systems use remote_fs_session_delete.'
-high_risk: true
+description: 'Remove a file from this session''s view, in the named repo. Use for: removing a draft that''s no longer needed, cleaning up before exporting, getting rid of an uploaded file the user wants gone, freeing space within the 10 MiB session budget. Triggered by "delete the file", "remove", "rm", "get rid of the file called". Returns the repo, the path and a deleted flag. A project file is NOT erased — it is only hidden from this conversation. For removing files on remote systems use remote_fs_session_delete.'
+high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:

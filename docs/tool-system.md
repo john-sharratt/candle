@@ -18,7 +18,7 @@ Every tool call runs in a `ToolContext` that carries **grants** — a subset of 
 
 | Capability | Covers |
 |---|---|
-| `disk_write` | changing files on the host's disk — the direct file store and SQLite connections |
+| `disk_write` | changing files on the host's disk — a git writer's checkout run, a sandbox, and SQLite connections |
 | `network` | any outbound connection — HTTP, sockets, DNS, ICMP |
 | `exec` | running programs on this host — subprocesses, sub-agents |
 | `sandbox` | running model-written JavaScript in the embedded boa VM, whose only filesystem is the context's file store (`vfs.read` / `vfs.write` / `vfs.list`) |
@@ -27,13 +27,13 @@ Every tool call runs in a `ToolContext` that carries **grants** — a subset of 
 A context grants nothing unless its builder grants it, and the check is made twice, independently:
 
 1. **At dispatch.** Each registered tool declares what it needs (`registry::register_all`), and `RegisteredTool::call` refuses a call whose context lacks it before the arguments are parsed.
-2. **At the primitive.** Tools reach sockets, name resolution and HTTP clients only through `zend_tools::net`, subprocesses only through `zend_tools::exec`, SQLite only through `zend_tools::disk`, the credential store only through `ToolContext::credentials`, the shared HTTP client only through `ToolContext::http`, and the JS VM only through a `run_js` that takes the grants. A disk-writing file store can only be built from a `DiskWriteGrant`, which only a context holding `disk_write` can produce. Source-scanning tests fail the build if a tool module names a raw socket, process, HTTP-client, database or file-writing constructor.
+2. **At the primitive.** Tools reach sockets, name resolution and HTTP clients only through `zend_tools::net`, subprocesses only through `zend_tools::exec`, SQLite only through `zend_tools::disk`, the credential store only through `ToolContext::credentials`, the shared HTTP client only through `ToolContext::http`, and the JS VM only through a `run_js` that takes the grants. A checkout run can only be built from a `DiskWriteGrant`, which only a context holding `disk_write` can produce; the file store itself never writes the disk. Source-scanning tests fail the build if a tool module names a raw socket, process, HTTP-client, database or file-writing constructor.
 
 So a tool whose declaration is wrong, or a call the model makes for a tool its mode never offered, still cannot act. The refusal is an ordinary tool error the model reads: `{"error":"not_permitted","detail":"this action needs the `network` permission, which this conversation does not have; nothing was done"}`.
 
-In `zend` the grants follow the tools mode (`zend/src/access.rs`): `none` and `restricted` grant nothing, `comprehensive` grants `network`, `sandbox` and `secrets`, and `mutable` grants everything. Host execution (`exec`) is Mutable-only, because the overlay that keeps Comprehensive's file changes off the disk cannot stand in front of a program; the JS sandbox can, since the overlay is the only filesystem it has. SSH and telnet run their commands on the remote host and need only `network`. Each mode offers exactly the tools its grants cover, and Restricted also drops the high-risk ones.
+In `zend` the grants follow the tools mode (`zend/src/access.rs`): `none` and `restricted` grant nothing, and `comprehensive` grants everything. Each mode offers exactly the tools its grants cover, and Restricted also drops the high-risk ones — so Restricted is the computing tools, the file tools (writes included) and the git readers, with no command line, no code, no network and no git writer. SSH and telnet run their commands on the remote host and need only `network`.
 
-`disk_write` is what confines the repository-changing `git_*` tools to Mutable — see the Git section below. It is the same lever as for the file tools, used the other way round: a file change in Comprehensive is absorbed by the overlay, but there is no overlay that can stand in front of a commit or a push, so those need the grant Comprehensive does not have.
+The file tools need no grant in any mode. In every mode they work on the conversation's own overlay, recorded in the substrate as VFS events, and never write the workspace on disk; a conversation's changes reach a repository only through `git_commit`. That is why Restricted may write files: the write is absorbed by the overlay. There is no overlay that can stand in front of a commit or a push, so `disk_write` is what confines the repository-changing `git_*` tools to Comprehensive — see the Git section below.
 
 `web_fetch` additionally refuses private and local addresses — literal, resolved, and redirect targets — and connects through a resolver that applies the same rule, so a name cannot pass the check with a public address and connect with a private one.
 
@@ -946,7 +946,7 @@ one of these tools is a thin request/response shell over that crate.
 | | Tools | Declares | Offered in |
 |---|---|---|---|
 | **Readers** | `git_status`, `git_log`, `git_show`, `git_grep`, `git_refs` | nothing | Restricted and up |
-| **Writers** | `git_commit`, `git_merge`, `git_ref`, `git_switch`, `git_reset`, `git_fetch`, `git_push` | `disk_write` + `network` | **Mutable only** |
+| **Writers** | `git_commit`, `git_merge`, `git_ref`, `git_switch`, `git_reset`, `git_fetch`, `git_push` | `disk_write` + `network` | **Comprehensive only** |
 
 Reads and writes stay separate **tools**, never modes of one tool, because
 that split is what the capability check binds to. Every writer declares
@@ -986,9 +986,9 @@ from `what`. An alias follows what the model *means* rather than what git
 means: `git_remote_update` is a fetch in git, but the model reached for it to
 learn where a repository pushes, so it resolves to `git_refs`.
 
-Comprehensive's grants deliberately withhold `disk_write`, so every tool that
-changes a repository is confined to Mutable — not offered there, and refused at
-dispatch before its arguments are parsed if a call arrives anyway. Reading
+Restricted's grants hold no `disk_write`, so every tool that changes a
+repository is confined to Comprehensive — not offered in Restricted, and
+refused at dispatch before its arguments are parsed if a call arrives anyway. Reading
 history and changing it are the two halves, and the capability is the line
 between them. `registry::git_reads_are_open_and_every_git_write_needs_disk_write`
 pins the split, and fails if a new git tool is registered without being placed
@@ -1017,8 +1017,9 @@ checked-out `HEAD`. Instead:
   `git_status` lists them (and `incoming` — commits the branch has that it
   does not), `git_commit` commits them, `git_merge` brings others' commits
   into them, `git_switch` carries them to another branch, and `git_reset`
-  keeps them (`soft`) or discards them (`hard`). zend saves the branch and the
-  base with the conversation's state after every tool round.
+  keeps them (`soft`) or discards them (`hard`). zend saves the branch with
+  the conversation's state, and the base and the changes as events on its
+  timeline (`docs/zend_vfs_events.md`), after every tool round.
 - **Writes go to origin; reads stay local** (`zend_vfs::origin`), and **nothing
   anyone wrote is ever lost**. A commit is one attempt, published whole or not
   at all: it is refused — with nothing written anywhere and the conversation's

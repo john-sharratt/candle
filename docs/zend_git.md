@@ -534,7 +534,7 @@ Twelve `git_*` tools in `zend-tools/src/tools/git/`, each taking the workspace's
 | `git_grep` | `grep` at a revision |
 | `git_refs` | by `kind`: `branches()`, `tags()`, `remotes()`, `remote_branches()` |
 
-**Writes** — every one declares `DiskWrite` and `Network`, which the Comprehensive tools mode's grants withhold, so they are Mutable's alone and are refused at dispatch anywhere else:
+**Writes** — every one declares `DiskWrite` and `Network`, which the Restricted tools mode's grants withhold, so they are Comprehensive's alone and are refused at dispatch anywhere else:
 
 | Tool | Wraps |
 |---|---|

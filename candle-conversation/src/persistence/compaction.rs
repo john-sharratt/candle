@@ -35,6 +35,7 @@ use super::record::{
 };
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::streams::StreamId;
+use super::vfs::{carried, VfsIndex};
 use super::Result;
 use crate::projection::TimelineId;
 use crate::substrate::Substrate;
@@ -174,8 +175,34 @@ pub fn collect_live_records(
     manifest: &Manifest,
     substrate: &Substrate,
     npc_locs: &HashMap<u64, RecordLoc>,
+    vfs_index: &VfsIndex,
 ) -> Vec<CompactItem> {
     let mut out: Vec<CompactItem> = Vec::new();
+
+    // A conversation's file events, staged verbatim: their bodies belong to
+    // the daemon above, so like characters they are carried by location.
+    // Only the live events of live timelines — a retired, distilled or
+    // unregistered conversation's are orphans and stay behind. Tombstones
+    // stay behind too: the events they killed are not carried either, so
+    // nothing is left for them to kill.
+    for (timeline, tl) in carried(substrate, vfs_index) {
+        for (&seq, loc) in tl.events() {
+            out.push(CompactItem::raw(
+                RecordHeader {
+                    record_type: RecordType::VfsEvent,
+                    format: 0,
+                    payload_len: loc.payload_len,
+                    crc: 0,
+                    stream_id: timeline,
+                    chunk_index: seq,
+                    token_count: 0,
+                },
+                loc.segment,
+                loc.offset,
+                loc.record_size,
+            ));
+        }
+    }
 
     // Characters, staged verbatim from wherever they physically live.
     //
@@ -957,7 +984,7 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         // Exactly: 1 ModelSpec + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
         assert_eq!(live.len(), 3);
         // Each read-back item points at the live winner's on-disk location — the
@@ -1008,7 +1035,7 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         assert!(
             !has_type(&live, RecordType::Chunk),
             "orphan chunks (no StreamDecl) must be reclaimed, not kept forever",
@@ -1052,7 +1079,7 @@ mod tests {
         let (before, before_sub, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&before, &before_sub, &HashMap::new());
+        let live = collect_live_records(&before, &before_sub, &HashMap::new(), &VfsIndex::new());
         let path = std::env::temp_dir().join(format!(
             "kvtier_compact_{}.log",
             std::time::SystemTime::now()
@@ -1152,7 +1179,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         // The marker survives, at its mode — without it the exemption is lost.
         assert!(
@@ -1280,7 +1307,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         let has_label = |needle: &str| {
             live.iter().any(|it| {
@@ -1380,7 +1407,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         // The dead timeline's records are physically gone from the live set.
         // Chunks are read-back (`Raw`) items keyed by stream id; the dead
@@ -1447,7 +1474,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         assert!(
             has_synth(&live, RecordType::ProjectionEvents, &proj_payload),
@@ -1488,7 +1515,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         assert!(
             has_synth(&live, RecordType::WideQSig, &wide_payload),
@@ -1545,7 +1572,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         // The declaration and the sig survive — the belief gallery still finds it.
         assert!(
@@ -1667,7 +1694,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -1715,7 +1742,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         assert!(
             !has_type(&live, RecordType::Snapshot),
             "a tombstoned timeline's recurrent snapshot survived compaction"
@@ -1771,7 +1798,7 @@ mod tests {
              incremental maintenance will relocate it forward forever",
         );
         // And therefore also absent from the full-compaction live set.
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         assert!(
             !has_type(&live, RecordType::Snapshot),
             "a distilled timeline's recurrent snapshot survived compaction",
@@ -1792,7 +1819,7 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(substrate.recurrent_snapshot_entries().count(), 1);
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         assert!(has_type(&live, RecordType::Snapshot));
     }
 
@@ -1831,7 +1858,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         let kept: Vec<u64> = live
             .iter()
@@ -1902,7 +1929,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -1936,7 +1963,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         let snaps: Vec<_> = live
             .iter()
@@ -2006,7 +2033,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
 
         assert!(
             has_type(&live, RecordType::StreamDecl),
@@ -2080,7 +2107,7 @@ mod tests {
         npc_locs.insert(701, loc_at(4_096, 256));
         npc_locs.insert(700, loc_at(8_192, 320));
 
-        let live = collect_live_records(&manifest, &substrate, &npc_locs);
+        let live = collect_live_records(&manifest, &substrate, &npc_locs, &VfsIndex::new());
         let npcs: Vec<&CompactItem> = live
             .iter()
             .filter(|it| it.header().record_type == RecordType::Npc)
@@ -2101,7 +2128,7 @@ mod tests {
     #[test]
     fn collect_emits_nothing_for_an_empty_cast() {
         let (manifest, substrate) = empty_store();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         assert!(!has_type(&live, RecordType::Npc));
     }
 
@@ -2114,13 +2141,87 @@ mod tests {
         let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
         npc_locs.insert(900, loc_at(4_096, 192));
 
-        let live = collect_live_records(&manifest, &substrate, &npc_locs);
+        let live = collect_live_records(&manifest, &substrate, &npc_locs, &VfsIndex::new());
         assert!(
             live.iter().any(
                 |it| it.header().record_type == RecordType::Npc && it.header().stream_id == 900
             ),
             "a tombstoned character is still a record",
         );
+    }
+
+    /// **A conversation's file events are carried while it lives, and only
+    /// then**: a tombstoned, a distilled and an unregistered conversation's
+    /// events are orphans and stay behind, and no tombstone is carried — what
+    /// it killed is not carried either.
+    #[test]
+    fn collect_carries_only_live_conversations_file_events() {
+        use crate::persistence::record::{DistillMode, DistillPayload};
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let decl = |timeline_id: u64| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id,
+                turn_index: 0,
+                turn_id_day: 0,
+                turn_id_seq: 1,
+                role: 2,
+                block_start: 0,
+                block_end: 2,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: Vec::new(),
+            })
+            .encode()
+        };
+        let (live_tl, dead_tl, distilled_tl, never_tl) = (11u64, 12u64, 13u64, 14u64);
+        let mut blob = Vec::new();
+        for (sid, tl) in [(801u64, live_tl), (802, dead_tl), (803, distilled_tl)] {
+            blob.extend_from_slice(&record(RecordType::StreamDecl, sid, 0, &decl(tl)));
+        }
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: dead_tl,
+                turn_index: None,
+                reason: None,
+            }
+            .encode(),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Distilled,
+            0,
+            0,
+            &DistillPayload {
+                timeline_id: distilled_tl,
+                mode: DistillMode::ProvenanceOnly,
+            }
+            .encode(),
+        ));
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+
+        let mut vfs = VfsIndex::new();
+        for tl in [live_tl, dead_tl, distilled_tl, never_tl] {
+            vfs.record_event(tl, 0, loc_at(4_096 * tl, 128));
+            vfs.record_event(tl, 1, loc_at(4_096 * tl + 1_024, 128));
+        }
+        vfs.record_tombstone(live_tl, 2, loc_at(90_000, 64), &[0]);
+
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &vfs);
+        let events: Vec<(u64, u64, (u64, u64))> = live
+            .iter()
+            .filter(|it| it.header().record_type == RecordType::VfsEvent)
+            .map(|it| (it.header().stream_id, it.header().chunk_index, raw_loc(it)))
+            .collect();
+        assert_eq!(events, vec![(live_tl, 1, (4_096 * live_tl + 1_024, 128))]);
+        assert!(!has_type(&live, RecordType::VfsTombstone));
     }
 
     /// A tool round-trip's coupling survives compaction.
@@ -2188,7 +2289,7 @@ mod tests {
             "replay must install both couplings",
         );
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         for from_turn in [0u32, 1] {
             assert!(
                 has_synth(
@@ -2237,7 +2338,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         assert!(!has_type(&live, RecordType::TurnCoupling));
     }
 
@@ -2333,7 +2434,6 @@ mod tests {
                 &ConvState {
                     archived: true,
                     branches: [("candle".to_string(), "zen/work".to_string())].into(),
-                    files: [("candle".to_string(), serde_json::json!({ "a.txt": 1 }))].into(),
                 },
             ),
         ));
@@ -2424,8 +2524,12 @@ mod tests {
         // Characters are tracked persistence-side, not in the substrate.
         let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
         npc_locs.insert(8812, loc_at(4_096, 256));
+        // So are a conversation's file events and their tombstones.
+        let mut vfs = VfsIndex::new();
+        vfs.record_event(live_tl, 0, loc_at(8_192, 128));
+        vfs.record_tombstone(live_tl, 1, loc_at(12_288, 64), &[]);
 
-        let live = collect_live_records(&manifest, &substrate, &npc_locs);
+        let live = collect_live_records(&manifest, &substrate, &npc_locs, &vfs);
 
         for &rt in WRITTEN_RECORD_TYPES {
             match survival(rt) {
@@ -2442,17 +2546,22 @@ mod tests {
                     "{rt:?} is regenerated by the writer; carrying a stale copy \
                      forward would corrupt the new chain",
                 ),
+                // Compaction carries none of what the marker killed, so the
+                // marker is left behind with it.
+                Survival::Maintained => assert!(
+                    !has_type(&live, rt),
+                    "{rt:?} only keeps dead records dead; compaction drops them, so \
+                     carrying the marker forward keeps nothing but itself",
+                ),
                 Survival::NeverWritten => unreachable!("{rt:?} is in WRITTEN_RECORD_TYPES"),
             }
         }
 
-        // The conversation state comes through whole — its branches and file
-        // changes too, not just the archived flag — keyed in the header by its
-        // timeline.
+        // The conversation state comes through whole — its branches too, not
+        // just the archived flag — keyed in the header by its timeline.
         let state = ConvState {
             archived: true,
             branches: [("candle".to_string(), "zen/work".to_string())].into(),
-            files: [("candle".to_string(), serde_json::json!({ "a.txt": 1 }))].into(),
         };
         assert!(has_synth(
             &live,
@@ -2486,7 +2595,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         assert!(
             has_synth(
                 &live,
@@ -2531,7 +2640,7 @@ mod tests {
             "replay must mark the stream tombstoned",
         );
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new());
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
         // The reason is diagnostic only and is not re-derived at compaction
         // time — the same rule the turn-scoped tombstone's re-emit follows —
         // so only the marker's presence (not its original reason text) is

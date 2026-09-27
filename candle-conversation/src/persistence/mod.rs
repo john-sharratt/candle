@@ -48,6 +48,7 @@ pub mod streams;
 pub mod survival;
 pub mod thread;
 pub mod transfer;
+pub mod vfs;
 pub mod walker;
 pub mod writer;
 
@@ -74,6 +75,7 @@ use segment::SegmentId;
 use segmented_log::SegmentedLog;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
+use vfs::VfsIndex;
 use walker::WalkEntry;
 
 /// Errors raised by the persistence layer.
@@ -347,6 +349,12 @@ pub struct SubstratePersistence {
     /// says which record that is. Without it, `collect_live_records` would omit
     /// every NPC and the first compaction would delete the entire cast.
     npc_locs: HashMap<u64, RecordLoc>,
+
+    /// Where every conversation's live file events and tombstones are —
+    /// `docs/zend_vfs_events.md`. Their bodies belong to the daemon above and
+    /// are never in RAM here, so like `npc_locs` this map is what keeps them:
+    /// compaction and maintenance carry what it names, and a resume reads it.
+    vfs_index: VfsIndex,
 
     /// Per-type record counts as the store stood when it opened — the baseline
     /// a rewrite's carry-forward tally is reported against, so a class that
@@ -628,6 +636,7 @@ impl SubstratePersistence {
         let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
         let mut snapshot_locs: HashMap<u64, RecordLoc> = HashMap::new();
         let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        let mut vfs_index = VfsIndex::new();
         // What the store actually holds, by type. One array increment per record
         // in a walk that already visits every record — see `RecordCensus`.
         let mut census = RecordCensus::new();
@@ -637,6 +646,7 @@ impl SubstratePersistence {
             record_metadata_loc(&mut metadata_locs, entry);
             record_snapshot_loc(&mut snapshot_locs, entry);
             record_npc_loc(&mut npc_locs, entry);
+            vfs::record_vfs_loc(&mut vfs_index, &mut accounting, entry);
             sink(entry);
         };
         let opened = if read_only {
@@ -701,6 +711,7 @@ impl SubstratePersistence {
             metadata_locs,
             snapshot_locs,
             npc_locs,
+            vfs_index,
             open_census: census,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
@@ -1206,6 +1217,9 @@ impl SubstratePersistence {
         // and the same one `record_snapshot_loc` replays on reload.
         self.snapshot_locs
             .remove(&snapshot_stream_id(timeline_id).0);
+        // Its file events are orphans now: out of the index, so no rewrite
+        // carries them, and their bytes dead.
+        vfs::retire_timeline(&mut self.vfs_index, &mut self.accounting, timeline_id);
         Ok(())
     }
 
@@ -1890,7 +1904,12 @@ impl SubstratePersistence {
         let dir = self.segments.dir().to_path_buf();
         // Planning only — no disk reads; each read-back record carries its
         // source location, read back coalesced + staged verbatim in step 3.
-        let live = compaction::collect_live_records(&self.manifest, substrate, &self.npc_locs);
+        let live = compaction::collect_live_records(
+            &self.manifest,
+            substrate,
+            &self.npc_locs,
+            &self.vfs_index,
+        );
         // What this compaction is carrying forward, by type, against what the
         // store held when it opened. A class present at open and absent here is
         // being deleted — the failure this whole module exists to make visible,
@@ -2007,15 +2026,18 @@ impl SubstratePersistence {
         self.metadata_locs.clear();
         self.snapshot_locs.clear();
         self.npc_locs.clear();
+        self.vfs_index.clear();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
         let snapshot_locs = &mut self.snapshot_locs;
         let npc_locs = &mut self.npc_locs;
+        let vfs_index = &mut self.vfs_index;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(metadata_locs, entry);
             record_snapshot_loc(snapshot_locs, entry);
             record_npc_loc(npc_locs, entry);
+            vfs::record_vfs_loc(vfs_index, accounting, entry);
             substrate.apply_walker_entry(entry);
         })?;
         // The compacted segment carries a fresh index chain; chain the next

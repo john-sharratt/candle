@@ -5,7 +5,7 @@
 //!
 //! - **The developer's working tree is never touched**, and a branch that is
 //!   checked out cannot be moved.
-//! - **Comprehensive cannot run either of them** — each tool's last test
+//! - **Restricted cannot run either of them** — each tool's last test
 //!   calls it on the read-only context and asserts the refusal, so a tool
 //!   that lost its `DiskWrite` declaration would fail here.
 
@@ -33,7 +33,7 @@ fn take_commits_the_file_as_the_conversation_holds_it() {
     let ws = GitWorkspace::new();
     ws.git(&["branch", "work"]);
     ws.write_worktree("src/lib.rs", "a job left this in the folder\n");
-    let ctx = ws.mutable_ctx();
+    let ctx = ws.comprehensive_ctx();
     ctx.files
         .repo("app")
         .unwrap()
@@ -470,7 +470,7 @@ fn each_source_names_what_it_needs() {
 }
 
 #[test]
-fn a_comprehensive_context_cannot_commit() {
+fn a_restricted_context_cannot_commit() {
     let ws = GitWorkspace::new();
     ws.git(&["branch", "work"]);
     let before = ws.oid("work");
@@ -662,7 +662,7 @@ fn an_invalid_ref_name_is_refused() {
 }
 
 #[test]
-fn a_comprehensive_context_cannot_change_a_ref() {
+fn a_restricted_context_cannot_change_a_ref() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_ref",

@@ -54,7 +54,7 @@ use crate::coding_sampling;
 use crate::config::DaemonConfig;
 use crate::conv_branches::{self, BaseBranches};
 use crate::conv_file_store::ConvFileStore;
-use crate::conv_overlay;
+use crate::conv_overlay::{self, Mirror};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
@@ -192,6 +192,11 @@ struct ConvState {
     /// conversation and restored when this state is built again
     /// ([`conv_overlay`]).
     files: Arc<RepoFiles>,
+    /// What the substrate holds of `files`, as events on the conversation's
+    /// timeline — what each save writes the difference against. Unread until
+    /// the conversation's events have been read back, and while unread
+    /// nothing is saved.
+    mirror: Arc<Mutex<Mirror>>,
 }
 
 /// Metadata keys carrying the composer dials a conversation last ran under.
@@ -1338,14 +1343,12 @@ impl InferenceState {
                     .collect();
                 crate::tool_summary::build_tool_summary(&sections)
             };
-            let summaries: Vec<(String, Reserved, &str)> = [
-                ToolMode::Restricted,
-                ToolMode::Comprehensive,
-                ToolMode::Mutable,
-            ]
-            .into_iter()
-            .filter_map(|mode| Some((summary_for(mode), tool_summary_section(mode)?, mode.id())))
-            .collect();
+            let summaries: Vec<(String, Reserved, &str)> = ToolMode::ALL
+                .into_iter()
+                .filter_map(|mode| {
+                    Some((summary_for(mode), tool_summary_section(mode)?, mode.id()))
+                })
+                .collect();
             // Assembly is instant — the step's second half completes immediately.
             progress.set_step_progress(10_000, 10_000);
 
@@ -2589,7 +2592,6 @@ fn tool_summary_section(mode: ToolMode) -> Option<Reserved> {
         ToolMode::None => None,
         ToolMode::Restricted => Some(Reserved::ToolSummaryRestricted),
         ToolMode::Comprehensive => Some(Reserved::ToolSummary),
-        ToolMode::Mutable => Some(Reserved::ToolSummaryMutable),
     }
 }
 
@@ -2605,7 +2607,7 @@ fn tool_summary_section(mode: ToolMode) -> Option<Reserved> {
 fn build_mode_builder(base: &Builder, mode: ToolMode) -> anyhow::Result<Arc<Builder>> {
     let mut b = base.clone();
     // Keep exactly the tools this mode offers — none in None, everything in
-    // Mutable; the summary association below points the mode at its listing.
+    // Comprehensive; the summary association below points the mode at its listing.
     b.retain_collection_sections("tools", &crate::tools::offered_tool_names(mode))
         .map_err(|e| anyhow::anyhow!("{} tools projection: {e}", mode.id()))?;
     // Associate the sealed tool-catalog summary (built by `build_tool_summary`,
@@ -2631,7 +2633,7 @@ fn build_mode_builder(base: &Builder, mode: ToolMode) -> anyhow::Result<Arc<Buil
 /// hands out a cheap `Arc` clone instead of re-cloning the ~93-section schema.
 struct ModeBuilders {
     /// Indexed by [`ToolMode::level`].
-    builders: [Arc<Builder>; 4],
+    builders: [Arc<Builder>; ToolMode::ALL.len()],
 }
 
 impl ModeBuilders {
@@ -2640,10 +2642,10 @@ impl ModeBuilders {
     /// the daemon cannot serve — and falling back to another mode's builder
     /// would offer a mode tools it does not grant.
     fn build(base: &Builder) -> anyhow::Result<Self> {
-        let [none, restricted, comprehensive, mutable] =
+        let [none, restricted, comprehensive] =
             ToolMode::ALL.map(|mode| build_mode_builder(base, mode));
         Ok(Self {
-            builders: [none?, restricted?, comprehensive?, mutable?],
+            builders: [none?, restricted?, comprehensive?],
         })
     }
 
@@ -2894,9 +2896,9 @@ fn run_inference_stream(
         // Set when this request is the one that actually mints the
         // conversation, so its lineage is recorded once, after the guard drops.
         let mut minted = false;
-        // A minted conversation's file stores, restored from its saved state
-        // once the map guard is released.
-        let mut minted_files: Option<Arc<RepoFiles>> = None;
+        // A minted conversation's file stores and their mirror, restored from
+        // its events once the map guard is released.
+        let mut minted_files: Option<(Arc<RepoFiles>, Arc<Mutex<Mirror>>)> = None;
         let forked: anyhow::Result<Arc<ConvLock<ConvState>>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {
@@ -2911,11 +2913,13 @@ fn run_inference_stream(
                 match state.base_conv.lock().unwrap().fork_resuming(timeline) {
                     Ok(conv) => {
                         let files = state.tool_host.conversation_files();
-                        minted_files = Some(Arc::clone(&files));
+                        let mirror = Arc::new(Mutex::new(Mirror::unread()));
+                        minted_files = Some((Arc::clone(&files), Arc::clone(&mirror)));
                         let arc = Arc::new(ConvLock::new(ConvState {
                             conv,
                             identity: stored_identity.clone(),
                             files,
+                            mirror,
                         }));
                         map.insert(conv_id.clone(), Arc::clone(&arc));
                         minted = true;
@@ -2997,11 +3001,11 @@ fn run_inference_stream(
             conv_branches::seed(&engine, timeline, &state.base_branches);
         }
 
-        if let Some(files) = minted_files {
+        if let Some((files, mirror)) = minted_files {
             // A conversation built again — after an eviction, after a restart
             // — reads each repository through its own branch, and gets back
             // the changes its tool rounds made there.
-            conv_overlay::restore(&state.engine.lock().unwrap(), timeline, &files);
+            conv_overlay::restore(&state.engine.lock().unwrap(), timeline, &files, &mirror);
             // It still holds the reads it asked for, but the set that says so
             // is in-memory and did not survive. Replay its own calls so it
             // knows what it is carrying — otherwise it re-reads every file it
@@ -3173,13 +3177,18 @@ fn run_inference_stream(
                 resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
                 return;
             }
-            // The round is finished where it was started: on disk when the
-            // conversation was held at Mutable, over its own files otherwise.
+            // The round is finished over the conversation's own files, under
+            // the grants of the mode it was held at.
             let ctx = state.tool_host.context_for(tools_mode, &cs.files);
             let dispatched =
                 tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, Dispatch::Resumed))
                     .await;
-            conv_overlay::save(&state.engine.lock().unwrap(), timeline, &cs.files);
+            conv_overlay::save(
+                &state.engine.lock().unwrap(),
+                timeline,
+                &cs.files,
+                &cs.mirror,
+            );
             let text = match dispatched {
                 Ok(results) => format_tool_responses(&results),
                 Err(e) => {
@@ -3745,7 +3754,12 @@ fn run_inference_stream(
             let ctx = state.tool_host.context_for(tools_mode, &cs.files);
             let ran = tokio::task::spawn_blocking(move || tool_round::run(&ctx, round)).await;
             // Whatever the round changed outlives this conversation's state.
-            conv_overlay::save(&state.engine.lock().unwrap(), timeline, &cs.files);
+            conv_overlay::save(
+                &state.engine.lock().unwrap(),
+                timeline,
+                &cs.files,
+                &cs.mirror,
+            );
             let mut results = match ran {
                 Ok(r) => r,
                 Err(e) => {

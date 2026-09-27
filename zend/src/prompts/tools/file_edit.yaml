@@ -29,7 +29,7 @@ questions:
 - change these three places in one patch
 category: Files
 description: 'Apply a unified diff to an existing file in the named repo. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. The patch is one or more `@@ -old,count +new,count @@` hunks, each line prefixed with a space for context, `-` for a removed line, `+` for an added one. Hunks are located by their context, not by their line numbers, so the numbers need only be close; a hunk whose context matches in several places is rejected as ambiguous, and a hunk whose change is already in the file is reported as already applied rather than applied twice — so re-sending the same patch is safe. Either every hunk lands or none does. Use for: changing a value in a config, editing several places in one file at once, updating a function body, fixing a typo. Triggered by "change X to Y in the file", "apply this diff", "update these lines", "fix the value of". Returns the repo, the path, how many hunks applied, how many were already applied, and the new byte count. For full rewrites use write.'
-high_risk: true
+high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:

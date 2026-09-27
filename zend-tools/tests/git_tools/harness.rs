@@ -17,7 +17,7 @@ use std::process::Command;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use zend_tools::registry::find;
-use zend_tools::{Capability, Grants, ToolContext};
+use zend_tools::{Grants, ToolContext};
 use zend_vfs::{RepoSpec, Workspace};
 
 /// A workspace holding one git repository called `app`.
@@ -122,20 +122,15 @@ impl GitWorkspace {
         ToolContext::with_workspace(ws).granting(grants)
     }
 
-    /// A context that may run the writers — Mutable's grants.
-    pub fn mutable_ctx(&self) -> ToolContext {
+    /// A context that may run the writers — Comprehensive's grants.
+    pub fn comprehensive_ctx(&self) -> ToolContext {
         self.ctx(Grants::ALL)
     }
 
-    /// A context that may run only the readers — Comprehensive's grants,
-    /// which deliberately withhold `DiskWrite`.
-    pub fn comprehensive_ctx(&self) -> ToolContext {
-        self.ctx(
-            Grants::NONE
-                .with(Capability::Network)
-                .with(Capability::Sandbox)
-                .with(Capability::Secrets),
-        )
+    /// A context that may run only the readers — Restricted's grants, which
+    /// hold nothing, `DiskWrite` included.
+    pub fn restricted_ctx(&self) -> ToolContext {
+        self.ctx(Grants::NONE)
     }
 
     /// One conversation over this workspace: a writable context kept across
@@ -143,7 +138,7 @@ impl GitWorkspace {
     /// branch it switches to stays its branch.
     pub fn conversation(&self) -> Conversation {
         Conversation {
-            ctx: self.mutable_ctx(),
+            ctx: self.comprehensive_ctx(),
         }
     }
 
@@ -151,14 +146,14 @@ impl GitWorkspace {
     pub fn read(&self, tool: &str, args: Value) -> Value {
         find(tool)
             .unwrap_or_else(|| panic!("{tool} is registered"))
-            .call(&self.comprehensive_ctx(), &args)
+            .call(&self.restricted_ctx(), &args)
     }
 
     /// Call a tool against this workspace's writable context.
     pub fn write(&self, tool: &str, args: Value) -> Value {
         find(tool)
             .unwrap_or_else(|| panic!("{tool} is registered"))
-            .call(&self.mutable_ctx(), &args)
+            .call(&self.comprehensive_ctx(), &args)
     }
 
     /// A bare repository beside the workspace acting as `origin`, reachable

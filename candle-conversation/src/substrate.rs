@@ -1236,10 +1236,6 @@ pub struct TimelineEntry {
     /// the repository's workspace name. Persisted with `archived` in the same
     /// `RecordType::ConvState` record — see [`ConvState`].
     pub branches: BTreeMap<String, String>,
-    /// The changes this conversation has made to each repository's files, as
-    /// the daemon's file layer records them. Persisted in the same
-    /// `RecordType::ConvState` record — see [`ConvState`].
-    pub files: BTreeMap<String, serde_json::Value>,
     /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
@@ -1412,7 +1408,6 @@ impl TimelineEntry {
             custom: BTreeMap::new(),
             archived: false,
             branches: BTreeMap::new(),
-            files: BTreeMap::new(),
             turns: BTreeMap::new(),
             tree_meta: BTreeMap::new(),
             debug_id: None,
@@ -3797,7 +3792,6 @@ impl Substrate {
         if let Some(entry) = self.timelines.get_mut(&timeline) {
             entry.archived = state.archived;
             entry.branches = state.branches;
-            entry.files = state.files;
         }
     }
 
@@ -4536,6 +4530,11 @@ impl Substrate {
             // the same walk through its own sink. The substrate holds no
             // opinion about a character.
             | RecordType::Npc
+            // A conversation's file events belong to the daemon above; the
+            // persistence layer locates them (`VfsIndex`) and the substrate
+            // holds no opinion about them either.
+            | RecordType::VfsEvent
+            | RecordType::VfsTombstone
             | RecordType::Unknown => {}
         }
     }
@@ -5406,27 +5405,7 @@ impl Substrate {
         self.timelines.get(&timeline).map(|e| ConvState {
             archived: e.archived,
             branches: e.branches.clone(),
-            files: e.files.clone(),
         })
-    }
-
-    /// Set the file changes `timeline` has made — the whole map, repository
-    /// name to changes, replacing the last. No-op when the timeline isn't
-    /// registered. Returns `true` when they actually changed, so the caller
-    /// can skip the persistence write when nothing did.
-    pub fn set_files(
-        &mut self,
-        timeline: TimelineId,
-        files: &BTreeMap<String, serde_json::Value>,
-    ) -> bool {
-        let Some(entry) = self.timelines.get_mut(&timeline) else {
-            return false;
-        };
-        if &entry.files == files {
-            return false;
-        }
-        entry.files = files.clone();
-        true
     }
 
     /// Set the branch `timeline` works on in `repo`. No-op when the timeline
@@ -9227,13 +9206,11 @@ mod tests {
                 .into_iter()
                 .map(|(r, b)| (r.to_string(), b.to_string()))
                 .collect(),
-            files: Default::default(),
         };
         assert_eq!(sub.conv_state(a), Some(a_state.clone()));
         let b_state = super::ConvState {
             archived: true,
             branches: Default::default(),
-            files: Default::default(),
         };
         assert_eq!(
             sub.live_conv_states(),

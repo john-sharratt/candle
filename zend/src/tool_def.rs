@@ -967,11 +967,45 @@ mod tests {
         );
     }
 
+    /// **Restricted is the file tools and the git readers, and no command
+    /// line.** Its file changes stay in the overlay, so writing is safe; the
+    /// git writers, code, the network and programs on this host are not.
     #[test]
-    fn restricted_excludes_high_risk() {
+    fn restricted_writes_files_and_reads_git_but_runs_nothing() {
         let safe = names_for(ToolMode::Restricted);
-        assert!(safe.contains("datetime"), "datetime is safe");
-        assert!(!safe.contains("write"), "write is high-risk");
+        for name in [
+            "datetime",
+            "write",
+            "file_edit",
+            "file_delete",
+            "file_read",
+            "git_status",
+            "git_log",
+            "git_show",
+            "git_grep",
+            "git_refs",
+        ] {
+            assert!(safe.contains(name), "{name} missing from restricted");
+        }
+        for name in [
+            "git_commit",
+            "git_merge",
+            "git_ref",
+            "git_switch",
+            "git_reset",
+            "git_fetch",
+            "git_push",
+            "code_run",
+            "code_session_exec",
+            "ssh_session_exec",
+            "telnet_send",
+            "ping_icmp",
+            "trace_route",
+            "sub_run",
+            "sql_session_query",
+        ] {
+            assert!(!safe.contains(name), "{name} offered in restricted");
+        }
     }
 
     /// **No mode offers what it would refuse.** Every tool a mode projects
@@ -1003,35 +1037,16 @@ mod tests {
         }
     }
 
-    /// **Programs run on the host only in Mutable.** The overlay cannot stand
-    /// in front of a program, so no overlay mode offers one; the JS sandbox,
-    /// whose only filesystem is the overlay, and the network and remote-shell
-    /// tools stay in Comprehensive.
+    /// **Comprehensive offers every tool** — programs on the host, the JS
+    /// sandbox, the network, remote shells and the git writers included.
     #[test]
-    fn host_execution_is_offered_only_in_mutable() {
+    fn comprehensive_offers_every_tool() {
         let comprehensive = names_for(ToolMode::Comprehensive);
-        let mutable = names_for(ToolMode::Mutable);
-        for name in ["ping_icmp", "trace_route", "sub_run"] {
-            assert!(
-                !comprehensive.contains(name),
-                "{name} offered in comprehensive"
-            );
-            assert!(mutable.contains(name), "{name} missing from mutable");
-        }
-        for name in [
-            "code_run",
-            "code_session_exec",
-            "web_fetch",
-            "web_search",
-            "ssh_session_exec",
-            "write",
-        ] {
-            assert!(
-                comprehensive.contains(name),
-                "{name} missing from comprehensive"
-            );
-        }
-        assert_eq!(mutable.len(), all().len(), "mutable offers every tool");
+        assert_eq!(
+            comprehensive.len(),
+            all().len(),
+            "comprehensive offers every tool"
+        );
     }
 
     /// Every definition carries a real category (never the `"Other"` fallback the

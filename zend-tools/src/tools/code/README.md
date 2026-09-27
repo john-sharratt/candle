@@ -8,9 +8,9 @@ scripts are bounded by loop / recursion limits. `run_js()` also refuses to
 create a VM unless the context holds the `sandbox` capability, so running code
 needs that grant even if the dispatch-level check in the registry were bypassed.
 
-Because nothing a script does can reach past the file store, the sandbox is
-granted in the overlay (Comprehensive) tools mode as well as Mutable, unlike
-`exec` (programs on the host), which is Mutable-only.
+Nothing a script does can reach past the file store. The sandbox is granted in
+the Comprehensive tools mode, with every other capability; Restricted grants
+none, so it runs no code at all.
 
 ## The `vfs` global
 
@@ -21,8 +21,8 @@ granted in the overlay (Comprehensive) tools mode as well as Mutable, unlike
 | `vfs.list(prefix)` | up to 200 paths under `prefix` |
 | `require('./path')` | a CommonJS module from the store (`module.exports` / `exports`), resolved like Node's relative requires with `.js` optional; Node built-ins and npm modules are not available |
 
-A script sees what the `file_*` tools see: the session overlay in Comprehensive,
-the workspace on disk in Mutable. `eval(vfs.read('scratch/lib.js'))` loads a file
+A script sees what the `file_*` tools see: the conversation's overlay over the
+workspace, whose disk it never writes. `eval(vfs.read('scratch/lib.js'))` loads a file
 just written with `write`, so it can be tested in the same call. Protected paths
 (`secrets/`) throw. When a session replays its history, `vfs.write` writes nothing.
 

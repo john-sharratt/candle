@@ -7,6 +7,7 @@ use crate::handle::{TokenDecoder, TurnEvent};
 use crate::persistence::manifest::ConvState;
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
+use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
     Builder, CollectionWarm, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget,
@@ -1063,22 +1064,30 @@ impl ConversationEngine {
             .set_conversation_branches(timeline, branches)
     }
 
-    /// Set the changes a conversation has made to each repository's files —
-    /// repository workspace name to the daemon's record of them, the whole
-    /// map, replacing the last. Persisted with the rest of the conversation's
-    /// state as one `RecordType::ConvState` record (last-writer-wins); a call
-    /// that changes nothing writes nothing.
-    pub fn set_conversation_files(
+    /// Stage a set of a conversation's changes to its files as events on its
+    /// timeline, events before tombstones, for the group commit to make
+    /// durable — see `docs/zend_vfs_events.md`. Returns the sequence numbers
+    /// the events took, in order.
+    pub fn write_conversation_files(
         &self,
         timeline: TimelineId,
-        files: &BTreeMap<String, serde_json::Value>,
-    ) {
-        self.conversation.set_conversation_files(timeline, files)
+        write: &VfsWrite,
+    ) -> crate::Result<Vec<u64>> {
+        self.conversation
+            .write_conversation_files(timeline, write)
+            .map_err(ConversationError::Model)
     }
 
-    /// A conversation's whole state — archived flag, the branch it works on
-    /// in each repository, and its changes to their files — or `None` for an
-    /// unknown timeline.
+    /// Every live event of a conversation's files, in `(repo, key, seq)`
+    /// order — what building the conversation again replays.
+    pub fn conversation_files(&self, timeline: TimelineId) -> crate::Result<Vec<VfsEventPayload>> {
+        self.conversation
+            .conversation_files(timeline)
+            .map_err(ConversationError::Model)
+    }
+
+    /// A conversation's state — archived flag and the branch it works on in
+    /// each repository — or `None` for an unknown timeline.
     pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
         self.conversation.conversation_state(timeline)
     }

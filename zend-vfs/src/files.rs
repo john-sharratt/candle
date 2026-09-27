@@ -26,12 +26,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use super::vfs::git_source::GitSource;
 use super::vfs::{Snapshot, VfsStore};
 use super::workspace::{Workspace, ALL_REPOS};
-use crate::{BranchName, DiskWriteGrant, Rev};
+use crate::{BranchName, Rev};
 
 /// Each git repository's source, by repository name.
 type Sources = BTreeMap<String, Arc<GitSource>>;
@@ -63,10 +63,6 @@ pub struct RepoFiles {
     workspace: Option<Workspace>,
     sources: Arc<Sources>,
     stores: RwLock<Vec<(String, Arc<VfsStore>)>>,
-    direct: bool,
-    /// Saved work that could not be restored, by the key it was saved under,
-    /// as saved: kept so that saving the set again never overwrites it.
-    unrestored: Mutex<BTreeMap<String, String>>,
 }
 
 impl RepoFiles {
@@ -76,8 +72,6 @@ impl RepoFiles {
             workspace: None,
             sources: Arc::default(),
             stores: RwLock::new(Vec::new()),
-            direct: false,
-            unrestored: Mutex::default(),
         }
     }
 
@@ -112,45 +106,14 @@ impl RepoFiles {
             workspace: Some(workspace),
             sources,
             stores: RwLock::new(stores),
-            direct: false,
-            unrestored: Mutex::default(),
-        }
-    }
-
-    /// A direct store over each of `workspace`'s repositories: writes and
-    /// deletes change the files on disk. Takes the grant [`VfsStore::direct`]
-    /// needs.
-    pub fn direct(workspace: Workspace, grant: DiskWriteGrant) -> Self {
-        let stores = workspace
-            .repos()
-            .iter()
-            .map(|r| (r.name.clone(), Arc::new(VfsStore::direct(&r.dir, &grant))))
-            .collect();
-        Self {
-            workspace: Some(workspace),
-            sources: Arc::default(),
-            stores: RwLock::new(stores),
-            direct: true,
-            unrestored: Mutex::default(),
         }
     }
 
     /// A set of the same kind with none of this one's session changes — what
-    /// a new conversation starts from. An overlay set gets fresh overlays over
-    /// the same workspace, reading through the same sources, on each
-    /// repository's first branch; a detached set a fresh detached one. A
-    /// direct set holds no session changes — its writes are on disk — so the
-    /// new set shares its stores.
+    /// a new conversation starts from: fresh overlays over the same
+    /// workspace, reading through the same sources, on each repository's
+    /// first branch; for a detached set a fresh detached one.
     pub fn fresh(&self) -> Self {
-        if self.direct {
-            return Self {
-                workspace: self.workspace.clone(),
-                sources: Arc::clone(&self.sources),
-                stores: RwLock::new(self.all()),
-                direct: true,
-                unrestored: Mutex::default(),
-            };
-        }
         match &self.workspace {
             Some(workspace) => Self::over(workspace.clone(), Arc::clone(&self.sources)),
             None => Self::detached(),
@@ -184,11 +147,6 @@ impl RepoFiles {
     /// The workspace behind these stores, if any.
     pub fn workspace(&self) -> Option<&Workspace> {
         self.workspace.as_ref()
-    }
-
-    /// Whether writes and deletes change the files on disk.
-    pub fn is_direct(&self) -> bool {
-        self.direct
     }
 
     /// The store for the repository called `name`.
@@ -264,24 +222,6 @@ impl RepoFiles {
             }
         }
         refused
-    }
-
-    /// Keep `saved` — work saved under `key` that could not be restored — so
-    /// that it is saved again as it was ([`Self::unrestored`]), never
-    /// overwritten by what this set holds.
-    pub fn keep_unrestored(&self, key: String, saved: String) {
-        self.unrestored
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, saved);
-    }
-
-    /// The saved work [`Self::keep_unrestored`] kept, by key.
-    pub fn unrestored(&self) -> BTreeMap<String, String> {
-        self.unrestored
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
 
     /// Bytes held in every store's upper layer together.
@@ -379,7 +319,6 @@ mod tests {
         let files = RepoFiles::overlay(ws);
         assert_eq!(files.names(), vec!["a", "b"]);
         assert_eq!(files.all().len(), 2);
-        assert!(!files.is_direct());
     }
 
     /// The same store answers every call for one repository, so a write is
@@ -415,7 +354,6 @@ mod tests {
         first.repo("b").unwrap().delete("two.txt");
 
         let second = first.fresh();
-        assert!(!second.is_direct());
         assert_eq!(second.names(), first.names());
         assert_eq!(
             second
@@ -533,22 +471,6 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(names, expected);
         assert_eq!(read(&fresh, &repo, "a.txt").as_deref(), Some("topic\n"));
-    }
-
-    #[test]
-    fn a_direct_set_writes_each_repository_on_disk() {
-        let (dir, ws) = two_repos();
-        let files = RepoFiles::direct(ws, DiskWriteGrant::issue());
-        assert!(files.is_direct());
-        files
-            .repo("b")
-            .unwrap()
-            .write("made.txt", "m".into())
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("b").join("made.txt")).unwrap(),
-            "m"
-        );
     }
 
     /// **A detached set makes a store per name on first use**, since there is

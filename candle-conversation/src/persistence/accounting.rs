@@ -48,6 +48,13 @@ impl RecordAccounting {
     pub fn record(&mut self, header: &RecordHeader, padded_size: u64) {
         let key = match header.record_type {
             RecordType::Chunk => (RecordType::Chunk, header.stream_id, header.chunk_index),
+            // A conversation's file events and tombstones are keyed by timeline
+            // and sequence number, each unique: nothing supersedes one. An
+            // event dies by a tombstone or with its timeline, and the index
+            // that sees that says so through `retire`.
+            RecordType::VfsEvent | RecordType::VfsTombstone => {
+                (header.record_type, header.stream_id, header.chunk_index)
+            }
             // `Snapshot` is header-keyed by a synthetic per-timeline stream
             // id: the newest snapshot supersedes the previous one here — this
             // insert-returning-old IS the single-tail tombstone (design doc
@@ -95,6 +102,16 @@ impl RecordAccounting {
         };
         if let Some(old) = self.live_sizes.insert(key, padded_size) {
             self.dead_bytes += old;
+        }
+    }
+
+    /// Count the live record keyed `(rt, stream_id, index)` as dead — for a
+    /// record nothing supersedes but something else killed: a file event its
+    /// tombstone named, or whose timeline was tombstoned. A key not live is
+    /// left alone, so retiring twice counts once.
+    pub fn retire(&mut self, rt: RecordType, stream_id: u64, index: u64) {
+        if let Some(size) = self.live_sizes.remove(&(rt, stream_id, index)) {
+            self.dead_bytes += size;
         }
     }
 
@@ -184,6 +201,22 @@ mod tests {
             acc.record(&header(RecordType::HeaderIndex, 0, 0), 4096);
         }
         assert_eq!(acc.dead_bytes(), 0);
+    }
+
+    /// **A file event is live until something retires it** — its sequence
+    /// number is unique, so no later record supersedes it — and retiring it
+    /// twice counts it once.
+    #[test]
+    fn a_file_event_is_live_until_retired() {
+        let mut acc = RecordAccounting::new();
+        acc.record(&header(RecordType::VfsEvent, 7, 1), 4096);
+        acc.record(&header(RecordType::VfsEvent, 7, 2), 8192);
+        assert_eq!(acc.dead_bytes(), 0);
+        acc.retire(RecordType::VfsEvent, 7, 2);
+        acc.retire(RecordType::VfsEvent, 7, 2);
+        assert_eq!(acc.dead_bytes(), 8192);
+        acc.retire(RecordType::VfsEvent, 7, 9);
+        assert_eq!(acc.dead_bytes(), 8192, "a key never live retires nothing");
     }
 
     #[test]

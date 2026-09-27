@@ -10,9 +10,9 @@
 //!   [`GIT_SWITCH`], [`GIT_RESET`], [`GIT_FETCH`], [`GIT_PUSH`] — declare
 //!   [`Capability::DiskWrite`](crate::grants::Capability::DiskWrite) and
 //!   [`Capability::Network`](crate::grants::Capability::Network), which the
-//!   Comprehensive tools mode's grants withhold. Changing a repository is
-//!   Mutable's alone, and a call that arrives anywhere else is refused before
-//!   its arguments are parsed.
+//!   Restricted tools mode's grants withhold. Changing a repository is
+//!   Comprehensive's alone, and a call that arrives anywhere else is refused
+//!   before its arguments are parsed.
 //!
 //! # Origin is the record; the conversation is on a branch, at its own base
 //!

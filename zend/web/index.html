@@ -393,7 +393,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     try { localStorage.setItem(key, String(value)); } catch (_) {}
   }
   // The tools modes, by wire id, in dial order — a mode's level is its index.
-  const TOOL_MODE_IDS = ['none', 'restricted', 'comprehensive', 'mutable'];
+  const TOOL_MODE_IDS = ['none', 'restricted', 'comprehensive'];
   // Which of those this caller may use, and the one it starts at: from
   // GET /v1/me (`loadAccess`). Until that answers the page assumes the least —
   // the daemon holds a mode above the caller's role to Restricted regardless,
@@ -2323,7 +2323,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', pref: 'zend.verbosity', ticksGrow: false, glyph: GLYPH_LINES },
     // `allowed` limits the menu to the levels this caller may use, and `clamp`
     // turns the level asked for into the one a turn will use (GET /v1/me).
-    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive', 'Mutable'], subs: ['no tools', 'safe tools only', 'every tool', 'every tool, edits files on disk'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true, allowed: toolsAllowed, clamp: clampTools },
+    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive'], subs: ['no tools', 'files and git reads', 'every tool'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true, allowed: toolsAllowed, clamp: clampTools },
   };
   function buildDial(which) {
     const d = DIALS[which];
