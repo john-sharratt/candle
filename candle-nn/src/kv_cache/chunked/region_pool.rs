@@ -238,8 +238,23 @@ impl Drop for RegionHandle {
 pub struct RegionStats {
     /// Regions the reservation actually claimed.
     pub total: usize,
-    /// Regions held by an arena right now.
+    /// Regions held by any tenant right now — a KV arena, a record arena, or a
+    /// span tenant such as the recurrent state store or the provenance gallery.
+    ///
+    /// **Not "held by an arena", which is what this said.** Three unlike tenants
+    /// claim from one free list, and reading this as the arena count is how the
+    /// fragmentation efficiency figure came to divide the KV pools' packed arena
+    /// count by a frontier that a recurrent state store was holding up: on
+    /// Qwen3.8-Flash-Next that reads 4% with the KV pools packed to within two
+    /// arenas of perfect. [`Self::span_tenant`] is the part that is not an arena.
     pub live: usize,
+    /// Of [`Self::live`], the regions held by a span tenant rather than an arena.
+    ///
+    /// Counted where the handles are minted rather than derived by subtracting the
+    /// arena pools' totals, because those come from a different snapshot behind a
+    /// different lock — and a figure formed by subtracting two populations is the
+    /// shape that produced the wrong reading in the first place.
+    pub span_tenant: usize,
     /// Regions claimable right now without evicting anything — the pressure
     /// signal, and the admission budget. Excludes anything the transient tier's
     /// ceiling forbids; see [`blocked`](Self::blocked).
@@ -388,6 +403,14 @@ struct RegionPool {
     /// Returned regions, lowest first (principle 5: keep live data left-packed).
     free: BinaryHeap<Reverse<usize>>,
     live: usize,
+    /// Of `live`, the regions a [`SpanRegion`] holds rather than an arena.
+    ///
+    /// Maintained by `SpanRegion`'s own construction and drop, which is the only
+    /// place a span tenant's handle is minted, so it cannot drift from the handles
+    /// that exist. What it is for is the fragmentation efficiency figure: without
+    /// it, ground a recurrent state store legitimately holds is charged to the KV
+    /// side as fragmentation nothing can pack away.
+    span_live: usize,
     peak_live: usize,
     /// Per region, whether a live [`RegionHandle`] holds it right now.
     ///
@@ -982,6 +1005,7 @@ impl RegionPool {
             next: 0,
             free: BinaryHeap::new(),
             live: 0,
+            span_live: 0,
             peak_live: 0,
             // **Epochs start at one**, so that zero can mean "never dirtied" in
             // `dirty_epoch` without colliding with a real epoch. A pristine
@@ -2545,6 +2569,20 @@ pub struct SpanRegion {
 }
 
 impl SpanRegion {
+    /// Wrap a claimed region as a span tenant's, counting it as one.
+    ///
+    /// The only constructor, so `span_live` cannot disagree with the handles that
+    /// exist — which is the property the efficiency figure needs, because it is
+    /// otherwise formed by subtracting two populations sampled behind two locks.
+    fn adopt(inner: RegionHandle) -> Self {
+        let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pool) = map.get_mut(&inner.ordinal) {
+            pool.span_live += 1;
+        }
+        drop(map);
+        Self { inner }
+    }
+
     /// Device address of the region's first byte.
     pub fn base(&self) -> u64 {
         self.inner.base()
@@ -2553,6 +2591,18 @@ impl SpanRegion {
     /// Bytes in a region — the unit this allocator deals in.
     pub const fn bytes() -> usize {
         REGION_BYTES
+    }
+}
+
+impl Drop for SpanRegion {
+    fn drop(&mut self) {
+        // Before the inner handle's own drop returns the region to the free list,
+        // and on the same lock it takes — so a reader between the two sees the
+        // region as neither a span tenant's nor free, never as both.
+        let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pool) = map.get_mut(&self.inner.ordinal) {
+            pool.span_live = pool.span_live.saturating_sub(1);
+        }
     }
 }
 
@@ -2607,7 +2657,7 @@ pub fn claim_span_region(
     // Held across the claim, so a forward cannot open between the gate and the
     // frontier moving.
     let _window = super::bump_arena::enter_arena_window(&stream, tenant)?;
-    Ok(claim_region(&stream)?.map(|inner| SpanRegion { inner }))
+    Ok(claim_region(&stream)?.map(SpanRegion::adopt))
 }
 
 /// An open arena window, for a tenant claiming SEVERAL regions at once.
@@ -2643,7 +2693,7 @@ impl SpanClaims {
 
     /// One more region, or `None` when the KV side has none spare.
     pub fn claim(&self) -> Result<Option<SpanRegion>> {
-        Ok(claim_region(&self.stream)?.map(|inner| SpanRegion { inner }))
+        Ok(claim_region(&self.stream)?.map(SpanRegion::adopt))
     }
 }
 
@@ -2760,6 +2810,7 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
     map.get(&ordinal).map(|pool| RegionStats {
         total: pool.total,
         live: pool.live,
+        span_tenant: pool.span_live,
         free: pool.free_count(),
         blocked: pool.ceiling_blocked(),
         peak_live: pool.peak_live,

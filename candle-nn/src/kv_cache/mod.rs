@@ -134,7 +134,7 @@ pub use chunked::{
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunked::{
-    production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
+    production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta, ChunkPin,
     ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
     KvErrorThresholdFactors, LLAMA2_KV_FACTOR, LLAMA3_KV_FACTOR, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
@@ -142,7 +142,7 @@ pub use chunked::{
     QWEN35_9B_KV_FACTORS, QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS,
     QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS,
 };
-pub use chunked::{rewrite_sealed, CompactionMap, RecordGeometry, Sweep};
+pub use chunked::{rewrite_sealed, CompactionMap, Sweep};
 pub use chunked::{ArenaKey, StoragePolicy};
 pub use chunked::{LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE};
 pub use rotating::{

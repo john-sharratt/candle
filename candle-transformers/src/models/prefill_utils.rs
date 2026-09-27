@@ -28,7 +28,7 @@ use crate::models::slot_state::SlotTokenLayout;
 #[cfg(feature = "cuda")]
 use candle_kernels::rope::RopeRungsFfi;
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::HeadGids;
+use candle_nn::kv_cache::ChunkPin;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -66,7 +66,7 @@ struct SlotHeaderUpload {
     /// headers address with one refcount bump per slot rather than a clone per
     /// chunk — the difference between O(1) and O(depth) on every layer of every
     /// step.
-    _pinned_gids: Vec<Arc<Vec<HeadGids>>>,
+    _pinned_gids: Vec<Arc<Vec<ChunkPin>>>,
 }
 
 /// Per-forward cache of the layer-invariant uploaded `position_map`.

@@ -90,12 +90,19 @@ impl Geometry {
 /// memory report sees it**.
 ///
 /// Every field is in regions except [`Self::denied_mib`], and together they
-/// decompose the frontier: `frontier = packed + sparsity + holes`, where sparsity is
-/// `arenas - packed` and holes is `frontier - live`. Kept as a struct rather than a
-/// tuple because the figures are only interpretable together — an efficiency
-/// percentage on its own cannot say whether the loss is air inside the arenas, which
-/// a pack removes, or free regions stranded below the frontier, which the next claim
-/// takes by itself.
+/// decompose the frontier: `frontier = packed + span + sparsity + holes`, where
+/// sparsity is `arenas - packed` and holes is `frontier - live`. Kept as a struct
+/// rather than a tuple because the figures are only interpretable together — an
+/// efficiency percentage on its own cannot say whether the loss is air inside the
+/// arenas, which a pack removes, or free regions stranded below the frontier, which
+/// the next claim takes by itself.
+///
+/// `span` is the term that is not a loss: whole regions a span tenant holds — a
+/// sequence's recurrent state store, the provenance gallery. Without it the figure is
+/// unreadable on any model that has one. Qwen3.8-Flash-Next, whose DeltaNet layers
+/// keep their state there, read 4% efficiency with the KV pools packed to within two
+/// arenas of perfect, because a few hundred regions of live recurrent state were being
+/// charged to compaction as fragmentation.
 ///
 /// All of it comes from the report and none from a second `region_stats` call, so the
 /// numerator and the denominator are one moment. See [`Composition::frontier`].
@@ -103,7 +110,7 @@ impl Geometry {
 struct Composition {
     /// What a perfect pack of the KV pools would return.
     denied_mib: usize,
-    /// `packed / frontier`, as a percentage.
+    /// `(packed + span) / frontier`, as a percentage.
     eff: usize,
     /// Arenas the GPU KV pools hold.
     arenas: usize,
@@ -111,9 +118,14 @@ struct Composition {
     packed: usize,
     /// The arena frontier at the same instant as the rows above.
     frontier: usize,
-    /// Regions held by a live arena at that instant.
+    /// Regions held by any tenant at that instant.
     live: usize,
-    /// Everything below the frontier that is not holding KV, in MiB — sparsity plus
+    /// Of `live`, the regions a span tenant holds. In use, and not packable.
+    span: usize,
+    /// Of `live`, the regions `KvHead` record arenas hold. In use, not packable, and in no
+    /// size-class row — so absent from `packed` and `arenas` both.
+    record: usize,
+    /// Everything below the frontier that is holding nothing, in MiB — sparsity plus
     /// holes. The absolute form of [`Self::eff`], and the unit the weight side
     /// actually loses.
     loss_mib: usize,
@@ -508,9 +520,9 @@ pub fn run_on_model(
         let packed: usize = report.kv.classes.iter().map(|c| c.packed_arenas).sum();
         let arenas: usize = report.kv.classes.iter().map(|c| c.arenas).sum();
         // **Every figure from the one publish, the frontier included.** Efficiency
-        // is `packed / frontier`, matching `GroundLost::efficiency_pct`: a region
-        // below the frontier costs the weight side whether it is live, sparse or
-        // free, so the live count is the wrong denominator. No frontier means
+        // is `(packed + span) / frontier`, matching `GroundLost::efficiency_pct`: a
+        // region below the frontier costs the weight side whether it is live, sparse
+        // or free, so the live count is the wrong denominator. No frontier means
         // nothing denied, so a pool at rest is fully efficient.
         //
         // Reading the frontier from `region_stats` here instead — a sample taken
@@ -519,7 +531,22 @@ pub fn run_on_model(
         // exactly like a second tenant holding ground below the frontier rather
         // than like the sampling skew it was.
         let frontier = report.kv.frontier_regions;
-        let eff = (packed * 100).checked_div(frontier).unwrap_or(100);
+        // **The span tenants are in the numerator.** They hold whole regions of live
+        // data from the same free list and no compaction can pack them, so charging
+        // them as fragmentation makes the figure measure the model's architecture
+        // rather than the pass: Flash-Next's recurrent state store alone read the gate
+        // down from 97% to 4%. Clamped because the two halves come from one publish
+        // but not from one lock, so a region released between them must not overflow.
+        // Both kinds of in-use-but-unpackable ground. `span` is a tenant's (a recurrent
+        // state store, the gallery); `record` is the `KvHead` record arenas, which appear in
+        // no size-class row because `gpu_class_stats` reports band pools only. Charging
+        // either as waste makes the figure measure the model's architecture rather than the
+        // pass — the state store alone read the gate down from 97% to 4% on Flash-Next, and
+        // record arenas cost the 30B 11 of its 62 "denied" regions.
+        let span = report.kv.span_regions;
+        let record = report.kv.record_regions;
+        let in_use = (packed + span + record).min(frontier);
+        let eff = (in_use * 100).checked_div(frontier).unwrap_or(100);
         Composition {
             denied_mib: freeable * (candle_nn::kv_cache::REGION_BYTES >> 20),
             eff,
@@ -527,7 +554,9 @@ pub fn run_on_model(
             packed,
             frontier,
             live: report.kv.live_regions,
-            loss_mib: frontier.saturating_sub(packed) * (candle_nn::kv_cache::REGION_BYTES >> 20),
+            span,
+            record,
+            loss_mib: frontier.saturating_sub(in_use) * (candle_nn::kv_cache::REGION_BYTES >> 20),
             captured_ms: report.captured_unix_ms,
         }
     };
@@ -561,7 +590,7 @@ pub fn run_on_model(
     println!("\nphase A — overlapping churn\n");
     println!(
         "   t(s)  conc  live  wmark  holes  free  weightMiB  started  retired  \
-         strag  rFront  rLive  kvArena  packed  freeableMiB  eff%"
+         strag  rFront  rLive  rSpan  kvArena  packed  freeableMiB  eff%"
     );
     while t_churn.elapsed() < Duration::from_secs(args.churn_secs) {
         std::thread::sleep(Duration::from_millis(1500));
@@ -640,7 +669,7 @@ pub fn run_on_model(
         }
         println!(
             "  {:5.1}  {:4}  {:4}  {:5}  {:5}  {:4}  {:9}  {:7}  {:7}  {:5}  \
-             {:6}  {:5}  {:7}  {:6}  {:11}  {:4}",
+             {:6}  {:5}  {:5}  {:7}  {:6}  {:11}  {:4}",
             t_churn.elapsed().as_secs_f64(),
             conc,
             g.live,
@@ -653,6 +682,7 @@ pub fn run_on_model(
             stragglers_held.load(Ordering::Relaxed),
             frag.frontier,
             frag.live,
+            frag.span + frag.record,
             frag.arenas,
             frag.packed,
             frag.denied_mib,
@@ -943,7 +973,9 @@ pub fn run_on_model(
         builder.conversation_config(),
     )?;
 
-    println!("   t(s)  frontier  live  free  weightMiB  rFront  rLive  kvArena  packed  eff%");
+    println!(
+        "   t(s)  frontier  live  free  weightMiB  rFront  rLive  rSpan  kvArena  packed  eff%"
+    );
     let t_drain = Instant::now();
     // The lowest frontier and the highest weight zone the drain reached — the pair
     // the uptake gate is judged on. Extremes rather than the final sample, because
@@ -984,7 +1016,7 @@ pub fn run_on_model(
         highest_weight_mib = highest_weight_mib.max(g.weight_mib);
         let c = frag_totals();
         println!(
-            "  {:5.1}  {:8}  {:4}  {:4}  {:9}  {:6}  {:5}  {:7}  {:6}  {:4}",
+            "  {:5.1}  {:8}  {:4}  {:4}  {:9}  {:6}  {:5}  {:5}  {:7}  {:6}  {:4}",
             t_drain.elapsed().as_secs_f64(),
             g.watermark,
             g.live,
@@ -992,6 +1024,7 @@ pub fn run_on_model(
             g.weight_mib,
             c.frontier,
             c.live,
+            c.span + c.record,
             c.arenas,
             c.packed,
             c.eff,
@@ -1059,13 +1092,15 @@ pub fn run_on_model(
 
     // ── Results ──────────────────────────────────────────────────────────────
     println!("\n=== VRAM efficiency ===\n");
-    println!("  phase                    frontier  live  kvArena  packed  eff%   lossMiB");
+    println!(
+        "  phase                    frontier  live  span  rec  kvArena  packed  eff%   lossMiB"
+    );
     // Every column of a row comes from one `Composition`, so the frontier printed
     // is the frontier the percentage was divided by.
     let row = |name: &str, c: &Composition| {
         println!(
-            "  {name:<22}  {:8}  {:4}  {:7}  {:6}  {:4}   {:7}",
-            c.frontier, c.live, c.arenas, c.packed, c.eff, c.loss_mib,
+            "  {name:<22}  {:8}  {:4}  {:4}  {:3}  {:7}  {:6}  {:4}   {:7}",
+            c.frontier, c.live, c.span, c.record, c.arenas, c.packed, c.eff, c.loss_mib,
         );
     };
     row(
@@ -1109,13 +1144,19 @@ pub fn run_on_model(
     );
 
     println!(
-        "\n  efficiency = packed / frontier — of the ground denied to the weight \
-         side, the share\n  actually holding KV. The frontier is the denominator \
-         because the frontier is what\n  the weight side loses: the tier stands above \
-         the highest live arena and\n  `weight_floor` is measured from there. The \
-         remainder splits into the two losses a\n  pack removes: air inside the \
-         arenas (kvArena - packed) and free regions stranded\n  below the frontier \
-         (frontier - live)."
+        "\n  efficiency = (packed + span + rec) / frontier — of the ground denied to \
+         the weight side,\n  the share actually holding something. The frontier is the \
+         denominator because the\n  frontier is what the weight side loses: the tier \
+         stands above the highest live\n  arena and `weight_floor` is measured from \
+         there.\n\n  `span` is whole regions a span tenant holds — a sequence's \
+         recurrent state store, the\n  provenance gallery. `rec` is the `KvHead` record \
+         arenas, which are in no size-class\n  row at all because the class stats report \
+         band pools only. Both are in use and\n  neither is packable, so they belong \
+         beside `packed` and not in the loss; charged as\n  waste they make a perfectly \
+         packed pool look fragmented.\n\n  The remainder splits into the two real \
+         losses: air inside the arenas\n  (kvArena - packed), which a pack removes, and \
+         free regions stranded below the\n  frontier (frontier - live), which only a \
+         falling frontier removes."
     );
 
     println!(

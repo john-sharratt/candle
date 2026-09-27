@@ -2199,6 +2199,14 @@ impl BatchedInferenceSession {
             watermark: stats.live_watermark,
             live_arenas: stats.live,
             packed_arenas,
+            span_regions: stats.span_tenant,
+            // In-use ground that appears in no size-class row, so a consumer summing those
+            // rows would charge it as waste. See `GroundLost::record_regions`.
+            record_regions: self
+                .backings
+                .first()
+                .map(|b| b.record_arena_regions())
+                .unwrap_or(0),
         })
     }
 

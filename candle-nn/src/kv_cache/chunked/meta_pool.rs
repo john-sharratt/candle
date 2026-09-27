@@ -14,6 +14,12 @@
 //! left here is the record *layout* — [`chunk_record_bytes`], [`band_ptr_offset`] and
 //! [`serialize_kv_heads`] — plus the handle.
 //!
+//! **A record also holds the bands it names**, and that is the property the rest of the
+//! cache leans on: its pointer words are raw addresses, so without a reference to the
+//! gids they were derived from the record is a dead copy of a fact somebody else owns —
+//! which is what let a KV compaction rewrite the gids, free the slots, and leave records
+//! reading another chunk's K/V. See [`MetaGid`] and `compact_backings`.
+//!
 //! It used to own growable `CudaSlice<u8>` slabs with a refcount table per slab: a
 //! second allocator, over ground the span partition could not account for, whose records
 //! were serialized on the host and uploaded per run. The bytes are now written on the
@@ -51,11 +57,13 @@ pub(crate) fn chunk_record_bytes(n_kv_head: usize, head_dim: usize, n_palette: u
 
 /// Byte offset of one band's 8-byte device pointer inside a chunk record.
 ///
-/// The inverse of the pointer writes in [`serialize_kv_heads`], and the reason a
-/// KV compaction can **patch** a record instead of rebuilding it: given a moved
-/// band, this says which word of the resident record names it, so the fix is one
-/// 8-byte store per moved band rather than a fresh record serialized on the host
-/// and shipped over the bus.
+/// The inverse of the pointer writes in [`serialize_kv_heads`]: given a band, this says
+/// which word of the resident record names it. Two readers, both diagnostic — the
+/// integrity check, which reads a record back and compares that word against the band's
+/// own address, and the test that holds the device fill kernel against the host
+/// serializer. **Nothing in production rewrites a record**; it used to be how a KV
+/// compaction patched one in place, and that is exactly what corrupted K/V (see
+/// `compact_backings`).
 ///
 /// `is_value` selects the V pointer over the K pointer. `p` is the band (palette)
 /// index; the gid that feeds this word is `gids[h * n_palette * 2 + p * 2 +
@@ -67,6 +75,10 @@ pub(crate) fn chunk_record_bytes(n_kv_head: usize, head_dim: usize, n_palette: u
 /// [`band_ptr_offset_agrees_with_the_serializer`](tests), which builds a real
 /// record and reads each pointer back through this — an independent copy of the
 /// layout arithmetic would be exactly the kind of second opinion that drifts.
+#[cfg_attr(
+    not(all(feature = "cuda", feature = "tensor-assert")),
+    allow(dead_code)
+)]
 pub(crate) fn band_ptr_offset(
     h: usize,
     p: usize,
@@ -284,6 +296,28 @@ pub(crate) fn serialize_kv_heads(
 ///
 /// Stored alongside `HeadGids` on `ChunkWindow` / `SealedChunk`, so a chunk's
 /// record shares the chunk's lifetime through `#[derive(Clone)]`.
+///
+/// # The record owns the bands it names
+///
+/// [`Self::bands`] is a clone of the very `HeadGids` the record's pointer words were
+/// serialized from, so **a record can never outlive the slots it describes**. That is
+/// a structural property, not a checked one: the allocator cannot reissue a band slot
+/// while any record still points at it, because the record is one of its refcount
+/// holders.
+///
+/// Without it the record was a *dead copy* of a fact the gid owned — the address
+/// `base_ptr + chunk_idx · chunk_byte_stride`, stored with no reference to the thing
+/// it was derived from — and nothing structurally stopped the copy outliving its
+/// subject. That is the general rule `CLAUDE.md` states as "a captured device address
+/// is invalidated by anything that moves what it names, and a reference count is not
+/// a location", and it is what made a KV compaction corrupt K/V: the pass rewrote the
+/// holders' gids, the source lost its last refcount, the allocator reissued that
+/// ground, and records still naming it read another chunk's K/V — finite, plausibly
+/// shaped and wrong, with nothing anywhere to fault.
+///
+/// One `Arc` bump per record, eight bytes on the handle, nothing per band: the clone
+/// shares the same `ChunkGid` objects, so each refcount lands on the arena the gid
+/// came from rather than on a reconstruction of it.
 #[derive(Clone, Debug)]
 pub struct MetaGid {
     /// The record's arena slot, which is what refcounts it. A detached record holds
@@ -291,6 +325,10 @@ pub struct MetaGid {
     /// same way on both — an `Option` here silently made `strong_count` a constant
     /// for detached records and stopped counting their clones.
     gid: ChunkGid,
+    /// The bands this record's pointer words name, held so it cannot outlive them.
+    ///
+    /// See the type note. `None` only for a detached record, which names nothing.
+    bands: Option<HeadGids>,
     /// Cached device address of this record — `arena_base + slot · stride`,
     /// resolved at allocation.
     ///
@@ -331,18 +369,37 @@ impl MetaGid {
         self.gid.strong_count()
     }
 
+    /// The bands this record's pointer words name, or `None` for a detached record.
+    ///
+    /// Held rather than derived: this is the clone that makes the record's addresses
+    /// outlive-proof. A caller comparing it against a chunk's own gids is comparing
+    /// two handles to one allocation, not two derivations of one address.
+    #[inline]
+    pub fn bands(&self) -> Option<&HeadGids> {
+        self.bands.as_ref()
+    }
+
     /// A detached record with no arena backing, for tests and diagnostic chunks
     /// that never resolve a real device record. Mirrors `ChunkGid::detached`.
     pub fn detached(id: i64) -> Self {
         Self {
             gid: ChunkGid::detached(id),
+            bands: None,
             device_addr: 0,
         }
     }
 
-    /// Wrap a freshly allocated record slot.
-    pub(super) fn from_slot(gid: ChunkGid, device_addr: u64) -> Self {
-        Self { gid, device_addr }
+    /// Wrap a freshly allocated record slot around the bands it will describe.
+    ///
+    /// `bands` must be the same `HeadGids` the record's pointer words are serialized
+    /// from — that is the whole contract, and it is what
+    /// `a_record_holds_the_bands_it_names` pins.
+    pub(super) fn from_slot(gid: ChunkGid, bands: HeadGids, device_addr: u64) -> Self {
+        Self {
+            gid,
+            bands: Some(bands),
+            device_addr,
+        }
     }
 }
 
@@ -405,7 +462,8 @@ mod tests {
     /// refcount machinery without needing a device.
     #[test]
     fn a_clone_shares_the_record_slot_and_the_last_drop_releases_it() {
-        let a = MetaGid::from_slot(ChunkGid::detached(7), 0xdead_0000);
+        let bands = HeadGids::uniform(ChunkGid::detached(11), 1);
+        let a = MetaGid::from_slot(ChunkGid::detached(7), bands, 0xdead_0000);
         assert_eq!(a.raw(), 7, "the handle's id is its slot's");
         assert_eq!(a.device_addr(), 0xdead_0000);
         assert_eq!(a.strong_count(), 1);
@@ -424,6 +482,68 @@ mod tests {
         assert_eq!(a.strong_count(), 2);
         drop(c);
         assert_eq!(a.strong_count(), 1, "the slot is still held by `a`");
+    }
+
+    /// **A record holds the bands it names, so it cannot outlive them.**
+    ///
+    /// This is the property the whole compaction design now rests on: the pass rewrites
+    /// holders' gids and leaves records alone, which is only safe because a record is
+    /// itself a refcount holder of the slots its pointer words address. Drop every
+    /// *chunk* reference to a band and the record's keeps the slot alive; drop the
+    /// record too and it goes.
+    ///
+    /// Asserted on `ChunkGid::detached`, which carries the same refcount machinery
+    /// without needing a device — the strong count is the observable, and it is the one
+    /// the allocator consults before reissuing ground.
+    #[test]
+    fn a_record_holds_the_bands_it_names() {
+        let band = ChunkGid::detached(41);
+        // Counted as deltas, not absolutes: `HeadGids::uniform` puts a clone of the gid in
+        // every `(head, palette, K/V)` slot, so the raw numbers are a property of the
+        // geometry while what is under test is *who is holding*.
+        let unheld = band.strong_count();
+        let bands = HeadGids::uniform(band.clone(), 1);
+        let held = band.strong_count();
+        assert!(held > unheld, "the gid vector holds the band");
+
+        // **The record shares the vector rather than copying the gids.** `HeadGids` is
+        // `Arc<Vec<ChunkGid>>`, so this costs one `Arc` bump and nothing per band — and
+        // the band's own count does not move, because the holder of that refcount is the
+        // vector, which is now held twice.
+        let record = MetaGid::from_slot(ChunkGid::detached(7), bands.clone(), 0xfeed_0000);
+        assert_eq!(
+            band.strong_count(),
+            held,
+            "no gid is cloned, only the vector"
+        );
+        let named = record.bands().expect("a record from_slot names bands");
+        assert!(
+            named.is_same_alloc(&bands),
+            "and it is the SAME allocation the chunk holds, not a copy of it",
+        );
+
+        // The chunk lets go — which is exactly what a compaction's gid rewrite does when
+        // it installs a fresh `HeadGids` over the old one.
+        drop(bands);
+        assert_eq!(
+            band.strong_count(),
+            held,
+            "the record still holds the vector, so the band slot is still allocated and \
+             the allocator cannot reissue this ground",
+        );
+
+        drop(record);
+        assert_eq!(
+            band.strong_count(),
+            unheld,
+            "and only when the record goes too is the band free",
+        );
+    }
+
+    /// A detached record names nothing, and says so rather than pretending to bands.
+    #[test]
+    fn a_detached_record_names_no_bands() {
+        assert!(MetaGid::detached(-1).bands().is_none());
     }
 
     /// **Every geometry in the model table must land on a record-stride rung that holds

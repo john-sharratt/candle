@@ -363,7 +363,8 @@ impl Scheduler {
             super::profile::record("compact:copy", t.copy);
             super::profile::record("compact:barrier", t.barrier);
             super::profile::record("compact:sweep", t.sweep);
-            super::profile::record("compact:patch", t.patch);
+            super::profile::record("compact:mint", t.mint);
+            super::profile::record("compact:invalidate", t.invalidate);
             super::profile::record("compact:publish", t.publish);
         }
         match outcome {
@@ -375,7 +376,17 @@ impl Scheduler {
                     target: "candle_conversation::scheduler::vram_relief",
                     moves = report.moves,
                     allocations = report.allocations_rewritten,
-                    patched = report.patched_words,
+                    // Fresh records for the relocated chunks, one batched launch. Lower
+                    // than `allocations` by however many were writer windows, which carry
+                    // no record and are addressed from their gids.
+                    minted = report.records_minted,
+                    // Non-zero means the up-front reservation under-provisioned and those
+                    // chunks' sources were not reclaimed. Correct, but degrading.
+                    records_declined = report.records_declined,
+                    record_arenas_reserved = report.record_arenas_reserved,
+                    // The pass's downstream cost: each cleared buffer is a host
+                    // re-serialisation and an upload on its slot's next sync.
+                    buffers_cleared = report.decode_buffers_cleared,
                     arenas_released = report.arenas_released,
                     frontier_before = report.frontier_before,
                     frontier_after = report.frontier_after,
@@ -391,13 +402,13 @@ impl Scheduler {
                     // that spent 80 ms working. Only visible through the profile
                     // spans otherwise, and those compile to nothing by default.
                     quiesce_us = report.timings.quiesce.as_micros(),
-                    // The relocation accounting. `patched` alone is not readable:
-                    // it sat 44% below `moves` for a whole run with three possible
-                    // causes and no way to tell them apart, only one of which is a
-                    // defect. `unwitnessed` is that one.
+                    // **The figure that says whether the pass was complete.** A relocated
+                    // slot no holder the sweep reached names: its claim is wasted, its
+                    // source is not reclaimed, and because nothing names it the census
+                    // will plan it again next pass. Not a correctness problem — every
+                    // party naming a slot keeps it alive — but the holder list is
+                    // maintained by hand and this is how a missing one shows up.
                     unwitnessed = report.unwitnessed,
-                    patch_no_record = report.patch_no_record,
-                    patch_dup_record = report.patch_dup_record,
                     // Read/write collisions declined before the launch. Non-zero is
                     // the guard working: a collision suffered corrupts a chunk
                     // silently, and this is the only line that says it was there.
@@ -408,20 +419,6 @@ impl Scheduler {
             Ok(_) => {}
             Err(candle_nn::kv_cache::CompactionRefused::WaveInFlight) => {
                 // Ordinary contention. The next pass tries again.
-            }
-            // **The pass is switched off because it corrupts K/V** — see
-            // `compact_backings`. Fragmentation therefore stands: the frontier stays
-            // where the high-water mark put it and the weight side does not get that
-            // ground back, which costs expert residency and so decode rate. That is
-            // the trade being made deliberately, and it is logged at `debug` rather
-            // than `warn` because the gate above fires every 150 ms and a warning
-            // repeated four hundred times a minute trains the reader to skip it.
-            Err(candle_nn::kv_cache::CompactionRefused::Disabled) => {
-                tracing::debug!(
-                    target: "candle_conversation::scheduler::vram_relief",
-                    "kv compaction is disabled; fragmentation stands and the weight \
-                     side keeps whatever the frontier denies it",
-                );
             }
             // **A fault is reported, not declined.** Every other arm here is "not
             // now" and belongs at `debug`, which is why this one cannot share the

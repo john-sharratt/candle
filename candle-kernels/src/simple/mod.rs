@@ -103,7 +103,6 @@ pub mod comp_idx;
 // Batched row scatter: many (source run → destination offset) copies in one
 // launch, driven by a descriptor table — the corpus-gallery append across every
 // session of a wave
-pub mod kv_ptr_patch;
 pub mod rows_scatter;
 
 // One content hash per KV slot over the bands its block tables name, folded

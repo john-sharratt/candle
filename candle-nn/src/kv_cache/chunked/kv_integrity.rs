@@ -79,6 +79,13 @@ pub struct SlotIntegrity {
     /// Reported rather than judged: a record is shared by every holder of a chunk, so
     /// a holder that is not its owner can disagree legitimately. A *rising* count
     /// across an operation is the signal; an absolute count is not.
+    ///
+    /// **A compaction has two routine sources of its own, so read it against them.** A
+    /// chunk the sweep reached but could not mint a record for (`records_declined`) keeps
+    /// gids naming the destination and a record naming the source — safe, because the chunk
+    /// is immutable and both slots are held, and a guaranteed disagreement. So is a
+    /// writer-owned chunk the sweep skipped. Neither is a defect; a rise with
+    /// `records_declined == 0` is.
     pub pointer_disagreements: usize,
 }
 
@@ -267,7 +274,7 @@ pub fn snapshot(backings: &[ChunkedKvBacking]) -> Result<IntegrityReport> {
 /// names the operation that broke them.** A check wired differently at each site
 /// cannot be compared across sites.
 ///
-/// `whence` names the boundary in the log. The three counts are the pass's own
+/// `whence` names the boundary in the log. `moves` and `unwitnessed` are the pass's own
 /// accounting, passed through so one line carries both what the pass did and what the
 /// state looks like afterwards; zero for a boundary that is not a compaction. `before`
 /// is the snapshot from the opening boundary of the same operation, against which content
@@ -282,12 +289,30 @@ pub fn snapshot(backings: &[ChunkedKvBacking]) -> Result<IntegrityReport> {
 /// the caller may be unable to abandon, and an integrity check that takes the process down
 /// while reporting "your bookkeeping is slightly wrong" is not a trade worth making.
 /// `snapshot` is there for a caller that wants to act on the numbers itself.
+///
+/// # A clean report is NOT proof that nothing is corrupt
+///
+/// Both halves are scoped, and a fault outside both scopes reads as perfect health.
+/// Measured 2026-09-27: a `KvHead` record claim promoted into a *band* arena wrote a
+/// record on top of live K/V, and this reported **zero orphans and zero content changes**
+/// on a run whose engine probe answered wrongly on six sessions of eight.
+///
+/// - [`validate_references`] asks whether a reference names ground the refcount tables
+///   call free. A record sitting in a band slot is not that: every reference involved
+///   names a live slot, and the slot's own refcount is held. Nothing is orphaned.
+/// - [`hash_slots`] covers only the bands that **live slots' block tables** name —
+///   `live_bands` walks `state.sequences`. K/V belonging to an evicted or
+///   substrate-resident chunk is outside the hash, so ground clobbered there changes no
+///   number here.
+///
+/// The engine probe's story gate is what caught it, which is the general rule: these
+/// checks narrow a fault once something else has said one exists, and they cannot be read
+/// in the other direction.
 pub fn report_boundary(
     backings: &[ChunkedKvBacking],
     whence: &str,
     moves: usize,
-    no_record: usize,
-    dup_record: usize,
+    unwitnessed: usize,
     before: Option<&IntegrityReport>,
 ) -> IntegrityReport {
     let report = match snapshot(backings) {
@@ -320,8 +345,7 @@ pub fn report_boundary(
                 .map(|s| s.pointer_disagreements)
                 .sum::<usize>(),
             moves,
-            no_record,
-            dup_record,
+            unwitnessed,
             worst = ?worst,
             "ORPHANED REFERENCES: live slots name bands the refcount tables call free, so \
              the allocator will reissue that ground while these references still point at \
@@ -338,8 +362,7 @@ pub fn report_boundary(
                 changed = changed.len(),
                 slots = report.slots.len(),
                 moves,
-                no_record,
-                dup_record,
+                unwitnessed,
                 worst = ?changed.iter().take(8).collect::<Vec<_>>(),
                 "K/V CHANGED ACROSS AN OPERATION THAT MOVES IT WITHOUT REWRITING IT: these \
                  slots read different bytes than they did at the opening boundary, so some \

@@ -80,7 +80,7 @@ use std::time::{Duration, Instant};
 use candle::Result;
 
 use super::arena::ArenaKey;
-use super::compact_map::{CompactionMap, PatchWord, RecordGeometry, Sweep};
+use super::compact_map::{CompactionMap, Sweep};
 use super::compact_plan::{plan_pool, ChunkMove};
 use super::size_class::SizeClass;
 use crate::kv_cache::ArenaLocation;
@@ -92,8 +92,6 @@ pub struct CompactionReport {
     pub moves: usize,
     /// `HeadGids` allocations rewritten. Lower than `moves` whenever holders share.
     pub allocations_rewritten: usize,
-    /// Device pointer words the patch kernel stored.
-    pub patched_words: usize,
     /// Moves this pass declined because the slot claimed for them was one it had
     /// already planned to read.
     ///
@@ -109,13 +107,31 @@ pub struct CompactionReport {
     /// be corrected. It was 129 of 6767 on one measured pass, which is how the
     /// projection caches were found to be holders nobody swept.
     pub unwitnessed: usize,
-    /// Moved bands whose holder carried no device record — a live chunk window
-    /// addressed from its block table, or a record resident on the host. Ordinary:
-    /// neither needs a patch word.
-    pub patch_no_record: usize,
-    /// Moved bands whose record an earlier holder had already emitted. Ordinary: one
-    /// record describes one chunk however many holders name it.
-    pub patch_dup_record: usize,
+    /// Fresh `KvHead` records minted for relocated chunks — one per rewritten gid
+    /// allocation that had a record, written by one batched launch.
+    ///
+    /// Lower than [`Self::allocations_rewritten`] by however many relocated chunks
+    /// carried no record: a live writer window is addressed from its gids and is given
+    /// none. Zero with a non-zero `moves` means the pass relocated only writer windows.
+    pub records_minted: usize,
+    /// Relocated chunks that wanted a fresh record and could not have one, because the
+    /// pre-provisioned record slots ran out mid-sweep.
+    ///
+    /// Correct but degraded: each keeps the record it has, which still names its source
+    /// and still holds it alive, so nothing is reclaimed for that chunk. A standing
+    /// non-zero reading means the reservation is under-provisioning.
+    pub records_declined: usize,
+    /// Record arenas the pass created up front so the sweep would not have to.
+    pub record_arenas_reserved: usize,
+    /// Cached decode buffers thrown away because a mint moved record addresses, *beyond*
+    /// the ones the holder rewrite already cleared.
+    ///
+    /// **Zero on every measured run, and that is the healthy reading**: a record is minted
+    /// only for a chunk whose gids were rewritten, and rewriting a slot's gids clears its
+    /// buffer, so the pass-wide sweep finds nothing left. A non-zero reading means that
+    /// coupling has broken — a record replaced without its slot being rewritten — which is
+    /// a header pointing at a reissued record slot.
+    pub decode_buffers_cleared: usize,
     /// Arenas released afterwards, and so regions handed back.
     pub arenas_released: usize,
     /// The frontier before and after, in regions — the figure the pass exists to
@@ -158,10 +174,16 @@ pub struct CompactionTimings {
     /// The barrier between the copies and the records that will name their
     /// destinations.
     pub barrier: Duration,
-    /// Rewriting every holder's gids — this crate's block tables, then the caller's.
+    /// Rewriting every holder's gids — this crate's block tables, then the caller's —
+    /// and claiming a record slot for each rewritten chunk that had one.
     pub sweep: Duration,
-    /// Uploading the patch words and launching the band-pointer store.
-    pub patch: Duration,
+    /// The one launch that writes every minted record's bytes.
+    pub mint: Duration,
+    /// Throwing away every slot's cached decode buffer after a mint moved record
+    /// addresses. Timed apart from [`Self::mint`] because it is a lock and a host walk per
+    /// backing rather than a launch, and charging it to the fill would make a slow
+    /// invalidation read as a slow kernel.
+    pub invalidate: Duration,
     /// The device-wide sync, and releasing the arenas the pass emptied.
     pub publish: Duration,
 }
@@ -279,10 +301,6 @@ pub fn compaction_tally() -> CompactionTally {
 /// rewritten, nothing freed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionRefused {
-    /// **The pass is switched off, because it corrupts K/V.** See
-    /// [`compact_backings`] for the evidence and for what has to be true before it
-    /// runs again.
-    Disabled,
     /// A forward owns the partition. Ordinary between-forwards contention; the
     /// caller notes it and comes back.
     WaveInFlight,
@@ -314,12 +332,21 @@ pub enum CompactionRefused {
     /// The pre-rewrite barrier failed, with the same consequence as
     /// [`Self::CopyFailed`].
     BarrierFailed,
-    /// A backing's own block tables could not be rewritten.
-    HolderRewriteFailed,
-    /// The caller's sweep failed. Its holders still name the old slots, which are
-    /// still live and still hold the bytes, so the pool is left consistent but
-    /// unpacked.
-    SweepFailed,
+    /// The holder sweep failed part-way — either a backing's own block tables or the
+    /// caller's residences.
+    ///
+    /// **Partially applied, fully published, nothing released.** The sweep installs in
+    /// place, so everything it reached before the error holds its new gids and its new
+    /// record; the pass therefore fills those records, invalidates the cached decode
+    /// buffers and fences before returning this, and skips only the release of emptied
+    /// arenas. What is left is sound for the same reason an unreached holder is — each
+    /// side names ground it keeps alive — and what is lost is the reclaim.
+    ///
+    /// One variant for both halves because they now have identical consequences; it was
+    /// two while a refusal here could still claim "nothing published", which stopped being
+    /// true when the sweep started minting records. Carries the message because a caller
+    /// reports this rather than logging it.
+    SweepFailed(String),
     /// **Not a refusal — a partition invariant broke while planning.** The pass is
     /// abandoned at the same safe point a refusal abandons it (claims are host-only
     /// and the copy has not launched, so nothing is copied, rewritten or freed), but
@@ -392,57 +419,93 @@ struct CopyRecords {
 /// block tables are these backings') passes a closure that does nothing. That is a
 /// statement about that caller, not a default.
 ///
-/// # The pass does not run: it corrupts K/V
+/// # The pass rewrites gids, and MINTS a record — it never rewrites one
 ///
-/// Every call returns [`CompactionRefused::Disabled`] before touching anything. The
-/// machinery below is complete and is kept whole deliberately — it is what the fix
-/// has to be made against, and it carries the instrumentation that found the fault.
+/// A chunk's location is written down twice: in the `ChunkGid`, which holds the arena
+/// slot's refcount, and in the `KvHead` record's band-pointer word, which is the
+/// address the paged kernels dereference. Both are published, and neither is *patched*.
 ///
-/// **What goes wrong.** A chunk's location is written down twice: in the `ChunkGid`,
-/// which holds the arena slot's refcount, and in the `KvHead` record's band-pointer
-/// word, which is the address the paged kernels dereference. This pass rewrites both,
-/// and leaves behind records whose pointer names a slot no gid holds. Only the gid
-/// keeps a slot alive, so that slot is free: the allocator reissues it, correctly, as
-/// a later pass's destination and writes another chunk's K/V into it. The band then
-/// reads finite, plausibly-shaped, wrong values.
+/// The gids are rewritten through their holders, because a gid is an owning handle. A
+/// relocated chunk is then given a **freshly minted** record built from its new gids
+/// ([`RecordMint`](super::compact_mint::RecordMint)), and the record it had is left
+/// exactly as it is for whoever still holds it. Two properties make each side sound on
+/// its own:
 ///
-/// **The measurements**, from Qwen3.8-Flash-Next with compaction on and the
-/// `tensor-assert` harness in place. Zero orphaned gids against eight orphaned
-/// records, so the gid side is sound and the record side is not. Seven of seven
-/// clobbered addresses were written by the pass itself as destinations, five of those
-/// seven with the record's pointer unchanged across the pass. The pool is
-/// self-consistent throughout — no slot is double-allocated — which is why nothing
-/// faults and nothing downstream of the pass can see it.
+/// * A record holds a clone of the `HeadGids` its words were serialized from (see
+///   [`MetaGid`](super::meta_pool::MetaGid)), so **a record cannot outlive the bands it
+///   names** — the allocator will not reissue a band slot while a record points at it,
+///   because the record is one of that slot's refcount holders.
+/// * So the rewritten holders name the destination and read a record naming the
+///   destination; the holders the sweep did not reach name the source and read a record
+///   naming the source, which their own record keeps alive. Neither had to be *found*.
 ///
-/// **Why it is fatal on a recurrent model and survivable elsewhere.** Wrong K/V puts
-/// a NaN in the first full-attention layer; a DeltaNet layer then computes its
-/// recurrent state from that NaN and the state is *persisted*, so the next wave's
-/// logits are entirely NaN and the model emits `!!!!!!!!` forever. The 30B survives
-/// the identical wrong K/V because it has no recurrent state to persist it into.
+/// Installing the minted record drops the old one, and when that was the chunk's last
+/// holder the old record's slot frees — taking with it the clone of the *old* gids it was
+/// holding, which is the last reference to the source bands. That is what lets
+/// `release_empty_arenas` hand the region back, and it is the whole reclaim.
 ///
-/// **What re-enabling requires.** Not a repair at a call site: the two recordings have
-/// to stop being able to disagree. `KvHead` records need to move into an arena so they
-/// are walkable and relocatable, and the patch has to be driven from that walk rather
-/// than from a per-holder sweep that can visit a record twice or not at all — the
-/// design is in `docs/vram_span_partition.md`. The gate for turning this back on is
-/// the check already wired here: `kv_integrity::report_boundary` must report zero
-/// orphaned records and an unchanged content hash across a pass, over a run long
-/// enough to compact many times.
+/// A **live writer window** carries no record (`meta: None`), is addressed from its own
+/// gids, and has its cached decode buffer thrown away — so it reads and writes the
+/// destination, consistently, and is never given a record. `sealed ⇒ has a record ⇒
+/// immutable` and `live ⇒ meta: None` is the invariant that keeps a written chunk and a
+/// record-read chunk from being the same chunk; `set_block_gids` enforces it from the
+/// other side by clearing `meta` on any gid mutation, and
+/// `a_writer_owned_chunk_with_a_record_is_left_alone` pins the pass's own half.
+///
+/// ## What a mint moves, and what must therefore be dropped
+///
+/// A mint changes a **record's** address. A band's address is owned — by the record — but
+/// a record's own address is cached as a bare `kvheads_ptr` word in every `TokenSlice`
+/// header of every slot's decode buffer, and that buffer is reused whenever the chunk
+/// *count* agrees, which a compaction never changes. `rewrite_for_compaction` clears the
+/// buffer of each slot whose own chunks moved, which is the set whose *band* addresses
+/// changed and is not provably the set whose *record* addresses changed. So a pass that
+/// minted anything clears every slot's buffer in every backing.
+///
+/// ## Why the previous design corrupted K/V
+///
+/// The pass used to rewrite the records too, and with a record owning nothing it could
+/// not be made correct either way round. **A chunk has exactly one record, shared by
+/// every holder of that chunk**, so a pass that rewrites some of a chunk's holders to
+/// the destination and leaves the rest on the source has no correct value to put in
+/// that word: whichever slot it names is kept alive only by the holders naming the same
+/// slot, and when those go the others are still reading through the record into
+/// re-tenanted ground. Patching to the destination, patching to the source and leaving
+/// it alone were all wrong — leaving it alone only became right once the record started
+/// holding a refcount.
+///
+/// Measured on Qwen3.8-Flash-Next with the `tensor-assert` harness: zero orphaned gids
+/// against 148 orphaned records already present when a pass *began*, 4,320 pointer/gid
+/// disagreements on two slots, and an engine probe answering 8/8, 5/8, 8/8, 5/8 against
+/// 8/8 twice with the pass off. It was fatal on a recurrent model and survivable
+/// elsewhere: wrong K/V puts a NaN in the first full-attention layer, a DeltaNet layer
+/// computes its *persisted* recurrent state from it, and every later wave's logits are
+/// NaN, so the model emits `!!!!!!!!` forever. The 30B ate the identical wrong K/V,
+/// because it has no recurrent state to keep it in.
+///
+/// Three more faults were paid for on the way, each found by correlating a log line
+/// against the story gate rather than by inspection, and each worth knowing because the
+/// shape recurs: a record claim **promoted into a band arena** and filled over live K/V
+/// (`stamp_region_promoting` widens the size class, and `ArenaKey::new` is always a band
+/// key); a record claim **creating or releasing an arena mid-sweep**, which re-tenants an
+/// `arena_idx` that half-rewritten holders still name — `arena slot: 2176 B requested from
+/// a 1152 B slot`, 198/92/114 times on corrupt runs against 0 on clean ones; and
+/// `Sweep::memo` keyed on `Arc::as_ptr` while minting made originals die mid-sweep, so a
+/// replacement could land on a dead original's address and a second visit was handed
+/// another chunk's gids.
+///
+/// `kv_integrity::report_boundary` is wired at both boundaries below under
+/// `tensor-assert` and remains the standing check — but **it cannot see most of this
+/// class**: it reported zero orphans and zero content changes on a run that answered 2/8,
+/// because nothing was orphaned and its hash covers only bands that *live* slots' block
+/// tables name. The engine probe's story gate is the oracle, and one clean run means
+/// nothing: require several consecutive.
 #[cfg(feature = "cuda")]
 pub fn compact_backings(
     backings: &[super::backing::ChunkedKvBacking],
     budget: Duration,
     sweep: &mut dyn FnMut(&mut Sweep<'_>) -> Result<()>,
 ) -> std::result::Result<CompactionReport, CompactionRefused> {
-    /// Whether the pass may run. **False, because it corrupts K/V** — the header
-    /// above has the evidence and the condition for flipping it back.
-    const ENABLED: bool = false;
-    // Refused before the attempt is counted: a pass that is switched off is not an
-    // attempt that failed, and tallying it would put a denominator under a rate
-    // nothing is measuring.
-    if !ENABLED {
-        return Err(CompactionRefused::Disabled);
-    }
     note(0, 1);
     let Some(first) = backings.first() else {
         note(4, 1);
@@ -471,15 +534,11 @@ pub fn compact_backings(
         Err(CompactionRefused::MigrateInFlight) => note(10, 1),
         Err(CompactionRefused::AlreadyPacked) => note(3, 1),
         Err(CompactionRefused::NoDevice) => note(4, 1),
-        // `compact_with` never produces this: the switch at the top of this function
-        // returns before the pass is attempted, so nothing reaches the tally.
-        Err(CompactionRefused::Disabled) => {}
         Err(
             CompactionRefused::ClaimsLost
             | CompactionRefused::CopyFailed
             | CompactionRefused::BarrierFailed
-            | CompactionRefused::HolderRewriteFailed
-            | CompactionRefused::SweepFailed
+            | CompactionRefused::SweepFailed(_)
             | CompactionRefused::Fault(_),
         ) => note(9, 1),
     }
@@ -746,7 +805,7 @@ impl super::backing::ChunkedKvBacking {
         // the harness rather than standing in the pass.
         #[cfg(feature = "tensor-assert")]
         let entering =
-            super::kv_integrity::report_boundary(backings, "entering a compaction", 0, 0, 0, None);
+            super::kv_integrity::report_boundary(backings, "entering a compaction", 0, 0, None);
 
         report.timings.claim = phase.elapsed();
         phase = Instant::now();
@@ -817,178 +876,245 @@ impl super::backing::ChunkedKvBacking {
         phase = Instant::now();
 
         // ── Rewrite every holder: ours, then the caller's ────────────────────
-        // **The band count comes from the backing, not from the GQA constant.**
-        //
-        // `n_palette()` is `LATENT_N_BANDS` on a single-latent backing and
-        // `N_PALETTE` for GQA, and its own doc says it drives the KvHead record
-        // layout, which is exactly what `emit_patch` indexes. Hardcoding the GQA
-        // constant is correct for GQA and silently wrong for the latent path: the
-        // record stride and every band offset would be computed for a quarter of the
-        // bands there, so the patch would write correct addresses into the wrong
-        // words — over the palette, format and scale fields of an earlier head — and
-        // leave the upper bands naming vacated slots. Neither shows up as a fault,
-        // and the patch verifier cannot see it either, because each word does hold
-        // the value it was given.
-        let geometry = RecordGeometry {
-            n_kv_head: self.n_kv_head(),
-            head_dim: self.head_dim(),
-            n_palette: self.n_palette(),
+        // Gids, and a freshly minted record for each rewritten chunk that had one. No
+        // record is ever rewritten — see the header.
+        let mut mint = match super::compact_mint::RecordMint::new(self) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(
+                    target: "candle_nn::kv_cache::compact",
+                    "compaction cannot mint records at this geometry, abandoning the pass \
+                     before anything is published: {e}",
+                );
+                return Err(CompactionRefused::Fault(e.to_string()));
+            }
         };
-        let mut sweep_state = Sweep::new(&map, geometry);
+        // **Every record arena this pass needs is created HERE, before a single holder is
+        // touched.** A record claim that had to create an arena mid-sweep would register
+        // one, and a registration can re-tenant an `arena_idx` that holders the sweep has
+        // not reached are still naming — after which their gids resolve against an arena
+        // of the wrong stride. That is what `arena slot: 2176 B requested from a 1152 B
+        // slot` was, 198 of them on a run that answered 1/8 against none on the runs that
+        // answered 8/8. `map.len()` is the upper bound on mints, so this over-provisions
+        // by design.
+        if let Some(m) = mint.as_mut() {
+            // **Bounded by the chunk count, not the move count.** One record per relocated
+            // chunk, and a chunk covers `n_kv_head · n_palette · 2` bands — so `map.len()`
+            // over-provisions by up to that factor, and every extra arena is a *region*
+            // claimed from the same free list. With no hole below the frontier that claim
+            // lands above it and raises the number the pass exists to lower, which is
+            // exactly why `lowest_hole_destination` refuses in the same situation. Rounded
+            // up, and at least one, so a small pass still provisions.
+            let bands_per_chunk = (self.n_kv_head() * self.n_palette() * 2).max(1);
+            let want = map.len().div_ceil(bands_per_chunk).max(1);
+            if let Err(e) = m.reserve(self, want) {
+                tracing::error!(
+                    target: "candle_nn::kv_cache::compact",
+                    "compaction could not provision record slots, abandoning the pass \
+                     before anything is published: {e}",
+                );
+                return Err(CompactionRefused::Fault(e.to_string()));
+            }
+        }
+        let mut sweep_state = match mint.as_mut() {
+            Some(m) => Sweep::with_mint(&map, m, self),
+            None => Sweep::new(&map),
+        };
         // **Every backing, one sweep.** Sharing the `Sweep` across them is not an
         // optimisation: layers routinely hold the SAME `HeadGids` allocation, so a
         // per-backing sweep would give each its own equal-but-distinct replacement
         // and the refcounts would then disagree with the sharing the cache believes
         // exists.
-        for b in backings {
-            if let Err(e) = b.rewrite_own_holders(&mut sweep_state) {
-                tracing::error!(
-                    target: "candle_nn::kv_cache::compact",
-                    "compaction could not rewrite a backing's block tables: {e}",
-                );
-                return Err(CompactionRefused::HolderRewriteFailed);
-            }
-        }
-        if let Err(e) = sweep(&mut sweep_state) {
-            // The caller could not finish. Its holders still name the old slots,
-            // which are still live and still hold the bytes — so refusing here
-            // leaves a consistent, if unpacked, pool. This is the branch that
-            // exists so an incomplete sweep is a refusal and not a corruption.
+        // **A sweep that fails part-way has PUBLISHED part-way, and the records it
+        // minted still need their bytes.**
+        //
+        // `rewrite_own_holders` mutates each backing's block tables in place, and the
+        // caller's closure installs per residence, so an error on backing *k* or
+        // residence *k* leaves everything before it holding fresh `MetaGid`s — whose
+        // slots are filled only by the batched launch below. Returning here without
+        // that launch would leave live chunks pointing at record slots holding the
+        // previous tenant's record: well-formed band pointers into ground that has
+        // since been freed and reissued, which is the original corruption exactly.
+        //
+        // So the outcome is *captured* and the fill, the invalidation and the fence all
+        // run regardless; only the release of the emptied arenas is skipped. What that
+        // leaves is a partially-applied pass, and a partially-applied pass is sound for
+        // the same reason an unreached holder is: the holders that were rewritten name
+        // destinations and carry records naming destinations, the holders that were not
+        // name sources and carry records naming sources, and each side keeps its own
+        // ground alive. The comment this replaces claimed "nothing published", which was
+        // true before a sweep minted anything.
+        let swept_ok = backings
+            .iter()
+            .try_fold((), |_, b| {
+                b.rewrite_own_holders(&mut sweep_state).map(|_| ())
+            })
+            .and_then(|_| sweep(&mut sweep_state));
+        if let Err(e) = &swept_ok {
             tracing::error!(
                 target: "candle_nn::kv_cache::compact",
-                "caller's sweep failed; compaction abandoned with nothing published: {e}",
+                "compaction's holder sweep failed part-way; publishing what it installed \
+                 and releasing nothing: {e}",
             );
-            return Err(CompactionRefused::SweepFailed);
         }
-        // **Every relocated slot must be named by a holder this sweep rewrote.**
+        // **Relocated slots no holder this sweep reached names.**
         //
-        // The pass is about to free the sources. That is sound only if nothing still
-        // points at them, and the sweep is what makes it so — it walks the backings'
-        // block tables and the caller's residences and rewrites each gid it finds.
-        // A holder it does not reach keeps naming the source, the source is handed to
-        // the next claim, and the stale holder then reads another sequence's KV:
-        // finite, plausibly shaped and wrong, which is why it surfaces as a NaN many
-        // layers later rather than as a fault.
-        //
-        // Counted against the destinations rather than against `patched_words`,
-        // because those are different questions. A live chunk window carries no
-        // device record and contributes no patch word, so `patched < moves` is
-        // ordinary and says nothing. A destination no holder named at all is not
-        // ordinary.
+        // Pure reclaim accounting now, not a correctness proxy. Nothing is freed by
+        // this pass unless every party naming it let go, and the records let go only
+        // when their chunk does — so an unreached holder costs the ground it is sitting
+        // on and cannot cost correctness. Counted because the holder list is maintained
+        // by hand and a new holder nobody sweeps is otherwise invisible: a rising
+        // reading is how one is discovered.
         report.unwitnessed = sweep_state.unwitnessed(&map).len();
-        let (no_record, dup_record) = sweep_state.patch_skips();
-        report.patch_no_record = no_record;
-        report.patch_dup_record = dup_record;
         if report.unwitnessed != 0 {
-            // **Reported, not fatal, and the distinction is honest rather than
-            // lenient.** An unwitnessed destination is certainly a defect: the pass
-            // claimed a slot, copied into it, and no holder it reached names the
-            // result, so the claim is wasted and the source's holder will never be
-            // corrected. Whether it is also *corruption* is a separate question this
-            // check cannot answer — the unreached holder still owns a `ChunkGid`, so
-            // its source keeps a refcount and the pool cannot re-tenant that slot,
-            // which is the very thing corruption would require.
-            //
-            // Killing the daemon over a fault whose severity is unestablished would
-            // be the wrong trade, and so would staying silent. It is counted on the
-            // report and logged at `error` with its attribution.
             tracing::error!(
                 target: "candle_nn::kv_cache::compact",
                 moved = map.len(),
                 unwitnessed = report.unwitnessed,
                 "compaction relocated slots no holder it reached names — the sweep's \
                  holder set is incomplete, so those claims are wasted and their \
-                 sources will never be rewritten",
+                 sources are not reclaimed",
             );
         }
         report.allocations_rewritten = sweep_state.allocations_rewritten();
         report.timings.sweep = phase.elapsed();
         phase = Instant::now();
 
-        // ── Patch the device records, then fence ─────────────────────────────
-        let words = sweep_state.into_patch_words();
-        report.patched_words = words.len();
-        // **Past this line the pass has committed, so a failure here is fatal and
-        // not a refusal.**
+        // ── Fill the minted records, in one launch ───────────────────────────
+        // **Every rewritten chunk already holds its new record; this writes the bytes.**
+        // The slots were claimed during the sweep (host-only) so the holder could install
+        // the handle in the same visit, and the fill is batched to here because it is a
+        // device launch and there is exactly one per pass however many records were
+        // minted.
         //
-        // Every holder above has already had its gids rewritten in place — the
-        // block tables and the caller's sealed sequences now name the destination
-        // slots. The device records are the other half of that same publish, and
-        // the patch is what performs it. If it does not happen:
+        // Ordered before the barrier below deliberately: that barrier is what makes these
+        // writes visible to every other stream, and `release_empty_arenas` after it hands
+        // back the regions the old records' deaths just emptied. Nothing reads a minted
+        // record in between — the pass holds the arena window, so no forward is in flight.
         //
-        // - the records still name the source bands, while every holder names the
-        //   destinations, and
-        // - `release_empty_arenas` below then frees the sources, so the records
-        //   point into ground the pool has handed back.
-        //
-        // There is nothing to return to. The rewrite is not undoable — it installed
-        // replacements across backings, the substrate and the projection caches
-        // sharing one allocation — so reporting a refusal would claim "nothing
-        // published" of a pool that is already half published, and the reader of
-        // that lie is a scheduler that will go on decoding from it. Wrong attention
-        // on every layer, no fault, discovered as a wrong answer.
-        //
-        // So it fails loudly instead. This is the same judgement as the sweep
-        // branch above — an incomplete pass must never be mistaken for a complete
-        // one — but the branch above can still refuse because it runs *before*
-        // anything is installed, and this one cannot.
-        if let Err(e) = self.patch_band_pointers(&words) {
-            panic!(
-                "compaction published {} relocations and then could not patch the \
-                 {} band pointers naming them: {e}. Every holder now names the \
-                 destination slots while the device records still name the sources, \
-                 and the rewrite cannot be undone — continuing would decode from \
-                 records pointing at ground this pass is about to release.",
-                map.len(),
-                words.len(),
-            );
+        // Fatal rather than a refusal, for the same reason the barrier is: every holder's
+        // gids and record have already been installed, so there is nothing to return to.
+        // A record left unfilled holds whatever its slot held before, which is another
+        // chunk's record or uninitialised ground.
+        drop(sweep_state);
+        if let Some(m) = mint.as_mut() {
+            report.records_declined = m.declined();
+            report.record_arenas_reserved = m.reserved_arenas();
+            if report.records_declined != 0 {
+                // Correct but degraded: those chunks keep the record they have, which
+                // still names their source and still holds it alive, so nothing is
+                // reclaimed for them. A standing non-zero reading means the reservation
+                // is under-provisioning.
+                tracing::warn!(
+                    target: "candle_nn::kv_cache::compact",
+                    declined = report.records_declined,
+                    minted = m.len(),
+                    "compaction ran out of pre-provisioned record slots mid-sweep; those \
+                     chunks keep their old records and their sources are not reclaimed",
+                );
+            }
+            match m.flush(self) {
+                Ok(n) => report.records_minted = n,
+                Err(e) => panic!(
+                    "compaction published {} relocations and then could not fill the {} \
+                     records it minted for them: {e}. Those holders now name records whose \
+                     bytes were never written, so the paged kernels would dereference \
+                     whatever the slots held before.",
+                    map.len(),
+                    m.len(),
+                ),
+            }
         }
 
-        report.timings.patch = phase.elapsed();
+        // **A mint moved record addresses, so every cached one is dropped.**
+        //
+        // A `kvheads_ptr` is a *record's* address, cached in a slice header and owned by
+        // nothing, so a mint invalidates every buffer holding one. Today that set is
+        // already covered: a record is minted only for a chunk whose gids were rewritten,
+        // and `rewrite_for_compaction` clears the buffer of every slot that rewrote
+        // anything — which is why this measures `decode_buffers_cleared = 0` on every run.
+        //
+        // It is kept because the two sets are equal by a *coupling* — mint iff gids moved —
+        // and not by construction. A future path that replaces a record without moving
+        // gids would break it silently, and the failure is a header dereferencing a record
+        // slot the pool has since reissued: another chunk's band pointers, finite and
+        // plausible, with nothing to fault. One lock per backing per minting pass buys the
+        // guarantee, and the counter beside it is what would show the coupling breaking.
+        report.timings.mint = phase.elapsed();
         phase = Instant::now();
 
-        // No separate invalidation step: `SequenceState::rewrite_for_compaction`
-        // throws away its own cached decode buffer when it moves anything, which is
-        // what makes the step impossible to omit rather than merely documented.
+        if report.records_minted > 0 {
+            for b in backings {
+                match b.invalidate_all_decode_buffers() {
+                    Ok(n) => report.decode_buffers_cleared += n,
+                    Err(e) => panic!(
+                        "compaction minted {} records and then could not invalidate the \
+                         cached decode buffers naming the old ones: {e}. Those buffers hold \
+                         `kvheads_ptr` words pointing at record slots this pass has already \
+                         released, so the next forward would read another chunk's band \
+                         pointers.",
+                        report.records_minted,
+                    ),
+                }
+            }
+        }
+
+        report.timings.invalidate = phase.elapsed();
+        phase = Instant::now();
+
+        // Two invalidations, and both are needed. `SequenceState::rewrite_for_compaction`
+        // throws away its own slot's cached decode buffer as it rewrites, which is what
+        // makes *that* step impossible to omit rather than merely documented; the
+        // pass-wide sweep above covers the slots whose buffers went stale because a
+        // record's address moved rather than a band's.
 
         // Device-wide, not per-stream: one barrier at between-forwards cadence
         // buys the removal of the entire overlap failure domain, side streams this
         // module does not know about included.
-        // Fatal for the same reason as the patch above, and one step worse: this
-        // barrier is what makes the copies and the patch visible to every other
-        // stream before the next line hands their source ground back. Carrying on
-        // without it releases regions while kernels may still be reading them, and
-        // the pool's next tenant then zeroes ground a live reader is in — which
-        // reports as an illegal address in some unrelated kernel, or as nothing at
-        // all.
+        // **Fatal, not a refusal: the gid rewrite above is already published.** This
+        // barrier is what makes the copies visible to every other stream before the
+        // next line hands any emptied region back. Carrying on without it releases
+        // regions while kernels may still be reading them, and the pool's next tenant
+        // then zeroes ground a live reader is in — which reports as an illegal address
+        // in some unrelated kernel, or as nothing at all.
         if let Err(e) = self.device().synchronize() {
             panic!(
                 "compaction published {} relocations and then could not fence them: \
-                 {e}. The copies and the band-pointer patch are not known to have \
-                 retired, and the next step returns their source regions to the \
-                 pool — releasing ground that may still have readers.",
+                 {e}. The copies are not known to have retired, and the next step \
+                 returns emptied regions to the pool — releasing ground that may still \
+                 have readers.",
                 map.len(),
             );
         }
 
         // **Every reference the pass leaves behind, re-checked now that it has
         // published, and every slot's content against what it held on the way in.** An
-        // orphan count that rose across the pass means it rewrote gids and did not update
-        // every record that named them, which is the fault that frees a slot while a
-        // record still points at it. A content hash that moved means that fault has
-        // already been cashed in: some party is reading ground another chunk now owns.
+        // orphan count that rose across the pass means some party names a slot the
+        // refcount tables call free — which a record now cannot, because it holds one of
+        // those refcounts, so a rise here is a *gid* holder nobody swept. A content hash
+        // that moved means it has already been cashed in: something is reading ground
+        // another chunk now owns.
         #[cfg(feature = "tensor-assert")]
         super::kv_integrity::report_boundary(
             backings,
             "after a compaction",
             report.moves,
-            report.patch_no_record,
-            report.patch_dup_record,
+            report.unwitnessed,
             Some(&entering),
         );
 
-        // The old slots' gids died with the replacements installed above, so the
-        // arenas they emptied are tombstoneable now.
+        // **Nothing is released after a part-way sweep.** Everything above has been
+        // published and fenced, so the pool is consistent — but the holders the sweep did
+        // not reach still name sources, and handing regions back is the one step that
+        // depends on having reached all of them. Refusing here costs the reclaim and
+        // nothing else.
+        if let Err(e) = swept_ok {
+            return Err(CompactionRefused::SweepFailed(e.to_string()));
+        }
+
+        // Whatever the replacements above emptied is tombstoneable now. A source a
+        // surviving holder or its record still names is NOT empty, so this reclaims only
+        // the chunks nothing is left pointing at.
         report.arenas_released = self.release_empty_arenas().unwrap_or(0);
         report.frontier_after = self.frontier_regions().unwrap_or(frontier_before);
         report.timings.publish = phase.elapsed();
@@ -1446,84 +1572,6 @@ impl super::backing::ChunkedKvBacking {
             }
         }
         Ok(touched)
-    }
-
-    /// Store each patch word with the device kernel, in one launch.
-    ///
-    /// Only the table crosses the bus. The alternative — `build_meta_records` per
-    /// moved chunk — serialises a whole record on the host and ships it, which for
-    /// a few thousand moves is a few thousand small uploads.
-    #[cfg(feature = "cuda")]
-    fn patch_band_pointers(&self, words: &[PatchWord]) -> Result<()> {
-        if words.is_empty() {
-            return Ok(());
-        }
-        let candle::Device::Cuda(cuda) = self.device() else {
-            return Ok(());
-        };
-        use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
-        use candle::cuda_backend::kernels;
-
-        // Two arrays, one upload each: the only thing that crosses the bus for the
-        // whole patch. Everything else is written by the kernel in place.
-        let addrs: Vec<u64> = words.iter().map(|w| w.addr).collect();
-        let vals: Vec<u64> = words.iter().map(|w| w.value).collect();
-        let d_addrs = cuda.memcpy_stod(&addrs)?;
-        let d_vals = cuda.memcpy_stod(&vals)?;
-        let stream = cuda.cuda_stream();
-        let (a, _ga) = d_addrs.device_ptr(&stream);
-        let (v, _gv) = d_vals.device_ptr(&stream);
-        candle::set_kernel_breadcrumb("run_kv_ptr_patch", file!(), line!());
-        unsafe {
-            kernels::simple::kv_ptr_patch::run_kv_ptr_patch(
-                a as *const u64,
-                v as *const u64,
-                words.len() as i32,
-                stream.cu_stream() as *mut std::ffi::c_void,
-            );
-        }
-
-        // **"The patch ran" is not evidence that it landed. This is.**
-        //
-        // The verifier was written with the patch and never called, while both its
-        // FFI doc and its `.cu` header claimed it backed "the compaction's own
-        // self-check". Nothing checked anything: the launch is asynchronous and
-        // unchecked, and a band pointer left stale does not fault — every address in
-        // the reservation is mapped, so the record reads whatever now occupies the
-        // vacated slot. It surfaces as a wrong number many layers downstream, in a
-        // different subsystem, long after the pass that caused it returned "ok".
-        //
-        // One launch and one 4-byte readback per pass, at between-forwards cadence,
-        // on a path that already synchronises the device twice. Cheap enough to be
-        // unconditional, and being unconditional is the point — a proof compiled out
-        // of the build where the fault happens proves nothing.
-        let mut d_bad = cuda.memcpy_stod(&[0u32])?;
-        {
-            let (b, _gb) = d_bad.device_ptr_mut(&stream);
-            candle::set_kernel_breadcrumb("run_kv_ptr_verify", file!(), line!());
-            unsafe {
-                kernels::simple::kv_ptr_patch::run_kv_ptr_verify(
-                    a as *const u64,
-                    v as *const u64,
-                    words.len() as i32,
-                    b as *mut u32,
-                    stream.cu_stream() as *mut std::ffi::c_void,
-                );
-            }
-        }
-        let bad = cuda.memcpy_dtov(&d_bad)?;
-        let stale = bad.first().copied().unwrap_or(0);
-        if stale != 0 {
-            candle::bail!(
-                "compaction patched {} band pointers and {stale} of them do not hold \
-                 the value they were given. Those records still name the slots this \
-                 pass is about to free, so the next claim re-tenants that ground and \
-                 the record reads another sequence's KV — finite, plausibly shaped \
-                 and wrong, with no fault anywhere.",
-                words.len(),
-            )
-        }
-        Ok(())
     }
 }
 

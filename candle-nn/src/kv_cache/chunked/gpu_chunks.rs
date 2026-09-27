@@ -17,6 +17,7 @@
 //! changes, and the host never waits for the GPU to reach an upload.
 
 use super::head_gids::HeadGids;
+use super::meta_pool::MetaGid;
 use super::slot_state_arena::{self, SlotStateSlot};
 use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
@@ -27,6 +28,36 @@ use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream};
 use candle::cuda_backend::WrapErr;
 use candle::quantized::pinned_staging::{give_recycled_wc, take_recycled_wc, PinnedBuf};
 use std::sync::Arc;
+
+/// Everything one serialised chunk's headers dereference, held alive for the life of
+/// any launch that reads them.
+///
+/// Both halves are addresses in a slice header: the record's own (`kvheads_ptr`) and,
+/// through it, each band's. So both handles have to be held — see [`GpuChunks::pins`],
+/// where holding only the first cost a night.
+#[derive(Clone, Debug)]
+pub struct ChunkPin {
+    /// The chunk's bands.
+    gids: HeadGids,
+    /// The chunk's resident record, when it has one. `None` for a live writer window,
+    /// whose heads are serialised inline and name no record slot.
+    _meta: Option<MetaGid>,
+}
+
+impl ChunkPin {
+    fn of(chunk: &ChunkWindow) -> Self {
+        Self {
+            gids: chunk.gids.clone(),
+            _meta: chunk.meta.clone(),
+        }
+    }
+
+    /// Whether this pin already names `chunk`'s band allocation — the cheap check
+    /// `update_chunk` uses before replacing a pin.
+    fn is_same_alloc(&self, gids: &HeadGids) -> bool {
+        self.gids.is_same_alloc(gids)
+    }
+}
 
 /// Cached host + device-side serialised slot-state for one sequence.
 pub(crate) struct GpuChunks {
@@ -69,11 +100,18 @@ pub(crate) struct GpuChunks {
     /// re-tenanted under an in-flight kernel. So the serialisation carries its
     /// own pins, taken in the same pass that wrote the bytes.
     ///
+    /// **The record handles are pinned for the same reason and it is not optional.**
+    /// A header's `kvheads_ptr` is a *record's* address, and a record slot is an
+    /// ordinary arena slot: a compaction mints a fresh record per relocated chunk —
+    /// 800–1,400 a pass — which frees the old one and reissues its slot inside the
+    /// same sweep. A launch holding only the band gids would keep the bands alive
+    /// while the record its headers point at was handed to another chunk.
+    ///
     /// Shared, so a launch holds the set it actually read with ONE refcount
     /// bump rather than a clone per chunk: `clear` installs a fresh vector and
     /// a launch still holding the old one keeps exactly the arenas its headers
     /// point at, for as long as it needs them.
-    pins: Arc<Vec<HeadGids>>,
+    pins: Arc<Vec<ChunkPin>>,
     /// The pinned buffers an upload is copied through — two, so one can carry
     /// a copy still waiting in the stream while the next upload fills the
     /// other. See [`choose_staging`] for which one an upload takes.
@@ -186,7 +224,7 @@ impl GpuChunks {
 
     /// The chunks this serialisation references, for a consumer to hold across
     /// its launch. One refcount bump — see [`Self::pins`].
-    pub(crate) fn pins(&self) -> Arc<Vec<HeadGids>> {
+    pub(crate) fn pins(&self) -> Arc<Vec<ChunkPin>> {
         Arc::clone(&self.pins)
     }
 
@@ -601,8 +639,13 @@ impl GpuChunksGuard<'_> {
                 self.inner.pins.len()
             );
         }
+        // Replaced whole rather than only when the band allocation differs: the record
+        // handle beside it can change while the gids do not — a compaction mints a fresh
+        // record for a chunk whose gids it also replaced, but a chunk re-serialised for
+        // any other reason can have picked up a new record too, and a pin naming the old
+        // one holds the wrong slot alive.
         if !self.inner.pins[chunk_idx].is_same_alloc(&chunk.gids) {
-            Arc::make_mut(&mut self.inner.pins)[chunk_idx] = chunk.gids.clone();
+            Arc::make_mut(&mut self.inner.pins)[chunk_idx] = ChunkPin::of(chunk);
         }
         self.dirty_chunks.push(chunk_idx);
         Ok(())
@@ -637,7 +680,7 @@ impl GpuChunksGuard<'_> {
         // Pin what this pass is about to reference. A fresh vector, never a
         // mutation of the old one: a launch reading the previous serialisation
         // still holds that one and must keep ITS arenas, not these.
-        self.inner.pins = Arc::new(chunks.iter().map(|c| c.gids.clone()).collect());
+        self.inner.pins = Arc::new(chunks.iter().map(ChunkPin::of).collect());
         // All chunks in a backing share one band count; derive it from the first.
         let n_palette = chunk_n_palette(&chunks[0], n_kv_head);
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);

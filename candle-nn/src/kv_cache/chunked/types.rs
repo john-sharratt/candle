@@ -23,8 +23,10 @@ pub const TARGET_ARENA_BYTES: usize = 16 * 1024 * 1024;
 /// stride lives with the size-class ladder because that is what bounds it.
 pub use super::size_class::GID_STRIDE;
 
+#[cfg(feature = "cuda")]
+use super::compact_mint::RecordInputs;
 use super::gid_pool::ChunkGid;
-use super::gpu_chunks::GpuChunks;
+use super::gpu_chunks::{ChunkPin, GpuChunks};
 use super::head_gids::{band_tags, HeadGids};
 use super::meta_pool::MetaGid;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
@@ -898,9 +900,25 @@ impl SequenceState {
     /// Making the rewrite carry its own invalidation is what stops that from being
     /// a step anyone can omit.
     ///
-    /// The chunk keeps its `MetaGid`: the device record is *patched* through the
-    /// words the sweep accumulates, not rebuilt, which is sound because a
-    /// compaction moves each slot once for every holder at once.
+    /// **The chunk keeps its `MetaGid`, untouched, and a WRITER-owned chunk that has one
+    /// is skipped entirely.**
+    ///
+    /// The pass rewrites gids and never rewrites a record; a record holds a clone of the
+    /// gids it was serialized from, so the source slots it names keep a refcount and
+    /// keep their bytes, and reading through it stays correct. See `compact_backings`.
+    ///
+    /// That argument needs the chunk to be *immutable*, which is what
+    /// [`Self::writer_start_idx`] decides: chunks below it are Arc-shared prefix history
+    /// and must not be extended, chunks at or above it are the writer's and are written
+    /// by the decode kernel. A writer-owned chunk writes through its **gids** (the
+    /// destination) while anything resolving its record would read the **source**, so the
+    /// two would diverge on the next token. Every path that gives a `ChunkWindow` a
+    /// record gives it to sealed prefix history, and `set_block_gids` clears `meta` on any
+    /// gid mutation — so this combination should not arise. It is skipped rather than
+    /// asserted because skipping is safe under every circumstance: the chunk keeps naming
+    /// its source, which its record also names, and the pass simply reclaims nothing for
+    /// it. The `error` beside it is how a new path that breaks the invariant announces
+    /// itself.
     ///
     /// Only the compaction pass sweeps, and there is no host compaction.
     #[cfg(feature = "cuda")]
@@ -909,13 +927,40 @@ impl SequenceState {
         sweep: &mut super::compact_map::Sweep<'_>,
     ) -> candle::Result<bool> {
         let mut moved = false;
-        for cw in self.chunks.iter_mut() {
+        let writer_start = self.writer_start_idx;
+        for (idx, cw) in self.chunks.iter_mut().enumerate() {
+            if idx >= writer_start && cw.meta.is_some() {
+                tracing::error!(
+                    target: "candle_nn::kv_cache::compact",
+                    block = idx,
+                    writer_start,
+                    "a writer-owned chunk carries a KvHead record: it is written through \
+                     its gids and read through that record, so relocating it would let \
+                     the two diverge on the next token. Left where it is — some path is \
+                     handing a record to a writable chunk",
+                );
+                continue;
+            }
             let Some(next) = sweep.rewrite_gids(&cw.gids)? else {
                 continue;
             };
-            match cw.meta.as_ref() {
-                Some(meta) => sweep.emit_patch(meta.device_addr(), &next),
-                None => sweep.note_no_meta(),
+            // A fresh record for the new bands, and only for a chunk that had one —
+            // prefix history, by the check above. Installing it drops the old record,
+            // which is what releases the source.
+            if cw.meta.is_some() {
+                if let Some(record) = sweep.mint_record(
+                    &next,
+                    RecordInputs {
+                        k_pal: &cw.k_pal,
+                        v_pal: &cw.v_pal,
+                        k_scale: &cw.k_scale,
+                        v_scale: &cw.v_scale,
+                        k_fmt: &cw.k_fmt,
+                        v_fmt: &cw.v_fmt,
+                    },
+                )? {
+                    cw.meta = Some(record);
+                }
             }
             cw.gids = next;
             moved = true;
@@ -1175,7 +1220,7 @@ impl SequenceState {
 
     /// The chunks the serialised slot-state references, for a consumer to hold
     /// across its launch (see `GpuChunks::pins`).
-    pub(crate) fn gpu_chunk_pins(&self) -> Arc<Vec<HeadGids>> {
+    pub(crate) fn gpu_chunk_pins(&self) -> Arc<Vec<ChunkPin>> {
         self.gpu_chunks.pins()
     }
 
@@ -1528,6 +1573,64 @@ mod writer_region_tests {
         }
         s.set_writer_start_idx(writer_start);
         s
+    }
+
+    /// **A writer-owned chunk that carries a record is left exactly where it is.**
+    ///
+    /// The compaction design needs `sealed ⇒ has a record ⇒ immutable` and
+    /// `live ⇒ meta: None`, because a writer-owned chunk writes through its **gids** while
+    /// anything resolving its record reads through the **record** — so relocating one
+    /// would let the two diverge on the next token. Every path that gives a `ChunkWindow`
+    /// a record gives it to sealed prefix history, and `set_block_gids` clears `meta` on
+    /// any gid mutation, so the combination should not arise; `rewrite_for_compaction`
+    /// skips it rather than trusting that, because skipping is safe under every
+    /// circumstance and a silent relocation is not.
+    ///
+    /// Asserted on the boundary `writer_start_idx` draws: the chunk below it is rewritten,
+    /// the one at it is not, and both carry a record so the only difference is the side.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_writer_owned_chunk_with_a_record_is_left_alone() {
+        use crate::kv_cache::chunked::compact_map::{CompactionMap, Sweep};
+        use crate::kv_cache::chunked::gid_pool::ChunkGid;
+        use crate::kv_cache::chunked::meta_pool::MetaGid;
+        use ArenaFormatTag::*;
+
+        let raw = |arena: usize, chunk: usize| (arena * GID_STRIDE + chunk) as i64;
+        let with_record = |usage: u32, gid: i64| {
+            let mut w = window(usage, Q8_KS);
+            w.gids = HeadGids::uniform(ChunkGid::detached(gid), 1);
+            w.meta = Some(MetaGid::from_slot(
+                ChunkGid::detached(999),
+                w.gids.clone(),
+                0xFEED,
+            ));
+            w
+        };
+
+        // Block 0 is sealed prefix history; block 1 is the writer's. Both relocate.
+        let mut s = layer(
+            vec![with_record(32, raw(5, 2)), with_record(32, raw(6, 3))],
+            1,
+        );
+        let mut map = CompactionMap::new();
+        map.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0x1000);
+        map.insert(raw(6, 3), ChunkGid::detached(raw(0, 2)), 0x2000);
+
+        let mut sweep = Sweep::new(&map);
+        assert!(s.rewrite_for_compaction(&mut sweep).unwrap());
+
+        assert_eq!(
+            s.chunk_at(0).unwrap().gids.as_slice()[0].raw(),
+            raw(0, 1),
+            "the sealed prefix chunk is relocated",
+        );
+        assert_eq!(
+            s.chunk_at(1).unwrap().gids.as_slice()[0].raw(),
+            raw(6, 3),
+            "the writer-owned chunk with a record keeps its source, so its gids and its \
+             record still agree",
+        );
     }
 
     /// The measured shape: a tail restored above the boundary — sealed full

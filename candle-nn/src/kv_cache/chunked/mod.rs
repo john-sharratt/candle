@@ -40,6 +40,10 @@ mod chunk_ops;
 pub mod compact;
 pub mod compact_map;
 pub mod compact_plan;
+// Minting a fresh `KvHead` record for each chunk a compaction relocated. CUDA only for
+// the same reason `compact` is: there are no device records without a device.
+#[cfg(feature = "cuda")]
+mod compact_mint;
 #[cfg(feature = "cuda")]
 mod compress;
 mod compression_policy;
@@ -111,7 +115,7 @@ pub use compact::{
     compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,
     CompactionTally,
 };
-pub use compact_map::{rewrite_sealed, CompactionMap, RecordGeometry, Sweep};
+pub use compact_map::{rewrite_sealed, CompactionMap, Sweep};
 pub use compact_plan::{
     fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
 };
@@ -129,6 +133,7 @@ pub use compression_policy::{
     QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS,
 };
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
+pub use gpu_chunks::ChunkPin;
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
 pub use migrate_flight::{

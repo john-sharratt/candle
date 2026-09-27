@@ -18,7 +18,7 @@ use std::time::Instant;
 use candle::wave_provenance::LeaseOrigin;
 use candle::{DType, Device, Result, Tensor};
 
-use super::arena::ArenaKey;
+use super::arena::{ArenaKey, ArenaKind};
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
 use super::backing::KV_DEVICE_OOM_MARKER;
@@ -912,6 +912,27 @@ impl BackingInner {
                 Err(e) if Self::is_wave_deferral(&e) => return Err(e),
                 Err(_) => {}
             }
+        }
+        // **Only a band claim may be promoted, and a record claim must NOT be.**
+        //
+        // Promotion widens `key.class` and rebuilds the key with `ArenaKey::new`, which
+        // is a `Band` key by construction. For a band that is the whole point — a rare
+        // format borrows a wider class's region instead of stamping one for itself. For a
+        // `KvHead` record it is silent corruption: the record would be handed a slot in a
+        // **band arena** and its bytes written on top of live K/V, which nothing
+        // downstream can catch. A record's size is model geometry
+        // (`n_kv_head × (head_dim/2 + 26 × n_palette)`), not a rung of the size-class
+        // ladder, so there is no wider class it belongs in and the stride check a caller
+        // does — "the slot is at least `record_bytes`" — passes happily on a 2 KiB band
+        // slot holding somebody's keys.
+        //
+        // Measured: with a compaction minting a fresh record per relocated chunk (800–1,400
+        // claims per pass) against a pool driven to saturation, the Flash-Next engine probe
+        // answered wrongly on one to three sessions of eight. A record claim that cannot
+        // get a region fails as itself instead, which the seal path and the compaction both
+        // already handle.
+        if !matches!(key.kind, ArenaKind::Band) {
+            return Err(stamp_err);
         }
         // No region. Look for a wider class that already has one with room.
         let mut class = key.class;

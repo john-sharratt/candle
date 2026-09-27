@@ -318,8 +318,16 @@ pub struct KvSection {
     /// it appears as regions the class rows cannot account for, which reads exactly
     /// like a second tenant holding ground. Measured — 734 phantom regions.
     pub frontier_regions: usize,
-    /// Regions held by a live arena at that same moment.
+    /// Regions held by any tenant at that same moment — arenas and span tenants.
     pub live_regions: usize,
+    /// Of [`Self::live_regions`], the ones a span tenant holds: a sequence's
+    /// recurrent state store, the provenance gallery. Ground in use that no
+    /// compaction can pack, so a consumer measuring fragmentation must not charge it.
+    pub span_regions: usize,
+    /// Of [`Self::live_regions`], the ones **record** arenas hold. In use, and absent from
+    /// [`Self::classes`] — which reports band pools only — so a consumer summing those rows
+    /// must add this or it charges live records as waste.
+    pub record_regions: usize,
 }
 
 /// One size class's share of the resident GPU arenas.
@@ -545,6 +553,8 @@ impl Scheduler {
             arenas,
             frontier_regions: ground.watermark,
             live_regions: ground.live_arenas,
+            span_regions: ground.span_regions,
+            record_regions: ground.record_regions,
         };
 
         // ── Warm tier ───────────────────────────────────────────────────────
@@ -774,6 +784,8 @@ mod tests {
                 // `packed_arenas` by the frontier should read as fully efficient.
                 frontier_regions: 1,
                 live_regions: 1,
+                span_regions: 0,
+                record_regions: 0,
             },
             warm: WarmSection {
                 resident_count: 7,

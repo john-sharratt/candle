@@ -300,12 +300,12 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
   leaves it exactly where it was. One fresh arena claims from the region free list,
   which is lowest-index-first, so it lands in a hole below the frontier and gives the
   walk a destination under the top arena. One per pass, and only while holes exist.
-- **Two CUDA calls for the whole pass.** The claims are a host walk producing three
-  `i64` arrays; one launch of the migration scatter/gather kernel copies every
-  relocated slot, and one launch of `kv_ptr_patch` stores every changed band pointer.
-  A per-chunk `memcpy_dtod_async` measured ~8 µs of launch overhead each, which put
-  1,024 moves in an 8 ms budget and left every pass clipped with the frontier exactly
-  where it started.
+- **Two CUDA calls for the whole pass.** The claims are a host walk producing three `i64`
+  arrays, and one launch of the migration scatter/gather kernel copies every relocated
+  slot; one further launch fills the records minted for them. A per-chunk
+  `memcpy_dtod_async` measured ~8 µs of launch overhead each, which put 1,024 moves in an
+  8 ms budget and left every pass clipped with the frontier exactly where it started. No
+  record is ever *rewritten* — see the record bullets below.
 - **It runs only between forwards, and it refuses rather than waits.** The pass takes
   the arena window, for exactly the reason `set_weight_floor` refuses while a tier is
   placed. It also takes an exclusive hold on chunk locations (`migrate_flight`),
@@ -332,6 +332,57 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
   refcount cannot stand in for one, because `HeadGids` is `Arc<Vec<ChunkGid>>` with a
   derived `Clone` and every sharing path shares the allocation. A prior branch tried
   that and corrupted conversations.
+- **The device records are NOT rewritten, and a record owns the bands it names.** A
+  chunk's location is recorded twice — in the gid, which refcounts the slot, and in the
+  `KvHead` record's band-pointer word, which is what the kernels dereference. The pass
+  rewrites only the first. A record holds a clone of the `HeadGids` its words were
+  serialized from (§8), so it cannot outlive the slots it addresses: they keep a
+  refcount for as long as it lives, still hold the bytes the copy read out of them, and
+  are read correctly through it. A sealed chunk is read through its record and never
+  written; a live writer window has no record and is addressed from its own gids, with
+  its decode buffer invalidated — so the two cannot diverge.
+
+  **It used to rewrite them, and that is what corrupted K/V.** A chunk has exactly one
+  record, shared by every holder of that chunk, so a pass that rewrote some of a chunk's
+  holders and missed others had no correct value for that word: whichever slot it named
+  was kept alive only by the holders naming the same slot, and when those went the rest
+  were still reading through it into re-tenanted ground. Patching to the destination,
+  patching to the source and leaving it alone were all wrong — leaving it alone became
+  right only once the record started holding a refcount. `unwitnessed` is the proof the
+  holder list is incomplete (53–1,240 on two passes of every Flash-Next run), and the
+  `tensor-assert` boundary named the side: zero orphaned gids against 148 orphaned
+  records already present when a pass *began*. A record-arena walk keyed on the address
+  each record held was built and measured — the Flash-Next probe answered 8/8, 5/8, 8/8,
+  5/8 against 8/8 twice with the pass off — and then deleted, because the domain was
+  never the problem.
+- **A relocated chunk is given a freshly MINTED record, and that is what reclaims the
+  ground.** `compact_mint.rs`: one record per rewritten `HeadGids` allocation that had a
+  record, claimed during the sweep (host-only, so the holder installs it in the same visit
+  and the sweep stays one traversal) and written by **one** batched device launch at the
+  end of the pass. Installing it drops the old record; when that was the chunk's last
+  holder, the old record's slot frees and with it the clone of the *old* gids it was
+  holding — the last reference to the source bands — so the source frees and
+  `release_empty_arenas` hands the region back.
+
+  Leaving the records alone instead is safe but reclaims nothing: measured on the
+  Flash-Next probe, 1.5–1.8 M relocations for 3–11 regions, because a source pinned only by
+  its record is still *occupied*, so the census re-plans it every pass and no holder names
+  the destination. With minting: 566 k moves, 79 regions, efficiency 92%.
+- **Minting moves a RECORD's address, and every cached copy of one must be dropped.** This
+  is the second half of the fix and it is not optional. A band's address is owned — by the
+  record — but a record's own address is cached as a bare `kvheads_ptr` word in every
+  `TokenSlice` header of every slot's decode buffer, and that buffer is reused whenever the
+  chunk *count* agrees, which a compaction never changes. `rewrite_for_compaction` clears
+  the buffer of each slot whose own chunks moved; that is the set whose *band* addresses
+  changed, and it is not provably the set whose *record* addresses changed. So a pass that
+  minted anything calls `invalidate_all_decode_buffers` on every backing.
+
+  Without it the probe answered 7/8, 5/8, 3/8, 2/8 — a stale `kvheads_ptr` dereferencing a
+  record slot the pool had reissued, which reads another chunk's band pointers and does not
+  fault. With it, 8/8. **And `kv_integrity::report_boundary` could not see any of it**: zero
+  orphans and zero content changes on a run that answered 2/8, because nothing was orphaned
+  (every reference named a live slot) and the content hash covers only bands that live
+  slots' block tables name. The engine probe's story gate is what caught it.
 
 ### The defect this work found, which is the one to remember
 
@@ -470,13 +521,38 @@ One arena kind, distinct from the band arenas, drawing regions from the same poo
   the existing design is reused rather than re-derived: the semantics wanted for a
   record — shared by every referencing slot, released when the last one goes — are
   exactly `ChunkGid`'s.
-- **Records are now enumerable, though nothing enumerates them yet.** Being arena slots,
-  the refcount tables *can* list every live record, which is the precondition for the
-  record walk that re-enabling record compaction needs. `kv_integrity::check_records`
-  does not use it: it still walks the block tables per holder and reads each record back
-  over the bus, exactly as it did when records lived in slabs. Driving that check — and
-  the pointer patch — from the refcount walk instead is the work this migration makes
-  possible, not work it did.
+- **A record owns the bands it names, and that is what makes a compaction safe.**
+  `MetaGid` carries a clone of the `HeadGids` its pointer words were serialized from, so
+  a record can never outlive the slots it addresses: the allocator cannot reissue a band
+  slot while a record still points at it, because the record is one of that slot's
+  refcount holders. One `Arc` bump per record, eight bytes on the handle, nothing per
+  band.
+
+  Before this, a record was a *dead copy* of a fact the gid owned — the address
+  `base_ptr + chunk_idx · chunk_byte_stride`, stored with no reference to its subject —
+  and that is the general rule `CLAUDE.md` states as "a captured device address is
+  invalidated by anything that moves what it names, and a reference count is not a
+  location". It is why a compaction that rewrote holders' gids and left records behind
+  read another chunk's K/V, and why the pass can now leave them alone instead. See §6.
+- **A record slot is an ordinary arena claim, which is what makes minting cheap.** A
+  compaction mints one record per relocated chunk — 800–1,400 a pass — and each is a
+  free-list pop plus an address, with the bytes written by one batched launch. That is the
+  other half of the reason for moving records here, and it is what the band arenas' reclaim
+  now depends on (§6).
+
+  Two hazards found paying for it. A record claim must **never** be promoted: when
+  `stamp_region_promoting` cannot get a region it widens `key.class` and rebuilds the key
+  with `ArenaKey::new`, which is a `Band` key, so the record was handed a slot in a band
+  arena and filled on top of live K/V — and every check passed, because a 1,344 B record
+  fits a 2 KiB band slot. The allocator now refuses for any non-`Band` kind. And a mint
+  moves a record's address, so every cached `kvheads_ptr` must be dropped (§6).
+- **Records are enumerable, and nothing needs it any more.** Being arena slots, the
+  arena table lists every record arena's base, stride and slot count, so a walk can
+  reach every record whether or not anything reachable names it. That was the original
+  reason given for moving records here; it was built, measured, and deleted once the RAII
+  above made rewriting records unnecessary. `kv_integrity::check_records` still walks the
+  block tables per holder and reads each record back over the bus, exactly as it did when
+  records lived in slabs — a diagnostic comparing boundaries, not a publish.
 
 ### Filling them: one batched launch, nothing on the host
 
@@ -516,10 +592,20 @@ Four properties this is required to have, and the reason each is not an optimisa
 
 ### What is deliberately not done yet
 
-**The record arenas are excluded from the compaction census.** Relocating a record
-changes the address every holder's gid resolves to, which is the same class of defect
-that had the band-side pass switched off (§6, and `compact_backings`). Records may be
-compacted only once the pointer patch is driven from the record walk itself rather
-than from a per-holder sweep that can visit a record twice or miss it — at which
-point the walk makes that patch straightforward, which is half the reason for moving
-them here. Until then a record arena is allocated from and released, never packed.
+**The record arenas are excluded from the compaction census.** A record arena is
+allocated from and released, never packed, so a record arena sitting high in the span
+holds the frontier up and no pass can lower it. Records are a few percent of the KV
+bytes, so the ground at stake is small, but it is not nothing and it is not bounded.
+
+Relocating a record is a different problem from relocating a band, and harder in one
+specific way: a band's address lives *inside* a record, which owns that band and can
+therefore be left alone — whereas a *record's* own address is recorded in the `MetaGid`
+every holder of the chunk carries and in the `kvheads_ptr` word of every slice header
+built from it, and nothing owns those. The first is reachable through the same holder
+sweep that rewrites gids; the second is a cached buffer per batch slot, invalidated
+today only for slots whose own chunks moved. Packing the record arenas means driving
+both, and the honest statement is that nobody has needed the ground yet.
+
+The band arenas *are* reclaimed — a relocated chunk gets a freshly minted record and the
+old one's death releases the source (§6). What remains unpacked is the record arenas
+themselves.

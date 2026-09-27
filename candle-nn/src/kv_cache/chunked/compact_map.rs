@@ -36,42 +36,37 @@
 //!   [`rewrite_sealed`] builds a new `HeadGids` and assigns it; nothing here
 //!   mutates one in place.
 //!
-//! # What the device needs afterwards
+//! # What the device needs afterwards: a NEW record, never a rewritten one
 //!
 //! Nothing on the GPU stores a gid. Every kernel reaches KV through a resident
-//! `KvHead` record holding **resolved addresses**, so a moved band leaves one
-//! stale 8-byte word per `(head, palette, K/V)` slot that named it. The rewrite
-//! emits those words as [`PatchWord`]s — address and new value — for the patch
-//! kernel to store in one launch. That is why a chunk keeps its `MetaGid` through
-//! a compaction rather than being given a fresh record: the record is *patched*,
-//! not rebuilt, which is sound here precisely because a compaction moves each slot
-//! once for every holder at once (see `kv_ptr_patch.cu`).
+//! `KvHead` record holding **resolved addresses**, and a record holds a clone of the
+//! `HeadGids` it was serialized from ([`MetaGid`](super::meta_pool::MetaGid)), so it
+//! cannot outlive the bands it names.
+//!
+//! So a rewritten chunk is given a **freshly minted** record built from its new gids
+//! ([`compact_mint`](super::compact_mint)), and the original record is left exactly as
+//! it is for whoever still holds it. Each side then describes live, consistent ground
+//! for its whole life: the new record names the destination, which the rewritten holder
+//! keeps alive, and the old one names the source, which its own held gids keep alive
+//! until the last holder of that chunk goes.
+//!
+//! Rewriting the shared record instead is what corrupted K/V. A chunk has exactly
+//! **one** record, so a pass that rewrote some of a chunk's holders and missed others
+//! had no correct value to put in it: whichever slot it named was kept alive only by the
+//! holders naming that same slot, and when those went the rest were still reading
+//! through it into re-tenanted ground. `compact_backings` carries the measurements.
 
 use ahash::{AHashMap, AHashSet};
 
+#[cfg(feature = "cuda")]
+use super::backing::ChunkedKvBacking;
+#[cfg(feature = "cuda")]
+use super::compact_mint::{RecordInputs, RecordMint};
 use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
-use super::meta_pool::band_ptr_offset;
+#[cfg(feature = "cuda")]
+use super::meta_pool::MetaGid;
 use super::types::{SealedChunk, SealedSequence};
-
-/// One 8-byte device word a compaction must overwrite: a band pointer inside a
-/// resident chunk record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PatchWord {
-    /// Device address of the word itself.
-    pub addr: u64,
-    /// The band's address after the move.
-    pub value: u64,
-}
-
-/// Geometry the record layout needs, so the rewrite can locate a band's pointer
-/// word without consulting the arena tables again.
-#[derive(Clone, Copy, Debug)]
-pub struct RecordGeometry {
-    pub n_kv_head: usize,
-    pub head_dim: usize,
-    pub n_palette: usize,
-}
 
 /// Where every relocated chunk went, published once per pass.
 ///
@@ -86,8 +81,8 @@ pub struct CompactionMap {
     /// `old raw id → replacement gid`, consulted only when `touched` says it is
     /// worth hashing.
     moved: AHashMap<i64, ChunkGid>,
-    /// Destination addresses by new raw id, for emitting patch words without
-    /// re-resolving the arena tables.
+    /// Destination addresses by new raw id, so the completeness check can ask
+    /// whether a gid a holder names is one of this pass's destinations.
     new_addr: AHashMap<i64, u64>,
 }
 
@@ -155,12 +150,6 @@ impl CompactionMap {
         }
         self.moved.get(&raw)
     }
-
-    /// Device address of the band a replacement gid names.
-    #[inline]
-    fn addr_of(&self, new_raw: i64) -> Option<u64> {
-        self.new_addr.get(&new_raw).copied()
-    }
 }
 
 impl Default for CompactionMap {
@@ -171,82 +160,115 @@ impl Default for CompactionMap {
 
 /// State threaded across every holder in one sweep.
 ///
-/// The memo is what makes a shared `HeadGids` allocation rewritten once; the
-/// patch words accumulate across holders because a record belongs to a chunk, not
-/// to whichever holder happened to be visited first.
+/// The memo is what makes a shared `HeadGids` allocation rewritten once, so two
+/// holders of one allocation come back sharing a single replacement rather than
+/// holding equal-but-distinct gids whose refcounts disagree with the sharing the
+/// cache believes exists.
 pub struct Sweep<'m> {
     map: &'m CompactionMap,
-    geometry: RecordGeometry,
     /// `HeadGids::alloc_id` → its replacement.
     memo: AHashMap<usize, HeadGids>,
-    /// Records already patched, so a chunk shared by several holders contributes
-    /// its words once.
-    records_done: AHashSet<(u64, usize)>,
-    /// The words the patch kernel must store, in insertion order.
-    patch: Vec<PatchWord>,
+    /// Every ORIGINAL allocation this sweep has rewritten, held alive until the sweep
+    /// ends.
+    ///
+    /// **The memo is keyed on an ADDRESS — `Arc::as_ptr` — so an original that dies
+    /// mid-sweep lets its key be recycled, and then the memo answers for the wrong
+    /// chunk.** `alloc_id`'s own contract is that it is "stable only while the `Arc` is
+    /// alive, which is exactly the life of the sweep that uses it"; this is what makes
+    /// that true instead of merely hoped for.
+    ///
+    /// It became reachable when a compaction started minting records: installing a fresh
+    /// record drops the old one, which drops *its* clone of the old gids, so original
+    /// allocations began dying while the sweep was still running. The next `map_unique`
+    /// could then allocate a replacement at a dead original's address — and because
+    /// [`Self::rewrite_gids`] consults the memo *before* asking whether anything moved, a
+    /// second visit to that holder was handed **another chunk's gids**. Second visits are
+    /// ordinary: several batch slots share one substrate, so the scheduler sweeps the same
+    /// residences once per slot and relies on a second visit matching nothing.
+    ///
+    /// One `Arc` clone per rewritten allocation, dropped with the sweep.
+    originals: Vec<HeadGids>,
     /// Allocations rewritten — the sweep's own progress figure.
     allocations_rewritten: usize,
-    /// Why a moved band got no patch word, counted so the deficit is attributable.
-    ///
-    /// `moves` and `patched_words` disagreed by 44% of a run's relocations and there
-    /// was no way to tell which of three reasons was responsible: a holder carrying
-    /// no device record (ordinary — a live chunk window's bands are addressed from
-    /// its block table), a record already emitted by an earlier holder (ordinary —
-    /// one record describes one chunk, however many holders name it), or a moved
-    /// band whose record nobody emitted at all (not ordinary). Three causes, one
-    /// number, and only the third is a defect.
-    no_record: usize,
-    dup_record: usize,
     /// Destination gids some visited holder actually named.
     ///
-    /// **The pass's own completeness proof, and it cannot be inferred from the
-    /// counts.** A pass relocates `map.len()` slots and frees their sources; that is
-    /// only sound if every one of them is named by a holder this sweep rewrote. A
-    /// holder nobody visits keeps naming the source slot, which is then handed to
-    /// the next claim — so the stale holder reads whatever now occupies it, which is
-    /// another sequence's KV, finite and plausible and wrong.
-    ///
-    /// `patch.len()` does not answer it. A live chunk window carries no device
-    /// record (`meta: None`) and correctly contributes no patch word, so
-    /// `patched < moves` is ordinary. What is not ordinary is a relocated slot that
-    /// no holder named at all, and only a set of what was seen can tell the two
-    /// apart.
+    /// **The gid side's completeness proof.** A pass relocates `map.len()` slots and
+    /// frees their sources; that is only sound if every one of them is named by a
+    /// holder this sweep rewrote. A holder nobody visits keeps naming the source
+    /// slot — which is not itself corruption, because that holder's gid still holds
+    /// the source's refcount and its record still names it, so nothing reissues it —
+    /// but it is a claim wasted and a holder left behind, and the set of holders this
+    /// sweep can reach is maintained by hand. A rising count is how a new holder nobody
+    /// swept is discovered.
     witnessed: AHashSet<i64>,
+    /// Where a rewritten chunk's fresh record comes from, and the backing that claims
+    /// it. `None` off a device, where there are no records at all.
+    ///
+    /// Held here rather than passed to each holder because the holders are visited
+    /// through a closure the caller owns, across three crates — see
+    /// [`Self::mint_record`].
+    #[cfg(feature = "cuda")]
+    mint: Option<(&'m mut RecordMint, &'m ChunkedKvBacking)>,
 }
 
 impl<'m> Sweep<'m> {
-    pub fn new(map: &'m CompactionMap, geometry: RecordGeometry) -> Self {
+    /// A sweep that rewrites gids and mints no records.
+    ///
+    /// For a caller with no device — there are no `KvHead` records to mint — and for the
+    /// unit tests, which exercise the gid rewrite on detached gids.
+    pub fn new(map: &'m CompactionMap) -> Self {
         Self {
             map,
-            geometry,
             memo: AHashMap::new(),
-            records_done: AHashSet::new(),
-            patch: Vec::new(),
+            originals: Vec::new(),
             allocations_rewritten: 0,
-            no_record: 0,
-            dup_record: 0,
             witnessed: AHashSet::new(),
+            #[cfg(feature = "cuda")]
+            mint: None,
         }
     }
 
-    /// Moved bands that produced no patch word, split by cause: holders with no
-    /// device record, and records an earlier holder had already emitted.
+    /// A sweep that mints a fresh record for every chunk whose gids it rewrites.
     ///
-    /// Only the compaction pass asks, and there is no host compaction.
+    /// The pass's own constructor. See [`compact_mint`](super::compact_mint) for why a
+    /// relocated chunk needs a new record rather than a rewritten one.
     #[cfg(feature = "cuda")]
-    pub(super) fn patch_skips(&self) -> (usize, usize) {
-        (self.no_record, self.dup_record)
+    pub(super) fn with_mint(
+        map: &'m CompactionMap,
+        mint: &'m mut RecordMint,
+        backing: &'m ChunkedKvBacking,
+    ) -> Self {
+        Self {
+            map,
+            memo: AHashMap::new(),
+            originals: Vec::new(),
+            allocations_rewritten: 0,
+            witnessed: AHashSet::new(),
+            mint: Some((mint, backing)),
+        }
     }
 
-    /// A rewritten holder that carries no `MetaGid` at all.
+    /// The fresh record for a chunk whose gids were just rewritten to `next`, or `None`
+    /// when this sweep mints none.
     ///
-    /// Counted separately from a `MetaGid` whose `device_addr` is zero: the first is
-    /// a chunk addressed from its block table, the second one whose record lives on
-    /// the host. Both are ordinary and neither needs a patch word, but they are
-    /// different shapes and a deficit that cannot be split into them is not
-    /// attributable.
-    pub(super) fn note_no_meta(&mut self) {
-        self.no_record += 1;
+    /// Called by the two places a chunk's `meta` lives — [`rewrite_sealed`] for a
+    /// `SealedChunk` and `SequenceState::rewrite_for_compaction` for a `ChunkWindow` —
+    /// in the same visit that installs `next`, which is what keeps the sweep to one
+    /// traversal of the holder set.
+    ///
+    /// **Only for a chunk that had a record.** A live writer window carries none and
+    /// must not be given one: it is written through its gids and would then be read
+    /// through a record, and the two would diverge on the next token.
+    #[cfg(feature = "cuda")]
+    pub(super) fn mint_record(
+        &mut self,
+        next: &HeadGids,
+        src: RecordInputs<'_>,
+    ) -> candle::Result<Option<MetaGid>> {
+        match self.mint.as_mut() {
+            Some((mint, backing)) => mint.mint(backing, next, src),
+            None => Ok(None),
+        }
     }
 
     /// Relocated slots no visited holder named — the pass's completeness gap.
@@ -260,14 +282,6 @@ impl<'m> Sweep<'m> {
         map.destinations()
             .filter(|raw| !self.witnessed.contains(raw))
             .collect()
-    }
-
-    /// The patch words, **sorted by address** — the order the patch kernel wants,
-    /// because one head's band pointers are 64 contiguous bytes and a sorted run
-    /// lands in one or two sectors rather than eight scattered ones.
-    pub fn into_patch_words(mut self) -> Vec<PatchWord> {
-        self.patch.sort_unstable_by_key(|w| w.addr);
-        self.patch
     }
 
     pub fn allocations_rewritten(&self) -> usize {
@@ -290,70 +304,21 @@ impl<'m> Sweep<'m> {
         }
         let map = self.map;
         let next = gids.map_unique(|g| Ok(map.get(g).cloned().unwrap_or_else(|| g.clone())))?;
-        // Every destination this holder now names. Recorded here rather than in
-        // `emit_patch` because a holder with no device record still names the slot
-        // and still keeps it honest — it is the naming that makes freeing the
-        // source safe, not the patch.
+        // Every destination this holder now names — it is the naming that keeps the
+        // destination's refcount honest, and the absence of a naming that leaves a
+        // source held by a holder the pass could not correct.
         for g in next.as_slice() {
             if map.is_destination(g.raw()) {
                 self.witnessed.insert(g.raw());
             }
         }
+        // Hold the original alive so its address cannot be recycled under the memo key —
+        // see [`Self::originals`]. Taken before the insert so the key is pinned for as long
+        // as the entry exists.
+        self.originals.push(gids.clone());
         self.memo.insert(id, next.clone());
         self.allocations_rewritten += 1;
         Ok(Some(next))
-    }
-
-    /// Emit the patch words for a chunk whose gids were rewritten.
-    ///
-    /// Indexes the gid slice at the RECORD's stride (`n_palette * 2` per head),
-    /// which is what `serialize_kv_heads` uses and is not the global
-    /// `GIDS_PER_HEAD` on a single-latent geometry.
-    pub(super) fn emit_patch(&mut self, record_addr: u64, next: &HeadGids) {
-        if record_addr == 0 {
-            self.no_record += 1;
-            return;
-        }
-        // **Keyed by record AND by the allocation whose bands it is describing.**
-        //
-        // It was keyed by record address alone, on the reasoning that two holders
-        // sharing a record describe the same chunk and therefore hold identical gids,
-        // so the second emission would be a duplicate. If that reasoning fails — two
-        // holders sharing a record whose allocations have diverged — the second
-        // holder's moved bands are never emitted, and the record keeps pointing at the
-        // slots this pass just vacated. Those slots then lose their last refcount, the
-        // allocator reissues them, and a record still held and still pointing there
-        // reads another chunk's K/V.
-        //
-        // Keying by the pair costs one `usize` in the tuple and cannot skip a holder
-        // that has anything of its own to say. A genuine duplicate — same record, same
-        // allocation — is still skipped, which is what the dedupe was for: one record
-        // describes one chunk however many holders name it.
-        if !self.records_done.insert((record_addr, next.alloc_id())) {
-            self.dup_record += 1;
-            return;
-        }
-        let g = self.geometry;
-        let stride = g.n_palette * 2;
-        let slots = next.as_slice();
-        for h in 0..g.n_kv_head {
-            for p in 0..g.n_palette {
-                for is_value in [false, true] {
-                    let idx = h * stride + p * 2 + usize::from(is_value);
-                    let Some(gid) = slots.get(idx) else { continue };
-                    let Some(addr) = self.map.addr_of(gid.raw()) else {
-                        // Not a destination of this pass: the band did not move,
-                        // so the record already names it correctly.
-                        continue;
-                    };
-                    let off = band_ptr_offset(h, p, is_value, g.head_dim, g.n_palette) as u64;
-                    self.patch.push(PatchWord {
-                        addr: record_addr + off,
-                        value: addr,
-                    });
-                }
-            }
-        }
     }
 }
 
@@ -371,8 +336,9 @@ impl<'m> Sweep<'m> {
 /// and tried to discover everyone pointing into it — and there is no index from a
 /// gid back to its holders, which is why it could not be made correct.
 ///
-/// The chunk keeps its `MetaGid`: its record is patched by the words this
-/// accumulates, not rebuilt.
+/// A rewritten chunk is given a **freshly minted** `MetaGid` when the sweep has a minter
+/// and it had a record to replace; no record is ever rewritten in place. See
+/// [`compact_mint`](super::compact_mint).
 pub fn rewrite_sealed(
     seqs: &[SealedSequence],
     sweep: &mut Sweep<'_>,
@@ -389,11 +355,29 @@ pub fn rewrite_sealed(
                 None => chunks.push(chunk.clone()),
                 Some(next) => {
                     touched_any = true;
-                    match chunk.meta.as_ref() {
-                        Some(meta) => sweep.emit_patch(meta.device_addr(), &next),
-                        None => sweep.note_no_meta(),
-                    }
                     let mut c = chunk.clone();
+                    // **A fresh record for the new bands, and only if this chunk had
+                    // one.** Installing it drops the old record — and with it the clone
+                    // of the old gids the old record was holding — which is what lets the
+                    // source be reclaimed. A chunk with no record is addressed from its
+                    // gids and must not be given one.
+                    #[cfg(feature = "cuda")]
+                    if c.meta.is_some() {
+                        let minted = sweep.mint_record(
+                            &next,
+                            RecordInputs {
+                                k_pal: &c.k_pal,
+                                v_pal: &c.v_pal,
+                                k_scale: &c.k_scale,
+                                v_scale: &c.v_scale,
+                                k_fmt: &c.k_fmt,
+                                v_fmt: &c.v_fmt,
+                            },
+                        )?;
+                        if let Some(record) = minted {
+                            c.meta = Some(record);
+                        }
+                    }
                     c.gids = next;
                     chunks.push(c);
                 }
@@ -412,15 +396,8 @@ pub fn rewrite_sealed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::chunked::meta_pool::MetaGid;
     use crate::kv_cache::chunked::types::GID_STRIDE;
-
-    fn geometry() -> RecordGeometry {
-        RecordGeometry {
-            n_kv_head: 1,
-            head_dim: 4,
-            n_palette: crate::kv_cache::N_PALETTE,
-        }
-    }
 
     fn raw(arena: usize, chunk: usize) -> i64 {
         (arena * GID_STRIDE + chunk) as i64
@@ -453,7 +430,7 @@ mod tests {
     #[test]
     fn an_empty_map_rewrites_nothing() {
         let map = CompactionMap::new();
-        let mut sweep = Sweep::new(&map, geometry());
+        let mut sweep = Sweep::new(&map);
         assert!(rewrite_sealed(&[], &mut sweep).unwrap().is_none());
     }
 
@@ -482,7 +459,7 @@ mod tests {
 
         let mut map = CompactionMap::new();
         map.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0x4000);
-        let mut sweep = Sweep::new(&map, geometry());
+        let mut sweep = Sweep::new(&map);
 
         let a = rewrite_sealed(&[seq_a], &mut sweep)
             .unwrap()
@@ -503,6 +480,78 @@ mod tests {
         assert_eq!(a[0].chunks[0].gids.as_slice()[0].raw(), raw(0, 1));
     }
 
+    /// **A second visit to an already-rewritten holder must match nothing — even after the
+    /// original allocation has been dropped.**
+    ///
+    /// The scheduler sweeps the same substrate once per batch slot that shares it, so a
+    /// second visit is ordinary and the pass relies on it being a no-op. The memo is keyed
+    /// on `HeadGids::alloc_id`, an `Arc` address, so that only holds while the original is
+    /// alive — and once a compaction mints records, installing a fresh one drops the old
+    /// record's clone of the old gids and originals start dying *mid-sweep*. A replacement
+    /// allocated at a dead original's address then collides with its memo key, and because
+    /// `rewrite_gids` consults the memo before asking whether anything moved, the holder is
+    /// handed **another chunk's gids**.
+    ///
+    /// Asserted on the **refcount**, not on an address collision. A test that dropped an
+    /// original and hoped the allocator reused its address would pass or fail by luck; what
+    /// makes the memo key safe is that the original is still *alive*, and a band's strong
+    /// count says so deterministically. The second-visit checks ride along.
+    #[test]
+    fn a_second_visit_matches_nothing_after_the_original_is_dropped() {
+        let mut map = CompactionMap::new();
+        map.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0x4000);
+        map.insert(raw(6, 4), ChunkGid::detached(raw(0, 9)), 0x8000);
+
+        let band = ChunkGid::detached(raw(5, 2));
+        let unheld = band.strong_count();
+        let mut sweep = Sweep::new(&map);
+
+        // Rewrite, install, and drop the original — the holder's own lifecycle.
+        let first = {
+            let original = HeadGids::uniform(band.clone(), 1);
+            let held = band.strong_count();
+            assert!(held > unheld, "the original gid vector holds the band");
+            let next = sweep.rewrite_gids(&original).unwrap().expect("moved");
+            drop(original);
+            assert_eq!(
+                band.strong_count(),
+                held,
+                "the SWEEP still holds the original, so its `alloc_id` cannot be recycled \
+                 under the memo key while the memo entry lives",
+            );
+            next
+        };
+        assert_eq!(first.as_slice()[0].raw(), raw(0, 1));
+
+        let second = {
+            let original = HeadGids::uniform(ChunkGid::detached(raw(6, 4)), 1);
+            let next = sweep.rewrite_gids(&original).unwrap().expect("moved");
+            drop(original);
+            next
+        };
+        assert_eq!(second.as_slice()[0].raw(), raw(0, 9));
+
+        // Both holders now hold replacements, which name destinations the map has no key
+        // for, so a second visit must match nothing rather than answer from the memo.
+        assert!(
+            sweep.rewrite_gids(&first).unwrap().is_none(),
+            "a second visit to the first holder must match nothing",
+        );
+        assert!(
+            sweep.rewrite_gids(&second).unwrap().is_none(),
+            "and a replacement must never be answered with another chunk's gids",
+        );
+        assert_eq!(
+            sweep.allocations_rewritten(),
+            2,
+            "two allocations rewritten, and no third invented by a recycled memo key",
+        );
+
+        // The sweep is what was holding it; when it goes, so does the original.
+        drop(sweep);
+        assert_eq!(band.strong_count(), unheld);
+    }
+
     /// A chunk none of whose gids moved is passed through by value, and the
     /// sequence reports no change at all when that is true of every chunk.
     #[test]
@@ -518,68 +567,58 @@ mod tests {
         };
         let mut map = CompactionMap::new();
         map.insert(raw(2, 0), ChunkGid::detached(raw(0, 0)), 0x10);
-        let mut sweep = Sweep::new(&map, geometry());
+        let mut sweep = Sweep::new(&map);
         assert!(rewrite_sealed(&[seq], &mut sweep).unwrap().is_none());
         assert_eq!(sweep.allocations_rewritten(), 0);
     }
 
-    /// Patch words come back **sorted by address**, which is what the kernel's
-    /// coalescing assumes.
+    /// **With no minter, a rewritten chunk keeps its record — and the record keeps the
+    /// bands it named, so it is still describing live ground.**
+    ///
+    /// A `Sweep::new` sweep mints nothing: that is the shape off a device, where there
+    /// are no `KvHead` records to mint, and it must still leave the pool consistent. The
+    /// rewrite replaces `gids`, so the chunk names the destination while `meta` names the
+    /// source — which is safe precisely because the record holds a clone of the
+    /// `HeadGids` it was serialized from, so that source keeps a refcount and keeps the
+    /// bytes the copy read out of it.
+    ///
+    /// The device path replaces the record instead ([`super::compact_mint`]); what is
+    /// pinned here is the *lifetime* claim underneath both, and the thing that would break
+    /// it is somebody clearing `meta` in `rewrite_sealed` — which reads as tidying up and
+    /// is the whole corruption.
     #[test]
-    fn patch_words_are_sorted_by_address() {
-        let map = {
-            let mut m = CompactionMap::new();
-            m.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0xABCD);
-            m
+    fn without_a_minter_a_rewritten_chunk_keeps_a_record_that_still_owns_its_bands() {
+        let source = ChunkGid::detached(raw(5, 2));
+        let bands = HeadGids::uniform(source.clone(), 1);
+        let record = MetaGid::from_slot(ChunkGid::detached(raw(9, 9)), bands.clone(), 0xFEED);
+        let seq = SealedSequence {
+            chunks: vec![SealedChunk {
+                meta: Some(record),
+                ..chunk_with(bands)
+            }],
+            token_count: 32,
+            chunk_size: 32,
+            location: crate::kv_cache::ArenaLocation::Gpu,
         };
-        let mut sweep = Sweep::new(&map, geometry());
-        // Two records, the higher address emitted first.
-        let next = HeadGids::uniform(ChunkGid::detached(raw(0, 1)), 1);
-        sweep.emit_patch(0x9000, &next);
-        sweep.emit_patch(0x1000, &next);
-        let words = sweep.into_patch_words();
-        assert!(!words.is_empty());
-        assert!(
-            words.windows(2).all(|w| w[0].addr <= w[1].addr),
-            "patch words must be ascending: {words:?}",
-        );
-        assert!(words.iter().all(|w| w.value == 0xABCD));
-    }
 
-    /// A record is patched once however many holders share its chunk — the words
-    /// describe the chunk, not the visit.
-    #[test]
-    fn a_shared_record_is_patched_once() {
-        let map = {
-            let mut m = CompactionMap::new();
-            m.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0xABCD);
-            m
-        };
-        let mut sweep = Sweep::new(&map, geometry());
-        let next = HeadGids::uniform(ChunkGid::detached(raw(0, 1)), 1);
-        sweep.emit_patch(0x2000, &next);
-        let after_first = sweep.patch.len();
-        sweep.emit_patch(0x2000, &next);
+        let mut map = CompactionMap::new();
+        map.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0x4000);
+        let mut sweep = Sweep::new(&map);
+        let out = rewrite_sealed(&[seq], &mut sweep).unwrap().expect("moved");
+        let chunk = &out[0].chunks[0];
+
         assert_eq!(
-            sweep.patch.len(),
-            after_first,
-            "second visit emitted words again"
+            chunk.gids.as_slice()[0].raw(),
+            raw(0, 1),
+            "the chunk must name the destination"
         );
-    }
-
-    /// A chunk with no device record contributes no words — there is nothing
-    /// resident to patch.
-    #[test]
-    fn a_chunk_with_no_record_emits_nothing() {
-        let map = {
-            let mut m = CompactionMap::new();
-            m.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0xABCD);
-            m
-        };
-        let mut sweep = Sweep::new(&map, geometry());
-        let next = HeadGids::uniform(ChunkGid::detached(raw(0, 1)), 1);
-        sweep.emit_patch(0, &next);
-        assert!(sweep.into_patch_words().is_empty());
+        let meta = chunk.meta.as_ref().expect("the record is carried through");
+        assert_eq!(meta.device_addr(), 0xFEED, "and it is the SAME record");
+        assert_eq!(
+            meta.bands().expect("a record names bands").as_slice()[0].raw(),
+            raw(5, 2),
+            "which still holds — and so still refcounts — the SOURCE band",
+        );
     }
 
     fn chunk_with(gids: HeadGids) -> SealedChunk {

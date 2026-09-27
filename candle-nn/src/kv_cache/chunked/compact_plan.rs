@@ -260,33 +260,66 @@ pub fn plan_pool(arenas: &[ArenaSlots], key: ArenaKey, max_moves: usize) -> Opti
 ///   *last* chunk goes, and nothing moves chunks between arenas, so this never
 ///   self-corrects at all.
 ///
-/// `watermark - packed_arenas` is the sum, and it is the figure a perfect
-/// compaction closes: pack the chunks (removing the second), which empties the high
-/// arenas, which lowers the frontier (removing the first).
+/// `watermark - packed_arenas - span_regions` is the sum, and it is the figure a
+/// perfect compaction closes: pack the chunks (removing the second), which empties
+/// the high arenas, which lowers the frontier (removing the first).
+///
+/// The third term is not a loss at all and is subtracted for that reason. A span
+/// tenant — a sequence's recurrent state store, the provenance gallery — claims
+/// whole regions from the same free list and holds them for as long as it needs
+/// them. That ground is *in use*, so charging it to fragmentation makes a perfectly
+/// packed pool score arbitrarily badly: on Qwen3.8-Flash-Next the recurrent state
+/// store holds a few hundred regions against twenty KV arenas, which read as 4%
+/// efficiency while the pools were packed to within two arenas of perfect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroundLost {
     /// One past the highest live region — the frontier the tier stands above.
     pub watermark: usize,
-    /// Regions held by an arena, across every pool.
+    /// Regions held by any tenant, across every pool — arenas and span tenants.
     pub live_arenas: usize,
     /// Arenas those pools' live chunks would occupy packed, across every pool.
     pub packed_arenas: usize,
+    /// Of [`Self::live_arenas`], the regions a span tenant holds rather than an
+    /// arena. Ground in use that no compaction can pack.
+    pub span_regions: usize,
+    /// Of [`Self::live_arenas`], the regions **record** arenas hold.
+    ///
+    /// In use, and not packable either: the compaction census covers `ArenaKind::Band`
+    /// pools only, so a record arena is allocated from and released but never packed.
+    /// Counted apart from [`Self::packed_arenas`] because that figure comes from the
+    /// size-class rows, which exclude record pools by design.
+    pub record_regions: usize,
 }
 
 impl GroundLost {
     /// Free regions stranded below the frontier — arena fragmentation.
+    ///
+    /// A span tenant's region is live, so it is already excluded: this is the ground
+    /// nobody holds at all.
     pub fn arena_holes(&self) -> usize {
         self.watermark.saturating_sub(self.live_arenas)
     }
 
     /// Regions a chunk pack would release — KV fragmentation.
     pub fn sparsity(&self) -> usize {
-        self.live_arenas.saturating_sub(self.packed_arenas)
+        self.live_arenas
+            .saturating_sub(self.span_regions)
+            .saturating_sub(self.record_regions)
+            .saturating_sub(self.packed_arenas)
     }
 
     /// Everything a perfect compaction would hand back to the weight side.
     pub fn total(&self) -> usize {
-        self.watermark.saturating_sub(self.packed_arenas)
+        self.watermark
+            .saturating_sub(self.packed_arenas)
+            .saturating_sub(self.span_regions)
+            .saturating_sub(self.record_regions)
+    }
+
+    /// Regions that are in use but that no compaction can pack — span tenants and record
+    /// arenas. The part of the denominator that is not a loss.
+    pub fn unpackable_in_use(&self) -> usize {
+        self.span_regions + self.record_regions
     }
 
     /// **VRAM efficiency: of the ground denied to the weight side, the percentage
@@ -300,12 +333,22 @@ impl GroundLost {
     /// holding a high arena as perfectly efficient, which is the exact state that
     /// kills decode.
     ///
+    /// **Span-tenant and record-arena regions count in the numerator**, because the
+    /// question is how much of the denied ground is *in use*, not how much of it is KV
+    /// chunks. Neither is packable — a recurrent state store's regions belong to live
+    /// sequences, and record arenas are outside the compaction census — so counting them
+    /// as waste makes the figure say nothing about compaction, which is what it exists to
+    /// measure. Measured: Qwen3.8-Flash-Next read 4% by the arithmetic that charged the
+    /// state store, against 97% by this one, with the KV pools packed to within two arenas
+    /// of perfect in *both* readings; and the 30B, which has no span tenant, lost 11 of its
+    /// 62 "denied" regions to record arenas holding live records.
+    ///
     /// 100 when nothing is live: no frontier, nothing denied.
     pub fn efficiency_pct(&self) -> usize {
         if self.watermark == 0 {
             return 100;
         }
-        self.packed_arenas * 100 / self.watermark
+        (self.packed_arenas + self.unpackable_in_use()).min(self.watermark) * 100 / self.watermark
     }
 }
 
@@ -710,6 +753,8 @@ mod tests {
             watermark: 1000,
             live_arenas: 900,
             packed_arenas: 300,
+            span_regions: 0,
+            record_regions: 0,
         };
         assert_eq!(g.arena_holes(), 100, "free regions below the frontier");
         assert_eq!(g.sparsity(), 600, "regions a chunk pack would release");
@@ -737,6 +782,8 @@ mod tests {
             watermark: 1000,
             live_arenas: 310,
             packed_arenas: 300,
+            span_regions: 0,
+            record_regions: 0,
         };
         assert_eq!(
             straggler.efficiency_pct(),
@@ -748,8 +795,124 @@ mod tests {
             watermark: 300,
             live_arenas: 300,
             packed_arenas: 300,
+            span_regions: 0,
+            record_regions: 0,
         };
         assert_eq!(packed.efficiency_pct(), 100);
+    }
+
+    /// **A span tenant's regions are in use, not fragmentation.**
+    ///
+    /// A recurrent state store claims whole regions from the same free list and holds
+    /// them for as long as its sequences live, so the frontier it pushes up is ground
+    /// nothing can pack. Counted as loss, a perfectly packed pool scores arbitrarily
+    /// badly: these are Qwen3.8-Flash-Next's measured figures, which read 4% by that
+    /// arithmetic with the KV pools two arenas off perfect.
+    #[test]
+    fn a_span_tenants_regions_are_in_use_not_lost() {
+        let flash_next = GroundLost {
+            watermark: 310,
+            live_arenas: 303,
+            packed_arenas: 15,
+            span_regions: 286,
+            record_regions: 0,
+        };
+        assert_eq!(
+            flash_next.efficiency_pct(),
+            97,
+            "the KV pools are packed; the frontier is the state store's",
+        );
+        assert_eq!(
+            flash_next.sparsity(),
+            2,
+            "two arenas of air, and that is all"
+        );
+        assert_eq!(flash_next.arena_holes(), 7, "seven regions nobody holds");
+        assert_eq!(flash_next.total(), 9, "nine regions a pack could recover");
+        assert_eq!(
+            flash_next.arena_holes() + flash_next.sparsity(),
+            flash_next.total(),
+            "the two losses must still sum to the whole",
+        );
+
+        // Charged as loss instead, the same pool reads as catastrophically fragmented
+        // — which is the reading this field exists to remove.
+        assert_eq!(
+            GroundLost {
+                span_regions: 0,
+                record_regions: 0,
+                ..flash_next
+            }
+            .efficiency_pct(),
+            4,
+        );
+    }
+
+    /// **A record arena's regions are in use, not fragmentation either.**
+    ///
+    /// `gpu_class_stats` reports `ArenaKind::Band` pools only — deliberately, so a record
+    /// arena pollutes neither the fragmentation figure nor the relief decisions reading it
+    /// — which leaves it in no size-class row and therefore in nothing a consumer sums.
+    /// Charged as waste it makes a perfectly packed pool look fragmented, and unlike the
+    /// span-tenant case it bites the models that have no span tenant at all. These are the
+    /// 30B's measured figures: 206 of 206 arenas packed, 11 record arenas, 51 genuine
+    /// holes.
+    #[test]
+    fn a_record_arenas_regions_are_in_use_not_lost() {
+        let thirty_b = GroundLost {
+            watermark: 268,
+            live_arenas: 217,
+            packed_arenas: 206,
+            span_regions: 0,
+            record_regions: 11,
+        };
+        assert_eq!(
+            thirty_b.sparsity(),
+            0,
+            "the pools are packed — no chunk pack would release anything",
+        );
+        assert_eq!(
+            thirty_b.total(),
+            51,
+            "so the whole loss is the stranded free regions, not the records",
+        );
+        assert_eq!(thirty_b.efficiency_pct(), 80);
+        // Charged as waste instead, the same pool reads as materially worse and the figure
+        // stops being about compaction.
+        assert_eq!(
+            GroundLost {
+                record_regions: 0,
+                ..thirty_b
+            }
+            .efficiency_pct(),
+            76,
+        );
+    }
+
+    /// A span tenant holding the whole frontier is fully efficient, and the
+    /// percentage cannot exceed 100 even if the two halves are read a moment apart.
+    #[test]
+    fn a_frontier_that_is_all_span_tenant_is_fully_efficient() {
+        let all_span = GroundLost {
+            watermark: 64,
+            live_arenas: 64,
+            packed_arenas: 0,
+            span_regions: 64,
+            record_regions: 0,
+        };
+        assert_eq!(all_span.efficiency_pct(), 100);
+        assert_eq!(all_span.total(), 0);
+        // The class rows and the region counters come from one publish but not one
+        // lock, so a region released between them must not produce 106%.
+        let skewed = GroundLost {
+            watermark: 64,
+            live_arenas: 64,
+            packed_arenas: 4,
+            span_regions: 64,
+            record_regions: 0,
+        };
+        assert_eq!(skewed.efficiency_pct(), 100);
+        assert_eq!(skewed.total(), 0);
     }
 
     /// Nothing live is not a failure: no frontier means nothing denied.
@@ -766,6 +929,8 @@ mod tests {
             watermark: 300,
             live_arenas: 300,
             packed_arenas: 300,
+            span_regions: 0,
+            record_regions: 0,
         };
         assert_eq!(g.arena_holes(), 0);
         assert_eq!(g.sparsity(), 0);
@@ -782,6 +947,8 @@ mod tests {
             watermark: 1915,
             live_arenas: 1915,
             packed_arenas: 1800,
+            span_regions: 0,
+            record_regions: 0,
         };
         assert_eq!(g.arena_holes(), 0, "no holes — the allocator refilled them");
         assert_eq!(g.sparsity(), 115);

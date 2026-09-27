@@ -510,4 +510,41 @@ mod tests {
             assert_eq!(storage.arena_count().unwrap(), 0);
         }
     }
+
+    /// **Widening a key by size class always produces a BAND key — which is why a record
+    /// claim must never be promoted.**
+    ///
+    /// `alloc::stamp_region_promoting` answers a claim it cannot get a region for by
+    /// widening `key.class` and rebuilding the key with `ArenaKey::new`. That constructor
+    /// is `ArenaKind::Band`, so a *record* claim promoted this way comes back holding a
+    /// slot in a band arena — and the record's bytes are then written on top of live K/V,
+    /// which raises nothing: the caller's own check is that the slot is at least
+    /// `record_bytes`, and a 1,344 B record fits a 2 KiB band slot perfectly.
+    ///
+    /// A record's size is model geometry, not a rung of the ladder, so there is no wider
+    /// class it belongs in. This pins the reason the allocator refuses rather than
+    /// promotes; it cost one to three sessions of eight on the Flash-Next engine probe,
+    /// intermittently, once a compaction started minting a record per relocated chunk.
+    #[test]
+    fn widening_a_key_by_class_always_yields_a_band_key() {
+        use crate::kv_cache::chunked::arena::ArenaKind;
+
+        let record = ArenaKey::for_records(ArenaLocation::Gpu, 1344);
+        assert!(
+            matches!(record.kind, ArenaKind::Record { .. }),
+            "a record key is not a band key",
+        );
+
+        // Exactly what the promotion loop would build for it.
+        let wider = record.class.promote().unwrap_or(record.class);
+        let promoted = ArenaKey::new(wider, record.location);
+        assert!(
+            matches!(promoted.kind, ArenaKind::Band),
+            "promotion cannot preserve the record kind, so the allocator must refuse it",
+        );
+        assert_ne!(
+            record, promoted,
+            "and the promoted key names a different pool entirely",
+        );
+    }
 }
