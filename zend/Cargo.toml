@@ -48,7 +48,6 @@ tokenizers          = { workspace = true }
 # per-language CSTs used by the carver.  Grammars are direct deps so each
 # can be pinned independently as the language ecosystem moves.
 ignore                  = "0.4"
-notify                  = "6"
 sha2                    = "0.10"
 #
 # `tree-sitter` sets `links = "tree-sitter"`, so exactly ONE version may exist

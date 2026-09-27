@@ -504,6 +504,30 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
             "make_tag",
         ],
     ),
+    (
+        "git_switch",
+        &[
+            "git_checkout",
+            "checkout",
+            "switch_branch",
+            "checkout_branch",
+            "git_checkout_branch",
+        ],
+    ),
+    (
+        "git_merge",
+        &["merge", "git_pull", "pull", "merge_branch", "pull_latest"],
+    ),
+    (
+        "git_reset",
+        &[
+            "reset",
+            "undo_commit",
+            "discard_changes",
+            "git_restore",
+            "reset_branch",
+        ],
+    ),
     ("git_fetch", &["fetch_remote", "fetch_origin"]),
     (
         "git_push",
@@ -949,7 +973,8 @@ use crate::tools::{
         FILE_WRITE,
     },
     git::{
-        GIT_COMMIT, GIT_FETCH, GIT_GREP, GIT_LOG, GIT_PUSH, GIT_REF, GIT_REFS, GIT_SHOW, GIT_STATUS,
+        GIT_COMMIT, GIT_FETCH, GIT_GREP, GIT_LOG, GIT_MERGE, GIT_PUSH, GIT_REF, GIT_REFS,
+        GIT_RESET, GIT_SHOW, GIT_STATUS, GIT_SWITCH,
     },
     hash::{HASH_COMPUTE, HASH_SCAN},
     hash_state::{HASH_STATE_FINALIZE, HASH_STATE_INIT, HASH_STATE_UPDATE},
@@ -1049,9 +1074,13 @@ fn register_all() -> &'static [RegisteredTool] {
         // The writers declare DiskWrite, which Comprehensive's grants
         // withhold — so changing a repository is Mutable's alone, and a call
         // that arrives anyway is refused before its arguments are parsed.
-        // Fetch and push also reach a remote.
-        GIT_COMMIT.requires(DISK),
-        GIT_REF.requires(DISK),
+        // Every one of them also reaches origin: a branch write is kept only
+        // once origin has it.
+        GIT_COMMIT.requires(NET_DISK),
+        GIT_MERGE.requires(NET_DISK),
+        GIT_REF.requires(NET_DISK),
+        GIT_SWITCH.requires(NET_DISK),
+        GIT_RESET.requires(NET_DISK),
         GIT_FETCH.requires(NET_DISK),
         GIT_PUSH.requires(NET_DISK),
         // Notes tools (4) — reads safe, write high-risk
@@ -1264,7 +1293,15 @@ mod capability_tests {
         let needs = |name: &str| find(name).unwrap_or_else(|| panic!("{name}")).requires;
 
         const READERS: [&str; 5] = ["git_status", "git_log", "git_show", "git_grep", "git_refs"];
-        const WRITERS: [&str; 4] = ["git_commit", "git_ref", "git_fetch", "git_push"];
+        const WRITERS: [&str; 7] = [
+            "git_commit",
+            "git_merge",
+            "git_ref",
+            "git_switch",
+            "git_reset",
+            "git_fetch",
+            "git_push",
+        ];
 
         for name in READERS {
             assert!(
@@ -1278,8 +1315,9 @@ mod capability_tests {
                 "{name} changes a repository and must declare DiskWrite",
             );
         }
-        // Reaching a remote is declared on top of the disk write.
-        for name in ["git_fetch", "git_push"] {
+        // Reaching origin is declared on top of the disk write: every write
+        // is kept only once origin has it.
+        for name in WRITERS {
             assert!(needs(name).contains(&Capability::Network), "{name}");
         }
         // Nothing here is `Exec`: the layer runs `git` with arguments it
@@ -1314,7 +1352,15 @@ mod capability_tests {
             .with(Capability::Sandbox)
             .with(Capability::Secrets);
         let ctx = ToolContext::new().granting(comprehensive);
-        for name in ["git_commit", "git_ref", "git_fetch", "git_push"] {
+        for name in [
+            "git_commit",
+            "git_merge",
+            "git_ref",
+            "git_switch",
+            "git_reset",
+            "git_fetch",
+            "git_push",
+        ] {
             let out = find(name).unwrap().call(&ctx, &json!({"repo": "app"}));
             assert_eq!(out["error"], NotPermitted::CODE, "{name} ran: {out}");
         }

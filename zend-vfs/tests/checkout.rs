@@ -17,9 +17,18 @@ use std::time::{Duration, SystemTime};
 
 use support::{cached_repo, disk, git, put};
 use tempfile::TempDir;
-use zend_vfs::checkout::{capture, materialize, CheckoutError, Ledger};
+use zend_vfs::checkout::{self, capture, CheckoutError, Ledger, Materialized};
 use zend_vfs::file_delta::{self, FileDelta};
 use zend_vfs::{BranchName, DiskWriteGrant, FileChanges, Head, Oid, Repo, RepoPath, Rev};
+
+fn materialize(
+    repo: &Repo,
+    grant: &DiskWriteGrant,
+    branch: &BranchName,
+    changes: &FileChanges,
+) -> Result<(Ledger, Materialized), CheckoutError> {
+    checkout::materialize(repo, grant, branch, changes)
+}
 
 // ── Fixture ──────────────────────────────────────────────────────────────────
 
@@ -197,7 +206,7 @@ fn every_kind(f: &Fixture) -> FileChanges {
 fn every_kind_of_change_materialises_exactly() {
     let f = fixture();
     let changes = every_kind(&f);
-    let (ledger, done) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    let (ledger, done) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
 
     assert_holds(&f, &changes, "first materialise");
     assert_eq!(disk(&f.root, "src/main.rs"), None);
@@ -224,7 +233,7 @@ fn materialising_the_same_state_again_touches_nothing() {
     let f = fixture();
     let changes = every_kind(&f);
     put(&f.root, "target/debug/app.bin", b"build output\n");
-    let (ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
 
     let watched = [
         "src/lib.rs",
@@ -237,7 +246,7 @@ fn materialising_the_same_state_again_touches_nothing() {
     ];
     let old: Vec<SystemTime> = watched.iter().map(|p| set_old_mtime(&f.root, p)).collect();
 
-    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes, Some(ledger)).unwrap();
+    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert!(done.written.is_empty(), "rewrote {:?}", done.written);
     assert!(done.removed.is_empty() && done.restored.is_empty() && !done.reset);
     assert_eq!(done.kept.len(), changes.len());
@@ -250,7 +259,9 @@ fn materialising_the_same_state_again_touches_nothing() {
 /// **One conversation after another**: what only the first changed goes back
 /// to the base — its new files removed, its deletion undone, its edits
 /// reverted — what the second changes lands, and a file both hold with the
-/// same bytes is not rewritten. Then back again.
+/// same bytes is not rewritten. Then back again. An ignored file the first
+/// wrote is not the checkout's to judge: the run that wrote it takes it
+/// away as it restores the checkout ([`checkout::preserve`]).
 #[test]
 fn switching_conversations_leaves_only_the_second() {
     let f = fixture();
@@ -270,14 +281,13 @@ fn switching_conversations_leaves_only_the_second() {
     change(&f, &mut b, "only_b.txt", Some(b"b\n"));
     change(&f, &mut b, "shared.txt", Some(b"same in both\n"));
 
-    let (ledger, _) = materialize(&f.repo, &grant(), &f.branch, &a, None).unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &a).unwrap();
     assert_holds(&f, &a, "a");
     let shared_mtime = set_old_mtime(&f.root, "shared.txt");
 
-    let (ledger, done) = materialize(&f.repo, &grant(), &f.branch, &b, Some(ledger)).unwrap();
+    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &b).unwrap();
     assert_holds(&f, &b, "b after a");
     assert_eq!(disk(&f.root, "only_a.txt"), None);
-    assert_eq!(disk(&f.root, "a.log"), None, "a's ignored file is gone too");
     assert_eq!(disk(&f.root, "src/main.rs"), at_base(&f, "src/main.rs"));
     assert_eq!(disk(&f.root, "src/lib.rs"), text(LIB));
     assert_eq!(
@@ -290,24 +300,24 @@ fn switching_conversations_leaves_only_the_second() {
     restored.sort();
     assert_eq!(restored, ["src/lib.rs", "src/main.rs"]);
 
-    let (_, _) = materialize(&f.repo, &grant(), &f.branch, &a, Some(ledger)).unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &a).unwrap();
     assert_holds(&f, &a, "a again");
     assert_eq!(disk(&f.root, "only_b.txt"), None);
     assert_eq!(disk(&f.root, "README.md"), at_base(&f, "README.md"));
 }
 
-/// **Drift the ledger never saw is still put right**: a file changed on the
-/// checkout by someone else, and a stray file, are found by status and reset.
+/// **Drift is put right**: a file changed on the checkout by someone else,
+/// and a stray file, are found by status and reset.
 #[test]
 fn drift_on_the_checkout_is_put_right() {
     let f = fixture();
     let changes = every_kind(&f);
-    let (ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     put(&f.root, "docs/guide/intro.md", b"someone else's edit\n");
     put(&f.root, "stray.txt", b"left behind\n");
     put(&f.root, "src/lib.rs", b"clobbered\n");
 
-    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes, Some(ledger)).unwrap();
+    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert_holds(&f, &changes, "after drift");
     assert_eq!(disk(&f.root, "stray.txt"), None);
     assert_eq!(done.written, ["src/lib.rs"]);
@@ -320,11 +330,11 @@ fn drift_on_the_checkout_is_put_right() {
 fn a_new_branch_or_a_staged_change_resets_the_checkout() {
     let f = fixture();
     let changes = every_kind(&f);
-    let (ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
 
     // A tool that staged something.
     git(&f.root, &["add", "src/new/module.rs"]);
-    let (ledger, done) = materialize(&f.repo, &grant(), &f.branch, &changes, Some(ledger)).unwrap();
+    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert!(done.reset && !done.switched);
     assert_holds(&f, &changes, "after a staged change");
 
@@ -342,8 +352,7 @@ fn a_new_branch_or_a_staged_change_resets_the_checkout() {
     git(&f.root, &["worktree", "remove", "--force", at]);
     let next = Oid::parse(git(&f.root, &["rev-parse", "refs/heads/next"]).trim()).unwrap();
 
-    let (_, done) =
-        materialize(&f.repo, &grant(), &branch("next"), &changes, Some(ledger)).unwrap();
+    let (_, done) = materialize(&f.repo, &grant(), &branch("next"), &changes).unwrap();
     assert!(done.reset && done.switched);
     assert_eq!(
         f.repo.head().unwrap(),
@@ -366,14 +375,14 @@ fn a_detached_checkout_is_put_on_the_branch() {
     let f = fixture();
     git(&f.root, &["checkout", "-q", "--detach", f.base.as_str()]);
     let changes = every_kind(&f);
-    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert!(done.reset && done.switched);
     assert_eq!(f.repo.head().unwrap().branch(), Some(&f.branch));
     assert_holds(&f, &changes, "after the switch");
 
     let before = disk(&f.root, "README.md");
     assert!(matches!(
-        materialize(&f.repo, &grant(), &branch("absent"), &changes, None),
+        materialize(&f.repo, &grant(), &branch("absent"), &changes),
         Err(CheckoutError::Git(_))
     ));
     assert_eq!(disk(&f.root, "README.md"), before);
@@ -409,7 +418,7 @@ fn a_written_file_is_dated_by_the_write() {
     put(&f.root, "target/debug/app.bin", b"built\n");
     let built = mtime(&f.root, "target/debug/app.bin");
 
-    let (ledger, done) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert_eq!(done.written, ["README.md", "src/new.rs"]);
     for path in ["README.md", "src/new.rs"] {
         assert!(
@@ -420,7 +429,7 @@ fn a_written_file_is_dated_by_the_write() {
 
     // Held already: not written, and its time is whatever it was.
     let kept = set_old_mtime(&f.root, "src/new.rs");
-    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes, Some(ledger)).unwrap();
+    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert!(done.written.is_empty(), "{done:?}");
     assert_eq!(mtime(&f.root, "src/new.rs"), kept);
 }
@@ -431,7 +440,7 @@ fn a_written_file_is_dated_by_the_write() {
 fn changes_that_do_not_fit_change_nothing() {
     let f = fixture();
     let good = every_kind(&f);
-    let (ledger, _) = materialize(&f.repo, &grant(), &f.branch, &good, None).unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &good).unwrap();
     let before: Vec<Option<Vec<u8>>> = ["src/lib.rs", "README.md", "notes.log"]
         .iter()
         .map(|p| disk(&f.root, p))
@@ -448,7 +457,7 @@ fn changes_that_do_not_fit_change_nothing() {
             }],
         },
     );
-    match materialize(&f.repo, &grant(), &f.branch, &bad, Some(ledger)) {
+    match materialize(&f.repo, &grant(), &f.branch, &bad) {
         Err(CheckoutError::Diverged { path }) => assert_eq!(path, "docs/guide/intro.md"),
         other => panic!("{other:?}"),
     }
@@ -473,7 +482,7 @@ fn an_unsafe_path_is_refused_before_anything_changes() {
                 content: "x".into(),
             },
         );
-        let result = materialize(&f.repo, &grant(), &f.branch, &c, None);
+        let result = materialize(&f.repo, &grant(), &f.branch, &c);
         assert!(
             matches!(result, Err(CheckoutError::UnsafePath { .. })),
             "{path}: {result:?}"
@@ -502,17 +511,10 @@ fn folders_a_conversation_made_go_with_its_files() {
         Some(b"more\n"),
     );
     change(&f, &mut changes, "cache/kept.txt", Some(b"mine\n"));
-    let (ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     put(&f.root, "cache/build.log", b"a build output\n");
 
-    materialize(
-        &f.repo,
-        &grant(),
-        &f.branch,
-        &FileChanges::new(),
-        Some(ledger),
-    )
-    .unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &FileChanges::new()).unwrap();
     assert!(!f.root.join("deep").exists(), "an emptied folder was left");
     assert!(!f.root.join("docs/guide/extra").exists());
     assert!(
@@ -532,7 +534,7 @@ fn a_nested_repository_is_left_alone() {
     std::fs::create_dir_all(&nested).unwrap();
     git(&nested, &["init", "-q"]);
     put(&nested, "x.txt", b"x\n");
-    materialize(&f.repo, &grant(), &f.branch, &FileChanges::new(), None).unwrap();
+    materialize(&f.repo, &grant(), &f.branch, &FileChanges::new()).unwrap();
     assert_eq!(disk(&nested, "x.txt"), text("x\n"));
 }
 
@@ -548,7 +550,7 @@ fn a_nested_repository_is_left_alone() {
 fn a_tools_changes_are_captured_and_replay_to_the_disk() {
     let f = fixture();
     let mut changes = every_kind(&f);
-    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
 
     // The tool.
     let lib = String::from_utf8(disk(&f.root, "src/lib.rs").unwrap()).unwrap();
@@ -597,9 +599,9 @@ fn a_tools_changes_are_captured_and_replay_to_the_disk() {
         assert_eq!(view(&f, &changes, path), disk(&f.root, path), "{path}");
     }
 
-    // The ledger now says what is on disk: materialising the result touches
-    // nothing.
-    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes, Some(ledger)).unwrap();
+    // What is on disk is what the changes say: materialising the result
+    // touches nothing.
+    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert!(done.written.is_empty(), "rewrote {:?}", done.written);
 }
 
@@ -609,8 +611,7 @@ fn a_tools_changes_are_captured_and_replay_to_the_disk() {
 #[test]
 fn a_file_removed_from_the_index_only_is_not_a_change() {
     let f = fixture();
-    let (mut ledger, _) =
-        materialize(&f.repo, &grant(), &f.branch, &FileChanges::new(), None).unwrap();
+    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &FileChanges::new()).unwrap();
     git(&f.root, &["rm", "-q", "--cached", "README.md"]);
     assert!(capture(&f.repo, &f.branch, &mut ledger).unwrap().is_empty());
 }
@@ -621,7 +622,7 @@ fn a_file_removed_from_the_index_only_is_not_a_change() {
 fn a_tool_that_changes_nothing_yields_nothing() {
     let f = fixture();
     let changes = every_kind(&f);
-    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert!(capture(&f.repo, &f.branch, &mut ledger).unwrap().is_empty());
 
     let same = disk(&f.root, "src/lib.rs").unwrap();
@@ -638,7 +639,7 @@ fn a_restored_mtime_is_caught_inside_the_racy_window() {
     let f = fixture();
     let mut changes = FileChanges::new();
     change(&f, &mut changes, "README.md", Some(b"aaaa\n"));
-    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     let written = mtime(&f.root, "README.md");
     put(&f.root, "README.md", b"bbbb\n");
     std::fs::File::options()
@@ -681,7 +682,7 @@ fn a_crlf_checkout_round_trips() {
         "src/lib.rs",
         Some(crlf_lib.replace("    2\r\n", "    22\r\n").as_bytes()),
     );
-    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
+    let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert_holds(&f, &changes, "crlf");
 
     let now = String::from_utf8(disk(&f.root, "src/lib.rs").unwrap()).unwrap();
@@ -697,19 +698,6 @@ fn a_crlf_checkout_round_trips() {
     assert_eq!(splices[0].inserted, "    33\r\n");
     changes.extend(captured);
     assert_holds(&f, &changes, "crlf after capture");
-}
-
-/// A ledger from a previous process works as well as one kept in memory.
-#[test]
-fn a_ledger_survives_its_wire_form() {
-    let f = fixture();
-    let changes = every_kind(&f);
-    let (ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes, None).unwrap();
-    let wire = serde_json::to_string(&ledger).unwrap();
-    let back: Ledger = serde_json::from_str(&wire).unwrap();
-    assert_eq!(back, ledger);
-    let (_, done) = materialize(&f.repo, &grant(), &f.branch, &changes, Some(back)).unwrap();
-    assert!(done.written.is_empty());
 }
 
 // ── Generated: many conversations, one checkout ──────────────────────────────
@@ -794,7 +782,6 @@ fn conversations_take_turns(seed: u64) {
     let mut rng = Lcg(seed);
     let mut n = 0;
     let mut conversations: Vec<FileChanges> = vec![FileChanges::new(); 3];
-    let mut ledger: Option<Ledger> = None;
 
     for round in 0..ROUNDS {
         let who = rng.below(conversations.len());
@@ -807,7 +794,7 @@ fn conversations_take_turns(seed: u64) {
             change(&f, c, path, new.as_deref());
         }
 
-        let (mut l, _) = materialize(&f.repo, &grant(), &f.branch, c, ledger.take())
+        let (mut l, _) = materialize(&f.repo, &grant(), &f.branch, c)
             .unwrap_or_else(|e| panic!("round {round}: {e}"));
         assert_holds(
             &f,
@@ -846,12 +833,11 @@ fn conversations_take_turns(seed: u64) {
             );
         }
 
-        let (l, done) = materialize(&f.repo, &grant(), &f.branch, c, Some(l)).unwrap();
+        let (_, done) = materialize(&f.repo, &grant(), &f.branch, c).unwrap();
         assert!(
             done.written.is_empty() && done.removed.is_empty(),
             "round {round}: {done:?}"
         );
-        ledger = Some(l);
     }
     assert_eq!(mtime(&f.root, ".gitignore"), never_touched);
 }

@@ -10,6 +10,7 @@
 //!   that lost its `DiskWrite` declaration would fail here.
 
 use serde_json::{json, Value};
+use zend_tools::registry::find;
 
 use crate::harness::{branch_rev, commit_rev, parent_rev, GitWorkspace};
 
@@ -24,16 +25,24 @@ fn git_ref(ws: &GitWorkspace, args: Value) -> Value {
 // ── git_commit: from files ───────────────────────────────────────────────────
 
 /// **`take` is the arm that exists so nothing has to be reproduced from
-/// memory.** The edit is already on disk; the commit picks it up.
+/// memory.** The edit is already in the conversation's files; the commit
+/// picks it up — and never what the repository's folder holds instead, which
+/// is the sandbox's, not the conversation's.
 #[test]
-fn take_commits_the_file_as_it_stands_on_disk() {
+fn take_commits_the_file_as_the_conversation_holds_it() {
     let ws = GitWorkspace::new();
     ws.git(&["branch", "work"]);
-    ws.write_worktree("src/lib.rs", "pub fn hello() -> u8 {\n    7\n}\n");
+    ws.write_worktree("src/lib.rs", "a job left this in the folder\n");
+    let ctx = ws.mutable_ctx();
+    ctx.files
+        .repo("app")
+        .unwrap()
+        .write("src/lib.rs", "pub fn hello() -> u8 {\n    7\n}\n".into())
+        .unwrap();
 
-    let out = commit(
-        &ws,
-        json!({"repo": "app", "branch": "work", "from": "files", "message": "take the edit",
+    let out = find("git_commit").unwrap().call(
+        &ctx,
+        &json!({"repo": "app", "branch": "work", "from": "files", "message": "take the edit",
                "changes": [{"action": "take", "path": "src/lib.rs"}]}),
     );
     assert_eq!(out["applied"], true, "{out}");
@@ -121,17 +130,63 @@ fn an_uncommitted_edit_on_disk_survives_a_commit() {
     assert_eq!(ws.oid("HEAD"), ws.oid("main"), "HEAD must not have moved");
 }
 
-/// **A checked-out branch is refused**, because moving it would change what
-/// the developer has open.
+/// **Committing your changes on your branch clears them**: the files now read
+/// from the branch itself, nothing is left uncommitted, and the repository's
+/// folder — the sandbox's — is not what was committed from.
 #[test]
-fn committing_on_the_checked_out_branch_is_refused() {
+fn committing_your_changes_on_your_branch_clears_them() {
     let ws = GitWorkspace::new();
-    let out = commit(
-        &ws,
-        json!({"repo": "app", "branch": "main", "from": "files", "message": "nope",
-               "changes": [{"action": "write", "path": "x.txt", "content": "x\n"}]}),
+    ws.write_worktree("README.md", "# left on disk by a job\n");
+    let conv = ws.conversation();
+    conv.write("README.md", "# app\n\ncommitted.\n");
+    conv.write("NOTES.md", "notes\n");
+    conv.delete("src/lib.rs");
+
+    let out = conv.call(
+        "git_commit",
+        json!({"repo": "app", "from": "changes", "message": "my work"}),
     );
-    assert_eq!(out["error"], "checked_out_branch", "{out}");
+    assert_eq!(out["applied"], true, "{out}");
+    assert_eq!(out["branch"], "main");
+    assert_eq!(out["on"], "local", "no origin here");
+    assert_eq!(ws.oid("main"), out["commit"].as_str().unwrap());
+    assert_eq!(ws.git(&["show", "main:README.md"]), "# app\n\ncommitted.\n");
+    assert_eq!(ws.git(&["show", "main:NOTES.md"]), "notes\n");
+    assert!(ws
+        .git(&["ls-tree", "--name-only", "-r", "main"])
+        .lines()
+        .all(|l| l != "src/lib.rs"));
+
+    let status = conv.status();
+    assert_eq!(status["clean"], true, "{status}");
+    assert_eq!(
+        conv.read("README.md").as_deref(),
+        Some("# app\n\ncommitted.\n")
+    );
+
+    let again = conv.call(
+        "git_commit",
+        json!({"repo": "app", "from": "changes", "message": "nothing"}),
+    );
+    assert_eq!(again["error"], "invalid_arguments", "{again}");
+}
+
+/// **Committing some files leaves the rest uncommitted.**
+#[test]
+fn committing_some_files_leaves_the_rest() {
+    let ws = GitWorkspace::new();
+    let conv = ws.conversation();
+    conv.write("a.txt", "a\n");
+    conv.write("b.txt", "b\n");
+    let out = conv.call(
+        "git_commit",
+        json!({"repo": "app", "from": "files", "message": "just a",
+               "changes": [{"action": "take", "path": "a.txt"}]}),
+    );
+    assert_eq!(out["applied"], true, "{out}");
+    let status = conv.status();
+    assert_eq!(status["counts"]["added"], 1, "{status}");
+    assert_eq!(status["changes"][0]["path"], "b.txt");
 }
 
 /// **`expected_head` is optional, and both paths work.** Omitted, the tip is
@@ -169,7 +224,7 @@ fn expected_head_is_optional_and_a_stale_one_is_refused() {
 }
 
 #[test]
-fn committing_on_a_branch_that_does_not_exist_points_at_git_ref() {
+fn committing_on_a_branch_that_does_not_exist_points_at_git_switch() {
     let ws = GitWorkspace::new();
     let out = commit(
         &ws,
@@ -177,7 +232,10 @@ fn committing_on_a_branch_that_does_not_exist_points_at_git_ref() {
                "changes": [{"action": "write", "path": "x.txt", "content": "x\n"}]}),
     );
     assert_eq!(out["error"], "invalid_arguments", "{out}");
-    assert!(out["detail"].as_str().unwrap().contains("git_ref"), "{out}");
+    assert!(
+        out["detail"].as_str().unwrap().contains("git_switch"),
+        "{out}"
+    );
 }
 
 /// A protected path cannot be committed — committing is not a way to launder
@@ -511,19 +569,36 @@ fn a_branch_is_deleted_and_reports_what_it_held() {
     assert!(!ws.git(&["branch"]).contains("doomed"));
 }
 
-/// **The checked-out branch is protected from both operations.**
+/// **The branch you are on is neither deleted nor moved by `git_ref`** —
+/// switch away first, or move it with `git_reset`, which moves your files
+/// with it.
 #[test]
-fn the_checked_out_branch_can_be_neither_moved_nor_deleted() {
+fn the_branch_you_are_on_is_neither_deleted_nor_moved_here() {
     let ws = GitWorkspace::new();
     let at = ws.oid("main");
-    for action in ["move", "delete"] {
-        let out = git_ref(
-            &ws,
-            json!({"repo": "app", "kind": "branch", "action": action, "name": "main",
-                   "at": commit_rev(&ws.oid("HEAD~1"))}),
-        );
-        assert_eq!(out["error"], "checked_out_branch", "{action}: {out}");
-    }
+    let conv = ws.conversation();
+    let out = conv.call(
+        "git_ref",
+        json!({"repo": "app", "kind": "branch", "action": "delete", "name": "main"}),
+    );
+    assert_eq!(out["error"], "invalid_arguments", "{out}");
+    assert!(
+        out["detail"].as_str().unwrap().contains("git_switch"),
+        "{out}"
+    );
+    assert_eq!(ws.oid("main"), at, "main must be untouched");
+
+    let back = ws.oid("HEAD~1");
+    let out = conv.call(
+        "git_ref",
+        json!({"repo": "app", "kind": "branch", "action": "move", "name": "main",
+               "at": commit_rev(&back), "expected": at}),
+    );
+    assert_eq!(out["error"], "invalid_arguments", "{out}");
+    assert!(
+        out["detail"].as_str().unwrap().contains("git_reset"),
+        "{out}"
+    );
     assert_eq!(ws.oid("main"), at, "main must be untouched");
 }
 

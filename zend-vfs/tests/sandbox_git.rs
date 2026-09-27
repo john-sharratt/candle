@@ -15,35 +15,29 @@ use zend_vfs::{SandboxCommand, SandboxError, VfsStore};
 
 /// Run `command` expecting the git refusal; returns what it named.
 async fn refused(f: &Fixture, files: &VfsStore, command: &SandboxCommand) -> String {
-    match f
-        .sandbox
-        .run(&grant(), &branch("main"), files, command)
-        .await
-    {
+    match try_run(f, "main", files, command).await {
         Err(SandboxError::Refused(Refused::Git { command })) => command,
         other => panic!("{command:?} was not refused as git: {other:?}"),
     }
 }
 
 /// **git as the program is refused, and the error tells the caller to use
-/// the git tools** — nothing runs, nothing is recorded, the checkout is reset
-/// and the next run goes ahead.
+/// the git tools** — nothing runs, nothing is recorded, the checkout is not
+/// touched and the next run goes ahead.
 #[tokio::test]
 async fn git_as_the_program_is_refused_towards_the_git_tools() {
     let f = fixture_allowing(&[SHELL, "git"]);
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     files.write("mine.txt", "mine\n".into()).unwrap();
-    let before = files.changes();
+    let before = files.changes().unwrap();
 
-    let result = f
-        .sandbox
-        .run(
-            &grant(),
-            &branch("main"),
-            &files,
-            &SandboxCommand::new("git").args(["commit", "-am", "wip"]),
-        )
-        .await;
+    let result = try_run(
+        &f,
+        "main",
+        &files,
+        &SandboxCommand::new("git").args(["commit", "-am", "wip"]),
+    )
+    .await;
     let error = result.unwrap_err();
     let message = error.to_string();
     assert!(
@@ -64,12 +58,12 @@ async fn git_as_the_program_is_refused_towards_the_git_tools() {
     ] {
         assert!(message.contains(tool), "{tool} missing from: {message}");
     }
-    assert_eq!(files.changes(), before);
-    assert_reset(&f, "main");
+    assert_eq!(files.changes().unwrap(), before);
+    assert_untouched(&f, "main");
     assert_eq!(disk(&f.root, "mine.txt"), None);
 
     let next = run(&f, "main", &files, &shell("echo next", "echo next")).await;
-    assert_eq!(next.stdout.text.trim_end(), "next");
+    assert_eq!(next.printed.trim_end(), "next");
 }
 
 /// **git anywhere in a script is refused before the script starts** — the
@@ -77,7 +71,7 @@ async fn git_as_the_program_is_refused_towards_the_git_tools() {
 #[tokio::test]
 async fn git_in_a_script_is_refused_before_anything_runs() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let named = refused(
         &f,
         &files,
@@ -90,7 +84,7 @@ async fn git_in_a_script_is_refused_before_anything_runs() {
     assert_eq!(named, "git status");
     assert_eq!(disk(&f.root, "ran.txt"), None, "the script started");
     assert!(!files.is_modified("ran.txt"));
-    assert_reset(&f, "main");
+    assert_untouched(&f, "main");
 }
 
 /// **Every way of running git directly through a command is refused**, on
@@ -99,7 +93,7 @@ async fn git_in_a_script_is_refused_before_anything_runs() {
 #[tokio::test]
 async fn every_direct_route_to_git_is_refused() {
     let f = fixture_allowing(&["sh", "bash", "cmd", "powershell", "pwsh", "env", "timeout"]);
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     // PowerShell's `-EncodedCommand`: base64 of UTF-16LE.
     let encoded = {
         let utf16: Vec<u8> = "Write-Host hi; git fetch"
@@ -158,7 +152,7 @@ async fn every_direct_route_to_git_is_refused() {
         assert_eq!(refused(&f, &files, &command).await, named, "{command:?}");
     }
     // Refused before the checkout was touched at all.
-    assert_reset(&f, "main");
+    assert_untouched(&f, "main");
 }
 
 /// **git is refused as git even where the program is not allowed at all** —
@@ -166,7 +160,7 @@ async fn every_direct_route_to_git_is_refused() {
 #[tokio::test]
 async fn git_is_named_as_git_before_the_allow_list() {
     let f = fixture_allowing(&[]);
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     assert_eq!(
         refused(&f, &files, &SandboxCommand::new("git").arg("status")).await,
         "git status"
@@ -182,14 +176,13 @@ async fn git_is_named_as_git_before_the_allow_list() {
     );
     // Without git, an unlisted program is refused as unlisted.
     assert!(matches!(
-        f.sandbox
-            .run(
-                &grant(),
-                &branch("main"),
-                &files,
-                &SandboxCommand::new("sh").args(["-c", "echo git"]),
-            )
-            .await,
+        try_run(
+            &f,
+            "main",
+            &files,
+            &SandboxCommand::new("sh").args(["-c", "echo git"]),
+        )
+        .await,
         Err(SandboxError::Refused(Refused::NotAllowed { .. }))
     ));
 }
@@ -200,7 +193,7 @@ async fn git_is_named_as_git_before_the_allow_list() {
 #[tokio::test]
 async fn commands_that_only_mention_git_run() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let command = shell(
         "echo git status & type .gitignore & echo \"quoted & git log\" & \
          echo escaped ^& git log & where git >NUL 2>&1 & echo checked & echo (git) & \
@@ -220,10 +213,10 @@ async fn commands_that_only_mention_git_run() {
         "commented",
     ] {
         assert!(
-            done.stdout.text.contains(mark),
+            done.printed.contains(mark),
             "{mark:?} missing from {:?}",
-            done.stdout.text
+            done.printed
         );
     }
-    assert_reset(&f, "main");
+    assert_untouched(&f, "main");
 }

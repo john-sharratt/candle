@@ -4,15 +4,9 @@
 //!
 //! 1. **Model** — fetch and load the GGUF weights.
 //! 2. **Substrate** — replay the redo log into the in-RAM substrate.
-//! 3. **Sections** — prefill the projection schema's pinned sections.
-//! 4. **Priming** — read the foundational documents the whole substrate
-//!    descends from, in order (`crate::priming_chain`).
-//! 5. **Ingesting** — run the schema-declared `raw` (ChatML) ingest passes, the
-//!    only kind still on this blocking path. Folder-scan (`repo_map`) and
-//!    per-file (`code_reading`) layers are seeded from the substrate at boot
-//!    and handed to `crate::ingest_worker`'s background worker instead — their
-//!    walk and pool work never gates `ready`. A schema with no `raw` layers
-//!    transitions through this step instantly.
+//! 3. **Sections** — prefill the projection schema's pinned sections, then
+//!    calibrate them.
+//! 4. **Normalizing** — relearn the tool catalog's score-normalization levels.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
 //! via [`Self::set_step`], reports intra-step progress via
@@ -32,19 +26,6 @@ pub enum LoadStep {
     Compacting,
     Sections,
     CalibratingSections,
-    /// The priming chain — the foundational documents every later conversation
-    /// descends from, read in order (`crate::priming_chain`). Each link is a
-    /// real conversation doing real tool calls and decoding its own summary, so
-    /// this is minutes of work, not bookkeeping: it gets its own step rather
-    /// than running invisibly under the tail of another one.
-    Priming,
-    /// The schema-driven `raw` (ChatML) ingest phase — the only ingest mode
-    /// still blocking here. Folder-scan and per-file layers are seeded from
-    /// the substrate in the pre-loop and ingested entirely off this path by
-    /// `crate::ingest_worker`'s background worker after `ready`. A `raw`
-    /// layer's display label ("Loading responses", …) is surfaced through the
-    /// `detail` sub-status.
-    Ingesting,
     /// The tool catalog's score-normalization hit levels, relearned from its
     /// corpus. They are runtime-only, so every start pays this — last, once the
     /// corpus is complete, and before `ready`, because a query scored against
@@ -61,8 +42,6 @@ impl LoadStep {
         LoadStep::Compacting,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
-        LoadStep::Priming,
-        LoadStep::Ingesting,
         LoadStep::Normalizing,
     ];
 
@@ -74,8 +53,6 @@ impl LoadStep {
             LoadStep::Compacting => "Compacting substrate",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
-            LoadStep::Priming => "Reading project documents",
-            LoadStep::Ingesting => "Ingesting workspace",
             LoadStep::Normalizing => "Normalizing scores",
         }
     }
@@ -84,8 +61,7 @@ impl LoadStep {
     /// the bar as an absolute "N / M unit" readout. Empty when the counter is a
     /// scaled fraction (e.g. section prefill reports bytes scaled to 10 000) or
     /// otherwise not a meaningful discrete count, in which case only the bar
-    /// shows. The `Ingesting` step's unit varies per ingest layer (folders vs
-    /// sections vs files) and is set explicitly via [`LoadProgress::set_step_unit`].
+    /// shows.
     pub fn unit(self) -> &'static str {
         match self {
             // No absolute readout: what the model step counts depends on the
@@ -98,8 +74,6 @@ impl LoadStep {
             LoadStep::Compacting => "",
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
-            LoadStep::Priming => "documents",
-            LoadStep::Ingesting => "",
             LoadStep::Normalizing => "",
         }
     }
@@ -112,11 +86,10 @@ pub struct LoadingSnapshot {
     pub progress: f32,
     pub completed: Vec<LoadStep>,
     /// Absolute progress within the current step: `progressed` of `total`
-    /// `unit`s done (e.g. 137 of 1000 files). `total == 0` means the step has
+    /// `unit`s done (e.g. 137 of 1000 turns). `total == 0` means the step has
     /// no measurable count yet. `unit` is empty when the counter is not a
     /// meaningful discrete count (scaled fraction) — the frontend then shows
-    /// only the bar, no "N / M" readout. Owned because ingest units are
-    /// projection-YAML-defined (per layer), not compile-time constants.
+    /// only the bar, no "N / M" readout.
     pub progressed: u64,
     pub total: u64,
     pub unit: String,
@@ -136,10 +109,8 @@ enum Inner {
         /// progress reported yet for this step" → bar reads 0%.
         progressed: u64,
         total: u64,
-        /// The noun `progressed`/`total` count (e.g. "files"). Defaults to the
-        /// step's [`LoadStep::unit`]; the ingest phase overrides it per layer via
-        /// [`LoadProgress::set_step_unit`] with the layer's YAML-defined unit.
-        /// Empty ⇒ no absolute readout shown.
+        /// The noun `progressed`/`total` count (e.g. "turns") — the step's
+        /// [`LoadStep::unit`]. Empty ⇒ no absolute readout shown.
         unit: String,
         /// Cumulative tokens prefilled during this step (ingest stat).
         prefill_tokens: u64,
@@ -170,11 +141,10 @@ impl LoadProgress {
     }
 
     /// Like [`Self::new`] but **does not** emit the "load step started" log.
-    /// For throwaway progress handles — the workspace watcher's repo-map /
-    /// code-reading refreshes and upload ingests create one per call just to
-    /// satisfy the progress parameter, and are not the model-load lifecycle.
-    /// Without this, every filesystem-event burst would spuriously log
-    /// "load step started Loading model".
+    /// For throwaway progress handles — ingest refreshes and upload ingests
+    /// create one per call just to satisfy the progress parameter, and are not
+    /// the model-load lifecycle, so they must not log "load step started
+    /// Loading model".
     pub fn silent() -> Self {
         Self {
             inner: Mutex::new(Inner::Loading {
@@ -262,16 +232,6 @@ impl LoadProgress {
             prefill_tokens: 0,
             started: Instant::now(),
         };
-    }
-
-    /// Override the unit noun for the current step's absolute readout. Used by
-    /// the ingest phase, whose single [`LoadStep::Ingesting`] step covers layers
-    /// that count different things (folders, sections, files) — each layer sets
-    /// its own YAML-defined unit as it begins. No-op once ready.
-    pub fn set_step_unit(&self, unit: &str) {
-        if let Inner::Loading { unit: u, .. } = &mut *self.inner.lock().unwrap() {
-            *u = unit.to_string();
-        }
     }
 
     /// Report real progress within the current step. `current` and
@@ -370,8 +330,8 @@ mod tests {
     }
 
     /// `silent()` has the same initial state as `new()` (it only differs by not
-    /// emitting the "load step started" log — the property that keeps a
-    /// watcher-refresh burst from spuriously logging "Loading model").
+    /// emitting the "load step started" log — the property that keeps an
+    /// ingest refresh from spuriously logging "Loading model").
     #[test]
     fn silent_starts_at_model_step_like_new() {
         let p = LoadProgress::silent();
@@ -444,23 +404,6 @@ mod tests {
         let p = LoadProgress::new();
         p.set_step(LoadStep::Substrate);
         p.set_step_progress(40, 100);
-        assert_eq!(p.snapshot().unwrap().unit, "turns");
-    }
-
-    #[test]
-    fn set_step_unit_overrides_and_step_change_resets_to_default() {
-        let p = LoadProgress::new();
-        // The ingest step has no fixed unit (its layers count different things).
-        p.set_step(LoadStep::Ingesting);
-        assert_eq!(p.snapshot().unwrap().unit, "");
-        p.set_step_unit("files");
-        p.set_step_progress(10, 1000);
-        let snap = p.snapshot().unwrap();
-        assert_eq!(snap.unit, "files");
-        assert_eq!(snap.progressed, 10);
-        assert_eq!(snap.total, 1000);
-        // Advancing to another step resets the unit to that step's default.
-        p.set_step(LoadStep::Substrate);
         assert_eq!(p.snapshot().unwrap().unit, "turns");
     }
 }

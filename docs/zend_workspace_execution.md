@@ -1,7 +1,7 @@
 # Zend: Workspace, Tooling and Execution Architecture
 
-**Status:** Workspace, tools and ingest built (§3–§6). Cluster execution designed, not built (§7–§8).
-**Scope:** How zend serves several repositories as one workspace; how the model reads and changes code in them; how the base conversation is seeded with every repository; and how real tooling (cargo, node, python, tests) will run across a cluster.
+**Status:** Workspace and tools built (§3–§4). Ingest (§5) is built but does not run: a repository's folder is the sandbox's, so nothing ingests from it, and ingest from the repositories' branches in git is not built. The priming chain (§6) is removed with it. The sandbox that runs tooling on one machine is built (`zend-vfs::sandbox`, §7.4); cluster execution is designed, not built (§7–§8).
+**Scope:** How zend serves several repositories as one workspace; how the model reads and changes code in them; how the base conversation is seeded with every repository; and how real tooling (cargo, node, python, tests) runs, on one machine and across a cluster.
 
 ---
 
@@ -13,7 +13,7 @@ Every file tool takes a `repo` argument and a path relative to that repository. 
 
 Internally, everything the ingest layers store is keyed by its **workspace-relative path** (`candle/src/lib.rs`), which is simultaneously a real path on disk and — split at its first segment — the `(repo, path)` pair a tool call takes.
 
-The base conversation every dialogue forks from descends from a **priming chain** that reads the workspace listing and then, for each repository in manifest order, its root listing and its anchor documents. The `repo_map` and `code_reading` layers then ingest every repository in the background.
+A conversation reads a git repository **through its branch, never its folder**. Each conversation works on its own branch per repository (`ConvState::branches`), at its own base commit on it; its `file_*` tools read that commit, with the conversation's own changes laid over it, and never the repository's folder on disk. The base moves only when the conversation commits, merges, switches or resets (`docs/zend_git.md` §7.9). The folder is whoever's working copy it is; the sandbox borrows it one job at a time and hands it back exactly as it found it (§7.4).
 
 ---
 
@@ -67,15 +67,16 @@ The daemon adds `uploads` after the listed repositories (`zend/src/workspace.rs`
 | `substrate/` | The redo log, logs, conversation files. Visible, not a dot-directory: it sits beside the repositories, not inside one. |
 | `<repo>/` | Each listed repository. |
 | `uploads/` | The daemon's uploads repository. |
+| `jobs/` | Reserved for the sandbox server's job logs, `<job id>.log` — outside every repository, so no job ever checks out, captures or resets another's log. The daemon does not run a sandbox server yet (§7.4), so it creates no such folder. |
 | `projection.yaml`, `tools/`, `identities/`, `<collection>s/`, raw layer folders | A *mind*'s configuration (a workspace carrying its own `projection.yaml`). Read from the workspace folder, never from a repository. |
 
-Anything else in the folder — other checkouts, stray files — is outside every repository and invisible to tools, the walk and the watcher.
+Anything else in the folder — other checkouts, stray files — is outside every repository and invisible to tools and the walk.
 
 ### 3.4 Two path forms, one split
 
 | Form | Example | Used by |
 |---|---|---|
-| Workspace-relative key | `candle/zend/src/main.rs` | The walk, `repo_map` / `code_reading` metadata and resume hashes, the watcher, uploads, the fast path. |
+| Workspace-relative key | `candle/zend/src/main.rs` | The walk, `repo_map` / `code_reading` metadata and resume hashes, uploads, the fast path. |
 | `(repo, path)` | `repo: candle`, `path: zend/src/main.rs` | Every tool call and tool response. |
 
 A repository's folder is its name, so the key's first segment *is* the repository, and `zend/src/repo_path.rs::split` converts one form to the other. There is no second mapping to keep consistent.
@@ -100,7 +101,14 @@ The model cannot reach the file: the `file_*` tools mount only the listed reposi
 
 ### 4.1 One store per repository
 
-`ToolContext.files` is a `RepoFiles` (`zend-vfs/src/files.rs`): one `VfsStore` per repository, each rooted at the repository's folder. A tool resolves `repo` to its store and the path inside it; `..` stops at the repository's root, so a path cannot reach a sibling repository or anything else in the workspace folder. The overlay/direct distinction, the `secrets/` refusal and the Windows spelling guards hold per store exactly as they did for the single root. A context built without a workspace (`ToolContext::new`, tests) is *detached*: each repository name gets an upper-only store on first use.
+`ToolContext.files` is a `RepoFiles` (`zend-vfs/src/files.rs`): one `VfsStore` per repository. A tool resolves `repo` to its store and the path inside it; `..` stops at the repository's root, so a path cannot reach a sibling repository or anything else in the workspace folder. The overlay/direct distinction, the `secrets/` refusal and the Windows spelling guards hold per store. A context built without a workspace (`ToolContext::new`, tests) is *detached*: each repository name gets an upper-only store on first use.
+
+What a store reads beneath the conversation's changes (`zend-vfs/src/vfs/`):
+
+- **A git repository — at the conversation's base.** The store reads a pinned commit's tree, never the folder and never a moving branch: `RepoFiles::set_branches` gives each store the conversation's branch when its state is built (`conv_overlay::restore`), and until then it reads the branch checked out when the daemon started. The first read pins the base — the commit the branch holds then, read over one long-running `cat-file --batch` per repository that every conversation's store shares (`GitSource`); a tree is listed once with `ls-tree -r` and kept, so listings, searches and existence checks run in memory. Only regular and executable files are there — a link or a submodule is not a file a tool reads — and hidden entries are left out of listings and searches and still read by exact path, as before.
+- **Any other folder — as it stands on disk.** The uploads repository, a scratch workspace, and every direct (Mutable) store.
+
+**A branch moving does not move a conversation.** Anyone's push, or another conversation's commit, changes nothing this conversation reads. Its base moves only when the conversation moves it — its own `git_commit`, `git_merge`, `git_switch` or `git_reset` — through `VfsStore::move_base`, which carries each uncommitted change onto the new tree (`vfs/carry.rs`, `docs/zend_git.md` §7.9): a change the new tree already holds is dropped, one whose edits still fit the new copy is kept as it is, and one that no longer fits is merged three ways, with overlaps left between markers and the path flagged as in conflict. A flag outlives later moves and clears only when a write or edit leaves the file without markers. A saved `Snapshot` names the base — its tree and parents — so a conversation restored after a restart reads exactly what it read before. `git_status` reports the commits the branch has gained beyond the base, which `git_merge` brings in.
 
 ### 4.2 Arguments
 
@@ -139,6 +147,8 @@ Because the enum is part of each tool's rendered definition, it is part of its c
 
 ## 5. Ingest
 
+No ingest pass runs at present. Every pass below walks a repository's folder, and the folder is not what any conversation reads — it is whoever's working copy it is, borrowed by the sandbox — so the load path seeds no layer, and the background worker's startup pass finds nothing to refresh and goes straight to warming the normalization levels of what the substrate already holds. Uploads are still ingested by their endpoint. Ingest from the repositories' branches in git, triggered by the commits that move them, is what replaces the folder walk; the machinery below is what it drives.
+
 ### 5.1 The walk
 
 `repo_scan::walk_workspace(workspace, scope, max_depth)` walks each listed repository from its own root — so a repository's own `.git` never prunes it, while nested checkouts and submodules *inside* a repository are still pruned — and keys every file workspace-relatively. Nothing outside the listed repositories is visited, and the uploads repository is never walked.
@@ -154,26 +164,17 @@ One unit per directory holding walked files (`candle/`, `candle/zend/src/`, …)
 
 A file's hidden conversation opens with ``Read the entire contents of `zend/src/main.rs` in the `candle` repository …``; the model decodes its own `file_read` calls, constrained to the repository enum. Resume hashes are path-qualified with the workspace-relative key.
 
-### 5.4 Watcher and fast path
+### 5.4 Fast path
 
-- The watcher watches each repository folder (the uploads repository included, which drives only the upload-deletion reconcile) and each raw layer folder — never the workspace folder itself, which may hold other checkouts.
-- The fast path, which serves a `file_read` from a `code_reading` conversation that already read the same bytes, joins the call's `repo` and `path` into the workspace-relative key the ingest hashed under. A `repo` the workspace does not list is never joined onto the workspace; the call runs for real and the tool refuses it.
+The fast path, which serves a `file_read` from a `code_reading` conversation that already read the same bytes, joins the call's `repo` and `path` into the workspace-relative key the ingest hashed under, and hashes the file as the conversation's store reads it — its branch as committed. A file the conversation has changed is never served: its own copy is what it must read. A `repo` the workspace does not list is never joined onto the workspace; the call runs for real and the tool refuses it.
+
+There is no file watcher: nothing reads a repository's folder for ingest, and the ingest that replaces the walk is triggered by commits.
 
 ---
 
 ## 6. Seeding the base conversation
 
-`priming_chain::build` runs once at startup, before any dialogue exists:
-
-```text
-workspace ls                          (the "." unit — the repositories)
-  -> for each repository, in manifest order:
-       repo ls                        (its root folder unit)
-         -> README.md -> ARCHITECTURE.md -> AGENTS.md -> CLAUDE.md
-  -> base_conv, every ingest base, every repo_map folder, every code_reading file
-```
-
-Each link is parented on the one before it, so the last link's projection carries the whole chain; `base_conv` is parented on the last link, so the first question ever asked already has every repository's listing and anchor documents behind it. Each link is also an ordinary `repo_map` / `code_reading` entry with the same resume key, so the background pass that follows finds it already done. Missing anchors, and repositories with no files at their root, are skipped.
+The base conversation every dialogue forks from is seeded with nothing from the repositories. The priming chain that read the workspace listing, each repository's root listing and its anchor documents (README, ARCHITECTURE, AGENTS, CLAUDE) walked the repositories' folders, and is removed with the rest of the folder ingest; a chain built from the branches belongs to the ingest that replaces it.
 
 ---
 
@@ -201,6 +202,24 @@ A lease covers a tool session (edit, build, test, fix) rather than a single call
 - Every command runs under a timeout that kills the whole process tree (a Job Object on Windows, a process group on Linux).
 - Leases expire slightly after the tool timeout, so a crashed holder's lease is reclaimed.
 - Tool output is rewritten from the agent's workspace folder to repository-relative paths before the model sees it, so the same error reads identically on every agent.
+
+### 7.4 One machine: the sandbox (built, not wired into the daemon)
+
+On one machine the repository's own folder is the build agent: `zend-vfs::sandbox`. That folder may be someone's working copy — a developer's clone with a branch checked out and work not yet committed — so it is borrowed, never taken. A `Sandbox` runs one job at a time in it:
+
+1. **Lock.**
+2. **Set aside** what the folder holds (`checkout::preserve`, `docs/zend_git.md` §7.7), under a file lock no other process's job can share. The index, and every changed, untracked and flagged file, are snapshotted byte for byte as git objects held by refs of their own. What is ignored is listed, and nothing on the list is ever removed or captured, whatever the branch's ignore rules say. An ignored file or folder at a path the job writes or the branch adds is moved aside. A journal in the git folder records all of it before anything is disturbed.
+3. **Put the checkout** on the conversation's branch at its base, and lay the conversation's changes down.
+4. **Check the command** — git run directly is refused, pointing at the git tools — and run it.
+5. **Read back** what it changed as deltas, and record them in the conversation's store.
+6. **Put the folder back**: `HEAD` where it was, the job's untracked files and links cleared, the set-aside files returned, the snapshot's bytes and index written back with their flags, and only then the snapshot let go.
+7. **Unlock.**
+
+However the job ends — refused, failed, timed out, panicked or abandoned — the folder is back before the next job may take it: the guard that puts it back drops before the lock does. A put-back that fails is retried; one that still fails keeps the snapshot and the journal and says where they are. A daemon that dies mid-job leaves the journal, and the next job restores from it before touching anything — first keeping what the folder holds by then under `refs/zend/recovered/`, and refusing outright when someone has worked in the folder since. A folder part way through a merge, rebase, cherry-pick, revert or bisect is refused untouched. Ignored files are never set aside or removed beyond the job's own, so build outputs survive from one job to the next and the build cache stays warm.
+
+A conversation whose base is not the commit its branch holds — it has not merged what the branch gained, or is finishing a merge — is refused before anything is touched: its changes were made on its base, and a checkout of the branch is not that.
+
+**`SandboxServer`** runs jobs in the background. `start_job` returns at once with the job's id (a random 64-bit number as URL-safe base64), its log (`<jobs dir>/<id>.log`, both output streams as they are printed, capped at 64 MiB), its output as a stream that follows the log from its first byte and ends with the job, and a handle that gives the outcome — and cancels the job, killing its process tree, when dropped first. `query_job` says whether a job is queued, running, exited, timed out, cancelled, refused or failed, and how many lines its log holds. The last 1000 jobs are kept; an older one is let go with its log. Nothing in the daemon creates a `SandboxServer` yet, so no model tool runs a command on the machine.
 
 ---
 
@@ -252,11 +271,17 @@ Agents are long-lived VMs, added or removed on queue depth and wait time, and re
 - `tool_def::constrain_repos` writes the exact enum, and the compiled `ToolSpec` carries it.
 - Every tool that takes `repo` declares it in its YAML exactly as its executor requires it.
 
+**Reading through branches** (CPU, `cargo test -p zend-vfs`)
+
+- A git repository reads its branch as committed, never the folder: a file changed on disk, and one only on disk, are not seen.
+- A store keeps its base while the branch moves; moving onto its own commit lets go of what landed; a three-way move merges and marks overlaps, flagged until settled; a snapshot restores the base and the conflicts; a failed move changes nothing.
+- A commit lands whole or not at all — behind origin, origin moving during the push, conflicts unsettled — and a merge brings the other writer's commits into the conversation's copy: fast-forward, diverged history finished by a merge commit, origin moving on during a merge on either side, edit meeting delete, both-added, binary refusal, no origin (`tests/work.rs`, a bare repository as origin). A conflict outlives later merges; a commit is never undone by the next; local-only commits survive a rewind and a delete.
+- The sandbox hands the folder back exactly as it found it — staged and unstaged edits byte for byte, line endings, permissions, skip-worktree, assume-unchanged and `add -N` entries, untracked files, removed and renamed files, files and folders swapped, links to folders, the branch (deleted or rewound by the job), an ignored file or folder at a path the job wrote or the branch adds, a file only uncommitted ignore rules ignore — after a job that succeeds, fails, is refused, is cancelled or is abandoned; a file the job names as no conversation could is cleared; a put-back that fails keeps everything and names the journal; a crash mid-job is recovered by the next, what stood kept first, and a folder worked in since is refused; a second preservation is refused while the first holds the lock; a link the command left is removed unfollowed; the server's log, stream, status, cancellation and eviction.
+
 **Ingest** (CPU)
 
 - The walk visits exactly the listed repositories, keys workspace-relatively, respects scope and depth, never walks uploads.
 - The workspace unit lists the repositories and heads the pass; prefilled calls split `repo` and `path`.
-- The priming chain plans each repository in manifest order with its own anchors.
-- The fast path refuses a repository the workspace does not list.
+- The fast path refuses a repository the workspace does not list, and never offers a file the conversation has changed.
 
 **End to end** (GPU, `#[ignore]`d): a daemon over a multi-repository workspace answers a question whose answer lives in the second repository's files.

@@ -1,14 +1,13 @@
-//! What the daemon last put on a checkout beyond its base commit, and how to
-//! tell cheaply that it is still there.
+//! What a run put on a checkout beyond its base commit, and how to tell
+//! cheaply that it is still there.
 //!
 //! [`materialize`](super::materialize) records, for every path a
 //! conversation changed, the content it wrote and the [`FileStamp`] the file
-//! had afterwards; [`capture`](super::capture) re-records each path it reads
-//! back. A later pass asks [`Ledger::verified`]: when the file's stamp is the
-//! recorded one and not racy, the recorded content is what the file holds and
-//! the file is never opened. That is what lets a pass over a checkout touch
-//! only the files that actually changed — the property a build cache over the
-//! checkout depends on.
+//! had afterwards. When the tool has run, [`capture`](super::capture) asks
+//! [`Ledger::verified`] of each: when the file's stamp is the recorded one and
+//! not racy, the recorded content is what the file holds and the file is
+//! never opened — so reading back what a tool did touches only the files it
+//! actually changed.
 //!
 //! Every path the ledger does not name holds its base commit's content, or is
 //! absent when the base has none: the ledger is exactly the checkout's
@@ -16,19 +15,13 @@
 
 use std::collections::BTreeMap;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
 use super::stamp::FileStamp;
 use crate::file_delta::now_ns;
 
 /// One path the checkout holds differently from its base.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// The file's bytes, or `None` when the path is absent. Base64 on the
-    /// wire.
-    #[serde(serialize_with = "to_base64", deserialize_with = "from_base64")]
+    /// The file's bytes, or `None` when the path is absent.
     pub content: Option<Vec<u8>>,
     /// The file's stamp when `content` was recorded, `None` for an absent
     /// path.
@@ -36,7 +29,7 @@ pub struct Entry {
 }
 
 /// A checkout's deviation from its base commit, stamped.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ledger {
     /// The commit the checkout's tracked files were put at.
     base: String,
@@ -105,11 +98,6 @@ impl Ledger {
         self.entries.insert(path.into(), Entry { content, stamp });
     }
 
-    /// Forget `path` — it holds its base's content again.
-    pub fn forget(&mut self, path: &str) {
-        self.entries.remove(path);
-    }
-
     /// Mark the stamps as taken now. Called once a pass has recorded every
     /// path it touched, so the racy window is measured from after the last
     /// write it made.
@@ -123,19 +111,6 @@ impl Ledger {
     pub(crate) fn seal_at(&mut self, ns: i64) {
         self.stamped_at_ns = ns;
     }
-}
-
-fn to_base64<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
-    match bytes {
-        Some(b) => s.serialize_some(&BASE64.encode(b)),
-        None => s.serialize_none(),
-    }
-}
-
-fn from_base64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
-    Option::<String>::deserialize(d)?
-        .map(|text| BASE64.decode(text).map_err(serde::de::Error::custom))
-        .transpose()
 }
 
 #[cfg(test)]
@@ -183,31 +158,14 @@ mod tests {
     }
 
     #[test]
-    fn entries_are_recorded_forgotten_and_listed_in_order() {
+    fn entries_are_recorded_and_listed_in_order() {
         let mut l = Ledger::new("abc");
         assert!(l.is_empty());
         l.record("b", Some(vec![1]), Some(stamp(1)));
         l.record("a", None, None);
         assert_eq!(l.paths().collect::<Vec<_>>(), ["a", "b"]);
-        l.forget("a");
-        assert_eq!(l.len(), 1);
+        assert_eq!(l.len(), 2);
         assert_eq!(l.base(), "abc");
         assert_eq!(l.entry("b").unwrap().content.as_deref(), Some(&[1u8][..]));
-    }
-
-    /// The wire form round-trips, content as base64 — a ledger can outlive
-    /// the process that wrote it.
-    #[test]
-    fn the_wire_form_round_trips() {
-        let mut l = Ledger::new("abc");
-        l.record("bin", Some(vec![0, 255]), Some(stamp(1)));
-        l.record("gone", None, None);
-        l.seal_at(42);
-        let wire = serde_json::to_string(&l).unwrap();
-        assert_eq!(
-            wire,
-            r#"{"base":"abc","entries":{"bin":{"content":"AP8=","stamp":{"size":3,"mtime_ns":1}},"gone":{"content":null,"stamp":null}},"stamped_at_ns":42}"#
-        );
-        assert_eq!(serde_json::from_str::<Ledger>(&wire).unwrap(), l);
     }
 }

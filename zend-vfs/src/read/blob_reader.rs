@@ -62,7 +62,7 @@ pub struct BlobReader {
 #[derive(Debug, PartialEq, Eq)]
 enum Header {
     Missing,
-    Found { kind: String, size: u64 },
+    Found { oid: Oid, kind: String, size: u64 },
 }
 
 fn parse_header(line: &[u8], request: &str) -> Result<Header, GitError> {
@@ -76,11 +76,12 @@ fn parse_header(line: &[u8], request: &str) -> Result<Header, GitError> {
     let [oid, kind, size] = parts[..] else {
         return Err(GitError::malformed("cat-file", line.to_string()));
     };
-    Oid::parse(oid)?;
+    let oid = Oid::parse(oid)?;
     let size = size
         .parse()
         .map_err(|_| GitError::malformed("cat-file", line.to_string()))?;
     Ok(Header::Found {
+        oid,
         kind: kind.to_string(),
         size,
     })
@@ -90,6 +91,7 @@ fn parse_header(line: &[u8], request: &str) -> Result<Header, GitError> {
 enum Reply {
     Missing,
     Found {
+        oid: Oid,
         kind: String,
         body: Vec<u8>,
     },
@@ -130,11 +132,11 @@ impl BlobReader {
         match parse_header(&line, request).map_err(std::io::Error::other)? {
             Header::Missing => Ok(Reply::Missing),
             Header::Found { size, .. } if size > max_bytes => Ok(Reply::TooLarge { size }),
-            Header::Found { kind, size } => {
+            Header::Found { oid, kind, size } => {
                 let mut body = vec![0; size as usize + 1];
                 batch.stdout.read_exact(&mut body)?;
                 body.pop(); // the newline after the contents
-                Ok(Reply::Found { kind, body })
+                Ok(Reply::Found { oid, kind, body })
             }
         }
     }
@@ -167,7 +169,9 @@ impl BlobReader {
         reply.map_err(GitError::Io)
     }
 
-    fn read_spec(&self, request: String) -> Result<Option<Vec<u8>>, GitError> {
+    /// The object `request` names, which must be a `kind`: its id and
+    /// contents, or `None` when the repository holds no such object.
+    fn read_kind(&self, request: String, kind: &str) -> Result<Option<(Oid, Vec<u8>)>, GitError> {
         let mut guard = self.batch.lock().unwrap_or_else(|e| e.into_inner());
         // One restart: a child that exited since the last read is replaced.
         for attempt in 0..2 {
@@ -177,7 +181,11 @@ impl BlobReader {
             let batch = guard.as_mut().expect("started above");
             match self.request_with_deadline(batch, &request) {
                 Ok(Reply::Missing) => return Ok(None),
-                Ok(Reply::Found { kind, body }) if kind == "blob" => return Ok(Some(body)),
+                Ok(Reply::Found {
+                    oid,
+                    kind: found,
+                    body,
+                }) if found == kind => return Ok(Some((oid, body))),
                 Ok(Reply::Found { kind, .. }) => {
                     return Err(GitError::NotABlob {
                         object: request,
@@ -211,12 +219,34 @@ impl BlobReader {
     /// The contents of `path` at `rev`, or `None` when `rev` holds no such
     /// path.
     pub fn read_at(&self, rev: &Rev, path: &RepoPath) -> Result<Option<Vec<u8>>, GitError> {
-        self.read_spec(format!("{}:{}", rev.spec(), path))
+        let found = self.read_kind(format!("{}:{}", rev.spec(), path), "blob")?;
+        Ok(found.map(|(_, body)| body))
     }
 
     /// The blob `oid`, or `None` when the repository does not hold it.
     pub fn read_blob(&self, oid: &Oid) -> Result<Option<Vec<u8>>, GitError> {
-        self.read_spec(oid.to_string())
+        Ok(self
+            .read_kind(oid.to_string(), "blob")?
+            .map(|(_, body)| body))
+    }
+
+    /// The commit `rev` names and that commit's root tree, or `None` when
+    /// `rev` names nothing — a branch that does not exist, or a `HEAD` with
+    /// no commit yet. One request to the running child: the tree is the first
+    /// line of the commit object.
+    pub fn commit_of(&self, rev: &Rev) -> Result<Option<(Oid, Oid)>, GitError> {
+        let request = format!("{}^{{commit}}", rev.spec());
+        let Some((commit, body)) = self.read_kind(request, "commit")? else {
+            return Ok(None);
+        };
+        let tree = body
+            .strip_prefix(b"tree ")
+            .and_then(|rest| rest.split(|&b| b == b'\n').next())
+            .and_then(|id| std::str::from_utf8(id).ok())
+            .ok_or_else(|| {
+                GitError::malformed("cat-file", format!("commit {commit} names no tree"))
+            })?;
+        Ok(Some((commit, Oid::parse(tree)?)))
     }
 }
 
@@ -246,6 +276,7 @@ mod tests {
         assert_eq!(
             parse_header(b"ce013625030ba8dba906f756967f9e9ca394464a blob 6\n", "x").unwrap(),
             Header::Found {
+                oid: Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap(),
                 kind: "blob".into(),
                 size: 6
             }
@@ -309,6 +340,30 @@ mod tests {
         // The reader is still in step after an error.
         let lib = RepoPath::parse("src/lib.rs").unwrap();
         assert_eq!(blobs.read_at(&Rev::Head, &lib).unwrap().unwrap(), b"x\n");
+    }
+
+    /// **A revision resolves to its commit and that commit's tree** in one
+    /// request; nothing named, nothing found.
+    #[test]
+    fn a_revision_resolves_to_its_commit_and_tree() {
+        let t = TestRepo::init();
+        let repo = t.repo();
+        let blobs = repo.blobs();
+        assert_eq!(blobs.commit_of(&Rev::Head).unwrap(), None, "no commit yet");
+        t.write("a.txt", b"a\n");
+        let first = t.commit_all("first");
+        let main = Rev::Branch(BranchName::parse("main").unwrap());
+        let (commit, tree) = blobs.commit_of(&main).unwrap().unwrap();
+        assert_eq!(commit, first);
+        assert_eq!(tree.as_str(), t.git(&["rev-parse", "main^{tree}"]).trim());
+
+        t.write("a.txt", b"b\n");
+        let second = t.commit_all("second");
+        let (moved, _) = blobs.commit_of(&main).unwrap().unwrap();
+        assert_eq!(moved, second, "the same reader sees the branch move");
+
+        let none = Rev::Branch(BranchName::parse("nope").unwrap());
+        assert_eq!(blobs.commit_of(&none).unwrap(), None);
     }
 
     #[test]

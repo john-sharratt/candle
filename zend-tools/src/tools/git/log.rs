@@ -147,7 +147,13 @@ impl Tool for GitLog {
         } else {
             let range = LogRange {
                 to,
-                exclude: req.since.as_ref().map(|r| r.resolve(&repo)).transpose()?,
+                exclude: req
+                    .since
+                    .as_ref()
+                    .map(|r| r.resolve(&repo))
+                    .transpose()?
+                    .into_iter()
+                    .collect(),
                 paths: path_args(paths)?,
             };
             repo.log(&range, MAX_WALK)?

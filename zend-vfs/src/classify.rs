@@ -41,6 +41,8 @@ const UNKNOWN_REVISION: &[&str] = &[
     "not a valid object name",
     "invalid object name",
     "not a valid commit name",
+    // A fetch of one branch the remote does not have.
+    "couldn't find remote ref",
 ];
 
 fn mentions(haystack: &str, needles: &[&str]) -> bool {

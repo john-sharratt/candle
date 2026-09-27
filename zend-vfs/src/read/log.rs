@@ -5,12 +5,12 @@ use crate::runner::Invocation;
 use crate::types::{GitTime, Oid, RepoPath, Rev, Signature};
 use crate::Repo;
 
-/// Commits reachable from `to` and not from `exclude`, limited to those that
-/// touch `paths` when any are given.
+/// Commits reachable from `to` and from none of `exclude`, limited to those
+/// that touch `paths` when any are given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRange {
     pub to: Rev,
-    pub exclude: Option<Rev>,
+    pub exclude: Vec<Rev>,
     pub paths: Vec<RepoPath>,
 }
 
@@ -19,7 +19,7 @@ impl LogRange {
     pub fn of(to: Rev) -> Self {
         Self {
             to,
-            exclude: None,
+            exclude: Vec::new(),
             paths: Vec::new(),
         }
     }
@@ -99,7 +99,7 @@ impl Repo {
             .log_invocation(limit)
             .arg("--end-of-options")
             .arg(range.to.spec());
-        if let Some(exclude) = &range.exclude {
+        for exclude in &range.exclude {
             inv = inv.arg(format!("^{}", exclude.spec()));
         }
         if !range.paths.is_empty() {
@@ -198,7 +198,7 @@ mod tests {
             .log(
                 &LogRange {
                     to: Rev::Head,
-                    exclude: Some(Rev::Oid(first)),
+                    exclude: vec![Rev::Oid(first)],
                     paths: Vec::new(),
                 },
                 10,

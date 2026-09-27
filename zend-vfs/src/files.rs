@@ -11,17 +11,30 @@
 //! own — [`RepoFiles::fresh`] makes one — and a file one conversation writes is
 //! never what another one reads.
 //!
+//! A repository under git is read through a branch ([`VfsStore::on_branch`]):
+//! the one checked out when the set was first made, until the conversation's
+//! own are given ([`RepoFiles::set_branches`]). The repository's
+//! [`GitSource`] is opened once, when the first set is made, and shared by
+//! every set made from it — one git process per repository however many
+//! conversations read it. A folder that is not a git repository is read as it
+//! stands on disk.
+//!
 //! A [`RepoFiles::detached`] set has no workspace behind it: there is no disk,
 //! so there is nothing to scope a name against, and each repository name gets
 //! an upper-only store the first time a call uses it. That is the shape a
 //! context built without a workspace — a test, a scratch interpreter — has.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::fmt;
+use std::sync::{Arc, Mutex, RwLock};
 
+use super::vfs::git_source::GitSource;
 use super::vfs::{Snapshot, VfsStore};
 use super::workspace::{Workspace, ALL_REPOS};
-use crate::DiskWriteGrant;
+use crate::{BranchName, DiskWriteGrant, Rev};
+
+/// Each git repository's source, by repository name.
+type Sources = BTreeMap<String, Arc<GitSource>>;
 
 /// A `repo` argument the workspace does not list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +45,8 @@ pub struct UnknownRepo {
     pub known: Vec<String>,
 }
 
-impl std::fmt::Display for UnknownRepo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for UnknownRepo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "no repository named {:?} — repo must be one of: {}",
@@ -48,8 +61,12 @@ impl std::error::Error for UnknownRepo {}
 /// One store per repository, in manifest order.
 pub struct RepoFiles {
     workspace: Option<Workspace>,
+    sources: Arc<Sources>,
     stores: RwLock<Vec<(String, Arc<VfsStore>)>>,
     direct: bool,
+    /// Saved work that could not be restored, by the key it was saved under,
+    /// as saved: kept so that saving the set again never overwrites it.
+    unrestored: Mutex<BTreeMap<String, String>>,
 }
 
 impl RepoFiles {
@@ -57,23 +74,46 @@ impl RepoFiles {
     pub fn detached() -> Self {
         Self {
             workspace: None,
+            sources: Arc::default(),
             stores: RwLock::new(Vec::new()),
             direct: false,
+            unrestored: Mutex::default(),
         }
     }
 
     /// An overlay store over each of `workspace`'s repositories: reads fall
-    /// through to disk, writes stay in memory.
+    /// through to each one's branch — or, for a folder not under git, to the
+    /// folder — and writes stay in memory.
     pub fn overlay(workspace: Workspace) -> Self {
+        let sources = workspace
+            .repos()
+            .iter()
+            .filter_map(|r| Some((r.name.clone(), GitSource::open(&r.dir).ok()?)))
+            .collect();
+        Self::over(workspace, Arc::new(sources))
+    }
+
+    /// Overlay stores over `workspace`, reading through `sources`.
+    fn over(workspace: Workspace, sources: Arc<Sources>) -> Self {
         let stores = workspace
             .repos()
             .iter()
-            .map(|r| (r.name.clone(), Arc::new(VfsStore::with_root(&r.dir))))
+            .map(|r| {
+                let store = match sources.get(&r.name) {
+                    Some(source) => {
+                        VfsStore::on_branch(Arc::clone(source), source.default_rev().clone())
+                    }
+                    None => VfsStore::with_root(&r.dir),
+                };
+                (r.name.clone(), Arc::new(store))
+            })
             .collect();
         Self {
             workspace: Some(workspace),
+            sources,
             stores: RwLock::new(stores),
             direct: false,
+            unrestored: Mutex::default(),
         }
     }
 
@@ -88,28 +128,57 @@ impl RepoFiles {
             .collect();
         Self {
             workspace: Some(workspace),
+            sources: Arc::default(),
             stores: RwLock::new(stores),
             direct: true,
+            unrestored: Mutex::default(),
         }
     }
 
     /// A set of the same kind with none of this one's session changes — what
     /// a new conversation starts from. An overlay set gets fresh overlays over
-    /// the same workspace, a detached set a fresh detached one. A direct set
-    /// holds no session changes — its writes are on disk — so the new set
-    /// shares its stores.
+    /// the same workspace, reading through the same sources, on each
+    /// repository's first branch; a detached set a fresh detached one. A
+    /// direct set holds no session changes — its writes are on disk — so the
+    /// new set shares its stores.
     pub fn fresh(&self) -> Self {
         if self.direct {
             return Self {
                 workspace: self.workspace.clone(),
+                sources: Arc::clone(&self.sources),
                 stores: RwLock::new(self.all()),
                 direct: true,
+                unrestored: Mutex::default(),
             };
         }
         match &self.workspace {
-            Some(workspace) => Self::overlay(workspace.clone()),
+            Some(workspace) => Self::over(workspace.clone(), Arc::clone(&self.sources)),
             None => Self::detached(),
         }
+    }
+
+    /// Read each named repository through the branch `branches` gives it —
+    /// the conversation's own. A repository the set does not have, one not
+    /// under git, and a name that is not a branch are named in the result
+    /// with the reason; the others are set all the same.
+    pub fn set_branches(&self, branches: &BTreeMap<String, String>) -> Vec<(String, String)> {
+        let mut refused = Vec::new();
+        for (name, branch) in branches {
+            let set = self
+                .repo(name)
+                .map_err(|e| e.to_string())
+                .and_then(|store| {
+                    let branch = BranchName::parse(branch).map_err(|e| e.to_string())?;
+                    store
+                        .set_branch(branch)
+                        .then_some(())
+                        .ok_or_else(|| "it is not read through git".to_string())
+                });
+            if let Err(why) = set {
+                refused.push((name.clone(), why));
+            }
+        }
+        refused
     }
 
     /// The workspace behind these stores, if any.
@@ -158,6 +227,18 @@ impl RepoFiles {
             .collect()
     }
 
+    /// The branch each repository read through git is on, by name — what a
+    /// conversation saves as its branches.
+    pub fn branches(&self) -> BTreeMap<String, String> {
+        self.all()
+            .into_iter()
+            .filter_map(|(name, store)| match store.rev()? {
+                Rev::Branch(branch) => Some((name, branch.as_str().to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every repository's session changes, by name — those with any, to be
     /// saved with the conversation they belong to.
     pub fn snapshots(&self) -> BTreeMap<String, Snapshot> {
@@ -183,6 +264,24 @@ impl RepoFiles {
             }
         }
         refused
+    }
+
+    /// Keep `saved` — work saved under `key` that could not be restored — so
+    /// that it is saved again as it was ([`Self::unrestored`]), never
+    /// overwritten by what this set holds.
+    pub fn keep_unrestored(&self, key: String, saved: String) {
+        self.unrestored
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, saved);
+    }
+
+    /// The saved work [`Self::keep_unrestored`] kept, by key.
+    pub fn unrestored(&self) -> BTreeMap<String, String> {
+        self.unrestored
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Bytes held in every store's upper layer together.
@@ -213,6 +312,7 @@ impl Default for RepoFiles {
 mod tests {
     use super::*;
 
+    use crate::testing::{scratch, TestRepo};
     use crate::workspace::RepoSpec;
 
     fn two_repos() -> (tempfile::TempDir, Workspace) {
@@ -375,6 +475,64 @@ mod tests {
                 .as_deref(),
             Some("mine")
         );
+    }
+
+    /// **A git repository reads through its branch, never its folder** — the
+    /// branch checked out when the set was made, then the conversation's own
+    /// — and every fresh set shares one source per repository. A folder not
+    /// under git reads from disk and takes no branch.
+    #[test]
+    fn a_git_repository_reads_through_its_branch_not_its_folder() {
+        let t = TestRepo::init();
+        t.write("a.txt", b"main\n");
+        t.commit_all("main");
+        t.git(&["checkout", "-q", "-b", "topic"]);
+        t.write("a.txt", b"topic\n");
+        t.commit_all("topic");
+        t.git(&["checkout", "-q", "main"]);
+        t.write("a.txt", b"left on disk by a job\n");
+        let plain = tempfile::Builder::new()
+            .prefix("plain-")
+            .tempdir_in(scratch())
+            .unwrap();
+        std::fs::write(plain.path().join("b.txt"), b"on disk\n").unwrap();
+        let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        let (repo, folder) = (name(&t.path), name(plain.path()));
+        let ws = Workspace::new(
+            scratch(),
+            vec![RepoSpec::named(&repo), RepoSpec::named(&folder)],
+        )
+        .unwrap();
+
+        let files = RepoFiles::overlay(ws);
+        let read = |files: &RepoFiles, repo: &str, path: &str| {
+            files.repo(repo).unwrap().read(path).unwrap()
+        };
+        assert_eq!(read(&files, &repo, "a.txt").as_deref(), Some("main\n"));
+        assert_eq!(read(&files, &folder, "b.txt").as_deref(), Some("on disk\n"));
+
+        let fresh = files.fresh();
+        assert!(Arc::ptr_eq(&files.sources, &fresh.sources), "one source");
+        let topic = BTreeMap::from([(repo.clone(), "topic".to_string())]);
+        assert!(fresh.set_branches(&topic).is_empty());
+        assert_eq!(read(&fresh, &repo, "a.txt").as_deref(), Some("topic\n"));
+        assert_eq!(fresh.branches(), topic, "the folder has no branch");
+        assert_eq!(
+            read(&files, &repo, "a.txt").as_deref(),
+            Some("main\n"),
+            "the first set is on its own branch still"
+        );
+
+        let refused = fresh.set_branches(&BTreeMap::from([
+            ("nope".to_string(), "main".to_string()),
+            (folder.clone(), "main".to_string()),
+            (repo.clone(), "bad..name".to_string()),
+        ]));
+        let names: Vec<&str> = refused.iter().map(|(n, _)| n.as_str()).collect();
+        let mut expected = vec![folder.as_str(), "nope", repo.as_str()];
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+        assert_eq!(read(&fresh, &repo, "a.txt").as_deref(), Some("topic\n"));
     }
 
     #[test]

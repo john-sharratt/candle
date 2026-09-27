@@ -4,21 +4,17 @@
 //! The result is what `git reset --hard`, a switch to the branch, and then
 //! writing every changed file would leave — `HEAD` on the branch, every
 //! tracked file at the branch's commit (the *base*) or at the conversation's
-//! content, every file a previous run added gone — but reached by touching
-//! only files whose bytes are wrong. A file that already holds what it should
-//! is left alone, timestamps and all; that is what keeps a build cache over
-//! the checkout valid from one run to the next. Three things make that
-//! possible:
+//! content, every untracked file gone — but reached by touching only files
+//! whose bytes are wrong. A file that already holds what it should is left
+//! alone, timestamps and all; that is what keeps a build cache over the
+//! checkout valid from one run to the next. The checkout is reset onto the
+//! branch only when `HEAD` is not on it at its commit already, or the index
+//! has been changed (a tool that ran `git add`, say); otherwise `git status`
+//! names exactly the files that differ from the base, and only those are
+//! looked at. Ignored files — build outputs — are never touched.
 //!
-//! - the checkout is reset onto the branch only when `HEAD` is not on it at its
-//!   commit already, or the index has been changed (a tool that ran `git add`,
-//!   say);
-//! - otherwise `git status` names exactly the files that differ from the base,
-//!   and only those — plus the files the previous run wrote, which may be
-//!   ignored and so invisible to status — are looked at;
-//! - the [`Ledger`] from the previous run vouches for a file's content by its
-//!   stamp, so a file this conversation's changes cover is read only when its
-//!   stamp says it may have changed.
+//! **Discards the checkout's state.** A checkout that may hold anyone's own
+//! work is [`preserve`](super::preserve())d first.
 //!
 //! A file that is written is dated by the write. One checkout serves every
 //! conversation, and a build cache over it compares a source's modification
@@ -32,12 +28,14 @@
 //! chain that does not fit the base commit, fails the call with the checkout as
 //! it was.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
 use super::error::CheckoutError;
 use super::ledger::Ledger;
+use super::preserve::Ignored;
 use super::stamp::FileStamp;
 use super::target::{self, Found, Target};
 use crate::{
@@ -52,9 +50,9 @@ pub struct Materialized {
     /// Whether `HEAD` was somewhere else — another branch, or detached — and
     /// was moved onto the branch by that reset.
     pub switched: bool,
-    /// Tracked files a previous run left changed, put back to the base.
+    /// Tracked files found changed, put back to the base.
     pub restored: Vec<String>,
-    /// Files a previous run added, removed.
+    /// Untracked files found, removed.
     pub removed: Vec<String>,
     /// Files written, or removed, to hold the conversation's content.
     pub written: Vec<String>,
@@ -64,25 +62,21 @@ pub struct Materialized {
 }
 
 /// Put the checkout `repo` works in on `branch`, with `changes` laid over the
-/// branch's commit.
+/// branch's commit. Returns the checkout's ledger — what
+/// [`capture`](super::capture) takes after the tool has run — and what was
+/// done.
 ///
-/// `previous` is the ledger the last [`materialize`] or
-/// [`capture`](super::capture) on this checkout left; `None` when there is
-/// none, which costs reads but never correctness. Returns the checkout's new
-/// ledger — what [`capture`](super::capture) takes after the tool has run —
-/// and what was done.
-///
-/// **Overwrites the checkout.** Only for one the daemon owns, and only while
-/// holding whatever keeps a second run off it.
+/// **Overwrites the checkout.** Only while holding whatever keeps a second
+/// run off it, and over a checkout whose own state is
+/// [`preserve`](super::preserve())d.
 pub fn materialize(
     repo: &Repo,
     _grant: &DiskWriteGrant,
     branch: &BranchName,
     changes: &FileChanges,
-    previous: Option<Ledger>,
 ) -> Result<(Ledger, Materialized), CheckoutError> {
     let root = repo.dir().to_path_buf();
-    let (head, mut status) = repo.status_with_head()?;
+    let (head, status) = repo.status_with_head()?;
     // On the branch, `HEAD`'s commit is the branch's; elsewhere it is read.
     let base = match &head {
         Head::Branch { branch: on, oid } if on == branch => oid.clone(),
@@ -120,7 +114,9 @@ pub fn materialize(
     let mut done = Materialized::default();
     let on_branch = head.branch() == Some(branch);
     let at_base = on_branch && head.oid() == Some(&base);
-    if !at_base || status.iter().any(changes_the_index) {
+    let mut status = status;
+    let index_changed = status.iter().any(changes_the_index);
+    if !at_base || index_changed {
         // The branch is read again by the checkout itself; a commit landing on
         // it in between is what the checkout — and so the ledger — is at.
         let landed = repo.force_checkout_branch(branch)?;
@@ -133,25 +129,21 @@ pub fn materialize(
         done.reset = true;
         done.switched = !on_branch;
     }
-    let previous_paths: Vec<String> = previous
-        .as_ref()
-        .map(|l| l.paths().map(str::to_string).collect())
-        .unwrap_or_default();
-    // What the previous ledger vouches for holds only while the checkout is
-    // where it left it.
-    let known = previous.filter(|l| !done.reset && l.base() == base.as_str());
 
-    // Tracked files a previous run changed, back to the base; files it added,
-    // gone. Both only where the conversation does not want them itself.
+    // Tracked files found changed, back to the base; untracked ones, gone.
+    // Both only where the conversation does not want them itself — and an
+    // untracked file only if it was not ignored when the checkout's own
+    // state was set aside: this branch's rules may not ignore it, but it is
+    // the checkout owner's all the same.
+    let kept = Ignored::kept_in(repo)?;
     let mut restore: Vec<RepoPath> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
     for entry in &status {
         let path = entry.path().as_str().to_string();
-        seen.insert(path.clone());
         if wanted.contains_key(&path) {
             continue;
         }
         match entry {
+            StatusEntry::Untracked { .. } if kept.covers(path.as_bytes()) => {}
             StatusEntry::Untracked { .. } => remove(&root, &path, &mut done.removed)?,
             _ => restore.push(entry.path().clone()),
         }
@@ -164,34 +156,12 @@ pub fn materialize(
         repo.restore_paths(&base, &refs)?;
         done.restored = restore.iter().map(|p| p.as_str().to_string()).collect();
     }
-    // A file the previous run wrote that git does not report — an ignored one —
-    // goes too, unless the base holds it (then status would have named it had
-    // it differed). A link standing there goes whatever the base holds.
-    let mut leftovers = Vec::new();
-    for path in previous_paths {
-        if wanted.contains_key(&path) || seen.contains(&path) {
-            continue;
-        }
-        let (target, found) = target::inspect(&root, &path)?;
-        let linked = matches!(found, Found::Link | Found::BehindLink { .. });
-        leftovers.push((path, target, linked));
-    }
-    let leftover_paths: Vec<&RepoPath> = leftovers.iter().map(|(_, t, _)| &t.repo_path).collect();
-    let held = repo.files_at(&base_rev, &leftover_paths)?;
-    for (path, target, linked) in &leftovers {
-        if *linked || !held.contains(target.repo_path.as_str()) {
-            remove(&root, path, &mut done.removed)?;
-        }
-    }
 
     // The conversation's own files: written only where they differ.
     let mut ledger = Ledger::new(base.as_str());
     for (path, (target, content)) in wanted {
         let stamp = stamp(&target.abs, &path)?;
-        let holds = match known.as_ref().and_then(|l| l.verified(&path, stamp)) {
-            Some(known) => known.map(<[u8]>::to_vec),
-            None => read(&target.abs, &path)?,
-        };
+        let holds = read(&target.abs, &path)?;
         if holds == content {
             done.kept.push(path.clone());
             ledger.record(path, content, stamp);
@@ -247,7 +217,7 @@ pub(crate) fn read(abs: &Path, path: &str) -> Result<Option<Vec<u8>>, CheckoutEr
 /// a write cut short leaves the old file whole rather than truncated. Creates
 /// the parent folders; a read-only file a tool left there is replaced all the
 /// same.
-fn write(abs: &Path, path: &str, bytes: &[u8]) -> Result<(), CheckoutError> {
+pub(super) fn write(abs: &Path, path: &str, bytes: &[u8]) -> Result<(), CheckoutError> {
     let fail = |e| CheckoutError::io(path, e);
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(fail)?;
@@ -257,7 +227,7 @@ fn write(abs: &Path, path: &str, bytes: &[u8]) -> Result<(), CheckoutError> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let temp = abs.with_file_name(format!(".{name}.zend-materialize"));
-    let written = std::fs::File::create(&temp)
+    let written = File::create(&temp)
         .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
         .and_then(|()| make_writable(abs))
         .and_then(|()| std::fs::rename(&temp, abs));
@@ -308,7 +278,11 @@ fn remove_link(abs: &Path, path: &str) -> Result<(), CheckoutError> {
 /// on the way to it, is removed so the restore cannot write through it, and
 /// an empty folder a tool left in the file's place is removed so the file
 /// can go back.
-fn clear_the_way(root: &Path, path: &str, removed: &mut Vec<String>) -> Result<(), CheckoutError> {
+pub(super) fn clear_the_way(
+    root: &Path,
+    path: &str,
+    removed: &mut Vec<String>,
+) -> Result<(), CheckoutError> {
     let (target, found) = target::inspect(root, path)?;
     match found {
         Found::Link => {
@@ -330,12 +304,16 @@ fn clear_the_way(root: &Path, path: &str, removed: &mut Vec<String>) -> Result<(
     Ok(())
 }
 
-/// Remove what a previous run added at `path`: a file, or a link — the link
-/// itself, or the one on the way to `path`, never what it points at — and
-/// then every folder above it the removal left empty, so no trace of the run's
-/// folders is left for the next conversation to list. A folder — an untracked
-/// repository nested in the checkout — is never removed.
-fn remove(root: &Path, path: &str, removed: &mut Vec<String>) -> Result<(), CheckoutError> {
+/// Remove an untracked file at `path`: a file, or a link — the link itself,
+/// or the one on the way to `path`, never what it points at — and then every
+/// folder above it the removal left empty, so no trace of a run's folders is
+/// left behind. A folder — an untracked repository nested in the checkout —
+/// is never removed.
+pub(super) fn remove(
+    root: &Path,
+    path: &str,
+    removed: &mut Vec<String>,
+) -> Result<(), CheckoutError> {
     let (target, found) = target::inspect(root, path)?;
     let gone = match found {
         Found::Absent | Found::Folder => return Ok(()),

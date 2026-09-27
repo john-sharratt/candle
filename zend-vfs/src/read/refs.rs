@@ -227,6 +227,31 @@ impl Repo {
         }
     }
 
+    /// Every ref under `folder` — `refs/...`, ending in `/` — with what it
+    /// points at. For the layer's own refs, whose names it builds itself.
+    pub(crate) fn refs_under(&self, folder: &str) -> Result<Vec<(RefName, Oid)>, GitError> {
+        if !folder.starts_with("refs/") || !folder.ends_with('/') {
+            return Err(GitError::invalid(format!(
+                "{folder} is not a folder of refs"
+            )));
+        }
+        let out = self
+            .git("for-each-ref")
+            .arg("--format=%(objectname) %(refname)")
+            .arg(folder)
+            .read_only()
+            .run_ok()?;
+        utf8("for-each-ref", out)?
+            .lines()
+            .map(|line| {
+                let (oid, name) = line
+                    .split_once(' ')
+                    .ok_or_else(|| GitError::malformed("for-each-ref", line.to_string()))?;
+                Ok((RefName::parse(name)?, Oid::parse(oid)?))
+            })
+            .collect()
+    }
+
     /// Every local branch, with its upstream when one is configured.
     pub fn branches(&self) -> Result<Vec<Branch>, GitError> {
         let out = self

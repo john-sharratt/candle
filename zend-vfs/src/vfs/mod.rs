@@ -14,28 +14,45 @@
 //!   the lines it changed — or, when it changes more than half the file's
 //!   lines, a replace of the whole file; a deletion is a [`FileDelta::Delete`].
 //!   A replace or a delete supersedes every earlier delta for its path.
-//! * **Lower** — the repository's folder on disk, read-only. Present only when a
-//!   root is configured ([`VfsStore::with_root`]); without one the store
-//!   degenerates to the upper layer alone.
+//! * **Lower** — the repository as committed, read-only, one of:
+//!   - **a branch** ([`VfsStore::on_branch`]) — a git repository is read
+//!     through the branch the conversation works on, as that branch's tree
+//!     holds it, never through its folder: the folder is the sandbox's, and
+//!     holds whatever the last command run there left in it
+//!     ([`git_source`]);
+//!   - **a folder** ([`VfsStore::with_root`]) — a folder that is not a git
+//!     repository, read as it stands on disk ([`folder`]);
+//!   - **nothing** ([`VfsStore::new`]) — the store is its upper layer alone.
 //!
 //! One store belongs to one conversation (see [`super::files`]): a session's
 //! changes are its own, never visible to another conversation.
 //!
-//! A read of a path the session has not changed falls through to the
-//! workspace, so a tool call sees the real project without the session having to
-//! load it. A read of a path it has changed replays that path's chain — onto the
-//! workspace's copy when the chain opens with an edit. A write always lands in the
-//! upper layer — the workspace is **never** modified.
+//! A read of a path the session has not changed falls through to the lower
+//! layer, so a tool call sees the real project without the session having to
+//! load it. A read of a path it has changed replays that path's chain — onto
+//! the lower layer's copy when the chain opens with an edit. A write always
+//! lands in the upper layer — the repository is **never** modified.
 //!
-//! A chain that opens with an edit depends on the workspace's copy it was made
-//! against. Each splice names the text it removes, so when that copy changes on
+//! A chain that opens with an edit depends on the copy it was made against.
+//! Each splice names the text it removes, so when a folder's copy changes on
 //! disk underneath the edit, replay refuses it as [`VfsError::Diverged`] rather
 //! than splicing the change into the wrong place; writing the whole file
 //! supersedes the edit and settles the file again.
 //!
-//! Deleting a workspace-backed file records a [`FileDelta::Delete`] instead of
-//! touching disk: the path then reads as absent and stops appearing in listings,
-//! but the file on disk is untouched. Writing the path supersedes the deletion.
+//! A store over a branch reads it at one commit, its [`Base`]: taken from the
+//! branch the first time the store reads it, and kept. The branch moving under
+//! it — another conversation's commit, a push from elsewhere — changes nothing
+//! it reads. The base moves only when the conversation moves it
+//! ([`VfsStore::move_base`]): its own commit, a merge, a switch, a reset. Each
+//! move carries the chains onto the new base's tree ([`carry`]), asking the
+//! move how every path the two trees hold differently should now read — so a
+//! merge is where another writer's changes meet this conversation's, and any
+//! overlap is left in the conversation's copy between conflict markers, the
+//! path flagged until the conversation settles it ([`VfsStore::conflicts`]).
+//!
+//! Deleting a file the lower layer holds records a [`FileDelta::Delete`]
+//! instead of touching it: the path then reads as absent and stops appearing in
+//! listings. Writing the path supersedes the deletion.
 //!
 //! # Path normalisation
 //!
@@ -47,11 +64,12 @@
 //!
 //! # Lower-layer rules
 //!
-//! The workspace walk is `ignore`-driven (the same crate ripgrep uses), so
-//! `.gitignore`, `.ignore`, the global git ignore, and hidden-file rules all
-//! apply — `target/` and friends never appear. Hidden files are excluded from
-//! listings the way `ls` excludes them, but they still *read* fine by exact path:
-//! `.gitignore` does not show up in `list` and does resolve in `read`.
+//! A branch holds only what was committed, so `target/` and friends never
+//! appear; a folder's walk is `ignore`-driven (the same crate ripgrep uses), so
+//! `.gitignore`, `.ignore`, the global git ignore apply to it. In both, hidden
+//! files are excluded from listings the way `ls` excludes them, but they still
+//! *read* fine by exact path: `.gitignore` does not show up in `list` and does
+//! resolve in `read`.
 //!
 //! Files above [`MAX_LOWER_FILE_BYTES`] are listed but refuse to read, as do files
 //! whose bytes are not valid UTF-8; both surface as [`VfsError::Unreadable`].
@@ -82,12 +100,13 @@
 //! worst of both worlds: hidden from the operator auditing what the model can
 //! see, and one call away from the transcript.
 //!
-//! The refusal is enforced in [`VfsStore::lower_path`], the single funnel every
-//! lower-layer read goes through, rather than at each call site — a guard that
-//! has to be remembered at N call sites is a guard that is missing at one of
-//! them. Normalisation runs first, so alternate spellings (`/secrets/x`,
-//! `a/../secrets/x`, backslashes) all collapse onto the
-//! same key before the check sees it.
+//! The refusal is enforced where each lower layer is built, rather than at
+//! each call site — a guard that has to be remembered at N call sites is a
+//! guard that is missing at one of them: a folder reaches every file through
+//! one funnel ([`folder::path`]), and a branch's tree never holds a protected
+//! path at all ([`tree`]). Normalisation runs first, so alternate spellings
+//! (`/secrets/x`, `a/../secrets/x`, backslashes) all collapse onto the same
+//! key before the check sees it.
 //!
 //! # Size cap
 //!
@@ -99,9 +118,10 @@
 //!
 //! # Direct mode
 //!
-//! [`VfsStore::direct`] is the same store with no upper layer: a write lands in
-//! the workspace on disk, a delete removes the file, and every read therefore
-//! sees what is on disk. It backs the daemon's Mutable tools mode, for a caller
+//! [`VfsStore::direct`] is the same store with no upper layer over a folder: a
+//! write lands in the workspace on disk, a delete removes the file, and every
+//! read therefore sees what is on disk. It backs the daemon's Mutable tools
+//! mode, for a caller
 //! entitled to change the project itself rather than a session copy of it.
 //! Everything else holds unchanged — path normalisation (so `..` still cannot
 //! leave the root) and the protected-path refusal in particular, which in this
@@ -111,15 +131,30 @@
 //! the target, so a write interrupted partway leaves the old file whole rather
 //! than truncated.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
-use std::sync::RwLock;
+mod base;
+mod carry;
+mod conflict;
+mod folder;
+pub mod git_source;
+mod tree;
+mod view;
 
-use ignore::WalkBuilder;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
 use serde::{Deserialize, Serialize};
 
+pub use self::base::Base;
+use self::base::SavedBase;
+pub use self::carry::{Carried, Resolved, Resolver, Side};
+pub use self::conflict::has_markers;
+use self::git_source::GitSource;
+use self::tree::Tree;
+use self::view::View;
 use super::file_delta::{self, FileDelta, FileTimes, ReplayError, TimedDelta};
-use crate::{DiskWriteGrant, FileChanges};
+use crate::{BranchName, DiskWriteGrant, FileChanges, Rev};
 
 const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
@@ -173,8 +208,8 @@ pub enum VfsError {
     Diverged(String),
 }
 
-impl std::fmt::Display for VfsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for VfsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VfsError::Full => write!(f, "VFS storage limit exceeded (10 MiB)"),
             VfsError::Unreadable(why) => write!(f, "{why}"),
@@ -217,9 +252,8 @@ pub struct GrepOutcome {
 }
 
 /// One entry in a directory listing: normalised path, byte size. No line
-/// count — that would cost opening every file in the walk to compute (see the
-/// history on [`VfsStore::list_lower_dir`]), and a listing that never opens a
-/// file is the whole point of `file_list`. A file's length reaches the model
+/// count — that would cost opening every file in the walk to compute, and a
+/// listing that never opens a file is the whole point of `file_list`. A file's length reaches the model
 /// through `file_read`'s own header instead (`(page 0 of 13, lines 1-200 of
 /// 2499)`), which is exact, costs nothing extra, and arrives at the moment the
 /// number is actually needed.
@@ -236,6 +270,15 @@ pub struct ListEntry {
     /// a file read straight off the workspace. Always `false` for a directory
     /// entry: a directory is not itself written, only the files inside it.
     pub modified: bool,
+}
+
+/// How the session has changed a path, against the lower layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FileState {
+    /// The lower layer has no such file.
+    Added,
+    Modified,
+    Deleted,
 }
 
 /// Lines per [`VfsStore::read_page`] page.
@@ -278,6 +321,9 @@ pub struct PageResult {
 #[derive(Default)]
 struct Upper {
     chains: HashMap<String, Chain>,
+    /// Over a branch, what the chains are made on — `None` until the store
+    /// first reads the branch and takes it.
+    base: Option<Base>,
 }
 
 impl Upper {
@@ -298,13 +344,16 @@ impl Upper {
 /// before it, so a chain is at most one of those followed by edits. A chain
 /// that starts with an edit changes the workspace's copy of the file, and is
 /// replayed onto it.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Chain {
     /// Each with the moment its operation executed.
     deltas: Vec<TimedDelta>,
     /// The file's size after the last delta, `None` once deleted — kept so a
     /// listing never replays a chain to report a size.
     size: Option<usize>,
+    /// Left in conflict by a move of the base, until a change of the
+    /// session's own leaves it without a conflict's markers.
+    conflict: bool,
 }
 
 impl Chain {
@@ -313,27 +362,59 @@ impl Chain {
     }
 }
 
-/// A store's session changes, saved: each changed path's chain — every delta
-/// with the moment it was made — and the size the chain leaves the file at,
-/// `None` once deleted. On the wire, a map of path to chain.
+/// What a change to one path was computed against: the base and the path's
+/// chain as they stood when the file was read. A change is recorded only if
+/// both still stand when the write lock is taken — otherwise a move of the
+/// base, or another change to the path, landed in between, and the change is
+/// computed again against what is there now.
+#[derive(PartialEq)]
+struct Seen {
+    base: Option<Base>,
+    chain: Option<Chain>,
+}
+
+impl Seen {
+    fn of(upper: &Upper, norm: &str) -> Self {
+        Self {
+            base: upper.base.clone(),
+            chain: upper.chains.get(norm).cloned(),
+        }
+    }
+
+    fn stands(&self, upper: &Upper, norm: &str) -> bool {
+        self.base == upper.base && self.chain.as_ref() == upper.chains.get(norm)
+    }
+}
+
+/// A store's session state, saved: each changed path's chain — every delta
+/// with the moment it was made, the size the chain leaves the file at (`None`
+/// once deleted), and whether it is in conflict — and, over a branch, the
+/// [`Base`] they are made on, so a restored conversation reads the commit it
+/// read before however the branch has moved since.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(deny_unknown_fields)]
 pub struct Snapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<SavedBase>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     chains: BTreeMap<String, SavedChain>,
 }
 
 impl Snapshot {
-    /// Whether no path is changed.
+    /// Whether there is nothing to save: no base taken, no path changed.
     pub fn is_empty(&self) -> bool {
-        self.chains.is_empty()
+        self.base.is_none() && self.chains.is_empty()
     }
 }
 
 /// One path's saved chain — see [`Snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SavedChain {
     deltas: Vec<TimedDelta>,
     size: Option<usize>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    conflict: bool,
 }
 
 /// Where a store's writes land.
@@ -346,28 +427,56 @@ enum Layering {
     Direct,
 }
 
+/// What a store reads beneath its session's changes.
+#[derive(Default)]
+enum Lower {
+    /// Nothing: the store is its upper layer alone.
+    #[default]
+    None,
+    /// A folder on disk.
+    Folder(PathBuf),
+    /// A git repository's branch — or, with no branch known, whatever its
+    /// `HEAD` names.
+    Branch {
+        source: Arc<GitSource>,
+        rev: RwLock<Rev>,
+    },
+}
+
 /// Union-mount of a session-private in-memory layer over a read-only
-/// repository folder — or, built with [`VfsStore::direct`], the folder itself.
+/// repository — or, built with [`VfsStore::direct`], a folder itself.
 #[derive(Default)]
 pub struct VfsStore {
     upper: RwLock<Upper>,
-    /// Lower layer root: the repository's folder. `None` leaves the store
-    /// upper-only.
-    root: Option<PathBuf>,
+    lower: Lower,
     layering: Layering,
 }
 
 impl VfsStore {
-    /// Upper layer only — no fall-through to disk.
+    /// Upper layer only — nothing beneath it.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Overlay the upper layer on `root`, a repository's folder.
+    /// Overlay the upper layer on `root`, a folder that is not a git
+    /// repository.
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             upper: RwLock::new(Upper::default()),
-            root: Some(root.into()),
+            lower: Lower::Folder(root.into()),
+            layering: Layering::Overlay,
+        }
+    }
+
+    /// Overlay the upper layer on `rev` of the repository `source` reads —
+    /// a branch, as it moves.
+    pub fn on_branch(source: Arc<GitSource>, rev: Rev) -> Self {
+        Self {
+            upper: RwLock::new(Upper::default()),
+            lower: Lower::Branch {
+                source,
+                rev: RwLock::new(rev),
+            },
             layering: Layering::Overlay,
         }
     }
@@ -381,7 +490,7 @@ impl VfsStore {
     pub fn direct(root: impl Into<PathBuf>, _grant: &DiskWriteGrant) -> Self {
         Self {
             upper: RwLock::new(Upper::default()),
-            root: Some(root.into()),
+            lower: Lower::Folder(root.into()),
             layering: Layering::Direct,
         }
     }
@@ -391,9 +500,194 @@ impl VfsStore {
         self.layering == Layering::Direct
     }
 
-    /// The configured lower-layer root, if any.
+    /// The folder of the repository beneath this store — the one it reads,
+    /// or, over a branch, the one the branch belongs to. `None` for a store
+    /// with nothing beneath it.
     pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+        match &self.lower {
+            Lower::None => None,
+            Lower::Folder(root) => Some(root),
+            Lower::Branch { source, .. } => Some(source.dir()),
+        }
+    }
+
+    /// What the store reads through, over a branch; `None` for a folder or
+    /// for nothing.
+    pub fn rev(&self) -> Option<Rev> {
+        match &self.lower {
+            Lower::Branch { rev, .. } => Some(rev.read().unwrap().clone()),
+            _ => None,
+        }
+    }
+
+    /// Name `branch` as the one this store is on. A store holding no changes
+    /// and no merge being finished lets go of its base too, and takes the
+    /// branch's on its next read; any other keeps the base its work is made
+    /// on — a conversation being restored, whose saved base [`Self::restore`]
+    /// puts back. Moving a store with work onto another branch is
+    /// [`Self::move_base`]. `false`, and nothing changes, for a store that is
+    /// not over a branch.
+    pub fn set_branch(&self, branch: BranchName) -> bool {
+        match &self.lower {
+            Lower::Branch { rev, .. } => {
+                let mut upper = self.upper.write().unwrap();
+                *rev.write().unwrap() = Rev::Branch(branch);
+                let merging = upper.base.as_ref().is_some_and(|b| b.merging().is_some());
+                if upper.chains.is_empty() && !merging {
+                    upper.base = None;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Put the store at `to`, on `branch`, with none of its work: every
+    /// change and every conflict dropped, and any merge being finished with
+    /// them. Unlike [`Self::move_base`] nothing is carried, so nothing about
+    /// the work — nor the base it was made on, which may no longer be in the
+    /// repository — can stand in the way. Returns how many changed paths
+    /// were dropped.
+    pub fn reset_to(&self, branch: Option<BranchName>, to: Base) -> Result<usize, VfsError> {
+        let Lower::Branch { rev, .. } = &self.lower else {
+            return Err(VfsError::Unwritable(
+                "only a store over a branch has a base to move".into(),
+            ));
+        };
+        let mut upper = self.upper.write().unwrap();
+        let dropped = upper.chains.len();
+        *upper = Upper {
+            chains: HashMap::new(),
+            base: Some(to),
+        };
+        if let Some(branch) = branch {
+            *rev.write().unwrap() = Rev::Branch(branch);
+        }
+        Ok(dropped)
+    }
+
+    /// What the session's changes are made on, over a branch — taken from
+    /// the branch now if the store has not read it yet. `None` for a store
+    /// over a folder or nothing.
+    pub fn base(&self) -> Result<Option<Base>, VfsError> {
+        match &self.lower {
+            Lower::Branch { source, rev } => Ok(Some(self.pinned(source, rev)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The store's base, taken from the branch it names the first time.
+    fn pinned(&self, source: &GitSource, rev: &RwLock<Rev>) -> Result<Base, VfsError> {
+        if let Some(base) = &self.upper.read().unwrap().base {
+            return Ok(base.clone());
+        }
+        let rev = rev.read().unwrap().clone();
+        let found = source.base_at(&rev).map_err(|e| {
+            VfsError::Unreadable(format!("the branch could not be read from git: {e}"))
+        })?;
+        let mut upper = self.upper.write().unwrap();
+        // Another caller may have taken it between the two locks.
+        Ok(upper.base.get_or_insert(found).clone())
+    }
+
+    /// The lower layer: over a branch, the tree of the store's base.
+    fn view(&self) -> Result<View<'_>, VfsError> {
+        match &self.lower {
+            Lower::None => Ok(View::Empty),
+            Lower::Folder(root) => Ok(View::Folder(root)),
+            Lower::Branch { source, rev } => {
+                let base = self.pinned(source, rev)?;
+                let tree = source.tree_of(&base).map_err(|e| {
+                    VfsError::Unreadable(format!("the base could not be read from git: {e}"))
+                })?;
+                Ok(View::Branch { source, tree })
+            }
+        }
+    }
+
+    /// Move the store onto `to` — and, given `branch`, onto that branch —
+    /// carrying the session's changes across ([`carry`]): every changed path
+    /// the old and new trees hold differently, and each of `extra`, is put
+    /// to `resolve`, and its answer recorded against the new tree. Returns
+    /// every path left in conflict. Everything is resolved first, so a
+    /// failure — a refusal from `resolve`, or changes that would no longer
+    /// fit the size cap — leaves the store as it was. Only a store over a
+    /// branch has a base to move.
+    pub fn move_base(
+        &self,
+        branch: Option<BranchName>,
+        to: Base,
+        extra: &[String],
+        resolve: &mut Resolver<'_>,
+    ) -> Result<Vec<String>, VfsError> {
+        let Lower::Branch { source, rev } = &self.lower else {
+            return Err(VfsError::Unwritable(
+                "only a store over a branch has a base to move".into(),
+            ));
+        };
+        let unreadable =
+            |e| VfsError::Unreadable(format!("the base could not be read from git: {e}"));
+        // Held for the whole move: no change of the conversation's can land
+        // between reading the base the chains are made on and replacing it.
+        let mut upper = self.upper.write().unwrap();
+        // With nothing to carry — no change of the conversation's, and no
+        // path the caller asks to reconsider — the old tree is never read, so
+        // a base the repository no longer holds is still left behind.
+        let nothing_to_carry = upper.chains.is_empty() && extra.is_empty();
+        let old_tree = match (&upper.base, nothing_to_carry) {
+            (_, true) => Arc::new(Tree::empty()),
+            (Some(from), false) => source.tree_of(from).map_err(unreadable)?,
+            (None, false) => {
+                let rev = rev.read().unwrap().clone();
+                let from = source.base_at(&rev).map_err(unreadable)?;
+                source.tree_of(&from).map_err(unreadable)?
+            }
+        };
+        let old = View::Branch {
+            source,
+            tree: old_tree,
+        };
+        let new = View::Branch {
+            source,
+            tree: source.tree_of(&to).map_err(unreadable)?,
+        };
+        let mut chains = upper.chains.clone();
+        carry::carry(&mut chains, &old, &new, extra, resolve)?;
+        let moved = Upper {
+            chains,
+            base: Some(to),
+        };
+        if moved.bytes() > MAX_BYTES {
+            return Err(VfsError::Full);
+        }
+        *upper = moved;
+        if let Some(branch) = branch {
+            *rev.write().unwrap() = Rev::Branch(branch);
+        }
+        Ok(Self::conflicted(&upper))
+    }
+
+    /// Every path left in conflict by a move of the base, sorted — the
+    /// conversation's to settle before it commits.
+    pub fn conflicts(&self) -> Vec<String> {
+        Self::conflicted(&self.upper.read().unwrap())
+    }
+
+    fn conflicted(upper: &Upper) -> Vec<String> {
+        let mut out: Vec<String> = upper
+            .chains
+            .iter()
+            .filter(|(_, c)| c.conflict)
+            .map(|(path, _)| path.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Whether `norm`, about to hold `content`, stays in conflict: it was,
+    /// and a conflict's markers are still in it.
+    fn still_conflicted(upper: &Upper, norm: &str, content: Option<&str>) -> bool {
+        upper.chains.get(norm).is_some_and(|c| c.conflict) && content.is_some_and(has_markers)
     }
 
     /// Replace the whole file with `content` — recorded as one
@@ -414,13 +708,16 @@ impl VfsStore {
         if self.is_direct() {
             return self.write_disk(&norm, &content);
         }
-        let created = !self.resolves_as_file(&norm);
+        let view = self.view()?;
+        let created = !self.resolves_as_file(&view, &norm);
         let size = content.len();
+        let mut guard = self.upper.write().unwrap();
+        let conflict = Self::still_conflicted(&guard, &norm, Some(&content));
         let chain = Chain {
             deltas: vec![TimedDelta::now(FileDelta::Replace { content })],
             size: Some(size),
+            conflict,
         };
-        let mut guard = self.upper.write().unwrap();
         Self::set_capped(&mut guard, norm, chain)?;
         Ok(created)
     }
@@ -437,37 +734,60 @@ impl VfsStore {
     pub fn edit(&self, path: &str, content: String) -> Result<bool, VfsError> {
         let norm = Self::normalize(path);
         Self::guard(&norm)?;
-        let current = self
-            .current(&norm)?
-            .ok_or_else(|| VfsError::Unreadable(format!("{norm} does not exist to edit")))?;
-        if current == content {
-            return Ok(false);
-        }
-        if self.is_direct() {
-            self.write_disk(&norm, &content)?;
+        loop {
+            let seen = Seen::of(&self.upper.read().unwrap(), &norm);
+            let view = self.view()?;
+            let current = self
+                .current(&view, &norm)?
+                .ok_or_else(|| VfsError::Unreadable(format!("{norm} does not exist to edit")))?;
+            if current == content {
+                // Keeping a file in conflict exactly as it stands — the side
+                // of an edit that met a delete, say — settles it, markers
+                // aside.
+                let mut guard = self.upper.write().unwrap();
+                if !seen.stands(&guard, &norm) {
+                    continue;
+                }
+                if let Some(chain) = guard.chains.get_mut(&norm) {
+                    if chain.conflict && !has_markers(&content) {
+                        chain.conflict = false;
+                    }
+                }
+                return Ok(false);
+            }
+            if self.is_direct() {
+                self.write_disk(&norm, &content)?;
+                return Ok(true);
+            }
+            let size = Some(content.len());
+            let delta = TimedDelta::now(file_delta::delta(&current, &content));
+            let mut guard = self.upper.write().unwrap();
+            if !seen.stands(&guard, &norm) {
+                continue;
+            }
+            let conflict = Self::still_conflicted(&guard, &norm, Some(&content));
+            let chain = match delta.delta {
+                // A replacement supersedes the chain, as a write does.
+                FileDelta::Replace { .. } => Chain {
+                    deltas: vec![delta],
+                    size,
+                    conflict,
+                },
+                _ => {
+                    let mut chain = seen.chain.unwrap_or(Chain {
+                        deltas: Vec::new(),
+                        size: None,
+                        conflict: false,
+                    });
+                    chain.deltas.push(delta);
+                    chain.size = size;
+                    chain.conflict = conflict;
+                    chain
+                }
+            };
+            Self::set_capped(&mut guard, norm, chain)?;
             return Ok(true);
         }
-        let size = Some(content.len());
-        let delta = TimedDelta::now(file_delta::delta(&current, &content));
-        let mut guard = self.upper.write().unwrap();
-        let chain = match delta.delta {
-            // A replacement supersedes the chain, as a write does.
-            FileDelta::Replace { .. } => Chain {
-                deltas: vec![delta],
-                size,
-            },
-            _ => {
-                let mut chain = guard.chains.get(&norm).cloned().unwrap_or(Chain {
-                    deltas: Vec::new(),
-                    size: None,
-                });
-                chain.deltas.push(delta);
-                chain.size = size;
-                chain
-            }
-        };
-        Self::set_capped(&mut guard, norm, chain)?;
-        Ok(true)
     }
 
     /// Resolve a path through the overlay: the session's deltas replayed onto
@@ -477,30 +797,35 @@ impl VfsStore {
     pub fn read(&self, path: &str) -> Result<Option<String>, VfsError> {
         let norm = Self::normalize(path);
         Self::guard(&norm)?;
-        self.current(&norm)
+        let view = self.view()?;
+        self.current(&view, &norm)
     }
 
     /// Whether the session has changed `path` — written, edited or deleted it —
-    /// so that what a read returns is no longer the workspace's copy.
+    /// so that what a read returns is no longer the lower layer's copy.
     pub fn is_modified(&self, path: &str) -> bool {
-        let norm = Self::normalize(path);
-        self.upper.read().unwrap().chains.contains_key(&norm)
+        self.holds(&Self::normalize(path))
+    }
+
+    /// Whether the session layer holds a chain for `norm`.
+    fn holds(&self, norm: &str) -> bool {
+        self.upper.read().unwrap().chains.contains_key(norm)
     }
 
     /// `norm`'s content as this store resolves it: the session's chain
-    /// replayed, or the workspace's copy.
+    /// replayed, or the lower layer's copy.
     ///
-    /// A chain opening with an edit is replayed onto the workspace's copy as it
-    /// is now. When that copy has changed underneath the edit, the edit no
+    /// A chain opening with an edit is replayed onto the lower layer's copy as
+    /// it is now. When that copy has changed underneath the edit, the edit no
     /// longer fits it and the read is refused as [`VfsError::Diverged`] — the
     /// alternative is splicing the session's change into the wrong place.
-    fn current(&self, norm: &str) -> Result<Option<String>, VfsError> {
+    fn current(&self, view: &View<'_>, norm: &str) -> Result<Option<String>, VfsError> {
         let chain = self.upper.read().unwrap().chains.get(norm).cloned();
         let Some(chain) = chain else {
-            return self.read_lower(norm);
+            return view.read_text(norm);
         };
         let base = match chain.deltas.first().map(|t| &t.delta) {
-            Some(FileDelta::Edit { .. }) => self.read_lower(norm)?,
+            Some(FileDelta::Edit { .. }) => view.read_text(norm)?,
             _ => None,
         };
         file_delta::replay(base, chain.deltas.iter().map(|t| &t.delta)).map_err(|e| match e {
@@ -550,51 +875,67 @@ impl VfsStore {
         if deltas.is_empty() {
             return Ok(());
         }
-        let replayed = file_delta::replay(self.current(&norm)?, deltas.iter().map(|t| &t.delta));
-        let result = replayed.map_err(|e| match e {
-            ReplayError::Diverged(_) => VfsError::Diverged(format!(
-                "the changes do not fit {norm} as it stands — read it and build them again"
-            )),
-            ReplayError::NotText => Self::not_text(&norm),
-        })?;
-        if self.is_direct() {
-            match result {
-                Some(text) => {
-                    self.write_disk(&norm, &text)?;
+        loop {
+            let seen = Seen::of(&self.upper.read().unwrap(), &norm);
+            let view = self.view()?;
+            let replayed =
+                file_delta::replay(self.current(&view, &norm)?, deltas.iter().map(|t| &t.delta));
+            let result = replayed.map_err(|e| match e {
+                ReplayError::Diverged(_) => VfsError::Diverged(format!(
+                    "the changes do not fit {norm} as it stands — read it and build them again"
+                )),
+                ReplayError::NotText => Self::not_text(&norm),
+            })?;
+            if self.is_direct() {
+                match result {
+                    Some(text) => {
+                        self.write_disk(&norm, &text)?;
+                    }
+                    None => {
+                        self.delete(&norm);
+                    }
                 }
-                None => {
-                    self.delete(&norm);
-                }
+                return Ok(());
             }
-            return Ok(());
+            let in_lower = view.is_file(&norm);
+            let mut guard = self.upper.write().unwrap();
+            if !seen.stands(&guard, &norm) {
+                continue;
+            }
+            let conflict = Self::still_conflicted(&guard, &norm, result.as_deref());
+            let mut chain = seen.chain.unwrap_or(Chain {
+                deltas: Vec::new(),
+                size: None,
+                conflict: false,
+            });
+            chain.deltas.extend(deltas.iter().cloned());
+            // A replace or a delete supersedes everything before it.
+            if let Some(last) = chain.deltas.iter().rposition(|t| t.delta.supersedes()) {
+                chain.deltas.drain(..last);
+            }
+            chain.size = result.as_ref().map(String::len);
+            chain.conflict = conflict;
+            // Deleting a file only the session made leaves nothing to record.
+            if chain.size.is_none() && !in_lower {
+                guard.chains.remove(&norm);
+                return Ok(());
+            }
+            return Self::set_capped(&mut guard, norm, chain);
         }
-        let in_lower = self.lower_exists(&norm);
-        let mut guard = self.upper.write().unwrap();
-        let mut chain = guard.chains.get(&norm).cloned().unwrap_or(Chain {
-            deltas: Vec::new(),
-            size: None,
-        });
-        chain.deltas.extend(deltas.iter().cloned());
-        // A replace or a delete supersedes everything before it.
-        if let Some(last) = chain.deltas.iter().rposition(|t| t.delta.supersedes()) {
-            chain.deltas.drain(..last);
-        }
-        chain.size = result.as_ref().map(String::len);
-        // Deleting a file only the session made leaves nothing to record.
-        if chain.size.is_none() && !in_lower {
-            guard.chains.remove(&norm);
-            return Ok(());
-        }
-        Self::set_capped(&mut guard, norm, chain)
     }
 
-    /// The session's changes as they are saved: every changed path's chain,
-    /// each delta with its moment, and the size it leaves the file at — what
+    /// The session's state as it is saved: every changed path's chain, each
+    /// delta with its moment, the size it leaves the file at and whether it
+    /// is in conflict, with the base they are made on — what
     /// [`Self::restore`] puts back exactly, with nothing replayed. A direct
     /// store holds none.
     pub fn snapshot(&self) -> Snapshot {
-        let upper = self.upper.read().unwrap();
+        Self::saved(&self.upper.read().unwrap())
+    }
+
+    fn saved(upper: &Upper) -> Snapshot {
         Snapshot {
+            base: upper.base.as_ref().map(Base::saved),
             chains: upper
                 .chains
                 .iter()
@@ -602,6 +943,7 @@ impl VfsStore {
                     let saved = SavedChain {
                         deltas: chain.deltas.clone(),
                         size: chain.size,
+                        conflict: chain.conflict,
                     };
                     (path.clone(), saved)
                 })
@@ -609,20 +951,44 @@ impl VfsStore {
         }
     }
 
-    /// Put back changes a [`Self::snapshot`] saved, replacing whatever the
+    /// Put back what a [`Self::snapshot`] saved, replacing whatever the
     /// session layer holds — how a conversation's own copy of a repository
-    /// outlives the store that held it. A protected path is refused, and so
-    /// is a set past the size cap; either way the store is left as it was. A
+    /// outlives the store that held it, reading the base it read before. A
+    /// protected path is refused, and so is a set past the size cap or a base
+    /// that does not name objects; any of these leaves the store as it was. A
     /// direct store holds no session changes and takes none.
     pub fn restore(&self, snapshot: Snapshot) -> Result<(), VfsError> {
         if snapshot.is_empty() {
             return Ok(());
         }
+        let restored = self.upper_of(snapshot)?;
+        *self.upper.write().unwrap() = restored;
+        Ok(())
+    }
+
+    /// Put back `before`, a [`Self::snapshot`] taken before a change, only if
+    /// the store still holds exactly `after` — what that change left. Returns
+    /// whether it did: a change of the conversation's that landed since is
+    /// never undone by rolling back another.
+    pub fn roll_back(&self, after: &Snapshot, before: Snapshot) -> Result<bool, VfsError> {
+        let restored = self.upper_of(before)?;
+        let mut upper = self.upper.write().unwrap();
+        if Self::saved(&upper) != *after {
+            return Ok(false);
+        }
+        *upper = restored;
+        Ok(true)
+    }
+
+    /// The session layer `snapshot` saved, checked: no protected path, within
+    /// the size cap, a base naming objects.
+    fn upper_of(&self, snapshot: Snapshot) -> Result<Upper, VfsError> {
         if self.is_direct() {
             return Err(VfsError::Unwritable(
                 "a store that writes the disk directly holds no session changes to restore".into(),
             ));
         }
+        let base = snapshot.base.as_ref().map(SavedBase::parse).transpose()?;
         let mut chains = HashMap::with_capacity(snapshot.chains.len());
         for (path, saved) in snapshot.chains {
             let norm = Self::normalize(&path);
@@ -632,22 +998,23 @@ impl VfsStore {
                 Chain {
                     deltas: saved.deltas,
                     size: saved.size,
+                    conflict: saved.conflict,
                 },
             );
         }
-        let restored = Upper { chains };
+        let restored = Upper { chains, base };
         if restored.bytes() > MAX_BYTES {
             return Err(VfsError::Full);
         }
-        *self.upper.write().unwrap() = restored;
-        Ok(())
+        Ok(restored)
     }
 
-    /// Every change the session holds, path by path — what a checkout replays
-    /// onto a repository's files to put this conversation on disk (see
-    /// [`crate::checkout`]). A direct store holds none: its changes are on
-    /// disk already.
-    pub fn changes(&self) -> FileChanges {
+    /// Every change the session holds, path by path, made against its base's
+    /// tree — what a checkout replays onto a repository's files to put this
+    /// conversation on disk (see [`crate::checkout`]). A direct store holds
+    /// none: its changes are on disk already.
+    pub fn changes(&self) -> Result<FileChanges, VfsError> {
+        self.view()?;
         let upper = self.upper.read().unwrap();
         let mut changes = FileChanges::new();
         for (path, chain) in &upper.chains {
@@ -655,7 +1022,7 @@ impl VfsStore {
                 changes.push_timed(path.clone(), delta.clone());
             }
         }
-        changes
+        Ok(changes)
     }
 
     fn diverged(norm: &str) -> VfsError {
@@ -665,50 +1032,52 @@ impl VfsStore {
         ))
     }
 
+    /// Refusal of a lower-layer file above [`MAX_LOWER_FILE_BYTES`].
+    fn too_large(norm: &str, bytes: u64) -> VfsError {
+        VfsError::Unreadable(format!(
+            "{norm} is {bytes} bytes, above the {MAX_LOWER_FILE_BYTES}-byte workspace read limit",
+        ))
+    }
+
     /// A file's bytes, resolved through the overlay the same way
     /// [`Self::read`] is, for a caller that records content rather than
     /// showing it — `git_commit`'s `take`. Neither the UTF-8 requirement nor
     /// [`MAX_LOWER_FILE_BYTES`] applies, since nothing here reaches a tool
     /// response; every rule on which file a path may open does, because it
-    /// goes through [`Self::lower_path`] like every other read.
+    /// reads through the same lower layer every other read does.
     pub fn read_bytes(&self, path: &str) -> Result<Option<Vec<u8>>, VfsError> {
         let norm = Self::normalize(path);
         Self::guard(&norm)?;
-        if self.is_modified(&norm) {
-            return Ok(self.current(&norm)?.map(String::into_bytes));
+        let view = self.view()?;
+        if self.holds(&norm) {
+            return Ok(self.current(&view, &norm)?.map(String::into_bytes));
         }
-        let Some(abs) = self.lower_path(&norm) else {
-            return Ok(None);
-        };
-        if !std::fs::metadata(&abs).is_ok_and(|m| m.is_file()) {
-            return Ok(None);
-        }
-        std::fs::read(&abs)
-            .map(Some)
-            .map_err(|e| VfsError::Unreadable(format!("{norm} could not be read: {e}")))
+        view.read_bytes(&norm)
     }
 
     /// One [`PAGE_LINES`]-line page of a file, resolved through the overlay the
     /// same way [`Self::read`] is. `Ok(None)` means the path does not exist in
     /// either layer.
     ///
-    /// Bounded memory regardless of file size: the workspace layer streams the
-    /// file line by line rather than materialising it (`file_read` used to read
-    /// the whole file into a `String` and a `Vec<&str>` slice of it just to
-    /// return 300 lines). A file the session changed is replayed from its
-    /// deltas once and paged from that text.
+    /// A folder's file is streamed line by line rather than materialised
+    /// (`file_read` used to read the whole file into a `String` and a
+    /// `Vec<&str>` slice of it just to return 300 lines); a branch's blob,
+    /// already bounded by [`MAX_LOWER_FILE_BYTES`], is paged from its text. A
+    /// file the session changed is replayed from its deltas once and paged
+    /// from that text.
     pub fn read_page(&self, path: &str, page: u32) -> Result<Option<PageResult>, VfsError> {
         let norm = Self::normalize(path);
         Self::guard(&norm)?;
-        if self.is_modified(&norm) {
-            let Some(text) = self.current(&norm)? else {
+        let view = self.view()?;
+        if self.holds(&norm) {
+            let Some(text) = self.current(&view, &norm)? else {
                 return Ok(None);
             };
             return Self::paginate(std::io::Cursor::new(text.as_bytes()), page)
                 .map(Some)
                 .map_err(|e| VfsError::Unreadable(format!("{norm} could not be read: {e}")));
         }
-        self.read_lower_page(&norm, page)
+        view.read_page(&norm, page)
     }
 
     /// One level of `dir`'s contents, upper layer shadowing the workspace:
@@ -723,13 +1092,14 @@ impl VfsStore {
         if Self::is_protected(&norm) {
             return Ok(Some(Vec::new()));
         }
+        let view = self.view()?;
         // `norm` resolving as a file rules out a directory listing outright —
         // checked first, and independently of the walk below, because a
         // conflicting write elsewhere in the upper layer (e.g. a file at
         // `"a/b.rs/c.rs"` alongside a real file at `"a/b.rs"`) would otherwise
         // make `upper_has_children` true for `"a/b.rs"` and this would
         // silently resolve a file path as a directory.
-        if self.resolves_as_file(&norm) {
+        if self.resolves_as_file(&view, &norm) {
             return Ok(None);
         }
         let mut out: Vec<ListEntry> = Vec::new();
@@ -776,13 +1146,13 @@ impl VfsStore {
             }
         }
 
-        let lower_is_dir = self.lower_dir_exists(&norm);
+        let lower_is_dir = view.is_dir(&norm);
         if !lower_is_dir && !upper_has_children && !norm.is_empty() {
             return Ok(None);
         }
 
         if lower_is_dir || norm.is_empty() {
-            for (path, bytes, is_dir) in self.list_lower_dir(&norm) {
+            for (path, bytes, is_dir) in view.children(&norm) {
                 if seen.contains(&(path.clone(), is_dir)) {
                     continue;
                 }
@@ -804,21 +1174,21 @@ impl VfsStore {
     /// existence only, never a content read (matching `list_dir`'s "never
     /// opens a file" contract). Upper-first, respecting whiteouts, the same
     /// precedence `read` uses.
-    fn resolves_as_file(&self, norm: &str) -> bool {
+    fn resolves_as_file(&self, view: &View<'_>, norm: &str) -> bool {
         if norm.is_empty() {
             return false;
         }
         if let Some(chain) = self.upper.read().unwrap().chains.get(norm) {
             return chain.size.is_some();
         }
-        self.lower_exists(norm)
+        view.is_file(norm)
     }
 
-    /// Remove a path from the overlay. A file the workspace holds is recorded
-    /// as one [`FileDelta::Delete`], superseding the path's earlier deltas, so
-    /// it stops resolving; a file only the session made just loses its deltas.
-    /// Returns whether the path resolved before the call. The workspace is
-    /// never touched.
+    /// Remove a path from the overlay. A file the lower layer holds is
+    /// recorded as one [`FileDelta::Delete`], superseding the path's earlier
+    /// deltas, so it stops resolving; a file only the session made just loses
+    /// its deltas. Returns whether the path resolved before the call. The
+    /// lower layer is never touched.
     ///
     /// On a [`direct`](Self::direct) store the file is removed from disk, and the
     /// result is whether it existed and was removed.
@@ -829,10 +1199,13 @@ impl VfsStore {
         }
         if self.is_direct() {
             return self
-                .lower_path(&norm)
+                .disk_path(&norm)
                 .is_some_and(|abs| abs.is_file() && std::fs::remove_file(abs).is_ok());
         }
-        let in_lower = self.lower_exists(&norm);
+        let Ok(view) = self.view() else {
+            return false;
+        };
+        let in_lower = view.is_file(&norm);
         let mut guard = self.upper.write().unwrap();
         if guard.deleted(&norm) {
             return false;
@@ -844,10 +1217,43 @@ impl VfsStore {
                 Chain {
                     deltas: vec![TimedDelta::now(FileDelta::Delete)],
                     size: None,
+                    conflict: false,
                 },
             );
         }
         had_upper || in_lower
+    }
+
+    /// Every path the session has changed, sorted, and how — against the
+    /// lower layer as it stands now: what a status of the conversation's
+    /// uncommitted work reports.
+    pub fn status(&self) -> Vec<(String, FileState)> {
+        let Ok(view) = self.view() else {
+            return Vec::new();
+        };
+        let upper = self.upper.read().unwrap();
+        let mut out: Vec<(String, FileState)> = upper
+            .chains
+            .iter()
+            .map(|(path, chain)| {
+                let state = match (chain.size, view.is_file(path)) {
+                    (None, _) => FileState::Deleted,
+                    (Some(_), true) => FileState::Modified,
+                    (Some(_), false) => FileState::Added,
+                };
+                (path.clone(), state)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Drop every change the session holds: every path reads as the lower
+    /// layer holds it again. What a hard reset does to the conversation's
+    /// uncommitted work. A direct store holds none.
+    pub fn discard(&self) {
+        let mut upper = self.upper.write().unwrap();
+        upper.chains.clear();
     }
 
     /// Bytes the session's deltas hold. Workspace files cost nothing — they
@@ -880,7 +1286,7 @@ impl VfsStore {
     /// replaces the file in one step, so a write cut short leaves the old
     /// content whole rather than a truncated file.
     fn write_disk(&self, norm: &str, content: &str) -> Result<bool, VfsError> {
-        let abs = self.lower_path(norm).ok_or_else(|| {
+        let abs = self.disk_path(norm).ok_or_else(|| {
             VfsError::Unwritable(format!("{norm:?} does not name a file in the workspace"))
         })?;
         let fail = |what: &str, e: std::io::Error| {
@@ -906,93 +1312,18 @@ impl VfsStore {
         Ok(!existed)
     }
 
-    // ── Lower-layer helpers ──────────────────────────────────────────────────
-
-    /// Absolute path of `norm` under the workspace, or `None` when there is no
-    /// lower layer or the key is empty (the root itself is not a file).
-    fn lower_path(&self, norm: &str) -> Option<PathBuf> {
-        let root = self.root.as_ref()?;
-        if norm.is_empty() {
-            return None;
+    /// Where a direct store's `norm` is on disk — through the folder layer's
+    /// one funnel, so a write is refused exactly what a read is.
+    fn disk_path(&self, norm: &str) -> Option<PathBuf> {
+        match &self.lower {
+            Lower::Folder(root) => folder::path(root, norm),
+            _ => None,
         }
-        // The single funnel for lower-layer access. Guarding here rather than at
-        // each caller is what makes the protection total: `read_lower`,
-        // `lower_exists`, and anything added later inherit it without knowing it
-        // exists.
-        if Self::is_protected(norm) {
-            return None;
-        }
-        Self::contained(root, norm)
     }
 
-    /// [`Self::under`], and then the same question asked of where the path
-    /// really leads: with every symlink and junction on the way resolved, it
-    /// must still be under `root` and outside every protected folder.
-    ///
-    /// The spelling checks alone are not enough. A symlink committed to a
-    /// repository — `notes.md -> ~/.zend/secrets.yaml`, or a folder junction
-    /// to the user's home — spells a plain workspace path and opens a file
-    /// outside every repository, which is exactly where the daemon's secrets
-    /// live; one pointing at the repository's own `secrets/` folder opens it
-    /// under an unprotected name. A path that does not exist yet (a direct
-    /// write creating it) is judged by its deepest existing ancestor, so a
-    /// new file under a linked folder is refused too.
-    fn contained(root: &Path, norm: &str) -> Option<PathBuf> {
-        let joined = Self::under(root, norm)?;
-        let real_root = root.canonicalize().ok()?;
-        let mut probe = joined.clone();
-        let real = loop {
-            match probe.canonicalize() {
-                Ok(real) => break real,
-                Err(_) => {
-                    if !probe.pop() {
-                        return None;
-                    }
-                }
-            }
-        };
-        let rel = real.strip_prefix(&real_root).ok()?;
-        let key = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        if Self::is_protected(&key) {
-            return None;
-        }
-        Some(joined)
-    }
+    // ── Path rules ───────────────────────────────────────────────────────────
 
-    /// `root.join(norm)`, only when the result stays under `root`.
-    ///
-    /// Normalisation removes `..` and leading separators, but not a Windows
-    /// drive or device prefix: `C:/Users/x/.ssh/id_rsa` normalises to itself,
-    /// and joining a path that carries a prefix *replaces* the root — so a
-    /// `file_read`, a script's `vfs.read`, or a direct write reached any file on
-    /// the host. A segment with a `:` in it is a drive (`C:`), a device path
-    /// (`\\?\C:\`), or an NTFS alternate stream (`notes.txt:hidden`), and none
-    /// of those names a workspace file; the component check refuses anything
-    /// else that is not a plain name.
-    ///
-    /// So is any other spelling Windows would resolve to a different name: a
-    /// segment ending in a dot or a space (both dropped when the name is
-    /// opened), and an 8.3 short name (`SECRET~1`), which opens the long name
-    /// it abbreviates — `secrets/` included — past every check made on the
-    /// spelling.
-    fn under(root: &Path, norm: &str) -> Option<PathBuf> {
-        if !Self::addressable(norm) {
-            return None;
-        }
-        if !Path::new(norm)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
-        {
-            return None;
-        }
-        Some(root.join(norm))
-    }
-
-    /// Whether every segment of `norm` is a name [`Self::under`] accepts — no
+    /// Whether every segment of `norm` is a name a folder opens as itself — no
     /// `:`, no trailing `.` or space, no 8.3 short-name tail.
     ///
     /// The workspace walks apply it too, so a listing never shows a file the
@@ -1025,59 +1356,6 @@ impl VfsStore {
         Ok(())
     }
 
-    fn lower_exists(&self, norm: &str) -> bool {
-        self.lower_path(norm).is_some_and(|p| p.is_file())
-    }
-
-    fn read_lower(&self, norm: &str) -> Result<Option<String>, VfsError> {
-        let Some(abs) = self.lower_path(norm) else {
-            return Ok(None);
-        };
-        let Ok(meta) = std::fs::metadata(&abs) else {
-            return Ok(None);
-        };
-        if !meta.is_file() {
-            return Ok(None);
-        }
-        if meta.len() > MAX_LOWER_FILE_BYTES {
-            return Err(VfsError::Unreadable(format!(
-                "{norm} is {} bytes, above the {MAX_LOWER_FILE_BYTES}-byte workspace read limit",
-                meta.len(),
-            )));
-        }
-        let bytes = std::fs::read(&abs)
-            .map_err(|e| VfsError::Unreadable(format!("{norm} could not be read: {e}")))?;
-        String::from_utf8(bytes)
-            .map(Some)
-            .map_err(|_| VfsError::Unreadable(format!("{norm} is not valid UTF-8 text")))
-    }
-
-    /// [`Self::read_page`]'s workspace half: open the file and stream it rather
-    /// than reading it whole, so a 4 MiB file costs [`PAGE_LINES`] lines of
-    /// memory, not 4 MiB.
-    fn read_lower_page(&self, norm: &str, page: u32) -> Result<Option<PageResult>, VfsError> {
-        let Some(abs) = self.lower_path(norm) else {
-            return Ok(None);
-        };
-        let Ok(meta) = std::fs::metadata(&abs) else {
-            return Ok(None);
-        };
-        if !meta.is_file() {
-            return Ok(None);
-        }
-        if meta.len() > MAX_LOWER_FILE_BYTES {
-            return Err(VfsError::Unreadable(format!(
-                "{norm} is {} bytes, above the {MAX_LOWER_FILE_BYTES}-byte workspace read limit",
-                meta.len(),
-            )));
-        }
-        let file = std::fs::File::open(&abs)
-            .map_err(|e| VfsError::Unreadable(format!("{norm} could not be read: {e}")))?;
-        Self::paginate(std::io::BufReader::new(file), page)
-            .map(Some)
-            .map_err(|e| VfsError::Unreadable(format!("{norm} is not valid UTF-8 text: {e}")))
-    }
-
     /// Stream `reader` line by line and return page `requested_page`
     /// ([`PAGE_LINES`]-line strides, 0-based), without ever holding more than
     /// two pages' worth of lines at once.
@@ -1103,8 +1381,8 @@ impl VfsStore {
         loop {
             buf.clear();
             // `read_line` requires valid UTF-8 (an `io::Error` otherwise), which
-            // is the same "the whole file must be text" contract `read_lower`
-            // enforces up front — just discovered while streaming instead of
+            // is the same "the whole file must be text" contract a whole-file
+            // read enforces up front — just discovered while streaming instead of
             // before returning anything.
             let n = reader.read_line(&mut buf)?;
             if n == 0 {
@@ -1165,157 +1443,22 @@ impl VfsStore {
         })
     }
 
-    /// `true` when `norm` names a real directory under the root — the empty
-    /// path (the root itself) always does, when there is a root at all.
-    fn lower_dir_exists(&self, norm: &str) -> bool {
-        let Some(root) = self.root.as_ref() else {
-            return false;
-        };
-        if norm.is_empty() {
-            root.is_dir()
-        } else {
-            Self::contained(root, norm).is_some_and(|p| p.is_dir())
-        }
-    }
-
-    /// One level of the workspace directory `norm`: its immediate file and
-    /// subdirectory children, honouring every ignore file the `ignore` crate
-    /// knows. Bounded to depth 1, so a listing costs one directory's worth of
-    /// `readdir`, never a walk of a whole subtree — what makes `file_list`
-    /// cheap on a large repository no matter how deep `norm` is. Returns
-    /// `(normalised path, bytes, is_dir)`; `bytes` is `None` for a
-    /// subdirectory and metadata-only for a file — never a file open, which is
-    /// what makes a listing cheap even where it does open a directory (see the
-    /// history in [`Self::read_lower_page`]'s sibling doc). A protected entry
-    /// (see [`PROTECTED_SEGMENT`]) is dropped rather than listed — the same
-    /// silence `secrets/` gets everywhere else — so listing the protected
-    /// directory itself, or a parent that contains one, comes back empty of
-    /// it rather than erroring, and never names it. An entry [`Self::addressable`]
-    /// refuses (a `:` in the name, an 8.3 short-name tail, …) is dropped too —
-    /// a listing never shows a file the store cannot open.
-    fn list_lower_dir(&self, norm: &str) -> Vec<(String, Option<usize>, bool)> {
-        let Some(root) = self.root.as_ref() else {
-            return Vec::new();
-        };
-        let walk_root = if norm.is_empty() {
-            root.clone()
-        } else {
-            let Some(p) = Self::contained(root, norm) else {
-                return Vec::new();
-            };
-            p
-        };
-
-        let mut out = Vec::new();
-        for entry in Self::lower_walker(&walk_root, Some(1)).flatten() {
-            // Depth 0 is `walk_root` itself, not a child of it.
-            if entry.depth() == 0 {
-                continue;
-            }
-            let file_type = entry.file_type();
-            let is_dir = file_type.is_some_and(|t| t.is_dir());
-            let is_file = file_type.is_some_and(|t| t.is_file());
-            if !is_dir && !is_file {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy();
-            let path = if norm.is_empty() {
-                name.into_owned()
-            } else {
-                format!("{norm}/{name}")
-            };
-            if Self::is_protected(&path) || !Self::addressable(&path) {
-                continue;
-            }
-            if is_dir {
-                out.push((path, None, true));
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            out.push((path, Some(meta.len() as usize), false));
-        }
-        out
-    }
-
-    /// The ignore-driven walker both lower-layer passes use.
-    ///
-    /// One builder, so a listing and a search can never disagree about what is
-    /// visible — a file hidden from `file_list` but reachable by `file_grep`
-    /// would be the same class of hole as the read path that ignored these
-    /// rules entirely. `max_depth` is `Some(1)` for a one-level directory
-    /// listing and `None` for a search, which walks the whole subtree.
-    fn lower_walker(root: &Path, max_depth: Option<usize>) -> ignore::Walk {
-        WalkBuilder::new(root)
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .ignore(true)
-            .require_git(false)
-            .parents(true)
-            .max_depth(max_depth)
-            .build()
-    }
-
-    /// Where a lower-layer walk for `norm_prefix` starts, and the prefix filter
-    /// its keys still need.
-    ///
-    /// Walking from the prefix directory (when it is one under the root) keeps
-    /// a narrow listing cheap on a large repository; otherwise the walk covers
-    /// the root and filters, which is what a partial-segment prefix like
-    /// `src/ma` needs — and what a prefix naming somewhere outside the root
-    /// gets, so it lists nothing rather than walking another drive.
-    fn walk_start<'p>(root: &Path, norm_prefix: &'p str) -> (PathBuf, Option<&'p str>) {
-        match Self::contained(root, norm_prefix) {
-            Some(dir) if !norm_prefix.is_empty() && dir.is_dir() => (dir, None),
-            _ => (root.to_path_buf(), Some(norm_prefix)),
-        }
-    }
-
-    /// Normalised keys of the workspace files under `norm_prefix`.
-    ///
-    /// Deliberately stats nothing and reads nothing: this backs path search and
-    /// the candidate list for a content search, which need only the names.
-    fn walk_lower_paths(&self, norm_prefix: &str) -> Vec<String> {
-        let Some(root) = self.root.as_ref() else {
-            return Vec::new();
-        };
-        let (walk_root, filter) = Self::walk_start(root, norm_prefix);
-
-        let mut out = Vec::new();
-        for entry in Self::lower_walker(&walk_root, None).flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let Ok(rel) = entry.path().strip_prefix(root) else {
-                continue;
-            };
-            let key = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            if Self::is_protected(&key) || !Self::addressable(&key) {
-                continue;
-            }
-            if let Some(p) = filter {
-                if !Self::matches_prefix(&key, p) {
-                    continue;
-                }
-            }
-            out.push(key);
-        }
-        out
-    }
-
     // ── Search ───────────────────────────────────────────────────────────────
 
-    /// Every path visible under `prefix`, upper layer shadowing the workspace.
+    /// Every path visible under `prefix`, upper layer shadowing the lower.
     ///
-    /// Unlike [`VfsStore::list`] this reads no file contents, so it stays cheap
-    /// over a whole repository — line counts are what make a full listing
-    /// expensive, and a path search does not need them.
+    /// Unlike [`VfsStore::list_dir`] this reads no file contents, so it stays
+    /// cheap over a whole repository — line counts are what make a full
+    /// listing expensive, and a path search does not need them.
     pub fn paths(&self, prefix: &str) -> Vec<String> {
+        match self.view() {
+            Ok(view) => self.paths_in(&view, prefix),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// [`Self::paths`], against `view`.
+    fn paths_in(&self, view: &View<'_>, prefix: &str) -> Vec<String> {
         let norm_prefix = Self::normalize(prefix);
         let mut seen: HashSet<String> = HashSet::new();
         let mut out: Vec<String> = Vec::new();
@@ -1331,7 +1474,7 @@ impl VfsStore {
                 }
             }
         }
-        for path in self.walk_lower_paths(&norm_prefix) {
+        for path in view.files_under(&norm_prefix) {
             if !seen.contains(&path) {
                 out.push(path);
             }
@@ -1353,9 +1496,12 @@ impl VfsStore {
         max_total: usize,
     ) -> GrepOutcome {
         let mut out = GrepOutcome::default();
-        for path in self.paths(prefix) {
-            let modified = self.is_modified(&path);
-            let Ok(Some(content)) = self.current(&path) else {
+        let Ok(view) = self.view() else {
+            return out;
+        };
+        for path in self.paths_in(&view, prefix) {
+            let modified = self.holds(&path);
+            let Ok(Some(content)) = self.current(&view, &path) else {
                 continue;
             };
             out.files_searched += 1;
@@ -1499,7 +1645,7 @@ mod tests {
         store.write("src/new.rs", "new\n".into()).unwrap();
         store.delete("src/main.rs");
 
-        let changes = store.changes();
+        let changes = store.changes().unwrap();
         assert_eq!(
             changes.paths().collect::<Vec<_>>(),
             ["README.md", "src/main.rs", "src/new.rs"]
@@ -1513,10 +1659,10 @@ mod tests {
                 "{path}"
             );
         }
-        assert!(VfsStore::new().changes().is_empty());
+        assert!(VfsStore::new().changes().unwrap().is_empty());
         let direct = VfsStore::direct(dir.path(), &granted());
         direct.write("x.txt", "x".into()).unwrap();
-        assert!(direct.changes().is_empty());
+        assert!(direct.changes().unwrap().is_empty());
     }
 
     // ── saving and restoring ─────────────────────────────────────────────────
@@ -1583,19 +1729,35 @@ mod tests {
         let (dir, store) = store_with_tree();
         store.write("kept.txt", "kept\n".into()).unwrap();
         let protected: Snapshot =
-            serde_json::from_str(r#"{"secrets/key.txt":{"deltas":[],"size":1}}"#).unwrap();
+            serde_json::from_str(r#"{"chains":{"secrets/key.txt":{"deltas":[],"size":1}}}"#)
+                .unwrap();
         assert!(matches!(
             store.restore(protected),
             Err(VfsError::Forbidden(_))
         ));
         let huge = "x".repeat(MAX_BYTES + 1);
         let too_big: Snapshot = serde_json::from_value(serde_json::json!({
-            "big.txt": {
-                "deltas": [{ "at_ns": 1, "kind": "replace", "content": huge }],
-                "size": MAX_BYTES + 1
+            "chains": {
+                "big.txt": {
+                    "deltas": [{ "at_ns": 1, "kind": "replace", "content": huge }],
+                    "size": MAX_BYTES + 1
+                }
             }
         }))
         .unwrap();
+        let no_tree: Snapshot = serde_json::from_value(serde_json::json!({
+            "base": { "tree": "not an object id" },
+            "chains": { "a.txt": { "deltas": [], "size": 1 } }
+        }))
+        .unwrap();
+        assert!(matches!(
+            store.restore(no_tree),
+            Err(VfsError::Unreadable(_))
+        ));
+        assert!(
+            serde_json::from_str::<Snapshot>(r#"{"a.txt":{"deltas":[],"size":1}}"#).is_err(),
+            "a map of paths with no `chains` is not a snapshot"
+        );
         assert!(matches!(store.restore(too_big), Err(VfsError::Full)));
         assert!(
             store.is_modified("kept.txt"),

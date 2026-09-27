@@ -99,8 +99,10 @@ impl Repo {
         let mut inv = self
             .git("fetch")
             .args(["--quiet", "--no-tags", "--no-recurse-submodules"]);
-        if *spec == FetchSpec::AllBranches {
-            inv = inv.arg("--prune");
+        match spec {
+            FetchSpec::AllBranches => inv = inv.arg("--prune"),
+            // A branch the remote does not have is an unknown revision.
+            FetchSpec::Branch(branch) => inv = inv.about_rev(branch.to_ref().to_string()),
         }
         inv.arg("--end-of-options")
             .arg(remote.as_str())
@@ -249,6 +251,13 @@ mod tests {
 
         // No local branch appeared or moved.
         assert_eq!(repo.branches().unwrap(), vec![]);
+
+        // A branch the remote does not have is an unknown revision.
+        let absent = BranchName::parse("absent").unwrap();
+        assert!(matches!(
+            repo.fetch(&o, &FetchSpec::Branch(absent)),
+            Err(GitError::UnknownRevision { .. })
+        ));
 
         // Nothing changed: nothing reported. One branch: only that ref.
         let main_branch = BranchName::parse("main").unwrap();

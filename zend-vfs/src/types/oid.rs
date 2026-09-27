@@ -20,6 +20,17 @@ impl ObjectFormat {
         }
     }
 
+    /// The id of the empty tree, which every repository of this format
+    /// holds without it being written.
+    pub fn empty_tree(self) -> Oid {
+        Oid(match self {
+            Self::Sha1 => "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string(),
+            Self::Sha256 => {
+                "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321".to_string()
+            }
+        })
+    }
+
     /// Parse `rev-parse --show-object-format` output.
     pub fn parse(name: &str) -> Result<Self, GitError> {
         match name {
@@ -134,5 +145,14 @@ mod tests {
         assert_eq!(ObjectFormat::parse("sha1").unwrap().hex_len(), 40);
         assert_eq!(ObjectFormat::parse("sha256").unwrap().hex_len(), 64);
         assert!(ObjectFormat::parse("md5").is_err());
+    }
+
+    #[test]
+    fn each_format_names_its_empty_tree() {
+        assert_eq!(ObjectFormat::Sha1.empty_tree().as_str(), EMPTY_TREE);
+        assert_eq!(
+            ObjectFormat::Sha256.empty_tree().as_str(),
+            "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+        );
     }
 }

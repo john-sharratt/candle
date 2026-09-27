@@ -1,16 +1,35 @@
 //! `git_*` tools — the typed git layer ([`zend_vfs`]) over the workspace's
 //! repositories.
 //!
-//! # Nine tools, split by capability
+//! # Twelve tools, split by capability
 //!
 //! - **Readers** — [`GIT_STATUS`], [`GIT_LOG`], [`GIT_SHOW`], [`GIT_GREP`],
 //!   [`GIT_REFS`] — answer questions and change nothing. They declare no
-//!   capability.
-//! - **Writers** — [`GIT_COMMIT`], [`GIT_REF`], [`GIT_FETCH`], [`GIT_PUSH`] —
-//!   declare [`Capability::DiskWrite`](crate::grants::Capability::DiskWrite),
-//!   which the Comprehensive tools mode's grants withhold. Changing a
-//!   repository is Mutable's alone, and a call that arrives anywhere else is
-//!   refused before its arguments are parsed.
+//!   capability, and read only local refs: no read waits on the network.
+//! - **Writers** — [`GIT_COMMIT`], [`GIT_MERGE`], [`GIT_REF`],
+//!   [`GIT_SWITCH`], [`GIT_RESET`], [`GIT_FETCH`], [`GIT_PUSH`] — declare
+//!   [`Capability::DiskWrite`](crate::grants::Capability::DiskWrite) and
+//!   [`Capability::Network`](crate::grants::Capability::Network), which the
+//!   Comprehensive tools mode's grants withhold. Changing a repository is
+//!   Mutable's alone, and a call that arrives anywhere else is refused before
+//!   its arguments are parsed.
+//!
+//! # Origin is the record; the conversation is on a branch, at its own base
+//!
+//! A branch write goes to origin first and the local branch follows
+//! ([`zend_vfs::origin`]), so a commit, a new branch, a moved or deleted one
+//! is only ever kept once origin has it.
+//!
+//! Each conversation is on one branch per repository — its file store's
+//! ([`ConvRepo`]) — and reads it at its own base commit, which is what `HEAD`
+//! means to every tool here: the repository's folder belongs to the sandbox,
+//! so its own checked-out `HEAD` says nothing about any conversation. The
+//! base moves only when the conversation moves it. A commit is one attempt,
+//! published whole or refused with nothing written — refused, too, when the
+//! branch holds commits the conversation does not have; `git_merge` brings
+//! them into the conversation's own copy, overlaps marked there for it to
+//! settle, and the next commit lands on top ([`zend_vfs::work`]). Nothing
+//! anyone wrote is ever lost on the way.
 //!
 //! Reads and writes stay separate **tools**, never modes of one tool, because
 //! that split is what the capability check binds to.
@@ -49,30 +68,41 @@ mod fetch;
 mod grep;
 mod line_history;
 mod log;
+mod merge;
 mod push;
 mod reference;
 mod refs;
+mod reset;
 mod show;
 mod status;
+mod switch;
 mod wire;
 
 pub use commit::GIT_COMMIT;
 pub use fetch::GIT_FETCH;
 pub use grep::GIT_GREP;
 pub use log::GIT_LOG;
+pub use merge::GIT_MERGE;
 pub use push::GIT_PUSH;
 pub use reference::GIT_REF;
 pub use refs::GIT_REFS;
+pub use reset::GIT_RESET;
 pub use show::GIT_SHOW;
 pub use status::GIT_STATUS;
+pub use switch::GIT_SWITCH;
+
+use std::ops::Deref;
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zend_vfs::{
-    Ancestor, BranchName, GitError, Oid, RefName, Repo as GitRepo, RepoPath, Rev, TagName,
+    Ancestor, BranchName, GitError, Oid, Published, RefName, Rejection, Repo as GitRepo, RepoPath,
+    Rev, TagName, VfsStore,
 };
 
+use self::wire::{landed_on, refusal};
 use crate::context::ToolContext;
 use crate::tool::ToolError;
 
@@ -119,8 +149,96 @@ impl ToolError for GitToolError {
     }
 }
 
-/// Open the workspace repository called `name` as a git working tree.
-pub fn open(ctx: &ToolContext, name: &str) -> Result<GitRepo, GitToolError> {
+/// A workspace repository as one conversation sees it: the repository, and
+/// the conversation's own file store over it, whose branch is the one the
+/// conversation is on and whose base commit is what `HEAD` means to it. The
+/// repository's folder is the sandbox's, so its checked-out `HEAD` is
+/// whatever the last job left there, and never what a conversation is on.
+pub struct ConvRepo {
+    repo: GitRepo,
+    store: Option<Arc<VfsStore>>,
+}
+
+impl ConvRepo {
+    /// The conversation's branch here, when its store reads one.
+    pub fn branch(&self) -> Option<BranchName> {
+        match self.store.as_ref()?.rev()? {
+            Rev::Branch(branch) => Some(branch),
+            _ => None,
+        }
+    }
+
+    /// What `HEAD` means to this conversation: the commit its files are
+    /// based on — which is where its branch stood when it last committed,
+    /// merged, switched or reset, not wherever another writer has moved the
+    /// branch since. A branch with no commit yet is named as itself; a store
+    /// over a folder, which reads what the folder holds, leaves the folder's
+    /// own `HEAD`. A base that cannot be read is an error — never the branch
+    /// tip or the folder's checkout standing in for it.
+    pub fn head(&self) -> Result<Rev, GitToolError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| GitError::invalid("this session holds no files for this repository"))?;
+        let base = store
+            .base()
+            .map_err(|e| GitError::invalid(format!("your files' base cannot be read: {e}")))?;
+        Ok(match base {
+            Some(base) => match base.commit() {
+                Some(commit) => Rev::Oid(commit.clone()),
+                None => store.rev().unwrap_or(Rev::Head),
+            },
+            None => store.rev().unwrap_or(Rev::Head),
+        })
+    }
+
+    /// The conversation's branch, or an error saying there is none to write.
+    pub fn require_branch(&self) -> Result<BranchName, GitToolError> {
+        self.branch().ok_or_else(|| {
+            GitError::invalid(
+                "this conversation is on no branch in this repository; switch to one with \
+                 git_switch",
+            )
+            .into()
+        })
+    }
+
+    /// The conversation's file store over this repository.
+    pub fn store(&self) -> Option<&Arc<VfsStore>> {
+        self.store.as_ref()
+    }
+}
+
+impl Deref for ConvRepo {
+    type Target = GitRepo;
+
+    fn deref(&self) -> &GitRepo {
+        &self.repo
+    }
+}
+
+/// A publish origin refused, as the call's error; a landed one, as where it
+/// is kept.
+pub(super) fn landed(name: &RefName, published: Published) -> Result<&'static str, GitToolError> {
+    match published {
+        Published::Refused(Rejection::Stale) => Err(GitError::StaleRef {
+            name: name.clone(),
+            detail: "origin's copy moved since it was fetched".to_string(),
+        }
+        .into()),
+        Published::Refused(why) => Err(GitError::invalid(refusal(&why)).into()),
+        Published::Behind => Err(GitError::StaleRef {
+            name: name.clone(),
+            detail: "origin holds commits this does not descend from; git_merge them in first"
+                .to_string(),
+        }
+        .into()),
+        landed => Ok(landed_on(&landed)),
+    }
+}
+
+/// Open the workspace repository called `name`, as this conversation sees it.
+pub fn open(ctx: &ToolContext, name: &str) -> Result<ConvRepo, GitToolError> {
     let workspace = ctx.files.workspace().ok_or(GitToolError::NoWorkspace)?;
     let repo = workspace
         .repo(name)
@@ -128,14 +246,17 @@ pub fn open(ctx: &ToolContext, name: &str) -> Result<GitRepo, GitToolError> {
             name: name.to_string(),
             known: workspace.names().join(", "),
         })?;
-    Ok(GitRepo::open(&repo.dir)?)
+    Ok(ConvRepo {
+        repo: GitRepo::open(&repo.dir)?,
+        store: ctx.files.repo(name).ok(),
+    })
 }
 
 /// Which form of revision a [`RevArg`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RevKind {
-    /// What the developer has checked out. Needs no `name`.
+    /// The branch this conversation is on. Needs no `name`.
     Head,
     /// A local branch by short name, e.g. `main`.
     Branch,
@@ -156,8 +277,9 @@ pub enum RevKind {
     /// `refs/remotes/origin/main` — which, measured live, it did not reach
     /// for. It wrote the call it wanted in prose and emitted `null`.
     RemoteBranch,
-    /// The branch `name` tracks — its upstream, or `HEAD`'s upstream when
-    /// `name` is omitted. The form for "how far ahead of my upstream am I".
+    /// The branch `name` tracks — its upstream, or that of the branch this
+    /// conversation is on when `name` is omitted. The form for "how far ahead
+    /// of my upstream am I".
     Upstream,
 }
 
@@ -197,13 +319,14 @@ pub struct RevArg {
 }
 
 impl RevArg {
-    /// This argument as the git layer's own typed revision.
+    /// This argument as the git layer's own typed revision, `HEAD` being the
+    /// branch the conversation is on.
     ///
     /// `parent` is resolved here to an object id, along first parents, so
     /// what comes out is a commit the layer has already found — and when the
     /// history is shorter than asked for, the error says how far back it
     /// goes.
-    pub fn resolve(&self, repo: &GitRepo) -> Result<Rev, GitToolError> {
+    pub fn resolve(&self, repo: &ConvRepo) -> Result<Rev, GitToolError> {
         let named = |what: &str| -> Result<&str, GitToolError> {
             self.name
                 .as_deref()
@@ -211,7 +334,7 @@ impl RevArg {
                 .ok_or_else(|| GitError::invalid(format!("a {what} revision needs `name`")).into())
         };
         Ok(match self.kind {
-            RevKind::Head => Rev::Head,
+            RevKind::Head => repo.head()?,
             RevKind::Branch => Rev::Branch(BranchName::parse(named("branch")?)?),
             RevKind::Tag => Rev::Tag(TagName::parse(named("tag")?)?),
             RevKind::Ref => Rev::Ref(RefName::parse(named("ref")?)?),
@@ -231,12 +354,7 @@ impl RevArg {
             RevKind::Upstream => {
                 let of = match self.name.as_deref().filter(|s| !s.is_empty()) {
                     Some(name) => BranchName::parse(name)?,
-                    None => repo.head()?.branch().cloned().ok_or_else(|| {
-                        GitError::invalid(
-                            "HEAD is detached, so it tracks nothing; name the branch whose \
-                             upstream you mean",
-                        )
-                    })?,
+                    None => repo.require_branch()?,
                 };
                 let branch = repo
                     .branches()?
@@ -261,7 +379,7 @@ impl RevArg {
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or("HEAD");
-                let base = branchish(from)?;
+                let base = branchish(from, repo)?;
                 let back = self.back.unwrap_or(1);
                 match repo.first_parent_ancestor(&base, back)? {
                     Ancestor::Found(oid) => Rev::Oid(oid),
@@ -279,11 +397,12 @@ impl RevArg {
 }
 
 /// A `parent`'s base, read as whichever form the name fits: a full object id,
-/// a full ref, or a branch. The model writes `HEAD`, `main` or a sha here and
-/// all three work, because guessing wrong would be another dead end.
-fn branchish(name: &str) -> Result<Rev, GitToolError> {
+/// a full ref, or a branch — `HEAD` being the conversation's. The model writes
+/// `HEAD`, `main` or a sha here and all three work, because guessing wrong
+/// would be another dead end.
+fn branchish(name: &str, repo: &ConvRepo) -> Result<Rev, GitToolError> {
     if name == "HEAD" {
-        return Ok(Rev::Head);
+        return repo.head();
     }
     if let Ok(oid) = Oid::parse(name) {
         return Ok(Rev::Oid(oid));
@@ -294,10 +413,11 @@ fn branchish(name: &str) -> Result<Rev, GitToolError> {
     Ok(Rev::Branch(BranchName::parse(name)?))
 }
 
-/// A revision argument that defaults to `HEAD` when the call omits it.
-pub fn rev_or_head(rev: &Option<RevArg>, repo: &GitRepo) -> Result<Rev, GitToolError> {
+/// A revision argument that defaults to the conversation's branch when the
+/// call omits it.
+pub fn rev_or_head(rev: &Option<RevArg>, repo: &ConvRepo) -> Result<Rev, GitToolError> {
     match rev {
-        None => Ok(Rev::Head),
+        None => repo.head(),
         Some(r) => r.resolve(repo),
     }
 }

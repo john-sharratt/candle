@@ -89,10 +89,10 @@ Paths are relative to the repo root.
 
 Notes on the arguments:
 
-- **`--skip-layer`** (zend) keeps a layer in service but stops re-reading it from disk at
-  boot — "the corpus is built". It is not `--disable-layer`, which removes the layer from
-  retrieval. npcd has no such flag; pass `--skip-layer` only to a binary whose `--help`
-  lists it.
+- **`--disable-layer`** (zend) removes a layer from retrieval. zend reads no layer from the
+  repositories' folders at boot — they belong to the sandbox's jobs — so there is no flag
+  for "stop re-reading the disk"; a recorded line carrying `--skip-layer` must drop it, as
+  zend no longer accepts it.
 - **`--mind`** (npcd) names the mind directory: a directory holding `projection.yaml`
   beside its content libraries (`personalities/`, `worlds/`, `responses/`, `moods/`).
   npcd refuses to start on a directory without `projection.yaml`, and without `--mind` it

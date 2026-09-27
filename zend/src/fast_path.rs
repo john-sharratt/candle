@@ -136,11 +136,11 @@ fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, Strin
 /// projection.
 ///
 /// A call is left alone — and so runs for real — whenever anything is unsure:
-/// the conversation has changed the file in `files` (so its copy is not the one
-/// on disk the corpus read), the file cannot be read from disk, no conversation
+/// the conversation has changed the file in `files` (so its copy is not the
+/// committed one the corpus read), the file cannot be read, no conversation
 /// carries its hash, or the read does not fit `budget_tokens`.
 /// Takes the engine's `Mutex` rather than a locked engine: the file reads and
-/// hashing below are disk work, and holding the engine across them would stall
+/// hashing below are git work, and holding the engine across them would stall
 /// every other conversation and the ingest worker for the length of a round.
 /// The lock is taken per candidate, around the lookup and admit only.
 pub fn screen(
@@ -161,11 +161,7 @@ pub fn screen(
             let Some((key, repo, rel)) = read_key(&step, workspace) else {
                 return step;
             };
-            // The conversation's own copy is what its read must return.
-            if files.repo(&repo).is_ok_and(|store| store.is_modified(&rel)) {
-                return step;
-            }
-            let Ok(bytes) = std::fs::read(workspace.root().join(&key)) else {
+            let Some(bytes) = committed(files, &repo, &rel) else {
                 return step;
             };
             if !fits_fast_path(bytes.len()) {
@@ -213,6 +209,18 @@ pub fn screen(
     (out, served)
 }
 
+/// The file `rel` in `repo` as its branch holds it, through the
+/// conversation's store — `None` when the conversation has changed it (its
+/// own copy is what its read must return, and no corpus read that), or when
+/// there is no such file.
+fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<Vec<u8>> {
+    let store = files.repo(repo).ok()?;
+    if store.is_modified(rel) {
+        return None;
+    }
+    store.read_bytes(rel).ok()?
+}
+
 /// Rebuild `target`'s fast-path set by replaying its own `file_read` calls.
 ///
 /// The set is in-memory, so a restart loses it while the conversation it
@@ -221,9 +229,10 @@ pub fn screen(
 ///
 /// The conversation's turns are the record: each assistant turn carries the
 /// `<tool_call>` blocks it wrote, which `tool_round::plan` already parses. The
-/// hashes are recomputed from disk rather than stored, so a file edited while
-/// the daemon was down re-hashes to a miss and is read again — which is the
-/// correct answer, and one no persisted table could have given.
+/// hashes are recomputed from `files` — the conversation's own view of each
+/// branch — rather than stored, so a file committed anew while the daemon was
+/// down re-hashes to a miss and is read again — which is the correct answer,
+/// and one no persisted table could have given.
 ///
 /// Oldest turn first, so the most recent read ends up at the front of the set
 /// exactly as it would have during the live conversation.
@@ -231,6 +240,7 @@ pub fn rebuild(
     engine: &Mutex<ConversationEngine>,
     target: TimelineId,
     workspace: &Workspace,
+    files: &RepoFiles,
     budget_tokens: usize,
 ) -> usize {
     if budget_tokens == 0 {
@@ -244,10 +254,10 @@ pub fn rebuild(
     let mut admitted = 0usize;
     for text in texts {
         for step in crate::tool_round::plan(&text) {
-            let Some((key, _, _)) = read_key(&step, workspace) else {
+            let Some((key, repo, rel)) = read_key(&step, workspace) else {
                 continue;
             };
-            let Ok(bytes) = std::fs::read(workspace.root().join(&key)) else {
+            let Some(bytes) = committed(files, &repo, &rel) else {
                 continue;
             };
             if !fits_fast_path(bytes.len()) {
@@ -426,6 +436,27 @@ mod tests {
         assert_eq!(read_target(&step), None);
         let step = call(FILE_READ, json!({"path": "zend/src/main.rs"}));
         assert_eq!(read_target(&step), None);
+    }
+
+    /// **A file is hashed as the conversation's store reads it, and never once
+    /// the conversation has changed it** — its own copy is what it must read.
+    #[test]
+    fn only_a_file_the_conversation_left_alone_is_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("candle")).unwrap();
+        std::fs::write(dir.path().join("candle/a.rs"), b"a\n").unwrap();
+        std::fs::write(dir.path().join("candle/b.rs"), b"b\n").unwrap();
+        let ws = Workspace::new(dir.path(), vec![RepoSpec::named("candle")]).unwrap();
+        let files = RepoFiles::overlay(ws);
+        files
+            .repo("candle")
+            .unwrap()
+            .write("b.rs", "mine\n".into())
+            .unwrap();
+        assert_eq!(committed(&files, "candle", "a.rs"), Some(b"a\n".to_vec()));
+        assert_eq!(committed(&files, "candle", "b.rs"), None);
+        assert_eq!(committed(&files, "candle", "nope.rs"), None);
+        assert_eq!(committed(&files, "other", "a.rs"), None);
     }
 
     /// An already-answered step is never re-examined — it has no file to read.

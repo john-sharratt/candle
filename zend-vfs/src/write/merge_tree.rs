@@ -64,6 +64,15 @@ pub(crate) fn parse_unmerged(
     Ok(paths)
 }
 
+/// A merge taken as far as it goes: every path it settled merged, and each
+/// conflicting path left as `ours` holds it — absent where `ours` has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialMerge {
+    pub tree: Oid,
+    /// The paths left as `ours` holds them.
+    pub conflicts: Vec<RepoPath>,
+}
+
 impl Repo {
     /// Merge `theirs` into `ours` over `merge_base`, without a working tree
     /// or the user's index.
@@ -73,6 +82,36 @@ impl Repo {
         ours: &Oid,
         theirs: &Oid,
     ) -> Result<MergeOutcome, GitError> {
+        let (tree, conflicts) = self.merge_in_index(merge_base, ours, theirs, false)?;
+        Ok(match tree {
+            Some(tree) => MergeOutcome::Clean { tree },
+            None => MergeOutcome::Conflicted { paths: conflicts },
+        })
+    }
+
+    /// Merge `theirs` into `ours` over `merge_base` as [`Self::merge_trees`]
+    /// does, writing the tree even when paths conflict: each of those is left
+    /// as `ours` holds it, for the conflict to be settled elsewhere.
+    pub fn merge_trees_keeping_ours(
+        &self,
+        merge_base: &Oid,
+        ours: &Oid,
+        theirs: &Oid,
+    ) -> Result<PartialMerge, GitError> {
+        let (tree, conflicts) = self.merge_in_index(merge_base, ours, theirs, true)?;
+        let tree = tree.ok_or_else(|| GitError::malformed("write-tree", "no tree was written"))?;
+        Ok(PartialMerge { tree, conflicts })
+    }
+
+    /// The merge in a private index: the tree, unless paths conflict and
+    /// `keep_ours` is false; and the conflicting paths.
+    fn merge_in_index(
+        &self,
+        merge_base: &Oid,
+        ours: &Oid,
+        theirs: &Oid,
+        keep_ours: bool,
+    ) -> Result<(Option<Oid>, Vec<RepoPath>), GitError> {
         let _write = self.write_lock();
         let index = PrivateIndex::new(self.git_dir());
         let in_index = |inv: Invocation| inv.env("GIT_INDEX_FILE", &index.0);
@@ -85,36 +124,54 @@ impl Repo {
         let unmerged =
             parse_unmerged(&in_index(self.git("ls-files")).args(["-u", "-z"]).run_ok()?)?;
 
-        let mut resolved: Vec<(RepoPath, FileMode, Oid)> = Vec::new();
+        // Each path settled at stage 0: merged, or — a conflict, kept as ours
+        // — ours' side, or nothing where ours has none.
+        let mut settled: Vec<(RepoPath, Option<Side>)> = Vec::new();
         let mut conflicts: Vec<RepoPath> = Vec::new();
         for (path, stages) in unmerged {
-            let merged = match stages {
+            let file = |m: &FileMode| matches!(m, FileMode::Regular | FileMode::Executable);
+            let merged = match &stages {
                 [Some((bm, bo)), Some((om, oo)), Some((tm, to))]
-                    if om == tm
-                        && matches!(om, FileMode::Regular | FileMode::Executable)
-                        && matches!(bm, FileMode::Regular | FileMode::Executable) =>
+                    if file(bm) && file(om) && file(tm) =>
                 {
-                    self.merge_file(&bo, &oo, &to)?.map(|oid| (om, oid))
+                    // The mode one side changed and the other left alone is
+                    // taken; both changing it differently is a conflict.
+                    let mode = if om == tm || bm == tm {
+                        Some(*om)
+                    } else if bm == om {
+                        Some(*tm)
+                    } else {
+                        None
+                    };
+                    match mode {
+                        Some(mode) => self.merge_file(bo, oo, to)?.map(|oid| (mode, oid)),
+                        None => None,
+                    }
                 }
                 _ => None,
             };
             match merged {
-                Some((mode, oid)) => resolved.push((path, mode, oid)),
-                None => conflicts.push(path),
+                Some(side) => settled.push((path, Some(side))),
+                None => {
+                    settled.push((path.clone(), stages[1].clone()));
+                    conflicts.push(path);
+                }
             }
         }
-        if !conflicts.is_empty() {
-            return Ok(MergeOutcome::Conflicted { paths: conflicts });
+        if !conflicts.is_empty() && !keep_ours {
+            return Ok((None, conflicts));
         }
 
-        if !resolved.is_empty() {
-            // A mode-0 line drops every stage of the path; the next line
-            // adds the merged file at stage 0.
+        if !settled.is_empty() {
+            // A mode-0 line drops every stage of the path; the next line, if
+            // any, adds the settled file at stage 0.
             let zero = "0".repeat(self.format().hex_len());
             let mut info = Vec::new();
-            for (path, mode, oid) in &resolved {
+            for (path, side) in &settled {
                 info.extend_from_slice(format!("0 {zero}\t{path}\0").as_bytes());
-                info.extend_from_slice(format!("{} {oid}\t{path}\0", mode.as_str()).as_bytes());
+                if let Some((mode, oid)) = side {
+                    info.extend_from_slice(format!("{} {oid}\t{path}\0", mode.as_str()).as_bytes());
+                }
             }
             in_index(self.git("update-index"))
                 .args(["-z", "--index-info"])
@@ -122,9 +179,8 @@ impl Repo {
                 .run_ok()?;
         }
         let tree = in_index(self.git("write-tree")).run_ok()?;
-        Ok(MergeOutcome::Clean {
-            tree: Oid::parse(utf8("write-tree", tree)?.trim())?,
-        })
+        let tree = Oid::parse(utf8("write-tree", tree)?.trim())?;
+        Ok((Some(tree), conflicts))
     }
 
     /// Merge three versions of a file line by line: the merged blob, or
@@ -323,5 +379,69 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// **A mode one side changed is kept when the other side edited the
+    /// file**: the edit and the executable bit both land.
+    #[test]
+    fn a_mode_change_meets_an_edit_and_both_land() {
+        let t = TestRepo::init();
+        let lines: String = (1..=6).map(|i| format!("line {i}\n")).collect();
+        t.write("run.sh", lines.as_bytes());
+        let base = t.commit_all("base");
+        t.write("run.sh", lines.replace("line 1\n", "ours\n").as_bytes());
+        let ours = t.commit_all("ours");
+        t.git(&["checkout", "-q", "-b", "theirs", base.as_str()]);
+        t.git(&["update-index", "--chmod=+x", "run.sh"]);
+        t.git(&["commit", "-q", "-m", "executable"]);
+        let theirs = t.oid("HEAD");
+
+        let tree = match t.repo().merge_trees(&base, &ours, &theirs).unwrap() {
+            MergeOutcome::Clean { tree } => tree,
+            other => panic!("{other:?}"),
+        };
+        let listed = t.git(&["ls-tree", tree.as_str(), "run.sh"]);
+        assert!(listed.starts_with("100755 "), "{listed}");
+        assert_eq!(
+            t.git(&["show", &format!("{tree}:run.sh")]),
+            lines.replace("line 1\n", "ours\n")
+        );
+    }
+
+    /// **Kept as ours, a conflicting merge still writes its tree**: every
+    /// settled path merged, each conflicting one as ours holds it — a file
+    /// ours deleted stays deleted.
+    #[test]
+    fn a_merge_keeping_ours_writes_the_settled_tree() {
+        let t = TestRepo::init();
+        t.write("a.txt", b"a\n");
+        t.write("b.txt", b"b\n");
+        t.write("gone.txt", b"g\n");
+        let base = t.commit_all("base");
+        t.write("a.txt", b"ours\n");
+        std::fs::remove_file(t.path.join("gone.txt")).unwrap();
+        let ours = t.commit_all("ours");
+        t.git(&["checkout", "-q", "-b", "theirs", base.as_str()]);
+        t.write("a.txt", b"theirs\n");
+        t.write("b.txt", b"theirs b\n");
+        t.write("gone.txt", b"theirs g\n");
+        let theirs = t.commit_all("theirs");
+
+        let merged = t
+            .repo()
+            .merge_trees_keeping_ours(&base, &ours, &theirs)
+            .unwrap();
+        assert_eq!(
+            merged.conflicts,
+            vec![
+                RepoPath::parse("a.txt").unwrap(),
+                RepoPath::parse("gone.txt").unwrap()
+            ]
+        );
+        let listed = t.git(&["ls-tree", "--name-only", merged.tree.as_str()]);
+        assert_eq!(listed, "a.txt\nb.txt\n");
+        let show = |p: &str| t.git(&["show", &format!("{}:{p}", merged.tree)]);
+        assert_eq!(show("a.txt"), "ours\n");
+        assert_eq!(show("b.txt"), "theirs b\n");
     }
 }

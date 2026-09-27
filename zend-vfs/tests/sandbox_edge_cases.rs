@@ -3,8 +3,8 @@
 //! checkout's git state behind the sandbox's back, processes that misbehave,
 //! runs that overlap or are abandoned, and links out of the repository.
 //!
-//! Every test ends the same way: the checkout is the branch again, and
-//! nothing outside the repository has been touched.
+//! Every test ends the same way: the next job puts the checkout back to the
+//! branch, and nothing outside the repository has been touched.
 
 mod support;
 
@@ -12,10 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::*;
-use zend_vfs::checkout::CheckoutError;
 use zend_vfs::file_delta::FileDelta;
-use zend_vfs::sandbox::process::MAX_STREAM_BYTES;
-use zend_vfs::{GitError, Oid, RunOutcome, SandboxCommand, SandboxError, VfsStore};
+use zend_vfs::{Oid, RunOutcome, SandboxCommand, SandboxError, VfsStore};
 
 fn main_at(f: &Fixture) -> Oid {
     Oid::parse(git(&f.root, &["rev-parse", "refs/heads/main"]).trim()).unwrap()
@@ -50,7 +48,7 @@ fn outside(f: &Fixture) -> std::path::PathBuf {
 #[tokio::test]
 async fn an_edit_on_top_of_the_conversations_edit() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     files
         .edit("src/lib.rs", "pub fn one() -> u8 {\n    11\n}\n".into())
         .unwrap();
@@ -69,7 +67,7 @@ async fn an_edit_on_top_of_the_conversations_edit() {
         "{text:?}"
     );
     assert_eq!(files.deltas("src/lib.rs").unwrap().len(), 2);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "src/lib.rs").unwrap(), LIB);
 }
 
@@ -77,12 +75,12 @@ async fn an_edit_on_top_of_the_conversations_edit() {
 #[tokio::test]
 async fn deleting_a_tracked_file() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(&f, "main", &files, &shell("del README.md", "rm README.md")).await;
     assert_eq!(changed(&done), ["README.md"]);
     assert_eq!(delta(&done, "README.md"), &FileDelta::Delete);
     assert_eq!(read(&files, "README.md"), None);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "README.md").unwrap(), README);
 }
 
@@ -91,7 +89,7 @@ async fn deleting_a_tracked_file() {
 #[tokio::test]
 async fn recreating_a_file_the_conversation_deleted() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     assert!(files.delete("README.md"));
     let done = run(
         &f,
@@ -103,10 +101,10 @@ async fn recreating_a_file_the_conversation_deleted() {
         ),
     )
     .await;
-    assert_eq!(done.stdout.text.trim_end(), "absent");
+    assert_eq!(done.printed.trim_end(), "absent");
     assert_eq!(changed(&done), ["README.md"]);
     assert_eq!(read(&files, "README.md").unwrap().trim_end(), "again");
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **A command putting a file back to the branch's content records that**:
@@ -114,7 +112,7 @@ async fn recreating_a_file_the_conversation_deleted() {
 #[tokio::test]
 async fn putting_a_changed_file_back_to_the_branch() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     files.write("src/lib.rs", "rewritten\n".into()).unwrap();
     let done = run(
         &f,
@@ -128,7 +126,7 @@ async fn putting_a_changed_file_back_to_the_branch() {
     .await;
     assert_eq!(changed(&done), ["src/lib.rs"]);
     assert_eq!(read(&files, "src/lib.rs").unwrap().as_bytes(), LIB);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **Rewriting a file with the bytes it already holds records nothing**, and
@@ -136,7 +134,7 @@ async fn putting_a_changed_file_back_to_the_branch() {
 #[tokio::test]
 async fn rewriting_the_same_bytes_records_nothing() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     files.write("mine.txt", "mine\n".into()).unwrap();
     let done = run(
         &f,
@@ -152,7 +150,7 @@ async fn rewriting_the_same_bytes_records_nothing() {
     .await;
     assert!(done.changed.is_empty(), "{done:?}");
     assert!(done.unrecorded.is_empty(), "{done:?}");
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **New files deep in new folders, with spaces and non-ASCII names, and an
@@ -161,7 +159,7 @@ async fn rewriting_the_same_bytes_records_nothing() {
 #[tokio::test]
 async fn new_nested_files_with_awkward_names_and_an_empty_file() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     // Quoted names go through a batch file: `cmd` does not read the escaped
     // quotes a quoted argument arrives with.
     files
@@ -189,7 +187,7 @@ async fn new_nested_files_with_awkward_names_and_an_empty_file() {
     );
     assert_eq!(read(&files, "a b/c/café ü.txt").unwrap().trim_end(), "x");
     assert_eq!(read(&files, "empty.txt").unwrap(), "");
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert!(
         !f.root.join("a b").exists(),
         "the new folder was left behind"
@@ -200,7 +198,7 @@ async fn new_nested_files_with_awkward_names_and_an_empty_file() {
 #[tokio::test]
 async fn deleting_a_whole_tracked_folder() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -210,7 +208,7 @@ async fn deleting_a_whole_tracked_folder() {
     .await;
     assert_eq!(changed(&done), ["templates/lib.rs.orig"]);
     assert_eq!(read(&files, "templates/lib.rs.orig"), None);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **A file replaced by a folder of the same name is a delete of the file
@@ -219,7 +217,7 @@ async fn deleting_a_whole_tracked_folder() {
 #[tokio::test]
 async fn a_file_replaced_by_a_folder() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -232,7 +230,7 @@ async fn a_file_replaced_by_a_folder() {
     .await;
     assert_eq!(changed(&done), ["src/lib.rs", "src/lib.rs/inner.txt"]);
     assert_eq!(delta(&done, "src/lib.rs"), &FileDelta::Delete);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "src/lib.rs").unwrap(), LIB);
 
     let again = run(
@@ -242,8 +240,8 @@ async fn a_file_replaced_by_a_folder() {
         &shell("type src\\lib.rs\\inner.txt", "cat src/lib.rs/inner.txt"),
     )
     .await;
-    assert_eq!(again.stdout.text.trim_end(), "inner");
-    assert_reset(&f, "main");
+    assert_eq!(again.printed.trim_end(), "inner");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "src/lib.rs").unwrap(), LIB);
 }
 
@@ -255,7 +253,7 @@ async fn a_file_replaced_by_a_folder() {
 #[tokio::test]
 async fn ignored_output_is_not_recorded_but_the_conversations_ignored_file_is() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     files
         .write("notes.log", "the conversation's\n".into())
         .unwrap();
@@ -272,7 +270,7 @@ async fn ignored_output_is_not_recorded_but_the_conversations_ignored_file_is() 
     assert_eq!(changed(&done), ["notes.log"]);
     assert!(read(&files, "notes.log").unwrap().contains("more"));
     assert!(!files.is_modified("target/out.bin"));
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "notes.log"), None);
     assert!(disk(&f.root, "target/out.bin").is_some(), "the build cache");
 }
@@ -283,7 +281,7 @@ async fn ignored_output_is_not_recorded_but_the_conversations_ignored_file_is() 
 #[tokio::test]
 async fn a_protected_file_the_command_writes_is_unrecorded_and_removed() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -297,7 +295,7 @@ async fn a_protected_file_the_command_writes_is_unrecorded_and_removed() {
     assert!(done.changed.is_empty(), "{done:?}");
     assert_eq!(unrecorded(&done), ["secrets/key.txt"]);
     assert!(done.unrecorded[0].why.contains("protected"), "{done:?}");
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "secrets/key.txt"), None);
 }
 
@@ -305,7 +303,7 @@ async fn a_protected_file_the_command_writes_is_unrecorded_and_removed() {
 #[tokio::test]
 async fn changes_past_the_stores_cap_are_reported() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let big = "0123456789abcdef\n".repeat(6 * 1024 * 1024 / 17);
     files.write("big.txt", big).unwrap();
     let done = run(
@@ -322,7 +320,7 @@ async fn changes_past_the_stores_cap_are_reported() {
     assert_eq!(unrecorded(&done), ["a.txt", "b.txt"]);
     assert!(done.unrecorded.iter().all(|u| u.why.contains("limit")));
     assert_eq!(read(&files, "a.txt"), None);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 // ── Git state changed behind the sandbox's back ──────────────────────────────
@@ -347,7 +345,7 @@ fn script(files: &VfsStore, windows: &[&str], unix: &[&str]) -> SandboxCommand {
 #[tokio::test]
 async fn a_program_that_stages() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let command = script(
         &files,
         &[
@@ -365,7 +363,7 @@ async fn a_program_that_stages() {
     );
     let done = run(&f, "main", &files, &command).await;
     assert_eq!(changed(&done), ["README.md", "staged.txt"]);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "staged.txt"), None);
 }
 
@@ -375,7 +373,7 @@ async fn a_program_that_stages() {
 #[tokio::test]
 async fn a_program_that_commits() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let commit = "git -c user.name=t -c user.email=t@example.com -c commit.gpgSign=false \
                   commit -q -m tool";
     let command = script(
@@ -398,7 +396,7 @@ async fn a_program_that_commits() {
     assert_eq!(main_at(&f), f.base, "the branch moved");
     assert_eq!(changed(&done), ["README.md", "committed.txt"]);
     assert_eq!(read(&files, "README.md"), None);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "README.md").unwrap(), README);
 }
 
@@ -407,7 +405,7 @@ async fn a_program_that_commits() {
 #[tokio::test]
 async fn a_program_that_switches_branch() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let feature = git(&f.root, &["rev-parse", "refs/heads/feature"]);
     let command = script(
         &files,
@@ -421,7 +419,7 @@ async fn a_program_that_switches_branch() {
         read(&files, "FEATURE.md").unwrap(),
         "only on the feature branch\n"
     );
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(git(&f.root, &["rev-parse", "refs/heads/feature"]), feature);
 }
 
@@ -429,7 +427,7 @@ async fn a_program_that_switches_branch() {
 #[tokio::test]
 async fn a_program_that_detaches_head() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let command = script(
         &files,
         &["git checkout -q --detach"],
@@ -437,14 +435,14 @@ async fn a_program_that_detaches_head() {
     );
     let done = run(&f, "main", &files, &command).await;
     assert!(done.changed.is_empty(), "{done:?}");
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **A deleted branch is restored** where it was.
 #[tokio::test]
 async fn a_program_that_deletes_the_branch() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let command = script(
         &files,
         &["git update-ref -d refs/heads/main"],
@@ -453,7 +451,7 @@ async fn a_program_that_deletes_the_branch() {
     let done = run(&f, "main", &files, &command).await;
     assert!(done.changed.is_empty(), "{done:?}");
     assert_eq!(main_at(&f), f.base);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 // ── Processes that misbehave ─────────────────────────────────────────────────
@@ -465,7 +463,7 @@ async fn a_program_that_deletes_the_branch() {
 #[tokio::test]
 async fn a_background_process_does_not_outlive_the_run() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     // The writer writes `early.txt`, then `late.txt` a second later. The
     // command starts it, waits only until `early.txt` exists — the writer is
     // demonstrably running — and exits. Alive at the run's end, the writer
@@ -498,7 +496,7 @@ async fn a_background_process_does_not_outlive_the_run() {
         )
         .unwrap();
     let done = run(&f, "main", &files, &shell(".\\main.cmd", "sh main.sh")).await;
-    assert!(done.stdout.text.contains("started"), "{done:?}");
+    assert!(done.printed.contains("started"), "{done:?}");
     assert_eq!(
         changed(&done),
         ["early.txt"],
@@ -512,7 +510,7 @@ async fn a_background_process_does_not_outlive_the_run() {
         "the background writer lived"
     );
     assert!(!files.is_modified("late.txt"));
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **A command that reads its input gets its end at once**, never the
@@ -520,7 +518,7 @@ async fn a_background_process_does_not_outlive_the_run() {
 #[tokio::test]
 async fn a_command_reading_its_input_sees_the_end() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -530,29 +528,29 @@ async fn a_command_reading_its_input_sees_the_end() {
     .await;
     assert!(!done.timed_out);
     assert_eq!(done.exit_code, Some(0));
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
-/// **Output past the cap is cut, counted, and does not stall the command.**
+/// **Megabytes of output reach the sink whole**, counted, without stalling
+/// the command. (The cap on what a sink is given is pinned in `process`.)
 #[tokio::test]
-async fn output_past_the_cap() {
+async fn megabytes_of_output_reach_the_sink_whole() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let big = "0123456789abcde\n".repeat(3 * 1024 * 1024 / 16);
     files.write("big.txt", big.clone()).unwrap();
     let done = run(&f, "main", &files, &shell("type big.txt", "cat big.txt")).await;
-    assert!(done.stdout.truncated);
-    assert_eq!(done.stdout.bytes, big.len() as u64);
-    assert_eq!(done.stdout.text.len(), MAX_STREAM_BYTES);
-    assert!(big.starts_with(&done.stdout.text));
-    assert_reset(&f, "main");
+    assert!(!done.output.truncated);
+    assert_eq!(done.output.bytes, big.len() as u64);
+    assert_eq!(done.printed, big);
+    assert_put_back(&f, "main").await;
 }
 
-/// **Bytes that are not UTF-8 come back replaced, with their true count.**
+/// **Bytes that are not UTF-8 reach the sink as they are**, counted.
 #[tokio::test]
 async fn output_that_is_not_text() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -560,34 +558,32 @@ async fn output_that_is_not_text() {
         &shell("type assets\\logo.bin", "cat assets/logo.bin"),
     )
     .await;
-    assert_eq!(done.stdout.bytes, BINARY.len() as u64);
-    assert!(done.stdout.text.contains('\u{FFFD}'));
-    assert_reset(&f, "main");
+    assert_eq!(done.output.bytes, BINARY.len() as u64);
+    assert_eq!(done.printed, String::from_utf8_lossy(BINARY));
+    assert_put_back(&f, "main").await;
 }
 
-/// **A listed program that is not installed fails to start**, the checkout
-/// is reset, and the lock is free for the next run.
+/// **A listed program that is not installed fails to start**, records
+/// nothing, and leaves the lock free for the next run.
 #[tokio::test]
 async fn a_program_that_is_not_there() {
     let f = fixture_allowing(&["no-such-program-zend-vfs"]);
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     files.write("mine.txt", "mine\n".into()).unwrap();
+    let before = files.changes().unwrap();
     for _ in 0..2 {
-        let result = f
-            .sandbox
-            .run(
-                &grant(),
-                &branch("main"),
-                &files,
-                &SandboxCommand::new("no-such-program-zend-vfs"),
-            )
-            .await;
+        let result = try_run(
+            &f,
+            "main",
+            &files,
+            &SandboxCommand::new("no-such-program-zend-vfs"),
+        )
+        .await;
         assert!(
             matches!(result, Err(SandboxError::Start { .. })),
             "{result:?}"
         );
-        assert_reset(&f, "main");
-        assert_eq!(disk(&f.root, "mine.txt"), None);
+        assert_eq!(files.changes().unwrap(), before);
     }
 }
 
@@ -595,7 +591,7 @@ async fn a_program_that_is_not_there() {
 #[tokio::test]
 async fn a_zero_timeout() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -604,14 +600,14 @@ async fn a_zero_timeout() {
     )
     .await;
     assert!(done.timed_out);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **A command that fails still has its changes recorded.**
 #[tokio::test]
 async fn a_failing_command_still_records() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -621,7 +617,7 @@ async fn a_failing_command_still_records() {
     .await;
     assert_eq!(done.exit_code, Some(1));
     assert_eq!(changed(&done), ["x.txt"]);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **A file the command makes read-only does not wedge the checkout** for the
@@ -629,7 +625,7 @@ async fn a_failing_command_still_records() {
 #[tokio::test]
 async fn a_read_only_file_left_by_a_command() {
     let f = fixture();
-    let first = VfsStore::with_root(&f.root);
+    let first = f.store();
     run(
         &f,
         "main",
@@ -637,7 +633,7 @@ async fn a_read_only_file_left_by_a_command() {
         &shell("attrib +R README.md", "chmod a-w README.md"),
     )
     .await;
-    let second = VfsStore::with_root(&f.root);
+    let second = f.store();
     second.write("README.md", "# second\n".into()).unwrap();
     let done = run(
         &f,
@@ -646,38 +642,37 @@ async fn a_read_only_file_left_by_a_command() {
         &shell("type README.md", "cat README.md"),
     )
     .await;
-    assert_eq!(done.stdout.text.trim_end(), "# second");
-    assert_reset(&f, "main");
+    assert_eq!(done.printed.trim_end(), "# second");
+    assert_put_back(&f, "main").await;
 }
 
 // ── Runs over time, together, and abandoned ──────────────────────────────────
 
 /// **One conversation's runs build on each other**: each sees what the last
-/// recorded, and the checkout holds none of it between runs.
+/// recorded, laid down afresh — another conversation's run between them
+/// included — and none leaves its files in the folder.
 #[tokio::test]
 async fn successive_runs_of_one_conversation() {
     let f = fixture();
-    let files = VfsStore::with_root(&f.root);
-    run(
-        &f,
-        "main",
-        &files,
-        &shell("echo one> log.txt", "echo one > log.txt"),
-    )
-    .await;
-    assert_eq!(disk(&f.root, "log.txt"), None);
-    run(
-        &f,
-        "main",
-        &files,
-        &shell("echo two>> log.txt", "echo two >> log.txt"),
-    )
-    .await;
-    let done = run(&f, "main", &files, &shell("type log.txt", "cat log.txt")).await;
-    let lines: Vec<&str> = done.stdout.text.lines().map(str::trim_end).collect();
+    let files = f.store();
+    let one = shell("echo one> log.txt", "echo one > log.txt");
+    run_job(&f.sandbox, "one", "main", &files, &one)
+        .await
+        .unwrap();
+    assert_eq!(disk(&f.root, "log.txt"), None, "the job's file is not left");
+    let two = shell("echo two>> log.txt", "echo two >> log.txt");
+    run_job(&f.sandbox, "two", "main", &files, &two)
+        .await
+        .unwrap();
+    run(&f, "main", &f.store(), &shell("echo x", "echo x")).await;
+    let list = shell("type log.txt", "cat log.txt");
+    let done = run_job(&f.sandbox, "three", "main", &files, &list)
+        .await
+        .unwrap();
+    let lines: Vec<&str> = done.printed.lines().map(str::trim_end).collect();
     assert_eq!(lines, ["one", "two"]);
     assert_eq!(files.deltas("log.txt").unwrap().len(), 2);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **Many conversations at once, on real threads, each see only their own
@@ -690,7 +685,7 @@ async fn many_conversations_at_once() {
     for n in 0..CONVERSATIONS {
         let f = Arc::clone(&f);
         runs.spawn(async move {
-            let files = VfsStore::with_root(&f.root);
+            let files = f.store();
             files
                 .write("id.txt", format!("conversation {n}\n"))
                 .unwrap();
@@ -709,16 +704,16 @@ async fn many_conversations_at_once() {
     while let Some(joined) = runs.join_next().await {
         let (n, done, id) = joined.unwrap();
         assert!(
-            done.stdout.text.starts_with(&format!("conversation {n}")),
+            done.printed.starts_with(&format!("conversation {n}")),
             "{n}: {:?}",
-            done.stdout
+            done.printed
         );
         for m in 0..CONVERSATIONS {
             assert_eq!(
-                done.stdout.text.contains(&format!("only-{m}.txt")),
+                done.printed.contains(&format!("only-{m}.txt")),
                 m == n,
                 "conversation {n} listing only-{m}.txt: {:?}",
-                done.stdout.text
+                done.printed
             );
         }
         assert_eq!(changed(&done), ["id.txt"]);
@@ -726,7 +721,7 @@ async fn many_conversations_at_once() {
         seen += 1;
     }
     assert_eq!(seen, CONVERSATIONS);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
 }
 
 /// **An abandoned run records nothing and leaves nothing for the next**: the
@@ -734,7 +729,7 @@ async fn many_conversations_at_once() {
 #[tokio::test]
 async fn an_abandoned_run() {
     let f = fixture();
-    let a = VfsStore::with_root(&f.root);
+    let a = f.store();
     a.write("a.txt", "a's\n".into()).unwrap();
     let slow = shell(
         "echo x> partial.txt & ping -n 30 127.0.0.1 >NUL",
@@ -742,25 +737,18 @@ async fn an_abandoned_run() {
     );
     let abandoned = tokio::time::timeout(
         Duration::from_millis(600),
-        f.sandbox.run(&grant(), &branch("main"), &a, &slow),
+        run_job(&f.sandbox, "abandoned", "main", &a, &slow),
     )
     .await;
     assert!(abandoned.is_err(), "the run finished: {abandoned:?}");
     assert!(!a.is_modified("partial.txt"));
 
-    let b = VfsStore::with_root(&f.root);
-    let done = run(&f, "main", &b, &shell("dir /B", "ls")).await;
-    assert!(
-        !done.stdout.text.contains("a.txt"),
-        "{:?}",
-        done.stdout.text
-    );
-    assert!(
-        !done.stdout.text.contains("partial.txt"),
-        "{:?}",
-        done.stdout.text
-    );
-    assert_reset(&f, "main");
+    let b = f.store();
+    let list = shell("dir /B", "ls");
+    let done = run_job(&f.sandbox, "b", "main", &b, &list).await.unwrap();
+    assert!(!done.printed.contains("a.txt"), "{:?}", done.printed);
+    assert!(!done.printed.contains("partial.txt"), "{:?}", done.printed);
+    assert_put_back(&f, "main").await;
 }
 
 /// **A branch that does not exist fails the run before the checkout is
@@ -769,29 +757,48 @@ async fn an_abandoned_run() {
 async fn a_branch_that_does_not_exist() {
     let f = fixture();
     put(&f.root, "untracked-dev-file.txt", b"left alone\n");
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     files.write("mine.txt", "mine\n".into()).unwrap();
-    let result = f
-        .sandbox
-        .run(
-            &grant(),
-            &branch("absent"),
-            &files,
-            &shell("echo x", "echo x"),
-        )
-        .await;
+    let result = try_run(&f, "absent", &files, &shell("echo x", "echo x")).await;
     assert!(
         matches!(
-            result,
-            Err(SandboxError::Checkout(CheckoutError::Git(
-                GitError::UnknownRevision { .. }
-            )))
+            &result,
+            Err(SandboxError::BaseNotBranch { branch, tip, .. })
+                if branch == "absent" && tip == "no commit"
         ),
         "{result:?}"
     );
     assert_eq!(
         disk(&f.root, "untracked-dev-file.txt").unwrap(),
         b"left alone\n"
+    );
+    assert_eq!(disk(&f.root, "mine.txt"), None);
+}
+
+/// **A conversation whose base the branch has moved past is refused before
+/// the checkout is touched**: its changes were made on another commit than
+/// a checkout of the branch would hold.
+#[tokio::test]
+async fn a_base_the_branch_moved_past_is_refused() {
+    let f = fixture();
+    let files = f.store();
+    files.write("mine.txt", "mine\n".into()).unwrap();
+    let pinned = files.base().unwrap().unwrap();
+    // Another conversation's commit: objects and a ref, the checkout alone.
+    let tree = git(&f.root, &["rev-parse", "main^{tree}"]);
+    let moved = git(
+        &f.root,
+        &["commit-tree", tree.trim(), "-p", "main", "-m", "elsewhere"],
+    );
+    git(&f.root, &["update-ref", "refs/heads/main", moved.trim()]);
+    let result = try_run(&f, "main", &files, &shell("echo x", "echo x")).await;
+    assert!(
+        matches!(
+            &result,
+            Err(SandboxError::BaseNotBranch { base, tip, .. })
+                if *base == pinned.commit().unwrap().to_string() && tip == moved.trim()
+        ),
+        "{result:?}"
     );
     assert_eq!(disk(&f.root, "mine.txt"), None);
 }
@@ -804,7 +811,7 @@ async fn a_branch_that_does_not_exist() {
 async fn a_link_to_outside_the_repository() {
     let f = fixture();
     let outside = outside(&f);
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -818,7 +825,7 @@ async fn a_link_to_outside_the_repository() {
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert!(done.changed.is_empty(), "{done:?}");
     assert!(done.unrecorded.is_empty(), "{done:?}");
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert!(std::fs::symlink_metadata(f.root.join("linked")).is_err());
     assert_eq!(
         std::fs::read(&outside).unwrap(),
@@ -833,7 +840,7 @@ async fn a_link_to_outside_the_repository() {
 async fn a_folder_replaced_by_a_link_to_outside() {
     let f = fixture();
     let outside = outside(&f);
-    let files = VfsStore::with_root(&f.root);
+    let files = f.store();
     let done = run(
         &f,
         "main",
@@ -847,7 +854,7 @@ async fn a_folder_replaced_by_a_link_to_outside() {
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert_eq!(changed(&done), ["templates/lib.rs.orig"]);
     assert_eq!(read(&files, "templates/lib.rs.orig"), None);
-    assert_reset(&f, "main");
+    assert_put_back(&f, "main").await;
     assert_eq!(disk(&f.root, "templates/lib.rs.orig").unwrap(), LIB);
     assert_eq!(
         std::fs::read(&outside).unwrap(),

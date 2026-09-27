@@ -138,6 +138,15 @@ impl GitWorkspace {
         )
     }
 
+    /// One conversation over this workspace: a writable context kept across
+    /// calls, so what it writes stays its own uncommitted work and the
+    /// branch it switches to stays its branch.
+    pub fn conversation(&self) -> Conversation {
+        Conversation {
+            ctx: self.mutable_ctx(),
+        }
+    }
+
     /// Call a tool against this workspace's read-only context.
     pub fn read(&self, tool: &str, args: Value) -> Value {
         find(tool)
@@ -174,6 +183,43 @@ impl GitWorkspace {
         git_in(&other, &["config", "user.name", "Other"]);
         git_in(&other, &["config", "user.email", "other@example.com"]);
         other
+    }
+}
+
+/// One conversation: tool calls against one context, whose files are its own.
+pub struct Conversation {
+    pub ctx: ToolContext,
+}
+
+impl Conversation {
+    pub fn call(&self, tool: &str, args: Value) -> Value {
+        find(tool)
+            .unwrap_or_else(|| panic!("{tool} is registered"))
+            .call(&self.ctx, &args)
+    }
+
+    /// Write `path` in the conversation's files, uncommitted.
+    pub fn write(&self, path: &str, content: &str) {
+        self.ctx
+            .files
+            .repo("app")
+            .unwrap()
+            .write(path, content.to_string())
+            .unwrap();
+    }
+
+    /// Delete `path` from the conversation's files, uncommitted.
+    pub fn delete(&self, path: &str) {
+        assert!(self.ctx.files.repo("app").unwrap().delete(path), "{path}");
+    }
+
+    /// `path` as the conversation reads it.
+    pub fn read(&self, path: &str) -> Option<String> {
+        self.ctx.files.repo("app").unwrap().read(path).unwrap()
+    }
+
+    pub fn status(&self) -> Value {
+        self.call("git_status", json!({"repo": "app", "page": 0}))
     }
 }
 

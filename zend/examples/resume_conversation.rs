@@ -32,7 +32,7 @@ use clap::{Parser, ValueEnum};
 use regex::Regex;
 use tracing_subscriber::EnvFilter;
 use zend::api::chat::{apply_tools_dial, dial_selection};
-use zend::config::{layer_flag_sets, DaemonConfig};
+use zend::config::DaemonConfig;
 use zend::log_broadcast::LogBus;
 use zend::session::{
     Demonstration, ReplayOutcome, ReplaySampling, ReplaySpec, TurnComparison, ZendSession,
@@ -78,9 +78,6 @@ struct Args {
     /// Layers out of service, as the daemon's `--disable-layer`.
     #[arg(long = "disable-layer", default_value = "code_reading")]
     disable_layer: Vec<String>,
-    /// Layers in service but not read, as the daemon's `--skip-layer`.
-    #[arg(long = "skip-layer", default_value = "repo_map")]
-    skip_layer: Vec<String>,
     /// A run whose output matches any of these patterns counts as a failure.
     #[arg(long = "fail-if")]
     fail_if: Vec<String>,
@@ -225,10 +222,8 @@ async fn main() -> anyhow::Result<()> {
         DemonstrationArg::FirstStep => Demonstration::FirstStepOnly,
     };
 
-    let (disabled_layers, skipped_layers) = layer_flag_sets(&args.disable_layer, &args.skip_layer);
     let config = DaemonConfig {
-        disabled_layers,
-        skipped_layers,
+        disabled_layers: args.disable_layer.iter().cloned().collect(),
         read_only_substrate: true,
         qsa_selection_budget: args.qsa_selection_budget,
         ..DaemonConfig::new(zend::workspace::open(&args.workspace)?)

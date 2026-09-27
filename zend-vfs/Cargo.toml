@@ -20,7 +20,14 @@ ignore = "0.4"
 similar = "2"
 # The sandbox: a command run as a child process, its output read and its
 # timeout kept without a thread per run, one run per checkout at a time.
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+# The sandbox server: a job's output handed out as a stream, and its id drawn
+# at random.
+futures = { workspace = true }
+rand    = { workspace = true }
+# A checkout that could not be put back as its owner left it, reported when
+# nothing is left to return the error to.
+tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

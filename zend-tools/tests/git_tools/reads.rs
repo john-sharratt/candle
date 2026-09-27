@@ -11,41 +11,57 @@ use crate::harness::{branch_rev, commit_rev, head_rev, parent_rev, tag_rev, GitW
 // ── git_status ───────────────────────────────────────────────────────────────
 
 #[test]
-fn a_committed_repository_is_clean_and_names_its_branch() {
+fn a_conversation_with_no_changes_is_clean_and_names_its_branch() {
     let ws = GitWorkspace::new();
     let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
     assert_eq!(out["clean"], true, "{out}");
     assert_eq!(out["branch"], "main");
     assert_eq!(out["head"], ws.oid("HEAD"));
     assert!(out["changes"].as_array().unwrap().is_empty());
-    assert_eq!(out["counts"]["unstaged"], 0);
+    assert_eq!(out["counts"]["modified"], 0);
 }
 
-/// Both sides are named, because "modified" alone would not say whether the
-/// next commit would carry the change.
+/// **What the conversation changed is reported, and never what is on disk**
+/// — the repository's folder is the sandbox's, and holds whatever a job left.
 #[test]
-fn an_edit_is_reported_and_staging_moves_which_side_it_is_on() {
+fn the_conversations_changes_are_reported_and_never_the_folders() {
     let ws = GitWorkspace::new();
-    ws.write_worktree("README.md", "# app\n\nedited.\n");
-    let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
-    assert_eq!(out["clean"], false, "{out}");
-    let c = &out["changes"][0];
-    assert_eq!(c["path"], "README.md");
-    assert_eq!(c["unstaged"], "modified");
-    assert!(
-        c.get("staged").is_none(),
-        "an unchanged side is left out: {c}"
+    ws.write_worktree("README.md", "# left on disk by a job\n");
+    ws.write_worktree("stray.txt", "stray\n");
+    let conv = ws.conversation();
+    assert_eq!(
+        conv.status()["clean"],
+        true,
+        "the folder is not the conversation"
     );
-    assert_eq!(out["counts"]["unstaged"], 1);
-    assert_eq!(out["counts"]["staged"], 0);
 
-    ws.git(&["add", "README.md"]);
-    let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
-    let c = &out["changes"][0];
-    assert_eq!(c["staged"], "modified");
-    assert!(c.get("unstaged").is_none(), "{c}");
-    assert_eq!(out["counts"]["staged"], 1);
-    assert_eq!(out["counts"]["unstaged"], 0);
+    conv.write("README.md", "# app\n\nedited.\n");
+    conv.write("NOTES.md", "notes\n");
+    conv.delete("src/lib.rs");
+    let out = conv.status();
+    assert_eq!(out["clean"], false, "{out}");
+    let changes: Vec<(String, String)> = out["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["path"].as_str().unwrap().to_string(),
+                c["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        changes,
+        [
+            ("NOTES.md".to_string(), "added".to_string()),
+            ("README.md".to_string(), "modified".to_string()),
+            ("src/lib.rs".to_string(), "deleted".to_string()),
+        ]
+    );
+    assert_eq!(out["counts"]["added"], 1);
+    assert_eq!(out["counts"]["modified"], 1);
+    assert_eq!(out["counts"]["deleted"], 1);
 }
 
 /// **"How far ahead am I" is answered by the tool asked it first.** Live, the
@@ -71,25 +87,25 @@ fn status_reports_how_far_ahead_of_its_upstream_the_branch_is() {
     assert!(out.get("no_upstream").is_none(), "{out}");
 }
 
-/// Without an upstream the reply names the call that counts it instead, so
-/// the question still has a next step rather than a dead end.
+/// Without a copy on origin the reply says why there is nothing to compare
+/// against, so the question still has an answer rather than a dead end.
 #[test]
-fn status_without_an_upstream_names_the_call_that_counts_it() {
+fn status_without_an_upstream_says_why() {
     let ws = GitWorkspace::new();
     let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
     assert!(out.get("upstream").is_none(), "{out}");
     let hint = out["no_upstream"].as_str().unwrap();
-    assert!(hint.contains("git_log"), "{hint}");
-    assert!(hint.contains("remote_branch"), "{hint}");
-}
+    assert!(hint.contains("no origin"), "{hint}");
 
-#[test]
-fn a_new_file_is_reported_untracked() {
-    let ws = GitWorkspace::new();
-    ws.write_worktree("NOTES.md", "notes\n");
+    ws.git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://example.com/acme/app.git",
+    ]);
     let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
-    assert_eq!(out["changes"][0]["state"], "untracked");
-    assert_eq!(out["counts"]["untracked"], 1);
+    let hint = out["no_upstream"].as_str().unwrap();
+    assert!(hint.contains("origin has no copy"), "{hint}");
 }
 
 /// **Counts cover every changed path, not just the page.** They exist because
@@ -98,16 +114,17 @@ fn a_new_file_is_reported_untracked() {
 #[test]
 fn status_pages_and_the_counts_cover_everything() {
     let ws = GitWorkspace::new();
+    let conv = ws.conversation();
     for i in 0..100 {
-        ws.write_worktree(&format!("f{i}.txt"), "x\n");
+        conv.write(&format!("f{i}.txt"), "x\n");
     }
-    let first = ws.read("git_status", json!({"repo": "app", "page": 0}));
-    assert_eq!(first["counts"]["untracked"], 100, "{}", first["counts"]);
+    let first = conv.status();
+    assert_eq!(first["counts"]["added"], 100, "{}", first["counts"]);
     assert_eq!(first["paging"]["total"], 100);
     assert_eq!(first["changes"].as_array().unwrap().len(), 80);
     assert_eq!(first["paging"]["next_page"], 1);
 
-    let second = ws.read("git_status", json!({"repo": "app", "page": 1}));
+    let second = conv.call("git_status", json!({"repo": "app", "page": 1}));
     assert_eq!(second["changes"].as_array().unwrap().len(), 20);
     assert!(second["paging"]["next_page"].is_null());
 }
@@ -118,8 +135,9 @@ fn status_pages_and_the_counts_cover_everything() {
 #[test]
 fn a_page_past_the_end_clamps_to_the_last_page() {
     let ws = GitWorkspace::new();
-    ws.write_worktree("one.txt", "x\n");
-    let out = ws.read("git_status", json!({"repo": "app", "page": 99}));
+    let conv = ws.conversation();
+    conv.write("one.txt", "x\n");
+    let out = conv.call("git_status", json!({"repo": "app", "page": 99}));
     assert_eq!(out["paging"]["page"], 0, "{out}");
     assert_eq!(out["changes"].as_array().unwrap().len(), 1);
 }

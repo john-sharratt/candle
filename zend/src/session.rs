@@ -12,7 +12,6 @@ use std::time::SystemTime;
 use futures::executor::block_on;
 use futures::future::select_all;
 use futures::{Stream, StreamExt};
-use notify::RecommendedWatcher;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as ConvLock;
 use tokio::sync::OwnedMutexGuard;
@@ -74,7 +73,6 @@ use crate::tools::{
     ToolCall, ToolHost, CALIB_TOOL_SELECTOR,
 };
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
-use crate::watcher::WatchDepth;
 use crate::workspace::UPLOADS_REPO;
 
 mod replay;
@@ -449,13 +447,6 @@ struct InferenceState {
     /// so they have no reasoning to protect and stay on their existing
     /// from-scratch construction (`raw_read::ingest_raw`).
     ingest_bases: HashMap<String, Mutex<Sequence>>,
-    /// The priming chain's final link (`priming_chain::build`, run once at
-    /// boot before `base_conv`/every `ingest_bases` entry is adopted onto
-    /// it) — `None` when no anchor file (root ls / README / ARCHITECTURE /
-    /// AGENTS / CLAUDE.md) was found. Every `RefreshContext` built from here
-    /// on carries the current value, so a background pass's units adopt
-    /// whatever the chain currently ends at.
-    priming_chain_end: Mutex<Option<TimelineId>>,
     /// Queue feeding the dedicated titler task. The request path enqueues a
     /// [`TitleJob`] (non-blocking, dropped if the task is backed up) instead
     /// of spawning per submit, so title generation runs in the background —
@@ -874,7 +865,6 @@ impl InferenceState {
         workspace: Workspace,
         secrets: Arc<Secrets>,
         disabled_layers: HashSet<String>,
-        skipped_layers: HashSet<String>,
         wiped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
         max_depth: Option<usize>,
@@ -883,7 +873,6 @@ impl InferenceState {
         qsa_selection_budget: Option<usize>,
         summarize: bool,
         progress: Arc<LoadProgress>,
-        status_tx: tokio::sync::watch::Sender<String>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
         // mind's section folders live. Repositories are reached through
@@ -2165,7 +2154,6 @@ impl InferenceState {
             ingest_bases.insert(il.name.clone(), Mutex::new(base));
         }
 
-        let mut ingest_convs: HashMap<String, IngestConv> = HashMap::new();
         for il in &ingest_layers {
             if disabled_layers.contains(&il.name) {
                 continue;
@@ -2207,156 +2195,13 @@ impl InferenceState {
                     ),
                 }
             }
-            // Seed the registry from the DURABLE record, unconditionally — not as
-            // a side effect of a pass having run. This is what lets Folders/Files
-            // ingestion move entirely off the load path below: the background
-            // ingest worker's first pass reads its `prior` state from here, and a
-            // layer that has never ingested seeds an EMPTY state, which
-            // `refresh_repo_map`/`refresh_code_reading` correctly read as
-            // "everything changed" on that first pass. `Raw` is not seeded here —
-            // `IngestConv::Raw` holds a live `Sequence` that can't be rebuilt from
-            // the substrate alone, so it stays on the blocking path below.
-            //
-            // `--skip-layer` deliberately seeds NOTHING: absence from this
-            // registry is still the one gate `refresh_ingest_layers` uses to mean
-            // "never re-read from disk" (mirrored by `--disable-layer`, which also
-            // takes no append-only mark or crashed-partial sweep above).
-            if skipped_layers.contains(&il.name) {
-                continue;
-            }
-            match il.mode {
-                IngestMode::Folders => {
-                    ingest_convs.insert(
-                        il.name.clone(),
-                        IngestConv::Folders {
-                            state: crate::repo_scan::dir_state_from_substrate(&engine),
-                        },
-                    );
-                }
-                IngestMode::Files => {
-                    ingest_convs.insert(
-                        il.name.clone(),
-                        IngestConv::Files {
-                            state: crate::code_read::code_read_state_from_substrate(&engine),
-                        },
-                    );
-                }
-                IngestMode::Raw => {} // minted below — needs a live Sequence
-            }
         }
-
-        // The priming chain — root ls, then README/ARCHITECTURE/AGENTS/
-        // CLAUDE.md in order, each recording the previous as its parent —
-        // built BEFORE `base_conv` (parented onto it below) and every
-        // `ingest_bases` entry is handed out, so the very first question
-        // ever asked already has it. `self.refresh_ctx()` isn't callable yet
-        // (no `self` exists), so this builds the equivalent by hand from the
-        // same locals `refresh_ctx()` reads once the struct exists. See
-        // `priming_chain` and `InferenceState::priming_chain_end`.
-        //
-        // Its own step: each link decodes a real summary, so this is minutes
-        // of visible work. Folded into the tail of `CalibratingSections` it
-        // left that bar reading 100% for 203 of its 210 seconds.
-        progress.set_step(LoadStep::Priming);
-        let priming_tool_host = ToolHost::new(&workspace, Arc::clone(&secrets));
-        let priming_ctx = RefreshContext {
-            engine: &engine,
-            proj_builder: proj_builder_refresh.clone(),
-            config: conv_config.clone(),
-            formatted_prompt: &formatted_prompt,
-            think_triggers: match &think_steering {
-                Some(ts) => ts.registry_for(&tool_stencil, ThinkMode::Quick),
-                None => Arc::clone(&tool_stencil),
-            },
-            tool_ctx: priming_tool_host.context_for(
-                ToolMode::Restricted,
-                &priming_tool_host.conversation_files(),
-            ),
-            priming_chain_end: None,
-        };
-        let priming_chain_end = match (
-            ingest_bases.get("repo_map"),
-            ingest_bases.get("code_reading"),
-        ) {
-            (Some(repo_map_base), Some(code_reading_base)) => crate::priming_chain::build(
-                &priming_ctx,
-                &workspace,
-                repo_map_base,
-                code_reading_base,
-                &progress,
-            )?,
-            _ => None,
-        };
-        // Every dialogue forks `base_conv` (`ZendSession`'s `fork_resuming`),
-        // and a fork inherits its parent's lineage, so parenting the base onto
-        // the chain end is what puts the anchor documents in front of the very
-        // first question asked — without copying a single turn.
-        if let Some(chain_end) = priming_chain_end {
-            engine
-                .lock()
-                .unwrap()
-                .set_forked_from(base_conv.timeline_id(), chain_end)
-                .map_err(|e| anyhow::anyhow!("base_conv priming-chain parent: {e}"))?;
-        }
-
-        progress.set_step(LoadStep::Ingesting);
-        for il in &ingest_layers {
-            // Cooperative shutdown: stop before the next layer if a Ctrl-C landed
-            // mid-ingest. The per-file loops inside the ingest calls below check
-            // the same flag, so cancellation lands within a file, not a layer.
-            if candle_conversation::ingest_cancelled() {
-                break;
-            }
-            // Both flags stop the read; they differ in everything else, and the
-            // divergence is handled in the pre-loop above (append-only mark,
-            // gather membership, crashed-partial sweep, registry seeding). Here
-            // they agree.
-            if disabled_layers.contains(&il.name) {
-                tracing::info!(layer = %il.name, "--disable-layer: layer inert, startup ingest suppressed");
-                continue;
-            }
-            if skipped_layers.contains(&il.name) {
-                tracing::info!(layer = %il.name, "--skip-layer: layer live, startup ingest skipped");
-                continue;
-            }
-            let content_root = root.join(&il.folder);
-            match il.mode {
-                // Folder-scan and per-file ingestion no longer run on the load
-                // path at all: the registry above is already seeded from the
-                // substrate, and the background ingest worker's first pass —
-                // woken right after this function returns — does the actual walk
-                // and pool work through `refresh_repo_map`/`refresh_code_reading`,
-                // so `ready` is never gated on it.
-                IngestMode::Folders | IngestMode::Files => {
-                    tracing::info!(
-                        layer = %il.name,
-                        mode = ?il.mode,
-                        "ingest deferred to the background worker",
-                    );
-                }
-                IngestMode::Raw => {
-                    // The layer's display label rides the step's `detail` sub-status.
-                    status_tx.send(il.display.clone()).ok();
-                    progress.set_step_progress(0, 0);
-                    // The absolute readout's unit is the layer's YAML-defined
-                    // `ingest_unit` (mode-defaulted in `ingest_layers`).
-                    progress.set_step_unit(&il.unit);
-                    tracing::info!(layer = %il.name, mode = ?il.mode, folder = %il.folder, "ingest pass starting");
-                    let (sequence, state) = crate::raw_read::ingest_raw(
-                        &engine,
-                        proj_builder_refresh.clone(),
-                        &content_root,
-                        conv_config.clone(),
-                        &progress,
-                        &il.name,
-                        &il.group,
-                    )?;
-                    ingest_convs.insert(il.name.clone(), IngestConv::Raw { sequence, state });
-                }
-            }
-        }
-        // Clear the ingest sub-status now the phase is done.
-        status_tx.send(String::new()).ok();
+        // The registry starts empty for every layer, which is the one gate
+        // `refresh_ingest_layers` reads as "never re-read": the repositories'
+        // folders belong to the sandbox's jobs and hold whatever the last job
+        // left there, so nothing ingests from them. What the substrate already
+        // holds stays live — marked, swept and warmed above and after `ready`.
+        let ingest_convs: HashMap<String, IngestConv> = HashMap::new();
 
         // Cooperative shutdown during the (long) startup ingest: if a Ctrl-C
         // arrived while ingesting, the loop above broke early. Don't finish
@@ -2413,7 +2258,6 @@ impl InferenceState {
             tool_modes: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
             ingest_bases,
-            priming_chain_end: Mutex::new(priming_chain_end),
             titler_tx,
             titler_worker: Mutex::new(None),
             titler_timeline,
@@ -2461,7 +2305,6 @@ impl InferenceState {
             tool_ctx: self
                 .tool_host
                 .context_for(ToolMode::Restricted, &self.tool_host.conversation_files()),
-            priming_chain_end: *self.priming_chain_end.lock().unwrap(),
         }
     }
 
@@ -2623,47 +2466,6 @@ impl InferenceState {
             }
         }
         Ok(any)
-    }
-
-    /// The folders the raw layers read, which the watcher watches beside the
-    /// repositories.
-    fn raw_layer_folders(&self) -> Vec<PathBuf> {
-        self.ingest_layers
-            .iter()
-            .filter(|il| il.mode == IngestMode::Raw)
-            .map(|il| self.workspace.root().join(&il.folder))
-            .collect()
-    }
-
-    /// The watcher's `--max-depth` filter: the bound, measured from each walk's
-    /// start — every repository's root, or a layer's `--ingest-dir` scope — for
-    /// the layers whose walk it bounds (`repo_map`, `code_reading`), with every
-    /// raw layer's folder left unbounded. `None` when no bound was given —
-    /// every event counts.
-    fn watch_depth(&self) -> Option<WatchDepth> {
-        let max = self.max_depth?;
-        let root = self.workspace.root();
-        let walked = |il: &&IngestLayer| matches!(il.mode, IngestMode::Folders | IngestMode::Files);
-        let starts = |il: &IngestLayer| -> Vec<PathBuf> {
-            if il.folder.is_empty() {
-                self.workspace
-                    .repos()
-                    .iter()
-                    .filter(|r| !crate::code_read::is_upload_path(&r.name))
-                    .map(|r| r.dir.clone())
-                    .collect()
-            } else {
-                vec![root.join(&il.folder)]
-            }
-        };
-        Some(WatchDepth::new(
-            max,
-            self.ingest_layers.iter().filter(walked).flat_map(starts),
-            self.ingest_layers
-                .iter()
-                .filter(|il| !walked(il))
-                .map(|il| root.join(&il.folder)),
-        ))
     }
 
     /// Ingest **only** the given workspace-relative files into the projection's
@@ -3146,11 +2948,6 @@ fn run_inference_stream(
                 );
             }
         }
-        // A conversation built again — after an eviction, after a restart —
-        // gets back the changes its tool rounds made to the workspace's files.
-        if let Some(files) = minted_files {
-            conv_overlay::restore(&state.engine.lock().unwrap(), timeline, &files);
-        }
         let conv_arc = match forked {
             Ok(arc) => arc,
             Err(e) => {
@@ -3182,27 +2979,6 @@ fn run_inference_stream(
                 }
             })
             .await;
-            // A conversation recovered from the substrate still holds the reads
-            // it asked for, but the set that says so is in-memory and did not
-            // survive. Replay its own calls so it knows what it is carrying —
-            // otherwise it re-reads every file it had already been given.
-            let rebuild_state = Arc::clone(&state);
-            let _ = tokio::task::spawn_blocking(move || {
-                let budget = rebuild_state
-                    .refresh_builder
-                    .schema()
-                    .layers
-                    .iter()
-                    .find(|l| l.name == "code_reading")
-                    .map_or(0, |l| l.fast_path_window);
-                crate::fast_path::rebuild(
-                    &rebuild_state.engine,
-                    timeline,
-                    &rebuild_state.workspace,
-                    budget,
-                );
-            })
-            .await;
         }
 
         // Persist the conv_id ↔ timeline mapping *after* `fork_resuming`
@@ -3219,6 +2995,35 @@ fn run_inference_stream(
             // each repository's base; one already working somewhere keeps it,
             // and then this writes nothing.
             conv_branches::seed(&engine, timeline, &state.base_branches);
+        }
+
+        if let Some(files) = minted_files {
+            // A conversation built again — after an eviction, after a restart
+            // — reads each repository through its own branch, and gets back
+            // the changes its tool rounds made there.
+            conv_overlay::restore(&state.engine.lock().unwrap(), timeline, &files);
+            // It still holds the reads it asked for, but the set that says so
+            // is in-memory and did not survive. Replay its own calls so it
+            // knows what it is carrying — otherwise it re-reads every file it
+            // had already been given.
+            let rebuild_state = Arc::clone(&state);
+            let _ = tokio::task::spawn_blocking(move || {
+                let budget = rebuild_state
+                    .refresh_builder
+                    .schema()
+                    .layers
+                    .iter()
+                    .find(|l| l.name == "code_reading")
+                    .map_or(0, |l| l.fast_path_window);
+                crate::fast_path::rebuild(
+                    &rebuild_state.engine,
+                    timeline,
+                    &rebuild_state.workspace,
+                    &files,
+                    budget,
+                );
+            })
+            .await;
         }
 
         // An explicit request `identity` overrides and is persisted, so later
@@ -4517,10 +4322,6 @@ pub struct ZendSession {
     started_at_ms: u64,
     /// Populated in the background after construction; None until model loads.
     inference: Arc<RwLock<Option<Arc<InferenceState>>>>,
-    /// Workspace file-watcher.  Started after the model loads; held
-    /// here so dropping the session also drops the watch.  None until
-    /// the inference state is ready.
-    watcher: Mutex<Option<RecommendedWatcher>>,
     /// Conversation-files store (uploads). Persistent under the workspace,
     /// independent of the inference engine — available before the model loads.
     file_store: ConvFileStore,
@@ -4662,7 +4463,6 @@ impl ZendSession {
         let file_store = ConvFileStore::open(config.workspace.root());
         Self {
             inference: Arc::new(RwLock::new(None)),
-            watcher: Mutex::new(None),
             config,
             projection_builder,
             log,
@@ -5821,7 +5621,6 @@ impl ZendSession {
         let workspace = self.config.workspace.clone();
         let secrets = Arc::clone(&self.config.secrets);
         let disabled_layers = self.config.disabled_layers.clone();
-        let skipped_layers = self.config.skipped_layers.clone();
         let wiped_layers = self.config.wiped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
         let max_depth = self.config.max_depth;
@@ -5840,16 +5639,14 @@ impl ZendSession {
         candle_conversation::reset_ingest_cancel();
         // Handle to the ambient Tokio runtime (if any). The loader runs on a
         // plain OS thread and drops its temporary download runtime before the
-        // model load, so the workspace watcher's `tokio::spawn` would otherwise
+        // model load, so the ingest worker's `tokio::spawn` would otherwise
         // panic for lack of a runtime context — which killed the loader thread
         // before `mark_ready()`, wedging the loading screen. We re-enter this
-        // handle after the download phase so the watcher can spawn. `None` in
-        // test contexts with no ambient runtime (the watcher is then skipped).
+        // handle after the download phase so the worker can spawn.
         let rt_handle = tokio::runtime::Handle::try_current().ok();
-        // Held by the spawned thread so the workspace watcher's
-        // lifetime ends when the session is dropped — the watcher
-        // is stored under `Arc<ZendSession>::watcher`.
-        let session_for_watcher: Arc<Self> = Arc::clone(self);
+        // Held by the spawned thread, which stores the ingest worker on the
+        // session and hands it to the resumed turns.
+        let session_for_loader: Arc<Self> = Arc::clone(self);
         // OS thread, not `tokio::spawn` — `start_loading` may be
         // called from contexts without an ambient Tokio runtime
         // (integration tests, alternative binaries).  The bits that
@@ -5891,7 +5688,7 @@ impl ZendSession {
                 drop(download_runtime);
 
                 // Re-enter the main Tokio runtime for the rest of this thread so the
-                // workspace watcher's `tokio::spawn` has a runtime context. Must come
+                // ingest worker's `tokio::spawn` has a runtime context. Must come
                 // *after* the download runtime is dropped (no nested `block_on`).
                 // The model load is synchronous, so holding the enter guard is safe.
                 let _rt_guard = rt_handle.as_ref().map(|h| h.enter());
@@ -5915,7 +5712,6 @@ impl ZendSession {
                     workspace,
                     secrets,
                     disabled_layers,
-                    skipped_layers,
                     wiped_layers,
                     ingest_dirs,
                     max_depth,
@@ -5924,7 +5720,6 @@ impl ZendSession {
                     qsa_selection_budget,
                     summarize,
                     load_progress_for_blocking,
-                    status_tx.clone(),
                 ) {
                     Ok(Some(state)) => {
                         *slot.write().unwrap() = Some(Arc::clone(&state));
@@ -5951,76 +5746,24 @@ impl ZendSession {
                         // ingest passes own it and report sub-step progress
                         // through the same `LoadProgress` handle.
 
-                        // One wake handle shared by the startup handoff below and
-                        // the watcher's debounced burst — both just ask the single
-                        // background ingest worker for a pass; neither runs one
-                        // itself.
-                        let wake = Arc::new(tokio::sync::Notify::new());
-                        // Arm the workspace watcher. A filesystem-event burst
-                        // debounces into one wake covering every populated ingest
-                        // layer: name-relevant events (create / remove / rename)
-                        // can move a folder-scan layer's directory hashes, content
-                        // edits can move a per-file layer's content hashes. The
-                        // worker's own pass short-circuits internally per layer
-                        // when its hash record is unchanged, and a layer that was
-                        // never populated (absent from the registry — disabled,
-                        // skipped, or no ingest layers at all) is skipped there, so
-                        // the work is bounded and a `--disable-layer` layer is
-                        // never re-ingested.
-                        let wake_for_watcher = Arc::clone(&wake);
-                        let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                            // A burst only ever WAKES the worker; it never runs a
-                            // pass itself. Two callers in a pool at once would
-                            // corrupt `repo_scan`'s per-pass KV pricing statics and
-                            // clobber each other's `ingest_report` entry.
-                            wake_for_watcher.notify_one();
-                        });
-                        // Uploads are endpoint-managed, so upload churn never
-                        // drives the source refresh above — but a deletion of an
+                        // Uploads are endpoint-managed, but a deletion of an
                         // uploaded file still has to retire its substrate
-                        // conversation. Fire the cheap tombstone-if-absent
-                        // reconcile once at startup (uploads deleted while the
-                        // daemon was down) and on every `uploads/` watcher burst.
-                        // A read-only substrate takes none of this upkeep, here or
-                        // below: it is written by the daemon beside it.
+                        // conversation: the cheap tombstone-if-absent reconcile
+                        // runs once at startup, for uploads deleted while the
+                        // daemon was down. A read-only substrate takes none of
+                        // this upkeep, here or below: it is written by the daemon
+                        // beside it.
                         if !read_only_substrate {
                             state.reconcile_uploaded_files();
-                        }
-                        let inference_for_uploads = Arc::clone(&slot);
-                        let on_uploads_changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                            let Some(state) = inference_for_uploads
-                                .read()
-                                .unwrap()
-                                .as_ref()
-                                .map(Arc::clone)
-                            else {
-                                return;
-                            };
-                            state.reconcile_uploaded_files();
-                        });
-                        if !read_only_substrate {
-                            match crate::watcher::spawn(
-                                &state.workspace,
-                                &state.raw_layer_folders(),
-                                state.watch_depth(),
-                                on_refresh,
-                                on_uploads_changed,
-                            ) {
-                                Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
-                                Err(e) => {
-                                    tracing::warn!("workspace watcher failed to start: {e:#}")
-                                }
-                            }
                         }
 
-                        // The single background ingest worker. `pass` is exactly
-                        // the "startup background reconcile" this replaces: the
-                        // load path no longer ingests Folders/Files layers at all
-                        // (see `InferenceState::load`), so the registry seeded
-                        // there — empty on a fresh install, the substrate's
-                        // last-known state on every later start — is what this
-                        // worker's first pass diffs against, off the load critical
-                        // path, exactly like a later watcher burst.
+                        // The single background ingest worker. Its one pass at
+                        // startup finds the layer registry empty — nothing reads
+                        // the repositories' folders, which are the jobs' own (see
+                        // `InferenceState::load`) — and is followed by the ingest
+                        // normalization warm-up over what the substrate already
+                        // holds.
+                        let wake = Arc::new(tokio::sync::Notify::new());
                         if !read_only_substrate {
                             let pass_state = Arc::clone(&state);
                             let pass: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -6056,7 +5799,7 @@ impl ZendSession {
                             // — starts NOW, in the background, while the lines
                             // below take the daemon to `ready` without waiting on it.
                             worker.wake();
-                            *session_for_watcher.ingest_worker.lock().unwrap() = Some(worker);
+                            *session_for_loader.ingest_worker.lock().unwrap() = Some(worker);
                         }
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
@@ -6070,7 +5813,7 @@ impl ZendSession {
                         // which is written by the daemon beside this one.
                         if !read_only_substrate {
                             resume_unfinished_turns(
-                                Arc::clone(&session_for_watcher),
+                                Arc::clone(&session_for_loader),
                                 Arc::clone(&state),
                             );
                         }

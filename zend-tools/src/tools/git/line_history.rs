@@ -121,7 +121,7 @@ pub fn line_history(
     let walk = repo.log(
         &LogRange {
             to: rev.clone(),
-            exclude: None,
+            exclude: Vec::new(),
             paths: vec![path.clone()],
         },
         MAX_FILE_WALK,

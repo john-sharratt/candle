@@ -16,12 +16,12 @@ questions:
 - drop the old branch now that it is merged
 - make an annotated tag recording who tagged it and when
 - why can I not move that tag to a new commit
-- give me a branch at the current HEAD
-- create the branch but do not switch my working tree to it
+- give me a branch at the commit I am on
+- create the branch but do not switch to it
 - remove the branch named experiment
 - repoint the release branch onto this commit
 category: Git
-description: 'Create, move or delete a branch or a tag. `kind` picks which and `action` picks the operation. `create` takes `at`, the revision the ref starts from, defaulting to HEAD; a tag created with a `message` is annotated, recording who tagged it and when, while a tag without one is a bare pointer. `move` repoints an existing branch — a tag is NOT moved, so to retarget one, delete it and create it again. `delete` removes either kind. `expected` is optional throughout: omit it and the ref''s current value is read here and swapped atomically, or give it to refuse the change if the ref moved since you looked. **Nothing is checked out and no file on disk changes** — this moves a pointer, it does not switch the working tree — and a branch checked out in any worktree is refused rather than silently diverging from what the developer has open. Use for "make a branch for this", "tag this as v2.0", "delete the merged branch", "remove that bad tag", "point the branch at this commit". Writes to the repository.'
+description: 'Create, move or delete a branch or a tag, on origin. `kind` picks which and `action` picks the operation. `create` takes `at`, the revision the ref starts from, defaulting to your own commit; a tag created with a `message` is annotated, recording who tagged it and when, while a tag without one is a bare pointer. `move` repoints an existing branch other than the one you are on — git_reset moves that one — and a tag is NOT moved, so to retarget one, delete it and create it again. A move that would take commits off the branch is refused unless `expected` names the tip it takes them from. `delete` removes either kind, but never the branch you are on: git_switch away from it first. `expected` is optional throughout: omit it and the ref''s current value is read — a branch''s from origin, a tag''s from this repository — and swapped atomically, or give it to refuse the change if the ref moved since you looked. This moves a pointer and does NOT switch your branch — git_switch does that. Use for "make a branch for this", "tag this as v2.0", "delete the merged branch", "remove that bad tag", "point the branch at this commit". Writes to origin.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -48,7 +48,7 @@ parameters:
           minimum: 0.0
           type: integer
         kind:
-          description: 'Which form: `head` (what is checked out, needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or HEAD''s upstream when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          description: 'Which form: `head` (your own commit — the branch you are on as your files have it — needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
           enum:
           - head
           - branch
@@ -60,7 +60,7 @@ parameters:
           - parent
           type: string
         name:
-          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to HEAD. Omit for `head`.
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
           type: string
       required:
       - kind
@@ -73,9 +73,9 @@ parameters:
     at:
       allOf:
       - $ref: '#/definitions/RevArg'
-      description: 'Where the ref points, for `create` and `move`. Leave it out for the checked-out HEAD.'
+      description: 'Where the ref points, for `create` and `move`. Leave it out for the branch you are on.'
     expected:
-      description: 'What the ref must currently hold, for `move` and `delete`. Leave it out and the current value is read here, still swapped atomically; give it to refuse the change if the ref moved since you looked.'
+      description: 'What the ref must currently hold, for `move` and `delete`. Leave it out and the current value is read — a branch''s from origin, a tag''s from this repository — still swapped atomically; give it to refuse the change if the ref moved since you looked.'
       type: string
     kind:
       allOf:
@@ -107,4 +107,4 @@ examples:
 - point the release branch at the commit I just recorded<|im_end|>
 - remove that bad tag from the repo<|im_end|>
 - start a branch from the previous commit<|im_end|>
-- I need a branch for this work, do not switch my checkout<|im_end|>
+- I need a branch for this work, but do not switch to it<|im_end|>

@@ -36,6 +36,7 @@ use std::collections::BTreeSet;
 use super::error::CheckoutError;
 use super::ledger::Ledger;
 use super::materialize::{read, stamp};
+use super::preserve::Ignored;
 use super::reclaim::reclaim;
 use super::target::{self, Found};
 use crate::file_delta::{self, TimedDelta};
@@ -62,6 +63,10 @@ pub fn capture(
     let base = Rev::Oid(base_oid);
 
     let mut candidates: BTreeSet<String> = ledger.paths().map(str::to_string).collect();
+    // What was ignored when the checkout's own state was set aside is its
+    // owner's, whatever this branch's rules say: never read back as the
+    // conversation's, unless the conversation wrote it.
+    let kept = Ignored::kept_in(repo)?;
     // Paths git reports untracked and nothing else: the base holds no copy of
     // them. (`git rm --cached` makes a path both a staged delete and
     // untracked — the base has that one.)
@@ -74,6 +79,9 @@ pub fn capture(
         }
         let path = entry.path().as_str().to_string();
         if matches!(entry, StatusEntry::Untracked { .. }) {
+            if kept.covers(path.as_bytes()) && ledger.entry(&path).is_none() {
+                continue;
+            }
             untracked.insert(path.clone());
         } else {
             tracked.insert(path.clone());

@@ -24,6 +24,7 @@
 mod log_file;
 mod self_heal;
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +37,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use zend::access;
 use zend::api;
-use zend::config::{layer_flag_sets, DaemonConfig, ModelChoice};
+use zend::config::{DaemonConfig, ModelChoice};
 use zend::download;
 use zend::log_broadcast::{BusWriter, LogBus};
 use zend::session::ZendSession;
@@ -88,26 +89,8 @@ struct Cli {
     /// its crashed-partial conversations are left exactly as they are. Use this
     /// to freeze a layer, or to run a projection whose ingest layers are
     /// deliberately empty.
-    ///
-    /// Use `--skip-layer` instead to keep a layer working and merely stop
-    /// reading from disk.
     #[arg(long = "disable-layer", value_name = "NAME")]
     disable_layer: Vec<String>,
-
-    /// Keep a turn-sink **layer** in service but skip LOADING it, by its schema
-    /// name. Repeatable.
-    ///
-    /// The layer is fully live: its existing turns compete in the provenance
-    /// gather, its hit levels are normalization-warmed on every boot, and its
-    /// crashed-partial conversations are retired. Only the reading is skipped —
-    /// no startup ingest pass and no watcher-driven refresh — so the substrate's
-    /// content for that layer is whatever is already there.
-    ///
-    /// This is the flag for "the corpus is built, stop re-reading the disk".
-    /// `--disable-layer` is the stronger one: it also removes the layer from
-    /// retrieval. Naming a layer in both is the same as disabling it.
-    #[arg(long = "skip-layer", value_name = "NAME")]
-    skip_layer: Vec<String>,
 
     /// Tombstone EVERY conversation in a turn-sink layer, by its schema name
     /// (e.g. `repo_map`, `code_reading`), before this load's registry is
@@ -467,9 +450,7 @@ async fn main() -> anyhow::Result<()> {
     // `self_heal.rs`.
     self_heal::spawn_watchdog(launch_spec, substrate_dir);
 
-    // Disjoint by construction: `--disable-layer` subsumes `--skip-layer`. The
-    // precedence lives in `layer_flag_sets`, where it is tested.
-    let (disabled_layers, skipped_layers) = layer_flag_sets(&cli.disable_layer, &cli.skip_layer);
+    let disabled_layers: HashSet<String> = cli.disable_layer.iter().cloned().collect();
 
     // `--ingest-dir <layer>=<path>` — parsed up front so a malformed pair fails
     // the launch rather than silently ingesting the whole workspace.
@@ -522,7 +503,6 @@ async fn main() -> anyhow::Result<()> {
         secrets,
         port: cli.port,
         disabled_layers: disabled_layers.clone(),
-        skipped_layers: skipped_layers.clone(),
         wiped_layers: cli.wipe_layer.iter().cloned().collect(),
         ingest_dirs: ingest_dirs.clone(),
         max_depth: cli.max_depth.map(|d| d as usize),
@@ -546,15 +526,6 @@ async fn main() -> anyhow::Result<()> {
             "--disable-layer: these layers are OUT OF SERVICE — not populated, not \
              gathered, not normalization-warmed, not cleaned up (their turns stay in \
              the substrate but cannot be selected)",
-        );
-    }
-    if !skipped_layers.is_empty() {
-        let mut names: Vec<&str> = skipped_layers.iter().map(String::as_str).collect();
-        names.sort_unstable();
-        tracing::info!(
-            layers = %names.join(", "),
-            "--skip-layer: these layers stay IN SERVICE — gathered, warmed and cleaned \
-             up — but nothing is read from disk for them this boot",
         );
     }
     if !cli.wipe_layer.is_empty() {

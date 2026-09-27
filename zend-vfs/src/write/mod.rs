@@ -5,6 +5,7 @@ pub mod apply;
 pub mod blobs;
 pub mod commit;
 pub mod fast_import;
+pub mod merge_text;
 pub mod merge_tree;
 pub mod pick;
 pub mod ref_txn;

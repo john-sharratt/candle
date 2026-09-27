@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::tools::file::grep::truncate;
 use zend_vfs::{
     BlameLine, Branch, CommitInfo, DiffEntry, DiffStatus, FileMode, GitTime, GrepHit, ObjectKind,
-    Remote, Signature, StatusCode, StatusEntry, Tag, TreeEntry, Upstream, Xy,
+    Published, Rejection, Remote, Signature, Tag, TreeEntry, Upstream,
 };
 
 #[derive(Serialize)]
@@ -134,84 +134,25 @@ impl From<&DiffEntry> for WireChange {
     }
 }
 
-fn status_code(c: StatusCode) -> &'static str {
-    match c {
-        StatusCode::Unmodified => "unmodified",
-        StatusCode::Modified => "modified",
-        StatusCode::TypeChanged => "type_changed",
-        StatusCode::Added => "added",
-        StatusCode::Deleted => "deleted",
-        StatusCode::Renamed => "renamed",
-        StatusCode::Copied => "copied",
-        StatusCode::Unmerged => "unmerged",
+/// Where a branch write landed: `origin` when origin took it, `local` when
+/// the repository has no origin and the local branch is the record.
+pub fn landed_on(published: &Published) -> &'static str {
+    match published {
+        Published::Pushed(_) => "origin",
+        Published::Local => "local",
+        Published::Refused(_) | Published::Behind => "nowhere",
     }
 }
 
-/// One path's working-tree state.
-///
-/// `staged` and `unstaged` are git's two sides — what differs between the last
-/// commit and the index, and between the index and the file on disk. A path
-/// can be both at once. **A side with nothing on it is left out** rather than
-/// spelled `"unmodified"`: nearly every path in a working tree changes on one
-/// side only, so the word was a third of every entry and said nothing.
-#[derive(Serialize)]
-pub struct WireStatus {
-    pub path: String,
-    /// `untracked`, `unmerged`, `renamed` or `changed`.
-    pub state: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staged: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unstaged: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from_path: Option<String>,
-}
-
-impl From<&StatusEntry> for WireStatus {
-    fn from(e: &StatusEntry) -> Self {
-        let path = e.path().as_str().to_string();
-        let side =
-            |code: StatusCode| (!matches!(code, StatusCode::Unmodified)).then(|| status_code(code));
-        let two = |xy: &Xy| (side(xy.index), side(xy.worktree));
-        match e {
-            StatusEntry::Untracked { .. } => Self {
-                path,
-                state: "untracked",
-                staged: None,
-                unstaged: None,
-                from_path: None,
-            },
-            StatusEntry::Changed { xy, .. } => {
-                let (staged, unstaged) = two(xy);
-                Self {
-                    path,
-                    state: "changed",
-                    staged,
-                    unstaged,
-                    from_path: None,
-                }
-            }
-            StatusEntry::Renamed { xy, from, .. } => {
-                let (staged, unstaged) = two(xy);
-                Self {
-                    path,
-                    state: "renamed",
-                    staged,
-                    unstaged,
-                    from_path: Some(from.as_str().to_string()),
-                }
-            }
-            StatusEntry::Unmerged { xy, .. } => {
-                let (staged, unstaged) = two(xy);
-                Self {
-                    path,
-                    state: "unmerged",
-                    staged,
-                    unstaged,
-                    from_path: None,
-                }
-            }
-        }
+/// Why origin refused a write, in words the model can act on.
+pub fn refusal(rejection: &Rejection) -> String {
+    match rejection {
+        Rejection::Stale => "origin's copy of the branch moved while this was being written, \
+                             so nothing was written"
+            .to_string(),
+        Rejection::AtomicAborted => "another change in the same push was refused".to_string(),
+        Rejection::Remote(why) => format!("origin refused it: {why}"),
+        Rejection::Other(why) => format!("origin refused it: {why}"),
     }
 }
 
@@ -247,7 +188,7 @@ pub struct WireBranch {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<WireUpstream>,
-    /// Whether this is the branch the developer has checked out.
+    /// Whether this is the branch the conversation is on.
     pub head: bool,
 }
 

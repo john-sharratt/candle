@@ -13,9 +13,16 @@
 //!   materialised onto a real checkout for a tool to run on, and what the tool
 //!   changed captured back as deltas.
 //! - **The sandbox** ([`sandbox`]) — one repository's whole command run as a
-//!   conversation: lock, reset onto its branch, lay its changes down, check
-//!   and run the command, read back and record what it changed, reset,
-//!   unlock.
+//!   conversation: lock, set aside what the checkout holds, put it on the
+//!   conversation's branch, lay its changes down, check and run the command,
+//!   read back and record what it changed, put the checkout's own state back,
+//!   unlock — and its server, which runs jobs in the background with their
+//!   output in a log file.
+//!
+//! A branch's record is origin ([`origin`]): a write goes there first and the
+//! local branch follows; a read stays local. A conversation's work joins a
+//! branch through [`work`]: a commit published whole or not at all, and a
+//! merge into the conversation's own copy.
 //!
 //! Writing the disk takes a [`DiskWriteGrant`], which only the tool layer's
 //! capability check issues.
@@ -44,6 +51,7 @@ pub mod file_changes;
 pub mod file_delta;
 pub mod files;
 mod kill_tree;
+pub mod origin;
 pub mod patch;
 mod read;
 mod redact;
@@ -54,6 +62,7 @@ mod setup;
 pub mod types;
 pub mod version;
 pub mod vfs;
+pub mod work;
 pub mod workspace;
 mod worktrees;
 mod write;
@@ -61,6 +70,7 @@ mod write;
 #[cfg(test)]
 mod testing;
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -70,6 +80,7 @@ pub use error::GitError;
 pub use file_changes::FileChanges;
 pub use file_delta::{FileDelta, FileTimes, Splice, TimedDelta};
 pub use files::{RepoFiles, UnknownRepo};
+pub use origin::{Published, Pulled, ORIGIN};
 pub use read::blame::{BlameLine, LineRange};
 pub use read::blob_reader::BlobReader;
 pub use read::diff::{DiffEntry, DiffSide, DiffStatus};
@@ -81,24 +92,31 @@ pub use read::refs::{Ancestor, Branch, Remote, Upstream};
 pub use read::remote_branches::RemoteBranch;
 pub use read::status::{StatusCode, StatusEntry, Xy};
 pub use read::tags::Tag;
-pub use read::tree::{ObjectKind, TreeEntry};
+pub use read::tree::{ObjectKind, SizedEntry, TreeEntry};
 pub use remote::fetch::{FetchFlag, FetchSpec, RefUpdate};
 pub use remote::ls_remote::RemoteRefs;
 pub use remote::manage::UrlKind;
 pub use remote::push::{
     Lease, PushAction, PushOutcome, PushResult, PushSpec, PushTarget, Rejection,
 };
-pub use sandbox::{CommandPolicy, RunOutcome, Sandbox, SandboxCommand, SandboxError};
+pub use sandbox::{
+    CommandPolicy, Job, JobHandle, JobId, JobInfo, JobNotFound, JobRequest, JobStatus,
+    OutputStream, RunOutcome, Sandbox, SandboxCommand, SandboxError, SandboxServer, StartedJob,
+    JOBS_DIR,
+};
 pub use setup::clone::CloneOptions;
 pub use types::{
     BranchName, FileMode, GitTime, ObjectFormat, Oid, RefName, RemoteName, RemoteUrl, RepoPath,
     Rev, Signature, TagName,
 };
-pub use vfs::{Snapshot, VfsError, VfsStore};
+pub use vfs::git_source::GitSource;
+pub use vfs::{has_markers, Base, FileState, Snapshot, VfsError, VfsStore};
+pub use work::{merge_into, Committing, Landed, Merged, NotCommitted};
 pub use workspace::{RepoSpec, Workspace, WorkspaceError, ALL_REPOS, MANIFEST_FILE};
 pub use worktrees::{Worktree, WorktreeCheckout};
 pub use write::apply::ApplyOutcome;
-pub use write::merge_tree::MergeOutcome;
+pub use write::merge_text::{MergeLabels, MergedText};
+pub use write::merge_tree::{MergeOutcome, PartialMerge};
 pub use write::pick::PickOutcome;
 pub use write::ref_txn::{RefOp, RefTransaction};
 pub use write::tags::TagAnnotation;
@@ -121,8 +139,8 @@ pub struct Repo {
     write: Mutex<()>,
 }
 
-impl std::fmt::Debug for Repo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Repo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Repo")
             .field("dir", &self.dir)
             .field("format", &self.format)

@@ -7,6 +7,7 @@
 
 mod harness;
 
+mod conversation;
 mod reads;
 mod remote;
 mod writes;

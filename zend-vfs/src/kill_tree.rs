@@ -140,6 +140,15 @@ mod imp {
             }
         }
     }
+
+    impl Drop for Tree {
+        /// Whatever is still in the group goes with the last handle on it, as
+        /// a Windows job's does — so a run whose future is dropped part way
+        /// leaves nothing of its command running.
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
 }
 
 /// Set `command` up to start a tree [`ProcessTree::adopt`] can kill.

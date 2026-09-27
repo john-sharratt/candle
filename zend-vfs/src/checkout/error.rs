@@ -27,6 +27,18 @@ pub enum CheckoutError {
     /// laid over. Nothing of the conversation's has been written.
     #[error("{branch} moved while the checkout was being put on it; run again")]
     BranchMoved { branch: String },
+    /// The checkout's own state, set aside while a run used it, could not be
+    /// put back. It is kept whole — the journal in `journal` names the
+    /// commits under `refs/zend/preserved/` and the files moved aside beside
+    /// it — and the next run puts it back before doing anything else.
+    #[error(
+        "the checkout's own state could not be put back yet; it is kept whole, journalled in \
+         {journal}, and the next run finishes putting it back before anything else: {detail}"
+    )]
+    NotPutBack { journal: String, detail: String },
+    /// A preservation's journal could not be written or read.
+    #[error("the checkout's preservation journal {0}")]
+    Journal(String),
     /// `path` could lead outside the checkout, or into its git database, or
     /// names something that is not a file.
     #[error("{path}: {why}")]
@@ -39,6 +51,10 @@ impl CheckoutError {
             path: path.to_string(),
             source,
         }
+    }
+
+    pub(crate) fn journal(detail: impl Into<String>) -> Self {
+        CheckoutError::Journal(detail.into())
     }
 
     pub(crate) fn unsafe_path(path: &str, why: &str) -> Self {

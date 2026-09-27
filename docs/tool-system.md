@@ -946,13 +946,13 @@ one of these tools is a thin request/response shell over that crate.
 | | Tools | Declares | Offered in |
 |---|---|---|---|
 | **Readers** | `git_status`, `git_log`, `git_show`, `git_grep`, `git_refs` | nothing | Restricted and up |
-| **Writers** | `git_commit`, `git_ref` | `disk_write` | **Mutable only** |
-| **Remote writers** | `git_fetch`, `git_push` | `disk_write` + `network` | **Mutable only** |
+| **Writers** | `git_commit`, `git_merge`, `git_ref`, `git_switch`, `git_reset`, `git_fetch`, `git_push` | `disk_write` + `network` | **Mutable only** |
 
 Reads and writes stay separate **tools**, never modes of one tool, because
-that split is what the capability check binds to.
+that split is what the capability check binds to. Every writer declares
+`network`: a branch write is kept only once origin has it.
 
-### Nine tools, with the distinctions inside them
+### Twelve tools, with the distinctions inside them
 
 The constrained decoder guarantees a call's *structure* — an enum field can
 only decode to one of its listed values. What nothing enforces is which
@@ -965,14 +965,20 @@ So every distinction that was measured costing a wrong tool choice moved
 |---|---|---|
 | `git_show` | `what: changes \| patch \| file \| tree \| blame` | `git_diff`, `git_file`, `git_blame` |
 | `git_refs` | `kind: branches \| tags \| remotes \| remote_branches` | `git_branches`, `git_tags`, `git_remotes` |
-| `git_commit` | `from: files \| patch \| cherry_pick \| revert` | `git_apply`, `git_pick` |
+| `git_commit` | `from: changes \| files \| patch \| cherry_pick \| revert` | `git_apply`, `git_pick` |
 | `git_ref` | `kind × action` | `git_branch`, `git_tag` |
+| `git_switch` | `create` | `git_checkout` |
+| `git_reset` | `mode: soft \| hard` | `git_restore`, `undo_commit`, `discard_changes` |
+| `git_merge` | `from` (defaults to origin's copy of your branch) | `git_pull`, `merge_branch` |
 
 The file-versus-patch choice was the family's most common routing mistake —
 asked for a file's contents at a commit the model reached for the patch tool,
 looped, and on one turn claimed content it had never fetched. As `what` it
 cannot be got wrong. Seventeen tools became nine, and the family's rendered
-size fell by roughly 80% with no capability lost.
+size fell by roughly 80% with no capability lost; `git_switch` and `git_reset`
+came after, when conversations began working on branches of their own, and
+`git_merge` when a commit became one attempt that is refused, rather than
+rebuilt, when the branch has moved on.
 
 Names a model reaches for by habit resolve as aliases to the tool that does
 the job: `git_diff` or `git_blame` lands on `git_show`, which picks the mode
@@ -997,39 +1003,83 @@ the null device, and each call is bounded by a timeout with a process-tree
 kill. It is a reader with a subprocess inside it, in the same sense that the
 VFS is a reader with a `read(2)` inside it.
 
-### The working tree is never touched
+### A conversation is on a branch, and origin is the record
 
-No git tool writes the checkout, the index or `HEAD`. A commit is built as
-objects and published by moving a branch under compare-and-swap; a branch
-checked out in any worktree is refused rather than moved under the developer's
-feet; a worktree diff hashes rather than refreshing the index. So a tool call
-can never disturb uncommitted work, which is what makes the writers safe enough
-to offer at all.
+A repository's folder is whoever's working copy it is — the sandbox only
+borrows it — so no git tool reads or writes a working tree, an index or a
+checked-out `HEAD`. Instead:
 
-Three consequences the model has to be told, and the descriptions do tell it:
+- **Each conversation is on one branch per repository, at its own base** — its
+  file store's — and that base commit is what `HEAD` means to every git tool.
+  It moves only when the conversation commits, merges, switches or resets:
+  another writer's commit changes nothing the conversation reads until it
+  merges. Its uncommitted work is its file store's changes over the base:
+  `git_status` lists them (and `incoming` — commits the branch has that it
+  does not), `git_commit` commits them, `git_merge` brings others' commits
+  into them, `git_switch` carries them to another branch, and `git_reset`
+  keeps them (`soft`) or discards them (`hard`). zend saves the branch and the
+  base with the conversation's state after every tool round.
+- **Writes go to origin; reads stay local** (`zend_vfs::origin`), and **nothing
+  anyone wrote is ever lost**. A commit is one attempt, published whole or not
+  at all: it is refused — with nothing written anywhere and the conversation's
+  files untouched — when origin holds commits the conversation does not have,
+  when origin moves while it is pushed, or while a merge's conflicts are
+  unsettled, and the refusal says what to do. `git_merge` then brings origin's
+  commits into the conversation's own copy, as `git merge` does into a working
+  tree: where both sides changed the same lines, both are kept between
+  conflict markers and the file is listed until a write settles it; with
+  history on both sides, the next commit records the merge with both parents.
+  No commit is ever rewritten: a diverged local branch is left as it is. A
+  rewind (`git_reset` back, `git_ref` `move`) is pushed under a lease, and
+  `git_reset` refuses to move a branch that has commits the conversation never
+  saw. A repository with no `origin` keeps its record locally. Reads never wait
+  on the network: they read the local refs, as current as the last fetch left
+  them.
 
-- `git_commit`'s `take` action commits a file **exactly as it stands on disk**
-  and needs no content. It exists because the alternative — requiring the model
-  to reproduce a file it may not have read — is the one dead end in this family
+What the model has to be told, and the descriptions do tell it:
+
+- `git_commit`'s `take` action commits a file **exactly as you hold it** and
+  needs no content, and `from: changes` commits every uncommitted change at
+  once. `take` exists because the alternative — requiring the model to
+  reproduce a file it may not have read — is the one dead end in this family
   whose invented output would be *committed*. `write` is for content the model
-  genuinely authored. `take` reads through the repository's file store, the
-  same guarded route `file_read` takes, so a path that leaves the repository
-  (a drive-qualified `C:/…`, a link leading out) or reaches a protected folder
-  is refused here exactly as it is there. A `patch` is held to the same rules,
-  judged by the tree it produces.
-- Committing does not stage anything, and does not switch branches. A branch
-  must already exist (`git_ref` creates one) and must not be checked out.
+  genuinely authored. Both read through the conversation's file store, the
+  same guarded route `file_read` takes, so a protected path is refused here
+  exactly as it is there. A `patch` is held to the same rules, judged by the
+  tree it produces.
+- Once committed, the changes read from the branch itself and are no longer
+  uncommitted — the file store lets go of what the branch now holds.
+- A branch must already exist to commit on it (`git_switch` makes one); the
+  branch a conversation is on cannot be deleted, and is moved only by
+  `git_reset`, which moves the conversation's files with it — a `git_ref`
+  move under them would leave them on a commit the branch no longer holds.
+- A file in conflict holds everything until it is settled: no commit takes
+  it, on any branch, and neither `git_merge` nor `git_switch` runs — one
+  would merge its markers as content, the other carry them elsewhere.
 - A cherry-pick or revert that conflicts reports the conflicting paths and
-  commits nothing. There is no in-progress state to abort, unlike git's own.
+  commits nothing. The one in-progress state is a merge being finished: it is
+  committed whole with `from: changes` — `files` and `patch` are refused —
+  or abandoned with a hard `git_reset`.
+- A soft `git_reset` keeps what the commits it moves past changed as
+  uncommitted changes, so it is refused, before anything moves, when one of
+  those files is not text.
 
 ### Every ref move is a compare-and-swap, without requiring a value
 
-`git_ref` takes `expected`, and `git_commit` an `expected_head` — but both are
-**optional**, and omitting them is the ordinary case: the layer reads the
-ref's current value and swaps against that, still atomically. `git_push`'s
+`git_ref` takes `expected`, and `git_commit` and `git_reset` an
+`expected_head` — but all are **optional**, and omitting them is the ordinary
+case: the layer reads the ref's current value — a branch's from origin, a
+tag's from this repository — and swaps against that, still atomically. `git_push`'s
 lease works the same way, defaulting to this repository's remote-tracking
 ref, which is what `--force-with-lease` does by default and is the value that
 actually protects a concurrent push.
+
+Two writes need the value, because without it they would discard something
+the model has not seen: a `git_ref` `move` that takes commits off a branch,
+and a `git_commit` of the conversation's files onto *another* branch that has
+changed one of those files since the conversation's base. Each refusal names
+the tip it would overwrite, so giving it back is a read of the response, not
+an invention — and it is the model saying it looked.
 
 That is a deliberate change from requiring them. A guard the model can only
 satisfy by inventing an object id is not a guard; it is a prompt to fabricate.

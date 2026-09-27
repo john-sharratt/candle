@@ -1,29 +1,32 @@
-//! Starting a sandboxed command and reading what it prints.
+//! Starting a sandboxed command and passing on what it prints.
 //!
 //! The command runs in the repository's folder with nothing on its standard
-//! input, and its output is read while it runs — both streams at once, so a
-//! program that fills one pipe while the other is being waited on cannot
-//! stall. Each stream keeps its first [`MAX_STREAM_BYTES`] and counts the
-//! rest, so a runaway log cannot exhaust the daemon's memory.
+//! input. Both of its output streams are read while it runs — at once, so a
+//! program that fills one pipe while the other is being waited on cannot stall
+//! — and written to one sink the caller gives, each chunk as it arrives: the
+//! sink holds what the command printed in the order the two streams delivered
+//! it. Past [`MAX_OUTPUT_BYTES`] the rest is read and counted but not written,
+//! so a runaway log cannot fill the disk; a sink that fails to take a write is
+//! treated the same way, and the command runs on.
 //!
 //! The command and everything it starts are one process tree
 //! ([`ProcessTree`]). The tree is killed when the command exits — a build
 //! server or a watcher it left behind must not go on changing the checkout
-//! after the run has captured it and handed it to the next conversation — and
-//! when it outlives its timeout.
+//! after the run has captured it and handed it to the next conversation —
+//! when it outlives its timeout, and when the run is abandoned part way.
 
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::command::SandboxCommand;
-use super::outcome::Stream;
+use super::outcome::Output;
 use crate::kill_tree::{self, ProcessTree};
 
-/// The most of each output stream a run keeps.
-pub const MAX_STREAM_BYTES: usize = 1024 * 1024;
+/// The most of a command's output a run writes to its sink.
+pub const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What running a command produced.
 #[derive(Debug)]
@@ -31,12 +34,16 @@ pub(crate) struct Executed {
     /// The exit code; `None` when the command was killed or ended by a signal.
     pub exit_code: Option<i32>,
     pub timed_out: bool,
-    pub stdout: Stream,
-    pub stderr: Stream,
+    pub output: Output,
 }
 
-/// Run `command` in `dir` to completion, or until its timeout.
-pub(crate) async fn execute(dir: &Path, command: &SandboxCommand) -> io::Result<Executed> {
+/// Run `command` in `dir` to completion, or until its timeout, writing what
+/// it prints to `sink`.
+pub(crate) async fn execute(
+    dir: &Path,
+    command: &SandboxCommand,
+    sink: &mut (dyn AsyncWrite + Unpin + Send),
+) -> io::Result<Executed> {
     let program = if command.is_repository_program() {
         let rel = command
             .program
@@ -82,39 +89,70 @@ pub(crate) async fn execute(dir: &Path, command: &SandboxCommand) -> io::Result<
             Err(_) => child.wait().await.map(|_| (None, true)),
         }
     };
-    let (status, stdout, stderr) = tokio::join!(waited, read_capped(stdout), read_capped(stderr));
+    let (status, output) = tokio::join!(waited, pump(stdout, stderr, sink, MAX_OUTPUT_BYTES));
     let (exit_code, timed_out) = status?;
     Ok(Executed {
         exit_code,
         timed_out,
-        stdout: stdout?,
-        stderr: stderr?,
+        output: output?,
     })
 }
 
-/// Read `reader` to its end, keeping the first [`MAX_STREAM_BYTES`].
-async fn read_capped(mut reader: impl AsyncRead + Unpin) -> io::Result<Stream> {
-    let mut kept = Vec::new();
-    let mut total: u64 = 0;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buf).await?;
+/// Read both streams to their ends, writing each chunk to `sink` as it comes,
+/// up to `cap` bytes in all.
+async fn pump(
+    mut stdout: impl AsyncRead + Unpin,
+    mut stderr: impl AsyncRead + Unpin,
+    sink: &mut (dyn AsyncWrite + Unpin + Send),
+    cap: u64,
+) -> io::Result<Output> {
+    let mut out_buf = vec![0u8; 64 * 1024];
+    let mut err_buf = vec![0u8; 64 * 1024];
+    let (mut out_open, mut err_open) = (true, true);
+    let mut bytes: u64 = 0;
+    let mut written: u64 = 0;
+    let mut sink_open = true;
+    while out_open || err_open {
+        let (n, from_out) = tokio::select! {
+            read = stdout.read(&mut out_buf), if out_open => (read?, true),
+            read = stderr.read(&mut err_buf), if err_open => (read?, false),
+        };
         if n == 0 {
-            break;
+            if from_out {
+                out_open = false;
+            } else {
+                err_open = false;
+            }
+            continue;
         }
-        total += n as u64;
-        let room = MAX_STREAM_BYTES.saturating_sub(kept.len());
-        kept.extend_from_slice(&buf[..n.min(room)]);
+        bytes += n as u64;
+        let room = cap.saturating_sub(written).min(n as u64) as usize;
+        if room == 0 || !sink_open {
+            continue;
+        }
+        let chunk = if from_out {
+            &out_buf[..room]
+        } else {
+            &err_buf[..room]
+        };
+        match sink.write_all(chunk).await {
+            Ok(()) => written += room as u64,
+            Err(_) => sink_open = false,
+        }
     }
-    Ok(Stream {
-        text: String::from_utf8_lossy(&kept).into_owned(),
-        bytes: total,
-        truncated: total > kept.len() as u64,
+    if sink_open && sink.flush().await.is_err() {
+        sink_open = false;
+    }
+    Ok(Output {
+        bytes,
+        truncated: !sink_open || written < bytes,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -128,10 +166,10 @@ mod tests {
         }
     }
 
-    /// **Both streams and the exit code come back**, and the command runs in
-    /// the folder it was given.
+    /// **Both streams reach the sink and the exit code comes back**, and the
+    /// command runs in the folder it was given.
     #[tokio::test]
-    async fn output_and_exit_code_are_captured() {
+    async fn output_and_exit_code_come_back() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("here.txt"), b"in the folder").unwrap();
         let script = if cfg!(windows) {
@@ -139,16 +177,17 @@ mod tests {
         } else {
             "cat here.txt; echo to-stderr 1>&2; exit 3"
         };
-        let done = execute(dir.path(), &shell(script)).await.unwrap();
+        let mut sink = Vec::new();
+        let done = execute(dir.path(), &shell(script), &mut sink)
+            .await
+            .unwrap();
         assert_eq!(done.exit_code, Some(3));
         assert!(!done.timed_out);
-        assert!(
-            done.stdout.text.starts_with("in the folder"),
-            "{:?}",
-            done.stdout
-        );
-        assert_eq!(done.stderr.text.trim_end(), "to-stderr");
-        assert!(!done.stdout.truncated);
+        let text = String::from_utf8(sink).unwrap();
+        assert!(text.contains("in the folder"), "{text:?}");
+        assert!(text.contains("to-stderr"), "{text:?}");
+        assert_eq!(done.output.bytes, text.len() as u64);
+        assert!(!done.output.truncated);
     }
 
     /// **A command that outlives its timeout is killed** — promptly, not when
@@ -165,6 +204,7 @@ mod tests {
         let done = execute(
             dir.path(),
             &shell(script).timeout(Duration::from_millis(500)),
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -177,28 +217,66 @@ mod tests {
         );
     }
 
-    /// **Output past the cap is counted, not kept.**
+    /// **Output past the cap is counted, not written**, from either stream.
     #[tokio::test]
-    async fn output_past_the_cap_is_counted_not_kept() {
-        let big = vec![b'x'; MAX_STREAM_BYTES + 10];
-        let stream = read_capped(&big[..]).await.unwrap();
-        assert_eq!(stream.text.len(), MAX_STREAM_BYTES);
-        assert_eq!(stream.bytes, (MAX_STREAM_BYTES + 10) as u64);
-        assert!(stream.truncated);
-        let small = read_capped(&b"abc"[..]).await.unwrap();
+    async fn output_past_the_cap_is_counted_not_written() {
+        let mut sink = Vec::new();
+        let out = pump(&b"abcdef"[..], &b"ghij"[..], &mut sink, 8)
+            .await
+            .unwrap();
+        assert_eq!(out.bytes, 10);
+        assert!(out.truncated);
+        assert_eq!(sink.len(), 8);
+
+        let mut sink = Vec::new();
+        let out = pump(&b"abc"[..], &b""[..], &mut sink, 8).await.unwrap();
         assert_eq!(
-            (small.text.as_str(), small.bytes, small.truncated),
-            ("abc", 3, false)
+            (sink.as_slice(), out.bytes, out.truncated),
+            (&b"abc"[..], 3, false)
         );
+    }
+
+    /// A sink that refuses writes.
+    struct Broken;
+
+    impl AsyncWrite for Broken {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::other("disk full")))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// **A sink that fails is given up on, and the command still runs to its
+    /// end** — its output read and counted, so it never blocks on a full pipe.
+    #[tokio::test]
+    async fn a_failing_sink_does_not_stop_the_command() {
+        let out = pump(&b"abcdef"[..], &b"gh"[..], &mut Broken, 64)
+            .await
+            .unwrap();
+        assert_eq!(out.bytes, 8);
+        assert!(out.truncated);
     }
 
     /// A program that does not exist is an error, not an outcome.
     #[tokio::test]
     async fn a_missing_program_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let e = execute(dir.path(), &SandboxCommand::new("no-such-program-zend-vfs"))
-            .await
-            .unwrap_err();
+        let e = execute(
+            dir.path(),
+            &SandboxCommand::new("no-such-program-zend-vfs"),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 }

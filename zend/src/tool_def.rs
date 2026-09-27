@@ -721,7 +721,7 @@ mod tests {
         let commit = spec("git_commit");
         assert_eq!(
             sorted(&field(&commit.params, "from"), "git_commit's from"),
-            ["cherry_pick", "files", "patch", "revert"]
+            ["changes", "cherry_pick", "files", "patch", "revert"]
         );
         let change_fields = field(&commit.params, "changes")
             .items
@@ -746,6 +746,20 @@ mod tests {
         assert_eq!(
             sorted(&field(&git_ref.params, "action"), "git_ref's action"),
             ["create", "delete", "move"]
+        );
+
+        // What a reset does to the work, and where a new branch starts.
+        assert_eq!(
+            sorted(
+                &field(&spec("git_reset").params, "mode"),
+                "git_reset's mode"
+            ),
+            ["hard", "soft"]
+        );
+        let switch = spec("git_switch");
+        assert!(
+            field(&switch.params, "from").properties.is_some(),
+            "a new branch's start is a revision"
         );
 
         // A push item's action, inside the array.
@@ -815,7 +829,10 @@ mod tests {
             "git_grep",
             "git_refs",
             "git_commit",
+            "git_merge",
             "git_ref",
+            "git_switch",
+            "git_reset",
             "git_fetch",
             "git_push",
         ];

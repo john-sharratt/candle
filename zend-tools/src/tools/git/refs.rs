@@ -55,7 +55,7 @@ pub struct RefsResponse {
     pub kind: &'static str,
     /// How many refs of this kind exist, so "how many" is read, not counted.
     pub count: usize,
-    /// The branch checked out, when listing branches.
+    /// The branch this conversation is on, when listing branches.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
     pub paging: Paging,
@@ -75,7 +75,7 @@ impl Tool for GitRefs {
     const NAME: &'static str = "git_refs";
     const DESCRIPTION: &'static str =
         "List a repository's refs. `kind` picks which: `branches` gives local branches \
-         with the commit each points at, which one is checked out, and how far ahead or \
+         with the commit each points at, which one you are on, and how far ahead or \
          behind its upstream it is; `tags` gives tags with the commit each finally points \
          at and whether it is annotated; `remotes` gives configured remotes and their URLs \
          (credentials redacted); `remote_branches` gives the remote-tracking branches from \
@@ -112,8 +112,7 @@ impl Tool for GitRefs {
 
         match req.kind {
             RefKind::Branches => {
-                let head = repo.head()?;
-                let current = head.branch().map(|b| b.as_str().to_string());
+                let current = repo.branch().map(|b| b.as_str().to_string());
                 let all = repo.branches()?;
                 let paging = Paging::of(all.len(), page, PER_PAGE);
                 out.kind = "branches";

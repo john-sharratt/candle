@@ -54,7 +54,7 @@ parameters:
           minimum: 0.0
           type: integer
         kind:
-          description: 'Which form: `head` (what is checked out, needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or HEAD''s upstream when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          description: 'Which form: `head` (your own commit — the branch you are on as your files have it — needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
           enum:
           - head
           - branch
@@ -66,7 +66,7 @@ parameters:
           - parent
           type: string
         name:
-          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to HEAD. Omit for `head`.
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
           type: string
       required:
       - kind
@@ -96,7 +96,7 @@ parameters:
     rev:
       allOf:
       - $ref: '#/definitions/RevArg'
-      description: Where to start walking back from. Leave it out for the checked-out HEAD.
+      description: Where to start walking back from. Leave it out for the branch you are on.
     since:
       allOf:
       - $ref: '#/definitions/RevArg'

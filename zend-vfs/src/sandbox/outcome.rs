@@ -2,14 +2,13 @@
 
 use crate::file_delta::TimedDelta;
 
-/// One output stream of the command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stream {
-    /// What the stream held, up to the cap, with any invalid UTF-8 replaced.
-    pub text: String,
-    /// How many bytes the command wrote to it in all.
+/// What the command printed, as its sink took it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Output {
+    /// How many bytes the command wrote to its two streams together.
     pub bytes: u64,
-    /// Whether `text` stops short of everything the command wrote.
+    /// Whether the sink holds less than that — the output ran past the cap,
+    /// or the sink stopped taking writes.
     pub truncated: bool,
 }
 
@@ -24,7 +23,7 @@ pub struct ChangedFile {
 
 /// A file the command changed that the conversation's store could not take —
 /// a binary file, or one that would put the store over its size cap. The
-/// change is reported here rather than lost; the checkout no longer holds it.
+/// change is reported here rather than lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unrecorded {
     pub path: String,
@@ -33,7 +32,7 @@ pub struct Unrecorded {
     pub why: String,
 }
 
-/// Everything one run produced.
+/// Everything one run produced besides its output, which went to the sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
     /// The command's exit code; `None` when it was killed or ended by a
@@ -41,8 +40,7 @@ pub struct RunOutcome {
     pub exit_code: Option<i32>,
     /// Whether it was killed for running past its timeout.
     pub timed_out: bool,
-    pub stdout: Stream,
-    pub stderr: Stream,
+    pub output: Output,
     /// What the command changed, now in the conversation's store, in path
     /// order.
     pub changed: Vec<ChangedFile>,

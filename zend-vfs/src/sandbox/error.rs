@@ -22,6 +22,29 @@ pub enum SandboxError {
         "the conversation's files are written to disk directly; a sandbox runs over an overlay"
     )]
     DirectStore,
+    /// The conversation's store reads another branch than the job's — or the
+    /// repository's folder rather than a branch at all.
+    #[error("the conversation's files read {reads:?}, not the job's branch {branch}")]
+    WrongBranch {
+        branch: String,
+        reads: Option<String>,
+    },
+    /// The conversation's changes are made on another commit than the job's
+    /// branch holds — it has not merged what the branch has gained, or is
+    /// finishing a merge — and a checkout of the branch is not what they
+    /// were made on.
+    #[error(
+        "the conversation's files are made on {base}, but {branch} holds {tip}; merge the \
+         branch into them, or finish the merge under way, before running a command"
+    )]
+    BaseNotBranch {
+        branch: String,
+        base: String,
+        tip: String,
+    },
+    /// The conversation's store could not give its changes.
+    #[error("the conversation's files could not be read: {0}")]
+    Store(String),
     /// Putting the checkout in place, or reading back what the command
     /// changed, failed.
     #[error(transparent)]
@@ -40,12 +63,4 @@ pub enum SandboxError {
     /// runtime is shutting down.
     #[error("a sandbox step was interrupted: {0}")]
     Interrupted(String),
-    /// The checkout could not be reset after the run. `run` is how the run
-    /// itself ended, when it failed first. Nothing was recorded in the
-    /// conversation's store.
-    #[error("the checkout could not be reset after the run: {reset}")]
-    Reset {
-        reset: Box<SandboxError>,
-        run: Option<Box<SandboxError>>,
-    },
 }
