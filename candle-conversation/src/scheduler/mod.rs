@@ -5945,18 +5945,28 @@ impl Scheduler {
             self.free_summary_slot(slot);
             return;
         }
-        let block_count = self.session.sequence_block_count(slot.0).unwrap_or(0);
+        // **The block count comes from the snapshot, not from the slot**, and one
+        // resolution serves both the slice and the `sign(Q)` gather below so they
+        // cannot disagree. `snapshot_sequence_per_layer` drops each layer's trailing
+        // empty chunk while `sequence_block_count` counts it, so the two differ by one
+        // whenever that chunk is empty — see the note in
+        // `projection_assembler::apply_projection`, where the same pair made a boot
+        // from a fresh substrate impossible.
+        let block_count;
         let sealed_gpu = match self.session.snapshot_sequence_per_layer(slot.0) {
-            Ok(snap) => match slice_per_layer_sealed(&snap, 0, block_count) {
-                Ok(sliced) => sliced,
-                Err(e) => {
-                    let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
-                        "SubmitSummaryProbe: reproject slice: {e}"
-                    ))));
-                    self.free_summary_slot(slot);
-                    return;
+            Ok(snap) => {
+                block_count = snap.iter().map(|s| s.chunks.len()).min().unwrap_or(0);
+                match slice_per_layer_sealed(&snap, 0, block_count) {
+                    Ok(sliced) => sliced,
+                    Err(e) => {
+                        let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
+                            "SubmitSummaryProbe: reproject slice: {e}"
+                        ))));
+                        self.free_summary_slot(slot);
+                        return;
+                    }
                 }
-            },
+            }
             Err(e) => {
                 let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
                     "SubmitSummaryProbe: reproject snapshot: {e}"

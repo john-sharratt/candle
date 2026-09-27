@@ -1917,15 +1917,6 @@ fn drive_prefill_and_capture(
             ))
         })?;
     forward_tokens(ctx, tokens)?;
-    let end_block = ctx
-        .session
-        .sequence_block_count(parent_id.0)
-        .ok_or_else(|| {
-            ConversationError::Channel(format!(
-                "apply_projection: slot {} not in session",
-                parent_id
-            ))
-        })?;
 
     let captured = {
         let _g = profile::span("prefill:snapshot");
@@ -1933,6 +1924,31 @@ fn drive_prefill_and_capture(
             .session
             .snapshot_sequence_per_layer(parent_id.0)
             .map_err(ConversationError::Model)?;
+        // **The end of the range comes from the SNAPSHOT, never from the live
+        // slot.** `snapshot_sequence_per_layer` drops each layer's trailing empty
+        // chunk (`SealedSequence::drop_empty_tail`) so a skew can never be captured
+        // into a `CapturedSpan` and re-injected; `sequence_block_count` counts that
+        // chunk, because the slot really does hold it. Asking the slot and slicing
+        // the snapshot therefore disagreed by exactly one whenever the tail chunk was
+        // empty — which `reconcile_block_counts` above can make true on *every* layer
+        // at once, so all of them dropped it and the range ran one past all of them.
+        // That is a hard refusal from `slice_per_layer_sealed`, and it made a boot
+        // from a fresh substrate impossible: measured `seal range 40..49 is outside
+        // layer 0's 48 sealed chunk(s)`, identical on every attempt, while the old
+        // substrate masked it by having nothing left to ingest.
+        //
+        // Deriving it here is what the two sibling seal paths already do
+        // (`start_block + sealed[0].chunks.len()`), and it is lossless by the same
+        // argument that justifies the drop: an empty chunk holds no token and no
+        // position moves. The minimum across layers rather than layer 0's, so a
+        // layer that dropped one while others did not still yields a range every
+        // layer can satisfy — and a `min` that lands *below* `start_block` is left to
+        // fail, because that is a real divergence and not a tail to trim.
+        let end_block = full
+            .iter()
+            .map(|s| s.chunks.len())
+            .min()
+            .unwrap_or(start_block);
         slice_per_layer_sealed(&full, start_block, end_block)?
     };
     // The index rows this forward just built, taken as a page so a later

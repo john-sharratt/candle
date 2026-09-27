@@ -3366,14 +3366,27 @@ impl BatchedInferenceSession {
     /// to `recorded_metas`).
     ///
     /// Returns an error if the sequence is not allocated.
+    /// The trailing empty chunk is dropped here for the same reason
+    /// [`Self::snapshot_sequence_per_layer`] drops it, and the two **must** agree:
+    /// they are two views of the same layer, and callers resolve a block range
+    /// against one and then slice the other. Without this they differed by exactly
+    /// one whenever the writer chunk was empty — `record_turn` reports it because the
+    /// slot really holds it — and `resolve_seal_range` clamped a seal to the longer
+    /// count. Measured: `seal range 40..49 is outside layer 0's 48 sealed chunk(s)`,
+    /// deterministic on every boot from a fresh substrate, which made the daemon
+    /// unable to start at all; an existing substrate hid it by leaving nothing to
+    /// ingest. Lossless, by the argument that justifies the drop downstream: an empty
+    /// chunk holds no token, so no range and no position moves.
     pub fn snapshot_sequence(&self, idx: usize) -> Result<candle_nn::kv_cache::SealedSequence> {
         let backing = self
             .backings
             .first()
             .ok_or_else(|| candle::Error::Msg("snapshot_sequence: no backings".into()))?;
-        backing
+        let mut seq = backing
             .record_turn(idx)
-            .map_err(|e| candle::Error::Msg(format!("snapshot_sequence: {e}")))
+            .map_err(|e| candle::Error::Msg(format!("snapshot_sequence: {e}")))?;
+        seq.drop_empty_tail();
+        Ok(seq)
     }
 
     /// Snapshot a sequence into per-layer `SealedSequence`s, one
