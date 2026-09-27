@@ -756,15 +756,34 @@ impl ChunkedKvBacking {
         // taken from the backing's *live* `n_palette()` — the single latent carries four
         // times GQA's bands — so the key follows the geometry with nothing cached to go
         // stale against it. See `docs/vram_span_partition.md` §8.
-        // Checked before the call, because `for_records` *panics* on an oversized record
-        // and this runs on the seal and persistence threads — a panic there poisons the
-        // locks that the rest of this module `expect`s on, turning one bad geometry into
-        // unrelated failures everywhere.
+        // **Both geometry checks run before a single slot is claimed.** They used to sit
+        // in `fill_records_on_device`, after the claims, so a non-conforming geometry
+        // allocated and then freed N record slots on every seal for the life of the
+        // process. Nothing here has allocated yet, so a refusal costs nothing.
+        //
+        // The size check is here rather than inside `for_records` because that function
+        // *panics*, and this runs on the seal and persistence threads — a panic there
+        // poisons the locks the rest of this module `expect`s on, turning one bad geometry
+        // into unrelated failures everywhere.
         if rb > super::arena::RECORD_STRIDES[super::arena::RECORD_STRIDES.len() - 1] {
             candle::bail!(
                 "a {rb} B KvHead record ({n_kv_head} heads x head_dim {head_dim} x \
                  {n_palette} bands) exceeds the largest record stride. Add a rung to \
                  RECORD_STRIDES, checking it against GID_STRIDE."
+            );
+        }
+        // The fill kernel stores band pointers as `uint64_t` at `head_dim / 2 + p * 8`
+        // within heads `head_sz` apart, so both must be 8-aligned or the store faults.
+        // `head_dim % 16 == 0` gives the first, `n_palette % 4 == 0` the second. The host
+        // serializer never had to care — unaligned writes are legal there — which is why
+        // this was invisible until the fill moved to the device.
+        let head_sz = head_dim / 2 + n_palette * 26;
+        if !head_dim.is_multiple_of(16) || !head_sz.is_multiple_of(8) {
+            candle::bail!(
+                "KvHead record geometry is not 8-byte aligned: head_dim {head_dim} \
+                 (needs % 16 == 0) and per-head size {head_sz} (needs % 8 == 0) at \
+                 n_palette {n_palette}. The fill kernel stores band pointers as uint64_t, \
+                 which faults on an unaligned address."
             );
         }
         let record_key = ArenaKey::for_records(ArenaLocation::Gpu, rb);
@@ -822,7 +841,7 @@ impl ChunkedKvBacking {
     ) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+            use candle::cuda_backend::cudarc::driver::DevicePtr;
             use candle::cuda_backend::kernels::simple::kv_record_fill as krf;
 
             /// A derived-only input still needs one byte of device memory so its pointer is
@@ -836,6 +855,12 @@ impl ChunkedKvBacking {
             fn pad1_f32(mut v: Vec<f32>) -> Vec<f32> {
                 if v.is_empty() {
                     v.push(0.0);
+                }
+                v
+            }
+            fn pad1_i64(mut v: Vec<i64>) -> Vec<i64> {
+                if v.is_empty() {
+                    v.push(0);
                 }
                 v
             }
@@ -861,25 +886,9 @@ impl ChunkedKvBacking {
             let bands = n_kv_head * n_palette * 2;
             let tags = n_kv_head * n_palette;
 
-            // **The record's pointer words must be 8-byte aligned, or the kernel's
-            // stores fault.** A band pointer lives at `head_dim / 2 + p * 8` inside a
-            // head, and heads are `head_dim / 2 + n_palette * 26` apart, so both have to
-            // be multiples of 8 for a `uint64_t` store to be legal on the device —
-            // `head_dim % 16 == 0` gives the first and `n_palette % 4 == 0` the second.
-            // The host serializer never had to care: unaligned writes are legal there,
-            // which is why the constraint was invisible until the fill moved to CUDA
-            // (it surfaced as `CUDA_ERROR_MISALIGNED_ADDRESS` from a `head_dim = 4`
-            // fixture). Every production geometry satisfies it; a new one that does not
-            // must be caught here rather than faulting mid-seal.
-            let head_sz = head_dim / 2 + n_palette * 26;
-            if !head_dim.is_multiple_of(16) || !head_sz.is_multiple_of(8) {
-                candle::bail!(
-                    "KvHead record geometry is not 8-byte aligned: head_dim {head_dim} \
-                     (needs % 16 == 0) and per-head size {head_sz} (needs % 8 == 0) at \
-                     n_palette {n_palette}. The fill kernel stores band pointers as \
-                     uint64_t, which faults on an unaligned address."
-                );
-            }
+            // The record geometry's 8-byte alignment is checked by `build_meta_records`
+            // before it claims a slot, and again inside `run_kv_record_fill` for the
+            // callers that launch directly.
 
             // The descriptor and the packed inputs. Appending a chunk's existing slice is
             // a bulk copy, not a walk over bands — the per-band work is the kernel's.
@@ -963,14 +972,18 @@ impl ChunkedKvBacking {
                     v_scale.extend_from_slice(&src.v_scale[..tags]);
                     off
                 };
-                // Field order is the struct's — see `krf::KvRecordDesc`.
-                descs.extend_from_slice(&[
-                    h.device_addr() as i64,
-                    gid_off,
-                    pal_off,
-                    fmt_off,
-                    scale_off,
-                ]);
+                // Through the struct, so the field order is the compiler's business and
+                // the size assertions on both sides of the FFI cover these bytes.
+                descs.extend_from_slice(
+                    &krf::KvRecordDesc {
+                        dst: h.device_addr(),
+                        gid_off,
+                        pal_off,
+                        fmt_off,
+                        scale_off,
+                    }
+                    .to_words(),
+                );
             }
 
             // Extents indexed by arena index, so the kernel resolves a band the same way
@@ -978,7 +991,13 @@ impl ChunkedKvBacking {
             let n_extents = arena_info.len();
             let mut extents: Vec<i64> = Vec::with_capacity(n_extents * krf::EXTENT_WORDS);
             for r in arena_info {
-                extents.extend_from_slice(&[r.base_ptr as i64, r.chunk_byte_stride]);
+                extents.extend_from_slice(
+                    &krf::KvArenaExtent {
+                        base: r.base_ptr,
+                        stride: r.chunk_byte_stride,
+                    }
+                    .to_words(),
+                );
             }
 
             // `memcpy_stod` on an empty slice is not meaningful, so a derived-only input
@@ -992,7 +1011,10 @@ impl ChunkedKvBacking {
             let d_vfmt = cuda.memcpy_stod(&pad1_u8(v_fmt))?;
             let d_kscale = cuda.memcpy_stod(&pad1_f32(k_scale))?;
             let d_vscale = cuda.memcpy_stod(&pad1_f32(v_scale))?;
-            let mut d_ext = cuda.memcpy_stod(&extents)?;
+            // Padded like the rest: `arena_info` is legitimately empty when no arena is
+            // resolved, and the kernel bounds every extent lookup against `n_extents`, so
+            // the padding byte is never read — but the pointer still has to be valid.
+            let d_ext = cuda.memcpy_stod(&pad1_i64(extents))?;
             let stream = cuda.cuda_stream();
             {
                 let (p_desc, _g0) = d_descs.device_ptr(&stream);
@@ -1003,11 +1025,21 @@ impl ChunkedKvBacking {
                 let (p_vf, _g5) = d_vfmt.device_ptr(&stream);
                 let (p_ks, _g6) = d_kscale.device_ptr(&stream);
                 let (p_vs, _g7) = d_vscale.device_ptr(&stream);
-                let (p_ex, _g8) = d_ext.device_ptr_mut(&stream);
+                let (p_ex, _g8) = d_ext.device_ptr(&stream);
                 candle::set_kernel_breadcrumb("run_kv_record_fill", file!(), line!());
                 // SAFETY: every array is device-resident and at least as long as the
                 // offsets the descriptors name; each `dst` is a record slot this call just
                 // allocated, of exactly `chunk_record_bytes` bytes.
+                //
+                // **The buffers are dropped right after this async launch, and that is
+                // sound because of how `CudaSlice::drop` frees.** It waits on the slice's
+                // recorded events and then either calls `free_async` on the slice's own
+                // stream — the same stream this launches on, so the free is ordered behind
+                // the kernel — or, on a context without async allocation, synchronises the
+                // stream before a synchronous free. Either way the bytes outlive the read.
+                // Worth knowing that the second branch means this call site synchronises
+                // once per buffer on such a context, which is the one place the "no GPU
+                // syncs" property here depends on the driver rather than on this code.
                 unsafe {
                     krf::run_kv_record_fill(
                         p_desc as *const std::ffi::c_void,

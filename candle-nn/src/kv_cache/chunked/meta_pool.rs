@@ -227,11 +227,22 @@ pub(crate) fn serialize_kv_heads(
         for p in 0..n_palette {
             let k_gid = &gids.as_slice()[h * stride + p * 2];
             let v_gid = &gids.as_slice()[h * stride + p * 2 + 1];
+            // **A non-resident arena leaves the pointer null, rather than forming one
+            // from a zero base.** `resolve_arena_info` reports `base_ptr: 0` with a
+            // non-zero stride for a CPU/warm arena, so without this guard a band in one
+            // got `chunk_idx * stride` — a small, non-null, entirely bogus address that a
+            // kernel would happily dereference. The fill kernel has always guarded it
+            // (`e.base != 0 && e.stride > 0`); this is the reference catching up, and the
+            // two must agree because one is tested against the other.
             if let Some(ai) = arena_info.get(k_gid.arena_idx()) {
-                k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
+                if ai.base_ptr != 0 && ai.chunk_byte_stride > 0 {
+                    k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
+                }
             }
             if let Some(ai) = arena_info.get(v_gid.arena_idx()) {
-                v_ptr[p] = ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
+                if ai.base_ptr != 0 && ai.chunk_byte_stride > 0 {
+                    v_ptr[p] = ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
+                }
             }
             if let Some(&t) = k_fmt.get(tag_base + p) {
                 k_tag[p] = t;
@@ -280,7 +291,6 @@ pub struct MetaGid {
     /// same way on both — an `Option` here silently made `strong_count` a constant
     /// for detached records and stopped counting their clones.
     gid: ChunkGid,
-    id: i64,
     /// Cached device address of this record — `arena_base + slot · stride`,
     /// resolved at allocation.
     ///
@@ -295,9 +305,11 @@ pub struct MetaGid {
 }
 
 impl MetaGid {
+    /// The slot's raw gid. Forwarded rather than stored beside it: two copies of one
+    /// value can only ever disagree.
     #[inline]
     pub fn raw(&self) -> i64 {
-        self.id
+        self.gid.raw()
     }
 
     /// Cached device address of this record (0 if not device-resident).
@@ -324,18 +336,13 @@ impl MetaGid {
     pub fn detached(id: i64) -> Self {
         Self {
             gid: ChunkGid::detached(id),
-            id,
             device_addr: 0,
         }
     }
 
     /// Wrap a freshly allocated record slot.
     pub(super) fn from_slot(gid: ChunkGid, device_addr: u64) -> Self {
-        Self {
-            id: gid.raw(),
-            gid,
-            device_addr,
-        }
+        Self { gid, device_addr }
     }
 }
 
@@ -743,6 +750,12 @@ mod tests {
 
         // Two arenas with unlike strides: a pointer resolved against the wrong one is
         // then numerically distinguishable, which a single-arena fixture cannot show.
+        //
+        // The third is **not resident** — `base_ptr: 0` with a non-zero stride, which is
+        // exactly what `resolve_arena_info` reports for a CPU/warm arena. Both sides must
+        // leave such a band's pointer null; the reference used to form
+        // `chunk_idx * stride` from it, a small non-null address a kernel would
+        // dereference, and the old fixture's all-non-zero bases could not catch it.
         let arena_info = vec![
             ResolvedArenaInfo {
                 base_ptr: 0x1_0000,
@@ -752,6 +765,11 @@ mod tests {
             ResolvedArenaInfo {
                 base_ptr: 0x9_0000,
                 chunk_byte_stride: 1088,
+                chunk_capacity: u32::MAX,
+            },
+            ResolvedArenaInfo {
+                base_ptr: 0,
+                chunk_byte_stride: 2048,
                 chunk_capacity: u32::MAX,
             },
         ];
@@ -778,10 +796,12 @@ mod tests {
 
             // Gids alternate between the two arenas and walk chunk indices, so every
             // band resolves to a distinct address.
+            // Bands cycle over all three arenas, so every record exercises the resident
+            // pair and the non-resident one.
             let raws: Vec<i64> = (0..n_kv_head * n_palette * 2)
                 .map(|i| {
-                    let arena = (i % 2) as i64;
-                    let chunk = (i / 2) as i64 + 1;
+                    let arena = (i % 3) as i64;
+                    let chunk = (i / 3) as i64 + 1;
                     arena * GID_STRIDE as i64 + chunk
                 })
                 .collect();

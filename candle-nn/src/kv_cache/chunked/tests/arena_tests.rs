@@ -148,8 +148,13 @@ mod tests {
             assert!(!RECORD_STRIDES.is_empty());
             for stride in RECORD_STRIDES {
                 assert!(
-                    stride.is_power_of_two(),
-                    "stride {stride} is not a power of two, so slot decode is not a mask",
+                    stride.is_multiple_of(8),
+                    "stride {stride} is not 8-aligned, so a slot base need not be either \
+                     — and the kernel stores band pointers as uint64_t",
+                );
+                assert!(
+                    stride >= RECORD_STRIDES[0],
+                    "stride {stride} is below the floor the gid namespace allows",
                 );
                 let key = ArenaKey::for_record_stride(ArenaLocation::Gpu, stride);
                 assert_eq!(key.slot_stride(), stride);
@@ -171,7 +176,15 @@ mod tests {
         /// is exactly the `register_arena: missing preallocated pool for key` panic.
         #[test]
         fn a_record_size_and_its_stride_agree_on_the_key() {
-            for (bytes, want) in [(1usize, 512usize), (512, 512), (513, 1024), (1344, 2048)] {
+            // 1344 is the production GQA record (8 heads x HD128 x 4 bands); it lands on
+            // the 1,536 rung with 12.5% pad, where a power-of-two ladder gave 2,048 and 34%.
+            for (bytes, want) in [
+                (1usize, 512usize),
+                (512, 512),
+                (513, 768),
+                (1344, 1536),
+                (1537, 2048),
+            ] {
                 let by_size = ArenaKey::for_records(ArenaLocation::Gpu, bytes);
                 let by_stride = ArenaKey::for_record_stride(ArenaLocation::Gpu, want);
                 assert_eq!(

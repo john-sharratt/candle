@@ -1065,22 +1065,27 @@ fn preallocated_pool_table() -> AHashMap<ArenaKey, ArenaPool> {
     // now shares one pool and one free list, so a slot freed by any of them is
     // allocatable by all of them (`docs/archived/arena_unification.md` §3.4).
     let mut pools = AHashMap::with_capacity(
-        ArenaLocation::iter().count() * (SizeClass::COUNT + RECORD_STRIDES.len()),
+        ArenaLocation::iter().count() * SizeClass::COUNT + RECORD_STRIDES.len(),
     );
     for location in ArenaLocation::iter() {
         for class in SizeClass::all() {
             pools.insert(ArenaKey::new(class, location), ArenaPool::new(class));
         }
-        // **The `KvHead` record pools, preallocated for the same reason.** A record
-        // arena's stride is a power of two, so the strides it can ask for are the dozen
-        // rungs of `RECORD_STRIDES` — which is what keeps this table complete at
-        // construction and the lookup lock-free. A record pool sizes its refcount
-        // tables from the key's own capacity, not from a size class, because a record's
-        // slot count comes from its stride (`docs/vram_span_partition.md` §8).
-        for stride in RECORD_STRIDES {
-            let key = ArenaKey::for_record_stride(location, stride);
-            pools.insert(key, ArenaPool::with_chunks(key.chunks()));
-        }
+    }
+    // **The `KvHead` record pools, preallocated for the same reason — and GPU only.** A
+    // record arena's stride is one of the dozen rungs of `RECORD_STRIDES`, which is what
+    // keeps this table complete at construction and the lookup lock-free. A record pool
+    // sizes its refcount tables from the key's own capacity, not from a size class,
+    // because a record's slot count comes from its stride
+    // (`docs/vram_span_partition.md` §8).
+    //
+    // Not per location: records are allocated `Gpu` only, and a record cannot migrate
+    // tiers because its device address is fixed for the handle's life — every slice
+    // header holds it raw. A per-location loop minted twelve CPU pools that nothing
+    // could ever allocate from.
+    for stride in RECORD_STRIDES {
+        let key = ArenaKey::for_record_stride(ArenaLocation::Gpu, stride);
+        pools.insert(key, ArenaPool::with_chunks(key.chunks()));
     }
     pools
 }

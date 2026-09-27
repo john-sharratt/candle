@@ -233,10 +233,17 @@ extern "C" __global__ __launch_bounds__(KVREC_THREADS) void kv_record_fill_kerne
 // `kv_ptr_patch_blocks`.
 static inline int kv_record_fill_blocks(int64_t n_items) {
     const int64_t by_work = (n_items + KVREC_THREADS - 1) / KVREC_THREADS;
+    // Both queries are checked. They cannot fail in practice — a launch is imminent, so
+    // there is a current context — but an ignored error would leave `sms` uninitialised
+    // and size the grid from a stack value. On failure fall back to a conservative SM
+    // count: the grid-stride loop covers the work at any grid size, so a wrong count
+    // costs occupancy, never correctness.
     int dev = 0;
-    cudaGetDevice(&dev);
     int sms = 0;
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
+        sms = 32;
+    }
     if (sms <= 0) sms = 32;
     const int64_t cap = (int64_t)sms * 8;  // 8 waves per SM saturates a store-bound pass
     const int64_t n = by_work < cap ? by_work : cap;
@@ -250,6 +257,16 @@ extern "C" void run_kv_record_fill(const void* descs, const int64_t* gids, const
                                    int n_records, int n_kv_head, int head_dim, int n_palette,
                                    int gid_stride, int invalid_tag, cudaStream_t stream) {
     if (n_records <= 0) return;
+    // **The alignment precondition lives here, with the stores that depend on it.** A
+    // band pointer is a `uint64_t` at `head_dim / 2 + p * 8` inside a head, and heads sit
+    // `head_sz` apart, so both must be multiples of 8 or the store faults
+    // (`CUDA_ERROR_MISALIGNED_ADDRESS`). The caller checks this too, but callers are
+    // plural — the microbench and the byte-exact test launch directly — so a check that
+    // only one of them performs is a check that can be bypassed. Refusing to launch is
+    // better than faulting: the records stay as they were and the error surfaces at the
+    // caller's next sync rather than as a dead context.
+    const int head_sz_check = head_dim / 2 + n_palette * 26;
+    if ((head_dim % 16) != 0 || (head_sz_check % 8) != 0) return;
     // The grid is sized from the total work, not from the record count — see
     // `kv_record_fill_blocks`. Mirrors the host-side item count in the kernel so the two
     // cannot disagree about how much there is to do.

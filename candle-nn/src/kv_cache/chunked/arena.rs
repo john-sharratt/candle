@@ -49,8 +49,8 @@ pub struct ArenaKey {
 /// than separate size classes for two reasons:
 ///
 /// - **A record's size is model geometry, not a format.** It is
-///   `n_kv_head × (head_dim / 2 + 26 × n_palette)` rounded up to a power of two, which
-///   differs per checkpoint, so no fixed [`LADDER`](super::size_class::LADDER) rung can
+///   `n_kv_head × (head_dim / 2 + 26 × n_palette)` rounded up to a [`RECORD_STRIDES`]
+///   rung, which differs per checkpoint, so no fixed [`LADDER`](super::size_class::LADDER) rung can
 ///   express it — the ladder is a map from `KvFormat` to bytes and a record is not a
 ///   format.
 /// - **They are moved by different things.** Every walk that enumerates the band pools
@@ -76,24 +76,36 @@ pub enum ArenaKind {
 
 /// Every slot stride a `KvHead` record arena can have, smallest first.
 ///
-/// **Why a fixed list is enough.** A record is
-/// `n_kv_head × (head_dim / 2 + 26 × n_palette)` bytes rounded up to a power of two, so
-/// however the geometry varies the stride lands on one of these rungs. That is what
-/// lets the gid pool stay eager and lock-free: every pool a record can ask for is
-/// preallocated at construction, and nothing creates one at runtime.
+/// **Why a fixed list, and why it is not just the powers of two.** The property the
+/// allocator needs is that the set of record strides is *finite and known*, because that
+/// is what lets the gid pool preallocate every record pool at construction and stay eager
+/// and lock-free. Powers of two are one such set, but they are a wasteful one: a record's
+/// slot is pure padding above its size, and nothing recovers it.
 ///
-/// **The floor is not arbitrary.** `chunks_per_region` is
-/// `TARGET_ARENA_BYTES / stride`, and it must stay *below* `GID_STRIDE` or a chunk
-/// index collides with the next arena's gid namespace. At 16 MiB regions and a
-/// `1 << 16` gid stride, a 256 B slot would give exactly 65,536 chunks — the first
-/// value that breaks it — so the ladder starts at 512.
-/// [`record_strides_fit_the_gid_namespace`](tests) holds this.
+/// Rounding to powers of two put the 1,344 B GQA record in a 2,048 B slot — 34% pad, one
+/// record per chunk per layer, ~144 MiB at 48 layers and 128K context, all of it inside
+/// the reservation and subtracted from `weight_floor`'s arithmetic. The stated
+/// justification, that a power of two makes slot decode a shift and a mask, is not cashed
+/// in anywhere: nothing decodes a record slot from an address, because the kernel is
+/// handed absolute destinations and `record_slot_addr` multiplies.
+///
+/// So the rungs interleave 1.5× steps between the powers of two, which bounds the pad at
+/// a third of a slot instead of a half and puts that same GQA record in 1,536 B — 12.5%.
+/// Every rung is a multiple of 8, which is what keeps each slot's base 8-aligned for the
+/// `uint64_t` band-pointer stores.
+///
+/// **The floor is not arbitrary.** `chunks_per_region` is `TARGET_ARENA_BYTES / stride`,
+/// and it must stay *below* `GID_STRIDE` or a chunk index collides with the next arena's
+/// gid namespace. At 16 MiB regions and a `1 << 16` gid stride, a 256 B slot would give
+/// exactly 65,536 chunks — the first value that breaks it — so the ladder starts at 512.
+/// [`record_strides_fit_the_gid_namespace`](tests) holds all of this.
 ///
 /// The ceiling covers the widest geometry in the table (64 heads × 512 head_dim × 16
-/// bands is ~42 KiB) with room above it; an unlisted stride is a loud failure at
-/// allocation rather than a silently missing pool.
-pub const RECORD_STRIDES: [usize; 12] = [
-    512, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576,
+/// bands is ~42 KiB) with room above it; an unlisted size is a loud failure at allocation
+/// rather than a silently missing pool.
+pub const RECORD_STRIDES: [usize; 20] = [
+    512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768, 49_152,
+    65_536, 98_304, 131_072, 262_144, 524_288, 1_048_576,
 ];
 
 impl PartialEq for ArenaKey {
@@ -147,7 +159,7 @@ impl ArenaKey {
     /// The key the `KvHead` records of one backing allocate from.
     ///
     /// `record_bytes` is the serialized record size; the slot stride is that rounded up
-    /// to a power of two, which is the whole reason the pool table can stay **eager**:
+    /// to a [`RECORD_STRIDES`] rung, which is the whole reason the pool table stays **eager**:
     /// the stride space is a dozen discrete rungs rather than a continuum, so every one
     /// a geometry can ask for is preallocated and no pool is ever created at runtime.
     /// See [`RECORD_STRIDES`].
@@ -159,10 +171,10 @@ impl ArenaKey {
     /// admits, which decodes gids into the *next* arena and reads the wrong addresses
     /// without faulting. Loud here, rather than wrong later.
     pub fn for_records(location: ArenaLocation, record_bytes: usize) -> Self {
-        // The first rung that holds the record — NOT merely the next power of two. A
-        // record smaller than the floor would otherwise get a tiny stride and so more
-        // slots per arena than the gid namespace allows: a 1 B record rounds to a 1 B
-        // stride and 16,777,216 slots against a 65,536 limit.
+        // The first rung that holds the record — NOT merely the next power of two, which
+        // would both waste a third more of each slot and, below the floor, give more slots
+        // per arena than the gid namespace allows: a 1 B record rounds to a 1 B stride and
+        // 16,777,216 slots against a 65,536 limit.
         let stride = RECORD_STRIDES
             .iter()
             .copied()
@@ -186,8 +198,9 @@ impl ArenaKey {
     /// preallocated.
     pub fn for_record_stride(location: ArenaLocation, stride: usize) -> Self {
         debug_assert!(
-            stride.is_power_of_two(),
-            "a record stride is a power of two"
+            stride.is_multiple_of(8),
+            "a record stride must be 8-aligned so every slot base is, for the \
+             uint64_t band-pointer stores"
         );
         // Capacity from the same region size the band arenas are carved to, so a
         // record arena is one region like every other and the frontier arithmetic in
@@ -207,10 +220,12 @@ impl ArenaKey {
 
     /// The same arena geometry at another tier.
     ///
-    /// Carries the class **and the kind**, which is why a migration names this rather
-    /// than rebuilding a key from parts: a record arena rebuilt as
-    /// `ArenaKey::new(class, location)` would come back as a band arena with a stride
-    /// its slots do not have.
+    /// Carries the class **and the kind**, so a tier migration cannot silently change
+    /// what an arena's slots hold. Today every caller is moving band arenas — records are
+    /// GPU-only and cannot migrate, because their address is fixed for the handle's life —
+    /// so this is a guard against a future caller rather than a fix for a present bug:
+    /// rebuilding a record key as `ArenaKey::new(class, location)` returns a band key
+    /// whose stride its slots do not have. `Arena::arena_key` had exactly that defect.
     pub fn at(&self, location: ArenaLocation) -> Self {
         Self { location, ..*self }
     }

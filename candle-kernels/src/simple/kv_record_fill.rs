@@ -49,6 +49,34 @@ pub struct KvArenaExtent {
 pub const DESC_WORDS: usize = 5;
 pub const EXTENT_WORDS: usize = 2;
 
+impl KvRecordDesc {
+    /// The descriptor as the words the kernel reads.
+    ///
+    /// Callers upload `Vec<i64>`, so without this they hand-wrote the five words in field
+    /// order with a comment asking the reader to check it — which left the structs above
+    /// constructed nowhere and their size assertions guarding nothing anyone used. Going
+    /// through here is what makes those assertions, and the `static_assert`s in the `.cu`,
+    /// actually cover the bytes that get sent.
+    #[inline]
+    pub fn to_words(self) -> [i64; DESC_WORDS] {
+        [
+            self.dst as i64,
+            self.gid_off,
+            self.pal_off,
+            self.fmt_off,
+            self.scale_off,
+        ]
+    }
+}
+
+impl KvArenaExtent {
+    /// The extent as the words the kernel reads. See [`KvRecordDesc::to_words`].
+    #[inline]
+    pub fn to_words(self) -> [i64; EXTENT_WORDS] {
+        [self.base as i64, self.stride]
+    }
+}
+
 const _: () = assert!(std::mem::size_of::<KvRecordDesc>() == DESC_WORDS * 8);
 const _: () = assert!(std::mem::size_of::<KvArenaExtent>() == EXTENT_WORDS * 8);
 const _: () = assert!(std::mem::align_of::<KvRecordDesc>() == 8);

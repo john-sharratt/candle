@@ -444,22 +444,26 @@ competing for the card* — and it costs three things that matter here:
 
 One arena kind, distinct from the band arenas, drawing regions from the same pool:
 
-- **Stride is the record size rounded up to a power of two.** A record is
-  `n_kv_head × (head_dim / 2 + 26 × n_palette)` bytes; rounding up makes slot decode
-  `chunks_per_region` exact, and keeps the stride space to the dozen discrete rungs of
-  `RECORD_STRIDES` — which is what lets the gid pool preallocate every record pool it
-  could ever be asked for and stay lock-free.
+- **Stride is the record size rounded up to a `RECORD_STRIDES` rung.** A record is
+  `n_kv_head × (head_dim / 2 + 26 × n_palette)` bytes. The property that matters is that
+  the set of strides is *finite and known*, because that is what lets the gid pool
+  preallocate every record pool it could be asked for and stay eager and lock-free.
+  The rungs interleave 1.5× steps between the powers of two, every one a multiple of 8 so
+  each slot base is 8-aligned for the `uint64_t` band-pointer stores.
   **Derived per call, not cached.** `n_palette` changes after the backing exists —
   `set_single_latent` gives the single latent four times GQA's bands — so a record size
   taken once at construction would be the GQA one and every record would overrun its
   slot. `build_meta_records` therefore recomputes it from the live `n_palette()` on
   every call and picks the key from that, leaving nothing to keep in step.
-  > The padding is **not** free, and the "shift and a mask" is not currently cashed in:
-  > nothing decodes a record slot from an address — the kernel is handed absolute
-  > destinations and `record_slot_addr` multiplies. At the GQA geometry a 1,344 B record
-  > sits in a 2,048 B slot, so ~34% of every record slot is pad, now inside the
-  > reservation and subtracted from `weight_floor`'s arithmetic (~144 MiB at 48 layers
-  > and 128K context). A non-power-of-two rung list would remove it at no cost.
+  > **Why not powers of two.** They were, and the pad is not free: a record's slot is
+  > pure padding above its size and nothing recovers it. The 1,344 B GQA record sat in a
+  > 2,048 B slot — 34%, one record per chunk per layer, ~144 MiB at 48 layers and 128K
+  > context, all inside the reservation and subtracted from `weight_floor`'s arithmetic.
+  > The justification offered for powers of two — that slot decode becomes a shift and a
+  > mask — is not cashed in anywhere: nothing decodes a record slot from an address,
+  > because the kernel is handed absolute destinations and `record_slot_addr` multiplies.
+  > Interleaving 1.5× rungs bounds the pad at a third of a slot instead of a half and puts
+  > that record in 1,536 B (12.5%), for the same finite-pool property.
 - **The handle is the existing arena gid.** A record is an arena slot, so `ChunkGid`
   and the arena refcount tables give refcounting, cloning across every holder of the
   chunk, and free-on-last-drop with no new lifetime machinery. This is the one place
