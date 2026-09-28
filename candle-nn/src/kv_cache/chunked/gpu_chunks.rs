@@ -41,21 +41,35 @@ pub struct ChunkPin {
     gids: HeadGids,
     /// The chunk's resident record, when it has one. `None` for a live writer window,
     /// whose heads are serialised inline and name no record slot.
-    _meta: Option<MetaGid>,
+    meta: Option<MetaGid>,
 }
 
 impl ChunkPin {
     fn of(chunk: &ChunkWindow) -> Self {
         Self {
             gids: chunk.gids.clone(),
-            _meta: chunk.meta.clone(),
+            meta: chunk.meta.clone(),
         }
     }
 
-    /// Whether this pin already names `chunk`'s band allocation — the cheap check
-    /// `update_chunk` uses before replacing a pin.
-    fn is_same_alloc(&self, gids: &HeadGids) -> bool {
-        self.gids.is_same_alloc(gids)
+    /// `HeadGids::alloc_id` of the bands this pin holds. Stable for as long as the pin
+    /// lives, because the pin is what keeps the allocation alive.
+    pub(crate) fn bands_alloc_id(&self) -> usize {
+        self.gids.alloc_id()
+    }
+
+    /// Raw id of the record slot this pin holds, if the chunk has a record. Unique for
+    /// as long as the pin lives, for the same reason.
+    pub(crate) fn record_raw(&self) -> Option<i64> {
+        self.meta.as_ref().map(MetaGid::raw)
+    }
+
+    /// Whether this pin already holds exactly what `chunk`'s header will name — its band
+    /// allocation and its record slot — the cheap check `update_chunk` uses before
+    /// replacing a pin.
+    fn describes(&self, chunk: &ChunkWindow) -> bool {
+        self.gids.is_same_alloc(&chunk.gids)
+            && self.record_raw() == chunk.meta.as_ref().map(MetaGid::raw)
     }
 }
 
@@ -639,12 +653,12 @@ impl GpuChunksGuard<'_> {
                 self.inner.pins.len()
             );
         }
-        // Replaced whole rather than only when the band allocation differs: the record
-        // handle beside it can change while the gids do not — a compaction mints a fresh
-        // record for a chunk whose gids it also replaced, but a chunk re-serialised for
-        // any other reason can have picked up a new record too, and a pin naming the old
-        // one holds the wrong slot alive.
-        if !self.inner.pins[chunk_idx].is_same_alloc(&chunk.gids) {
+        // Replaced whole when EITHER handle differs, not only the band allocation: the
+        // record beside it can change while the gids do not — a compaction that copies a
+        // record lower moves the chunk onto the copy and leaves its gids alone — and a pin
+        // naming the old record then holds the wrong slot alive while the header just
+        // written names the new one, which nothing in this buffer holds.
+        if !self.inner.pins[chunk_idx].describes(chunk) {
             Arc::make_mut(&mut self.inner.pins)[chunk_idx] = ChunkPin::of(chunk);
         }
         self.dirty_chunks.push(chunk_idx);
@@ -1214,5 +1228,54 @@ mod staging_tests {
         // two, and the upload waits for it.
         assert_eq!(choose_staging([true, true], Some(0)), (1, true));
         assert_eq!(choose_staging([true, true], Some(1)), (0, true));
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::kv_cache::chunked::gid_pool::ChunkGid;
+
+    fn window(gids: HeadGids, meta: Option<MetaGid>) -> ChunkWindow {
+        ChunkWindow {
+            gids,
+            usage: 32,
+            offset: 0,
+            k_pal: Arc::new(Vec::new()),
+            v_pal: Arc::new(Vec::new()),
+            k_scale: Arc::new(Vec::new()),
+            v_scale: Arc::new(Vec::new()),
+            k_fmt: Arc::new(Vec::new()),
+            v_fmt: Arc::new(Vec::new()),
+            meta,
+        }
+    }
+
+    /// **A pin no longer describes a chunk whose record changed under unchanged gids.**
+    ///
+    /// That is what a compaction's record move produces: the chunk is moved onto a copy of
+    /// its record and its bands stay put. A pin compared on bands alone would stay on the
+    /// OLD record while `update_chunk` writes a header naming the new one, leaving the
+    /// record the header dereferences held by nothing in the buffer.
+    #[test]
+    fn a_pin_is_stale_when_only_the_record_changed() {
+        let bands = HeadGids::uniform(ChunkGid::detached(7), 1);
+        let old = MetaGid::from_slot(ChunkGid::detached(100), bands.clone(), 0xA000);
+        let new = MetaGid::from_slot(ChunkGid::detached(200), bands.clone(), 0xB000);
+
+        let pin = ChunkPin::of(&window(bands.clone(), Some(old.clone())));
+        assert!(pin.describes(&window(bands.clone(), Some(old))));
+        assert!(
+            !pin.describes(&window(bands.clone(), Some(new))),
+            "same bands, different record: the pin must be replaced",
+        );
+        assert!(
+            !pin.describes(&window(bands, None)),
+            "a record dropped is a change too",
+        );
+        assert!(
+            !pin.describes(&window(HeadGids::uniform(ChunkGid::detached(8), 1), None)),
+            "and so is a band change",
+        );
     }
 }

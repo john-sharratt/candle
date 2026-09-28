@@ -284,10 +284,10 @@ pub struct GroundLost {
     pub span_regions: usize,
     /// Of [`Self::live_arenas`], the regions **record** arenas hold.
     ///
-    /// In use, and not packable either: the compaction census covers `ArenaKind::Band`
-    /// pools only, so a record arena is allocated from and released but never packed.
-    /// Counted apart from [`Self::packed_arenas`] because that figure comes from the
-    /// size-class rows, which exclude record pools by design.
+    /// In use. Counted apart from [`Self::packed_arenas`] because that figure comes from
+    /// the size-class rows, which exclude record pools by design; the compaction pass packs
+    /// them, but their occupancy is not in any class row for a packed figure to be derived
+    /// from, so they are charged as wholly in use.
     pub record_regions: usize,
 }
 

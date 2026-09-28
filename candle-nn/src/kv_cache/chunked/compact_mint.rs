@@ -45,7 +45,8 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use candle::Result;
 
-use super::backing::{ChunkedKvBacking, RecordLayout};
+use super::backing::{ChunkedKvBacking, RecordLayout, RecordPlacement};
+use super::fresh_arenas::FreshArenas;
 use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
 use super::meta_pool::{ChunkRecordSrc, MetaGid};
@@ -144,6 +145,8 @@ pub(super) struct RecordMint {
     declined: usize,
     /// Record arenas created up front by the reservation, for the pass's log line.
     reserved_arenas: usize,
+    /// Which record slots a mint may take, and in what order — set by [`Self::reserve`].
+    placement: RecordPlacement,
 }
 
 impl RecordMint {
@@ -161,6 +164,7 @@ impl RecordMint {
             handles: Vec::new(),
             declined: 0,
             reserved_arenas: 0,
+            placement: RecordPlacement::default(),
         }))
     }
 
@@ -172,13 +176,26 @@ impl RecordMint {
     /// [`ChunkedKvBacking::try_alloc_record_slot`]. Doing it here means every arena this
     /// pass needs exists before anything is published, and the sweep only pops free lists.
     ///
-    /// `want` is an upper bound (the pass's move count), so this over-provisions: a
-    /// relocated chunk covers `n_kv_head · n_palette · 2` moved bands, so the real mint
-    /// count runs a half to a thirteenth of the moves. Over-provisioning costs a record
-    /// arena or two — 16 MiB each, released again by the ordinary empty-arena sweep — and
-    /// under-provisioning costs reclaim, so the bound is the right way to be wrong.
-    pub(super) fn reserve(&mut self, backing: &ChunkedKvBacking, want: usize) -> Result<()> {
-        self.reserved_arenas = backing.reserve_record_slots(self.layout.key, want)?;
+    /// `want` is an upper bound, so this can over-provision. Over-provisioning costs a
+    /// record arena or two — 16 MiB each, which `fresh` releases when the pass ends if no
+    /// mint reached them — and under-provisioning costs reclaim,
+    /// so the bound is the right way to be wrong.
+    ///
+    /// Also fixes where the mints land: the pool's arenas lowest in the span first, taken
+    /// after the reservation so the arenas it just created are among them, and never one
+    /// of `planned_sources` — the record slots this pass is reading.
+    pub(super) fn reserve(
+        &mut self,
+        backing: &ChunkedKvBacking,
+        want: usize,
+        planned_sources: HashSet<(usize, u32)>,
+        fresh: &mut FreshArenas<'_>,
+    ) -> Result<()> {
+        self.reserved_arenas = backing.reserve_record_slots(self.layout.key, want, fresh)?;
+        self.placement = RecordPlacement {
+            order: backing.arenas_by_rank(self.layout.key),
+            avoid: planned_sources,
+        };
         Ok(())
     }
 
@@ -234,7 +251,7 @@ impl RecordMint {
         // **Non-creating, and the caller keeps its old record if the pool is out.** See
         // `try_alloc_record_slot`: creating an arena here would re-tenant an `arena_idx`
         // that holders this sweep has not reached are still naming.
-        let Some(gid) = backing.try_alloc_record_slot(self.layout.key) else {
+        let Some(gid) = backing.try_alloc_record_slot(self.layout.key, &self.placement) else {
             self.declined += 1;
             return Ok(None);
         };

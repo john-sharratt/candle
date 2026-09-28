@@ -900,12 +900,14 @@ impl SequenceState {
     /// Making the rewrite carry its own invalidation is what stops that from being
     /// a step anyone can omit.
     ///
-    /// **The chunk keeps its `MetaGid`, untouched, and a WRITER-owned chunk that has one
-    /// is skipped entirely.**
+    /// **A record is replaced, never rewritten, and a WRITER-owned chunk that has one is
+    /// skipped entirely.**
     ///
-    /// The pass rewrites gids and never rewrites a record; a record holds a clone of the
-    /// gids it was serialized from, so the source slots it names keep a refcount and
-    /// keep their bytes, and reading through it stays correct. See `compact_backings`.
+    /// The pass rewrites gids and never rewrites a record's bytes. A chunk whose gids moved
+    /// is given a freshly minted record; a chunk whose record was copied lower is moved
+    /// onto the copy (`Sweep::follow_record`). A record holds a clone of the gids it was
+    /// serialized from, so whichever record a chunk ends up holding keeps the bands it
+    /// names alive, and reading through it stays correct. See `compact_backings`.
     ///
     /// That argument needs the chunk to be *immutable*, which is what
     /// [`Self::writer_start_idx`] decides: chunks below it are Arc-shared prefix history
@@ -941,29 +943,33 @@ impl SequenceState {
                 );
                 continue;
             }
-            let Some(next) = sweep.rewrite_gids(&cw.gids)? else {
-                continue;
-            };
-            // A fresh record for the new bands, and only for a chunk that had one —
-            // prefix history, by the check above. Installing it drops the old record,
-            // which is what releases the source.
-            if cw.meta.is_some() {
-                if let Some(record) = sweep.mint_record(
-                    &next,
-                    RecordInputs {
-                        k_pal: &cw.k_pal,
-                        v_pal: &cw.v_pal,
-                        k_scale: &cw.k_scale,
-                        v_scale: &cw.v_scale,
-                        k_fmt: &cw.k_fmt,
-                        v_fmt: &cw.v_fmt,
-                    },
-                )? {
-                    cw.meta = Some(record);
+            if let Some(next) = sweep.rewrite_gids(&cw.gids)? {
+                // A fresh record for the new bands, and only for a chunk that had one —
+                // prefix history, by the check above. Installing it retires the old
+                // record, which is what releases the source once the sweep ends.
+                if cw.meta.is_some() {
+                    if let Some(record) = sweep.mint_record(
+                        &next,
+                        RecordInputs {
+                            k_pal: &cw.k_pal,
+                            v_pal: &cw.v_pal,
+                            k_scale: &cw.k_scale,
+                            v_scale: &cw.v_scale,
+                            k_fmt: &cw.k_fmt,
+                            v_fmt: &cw.v_fmt,
+                        },
+                    )? {
+                        sweep.install_record(&mut cw.meta, record);
+                    }
                 }
+                cw.gids = next;
+                moved = true;
             }
-            cw.gids = next;
-            moved = true;
+            // A relocated record moves the address this slot's cached decode buffer
+            // holds as `kvheads_ptr`, so it counts as a move for the invalidation below.
+            if sweep.follow_record(&mut cw.meta) {
+                moved = true;
+            }
         }
         if moved {
             self.invalidate_gpu_chunks();
@@ -1630,6 +1636,53 @@ mod writer_region_tests {
             raw(6, 3),
             "the writer-owned chunk with a record keeps its source, so its gids and its \
              record still agree",
+        );
+    }
+
+    /// **A record followed to its copy counts as a move, with its bands untouched.**
+    ///
+    /// The slot's cached decode buffer holds the record's address as `kvheads_ptr`, so a
+    /// chunk whose record moved while its bands did not must still report a move — that
+    /// report is what throws the buffer away. Missing it leaves a header naming the old
+    /// record slot, which the pool reissues once the old handle goes.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_followed_record_counts_as_a_move_and_leaves_the_bands_alone() {
+        use crate::kv_cache::chunked::compact_map::{CompactionMap, Sweep};
+        use crate::kv_cache::chunked::gid_pool::ChunkGid;
+        use crate::kv_cache::chunked::meta_pool::MetaGid;
+        use ArenaFormatTag::*;
+
+        let raw = |arena: usize, chunk: usize| (arena * GID_STRIDE + chunk) as i64;
+        let mut w = window(32, Q8_KS);
+        w.gids = HeadGids::uniform(ChunkGid::detached(raw(5, 2)), 1);
+        w.meta = Some(MetaGid::from_slot(
+            ChunkGid::detached(raw(9, 9)),
+            w.gids.clone(),
+            0xFEED,
+        ));
+        let bands = w.gids.clone();
+        let mut s = layer(vec![w], 1);
+
+        let mut map = CompactionMap::new();
+        map.insert_record(raw(9, 9), ChunkGid::detached(raw(1, 4)), 0xBEEF);
+        let mut sweep = Sweep::new(&map);
+        assert!(
+            s.rewrite_for_compaction(&mut sweep).unwrap(),
+            "a followed record is a move, or the slot's decode buffer keeps the old address",
+        );
+
+        let chunk = s.chunk_at(0).unwrap();
+        let meta = chunk.meta.as_ref().expect("the chunk still has a record");
+        assert_eq!(meta.raw(), raw(1, 4));
+        assert_eq!(meta.device_addr(), 0xBEEF);
+        assert!(
+            chunk.gids.is_same_alloc(&bands),
+            "the bands did not move, so the gids are the same allocation",
+        );
+        assert!(
+            meta.bands().unwrap().is_same_alloc(&bands),
+            "and the copy's handle holds the same bands the original did",
         );
     }
 

@@ -384,6 +384,13 @@ impl Scheduler {
                     // chunks' sources were not reclaimed. Correct, but degrading.
                     records_declined = report.records_declined,
                     record_arenas_reserved = report.record_arenas_reserved,
+                    // Arenas created ahead of demand; the unused ones, which the pass
+                    // hands back itself, are among `arenas_released`.
+                    fresh_arenas = report.fresh_arenas,
+                    // `KvHead` records copied lower (included in `moves`), and the
+                    // copies no holder took — expected where the chunk was minted anew.
+                    records_moved = report.records_moved,
+                    records_unfollowed = report.records_unfollowed,
                     // The pass's downstream cost: each cleared buffer is a host
                     // re-serialisation and an upload on its slot's next sync.
                     buffers_cleared = report.decode_buffers_cleared,
@@ -402,6 +409,10 @@ impl Scheduler {
                     // that spent 80 ms working. Only visible through the profile
                     // spans otherwise, and those compile to nothing by default.
                     quiesce_us = report.timings.quiesce.as_micros(),
+                    // The host walk over every slot's decode-buffer pins, outside the
+                    // budget like the quiesce. Named because it scales with slots ×
+                    // chunks × layers, not with what the pass moved.
+                    invalidate_us = report.timings.invalidate.as_micros(),
                     // **The figure that says whether the pass was complete.** A relocated
                     // slot no holder the sweep reached names: its claim is wasted, its
                     // source is not reclaimed, and because nothing names it the census

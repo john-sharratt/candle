@@ -15,7 +15,10 @@ use candle::quantized::pinned_staging::{Generation, PinnedStager};
 // `DType`, or the crate's own `Result` anywhere in this file.)
 use candle::{DType, Device, Result};
 
+#[cfg(feature = "cuda")]
+use super::compact_map::Replaced;
 use super::compact_plan::ArenaSlots;
+use super::fresh_arenas::FreshArenas;
 use super::head_gids::ChunkBands;
 use super::{
     Arena, ArenaKey, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta,
@@ -335,6 +338,20 @@ impl BackingInner {
         }
         Ok(freed)
     }
+
+    /// Release one arena the caller created, if nothing is in it; `true` when it did.
+    ///
+    /// The targeted form of [`Self::release_empty_arenas`], for a creator handing back
+    /// what it made and did not use without also releasing everything else that happens
+    /// to be empty. The pool entry and the storage go together, as in the sweep.
+    pub(super) fn release_arena_if_empty(&self, key: ArenaKey, arena_idx: usize) -> Result<bool> {
+        if !self.pool.tombstone_if_empty(key, arena_idx) {
+            return Ok(false);
+        }
+        self.storage.release_arena(arena_idx)?;
+        self.pool.resync_counters();
+        Ok(true)
+    }
 }
 
 /// Shared backing storage for a chunked (paged) KV cache.
@@ -350,6 +367,15 @@ pub struct ChunkedKvBacking {
     pub(crate) layer_idx: usize,
     /// Per-layer block table state (sequences, max_blocks).
     pub(crate) state: Arc<RwLock<BlockTableState>>,
+}
+
+/// Where a compaction's mints may land — see [`ChunkedKvBacking::try_alloc_record_slot`].
+#[derive(Default)]
+pub(super) struct RecordPlacement {
+    /// Record arenas to fill first, lowest in the span first.
+    pub order: Vec<usize>,
+    /// `(arena, slot)` the pass has planned to read as record sources.
+    pub avoid: HashSet<(usize, u32)>,
 }
 
 /// Where one backing's `KvHead` records live and how big they are — see
@@ -736,34 +762,41 @@ impl ChunkedKvBacking {
         meta.device_addr()
     }
 
-    /// Throw away every slot's cached decode buffer in this backing.
+    /// Throw away every cached decode buffer in this backing that was serialised from
+    /// ground a compaction's sweep replaced, and answer which slots those were.
     ///
-    /// **Because a minted record moves a record's ADDRESS, and that address is cached
-    /// without being owned.** Each slice header in the decode buffer carries a
-    /// `kvheads_ptr` — the raw `MetaGid::device_addr()` of its chunk's record — and the
-    /// buffer is reused whenever the chunk *count* agrees, which a compaction never
-    /// changes. `SequenceState::rewrite_for_compaction` clears the buffer for a slot whose
-    /// own chunks moved, and that is the set of slots whose *band* addresses changed; it is
-    /// not provably the set whose *record* addresses changed, because a record address can
-    /// only be reached through a chain of caches this crate does not own.
+    /// **A buffer caches addresses it does not own the meaning of.** Each slice header
+    /// carries a `kvheads_ptr` — its chunk's record address — and band addresses behind
+    /// it, and the buffer is reused whenever the chunk *count* agrees, which a compaction
+    /// never changes. `SequenceState::rewrite_for_compaction` clears the buffer of a slot
+    /// whose own chunks it rewrote; this catches a buffer that names replaced ground
+    /// through anything else.
     ///
-    /// So a pass that minted anything clears all of them. A rebuild costs one host
-    /// serialisation per slot on its next sync, at between-forwards cadence, against a
-    /// stale `kvheads_ptr` that dereferences a record slot the pool has since reissued —
-    /// which reads another chunk's band pointers and does not fault, because every address
-    /// in the reservation is mapped.
-    #[allow(dead_code)] // the only caller is `compact`, which is cuda-gated
-    pub(super) fn invalidate_all_decode_buffers(&self) -> Result<usize> {
+    /// **Decided from the buffer's own pins, not by clearing everything.** Every buffer
+    /// holds a [`ChunkPin`](super::gpu_chunks::ChunkPin) per serialised chunk, so it can
+    /// say exactly which bands and records its headers name. A buffer naming none of what
+    /// the sweep replaced is still exact and is kept: clearing it would cost its slot a
+    /// host re-serialisation, and would make the count below mean nothing.
+    ///
+    /// A non-empty answer is therefore a real finding: a buffer whose slot the sweep did
+    /// not rewrite, naming ground it moved other holders off. Not a correctness fault on
+    /// its own, since the pins keep that ground alive for as long as the buffer is held,
+    /// but it is a holder the sweep does not reach and ground the pass cannot reclaim.
+    #[cfg(feature = "cuda")]
+    pub(super) fn invalidate_decode_buffers_naming(
+        &self,
+        replaced: &Replaced,
+    ) -> Result<Vec<usize>> {
         let mut state = self
             .state
             .write()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-        let mut cleared = 0usize;
-        for entry in state.sequences.iter_mut() {
+        let mut cleared = Vec::new();
+        for (slot, entry) in state.sequences.iter_mut().enumerate() {
             let Some(seq) = entry.as_mut() else { continue };
-            if seq.has_decode_gpu_chunks() {
+            if seq.has_decode_gpu_chunks() && replaced.names_any(&seq.gpu_chunk_pins()) {
                 seq.invalidate_gpu_chunks();
-                cleared += 1;
+                cleared.push(slot);
             }
         }
         Ok(cleared)
@@ -783,7 +816,7 @@ impl ChunkedKvBacking {
     /// # Why a compaction may not use the promoting claim
     ///
     /// [`Self::alloc_chunk_for_key`] widens to `claim_slot_promoting`, which on a miss
-    /// calls `release_empty_arenas()` and `claim_fresh_region()`. Both are safe at a seal
+    /// calls `release_empty_arenas()` and stamps a fresh region. Both are safe at a seal
     /// boundary and **not** safe inside a compaction's holder sweep: releasing an arena
     /// frees its `arena_idx`, and the next registration re-tenants that index for a
     /// different key — `ChunkGidPool::register_arena` calls it out as the
@@ -796,8 +829,23 @@ impl ChunkedKvBacking {
     ///
     /// So the pass provisions the pool up front ([`Self::reserve_record_slots`]) and takes
     /// only what already exists while it is sweeping.
+    ///
+    /// # Where the slot comes from
+    ///
+    /// `placement.order` is tried first, arena by arena — the pool's arenas lowest in the
+    /// span first — so a mint lands as low as the pool allows rather than wherever the
+    /// lowest arena *index* is, which is unrelated to address. A mint left to index order
+    /// can land in the very arena the same pass is draining, and keep it alive.
+    ///
+    /// No slot in `placement.avoid` is ever returned: those are this pass's planned record
+    /// sources. One is on the free list only if its record died after the census, and a
+    /// mint written there would land in ground the pass has declared it is reading.
     #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
-    pub(super) fn try_alloc_record_slot(&self, key: ArenaKey) -> Option<ChunkGid> {
+    pub(super) fn try_alloc_record_slot(
+        &self,
+        key: ArenaKey,
+        placement: &RecordPlacement,
+    ) -> Option<ChunkGid> {
         // **Held, not dropped, until a materialised one is found.** The pool can hold a
         // registration whose storage was never materialised, and a record in one has no
         // address — but dropping such a gid returns the slot to the head of the same free
@@ -810,17 +858,34 @@ impl ChunkedKvBacking {
         // on return, which is the right lifetime: the pass is inside the arena window, so
         // nothing else is claiming, and a registration that is unmaterialised now will
         // still be unmaterialised on the next mint.
+        //
+        // A planned source is held the same way, for the same reason: dropped, it would be
+        // popped again by the next claim.
+        let usable = |gid: &ChunkGid| {
+            !placement
+                .avoid
+                .contains(&(gid.arena_idx(), gid.chunk_idx() as u32))
+                && self
+                    .inner
+                    .storage
+                    .read(|s| s.has_arena(gid.arena_idx()))
+                    .unwrap_or(false)
+        };
         let mut rejected: Vec<ChunkGid> = Vec::new();
+        for &arena in &placement.order {
+            while let Some(gid) = self.inner.pool.allocate_from_arena(key, arena) {
+                if usable(&gid) {
+                    return Some(gid);
+                }
+                rejected.push(gid);
+            }
+        }
+        // Arenas the order does not know of: any the pool registered after it was taken.
         let found = loop {
             let Some(gid) = self.inner.pool.allocate_for(key) else {
                 break None;
             };
-            if self
-                .inner
-                .storage
-                .read(|s| s.has_arena(gid.arena_idx()))
-                .unwrap_or(false)
-            {
+            if usable(&gid) {
                 break Some(gid);
             }
             rejected.push(gid);
@@ -829,14 +894,47 @@ impl ChunkedKvBacking {
         found
     }
 
+    /// The pool's arena indices, lowest in the span first — the order a mint fills them
+    /// in. Arenas with no region (host arenas) have no position and are left out.
+    #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
+    pub(super) fn arenas_by_rank(&self, key: ArenaKey) -> Vec<usize> {
+        let load = self.inner.pool.pool_arena_load(key);
+        let mut ranked: Vec<(usize, usize)> = self
+            .inner
+            .storage
+            .read(|s| {
+                let arenas = s.arenas();
+                load.iter()
+                    .filter_map(|(idx, _, _)| {
+                        arenas
+                            .get(idx)
+                            .and_then(|a| a.region_rank())
+                            .map(|r| (r, *idx))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ranked.sort_unstable();
+        ranked.into_iter().map(|(_, idx)| idx).collect()
+    }
+
     /// Make sure the record pool for `key` can satisfy `want` claims without creating an
     /// arena, and answer how many arenas that took.
     ///
     /// **Called before the sweep, which is the only safe place to create one.** See
     /// [`Self::try_alloc_record_slot`] for what goes wrong if an arena is created or
     /// released while holders are half-rewritten.
+    ///
+    /// Every arena it creates is noted in `fresh`, which keeps the empty sweep off it
+    /// until the pass ends and then releases any the mints never reached. See
+    /// [`FreshArenas`].
     #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
-    pub(super) fn reserve_record_slots(&self, key: ArenaKey, want: usize) -> Result<usize> {
+    pub(super) fn reserve_record_slots(
+        &self,
+        key: ArenaKey,
+        want: usize,
+        fresh: &mut FreshArenas<'_>,
+    ) -> Result<usize> {
         let free = |b: &Self| -> usize {
             b.inner
                 .pool
@@ -854,11 +952,11 @@ impl ChunkedKvBacking {
         // **And a claim is only taken while a hole exists below the frontier.** The region
         // free list is lowest-index-first, so with holes a fresh arena lands *under* the
         // frontier and costs nothing; with none it lands above and raises the very number
-        // the pass exists to lower. `lowest_hole_destination` refuses for the same reason,
+        // the pass exists to lower. `provision_low_arenas` stops for the same reason,
         // and this is the same trade: declining a mint costs one chunk's reclaim, raising
         // the frontier costs the weight side a region.
         while free(self) < want && self.has_region_hole() {
-            if self.inner.claim_fresh_region(key).is_err() {
+            if fresh.claim(&self.inner, key).is_err() {
                 break;
             }
             created += 1;
@@ -2264,8 +2362,8 @@ impl ChunkedKvBacking {
     /// would land *under* the frontier rather than raise it.
     ///
     /// The region free list is lowest-index-first, so a claim takes the lowest hole when
-    /// one exists. Used to gate speculative provisioning; `lowest_hole_destination` asks
-    /// the same question for the same reason.
+    /// one exists. Gates every arena a compaction creates ahead of demand — the per-pool
+    /// low arenas and the record reservation.
     #[cfg(feature = "cuda")]
     pub(super) fn has_region_hole(&self) -> bool {
         let candle::DeviceLocation::Cuda { gpu_id } = self.device().location() else {
@@ -2469,6 +2567,29 @@ impl ChunkedKvBacking {
                 });
             }
             out
+        })
+    }
+
+    /// The census entry for an arena this pass has just created and nothing occupies:
+    /// its physical rank and capacity, with no occupied slots.
+    ///
+    /// What [`Self::compaction_census`] would report for it, without re-walking the rest
+    /// of the pool's bitmaps to find out. `None` when the arena has no region (a host
+    /// arena) or is not in storage.
+    #[allow(dead_code)] // the only caller is `compact`, which is cuda-gated
+    pub(super) fn fresh_arena_slots(&self, key: ArenaKey, arena_idx: usize) -> Option<ArenaSlots> {
+        let rank = self
+            .inner
+            .storage
+            .read(|s| s.arenas().get(&arena_idx).and_then(|a| a.region_rank()))
+            .ok()
+            .flatten()?;
+        Some(ArenaSlots {
+            arena_idx,
+            key,
+            rank,
+            capacity: key.chunks(),
+            occupied: Vec::new(),
         })
     }
 

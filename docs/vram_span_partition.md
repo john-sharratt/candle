@@ -294,12 +294,31 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
   so deciding where to spend the budget does not spend it. Measured before the
   ordering: nine seconds at 52–59% with the frontier pinned and 64 free regions
   under it, every pass running and clipping on the low rungs.
-- **A fresh low arena for the pool at the top.** Packing is per pool, so each pool
-  converges onto *its own* lowest arenas — and the pool holding the highest arena in
-  the span may have no lower arena with room, in which case a perfect per-pool pack
-  leaves it exactly where it was. One fresh arena claims from the region free list,
-  which is lowest-index-first, so it lands in a hole below the frontier and gives the
-  walk a destination under the top arena. One per pass, and only while holes exist.
+- **A fresh low arena for every pool, highest pool first.** Packing is per pool, so
+  each pool converges onto *its own* lowest arenas — and a pool whose lowest arena sits
+  high in the span packs perfectly and stays where it is. Before planning, every
+  censused pool is given one fresh arena, in the census's order (the pool whose top
+  arena is highest first). The region free list is lowest-index-first, so that order
+  hands the lowest hole to the pool standing highest, the next hole to the next, and
+  the walk then fills each fresh arena first because it ranks lowest in its pool. Only
+  while a hole exists below the frontier: with none, a claim would land above it and
+  raise it. A fresh arena that lands above its own pool's top receives nothing and is
+  released as soon as the claims are in — one O(1) claim and one O(1) release, which
+  falls to nothing once the pools sit in the lowest regions.
+- **Every empty arena goes back, including the pass's own.** An arena's creation window
+  — which keeps the empty sweep off it — is always closed by its creator: at the first
+  claim for an allocate-on-demand creator, and explicitly right after its claim for a
+  stamp (`claim_fresh_region_open`, then `finish_creation`), so no arena is left
+  unreclaimable because nothing happened to land in it. Measured on the 30B with windows
+  left open: 11 record arenas standing where 1 was in use.
+
+  The pass protects what it creates ahead of demand (`FreshArenas`) and releases it
+  itself: the per-pool low arenas the plan put nothing in go back right after the
+  claims — before the holder sweep, when nothing can name an empty arena, and before the
+  record reservation looks for a hole — and whatever is still empty goes back when the
+  pass ends, on every exit path. The arenas that took relocations stay protected until
+  then, because releasing one mid-sweep would free an `arena_idx` an unreached holder
+  still names.
 - **Two CUDA calls for the whole pass.** The claims are a host walk producing three `i64`
   arrays, and one launch of the migration scatter/gather kernel copies every relocated
   slot; one further launch fills the records minted for them. A per-chunk
@@ -373,9 +392,15 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
   record — but a record's own address is cached as a bare `kvheads_ptr` word in every
   `TokenSlice` header of every slot's decode buffer, and that buffer is reused whenever the
   chunk *count* agrees, which a compaction never changes. `rewrite_for_compaction` clears
-  the buffer of each slot whose own chunks moved; that is the set whose *band* addresses
-  changed, and it is not provably the set whose *record* addresses changed. So a pass that
-  minted anything calls `invalidate_all_decode_buffers` on every backing.
+  the buffer of each slot whose own chunks moved or whose record was followed to a copy.
+  After the holder sweep, every other slot's buffer is checked against what the sweep
+  replaced, using the `ChunkPin`s the buffer holds for each chunk it serialised — one per
+  header, naming its bands and its record — and any buffer naming replaced ground is
+  dropped (`invalidate_decode_buffers_naming`). A buffer naming nothing replaced is exact
+  and is kept. Zero is the expected count: a non-zero one names a slot whose buffer
+  reaches a chunk through something the sweep does not rewrite. The pins keep that ground
+  alive, so it is not a wrong read — the pin must name the record the header names, which
+  is why `update_chunk` replaces a pin when either the bands or the record changed.
 
   Without it the probe answered 7/8, 5/8, 3/8, 2/8 — a stale `kvheads_ptr` dereferencing a
   record slot the pool had reissued, which reads another chunk's band pointers and does not
@@ -590,22 +615,39 @@ Four properties this is required to have, and the reason each is not an optimisa
    stream and nothing is read back. A fill that fenced would put a device-wide wait
    between every pair of chunk allocations.
 
-### What is deliberately not done yet
+### Packing the record arenas
 
-**The record arenas are excluded from the compaction census.** A record arena is
-allocated from and released, never packed, so a record arena sitting high in the span
-holds the frontier up and no pass can lower it. Records are a few percent of the KV
-bytes, so the ground at stake is small, but it is not nothing and it is not bounded.
+**The record pool is compacted by the same pass, with the same walk.** A record arena
+is a region like any other, so a sparse one high in the span holds the frontier up
+exactly as a sparse band arena does. The pass ranks the record pool beside the band
+pools, gives it a fresh low arena the same way, plans it with `plan_pool`, and copies
+its moves in the same batched launch as the bands.
 
-Relocating a record is a different problem from relocating a band, and harder in one
-specific way: a band's address lives *inside* a record, which owns that band and can
-therefore be left alone — whereas a *record's* own address is recorded in the `MetaGid`
-every holder of the chunk carries and in the `kvheads_ptr` word of every slice header
-built from it, and nothing owns those. The first is reachable through the same holder
-sweep that rewrites gids; the second is a cached buffer per batch slot, invalidated
-today only for slots whose own chunks moved. Packing the record arenas means driving
-both, and the honest statement is that nobody has needed the ground yet.
+What differs is how a holder follows the move, and it is the minting argument again:
 
-The band arenas *are* reclaimed — a relocated chunk gets a freshly minted record and the
-old one's death releases the source (§6). What remains unpacked is the record arenas
-themselves.
+- **A copy is a correct record.** A record's bytes are band *addresses*, never its own
+  slot, so the bytes at the new slot describe exactly what the old ones did. No fill
+  kernel runs; the copy is byte-exact.
+- **Holders get a new handle; the old one is never touched.** The sweep looks up each
+  holder's `meta` by its slot's raw id and installs a `MetaGid` for the copy carrying the
+  same `bands` clone. A holder the sweep does not reach keeps the old handle, whose slot
+  stays occupied — and whose address stays valid — for as long as it does. Nothing is ever
+  relocated under a handle.
+- **Bands first, then the record.** A chunk whose bands moved in the same pass is given a
+  freshly minted record, and its record's copy is left unused: the copy names the
+  *source* bands. `Sweep::follow_record` skips anything the sweep minted.
+- **Every retired record is held until the sweep ends.** Records are followed by raw id,
+  and a record whose last holder was replaced frees its slot — which a mint in the same
+  sweep can then be handed. A second visit to a holder of that mint would find its raw id
+  in the record map and be given a copy of the old chunk's record. Holding the retired
+  records keeps every raw id the sweep resolves meaning one thing, which is the same fix
+  `Sweep::originals` makes for band gids.
+- **The cached `kvheads_ptr` words are dropped.** A followed record moves the address a
+  slot's decode buffer holds, so the slot counts as moved and its buffer is thrown away;
+  any other buffer still naming a record the sweep retired is caught by the pin check
+  (§6).
+- **Mints land low, and never on a record source.** A mint takes a slot from the record
+  arenas lowest in the span first, rather than by arena index — which is unrelated to
+  address, and would put fresh mints in the very arena the pass is draining. It never
+  takes one of the pass's planned record sources, whose record may have died after the
+  census: that slot is ground the pass has declared it is reading.

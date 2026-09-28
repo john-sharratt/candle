@@ -53,10 +53,12 @@ pub struct ArenaKey {
 ///   rung, which differs per checkpoint, so no fixed [`LADDER`](super::size_class::LADDER) rung can
 ///   express it — the ladder is a map from `KvFormat` to bytes and a record is not a
 ///   format.
-/// - **They are moved by different things.** Every walk that enumerates the band pools
-///   iterates `SizeClass::all()` against a [`ArenaKind::Band`] key, so record arenas are
-///   excluded from the compaction census by construction rather than by a filter someone
-///   has to remember. That exclusion is deliberate and temporary — see §8.
+/// - **Holders follow them through different fields.** Both are packed by the same
+///   compaction walk, but a moved band is followed through a chunk's `gids` and a moved
+///   record through its `meta` — see §8. Every walk that enumerates the *band* pools
+///   iterates `SizeClass::all()` against a [`ArenaKind::Band`] key, so the size-class
+///   statistics and the relief decisions that read them never see a record arena; the
+///   compaction pass adds the record pool to its ranking explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArenaKind {
     /// K/V payload. Stride and capacity come from the size class.

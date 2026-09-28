@@ -79,9 +79,11 @@ use std::time::{Duration, Instant};
 
 use candle::Result;
 
-use super::arena::ArenaKey;
+use super::arena::{ArenaKey, ArenaKind};
+use super::backing::ChunkedKvBacking;
 use super::compact_map::{CompactionMap, Sweep};
-use super::compact_plan::{plan_pool, ChunkMove};
+use super::compact_plan::{plan_pool, ArenaSlots, ChunkMove};
+use super::fresh_arenas::FreshArenas;
 use super::size_class::SizeClass;
 use crate::kv_cache::ArenaLocation;
 
@@ -123,14 +125,27 @@ pub struct CompactionReport {
     pub records_declined: usize,
     /// Record arenas the pass created up front so the sweep would not have to.
     pub record_arenas_reserved: usize,
-    /// Cached decode buffers thrown away because a mint moved record addresses, *beyond*
-    /// the ones the holder rewrite already cleared.
+    /// Every arena the pass created ahead of demand — the per-pool low destinations and
+    /// the record reservation. Whichever of them received nothing the pass releases itself,
+    /// and those are counted in `arenas_released`.
+    pub fresh_arenas: usize,
+    /// `KvHead` records copied to a lower slot, in the same launch as the bands. Counted
+    /// in [`Self::moves`] as well, which is every slot the pass copied.
+    pub records_moved: usize,
+    /// Relocated records no visited holder was moved onto. Expected non-zero: a chunk
+    /// whose bands also moved this pass is given a freshly minted record instead, and
+    /// its record's copy goes unused. A reading near `records_moved` on passes that
+    /// minted little means a record holder the sweep does not reach.
+    pub records_unfollowed: usize,
+    /// Cached decode buffers that still named ground the sweep replaced after the holder
+    /// rewrite had run — decided from each buffer's own pins, so a buffer naming nothing
+    /// replaced is neither cleared nor counted.
     ///
-    /// **Zero on every measured run, and that is the healthy reading**: a record is minted
-    /// only for a chunk whose gids were rewritten, and rewriting a slot's gids clears its
-    /// buffer, so the pass-wide sweep finds nothing left. A non-zero reading means that
-    /// coupling has broken — a record replaced without its slot being rewritten — which is
-    /// a header pointing at a reissued record slot.
+    /// **Zero is the healthy reading.** A slot whose chunks moved has its buffer cleared by
+    /// its own rewrite, so a buffer left naming replaced ground belongs to a holder the
+    /// sweep does not reach. The pins keep that ground alive, so it is not a wrong read,
+    /// but it is ground the pass cannot reclaim until the buffer goes; the warning beside
+    /// it names the slots.
     pub decode_buffers_cleared: usize,
     /// Arenas released afterwards, and so regions handed back.
     pub arenas_released: usize,
@@ -179,10 +194,9 @@ pub struct CompactionTimings {
     pub sweep: Duration,
     /// The one launch that writes every minted record's bytes.
     pub mint: Duration,
-    /// Throwing away every slot's cached decode buffer after a mint moved record
-    /// addresses. Timed apart from [`Self::mint`] because it is a lock and a host walk per
-    /// backing rather than a launch, and charging it to the fill would make a slow
-    /// invalidation read as a slow kernel.
+    /// Checking every slot's cached decode buffer against what the sweep replaced, and
+    /// dropping the ones that name it. A lock and a host walk per backing, timed apart
+    /// from [`Self::mint`] so a slow check does not read as a slow kernel.
     pub invalidate: Duration,
     /// The device-wide sync, and releasing the arenas the pass emptied.
     pub publish: Duration,
@@ -659,14 +673,23 @@ impl super::backing::ChunkedKvBacking {
         //
         // The order comes from `pool_top_rank`, which answers without the census, so
         // deciding where to spend the budget does not spend it.
+        //
+        // **The `KvHead` record pool is ranked beside the band pools.** Its arenas are
+        // regions like any other, so a sparse one high in the span holds the frontier up
+        // exactly as a sparse band arena does. The same walk packs it; what differs is how
+        // a holder follows a moved record (`Sweep::follow_record`), not how it is planned.
+        let record_key = if self.records_are_resident() {
+            self.record_layout().ok().map(|l| l.key)
+        } else {
+            None
+        };
         let mut by_rank: Vec<(usize, ArenaKey)> = SizeClass::all()
-            .filter_map(|class| {
-                let key = ArenaKey::new(class, ArenaLocation::Gpu);
-                self.pool_top_rank(key).map(|(rank, _)| (rank, key))
-            })
+            .map(|class| ArenaKey::new(class, ArenaLocation::Gpu))
+            .chain(record_key)
+            .filter_map(|key| self.pool_top_rank(key).map(|(rank, _)| (rank, key)))
             .collect();
         by_rank.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
-        let mut census_by_pool: Vec<(ArenaKey, Vec<super::compact_plan::ArenaSlots>)> = Vec::new();
+        let mut census_by_pool: Vec<(ArenaKey, Vec<ArenaSlots>)> = Vec::new();
         for (_, key) in by_rank {
             if started.elapsed() >= plan_deadline && !census_by_pool.is_empty() {
                 report.clipped = true;
@@ -677,35 +700,11 @@ impl super::backing::ChunkedKvBacking {
             };
             census_by_pool.push((key, census));
         }
-        // **Give the topmost arena's pool somewhere lower to go.** This is the step
-        // without which the frontier stops falling while everything else looks
-        // perfect. Packing is per pool, so each pool converges onto *its own* lowest
-        // arenas — and the pool holding the highest arena in the span may have no
-        // lower arena with room, in which case a perfect per-pool pack leaves that one
-        // arena exactly where it was and the frontier with it. Measured: every pool
-        // gapless, 131 arenas live, and a frontier of 330.
-        //
-        // One fresh arena for that pool is the whole fix. A fresh arena claims from
-        // the region free list, which is lowest-index-first, so it lands in a hole
-        // *below* the frontier and the walk then has a destination under the top
-        // arena. One per pass, and only while holes exist — otherwise a claim would
-        // take a region above the frontier and push it up, which is the opposite of
-        // the objective.
-        if let Some(fresh) = self.lowest_hole_destination(&census_by_pool) {
-            match self.inner.claim_fresh_region(fresh) {
-                Ok(_) => {
-                    if let Ok(recensus) = self.compaction_census(fresh) {
-                        if let Some(slot) = census_by_pool.iter_mut().find(|(k, _)| *k == fresh) {
-                            slot.1 = recensus;
-                        }
-                    }
-                }
-                Err(e) => tracing::debug!(
-                    target: "candle_nn::kv_cache::compact",
-                    "no fresh low arena for the top pool, packing without one: {e}",
-                ),
-            }
-        }
+        // Every arena the pass creates ahead of demand goes through `fresh`, which keeps
+        // the empty sweep off it while the pass needs it and releases the ones nothing
+        // landed in itself — see [`FreshArenas`].
+        let mut fresh = FreshArenas::new(&*self.inner);
+        self.provision_low_arenas(&mut census_by_pool, &mut fresh);
         for (key, census) in &census_by_pool {
             let Some(plan) = plan_pool(census, *key, 0) else {
                 continue;
@@ -769,6 +768,22 @@ impl super::backing::ChunkedKvBacking {
         if map.is_empty() {
             return Err(CompactionRefused::ClaimsLost);
         }
+        // **Every provisioned arena the plan put nothing in goes back now**, before the
+        // record reservation below looks for a hole to claim. The per-pool arenas took
+        // one hole each, and a reservation that found none would leave the mints nowhere
+        // to land. Safe here and only here: no holder has been rewritten yet, so nothing
+        // names an empty arena. See [`FreshArenas::release_unused`].
+        if let Err(e) = fresh.release_unused() {
+            return Err(CompactionRefused::Fault(e.to_string()));
+        }
+        // The record slots this pass will read, which no mint may be handed — see
+        // `ChunkedKvBacking::try_alloc_record_slot`.
+        let record_sources: HashSet<(usize, u32)> = pending
+            .iter()
+            .zip(&pool_of)
+            .filter(|(_, key)| matches!(key.kind, ArenaKind::Record { .. }))
+            .map(|(m, _)| (m.from.0, m.from.1))
+            .collect();
         // From here until the pass ends, the slots it is about to move are declared
         // immutable and any instrumented write into them names its writer. See
         // [`ReadonlySources`] for why it is the sources and not the whole band.
@@ -903,11 +918,11 @@ impl super::backing::ChunkedKvBacking {
             // over-provisions by up to that factor, and every extra arena is a *region*
             // claimed from the same free list. With no hole below the frontier that claim
             // lands above it and raises the number the pass exists to lower, which is
-            // exactly why `lowest_hole_destination` refuses in the same situation. Rounded
+            // exactly why `provision_low_arenas` stops in the same situation. Rounded
             // up, and at least one, so a small pass still provisions.
             let bands_per_chunk = (self.n_kv_head() * self.n_palette() * 2).max(1);
             let want = map.len().div_ceil(bands_per_chunk).max(1);
-            if let Err(e) = m.reserve(self, want) {
+            if let Err(e) = m.reserve(self, want, record_sources, &mut fresh) {
                 tracing::error!(
                     target: "candle_nn::kv_cache::compact",
                     "compaction could not provision record slots, abandoning the pass \
@@ -977,7 +992,58 @@ impl super::backing::ChunkedKvBacking {
             );
         }
         report.allocations_rewritten = sweep_state.allocations_rewritten();
+        report.records_moved = map.records_len();
+        report.records_unfollowed = sweep_state.records_unfollowed();
         report.timings.sweep = phase.elapsed();
+        phase = Instant::now();
+
+        // ── Drop every cached decode buffer serialised from replaced ground ──
+        // A `kvheads_ptr` is a record's address and the band pointers behind it are the
+        // bands', both cached in a slice header and owned by nothing. The live slots are
+        // already covered: `rewrite_for_compaction` clears the buffer of every slot whose
+        // gids moved or whose record was followed to a copy. This catches a buffer that
+        // names replaced ground through a chunk *not* in its slot's own block table — a
+        // holder the sweep does not reach — and names the slot, so the finding points at
+        // it. Decided from each buffer's own pins, so a buffer that names nothing replaced
+        // is kept and not miscounted.
+        //
+        // **Before the sweep drops**, because the replaced set is identified by allocation
+        // address and record raw id, which only the sweep's own pins keep from being
+        // reused. The minted records' bytes are not needed for this: it is host-only.
+        //
+        // Fatal on a poisoned lock: every holder has been installed, so there is nothing to
+        // return to, and an unchecked buffer may be naming ground the pass is about to hand
+        // back.
+        let replaced = sweep_state.replaced();
+        // A pass whose claims all landed and whose holders all turned out to be elsewhere
+        // replaced nothing; there is no buffer to check against it.
+        let checked: &[ChunkedKvBacking] = if replaced.is_empty() { &[] } else { backings };
+        for (layer, b) in checked.iter().enumerate() {
+            match b.invalidate_decode_buffers_naming(&replaced) {
+                Ok(slots) if slots.is_empty() => {}
+                Ok(slots) => {
+                    tracing::warn!(
+                        target: "candle_nn::kv_cache::compact",
+                        layer,
+                        ?slots,
+                        "a cached decode buffer named ground this compaction replaced, but \
+                         its slot's own rewrite did not clear it — a holder of those chunks \
+                         the sweep does not reach. Cleared here; its old ground stays pinned \
+                         until then",
+                    );
+                    report.decode_buffers_cleared += slots.len();
+                }
+                Err(e) => panic!(
+                    "compaction published {} band and {} record relocations and then could \
+                     not check the cached decode buffers against them: {e}. A buffer naming \
+                     replaced ground would go on being read.",
+                    map.len(),
+                    map.records_len(),
+                ),
+            }
+        }
+        drop(replaced);
+        report.timings.invalidate = phase.elapsed();
         phase = Instant::now();
 
         // ── Fill the minted records, in one launch ───────────────────────────
@@ -1026,47 +1092,8 @@ impl super::backing::ChunkedKvBacking {
             }
         }
 
-        // **A mint moved record addresses, so every cached one is dropped.**
-        //
-        // A `kvheads_ptr` is a *record's* address, cached in a slice header and owned by
-        // nothing, so a mint invalidates every buffer holding one. Today that set is
-        // already covered: a record is minted only for a chunk whose gids were rewritten,
-        // and `rewrite_for_compaction` clears the buffer of every slot that rewrote
-        // anything — which is why this measures `decode_buffers_cleared = 0` on every run.
-        //
-        // It is kept because the two sets are equal by a *coupling* — mint iff gids moved —
-        // and not by construction. A future path that replaces a record without moving
-        // gids would break it silently, and the failure is a header dereferencing a record
-        // slot the pool has since reissued: another chunk's band pointers, finite and
-        // plausible, with nothing to fault. One lock per backing per minting pass buys the
-        // guarantee, and the counter beside it is what would show the coupling breaking.
         report.timings.mint = phase.elapsed();
         phase = Instant::now();
-
-        if report.records_minted > 0 {
-            for b in backings {
-                match b.invalidate_all_decode_buffers() {
-                    Ok(n) => report.decode_buffers_cleared += n,
-                    Err(e) => panic!(
-                        "compaction minted {} records and then could not invalidate the \
-                         cached decode buffers naming the old ones: {e}. Those buffers hold \
-                         `kvheads_ptr` words pointing at record slots this pass has already \
-                         released, so the next forward would read another chunk's band \
-                         pointers.",
-                        report.records_minted,
-                    ),
-                }
-            }
-        }
-
-        report.timings.invalidate = phase.elapsed();
-        phase = Instant::now();
-
-        // Two invalidations, and both are needed. `SequenceState::rewrite_for_compaction`
-        // throws away its own slot's cached decode buffer as it rewrites, which is what
-        // makes *that* step impossible to omit rather than merely documented; the
-        // pass-wide sweep above covers the slots whose buffers went stale because a
-        // record's address moved rather than a band's.
 
         // Device-wide, not per-stream: one barrier at between-forwards cadence
         // buys the removal of the entire overlap failure domain, side streams this
@@ -1103,11 +1130,13 @@ impl super::backing::ChunkedKvBacking {
             Some(&entering),
         );
 
-        // **Nothing is released after a part-way sweep.** Everything above has been
-        // published and fenced, so the pool is consistent — but the holders the sweep did
-        // not reach still name sources, and handing regions back is the one step that
+        // **No emptied source is released after a part-way sweep.** Everything above has
+        // been published and fenced, so the pool is consistent — but the holders the sweep
+        // did not reach still name sources, and handing regions back is the one step that
         // depends on having reached all of them. Refusing here costs the reclaim and
-        // nothing else.
+        // nothing else. The arenas this pass provisioned are still handed back when
+        // `fresh` drops on the way out: an empty one is named by nothing, because every
+        // destination and every mint in it keeps it occupied.
         if let Err(e) = swept_ok {
             return Err(CompactionRefused::SweepFailed(e.to_string()));
         }
@@ -1115,53 +1144,73 @@ impl super::backing::ChunkedKvBacking {
         // Whatever the replacements above emptied is tombstoneable now. A source a
         // surviving holder or its record still names is NOT empty, so this reclaims only
         // the chunks nothing is left pointing at.
-        report.arenas_released = self.release_empty_arenas().unwrap_or(0);
+        //
+        // The arenas this pass provisioned go first, and are counted: until the holder
+        // sweep was over a released one was an `arena_idx` open to re-tenancy under
+        // holders it had not reached, so they were held until here.
+        report.fresh_arenas = fresh.created();
+        let fresh_released = fresh.finish();
+        report.arenas_released = fresh_released + self.release_empty_arenas().unwrap_or(0);
         report.frontier_after = self.frontier_regions().unwrap_or(frontier_before);
         report.timings.publish = phase.elapsed();
         Ok(report)
     }
 
-    /// The pool that should be given one fresh low arena this pass, or `None`.
+    /// Give every censused pool one fresh arena as low in the span as the free list can
+    /// place it, **the pool highest on the frontier first**, and add each to its pool's
+    /// census so the walk plans into it.
     ///
-    /// Answers a question a per-pool pack cannot: which pool is *holding the
-    /// frontier up*, and can it get out of its own way? The pool owning the highest
-    /// arena in the span is the only one whose position costs anything, and it needs
-    /// help only when its lower arenas cannot absorb that arena's live chunks —
-    /// otherwise [`plan_pool`] drains it unaided.
+    /// **Why every pool, not just the top one.** Packing is per pool, so each pool
+    /// converges onto *its own* lowest arenas — and a pool whose lowest arena sits high
+    /// in the span packs perfectly and stays exactly where it is: every pool gapless, 131
+    /// arenas live and a frontier of 330 is a state a per-pool pack alone settles into. A
+    /// lower destination for only the pool owning the topmost arena moves that one arena
+    /// and no other pool. A fresh arena per pool gives each of them ground below its own,
+    /// so the whole population moves down together.
     ///
-    /// `None` when there are no holes, because a fresh arena would then claim a
-    /// region *above* the frontier and raise the very number the pass exists to
-    /// lower.
-    fn lowest_hole_destination(
+    /// **Why this order places them right.** `census_by_pool` is already sorted by each
+    /// pool's highest arena, highest first, and the region free list is lowest-index
+    /// first — so claiming in this order hands the lowest hole to the pool standing
+    /// highest, the next hole to the next, and so on. Nothing needs to be computed for
+    /// that pairing; it falls out of the two orders.
+    ///
+    /// **Only while a hole exists below the frontier.** With none, the claim would take a
+    /// region *above* it and raise the very number the pass exists to lower, so the lower
+    /// pools go without — they are the ones whose position matters least.
+    ///
+    /// An arena that lands above its own pool's top receives nothing, because the walk
+    /// fills the lowest slots first, and the pass releases it as soon as the claims are
+    /// in ([`FreshArenas::release_unused`]) — on a pass that stops earlier, when
+    /// [`FreshArenas`] drops. That is the churn this costs: one region claim and one
+    /// release, both O(1) on the region free list.
+    fn provision_low_arenas(
         &self,
-        census_by_pool: &[(ArenaKey, Vec<super::compact_plan::ArenaSlots>)],
-    ) -> Option<ArenaKey> {
-        let candle::DeviceLocation::Cuda { gpu_id } = self.device().location() else {
-            return None;
-        };
-        let stats = super::region_pool::region_stats(gpu_id)?;
-        // No stranded region below the frontier means no low ground to claim.
-        if stats.live_watermark <= stats.live {
-            return None;
+        census_by_pool: &mut [(ArenaKey, Vec<ArenaSlots>)],
+        fresh: &mut FreshArenas<'_>,
+    ) {
+        for (key, census) in census_by_pool.iter_mut() {
+            if census.is_empty() {
+                continue;
+            }
+            if !self.has_region_hole() {
+                break;
+            }
+            let arena_idx = match fresh.claim(&self.inner, *key) {
+                Ok(idx) => idx,
+                // No region for this pool is no region for any pool below it either.
+                Err(e) => {
+                    tracing::debug!(
+                        target: "candle_nn::kv_cache::compact",
+                        ?key,
+                        "no fresh low arena, packing the remaining pools without one: {e}",
+                    );
+                    break;
+                }
+            };
+            if let Some(slots) = self.fresh_arena_slots(*key, arena_idx) {
+                census.push(slots);
+            }
         }
-        // The highest-ranked arena anywhere, and the pool that owns it.
-        let (key, top_rank) = census_by_pool
-            .iter()
-            .flat_map(|(k, c)| c.iter().map(move |a| (*k, a.rank)))
-            .max_by_key(|(_, rank)| *rank)?;
-        let pool = &census_by_pool.iter().find(|(k, _)| *k == key)?.1;
-        let top = pool.iter().find(|a| a.rank == top_rank)?;
-        // Room below it, in slots, against what it is holding. A pool that can
-        // already absorb its own top arena is packed by the walk alone.
-        let room_below: usize = pool
-            .iter()
-            .filter(|a| a.rank < top_rank)
-            .map(|a| a.capacity.saturating_sub(a.occupied.len()))
-            .sum();
-        if top.occupied.is_empty() || room_below >= top.occupied.len() {
-            return None;
-        }
-        Some(key)
     }
 
     /// One past the highest live region on this device — the frontier, in regions.
@@ -1312,7 +1361,12 @@ impl super::backing::ChunkedKvBacking {
             records.dsts.push(dst as i64);
             records.lens.push(dst_stride);
             let old_raw = (m.from.0 * super::types::GID_STRIDE + m.from.1 as usize) as i64;
-            map.insert(old_raw, new_gid, dst);
+            // A band is followed through a holder's gids, a record through its `meta` —
+            // the same copy, published to the field that names it.
+            match key.kind {
+                ArenaKind::Band => map.insert(old_raw, new_gid, dst),
+                ArenaKind::Record { .. } => map.insert_record(old_raw, new_gid, dst),
+            }
         }
         Ok(())
     }

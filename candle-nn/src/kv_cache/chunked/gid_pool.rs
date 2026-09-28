@@ -138,8 +138,10 @@ pub struct ArenaRefcounts {
     /// full → non-full transition so the pool's `allocate_any` can find it via
     /// find-first-set instead of scanning every arena.
     capacity: Arc<CapacityBitmap>,
-    /// Creation window guard: `true` from registration until the arena hands
-    /// out its FIRST gid. `register_arena` releases the metadata lock before
+    /// Creation window guard: `true` from registration until the arena hands out
+    /// its FIRST gid, or until its creator closes it explicitly with
+    /// `ChunkGidPool::finish_creation` — which every creator that may not claim does
+    /// (a stamp after its by-name claim, a compaction's provisioned arenas once built). `register_arena` releases the metadata lock before
     /// its caller allocates chunks or writes data, so a freshly-registered
     /// arena sits at `live == 0`, unprotected — and `try_tombstone` on another
     /// thread could free it (and recycle its INDEX to a different owner) while
@@ -962,6 +964,30 @@ impl ArenaPool {
         Some(candidate)
     }
 
+    /// Remove `arena_idx`'s table if it is past its creation window and holds no live
+    /// slot; `true` when it did.
+    ///
+    /// [`Self::try_tombstone`] for one named arena, under the same gate and for the same
+    /// reason. Protection is not consulted: the only caller is the creator that holds
+    /// the protection, releasing its own arena.
+    fn tombstone_if_empty(&self, arena_idx: usize) -> bool {
+        let _gate = self.alloc_gate.lock().unwrap();
+        let empty = self
+            .tables
+            .read()
+            .unwrap()
+            .get(&arena_idx)
+            .is_some_and(|t| !t.creation_pending() && t.live_count() == 0);
+        if !empty {
+            return false;
+        }
+        let mut tables = self.tables.write().unwrap();
+        tables.remove(&arena_idx);
+        self.total_arenas.fetch_sub(1, Ordering::Relaxed);
+        self.capacity.clear(arena_idx);
+        true
+    }
+
     /// Force-remove an arena's table regardless of whether it's empty.
     /// Used by the legacy `release_arena` path after a manual gid drain.
     fn force_release(&self, arena_idx: usize) {
@@ -1163,6 +1189,12 @@ impl ChunkGidPool {
     pub fn protect_arena(&self, arena_idx: usize) {
         let mut state = self.inner.metadata.lock().unwrap();
         state.protected_arenas.insert(arena_idx);
+    }
+
+    /// Lift [`Self::protect_arena`], so the empty sweep may reclaim the arena again.
+    pub fn unprotect_arena(&self, arena_idx: usize) {
+        let mut state = self.inner.metadata.lock().unwrap();
+        state.protected_arenas.remove(&arena_idx);
     }
 
     /// Register a new arena with the pool.
@@ -1410,6 +1442,30 @@ impl ChunkGidPool {
         state.arena_registry[arena_idx] = None;
         state.free_arenas.push_back(arena_idx);
         Some(arena_idx)
+    }
+
+    /// Release one named arena if it is empty and past its creation window, returning
+    /// its index to the free list; `true` when it did.
+    ///
+    /// For a creator handing back an arena it made and did not use. The caller releases
+    /// the arena's storage afterwards, exactly as after [`Self::next_tombstone`].
+    ///
+    /// **The index leaves the protected set here, under the same lock that puts it on
+    /// the free list.** Lifted any later, the index would sit free and protected at once,
+    /// and a creator that registered and protected it in between would have its
+    /// protection erased by the belated lift.
+    pub fn tombstone_if_empty(&self, key: ArenaKey, arena_idx: usize) -> bool {
+        let mut state = self.inner.metadata.lock().unwrap();
+        let Some(pool) = self.inner.pools.get(&key) else {
+            return false;
+        };
+        if !pool.tombstone_if_empty(arena_idx) {
+            return false;
+        }
+        state.arena_registry[arena_idx] = None;
+        state.protected_arenas.remove(&arena_idx);
+        state.free_arenas.push_back(arena_idx);
+        true
     }
 
     /// Declare an arena created **ahead of demand** finished, so the empty

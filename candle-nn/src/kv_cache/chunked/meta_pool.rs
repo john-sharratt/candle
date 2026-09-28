@@ -335,10 +335,12 @@ pub struct MetaGid {
     /// **Stable for the handle's life, and every paged kernel depends on that.**
     /// It is written raw into each slice header's `kvheads_ptr` word and
     /// dereferenced by `reinterpret_cast` with no indirection
-    /// (`paged-decode/slot_types.cuh`), so nothing may relocate a held record —
-    /// which is exactly why the record arenas are excluded from the compaction
-    /// census. `0` ⇒ no device residence (a host-only pool), in which case the
-    /// chunk has no record at all.
+    /// (`paged-decode/slot_types.cuh`), so nothing may relocate a held record. A
+    /// compaction that packs the record arenas does not: it copies the bytes to a
+    /// new slot, gives the holders it reaches a *new* handle for that slot, and
+    /// leaves this one — and its address — valid for whoever still holds it. `0` ⇒
+    /// no device residence (a host-only pool), in which case the chunk has no
+    /// record at all.
     device_addr: u64,
 }
 

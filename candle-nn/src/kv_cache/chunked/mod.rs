@@ -49,6 +49,7 @@ mod compress;
 mod compression_policy;
 pub(super) mod cpu_selection;
 pub mod fletcher_golden;
+mod fresh_arenas;
 mod gid_pool;
 #[cfg(feature = "cuda")]
 mod gpu_chunks;
