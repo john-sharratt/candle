@@ -552,7 +552,15 @@ fn minimal_value(p: &Param) -> String {
         ParamType::String => "\"\"".into(),
         ParamType::Integer | ParamType::Number => "0".into(),
         ParamType::Boolean => "false".into(),
-        ParamType::Array => "[]".into(),
+        // A guided array holds at least its `minItems` elements, which the
+        // tree separates as `, `.
+        ParamType::Array => match &p.items {
+            Some(item) => {
+                let elements: Vec<String> = (0..p.min_items).map(|_| minimal_value(item)).collect();
+                format!("[{}]", elements.join(", "))
+            }
+            None => "[]".into(),
+        },
         // An object with a schema is guided, so its required fields are forced
         // exactly as a call's are.
         ParamType::Object => match &p.properties {
@@ -562,14 +570,45 @@ fn minimal_value(p: &Param) -> String {
     }
 }
 
-/// `"key": value` for every required field, in the tree's order.
+/// `"key": value` for every field a minimal call writes, in the tree's order.
 fn required_fields(params: &[Param]) -> String {
-    params
+    let (required, optional): (Vec<&Param>, Vec<&Param>) = params.iter().partition(|p| p.required);
+    written(&required, optional)
         .iter()
-        .filter(|p| p.required)
         .map(|p| format!("\"{}\": {}", p.name, minimal_value(p)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The fields a minimal call writes, in the order the tree writes them
+/// (`build_sequence`): the required ones in turn — and after a required
+/// enum field whose first value requires fields of its own, by every rule
+/// naming that value, those fields, taken from the optional ones in their
+/// order and written once the required ones after it are.
+fn written<'p>(required: &[&'p Param], optional: Vec<&'p Param>) -> Vec<&'p Param> {
+    let mut out = Vec::new();
+    for (at, &p) in required.iter().enumerate() {
+        out.push(p);
+        let discriminates = !p.requires.is_empty() && !p.nullable;
+        let first = p.enum_values.as_ref().and_then(|v| v.first());
+        let Some(first) = first.filter(|_| discriminates) else {
+            continue;
+        };
+        let needs: Vec<&str> = p
+            .requires
+            .iter()
+            .filter(|(value, _)| value == first)
+            .flat_map(|(_, fields)| fields.iter().map(String::as_str))
+            .collect();
+        let (promoted, still): (Vec<&Param>, Vec<&Param>) = optional
+            .into_iter()
+            .partition(|o| needs.contains(&o.name.as_str()));
+        let mut rest: Vec<&Param> = required[at + 1..].to_vec();
+        rest.extend(promoted);
+        out.extend(written(&rest, still));
+        return out;
+    }
+    out
 }
 
 /// A minimal valid call: name + every required field (in the tree's order) with
