@@ -496,7 +496,119 @@ mod tests {
         assert_eq!(repo.enum_values, Some(repos));
     }
 
-    /// **Every git definition names exactly the fields its executor reads.**
+    /// **A value rule names what exists.** Each `if`/`then` a definition
+    /// carries — the fields one value of a field requires, which the grammar
+    /// writes as required after that value — tests a field the definition
+    /// has, for values that field allows, and requires fields it has. A
+    /// misspelt name would leave the requirement silently off, and the call
+    /// free to close without what its mode needs.
+    #[test]
+    fn every_value_rule_names_real_fields_and_values() {
+        let mut ruled = Vec::new();
+        for def in load_bundled().iter() {
+            let params = &def.parameters;
+            let Some(rules) = params.get("allOf").and_then(Value::as_array) else {
+                continue;
+            };
+            ruled.push(def.name.clone());
+            let props = params["properties"].as_object().unwrap();
+            // A field's allowed values, through the `allOf`/`$ref` a named
+            // enum is written with.
+            let allowed = |field: &str| -> Vec<String> {
+                let schema = &props[field];
+                let named = schema["allOf"][0]["$ref"]
+                    .as_str()
+                    .or_else(|| schema["$ref"].as_str())
+                    .and_then(|r| r.strip_prefix("#/definitions/"));
+                let schema = match named {
+                    Some(name) => &params["definitions"][name],
+                    None => schema,
+                };
+                schema["enum"]
+                    .as_array()
+                    .map(|e| {
+                        e.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            // Parsed once per definition, not once per rule: every rule below
+            // reads the same schema, and re-parsing it per rule was pure
+            // repeated work for a definition with more than one `allOf` rule.
+            let spec = ToolSpec::from_json_schema(&def.name, params);
+            for rule in rules {
+                let tested = rule["if"]["properties"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{}: a rule without `if.properties`", def.name));
+                // A rule's `if` tests exactly one field, or the grammar drops
+                // it — checked up front so the per-value work below can
+                // assume a single `(field, values)` pair.
+                assert_eq!(
+                    tested.len(),
+                    1,
+                    "{}: a rule's `if` tests one field, or the grammar drops it",
+                    def.name
+                );
+                let (field, test) = tested.iter().next().unwrap();
+                assert!(
+                    props.contains_key(field),
+                    "{}: tests no field {field}",
+                    def.name
+                );
+                let values: Vec<&str> = match (&test["const"], &test["enum"]) {
+                    (Value::String(one), _) => vec![one.as_str()],
+                    (_, Value::Array(many)) => many.iter().filter_map(Value::as_str).collect(),
+                    _ => panic!("{}: {field} is tested by neither const nor enum", def.name),
+                };
+                let allows = allowed(field);
+                for value in &values {
+                    assert!(
+                        allows.iter().any(|a| a == value),
+                        "{}: {field} has no value {value} (it allows {allows:?})",
+                        def.name
+                    );
+                }
+                // The grammar acts on a rule only over a required, non-null
+                // enum — anywhere else it would be dropped without a word.
+                let param = spec.params.iter().find(|p| &p.name == field).unwrap();
+                assert!(
+                    param.required && !param.nullable && param.enum_values.is_some(),
+                    "{}: the grammar does not act on the rule over {field}",
+                    def.name
+                );
+                // And only when THIS rule's specific tested value carries its
+                // own required fields — checking the field's aggregate
+                // `requires` (every value any rule on it ever named) would
+                // pass even if a bug dropped or mis-recorded the requirement
+                // for exactly this value, as long as some other rule on the
+                // same field left it non-empty.
+                for value in &values {
+                    assert!(
+                        param
+                            .requires
+                            .iter()
+                            .any(|(v, reqs)| v == value && !reqs.is_empty()),
+                        "{}: {field}={value} carries no requirement the grammar acts on",
+                        def.name
+                    );
+                }
+                let required = rule["then"]["required"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{}: a rule without `then.required`", def.name));
+                for field in required.iter().filter_map(Value::as_str) {
+                    assert!(
+                        props.contains_key(field),
+                        "{}: requires no field {field}",
+                        def.name
+                    );
+                }
+            }
+        }
+        assert!(ruled.iter().any(|n| n == "git_commit"), "{ruled:?}");
+    }
+
+    /// **Every definition names exactly the fields its executor reads.**
     ///
     /// The YAML and the Rust request type are deliberately separate — the
     /// definition carries trigger-rich prose no derive could produce — but
@@ -507,12 +619,10 @@ mod tests {
     /// call at run time, in a family where a failed call may be a refused
     /// commit.
     ///
-    /// Scoped to `git_*` because that is the family this guard was written
-    /// with; the comparison is shape-only (names and requiredness), so
-    /// extending it to the rest of the catalog is a matter of removing the
-    /// filter and fixing whatever it finds.
+    /// Every definition in the catalog, not one family: a new tool is held to
+    /// it from the day it is written.
     #[test]
-    fn every_git_definition_matches_its_executors_request_type() {
+    fn every_definition_matches_its_executors_request_type() {
         let names = |schema: &Value| -> HashSet<String> {
             schema
                 .get("properties")
@@ -547,7 +657,7 @@ mod tests {
             out
         };
 
-        for def in load_bundled().iter().filter(|d| d.name.starts_with("git_")) {
+        for def in load_bundled().iter() {
             let tool = zend_tools::registry::find(&def.name)
                 .unwrap_or_else(|| panic!("{} has no executor", def.name));
             let generated = (tool.schema)();
@@ -595,9 +705,15 @@ mod tests {
             // offered. Checked on the decoder's own reading of the definition,
             // so any spelling of nullability — a `null` type, an `anyOf` with
             // `{"type":"null"}` — is caught.
+            // The git family's rule: its `null` was the cheapest wrong value.
+            // Elsewhere an `Option` field may be nullable (`file_list`'s
+            // `prefix`), and the stencil offers `null` beside the value.
             let spec = ToolSpec::from_json_schema(&def.name, &def.parameters);
-            let mut stack: Vec<(String, &Param)> =
-                spec.params.iter().map(|p| (p.name.clone(), p)).collect();
+            let mut stack: Vec<(String, &Param)> = if def.name.starts_with("git_") {
+                spec.params.iter().map(|p| (p.name.clone(), p)).collect()
+            } else {
+                Vec::new()
+            };
             while let Some((path, p)) = stack.pop() {
                 assert!(
                     !p.nullable,
@@ -721,7 +837,7 @@ mod tests {
         let commit = spec("git_commit");
         assert_eq!(
             sorted(&field(&commit.params, "from"), "git_commit's from"),
-            ["changes", "cherry_pick", "files", "patch", "revert"]
+            ["all_changes", "cherry_pick", "files", "patch", "revert"]
         );
         let change_fields = field(&commit.params, "changes")
             .items
@@ -835,6 +951,9 @@ mod tests {
             "git_reset",
             "git_fetch",
             "git_push",
+            // A command runs in one repository's sandbox.
+            "run_command",
+            "run_output",
         ];
         let any_repo = ["file_list", "file_search", "file_grep"];
         for def in load_bundled() {
@@ -1003,6 +1122,8 @@ mod tests {
             "trace_route",
             "sub_run",
             "sql_session_query",
+            "run_command",
+            "run_output",
         ] {
             assert!(!safe.contains(name), "{name} offered in restricted");
         }

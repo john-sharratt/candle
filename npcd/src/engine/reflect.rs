@@ -371,9 +371,11 @@ fn call_tree(
                 required: p.required,
                 enum_values: None,
                 items: None,
+                min_items: 0,
                 properties: None,
                 nullable: false,
                 minimum: None,
+                requires: Vec::new(),
             })
             .collect(),
     };

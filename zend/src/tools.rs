@@ -25,6 +25,7 @@
 //! final natural-language answer.
 
 use std::collections::HashSet;
+use std::io;
 use std::iter;
 use std::sync::{Arc, OnceLock};
 
@@ -38,11 +39,13 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
+use zend_tools::sandboxes::Sandboxes;
 use zend_tools::state::Secrets;
-use zend_tools::{registry, replay, Replay, ToolContext};
+use zend_tools::{alias_pins, registry, replay, Replay, ToolContext};
 use zend_vfs::{RepoFiles, Workspace};
 
 use crate::access;
+use crate::sandbox_programs;
 use crate::tool_guidance;
 use crate::types::ToolMode;
 
@@ -471,6 +474,10 @@ pub(crate) fn calls_in_answer(answer: &str) -> Vec<(usize, ToolCall)> {
 /// times, its reasoning saying "write the file now" before every call.
 /// Dispatch already resolves aliases ([`registry::find`]); compiling them
 /// lets the call reach it as the model wrote it.
+///
+/// **An alias whose name fixes an argument is compiled with it fixed**
+/// ([`alias_pins`]): the field is narrowed to that one value, which the grammar
+/// then writes itself. `git_cherry_pick` cannot decode `from: revert`.
 pub fn tool_catalog() -> &'static [ToolSpec] {
     static SPECS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
     SPECS.get_or_init(|| {
@@ -479,10 +486,24 @@ pub fn tool_catalog() -> &'static [ToolSpec] {
             .flat_map(|d| {
                 iter::once(d.name.as_str())
                     .chain(registry::aliases(&d.name).iter().copied())
-                    .map(|name| ToolSpec::from_json_schema(name, &d.parameters))
+                    .map(|name| ToolSpec::from_json_schema(name, &pinned(name, &d.parameters)))
             })
             .collect()
     })
+}
+
+/// `parameters` with each field `name` fixes narrowed to its one value.
+fn pinned(name: &str, parameters: &Value) -> Value {
+    let mut narrowed = parameters.clone();
+    for (field, value) in alias_pins::pins(name) {
+        let property = &mut narrowed["properties"][*field];
+        let description = property.get("description").cloned();
+        *property = serde_json::json!({"type": "string", "enum": [value]});
+        if let Some(description) = description {
+            property["description"] = description;
+        }
+    }
+    narrowed
 }
 
 /// Parse one call object's JSON. `Ok(None)` when it parses but names no tool.
@@ -547,7 +568,12 @@ impl RawCall {
 /// it ([`crate::tool_guidance`]).
 pub fn run_tool(ctx: &ToolContext, call: &ToolCall) -> Value {
     match registry::find(&call.name) {
-        Some(t) => tool_guidance::with_guidance(t.name, t.call(ctx, &call.arguments)),
+        // An alias's name fixes some arguments; a call that contradicts it is
+        // refused before it runs ([`alias_pins`]).
+        Some(t) => match alias_pins::apply(&call.name, &call.arguments) {
+            Ok(args) => tool_guidance::with_guidance(t.name, t.call(ctx, &args)),
+            Err(refusal) => tool_guidance::with_guidance(t.name, refusal),
+        },
         None => tool_guidance::unknown_tool(&call.name, ctx.grants()),
     }
 }
@@ -725,7 +751,8 @@ pub fn tool_round_text(text: &str) -> TurnText {
 /// It holds one context per tools mode. They share every other store and differ
 /// only in their [`Grants`](zend_tools::Grants) ([`access::grants`]) — so what
 /// a round may do is fixed by the context it is handed, not by which tools its
-/// prompt offered.
+/// prompt offered. The workspace's command sandboxes are shared by all of
+/// them; only a context granted `Exec` can reach them.
 #[derive(Clone)]
 pub struct ToolHost {
     /// Indexed by [`ToolMode::level`]. Each mode's own file stores are never
@@ -735,14 +762,19 @@ pub struct ToolHost {
 
 impl ToolHost {
     /// Build a host whose file tools overlay `workspace`'s repositories, which
-    /// reads fall through to when the session layer has no entry, and whose
-    /// every context carries `secrets` — read once by the daemon at launch
-    /// ([`crate::secrets::load`]).
-    pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> Self {
-        let base = ToolContext::with_workspace(workspace.clone()).with_secrets(secrets);
+    /// reads fall through to when the session layer has no entry, whose every
+    /// context carries `secrets` — read once by the daemon at launch
+    /// ([`crate::secrets::load`]) — and whose commands run in a sandbox per git
+    /// repository, starting the programs [`sandbox_programs`] lists. Fails
+    /// only when the workspace's jobs folder cannot be made.
+    pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> io::Result<Self> {
+        let sandboxes = Sandboxes::for_workspace(workspace, &sandbox_programs::policy())?;
+        let base = ToolContext::with_workspace(workspace.clone())
+            .with_secrets(secrets)
+            .with_sandboxes(Arc::new(sandboxes));
         let contexts =
             ToolMode::ALL.map(|mode| Arc::new(base.clone().granting(access::grants(mode))));
-        Self { contexts }
+        Ok(Self { contexts })
     }
 
     /// A new conversation's own file stores: an overlay over each repository
@@ -781,6 +813,65 @@ mod tests {
         Arc::new(Secrets::empty())
     }
 
+    // ── Aliases that fix an argument ────────────────────────────────────────
+
+    /// **An alias that fixes an argument is compiled with only that value**,
+    /// while the canonical tool keeps every one: `git_cherry_pick` cannot
+    /// decode `from: revert`, and `git_commit` still can.
+    #[test]
+    fn an_alias_is_compiled_with_its_fixed_argument() {
+        let values = |tool: &str, field: &str| {
+            tool_catalog()
+                .iter()
+                .find(|s| s.name == tool)
+                .unwrap_or_else(|| panic!("{tool} compiled"))
+                .params
+                .iter()
+                .find(|p| p.name == field)
+                .unwrap_or_else(|| panic!("{tool}.{field}"))
+                .enum_values
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(values("git_cherry_pick", "from"), vec!["cherry_pick"]);
+        assert_eq!(values("git_revert", "from"), vec!["revert"]);
+        assert_eq!(values("delete_tag", "kind"), vec!["tag"]);
+        assert_eq!(values("delete_tag", "action"), vec!["delete"]);
+        assert!(values("git_commit", "from").len() > 1);
+    }
+
+    /// **Dispatch holds an alias to its name** for a call that did not come
+    /// through the grammar: a contradicting value is refused before the tool
+    /// runs.
+    #[test]
+    fn dispatch_refuses_an_alias_its_arguments_contradict() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        let ctx = host.context_for(ToolMode::Comprehensive, &host.conversation_files());
+        let out = run_tool(
+            &ctx,
+            &ToolCall {
+                name: "git_cherry_pick".to_string(),
+                arguments: serde_json::json!({"repo": "r", "from": "revert", "commit": "c"}),
+            },
+        );
+        assert_eq!(out["error"], "invalid_arguments", "{out}");
+        assert!(
+            out["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("`git_cherry_pick` means `from: cherry_pick`"),
+            "{out}"
+        );
+        // Shaped like every other `invalid_arguments` refusal — `with_guidance`
+        // must enrich this one too, not just the ones `t.call` itself returns.
+        assert_eq!(
+            out["hint"],
+            "call again with arguments that match `parameters`"
+        );
+        assert!(out["parameters"].is_object(), "{out}");
+    }
+
     // ── The daemon's secrets ────────────────────────────────────────────────
 
     /// **`ToolHost::new` hands the daemon's secrets to every mode's context.**
@@ -803,7 +894,7 @@ mod tests {
         }
         let secrets = Arc::new(Secrets::load(&path).unwrap());
 
-        let host = ToolHost::new(&workspace_in(&dir), secrets);
+        let host = ToolHost::new(&workspace_in(&dir), secrets).unwrap();
         let files = host.conversation_files();
         for mode in ToolMode::ALL {
             assert_eq!(
@@ -822,7 +913,7 @@ mod tests {
     #[test]
     fn each_modes_context_carries_its_grants() {
         let dir = tempfile::tempdir().unwrap();
-        let host = ToolHost::new(&workspace_in(&dir), no_secrets());
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
         let files = host.conversation_files();
         for mode in ToolMode::ALL {
             let ctx = host.context_for(mode, &files);
@@ -845,6 +936,10 @@ mod tests {
                 serde_json::json!({ "repo": "r", "message": "m" }),
             ),
             ("ping_icmp", serde_json::json!({ "host": "127.0.0.1" })),
+            (
+                "run_command",
+                serde_json::json!({ "repo": "r", "program": "npm", "args": ["test"] }),
+            ),
         ] {
             let call = ToolCall {
                 name: name.to_string(),
@@ -856,6 +951,14 @@ mod tests {
                 "{name} ran in Restricted"
             );
         }
+        // Comprehensive reaches the sandboxes — here to be told the folder is
+        // not a git repository, so there is none for it.
+        let comprehensive = host.context_for(ToolMode::Comprehensive, &files);
+        let call = ToolCall {
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({ "repo": "r", "program": "npm", "args": ["test"] }),
+        };
+        assert_eq!(run_tool(&comprehensive, &call)["error"], "no_sandbox");
     }
 
     /// A workspace with no document leaves every secret unset and the daemon
@@ -863,7 +966,7 @@ mod tests {
     #[test]
     fn a_workspace_without_secrets_still_builds_a_host() {
         let dir = tempfile::tempdir().unwrap();
-        let host = ToolHost::new(&workspace_in(&dir), no_secrets());
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
         assert_eq!(
             host.context_for(ToolMode::Restricted, &host.conversation_files())
                 .secrets
@@ -880,7 +983,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("r")).unwrap();
         std::fs::write(dir.path().join("r/shared.txt"), "disk\n").unwrap();
-        let host = ToolHost::new(&workspace_in(&dir), no_secrets());
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
         let (a, b) = (host.conversation_files(), host.conversation_files());
         let in_a = host.context_for(ToolMode::Comprehensive, &a);
         let in_b = host.context_for(ToolMode::Comprehensive, &b);

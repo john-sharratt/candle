@@ -52,9 +52,11 @@ scraper = "0.21"
 byteorder = { workspace = true }
 boa_engine = "0.21.1"
 # The workspace repositories: the typed git layer (nothing else in this crate
-# spawns or parses git), the file stores the file tools work through, and the
-# patch engine behind file_edit.
+# spawns or parses git), the file stores the file tools work through, the
+# replace engine behind file_edit, and the sandbox `run_command` runs jobs in.
 zend-vfs = { path = "../zend-vfs" }
+# A sandbox job is async; a tool call drives it on a runtime of its own.
+tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

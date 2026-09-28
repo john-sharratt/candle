@@ -231,6 +231,75 @@ fn a_tag_is_published_and_can_be_deleted_again() {
     assert!(!git_in(&origin, &["tag", "-l"]).contains("v1.0"));
 }
 
+/// **A tag already gone from origin is deleted here.** Measured live: a tag
+/// made with git_ref and then deleted on origin with git_push could not be
+/// deleted locally — git_ref's delete swapped origin's copy under a lease on
+/// this one, origin had none, and the refusal said a branch had moved. The
+/// same tag on origin only goes from origin; one in neither place is named.
+#[test]
+fn a_tag_is_deleted_wherever_it_still_is() {
+    let ws = GitWorkspace::new();
+    let origin = ws.with_origin();
+    publish_main(&ws);
+    let tag = |name: &str| json!({"repo": "app", "kind": "tag", "action": "create", "name": name});
+    let delete =
+        |name: &str| json!({"repo": "app", "kind": "tag", "action": "delete", "name": name});
+
+    let made = ws.write("git_ref", tag("scratch"));
+    assert_eq!(made["on"], "origin", "{made}");
+    let gone = push(&ws, json!([{"action": "delete_tag", "name": "scratch"}]));
+    assert_eq!(gone["accepted"], true, "{gone}");
+    let here_only = ws.write("git_ref", delete("scratch"));
+    assert_eq!(here_only["action"], "deleted", "{here_only}");
+    assert_eq!(here_only["on"], "local", "only the copy here went");
+    assert_eq!(here_only["previous"], ws.oid("HEAD"));
+    assert!(!ws.git(&["tag", "-l"]).contains("scratch"));
+
+    ws.write("git_ref", tag("remote-only"));
+    ws.git(&["tag", "-d", "remote-only"]);
+    let there_only = ws.write("git_ref", delete("remote-only"));
+    assert_eq!(there_only["action"], "deleted", "{there_only}");
+    assert_eq!(there_only["on"], "origin");
+    assert!(!git_in(&origin, &["tag", "-l"]).contains("remote-only"));
+
+    // One name, two tags: neither goes unseen.
+    ws.write("git_ref", tag("split"));
+    ws.git(&["tag", "-f", "split", "HEAD~1"]);
+    let split = ws.write("git_ref", delete("split"));
+    assert_eq!(split["error"], "stale_ref", "{split}");
+    assert!(git_in(&origin, &["tag", "-l"]).contains("split"));
+    assert!(ws.git(&["tag", "-l"]).contains("split"));
+
+    let nowhere = ws.write("git_ref", delete("never"));
+    assert!(
+        nowhere["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no tag named never"),
+        "{nowhere}"
+    );
+}
+
+/// **A tag pushed as a branch is refused towards `update_tag`**, and origin
+/// gains no branch of the tag's name.
+#[test]
+fn a_tag_pushed_as_a_branch_is_refused() {
+    let ws = GitWorkspace::new();
+    let origin = ws.with_origin();
+    publish_main(&ws);
+    ws.git(&["tag", "v3.0"]);
+    let out = push(
+        &ws,
+        json!([{"action": "update_branch", "name": "v3.0", "new": true,
+                "source": {"kind": "tag", "name": "v3.0"}}]),
+    );
+    assert!(
+        out["detail"].as_str().unwrap().contains("update_tag"),
+        "{out}"
+    );
+    assert!(!git_in(&origin, &["branch", "--list"]).contains("v3.0"));
+}
+
 /// **An annotated tag reaches the remote as itself**, message and tagger
 /// intact — not as a lightweight tag on its commit — and can be deleted
 /// there again without naming what it holds.

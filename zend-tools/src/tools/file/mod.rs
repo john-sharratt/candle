@@ -31,16 +31,16 @@
 //! Paths are normalised before use (see [`VfsStore`]), so
 //! `./src/../src/main.rs`, `/src/main.rs`, and `src/main.rs` are all one entry.
 //!
-//! # `file_edit` patches
+//! # `file_edit` replacements
 //!
-//! `file_edit` takes a unified diff. Hunks are located by their context, not by
-//! the `@@` line numbers, so a stale line number costs nothing while a hunk that
-//! matches in more than one place is `ambiguous` rather than a guess. A hunk
-//! whose change is already in the file counts as already applied, which is what
-//! makes sending the same patch twice a no-op; a hunk that matches nowhere is
-//! `not_found`, and a patch that is not a readable diff is `invalid_arguments`.
-//! Either every hunk lands or the file is left exactly as it was. The engine is
-//! [`zend_vfs::patch`], where the format and each failure are documented.
+//! `file_edit` replaces `old_text` — quoted from the file as it stands — with
+//! `new_text`. Text found exactly is replaced; text quoted at the wrong
+//! indentation is found line by line and the replacement re-indented to the
+//! file's. Text that occurs more than once is `ambiguous` unless every
+//! occurrence is asked for; text that is nowhere is `not_found`. An edit whose
+//! result is already in the file counts as already applied, which is what makes
+//! sending it twice a no-op. The engine is [`zend_vfs::replace`], where the
+//! matching and each failure are documented.
 //!
 //! # `file_present`
 //!
@@ -58,12 +58,12 @@
 //!
 //! | Code | Cause |
 //! |------|-------|
-//! | `not_found` | Path resolves in neither layer (`file_read`, `file_edit`, `file_delete`), or a `file_edit` hunk matches nothing |
+//! | `not_found` | Path resolves in neither layer (`file_read`, `file_edit`, `file_delete`), or a `file_edit` `old_text` is not in the file |
 //! | `vfs_full` | Write or copy-up would exceed the 10 MiB session cap |
-//! | `ambiguous` | A `file_edit` hunk matches in more than one place |
+//! | `ambiguous` | A `file_edit` `old_text` occurs more than once and `replace_all` is not set |
 //! | `no_files_found` | All requested paths are missing (`file_present`) |
 //! | `unreadable` | Workspace file is above the read limit or is not UTF-8 text |
-//! | `invalid_arguments` | The `file_edit` patch is not a readable unified diff, a `file_grep` pattern is not a valid regex, or a `file_read` path is a web address |
+//! | `invalid_arguments` | A `file_edit` `old_text` is empty or the same as `new_text`, a `file_grep` pattern is not a valid regex, or a `file_read` path is a web address |
 //! | `forbidden` | The path is under a `secrets/` directory — see [`zend_vfs::vfs`] |
 //! | `unknown_repo` | `repo` names no repository in the workspace; the message lists the ones it does |
 
@@ -72,7 +72,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use thiserror::Error;
 
-use zend_vfs::patch::PatchError;
+use zend_vfs::replace::ReplaceError;
 use zend_vfs::{UnknownRepo, VfsError, VfsStore, ALL_REPOS};
 
 use crate::tools::code::UNKNOWN_REPO;
@@ -190,20 +190,21 @@ pub enum FileError {
     IsUrl(String),
     #[error("VFS storage limit exceeded")]
     VfsFull,
-    /// A `file_edit` hunk matched nowhere in the file. It shares the
+    /// A `file_edit` `old_text` is nowhere in the file. It shares the
     /// `not_found` code with a missing path because it is the same answer —
     /// what the call named is not there — and the detail says which.
     #[error("{0}")]
-    HunkUnmatched(String),
-    /// A `file_edit` hunk matched in more than one place.
+    TextUnmatched(String),
+    /// A `file_edit` `old_text` occurs more than once.
     #[error("{0}")]
     Ambiguous(String),
     #[error("no files found")]
     NoFilesFound,
     #[error("{0}")]
     Unreadable(String),
-    /// The `file_edit` patch is not a unified diff the engine can read, or a
-    /// `file_grep` pattern is not a valid regular expression.
+    /// A `file_edit` that changes nothing — an empty `old_text`, or a
+    /// `new_text` the same as it — or a `file_grep` pattern that is not a
+    /// valid regular expression.
     #[error("{0}")]
     InvalidArguments(String),
     /// The path is under a `secrets/` directory. Named distinctly from
@@ -226,7 +227,7 @@ pub enum FileError {
 impl ToolError for FileError {
     fn code(&self) -> &'static str {
         match self {
-            FileError::NotFound(_) | FileError::NothingToEdit(_) | FileError::HunkUnmatched(_) => {
+            FileError::NotFound(_) | FileError::NothingToEdit(_) | FileError::TextUnmatched(_) => {
                 "not_found"
             }
             FileError::VfsFull => "vfs_full",
@@ -259,12 +260,12 @@ impl From<VfsError> for FileError {
     }
 }
 
-impl From<PatchError> for FileError {
-    fn from(e: PatchError) -> Self {
+impl From<ReplaceError> for FileError {
+    fn from(e: ReplaceError) -> Self {
         match e {
-            PatchError::Malformed(why) => FileError::InvalidArguments(why),
-            PatchError::Ambiguous(why) => FileError::Ambiguous(why),
-            PatchError::Unmatched(why) => FileError::HunkUnmatched(why),
+            ReplaceError::Invalid(why) => FileError::InvalidArguments(why),
+            ReplaceError::Ambiguous(why) => FileError::Ambiguous(why),
+            ReplaceError::Unmatched(why) => FileError::TextUnmatched(why),
         }
     }
 }

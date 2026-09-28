@@ -308,6 +308,7 @@ async fn a_refused_command_never_runs_and_touches_nothing() {
             SandboxCommand::new("python").arg("x.py"),
             Refused::NotAllowed {
                 program: "python".into(),
+                allowed: f.sandbox.policy().allowed(),
             },
         ),
         (

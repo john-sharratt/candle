@@ -16,6 +16,7 @@
 //! | `http_client` | `reqwest::blocking::Client` | Shared HTTP client for `web_fetch`, `weather`, etc. — reached only through [`ToolContext::http`] |
 //! | `secrets` | [`state::Secrets`] | The daemon's API keys and tokens (Tavily, GitHub), read once from a per-user file |
 //! | `subagent_runner` | `Option<Arc<dyn SubagentRunner>>` | Injected by daemon to run nested agent loops |
+//! | `sandboxes` | [`Sandboxes`] | The workspace's command sandboxes `run_command` runs in — reached only through [`ToolContext::sandboxes`] |
 //!
 //! # Grants
 //!
@@ -37,6 +38,7 @@
 use std::sync::Arc;
 
 use crate::grants::{Capability, Grants, NotPermitted};
+use crate::sandboxes::Sandboxes;
 use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
 use zend_vfs::{RepoFiles, Workspace};
 
@@ -52,6 +54,9 @@ pub struct ToolContext {
     http_client: reqwest::blocking::Client,
     pub secrets: Arc<Secrets>,
     pub subagent_runner: Option<Arc<dyn crate::SubagentRunner>>,
+    /// `None` for a context the daemon gave no workspace's sandboxes — a test,
+    /// a detached context — which has no checkout to run a command on.
+    sandboxes: Option<Arc<Sandboxes>>,
     grants: Grants,
 }
 
@@ -86,6 +91,7 @@ impl ToolContext {
             // themselves unconfigured rather than reaching the network.
             secrets: Arc::new(Secrets::empty()),
             subagent_runner: None,
+            sandboxes: None,
             grants: Grants::NONE,
         }
     }
@@ -111,6 +117,20 @@ impl ToolContext {
     pub fn credentials(&self) -> Result<&CredentialStore, NotPermitted> {
         self.grants.require(Capability::Secrets)?;
         Ok(&self.credentials)
+    }
+
+    /// The workspace's command sandboxes, when the context may run programs
+    /// on this host — `None` when it was given none.
+    pub fn sandboxes(&self) -> Result<Option<&Sandboxes>, NotPermitted> {
+        self.grants.require(Capability::Exec)?;
+        Ok(self.sandboxes.as_deref())
+    }
+
+    /// This context with `sandboxes` to run commands in, shared by every
+    /// context built from it.
+    pub fn with_sandboxes(mut self, sandboxes: Arc<Sandboxes>) -> Self {
+        self.sandboxes = Some(sandboxes);
+        self
     }
 
     /// This context with `files` as its file stores — one conversation's own,
@@ -165,5 +185,15 @@ mod tests {
             .granting(Grants::NONE.with(Capability::Network))
             .http()
             .is_ok());
+    }
+
+    /// **The sandboxes are out of reach without `Exec`**, and a context given
+    /// none says so rather than inventing some.
+    #[test]
+    fn the_sandboxes_need_exec() {
+        let ctx = ToolContext::new();
+        assert_eq!(ctx.sandboxes().err(), Some(NotPermitted(Capability::Exec)));
+        let ctx = ctx.granting(Grants::NONE.with(Capability::Exec));
+        assert!(ctx.sandboxes().unwrap().is_none());
     }
 }

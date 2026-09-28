@@ -19,7 +19,7 @@ which is what most unit tests use.
 |------|------|-------------|
 | `write.rs` | `write` | Create or overwrite a file; enforces 10 MiB cap |
 | `read.rs` | `file_read` | Return a file, or a line range of it, as a numbered, fenced excerpt; only `path` is required |
-| `edit.rs` | `file_edit` | Applies a unified diff; the engine is `patch.rs` |
+| `edit.rs` | `file_edit` | Replaces `old_text` with `new_text`; the engine is `zend-vfs/src/replace/` |
 | `list.rs` | `file_list` | Paged, one-level union listing of a directory's project + session files |
 | `delete.rs` | `file_delete` | Drop a session file or whiteout a project one; returns `deleted` flag |
 | `present.rs` | `file_present` | Foreground presentation gesture |
@@ -58,31 +58,28 @@ failing. The header reads `(page P of N, lines a-b of total)`, which names
 both the page just returned and the total page count, so the model reads it
 straight to know whether to keep going.
 
-## `file_edit` patches
+## `file_edit` replacements
 
-`file_edit` takes a unified diff: one or more `@@` hunks of `' '` context, `-`
-removed and `+` added lines. `zend-vfs/src/patch.rs` is the engine, and its module docs are
-the reference for the format.
+`file_edit` takes `old_text` — the text to change, quoted from the file as it
+stands — and `new_text`, what takes its place. `zend-vfs/src/replace/` is the
+engine, and its module docs are the reference.
 
-Hunks are located by their **content**, never by the `@@` line numbers. A
-hunk's pre-image (its context and removed lines) must match a run of whole
-lines exactly — no fuzz, and never a substring of a line. The line numbers are
-only a hint for choosing between equal matches:
-
-- pre-image found once, or nearest the hint → applied
-- pre-image found in two equally-distant places → `ambiguous`
-- pre-image absent but post-image present → **already applied**, nothing written
-- neither present → `not_found`, naming the hunk and its `@@` header
-- not a readable diff → `invalid_arguments`
+- `old_text` found exactly once → replaced (`"matched": "exact"`); an indented
+  `old_text` must start a line
+- found more than once (overlapping counted apart) → `ambiguous`, unless
+  `replace_all` is set
+- not found exactly, but found as whole lines with their indentation ignored →
+  replaced, the new text re-indented to the file's (`"matched": "indentation"`)
+- absent, with `new_text` standing in the file as whole lines that are not
+  only punctuation → **already applied**, nothing written
+- neither → `not_found`, saying where the first line of `old_text` is, if it is
+- empty `old_text`, or `new_text` the same → `invalid_arguments`
 
 Already-applied detection is what makes the tool idempotent: sending the same
-patch twice succeeds both times and the second call writes nothing. It is also
-why `-retries = 3` / `+retries = 30` cannot produce `retries = 300` — matching
-is by whole line, so `retries = 30` is not a second `retries = 3`.
-
-Hunks apply in order, each searched from the end of the one before, so they
-cannot overlap. Either every hunk lands or the file is left exactly as it was —
-a partially patched file is never written.
+edit twice succeeds both times and the second call writes nothing. An
+occurrence of `old_text` inside an occurrence of `new_text` is the edit's own
+result and is not counted, which is why `retries = 3` → `retries = 30` cannot
+produce `retries = 300`.
 
 ## `file_present` vs Files panel
 
@@ -102,9 +99,9 @@ retained — only a write or a successful edit consumes budget.
 
 | Code | When |
 |------|------|
-| `not_found` | Path resolves in neither layer (`read`, `edit`, `delete`), or an `edit` hunk matches nothing |
+| `not_found` | Path resolves in neither layer (`read`, `edit`, `delete`), or an `edit`'s `old_text` is not in the file |
 | `vfs_full` | Write would exceed 10 MiB cap |
-| `ambiguous` | An `edit` hunk matches in more than one place |
+| `ambiguous` | An `edit`'s `old_text` occurs more than once and `replace_all` is not set |
 | `no_files_found` | All requested paths missing (`present`) |
 | `unreadable` | Project file above the read limit or not UTF-8 text |
-| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `path` — or an `edit` patch is not a readable unified diff |
+| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `path` — or an `edit` whose `old_text` is empty or the same as its `new_text` |

@@ -105,13 +105,24 @@ impl Tool for GitMerge {
         let merged = merge_into(&repo, &store, &theirs, &label)?;
         let (state, next) = match &merged {
             Merged::UpToDate => ("up_to_date", "nothing came in; commit as you were"),
+            // Whether `theirs` is already what your branch's own upstream
+            // holds (nothing left to publish) or a ref your branch does not
+            // hold yet (a commit is what moves your branch onto it) is not
+            // decidable from `req.from` alone: pulling your own branch's
+            // upstream implicitly (`from: None`) and naming that exact same
+            // ref explicitly are the identical case, and `git_commit` is what
+            // actually knows which one this is (`committing.ahead()`). Say
+            // both truthfully rather than assert the wrong one.
             Merged::FastForward { conflicts } if conflicts.is_empty() => (
                 "fast_forward",
-                "your files now include what came in; git_commit when ready",
+                "your files now include what came in; git_commit with `from: all_changes` \
+                 publishes it to your branch if it does not already hold this, and commits any \
+                 other changes of your own regardless — or, if your branch already holds it and \
+                 you have no changes of your own, there is nothing left to commit",
             ),
             Merged::Merging { conflicts } if conflicts.is_empty() => (
                 "merging",
-                "merged cleanly; git_commit with `from: changes` records the merge",
+                "merged cleanly; git_commit with `from: all_changes` records the merge",
             ),
             Merged::FastForward { .. } | Merged::Merging { .. } => (
                 if matches!(merged, Merged::Merging { .. }) {

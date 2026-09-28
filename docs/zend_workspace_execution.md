@@ -1,6 +1,6 @@
 # Zend: Workspace, Tooling and Execution Architecture
 
-**Status:** Workspace and tools built (§3–§4). Ingest (§5) is built but does not run: a repository's folder is the sandbox's, so nothing ingests from it, and ingest from the repositories' branches in git is not built. The priming chain (§6) is removed with it. The sandbox that runs tooling on one machine is built (`zend-vfs::sandbox`, §7.4); cluster execution is designed, not built (§7–§8).
+**Status:** Workspace and tools built (§3–§4). Ingest (§5) is built but does not run: a repository's folder is the sandbox's, so nothing ingests from it, and ingest from the repositories' branches in git is not built. The priming chain (§6) is removed with it. The sandbox that runs tooling on one machine is built and wired into the daemon as `run_command` (`zend-vfs::sandbox`, §7.4); cluster execution is designed, not built (§7–§8).
 **Scope:** How zend serves several repositories as one workspace; how the model reads and changes code in them; how the base conversation is seeded with every repository; and how real tooling (cargo, node, python, tests) runs, on one machine and across a cluster.
 
 ---
@@ -51,7 +51,7 @@ repos:
 Rules, enforced when the workspace is built (`zend-vfs/src/workspace.rs`):
 
 - At least one repository.
-- A name is one plain folder name: no separators, no `.`/`..`, nothing Windows would open as another name (a `:`, a trailing dot or space, an 8.3 `~N` tail), and not `secrets`. Names are unique, so no two repositories share a folder and none nests in another.
+- A name is one plain folder name: no separators, no `.`/`..`, nothing Windows would open as another name (a `:`, a trailing dot or space, an 8.3 `~N` tail), not `secrets`, and not `jobs` in any case — the folder the command sandboxes write their job logs to (§7.4). Names are unique, so no two repositories share a folder and none nests in another.
 - Each folder must exist. A manifest key the schema does not know (a misspelt `name`, a `path:` field) is an error, not ignored.
 - A missing manifest fails the launch immediately — before the model loads.
 
@@ -67,7 +67,7 @@ The daemon adds `uploads` after the listed repositories (`zend/src/workspace.rs`
 | `substrate/` | The redo log, logs, conversation files. Visible, not a dot-directory: it sits beside the repositories, not inside one. |
 | `<repo>/` | Each listed repository. |
 | `uploads/` | The daemon's uploads repository. |
-| `jobs/` | Reserved for the sandbox server's job logs, `<job id>.log` — outside every repository, so no job ever checks out, captures or resets another's log. The daemon does not run a sandbox server yet (§7.4), so it creates no such folder. |
+| `jobs/` | The sandbox servers' job logs, `<job id>.log` — outside every repository, so no job ever checks out, captures or resets another's log. Made at startup (§7.4). |
 | `projection.yaml`, `tools/`, `identities/`, `<collection>s/`, raw layer folders | A *mind*'s configuration (a workspace carrying its own `projection.yaml`). Read from the workspace folder, never from a repository. |
 
 Anything else in the folder — other checkouts, stray files — is outside every repository and invisible to tools and the walk.
@@ -203,7 +203,7 @@ A lease covers a tool session (edit, build, test, fix) rather than a single call
 - Leases expire slightly after the tool timeout, so a crashed holder's lease is reclaimed.
 - Tool output is rewritten from the agent's workspace folder to repository-relative paths before the model sees it, so the same error reads identically on every agent.
 
-### 7.4 One machine: the sandbox (built, not wired into the daemon)
+### 7.4 One machine: the sandbox
 
 On one machine the repository's own folder is the build agent: `zend-vfs::sandbox`. That folder may be someone's working copy — a developer's clone with a branch checked out and work not yet committed — so it is borrowed, never taken. A `Sandbox` runs one job at a time in it:
 
@@ -217,9 +217,20 @@ On one machine the repository's own folder is the build agent: `zend-vfs::sandbo
 
 However the job ends — refused, failed, timed out, panicked or abandoned — the folder is back before the next job may take it: the guard that puts it back drops before the lock does. A put-back that fails is retried; one that still fails keeps the snapshot and the journal and says where they are. A daemon that dies mid-job leaves the journal, and the next job restores from it before touching anything — first keeping what the folder holds by then under `refs/zend/recovered/`, and refusing outright when someone has worked in the folder since. A folder part way through a merge, rebase, cherry-pick, revert or bisect is refused untouched. Ignored files are never set aside or removed beyond the job's own, so build outputs survive from one job to the next and the build cache stays warm.
 
-A conversation whose base is not the commit its branch holds — it has not merged what the branch gained, or is finishing a merge — is refused before anything is touched: its changes were made on its base, and a checkout of the branch is not that.
+A conversation whose base is not the commit its branch holds is refused before anything is touched: its changes were made on its base, and a checkout of the branch is not that. Each way it can differ has its own refusal naming the way on — **behind** (the branch gained commits the conversation has not merged: `git_merge`), **ahead** (a merge fast-forwarded the conversation past its branch: `git_commit` with `from: all_changes` publishes it, with no commit of its own when it has no change), and **merging** (a merge is being finished: commit it).
 
-**`SandboxServer`** runs jobs in the background. `start_job` returns at once with the job's id (a random 64-bit number as URL-safe base64), its log (`<jobs dir>/<id>.log`, both output streams as they are printed, capped at 64 MiB), its output as a stream that follows the log from its first byte and ends with the job, and a handle that gives the outcome — and cancels the job, killing its process tree, when dropped first. `query_job` says whether a job is queued, running, exited, timed out, cancelled, refused or failed, and how many lines its log holds. The last 1000 jobs are kept; an older one is let go with its log. Nothing in the daemon creates a `SandboxServer` yet, so no model tool runs a command on the machine.
+**`SandboxServer`** runs jobs in the background. `start_job` returns at once with the job's id (a random 64-bit number as URL-safe base64), its log (`<jobs dir>/<id>.log`, both output streams as they are printed, capped at 64 MiB), its output as a stream that follows the log from its first byte and ends with the job, and a handle that gives the outcome — and cancels the job, killing its process tree, when dropped first. `query_job` says whether a job is queued, running, exited, timed out, cancelled, refused or failed, and how many lines its log holds. The last 1000 jobs are kept; an older one is let go with its log.
+
+A program named without a path is looked up the way a shell looks it up: on Windows through `PATHEXT` as well as `PATH` (`sandbox/resolve.rs`), so `npm` starts the `npm.cmd` Node installs beside `node.exe`, which the system alone would not find.
+
+**In the daemon.** `ToolHost::new` builds one `SandboxServer` per git repository of the workspace (`zend_tools::sandboxes::Sandboxes`; a folder that is not a git repository — `uploads` — gets none), logging to the workspace folder's `jobs/`, and shares them with every tool context; only a context granted `Exec` reaches them (`ToolContext::sandboxes`). The programs a job may start are the deployment's allow-list, `zend/src/sandbox_programs.rs`: the build, test and packaging toolchains (`node`, `npm`, `npx`, `cargo`, `python`, `pytest`, `go`, `dotnet`, `make`, …) and no shell. The list decides which programs start, not what they do — an interpreter or a package manager on it runs whatever it is handed, with the daemon's rights — so it is not the security boundary; the tools mode is.
+
+Two tools drive it, Comprehensive only (`Network` + `Exec` + `DiskWrite`, high-risk):
+
+- **`run_command`** `{repo, program, args, timeout_secs}` — runs one program, no shell (`args` required, `[]` for none; shell syntax that would reach the program verbatim — an argument that is `&&`, `||`, `|`, `>`, `>>` or `2>&1`, or a value opened with a shell's escaped quote `\"` — is refused with the call it should have been, and a git command line goes straight to the git refusal), on the conversation's branch with its changes laid down, and waits for it (600 s by default, at most 1800). It returns the exit code, whether it timed out, the files it changed — now among the conversation's uncommitted changes, persisted like any edit — anything its changes could not hold, and the first page of its output: 200 lines, terminal colours stripped, a line past 500 characters cut. A refused command, a conversation behind its branch (`behind`: merge first), ahead of it (`unpublished`: commit first), or finishing a merge (`merging`), and a program that cannot start are each their own error code.
+- **`run_output`** `{repo, job, page}` — any page of a run's log, and how the run stands; a page past the end is the last.
+
+A tool call drives its job on a thread and runtime of its own (`sandboxes/block.rs`) and waits for it there, so the wait holds none of the daemon's async workers, and a call from any context — a blocking thread or an async task — works the same.
 
 ---
 

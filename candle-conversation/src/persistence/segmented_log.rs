@@ -544,6 +544,17 @@ impl SegmentedLog {
         self.active.pending_len()
     }
 
+    /// Write what is staged into the active segment without syncing it —
+    /// bounding the staging buffer; the next [`Self::commit`] syncs it.
+    pub fn flush(&mut self) -> Result<()> {
+        self.active.flush()
+    }
+
+    /// Whether the active segment has anything a commit would do.
+    pub fn needs_commit(&self) -> bool {
+        self.active.needs_commit()
+    }
+
     /// Flush + fsync the active segment.
     pub fn commit(&mut self) -> Result<()> {
         self.active.commit()
@@ -559,7 +570,8 @@ impl SegmentedLog {
         self.active.superblock()
     }
 
-    /// The active segment's durable logical end.
+    /// The logical end of what is written to the active segment — synced
+    /// only once committed ([`LogFile::write_offset`]).
     pub fn write_offset(&self) -> u64 {
         self.active.write_offset()
     }

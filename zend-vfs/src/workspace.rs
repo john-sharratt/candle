@@ -23,7 +23,8 @@
 //! * At least one repository.
 //! * A name is one plain path segment — no separators, no `.`/`..`, nothing a
 //!   Windows open would resolve to another name (the rule [`VfsStore`] applies
-//!   to every path segment), and not a `secrets` directory. Names are unique,
+//!   to every path segment), not a `secrets` directory, and not `jobs`, where
+//!   the command sandboxes log their jobs. Names are unique,
 //!   so no two repositories share a folder and none nests inside another.
 //! * [`Workspace::load`] also requires each folder to exist.
 
@@ -32,6 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+use super::sandbox::JOBS_DIR;
 use super::vfs::VfsStore;
 
 /// The manifest's file name, in the workspace folder.
@@ -206,7 +208,9 @@ impl Workspace {
 pub const ALL_REPOS: &str = "*";
 
 /// Whether `name` is one plain segment a repository can be called — a name
-/// a folder on any platform may carry, so never [`ALL_REPOS`].
+/// a folder on any platform may carry, so never [`ALL_REPOS`], and never the
+/// folder the command sandboxes log their jobs to ([`JOBS_DIR`]), in any case:
+/// a repository there would have every job's log written into its checkout.
 fn is_plain_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -214,6 +218,7 @@ fn is_plain_name(name: &str) -> bool {
         && !name.contains(['/', '\\', '<', '>', ':', '"', '|', '?', '*'])
         && VfsStore::addressable(name)
         && !VfsStore::is_protected(name)
+        && !name.eq_ignore_ascii_case(JOBS_DIR)
 }
 
 #[cfg(test)]
@@ -278,7 +283,7 @@ mod tests {
     fn names_must_be_single_plain_segments() {
         for bad in [
             "", ".", "..", "a/b", "a\\b", "c:", "secrets", "SECRETS", "x.", "LONG~1", ALL_REPOS,
-            "a*", "a?", "a|b", "<a>", "\"a\"",
+            "a*", "a?", "a|b", "<a>", "\"a\"", "jobs", "Jobs",
         ] {
             assert_eq!(
                 Workspace::new("/w", vec![RepoSpec::named(bad)]),

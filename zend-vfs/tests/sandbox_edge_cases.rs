@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use support::*;
 use zend_vfs::file_delta::FileDelta;
-use zend_vfs::{Oid, RunOutcome, SandboxCommand, SandboxError, VfsStore};
+use zend_vfs::{merge_into, Merged, Oid, RunOutcome, SandboxCommand, SandboxError, VfsStore};
 
 fn main_at(f: &Fixture) -> Oid {
     Oid::parse(git(&f.root, &["rev-parse", "refs/heads/main"]).trim()).unwrap()
@@ -763,7 +763,7 @@ async fn a_branch_that_does_not_exist() {
     assert!(
         matches!(
             &result,
-            Err(SandboxError::BaseNotBranch { branch, tip, .. })
+            Err(SandboxError::Ahead { branch, tip, .. })
                 if branch == "absent" && tip == "no commit"
         ),
         "{result:?}"
@@ -795,12 +795,89 @@ async fn a_base_the_branch_moved_past_is_refused() {
     assert!(
         matches!(
             &result,
-            Err(SandboxError::BaseNotBranch { base, tip, .. })
+            Err(SandboxError::Behind { base, tip, .. })
                 if *base == pinned.commit().unwrap().to_string() && tip == moved.trim()
         ),
         "{result:?}"
     );
     assert_eq!(disk(&f.root, "mine.txt"), None);
+}
+
+/// **A conversation a merge fast-forwarded past its branch is refused before
+/// the checkout is touched, and told to publish** — a checkout of the branch
+/// lacks what the merge brought in.
+#[tokio::test]
+async fn a_base_ahead_of_the_branch_is_refused() {
+    let f = fixture();
+    let files = f.store();
+    files.write("mine.txt", "mine\n".into()).unwrap();
+    let feature = Oid::parse(git(&f.root, &["rev-parse", "feature"]).trim()).unwrap();
+    let merged = merge_into(f.sandbox.repo(), &files, &feature, "feature").unwrap();
+    assert_eq!(merged, Merged::FastForward { conflicts: vec![] });
+    let result = try_run(&f, "main", &files, &shell("echo x", "echo x")).await;
+    assert!(
+        matches!(
+            &result,
+            Err(SandboxError::Ahead { branch, base, tip })
+                if branch == "main" && *base == feature.to_string()
+                    && *tip == main_at(&f).to_string()
+        ),
+        "{result:?}"
+    );
+    assert!(
+        result.unwrap_err().to_string().contains("git_commit"),
+        "the refusal names the way on"
+    );
+    assert_eq!(disk(&f.root, "mine.txt"), None);
+}
+
+/// **A conversation and a branch that have each moved on are behind, not
+/// ahead**: the branch holds a commit the conversation's files lack, whatever
+/// the conversation holds that the branch lacks.
+#[tokio::test]
+async fn a_branch_diverged_from_the_base_is_behind() {
+    let f = fixture();
+    let files = f.store();
+    // Work of its own, so the store keeps the base it is made on.
+    files.write("mine.txt", "mine\n".into()).unwrap();
+    let feature = Oid::parse(git(&f.root, &["rev-parse", "feature"]).trim()).unwrap();
+    merge_into(f.sandbox.repo(), &files, &feature, "feature").unwrap();
+    let tree = git(&f.root, &["rev-parse", "main^{tree}"]);
+    let sibling = git(
+        &f.root,
+        &["commit-tree", tree.trim(), "-p", "main", "-m", "sibling"],
+    );
+    git(&f.root, &["update-ref", "refs/heads/main", sibling.trim()]);
+    let result = try_run(&f, "main", &files, &shell("echo x", "echo x")).await;
+    assert!(
+        matches!(&result, Err(SandboxError::Behind { base, tip, .. })
+            if *base == feature.to_string() && tip == sibling.trim()),
+        "{result:?}"
+    );
+}
+
+/// **A conversation finishing a merge is refused before the checkout is
+/// touched**: no commit holds the tree its files are made on.
+#[tokio::test]
+async fn a_merge_being_finished_is_refused() {
+    let f = fixture();
+    let files = f.store();
+    let feature = Oid::parse(git(&f.root, &["rev-parse", "feature"]).trim()).unwrap();
+    merge_into(f.sandbox.repo(), &files, &feature, "feature").unwrap();
+    // A sibling of `feature` on `main`: both sides now have a commit of their own.
+    let tree = git(&f.root, &["rev-parse", "main^{tree}"]);
+    let sibling = git(
+        &f.root,
+        &["commit-tree", tree.trim(), "-p", "main", "-m", "sibling"],
+    );
+    let sibling = Oid::parse(sibling.trim()).unwrap();
+    let merged = merge_into(f.sandbox.repo(), &files, &sibling, "sibling").unwrap();
+    assert_eq!(merged, Merged::Merging { conflicts: vec![] });
+    let result = try_run(&f, "main", &files, &shell("echo x", "echo x")).await;
+    assert!(
+        matches!(&result, Err(SandboxError::Merging { branch }) if branch == "main"),
+        "{result:?}"
+    );
 }
 
 // ── Links out of the repository ──────────────────────────────────────────────

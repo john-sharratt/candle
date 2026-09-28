@@ -1,4 +1,4 @@
-//! Static registry of all 104 tool implementations.
+//! Static registry of all 106 tool implementations.
 //!
 //! # How a tool is registered
 //!
@@ -946,6 +946,23 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
         &["code_close", "close_code", "close_repl", "end_code_session"],
     ),
     (
+        "run_command",
+        &[
+            "execute_command",
+            "run_shell_command",
+            "shell",
+            "bash",
+            "terminal",
+            "run_tests",
+            "exec_command",
+            "run_terminal_cmd",
+        ],
+    ),
+    (
+        "run_output",
+        &["command_output", "job_output", "read_output", "run_log"],
+    ),
+    (
         "sub_run",
         &[
             "subagent",
@@ -990,6 +1007,7 @@ use crate::tools::{
         REMOTE_FS_SESSION_OPEN, REMOTE_FS_SESSION_PUT, REMOTE_FS_SESSION_RENAME,
         REMOTE_FS_SESSION_STAT,
     },
+    run::{RUN_COMMAND, RUN_OUTPUT},
     sql_session::{SQL_SESSION_CLOSE, SQL_SESSION_LIST, SQL_SESSION_OPEN, SQL_SESSION_QUERY},
     ssh::{
         SSH_SESSION_CLOSE, SSH_SESSION_EXEC, SSH_SESSION_EXEC_ASYNC, SSH_SESSION_LIST,
@@ -1031,6 +1049,10 @@ fn register_all() -> &'static [RegisteredTool] {
     const DISK: &[Capability] = &[DiskWrite];
     // A git fetch or push both reaches a remote and writes refs locally.
     const NET_DISK: &[Capability] = &[Network, DiskWrite];
+    // A command starts a program on a checkout of the repository's folder, and
+    // the programs a sandbox lists reach the network themselves (`npm
+    // install`, `cargo fetch`) — nothing stands between them and it.
+    const NET_EXEC_DISK: &[Capability] = &[Network, Exec, DiskWrite];
 
     // Which tools Restricted mode offers is decided in `zend` from each
     // definition's `high_risk` flag and these declarations together; the
@@ -1185,6 +1207,13 @@ fn register_all() -> &'static [RegisteredTool] {
         CODE_SESSION_CLOSE.requires(SANDBOX),
         // Subagent (1) — high-risk (delegated agency)
         SUBAGENT.requires(EXEC),
+        // Commands (2) — a program run on this host, in a repository's
+        // sandbox: `Exec` to start it, `DiskWrite` for the checkout it runs
+        // on, `Network` for what the listed toolchains fetch. Reading a run's
+        // log needs `Exec` too — only a context that may run programs has
+        // runs to read.
+        RUN_COMMAND.requires(NET_EXEC_DISK),
+        RUN_OUTPUT.requires(EXEC),
     ];
     TOOLS
 }
@@ -1255,9 +1284,15 @@ mod capability_tests {
             assert!(needs(name).contains(&Capability::Network), "{name}");
         }
         // Exec is a program running on this host.
-        for name in ["ping_icmp", "trace_route", "sub_run"] {
+        for name in ["ping_icmp", "trace_route", "sub_run", "run_output"] {
             assert!(needs(name).contains(&Capability::Exec), "{name}");
         }
+        // A command runs on a checkout of the repository's folder, and what
+        // it runs reaches the network.
+        assert_eq!(
+            needs("run_command"),
+            [Capability::Network, Capability::Exec, Capability::DiskWrite]
+        );
         // Model-written code runs in the sandbox, not as a host program.
         for name in ["code_run", "code_session_exec", "code_session_open"] {
             assert_eq!(needs(name), [Capability::Sandbox], "{name}");

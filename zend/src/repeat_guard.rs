@@ -27,7 +27,14 @@
 //! from its sampling, and a call it writes some other way is not run. The
 //! conversation keeps a response for every call it ran, and the model gets to
 //! say what it has rather than the turn ending mid-call.
+//!
+//! **That answer is bounded** ([`closing_answer`]). A model that loops on
+//! tools does not always stop when it cannot call one: measured twice, the
+//! closing turn wrote "Let me revert the commit:" — reached for the banned
+//! call — and wrote it again, for 4,700 and 5,800 tokens, until the turn's
+//! own limit. What it has to say is a summary of results it already holds.
 
+use candle_conversation::SamplingConfig;
 use serde_json::{json, Value};
 
 use crate::tools::{ToolCall, ToolResult};
@@ -35,6 +42,39 @@ use crate::tools::{ToolCall, ToolResult};
 /// Consecutive rounds made entirely of repeats after which the loop closes —
 /// with the first call, three identical rounds in all.
 pub const STOP_AFTER: usize = 2;
+
+/// Answer tokens past the think block after which the closing answer ends at
+/// the next sentence.
+pub const CLOSING_ANSWER_GRACEFUL: i32 = 768;
+/// Answer tokens past the think block at which the closing answer ends
+/// regardless.
+pub const CLOSING_ANSWER_FORCED: i32 = 1024;
+
+/// `sampling` for the turn that answers the closing round: `<tool_call>`
+/// (`open`, when resolved) banned, and the answer ended at the first sentence
+/// [`CLOSING_ANSWER_GRACEFUL`] tokens past the point the think block is forced
+/// shut, and [`CLOSING_ANSWER_FORCED`] past it at the latest — or sooner,
+/// where the turn already had a tighter bound. The EOS limits count the whole
+/// turn, reasoning included, so the answer's room sits above the thinking
+/// cap, as the turn's own budget has it ([`crate::think_budget`]): measured
+/// from the start instead, a closing turn that reasoned for 768 tokens would
+/// end inside its block with no answer at all.
+pub fn closing_answer(sampling: &mut SamplingConfig, open: i32) {
+    if open >= 0 {
+        sampling.banned_tokens.push(open);
+    }
+    let thinking = sampling.force_segment_close_after.max(0);
+    let bounded = |set: i32, cap: i32| if set > 0 { set.min(cap) } else { cap };
+    let graceful = bounded(
+        sampling.graceful_eos_after,
+        thinking + CLOSING_ANSWER_GRACEFUL,
+    );
+    sampling.graceful_eos_after = graceful;
+    sampling.forced_eos_after =
+        bounded(sampling.forced_eos_after, thinking + CLOSING_ANSWER_FORCED);
+    // The EOS pressure ramps to the graceful point, as it does on any turn.
+    sampling.eos_ramp_len = bounded(sampling.eos_ramp_len, graceful);
+}
 
 /// What the loop does after a screened round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +167,10 @@ fn notice(call: &ToolCall) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use candle_conversation::stencil::ThinkMode;
+
     use super::*;
+    use crate::think_budget::steer;
 
     fn result(name: &str, args: Value, response: Value) -> ToolResult {
         ToolResult {
@@ -137,6 +180,42 @@ mod tests {
             },
             response,
         }
+    }
+
+    /// **The closing answer bans the call and is bounded above the think
+    /// block** — on a turn the balanced dial programmed, the answer keeps its
+    /// room past the 3072-token thinking cap — and a tighter bound the turn
+    /// already had stands.
+    #[test]
+    fn the_closing_answer_is_banned_from_calling_and_bounded() {
+        let mut balanced = SamplingConfig::default();
+        steer(&mut balanced, ThinkMode::Balanced, 7168, &[]);
+        closing_answer(&mut balanced, 42);
+        assert!(balanced.banned_tokens.contains(&42));
+        assert_eq!(
+            (balanced.graceful_eos_after, balanced.forced_eos_after),
+            (3072 + CLOSING_ANSWER_GRACEFUL, 3072 + CLOSING_ANSWER_FORCED)
+        );
+        assert_eq!(balanced.eos_ramp_len, balanced.graceful_eos_after);
+
+        let mut unsteered = SamplingConfig::default();
+        closing_answer(&mut unsteered, -1);
+        assert!(!unsteered.banned_tokens.contains(&-1));
+        assert_eq!(
+            (unsteered.graceful_eos_after, unsteered.forced_eos_after),
+            (CLOSING_ANSWER_GRACEFUL, CLOSING_ANSWER_FORCED)
+        );
+
+        let mut tight = SamplingConfig {
+            graceful_eos_after: 100,
+            forced_eos_after: 5000,
+            ..SamplingConfig::default()
+        };
+        closing_answer(&mut tight, -1);
+        assert_eq!(
+            (tight.graceful_eos_after, tight.forced_eos_after),
+            (100, CLOSING_ANSWER_FORCED)
+        );
     }
 
     fn missing() -> ToolResult {

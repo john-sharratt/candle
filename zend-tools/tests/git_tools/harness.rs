@@ -13,12 +13,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use zend_tools::registry::find;
+use zend_tools::sandboxes::Sandboxes;
 use zend_tools::{Grants, ToolContext};
-use zend_vfs::{RepoSpec, Workspace};
+use zend_vfs::{CommandPolicy, RepoSpec, Workspace};
 
 /// A workspace holding one git repository called `app`.
 pub struct GitWorkspace {
@@ -139,6 +141,19 @@ impl GitWorkspace {
     pub fn conversation(&self) -> Conversation {
         Conversation {
             ctx: self.comprehensive_ctx(),
+        }
+    }
+
+    /// One conversation that can run `programs` in the workspace's sandboxes.
+    pub fn conversation_running(&self, programs: &[&str]) -> Conversation {
+        let ws = Workspace::new(self.dir.path(), vec![RepoSpec::named("app")]).unwrap();
+        let sandboxes =
+            Sandboxes::for_workspace(&ws, &CommandPolicy::allowing(programs.iter().copied()))
+                .unwrap();
+        Conversation {
+            ctx: ToolContext::with_workspace(ws)
+                .granting(Grants::ALL)
+                .with_sandboxes(Arc::new(sandboxes)),
         }
     }
 

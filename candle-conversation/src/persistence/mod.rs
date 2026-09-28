@@ -45,6 +45,7 @@ pub mod resume;
 pub mod segment;
 pub mod segmented_log;
 pub mod streams;
+mod stripes;
 pub mod survival;
 pub mod thread;
 pub mod transfer;
@@ -517,6 +518,15 @@ pub const COMPACTION_DEAD_RATIO_THRESHOLD: f32 = 0.5;
 /// reclaims nothing worth the pause, regardless of its dead ratio.
 pub const COMPACTION_MIN_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Staged bytes at which an append writes the group-commit buffer through to
+/// the active segment. Writing through is not a commit — nothing is synced
+/// until the next [`SubstratePersistence::commit`] — it only stops the buffer
+/// from holding everything between commits. Commits are paced by
+/// [`INDEX_FLUSH_ENTRIES`] records, and maintenance relocates chunk records of
+/// ~165 KB each, so an unbounded buffer reached 2.1 GB inside one compaction
+/// and aborted the daemon on the allocation.
+pub const STAGE_FLUSH_BYTES: usize = 64 * 1024 * 1024;
+
 impl SubstratePersistence {
     /// Open the persistence layer at `<cwd>/substrate/substrate.log`,
     /// creating the directory and file if absent and recovering the
@@ -738,7 +748,8 @@ impl SubstratePersistence {
         &self.inherited
     }
 
-    /// The durable logical end of the active segment.
+    /// The logical end of what is written to the active segment — synced only
+    /// once committed.
     pub fn write_offset(&self) -> u64 {
         self.segments.write_offset()
     }
@@ -863,6 +874,9 @@ impl SubstratePersistence {
             }
             self.rotate_if_over_target()?;
         }
+        // Last, once the record is accounted and indexed: a write that fails
+        // leaves it staged and known, for the next commit to carry.
+        self.write_through_if_over_stage()?;
         Ok((segment, offset, size))
     }
 
@@ -904,6 +918,8 @@ impl SubstratePersistence {
             }
             self.rotate_if_over_target()?;
         }
+        // Last, as in `append_record`.
+        self.write_through_if_over_stage()?;
         Ok((segment, offset, size))
     }
 
@@ -1319,8 +1335,9 @@ impl SubstratePersistence {
     }
 
     /// Read one chunk's payload — from the active log, else any inherited
-    /// log (§13.5). The chunk must be durable (committed); it is read from
-    /// the file, not the un-flushed staging buffer.
+    /// log (§13.5). The chunk must be written to the file — committed, or
+    /// written through by a long append; it is read from the file, not the
+    /// staging buffer.
     pub fn read_chunk(
         &mut self,
         substrate: &Substrate,
@@ -1630,17 +1647,27 @@ impl SubstratePersistence {
     }
 
     /// Bytes staged but not yet flushed to the active segment. Returns 0 when
-    /// there is nothing to write. The periodic flush task uses this to
-    /// avoid pointless `fsync` calls on an idle workspace.
+    /// there is nothing staged — which, once a large append has flushed part
+    /// way, is not the same as nothing to commit ([`Self::commit_if_pending`]).
     pub fn pending_bytes(&self) -> usize {
         self.segments.pending_len()
     }
 
-    /// Group-commit if (and only if) there are staged records. Returns
-    /// `Ok(true)` when a flush+fsync actually happened, `Ok(false)` for the
-    /// no-op idle path. Cheap to call on a tight timer.
+    /// Write the staged records through to the active segment once they reach
+    /// [`STAGE_FLUSH_BYTES`], leaving the sync to the next commit.
+    fn write_through_if_over_stage(&mut self) -> Result<()> {
+        if self.segments.pending_len() >= STAGE_FLUSH_BYTES {
+            self.segments.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Group-commit if (and only if) there is something to make durable —
+    /// records staged, or written through by a large append and not yet
+    /// synced. Returns `Ok(true)` when a flush+fsync actually happened,
+    /// `Ok(false)` for the no-op idle path. Cheap to call on a tight timer.
     pub fn commit_if_pending(&mut self) -> Result<bool> {
-        if self.segments.pending_len() == 0 {
+        if !self.segments.needs_commit() {
             return Ok(false);
         }
         self.segments.commit()?;
@@ -1695,6 +1722,11 @@ impl SubstratePersistence {
             return Ok(());
         }
         self.flush_header_index()?;
+        // A write-through may have left bytes on the segment that no commit
+        // has synced yet; a sealed segment's handle is dropped, so sync now.
+        if self.segments.needs_commit() {
+            self.segments.commit()?;
+        }
         self.segments.seal_and_rotate()?;
         // The fresh active starts its own `HeaderIndex` chain — the sealed
         // segment keeps the chain the flush above completed.
@@ -2080,6 +2112,75 @@ mod tests {
             },
             debug_name: name.to_string(),
         })
+    }
+
+    /// **The staging buffer never holds more than the write-through bound plus
+    /// one record**, and bytes written through still owe a commit: 70 one-MiB
+    /// appends with no commit between them leave under 65 MiB staged, the rest
+    /// on the segment, and `commit_if_pending` syncs once and then idles.
+    #[test]
+    fn a_long_append_run_writes_through_and_still_owes_a_commit() {
+        let dir = tmp_dir("write_through");
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        sp.commit().unwrap();
+        let start = sp.write_offset();
+        let payload = vec![7u8; 1024 * 1024];
+        let mut record = 0;
+        for chunk in 0..70u64 {
+            let (_, _, size) = sp
+                .append_record(RecordType::Tokens, 0, 9, chunk, 0, 0, &payload)
+                .unwrap();
+            record = size as usize;
+            assert!(sp.pending_bytes() < STAGE_FLUSH_BYTES + record);
+        }
+        assert!(sp.write_offset() > start);
+        assert!(sp.pending_bytes() < STAGE_FLUSH_BYTES);
+        assert!(sp.commit_if_pending().unwrap());
+        assert_eq!(sp.pending_bytes(), 0);
+        assert_eq!(sp.write_offset(), start + 70 * record as u64);
+        assert!(!sp.commit_if_pending().unwrap());
+        drop(sp);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Records written through and never committed reopen cleanly**: a
+    /// handle dropped mid-run — a crash, as far as the log can tell — leaves
+    /// the written-through records on the segment and loses only the staged
+    /// tail, and the log opens on a record boundary with a whole record count.
+    #[test]
+    fn records_written_through_but_not_committed_reopen_cleanly() {
+        let dir = tmp_dir("write_through_reopen");
+        let (start, record) = {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.commit().unwrap();
+            let start = sp.write_offset();
+            let payload = vec![7u8; 1024 * 1024];
+            let mut record = 0;
+            for chunk in 0..70u64 {
+                let (_, _, size) = sp
+                    .append_record(RecordType::Tokens, 0, 9, chunk, 0, 0, &payload)
+                    .unwrap();
+                record = size;
+            }
+            assert!(
+                sp.write_offset() > start,
+                "part of the run was written through"
+            );
+            (start, record)
+        };
+        let mut substrate = Substrate::new();
+        let reopened = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let kept = reopened.write_offset() - start;
+        assert_eq!(kept % record, 0, "the log ends on a record boundary");
+        assert!(
+            kept >= STAGE_FLUSH_BYTES as u64 && kept < 70 * record,
+            "kept {kept} bytes"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **A read-only handle refuses every write and changes no byte.** Built
@@ -2874,6 +2975,79 @@ mod tests {
                 chunk_payload((n - 1) as u32)
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Full compaction carries a live run longer than one read stripe
+    /// whole**: seventy one-MiB chunks back to back, read back byte for byte
+    /// after the rewrite and after a reload.
+    #[test]
+    fn compact_carries_a_live_run_past_one_stripe() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+        let dir = tmp_dir("compact_stripes");
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 56,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
+        let big = |index: u64| ChunkPayload {
+            kv_bytes: (0..1024 * 1024u64)
+                .map(|i| ((i + index * 17) % 251) as u8)
+                .collect(),
+            ..chunk_payload(index as u32)
+        };
+        const LIVE: u64 = 70;
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            sp.write_chunk(sid, LIVE, 32, 4, None, &chunk_payload(1))
+                .unwrap(); // superseded below
+            for i in 0..LIVE {
+                sp.write_chunk(sid, i, 32, 4, None, &big(i)).unwrap();
+            }
+            sp.write_chunk(sid, LIVE, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.compact(&mut substrate, None).unwrap();
+            for i in 0..LIVE {
+                assert_eq!(
+                    sp.read_chunk(&substrate, sid, i).unwrap(),
+                    big(i),
+                    "chunk {i}"
+                );
+            }
+        }
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        for i in 0..LIVE {
+            assert_eq!(
+                sp.read_chunk(&substrate, sid, i).unwrap(),
+                big(i),
+                "chunk {i}"
+            );
+        }
+        assert_eq!(
+            sp.read_chunk(&substrate, sid, LIVE).unwrap(),
+            chunk_payload(2)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

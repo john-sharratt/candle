@@ -20,7 +20,7 @@ Every tool call runs in a `ToolContext` that carries **grants** — a subset of 
 |---|---|
 | `disk_write` | changing files on the host's disk — a git writer's checkout run, a sandbox, and SQLite connections |
 | `network` | any outbound connection — HTTP, sockets, DNS, ICMP |
-| `exec` | running programs on this host — subprocesses, sub-agents |
+| `exec` | running programs on this host — subprocesses, sub-agents, a repository sandbox's `run_command` |
 | `sandbox` | running model-written JavaScript in the embedded boa VM, whose only filesystem is the context's file store (`vfs.read` / `vfs.write` / `vfs.list`) |
 | `secrets` | reading or changing stored credentials |
 
@@ -653,7 +653,7 @@ The `required` list is declared `path, start_line, end_line`, and the constraine
 
 ### `file_edit`
 
-Apply a unified diff to an existing VFS file. The patch is one or more `@@ -old,count +new,count @@` hunks, each line prefixed with a space for context, `-` for a removed line, `+` for an added one. Use for: changing a value in a config, editing several places in one file at once, updating a function body, fixing a typo. Hunks are located by their context rather than by their line numbers, so the numbers need only be close; a hunk whose context matches in several places returns an `ambiguous` error and asks for more surrounding context, and a hunk whose change is already in the file is reported as already applied rather than applied twice. Either every hunk lands or none does. Triggered by "change X to Y in the file", "apply this diff", "edit the file to replace", "update these lines", "fix the value of". Returns path, per-hunk counts, and new byte count. For full rewrites of a file use `file_write`.
+Replace one piece of text in an existing VFS file with another. `old_text` is the text to change, copied from the file as it stands — whole lines, with enough of the lines around it to occur only once; `new_text` is what takes its place, empty to delete it. Use for: changing a value in a config, updating a function body, adding a method after an existing one, fixing a typo. Triggered by "change X to Y in the file", "update these lines", "fix the value of", "add this after". Returns path, how many occurrences were replaced, whether the edit was already applied, how the text was matched, and the new byte count. For full rewrites of a file use `write`.
 
 **Parameters**
 
@@ -661,23 +661,25 @@ Apply a unified diff to an existing VFS file. The patch is one or more `@@ -old,
 {
   "type": "object",
   "properties": {
+    "repo": {"type": "string"},
     "path": {"type": "string"},
-    "patch": {
-      "type": "string",
-      "description": "Unified-diff body: one or more `@@ -old,count +new,count @@` hunks whose lines are prefixed with a space (context), `-` (removed) or `+` (added). Give every hunk at least one context or removed line."
-    }
+    "old_text": {"type": "string", "description": "The text to replace, copied from the file exactly as it stands — whole lines, with enough around it to occur once. Without the line numbers `file_read` shows."},
+    "new_text": {"type": "string", "description": "The text that takes its place. Empty to delete `old_text`."},
+    "replace_all": {"type": "boolean", "default": false}
   },
-  "required": ["path", "patch"]
+  "required": ["repo", "path", "old_text", "new_text"]
 }
 ```
 
 **Returns**
 
 ```json
-{"path": "src/main.rs", "hunks_applied": 2, "hunks_already_applied": 0, "bytes": 1289}
+{"repo": "app", "path": "src/main.rs", "replacements": 1, "already_applied": false, "matched": "exact", "bytes": 1289}
 ```
 
-**Implementation.** `zend-vfs/src/patch.rs`, which parses the diff and applies it to the file read through the overlay. A hunk is found by its **pre-image** — its context and removed lines, matched as a run of whole lines, with no fuzz and never as a substring of a line. The `@@` numbers are a hint used only to choose between equal matches; the occurrence nearest the hinted position wins and a tie returns `{"error": "ambiguous", "detail": "hunk 1 (@@ -3 +3 @@) matches in more than one place..."}`. When a pre-image is absent the engine looks for the hunk's **post-image** (its context and added lines): finding it means the change is already in the file, so the hunk counts as already applied and nothing is written for it. That is what makes re-sending a patch a no-op — and why `-retries = 3` / `+retries = 30` cannot compound into `retries = 300`, since whole-line matching does not see `retries = 3` inside `retries = 30`. A hunk that is neither applicable nor already applied returns `{"error": "not_found", "detail": "hunk 2 (@@ -3,2 +3,2 @@) does not apply..."}` and **nothing is written at all**: the patched copy is built to one side and stored only once every hunk has landed, so a half-patched file never reaches the VFS. Locating by content rather than by line number is the point — it is what lets a model patch a file whose line numbers have moved since it read it, and what makes a retry after an unclear result safe.
+**Why this shape.** It replaced a unified-diff `patch` argument. A live model could not drive the diff: it planned a correct hunk in its reasoning and then emitted the lines with no `@@` header, invented line numbers, and indented its context lines by what the line-numbered `file_read` view suggested rather than by what the file held — five failed calls before it gave up and rewrote the whole file with `write`. Quoting the old text and the new is the edit format models are trained on: nothing to count, no prefixes, no line numbers.
+
+**Implementation.** `zend-vfs/src/replace/`, applied to the file read through the overlay. `old_text` is looked for **exactly** first; one occurrence is replaced, several (overlapping ones counted apart) return `{"error": "ambiguous", ...}` unless `replace_all` is set. An `old_text` that opens with indentation must start a line — found partway into deeper indentation, it is the right line at the wrong depth. Failing that it is looked for **line by line with indentation ignored** — each line compared with its surrounding whitespace trimmed — the mistake a model actually makes; the replacement is re-indented by the difference between the file's indentation and the one `old_text` was written at, and the response says `"matched": "indentation"`. Nothing looser is tried. When `old_text` is absent and `new_text` stands in the file **as whole lines** that say something (not only punctuation), the edit is **already applied** and nothing is written — a bare substring of `new_text` is found by accident and never counts; an occurrence of `old_text` inside an occurrence of `new_text` is the edit's own result and is not counted, so `retries = 3` → `retries = 30` re-sent cannot compound into `retries = 300`. A deletion leaves nothing to recognise, so its missing `old_text` is `not_found`. `not_found` says where the first line of `old_text` is in the file, when it is, so the next call can quote the file as it stands. An LF edit lands in a CRLF file as CRLF; every line the edit does not replace keeps its own ending, and a missing final newline is kept.
 
 ---
 
@@ -932,7 +934,22 @@ The VFS should be visible to the user as a collapsible "Files" panel in the web 
 
 ### VFS execution
 
-VFS tools cover editing only — there is no `code_run` operation from inside the VFS layer itself. Faking execution by letting the model produce the output it thinks would result is worse than no execution at all: the model presents hallucinated output as ground truth, and there's no signal to the user that nothing actually ran. Real code execution lives in the Code Execution tool group (`code_run`, `code_session_*`) below, which runs code in a Firecracker microVM or gVisor container with proper isolation and can mount a slice of the VFS into the sandbox at `/work` so generated artefacts flow back to the model's editable filesystem.
+VFS tools cover editing only. Faking execution by letting the model produce the output it thinks would result is worse than no execution at all: the model presents hallucinated output as ground truth, and there's no signal to the user that nothing actually ran. Real execution is two tool groups: **Commands** (`run_command`, `run_output`, next section), which run a real program — a test suite, a build — on a checkout of the conversation's branch with its changes laid down, what it changes coming back into the VFS; and **Code Execution** (`code_run`, `code_session_*`), JavaScript on the embedded VM, whose only filesystem is the VFS itself.
+
+## Commands
+
+`run_command` runs one program in a repository's sandbox (`docs/zend_workspace_execution.md` §7.4): the repository's own folder is set aside, checked out on the conversation's branch at its base with its uncommitted changes laid down, the program run, what it changed read back into the conversation's changes, and the folder put back as it was. It needs `exec` (a program on this host), `disk_write` (the checkout) and `network` (what the toolchains fetch), so only Comprehensive offers it.
+
+| | Declares | Offered in |
+|---|---|---|
+| `run_command` `{repo, program, args, timeout_secs}` | `network` + `exec` + `disk_write` | **Comprehensive only** |
+| `run_output` `{repo, job, page}` | `exec` | **Comprehensive only** |
+
+- **One program, no shell.** `program` is the program (`npm`, `cargo`, `python`) and `args` its arguments, each passed as written — `npm test` is `program: "npm", args: ["test"]`, and a repository script runs through its interpreter (`node` with `["scripts/report.js"]`); no `&&`, pipes or redirects. `args` is required (`[]` for none), so the grammar cannot close the call before the arguments are decided. A whole command line sent as `program` is refused with the call it should have been — or, when it holds quotes, told to pass each argument apart, since splitting it at its spaces would keep the quotes; a git command line goes straight to the git refusal, unless it holds shell syntax, which is refused first. The daemon's allow-list (`zend/src/sandbox_programs.rs`) names the build, test and packaging toolchains and no shell; a program it does not list is refused with the list. git run directly is refused with a pointer to the git tools.
+- **The allow-list is not a sandbox.** It decides which programs start, not what they do: `python -c`, `node -e`, an `npm` script or an `npx` package run anything the daemon's rights allow, git and the network included, and the policy's argument checks see only the command line. The boundary is the mode: `run_command` needs `network` + `exec` + `disk_write`, which only Comprehensive grants, and only an admin may use Comprehensive.
+- **It waits.** The call returns when the program ends or is killed at its timeout (600 s by default, at most 1800) with everything it started. It returns the exit code, the files it changed (`edited` / `written` / `deleted`), and page 0 of the output.
+- **Output is paged.** 200 lines a page, colour codes stripped, over-long lines cut; `run_output` reads any page of a run by its `job` id, and a page past the end is the last.
+- **Refusals the model can act on:** `refused` (the policy), `behind` (the branch holds commits the conversation's files are not based on — `git_merge` first), `unpublished` (a merge fast-forwarded the conversation past its branch — `git_commit` with `from: all_changes` publishes it first), `merging` (a merge is being finished — commit it first), `no_branch` (the conversation is on no branch), `cannot_start` (not installed), `no_sandbox` (not a git repository), and `invalid_arguments` for a command line in `program` or shell syntax in `args` — an operator or redirect (`&&`, a pipe, `>out.txt`, `2>&1`), told to run one program per call, or a shell's escaped quote, told the argument as it should arrive.
 
 ## Git
 
@@ -965,7 +982,7 @@ So every distinction that was measured costing a wrong tool choice moved
 |---|---|---|
 | `git_show` | `what: changes \| patch \| file \| tree \| blame` | `git_diff`, `git_file`, `git_blame` |
 | `git_refs` | `kind: branches \| tags \| remotes \| remote_branches` | `git_branches`, `git_tags`, `git_remotes` |
-| `git_commit` | `from: changes \| files \| patch \| cherry_pick \| revert` | `git_apply`, `git_pick` |
+| `git_commit` | `from: all_changes \| files \| patch \| cherry_pick \| revert` | `git_apply`, `git_pick` |
 | `git_ref` | `kind × action` | `git_branch`, `git_tag` |
 | `git_switch` | `create` | `git_checkout` |
 | `git_reset` | `mode: soft \| hard` | `git_restore`, `undo_commit`, `discard_changes` |
@@ -1040,8 +1057,11 @@ checked-out `HEAD`. Instead:
 What the model has to be told, and the descriptions do tell it:
 
 - `git_commit`'s `take` action commits a file **exactly as you hold it** and
-  needs no content, and `from: changes` commits every uncommitted change at
-  once. `take` exists because the alternative — requiring the model to
+  needs no content, and `from: all_changes` commits every uncommitted change
+  at once while `from: files` commits only the files it lists. The value is
+  named for what it takes: as `changes` it read as "my changes", and a model
+  whose reasoning said "commit only README.md" chose it and committed the
+  file it had been told to leave out. `take` exists because the alternative — requiring the model to
   reproduce a file it may not have read — is the one dead end in this family
   whose invented output would be *committed*. `write` is for content the model
   genuinely authored. Both read through the conversation's file store, the
@@ -1059,7 +1079,7 @@ What the model has to be told, and the descriptions do tell it:
   would merge its markers as content, the other carry them elsewhere.
 - A cherry-pick or revert that conflicts reports the conflicting paths and
   commits nothing. The one in-progress state is a merge being finished: it is
-  committed whole with `from: changes` — `files` and `patch` are refused —
+  committed whole with `from: all_changes` — `files` and `patch` are refused —
   or abandoned with a hard `git_reset`.
 - A soft `git_reset` keeps what the commits it moves past changed as
   uncommitted changes, so it is refused, before anything moves, when one of
@@ -1070,14 +1090,17 @@ What the model has to be told, and the descriptions do tell it:
 `git_ref` takes `expected`, and `git_commit` and `git_reset` an
 `expected_head` — but all are **optional**, and omitting them is the ordinary
 case: the layer reads the ref's current value — a branch's from origin, a
-tag's from this repository — and swaps against that, still atomically. `git_push`'s
+tag's from this repository and from origin, refusing a delete when the two
+differ — and swaps against that, still atomically. `git_push`'s
 lease works the same way, defaulting to this repository's remote-tracking
 ref, which is what `--force-with-lease` does by default and is the value that
 actually protects a concurrent push.
 
-Two writes need the value, because without it they would discard something
-the model has not seen: a `git_ref` `move` that takes commits off a branch,
-and a `git_commit` of the conversation's files onto *another* branch that has
+Three writes need the value, because without it they would discard something
+the model has not seen: a `git_ref` `move` that takes commits off a branch, a
+`git_reset` that does (its refusal lists them and points at `git_commit`'s
+`revert`, which undoes a commit without rewriting history), and a
+`git_commit` of the conversation's files onto *another* branch that has
 changed one of those files since the conversation's base. Each refusal names
 the tip it would overwrite, so giving it back is a read of the response, not
 an invention — and it is the model saying it looked.
@@ -1203,6 +1226,33 @@ every key the grammar offers is one the type accepts. A kind's own requirement
 still holds — `{"kind":"commit"}` with no `name` has nothing to resolve and is
 refused, with the reason — and the request stays strict, so a misspelt
 parameter like `max_count` is an error rather than a silently dropped argument.
+
+A dependency the grammar *can* carry is one field's value requiring others.
+A definition states it as JSON Schema's own `allOf` of
+`{"if": {"properties": {F: {"const" | "enum": …}}}, "then": {"required": […]}}`,
+and the stencil reads each rule onto `F` (`Param::requires`): after each value
+of `F` the grammar continues into a tail of its own in which the fields that
+value requires are required. `git_commit` uses it — `message` for
+`all_changes`, `files` and `patch`, the `changes` list for `files`, `patch` for `patch`, `commit` for
+`cherry_pick` and `revert` — because none of them is needed by every mode, so
+the request type can require none, and an optional field is a close the model
+takes: measured live, `{"from": "files", "message": …}` and then
+`{"from": "files", "changes": []}`, with the files it meant to `take` named in
+its own reasoning. A guided array's `minItems` holds the same way: no `]` is
+offered before that many elements (`git_push`'s `pushes`, `git_commit`'s
+`changes`). A decision that every call makes is simply required —
+`git_switch`'s `create`, `run_command`'s `args`.
+
+An alias whose name says a mode fixes it (`zend-tools/src/alias_pins.rs`):
+`git_cherry_pick` is `from: cherry_pick`, `git_revert` is `from: revert`,
+`git_apply` is `from: patch`, `delete_tag` is `kind: tag, action: delete`, and
+so on. zend compiles each such alias with the field narrowed to that value, so
+the grammar writes it; a call that reaches dispatch without the grammar gets a
+missing value filled in and a contradicting one refused. An alias carries the
+canonical tool's whole request, and without the pin a name and its argument
+could disagree: measured live, `git_cherry_pick` was decoded with
+`from: revert`, undid a commit the branch never had, and the conflict that made
+was "settled" by deleting a line.
 
 ### Choosing between the file tools and the git tools
 
@@ -3995,9 +4045,11 @@ XOR two byte strings. Use for: constructing per-record nonces in TLS (the nonce 
 
 ## Code Execution
 
-Sandboxed code execution for languages the agent can run locally on the backend host. Each invocation runs in an isolated Firecracker microVM (or gVisor container) with no network by default, a writable scratch filesystem, memory and CPU limits, and an absolute wall-clock timeout. The sandbox cannot reach the orchestrator's network, the credential store, the persistent notes, or any other session's state — it is a fully isolated execution environment that happens to share an optional VFS mount with the calling session.
+**As built:** the `code_*` tools run JavaScript only, on the embedded pure-Rust boa VM (`zend-tools/src/tools/code/`) — no subprocess, no network, no host filesystem; the script's only files are the conversation's own through a `vfs` global. A real program — Python, a test runner, a compiler — runs through `run_command` (the Commands section above) instead. The rest of this section describes the isolated multi-language design the VM stands in for; the parameters below are the design's, and the implemented tools' are in their definitions (`zend/src/prompts/tools/code_*.yaml`).
 
-Languages supported at v1: `python` (3.12, with numpy, pandas, scipy, matplotlib, requests pre-installed), `node` (Node.js 22, with axios and lodash), `bash` (busybox + GNU coreutils), `ruby` (3.3), `go` (1.23, compiled and run in one call), `rust` (1.84, compiled and run in one call). Adding a language is a backend operation — the model treats the language list as fixed at runtime.
+The design: sandboxed code execution for languages the agent can run locally on the backend host. Each invocation runs in an isolated Firecracker microVM (or gVisor container) with no network by default, a writable scratch filesystem, memory and CPU limits, and an absolute wall-clock timeout. The sandbox cannot reach the orchestrator's network, the credential store, the persistent notes, or any other session's state — it is a fully isolated execution environment that happens to share an optional VFS mount with the calling session.
+
+Languages in the design: `python` (3.12, with numpy, pandas, scipy, matplotlib, requests pre-installed), `node` (Node.js 22, with axios and lodash), `bash` (busybox + GNU coreutils), `ruby` (3.3), `go` (1.23, compiled and run in one call), `rust` (1.84, compiled and run in one call). Adding a language is a backend operation — the model treats the language list as fixed at runtime.
 
 Two paths: `code_run` for one-shot execution where state doesn't need to persist across calls, and `code_session_*` for persistent REPL-style sandboxes where variable bindings, imports, and filesystem state survive across calls. Use the session path when running many related snippets that share state; use one-shot for independent code where each call is self-contained.
 

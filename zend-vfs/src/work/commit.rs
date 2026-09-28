@@ -27,7 +27,8 @@ pub enum NotCommitted {
 pub struct Landed {
     pub commit: Oid,
     /// Its parents: the conversation's commit, and the one merged into it
-    /// when the commit finished a merge.
+    /// when the commit finished a merge. Empty when no commit was made — a
+    /// fast-forwarded base published as it was ([`Committing::publish_base`]).
     pub parents: Vec<Oid>,
     /// Where it is kept.
     pub published: Published,
@@ -119,6 +120,44 @@ impl Committing {
     /// Whether this commit finishes a merge.
     pub fn finishes_merge(&self) -> bool {
         self.base.merging().is_some()
+    }
+
+    /// Whether the conversation's base is a commit its branch does not hold
+    /// yet — a merge fast-forwarded the files past the branch, or the branch
+    /// has no commit — so the base alone is work to publish.
+    pub fn ahead(&self) -> bool {
+        match (self.base.merging(), self.base.commit()) {
+            (None, Some(commit)) => self.pulled.record() != Some(commit),
+            _ => false,
+        }
+    }
+
+    /// What the branch held when this began: origin's copy or, with no
+    /// origin, the local branch.
+    pub fn record(&self) -> Option<&Oid> {
+        self.pulled.record()
+    }
+
+    /// Publish the conversation's base commit as the branch's tip, as `git
+    /// push` publishes a branch a merge fast-forwarded: no commit is made, and
+    /// the files stay where they are, now on the branch. Only while
+    /// [`Self::ahead`]. The landed commit reports no parents of its own —
+    /// it is the one the merge brought in, whatever they were.
+    pub fn publish_base(self, repo: &Repo) -> Result<Result<Landed, NotCommitted>, GitError> {
+        assert!(self.ahead(), "publish_base with a base the branch holds");
+        let commit = self.onto;
+        match repo.publish_commit(&self.pulled, &commit)? {
+            Published::Behind => Ok(Err(NotCommitted::Behind {
+                record: self.pulled.record().cloned().unwrap_or(commit),
+            })),
+            Published::Refused(why) => Ok(Err(NotCommitted::Refused(why))),
+            published => Ok(Ok(Landed {
+                commit,
+                parents: Vec::new(),
+                published,
+                behind: None,
+            })),
+        }
     }
 
     /// Publish `built` — a commit on [`Self::onto`] — as the branch's next

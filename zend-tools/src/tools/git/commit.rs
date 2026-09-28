@@ -14,7 +14,9 @@
 //! conversation does not have, or when origin moves during the push. The way
 //! on is git_merge, then the commit again. Once it lands, the committed
 //! changes read from the branch and leave the conversation's uncommitted
-//! work; a commit made while a merge is being finished records the merge.
+//! work; a commit made while a merge is being finished records the merge,
+//! and one after a merge fast-forwarded the files past the branch, with no
+//! change of the conversation's own, moves the branch onto them.
 //!
 //! On another branch the commit is built on origin's copy of that branch,
 //! and published the same way.
@@ -26,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 use zend_vfs::{
     ApplyOutcome, BranchName, ChangeSet, Committing, FileMode, FileState, GitError, Landed,
-    NotCommitted, Oid, PickOutcome, Published, Rejection, RepoPath, Rev, Signature, TreeEntry,
-    VfsStore,
+    LogRange, MergeLabels, NotCommitted, Oid, PickOutcome, Published, Rejection, RepoPath, Rev,
+    Signature, TreeEntry, VfsStore,
 };
 
 use super::wire::{landed_on, refusal};
@@ -39,10 +41,17 @@ use crate::{RegisteredTool, Tool, ToolContext};
 #[serde(rename_all = "snake_case")]
 pub enum CommitFrom {
     /// Every change you have not committed, as git_status lists it — and,
-    /// while a merge is being finished, the merge itself, even with no
-    /// change of your own.
-    Changes,
-    /// The `changes` list: files written, taken as you hold them, or deleted.
+    /// while a merge is being finished or after one fast-forwarded your
+    /// files past the branch, what the merge brought in, even with no change
+    /// of your own.
+    ///
+    /// Named for what it takes — all of it. As `changes` it read as "my
+    /// changes": measured live, a model whose reasoning said "commit only
+    /// README.md" wrote `from: changes` as its first constrained choice, and
+    /// committed the file it had been told to leave out as well.
+    AllChanges,
+    /// The `changes` list: files written, taken as you hold them, or deleted —
+    /// some of your changes and not others.
     Files,
     /// A unified-diff `patch` applied to the branch.
     Patch,
@@ -101,12 +110,17 @@ pub struct CommitRequest {
     pub branch: Option<String>,
     /// Where the content comes from. Required.
     pub from: CommitFrom,
-    /// The commit message. Required for `changes`, `files` and `patch`;
+    /// The commit message. Required for `all_changes`, `files` and `patch`;
     /// `cherry_pick` keeps the original's and `revert` writes its own.
     #[serde(default)]
     #[schemars(with = "String")]
     pub message: Option<String>,
-    /// For `from: files` — the files this commit changes.
+    /// For `from: files` — the files this commit changes. Emptiness is
+    /// refused where it matters — the `files()` closure below, scoped to
+    /// `from: files` — not here: a field-level `Validate` on `Option<Vec<_>>`
+    /// applies to the inner value whenever it is `Some`, so a `min` here would
+    /// also refuse a `from: patch`/`cherry_pick`/`revert` call that happened to
+    /// carry `changes: []`, which is none of this field's business under those.
     #[validate(length(max = 200))]
     #[serde(default)]
     #[schemars(with = "Vec<FileChange>")]
@@ -149,7 +163,8 @@ pub struct CommitResponse {
     pub on: Option<&'static str>,
     /// Set when the commit landed but your files could not be moved onto it:
     /// they still read from the commit before it, and git_merge brings them
-    /// up to it.
+    /// up to it. Also set when no commit was needed — the branch was moved
+    /// onto the commit a merge brought your files onto.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// Why nothing was committed, and what to do next.
@@ -159,12 +174,32 @@ pub struct CommitResponse {
     /// a cherry-pick or revert could not apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflicts: Option<Vec<String>>,
+    /// For a cherry-pick or revert that did not apply: each file in
+    /// `conflicts` with the commit's change merged in as far as it goes, and
+    /// both sides of every overlap between conflict markers — to write as it
+    /// should be. A file that is not text is left out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drafts: Option<Vec<Draft>>,
 }
+
+/// One conflicting file of a replay, merged three ways.
+#[derive(Serialize)]
+pub struct Draft {
+    pub path: String,
+    /// The merge, overlaps between `<<<<<<< your branch` and `>>>>>>> the
+    /// commit` markers. Cut past [`DRAFT_SHOWN_BYTES`].
+    pub content: String,
+}
+
+/// How much of one draft a refused replay's answer carries.
+const DRAFT_SHOWN_BYTES: usize = 16 * 1024;
 
 /// Content that does not apply to the commit it is built on.
 struct Refusal {
     reason: String,
     conflicts: Option<Vec<String>>,
+    /// The conflicting files merged three ways, when a replay did not apply.
+    drafts: Option<Vec<Draft>>,
 }
 
 /// The change set `changes` describe. `take` reads through `files`, the
@@ -260,11 +295,19 @@ impl Content<'_> {
         identity: &Signature,
     ) -> Result<Result<Oid, Refusal>, GitToolError> {
         let message = self.message.as_deref().unwrap_or_default();
-        let refused =
-            |reason: String, conflicts: Option<Vec<String>>| Ok(Err(Refusal { reason, conflicts }));
+        let refused = |reason: String, conflicts: Option<Vec<String>>| {
+            Ok(Err(Refusal {
+                reason,
+                conflicts,
+                drafts: None,
+            }))
+        };
         match self.from {
-            CommitFrom::Changes | CommitFrom::Files => {
-                let set = self.set.as_ref().expect("gathered for changes and files");
+            CommitFrom::AllChanges | CommitFrom::Files => {
+                let set = self
+                    .set
+                    .as_ref()
+                    .expect("gathered for all_changes and files");
                 Ok(Ok(
                     repo.commit_changes(onto, set, message, identity, identity)?
                 ))
@@ -284,6 +327,22 @@ impl Content<'_> {
             }
             CommitFrom::CherryPick | CommitFrom::Revert => {
                 let subject = self.subject.as_ref().expect("gathered for a replay");
+                // A replay must have something to do: a cherry-pick brings a
+                // commit the branch lacks, a revert undoes one it holds.
+                // Measured live: a model cherry-picked a commit already in the
+                // branch's history, took the conflict it made for the change it
+                // wanted, and "settled" it by undoing the revert it had just
+                // committed.
+                let held = repo.is_ancestor(&Rev::Oid(subject.clone()), &Rev::Oid(onto.clone()))?;
+                match (self.from, held) {
+                    (CommitFrom::CherryPick, true) => {
+                        return refused(already_held(subject), None);
+                    }
+                    (CommitFrom::Revert, false) => {
+                        return refused(not_held(subject), None);
+                    }
+                    _ => {}
+                }
                 let outcome = if self.from == CommitFrom::CherryPick {
                     repo.cherry_pick(subject, onto, identity)?
                 } else {
@@ -291,14 +350,129 @@ impl Content<'_> {
                 };
                 match outcome {
                     PickOutcome::Clean(commit) => Ok(Ok(commit)),
-                    PickOutcome::Conflicted { paths } => refused(
-                        "the change does not apply cleanly here".to_string(),
-                        Some(paths.iter().map(|p| p.as_str().to_string()).collect()),
-                    ),
+                    PickOutcome::Conflicted { paths } => Ok(Err(Refusal {
+                        reason: replay_conflict(self.from, subject, onto),
+                        conflicts: Some(paths.iter().map(|p| p.as_str().to_string()).collect()),
+                        drafts: Some(drafts(repo, self.from, subject, onto, &paths)?),
+                    })),
                 }
             }
         }
     }
+}
+
+/// Why a cherry-pick of `commit` has nothing to do: the branch holds it.
+fn already_held(commit: &Oid) -> String {
+    format!(
+        "{commit} is already in this branch's history, so there is nothing to replay and \
+         nothing was committed. To bring over a commit from another branch, git_log that branch \
+         with `since` set to this one: what it lists is what this branch lacks"
+    )
+}
+
+/// Why a revert of `commit` has nothing to do: the branch does not hold it.
+fn not_held(commit: &Oid) -> String {
+    format!(
+        "{commit} is not in this branch's history, so there is nothing of it to undo and \
+         nothing was committed. git_log this branch for the commit to revert"
+    )
+}
+
+/// Why `commit` cannot be replayed in `repo`: it is not there.
+fn no_such_commit(repo: &str, commit: &Oid) -> GitError {
+    GitError::invalid(format!(
+        "{repo} holds no commit {commit} — an id from another repository's history is not in \
+         this one. git_log in {repo} on the branch that holds the change gives its id; for a \
+         branch on origin, `rev: {{\"kind\": \"remote_branch\", \"name\": \"origin/<branch>\"}}`"
+    ))
+}
+
+/// Why a replay of `subject` onto `onto` was refused, and the way on: the
+/// `drafts` the answer carries, written as they should be. A replay is one
+/// attempt, whole or not at all, so what is left is to make the change by
+/// hand. Measured live: told where to read the commit's change, a model read
+/// its own branch's latest patch instead and made that; handed the commit's
+/// patch alone, another rebuilt the file from it and dropped the branch's
+/// own line beside it. A merged file shows both at once.
+fn replay_conflict(from: CommitFrom, subject: &Oid, onto: &Oid) -> String {
+    let what = match from {
+        CommitFrom::Revert => "undoing",
+        _ => "replaying",
+    };
+    format!(
+        "{what} {subject} does not apply cleanly onto {onto}, where the files in `conflicts` \
+         have changed too, so nothing was committed. `drafts` holds each of them with the \
+         change merged in as far as it goes, and both sides of every overlap between \
+         <<<<<<< your branch and >>>>>>> the commit markers: write each file as it should be — \
+         keeping the lines of both sides that belong — then commit them with git_commit"
+    )
+}
+
+/// Each of `paths` with `subject`'s change — undone, for a revert — merged
+/// three ways into `onto`'s copy: its parent (or the empty tree) as the base.
+/// A side that is not text leaves its file out.
+fn drafts(
+    repo: &ConvRepo,
+    from: CommitFrom,
+    subject: &Oid,
+    onto: &Oid,
+    paths: &[RepoPath],
+) -> Result<Vec<Draft>, GitToolError> {
+    let info = repo.log(&LogRange::of(Rev::Oid(subject.clone())), 1)?;
+    let parent = match info.first().and_then(|c| c.parents.first()) {
+        Some(parent) => parent.clone(),
+        None => repo.format().empty_tree(),
+    };
+    let (base, theirs, label) = match from {
+        CommitFrom::Revert => (subject, &parent, "the commit undone"),
+        _ => (&parent, subject, "the commit"),
+    };
+    let blobs = repo.blobs();
+    let text_at = |rev: &Oid, path: &RepoPath| -> Result<Option<String>, GitToolError> {
+        Ok(match blobs.read_at(&Rev::Oid(rev.clone()), path) {
+            Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
+            Ok(None) => Some(String::new()),
+            Err(GitError::BlobTooLarge { .. }) | Err(GitError::NotABlob { .. }) => None,
+            Err(e) => return Err(e.into()),
+        })
+    };
+    let mut drafts = Vec::new();
+    for path in paths {
+        let (Some(was), Some(yours), Some(incoming)) = (
+            text_at(base, path)?,
+            text_at(onto, path)?,
+            text_at(theirs, path)?,
+        ) else {
+            continue;
+        };
+        let labels = MergeLabels {
+            ours: "your branch",
+            base: "before the commit",
+            theirs: label,
+        };
+        let merged = repo.merge_text(&was, &yours, &incoming, labels)?;
+        drafts.push(Draft {
+            path: path.as_str().to_string(),
+            content: cut(merged.text, subject),
+        });
+    }
+    Ok(drafts)
+}
+
+/// `text`, cut at [`DRAFT_SHOWN_BYTES`] on a character boundary with a note.
+fn cut(text: String, subject: &Oid) -> String {
+    if text.len() <= DRAFT_SHOWN_BYTES {
+        return text;
+    }
+    let at = (0..=DRAFT_SHOWN_BYTES)
+        .rev()
+        .find(|&at| text.is_char_boundary(at))
+        .unwrap_or(0);
+    format!(
+        "{}\n… (cut here; git_show {{\"what\": \"patch\", \"rev\": {{\"kind\": \"commit\", \
+         \"name\": \"{subject}\"}}}} reads the commit's change whole)",
+        &text[..at]
+    )
 }
 
 impl CommitResponse {
@@ -315,6 +489,7 @@ impl CommitResponse {
             note: None,
             reason: None,
             conflicts: None,
+            drafts: None,
         }
     }
 
@@ -334,9 +509,25 @@ impl CommitResponse {
         self
     }
 
+    /// The branch moved onto the commit a merge brought the files onto, with
+    /// no commit made.
+    fn fast_forwarded(mut self, landed: Landed, from: Option<Oid>) -> Self {
+        let from = from.map_or_else(|| "no commit".to_string(), |o| o.to_string());
+        self.note = Some(format!(
+            "no new commit was needed: {} moved from {from} to {}, the commit a merge brought \
+             your files onto",
+            self.branch, landed.commit
+        ));
+        self.applied = true;
+        self.commit = Some(landed.commit.as_str().to_string());
+        self.on = Some(landed_on(&landed.published));
+        self
+    }
+
     fn refused(mut self, refusal: Refusal) -> Self {
         self.reason = Some(refusal.reason);
         self.conflicts = refusal.conflicts;
+        self.drafts = refusal.drafts;
         self
     }
 
@@ -350,6 +541,7 @@ impl CommitResponse {
                          write each as it should be — or delete it — then commit again"
                     .to_string(),
                 conflicts: Some(paths),
+                drafts: None,
             },
             NotCommitted::Behind { record } => Refusal {
                 reason: format!(
@@ -358,6 +550,7 @@ impl CommitResponse {
                      into your files; then commit again"
                 ),
                 conflicts: None,
+                drafts: None,
             },
             NotCommitted::Refused(Rejection::Stale) => Refusal {
                 reason: format!(
@@ -366,10 +559,12 @@ impl CommitResponse {
                      arrived; then commit again"
                 ),
                 conflicts: None,
+                drafts: None,
             },
             NotCommitted::Refused(why) => Refusal {
                 reason: refusal(&why),
                 conflicts: None,
+                drafts: None,
             },
         };
         self.refused(refusal)
@@ -389,6 +584,7 @@ impl CommitResponse {
         self.refused(Refusal {
             reason,
             conflicts: None,
+            drafts: None,
         })
     }
 }
@@ -400,15 +596,17 @@ impl Tool for GitCommit {
     const DESCRIPTION: &'static str =
         "Record one commit on a branch — the branch you are on unless you name another — \
          and publish it to origin, all at once or not at all. `from` says where the content \
-         comes from: `changes` commits every change you have not committed (what git_status \
-         lists); `files` takes a list — `take` commits a file exactly as you hold it (prefer \
-         this whenever the edit is already written), `write` replaces it with `content`, \
-         `delete` removes it; `patch` applies a unified diff; `cherry_pick` replays another \
+         comes from: `all_changes` commits every change you have not committed (what \
+         git_status lists), and publishes what a git_merge brought in even with no change of \
+         your own; `files` commits only the files it lists — `take` commits a file exactly \
+         as you hold it (prefer this whenever the edit is already written), `write` replaces \
+         it with `content`, `delete` removes it — and leaves every other change uncommitted; \
+         `patch` applies a unified diff; `cherry_pick` replays another \
          commit onto the branch; `revert` applies one backwards. Once committed, those \
          changes are no longer uncommitted. If the branch has commits you do not have, or \
          gets one while this is pushed, nothing is committed and your files are untouched: \
          git_merge them in, then commit again. Files still in conflict from a merge must be \
-         settled first, and a merge is committed whole, with `changes`. Committing `files` to \
+         settled first, and a merge is committed whole, with `all_changes`. Committing `files` to \
          another branch that has changed them since your work started is refused unless \
          `expected_head` names that branch's tip. A patch that does not apply, or a \
          replay that conflicts, reports why and commits nothing. The branch must already \
@@ -432,7 +630,7 @@ impl Tool for GitCommit {
         if message.is_none()
             && matches!(
                 req.from,
-                CommitFrom::Changes | CommitFrom::Files | CommitFrom::Patch
+                CommitFrom::AllChanges | CommitFrom::Files | CommitFrom::Patch
             )
         {
             return Err(GitError::invalid("this commit needs a `message`").into());
@@ -455,7 +653,16 @@ impl Tool for GitCommit {
                     .ok_or_else(|| {
                         GitError::invalid("this needs the id of the commit to replay, in `commit`")
                     })?;
-                Some(Oid::parse(id)?)
+                let oid = Oid::parse(id)?;
+                // A commit this repository does not hold is named as such, with
+                // where its id comes from — not git's `bad object`. Measured
+                // live: a model looked the change up in another repository of
+                // the workspace, replayed that commit's id here, and read the
+                // raw git failure as a reason to go looking somewhere else.
+                if repo.blobs().commit_of(&Rev::Oid(oid.clone()))?.is_none() {
+                    return Err(no_such_commit(&req.repo, &oid).into());
+                }
+                Some(oid)
             }
             _ => None,
         };
@@ -493,16 +700,29 @@ impl Tool for GitCommit {
             // A merge is recorded with every change the conversation settled
             // it with: committing some of them, or a patch, would record the
             // merge with the other side's changes to the rest dropped.
-            if finishing_merge && req.from != CommitFrom::Changes {
+            if finishing_merge && req.from != CommitFrom::AllChanges {
                 return Err(GitError::invalid(
                     "a merge is being finished here, and it is committed whole: use \
-                     `from: changes`, which records the merge with everything you settled it \
+                     `from: all_changes`, which records the merge with everything you settled it \
                      with — then make any other commit",
                 )
                 .into());
             }
+            // A merge that fast-forwarded the files past the branch leaves no
+            // change to commit: publishing it is moving the branch onto them.
+            if req.from == CommitFrom::AllChanges
+                && !finishing_merge
+                && committing.ahead()
+                && store.status().is_empty()
+            {
+                let from = committing.record().cloned();
+                return Ok(match committing.publish_base(&repo)? {
+                    Ok(landed) => out.fast_forwarded(landed, from),
+                    Err(why) => out.not_committed(&branch, why),
+                });
+            }
             let set = match req.from {
-                CommitFrom::Changes => Some(uncommitted(store, finishing_merge)?),
+                CommitFrom::AllChanges => Some(uncommitted(store, finishing_merge)?),
                 CommitFrom::Files => Some(files()?),
                 _ => None,
             };
@@ -526,7 +746,7 @@ impl Tool for GitCommit {
             );
         }
 
-        if req.from == CommitFrom::Changes {
+        if req.from == CommitFrom::AllChanges {
             let on = current.map_or_else(|| "no branch".to_string(), |b| b.to_string());
             return Err(GitError::invalid(format!(
                 "your uncommitted changes are made on {on}, not {branch}: switch to {branch} \
@@ -586,6 +806,7 @@ impl Tool for GitCommit {
                          again with `expected_head` set to {onto}"
                     ),
                     conflicts: Some(changed),
+                    drafts: None,
                 }));
             }
         }
@@ -652,3 +873,76 @@ fn changed_since_your_base(
 }
 
 pub const GIT_COMMIT: RegisteredTool = RegisteredTool::new::<GitCommit>();
+
+#[cfg(test)]
+mod validation_tests {
+    use validator::Validate;
+
+    use super::{ChangeAction, CommitFrom, CommitRequest, FileChange};
+
+    fn file(path: &str) -> FileChange {
+        FileChange {
+            action: ChangeAction::Take,
+            path: path.to_string(),
+            content: None,
+            executable: None,
+        }
+    }
+
+    /// `changes` has no business being validated for a `from` that never
+    /// reads it. A field-level `Validate` on `Option<Vec<_>>` applies to the
+    /// inner value whenever it is `Some` — regardless of `from` — so this is
+    /// the regression a blanket `min` on the field reintroduces.
+    #[test]
+    fn an_empty_changes_list_does_not_refuse_a_patch_commit() {
+        let req = CommitRequest {
+            repo: "r".to_string(),
+            branch: None,
+            from: CommitFrom::Patch,
+            message: Some("m".to_string()),
+            changes: Some(vec![]),
+            patch: Some("diff".to_string()),
+            commit: None,
+            expected_head: None,
+        };
+        assert!(req.validate().is_ok(), "{:?}", req.validate());
+    }
+
+    /// The upper bound is still real — `changes` genuinely belongs to
+    /// `from: files`, so a request that grossly overruns it is still refused
+    /// at the field, whichever `from` carried it.
+    #[test]
+    fn an_oversized_changes_list_is_still_refused() {
+        let req = CommitRequest {
+            repo: "r".to_string(),
+            branch: None,
+            from: CommitFrom::Files,
+            message: Some("m".to_string()),
+            changes: Some((0..201).map(|i| file(&format!("f{i}"))).collect()),
+            patch: None,
+            commit: None,
+            expected_head: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    /// The real protection against an empty `changes` under `from: files`
+    /// lives in the `files()` closure, scoped to that `from` — not the
+    /// struct-level validator. Covered here as the sibling fact to the two
+    /// tests above: this crate's own `git_tools` integration tests exercise
+    /// the closure's refusal through a live repo.
+    #[test]
+    fn an_empty_changes_list_passes_struct_validation_regardless_of_from() {
+        let req = CommitRequest {
+            repo: "r".to_string(),
+            branch: None,
+            from: CommitFrom::Files,
+            message: Some("m".to_string()),
+            changes: Some(vec![]),
+            patch: None,
+            commit: None,
+            expected_head: None,
+        };
+        assert!(req.validate().is_ok(), "{:?}", req.validate());
+    }
+}

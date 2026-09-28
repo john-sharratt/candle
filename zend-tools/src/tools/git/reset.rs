@@ -4,9 +4,10 @@
 //! The branch moves from the conversation's own `HEAD` — its base — and only
 //! when the branch still holds exactly that: moving a branch that has gained
 //! commits the conversation never saw would take them off it, so that is
-//! refused until they are merged in. The move goes to origin first, under a
-//! lease on what origin held, and locally after. Then, as `git reset` does to
-//! a working tree:
+//! refused until they are merged in. A move that takes any commit off the
+//! branch is made only with `expected_head` naming the base. The move goes to
+//! origin first, under a lease on what origin held, and locally after. Then,
+//! as `git reset` does to a working tree:
 //!
 //! - **`soft`** keeps what you see exactly as it was: every file the move
 //!   changed becomes one of your uncommitted changes, holding what the
@@ -20,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 use zend_vfs::vfs::Carried;
 use zend_vfs::work::{held, keep_ours};
-use zend_vfs::{Base, GitError, Oid, RepoPath, Rev, VfsError, VfsStore};
+use zend_vfs::{
+    Base, BranchName, CommitInfo, GitError, LogRange, Oid, RepoPath, Rev, VfsError, VfsStore,
+};
 
 use super::{landed, open, ConvRepo, GitToolError, RevArg};
 use crate::{RegisteredTool, Tool, ToolContext};
@@ -50,7 +53,8 @@ pub struct ResetRequest {
     pub mode: ResetMode,
     /// The commit you must be at — git_status's `head`. Omit it and the reset
     /// starts from wherever that is; give it to refuse the reset if it moved
-    /// since you looked.
+    /// since you looked. A reset that takes commits off the branch needs it:
+    /// without it, one is refused, naming the commits it would take off.
     #[serde(default)]
     #[schemars(with = "String")]
     pub expected_head: Option<String>,
@@ -153,6 +157,56 @@ fn keep_as_it_was(
     Ok(kept)
 }
 
+/// How many commits a refused reset counts before saying "or more".
+const TAKEN_COUNTED: usize = 100;
+/// How many of them it names.
+const TAKEN_NAMED: usize = 5;
+
+/// Why a reset that would take `taken` off `branch` — moving it from `was`
+/// to `now` — is refused without `expected_head`.
+///
+/// Every commit here is published — on origin, or on the local branch that is
+/// the record when there is none — so taking one off rewrites what everyone
+/// reads, and it is made only on purpose — as git_ref's move of a branch is.
+/// Measured live: asked to "revert, don't reset" one commit twelve back, a
+/// model soft-reset the branch to that commit's parent, took all twelve off
+/// origin, and committed the lot back as one "revert".
+fn taken_off(
+    branch: &BranchName,
+    was: &Oid,
+    now: &Oid,
+    taken: &[CommitInfo],
+    on_origin: bool,
+) -> String {
+    let rewriting = if on_origin {
+        "rewriting origin's copy for everyone"
+    } else {
+        "rewriting its history"
+    };
+    let count = match taken.len() {
+        n if n > TAKEN_COUNTED => format!("more than {TAKEN_COUNTED} commits"),
+        1 => "1 commit".to_string(),
+        n => format!("{n} commits"),
+    };
+    let named: Vec<String> = taken
+        .iter()
+        .take(TAKEN_NAMED)
+        .map(|c| format!("{} {}", &c.oid.as_str()[..7], c.subject()))
+        .collect();
+    let more = if taken.len() > TAKEN_NAMED {
+        "; …"
+    } else {
+        ""
+    };
+    format!(
+        "moving {branch} to {now} takes {count} off it, {rewriting}: {}{more}. To undo a \
+         commit and keep history, git_commit with `from: revert` and its `commit` makes a new \
+         commit reversing it. If taking them off is what you mean, call git_reset again with \
+         `expected_head` set to {was}",
+        named.join("; ")
+    )
+}
+
 pub struct GitReset;
 
 impl Tool for GitReset {
@@ -163,14 +217,15 @@ impl Tool for GitReset {
          what the commits you moved past changed becomes your uncommitted changes, ready to \
          commit again. `hard` discards every uncommitted change, so you see the branch as \
          it now stands; with no `to` it only discards your changes, a merge being finished \
-         included. Moving back rewrites origin's copy of the branch, so it is refused while \
-         the branch has commits you do not have — git_merge them in first — or if someone \
-         else pushes in between. A soft reset past a file that is not text is refused, \
-         since it could not be kept, and so is a soft reset while a merge is being \
-         finished — commit it or discard it with a hard reset. Use for \"undo the last commit\", \"throw away my \
-         changes\", \"abandon this merge\", \"put the branch back to that commit\". To undo \
-         a commit without rewriting history, git_commit's `revert` is the way. Writes to \
-         origin.";
+         included. Moving back rewrites origin's copy of the branch, so it needs \
+         `expected_head` naming where you are — without it the reset is refused, naming the \
+         commits it would take off — and it is refused while the branch has commits you do \
+         not have — git_merge them in first — or if someone else pushes in between. A soft \
+         reset past a file that is not text is refused, since it could not be kept, and so \
+         is a soft reset while a merge is being finished — commit it or discard it with a \
+         hard reset. Use for \"undo the last commit\", \"throw away my changes\", \"abandon \
+         this merge\", \"put the branch back to that commit\". To undo a commit without \
+         rewriting history, git_commit's `revert` is the way. Writes to origin.";
 
     type Request = ResetRequest;
     type Response = ResetResponse;
@@ -278,6 +333,18 @@ impl Tool for GitReset {
                 _ => Some(pulled),
             }
         };
+        if let (Some(pulled), None) = (&pulled, &req.expected_head) {
+            let range = LogRange {
+                to: Rev::Oid(was.clone()),
+                exclude: vec![Rev::Oid(now.clone())],
+                paths: Vec::new(),
+            };
+            let taken = repo.log(&range, TAKEN_COUNTED + 1)?;
+            if !taken.is_empty() {
+                let why = taken_off(&branch, &was, &now, &taken, pulled.origin.is_some());
+                return Err(GitError::invalid(why).into());
+            }
+        }
 
         // The conversation's files move first, so that anything about them
         // that cannot be done — the work would not fit, a file could not be

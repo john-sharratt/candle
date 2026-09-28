@@ -35,6 +35,7 @@ use super::record::{
 };
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::streams::StreamId;
+use super::stripes::{stripes, MAX_STRIPE_BYTES};
 use super::vfs::{carried, VfsIndex};
 use super::Result;
 use crate::projection::TimelineId;
@@ -790,9 +791,10 @@ pub fn write_compacted_log(
     // in-RAM payload; a `Raw` item begins a **run** — the maximal span of
     // consecutive `Raw` items that is also physically contiguous in one source
     // segment (a stream's chunk/token run: adjacent on disk and adjacent in the
-    // list). The whole run is read in **one coalesced stripe** and each record
-    // staged straight from the read buffer: one copy per record, no per-record
-    // allocation, no whole-store intermediate buffer.
+    // list). The run is read in **coalesced stripes** of at most
+    // `MAX_STRIPE_BYTES` and each record staged straight from the read buffer:
+    // one copy per record, no per-record allocation, and no buffer — read or
+    // write — larger than a stripe plus `COMPACT_FLUSH_BYTES`.
     let mut buf: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < items.len() {
@@ -828,42 +830,63 @@ pub fn write_compacted_log(
                     end += rs2;
                     j += 1;
                 }
-                let len = (end - start) as usize;
-                if buf.len() < len {
-                    buf.resize(len, 0);
-                }
-                read_into(seg, start, &mut buf[..len])?;
-                let mut within = 0usize;
-                for it in &items[i..j] {
-                    let CompactItem::Raw {
-                        header,
-                        record_size,
-                        ..
-                    } = it
-                    else {
-                        unreachable!("a Raw run holds only Raw items");
-                    };
-                    let sz = *record_size as usize;
-                    let staged = log.stage(&buf[within..within + sz]);
-                    within += sz;
-                    // Singletons resolve from the manifest (the substrate replay
-                    // never rebuilds them); `Chunk` / `Tokens` are substrate-
-                    // indexed and never enter the manifest.
-                    let loc = RecordLoc {
-                        segment: FIRST_SEGMENT,
-                        offset: staged,
-                        payload_len: header.payload_len,
-                        record_size: sz as u64,
-                    };
-                    match header.record_type {
-                        RecordType::ModelSpec => manifest.model_spec = Some(loc),
-                        RecordType::Template => manifest.template = Some(loc),
-                        RecordType::Tokenizer => manifest.tokenizer = Some(loc),
-                        _ => {}
+                // The run is read a bounded stripe at a time, and the write
+                // buffer flushed between stripes: a segment of back-to-back
+                // live chunks is one run of gigabytes (see `stripes`).
+                let run = &items[i..j];
+                let spans: Vec<(u64, u64)> = run
+                    .iter()
+                    .map(|it| match it {
+                        CompactItem::Raw {
+                            offset,
+                            record_size,
+                            ..
+                        } => (*offset, *record_size),
+                        CompactItem::Synth { .. } => unreachable!("a Raw run holds only Raw items"),
+                    })
+                    .collect();
+                for (a, b) in stripes(&spans, MAX_STRIPE_BYTES) {
+                    let from = spans[a].0;
+                    let len = (spans[b - 1].0 + spans[b - 1].1 - from) as usize;
+                    if buf.len() < len {
+                        buf.resize(len, 0);
                     }
-                    pending.push(IndexEntry::from_header(header, staged, sz as u64));
-                    if pending.len() >= INDEX_FLUSH_ENTRIES {
-                        flush_index(&mut log, &mut pending, &mut last_index);
+                    read_into(seg, from, &mut buf[..len])?;
+                    let mut within = 0usize;
+                    for it in &run[a..b] {
+                        let CompactItem::Raw {
+                            header,
+                            record_size,
+                            ..
+                        } = it
+                        else {
+                            unreachable!("a Raw run holds only Raw items");
+                        };
+                        let sz = *record_size as usize;
+                        let staged = log.stage(&buf[within..within + sz]);
+                        within += sz;
+                        // Singletons resolve from the manifest (the substrate
+                        // replay never rebuilds them); `Chunk` / `Tokens` are
+                        // substrate-indexed and never enter the manifest.
+                        let loc = RecordLoc {
+                            segment: FIRST_SEGMENT,
+                            offset: staged,
+                            payload_len: header.payload_len,
+                            record_size: sz as u64,
+                        };
+                        match header.record_type {
+                            RecordType::ModelSpec => manifest.model_spec = Some(loc),
+                            RecordType::Template => manifest.template = Some(loc),
+                            RecordType::Tokenizer => manifest.tokenizer = Some(loc),
+                            _ => {}
+                        }
+                        pending.push(IndexEntry::from_header(header, staged, sz as u64));
+                        if pending.len() >= INDEX_FLUSH_ENTRIES {
+                            flush_index(&mut log, &mut pending, &mut last_index);
+                        }
+                    }
+                    if log.pending_len() >= COMPACT_FLUSH_BYTES {
+                        log.flush()?;
                     }
                 }
                 i = j;

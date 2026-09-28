@@ -144,7 +144,7 @@ fn committing_your_changes_on_your_branch_clears_them() {
 
     let out = conv.call(
         "git_commit",
-        json!({"repo": "app", "from": "changes", "message": "my work"}),
+        json!({"repo": "app", "from": "all_changes", "message": "my work"}),
     );
     assert_eq!(out["applied"], true, "{out}");
     assert_eq!(out["branch"], "main");
@@ -166,7 +166,7 @@ fn committing_your_changes_on_your_branch_clears_them() {
 
     let again = conv.call(
         "git_commit",
-        json!({"repo": "app", "from": "changes", "message": "nothing"}),
+        json!({"repo": "app", "from": "all_changes", "message": "nothing"}),
     );
     assert_eq!(again["error"], "invalid_arguments", "{again}");
 }
@@ -414,6 +414,27 @@ fn a_conflict_names_the_paths_and_leaves_the_branch_alone() {
     );
     assert_eq!(out["applied"], false, "{out}");
     assert_eq!(out["conflicts"][0], "src/lib.rs");
+    // The way on is the change made by hand, and the answer carries the file
+    // merged three ways, both sides of the overlap marked.
+    assert_eq!(
+        out["reason"],
+        format!(
+            "replaying {side} does not apply cleanly onto {before}, where the files in \
+             `conflicts` have changed too, so nothing was committed. `drafts` holds each of \
+             them with the change merged in as far as it goes, and both sides of every overlap \
+             between <<<<<<< your branch and >>>>>>> the commit markers: write each file as it \
+             should be — keeping the lines of both sides that belong — then commit them with \
+             git_commit"
+        )
+    );
+    assert_eq!(
+        out["drafts"],
+        json!([{
+            "path": "src/lib.rs",
+            "content": "pub fn hello() -> &'static str {\n<<<<<<< your branch\n    \"hello\"\n\
+                        =======\n    \"side\"\n>>>>>>> the commit\n}\n"
+        }])
+    );
     assert_eq!(ws.oid("work"), before);
     assert!(!ws.repo_dir().join(".git/CHERRY_PICK_HEAD").exists());
 }
@@ -425,15 +446,84 @@ fn a_merge_commit_cannot_be_replayed_and_says_why() {
     ws.write_worktree("side.txt", "side\n");
     ws.commit_all("side work");
     ws.git(&["checkout", "-q", "main"]);
+    // `work` stays before the merge, so the merge is a commit it lacks.
+    ws.git(&["branch", "work"]);
     ws.git(&["merge", "--no-ff", "-q", "-m", "merge side", "side"]);
     let merge = ws.oid("HEAD");
-    ws.git(&["branch", "work"]);
     let out = commit(
         &ws,
         json!({"repo": "app", "branch": "work", "from": "cherry_pick", "commit": merge}),
     );
     assert_eq!(out["error"], "invalid_arguments", "{out}");
     assert!(out["detail"].as_str().unwrap().contains("merge"), "{out}");
+}
+
+/// **A replay with nothing to do is refused, and nothing moves**: a
+/// cherry-pick of a commit the branch already holds, and a revert of one it
+/// does not.
+#[test]
+fn a_replay_with_nothing_to_do_is_refused() {
+    let ws = GitWorkspace::new();
+    let held = ws.oid("HEAD~1");
+    ws.git(&["checkout", "-q", "-b", "side", "HEAD~1"]);
+    ws.write_worktree("side.txt", "side\n");
+    let elsewhere = ws.commit_all("side work");
+    ws.git(&["checkout", "-q", "main"]);
+    ws.git(&["branch", "work"]);
+    let before = ws.oid("work");
+
+    let pick = commit(
+        &ws,
+        json!({"repo": "app", "branch": "work", "from": "cherry_pick", "commit": held}),
+    );
+    assert_eq!(pick["applied"], false, "{pick}");
+    assert_eq!(
+        pick["reason"],
+        format!(
+            "{held} is already in this branch's history, so there is nothing to replay and \
+             nothing was committed. To bring over a commit from another branch, git_log that \
+             branch with `since` set to this one: what it lists is what this branch lacks"
+        )
+    );
+    let revert = commit(
+        &ws,
+        json!({"repo": "app", "branch": "work", "from": "revert", "commit": elsewhere}),
+    );
+    assert_eq!(revert["applied"], false, "{revert}");
+    assert_eq!(
+        revert["reason"],
+        format!(
+            "{elsewhere} is not in this branch's history, so there is nothing of it to undo and \
+             nothing was committed. git_log this branch for the commit to revert"
+        )
+    );
+    assert_eq!(ws.oid("work"), before, "nothing moved");
+}
+
+/// **Replaying a commit the repository does not hold says so**, and where
+/// the id comes from — not git's `bad object`.
+#[test]
+fn replaying_a_commit_from_elsewhere_names_where_to_look() {
+    let ws = GitWorkspace::new();
+    ws.git(&["branch", "work"]);
+    let absent = "3f73f8722a390439c029daf7748a9ab24791a016";
+    for from in ["cherry_pick", "revert"] {
+        let out = commit(
+            &ws,
+            json!({"repo": "app", "branch": "work", "from": from, "commit": absent}),
+        );
+        assert_eq!(out["error"], "invalid_arguments", "{from}: {out}");
+        assert_eq!(
+            out["detail"],
+            format!(
+                "invalid input: app holds no commit {absent} — an id from another repository's \
+                 history is not in this one. git_log in app on the branch that holds the change \
+                 gives its id; for a branch on origin, `rev: {{\"kind\": \"remote_branch\", \
+                 \"name\": \"origin/<branch>\"}}`"
+            ),
+            "{from}"
+        );
+    }
 }
 
 /// Each source names what it is missing rather than failing obscurely.
@@ -494,6 +584,12 @@ fn a_branch_is_created_at_head_by_default() {
     );
     assert_eq!(out["action"], "created", "{out}");
     assert_eq!(ws.oid("feature/login"), ws.oid("HEAD"));
+    // Creating is not switching, and the answer says so.
+    assert_eq!(
+        out["note"],
+        "feature/login was created, but you are still on main: what you edit and commit goes \
+         to main. To work on feature/login, git_switch to it with `create: false`"
+    );
 }
 
 /// A branch can start anywhere a revision can name — including a `parent`,

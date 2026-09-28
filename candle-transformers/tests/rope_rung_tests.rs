@@ -1396,7 +1396,12 @@ fn assert_within(label: &str, got: &Tensor, reference: &Reference) -> Result<()>
     let mut outside = 0usize;
     let mut first = usize::MAX;
     let mut last = 0usize;
-    for (i, ((g, o), b)) in got.iter().zip(&reference.out).zip(&reference.band).enumerate() {
+    for (i, ((g, o), b)) in got
+        .iter()
+        .zip(&reference.out)
+        .zip(&reference.band)
+        .enumerate()
+    {
         let e = (*g as f64 - o).abs();
         // A NaN output is outside every band.
         if e.is_nan() || e > *b {
@@ -1596,7 +1601,16 @@ fn q_scale_applies_to_q_rotary_pairs_only() -> Result<()> {
         )
     };
     let reference = |rope: &RopeRungs, qs: QScale, q: &[f32]| {
-        reference_decode(g, rope, Q4_RUNG, qs, false, q, &inp.keys_host, &inp.values_host)
+        reference_decode(
+            g,
+            rope,
+            Q4_RUNG,
+            qs,
+            false,
+            q,
+            &inp.keys_host,
+            &inp.values_host,
+        )
     };
 
     // With the temperature: m² on the rotary pairs, nothing on the pass-through.

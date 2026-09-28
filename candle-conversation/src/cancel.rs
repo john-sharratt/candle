@@ -111,11 +111,37 @@ pub fn ingest_cancelled() -> bool {
 mod tests {
     use super::*;
 
-    /// The flag is process-scoped, so these tests share it with each other and
-    /// with any ingest test in the binary — each one leaves it cleared.
+    /// The flag — and `CANCEL_WAKERS` — are process-scoped, so these tests
+    /// share them with each other, and Rust's default test harness runs every
+    /// test in this binary on its own thread, concurrently. `a_parked_waiter`
+    /// spinning on "`CANCEL_WAKERS` is non-empty" cannot tell its own waiter
+    /// apart from another test's — `a_dropped_waiter`'s raw `poll` registers
+    /// one too — so it can read a sibling's entry as its own, latch the cancel
+    /// on that mistaken signal, and only then have its actual spawned thread
+    /// register: a registration the one `request_ingest_cancel` call already
+    /// missed, parked with nothing left to ever wake it. Measured: reliably
+    /// live under a full unthrottled `cargo test`, hanging (not failing) for
+    /// as long as the run is left to sit — no amount of waiting resolves it.
+    ///
+    /// A lock serialising this module's tests removes the interleaving these
+    /// three depend on not having, rather than trying to make the shared
+    /// latch itself safe for concurrent test ownership — which is not what it
+    /// is for: exactly one process-wide shutdown latches it for real, and
+    /// these tests are the only callers that ever contend over it at all.
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    /// Recovers a poisoned lock rather than propagating the poison: a prior
+    /// test's panic while holding `TEST_SERIAL` must not fail every test
+    /// after it with "lock poisoned" instead of its own assertion.
+    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     #[test]
     fn an_already_latched_cancel_resolves_immediately() {
+        let _serial = lock_tests();
         request_ingest_cancel();
         futures::executor::block_on(ingest_cancel_wait());
         reset_ingest_cancel();
@@ -123,14 +149,14 @@ mod tests {
 
     #[test]
     fn a_parked_waiter_is_woken_by_the_cancel() {
+        let _serial = lock_tests();
         reset_ingest_cancel();
         let waited = std::thread::spawn(|| {
             futures::executor::block_on(ingest_cancel_wait());
         });
         // Let the waiter park before latching — registration is what is under
-        // test. The flag is process-scoped, so a parallel test latching it can
-        // resolve the waiter before it ever registers; that finished thread is
-        // the other exit from this spin.
+        // test. Held exclusively via `TEST_SERIAL` now, so the only other
+        // thread that can touch `CANCEL_WAKERS` here is `waited` itself.
         while CANCEL_WAKERS.lock().unwrap().is_empty() && !waited.is_finished() {
             std::thread::yield_now();
         }
@@ -141,6 +167,7 @@ mod tests {
 
     #[test]
     fn a_dropped_waiter_leaves_no_waker_behind() {
+        let _serial = lock_tests();
         reset_ingest_cancel();
         let wait = ingest_cancel_wait();
         let id = wait.id;

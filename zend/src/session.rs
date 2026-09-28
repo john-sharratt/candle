@@ -17,6 +17,7 @@ use tokio::sync::Mutex as ConvLock;
 use tokio::sync::OwnedMutexGuard;
 use tokio::task::JoinHandle as TaskHandle;
 
+use candle::vram;
 use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
@@ -836,6 +837,121 @@ const CALIBRATION_BATCH: usize = 16;
 /// window amortises that boundary over eight cases rather than paying it for
 /// one. See the refill site for the measurement.
 const CALIBRATION_REFILL: usize = CALIBRATION_BATCH / 2;
+/// Below this much free host RAM, the window stops refilling regardless of how
+/// many slots are free, and the phase gives up on the remainder rather than
+/// pressing on — see the refill site.
+///
+/// **The concurrency window is the lever here, not the model-load-time expert
+/// warm tier.** A from-empty full calibration (thousands of `kv_lossless`
+/// cases, each pinned so its Q survives to the wide-sig capture) crashed a
+/// 31.5 GiB Windows box with a raw host allocator abort three times running —
+/// `memory allocation of 16777216 bytes failed`, 15–51 % through the corpus,
+/// `vram::available_low_water` reading single-digit MiB in the run that got
+/// furthest. Widening `WARM_TIER_HEADROOM` to cover it was tried and reverted:
+/// that headroom is paid on every boot, and the crate's own regression test for
+/// the everyday case (this same 31.5 GiB machine profile, 20 GiB free at
+/// launch) measured the expert tier dropping to exactly the new shortfall —
+/// "too tight to be worth the pack-file misses it avoids". Calibration's much
+/// larger transient is the rare, one-time-until-the-substrate-exists case, and
+/// backing off ITS OWN concurrency under real memory pressure is what actually
+/// targets it, without taxing steady-state serving at all.
+///
+/// 1 GiB, not tuned to a measured floor the way [`CALIBRATION_BATCH`] was: it
+/// only needs to be comfortably above the ~16 MiB allocation that failed at the
+/// single-digit-MiB troughs measured so far, with headroom for one case's
+/// prefill on top. Revisit once a run this floor actually governed has logged
+/// its own low-water mark.
+const CALIBRATION_HOST_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// How many new calibration cases to submit this iteration. Split out of the
+/// refill site so the decision is testable without a live engine — mirrors
+/// `warm_sizing_from` being split out of `warm_slots_for` for the same reason.
+///
+/// The warm-up case (`!warmed`) always goes in alone, before anything else is
+/// asked of the window, regardless of host pressure: skipping it would leave
+/// the shared tool sections unpinned and break every case after it. Past that,
+/// host pressure overrides the ordinary window-refill cadence outright — no
+/// point amortising a wave boundary over cases that would run the machine out
+/// of memory.
+fn calibration_window_want(
+    free: usize,
+    warmed: bool,
+    inflight_empty: bool,
+    host_tight: bool,
+) -> usize {
+    if !warmed {
+        1
+    } else if host_tight {
+        0
+    } else if free >= CALIBRATION_REFILL || inflight_empty {
+        free
+    } else {
+        0
+    }
+}
+
+/// Whether the calibration phase should stop early rather than wait: nothing
+/// in flight can retire to free room, free RAM is already under
+/// [`CALIBRATION_HOST_FLOOR_BYTES`], and cases remain that would otherwise be
+/// asked for. `warmed` guards the same edge as [`calibration_window_want`] —
+/// the one required case still goes in even under pressure, so this can never
+/// fire before it has.
+fn calibration_should_stop_for_host_pressure(
+    warmed: bool,
+    host_tight: bool,
+    inflight_empty: bool,
+    cases_remain: bool,
+) -> bool {
+    warmed && host_tight && inflight_empty && cases_remain
+}
+
+#[cfg(test)]
+mod calibration_window_tests {
+    use super::{calibration_should_stop_for_host_pressure, calibration_window_want};
+
+    #[test]
+    fn the_warm_up_case_goes_in_alone_even_under_pressure() {
+        assert_eq!(calibration_window_want(16, false, true, true), 1);
+        assert_eq!(calibration_window_want(16, false, true, false), 1);
+    }
+
+    #[test]
+    fn host_pressure_closes_the_window_regardless_of_free_slots() {
+        assert_eq!(calibration_window_want(16, true, true, true), 0);
+        assert_eq!(calibration_window_want(1, true, false, true), 0);
+    }
+
+    #[test]
+    fn without_pressure_the_ordinary_refill_cadence_holds() {
+        // Half the window free: refills.
+        assert_eq!(calibration_window_want(8, true, false, false), 8);
+        // Fewer than half free, something still running: waits.
+        assert_eq!(calibration_window_want(3, true, false, false), 0);
+        // Nothing in flight regardless of the count: the tail case.
+        assert_eq!(calibration_window_want(3, true, true, false), 3);
+    }
+
+    #[test]
+    fn stopping_needs_pressure_nothing_in_flight_and_work_left() {
+        assert!(calibration_should_stop_for_host_pressure(
+            true, true, true, true
+        ));
+        // Any one condition missing and it must not stop.
+        assert!(!calibration_should_stop_for_host_pressure(
+            false, true, true, true
+        )); // not warmed yet
+        assert!(!calibration_should_stop_for_host_pressure(
+            true, false, true, true
+        )); // no pressure
+        assert!(!calibration_should_stop_for_host_pressure(
+            true, true, false, true
+        )); // still work in flight to retire
+        assert!(!calibration_should_stop_for_host_pressure(
+            true, true, true, false
+        )); // nothing left to submit anyway
+    }
+}
+
 /// Conversation-metadata key tagging each calibration conversation with its
 /// `"{tool}|{example}"` case **at creation**, so it is findable by case on a
 /// later load — finished or half-finished. *Done* is signalled separately by
@@ -1291,6 +1407,13 @@ impl InferenceState {
         // two phases compose into one continuous bar.
         let section_progress = Arc::clone(&progress);
         let section_hook = move |done: u64, total: u64| {
+            // Cheap (one `GlobalMemoryStatusEx`/`/proc/meminfo` read) at section
+            // granularity, not per token — see `vram::sample_available_low_water`.
+            // Section prefill is the first of the two boot phases whose combined
+            // footprint (tool corpus + the expert warm tier sized against
+            // launch-time RAM) has crashed a from-empty-substrate boot with a raw
+            // host allocator abort; this is the trough this phase leaves behind.
+            vram::sample_available_low_water();
             let scaled = (done * 5_000).checked_div(total).unwrap_or(0);
             section_progress.set_step_progress(scaled, 10_000);
         };
@@ -1323,6 +1446,7 @@ impl InferenceState {
         // shared-structure noise to section scoring.
         tracing::info!(
             n_tool_sections = tool_sections.len(),
+            free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
             "base conversation ready (prelude + tool catalog + outro pinned at init)",
         );
 
@@ -1750,13 +1874,34 @@ impl InferenceState {
                 // than the threshold, so nothing is running to wait behind and
                 // the block must be issued at whatever size is left.
                 let free = CALIBRATION_BATCH.saturating_sub(inflight.len());
-                let want = if !warmed {
-                    1
-                } else if free >= CALIBRATION_REFILL || inflight.is_empty() {
-                    free
-                } else {
-                    0
-                };
+                // Host-RAM backpressure — see `CALIBRATION_HOST_FLOOR_BYTES`.
+                // Checked live (not from the low-water mark, which only ever
+                // falls) so the window reopens once retiring cases free room.
+                let host_tight = vram::available_physical_ram()
+                    .is_some_and(|free_bytes| free_bytes < CALIBRATION_HOST_FLOOR_BYTES);
+                let inflight_empty = inflight.is_empty();
+                let cases_remain = !to_run_iter.as_slice().is_empty();
+                if calibration_should_stop_for_host_pressure(
+                    warmed,
+                    host_tight,
+                    inflight_empty,
+                    cases_remain,
+                ) {
+                    // Nothing left in flight to retire and free room, and free
+                    // RAM is already under the floor: waiting here cannot help.
+                    // Stop cleanly rather than press on into the allocator abort
+                    // this floor exists to avoid — a case is individually
+                    // archived and resumed on the next boot, so nothing sealed
+                    // so far is lost.
+                    tracing::warn!(
+                        free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
+                        remaining = to_run_iter.as_slice().len(),
+                        "calibrating sections: host RAM too tight to continue safely; \
+                         stopping early, remaining cases resume on the next boot"
+                    );
+                    break;
+                }
+                let want = calibration_window_want(free, warmed, inflight_empty, host_tight);
                 let batch: Vec<&CalibCase<'_>> =
                     (0..want).map_while(|_| to_run_iter.next()).collect();
                 let created_any = !batch.is_empty();
@@ -2034,6 +2179,21 @@ impl InferenceState {
                     }
                     reclaimed_up_to = calib_timelines.len();
                 }
+                // Same window cadence as the demote sweep above, so a from-empty
+                // full recalibration's host-RAM trough is recorded as it happens
+                // rather than inferred after a crash — see
+                // `vram::sample_available_low_water`. Logged here too, not only at
+                // the phase's end: a raw allocator abort kills the process with no
+                // unwind, so a log line only at completion is never written when
+                // the phase itself is what crashes — exactly the run this exists
+                // to diagnose.
+                vram::sample_available_low_water();
+                tracing::info!(
+                    done,
+                    total,
+                    free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
+                    "calibrating sections: window checkpoint"
+                );
             }
             // Boundary sweep: flush the pending hot→warm migration so the final
             // window's just-sealed cases are warm-backed, then demote every
@@ -2053,6 +2213,7 @@ impl InferenceState {
                 resumed = total.saturating_sub(calib_timelines.len()),
                 ran = calib_timelines.len(),
                 demoted_timelines = calib_timelines.len(),
+                free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
                 "calibrating sections complete"
             );
         }
@@ -2275,7 +2436,7 @@ impl InferenceState {
             identity_builders,
             think_closer_phrase,
             tokenizer,
-            tool_host: ToolHost::new(&workspace, secrets),
+            tool_host: ToolHost::new(&workspace, secrets)?,
             workspace,
             base_branches,
             tool_stencil,
@@ -3285,9 +3446,7 @@ fn run_inference_stream(
                     id if id >= 0 => id,
                     _ => cs.conv.default_sampling().tool_call_open_token_id,
                 };
-                if open >= 0 {
-                    this_turn.banned_tokens.push(open);
-                }
+                repeat_guard::closing_answer(&mut this_turn, open);
             }
             let options = candle_conversation::TurnOptions {
                 max_tokens,

@@ -25,18 +25,26 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
+use std::time::Instant;
 
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection;
 use candle_conversation::stencil::ThinkMode;
-use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent};
+use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent, TurnOptions};
+use tempfile::TempDir;
+use tracing::Level;
 
-use zend::code_read::{CodeReadState, RefreshOutcome as CodeReadOutcome};
+use zend::code_read::{refresh_code_reading, CodeReadState, RefreshOutcome as CodeReadOutcome};
 use zend::loading::LoadProgress;
 use zend::refresh_ctx::RefreshContext;
-use zend::repo_scan::{DirState, RefreshOutcome as RepoMapOutcome};
+use zend::repo_scan::{
+    refresh_repo_map, walk_workspace, DirState, RefreshOutcome as RepoMapOutcome,
+};
+use zend::tools::{install_tool_catalog, tool_catalog, ToolHost};
+use zend::types::ToolMode;
+use zend::workspace::single_repo;
 use zend_tools::state::Secrets;
 
 const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
@@ -56,11 +64,10 @@ fn cuda_device() -> Option<Device> {
 }
 
 fn init_tracing() {
-    use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(Level::WARN)
             .with_test_writer()
             .try_init();
     });
@@ -69,7 +76,7 @@ fn init_tracing() {
 /// The fixture workspace's one repository, where every file is planted.
 const FIXTURE_REPO: &str = "demo-app";
 
-fn build_fixture_workspace() -> tempfile::TempDir {
+fn build_fixture_workspace() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join(FIXTURE_REPO);
     write(
@@ -136,7 +143,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         "=== Loading Qwen3-30B-A3B against {} ===",
         workspace.display()
     );
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     let dialect = Model::Qwen3_30B_A3B_Q4.spec().dialect.clone();
     let workspace_str = workspace.display().to_string();
@@ -148,7 +155,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     .expect("parse projection.yaml");
     let dialogue_layer = proj_builder.id_for_layer("dialogue").unwrap();
     let primary_group = proj_builder.id_for_group("primary_conversation").unwrap();
-    let _ = zend::tools::install_tool_catalog(&mut proj_builder).expect("install tool catalog");
+    let _ = install_tool_catalog(&mut proj_builder).expect("install tool catalog");
 
     let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()
@@ -179,7 +186,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // through `RefreshContext` — see `session.rs`. `code_reading`'s hidden
     // per-file conversations use these to frame identically to `dialogue`.
     let tool_stencil = engine
-        .compile_tool_stencil(zend::tools::tool_catalog())
+        .compile_tool_stencil(tool_catalog())
         .expect("tool stencil compile");
     let think_steering = engine
         .compile_think_steering()
@@ -187,14 +194,11 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // `Quick`, not `Off` — see `RefreshContext::think_triggers`'s doc.
     let think_triggers = match &think_steering {
         Some(ts) => ts.registry_for(&tool_stencil, ThinkMode::Quick),
-        None => std::sync::Arc::clone(&tool_stencil),
+        None => Arc::clone(&tool_stencil),
     };
-    let served = zend::workspace::single_repo(workspace, FIXTURE_REPO).expect("workspace");
-    let tool_host = zend::tools::ToolHost::new(&served, Arc::new(Secrets::empty()));
-    let tool_ctx = tool_host.context_for(
-        zend::types::ToolMode::Restricted,
-        &tool_host.conversation_files(),
-    );
+    let served = single_repo(workspace, FIXTURE_REPO).expect("workspace");
+    let tool_host = ToolHost::new(&served, Arc::new(Secrets::empty())).expect("tool host");
+    let tool_ctx = tool_host.context_for(ToolMode::Restricted, &tool_host.conversation_files());
     let dialogue = engine
         .new_conversation_with_projection(
             &formatted_prompt,
@@ -250,16 +254,16 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // prior state standing in for a fresh install's seeded-but-empty
     // registry entry.
     let engine = Mutex::new(engine);
-    let walked = zend::repo_scan::walk_workspace(&served, "", None);
+    let walked = walk_workspace(&served, "", None);
     let repo_map_ctx = RefreshContext {
         engine: &engine,
         proj_builder: proj_builder_repo_map,
         config: conv_config.clone(),
         formatted_prompt: &formatted_prompt,
-        think_triggers: std::sync::Arc::clone(&think_triggers),
-        tool_ctx: std::sync::Arc::clone(&tool_ctx),
+        think_triggers: Arc::clone(&think_triggers),
+        tool_ctx: Arc::clone(&tool_ctx),
     };
-    let repo_map_state = match zend::repo_scan::refresh_repo_map(
+    let repo_map_state = match refresh_repo_map(
         &repo_map_ctx,
         &served,
         &walked,
@@ -286,7 +290,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         think_triggers,
         tool_ctx,
     };
-    let code_read_state = match zend::code_read::refresh_code_reading(
+    let code_read_state = match refresh_code_reading(
         &code_read_ctx,
         workspace,
         &walked,
@@ -314,7 +318,6 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
 }
 
 fn ask(seq: &mut Sequence, prompt: &str) -> String {
-    use candle_conversation::TurnOptions;
     let handle = seq
         .submit_turn_with_options(
             prompt,

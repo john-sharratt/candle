@@ -115,3 +115,5 @@ examples:
 - push the rebased branch over the old one without clobbering anyone<|im_end|>
 - that tag on the remote is wrong, remove it<|im_end|>
 - send this work upstream so the team can see it<|im_end|>
+- push the v0.2.0 tag to origin<|im_end|>
+- get rid of the scratch tag on the remote<|im_end|>

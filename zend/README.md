@@ -86,9 +86,11 @@ Anything not matched falls back to the embedded `web/` frontend (`GET /`, `/perf
 |---|---|---|
 | `none` | none | none |
 | `restricted` | the safe subset, needing no grant and not high-risk: the file tools (reads, writes, edits, deletes) and the git readers | none |
-| `comprehensive` | every tool: the network, credentials, the `code_*` JS sandbox, the git writers, SQLite, and programs on this host (`ping_icmp`, `trace_route`, `sub_run`) | all |
+| `comprehensive` | every tool: the network, credentials, the `code_*` JS sandbox, the git writers, SQLite, the command sandbox (`run_command`, `run_output`), and programs on this host (`ping_icmp`, `trace_route`, `sub_run`) | all |
 
 In every mode the file tools work on the conversation's own overlay: a write, edit or delete is held in memory, recorded in the substrate as VFS events, and never reaches the workspace on disk. A conversation's changes reach a repository only through `git_commit`, which is Comprehensive's. So Restricted may write files and still runs nothing — no command line, no code, no network. Each mode projects, and summarises, exactly the tools its grants cover.
+
+`run_command` runs one program (a test suite, a build) in a git repository's own folder, borrowed for the job: the folder is set aside, checked out on the conversation's branch with its uncommitted changes laid down, the program run, what it changed read back into the conversation's changes, and the folder put back exactly as it was. The programs it may start are listed in `src/sandbox_programs.rs`; job logs are kept in the workspace folder's `jobs/`. See `docs/zend_workspace_execution.md` §7.4.
 
 `comprehensive` is for admins. The caller's role comes from the gateway's `x-tokera-*` identity headers, resolved against `zend.roles.yaml` (embedded at build time; same shape as `npcd/npcd.web.yaml`'s `roles`). An admin defaults to `comprehensive`; everyone else — signed in or not — defaults to `restricted`, and a request asking for a mode above its role runs as `restricted` rather than failing (`src/access.rs`). The GUI asks `GET /v1/me` and offers only the allowed modes.
 

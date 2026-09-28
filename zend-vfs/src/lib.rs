@@ -8,7 +8,8 @@
 //! - **The file layer** — the [`workspace`] manifest; a conversation's changes
 //!   as deltas ([`file_delta`], [`file_changes`]); the overlay the `file_*`
 //!   tools read and write through ([`vfs`], one store per repository gathered in
-//!   [`files`]); and the unified-diff engine behind `file_edit` ([`patch`]).
+//!   [`files`]); and the search-and-replace engine behind `file_edit`
+//!   ([`replace`]).
 //! - **The execution checkout** ([`checkout`]) — a conversation's changes
 //!   materialised onto a real checkout for a tool to run on, and what the tool
 //!   changed captured back as deltas.
@@ -52,10 +53,10 @@ pub mod file_delta;
 pub mod files;
 mod kill_tree;
 pub mod origin;
-pub mod patch;
 mod read;
 mod redact;
 mod remote;
+pub mod replace;
 mod runner;
 pub mod sandbox;
 mod setup;

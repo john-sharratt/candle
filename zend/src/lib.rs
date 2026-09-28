@@ -42,6 +42,7 @@ pub mod repo_path;
 pub mod repo_scan;
 pub mod response_section;
 pub mod resume;
+pub mod sandbox_programs;
 pub mod secrets;
 pub mod session;
 pub mod think_budget;

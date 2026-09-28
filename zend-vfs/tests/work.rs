@@ -146,7 +146,7 @@ impl World {
             .collect()
     }
 
-    /// Commit every change `store` holds, as `git_commit from: changes` does.
+    /// Commit every change `store` holds, as `git_commit from: all_changes` does.
     fn commit(&self, store: &VfsStore) -> Result<Landed, NotCommitted> {
         let main = branch("main");
         let committing = Committing::begin(&self.repo, store, &main).unwrap()?;
@@ -268,6 +268,66 @@ fn origin_moving_during_a_commit_refuses_it_whole() {
     assert_eq!(outcome, Err(NotCommitted::Refused(Rejection::Stale)));
     assert_eq!(w.on_origin(), theirs);
     assert_eq!(conv.snapshot(), before);
+}
+
+/// A commit on this machine that builds on `main` — another branch's work —
+/// with no ref pointing at it.
+fn ahead_of_main(w: &World) -> Oid {
+    let tree = git(&w.local, &["rev-parse", "main^{tree}"]);
+    let made = git(
+        &w.local,
+        &["commit-tree", tree.trim(), "-p", "main", "-m", "elsewhere"],
+    );
+    Oid::parse(made.trim()).unwrap()
+}
+
+/// **A fast-forward merge of other work is published as it is**: the base is
+/// ahead of the branch, and publishing it moves origin and the local branch
+/// onto it with no commit of its own.
+#[test]
+fn a_fast_forwarded_base_is_published_as_it_is() {
+    let w = World::new();
+    let conv = w.conversation();
+    let theirs = ahead_of_main(&w);
+    assert_eq!(
+        merge_into(&w.repo, &conv, &theirs, "elsewhere").unwrap(),
+        Merged::FastForward { conflicts: vec![] }
+    );
+    let committing = Committing::begin(&w.repo, &conv, &branch("main"))
+        .unwrap()
+        .unwrap();
+    assert!(committing.ahead());
+    assert_eq!(committing.record(), Some(&w.on_origin()));
+    let landed = committing.publish_base(&w.repo).unwrap().unwrap();
+    assert_eq!(landed.commit, theirs);
+    assert!(landed.parents.is_empty(), "no commit was made");
+    assert_eq!(w.on_origin(), theirs);
+    assert_eq!(w.local_main(), theirs);
+    // Published, the base is the branch again: nothing ahead.
+    let again = Committing::begin(&w.repo, &conv, &branch("main"))
+        .unwrap()
+        .unwrap();
+    assert!(!again.ahead());
+}
+
+/// **Origin moving before the fast-forward is published refuses it**, and
+/// nothing moves — the lease, as for any commit.
+#[test]
+fn origin_moving_refuses_publishing_a_fast_forward() {
+    let w = World::new();
+    let conv = w.conversation();
+    let theirs = ahead_of_main(&w);
+    merge_into(&w.repo, &conv, &theirs, "elsewhere").unwrap();
+    let committing = Committing::begin(&w.repo, &conv, &branch("main"))
+        .unwrap()
+        .unwrap();
+    let raced = w.push_other(&[("keep.txt", Some(b"raced\n"))]);
+    assert_eq!(
+        committing.publish_base(&w.repo).unwrap(),
+        Err(NotCommitted::Refused(Rejection::Stale))
+    );
+    assert_eq!(w.on_origin(), raced);
+    assert_eq!(conv.base().unwrap().unwrap().commit(), Some(&theirs));
 }
 
 /// **Two conversations on one branch**: the first's commit changes nothing

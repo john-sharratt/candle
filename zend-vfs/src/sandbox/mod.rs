@@ -51,6 +51,7 @@
 //! | [`policy`] | The security check a command passes before it runs |
 //! | `git_use` | Finding git run directly — as the program, or in a shell's script |
 //! | [`process`] | Starting it, passing on its output, killing its process tree |
+//! | `resolve` | Finding the file a program name on the `PATH` starts |
 //! | [`outcome`] | What a run hands back |
 //! | [`server`] | Jobs run in the background, their output in a log file |
 //!
@@ -63,6 +64,7 @@ mod git_use;
 pub mod outcome;
 pub mod policy;
 pub mod process;
+mod resolve;
 pub mod server;
 
 use std::path::Path;
@@ -271,18 +273,31 @@ impl Sandbox {
             .repo
             .ref_target(&branch.to_ref())
             .map_err(|e| store(e.to_string()))?;
-        match (base, tip) {
-            (Some(base), Some(tip)) if base.merging().is_none() && base.commit() == Some(&tip) => {
-                Ok(tip)
-            }
-            (base, tip) => Err(SandboxError::BaseNotBranch {
+        if base.as_ref().is_some_and(|b| b.merging().is_some()) {
+            return Err(SandboxError::Merging {
                 branch: branch.to_string(),
-                base: base
-                    .and_then(|b| b.commit().map(|c| c.to_string()))
-                    .unwrap_or_else(|| "no commit".to_string()),
-                tip: tip.map_or_else(|| "no commit".to_string(), |t| t.to_string()),
-            }),
+            });
         }
+        let made_on = base.as_ref().and_then(|b| b.commit()).cloned();
+        let named = |oid: &Option<Oid>| {
+            oid.as_ref()
+                .map_or_else(|| "no commit".to_string(), |o| o.to_string())
+        };
+        let ahead = match (&made_on, &tip) {
+            (Some(made_on), Some(tip)) if made_on == tip => return Ok(tip.clone()),
+            (Some(made_on), Some(tip)) => self
+                .repo
+                .is_ancestor(&Rev::Oid(tip.clone()), &Rev::Oid(made_on.clone()))
+                .map_err(|e| store(e.to_string()))?,
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
+        let (branch, base, tip) = (branch.to_string(), named(&made_on), named(&tip));
+        Err(if ahead {
+            SandboxError::Ahead { branch, base, tip }
+        } else {
+            SandboxError::Behind { branch, base, tip }
+        })
     }
 }
 

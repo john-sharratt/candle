@@ -17,7 +17,7 @@ questions:
 - start a topic branch from where I am
 - change which branch I am working on
 category: Git
-description: 'Switch to another branch in a repository, taking your uncommitted changes with you — merged onto that branch''s files, and where it changed the same lines, both kept between markers and listed in `conflicts` to settle: from then on you read, change and commit on that branch. A merge being finished must be committed or discarded first, and files in conflict settled. The branch is brought up to date with origin first, so a branch that only exists on origin works too. With `create`, the branch is made on origin, starting at `from`, which defaults to your own commit. Use for "switch to main", "start a branch for this", "work on feature/x", "go back to main". To make a branch without switching to it, use git_ref. Writes to origin when it makes the branch.'
+description: 'Switch to another branch in a repository, taking your uncommitted changes with you — merged onto that branch''s files, and where it changed the same lines, both kept between markers and listed in `conflicts` to settle: from then on you read, change and commit on that branch. A merge being finished must be committed or discarded first, and files in conflict settled. The branch is brought up to date with origin first, so a branch that only exists on origin works too. `create` is required: `true` makes a new branch on origin, starting at `from` (which defaults to your own commit); `false` switches to one that exists. Use for "switch to main", "start a branch for this", "work on feature/x", "go back to main". To make a branch without switching to it, use git_ref. Writes to origin when it makes the branch.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -54,7 +54,7 @@ parameters:
       minLength: 1
       type: string
     create:
-      description: Make the branch first, on origin. Leave it out, or false, to switch to a branch that already exists.
+      description: '`true` to make the branch first, on origin — a new branch; `false` to switch to a branch that already exists. Required.'
       type: boolean
     from:
       allOf:
@@ -67,6 +67,7 @@ parameters:
   required:
   - repo
   - branch
+  - create
   title: SwitchRequest
   type: object
 examples:

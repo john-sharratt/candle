@@ -120,3 +120,7 @@ examples:
 - who is responsible for the import block at the start of main.rs in battle-cities<|im_end|>
 - find out who authored lines 30 to 45 of the settings file<|im_end|>
 - when was each line of that function last touched, and by whom<|im_end|>
+- show me the patch of the single commit on the hotfix branch<|im_end|>
+- what exactly did commit df3294f change<|im_end|>
+- read the README as the docs branch on origin has it<|im_end|>
+- someone pushed a new branch, tell me what its commit actually changes<|im_end|>

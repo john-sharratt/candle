@@ -116,3 +116,7 @@ examples:
 - follow that file back through its renames<|im_end|>
 - what has landed on the release tag since the last one<|im_end|>
 - which commits wrote lines 10 to 30 of the scheduler module<|im_end|>
+- list the commits on origin's docs branch that I do not have locally<|im_end|>
+- what is new on the remote hotfix branch<|im_end|>
+- what does the docs branch on origin add over main<|im_end|>
+- which commits would I get from the perf branch that main does not have yet<|im_end|>

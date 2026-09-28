@@ -29,10 +29,14 @@ pub struct SwitchRequest {
     /// The branch to switch to, by short name. Required.
     #[validate(length(min = 1))]
     pub branch: String,
-    /// Make the branch first, on origin. Defaults to false.
-    #[serde(default)]
-    #[schemars(with = "bool")]
-    pub create: Option<bool>,
+    /// `true` to make the branch first, on origin; `false` to switch to one
+    /// that exists. Required — every call decides it: optional, it was the
+    /// field a model never reached. Measured live: asked to start
+    /// `feature/discount`, a model called `{repo, branch}` three times, was
+    /// told each time to set `create`, and committed the feature to `main`
+    /// instead — the grammar offered the call's close beside the optional
+    /// field, and it took the close.
+    pub create: bool,
     /// For `create`: where the new branch starts. Defaults to the branch you
     /// are on. Optional, never `null` — see [`RevArg`].
     #[serde(default)]
@@ -113,12 +117,12 @@ impl Tool for GitSwitch {
             ))
             .into());
         }
-        let start = match (&req.from, req.create.unwrap_or(false)) {
+        let start = match (&req.from, req.create) {
             (Some(from), true) => Some(repo.resolve(&from.resolve(&repo)?)?),
             (None, true) => Some(repo.resolve(&repo.head()?)?),
             (Some(_), false) => {
                 return Err(GitError::invalid(
-                    "`from` is where a new branch starts; set `create` to make one",
+                    "`from` is where a new branch starts; set `create: true` to make one",
                 )
                 .into())
             }
@@ -129,7 +133,7 @@ impl Tool for GitSwitch {
             Some(start) => {
                 if pulled.tip.is_some() || pulled.on_origin.is_some() {
                     return Err(GitError::invalid(format!(
-                        "a branch named {branch} already exists; switch to it without `create`"
+                        "a branch named {branch} already exists; switch to it with `create: false`"
                     ))
                     .into());
                 }
@@ -138,7 +142,10 @@ impl Tool for GitSwitch {
             }
             None => {
                 let tip = pulled.tip.ok_or_else(|| {
-                    GitError::invalid(format!("no branch named {branch}; set `create` to make it"))
+                    GitError::invalid(format!(
+                        "no branch named {branch}; call git_switch again with `create: true` \
+                         to make it"
+                    ))
                 })?;
                 (tip, None)
             }

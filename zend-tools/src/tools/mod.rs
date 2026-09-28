@@ -27,6 +27,7 @@
 //! | `notes` | `notes_{write,read,search,list}` | In-memory KV with FTS |
 //! | `random` | `random` | rand crate; real OS entropy |
 //! | `remote_fs` | `remote_fs_session_*` (10 tools) | SFTP via ssh2 |
+//! | `run` | `run_command`, `run_output` | A program in the repository's sandbox, on the conversation's branch |
 //! | `sql_session` | `sql_session_{open,query,list,close}` | rusqlite |
 //! | `ssh` | `ssh_session_{open,exec,exec_async,poll,list,close}` | ssh2 |
 //! | `subagent` | `sub_run` | Calls `SubagentRunner` trait impl injected by daemon |
@@ -55,6 +56,7 @@ pub mod network_diag;
 pub mod notes;
 pub mod random;
 pub mod remote_fs;
+pub mod run;
 pub mod sql_session;
 pub mod ssh;
 pub mod subagent;

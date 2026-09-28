@@ -337,7 +337,22 @@ impl RevArg {
             RevKind::Head => repo.head()?,
             RevKind::Branch => Rev::Branch(BranchName::parse(named("branch")?)?),
             RevKind::Tag => Rev::Tag(TagName::parse(named("tag")?)?),
-            RevKind::Ref => Rev::Ref(RefName::parse(named("ref")?)?),
+            RevKind::Ref => {
+                // A short name here is almost always a remote branch or a
+                // branch spoken of by its short name: measured live, four
+                // `git_log` calls named `origin/main` as a `ref` at once, and
+                // were each told only that it was not under refs/.
+                let name = named("ref")?;
+                if !name.starts_with("refs/") {
+                    return Err(GitError::invalid(format!(
+                        "a `ref` is a full ref name, starting refs/; for {name:?} use \
+                         `{{\"kind\": \"remote_branch\", \"name\": {name:?}}}` for a branch on a \
+                         remote, or `branch` or `tag` for one here"
+                    ))
+                    .into());
+                }
+                Rev::Ref(RefName::parse(name)?)
+            }
             RevKind::Commit => Rev::Oid(Oid::parse(named("commit")?)?),
             RevKind::RemoteBranch => {
                 // `origin/main` is the name it is spoken of by; the ref lives

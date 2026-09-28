@@ -23,19 +23,37 @@ pub enum SandboxError {
         branch: String,
         reads: Option<String>,
     },
-    /// The conversation's changes are made on another commit than the job's
-    /// branch holds — it has not merged what the branch has gained, or is
-    /// finishing a merge — and a checkout of the branch is not what they
-    /// were made on.
+    /// The job's branch holds commits the conversation's files are not made
+    /// on: a checkout of the branch is not what its changes were made on.
     #[error(
-        "the conversation's files are made on {base}, but {branch} holds {tip}; merge the \
-         branch into them, or finish the merge under way, before running a command"
+        "{branch} holds commits your files do not have: it is at {tip}, and your files are \
+         made on {base}. git_merge brings them in; then run the command"
     )]
-    BaseNotBranch {
+    Behind {
         branch: String,
         base: String,
         tip: String,
     },
+    /// The conversation's files are made on a commit the job's branch does
+    /// not hold yet — a merge fast-forwarded them past it, or the branch has
+    /// no commit — so a checkout of the branch is not what they read.
+    #[error(
+        "your files are made on {base}, which {branch} does not hold yet (it is at {tip}) — \
+         what a merge brought in is published by git_commit with `from: all_changes`, even with \
+         no change of your own; then run the command"
+    )]
+    Ahead {
+        branch: String,
+        base: String,
+        tip: String,
+    },
+    /// The conversation is finishing a merge: its files are made on a tree
+    /// no commit holds, and no checkout of the branch is that tree.
+    #[error(
+        "you are finishing a merge on {branch}, which no checkout holds until it is committed: \
+         settle any conflicts and git_commit with `from: all_changes`; then run the command"
+    )]
+    Merging { branch: String },
     /// The conversation's store could not give its changes.
     #[error("the conversation's files could not be read: {0}")]
     Store(String),

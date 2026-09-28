@@ -9,8 +9,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 use zend_vfs::{
-    BranchName, GitError, Oid, Pulled, PushOutcome, PushSpec, RefName, Rejection, Repo as GitRepo,
-    Rev, TagAnnotation, TagName,
+    BranchName, GitError, Oid, Pulled, PushOutcome, PushSpec, RefName, Rejection, Rev,
+    TagAnnotation, TagName,
 };
 
 use super::wire::refusal;
@@ -83,9 +83,14 @@ pub struct RefResponse {
     /// What it held before; absent after a creation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
-    /// Where the change is kept: `origin`, or `local` for a repository with
-    /// no origin.
+    /// Where the change was made: `origin`, or `local` when it was made only
+    /// here — the repository has no origin, or origin did not hold the tag
+    /// being deleted.
     pub on: &'static str,
+    /// After a branch is created: the branch you are still on, and how to
+    /// work on the new one instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// `held`, checked against what the caller expected, when it said. Reading
@@ -104,14 +109,6 @@ fn checked(name: &RefName, held: Oid, expected: &Option<String>) -> Result<Oid, 
         }
     }
     Ok(held)
-}
-
-/// What a ref holds locally, checked against `expected`.
-fn current(repo: &GitRepo, name: &RefName, expected: &Option<String>) -> Result<Oid, GitToolError> {
-    let held = repo
-        .ref_target(name)?
-        .ok_or_else(|| GitError::invalid(format!("no ref named {name}")))?;
-    checked(name, held, expected)
 }
 
 /// A branch as its record holds it — origin's copy, or with no origin the
@@ -158,7 +155,7 @@ impl Tool for GitRef {
          the one you are on (git_reset moves that one) — a move that would take commits off \
          it needs `expected`, naming the tip it takes them from. `delete` removes either — \
          never the branch you are on. `expected` is optional throughout: omit it and the \
-         ref's current value is read — a branch's from origin, a tag's from this repository \
+         ref's current value is read — a branch's from origin, a tag's here and on origin \
          — and swapped atomically, or give it to refuse the change if the ref moved since \
          you looked. This moves a \
          pointer and does not switch your branch — git_switch does that. Use for \"make a \
@@ -190,6 +187,7 @@ impl Tool for GitRef {
             target: None,
             previous: None,
             on: "",
+            note: None,
         };
 
         match (req.kind, req.action) {
@@ -207,6 +205,16 @@ impl Tool for GitRef {
                 out.action = "created";
                 out.id = Some(at.as_str().to_string());
                 out.target = Some(at.as_str().to_string());
+                // Creating is not switching. Measured live: asked to "create
+                // and switch to" a branch, a model created it here, edited,
+                // and committed its change to the branch it was still on.
+                let on = repo
+                    .branch()
+                    .map_or_else(|| "no branch".to_string(), |b| b.to_string());
+                out.note = Some(format!(
+                    "{branch} was created, but you are still on {on}: what you edit and commit \
+                     goes to {on}. To work on {branch}, git_switch to it with `create: false`"
+                ));
             }
             (RefTarget::Branch, RefAction::Move) => {
                 let branch = BranchName::parse(&req.name)?;
@@ -288,12 +296,50 @@ impl Tool for GitRef {
             }
             (RefTarget::Tag, RefAction::Delete) => {
                 let tag = TagName::parse(&req.name)?;
-                let old = current(&repo, &tag.to_ref(), &req.expected)?;
-                match push_tag(&repo, PushSpec::delete_tag(tag.clone(), old.clone()))? {
-                    Ok(on) => out.on = on,
-                    Err(why) => return Err(GitError::invalid(refusal(&why)).into()),
+                let name = tag.to_ref();
+                let here = repo.ref_target(&name)?;
+                // Origin's copy is read, not assumed to be this one: a tag
+                // already gone from origin — deleted by a push, or never
+                // published — leaves only the copy here to remove.
+                let origin = repo.origin()?;
+                let there = match &origin {
+                    Some(remote) => repo.ls_remote(remote)?.get(&name).cloned(),
+                    None => None,
+                };
+                let old = match (&here, &there) {
+                    // Two different tags of one name: `expected`, checked
+                    // against one, would let the other go unseen.
+                    (Some(held), Some(theirs)) if held != theirs => {
+                        return Err(GitError::StaleRef {
+                            name: name.clone(),
+                            detail: format!(
+                                "here it holds {held} but on origin {theirs}; look at both \
+                                 before deleting either"
+                            ),
+                        }
+                        .into())
+                    }
+                    (Some(held), _) | (None, Some(held)) => {
+                        checked(&name, held.clone(), &req.expected)?
+                    }
+                    (None, None) => {
+                        return Err(GitError::invalid(format!(
+                            "no tag named {tag}, here or on origin"
+                        ))
+                        .into())
+                    }
+                };
+                // Where it was deleted: origin, when origin had it.
+                out.on = "local";
+                if let Some(held) = there {
+                    match push_tag(&repo, PushSpec::delete_tag(tag.clone(), held))? {
+                        Ok(on) => out.on = on,
+                        Err(why) => return Err(GitError::invalid(refusal(&why)).into()),
+                    }
                 }
-                repo.delete_tag(&tag, &old)?;
+                if let Some(held) = &here {
+                    repo.delete_tag(&tag, held)?;
+                }
                 out.action = "deleted";
                 out.previous = Some(old.as_str().to_string());
             }

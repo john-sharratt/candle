@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::harness::{branch_rev, git_in, parent_rev, remote_oid, Conversation, GitWorkspace};
+use crate::harness::{
+    branch_rev, commit_rev, git_in, parent_rev, remote_oid, Conversation, GitWorkspace,
+};
 
 const HI: &str = "pub fn hello() -> &'static str {\n    \"hi\"\n}\n";
 const HELLO: &str = "pub fn hello() -> &'static str {\n    \"hello\"\n}\n";
@@ -151,7 +153,10 @@ fn a_merge_of_diverged_history_is_recorded_by_the_next_commit() {
     assert_eq!(status["merging"], theirs, "{status}");
     assert_eq!(status["clean"], false);
     assert_eq!(
-        conv.call("git_switch", json!({"repo": "app", "branch": "main"}))["error"],
+        conv.call(
+            "git_switch",
+            json!({"repo": "app", "branch": "main", "create": false})
+        )["error"],
         "invalid_arguments",
         "no switching away from a merge being finished"
     );
@@ -218,7 +223,7 @@ fn changes_commit_only_on_their_own_branch() {
     conv.write("mine.txt", "mine\n");
     let out = conv.call(
         "git_commit",
-        json!({"repo": "app", "branch": "release", "from": "changes", "message": "m"}),
+        json!({"repo": "app", "branch": "release", "from": "all_changes", "message": "m"}),
     );
     assert_eq!(out["error"], "invalid_arguments", "{out}");
     assert!(
@@ -389,8 +394,15 @@ fn a_file_in_conflict_holds_everything_until_it_is_settled() {
     assert_eq!(again["error"], "invalid_arguments", "{again}");
     assert!(again["detail"].as_str().unwrap().contains("README.md"));
 
-    let switched = conv.call("git_switch", json!({"repo": "app", "branch": "release"}));
+    let switched = conv.call(
+        "git_switch",
+        json!({"repo": "app", "branch": "release", "create": false}),
+    );
     assert_eq!(switched["error"], "invalid_arguments", "{switched}");
+    assert!(
+        switched["detail"].as_str().unwrap().contains("conflict"),
+        "refused for the conflicts, not the arguments: {switched}"
+    );
 
     let release = remote_oid(&origin, "refs/heads/release");
     let out = conv.call(
@@ -422,7 +434,7 @@ fn a_tag_origin_cannot_be_reached_for_is_not_kept() {
 fn commit(conv: &Conversation, message: &str) -> Value {
     conv.call(
         "git_commit",
-        json!({"repo": "app", "from": "changes", "message": message}),
+        json!({"repo": "app", "from": "all_changes", "message": message}),
     )
 }
 
@@ -473,7 +485,7 @@ fn switching_to_a_new_branch_makes_it_on_origin_and_carries_the_changes() {
 
     let out = conv.call(
         "git_commit",
-        json!({"repo": "app", "from": "changes", "message": "on the feature"}),
+        json!({"repo": "app", "from": "all_changes", "message": "on the feature"}),
     );
     assert_eq!(out["branch"], "feature", "{out}");
     assert_eq!(
@@ -492,7 +504,10 @@ fn switching_reads_the_other_branch_and_head_follows() {
     let theirs = someone_else_pushes(&ws, &origin, "theirs", "theirs.txt");
     let conv = ws.conversation();
 
-    let out = conv.call("git_switch", json!({"repo": "app", "branch": "theirs"}));
+    let out = conv.call(
+        "git_switch",
+        json!({"repo": "app", "branch": "theirs", "create": false}),
+    );
     assert_eq!(out["created"], false, "{out}");
     assert_eq!(out["id"], theirs);
     assert_eq!(conv.read("theirs.txt").as_deref(), Some("theirs\n"));
@@ -505,11 +520,24 @@ fn switching_reads_the_other_branch_and_head_follows() {
     );
     assert_eq!(refs["current"], "theirs", "{refs}");
 
-    let missing = conv.call("git_switch", json!({"repo": "app", "branch": "nope"}));
+    let missing = conv.call(
+        "git_switch",
+        json!({"repo": "app", "branch": "nope", "create": false}),
+    );
     assert_eq!(missing["error"], "invalid_arguments", "{missing}");
     assert!(
-        missing["detail"].as_str().unwrap().contains("create"),
+        missing["detail"]
+            .as_str()
+            .unwrap()
+            .contains("call git_switch again with `create: true`"),
         "{missing}"
+    );
+    // `create` is required: a call that leaves it out is bad arguments.
+    let undecided = conv.call("git_switch", json!({"repo": "app", "branch": "nope"}));
+    assert_eq!(undecided["error"], "invalid_arguments", "{undecided}");
+    assert!(
+        undecided["detail"].as_str().unwrap().contains("create"),
+        "{undecided}"
     );
 }
 
@@ -535,7 +563,9 @@ fn a_hard_reset_discards_the_changes() {
 
 /// **A soft reset back one commit keeps what you see**: the commit's change
 /// becomes uncommitted, ready to commit again — and origin's copy is
-/// rewound with it.
+/// rewound with it. Taking the commit off is made on purpose: without
+/// `expected_head` the reset is refused, naming the commit and the revert
+/// that would keep history, and nothing moves.
 #[test]
 fn a_soft_reset_back_one_keeps_the_view_and_rewinds_origin() {
     let (ws, origin) = on_origin();
@@ -543,9 +573,28 @@ fn a_soft_reset_back_one_keeps_the_view_and_rewinds_origin() {
     let parent = ws.oid("main~1");
     let conv = ws.conversation();
 
-    let out = conv.call(
+    let refused = conv.call(
         "git_reset",
         json!({"repo": "app", "mode": "soft", "to": parent_rev("HEAD", Some(1))}),
+    );
+    assert_eq!(
+        refused["detail"],
+        format!(
+            "invalid input: moving main to {parent} takes 1 commit off it, rewriting origin's \
+             copy for everyone: {} say hello properly. To undo a commit and keep history, \
+             git_commit with `from: revert` and its `commit` makes a new commit reversing it. \
+             If taking them off is what you mean, call git_reset again with `expected_head` set \
+             to {before}",
+            &before[..7]
+        ),
+        "{refused}"
+    );
+    assert_eq!(remote_oid(&origin, "refs/heads/main"), before);
+
+    let out = conv.call(
+        "git_reset",
+        json!({"repo": "app", "mode": "soft", "to": parent_rev("HEAD", Some(1)),
+               "expected_head": before}),
     );
     assert_eq!(out["on"], "origin", "{out}");
     assert_eq!(out["previous"], before);
@@ -560,10 +609,56 @@ fn a_soft_reset_back_one_keeps_the_view_and_rewinds_origin() {
 
     let out = conv.call(
         "git_commit",
-        json!({"repo": "app", "from": "changes", "message": "say hello again"}),
+        json!({"repo": "app", "from": "all_changes", "message": "say hello again"}),
     );
     assert_eq!(out["applied"], true, "{out}");
     assert_eq!(ws.git(&["show", "main:src/lib.rs"]), HELLO);
+}
+
+/// **A reset past many commits names five and counts them all**, and in a
+/// repository with no origin says it rewrites the branch's history, not
+/// origin's copy. Past a hundred it stops counting.
+#[test]
+fn a_refused_reset_counts_what_it_would_take_off() {
+    let ws = GitWorkspace::new();
+    let start = ws.oid("main");
+    for n in 1..=7 {
+        ws.write_worktree("n.txt", &format!("{n}\n"));
+        ws.commit_all(&format!("step {n}"));
+    }
+    let conv = ws.conversation();
+    let out = conv.call(
+        "git_reset",
+        json!({"repo": "app", "mode": "hard", "to": commit_rev(&start)}),
+    );
+    let detail = out["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("takes 7 commits off it, rewriting its history: "),
+        "{detail}"
+    );
+    for n in 3..=7 {
+        assert!(detail.contains(&format!("step {n}")), "{detail}");
+    }
+    assert!(!detail.contains("step 2"), "only five are named: {detail}");
+    assert!(detail.contains("; …."), "{detail}");
+
+    let mut tip = String::new();
+    for n in 8..=102 {
+        ws.write_worktree("n.txt", &format!("{n}\n"));
+        tip = ws.commit_all(&format!("step {n}"));
+    }
+    let many = ws.conversation().call(
+        "git_reset",
+        json!({"repo": "app", "mode": "hard", "to": commit_rev(&start)}),
+    );
+    assert!(
+        many["detail"]
+            .as_str()
+            .unwrap()
+            .contains("takes more than 100 commits off it"),
+        "{many}"
+    );
+    assert_eq!(ws.oid("main"), tip, "nothing moved");
 }
 
 /// **A hard reset back one commit shows the branch as it now stands.**
@@ -574,7 +669,8 @@ fn a_hard_reset_back_one_shows_the_older_commit() {
     conv.write("scratch.txt", "x\n");
     let out = conv.call(
         "git_reset",
-        json!({"repo": "app", "mode": "hard", "to": parent_rev("HEAD", Some(1))}),
+        json!({"repo": "app", "mode": "hard", "to": parent_rev("HEAD", Some(1)),
+               "expected_head": ws.oid("main")}),
     );
     assert_eq!(out["on"], "local", "{out}");
     assert_eq!(out["discarded"], 1);

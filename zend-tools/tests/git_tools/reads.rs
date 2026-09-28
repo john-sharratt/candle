@@ -613,6 +613,23 @@ fn a_parent_of_a_merge_is_its_first_parent() {
     assert_eq!(out["commits"][0]["id"], mainline, "{out}");
 }
 
+/// **A short name given as a `ref` is refused with the kinds that take it**
+/// — the call it should have been, not only what is wrong with it.
+#[test]
+fn a_short_name_as_a_ref_names_the_kind_it_should_be() {
+    let ws = GitWorkspace::new();
+    let out = ws.read(
+        "git_log",
+        json!({"repo": "app", "rev": {"kind": "ref", "name": "origin/main"}, "page": 0}),
+    );
+    assert_eq!(out["error"], "invalid_arguments", "{out}");
+    let detail = out["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(r#"{"kind": "remote_branch", "name": "origin/main"}"#),
+        "{detail}"
+    );
+}
+
 /// Every other form still resolves, and a kind that needs a name says so
 /// rather than failing obscurely.
 #[test]

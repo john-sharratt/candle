@@ -19,7 +19,8 @@
 //!   is read as a path, and so is every value glued into one — after each `=`
 //!   (`--out=../x`), after a short switch's letter (`-o../x`, `-I/etc`), and
 //!   after a switch's first `:` (`/out:C:\x`). An absolute one (`/etc/x`,
-//!   `C:\x`, `\\host\share`, `~/x`) or a relative one whose `..` climbs above
+//!   `C:\x`, `\\host\share`, `\x` — not `\"`, a shell's escaped quote — `~/x`)
+//!   or a relative one whose `..` climbs above
 //!   the repository's folder is refused. On Windows a whole argument of a
 //!   leading `/` followed by no further separator is a switch (`/C`,
 //!   `/nologo`), not a path, and passes.
@@ -50,8 +51,9 @@ pub enum Refused {
     NoProgram,
     #[error("a command cannot carry a NUL character")]
     Nul,
-    #[error("{program} is not a program this repository's sandbox runs")]
-    NotAllowed { program: String },
+    /// `allowed` names what does run, so the caller's next call can be one.
+    #[error("{program} is not a program this repository's sandbox runs; it runs: {allowed}")]
+    NotAllowed { program: String, allowed: String },
     /// The command runs git directly: `command` is the part that does, as
     /// the caller wrote it.
     #[error(
@@ -85,6 +87,15 @@ impl CommandPolicy {
         }
     }
 
+    /// The programs this policy starts, in order, comma-separated — or
+    /// `nothing` for a policy that starts none.
+    pub fn allowed(&self) -> String {
+        if self.programs.is_empty() {
+            return "nothing".to_string();
+        }
+        self.programs.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+
     /// Whether `command` may run in the repository whose checkout is at
     /// `root`: [`Self::check_command`], then [`Self::check_on_checkout`].
     /// See the module for every rule.
@@ -110,6 +121,7 @@ impl CommandPolicy {
         if !self.programs.contains(program) {
             return Err(Refused::NotAllowed {
                 program: program.clone(),
+                allowed: self.allowed(),
             });
         }
         if program.contains('\\') {
@@ -212,11 +224,16 @@ fn is_absolute(value: &str, whole: bool) -> bool {
         Some(_) => true,
         None => false,
     };
-    drive || rooted || value.starts_with('\\') || value.starts_with('~')
+    // `\"` opens a shell's escaped quote, not a rooted path: `"` is no part of
+    // a Windows path, and elsewhere `\` is no separator at all.
+    let backslash_rooted = value.starts_with('\\') && !value.starts_with("\\\"");
+    drive || rooted || backslash_rooted || value.starts_with('~')
 }
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
 
     fn policy() -> CommandPolicy {
@@ -230,7 +247,7 @@ mod tests {
         )
     }
 
-    fn root() -> tempfile::TempDir {
+    fn root() -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("build.sh"), b"#!/bin/sh\n").unwrap();
         std::fs::create_dir_all(dir.path().join("tools")).unwrap();
@@ -266,7 +283,8 @@ mod tests {
             assert_eq!(
                 check(dir.path(), program, &[]),
                 Err(Refused::NotAllowed {
-                    program: program.into()
+                    program: program.into(),
+                    allowed: "./build.sh, cargo, git, sh, tools/gen".into(),
                 }),
                 "{program}"
             );
@@ -274,8 +292,15 @@ mod tests {
         assert_eq!(
             CommandPolicy::default().check(dir.path(), &SandboxCommand::new("cargo")),
             Err(Refused::NotAllowed {
-                program: "cargo".into()
+                program: "cargo".into(),
+                allowed: "nothing".into(),
             })
+        );
+        // The refusal names what does run.
+        assert_eq!(
+            check(dir.path(), "python", &[]).unwrap_err().to_string(),
+            "python is not a program this repository's sandbox runs; it runs: ./build.sh, cargo, \
+             git, sh, tools/gen"
         );
         assert_eq!(check(dir.path(), "", &[]), Err(Refused::NoProgram));
     }
@@ -344,6 +369,22 @@ mod tests {
                 "{arg}"
             );
         }
+    }
+
+    /// **A shell's escaped quote is not a rooted path.** Measured live:
+    /// `scripts.lint=\"node --check src/index.js\"` was refused as absolute,
+    /// and the model wrote the file by hand instead of letting npm write it.
+    #[test]
+    fn an_escaped_quote_is_not_a_rooted_path() {
+        let dir = root();
+        let arg = "scripts.lint=\\\"node --check src/index.js\\\"";
+        assert_eq!(check(dir.path(), "cargo", &[arg]), Ok(()));
+        assert_eq!(
+            check(dir.path(), "cargo", &["--x=\\rooted"]),
+            Err(Refused::Absolute {
+                arg: "--x=\\rooted".into()
+            })
+        );
     }
 
     /// On Windows a `/` switch is not a path; elsewhere every leading `/` is.

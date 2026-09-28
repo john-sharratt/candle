@@ -24,11 +24,11 @@ questions:
 - edit the README to correct the install command
 - patch this file so the timeout is 30 seconds
 - rename the variable in that source file
-- apply this diff to src/server.rs
-- here is a unified diff, land it on that file
-- change these three places in one patch
+- add a method right after the existing list function
+- insert an import below the others at the top
+- delete the stale commented-out block in utils
 category: Files
-description: 'Apply a unified diff to an existing file in the named repo. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. The patch is one or more `@@ -old,count +new,count @@` hunks, each line prefixed with a space for context, `-` for a removed line, `+` for an added one. Hunks are located by their context, not by their line numbers, so the numbers need only be close; a hunk whose context matches in several places is rejected as ambiguous, and a hunk whose change is already in the file is reported as already applied rather than applied twice — so re-sending the same patch is safe. Either every hunk lands or none does. Use for: changing a value in a config, editing several places in one file at once, updating a function body, fixing a typo. Triggered by "change X to Y in the file", "apply this diff", "update these lines", "fix the value of". Returns the repo, the path, how many hunks applied, how many were already applied, and the new byte count. For full rewrites use write.'
+description: 'Replace one piece of text in an existing file of the named repo with another. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. `old_text` is the text to change, copied from the file exactly as it stands — whole lines, with enough of the lines around it to occur only once, and without the line numbers `file_read` shows; `new_text` is what takes its place, empty to delete it. Text quoted at the wrong indentation is still found, and the new text is re-indented to the file''s. Text that occurs more than once is refused unless `replace_all` is set; an edit whose result is already in the file is reported as already applied, so re-sending it is safe. Use for: changing a value in a config, updating a function body, adding a method after an existing one, fixing a typo. Triggered by "change X to Y in the file", "update these lines", "fix the value of", "add this after". Returns the repo, the path, how many occurrences were replaced, whether it was already applied, how the text was matched, and the new byte count. For full rewrites use write.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -41,120 +41,31 @@ parameters:
       description: Path of the file to edit, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
       minLength: 1
       type: string
-    patch:
-      description: 'Unified-diff body: one or more `@@ -old,count +new,count @@` hunks whose lines are prefixed with a space (context), `-` (removed) or `+` (added). Hunks are located by their context rather than by the line numbers, and a hunk whose change is already in the file is reported as already applied instead of applied twice. Give every hunk at least one context or removed line. Required.'
+    old_text:
+      description: The text to replace, copied from the file exactly as it stands — whole lines, with enough of the lines around it that it occurs only once. Without the line numbers `file_read` shows. Required.
       minLength: 1
       type: string
+    new_text:
+      description: The text that takes its place. Empty to delete `old_text`. Required.
+      type: string
+    replace_all:
+      default: false
+      description: Replace every occurrence of `old_text` instead of requiring exactly one. Optional; defaults to false.
+      type: boolean
   required:
   - repo
   - path
-  - patch
+  - old_text
+  - new_text
   title: EditRequest
   type: object
 examples:
-- |-
-  in Cargo.toml change the line `version = "0.1.0"` to `version = "0.2.0"`<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  Okay, the user wants the version in Cargo.toml changed from 0.1.0 to 0.2.0, without naming a repository — the workspace's generic app repository is where this root manifest belongs. file_edit takes a unified diff, so I need a hunk that removes the old version line and adds the new one.
-
-  I should give the hunk some context either side, because that is what locates it<|projection|> — a bare `version = "0.1.0"` could also appear in a dependency table, and a hunk that matches in two places comes back ambiguous. The `[package]` and `name` lines above it pin it to the manifest header.
-
-  The `@@` numbers only need to be close, since the hunk is found by its content, and the repo and path arguments<|projection|> decide the file so I do not need a `---`/`+++` header. The header line is 1 here anyway.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "Cargo.toml", "patch": "@@ -1,4 +1,4 @@\n [package]\n name = \"acme\"\n-version = \"0.1.0\"\n+version = \"0.2.0\"\n edition = \"2021\"\n"}}
-  </tool_call><|projection|>
-- |-
-  in src/config.rs replace the string `localhost` with `0.0.0.0`<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  The user wants "localhost" swapped for "0.0.0.0" in src/config.rs, without naming a repository — the workspace's generic app repository is where this goes. file_edit applies a unified diff, so the change is a hunk: the line holding "localhost" removed, the same line with "0.0.0.0" added.
-
-  <|projection|>A diff works in whole lines, not substrings, so I write the entire line on each side rather than just the word. I saw it inside bind_addr, so I will carry that function signature as the context line above — that is what the engine matches on, and it keeps the hunk<|projection|> unambiguous if "localhost" turns up elsewhere in the file.
-
-  The line numbers are a hint only, so 12 being slightly off does not matter.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/config.rs", "patch": "@@ -12,2 +12,2 @@\n pub fn bind_addr() -> &'static str {\n-    \"localhost\"\n+    \"0.0.0.0\"\n"}}
-  </tool_call><|projection|>
-- |-
-  update the port from 8080 to 9090 in config.toml<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  Okay, the user wants the port changed from 8080 to 9090 in config.toml, without naming a repository — the workspace's generic app repository is where this root config lives. Let me use file_edit, which takes a unified diff.
-
-  So the hunk removes `port = 8080` and adds `port = 9090`. The parameters are repo, path and patch<|projection|>. The repo is "app" and the path is "config.toml".
-
-  I do not know the exact line, but that is fine — the hunk is located by its context, and the `@@` numbers are only used to choose between equal matches. A config file like this has a `[server]` table heading<|projection|> above the port, so I will use that as the context line. One context line plus one removed line is two lines on the old side and two on the new.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "config.toml", "patch": "@@ -1,2 +1,2 @@\n [server]\n-port = 8080\n+port = 9090\n"}}
-  </tool_call><|projection|>
-- |-
-  rename the function fetch_user to load_user in src/utils.rs — it's defined once and called once<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  Two places in one file, and no repository named — the workspace's generic app repository is where this goes: the definition and the call site. file_edit takes a patch, and a patch can carry more than one hunk, so this is a single call with two `@@` sections rather than two calls.
-
-  <|projection|>Hunks apply in order and cannot overlap, so the definition at line 18 comes first and the call at line 42 second. Each needs a context line so it can be located — the body line under the signature for the first, the line after the call for the second.
-
-  Either both<|projection|> hunks land or neither does, which is what I want for a rename: a half-renamed file would not compile.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/utils.rs", "patch": "@@ -18,2 +18,2 @@\n-fn fetch_user(id: u64) -> User {\n+fn load_user(id: u64) -> User {\n     db::get(id)\n@@ -42,2 +42,2 @@\n-    let u = fetch_user(id);\n+    let u = load_user(id);\n     render(u);\n"}}
-  </tool_call><|projection|>
-- |-
-  I'm not sure that last edit went through — make sure retries is 30 in config/limits.toml<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  The user is unsure whether the earlier change landed, and names no repository — the workspace's generic app repository holds this config. I can just send the patch again: file_edit checks whether a hunk is already applied before it applies it, so if retries is already 30 the call reports the hunk as already applied and writes nothing.
-
-  <|projection|>That is safe precisely because matching is by whole line. `retries = 30` is not `retries = 3`, so there is no way to apply the change twice and end up with 300 — the engine finds the post-image instead and leaves the file alone.
-
-  So the same hunk as before, with<|projection|> the `[limits]` heading as context.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "config/limits.toml", "patch": "@@ -3,2 +3,2 @@\n [limits]\n-retries = 3\n+retries = 30\n"}}
-  </tool_call><|projection|>
-- |-
-  fix the typo `recieve` to `receive` in src/handlers/mod.rs<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  A single typo fix in a doc comment, no repository named — the workspace's generic app repository is where this goes. file_edit works in whole lines, so the hunk removes the comment line as it stands and adds the corrected one — I cannot patch just the word.
-
-  The line below it, the `pub fn recv` signature, goes in as context so<|projection|> the hunk is pinned to this one comment rather than any other place the misspelling appears.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/handlers/mod.rs", "patch": "@@ -7,2 +7,2 @@\n-/// Blocks until the socket recieves a frame.\n+/// Blocks until the socket receives a frame.\n pub fn recv(&self) -> Frame {\n"}}
-  </tool_call><|projection|>
-- |-
-  drop the leftover debug println in src/pipeline.rs<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  A deletion, no repository named — the workspace's generic app repository holds this src/pipeline.rs. In a unified diff that is a hunk with a `-` line and no `+` line for it, so the old side has three lines and the new side two.
-
-  I keep the lines either side as context — the compute call above and the return below<|projection|>. They locate the hunk, and without at least one of them there would be nothing to find it by.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/pipeline.rs", "patch": "@@ -21,3 +21,2 @@\n     let out = compute(input);\n-    println!(\"debug: {out:?}\");\n     return out;\n"}}
-  </tool_call><|projection|>
-- |-
-  add .env to .gitignore<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  An addition rather than a replacement, and no repository named — the workspace's generic app repository holds this root .gitignore. The hunk is `+` only — except that a hunk of nothing but added lines has no content to locate it by and would be rejected. I need to carry the existing lines as context and add the new one after them.
-
-  <|projection|>The file already has target/ and *.log, so those two go in as context lines and `.env` is the added line: two lines on the old side, three on the new.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": ".gitignore", "patch": "@@ -1,2 +1,3 @@\n target/\n *.log\n+.env\n"}}
-  </tool_call><|projection|>
+- in Cargo.toml change the line `version = "0.1.0"` to `version = "0.2.0"`<|im_end|>
+- in src/config.rs replace the string `localhost` with `0.0.0.0`<|im_end|>
+- update the port from 8080 to 9090 in config.toml<|im_end|>
+- rename the function fetch_user to load_user everywhere in src/utils.rs<|im_end|>
+- I'm not sure that last edit went through — make sure retries is 30 in config/limits.toml<|im_end|>
+- fix the typo `recieve` to `receive` in src/handlers/mod.rs<|im_end|>
+- drop the leftover debug println in src/pipeline.rs<|im_end|>
+- add .env to .gitignore<|im_end|>
+- add a len() method after is_empty() in src/queue.rs<|im_end|>

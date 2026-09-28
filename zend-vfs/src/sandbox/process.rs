@@ -23,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::command::SandboxCommand;
 use super::outcome::Output;
+use super::resolve;
 use crate::kill_tree::{self, ProcessTree};
 
 /// The most of a command's output a run writes to its sink.
@@ -51,7 +52,7 @@ pub(crate) async fn execute(
             .unwrap_or(&command.program);
         dir.join(rel).into_os_string()
     } else {
-        command.program.clone().into()
+        resolve::program(&command.program)
     };
     let mut std_command = Command::new(program);
     std_command
@@ -264,6 +265,25 @@ mod tests {
             .unwrap();
         assert_eq!(out.bytes, 8);
         assert!(out.truncated);
+    }
+
+    /// **A `.cmd` script starts, with its arguments** — how `npm` and `npx`
+    /// are installed on Windows.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_cmd_script_starts_with_its_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.cmd"), b"@echo hello %1\r\n").unwrap();
+        let mut sink = Vec::new();
+        let done = execute(
+            dir.path(),
+            &SandboxCommand::new("./hello.cmd").arg("world"),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(String::from_utf8(sink).unwrap().trim(), "hello world");
     }
 
     /// A program that does not exist is an error, not an outcome.

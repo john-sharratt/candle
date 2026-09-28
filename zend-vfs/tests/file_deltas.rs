@@ -8,10 +8,11 @@
 //!    from an old and a new text replay to the new text exactly, are ordered,
 //!    disjoint and minimal at their edges, survive their wire form, and refuse
 //!    a text they were not made against.
-//! 2. **Through the patch engine into a store**: unified diffs are generated
-//!    for each edit, applied by `file_edit`'s engine, and recorded in an
-//!    overlay, where they are held as deltas and the disk is untouched. The
-//!    overlay must hold the engine's text after every step.
+//! 2. **Through the replace engine into a store**: the old and new text a
+//!    model would send is generated for each edit, applied by `file_edit`'s
+//!    engine, and recorded in an overlay, where it is held as deltas and the
+//!    disk is untouched. The overlay must hold the engine's text after every
+//!    step.
 //! 3. **Stored deltas applied elsewhere**: a conversation's recorded chain,
 //!    applied to a fresh overlay over a pristine copy of the workspace,
 //!    reproduces the conversation's view there.
@@ -21,9 +22,8 @@
 
 use std::path::Path;
 
-use similar::TextDiff;
 use zend_vfs::file_delta::{self, Diverged, FileDelta, FileTimes, ReplayError, Splice, TimedDelta};
-use zend_vfs::{patch, VfsStore};
+use zend_vfs::{replace, VfsStore};
 
 // ── The generator ────────────────────────────────────────────────────────────
 
@@ -359,7 +359,7 @@ fn replay_follows_replace_and_delete() {
     );
 }
 
-// ── 2 and 3. Through the patch engine, into a store, and elsewhere ──────────
+// ── 2 and 3. Through the replace engine, into a store, and elsewhere ────────
 
 fn put(root: &Path, rel: &str, text: &str) {
     let p = root.join(rel);
@@ -371,9 +371,9 @@ fn on_disk(root: &Path, rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap()
 }
 
-/// A file the patch engine can take hunks for without ambiguity: distinct,
+/// A file every edit of which can be quoted without ambiguity: distinct,
 /// numbered lines, always newline-terminated, LF or CRLF.
-fn patchable_doc(rng: &mut Lcg, unique: &mut usize) -> Doc {
+fn editable_doc(rng: &mut Lcg, unique: &mut usize) -> Doc {
     let n = 6 + rng.below(40);
     Doc {
         lines: (0..n)
@@ -387,9 +387,9 @@ fn patchable_doc(rng: &mut Lcg, unique: &mut usize) -> Doc {
     }
 }
 
-/// One edit a patch can express: insertions, deletions and replacements of
-/// distinct lines, the file keeping at least one line of context.
-fn patchable_edit(rng: &mut Lcg, doc: &Doc, unique: &mut usize) -> Doc {
+/// One edit: insertions, deletions and replacements of distinct lines, the
+/// file keeping at least one line to quote beside them.
+fn line_edit(rng: &mut Lcg, doc: &Doc, unique: &mut usize) -> Doc {
     let mut out = doc.clone();
     for _ in 0..=rng.below(3) {
         let len = out.lines.len();
@@ -415,30 +415,48 @@ fn patchable_edit(rng: &mut Lcg, doc: &Doc, unique: &mut usize) -> Doc {
     out
 }
 
-/// A unified diff from `old` to `new`, as a model would send `file_edit`.
-fn unified(old: &str, new: &str) -> String {
-    TextDiff::from_lines(old, new)
-        .unified_diff()
-        .context_radius(2)
-        .to_string()
+/// The `old_text` / `new_text` a model would send `file_edit` for `old` →
+/// `new`: the lines that changed, with one unchanged line either side of them
+/// where there is one — which also gives a pure insertion something to quote.
+fn replacement(old: &Doc, new: &Doc) -> (String, String) {
+    let (a, b) = (&old.lines, &new.lines);
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let from = prefix.saturating_sub(1);
+    let text = |lines: &[String]| {
+        Doc {
+            lines: lines.to_vec(),
+            eol: old.eol,
+            trailing_newline: true,
+        }
+        .text()
+    };
+    let a_to = (a.len() - suffix + 1).min(a.len());
+    let b_to = (b.len() - suffix + 1).min(b.len());
+    (text(&a[from..a_to]), text(&b[from..b_to]))
 }
 
-/// **Patches built, stored and applied — into the overlay and elsewhere.**
+/// **Edits built, stored and applied — into the overlay and elsewhere.**
 ///
-/// For each case a workspace file is edited eight times. Each edit is a
-/// unified diff generated against the file as it stands, applied by
-/// `file_edit`'s patch engine, and recorded in an overlay store, which holds
-/// deltas and never touches its disk. After every step it holds the patch
-/// engine's result.
+/// For each case a workspace file is edited eight times. Each edit is the old
+/// and new text a model would quote, generated against the file as it stands,
+/// applied by `file_edit`'s replace engine, and recorded in an overlay store,
+/// which holds deltas and never touches its disk. After every step it holds
+/// the engine's result.
 ///
 /// Then the overlay's recorded chain is applied to a fresh overlay over a
 /// pristine copy of the workspace, reproducing the conversation's view there.
 #[test]
-fn patches_are_built_stored_and_applied_to_the_overlay_and_elsewhere() {
+fn edits_are_built_stored_and_applied_to_the_overlay_and_elsewhere() {
     let mut rng = Lcg(0x9a7c4);
     let mut unique = 0;
     for case in 0..60 {
-        let mut doc = patchable_doc(&mut rng, &mut unique);
+        let mut doc = editable_doc(&mut rng, &mut unique);
         let original = doc.text();
         let [overlay_root, fresh_root] = [(); 2].map(|_| tempfile::tempdir().unwrap());
         for root in [&overlay_root, &fresh_root] {
@@ -448,14 +466,16 @@ fn patches_are_built_stored_and_applied_to_the_overlay_and_elsewhere() {
         let mut doc_text = original.clone();
 
         for step in 0..8 {
-            let next = patchable_edit(&mut rng, &doc, &mut unique);
-            // Changes that cancel out leave nothing to patch.
+            let next = line_edit(&mut rng, &doc, &mut unique);
+            // Changes that cancel out leave nothing to edit.
             if next.text() == doc_text {
                 continue;
             }
-            let diff = unified(&doc_text, &next.text());
-            let patched = patch::apply(&doc_text, &diff)
-                .unwrap_or_else(|e| panic!("case {case} step {step}: {e}\n{diff}"));
+            let (old, new) = replacement(&doc, &next);
+            let patched = replace::apply(&doc_text, &old, &new, false).unwrap_or_else(|e| {
+                panic!("case {case} step {step}: {e}\nold: {old:?}\nnew: {new:?}")
+            });
+            assert_eq!(patched.replacements, 1, "case {case} step {step}");
             assert_eq!(
                 patched.content,
                 next.text(),

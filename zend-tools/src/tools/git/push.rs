@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 use zend_vfs::{
-    BranchName, Lease, Oid, PushOutcome, PushSpec, PushTarget, Rejection, RemoteName,
-    Repo as GitRepo, TagName,
+    BranchName, GitError, Lease, Oid, PushOutcome, PushSpec, PushTarget, Rejection, RemoteName,
+    Repo as GitRepo, Rev, TagName,
 };
 
 use super::{open, GitToolError, RevArg};
@@ -130,6 +130,32 @@ fn lease_from_tracking(
     })
 }
 
+/// `update_branch` naming a tag of this repository that is no branch here or
+/// on the remote is refused towards `update_tag`. Measured live: asked to push
+/// the tag `v0.1.0`, a model sent `update_branch` with the tag as its source,
+/// and origin gained a branch `v0.1.0` beside the tag — a name that then
+/// means two things to every git command that reads it.
+fn refuse_a_tag_as_a_branch(
+    repo: &GitRepo,
+    remote: &RemoteName,
+    branch: &BranchName,
+) -> Result<(), GitToolError> {
+    let Ok(tag) = TagName::parse(branch.as_str()) else {
+        return Ok(());
+    };
+    let is_tag = repo.ref_target(&tag.to_ref())?.is_some();
+    let is_branch = repo.ref_target(&branch.to_ref())?.is_some()
+        || repo.ref_target(&remote.tracking(branch))?.is_some();
+    if is_tag && !is_branch {
+        return Err(GitError::invalid(format!(
+            "{branch} is a tag here, not a branch: publish it with `update_tag`. A branch of \
+             the same name would make {branch} mean two things"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 pub struct GitPush;
 
 impl Tool for GitPush {
@@ -187,9 +213,10 @@ impl Tool for GitPush {
             specs.push(match item.action {
                 PushAct::UpdateBranch => {
                     let branch = BranchName::parse(&item.name)?;
+                    refuse_a_tag_as_a_branch(&repo, &remote, &branch)?;
                     let rev = match &item.source {
                         Some(r) => r.resolve(&repo)?,
-                        None => zend_vfs::Rev::Branch(branch.clone()),
+                        None => Rev::Branch(branch.clone()),
                     };
                     let source = repo.resolve(&rev)?;
                     PushSpec::branch(source, branch.clone(), lease(&repo, &branch)?)
@@ -200,7 +227,7 @@ impl Tool for GitPush {
                     let tag = TagName::parse(&item.name)?;
                     let rev = match &item.source {
                         Some(r) => r.resolve(&repo)?,
-                        None => zend_vfs::Rev::Tag(tag.clone()),
+                        None => Rev::Tag(tag.clone()),
                     };
                     PushSpec::tag(repo.resolve_object(&rev)?, tag)
                 }
@@ -211,7 +238,7 @@ impl Tool for GitPush {
                         None => match lease_from_tracking(&repo, &remote, &branch)? {
                             Lease::Expect(oid) => oid,
                             Lease::Absent => {
-                                return Err(zend_vfs::GitError::invalid(format!(
+                                return Err(GitError::invalid(format!(
                                     "nothing is known about {} on {}: run git_fetch, or \
                                      name what it holds in `expected`",
                                     item.name, req.remote
@@ -226,7 +253,7 @@ impl Tool for GitPush {
                     let tag = TagName::parse(&item.name)?;
                     let held = match &item.expected {
                         Some(e) => Oid::parse(e)?,
-                        None => repo.resolve_object(&zend_vfs::Rev::Tag(tag.clone()))?,
+                        None => repo.resolve_object(&Rev::Tag(tag.clone()))?,
                     };
                     PushSpec::delete_tag(tag, held)
                 }

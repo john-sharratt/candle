@@ -108,3 +108,7 @@ examples:
 - remove that bad tag from the repo<|im_end|>
 - start a branch from the previous commit<|im_end|>
 - I need a branch for this work, but do not switch to it<|im_end|>
+- tag the current main as v0.2.0 and put the tag on origin<|im_end|>
+- delete the scratch tag here and on origin<|im_end|>
+- make a nightly tag on main, then remove it again<|im_end|>
+- mark today's build with a lightweight tag<|im_end|>

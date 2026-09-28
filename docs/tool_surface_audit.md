@@ -268,11 +268,11 @@ which is ordinary file editing. `zend-tools` already implements it —
 per-conversation overlay that records each change as a delta — an edit as only
 the lines it changed, a delete as a marker — over the workspace's file. Its own
 documentation states the alignment that matters here: `file_edit`
-applies a unified diff whose hunks are *"located by their content, never by the
-`@@` line numbers"*, so a hunk matching in several places is refused as ambiguous
-rather than guessed at, and one whose change is already in the file is counted as
-already applied — which forces the model to provide enough context to identify a
-single edit site, and makes re-sending a patch safe.
+replaces an `old_text` quoted from the file with a `new_text`, located by its
+content and never by line number, so text matching in several places is refused
+as ambiguous rather than guessed at, and an edit whose result is already in the
+file is counted as already applied — which forces the model to quote enough to
+identify a single edit site, and makes re-sending an edit safe.
 
 It is a workspace member with no candle dependency, so `npcd` can depend on it
 directly. Reusing it costs one dependency and buys names the model already has a

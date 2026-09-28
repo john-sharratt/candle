@@ -70,6 +70,7 @@ use super::record::{
 };
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
+use super::stripes::{stripes, MAX_STRIPE_BYTES};
 use super::survival::RecordCensus;
 use super::vfs::carried as vfs_carried;
 use super::{PersistenceError, Result, SubstratePersistence};
@@ -1097,18 +1098,15 @@ impl SubstratePersistence {
     ) -> Result<Vec<(SegmentId, u64, u64)>> {
         let mut order: Vec<usize> = (0..items.len()).collect();
         order.sort_unstable_by_key(|&i| items[i].offset);
+        let spans: Vec<(u64, u64)> = order
+            .iter()
+            .map(|&k| (items[k].offset, items[k].record_size))
+            .collect();
         let mut new_locs = vec![(source, 0u64, 0u64); items.len()];
         let mut buf: Vec<u8> = Vec::new();
-        let mut i = 0;
-        while i < order.len() {
-            // Coalesce a contiguous run of records into one stripe read.
-            let start = items[order[i]].offset;
-            let mut end = start + items[order[i]].record_size;
-            let mut j = i + 1;
-            while j < order.len() && items[order[j]].offset == end {
-                end += items[order[j]].record_size;
-                j += 1;
-            }
+        for (i, j) in stripes(&spans, MAX_STRIPE_BYTES) {
+            let start = spans[i].0;
+            let end = spans[j - 1].0 + spans[j - 1].1;
             let len = (end - start) as usize;
             if buf.len() < len {
                 buf.resize(len, 0);
@@ -1120,7 +1118,6 @@ impl SubstratePersistence {
                 let raw = &buf[within..within + it.record_size as usize];
                 new_locs[k] = self.append_raw_record(&it.header, raw)?;
             }
-            i = j;
         }
         Ok(new_locs)
     }
@@ -2682,6 +2679,73 @@ mod tests {
                 chunk_payload(12)
             );
             assert_eq!(substrate.live_chunk_count(), 2);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A live run longer than one read stripe is relocated whole.** Seventy
+    /// one-MiB chunks stand back to back in a sealed segment — one run past
+    /// [`MAX_STRIPE_BYTES`] — beside a superseded record that makes it worth
+    /// compacting. Every chunk reads back byte for byte after the relocation
+    /// and after a reload.
+    #[test]
+    fn a_live_run_past_one_stripe_is_relocated_whole() {
+        let dir = tmp_dir("stripes");
+        let decl = turn_decl(303, 0);
+        let sid = decl.stream_id();
+        let big = |index: u64| ChunkPayload {
+            kv_bytes: (0..1024 * 1024u64)
+                .map(|i| ((i + index * 13) % 251) as u8)
+                .collect(),
+            ..chunk_payload(index as u32)
+        };
+        const LIVE: u64 = 70;
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            for i in 0..LIVE {
+                sp.write_chunk(sid, i, 32, 4, None, &big(i)).unwrap();
+            }
+            sp.write_chunk(sid, LIVE, 32, 4, None, &chunk_payload(1))
+                .unwrap(); // superseded below
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, LIVE, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.apply_maintenance_op(&mut substrate, &MaintenanceOp::Compact(SegmentId(1)))
+                .unwrap();
+            assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
+            for i in 0..LIVE {
+                assert_eq!(
+                    sp.read_chunk(&substrate, sid, i).unwrap(),
+                    big(i),
+                    "chunk {i}"
+                );
+            }
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            for i in 0..LIVE {
+                assert_eq!(
+                    sp.read_chunk(&substrate, sid, i).unwrap(),
+                    big(i),
+                    "chunk {i}"
+                );
+            }
+            assert_eq!(
+                sp.read_chunk(&substrate, sid, LIVE).unwrap(),
+                chunk_payload(2)
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

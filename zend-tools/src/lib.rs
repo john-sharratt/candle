@@ -18,6 +18,8 @@
 //! - [`grants`] — the capabilities a call may use; [`net`], [`exec`] and
 //!   [`disk`] are the only ways tool code reaches the network, starts a program
 //!   or opens a database, and each refuses without its capability
+//! - [`sandboxes`] — the workspace's command sandboxes, one per git
+//!   repository, that `run_command` runs a program in
 //! - [`state`] — the individual stores: [`state::CredentialStore`],
 //!   [`state::NotesStore`], [`state::SessionRegistry`], [`state::HashStateStore`],
 //!   [`state::Secrets`]; the file stores the `file_*` tools work through are
@@ -71,6 +73,7 @@
 //! pub const REGISTRATION: RegisteredTool = RegisteredTool::new::<MyTool>();
 //! ```
 
+pub mod alias_pins;
 pub mod context;
 pub mod disk;
 pub mod exec;
@@ -79,6 +82,7 @@ pub mod net;
 mod numfmt;
 pub mod registry;
 pub mod runner;
+pub mod sandboxes;
 #[cfg(test)]
 mod source_scan;
 pub mod state;

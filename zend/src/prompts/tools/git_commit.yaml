@@ -23,7 +23,7 @@ questions:
 - create a commit that adds the new config file
 - roll back that bad commit without rewriting history
 category: Git
-description: 'Record one commit on a branch — the branch you are on unless `branch` names another — and publish it to origin. `from` says where the content comes from. `changes` commits every change you have not committed, exactly what git_status lists. `files` takes a list of `changes`, each tagged by `action` — `take` commits the file EXACTLY as you hold it and needs no `content`, so prefer it whenever the edit is already written and never reproduce a file from memory; `write` replaces the file with `content`, which must be its COMPLETE new text, not a diff; `delete` removes it. `patch` applies the unified diff given in `patch`. `cherry_pick` replays the commit named in `commit` onto the branch, keeping its author and message. `revert` applies that commit backwards, undoing it. `message` is required for `changes`, `files` and `patch`; `cherry_pick` keeps the message it replays and `revert` writes its own. The commit is published to origin all at once or not at all: if the branch has commits you do not have, or someone pushes while this is sent, NOTHING is committed and your files stay exactly as they were — the answer says so, and git_merge brings their commits into your files so you can commit again. Files still in conflict from a merge are listed in `conflicts` and must be written as they should be first; a merge is committed whole, with `from: changes` only. Committing `files` to another branch that has changed them since your work started is refused unless `expected_head` names that branch''s tip. Once committed, those changes are no longer uncommitted — they read from the branch. A patch that does not apply, or a replay that conflicts, reports why and commits nothing. `expected_head` is optional: give it — git_status''s `head` — to refuse the commit if that moved since you looked. `changes` commits only on the branch you are on; for another branch name the files with `files`. The branch must already exist — make one with git_switch. Writes to origin.'
+description: 'Record one commit on a branch — the branch you are on unless `branch` names another — and publish it to origin. `from` says where the content comes from. `all_changes` commits every change you have not committed, exactly what git_status lists — and publishes what a git_merge brought into your files, even with no change of your own, so a merged branch is published by `all_changes` too. `files` commits ONLY the files you list in `changes` and leaves every other change uncommitted — use it whenever some of your changes are to be committed and others not; each entry is tagged by `action` — `take` commits the file EXACTLY as you hold it and needs no `content`, so prefer it whenever the edit is already written and never reproduce a file from memory; `write` replaces the file with `content`, which must be its COMPLETE new text, not a diff; `delete` removes it. `patch` applies the unified diff given in `patch`. `cherry_pick` replays the commit named in `commit` onto the branch, keeping its author and message. `revert` applies that commit backwards, undoing it. `message` is required for `all_changes`, `files` and `patch`; `cherry_pick` keeps the message it replays and `revert` writes its own. The commit is published to origin all at once or not at all: if the branch has commits you do not have, or someone pushes while this is sent, NOTHING is committed and your files stay exactly as they were — the answer says so, and git_merge brings their commits into your files so you can commit again. Files still in conflict from a merge are listed in `conflicts` and must be written as they should be first; a merge is committed whole, with `from: all_changes` only. Committing `files` to another branch that has changed them since your work started is refused unless `expected_head` names that branch''s tip. Once committed, those changes are no longer uncommitted — they read from the branch. A patch that does not apply, or a replay that conflicts, reports why and commits nothing. `expected_head` is optional: give it — git_status''s `head` — to refuse the commit if that moved since you looked. `all_changes` commits only on the branch you are on; for another branch name the files with `files`. The branch must already exist — make one with git_switch. To produce SEVERAL commits from changes you have not written yet, commit each piece as you finish writing it — write the first piece, commit it, then write the next piece and commit that — rather than writing everything first and trying to divide one dirty tree into several commits afterward. Once every edit is made, an earlier piece can no longer be committed on its own if a later edit touched the same file: `files` commits whole files, not the hunks inside them, so a second edit to a file already named in the first commit is baked into the working tree by the time you get to it. Writes to origin.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -36,9 +36,9 @@ parameters:
       - delete
       type: string
     CommitFrom:
-      description: 'Where the commit''s content comes from: `changes` (every change you have not committed — and a merge being finished, even with no change of your own), `files` (the `changes` list), `patch` (a unified diff), `cherry_pick` (replay another commit forwards), `revert` (apply another commit backwards).'
+      description: 'Where the commit''s content comes from: `all_changes` (every change you have not committed — and what a merge brought in, even with no change of your own), `files` (only the files in the `changes` list; every other change stays uncommitted), `patch` (a unified diff), `cherry_pick` (replay another commit forwards), `revert` (apply another commit backwards).'
       enum:
-      - changes
+      - all_changes
       - files
       - patch
       - cherry_pick
@@ -74,6 +74,7 @@ parameters:
       items:
         $ref: '#/definitions/FileChange'
       maxItems: 200
+      minItems: 1
       type: array
     commit:
       description: 'For `cherry_pick` and `revert` — the full object id of the commit to replay, as git_log reports it.'
@@ -86,7 +87,7 @@ parameters:
       - $ref: '#/definitions/CommitFrom'
       description: Where the content comes from. Required.
     message:
-      description: 'The commit message. Required for `changes`, `files` and `patch`; `cherry_pick` keeps the message it replays and `revert` writes its own.'
+      description: 'The commit message. Required for `all_changes`, `files` and `patch`; `cherry_pick` keeps the message it replays and `revert` writes its own.'
       type: string
     patch:
       description: 'For `from: patch` — a unified diff, as `git diff` produces it.'
@@ -98,6 +99,40 @@ parameters:
   required:
   - repo
   - from
+  allOf:
+  - if:
+      properties:
+        from:
+          enum:
+          - all_changes
+          - files
+          - patch
+    then:
+      required:
+      - message
+  - if:
+      properties:
+        from:
+          const: files
+    then:
+      required:
+      - changes
+  - if:
+      properties:
+        from:
+          const: patch
+    then:
+      required:
+      - patch
+  - if:
+      properties:
+        from:
+          enum:
+          - cherry_pick
+          - revert
+    then:
+      required:
+      - commit
   title: CommitRequest
   type: object
 examples:
@@ -110,3 +145,11 @@ examples:
 - commit the deletion of the dead module<|im_end|>
 - put all three edited files into one commit<|im_end|>
 - backport that fix onto the stable branch<|im_end|>
+- commit and push only the README change, leave my other edit uncommitted<|im_end|>
+- commit just the two test files and nothing else I touched<|im_end|>
+- revert the commit that broke the report, keep the history, do not reset<|im_end|>
+- bring the one commit on the hotfix branch over to main<|im_end|>
+- the conflicts are settled, commit the merge<|im_end|>
+- publish what I just merged in from the feature branch<|im_end|>
+- add the retry logic with its tests, then separately add the metrics counter for it with its own test change, as two commits<|im_end|>
+- write the parser fix and commit it, then write the changelog entry for it and commit that on its own<|im_end|>

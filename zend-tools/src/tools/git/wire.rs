@@ -147,7 +147,7 @@ pub fn landed_on(published: &Published) -> &'static str {
 /// Why origin refused a write, in words the model can act on.
 pub fn refusal(rejection: &Rejection) -> String {
     match rejection {
-        Rejection::Stale => "origin's copy of the branch moved while this was being written, \
+        Rejection::Stale => "what origin holds there changed while this was being written, \
                              so nothing was written"
             .to_string(),
         Rejection::AtomicAborted => "another change in the same push was refused".to_string(),

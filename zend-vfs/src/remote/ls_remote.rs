@@ -15,8 +15,13 @@ pub struct RemoteRefs {
 impl RemoteRefs {
     /// Where `branch` points on the remote, if it exists there.
     pub fn branch(&self, branch: &BranchName) -> Option<&Oid> {
-        let name = branch.to_ref();
-        self.refs.iter().find(|(r, _)| *r == name).map(|(_, o)| o)
+        self.get(&branch.to_ref())
+    }
+
+    /// What `name` holds on the remote — a tag's own object, unpeeled — if
+    /// it exists there.
+    pub fn get(&self, name: &RefName) -> Option<&Oid> {
+        self.refs.iter().find(|(r, _)| r == name).map(|(_, o)| o)
     }
 }
 
