@@ -3060,6 +3060,21 @@ fn run_inference_stream(
         // A minted conversation's file stores and their mirror, restored from
         // its events once the map guard is released.
         let mut minted_files: Option<(Arc<RepoFiles>, Arc<Mutex<Mirror>>)> = None;
+        // The per-conversation exclusivity guard, for the minting branch only
+        // — acquired here, inside the map's still-held lock, BEFORE the
+        // `map.insert` below makes this conv_id findable by any other
+        // request. `try_lock_owned` cannot contend: nothing else can hold a
+        // clone of `arc` before it exists in the map, and it does not exist
+        // in the map until the line after this succeeds. Without this, a
+        // second request for the same, not-yet-resident conv_id could find
+        // the map entry, win the race to lock it, and run a full turn against
+        // a `ConvState` whose files are not yet restored from the substrate
+        // (`upper.base` still unset) — and then have that turn's writes
+        // silently overwritten when this request's own restore, below,
+        // finally replaces the store's contents wholesale. See the note where
+        // this guard is picked back up, and `zend_run_iteration_traps.md`
+        // for the trace that found this.
+        let mut minted_guard: Option<OwnedMutexGuard<ConvState>> = None;
         let forked: anyhow::Result<Arc<ConvLock<ConvState>>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {
@@ -3082,6 +3097,10 @@ fn run_inference_stream(
                             files,
                             mirror,
                         }));
+                        minted_guard = Some(Arc::clone(&arc).try_lock_owned().expect(
+                            "a freshly minted conversation's lock cannot be held by \
+                                 anything else yet",
+                        ));
                         map.insert(conv_id.clone(), Arc::clone(&arc));
                         minted = true;
                         Ok(arc)
@@ -3121,6 +3140,21 @@ fn run_inference_stream(
                 return;
             }
         };
+        // Held across every decode await below, deliberately: this guard IS
+        // the per-conversation in-flight exclusivity — a second submit for
+        // the same conv_id parks here until this turn loop finishes.
+        //
+        // For a minted conversation this is `minted_guard`, already held from
+        // before this conv_id existed in `state.conversations` (see the note
+        // there) — never re-acquired here, only picked back up, so there is
+        // no gap between "findable" and "exclusive" for anything freshly
+        // minted. A reused conversation had no reason to hold anything
+        // earlier, so it acquires its own guard here — which is, as it always
+        // was, the first moment this codepath asks for one.
+        let mut cs = match minted_guard {
+            Some(guard) => guard,
+            None => conv_arc.clone().lock_owned().await,
+        };
         // The slot was seeded from this (fresh) timeline before the lineage
         // above existed; ask again so the conversation opens with the priming
         // chain's recurrent memory behind it rather than from nothing.
@@ -3131,19 +3165,24 @@ fn run_inference_stream(
         // task's contract is that every wait in it is an await — see the note
         // where it is spawned. Blocking here would pin a runtime worker and
         // stall every other stream sharing it.
+        //
+        // `cs` is moved into the closure and handed back rather than
+        // re-locked through `conv_arc`: it is already held, and
+        // `OwnedMutexGuard` is not reentrant — a second lock through the same
+        // Arc from this same logical task would deadlock against itself.
         if minted {
-            let arc = Arc::clone(&conv_arc);
             let cid = conv_id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let guard = arc.blocking_lock();
-                if let Err(e) = guard.conv.seed_recurrent_from_lineage() {
+            cs = tokio::task::spawn_blocking(move || {
+                if let Err(e) = cs.conv.seed_recurrent_from_lineage() {
                     tracing::warn!(
                         conv_id = %cid,
                         "seeding recurrent memory from the priming chain failed: {e}",
                     );
                 }
+                cs
             })
-            .await;
+            .await
+            .expect("seed_recurrent_from_lineage task panicked");
         }
 
         // Persist the conv_id ↔ timeline mapping *after* `fork_resuming`
@@ -3195,14 +3234,13 @@ fn run_inference_stream(
         // turns (and a daemon restart) keep it. Only writes when it actually
         // changes, to avoid a substrate write every turn.
         if let Some(req_id) = identity {
-            let changed = {
-                let mut cs = conv_arc.lock().await;
-                if cs.identity.as_deref() == Some(req_id.as_str()) {
-                    false
-                } else {
-                    cs.identity = Some(req_id.clone());
-                    true
-                }
+            // `cs` is already held (see above) — no reason to re-lock through
+            // `conv_arc` for what is the same guard under a different name.
+            let changed = if cs.identity.as_deref() == Some(req_id.as_str()) {
+                false
+            } else {
+                cs.identity = Some(req_id.clone());
+                true
             };
             if changed {
                 if let Err(e) = state
@@ -3272,11 +3310,6 @@ fn run_inference_stream(
                 tracing::debug!("titler queue full or closed — skipping label: {e}");
             }
         }
-
-        // Held across every decode await below, deliberately: this guard IS
-        // the per-conversation in-flight exclusivity — a second submit for the
-        // same conv_id parks here until this turn loop finishes.
-        let mut cs = conv_arc.lock().await;
 
         // Per-conversation projection swap. Both the prefill projection and the
         // reprojection read the swapped builder, so neither re-introduces a
