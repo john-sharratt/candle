@@ -68,6 +68,10 @@ pub use chunked::wave_plan::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
+    arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves, ArenaSlot, SlotMove,
+};
+#[cfg(feature = "cuda")]
+pub use chunked::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, end_wave_transient,
     guest_domain_stats, open_guest_arena, plan_wave_transient, wave_domain_stats, wave_is_live,
     BumpRange, ForwardOpen, WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
@@ -79,8 +83,6 @@ pub use chunked::{
     SpanClaims, SpanLayout, SpanRegion,
 };
 #[cfg(feature = "cuda")]
-pub use chunked::{claim_state_slots, state_arena_regions, StateSlot};
-#[cfg(feature = "cuda")]
 pub use chunked::{
     empty_sweep_stats, reclaim_empty_arenas, region_stats, spare_tally, RegionStats, REGION_BYTES,
 };
@@ -90,8 +92,8 @@ pub use chunked::{
     initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
     weight_capacity_bytes, weight_floor_after,
 };
-/// Fixed-stride arenas for per-sequence recurrent state — see `chunked::state_arena`.
-pub use chunked::{state_stride, STATE_ALIGN};
+/// Fixed-stride slot arenas, one set per span tenant — see `chunked::tenant_arena`.
+pub use chunked::{slot_stride, SlotTenant, SLOT_ALIGN};
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.
 pub use chunked::{

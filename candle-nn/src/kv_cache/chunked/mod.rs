@@ -88,9 +88,10 @@ pub(crate) mod slot_state_arena;
 /// Where the tier may stand and what the KV side may reach. Pure arithmetic, and
 /// outside the `cuda` gate so it can be exercised on any machine.
 pub mod span_geometry;
-/// Fixed-stride arenas for per-sequence recurrent state. The bookkeeping is host
-/// arithmetic and tested anywhere; the pool that claims regions is CUDA-only.
-pub mod state_arena;
+/// Fixed-stride slot arenas, dedicated per span tenant: recurrent state, rewind
+/// stashes, gallery pages, QSA index pages. The bookkeeping is host arithmetic and
+/// tested anywhere; the pool that claims regions is CUDA-only.
+pub mod tenant_arena;
 mod types;
 // Instrumentation for the bump arenas' high-water marks: its only caller is
 // `bump_arena`, so it shares that module's gating.
@@ -189,8 +190,10 @@ pub use region_pool::{
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;
 #[cfg(feature = "cuda")]
-pub use state_arena::{claim_state_slots, state_arena_regions, StateSlot};
-pub use state_arena::{state_stride, STATE_ALIGN};
+pub use tenant_arena::{
+    arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves, ArenaSlot, SlotMove,
+};
+pub use tenant_arena::{slot_stride, SlotTenant, SLOT_ALIGN};
 pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 // Defined in both configurations — `None` when there is no CUDA device to

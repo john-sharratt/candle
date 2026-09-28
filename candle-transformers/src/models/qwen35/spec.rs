@@ -40,10 +40,13 @@
 //! projections, attention, and a 512-expert MoE. On the measured hybrid that is
 //! a few percent of the wave it lets us skip.
 
-use candle::{Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
-use crate::models::delta_net::state_store::RegionBump;
+use candle::DType;
+use candle::{Device, Result, Tensor};
+
 use crate::models::delta_net::{
     delta_net_advance_spans, DeltaNetConstants, DeltaNetDims, DeltaNetOut, DeltaNetProjections,
     DeltaNetSeq, DeltaNetState, LayerKind, RecurrentStateStore, SpanOperands,
@@ -51,7 +54,7 @@ use crate::models::delta_net::{
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_empty;
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
+use candle_nn::kv_cache::{begin_wave, claim_arena_slots, LayerPhase, SlotTenant, WaveGeneration};
 
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
 /// one set of shared buffers, so the replay that consumes them advances every
@@ -76,28 +79,6 @@ pub struct VerifyStash {
     /// half-written stash advances some layers and not others, silently. This
     /// is the record that makes the difference checkable.
     pub filled: Vec<bool>,
-    /// The reservation regions `layers` is carved from.
-    ///
-    /// **The regions, not the allocator that claimed them.** Keeping the
-    /// `RegionBump` would keep its `SpanClaims` alive, and that is an open arena
-    /// window — every later wave blocks in `wave_gate` waiting for it to close.
-    /// Measured as a 58-minute hang with the process alive and not one line of
-    /// output. `RegionBump::into_regions` is the handover.
-    ///
-    /// **Declared last, and that is load-bearing.** Struct fields drop in
-    /// declaration order, so `layers` — whose tensors are `Foreign` leases
-    /// pointing into these regions — must be gone before the regions return to
-    /// the free list. Moving this field up would leave every buffer above it
-    /// naming ground another claimant may already hold.
-    ///
-    /// Empty on a device with no reservation to carve from: a CPU device, or a
-    /// unit test. Those fall back to driver memory, which is what the whole
-    /// stash used to do.
-    ///
-    /// Never read: it is an RAII holder and dropping it is the whole of its job.
-    #[cfg(feature = "cuda")]
-    #[allow(dead_code)]
-    regions: Vec<candle_nn::kv_cache::SpanRegion>,
 }
 
 /// One sequence's rows within the cohort stash.
@@ -111,6 +92,47 @@ pub struct StashSpan {
     pub start: usize,
     /// Rows the sweep captured for this sequence.
     pub len: usize,
+}
+
+/// `n` layers of driver-memory operands — for a device with no reservation to carve
+/// from (a CPU device, or a unit test), and for an empty cohort, which needs no
+/// memory at all.
+fn zeroed_layers(
+    dims: &DeltaNetDims,
+    cap: usize,
+    dev: &Device,
+    n: usize,
+) -> Result<Vec<SpanOperands>> {
+    (0..n)
+        .map(|_| SpanOperands::zeros(dims, cap, dev))
+        .collect()
+}
+
+/// `n` layers of operands in rewind-stash arena slots: one claim per operand width
+/// covering every layer, so the arena window opens at most four times for the whole
+/// stash rather than once per buffer.
+#[cfg(feature = "cuda")]
+fn stash_in_slots(
+    dims: &DeltaNetDims,
+    cap: usize,
+    dev: &Device,
+    n: usize,
+) -> Result<Vec<SpanOperands>> {
+    let f32_bytes = DType::F32.size_in_bytes();
+    let mut per_width = SpanOperands::widths(dims)
+        .into_iter()
+        .map(|cols| {
+            claim_arena_slots(dev, SlotTenant::RewindStash, cap * cols * f32_bytes, n)
+                .map(|slots| slots.into_iter().map(Arc::new))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    (0..n)
+        .map(|_| {
+            let slots =
+                [0, 1, 2, 3].map(|w| per_width[w].next().expect("n slots claimed per width"));
+            SpanOperands::in_slots(dims, cap, dev, slots)
+        })
+        .collect()
 }
 
 impl VerifyStash {
@@ -136,29 +158,19 @@ impl VerifyStash {
         // From the reservation where there is one, so the stash trades against
         // KV and weights like every other long-lived buffer instead of
         // competing invisibly for the card outside the span. See
-        // [`SpanOperands::in_regions`] for the measurement that made this
+        // [`SpanOperands::in_slots`] for the measurement that made this
         // necessary.
         #[cfg(feature = "cuda")]
-        let mut regions = RegionBump::for_device(dev)?;
-        let mut layers = Vec::with_capacity(n);
-        for _ in 0..n {
-            #[cfg(feature = "cuda")]
-            let ops = match regions.as_mut() {
-                Some(bump) => SpanOperands::in_regions(dims, cap, dev, bump)?,
-                None => SpanOperands::zeros(dims, cap, dev)?,
-            };
-            #[cfg(not(feature = "cuda"))]
-            let ops = SpanOperands::zeros(dims, cap, dev)?;
-            layers.push(ops);
-        }
+        let layers = match dev {
+            Device::Cuda(_) if cap > 0 && n > 0 => stash_in_slots(dims, cap, dev, n)?,
+            _ => zeroed_layers(dims, cap, dev, n)?,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let layers = zeroed_layers(dims, cap, dev, n)?;
         Ok(Self {
             layers,
             spans: Vec::new(),
             filled: vec![false; n],
-            // Takes the regions and drops the bump, closing the arena window
-            // before this returns — see the field's own note.
-            #[cfg(feature = "cuda")]
-            regions: regions.map_or_else(Vec::new, RegionBump::into_regions),
         })
     }
 
@@ -215,9 +227,10 @@ impl VerifyStash {
     /// **The buffers outlive a span deliberately and must not outlive every
     /// span.** Keeping them across steps is the point — they are reallocated
     /// only when a wider cohort arrives — but once no sequence names one, the
-    /// stash is holding reservation regions on behalf of nobody, and it holds
-    /// them for the life of the process. It is not KV, so no arena sweep sees
-    /// it and every KV-side diagnostic reports the pool as healthy.
+    /// stash is holding rewind-stash arena slots on behalf of nobody, and it holds
+    /// them for the life of the process. It is not KV, so every KV-side
+    /// diagnostic reports the pool as healthy; only the tenant's own arena count
+    /// shows the ground it keeps.
     pub fn is_unused(&self) -> bool {
         self.spans.is_empty()
     }

@@ -144,19 +144,57 @@ pub fn plan_pool(arenas: &[ArenaSlots], key: ArenaKey, max_moves: usize) -> Opti
         return None;
     }
     order.sort_unstable_by_key(|a| a.rank);
+    let runs: Vec<SlotRun<'_>> = order
+        .iter()
+        .map(|a| SlotRun {
+            id: a.arena_idx,
+            capacity: a.capacity,
+            occupied: &a.occupied,
+        })
+        .collect();
+    let (moves, clipped) = pack_moves(&runs, max_moves);
+    if moves.is_empty() {
+        return None;
+    }
+    Some(CompactPlan {
+        moves,
+        key,
+        clipped,
+    })
+}
 
+/// One arena as the two-cursor walk sees it: an id for the moves to name, its slot
+/// count, and its occupied slots in ascending order.
+pub struct SlotRun<'a> {
+    pub id: usize,
+    pub capacity: usize,
+    pub occupied: &'a [u32],
+}
+
+/// The two-cursor walk over arenas **already in address order**: the moves that pack
+/// their live slots into a gapless prefix, and whether `max_moves` (zero for none)
+/// stopped it first.
+///
+/// Every move copies the highest occupied slot into the lowest free one, and names
+/// both by `(SlotRun::id, slot)`. See [`plan_pool`] for why this is the minimum move
+/// count for a perfect pack, and why a clipped walk is still sound — the pool that
+/// applies a prefix of these moves is strictly better packed than before it.
+pub fn pack_moves(order: &[SlotRun<'_>], max_moves: usize) -> (Vec<ChunkMove>, bool) {
+    if order.is_empty() {
+        return (Vec::new(), false);
+    }
     // A flat occupancy view over the class's whole slot sequence. `occupied` is
     // ascending per arena, so a membership test is a binary search and the walk
     // below stays O(slots log capacity) rather than materialising a bitmap over
     // every slot of every arena — which at the 320 B class's 52,428 chunks per
     // arena would be the largest allocation in the pass.
-    let occupied_at = |arena: &ArenaSlots, slot: u32| arena.occupied.binary_search(&slot).is_ok();
+    let occupied_at = |arena: &SlotRun<'_>, slot: u32| arena.occupied.binary_search(&slot).is_ok();
 
     // Global slot ordinals, so "left is still below right" is one comparison.
     // Prefix sums over capacity, in rank order.
     let mut base = Vec::with_capacity(order.len());
     let mut total = 0usize;
-    for a in &order {
+    for a in order {
         base.push(total);
         total += a.capacity;
     }
@@ -184,7 +222,7 @@ pub fn plan_pool(arenas: &[ArenaSlots], key: ArenaKey, max_moves: usize) -> Opti
                 ls = 0;
                 continue;
             }
-            if occupied_at(order[lp], ls) {
+            if occupied_at(&order[lp], ls) {
                 ls += 1;
                 continue;
             }
@@ -205,7 +243,7 @@ pub fn plan_pool(arenas: &[ArenaSlots], key: ArenaKey, max_moves: usize) -> Opti
                 continue;
             }
             rs -= 1;
-            if occupied_at(order[rp], rs) {
+            if occupied_at(&order[rp], rs) {
                 break base[rp] + rs as usize;
             }
         };
@@ -224,22 +262,15 @@ pub fn plan_pool(arenas: &[ArenaSlots], key: ArenaKey, max_moves: usize) -> Opti
         }
 
         moves.push(ChunkMove {
-            from: (order[rp].arena_idx, rs),
-            to: (order[lp].arena_idx, ls),
+            from: (order[rp].id, rs),
+            to: (order[lp].id, ls),
         });
         // The destination is now occupied and the source now free; step both past
         // the slots just settled so neither cursor reconsiders them.
         ls += 1;
     }
 
-    if moves.is_empty() {
-        return None;
-    }
-    Some(CompactPlan {
-        moves,
-        key,
-        clipped,
-    })
+    (moves, clipped)
 }
 
 /// The whole of what fragmentation denies the weight side, in regions.

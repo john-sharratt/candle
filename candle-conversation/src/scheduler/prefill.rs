@@ -249,6 +249,12 @@ impl Scheduler {
         /// *considered* every wave rather than *run* every wave.
         const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
+        /// Layer states one recurrent pass may move. Each is one device copy of a few
+        /// MiB, so this bounds the pass at a few hundred MiB of copy — well under the
+        /// KV pass's budget — while letting a badly scattered arena set converge in a
+        /// handful of passes.
+        const MAX_STATE_MOVES: usize = 256;
+
         // **A cheap gate, because this is consulted every wave.** `kv_ground_lost`
         // is not cheap — it sums `packed_arenas` across the ladder, which is the
         // census — so it cannot be the thing that decides whether to census.
@@ -307,6 +313,36 @@ impl Scheduler {
         // is safe because a pass is idempotent under one `Sweep`: after a rewrite the
         // residence holds NEW gids and the map is keyed on the old ones, so a second
         // visit matches nothing.
+        // **Recurrent state first, in the same gap and for the same holes.** Its
+        // arenas are regions of the span like the KV side's, and on a hybrid stack
+        // they are most of what stands above the holes — the KV pools can be packed
+        // to a region while the frontier stays pinned by a state arena near the top.
+        // Its pass moves each state block with one device copy and repoints the one
+        // store that holds it, so it needs no holder sweep and no quiesce; a failure
+        // part-way leaves every store consistent (each move is whole) and is reported
+        // loudly rather than retried silently.
+        match self.model.compact_recurrent(MAX_STATE_MOVES) {
+            Ok(r) if r.planned > 0 => {
+                tracing::info!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    planned = r.planned,
+                    moved = r.moved,
+                    regions_before = r.regions_before,
+                    regions_after = r.regions_after,
+                    "recurrent state compaction packed the state arenas",
+                );
+                if r.regions_released() > 0 {
+                    let _g = super::profile::span("compact:reclaim_weights");
+                    self.model.reclaim_spare_ground();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                target: "candle_conversation::scheduler::vram_relief",
+                "recurrent state compaction failed: {e}",
+            ),
+        }
+
         let substrates: Vec<_> = self.slot_conversations.values().cloned().collect();
         let mut swept = 0usize;
         // **The projection caches are holders too.** Taken out for the duration so
@@ -534,28 +570,24 @@ impl Scheduler {
         // Gallery eviction — **this cannot clear the pressure below it**, and is
         // not here to.
         //
-        // `evict_lru` drops `PageRun`s, returning pages to the gallery's own
-        // `PagePool`. The VRAM behind them is `GalleryArena`'s `storage.slabs`,
-        // which is only ever appended to (`add_slab`) and never shrunk, and
-        // those slabs come from the CUDA pool rather than the KV reservation.
-        // So `region_stats().free` is unchanged by this call and the next
-        // `vram_under_pressure_for` is still true — `gallery_freed` counts bytes
-        // returned to a free list, not to the card.
+        // `evict_lru` drops `PageRun`s, returning page slots to the gallery's
+        // own arenas. A region goes back to the span only when the last page in
+        // its arena goes, so `gallery_freed` counts pages freed, and
+        // `region_stats().free` moves only by the arenas that emptied — the next
+        // `vram_under_pressure_for` can still be true.
         //
-        // Gallery growth is bounded by the arena itself now — it evicts to its
-        // own ceiling at admission — so this no longer has to be the only limit,
-        // and it must not fire merely because KV is tight. It used to: the test
-        // was KV pressure alone, which this call cannot clear, so every episode
-        // shed belief-scan residency that the next scan rebuilt from the
-        // substrate. Now it only runs when the arena is *itself* over its
-        // ceiling, which is the one case where evicting is the right answer and
-        // the bytes are genuinely reclaimable.
+        // Gallery growth is bounded by the arena itself — it evicts to its own
+        // ceiling at admission — so this is not the only limit, and it must not
+        // fire merely because KV is tight: that would shed belief-scan residency
+        // the next scan rebuilds from the substrate, every episode. It runs only
+        // when the arena is *itself* over its ceiling, which is the one case
+        // where evicting is the right answer.
         if self.vram_under_pressure_for(phase) {
             if let Some(arena) = self.gallery_arena.as_ref() {
                 let cap = arena.cap_bytes();
-                let resident = arena.resident_bytes();
-                if resident > cap {
-                    gallery_freed = arena.evict_lru((resident - cap).max(want));
+                let held = arena.page_bytes();
+                if held > cap {
+                    gallery_freed = arena.evict_lru((held - cap).max(want));
                 }
             }
         }

@@ -652,31 +652,63 @@ What differs is how a holder follows the move, and it is the minting argument ag
   takes one of the pass's planned record sources, whose record may have died after the
   census: that slot is ground the pass has declared it is reading.
 
-## 9. Recurrent state: the third arena kind
+## 9. Tenant arenas: the third arena kind
+
+**Tenant arenas** (`chunked::tenant_arena`) are one 16 MiB region cut into slots of one
+stride, the block rounded up to 256 B. They serve the span's per-sequence tenants that
+outlive a wave, and every tenant has **its own arenas** — pools are keyed by
+`(device, tenant, stride)`, so two tenants never share an arena even when their strides
+coincide, and each tenant's ground is countable on its own (`arena_regions`). The free
+set is a bitmap, so an arena of thousands of slots is as cheap as one of five.
+
+| Tenant | Slot | Holder |
+|---|---|---|
+| `RecurrentState` | one DeltaNet layer state (`s` + conv tail) | `RecurrentStateStore` |
+| `RewindStash` | one operand buffer of a speculative verify cohort, `[cap, width]` | `VerifyStash` (`SpanOperands::in_slots`) |
+| `Gallery` | one 6 KiB provenance gallery page (32 tokens × 24 words) | `GalleryArena`'s page runs |
+| `QsaIndex` | one live-tail key page (256 block keys), an open block, or a rewind copy of one | `IndexCache` (`qwen4exp::index_keys`) |
+
+Common to all of them:
+
+- **Device-global, not the KV backing's.** Their holders outlive every session, while a
+  KV backing and its arena storage belong to one; so each arena holds its region as a
+  `SpanRegion`, claimed through `SpanClaims` between forwards like every other tenant of
+  the span. The window is opened only when a new arena is needed, and a claim inside a
+  forward that does need one is refused, loudly.
+- **Views are anchored.** A tensor over a slot (`ArenaSlot::tensor`) holds an `Arc` of the
+  slot in its storage (`LeaseAnchor`), so the slot goes back only when no view of it is
+  left.
+- **Accounted as regions.** Each holder's whole-card figure counts its tenant's regions:
+  `RecurrentStateStore::arena_reserved_bytes` (recurrent state and rewind stash),
+  `GalleryArena::resident_bytes`, and the QSA-index share of qwen4exp's
+  `recurrent_reserved_bytes`.
+
+The gallery's growth ceiling is measured in the bytes of the pages its turns hold
+(`GalleryArena::page_bytes`), not in regions: eviction frees pages, and a region goes
+back only when its arena's last page does, so a ceiling on regions could stay breached
+however many turns were evicted. The QSA live tail is paged so that it grows a page at a
+time rather than doubling and copying, and so that its scorer reads it through the
+paged scorer's descriptor table (and `qsa_rope_rows`' source page table on the cuBLAS
+route) rather than as one dense block. Its snapshots copy the open block into rewind
+buffers claimed with the cache, so a forward's failure bracket allocates nothing.
+
+### Recurrent state
 
 A DeltaNet layer's state — the `s` accumulator plus its conv tail — is a fixed-size
 block of model geometry (3.12 MiB on Flash-Next, 2.09 MiB on Qwen3.5), and a sequence
-holds two per recurrent layer: the live state and the half a wave writes. They are
-**state arenas** (`chunked::state_arena`): one 16 MiB region cut into slots of one
-stride, the block rounded up to 256 B, shared by every sequence of that geometry. A
-sequence holds slots, not regions. Five fit a region on Flash-Next (2.6 % unused),
-seven on Qwen3.5 (8.4 %).
-
-- **Device-global, not the KV backing's.** A model's recurrent stores outlive every
-  session, while a KV backing and its arena storage belong to one; so the arenas are
-  keyed by `(device, stride)` and each holds its region as a `SpanRegion`, claimed
-  through `SpanClaims` between forwards like every other tenant of the span. The
-  window is opened only when a new arena is needed.
+holds two per recurrent layer: the live state and the half a wave writes. A sequence
+holds slots, not regions. Five fit a region on Flash-Next (2.6 % unused), seven on
+Qwen3.5 (8.4 %).
 - **One slot per layer state.** The live and write halves need not be adjacent — the
   kernels take a pointer per buffer — so each is its own slot, which is what lets a
   slot be a fifth of a region instead of two-fifths.
-- **RAII.** A `StateSlot` returns itself on drop, and the drop that empties an arena
+- **RAII.** An `ArenaSlot` returns itself on drop, and the drop that empties an arena
   releases its region. A recycled slot holds its last tenant's state, so a store zeroes
   its `live` slots (read at zero, invariant 6's exemption) and leaves the write halves
   alone.
 - **Priced as slots, accounted as regions.** Admission prices a store at two slots per
   recurrent layer at the stride — an arena's unused tail is shared and charged to no
-  one sequence. The whole-card report counts every state arena's regions instead
+  one sequence. The whole-card report counts every recurrent-state arena's regions instead
   (`RecurrentStateStore::arena_reserved_bytes`), because that is what recurrent state
   denies the rest of the span: a sum over stores would leave out every free slot and
   unused tail, and any slot a handle kept past its store.
@@ -689,6 +721,22 @@ seven on Qwen3.5 (8.4 %).
   while kernels may still be in flight: its next tenant in the arena works on the same
   primary stream, and a region released by an emptied arena is stamped dirty, so its
   next claim synchronises before zeroing it — the same fence every arena relies on.
-- **Not compacted yet.** The arenas are enumerable, every slot has an address and every
-  arena a position — the census a compaction plans from — but no pass moves them, so
-  their regions still count as span tenants in the efficiency report.
+- **Compacted with the same two-cursor walk, between forwards.** The scheduler runs a
+  recurrent pass in the same gap and behind the same gate as the KV pass
+  (`BatchedModelCore::compact_recurrent` → `compact_stores` → `plan_slot_moves`). Per
+  stride it claims as many
+  fresh low arenas as the pass's move budget can fill — the region free list puts them in
+  the lowest holes — then plans with `pack_moves`, destinations claimed as they are
+  planned. Each move is one device copy on the primary stream and a repoint of the one
+  store holding the source: that store's half gets tensors rebuilt on the new slot, and
+  the old slot goes back when its last anchor drops. Both halves of a layer move, since the
+  write half holds the rewind point right after a commit. No holder sweep and no quiesce:
+  a store is the only thing that can hold a slot except an anchored handle, which just
+  keeps the old slot alive. A pass is a no-op while any store has a wave open, and the
+  pointer tables are rebuilt every forward, so a moved half is simply read at its new
+  address next time.
+
+  Provisioning *one* low arena per pass was measured too slow: the state population fell
+  by at most a region per pass while sequences churned, and Flash-Next held at 84 % with
+  45 regions stranded. Sized to the move budget, the same probe reads 98 % worst
+  sustained, and the frontier equals the live count after the drain.

@@ -41,12 +41,16 @@
 #[cfg(feature = "cuda")]
 use std::cmp::Reverse;
 use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use candle::wave_provenance::WaveTicket;
 #[cfg(feature = "cuda")]
 use candle::LeaseAnchor;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::ArenaSlot;
 
 use super::types::{DeltaNetDims, ZGate};
 
@@ -969,19 +973,33 @@ impl SpanOperands {
     /// — see [`DeltaNetSeq::stash`].
     ///
     /// Driver memory, for a caller with no reservation to carve from — a CPU
-    /// device, or a unit test. Production takes [`Self::in_regions`]; see there
+    /// device, or a unit test. Production takes [`Self::in_slots`]; see there
     /// for why the difference matters.
     pub fn zeros(dims: &DeltaNetDims, cap: usize, dev: &Device) -> Result<Self> {
-        let f = |cols: usize| Tensor::zeros((cap, cols), DType::F32, dev);
+        let [qkv, z, beta_lin, alpha_lin] =
+            Self::widths(dims).map(|cols| Tensor::zeros((cap, cols), DType::F32, dev));
         Ok(Self {
-            qkv: f(dims.conv_dim())?,
-            z: f(dims.value_dim())?,
-            beta_lin: f(dims.n_v_heads)?,
-            alpha_lin: f(dims.n_v_heads)?,
+            qkv: qkv?,
+            z: z?,
+            beta_lin: beta_lin?,
+            alpha_lin: alpha_lin?,
         })
     }
 
-    /// [`Self::zeros`], carved from the **reservation** rather than the driver.
+    /// Columns of each operand, in field order: `qkv`, `z`, `beta_lin`, `alpha_lin`.
+    /// Each buffer is `[cap, width]` F32.
+    pub fn widths(dims: &DeltaNetDims) -> [usize; 4] {
+        [
+            dims.conv_dim(),
+            dims.value_dim(),
+            dims.n_v_heads,
+            dims.n_v_heads,
+        ]
+    }
+
+    /// [`Self::zeros`], in **rewind-stash arena slots** of the reservation rather
+    /// than driver memory — one slot per operand, in [`Self::widths`] order, each
+    /// zeroed and viewed as an anchored tensor so no view of it outlives the slot.
     ///
     /// The stash is long-lived per-cohort state: it must outlive the wave (that
     /// is what it is *for*), so it cannot come from the wave arena, and until
@@ -1002,26 +1020,32 @@ impl SpanOperands {
     /// Inside the reservation it is visible to the partition instead of
     /// competing with it: the region claim is counted, and a claim that runs
     /// short asks the weight side to concede layers rather than failing the
-    /// device. Same tier and the same lifetime class as the recurrent state it
-    /// exists to rewind, carved by a region bump rather than from a state arena
-    /// because its rows are sized by the verify cap, not by the model's geometry.
+    /// device. In an arena of its own tenant, so its slots are counted and packed
+    /// apart from the recurrent state it exists to rewind; its stride follows the
+    /// verify cap, which is why each width is a pool of its own.
     ///
-    /// `pub(crate)` rather than `pub`: it takes the region allocator, which is
-    /// this crate's own partition machinery and not something an external caller
-    /// could hold.
+    /// **Zeroed, unlike a wave buffer.** The replay hands the mixer the whole
+    /// `cap`-row buffer while only the captured spans were filled, so these are
+    /// zeros read before being written — hot-path invariant 6's exemption.
     #[cfg(feature = "cuda")]
-    pub(crate) fn in_regions(
+    pub fn in_slots(
         dims: &DeltaNetDims,
         cap: usize,
         dev: &Device,
-        bump: &mut super::state_store::RegionBump,
+        slots: [Arc<ArenaSlot>; 4],
     ) -> Result<Self> {
-        let mut f = |cols: usize| bump.take_zeroed((cap, cols), DType::F32, dev);
+        let mut out = Vec::with_capacity(4);
+        for (slot, cols) in slots.iter().zip(Self::widths(dims)) {
+            slot.zero(cap * cols * DType::F32.size_in_bytes(), dev)?;
+            out.push(slot.tensor(0, DType::F32, (cap, cols), dev)?);
+        }
+        let [qkv, z, beta_lin, alpha_lin]: [Tensor; 4] =
+            out.try_into().expect("four operands, four slots");
         Ok(Self {
-            qkv: f(dims.conv_dim())?,
-            z: f(dims.value_dim())?,
-            beta_lin: f(dims.n_v_heads)?,
-            alpha_lin: f(dims.n_v_heads)?,
+            qkv,
+            z,
+            beta_lin,
+            alpha_lin,
         })
     }
 

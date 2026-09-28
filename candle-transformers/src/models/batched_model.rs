@@ -54,6 +54,7 @@ use super::batched_layer::{
     forward_layer_batched_mixed, BatchedAttentionLayer, BatchedAttentionParams, BatchedPrefillMeta,
     DecodeHeaders, WaveAttnGroup,
 };
+use super::delta_net::RecurrentCompaction;
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
 use super::expert_lre::{WeightPlan, WeightPlanning};
@@ -464,6 +465,14 @@ pub trait BatchedModelCore {
     /// Zero on a stack with no recurrent layers, which is the true cost there.
     fn recurrent_store_bytes(&self) -> usize {
         0
+    }
+
+    /// Compact the arenas per-sequence recurrent state lives in, moving at most
+    /// `max_moves` layer states (zero for no bound). Between forwards only.
+    ///
+    /// Nothing to do on a stack with no recurrent layers, which is the default.
+    fn compact_recurrent(&self, _max_moves: usize) -> Result<RecurrentCompaction> {
+        Ok(RecurrentCompaction::default())
     }
 
     /// Reset expert pipeline telemetry counters to zero.

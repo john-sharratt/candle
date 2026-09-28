@@ -49,7 +49,7 @@ use super::wave::delta_net_mix_wave;
 
 use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::LayerKind;
-use crate::models::delta_net::{RecurrentStateStore, StashSlot};
+use crate::models::delta_net::{RecurrentCompaction, RecurrentStateStore, StashSlot};
 use crate::models::profile::pipeline_record_duration;
 use crate::models::verify_wave::VerifyPlan;
 use candle_nn::kv_cache::ModelGeometry;
@@ -698,6 +698,10 @@ impl ManagedBatchedModel for HybridBatched {
 
     fn recurrent_store_bytes(&self) -> usize {
         HybridBatched::recurrent_store_bytes(self)
+    }
+
+    fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        HybridBatched::compact_recurrent(self, max_moves)
     }
 
     fn reset_expert_stats(&self) {

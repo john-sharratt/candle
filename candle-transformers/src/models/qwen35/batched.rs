@@ -33,6 +33,7 @@ use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::RecurrentStateStore;
+use crate::models::delta_net::{compact_stores, RecurrentCompaction};
 use crate::models::draft_ladder::DraftLadder;
 use crate::models::lora::Adapter;
 use crate::models::rope_schedule::{RopeRungs, RopeSchedule};
@@ -507,6 +508,22 @@ impl HybridBatched {
     /// [`RecurrentStateStore::arena_reserved_bytes`].
     pub fn recurrent_reserved_bytes(&self) -> usize {
         RecurrentStateStore::arena_reserved_bytes(&self.model.device)
+    }
+
+    /// Compact the state arenas every sequence's recurrent state lives in — see
+    /// [`compact_stores`]. Between forwards; holds the map for the pass, which is
+    /// what keeps a wave from opening on a store mid-move.
+    pub fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        compact_stores(
+            map.values_mut(),
+            &self.model.cfg.delta_net,
+            &self.model.device,
+            max_moves,
+        )
     }
 
     /// What one sequence's state costs, whether or not one is standing.

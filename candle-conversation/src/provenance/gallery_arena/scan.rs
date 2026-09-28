@@ -312,8 +312,15 @@ impl GalleryArena {
         let (idx, reused) = match self.reuse_index(fp) {
             Some(idx) => (idx, true),
             None => {
-                let built = Arc::new(self.build_index(segments)?);
+                // The generation is read BEFORE the build. Read after it, a turn
+                // evicted or re-sealed by another thread mid-build would move the
+                // generation past the addresses this index captured, and the cache
+                // would then vouch for them. Read before, such a move leaves the
+                // entry stale and the next scan rebuilds — as does this build's own
+                // uploads, so an index is reused from the first rescan that uploads
+                // nothing.
                 let gen = self.residency_gen();
+                let built = Arc::new(self.build_index(segments)?);
                 self.store_index(fp, gen, built.clone());
                 (built, false)
             }

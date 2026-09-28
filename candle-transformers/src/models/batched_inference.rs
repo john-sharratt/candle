@@ -28,6 +28,7 @@ use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
 use super::expert_lre::WeightPlanning;
 use crate::models::delta_net::ExportedLayerState;
+use crate::models::delta_net::RecurrentCompaction;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::rope_schedule::rung_of;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
@@ -5284,6 +5285,13 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// Compact the arenas per-sequence recurrent state lives in, moving at most
+    /// `max_moves` layer states (zero for no bound). Between forwards only — the
+    /// scheduler runs it in the same gap as the KV compaction, for the same holes.
+    fn compact_recurrent(&self, _max_moves: usize) -> Result<RecurrentCompaction> {
+        Ok(RecurrentCompaction::default())
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 
@@ -5501,6 +5509,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn recurrent_store_bytes(&self) -> usize {
         self.model().recurrent_store_bytes()
+    }
+
+    fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        self.model().compact_recurrent(max_moves)
     }
 
     fn reset_expert_stats(&self) {

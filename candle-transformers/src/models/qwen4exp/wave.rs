@@ -33,9 +33,9 @@ use candle::quantized::cuda::to_dynamic;
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
-    begin_forward, begin_wave, end_wave_transient, ffn_work_dtype, plan_wave_transient,
-    DeltaNetWidths, HyperWidths, KvCache, LayerPhase, ModelGeometry, SharedExpertWidths, WavePlan,
-    WaveWidth, QWEN4EXP_KV_FACTORS,
+    arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype,
+    plan_wave_transient, DeltaNetWidths, HyperWidths, KvCache, LayerPhase, ModelGeometry,
+    SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth, QWEN4EXP_KV_FACTORS,
 };
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
@@ -43,7 +43,7 @@ use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hyper::{hc_combine, hc_mix};
-use super::indexer::{select_layer, IndexCache, IndexSnapshot};
+use super::indexer::{compact_index_caches, select_layer, IndexCache, IndexSnapshot};
 use super::paged_index;
 use super::paged_index::{IndexPage, SealedIndex};
 use super::ple::{ple_apply, ple_row_ids, PleState};
@@ -60,8 +60,8 @@ use crate::models::batched_layer::{
 use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::delta_net::StashSlot;
 use crate::models::delta_net::{
-    quantized_delta_net_layer_forward_spans, seq_spans, DeltaNetSeq, ExportedLayerState, LayerKind,
-    RecurrentStateStore, SeqSpan, ZGate,
+    compact_stores, quantized_delta_net_layer_forward_spans, seq_spans, DeltaNetSeq,
+    ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
 use crate::models::expert_lre::{WeightPlan, WeightPlanning};
@@ -468,7 +468,7 @@ impl Qwen4ExpBatched {
                 continue;
             }
             // Sealing is not a forward: no phase is open to carve from.
-            let cells = c.flush_open_block(w, ratio, cfg.rms_norm_eps, None)?;
+            let cells = c.flush_open_block(w, cfg.rms_norm_eps, None)?;
             pages.push(SealedIndex {
                 page: seal_page(&c.live_rows()?, cells.unwrap_or(ratio))?,
                 // The flush consumed the carried rows, so the page IS the whole
@@ -572,7 +572,7 @@ impl Qwen4ExpBatched {
                     .saturating_sub(c.page_row_span())
             };
             let mut fork = c.fork()?;
-            let cells = fork.flush_open_block(w, ratio, cfg.rms_norm_eps, None)?;
+            let cells = fork.flush_open_block(w, cfg.rms_norm_eps, None)?;
             let rows = fork.live_rows()?;
             let n = rows.dim(0)?;
             if first > n {
@@ -734,7 +734,7 @@ impl Qwen4ExpBatched {
                     continue;
                 }
                 let mut fork = c.fork()?;
-                let cells = fork.flush_open_block(w, ratio, cfg.rms_norm_eps, None)?;
+                let cells = fork.flush_open_block(w, cfg.rms_norm_eps, None)?;
                 layer_pages.push(SealedIndex {
                     page: seal_page(&fork.live_rows()?, cells.unwrap_or(ratio))?,
                     open: fork.open_rows()?,
@@ -1065,28 +1065,45 @@ impl Qwen4ExpBatched {
     /// tenant, and a total that omits it makes the partition look emptier than
     /// it is — the same blindness that let the dense weights hide.
     pub fn recurrent_reserved_bytes(&self) -> usize {
-        // Every state arena's regions, not a sum over the stores: the stores share
+        // Every tenant arena's regions, not a sum over the holders: holders share
         // arenas, so their sum leaves out the free slots and unused tails.
         let gdn = RecurrentStateStore::arena_reserved_bytes(&self.model.device);
-        let idx: usize = self
-            .index
-            .read()
-            .map(|m| {
-                m.values()
-                    .map(|caches| {
-                        caches
-                            .iter()
-                            .map(|c| {
-                                c.capacity_blocks()
-                                    * self.model.cfg.indexer.head_dim
-                                    * std::mem::size_of::<f32>()
-                            })
-                            .sum::<usize>()
-                    })
-                    .sum()
-            })
-            .unwrap_or(0);
+        let idx = arena_regions(&self.model.device, SlotTenant::QsaIndex) * SpanRegion::bytes();
         gdn + idx
+    }
+
+    /// Compact the arenas the carried state lives in: every sequence's GDN state
+    /// ([`compact_stores`]), then every QSA index cache ([`compact_index_caches`]).
+    /// The report sums both. Between forwards; holds both maps for the pass, which
+    /// is what keeps a wave from opening on a store or a cache mid-move.
+    pub fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        let mut map = self
+            .recurrent
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
+        let gdn = compact_stores(
+            map.values_mut(),
+            &self.model.cfg.delta_net,
+            &self.model.device,
+            max_moves,
+        )?;
+        let mut idx = self
+            .index
+            .write()
+            .map_err(|_| candle::Error::Msg("index lock poisoned".into()))?;
+        let mut caches: Vec<&mut IndexCache> = idx.values_mut().flatten().collect();
+        let qsa = compact_index_caches(
+            &mut caches,
+            self.model.cfg.indexer.head_dim,
+            &self.model.device,
+            max_moves,
+        )?;
+        Ok(RecurrentCompaction {
+            planned: gdn.planned + qsa.planned,
+            moved: gdn.moved + qsa.moved,
+            regions_before: gdn.regions_before + qsa.regions_before,
+            regions_after: gdn.regions_after + qsa.regions_after,
+        })
     }
 
     /// What admitting **one** more sequence costs in carried state.
@@ -1097,9 +1114,9 @@ impl Qwen4ExpBatched {
     /// answers before the first one exists, which is when admission asks.
     ///
     /// **The index caches are deliberately not in it.** They are the other half
-    /// of [`Self::recurrent_reserved_bytes`], but their size is
-    /// `capacity_blocks()` — it grows with the context the sequence has already
-    /// decoded, so a *new* sequence brings none. Charging a fresh turn for the
+    /// of [`Self::recurrent_reserved_bytes`], but their key pages grow with the
+    /// context the sequence has already decoded, so a *new* sequence brings only
+    /// its open-block buffers — a few KiB per layer. Charging a fresh turn for the
     /// index a long conversation has accumulated would price arrivals by the
     /// depth of the sequences already resident, which is the mistake this
     /// function exists to end.
@@ -1552,6 +1569,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn recurrent_store_bytes(&self) -> usize {
         Qwen4ExpBatched::recurrent_store_bytes(self)
+    }
+
+    fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        Qwen4ExpBatched::compact_recurrent(self, max_moves)
     }
 
     /// A view carve. The child borrows the parent's K/V; its carried state has
