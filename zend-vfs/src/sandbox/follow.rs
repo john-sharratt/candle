@@ -1,25 +1,37 @@
-//! Bringing a job's local branch up to the commit its conversation pinned,
+//! Bringing a job's local branch onto the commit its conversation pinned,
 //! with the checkout locked and its owner's state set aside.
 
 use std::collections::BTreeSet;
 
 use crate::checkout::{CheckoutError, Preserved};
+use crate::read::record::LocalBranch;
 use crate::{BranchName, Followed, Oid, Repo, Rev};
 
-/// Fast-forward `branch` to `to` where origin already holds it and the
-/// branch is behind it ([`Repo::follow_record`]). A branch that has moved
-/// off `to` since the job was checked fails it.
+/// Put `branch` on `to`, the commit on origin's copy the conversation
+/// pinned, for the job:
 ///
-/// When the owner's checkout is on `branch` with changes of its own to
-/// files the commits it would follow change too, nothing moves: put back
-/// over the branch once it moved on, the owner's copies would undo what it
-/// gained there — the case `git merge --ff-only` refuses too.
+/// - a branch holding commits origin never had — its owner's, never pushed —
+///   is set aside ([`Preserved::set_branch_aside`]): moved onto `to` for the
+///   job and put back at its own commit with the rest of the checkout, so
+///   the job never builds on them and nothing of them is lost or published;
+/// - a branch behind `to` is fast-forwarded to it ([`Repo::follow_record`]),
+///   and keeps what it gained.
+///
+/// A branch that has moved off what the job was checked against fails it.
+/// When the owner's checkout is on a branch it would fast-forward, with
+/// changes of its own to files the commits it would follow change too,
+/// nothing moves: put back over the branch once it moved on, the owner's
+/// copies would undo what it gained there — the case `git merge --ff-only`
+/// refuses too.
 pub(super) fn follow(
     repo: &Repo,
-    preserved: &Preserved,
+    preserved: &mut Preserved,
     branch: &BranchName,
     to: &Oid,
 ) -> Result<(), CheckoutError> {
+    if let Some(local) = repo.local_branch(branch)?.filter(LocalBranch::unpushed) {
+        return set_aside(repo, preserved, branch, &local, to);
+    }
     if preserved.is_on(branch) {
         let in_the_way = own_work_in_the_way(repo, preserved, branch, to)?;
         if !in_the_way.is_empty() {
@@ -30,10 +42,37 @@ pub(super) fn follow(
         }
     }
     match repo.follow_record(branch, to)? {
-        Followed::Refused => Err(CheckoutError::BranchMoved {
-            branch: branch.to_string(),
-        }),
+        Followed::Refused => Err(moved(branch)),
         Followed::Level | Followed::Moved { .. } => Ok(()),
+    }
+}
+
+/// Set the owner's unpushed commits on `branch` aside for the job — only
+/// onto a commit origin holds that what origin has of the branch leads to,
+/// as the job was checked against.
+fn set_aside(
+    repo: &Repo,
+    preserved: &mut Preserved,
+    branch: &BranchName,
+    local: &LocalBranch,
+    to: &Oid,
+) -> Result<(), CheckoutError> {
+    let leads_to = match &local.on_record {
+        Some(on_record) => {
+            on_record == to
+                || repo.is_ancestor(&Rev::Oid(on_record.clone()), &Rev::Oid(to.clone()))?
+        }
+        None => true,
+    };
+    if !leads_to || !repo.on_record(branch, to)? {
+        return Err(moved(branch));
+    }
+    preserved.set_branch_aside(branch, &local.tip, to)
+}
+
+fn moved(branch: &BranchName) -> CheckoutError {
+    CheckoutError::BranchMoved {
+        branch: branch.to_string(),
     }
 }
 
