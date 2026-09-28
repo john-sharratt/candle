@@ -410,6 +410,19 @@ pub struct MoeWorkRequest {
 /// Hints are sent by the forward thread while the async routing DtoH is
 /// in-flight, allowing the pipeline thread to start DMA for predicted
 /// experts before the full work request arrives.
+///
+/// **`Work` is deliberately not boxed**, which `clippy::large_enum_variant`
+/// asks for because it is ~240 B against `Hint`'s ~32. The fix it proposes costs
+/// a heap allocation on the MoE dispatch path — one per layer per wave, 28,511 of
+/// them in a single flagship engine run — to save a few bytes of stack in the
+/// rarer variant, which is the wrong trade on a hot path. The message is moved
+/// straight into a bounded channel whose buffer is already sized for the large
+/// variant, so the padding is never copied anywhere else.
+///
+/// The lint only fires with `--features profile`: `MoeWorkRequest::submitted_at`
+/// is a zero-sized `ProfileMark` without it and a real timestamp with it, which
+/// is what tips the ratio.
+#[allow(clippy::large_enum_variant)]
 pub enum PipelineMessage {
     /// Full MoE dispatch: classify → DMA → compute → return.
     Work(MoeWorkRequest),

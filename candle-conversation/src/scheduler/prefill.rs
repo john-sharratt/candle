@@ -2595,8 +2595,10 @@ impl Scheduler {
         // section pass already ran this wave (no decode present).
         let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced {
             if cursor == 0 && self.wave_prefill_residual.is_none() {
+                let _g = super::profile::span("loop:wave:form_group");
                 self.form_wave_group(!self.wave_section_advanced);
             }
+            let _g = super::profile::span("loop:wave:build_inputs");
             self.build_wave_group_inputs()
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
@@ -2611,6 +2613,7 @@ impl Scheduler {
                 if self.vram_under_pressure() {
                     self.relieve_vram_pressure("section", VramPhase::Load);
                 }
+                let _g = super::profile::span("loop:wave:build_section");
                 self.build_section_batch()
             } else {
                 None
@@ -2635,22 +2638,34 @@ impl Scheduler {
             let pre_seqs: Vec<usize> = verify_seqs.iter().chain(&sec_seqs).copied().collect();
             let pre_inputs: Vec<Tensor> =
                 verify_inputs.iter().chain(&sec_inputs).cloned().collect();
-            let out = self.model.forward_wave(
-                &mut self.session,
-                decode_seqs,
-                decode_inputs,
-                &pre_seqs,
-                &pre_inputs,
-                glue_seqs,
-                glue_inputs,
-                0,
-                n,
-                None,
-            )?;
+            // **The model's own time, separated from the scheduler's around it.**
+            // Without this the whole wave step reads as one opaque block: on the
+            // flagship `loop:prefill` was 336 ms/call against a 132 ms device
+            // sweep, and nothing said whether the difference was the forward
+            // waiting on the device or the assembly on either side of it.
+            let out = {
+                let _g = super::profile::span("loop:wave:forward");
+                self.model.forward_wave(
+                    &mut self.session,
+                    decode_seqs,
+                    decode_inputs,
+                    &pre_seqs,
+                    &pre_inputs,
+                    glue_seqs,
+                    glue_inputs,
+                    0,
+                    n,
+                    None,
+                )?
+            };
             if has_glue {
+                let _g = super::profile::span("loop:wave:reconcile_offsets");
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
-            let logits = out.logits_owned()?;
+            let logits = {
+                let _g = super::profile::span("loop:wave:logits_owned");
+                out.logits_owned()?
+            };
             let d = head_rows.min(logits.len());
             let dec_logits = logits[..d].to_vec();
             if !sec_gidx.is_empty() {
@@ -2740,6 +2755,7 @@ impl Scheduler {
             if let Some(p) = glue_pending {
                 self.session.set_pending_glue(p.clone());
             }
+            let _g = super::profile::span("loop:wave:forward");
             self.model
                 .forward_wave(
                     &mut self.session,
@@ -2794,6 +2810,7 @@ impl Scheduler {
         // that the caller reads its logits from.
         let mid_seqs: Vec<usize> = verify_seqs.iter().chain(&seq_ids).copied().collect();
         let mid_inputs: Vec<Tensor> = verify_inputs.iter().chain(&inputs).cloned().collect();
+        let _g_seg2 = super::profile::span("loop:wave:forward");
         let seg2 = match self.model.forward_wave(
             &mut self.session,
             decode_seqs,
@@ -2814,6 +2831,13 @@ impl Scheduler {
                 return Err(e);
             }
         };
+        // Closed here, not at end of scope. Left to drop naturally it would still be
+        // live when seg3's span opens below under the SAME name, so a paused wave
+        // (`win_end < n` with a full-sweep member) counted seg3's forward twice and
+        // inflated the call count — and it would also charge this span with the
+        // tallying, the residual narrowing and `complete_wave_group`, which is the
+        // opposite of what it is for.
+        _g_seg2.end();
 
         // Record the co-batched creep throughput — prefill and section members are
         // tallied into their own channels, sharing seg2's wall-clock (the forward
@@ -2875,9 +2899,13 @@ impl Scheduler {
             // glue]`. Decode first; creep members next (promote/seal); glue logits,
             // if present, trail and are discarded.
             if has_glue {
+                let _g = super::profile::span("loop:wave:reconcile_offsets");
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
-            let logits = seg2.logits_owned()?;
+            let logits = {
+                let _g = super::profile::span("loop:wave:logits_owned");
+                seg2.logits_owned()?
+            };
             let d = head_rows.min(logits.len());
             let creep_end = (d + members.len()).min(logits.len());
             let dec_logits = logits[..d].to_vec();
@@ -2916,6 +2944,7 @@ impl Scheduler {
         if let Some(p) = glue_pending {
             self.session.set_pending_glue(p.clone());
         }
+        let _g_seg3 = super::profile::span("loop:wave:forward");
         let seg3 = self.model.forward_wave(
             &mut self.session,
             decode_seqs,
@@ -2928,10 +2957,16 @@ impl Scheduler {
             n,
             seg3_in,
         )?;
+        // Closed before the post-forward work, for the same reason as seg2's.
+        _g_seg3.end();
         if has_glue {
+            let _g = super::profile::span("loop:wave:reconcile_offsets");
             self.reconcile_wave_offsets(glue_seqs)?;
         }
-        let mut logits = seg3.logits_owned()?;
+        let mut logits = {
+            let _g = super::profile::span("loop:wave:logits_owned");
+            seg3.logits_owned()?
+        };
         logits.truncate(head_rows);
         Ok(logits)
     }

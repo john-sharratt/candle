@@ -110,8 +110,11 @@ impl Scheduler {
         // under pressure — the governor's cheapest-first ladder sheds cold turns,
         // and the reprojection drain below handles working-set turnover. One check
         // per quantum (not per step) keeps it cheap.
-        if self.vram_under_pressure_for(VramPhase::Decode) {
-            self.relieve_vram_pressure("decode", VramPhase::Decode);
+        {
+            let _g = profile::span("loop:decode:relief_check");
+            if self.vram_under_pressure_for(VramPhase::Decode) {
+                self.relieve_vram_pressure("decode", VramPhase::Decode);
+            }
         }
         // Fire any reprojection queued by the just-completed prefill quantum
         // BEFORE the first decode step of this quantum. The turn's first
@@ -124,7 +127,10 @@ impl Scheduler {
         // token be sampled against the query-blind opening projection first,
         // which is exactly where a wrong-tool / hallucinated answer anchors.
         let t_reproj0 = Instant::now();
-        self.drain_pending_reprojections();
+        {
+            let _g = profile::span("loop:decode:reproject_first");
+            self.drain_pending_reprojections();
+        }
         self.wave_stats
             .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
         let deadline = Instant::now() + WAVE_SLICE;
@@ -134,24 +140,42 @@ impl Scheduler {
                 // No live decode work, but there may be sequences inserted as
                 // finished during the prefill phase (EOS on first token) that
                 // the decode loop never had a chance to clean up.
+                //
+                // Spanned like the in-loop call: this is the exit taken on the
+                // quanta where nothing decodes, which is exactly where a seal is
+                // most likely to be the whole cost, so leaving it unattributed
+                // under-reports the span precisely when it matters.
+                let _g = profile::span("loop:decode:cleanup");
                 self.cleanup_finished();
                 return;
             }
             // Inject any pending tool-call static runs (Layer 3) before the
             // decode forward, so a `Static` run costs one prefill rather than N
             // decode steps.  No-op when no sequence has an active stencil.
-            self.inject_stencil_prefills();
-            self.batch_decode_step();
+            {
+                let _g = profile::span("loop:decode:stencil");
+                self.inject_stencil_prefills();
+            }
+            {
+                let _g = profile::span("loop:decode:step");
+                self.batch_decode_step();
+            }
             // Drain any continuous-re-projection swaps queued during the
             // batch.  Must run BEFORE cleanup_finished so a swap that
             // re-keys an active_decodes entry doesn't race with finalize.
             // Timed separately (a sub-slice of the decode quantum) because the
             // provenance scan + glue gap-fill here is a prime "grows over time" suspect.
             let t_reproj = Instant::now();
-            self.drain_pending_reprojections();
+            {
+                let _g = profile::span("loop:decode:reproject");
+                self.drain_pending_reprojections();
+            }
             self.wave_stats
                 .add_phase(WavePhase::Reproject, t_reproj.elapsed().as_millis() as u64);
-            self.cleanup_finished();
+            {
+                let _g = profile::span("loop:decode:cleanup");
+                self.cleanup_finished();
+            }
             steps += 1;
 
             // Take on conversations that queued WHILE this wave was executing,
@@ -160,7 +184,11 @@ impl Scheduler {
             // creep cohort the moment this quantum clips to the top and
             // `form_wave_group` re-forms — so admission latency is bounded by
             // WAVE_SLICE, not by the whole in-flight generation finishing.
-            if !self.mid_wave_admission() {
+            let admitted = {
+                let _g = profile::span("loop:decode:mid_wave_admit");
+                self.mid_wave_admission()
+            };
+            if !admitted {
                 self.shutdown_requested = true;
                 return;
             }

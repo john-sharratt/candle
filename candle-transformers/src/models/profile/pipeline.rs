@@ -76,10 +76,21 @@ mod store {
 
     /// Snapshot and clear every thread's table plus the retired one, merged.
     pub(super) fn snapshot_and_reset_all() -> super::ProfileSnapshot {
+        collect_all(true)
+    }
+
+    /// Read every thread's accumulator **without** clearing it.
+    pub(super) fn snapshot_all() -> super::ProfileSnapshot {
+        collect_all(false)
+    }
+
+    fn collect_all(reset: bool) -> super::ProfileSnapshot {
         let mut out = super::ProfileSnapshot::default();
         if let Ok(mut r) = retired().lock() {
             out.merge(&r.snapshot());
-            r.reset();
+            if reset {
+                r.reset();
+            }
         }
         let Ok(mut l) = live().lock() else { return out };
         // Prune threads that have gone while collecting from those that remain.
@@ -87,7 +98,9 @@ mod store {
             Some(acc) => {
                 if let Ok(mut a) = acc.lock() {
                     out.merge(&a.snapshot());
-                    a.reset();
+                    if reset {
+                        a.reset();
+                    }
                 }
                 true
             }
@@ -136,5 +149,24 @@ pub fn pipeline_snapshot_and_reset() -> ProfileSnapshot {
 #[cfg(not(feature = "profile"))]
 #[inline(always)]
 pub fn pipeline_snapshot_and_reset() -> ProfileSnapshot {
+    ProfileSnapshot::default()
+}
+
+/// Read the pipeline profiler across every thread **without clearing it**.
+///
+/// For a caller that wants one stage's breakdown out of a longer run: take this
+/// before and after, and subtract. [`pipeline_snapshot_and_reset`] would give the
+/// same interval but destroy every *other* span in the process — which is what a
+/// gap-fill's op breakdown was doing to the whole engine table, leaving it
+/// covering only the window since the last gap-fill rather than the run.
+#[cfg(feature = "profile")]
+pub fn pipeline_snapshot() -> ProfileSnapshot {
+    store::snapshot_all()
+}
+
+/// Returns empty snapshot when profiling is disabled.
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+pub fn pipeline_snapshot() -> ProfileSnapshot {
     ProfileSnapshot::default()
 }

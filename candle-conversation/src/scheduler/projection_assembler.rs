@@ -1832,7 +1832,7 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
         {
-            let _g = profile::span("prefill:forward");
+            let _g = profile::span("loop:prefill:forward");
             let nl = ctx.model.num_layers().max(1);
             let _logits = ctx
                 .model
@@ -1872,7 +1872,7 @@ fn push_empty_if_sealed(
     last_was_sealed: bool,
 ) -> Result<(), ConversationError> {
     if last_was_sealed {
-        let _g = profile::span("prefill:push_empty");
+        let _g = profile::span("loop:prefill:push_empty");
         ctx.session
             .push_empty_writer_chunk(ctx.parent_id.0)
             .map_err(ConversationError::Model)?;
@@ -1919,7 +1919,7 @@ fn drive_prefill_and_capture(
     forward_tokens(ctx, tokens)?;
 
     let captured = {
-        let _g = profile::span("prefill:snapshot");
+        let _g = profile::span("loop:prefill:snapshot");
         let full = ctx
             .session
             .snapshot_sequence_per_layer(parent_id.0)
@@ -2030,12 +2030,19 @@ pub(super) fn fire_gap_fill_batch(
     // every column by its chunk `rope_base`, and masks each glue token by
     // `cpos > row_pos + fwd_ahead[t]`.
     session.set_pending_glue(pending);
-    // Clear the per-op pipeline profile so the snapshot below covers only this
+    // Read the per-op pipeline profile so the delta below covers only this
     // gap-fill forward (attn_core / mlp_ffn / qkv / out_proj, summed over layers).
+    //
+    // **A snapshot, not a snapshot-and-reset.** The reset is all-thread, so
+    // bracketing this one forward with it wiped every `loop:*` and `drain:*` span
+    // the run had accumulated — the engine's own profile table then covered only
+    // the window since the last gap-fill, which is a partial window dressed as a
+    // whole run. Subtracting two readings gives the same interval and destroys
+    // nothing.
     #[cfg(feature = "profile")]
-    let _ = candle_transformers::models::profile::pipeline_snapshot_and_reset();
+    let prof_before = candle_transformers::models::profile::pipeline_snapshot();
     {
-        let _g = profile::span("prefill:gap_fill");
+        let _g = profile::span("loop:prefill:gap_fill");
         // Route the glue islands through the wave's GLUE group so the pending
         // per-slot scatter descriptors (staged above) drive the paged-glue kernel.
         // A glue-only wave carries no logits (it only scatters K/V) and the result
@@ -2070,11 +2077,22 @@ pub(super) fn fire_gap_fill_batch(
     }
     #[cfg(feature = "profile")]
     {
-        let snap = candle_transformers::models::profile::pipeline_snapshot_and_reset();
-        let mut parts: Vec<String> = snap
+        let after = candle_transformers::models::profile::pipeline_snapshot();
+        // Only what this forward added: spans absent before, and the increase on
+        // spans already there. A span whose total did not move is left out.
+        let before: std::collections::HashMap<&str, (f64, u64)> = prof_before
             .entries
             .iter()
-            .map(|(n, ms, c)| format!("{n}={ms:.1}ms({c})"))
+            .map(|(n, ms, c)| (n.as_str(), (*ms, *c)))
+            .collect();
+        let mut parts: Vec<String> = after
+            .entries
+            .iter()
+            .filter_map(|(n, ms, c)| {
+                let (ms0, c0) = before.get(n.as_str()).copied().unwrap_or((0.0, 0));
+                let (d_ms, d_c) = (ms - ms0, c.saturating_sub(c0));
+                (d_c > 0).then(|| format!("{n}={d_ms:.1}ms({d_c})"))
+            })
             .collect();
         parts.sort_by(|a, b| b.cmp(a));
         tracing::info!(

@@ -133,6 +133,46 @@ fn qwen38_flash_next_q4ko() {
     outcome.assert_passed();
 }
 
+/// **The flagship's ceiling and its delivered rows, from one model load.**
+///
+/// The question this answers is how much of the forward path's throughput the
+/// conversation engine actually delivers. Answering it by reading the engine
+/// probe against the standalone gate in `candle-transformers` does not work: that
+/// gate builds the model at 262,144 context, which is a different RoPE
+/// configuration and therefore different numerics and a different cost. The
+/// ladder has to be measured on the model the engine runs, which is what
+/// [`ladder_and_engine`] does — same load, same context, same tokenizer, both
+/// sets of rows.
+#[test]
+#[ignore = "loads Qwen3.8-Flash-Next once and runs both the forward ladder and the \
+            engine probe — tens of minutes; needs the card to itself"]
+fn qwen38_flash_next_q4ko_combined() {
+    ladder_and_engine("qwen38-flash-next-q4ko", true);
+}
+
+/// The flagship's engine phase alone, with the span breakdown.
+///
+/// Read against [`qwen38_flash_next_q4ko_combined`]'s ladder rows: the ladder is
+/// what the forward costs, this is where the rest of the wall clock goes. The
+/// host and device tables are kept apart by [`print_pipeline_profile`] because
+/// device time overlaps the host and a shared denominator understates every host
+/// span.
+///
+/// **A profiled build is for attribution, not for throughput.**
+/// `docs/performance.md` §2.4: the spans cost 5–24% of decode and 1–3% of
+/// prefill, so the t/s this prints is lower than the engine's real rate. Quote
+/// the uninstrumented run for rate and this one for where the time went.
+#[test]
+#[ignore = "profile run: the flagship's engine probe alone, for the span breakdown. \
+            Needs --features hub,profile and the card to itself"]
+fn qwen38_flash_next_q4ko_profile_engine() {
+    logging();
+    let probe = Probe::new(resolved("qwen38-flash-next-q4ko"));
+    let outcome = run(&probe).expect("the probe ran");
+    summarise("qwen38-flash-next-q4ko (profile)", &outcome);
+    print_pipeline_profile("Flash-Next engine — full wave loop");
+}
+
 /// The forward ladder **alone**, at the daemon's declared context.
 ///
 /// Same rows and same method as the standalone gate in `candle-transformers`, but with
@@ -231,10 +271,71 @@ fn print_pipeline_profile(title: &str) {
     //
     // Membership is by name because that is where the distinction is decided: a span is
     // GPU exactly when its call site used `gpu_span`.
-    const GPU_PREFIXES: [&str; 10] = [
-        "wv:", "fwd:", "fwd_", "moe:", "prefill:", "decode:", "glue:", "dn:", "q4e:", "vw:",
+    // **Membership is the exact set of names `gpu_span` records, not a prefix
+    // guess.** A prefix rule cannot decide this, because host and device spans
+    // share namespaces in both directions: `decode:alloc` / `decode:meta`
+    // (`batched_layer.rs`), `moe:route` / `moe:sort` / `moe:submit`
+    // (`latent_moe/engine.rs`) and `decode:prep` / `prefill:prep`
+    // (`latent_moe/wave.rs`) are host `span()` calls that a `decode:`/`moe:`/
+    // `prefill:` prefix would file as device, while every `hc_mix:*` is a
+    // `gpu_span` that no prefix in the old list caught and that therefore read as
+    // host — 11 s of device time counted against the loop thread.
+    //
+    // A name absent here is treated as host, which is the safe direction: host is
+    // the residual the reader is hunting, so a device span added later inflates it
+    // visibly rather than hiding somewhere. Regenerate with:
+    //   grep -rhoE 'gpu_span(_if|_phase)?\("[a-z0-9_:]+"' --include=*.rs \
+    //     candle-transformers/src candle-conversation/src | grep -oE '"[a-z0-9_:]+"' | sort -u
+    const GPU_SPANS: [&str; 47] = [
+        "decode:kernel",
+        "decode:out_proj",
+        "decode:qkv_proj",
+        "dn:ffn",
+        "dn:mix",
+        "dn:out_proj",
+        "dn:proj",
+        "fwd:dntab",
+        "fwd:embed",
+        "fwd:head",
+        "fwd:layer",
+        "fwd:meta",
+        "glue:hdr_meta",
+        "glue:kernel",
+        "hc_mix:gate_mean",
+        "hc_mix:inject",
+        "hc_mix:lowrank",
+        "hc_mix:norm",
+        "moe:bucketize",
+        "moe:down",
+        "moe:gate_up",
+        "moe:gather",
+        "moe:scatter",
+        "moe:silu",
+        "prefill:kernel",
+        "prefill:out_proj",
+        "prefill:pack",
+        "prefill:qkv_proj",
+        "probe:bounded",
+        "probe:cpu",
+        "probe:cpu_scope",
+        "probe:gpu_matmul",
+        "probe:recycle",
+        "q4e:attn_decode",
+        "q4e:attn_prefill",
+        "q4e:gr_combine",
+        "q4e:gr_combine_ffn",
+        "q4e:gr_pre",
+        "q4e:gr_pre_ffn",
+        "q4e:moe_acts",
+        "q4e:moe_routed",
+        "q4e:mtp_head",
+        "q4e:ple",
+        "q4e:qsa_select",
+        "verify:fwd",
+        "vw:own",
+        "wv:sweep",
     ];
-    let is_gpu = |name: &str| GPU_PREFIXES.iter().any(|p| name.starts_with(p));
+    let is_gpu = |name: &str| GPU_SPANS.contains(&name);
 
     let mut host: Vec<_> = snap
         .entries
