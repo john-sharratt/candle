@@ -1,9 +1,9 @@
 //! `repo_map` layer ingestion — **one conversation per directory**.
 //!
-//! Each folder a branch lists (`crate::branch_ingest`) is explored as TWO
-//! `code_read`-shaped tool round-trips — list it, then read its module doc —
-//! the last of which DECODES a two-sentence summary of what the folder is for
-//! (see [`render`] for the turn shape). That summary is the layer's retrieval
+//! Each folder a branch lists (`crate::branch_ingest`) is explored as ONE
+//! `code_read`-shaped tool round-trip — list it — after which the conversation
+//! DECODES a one-sentence summary of what the folder is for (see [`render`]
+//! for the turn shape, and why nothing of the folder is read). That summary is the layer's retrieval
 //! surface: a query about "the KV cache paging code" matches prose describing
 //! that folder, where a bare file listing would only match on a filename the
 //! asker already knew.
@@ -14,8 +14,8 @@
 //! turns seal into the substrate. A unit's tools read the commit it was found
 //! on, so its turns show exactly what its key names.
 
-pub mod anchor;
 pub mod binary_sniff;
+pub mod converse;
 pub mod dir_unit;
 pub mod render;
 pub mod types;
@@ -31,21 +31,19 @@ use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
 use zend_vfs::Oid;
 
-use crate::branch_ingest::keys::CONTENT_KEY;
+use crate::branch_ingest::keys::{branches_value, BRANCHES_KEY, CONTENT_KEY};
 use crate::branch_ingest::plan::Committed;
 use crate::branch_ingest::units::FolderUnit;
 use crate::ingest_report::{Failures, IngestReport};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_path::split;
-use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
 pub use binary_sniff::is_binary_sample;
 pub use dir_unit::DirUnit;
 pub use types::Language;
 
 /// Directories ingested concurrently. Each unit is ONE conversation running a
-/// short chain (two prefills + one bounded decode), so this is the whole
+/// short chain (one prefill + one bounded decode), so this is the whole
 /// concurrent conversation count for the layer.
 ///
 /// Sized to feed BOTH row-groups. A directory's worker is a three-phase state
@@ -73,7 +71,7 @@ pub use types::Language;
 /// **61% of the phase's wall time against prefill's 24%**, and decode has no
 /// width cap of its own. At a pool of 24 both phases averaged only ~9 wide
 /// (max 23) — roughly a third of workers in a forward at any instant, since each
-/// unit's chain is two prefills then a decode. Prefill is capped at 24 per wave
+/// unit's chain then ran two prefills before its decode. Prefill is capped at 24 per wave
 /// regardless, so workers beyond that queue for prefill but still add to decode
 /// width, which is the phase that dominates.
 ///
@@ -167,7 +165,34 @@ fn max_live_conversations() -> Option<usize> {
         kv,
         SCAN_KV_BASELINE.load(Ordering::Relaxed),
         SCAN_LIVE_CONVS.load(Ordering::Relaxed),
+        // Zero when the model reports no zone to defend — a dense checkpoint or
+        // a CPU device, where the weight side has no elastic boundary and
+        // nothing is taken from it by a K/V claim.
+        report.weights.floor_bytes.unwrap_or(0),
+        weights_now(&report.weights),
     ))
+}
+
+/// What the weight side is holding right now, in the units the floor is
+/// expressed in.
+///
+/// **A zone figure, not base + zone.** `floor_bytes` is
+/// `interleave::optimal_weight_bytes` — a fraction of the achievable residency
+/// of the *elastic expert zone*, measured inside a span that is the KV regions
+/// plus that zone and nothing else. Dense base weights are allocated outside
+/// that span and no concession can ever release them, so counting them here
+/// reports ground the scan cannot have: `(base + zone) − zone_floor`, halved by
+/// the caller, overstates the concession by `base_bytes / 2`. It read correct on
+/// this card only because a wave stack reports no separate base at all.
+///
+/// With no floor to defend the answer is UNBOUNDED rather than zero: a stack
+/// that reports no zone has none for K/V to take from, so capacity alone is the
+/// bound and the caller's `min` must not clamp it to nothing.
+fn weights_now(weights: &candle_conversation::memory_report::WeightSection) -> u64 {
+    match weights.floor_bytes {
+        Some(_) => weights.resident_expert_bytes.unwrap_or(0),
+        None => u64::MAX,
+    }
 }
 
 /// Total reserved KV arena bytes in a memory report — the quantity the arena
@@ -215,6 +240,7 @@ fn kv_reserved(report: &MemoryReport) -> u64 {
 /// back the scratch margin instead spends the room the governor already reserved
 /// for KV — while [`SCAN_CONV_KV_MIN`] keeps the resulting width on the safe
 /// side of that point.
+#[allow(clippy::too_many_arguments)]
 fn scan_width(
     capacity: u64,
     scratch_margin: u64,
@@ -222,12 +248,51 @@ fn scan_width(
     kv: u64,
     baseline: u64,
     live: usize,
+    weight_floor: u64,
+    weights_now: u64,
 ) -> usize {
     let fixed = pool_used.saturating_sub(kv);
+    // **The scan may take what the weight zone can concede, and not a byte
+    // more.**
+    //
+    // `capacity` is the governor's balloon-measured resident capacity — the
+    // whole elastic span, not a K/V-only share — and the weight zone lives in
+    // that same span. Ground K/V claims is ground the weight side loses, so a
+    // width planned from capacity alone plans to evict the model.
+    //
+    // It did. At 96 directory conversations the pool's K/V reached 48 GB, the
+    // weight zone fell from 53.5 GB to 10.9 GB — 19 GB below its floor — and
+    // admission refused every prefill for the rest of the run, which is both
+    // correct and unrecoverable: the floor check compares residency against the
+    // floor, and no number of refusals hands K/V back.
+    //
+    // The bound is `weights_now - floor`, not `capacity - floor`. Subtracting
+    // the floor from capacity charges the scan for ground the weights are
+    // already standing on, which it can never take anyway; measured, that cut
+    // the pool from 96 to 7 on a card with 21 GB genuinely available and left
+    // admission idle at `queued=0` while decode ran at the pool's width.
+    // **Half of what it could concede, because the floor is a limit and not an
+    // optimum.**
+    //
+    // Conceding weight ground is permitted down to the floor and is not free on
+    // the way there: a smaller expert zone pages more, and the paging costs the
+    // forwards the extra conversations were opened to fill. Measured on the
+    // 72 GB card, over the same directory corpus:
+    //
+    //   pool 7   zone stable at 50.2 GB   12.2 units/min
+    //   pool 53  zone pinned at the floor  ~9.0 units/min   decode width 50
+    //
+    // The wide pool got everything it asked for — decode ran 50 sequences to the
+    // narrow pool's 4-7 — and still finished less work, because the zone spent
+    // the run at 28 GB. Taking half leaves the expert cache its working set and
+    // still opens several times the conversations a capacity-minus-floor bound
+    // allowed.
+    let concedeable = weights_now.saturating_sub(weight_floor) / 2;
     let for_kv = capacity
         .saturating_sub(scratch_margin)
         .saturating_sub(fixed)
-        .saturating_sub(baseline);
+        .saturating_sub(baseline)
+        .min(concedeable);
     let per_conv = per_conversation_kv(kv, baseline, live);
     ((for_kv / per_conv.max(1)) as usize).clamp(1, REPO_MAP_PARALLELISM)
 }
@@ -484,6 +549,9 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
 pub struct UnitJob {
     pub unit: FolderUnit,
     pub at: Option<Oid>,
+    /// Every branch whose tip lists the folder this way, recorded on the
+    /// conversation ([`BRANCHES_KEY`]); empty for the workspace's own unit.
+    pub branches: Vec<String>,
 }
 
 /// Ingest `jobs` — the units the pass queued (`docs/zend_branch_ingest.md`
@@ -877,7 +945,7 @@ fn run_dir_pool(
 }
 
 /// The tools a unit's chain runs against: file stores reading the commit the
-/// unit was found on, so the listing and the excerpt its turns show are the
+/// unit was found on, so the listing and the manifest hint its turns show are the
 /// ones its key names. The workspace's own unit lists repositories, which no
 /// commit holds. `None` when the unit's repository is not read through git.
 fn unit_tools(tools: &ToolContext, job: &UnitJob) -> Option<ToolContext> {
@@ -889,7 +957,7 @@ fn unit_tools(tools: &ToolContext, job: &UnitJob) -> Option<ToolContext> {
 }
 
 /// Ingest one directory into a fresh conversation: render the folder's
-/// round-trip chain, run it (two prefills + the summary decode), tag the
+/// round-trip chain, run it (the prefill + the summary decode), tag the
 /// conversation, and free it.
 ///
 /// The caller has already established this unit is not committed, and holds
@@ -914,13 +982,7 @@ fn process_one_dir(
         );
         return Ok(());
     };
-    // The anchor excerpt and the manifest hint, read from the unit's commit
-    // through the same stores its tool calls read.
-    let unit = DirUnit::read(&job.unit, |path| {
-        let (repo, inner) = split(path);
-        tools.files.repo(repo).ok()?.read_bytes(inner).ok()?
-    });
-    let unit = &unit;
+    let unit = &DirUnit::of(&job.unit);
     // Render BEFORE minting anything: the tool responses come from actually
     // running the tools, so a directory the tools can't read is caught here and
     // costs no conversation. Prefilling an error body would be worse than
@@ -1007,24 +1069,24 @@ fn process_one_dir(
         }
     }
 
-    // One chain on this conversation: request → list → read → DECODE. The
-    // conversation projects its own turns (`target_is_ingest_self`), so the
-    // request is in the decode's context where it belongs, and there is no
+    // One conversation, seeded with request → list → response and then driven as
+    // a REAL tool loop until it answers — see `converse::run_folder_conversation`.
+    // Any follow-up call runs against the same commit-pinned tools the seed
+    // listing came from, so every turn shows what the unit's key names.
+    // The conversation projects its own turns (`target_is_ingest_self`), so the
+    // request is in every decode's context where it belongs, and there is no
     // throwaway intermediate decode to set the wrong style.
-    let force_tools: Vec<String> = render::CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
-    let emit = {
-        let mut sink = SequenceTurnSink::new(&mut conv, Arc::clone(&plan.triggers));
-        sink.ingest_chain(
-            &prefilled,
-            &decode_user,
-            dir_tags(unit),
-            FOLDER_SUMMARY_MAX_TOKENS,
-            &force_tools,
-        )
-    };
+    let emit = converse::run_folder_conversation(
+        &mut conv,
+        unit,
+        &prefilled,
+        decode_user,
+        Arc::clone(&plan.triggers),
+        &tools,
+    );
 
-    let tokens = match emit {
-        Ok(tokens) => tokens,
+    let summary = match emit {
+        Ok(summary) => summary,
         Err(e) => {
             // The deferred tombstone is the safety net: `superseded` was never
             // tombstoned, so the prior generation stays live and committed —
@@ -1083,8 +1145,8 @@ fn process_one_dir(
     tags.insert(DIR_KEY.to_string(), unit.dir.clone());
     tags.insert(CONTENT_KEY.to_string(), unit.content_key.clone());
     tags.insert("files".to_string(), unit.listed.len().to_string());
-    if let Some(a) = &unit.anchor {
-        tags.insert("anchor".to_string(), a.path.clone());
+    if !job.branches.is_empty() {
+        tags.insert(BRANCHES_KEY.to_string(), branches_value(&job.branches));
     }
     // The tag write is what commits the new generation. If it fails, this
     // attempt has to go: keeping the prior generation live is right, but keeping
@@ -1153,7 +1215,8 @@ fn process_one_dir(
     tracing::debug!(
         target: "zend::repo_scan",
         dir = %unit.dir,
-        tokens,
+        tokens = summary.tokens,
+        tool_rounds = summary.tool_rounds,
         "directory ingested (chain prefilled + summary decoded)",
     );
     Ok(())
@@ -1231,6 +1294,39 @@ pub(crate) fn shared_prompt_body(builder: &projection::Builder) -> String {
 mod tests {
     use super::*;
 
+    /// **The concession is measured against the ZONE, never base + zone.**
+    ///
+    /// `floor_bytes` is a fraction of the elastic expert zone's achievable
+    /// residency, and dense base weights live outside the span it is measured
+    /// in — no concession can release them. Counting them overstated the ground
+    /// a scan could take by `base_bytes / 2`, and `scan_width`'s own tests
+    /// cannot see it because the unit is chosen at the call site.
+    #[test]
+    fn what_the_weight_side_holds_is_the_zone_not_the_dense_base() {
+        use candle_conversation::memory_report::WeightSection;
+        let section = |base: Option<u64>, floor: Option<u64>| WeightSection {
+            base_bytes: base,
+            resident_expert_bytes: Some(40 << 30),
+            floor_bytes: floor,
+        };
+        assert_eq!(
+            weights_now(&section(Some(20 << 30), Some(30 << 30))),
+            40 << 30,
+            "the dense base is not the zone's and is not conceded",
+        );
+        assert_eq!(
+            weights_now(&section(None, Some(30 << 30))),
+            40 << 30,
+            "a stack reporting no base reads the same — which is why this was latent",
+        );
+        assert_eq!(
+            weights_now(&section(Some(20 << 30), None)),
+            u64::MAX,
+            "no floor to defend ⇒ unbounded, so the caller's `min` cannot clamp \
+             the width to nothing",
+        );
+    }
+
     /// The completion protocol the crashed-partial sweep rests on: the directory
     /// tag is written at creation, the content key only on success, so `dir`
     /// without a key is the signature of an attempt that never finished.
@@ -1280,7 +1376,6 @@ mod tests {
         DirUnit {
             dir: dir.to_string(),
             listed: vec![format!("{dir}x.rs")],
-            anchor: None,
             module_hint: None,
             content_key: "abc".to_string(),
         }
@@ -1402,7 +1497,7 @@ mod tests {
     #[test]
     fn the_inherited_corpus_is_not_free_room() {
         const EXTRA: u64 = 2 * 1024 * 1024 * 1024;
-        let base = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2);
+        let base = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX);
         let with_corpus = scan_width(
             CAPACITY,
             SCRATCH,
@@ -1410,6 +1505,8 @@ mod tests {
             KV + EXTRA,
             PRE_SCAN + EXTRA,
             2,
+            0,
+            u64::MAX,
         );
         assert!(with_corpus < base, "{with_corpus} vs {base}");
     }
@@ -1428,9 +1525,68 @@ mod tests {
         let by_fraction = (((CAPACITY as f64) * 0.70) as u64)
             .saturating_sub(POOL_USED - KV + PRE_SCAN)
             / per_conv;
-        let by_governor = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2) as u64;
+        let by_governor =
+            scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX) as u64;
         assert_eq!(by_fraction, 0);
         assert_eq!(by_governor, 6);
+    }
+
+    /// **The weight zone's floor is not room the scan may plan against.**
+    ///
+    /// K/V and the model's weights share one span, so every region the pool
+    /// claims is ground the weight side loses. A width computed from capacity
+    /// alone therefore plans to evict the model — and did: 96 directory
+    /// conversations grew 48 GB of K/V, drove the weight zone from 53.5 GB to
+    /// 10.9 GB against a 28.8 GB floor, and left admission refusing every
+    /// prefill from then on, because the floor check compares residency to the
+    /// floor and refusing a prefill gives no K/V back.
+    #[test]
+    fn the_scan_may_take_only_what_the_weight_zone_can_concede() {
+        let unbounded = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX);
+        // A zone holding 9 GiB over an 8 GiB floor may concede 1 GiB, which is
+        // less than the capacity arithmetic would have allowed.
+        let defended = scan_width(
+            CAPACITY,
+            SCRATCH,
+            POOL_USED,
+            KV,
+            PRE_SCAN,
+            2,
+            8 * 1024 * 1024 * 1024,
+            9 * 1024 * 1024 * 1024,
+        );
+        assert!(defended < unbounded, "{defended} vs {unbounded}");
+        // A zone already at its floor concedes nothing, and the pool still does
+        // not reach zero: one conversation has to be able to run, or the ingest
+        // cannot make progress at all.
+        assert_eq!(
+            scan_width(
+                CAPACITY,
+                SCRATCH,
+                POOL_USED,
+                KV,
+                PRE_SCAN,
+                2,
+                8 * 1024 * 1024 * 1024,
+                8 * 1024 * 1024 * 1024,
+            ),
+            1,
+        );
+        // Ground the weights already hold is not charged to the scan: a zone
+        // far above its floor is bounded by capacity, exactly as before.
+        assert_eq!(
+            scan_width(
+                CAPACITY,
+                SCRATCH,
+                POOL_USED,
+                KV,
+                PRE_SCAN,
+                2,
+                8 * 1024 * 1024 * 1024,
+                u64::MAX,
+            ),
+            unbounded,
+        );
     }
 
     /// The floor charges a conversation for RESERVED arena, not for the live
@@ -1504,11 +1660,17 @@ mod tests {
     /// exceeds the thread count the pool actually spawns.
     #[test]
     fn the_width_stays_between_one_and_the_pool_ceiling() {
-        assert_eq!(scan_width(CAPACITY, SCRATCH, 14_000_000_000, 0, 0, 0), 1);
-        // A margin wider than the card leaves nothing, and still not zero.
-        assert_eq!(scan_width(CAPACITY, 2 * CAPACITY, 0, 0, 0, 0), 1);
         assert_eq!(
-            scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0),
+            scan_width(CAPACITY, SCRATCH, 14_000_000_000, 0, 0, 0, 0, u64::MAX),
+            1,
+        );
+        // A margin wider than the card leaves nothing, and still not zero.
+        assert_eq!(
+            scan_width(CAPACITY, 2 * CAPACITY, 0, 0, 0, 0, 0, u64::MAX),
+            1,
+        );
+        assert_eq!(
+            scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0, 0, u64::MAX),
             REPO_MAP_PARALLELISM,
         );
     }

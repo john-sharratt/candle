@@ -423,7 +423,26 @@ impl Qwen4ExpGpu {
             merged,
             mmap,
             int8mode,
-            None,
+            // **Beside the checkpoint, so the pack survives the process.**
+            //
+            // `None` here does not mean "no pack" — it means an EPHEMERAL one:
+            // `pack::open_or_create` puts it in the system temp directory and
+            // unlinks it the moment it is published, so the bytes live only as
+            // long as the open handle and every boot repacks from scratch.
+            // Measured on Qwen3.8-Flash-Next: 140 s of a 181 s load, every time,
+            // and a `%TEMP%` accumulating 47 GB of `.partial` files from runs
+            // that were killed before they could unlink.
+            //
+            // Derived here rather than plumbed from the caller: the pack's home
+            // is a property of the checkpoint, and `merged` is the checkpoint.
+            // `latent_moe::engine` takes the same parent for the same reason.
+            //
+            // The empty filter is not defensive: `Path::new("m.gguf").parent()`
+            // is `Some("")`, not `None`, so a bare filename would name a
+            // *relative* directory and drop a 45-74 GB pack in whatever the
+            // process's working directory happens to be. `None` comes back only
+            // for a root path.
+            merged.parent().filter(|p| !p.as_os_str().is_empty()),
             progress,
         )?
         .ok_or_else(|| candle::Error::Msg("qwen4exp engine: no expert tensors found".into()))?;

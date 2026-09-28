@@ -132,6 +132,40 @@ async fn model_independent_api_contract() {
         .unwrap();
     assert_eq!(r.status(), 404);
 
+    // **A turn must name its conversation.** There is no default conversation
+    // for unaddressed turns to accumulate on, so a chat request without a
+    // `conv_id` is refused outright rather than filed somewhere. Checked here
+    // rather than in a unit test because the refusal is the handler's, and it
+    // has to happen before the session is touched — which is why it answers
+    // 400 with no engine loaded, where every model-gated route above answers
+    // 503.
+    for body in [
+        serde_json::json!({ "model": "zen-code", "messages": [] }),
+        serde_json::json!({ "model": "zen-code", "conv_id": "   ", "messages": [] }),
+    ] {
+        let r = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "expected a refusal for {body}");
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["error"]["code"], "missing_conv_id", "body was {v}");
+        assert_eq!(v["error"]["param"], "conv_id", "body was {v}");
+    }
+
+    // `passthrough` carries the client's own context and never reaches the
+    // substrate, so it names no conversation and must not be refused for it.
+    // Model-gated like every other engine route, hence 503 and not 400.
+    let r = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({ "model": "passthrough", "messages": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(r.status(), 400, "passthrough must not require a conv_id");
+
     // archive is a model-gated write -> 503 when no engine is loaded
     let r = client
         .post(format!("{base}/v1/conversations/whatever/archive"))

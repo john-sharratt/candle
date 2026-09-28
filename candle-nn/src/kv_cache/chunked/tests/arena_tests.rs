@@ -131,6 +131,91 @@ mod tests {
             assert!(set.contains(&key(KvFormat::Float(DType::F16), ArenaLocation::Gpu)));
         }
 
+        /// Every record stride's slot count must stay **below** `GID_STRIDE`.
+        ///
+        /// A gid packs `arena_idx * GID_STRIDE + chunk_idx`, so a pool whose arenas hold
+        /// `GID_STRIDE` slots or more lets the last chunk index collide with the next
+        /// arena's namespace — the gid decodes to a different arena entirely, which is a
+        /// silent wrong-address read, not a fault. At 16 MiB regions and `1 << 16` that
+        /// makes 256 B the first stride that breaks, which is why `RECORD_STRIDES`
+        /// starts at 512. Asserted rather than commented because the two constants that
+        /// decide it live in different modules.
+        #[test]
+        fn record_strides_fit_the_gid_namespace() {
+            use crate::kv_cache::chunked::arena::RECORD_STRIDES;
+            use crate::kv_cache::chunked::size_class::GID_STRIDE;
+
+            assert!(!RECORD_STRIDES.is_empty());
+            for stride in RECORD_STRIDES {
+                assert!(
+                    stride.is_multiple_of(8),
+                    "stride {stride} is not 8-aligned, so a slot base need not be either \
+                     — and the kernel stores band pointers as uint64_t",
+                );
+                assert!(
+                    stride >= RECORD_STRIDES[0],
+                    "stride {stride} is below the floor the gid namespace allows",
+                );
+                let key = ArenaKey::for_record_stride(ArenaLocation::Gpu, stride);
+                assert_eq!(key.slot_stride(), stride);
+                assert!(
+                    key.chunks() > 0,
+                    "stride {stride} leaves no slots in a region",
+                );
+                assert!(
+                    key.chunks() < GID_STRIDE,
+                    "stride {stride} gives {} slots per arena, which reaches GID_STRIDE \
+                     ({GID_STRIDE}) — chunk indices would collide with the next arena",
+                    key.chunks(),
+                );
+            }
+        }
+
+        /// A key built from a record *size* and one built from its *stride* must be the
+        /// same key, or a caller looks up a pool the eager table never created — which
+        /// is exactly the `register_arena: missing preallocated pool for key` panic.
+        #[test]
+        fn a_record_size_and_its_stride_agree_on_the_key() {
+            // 1344 is the production GQA record (8 heads x HD128 x 4 bands); it lands on
+            // the 1,536 rung with 12.5% pad, where a power-of-two ladder gave 2,048 and 34%.
+            for (bytes, want) in [
+                (1usize, 512usize),
+                (512, 512),
+                (513, 768),
+                (1344, 1536),
+                (1537, 2048),
+            ] {
+                let by_size = ArenaKey::for_records(ArenaLocation::Gpu, bytes);
+                let by_stride = ArenaKey::for_record_stride(ArenaLocation::Gpu, want);
+                assert_eq!(
+                    by_size, by_stride,
+                    "a {bytes} B record must resolve to the {want} B rung",
+                );
+                assert!(
+                    by_size.slot_stride() >= bytes,
+                    "the slot must hold the record",
+                );
+            }
+        }
+
+        /// A record key and a band key never collide, however their classes compare —
+        /// which is what keeps record arenas out of every walk that enumerates
+        /// `SizeClass::all()` against a band key, the compaction census included.
+        #[test]
+        fn a_record_key_is_never_a_band_key() {
+            use std::collections::HashSet;
+
+            let rec = ArenaKey::for_records(ArenaLocation::Gpu, 1344);
+            let mut band_keys = HashSet::new();
+            for class in SizeClass::all() {
+                band_keys.insert(ArenaKey::new(class, ArenaLocation::Gpu));
+            }
+            assert!(
+                !band_keys.contains(&rec),
+                "the record key collides with a band pool, so the census would walk it",
+            );
+        }
+
         /// A format the ladder does not cover is a configuration error, and it
         /// is reported as one rather than silently landing in the top class.
         #[test]
@@ -207,7 +292,7 @@ mod tests {
         fn slab(class: SizeClass, location: ArenaLocation, index: usize) -> Arena {
             let bytes = class.chunks_per_region() * class.bytes();
             let data = Tensor::zeros(bytes, DType::U8, &Device::Cpu).unwrap();
-            Arena::new(data, class, location, index)
+            Arena::new(data, ArenaKey::new(class, location), index)
         }
 
         fn small() -> SizeClass {
@@ -408,8 +493,10 @@ mod tests {
                 .write(|s| {
                     for idx in 0..2 {
                         let data = Tensor::zeros(bytes, DType::U8, &Device::Cpu).unwrap();
-                        s.arenas_mut()
-                            .insert(idx, Arena::new(data, class, ArenaLocation::Cpu, idx));
+                        s.arenas_mut().insert(
+                            idx,
+                            Arena::new(data, ArenaKey::new(class, ArenaLocation::Cpu), idx),
+                        );
                     }
                 })
                 .unwrap();
@@ -422,5 +509,42 @@ mod tests {
             storage.truncate_arenas(0).unwrap();
             assert_eq!(storage.arena_count().unwrap(), 0);
         }
+    }
+
+    /// **Widening a key by size class always produces a BAND key — which is why a record
+    /// claim must never be promoted.**
+    ///
+    /// `alloc::stamp_region_promoting` answers a claim it cannot get a region for by
+    /// widening `key.class` and rebuilding the key with `ArenaKey::new`. That constructor
+    /// is `ArenaKind::Band`, so a *record* claim promoted this way comes back holding a
+    /// slot in a band arena — and the record's bytes are then written on top of live K/V,
+    /// which raises nothing: the caller's own check is that the slot is at least
+    /// `record_bytes`, and a 1,344 B record fits a 2 KiB band slot perfectly.
+    ///
+    /// A record's size is model geometry, not a rung of the ladder, so there is no wider
+    /// class it belongs in. This pins the reason the allocator refuses rather than
+    /// promotes; it cost one to three sessions of eight on the Flash-Next engine probe,
+    /// intermittently, once a compaction started minting a record per relocated chunk.
+    #[test]
+    fn widening_a_key_by_class_always_yields_a_band_key() {
+        use crate::kv_cache::chunked::arena::ArenaKind;
+
+        let record = ArenaKey::for_records(ArenaLocation::Gpu, 1344);
+        assert!(
+            matches!(record.kind, ArenaKind::Record { .. }),
+            "a record key is not a band key",
+        );
+
+        // Exactly what the promotion loop would build for it.
+        let wider = record.class.promote().unwrap_or(record.class);
+        let promoted = ArenaKey::new(wider, record.location);
+        assert!(
+            matches!(promoted.kind, ArenaKind::Band),
+            "promotion cannot preserve the record kind, so the allocator must refuse it",
+        );
+        assert_ne!(
+            record, promoted,
+            "and the promoted key names a different pool entirely",
+        );
     }
 }

@@ -100,8 +100,11 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[allow(dead_code)]
     pub top_p: Option<f32>,
-    /// Stable identifier for the conversation tab.
-    /// When absent, all requests share a single default conversation.
+    /// Stable identifier for the conversation tab — **required** for every
+    /// model but `passthrough`, which carries the client's own context and
+    /// never reaches the substrate. A request that omits it (or sends it blank)
+    /// is refused with `400 missing_conv_id`; there is no default conversation
+    /// for unaddressed turns to accumulate on.
     #[serde(default)]
     pub conv_id: Option<String>,
     /// Capture aid (zend-only): name of a section collection (e.g. `"tools"`)
@@ -255,6 +258,17 @@ mod request_tests {
         assert_eq!(req.verbosity, None);
         assert_eq!(req.think, None);
         assert_eq!(req.conv_id.as_deref(), Some("abc"));
+    }
+
+    /// An absent `conv_id` parses as absent rather than as any stand-in id.
+    ///
+    /// The wire format still accepts the omission — `passthrough` has no
+    /// conversation to name — and the refusal happens in the handler, on the
+    /// branch that actually reaches the substrate.
+    #[test]
+    fn an_omitted_conv_id_stays_absent() {
+        let req: ChatCompletionRequest = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        assert_eq!(req.conv_id, None);
     }
 
     #[test]

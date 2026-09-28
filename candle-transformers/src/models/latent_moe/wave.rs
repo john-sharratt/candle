@@ -903,12 +903,29 @@ impl ManagedBatchedModel for BatchedEngine {
             // The int8 tensor-core kernels emit F32 before the cast back to
             // `act_dtype`; both buffers are live at once, so both are planned.
             accum_dtype: DType::F32,
-            // Moot here — this forward takes its transients from the CUDA pool
-            // rather than the span (see `prefill_width_cap` below), so no
-            // projection buffer is carved from a wave arena at all.
-            projection_accum_roundtrip: false,
+            vocab: cfg.vocab_size,
+            // Every layer of this stack attends through MLA, so there is no
+            // second mixer chain for the phase to be the max of.
+            delta_net: None,
+            // The shared expert is folded into this family's routed block
+            // rather than priced beside it.
+            shared_expert: None,
+            // This family's forward takes its transients from the CUDA pool
+            // rather than the span (see `prefill_width_cap`), so nothing here is
+            // carved from a wave arena and the encoding flags only have to be
+            // self-consistent. Stated as the FP path, which is what it runs.
+            packed_norm: false,
+            packed_head: false,
             gated_qkv: false,
+            fused_qkv: false,
+            qkv_bias: false,
+            head_qk_norm: false,
+            head_norm_reshapes: false,
             partial_rotary: false,
+            decode_q8_context: false,
+            // No hyper-connections: one residual stream, as everything but the
+            // Flash-Next lineage.
+            hyper: None,
         }
     }
 

@@ -26,6 +26,12 @@ pub struct RopeRungs {
     /// `f32[n_rungs · (HI + LO) · pairs · 2]`, `(sin, cos)` pairs.
     tables: Tensor,
     /// `f32[n_rungs]`.
+    ///
+    /// The device copy exists solely to back [`Self::ffi`]'s pointer, so off
+    /// CUDA nothing reads it — host callers take [`Self::q_scale`], which reads
+    /// `host_q_scale`. Built in both builds rather than gated, so the two agree
+    /// on the struct's shape and the round-trip test below covers it either way.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     q_scale: Tensor,
     /// Shared, so a clone costs two reference counts, not the tables.
     host_tables: Arc<[Vec<f32>]>,

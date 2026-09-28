@@ -52,6 +52,7 @@ use crate::api::substrate::{
     SystemPromptView, TimelineDetail, ToolView, ToolsView, TurnView,
 };
 use crate::branch_ingest::filter::IngestScope;
+use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
 use crate::coding_sampling;
 use crate::config::DaemonConfig;
@@ -545,12 +546,16 @@ struct InferenceState {
 }
 
 // The titler uses this plain system prompt (not the projection schema), so the
-// dialogue `no_think` *section* never applies. `/no_think` is baked here for the
-// system side; the user side comes from the live `no_think_current` glue the
-// scheduler emits because generate_one_title sets `NO_THINK_SELECTOR` — one
-// glue mechanism shared with the dialogue, so Qwen3 suppresses reasoning instead
-// of burning the token budget on a `<think>` block.
-const TITLER_SYSTEM_PROMPT: &str = "/no_think\nYou write short conversation titles. \
+// dialogue `no_think` *section* never applies. Suppression is the `<think>`
+// trigger bound to `ThinkMode::Off` in `generate_one_title`, which is structural
+// and cannot be ignored — see there for why the soft switch is not enough.
+//
+// No `/no_think` here. It read as a system-side switch and was never one: the
+// marker only does anything on a dialect that declares it
+// (`Dialect::thinking_suppression`), this family declares the empty string, and
+// on the families that do declare it, it is honoured from the *user* turn rather
+// than the system prompt. It was prose to every model that ever saw it.
+const TITLER_SYSTEM_PROMPT: &str = "You write short conversation titles. \
 Given the user's first message, reply with a 3-6 word title that captures its topic. \
 No quotes, no period, no preamble — just the title.";
 
@@ -4032,11 +4037,10 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
     tokio::spawn(async move {
         // Passthrough conversations are the client's own turns and are not
         // resumable here; the titler's timeline is not a conversation; an
-        // archived one has been distilled and must not take another turn; a
-        // deleted one must stay deleted — `known_conversations` lists
-        // tombstoned timelines, because the sidebar shows them, so excluding
-        // them is this filter's job and not the lister's. An ingest layer
-        // carries no `conv_id` at all and is never listed here to begin with.
+        // archived one has been distilled and must not take another turn. A
+        // deleted one is already absent — `known_conversations` excludes
+        // tombstoned timelines. An ingest layer carries no `conv_id` at all and
+        // is never listed here to begin with.
         let candidates: Vec<(TimelineId, String)> = {
             let engine = state.engine.lock().unwrap();
             let titler = state.titler_timeline;
@@ -4044,10 +4048,7 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                 .known_conversations()
                 .into_iter()
                 .filter(|(tl, conv_id, _, archived, _)| {
-                    *tl != titler
-                        && !*archived
-                        && !engine.is_timeline_tombstoned(*tl)
-                        && !conv_id.starts_with(passthrough::CONV_ID_PREFIX)
+                    *tl != titler && !*archived && !conv_id.starts_with(passthrough::CONV_ID_PREFIX)
                 })
                 .map(|(tl, conv_id, _, _, _)| (tl, conv_id))
                 .collect()
@@ -4354,11 +4355,47 @@ async fn generate_one_title(
         TITLER_HEAD_TOKENS,
         TITLER_TAIL_TOKENS,
     );
-    // No `/no_think` baked into the user text: the selector below makes the
-    // scheduler emit it as live glue (`no_think_current`) right after the user
-    // opener — the same single mechanism the dialogue uses — so the only other
-    // copy is in the system prompt. The titler must never reason, or it fills the
-    // short budget with a `<think>` block and the stripped title comes back empty.
+    // **The titler must never reason, and the soft switch cannot stop it.**
+    //
+    // `NO_THINK_SELECTOR` below emits the scheduler's `no_think_current` glue,
+    // which renders `Dialect::no_think` — and on the Qwen3.5/3.8 family that is
+    // the empty string, because those models suppress by *prefilling* a closed
+    // block rather than by a marker (`Dialect::thinking_suppression`). So the
+    // glue was a zero-token segment and the `/no_think` in the system prompt was
+    // prose: the titler had two suppression mechanisms and, on the model this
+    // daemon actually runs, neither did anything.
+    //
+    // What that cost: the model reasoned into a 24-token budget and the label
+    // got whatever survived. A block that never closed stripped to nothing
+    // (`strip_think_blocks` drops an unterminated block to end) and the title
+    // was skipped; a block that closed just in time left a fragment, which is
+    // how "Cas", "The KV", "A" and "P" reached the sidebar — and, since a
+    // one-character `String` is not empty, they were written without a warning.
+    // Twelve identical prompts produced twelve different lengths, because what
+    // varied was the reasoning, not the budget.
+    //
+    // The trigger below is the layer that cannot be ignored: it binds `<think>`
+    // to `ThinkMode::Off`'s tree, whose whole body is the static run
+    // `"\n\n</think>"` with no free-decode span, so the block closes on the
+    // token after it opens and the budget goes to the title. `apply_think_mode`
+    // programs the sampler to match. This is the same three-layer arrangement
+    // the ingest summariser settled on after the same defect
+    // (`Conversation::submit_ingest_summary`) and the tree compressor's probe
+    // after it (`SubmitSummaryProbe`) — the titler was the one left behind.
+    let triggers = {
+        let en = state.engine.lock().unwrap();
+        match en.compile_think_steering() {
+            // No `<think>`/`</think>` token in this vocabulary, so there is no
+            // block to steer and nothing to bind to; `compile_think_steering`
+            // has already warned, and the sampler side below still runs.
+            Ok(Some(ts)) => ts.registry_for(&TriggerRegistry::new(), ThinkMode::Off),
+            Ok(None) => Arc::new(TriggerRegistry::new()),
+            Err(e) => {
+                tracing::warn!("titler think steering unavailable: {e}");
+                Arc::new(TriggerRegistry::new())
+            }
+        }
+    };
 
     // Clear the titler's in-memory turn tree so each title-gen starts from
     // just the system prompt (no accumulated history).
@@ -4373,9 +4410,16 @@ async fn generate_one_title(
         candle_conversation::NO_THINK_SELECTOR,
         candle_conversation::OptionalState::Present,
     );
+    // The sampler half of the same suppression: `Off` at this budget collapses
+    // the segment-close budget to a forced empty block, so the model is steered
+    // out of the block it opened as well as being structurally closed out of it.
+    let mut titler_sampling = titler.default_sampling();
+    titler_sampling.apply_think_mode(ThinkMode::Off, &state.tokenizer, TITLER_MAX_TOKENS);
     let opts = TurnOptions {
         max_tokens: Some(TITLER_MAX_TOKENS),
         selection: titler_sel,
+        sampling: Some(titler_sampling),
+        triggers,
         ..Default::default()
     };
     let handle = match titler.submit_turn_with_options(&truncated, opts) {
@@ -6437,6 +6481,21 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                         .is_some_and(|m| m.kind.is_summary())
                 })
                 .count();
+            let branches = s
+                .custom_of(tl)
+                .and_then(|m| m.get(BRANCHES_KEY))
+                .map(|v| {
+                    v.split(',')
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let commit = s
+                .custom_of(tl)
+                .and_then(|m| m.get(COMMIT_KEY))
+                .cloned()
+                .unwrap_or_default();
             conversations.push(ConvView {
                 timeline: tl.raw().to_string(),
                 conv_id: s.conv_id_of(tl).unwrap_or_default().to_string(),
@@ -6446,6 +6505,8 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                 turns: s.turn_count(tl),
                 tokens: s.total_token_count(tl),
                 summary_nodes,
+                branches,
+                commit,
             });
         }
     }

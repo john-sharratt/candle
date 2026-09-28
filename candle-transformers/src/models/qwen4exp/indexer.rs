@@ -31,10 +31,10 @@
 //!
 //! # Capacity
 //!
-//! [`IndexCache::ensure_capacity`] is called at wave admission, never inside
-//! the layer loop: growing reallocates, and an allocation between a tier
-//! placement and the forward that reads it is the arena-window hazard the
-//! span rules exist to prevent (hot-path invariant 7).
+//! The live tail's keys are pages of the span's QSA-index arenas
+//! ([`super::index_keys`]). [`IndexCache::ensure_capacity`] is called at wave
+//! admission, never inside the layer loop: a page claim that needs a new arena
+//! takes the arena window, which a forward holds shut (hot-path invariant 7).
 
 use candle::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
@@ -43,13 +43,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::paged_index::IndexPage;
 
 use super::config::IndexerConfig;
+/// Block keys per live-tail key page — see `index_keys`.
+pub use super::index_keys::PAGE_BLOCKS;
+use super::index_keys::{
+    alloc_buffers, row_addr, KeyPages, SnapshotBuffer, SnapshotBuffers, SNAPSHOT_BUFFERS,
+};
 use super::place::{PlacePage, Placement, PLACE_TILE_R};
 use super::qsa::{rms_norm_last, IndexerWeights};
 use super::qsa_select::{max_entries, max_keep, selected_width, MAX_RATIO};
 use super::spec::SpecCapture;
 use crate::models::delta_net::mix::SeqSpan;
+use crate::models::delta_net::RecurrentCompaction;
 use crate::models::operand_guard::expect_dense;
 use crate::models::qsa_selection::QsaSelection;
+use crate::models::wave_buffers::wave_from_vec_ticketed;
+use candle::wave_provenance::WaveTicket;
+use candle_nn::kv_cache::{arena_regions, plan_slot_moves, relocate_tensor, ArenaSlot, SlotTenant};
+
 use crate::models::rope_schedule::FactoredRope;
 
 /// Rows of scores computed in one tile.
@@ -102,9 +112,9 @@ impl TailRoute {
 /// One sequence's index cache for one full-attention layer.
 #[derive(Debug)]
 pub struct IndexCache {
-    /// `[capacity, head_dim]` F32 — prepared block keys (pooled, normed,
-    /// un-rotated). Only `[0, n_blocks)` is live.
-    keys: Tensor,
+    /// Prepared block keys (pooled, normed, un-rotated), in pages of the span's
+    /// QSA-index arenas. Only `[0, n_blocks)` is live.
+    keys: KeyPages,
     n_blocks: usize,
     /// `[MAX_RATIO, head_dim]` F32 — the raw projected keys of the block still
     /// filling, contiguous in `[0, n_open)`. Fewer than `ratio` rows; empty
@@ -118,6 +128,8 @@ pub struct IndexCache {
     raw: Tensor,
     /// Rows of [`Self::raw`] that are live.
     n_open: usize,
+    /// Rewind copies of [`Self::raw`], claimed with it — see [`Self::snapshot`].
+    snaps: SnapshotBuffers,
     /// Index rows for positions this sequence holds but never forwarded —
     /// prefixes whose K/V arrived by injection.
     ///
@@ -195,22 +207,33 @@ struct PlacedPage {
 #[derive(Debug)]
 pub struct IndexSnapshot {
     n_blocks: usize,
-    /// An OWNED copy of the open block's rows, not a handle to them: the buffer
-    /// they live in is written in place by the carry kernel, so a shared clone
-    /// would be overwritten by the very wave this snapshot exists to undo.
-    raw: Tensor,
+    /// A COPY of the open block's rows, not a handle to them: the buffer they
+    /// live in is written in place by the carry kernel, so a shared clone would
+    /// be overwritten by the very wave this snapshot exists to undo. In one of
+    /// the cache's own rewind buffers, which goes back when this drops; `None`
+    /// when there were no open rows to keep.
+    raw: Option<SnapshotBuffer>,
     n_open: usize,
+}
+
+/// The open block and its rewind copies, claimed together: `(raw, snapshot
+/// buffers)`. `MAX_RATIO` rows each, so the open block never resizes — it holds
+/// fewer than `ratio` rows and `ratio` is bounded by `MAX_RATIO`.
+fn open_block_buffers(head_dim: usize, device: &Device) -> Result<(Tensor, SnapshotBuffers)> {
+    let mut bufs = alloc_buffers(device, MAX_RATIO, head_dim, 1 + SNAPSHOT_BUFFERS)?;
+    let raw = bufs.pop().expect("claimed one more than the snapshots");
+    Ok((raw, SnapshotBuffers::new(bufs)))
 }
 
 impl IndexCache {
     pub fn new(head_dim: usize, device: &Device) -> Result<Self> {
+        let (raw, snaps) = open_block_buffers(head_dim, device)?;
         Ok(Self {
-            keys: Tensor::zeros((0, head_dim), DType::F32, device)?,
+            keys: KeyPages::new(head_dim, device),
             n_blocks: 0,
-            // `MAX_RATIO` rows so the buffer never resizes: the open block holds
-            // fewer than `ratio` rows and `ratio` is bounded by `MAX_RATIO`.
-            raw: Tensor::zeros((MAX_RATIO, head_dim), DType::F32, device)?,
+            raw,
             n_open: 0,
+            snaps,
             pages: Vec::new(),
             page_rows: vec![0],
             tail_base: 0,
@@ -219,9 +242,9 @@ impl IndexCache {
         })
     }
 
-    /// Blocks the key buffer can currently address.
+    /// Blocks the key pages can currently address.
     pub fn capacity_blocks(&self) -> usize {
-        self.keys.dim(0).unwrap_or(0)
+        self.keys.capacity_blocks()
     }
 
     /// Tokens this cache has consumed — `n_blocks · ratio + open`.
@@ -237,10 +260,20 @@ impl IndexCache {
         self.len(ratio) == 0
     }
 
+    /// A rewind point: the counters, and a copy of the open block's live rows in
+    /// one of the cache's own rewind buffers — no allocation, which is what lets a
+    /// forward take one after its span has opened.
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
+        let raw = if self.n_open > 0 {
+            let buf = self.snaps.take()?;
+            buf.tensor().slice_set(&self.open_rows()?, 0, 0)?;
+            Some(buf)
+        } else {
+            None
+        };
         Ok(IndexSnapshot {
             n_blocks: self.n_blocks,
-            raw: self.raw.to_owned_tensor()?,
+            raw,
             n_open: self.n_open,
         })
     }
@@ -309,8 +342,11 @@ impl IndexCache {
     /// next block. Handing the buffer over would leave the second restore with
     /// rows the first one's re-append had already overwritten.
     pub fn restore(&mut self, snap: &IndexSnapshot) -> Result<()> {
+        if let Some(buf) = &snap.raw {
+            self.raw
+                .slice_set(&buf.tensor().narrow(0, 0, snap.n_open)?, 0, 0)?;
+        }
         self.n_blocks = snap.n_blocks;
-        self.raw = snap.raw.to_owned_tensor()?;
         self.n_open = snap.n_open;
         Ok(())
     }
@@ -333,8 +369,9 @@ impl IndexCache {
     pub fn flush_open_block(
         &mut self,
         w: &IndexerWeights,
-        ratio: usize,
         rms_eps: f64,
+        // The open layer phase, for the flush job table.
+        ticket: Option<WaveTicket>,
     ) -> Result<Option<usize>> {
         use candle_kernels::simple::qsa_index_append::{run_qsa_index_flush, FLUSH_WORDS};
 
@@ -342,9 +379,9 @@ impl IndexCache {
             return Ok(None);
         }
         let cells = self.n_open;
-        let d = self.keys.dim(1)?;
-        self.ensure_capacity((self.n_blocks + 1) * ratio, ratio)?;
-        let dst = self.keys_ptr()? + (self.n_blocks as u64) * (d * 4) as u64;
+        let d = self.keys.head_dim();
+        self.keys.ensure(self.n_blocks + 1)?;
+        let dst = row_addr(&self.keys.page_ptrs()?, self.n_blocks, d);
         let src = self.raw_ptr()?;
         let jobs: Vec<i64> = vec![dst as i64, src as i64, cells as i64];
 
@@ -353,7 +390,7 @@ impl IndexCache {
             candle::bail!("qsa index flush runs on CUDA");
         };
         let stream = cuda.cuda_stream();
-        let jobs_t = Tensor::from_vec(jobs, (FLUSH_WORDS,), &device)?;
+        let jobs_t = wave_from_vec_ticketed(jobs, (FLUSH_WORDS,), &device, ticket)?;
         candle::set_kernel_breadcrumb("run_qsa_index_flush", file!(), line!());
         unsafe {
             run_qsa_index_flush(
@@ -405,13 +442,14 @@ impl IndexCache {
         ratio: usize,
         rms_eps: f64,
     ) -> Result<usize> {
-        let cells = self.flush_open_block(w, ratio, rms_eps)?;
+        // Closing a page is index maintenance, not a forward: no phase is open.
+        let cells = self.flush_open_block(w, rms_eps, None)?;
         if self.n_blocks == 0 {
             return Ok(0);
         }
-        // Owned: the page outlives the buffer, which the next append overwrites
-        // from row 0 once `n_blocks` is reset below.
-        let rows = self.live_rows()?.to_owned_tensor()?;
+        // Gathered out of the key pages, which the next append overwrites from
+        // row 0 once `n_blocks` is reset below.
+        let rows = self.live_rows()?;
         let last = cells.unwrap_or(ratio);
         let tokens = (self.n_blocks - 1) * ratio + last;
         // The page opens where the tail did. Its rows are un-rotated, so it
@@ -450,15 +488,18 @@ impl IndexCache {
         if n_open > 0 && open_d != head_dim {
             candle::bail!("index cache: open rows are [{n_open}, {open_d}] against {head_dim}");
         }
-        let raw = Tensor::zeros((MAX_RATIO, head_dim), DType::F32, rows.device())?;
+        let (raw, snaps) = open_block_buffers(head_dim, rows.device())?;
         if n_open > 0 {
             raw.slice_set(open, 0, 0)?;
         }
+        let mut keys = KeyPages::new(head_dim, rows.device());
+        keys.write_rows(rows)?;
         Ok(Self {
-            keys: rows.to_owned_tensor()?,
+            keys,
             n_blocks: n,
             raw,
             n_open,
+            snaps,
             pages: Vec::new(),
             page_rows: vec![0],
             tail_base: 0,
@@ -562,7 +603,8 @@ impl IndexCache {
             .iter()
             .map(|p| PlacePage { keys: &p.page.keys })
             .collect();
-        let placement = Placement::plan(&jobs)?;
+        // Placement runs between forwards, so there is no span to carve from.
+        let placement = Placement::plan(&jobs, None)?;
         placement.run(PLACE_TILE_R)?;
         self.placed.push(placement);
         self.placed_pages = self.pages.len();
@@ -650,13 +692,15 @@ impl IndexCache {
         self.page_rows[p] + whole
     }
 
-    /// The live prefix as a view — `[n_blocks, head_dim]`, no copy.
+    /// The live prefix as one owned `[n_blocks, head_dim]` tensor, gathered out
+    /// of the key pages.
     ///
     /// What a seal writes and what a single-page window reads. The rows above
     /// `n_blocks` are dead until an append writes them, so handing out the whole
-    /// buffer would persist uninitialised memory.
+    /// capacity would persist uninitialised memory. The scorer never comes here —
+    /// it reads the pages in place.
     pub fn live_rows(&self) -> Result<Tensor> {
-        self.keys.narrow(0, 0, self.n_blocks)
+        self.keys.gather(self.n_blocks)
     }
 
     /// The carried open block as a view — `[n_open, head_dim]`, no copy.
@@ -688,15 +732,21 @@ impl IndexCache {
     /// of blocks against a KV holding the whole history — the mismatch is
     /// silent, and it reads as a retrieval that simply chose badly.
     ///
-    /// The copy is `n_blocks × head_dim` floats per attention layer, so it is
-    /// proportional to depth rather than to the turn. That is the same shape of
-    /// cost the recurrent store's `fork_from` already pays at every view carve.
+    /// The copy is `n_blocks × head_dim` floats per attention layer, into only
+    /// the pages those keys reach, so it is proportional to depth rather than to
+    /// the parent's capacity. That is the same shape of cost the recurrent store's
+    /// `fork_from` already pays at every view carve.
     pub fn fork(&self) -> Result<Self> {
+        let (raw, snaps) = open_block_buffers(self.keys.head_dim(), self.keys.device())?;
+        if self.n_open > 0 {
+            raw.slice_set(&self.open_rows()?, 0, 0)?;
+        }
         Ok(Self {
-            keys: self.keys.to_owned_tensor()?,
+            keys: self.keys.fork(self.n_blocks)?,
             n_blocks: self.n_blocks,
-            raw: self.raw.to_owned_tensor()?,
+            raw,
             n_open: self.n_open,
+            snaps,
             // The pages are shared, not copied: a page is a sealed prefix that
             // nothing appends to, so parent and child read the same rows. Only
             // the live tail above them is written, and that is copied.
@@ -712,39 +762,37 @@ impl IndexCache {
         })
     }
 
-    /// Room for the blocks a sequence at `tokens` tokens will have completed.
+    /// Move every buffer of this cache whose slot is the source of a planned move
+    /// onto that move's destination — key pages, the open block, and the free
+    /// rewind buffers. Answers how many moved.
     ///
-    /// Called at wave admission. Growth doubles, so a long sequence pays a
-    /// logarithmic number of copies rather than one per wave.
-    pub fn ensure_capacity(&mut self, tokens: usize, ratio: usize) -> Result<()> {
-        let need = tokens / ratio + 1;
-        let cap = self.keys.dim(0)?;
-        if cap >= need {
-            return Ok(());
-        }
-        let head_dim = self.keys.dim(1)?;
-        let grown = (cap * 2).max(need).max(64);
-        // Uninitialised: the live prefix is copied in below and everything
-        // above `n_blocks` is dead until an append writes it, so zeroing is a
-        // full-width memset of bytes nothing reads (hot-path invariant 6).
-        let mut keys = Tensor::empty((grown, head_dim), DType::F32, self.keys.device())?;
-        if self.n_blocks > 0 {
-            keys = keys.slice_assign(
-                &[0..self.n_blocks, 0..head_dim],
-                &self.keys.narrow(0, 0, self.n_blocks)?,
-            )?;
-        }
-        self.keys = keys;
-        Ok(())
+    /// Between forwards only: a forward resolves page addresses into its tables
+    /// as it runs, and between forwards nothing holds one.
+    pub fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
+        Ok(self.keys.relocate(moves)?
+            + usize::from(relocate_tensor(&mut self.raw, moves)?)
+            + self.snaps.relocate(moves)?)
     }
 
-    /// Reset to empty — a sequence starting over at offset 0.
+    /// Room for the blocks a sequence at `tokens` tokens will have completed in
+    /// its live tail.
+    ///
+    /// Called at wave admission. The tail opens at [`Self::next_base`], so the
+    /// tokens injected pages already cover take no key pages here. Growth is a
+    /// page at a time and moves nothing already written.
+    pub fn ensure_capacity(&mut self, tokens: usize, ratio: usize) -> Result<()> {
+        self.keys
+            .ensure(tokens.saturating_sub(self.tail_base) / ratio + 1)
+    }
+
     /// Start the sequence over — including its injected prefix.
     ///
     /// The pages go too. They describe positions this slot held; a slot
     /// starting over holds none of them, and leaving them would put the next
-    /// sequence's first token at the old prefix's end.
+    /// sequence's first token at the old prefix's end. The key pages go back to
+    /// the span with them; admission claims what the new sequence needs.
     pub fn reset(&mut self) {
+        self.keys.clear();
         self.n_blocks = 0;
         self.n_open = 0;
         self.pages.clear();
@@ -759,11 +807,6 @@ impl IndexCache {
         let have = self.n_open + rows;
         let n_new = have / ratio;
         (n_new, have - n_new * ratio)
-    }
-
-    /// Device address of this cache's prepared-key buffer.
-    fn keys_ptr(&self) -> Result<u64> {
-        tensor_ptr(&self.keys)
     }
 
     /// Device address of this cache's open-block buffer.
@@ -799,6 +842,7 @@ impl IndexCache {
         out: &Tensor,
         out_stride: usize,
         row_base: usize,
+        ticket: Option<WaveTicket>,
     ) -> Result<Vec<u32>> {
         self.score_rows_routed(
             q,
@@ -811,6 +855,7 @@ impl IndexCache {
             out_stride,
             row_base,
             TailRoute::for_span,
+            ticket,
         )
     }
 
@@ -830,6 +875,7 @@ impl IndexCache {
         out_stride: usize,
         row_base: usize,
         route: impl FnOnce(usize, usize) -> TailRoute,
+        ticket: Option<WaveTicket>,
     ) -> Result<Vec<u32>> {
         let (t, qh, qd) = q.dims3()?;
         if t != qpos.len() {
@@ -912,6 +958,7 @@ impl IndexCache {
                 out,
                 out_stride,
                 row_base,
+                ticket,
             )?;
         }
         if tail_in_paged || live_cols == 0 {
@@ -922,8 +969,18 @@ impl IndexCache {
         // is a view: cuBLAS takes the transpose as `OP_T` with
         // `lda = head_dim`. Live-tail columns only: the pages above already
         // covered theirs.
+        // Read through the key pages' table, in place — the live tail is not one
+        // dense block, and gathering it into one would be a copy per span per
+        // layer per wave (hot-path invariant 2b).
+        let page_ptrs = self.keys.page_ptrs()?;
         let rotated = rotate_rows(
-            &self.keys.narrow(0, 0, live_cols)?,
+            RowSource::Paged {
+                pages: &page_ptrs,
+                rows_per_page: PAGE_BLOCKS,
+                rows: live_cols,
+                d,
+                device: self.keys.device(),
+            },
             rope,
             1,
             RowPositions::Affine {
@@ -932,6 +989,7 @@ impl IndexCache {
             },
             RowRungs::Uniform(rung),
             RotSide::Key,
+            ticket,
         )?;
         // Only narrowed when pages actually sit ahead of the tail. With none,
         // `page_cols` is 0 and the narrow is the whole buffer — a view that
@@ -1004,6 +1062,9 @@ impl IndexCache {
         out: &Tensor,
         out_stride: usize,
         row_base: usize,
+        // The span the page/candidate tables below belong to — rebuilt per
+        // scored layer and dead once the launch is issued.
+        ticket: Option<WaveTicket>,
     ) -> Result<()> {
         use candle_kernels::simple::qsa_score_paged::{run_qsa_score_paged, PAGE_WORDS};
 
@@ -1027,8 +1088,7 @@ impl IndexCache {
                 self.placed_pages,
             );
         }
-        let n_pages = self.pages.len() + usize::from(with_tail);
-        let mut desc: Vec<i64> = Vec::with_capacity(n_pages * PAGE_WORDS);
+        let mut desc: Vec<i64> = Vec::with_capacity((self.pages.len() + 1) * PAGE_WORDS);
         // The placements in order, each covering the batch it was planned for,
         // so the flattened entries are the pages' own order.
         let mut i = 0usize;
@@ -1052,20 +1112,29 @@ impl IndexCache {
             );
         }
         let mut first: Vec<u32> = self.page_rows.iter().map(|&r| r as u32).collect();
+        let mut n_pages = self.pages.len();
         if with_tail {
             let span = self.page_row_span();
-            // Row-major, as the append writes it: group `c` of row `j` at
-            // `c + j·(d/4)` float4s.
-            desc.push(self.keys_ptr()? as i64);
-            desc.push(1);
-            desc.push((d / 4) as i64);
-            desc.push(self.tail_base as i64 - (span * ratio) as i64);
-            first.push((span + self.n_blocks) as u32);
+            // One entry per key page the live tail reaches, each row-major as the
+            // append writes it: group `c` of row `j` at `c + j·(d/4)` float4s. The
+            // tail's rows are consecutive global rows across its pages, so every
+            // page shares the tail's `delta`.
+            let delta = self.tail_base as i64 - (span * ratio) as i64;
+            let mut end = span;
+            for (ptr, used) in self.keys.tail(self.n_blocks)? {
+                desc.push(ptr as i64);
+                desc.push(1);
+                desc.push((d / 4) as i64);
+                desc.push(delta);
+                end += used;
+                first.push(end as u32);
+                n_pages += 1;
+            }
         }
         let n_desc = desc.len();
-        let pages_tbl = Tensor::from_vec(desc, (n_desc,), &device)?;
-        let first_tbl = Tensor::from_vec(first, (n_pages + 1,), &device)?;
-        let cnt_t = Tensor::from_vec(cand.to_vec(), (t,), &device)?;
+        let pages_tbl = wave_from_vec_ticketed(desc, (n_desc,), &device, ticket)?;
+        let first_tbl = wave_from_vec_ticketed(first, (n_pages + 1,), &device, ticket)?;
+        let cnt_t = wave_from_vec_ticketed(cand.to_vec(), (t,), &device, ticket)?;
         let table = rope.table(rung)?;
 
         let candle::Device::Cuda(cuda) = &device else {
@@ -1140,24 +1209,63 @@ pub enum RotSide {
     Key,
 }
 
-/// Rotate `src` (`[n, d]`, contiguous) at its rows' positions and rungs from
-/// `rope`, into a new tensor.
+/// The rows [`rotate_rows`] reads.
+pub enum RowSource<'a> {
+    /// One dense `[n, d]` tensor — a wave's queries.
+    Dense(&'a Tensor),
+    /// `rows` rows of width `d` in pages of `rows_per_page`, row `r` at
+    /// `pages[r / rows_per_page] + (r % rows_per_page)·d` floats — a live tail's
+    /// keys, read in place.
+    Paged {
+        pages: &'a [u64],
+        rows_per_page: usize,
+        rows: usize,
+        d: usize,
+        device: &'a Device,
+    },
+}
+
+/// Rotate the rows of `src` at their positions and rungs from `rope`, into a new
+/// dense `[n, d]` tensor.
 ///
 /// Consecutive runs of `rows_per_pos` rows share a position and a rung — a
 /// query's heads all sit at the query's position, on its sequence's rung.
 #[cfg(feature = "cuda")]
 pub fn rotate_rows(
-    src: &Tensor,
+    src: RowSource<'_>,
     rope: &FactoredRope,
     rows_per_pos: usize,
     positions: RowPositions<'_>,
     rungs: RowRungs<'_>,
     side: RotSide,
+    // The open layer phase, for the position and rung tables below.
+    ticket: Option<WaveTicket>,
 ) -> Result<Tensor> {
     use candle_kernels::simple::qsa_rope_rows::run_qsa_rope_rows;
 
-    let (n, d) = src.dims2()?;
-    expect_dense(src, "qsa rope rows")?;
+    let (n, d, device) = match &src {
+        RowSource::Dense(t) => {
+            expect_dense(t, "qsa rope rows")?;
+            let (n, d) = t.dims2()?;
+            (n, d, t.device())
+        }
+        RowSource::Paged {
+            pages,
+            rows_per_page,
+            rows,
+            d,
+            device,
+        } => {
+            if *rows_per_page == 0 || rows.div_ceil(*rows_per_page) > pages.len() {
+                candle::bail!(
+                    "qsa rope rows: {rows} rows in pages of {rows_per_page} against a \
+                     {}-page table",
+                    pages.len()
+                );
+            }
+            (*rows, *d, *device)
+        }
+    };
     if rope.rope_dim() > d {
         candle::bail!(
             "qsa rope rows: a {}-wide rotary width on {d}-wide rows",
@@ -1171,7 +1279,7 @@ pub fn rotate_rows(
     if rows_per_pos == 0 {
         candle::bail!("qsa rope rows: rows_per_pos must be at least 1");
     }
-    let dst = Tensor::empty((n, d), DType::F32, src.device())?;
+    let dst = Tensor::empty((n, d), DType::F32, device)?;
     if n == 0 {
         return Ok(dst);
     }
@@ -1185,7 +1293,11 @@ pub fn rotate_rows(
                 );
             }
             let v: Vec<u32> = p.iter().map(|&x| x as u32).collect();
-            (Some(Tensor::from_vec(v, (p.len(),), src.device())?), 0, 0)
+            (
+                Some(wave_from_vec_ticketed(v, (p.len(),), device, ticket)?),
+                0,
+                0,
+            )
         }
         RowPositions::Affine { base, step } => (None, base, step),
     };
@@ -1198,7 +1310,12 @@ pub fn rotate_rows(
                 );
             }
             (
-                Some(Tensor::from_vec(r.to_vec(), (r.len(),), src.device())?),
+                Some(wave_from_vec_ticketed(
+                    r.to_vec(),
+                    (r.len(),),
+                    device,
+                    ticket,
+                )?),
                 0,
             )
         }
@@ -1220,14 +1337,41 @@ pub fn rotate_rows(
         Some(t) => u32_ptr(t)? as *const u32,
         None => std::ptr::null(),
     };
-    let candle::Device::Cuda(cuda) = src.device() else {
+    // The page table, uploaded for the launch; the dense source needs none.
+    let (src_ptr, pages_t, rows_per_src_page) = match &src {
+        RowSource::Dense(t) => (tensor_ptr(t)?, None, 0usize),
+        RowSource::Paged {
+            pages,
+            rows_per_page,
+            rows,
+            ..
+        } => {
+            let used: Vec<i64> = pages[..rows.div_ceil(*rows_per_page)]
+                .iter()
+                .map(|&p| p as i64)
+                .collect();
+            let len = used.len();
+            (
+                0,
+                Some(wave_from_vec_ticketed(used, (len,), device, ticket)?),
+                *rows_per_page,
+            )
+        }
+    };
+    let pages_ptr = match &pages_t {
+        Some(t) => i64_ptr(t)? as *const i64,
+        None => std::ptr::null(),
+    };
+    let candle::Device::Cuda(cuda) = device else {
         candle::bail!("qsa rope rows runs on CUDA");
     };
     let stream = cuda.cuda_stream();
     candle::set_kernel_breadcrumb("run_qsa_rope_rows", file!(), line!());
     unsafe {
         run_qsa_rope_rows(
-            tensor_ptr(src)? as *const f32,
+            src_ptr as *const f32,
+            pages_ptr,
+            rows_per_src_page as i32,
             tensor_ptr(&dst)? as *mut f32,
             n as i32,
             d as i32,
@@ -1440,6 +1584,7 @@ pub fn project_keys(h: &Tensor, w: &IndexerWeights) -> Result<Tensor> {
 /// frequencies. Each row rotates at its sequence's rung (`rungs`), and takes
 /// that rung's `m²` as the attention's queries do (§12).
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn project_queries(
     h: &Tensor,
     w: &IndexerWeights,
@@ -1448,6 +1593,8 @@ pub fn project_queries(
     positions: &[usize],
     rungs: RowRungs<'_>,
     rms_eps: f64,
+    // The open layer phase, for the rotation's position and rung tables.
+    ticket: Option<WaveTicket>,
 ) -> Result<Tensor> {
     let rows = h.dim(0)?;
     let q = h
@@ -1455,12 +1602,13 @@ pub fn project_queries(
         .reshape((rows, cfg.n_heads, cfg.head_dim))?;
     let q = rms_norm_last(&q, &w.q_norm, rms_eps)?.reshape((rows * cfg.n_heads, cfg.head_dim))?;
     rotate_rows(
-        &q,
+        RowSource::Dense(&q),
         rope,
         cfg.n_heads,
         RowPositions::PerGroup(positions),
         rungs,
         RotSide::Query,
+        ticket,
     )?
     .reshape((rows, cfg.n_heads, cfg.head_dim))
 }
@@ -1577,6 +1725,10 @@ pub fn append_wave(
     w: &IndexerWeights,
     ratio: usize,
     rms_eps: f64,
+    // The span the job and carry tables belong to — rebuilt per call and dead
+    // once the launches below are issued, so a per-layer phase is their
+    // lifetime. `None` falls back to an ordinary upload.
+    ticket: Option<WaveTicket>,
 ) -> Result<()> {
     use candle_kernels::simple::qsa_index_append::{
         run_qsa_index_append, run_qsa_index_carry, CARRY_WORDS, JOB_WORDS, MAX_D,
@@ -1588,7 +1740,7 @@ pub fn append_wave(
     if ratio == 0 || ratio > MAX_RATIO {
         candle::bail!("qsa append: ratio {ratio} outside 1..={MAX_RATIO}");
     }
-    let d = work[0].cache.keys.dim(1)?;
+    let d = work[0].cache.keys.head_dim();
     if d == 0 || d > MAX_D {
         candle::bail!(
             "qsa append: head_dim {d} outside 1..={MAX_D} — the kernel gives one thread to a \
@@ -1610,10 +1762,11 @@ pub fn append_wave(
         let (n_new, left) = span.cache.plan(span.rows, ratio);
         let n_blocks = span.cache.n_blocks;
         let n_open = span.cache.n_open;
-        // Before the pointer is taken: growing reallocates the key buffer.
-        span.cache
-            .ensure_capacity((n_blocks + n_new) * ratio, ratio)?;
-        let keys = span.cache.keys_ptr()?;
+        // Admission sized the pages for this wave, so this claims nothing; a
+        // page it did have to claim inside the forward is refused by the arena
+        // window rather than carved out of ground the wave stands on.
+        span.cache.keys.ensure(n_blocks + n_new)?;
+        let pages = span.cache.keys.page_ptrs()?;
         let raw = span.cache.raw_ptr()?;
 
         for i in 0..n_new {
@@ -1621,7 +1774,7 @@ pub fn append_wave(
             // every later one is contiguous in the wave's projection.
             let n0 = if i == 0 { n_open.min(ratio) } else { 0 };
             let src1 = span.start + (i * ratio).saturating_sub(n_open);
-            jobs.push((keys + (n_blocks + i) as u64 * row) as i64);
+            jobs.push(row_addr(&pages, n_blocks + i, d) as i64);
             jobs.push(if n0 > 0 { raw as i64 } else { 0 });
             jobs.push(n0 as i64);
             jobs.push((k_base + src1 as u64 * row) as i64);
@@ -1661,10 +1814,10 @@ pub fn append_wave(
         let n_carry = carries.len() / CARRY_WORDS;
         // Kept alive until the launches are issued.
         let jobs_t = (!jobs.is_empty())
-            .then(|| Tensor::from_vec(jobs, (n_jobs * JOB_WORDS,), &device))
+            .then(|| wave_from_vec_ticketed(jobs, (n_jobs * JOB_WORDS,), &device, ticket))
             .transpose()?;
         let carries_t = (!carries.is_empty())
-            .then(|| Tensor::from_vec(carries, (n_carry * CARRY_WORDS,), &device))
+            .then(|| wave_from_vec_ticketed(carries, (n_carry * CARRY_WORDS,), &device, ticket))
             .transpose()?;
         if let Some(t) = jobs_t.as_ref() {
             let k_norm = tensor_ptr(&w.k_norm)?;
@@ -1699,6 +1852,52 @@ pub fn append_wave(
         span.cache.n_open = n_open;
     }
     Ok(())
+}
+
+/// Compact the QSA-index arenas `caches` live in: for each of the tenant's two
+/// strides — a key page, and an open block or its rewind copy — plan the
+/// two-cursor pass and move every buffer whose slot is a source onto its
+/// destination. The same walk and the same provisioning as the recurrent-state
+/// pass (`compact_stores`); `max_moves` (zero for none) bounds each stride.
+///
+/// **Between forwards.** Every cache that could hold a source must be in `caches`:
+/// a source left behind keeps its slot and its claimed destination goes back, which
+/// is safe and shows as `moved` short of `planned`.
+pub fn compact_index_caches(
+    caches: &mut [&mut IndexCache],
+    head_dim: usize,
+    device: &Device,
+    max_moves: usize,
+) -> Result<RecurrentCompaction> {
+    if !matches!(device, Device::Cuda(_)) {
+        return Ok(RecurrentCompaction::default());
+    }
+    let f32_bytes = DType::F32.size_in_bytes();
+    let regions_before = arena_regions(device, SlotTenant::QsaIndex);
+    let mut planned = 0usize;
+    let mut moved = 0usize;
+    for rows in [PAGE_BLOCKS, MAX_RATIO] {
+        let moves = plan_slot_moves(
+            device,
+            SlotTenant::QsaIndex,
+            rows * head_dim * f32_bytes,
+            max_moves,
+        )?;
+        planned += moves.len();
+        let mut by_source: HashMap<u64, ArenaSlot> =
+            moves.into_iter().map(|m| (m.src, m.dst)).collect();
+        for cache in caches.iter_mut() {
+            moved += cache.relocate(&mut by_source)?;
+        }
+        // Destinations whose source nothing here held go back to their arenas.
+        drop(by_source);
+    }
+    Ok(RecurrentCompaction {
+        planned,
+        moved,
+        regions_before,
+        regions_after: arena_regions(device, SlotTenant::QsaIndex),
+    })
 }
 
 /// Device address of an i64 descriptor table.
@@ -1776,6 +1975,13 @@ pub fn select_layer(
     eps: f64,
     device: &Device,
     qsa_rows: &AtomicU64,
+    // The open LAYER phase's ticket, for the page, window, job and rotation
+    // tables built below. Every one of them is rebuilt for each attention layer
+    // and dead by the end of it, so a per-layer span is their lifetime — the
+    // forward-scoped span, sized for the few kilobytes a wave builds once,
+    // filled up partway through the sweep when they were put there instead.
+    // `None` falls back to an ordinary upload.
+    ticket: Option<WaveTicket>,
 ) -> Result<Option<QsaSelection>> {
     if compress_ratio == 0 {
         return Ok(None);
@@ -1825,7 +2031,7 @@ pub fn select_layer(
                 _ => RowRungs::PerGroup(&row_rungs),
             };
             Some(project_queries(
-                h, indexer, idx_cfg, rope, &positions, rungs, eps,
+                h, indexer, idx_cfg, rope, &positions, rungs, eps, ticket,
             )?)
         }
         None => None,
@@ -1875,7 +2081,7 @@ pub fn select_layer(
             work.len()
         );
     }
-    append_wave(&mut work, &k_all, indexer, compress_ratio, eps)?;
+    append_wave(&mut work, &k_all, indexer, compress_ratio, eps, ticket)?;
 
     // **Place any page that is carrying no placement, before anything scores.**
     //
@@ -1948,6 +2154,7 @@ pub fn select_layer(
                     &scores,
                     widest,
                     span.start,
+                    ticket,
                 )
                 .map_err(|e| candle::Error::Msg(format!("kv layer {kv}, seq {}: {e}", span.seq)))?;
             cand[span.start..span.start + span.len].copy_from_slice(&span_cand);
@@ -2001,8 +2208,8 @@ pub fn select_layer(
         }
     }
     let n_pages = pages.len() / 2;
-    let pages_t = Tensor::from_vec(pages, (n_pages, 2), device)?;
-    let win_t = Tensor::from_vec(win, (total_rows, 2), device)?;
+    let pages_t = wave_from_vec_ticketed(pages, (n_pages, 2), device, ticket)?;
+    let win_t = wave_from_vec_ticketed(win, (total_rows, 2), device, ticket)?;
     Ok(Some(sel.with_pages(pages_t, win_t)?))
 }
 
@@ -2024,6 +2231,40 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// **A compaction pass moves buffers, never their contents.** Three caches
+    /// across several key pages, the middle one dropped to leave holes, then a
+    /// pass: every surviving cache reads back exactly the keys and open rows it
+    /// held, and every buffer the pass reached now sits on a slot it planned.
+    #[test]
+    fn compaction_moves_index_buffers_without_changing_them() -> Result<()> {
+        let Some(device) = cuda() else {
+            return Ok(());
+        };
+        let d = 128usize;
+        let build = |n: usize, seed: u64| -> Result<(IndexCache, Vec<f32>, Vec<f32>)> {
+            let keys = lcg(n * d, seed, 1.0);
+            let open = lcg(3 * d, seed ^ 0x55, 1.0);
+            let cache = IndexCache::from_rows(
+                &Tensor::from_vec(keys.clone(), (n, d), &device)?,
+                &Tensor::from_vec(open.clone(), (3, d), &device)?,
+                d,
+            )?;
+            Ok((cache, keys, open))
+        };
+        let (mut a, a_keys, a_open) = build(2 * PAGE_BLOCKS + 7, 1)?;
+        let hole = build(3 * PAGE_BLOCKS, 2)?;
+        let (mut c, c_keys, c_open) = build(PAGE_BLOCKS + 1, 3)?;
+        drop(hole);
+
+        let report = compact_index_caches(&mut [&mut a, &mut c], d, &device, 0)?;
+        assert!(report.moved <= report.planned);
+        for (cache, keys, open) in [(&a, &a_keys, &a_open), (&c, &c_keys, &c_open)] {
+            assert_eq!(&cache.live_rows()?.flatten_all()?.to_vec1::<f32>()?, keys);
+            assert_eq!(&cache.open_rows()?.flatten_all()?.to_vec1::<f32>()?, open);
+        }
+        Ok(())
     }
 
     /// An index cache holding `pages` (by token width) and `open` carried rows,
@@ -2293,6 +2534,74 @@ mod tests {
         assert_eq!(c.indexed_tokens(ratio), 9);
     }
 
+    /// A snapshot keeps a COPY of the open rows: the wave after it writes the open
+    /// block in place, and restoring — twice, as a partial accept can — puts back
+    /// exactly the rows and counters it took.
+    #[test]
+    fn a_snapshot_restores_the_open_rows_it_copied() {
+        let d = 4usize;
+        let rows = Tensor::zeros((2, d), DType::F32, &Device::Cpu).unwrap();
+        let open_v: Vec<f32> = (0..2 * d).map(|i| i as f32 + 0.5).collect();
+        let open = Tensor::from_vec(open_v.clone(), (2, d), &Device::Cpu).unwrap();
+        let mut cache = IndexCache::from_rows(&rows, &open, d).unwrap();
+        let snap = cache.snapshot().unwrap();
+
+        let dirty = |c: &mut IndexCache| {
+            c.raw
+                .slice_set(
+                    &Tensor::full(-1f32, (MAX_RATIO, d), &Device::Cpu).unwrap(),
+                    0,
+                    0,
+                )
+                .unwrap();
+            c.n_blocks = 5;
+            c.n_open = 3;
+        };
+        for _ in 0..2 {
+            dirty(&mut cache);
+            cache.restore(&snap).unwrap();
+            assert_eq!(cache.seal_shape(), (2, 2));
+            assert_eq!(
+                cache
+                    .open_rows()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                open_v
+            );
+        }
+    }
+
+    /// Snapshots draw on the cache's own rewind buffers, which a dropped snapshot
+    /// gives back; more outstanding at once than there are buffers is refused by
+    /// name. A snapshot of an empty open block needs no buffer at all.
+    #[test]
+    fn snapshots_draw_on_a_fixed_set_of_rewind_buffers() {
+        let d = 4usize;
+        let rows = Tensor::zeros((1, d), DType::F32, &Device::Cpu).unwrap();
+        let empty = Tensor::zeros((0, d), DType::F32, &Device::Cpu).unwrap();
+        let bare = IndexCache::from_rows(&rows, &empty, d).unwrap();
+        let free: Vec<_> = (0..2 * SNAPSHOT_BUFFERS)
+            .map(|_| bare.snapshot().unwrap())
+            .collect();
+        assert!(free.iter().all(|s| s.raw.is_none()));
+
+        let open = Tensor::ones((1, d), DType::F32, &Device::Cpu).unwrap();
+        let cache = IndexCache::from_rows(&rows, &open, d).unwrap();
+        let mut held: Vec<_> = (0..SNAPSHOT_BUFFERS)
+            .map(|_| cache.snapshot().unwrap())
+            .collect();
+        let err = cache.snapshot().unwrap_err().to_string();
+        assert!(err.contains("outstanding"), "{err}");
+        held.pop();
+        assert!(
+            cache.snapshot().is_ok(),
+            "a dropped snapshot gives its buffer back"
+        );
+    }
+
     fn lcg(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         let mut s = seed;
         (0..n)
@@ -2473,7 +2782,7 @@ mod tests {
         fn append(&self, cache: &mut IndexCache, start: usize, rows: usize) -> Result<()> {
             cache.ensure_capacity(start + rows, self.ratio)?;
             let mut work = [AppendSpan { cache, start, rows }];
-            append_wave(&mut work, &self.keys, &self.w, self.ratio, self.eps)
+            append_wave(&mut work, &self.keys, &self.w, self.ratio, self.eps, None)
         }
 
         /// A cache holding the first `tokens` tokens, appended in waves whose
@@ -2524,10 +2833,11 @@ mod tests {
                 qpos,
                 RowRungs::Uniform(0),
                 self.eps,
+                None,
             )?;
             let scores = Tensor::empty((t, widest), DType::F32, &self.device)?;
             let cand = cache.score_rows(
-                &q, qpos, &self.cfg, self.ratio, &self.rope, 0, &scores, widest, 0,
+                &q, qpos, &self.cfg, self.ratio, &self.rope, 0, &scores, widest, 0, None,
             )?;
             let mut table = SelectionTable::new(t, self.ratio, self.cfg.top_k, &self.device)?;
             let tail: Vec<u32> = qpos
@@ -2813,9 +3123,11 @@ mod tests {
             &qpos,
             RowRungs::Uniform(0),
             rig.eps,
+            None,
         )?;
-        let refused =
-            child.score_rows(&q, &qpos, &rig.cfg, ratio, &rig.rope, 0, &scores, widest, 0);
+        let refused = child.score_rows(
+            &q, &qpos, &rig.cfg, ratio, &rig.rope, 0, &scores, widest, 0, None,
+        );
         assert!(
             refused.is_err(),
             "an unplaced fork scored without complaint — it has no placement to \
@@ -3172,7 +3484,7 @@ mod tests {
                 start: at,
                 rows,
             }];
-            append_wave(&mut work, &k_all, &w_gpu, ratio, eps)?;
+            append_wave(&mut work, &k_all, &w_gpu, ratio, eps, None)?;
             at += rows;
             assert_eq!(cache.len(ratio), at, "cache length after {at} tokens");
         }
@@ -3186,12 +3498,14 @@ mod tests {
             &qpos,
             RowRungs::Uniform(0),
             eps,
+            None,
         )?;
         let mut table = SelectionTable::new(t, ratio, cfg.top_k, &device)?;
         let widest = t.div_ceil(ratio).max(1);
         let scores = Tensor::empty((t, widest), DType::F32, &device)?;
-        let cand =
-            cache.score_rows(&q_all, &qpos, &cfg, ratio, &rope_gpu, 0, &scores, widest, 0)?;
+        let cand = cache.score_rows(
+            &q_all, &qpos, &cfg, ratio, &rope_gpu, 0, &scores, widest, 0, None,
+        )?;
         let tail: Vec<u32> = qpos.iter().map(|&p| cache.tail_len(p, ratio)).collect();
         table.fill_rows(&scores, &cand, &qpos, &tail, ratio, cfg.top_k, 0)?;
 
@@ -3252,12 +3566,13 @@ mod tests {
             }
             let src = Tensor::from_vec(host, (pos.len(), d), &device)?;
             let got = rotate_rows(
-                &src,
+                RowSource::Dense(&src),
                 &rope,
                 1,
                 RowPositions::PerGroup(&pos),
                 RowRungs::Uniform(0),
                 RotSide::Key,
+                None,
             )?
             .to_vec2::<f32>()?;
             for (r, &p) in pos.iter().enumerate() {
@@ -3314,12 +3629,13 @@ mod tests {
         let host = lcg(n * d, 0x5A, 1.0);
         let src = Tensor::from_vec(host.clone(), (n, d), &device)?;
         let mixed = rotate_rows(
-            &src,
+            RowSource::Dense(&src),
             &rope,
             heads,
             RowPositions::PerGroup(&pos),
             RowRungs::PerGroup(&row_rung),
             RotSide::Query,
+            None,
         )?
         .to_vec2::<f32>()?;
         for (g, (&p, &r)) in pos.iter().zip(&row_rung).enumerate() {
@@ -3330,21 +3646,23 @@ mod tests {
                 &device,
             )?;
             let alone = rotate_rows(
-                &one,
+                RowSource::Dense(&one),
                 &rope,
                 heads,
                 RowPositions::PerGroup(&[p]),
                 RowRungs::Uniform(r),
                 RotSide::Query,
+                None,
             )?
             .to_vec2::<f32>()?;
             let key = rotate_rows(
-                &one,
+                RowSource::Dense(&one),
                 &rope,
                 heads,
                 RowPositions::PerGroup(&[p]),
                 RowRungs::Uniform(r),
                 RotSide::Key,
+                None,
             )?
             .to_vec2::<f32>()?;
             let m2 = rungs.q_scale(r);
@@ -3376,12 +3694,13 @@ mod tests {
             }
         }
         assert!(rotate_rows(
-            &src,
+            RowSource::Dense(&src),
             &rope,
             heads,
             RowPositions::PerGroup(&pos),
             RowRungs::Uniform(3),
             RotSide::Key,
+            None,
         )
         .is_err());
         Ok(())
@@ -3397,12 +3716,13 @@ mod tests {
         let rope = FactoredRope::new(&plain_inv_freq(4, 1e6), &device)?;
         let src = Tensor::from_vec(vec![0f32; 8], (1, 8), &device)?;
         assert!(rotate_rows(
-            &src,
+            RowSource::Dense(&src),
             &rope,
             0,
             RowPositions::Affine { base: 0, step: 1 },
             RowRungs::Uniform(0),
             RotSide::Key,
+            None,
         )
         .is_err());
         Ok(())

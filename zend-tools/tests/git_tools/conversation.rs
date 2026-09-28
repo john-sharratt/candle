@@ -136,18 +136,36 @@ fn a_conflict_is_settled_in_the_conversations_files_before_it_commits() {
     );
 }
 
+/// Origin's `main` and a `topic` branch that both moved on from the same
+/// commit: `main` by `local.txt`, published from here, and `topic` by someone
+/// else's `theirs.txt`. Returns the two tips, `main`'s first.
+///
+/// History on both sides has to be made on origin. A conversation reads
+/// origin's copy of its branch, so a commit made here and never pushed is not
+/// in its base at all — merging origin's `main` into it would find nothing on
+/// its own side. `topic` is fetched so its tip can be named by id.
+fn diverged() -> (GitWorkspace, PathBuf, String, String) {
+    let (ws, origin) = on_origin();
+    let theirs = someone_else_pushes(&ws, &origin, "topic", "theirs.txt");
+    ws.write_worktree("local.txt", "made here\n");
+    let mine = ws.commit_all("mine");
+    ws.git(&["push", "-q", "origin", "main"]);
+    ws.git(&["fetch", "-q", "origin"]);
+    (ws, origin, mine, theirs)
+}
+
 /// **History on both sides: the merge is finished by the next commit, which
-/// records both parents** — a commit made on this machine and never pushed
-/// is kept, and so is everyone else's.
+/// records both parents** — the branch's own commits are kept, and so is
+/// everyone else's.
 #[test]
 fn a_merge_of_diverged_history_is_recorded_by_the_next_commit() {
-    let (ws, origin) = on_origin();
-    ws.write_worktree("local.txt", "made here, never pushed\n");
-    let local = ws.commit_all("local only");
+    let (ws, origin, local, theirs) = diverged();
     let conv = ws.conversation();
-    let theirs = someone_else_pushes(&ws, &origin, "main", "theirs.txt");
 
-    let merged = conv.call("git_merge", json!({"repo": "app"}));
+    let merged = conv.call(
+        "git_merge",
+        json!({"repo": "app", "from": commit_rev(&theirs)}),
+    );
     assert_eq!(merged["merged"], "merging", "{merged}");
     let status = conv.status();
     assert_eq!(status["merging"], theirs, "{status}");
@@ -167,10 +185,7 @@ fn a_merge_of_diverged_history_is_recorded_by_the_next_commit() {
     assert_eq!(out["merged"], theirs);
     let commit = out["commit"].as_str().unwrap();
     assert_eq!(remote_oid(&origin, "refs/heads/main"), commit);
-    assert_eq!(
-        ws.git(&["show", "main:local.txt"]),
-        "made here, never pushed\n"
-    );
+    assert_eq!(ws.git(&["show", "main:local.txt"]), "made here\n");
     assert_eq!(ws.git(&["show", "main:theirs.txt"]), "theirs\n");
     assert_eq!(conv.status()["clean"], true);
 }
@@ -179,12 +194,13 @@ fn a_merge_of_diverged_history_is_recorded_by_the_next_commit() {
 /// reads its own commit again.
 #[test]
 fn a_hard_reset_abandons_a_merge() {
-    let (ws, origin) = on_origin();
-    ws.write_worktree("local.txt", "local\n");
-    let local = ws.commit_all("local only");
+    let (ws, _origin, local, theirs) = diverged();
     let conv = ws.conversation();
-    someone_else_pushes(&ws, &origin, "main", "theirs.txt");
-    conv.call("git_merge", json!({"repo": "app"}));
+    let merged = conv.call(
+        "git_merge",
+        json!({"repo": "app", "from": commit_rev(&theirs)}),
+    );
+    assert_eq!(merged["merged"], "merging", "{merged}");
     assert_eq!(conv.read("theirs.txt").as_deref(), Some("theirs\n"));
 
     let out = conv.call("git_reset", json!({"repo": "app", "mode": "hard"}));
@@ -302,12 +318,13 @@ fn a_file_committed_over_another_branchs_change_is_refused() {
 /// finished is refused.
 #[test]
 fn a_merge_is_committed_whole() {
-    let (ws, origin) = on_origin();
-    ws.write_worktree("local.txt", "local\n");
-    ws.commit_all("local only");
+    let (ws, _origin, _local, theirs) = diverged();
     let conv = ws.conversation();
-    someone_else_pushes(&ws, &origin, "main", "theirs.txt");
-    conv.call("git_merge", json!({"repo": "app"}));
+    let merged = conv.call(
+        "git_merge",
+        json!({"repo": "app", "from": commit_rev(&theirs)}),
+    );
+    assert_eq!(merged["merged"], "merging", "{merged}");
     let out = conv.call(
         "git_commit",
         json!({"repo": "app", "from": "files", "message": "part",

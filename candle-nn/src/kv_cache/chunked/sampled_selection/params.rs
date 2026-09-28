@@ -435,9 +435,81 @@ impl KvErrorThresholdFactors {
 }
 
 /// Tuned for Qwen3-30B-A3B (MoE).
+///
+/// Re-derived 2026-09-25 (`k_low: 1.200 -> 1.000`) — the first time this row has
+/// been touched since it was imported, and the change that brings **C10 into the
+/// gate for this model at all**. Until now `quantized_qwen3_moe`'s C10 rung was
+/// commented out as "the compression is just too much"; it is measured here as a
+/// threshold, not a model limit.
+///
+/// **K was the aggressive side, not V, and the level's own doc comment is what
+/// hid it.** `InferenceMode::C10` is described as "K same as C9, V pushed
+/// further", which is true of the *candidate format list* and not of the
+/// thresholds: from C9 to C10 the shared tables move K high +14.5% and K low
+/// +20.7% against V high's +2.5%. V low does take the largest single step
+/// (+43.3%), which is why the V side looks like the obvious lever and is the
+/// wrong one here. This model is also the widest lo/hi clamp range in the table —
+/// `k_low/k_hi` = 29x, against Qwen3-8B's 18.5x — so a below-median block's K
+/// threshold could scale further out than on any other row.
+///
+/// Measured on the RTX PRO 5000, C10x2 StoryRewrite, sessions passing validation:
+///
+/// | side | value | C10 | mean C0-C9 ratio |
+/// |---|---|---|---|
+/// | K (chosen) | `k_low` 1.200 | 0/2 | 3.77x (baseline) |
+/// | K | `k_low` 1.100 | 1/2 | — |
+/// | K | `k_low` **1.000** | **2/2** | 3.75x (**-0.6%**) |
+/// | V (rejected) | `v_hi` 1.062 | 1/2 | — |
+/// | V (rejected) | `v_hi` 0.899 + `v_low` 2.598 | 2/2 | 3.59x (-4.7%) |
+///
+/// The graded 0/2 -> 1/2 -> 2/2 response is what identifies this as a threshold:
+/// a model-accuracy fault does not walk toward passing as the bound tightens.
+/// The V route reaches the same pass at eight times the cost and a *lower* top
+/// rung (C10 5.36x vs 5.50x), because tightening V spends ratio on all eleven
+/// levels to fix one. 1.000 sits one 0.100 step inside the measured edge, the
+/// same margin the C10 threshold note below uses, so ordinary upstream drift does
+/// not put the row back on an edge.
+///
+/// Cost at the rungs that already passed: C0 unchanged at 1.98x, C9 5.31x ->
+/// 5.24x, and C10 arrives at 5.50x — above the old C9, so the rung earns its
+/// place rather than merely existing.
+///
+/// # Re-derived 2026-09-26 (`k_hi: 0.475 -> 0.425`) — C10 at the *daemon's* context
+///
+/// The row above was calibrated against the gate's declared context of 262,144. The
+/// engine declares whatever its profile asks for — 8,192 for the fragmentation probe —
+/// and a different declared context is a different RoPE table, so it is a different
+/// numeric configuration. C10 failed 1/2 there, reproducibly, while every other rung
+/// passed and the 262,144 gate stayed 2/2.
+///
+/// **`k_hi` is the lever at this context, and `k_low` is not.** Stepping `k_low` down was
+/// the obvious move — it is what the 2026-09-25 note above identifies as *the* K lever —
+/// and it is the wrong one here. Measured at 8,192, C10x2:
+///
+/// | side | value | C10 sessions | C10 ratio |
+/// |---|---|---|---|
+/// | `k_low` | 1.000 (as calibrated) | 1/2 | 5.46x |
+/// | `k_low` | 0.900 | 1/2 | 5.42x |
+/// | `k_low` | 0.800 | 1/2 | 5.37x |
+/// | `k_hi` | 0.475 (as calibrated) | 1/2 | 5.46x |
+/// | `k_hi` | **0.425** | **2/2** (twice) | 5.38x |
+///
+/// Three `k_low` steps cost 0.09x of ratio and moved the pass rate not at all — which is
+/// the diagnostic, and it is worth stating because it is the opposite of the graded
+/// 0/2 -> 1/2 -> 2/2 response that identified `k_low` at the other context. **Monotonic
+/// cost with a flat pass rate means the lever is not connected to the failure**; the
+/// failing block is above the median, so its K threshold scales by `k_hi`.
+///
+/// `k_low` is therefore left at its calibrated 1.000. 0.425 is one 0.050 step inside the
+/// measured edge, the same margin discipline the note above uses.
+///
+/// Cost, both contexts re-measured: at 8,192 C9 5.22x -> 5.16x and C10 5.46x -> 5.38x; at
+/// 262,144 C9 5.18x and C10 5.42x, every rung still passing. C0 unchanged at 1.98x in
+/// both. So the tightening is paid at the top two rungs only, and the published gate keeps
+/// a C10 above its own C9.
 pub const QWEN3_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 0.475,
-    k_low: 1.200,
+    k_hi: 0.425,
+    k_low: 1.000,
     v_hi: 1.225,
     v_low: 2.700,
 };

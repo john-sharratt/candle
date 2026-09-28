@@ -422,6 +422,7 @@ impl CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 }
@@ -1120,6 +1121,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1160,6 +1162,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1201,6 +1204,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1244,6 +1248,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1286,6 +1291,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1328,6 +1334,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1370,6 +1377,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1419,6 +1427,7 @@ impl CudaDevice {
             slice,
             device: self.clone(),
             backing,
+            anchor: None,
         })
     }
 
@@ -1466,6 +1475,7 @@ impl CudaDevice {
             slice,
             device: self.clone(),
             backing,
+            anchor: None,
         })
     }
 }

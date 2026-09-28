@@ -201,6 +201,7 @@ pub mod slot_integrity;
 mod streamer;
 mod transition;
 mod types;
+mod weight_plan;
 mod zone_geometry;
 
 // Re-exports — the public API of this module.
@@ -236,3 +237,4 @@ pub(crate) use pipeline::slot_bytes_for;
 pub use types::{
     CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest, PipelineStats,
 };
+pub use weight_plan::{WeightPlan, WeightPlanning};

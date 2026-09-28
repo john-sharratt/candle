@@ -146,6 +146,7 @@ pub fn delta_net_mix_wave(
         rms_eps,
         table,
         ZGate::Silu,
+        mix_wave.as_ref(),
     )?;
     drop(seqs);
     let mixed = mixed.reshape(xt.shape())?;

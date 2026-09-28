@@ -16,9 +16,23 @@
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
+/// Rate-based wave budgeting — **compiled and tested, not yet wired.**
+///
+/// Admission: [`admit::fill`] is the path, and [`admit_ground::AdmitPass`] is
+/// the engine's answer to its `Ground` trait. An offer joins the wave while the
+/// wave goes *faster* carrying it — [`admit::rate`] models what a wave will
+/// actually achieve and the rest prices and orders candidates against that
+/// model rather than against free bytes.
+///
+/// What remains in [`admission`] is the arithmetic that survived the change: the
+/// per-block and per-prefill costing the new path still prices with, and the
+/// AIMD setpoint the *ingest* regulator moves.
+mod admit;
+mod admit_ground;
 mod decode;
 pub mod exported_state;
 mod guest_room;
+mod interleave;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
@@ -901,16 +915,11 @@ pub(super) fn drain_add_us(atom: &std::sync::atomic::AtomicU64, us: u64) {
     }
 }
 
-/// `device.synchronize()`, timed into [`WAIT_US`]. Use at every deliberate GPU
-/// drain on the scheduler thread so the wait surfaces as the Sync phase.
-fn timed_synchronize(device: &Device) {
-    let t = Instant::now();
-    let _ = device.synchronize();
-    WAIT_US.fetch_add(
-        t.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
+// `timed_synchronize` stood here — `device.synchronize()` timed into `WAIT_US`, so
+// a deliberate drain on the scheduler thread surfaced as the Sync phase. Its only
+// caller was the heavy-backlog stall, and with that released there is no deliberate
+// drain left on this thread to time. Re-add it with the next one rather than
+// keeping a timer for a wait nothing performs.
 
 /// Record a persistence-side stall into [`MAINT_US`] from another module (the
 /// segment-compaction I/O in `projection::resolver` holds the persistence lock
@@ -2847,6 +2856,51 @@ pub(crate) struct Scheduler {
     sampling_states: HashMap<SequenceId, SequenceSamplingState>,
     /// Prefill queue (FIFO) — newly submitted, not yet started.
     prefill_queue: VecDeque<PrefillWork>,
+    /// Whether a slot has released its ground since the last admission pass.
+    ///
+    /// **Admission opportunities are created only by completions.** Nothing new
+    /// can fit that did not fit before unless something freed ground, so a pass
+    /// over an engine where nothing finished re-prices every queued item to
+    /// reach the answer it reached last time. Set where a slot's ground goes
+    /// back — a decode cleaned up, a section sealed, a turn freed, an eviction
+    /// that shed something — and cleared by the pass that acts on it.
+    ///
+    /// Starts `true`: nothing has completed on a fresh engine, and one that
+    /// waited for a completion before its first admission would never take one.
+    pub(super) settled_since_admit: bool,
+    /// When the last KV compaction pass ran, so the cheap per-wave gate can hold a
+    /// floor on the interval. `None` before the first pass.
+    pub(super) last_kv_compaction: Option<std::time::Instant>,
+    /// Forwards this wave iteration has run, of either kind.
+    ///
+    /// The divisor for the loop's per-forward overhead: a wave's non-forward wall clock
+    /// is amortised across the forwards it carried, and that quotient is what the rate
+    /// planner needs to price width correctly. See `WaveRate::observe_overhead`.
+    pub(super) wave_forwards: usize,
+    /// Microseconds this wave iteration spent **outside** its forwards.
+    ///
+    /// Every non-forward phase, not just the one that was easiest to reach. Feeding only
+    /// the housekeeping left the submission drain out — 7% of the run on its own — and the
+    /// planner then under-priced width in proportion to what was missing, which is the
+    /// same error as omitting the term altogether, only smaller.
+    pub(super) wave_overhead_us: u64,
+    /// The engine's one wave throughput planner, carried across admission
+    /// passes because what it learns — the effective copy rate, the decode
+    /// layer time, the hit coefficient — is a property of the machine rather
+    /// than of any one wave.
+    ///
+    /// `None` until the model can describe its weight side
+    /// ([`ManagedBatchedModel::weight_plan`]), which on a streaming MoE stack is
+    /// after the first classify. A dense model never reports one and never
+    /// plans: admission then falls through to the width backstop alone.
+    pub(super) wave_rate: Option<admit::WaveRate>,
+    /// The expert cache's hit and miss counters as of the last observation.
+    ///
+    /// They are cumulative for the life of the process — nothing in the daemon
+    /// resets them — so the planner is taught the *delta* over each interval.
+    /// See `Scheduler::observe_expert_hit_rate`.
+    pub(super) expert_hits_seen: usize,
+    pub(super) expert_misses_seen: usize,
     /// In-flight prefills (partially advanced across loop iterations).
     /// Promoted from `prefill_queue` by `promote_new_prefills` and drained
     /// by `promote_finished_prefills_to_decodes` once their offset reaches
@@ -3126,13 +3180,6 @@ pub(crate) struct Scheduler {
     /// [`Self::cut_admit_budget_leveled`]. `None` until the first level cut.
     last_level_cut: Option<std::time::Instant>,
 
-    /// When the admission pass last traced a starved outcome (queued work the
-    /// budget would not take). Rate-limits that trace to one line per
-    /// `ADMIT_STARVED_LOG_INTERVAL` — the condition persists across every loop
-    /// iteration until the budget or the queue moves, so it would otherwise flood
-    /// the log at the loop rate. `None` until the first starved pass.
-    last_admit_starved_log: Option<std::time::Instant>,
-
     /// [`PREFILL_OK_TOKENS`] as of the last promote-side pressure episode —
     /// the "forwards are still completing" evidence that distinguishes chronic
     /// nominal pressure (hold the width) from a genuine stall (halve it). See
@@ -3386,6 +3433,14 @@ impl Scheduler {
             active_decodes: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
+            // See the field: the first pass has nothing to wait for.
+            settled_since_admit: true,
+            last_kv_compaction: None,
+            wave_forwards: 0,
+            wave_overhead_us: 0,
+            wave_rate: None,
+            expert_hits_seen: 0,
+            expert_misses_seen: 0,
             active_prefills: Vec::new(),
             active_section_ingests: Vec::new(),
             section_positional: HashMap::new(),
@@ -3425,7 +3480,6 @@ impl Scheduler {
             admit_grow_streak: 0,
             admit_ok_tokens_seen: 0,
             last_level_cut: None,
-            last_admit_starved_log: None,
             promote_ok_tokens_seen: 0,
             promote_last_progress: None,
             ingest_timelines: HashSet::new(),
@@ -3616,6 +3670,13 @@ impl Scheduler {
                 free_tool_calls_from_penalties,
                 recorded_reply,
             } => {
+                // **The whole SubmitTurn handler, because it is the one that runs real
+                // work on the loop thread.** Its siblings are bookkeeping; this one
+                // projects the turn, elevates warm KV, carves a view and gap-fills. The
+                // drain it sits inside measured 23 ms per call against a decode kernel of
+                // a fraction of that, so the question "is that this handler or the
+                // channel" needs its own answer.
+                let _g = profile::span("drain:submit_turn");
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
                 let parent_id = sequence_id;
@@ -3798,6 +3859,10 @@ impl Scheduler {
                         .cloned()
                         .unwrap_or_default();
                     carried_belief.decay_scores(CARRIED_BELIEF_TURN_DECAY);
+                    // Choosing the context: the provenance scan and the section-tree walk
+                    // that decide which turns this reply attends over. Pure selection —
+                    // no K/V has moved yet.
+                    let _g_project = profile::span("drain:project");
                     let projection = inputs.projection.project_with_mode_and_sink(
                         target,
                         &view,
@@ -3984,6 +4049,10 @@ impl Scheduler {
                     // residences NOT in the incoming projection), then batch
                     // select-promote the projected sections/turns into hot before
                     // `apply_projection` injects them.
+                    // Warm → hot for everything the projection selected that is not
+                    // already resident. A tier crossing, so it is bounded by PCIe rather
+                    // than by compute, and it runs before any forward can start.
+                    let _g = profile::span("drain:elevate");
                     self.elevate_projection_working_set(
                         &conversation,
                         &projected_sections,
@@ -3998,6 +4067,11 @@ impl Scheduler {
                 // reset it to empty, so it must be skipped here (not just fed
                 // empty segments, which is the RULER/summarisation reset path).
                 if !skip_projection {
+                    // Injecting the projected context into the parent slot: the K/V
+                    // scatter and the block-table writes for every selected segment. The
+                    // heaviest single step in the handler, and the one that scales with
+                    // how much context the projection chose.
+                    let _g = profile::span("drain:apply_projection");
                     if let Err(e) =
                         self.apply_projection(parent_id, BlockCount(0), &projected_segments)
                     {
@@ -4100,6 +4174,15 @@ impl Scheduler {
 
                 // Step 6: queue prefill on the view sequence, carrying the
                 // reprojection policy through to DecodeState.
+                //
+                // **An arrival is an admission opportunity too.** The pass is
+                // otherwise gated on completions — nothing new can fit that did
+                // not fit before unless something freed ground — but that is
+                // only true of work already queued. A turn arriving at an idle
+                // engine has never been offered at all, and waiting for a
+                // completion that will never come (nothing is running) leaves it
+                // queued indefinitely.
+                self.settled_since_admit = true;
                 self.prefill_queue.push_back(PrefillWork {
                     sequence_id: view_id,
                     tokens: prefill_tokens,
@@ -4152,13 +4235,13 @@ impl Scheduler {
                 self.sampling_states.remove(&sequence_id);
                 // Drop the conversation handle and projection target
                 // bound to this slot.
-                self.slot_conversations.remove(&sequence_id);
+                let freed_conversation = self.slot_conversations.remove(&sequence_id);
                 let freed_target = self.slot_targets.remove(&sequence_id);
                 self.ephemeral_slots.remove(&sequence_id);
                 self.ephemeral_sigs.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
-                self.slot_projection_state.remove(&sequence_id);
+                self.retire_slot_projection_state(sequence_id, freed_conversation);
                 // Purge any DEFERRED glue plan for this slot. A queued gap-fill
                 // must never outlive the slot layout it was planned against: the
                 // freed id is recycled immediately (the code_read scope workers
@@ -5613,6 +5696,8 @@ impl Scheduler {
                 response_tx,
             },
         );
+        // An arrival is an admission opportunity — see the sibling enqueue.
+        self.settled_since_admit = true;
         self.prefill_queue.push_back(PrefillWork {
             sequence_id: slot,
             tokens: TokenBuffer::from(token_ids),
@@ -5860,9 +5945,28 @@ impl Scheduler {
             self.free_summary_slot(slot);
             return;
         }
-        let block_count = self.session.sequence_block_count(slot.0).unwrap_or(0);
+        // **The block count comes from the snapshot, not from the slot**, and one
+        // resolution serves both the slice and the `sign(Q)` gather below so they
+        // cannot disagree. `snapshot_sequence_per_layer` drops each layer's trailing
+        // empty chunk while `sequence_block_count` counts it, so the two differ by one
+        // whenever that chunk is empty — see the note in
+        // `projection_assembler::apply_projection`, where the same pair made a boot
+        // from a fresh substrate impossible.
+        let block_count;
         let sealed_gpu = match self.session.snapshot_sequence_per_layer(slot.0) {
-            Ok(snap) => slice_per_layer_sealed(&snap, 0, block_count),
+            Ok(snap) => {
+                block_count = snap.iter().map(|s| s.chunks.len()).min().unwrap_or(0);
+                match slice_per_layer_sealed(&snap, 0, block_count) {
+                    Ok(sliced) => sliced,
+                    Err(e) => {
+                        let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
+                            "SubmitSummaryProbe: reproject slice: {e}"
+                        ))));
+                        self.free_summary_slot(slot);
+                        return;
+                    }
+                }
+            }
             Err(e) => {
                 let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
                     "SubmitSummaryProbe: reproject snapshot: {e}"
@@ -6026,10 +6130,15 @@ impl Scheduler {
     /// sequences before it is capped, whatever it believes they are worth.
     pub(super) const MAX_PREFILL_WIDTH: usize = 24;
 
-    /// Throughput floor the admission planner never closes past — one prefill
-    /// always in flight so the engine keeps making progress even under sustained
-    /// pressure (a lone oversized turn is then bounded by the per-arena VRAM gate).
-    const MIN_PREFILL_WIDTH: usize = 1;
+    /// The decode counterpart of [`Self::MAX_PREFILL_WIDTH`], and a backstop of
+    /// exactly the same kind: the rate model is the real throttle, and this is
+    /// the dumb ceiling beneath it so an error in the cost model costs
+    /// throughput rather than the daemon.
+    ///
+    /// Sixty-four, which is the width the aggregate benchmark runs at — the
+    /// engine is known to carry that many sessions, so a cap below it would
+    /// refuse work the hardware has already been shown to do.
+    pub(super) const MAX_DECODE_WIDTH: usize = 64;
 
     /// Multiplicative-decrease the admission budget: halve it toward one quantum.
     /// Called from every throttle signal — VRAM pressure surviving an eviction
@@ -6136,6 +6245,9 @@ impl Scheduler {
         self.prefill_queue.retain(|w| w.sequence_id != id);
         self.active_prefills.retain(|p| p.work.sequence_id != id);
         self.active_decodes.remove(&id);
+        // A terminal free is a completion as far as admission is concerned: the
+        // slot's ground is back whether it finished or was abandoned.
+        self.settled_since_admit = true;
         // The held wave cohort's residual is indexed by member POSITION, so a
         // member vanishing mid-cohort would desync every later member's slice
         // against the residual (the exact reason the cohort is otherwise held
@@ -6160,10 +6272,10 @@ impl Scheduler {
     fn free_summary_slot(&mut self, slot: SequenceId) {
         let _ = self.session.free_sequence(slot.0);
         let _ = self.model.release_sequence(slot.0);
-        self.slot_conversations.remove(&slot);
+        let freed_conversation = self.slot_conversations.remove(&slot);
         let freed_target = self.slot_targets.remove(&slot);
         self.sampling_states.remove(&slot);
-        self.slot_projection_state.remove(&slot);
+        self.retire_slot_projection_state(slot, freed_conversation);
         self.compression_event_sinks.remove(&slot);
         // A queued glue plan must not outlive the slot layout it was planned
         // against (see the FreeSequence handler's purge).
@@ -6184,9 +6296,9 @@ impl Scheduler {
     /// parent's whole projected prefix borrowed for the daemon's lifetime, and
     /// a failed wave never gave that KV back.
     fn discard_turn_view(&mut self, view_id: SequenceId) {
-        if self.turn_views.remove(&view_id).is_none() {
+        let Some(view_state) = self.turn_views.remove(&view_id) else {
             return;
-        }
+        };
         if let Err(e) = self.session.free_sequence(view_id.0) {
             tracing::warn!("failed to free turn view {}: {}", view_id, e);
         }
@@ -6199,7 +6311,10 @@ impl Scheduler {
         }
         self.sampling_states.remove(&view_id);
         self.slot_tokens.remove(&view_id);
-        self.slot_projection_state.remove(&view_id);
+        // A view's working set is recorded under its PARENT, so the parent's
+        // conversation is the substrate this republishes on.
+        let parent_conversation = self.slot_conversations.get(&view_state.parent_id).cloned();
+        self.retire_slot_projection_state(view_id, parent_conversation);
         self.purge_freed_slot_scheduling_state(view_id);
     }
 
@@ -6864,6 +6979,9 @@ impl Scheduler {
 
         for seq_id in finished_seq_ids {
             if let Some(state) = self.active_decodes.remove(&seq_id) {
+                // The slot's ground is back, so an admission that did not fit
+                // before may fit now.
+                self.settled_since_admit = true;
                 // The summarise decode completes through the job registry, not
                 // the substrate seal path: its body becomes the node's assistant
                 // half and is sealed with the derived scope. No view to finalize,
@@ -8384,7 +8502,7 @@ impl Scheduler {
                     layout,
                     token_ids,
                 } = turn_content.unwrap_or_default();
-                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
+                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to)?;
                 // Snapshot what the resume path needs before the substrate
                 // consumes `delta_gpu` / `token_ids` (§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
@@ -8753,7 +8871,7 @@ impl Scheduler {
                 debug_name,
                 in_collection,
             } => {
-                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
+                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to)?;
                 let stream_id = section_stream_id(*address);
                 let policy_active = self.session.compression_policy().is_some();
                 {
@@ -8944,11 +9062,28 @@ impl Scheduler {
     ///
     /// Read per forward rather than once at construction: the model's cap includes
     /// what the KV side can still hold, which moves with every claim.
-    fn prefill_pass_budget(&self) -> usize {
-        admission::prefill_pass_budget(
+    pub(super) fn prefill_pass_budget(&self) -> usize {
+        admit::pass_budget::prefill_pass_budget(
             self.max_prefill_pass_tokens,
             self.model
                 .prefill_width_cap(self.session.activation_dtype()),
+            // The KV side's own bound: the admit phase claims every chunk a
+            // forward will write before it computes anything, so a chunk wider
+            // than the free ground can back fails part way through claiming.
+            //
+            // Priced through `kv_token_cap`, which is the only thing here that
+            // knows the units. The KV side counts 16 MiB regions and this budget
+            // is in tokens; `vram_budget_available` is that same free count in
+            // bytes (`(free + blocked) × REGION_BYTES`, so it reads the ground a
+            // standing tier releases before these claims run, exactly as
+            // `kv_region_state` does), and the block price turns bytes into
+            // tokens.
+            self.session
+                .vram_budget_available()
+                .and_then(|free| admit::pass_budget::kv_token_cap(free, self.per_block_kv_bytes())),
+            // A tier budget that prices to a single row would make no progress,
+            // so the cap never falls below one chunk.
+            CHUNK_SIZE,
         )
     }
 
@@ -9569,6 +9704,49 @@ impl Scheduler {
         conversation
             .write()
             .set_working_set_pins(&keep_turns, &keep_sections);
+    }
+
+    /// Drop `slot`'s projection working set and republish the keep-set without
+    /// it, on that slot's own substrate.
+    ///
+    /// **A pin outliving its slot wedges durability, not just eviction.** The
+    /// keep-set is defined as the union of every *live* slot's working set, but
+    /// [`Self::publish_working_set_pins`] only ever runs from an elevate — so a
+    /// slot that goes away between elevates leaves its pins standing, and
+    /// nothing recomputes the union until some other slot happens to elevate.
+    /// `Substrate::snapshot_pending_cold` skips a pinned residence, so a turn
+    /// still named by a dead slot's working set is never appended to the redo
+    /// log at all: it sits hot+warm and un-durable for the rest of the
+    /// daemon's life. It is silent in every gauge, because `pending_cold_count`
+    /// mirrors the same pin filter and therefore reports nothing pending, and
+    /// the shutdown drain clears the pins wholesale before its final pass — so
+    /// a graceful stop writes the turn through and only a hard kill loses it.
+    ///
+    /// Measured on a `repo_map` unit: the summary decode's last reprojection
+    /// selects exactly the unit's first turn, whose slot is then freed, so
+    /// **every** folder conversation carried a turn with token_ids, a block
+    /// range and no `Chunk` records — `MISSING KV` from the inspector, with no
+    /// error on any path.
+    ///
+    /// Republished on the freed slot's OWN substrate: the scheduler hosts
+    /// conversations on many substrates at once and the pin set lives per
+    /// substrate, so the handle has to come from the slot being retired.
+    ///
+    /// This is the only place [`Self::slot_projection_state`] is removed from,
+    /// which is what makes "a removal is always followed by a republish" hold
+    /// by construction rather than by every caller remembering. Keep it that
+    /// way: a bare `remove` elsewhere re-opens the wedge silently.
+    fn retire_slot_projection_state(
+        &mut self,
+        slot: SequenceId,
+        conversation: Option<Conversation>,
+    ) {
+        if self.slot_projection_state.remove(&slot).is_none() {
+            return;
+        }
+        if let Some(conversation) = conversation {
+            self.publish_working_set_pins(&conversation, &[], &[]);
+        }
     }
 
     fn elevate_projection_working_set(
@@ -11043,9 +11221,19 @@ mod tests {
                 n_experts: 1,
                 act_dtype,
                 accum_dtype: DType::F32,
-                projection_accum_roundtrip: false,
+                vocab: 64,
+                delta_net: None,
+                shared_expert: None,
+                packed_norm: false,
+                packed_head: false,
                 gated_qkv: false,
+                fused_qkv: false,
+                qkv_bias: false,
+                head_qk_norm: false,
+                head_norm_reshapes: false,
                 partial_rotary: false,
+                decode_q8_context: false,
+                hyper: None,
             }
         }
         fn device(&self) -> &candle::Device {
@@ -11299,6 +11487,13 @@ mod tests {
         /// matters is that a restore under a *different* one is refused.
         const SCHEDULE_HASH: u64 = 0xD0D0_1234_5678_9ABC;
 
+        /// One sequence's recurrent store, the size a hybrid stack really runs.
+        const STORE_BYTES: usize = 126 * 1024 * 1024;
+
+        /// What the process holds with ten conversations' stores standing —
+        /// the figure admission must **not** reach for, whole or divided.
+        const RESERVED_TOTAL: usize = 10 * Self::STORE_BYTES;
+
         fn new() -> Self {
             Self {
                 inner: DummyModel::new(),
@@ -11461,6 +11656,17 @@ mod tests {
                 entry.closed.push(width);
             }
             Ok(width as usize)
+        }
+
+        /// What one store costs, and what the process is holding — deliberately
+        /// far apart, because the difference is what admission used to divide
+        /// by an unrelated count.
+        fn recurrent_store_bytes(&self) -> usize {
+            DummyRecurrentModel::STORE_BYTES
+        }
+
+        fn recurrent_reserved_bytes(&self) -> usize {
+            DummyRecurrentModel::RESERVED_TOTAL
         }
 
         fn positional_coverage(&self, seq: usize) -> Option<usize> {
@@ -12487,6 +12693,41 @@ mod tests {
         );
     }
 
+    /// **One turn is priced at one store, whatever the engine is holding.**
+    ///
+    /// The price comes from the model's geometry, so nothing about the
+    /// scheduler's occupancy can enter it. Both answers the old arithmetic gave
+    /// are asserted against by name, because both were wrong in production and
+    /// either would come back if someone reached for the total again:
+    ///
+    /// * `total / live` with nothing in flight divided by zero and answered
+    ///   **0** — a 126 MiB claim priced as free, admitted, and refused by the
+    ///   span on contact.
+    /// * the same expression with one sequence in flight answered the **whole
+    ///   total**, which is how a 41-row turn came to be priced at 4,450 MiB and
+    ///   refused as throughput-worse with seven turns queued behind it.
+    ///
+    /// A `live.max(1)` patch is caught by the second assertion too — it returns
+    /// the total here rather than one store.
+    #[test]
+    fn one_turn_is_priced_at_one_store_however_many_are_parked() {
+        let (sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let store = DummyRecurrentModel::STORE_BYTES as u64;
+        let total = DummyRecurrentModel::RESERVED_TOTAL as u64;
+
+        assert_eq!(
+            sched.recurrent_cost(),
+            store,
+            "one store, from the geometry"
+        );
+        assert_ne!(sched.recurrent_cost(), 0, "priced free with nothing live");
+        assert_ne!(
+            sched.recurrent_cost(),
+            total,
+            "billed for every store the process holds"
+        );
+    }
+
     /// **Speculative decode is refused up front on a model that cannot rewind.**
     ///
     /// The accept step puts the sequence back to the accepted prefix, which a
@@ -13339,6 +13580,182 @@ mod tests {
         assert!(
             state.finished,
             "the end of turn after the recording finishes it"
+        );
+    }
+
+    // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————
+
+    /// A scheduler over the stub model, for the admission tests below.
+    fn admission_scheduler() -> Scheduler {
+        let (_tx, rx) = flume::bounded(16);
+        Scheduler::new(
+            rx,
+            Box::new(DummyModel::new()) as Box<dyn ManagedBatchedModel + Send>,
+            make_test_session(),
+            make_dummy_tokenizer(),
+            vec![0u32].into(),
+            64,
+            8,
+            false,
+            None,
+            DecodeHealthConfig::default(),
+            512,
+            PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
+            Arc::new(crate::guest::Guests::new()),
+        )
+    }
+
+    /// A minimal queued turn: the only fields admission reads are the slot and
+    /// the token count it prices.
+    fn test_prefill_work(sequence_id: SequenceId) -> PrefillWork {
+        let (event_tx, _rx) = flume::bounded(16);
+        PrefillWork {
+            sequence_id,
+            tokens: TokenBuffer::from(vec![1u32; 64]),
+            prefill_text: String::new(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            prefill_assistant_text: String::new(),
+            event_tx,
+            max_decode_tokens: 16,
+            sampling: SamplingConfig::default(),
+            submitted_at: Instant::now(),
+            reprojection: None,
+            belief: PriorBelief::default(),
+            seal_action: SealAction::Turn,
+            post_decode_tokens: TokenBuffer::default(),
+            projection_offsets: Vec::new(),
+            staged_composition: None,
+            triggers: Arc::new(TriggerRegistry::default()),
+            turn_grammar: None,
+            free_tool_calls_from_penalties: false,
+            recorded_reply: None,
+        }
+    }
+
+    /// **Every figure admission compares must be in one currency.**
+    ///
+    /// This integration has been wedged twice by mixing them — expert-cache
+    /// occupancy against a zone capacity, then the zone's lagging extent against
+    /// a live-region identity — and each time the symptom was every offer
+    /// refused on a healthy card. The invariant that would have caught both is
+    /// simply that `Budget::resident` is the same quantity `Headroom::zone` is,
+    /// and that the floor is at or above the hold.
+    #[test]
+    fn the_headroom_and_the_budget_agree_on_one_currency() {
+        let sched = admission_scheduler();
+        let standing = sched.standing_tier_bytes();
+        let room = sched.admit_headroom(standing);
+        let budget = sched.admit_budget_terms(&room, 512);
+
+        assert_eq!(
+            budget.resident, room.zone,
+            "residency and the zone must be the same measurement",
+        );
+        assert!(
+            budget.decode_floor >= room.zone_min,
+            "the decode floor may never sit under the hold: {} < {}",
+            budget.decode_floor,
+            room.zone_min,
+        );
+        // The prefill floor is deliberately lower — it is the ground a prefill may
+        // spend for rows — but never below its own hold, and never above the
+        // decode's.
+        assert!(
+            budget.prefill_floor >= room.zone_min_prefill
+                && budget.prefill_floor <= budget.decode_floor,
+            "the prefill floor sits between its own hold and the decode's: {} / {} / {}",
+            room.zone_min_prefill,
+            budget.prefill_floor,
+            budget.decode_floor,
+        );
+        // The spendable ground is one subtraction, never the free list added
+        // beside the zone — that double-counts the same regions.
+        assert!(
+            room.free_kv <= room.zone,
+            "spendable ground cannot exceed the zone it comes out of",
+        );
+    }
+
+    /// **The tier is held back from admission, so the floor clears the hold by
+    /// a useful forward's worth.**
+    ///
+    /// Reserve nothing and K/V claims to the weight floor: the tier is the
+    /// span's third tenant and gets what is left, which is nothing, so no
+    /// forward can be planned at all — not a narrow one, none — and nothing
+    /// completes to give the ground back.
+    #[test]
+    fn the_floor_holds_back_a_useful_forwards_tier() {
+        let sched = admission_scheduler();
+        let room = sched.admit_headroom(0);
+        let budget = sched.admit_budget_terms(&room, 512);
+        assert_eq!(
+            budget.decode_floor,
+            room.floor().saturating_add(sched.min_forward_tier_bytes()),
+            "the floor is the hold, the eviction margin and a forward's tier",
+        );
+        // The prefill floor holds the tier back too: spending weights for rows is a
+        // trade, leaving no ground for the tier is a stall.
+        assert_eq!(
+            budget.prefill_floor,
+            room.prefill_floor()
+                .saturating_add(sched.min_forward_tier_bytes()),
+            "the prefill floor is its own hold, the margin and a forward's tier",
+        );
+    }
+
+    /// **A store cost is never derived from a division by zero.**
+    ///
+    /// The per-sequence figure is a whole-engine total over the live count, so
+    /// the empty engine is the case that has to be stated rather than computed.
+    #[test]
+    fn the_recurrent_cost_is_zero_on_an_empty_engine() {
+        let sched = admission_scheduler();
+        assert!(sched.active_decodes.is_empty() && sched.active_prefills.is_empty());
+        assert_eq!(sched.recurrent_cost(), 0);
+    }
+
+    /// **A stack that cannot describe its weight side still admits.**
+    ///
+    /// `weight_plan` is [`WeightPlanning::Dense`] for a model with no expert cache, and
+    /// such a stack has no residency to trade a wave's rows against — so admission
+    /// proceeds on its width backstop alone rather than waiting for a planner that will
+    /// never arm.
+    ///
+    /// The stub is `Dense` specifically, not merely "no plan": a routed model reporting
+    /// no plan is [`WeightPlanning::Incomplete`] and panics, because an unarmed planner
+    /// narrows every wave to one row. This test covers the case that is legitimate.
+    #[test]
+    fn an_engine_with_no_planner_still_takes_its_queue_head() {
+        let mut sched = admission_scheduler();
+        assert!(
+            matches!(
+                sched.model.weight_plan(),
+                candle_transformers::models::expert_lre::WeightPlanning::Dense
+            ),
+            "the stub reports no expert cache at all, which is the case under test",
+        );
+        let slot = sched.session.create_sequence().unwrap();
+        sched
+            .prefill_queue
+            .push_back(test_prefill_work(SequenceId(slot)));
+
+        sched.promote_new_prefills();
+
+        assert!(
+            sched.prefill_queue.is_empty(),
+            "the head must leave the queue",
+        );
+        assert_eq!(
+            sched.active_prefills.len(),
+            1,
+            "and must be in flight, or the engine never starts",
         );
     }
 

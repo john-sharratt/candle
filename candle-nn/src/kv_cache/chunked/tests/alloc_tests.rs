@@ -39,7 +39,9 @@ mod deferred_arena_tests {
     use crate::kv_cache::chunked::arena::ArenaKey;
     use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
     use crate::kv_cache::chunked::size_class::SizeClass;
-    use crate::kv_cache::chunked::{begin_wave, ChunkedKvBacking, KV_ARENA_MID_WAVE};
+    use crate::kv_cache::chunked::{
+        begin_forward, begin_wave, ChunkedKvBacking, KV_ARENA_MID_WAVE,
+    };
     use crate::kv_cache::LayerPhase;
     use candle::{DType, Device, Result};
 
@@ -139,6 +141,65 @@ mod deferred_arena_tests {
             "a deferral reported as exhaustion sends the next investigation \
              looking for a KV leak that is not there: {err}"
         );
+        Ok(())
+    }
+
+    /// **A forward that needs an arena it could not have claimed must still
+    /// leave the demand behind.**
+    ///
+    /// The forward's own thread is refused outright rather than told to retry:
+    /// it cannot end the forward, so there is no "come back later" for it to
+    /// act on. That refusal is correct, but it is only survivable if the class
+    /// it wanted is recorded — the *next* inter-forward gap is what creates it,
+    /// and the wave after that finds the arena already there.
+    ///
+    /// Without the record the engine cannot make progress at all: the format a
+    /// seal picks comes from the data it just wrote, so no amount of pre-claiming
+    /// in `admit_wave_kv` reaches it, and every following wave rediscovers the
+    /// same need at the same depth and dies the same way. That is not a slow
+    /// conversation, it is a wedged one — which is what a torn shutdown produced,
+    /// every turn answering `creating a KV arena from inside the forward` until
+    /// the conversation was deleted.
+    #[test]
+    fn a_forward_thread_refusal_still_records_what_it_wanted() -> Result<()> {
+        let _serial = gpu_serial();
+        let Ok(device @ Device::Cuda(_)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &device, 256)?;
+        let Device::Cuda(cd) = &device else {
+            unreachable!()
+        };
+        let stream = cd.cuda_stream();
+        let key = ArenaKey::new(SizeClass::at(SizeClass::COUNT - 1), ArenaLocation::Gpu);
+
+        // The forward owns the partition, and this is its own thread — the case
+        // `begin_wave` alone does not reproduce.
+        let forward = begin_forward(&stream);
+        let err = backing
+            .alloc_chunk_for_key(key)
+            .err()
+            .expect("a class with no arena cannot be served inside a forward")
+            .to_string();
+        assert!(
+            err.contains("from inside the forward"),
+            "the forward's own thread is refused as a placement fault, not as a \
+             retryable deferral: {err}"
+        );
+        drop(forward);
+
+        // The gap acts on the record. This is the assertion that matters: if it
+        // reads 0, nothing ever creates the arena and the engine cannot recover
+        // on its own.
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            1,
+            "the refusal must leave the class behind for the gap to create, or \
+             every later wave repeats it and the conversation is wedged"
+        );
+        backing
+            .alloc_chunk_for_key(key)
+            .expect("the class has an arena now, so no creation is needed");
         Ok(())
     }
 }
@@ -568,8 +629,10 @@ mod tests {
             let data = Tensor::zeros(bytes, DType::U8, &Device::Cpu).unwrap();
             let mut arena = crate::kv_cache::chunked::Arena::new(
                 data,
-                class,
-                crate::kv_cache::arena_table::ArenaLocation::Cpu,
+                crate::kv_cache::chunked::ArenaKey::new(
+                    class,
+                    crate::kv_cache::arena_table::ArenaLocation::Cpu,
+                ),
                 0,
             );
 

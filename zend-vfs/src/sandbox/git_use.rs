@@ -188,8 +188,10 @@ fn script_of(name: &str, args: &[String]) -> Option<(Dialect, String)> {
 fn decode_utf16le(encoded: &str) -> Option<String> {
     let bytes = BASE64.decode(encoded.trim()).ok()?;
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     Some(String::from_utf16_lossy(&units))
 }

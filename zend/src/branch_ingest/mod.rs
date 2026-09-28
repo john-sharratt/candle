@@ -10,6 +10,7 @@ pub mod filter;
 pub mod keys;
 pub mod manifest;
 pub mod plan;
+pub mod tie;
 pub mod units;
 pub mod walk;
 
@@ -22,6 +23,7 @@ use zend_vfs::{Repo, Workspace};
 
 use self::filter::IngestScope;
 use self::plan::{plan, Committed, Live};
+use self::tie::{backfill_commits, retie};
 use self::walk::{walk, Corpus, FileItem, RepoBranches, TreeCache};
 use crate::code_read::{self, is_upload_path, FileJob};
 use crate::ingest::IngestMode;
@@ -135,6 +137,17 @@ impl BranchIngest {
             .collect();
         let p = plan(&live, &committed);
         tombstone(ctx.engine, layer.name, &p.tombstone);
+        let branches: HashMap<&str, &[String]> = files
+            .iter()
+            .map(|f| (f.key.as_str(), &f.branches[..]))
+            .collect();
+        let held = still_held(&committed, &p.tombstone);
+        retie(ctx.engine, layer.name, &held, &branches);
+        let found: HashMap<&str, String> = files
+            .iter()
+            .map(|f| (f.key.as_str(), f.at.to_string()))
+            .collect();
+        backfill_commits(ctx.engine, layer.name, &held, &found);
         let jobs: Vec<FileJob> = p
             .queued
             .iter()
@@ -144,6 +157,7 @@ impl BranchIngest {
                 blob: f.file.blob.clone(),
                 language: f.file.language,
                 at: Some(f.at.clone()),
+                branches: f.branches.clone(),
             })
             .collect();
         tracing::info!(
@@ -188,12 +202,24 @@ fn units(
         .collect();
     let p = plan(&live, &committed);
     tombstone(ctx.engine, layer.name, &p.tombstone);
+    let branches: HashMap<&str, &[String]> = corpus
+        .units
+        .iter()
+        .map(|u| (u.unit.key.as_str(), &u.branches[..]))
+        .collect();
+    retie(
+        ctx.engine,
+        layer.name,
+        &still_held(&committed, &p.tombstone),
+        &branches,
+    );
     let jobs: Vec<UnitJob> = p
         .queued
         .iter()
         .map(|&i| UnitJob {
             unit: corpus.units[i].unit.clone(),
             at: corpus.units[i].at.clone(),
+            branches: corpus.units[i].branches.clone(),
         })
         .collect();
     tracing::info!(
@@ -241,6 +267,15 @@ fn record_branches(workspace: &Workspace) -> (Vec<RepoBranches>, Vec<String>) {
         }
     }
     (repos, unreadable)
+}
+
+/// `committed` without the conversations this pass tombstoned.
+fn still_held(committed: &[Committed], tombstoned: &[TimelineId]) -> Vec<Committed> {
+    committed
+        .iter()
+        .filter(|c| !tombstoned.contains(&c.timeline))
+        .cloned()
+        .collect()
 }
 
 /// Whether the workspace-relative `subject` lies in one of `repos`.

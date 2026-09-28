@@ -106,6 +106,22 @@ impl HeadGids {
         &self.0
     }
 
+    /// Identity of the underlying allocation, for memoising a rewrite.
+    ///
+    /// A compaction rewrites gids across every holder in the process, and holders
+    /// share these allocations rather than cloning the gids inside them — a
+    /// `HeadGids::clone` is one `Arc` bump. So a sweep keyed on this rewrites each
+    /// allocation **once** and installs the same replacement everywhere it was
+    /// held, which is both O(allocations) rather than O(holders) and the only way
+    /// to guarantee two holders of one allocation cannot end up disagreeing.
+    ///
+    /// Stable only while the `Arc` is alive, which is exactly the life of the
+    /// sweep that uses it. Never persist it.
+    #[inline]
+    pub fn alloc_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     /// Whether both handles name the same allocation — the same gids, not
     /// merely equal ones.
     ///

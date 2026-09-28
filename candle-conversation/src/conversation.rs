@@ -49,21 +49,52 @@ pub(crate) fn slice_per_layer_sealed(
     full: &[SealedSequence],
     from: usize,
     to: usize,
-) -> Vec<SealedSequence> {
+) -> crate::Result<Vec<SealedSequence>> {
     full.iter()
-        .map(|seq| {
-            let chunks: Vec<_> = seq
-                .chunks
-                .get(from..to.min(seq.chunks.len()))
-                .unwrap_or(&[])
-                .to_vec();
+        .enumerate()
+        .map(|(layer, seq)| {
+            // **A range this layer cannot satisfy is a fault, and the seal
+            // stops.** There is no correct smaller answer: the caller has
+            // already resolved `[from, to)` against the slot's block count and
+            // is about to write it as one indivisible turn, so a layer that
+            // cannot produce it means the two disagree about what the slot
+            // holds. Sealing the remainder would persist a turn whose K/V is
+            // silently short of its tokens, which reads back as a coherent turn
+            // and attends over the wrong span.
+            //
+            // It used to be `get(from..to.min(len)).unwrap_or(&[])`: `to` was
+            // clamped and `from` never was, so a `from` past the layer's end
+            // inverted the range and the fallback turned that into an empty
+            // seal. Measured: a `repo_map` folder's FIRST turn sealed blocks
+            // 77..80 against per-layer lists holding only the view's three new
+            // chunks, so every layer produced nothing. The turn persisted with
+            // its tokens and `chunks=0(3blk×0L)`, and nothing said so — the
+            // substrate validator cannot see it either, since it checks
+            // `layers × chunks_per_layer` only on turns that HAVE chunks.
+            // `from > to` is checked too, and not as a formality: an INVERTED
+            // range is the exact shape the old clamp produced, and both bounds
+            // tested against `len` alone would let `5..3` through to
+            // `chunks[5..3]` — a panic, from the one function that was made
+            // fallible so a bad range could be reported instead. With
+            // `from <= to <= len`, `from <= len` follows.
+            if from > to || to > seq.chunks.len() {
+                return Err(crate::ConversationError::Model(candle::Error::Msg(
+                    format!(
+                        "seal range {from}..{to} is outside layer {layer}'s {} sealed chunk(s) — \
+                     the slot's block count and this layer's K/V disagree, and sealing any \
+                     part of it would persist a turn whose K/V is short of its tokens",
+                        seq.chunks.len(),
+                    ),
+                )));
+            }
+            let chunks: Vec<_> = seq.chunks[from..to].to_vec();
             let token_count = chunks.iter().map(|c| c.token_count as usize).sum();
-            SealedSequence {
+            Ok(SealedSequence {
                 chunks,
                 token_count,
                 chunk_size: seq.chunk_size,
                 location: seq.location,
-            }
+            })
         })
         .collect()
 }
@@ -391,6 +422,25 @@ pub struct Sequence {
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
 /// glue the projection assembler wraps around the system prompt and each turn.
+/// One decoded round of [`Sequence::ingest_roundtrip_chain`].
+///
+/// An ingest that gathers its own evidence needs all three of these: the `text`
+/// to decide whether the model answered or issued a `<tool_call>`, the
+/// `turn_index` to couple that call to the response the caller feeds back, and
+/// the `tokens` to accumulate across the loop into the unit's ingest stat.
+#[derive(Debug, Clone)]
+pub struct ChainRound {
+    /// The decoded assistant text — the unit's summary, or the `<tool_call>` the
+    /// model issued in place of one.
+    pub text: String,
+    /// Sealed index of the decoded turn. Deliberately NOT "the last turn": the
+    /// async summariser can append a turn between the seal and the caller's
+    /// [`Sequence::couple_turn`].
+    pub turn_index: u32,
+    /// Tokens prefilled plus decoded in this round.
+    pub tokens: usize,
+}
+
 /// Returned by [`Sequence::glue_markers`] so the projection panel can render the
 /// framing verbatim.
 #[derive(Debug, Clone)]
@@ -2946,7 +2996,19 @@ impl Sequence {
 
     /// [`Self::ingest_roundtrip_chain_indices`] for a caller that owns the
     /// timeline itself (the serial path): couples the chain here rather than
-    /// leaving it to a splice. Returns tokens ingested.
+    /// leaving it to a splice.
+    ///
+    /// **One round, not a whole ingest.** The decoded text comes back so the
+    /// caller can see whether the model answered or issued a `<tool_call>`, run
+    /// the tool, and submit the response as the next round's `decode_user` with
+    /// an EMPTY `prefilled` — which is how `repo_map` drives a real agentic loop
+    /// over a folder (`zend::repo_scan::converse`). The last turn is left
+    /// uncoupled for exactly that reason: a round that turns out to be a call
+    /// gets coupled to the response the caller then feeds back.
+    ///
+    /// `closing` bans the tool-call opener for this round, forcing an answer in
+    /// prose on whatever the conversation has already gathered — the caller's
+    /// round cap reaching its end.
     pub fn ingest_roundtrip_chain(
         &mut self,
         prefilled: &[(TurnText, String)],
@@ -2955,22 +3017,34 @@ impl Sequence {
         max_summary_tokens: usize,
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
-    ) -> crate::Result<usize> {
-        let (indices, tokens) = self.ingest_roundtrip_chain_indices(
+        closing: bool,
+    ) -> crate::Result<ChainRound> {
+        let (indices, prefill_tokens, handle) = self.ingest_chain_submit(
             prefilled,
             decode_user,
             tags,
             max_summary_tokens,
             force_tools,
             triggers,
+            closing,
         )?;
+        let response = handle.wait_cancellable();
+        let (indices, tokens, text) =
+            self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
         // Couple every turn except the last: each prefilled turn belongs with the
         // one that answers it, so the summariser sees the whole exchange rather
         // than a call with no response.
         for idx in indices.iter().take(indices.len().saturating_sub(1)) {
             self.couple_turn(*idx)?;
         }
-        Ok(tokens)
+        let turn_index = *indices.last().ok_or_else(|| {
+            ConversationError::Channel("round-trip chain: no turns were sealed".into())
+        })?;
+        Ok(ChainRound {
+            text,
+            turn_index,
+            tokens,
+        })
     }
 
     /// Ingest an N-turn tool round-trip whose LAST assistant turn is decoded.
@@ -3007,6 +3081,7 @@ impl Sequence {
             max_summary_tokens,
             force_tools,
             triggers,
+            false,
         )?;
         // Interruptible wait: a graceful shutdown mid-ingest latches the cancel
         // flag, and this returns `IngestCancelled` instead of waiting out the
@@ -3014,7 +3089,9 @@ impl Sequence {
         // the scheduler's decode at its next step. The ingest caller unwinds this
         // as "cancelled", not a decode failure.
         let response = handle.wait_cancellable();
-        self.ingest_chain_settle(indices, prefill_tokens, handle, response)
+        let (indices, tokens, _) =
+            self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
+        Ok((indices, tokens))
     }
 
     /// [`Self::ingest_roundtrip_chain_indices`] awaited instead of blocked on —
@@ -3037,6 +3114,7 @@ impl Sequence {
             max_summary_tokens,
             force_tools,
             triggers,
+            false,
         )?;
         // Armed across the await like every async turn wait: dropping this
         // future drops the handle (the decode winds down scheduler-side) and
@@ -3044,21 +3122,24 @@ impl Sequence {
         // rejects every later turn with `TurnInFlight`.
         let armed = CancelClearsInFlight::arm(self);
         let response = handle.wait_cancellable_async().await;
-        armed
-            .disarm()
-            .ingest_chain_settle(indices, prefill_tokens, handle, response)
+        let (indices, tokens, _) =
+            armed
+                .disarm()
+                .ingest_chain_settle(indices, prefill_tokens, handle, response)?;
+        Ok((indices, tokens))
     }
 
     /// The tail both chain waits share: propagate the wait's verdict, read the
     /// sealed index off the response, and record the decoded turn with its
-    /// staged provenance events.
+    /// staged provenance events. Returns the sealed indices, the tokens, and the
+    /// decoded text.
     fn ingest_chain_settle(
         &mut self,
         mut indices: Vec<u32>,
         prefill_tokens: usize,
         handle: TurnHandle,
         response: crate::Result<TurnResponse>,
-    ) -> crate::Result<(Vec<u32>, usize)> {
+    ) -> crate::Result<(Vec<u32>, usize, String)> {
         let response = response?;
         let resp_tokens = response.token_ids.len();
         let resp_idx = response
@@ -3073,7 +3154,7 @@ impl Sequence {
         // Records the decoded turn + its staged provenance events.
         self.finish_turn_staged(handle, &response)?;
         indices.push(resp_idx);
-        Ok((indices, prefill_tokens + resp_tokens))
+        Ok((indices, prefill_tokens + resp_tokens, response.text))
     }
 
     /// The head both chain waits share: selection framing, the prefilled turns,
@@ -3087,6 +3168,7 @@ impl Sequence {
         max_summary_tokens: usize,
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
+        closing: bool,
     ) -> crate::Result<(Vec<u32>, usize, TurnHandle)> {
         // A scope round-trip frames on the dialogue prompt itself — the persona is
         // deliberately left alone. The turns it seals are later borrowed into
@@ -3183,6 +3265,20 @@ impl Sequence {
         // carries; a fresh `compression()` config would repeat it per summary.
         summary_sampling.line_end_token_ids = Arc::clone(&self.config.sampling.line_end_token_ids);
         summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
+        // The CLOSING round of an agentic ingest loop: ban the tool-call opener
+        // so a model still trying to gather evidence cannot open another call and
+        // has to answer on what it already has. Structural, for the same reason
+        // the `<think>` suppression above is: the request's prose asking for an
+        // answer is text the model may ignore, and a round that seals as a
+        // `<tool_call>` with nowhere to send it is the unit's whole budget spent
+        // on no summary at all. Mirrors the live dialogue loop's repeat-guard
+        // closing round.
+        if closing {
+            let open = self.config.sampling.tool_call_open_token_id;
+            if open >= 0 {
+                summary_sampling.banned_tokens.push(open);
+            }
+        }
         let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
             sampling: Some(summary_sampling),
@@ -5226,6 +5322,72 @@ mod windowed_ingest_tests {
         // Window reaches into the system-prompt region (keep_from <= sys_end) →
         // contiguous → whole parent.
         assert_eq!(w(13, &starts, 20, 2), vec![(0, 20)]);
+    }
+}
+
+/// The seal-range guard on [`slice_per_layer_sealed`]. It exists because a range
+/// the layers cannot satisfy used to be clamped into an EMPTY seal, persisting a
+/// turn with its tokens and no K/V; so every rejection path has to return the
+/// error, never panic and never silently narrow.
+/// A `SealedChunk` carries RAII per-head `ChunkGid`s, so these cases use
+/// EMPTY layers: the guard reads `chunks.len()` and nothing else, which is
+/// exactly what both rejection paths turn on. The multi-chunk success path is
+/// what every production seal exercises.
+#[cfg(test)]
+mod slice_per_layer_sealed_tests {
+    use super::slice_per_layer_sealed;
+    use candle_nn::kv_cache::{ArenaLocation, SealedSequence};
+
+    fn empty_layer() -> SealedSequence {
+        SealedSequence {
+            chunks: Vec::new(),
+            token_count: 0,
+            chunk_size: 32,
+            location: ArenaLocation::Cpu,
+        }
+    }
+
+    /// An empty range over an empty layer is legitimate — a section pin that
+    /// sealed nothing — and must slice cleanly rather than be rejected.
+    #[test]
+    fn an_empty_range_is_not_an_error() {
+        let out = slice_per_layer_sealed(&[empty_layer()], 0, 0).expect("empty range");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].chunks.is_empty());
+        assert_eq!(out[0].token_count, 0);
+    }
+
+    /// The `chunks=0(3blk×0L)` shape that started this: a range the layer cannot
+    /// satisfy must report, not narrow.
+    #[test]
+    fn a_range_past_a_layers_end_is_an_error() {
+        let err = slice_per_layer_sealed(&[empty_layer()], 77, 80)
+            .expect_err("an empty layer cannot satisfy 77..80");
+        let msg = err.to_string();
+        assert!(msg.contains("seal range 77..80"), "{msg}");
+        assert!(
+            msg.contains("layer 0"),
+            "names the layer that disagrees: {msg}"
+        );
+    }
+
+    /// **An inverted range is an error, not a panic.** Both bounds tested against
+    /// `len` alone would admit `5..3` and then panic in the slice — from the one
+    /// function made fallible so a bad range could be reported instead.
+    #[test]
+    fn an_inverted_range_is_an_error_not_a_panic() {
+        let err = slice_per_layer_sealed(&[empty_layer()], 5, 3).expect_err("5..3 is inverted");
+        assert!(err.to_string().contains("seal range 5..3"), "{err}");
+    }
+
+    /// Zero layers yields zero sequences and NO error — which is exactly why this
+    /// guard could not have caught the missing-K/V seal on its own: with no
+    /// layers the closure never runs, so the caller must treat an empty result as
+    /// a failed seal rather than trusting `Ok`.
+    #[test]
+    fn no_layers_yields_no_sequences_and_no_error() {
+        let out = slice_per_layer_sealed(&[], 77, 80).expect("no layers to check");
+        assert!(out.is_empty());
     }
 }
 

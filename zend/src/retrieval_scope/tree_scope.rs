@@ -10,6 +10,7 @@ use super::index::IngestIndex;
 use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::keys::file_key;
 use crate::branch_ingest::units::{folder_units, TreeFile};
+use crate::repo_scan::types::ModuleHint;
 
 /// One tree's units that have been ingested: files by path (repository
 /// -relative), folders by folder (workspace-relative).
@@ -22,12 +23,14 @@ pub struct TreeScope {
 impl TreeScope {
     /// The ingested units of `repo`'s `tree`: every file looked up by its
     /// key, and — under `folder_scope`, the scope the folder layer walked —
-    /// every folder unit derived exactly as the walk derives it.
+    /// every folder unit derived exactly as the walk derives it, its
+    /// manifest's hint found through `hint_of` as the walk finds it.
     pub fn of(
         index: &IngestIndex,
         repo: &str,
         tree: &Tree,
         folder_scope: Option<&IngestScope>,
+        hint_of: &mut dyn FnMut(&TreeFile) -> Option<ModuleHint>,
     ) -> Self {
         let mut out = Self::default();
         for (path, blob, _) in tree.files() {
@@ -49,7 +52,7 @@ impl TreeScope {
                 })
             })
             .collect();
-        for unit in folder_units(repo, tree, &read) {
+        for unit in folder_units(repo, tree, &read, hint_of) {
             if let Some(tl) = index.get(&unit.key) {
                 out.folders.insert(unit.dir, tl);
             }

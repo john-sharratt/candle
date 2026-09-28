@@ -1,9 +1,10 @@
 //! The `repo_map` layer's units as one tree lists them: one per folder
-//! holding files the layer reads, plus the workspace's own. Derived from the
-//! tree alone — what the folder's listing shows, which file describes it,
-//! which manifests it holds — so a unit's key is known before anything is
-//! read. The ingest and a conversation's retrieval scope both derive units
-//! here, so the two can never disagree on a key.
+//! holding files the layer reads, plus the workspace's own. Derived from what
+//! the folder's listing shows and the hint its manifest gives — the one file
+//! read, once per manifest version (`manifest::Hints`) — so a unit's key is
+//! known before any conversation runs. The ingest and a conversation's
+//! retrieval scope both derive units here, so the two can never disagree on a
+//! key.
 
 use std::collections::BTreeMap;
 
@@ -11,10 +12,9 @@ use zend_tools::tools::file::list::LIST_PAGE_ENTRIES;
 use zend_vfs::vfs::Tree;
 use zend_vfs::Oid;
 
-use super::keys::{dir_key, Listing, Shown};
+use super::keys::{dir_key, Listing};
 use super::manifest::is_manifest;
-use crate::repo_scan::anchor::ANCHOR_NAMES;
-use crate::repo_scan::types::Language;
+use crate::repo_scan::types::{Language, ModuleHint};
 
 /// One file of a tree that a layer reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,15 +23,6 @@ pub struct TreeFile {
     pub path: String,
     pub blob: Oid,
     pub size: u64,
-    pub language: Language,
-}
-
-/// A file whose content a folder's turns show.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShownFile {
-    /// Workspace-relative.
-    pub path: String,
-    pub blob: Oid,
     pub language: Language,
 }
 
@@ -49,10 +40,9 @@ pub struct FolderUnit {
     /// folder ending in `/`, in the listing's order; for the workspace, each
     /// repository as `name/`.
     pub listed: Vec<String>,
-    /// The file describing it — a README, else a crate or module root.
-    pub anchor: Option<ShownFile>,
-    /// Every manifest directly in it, in path order.
-    pub manifests: Vec<ShownFile>,
+    /// The hint its request carries: the first of its manifests, in path
+    /// order, that gives one.
+    pub module_hint: Option<ModuleHint>,
     /// [`dir_key`] over the above.
     pub key: String,
 }
@@ -60,8 +50,14 @@ pub struct FolderUnit {
 /// The folder units of `repo`'s `tree`, given the files of it the layer
 /// reads (`read`, workspace-relative, in path order). A folder holding no
 /// file the layer reads has no unit; one that does is keyed by all its
-/// listing shows, files the layer does not read and subfolders included.
-pub fn folder_units(repo: &str, tree: &Tree, read: &[TreeFile]) -> Vec<FolderUnit> {
+/// listing shows, files the layer does not read and subfolders included, and
+/// by the hint `hint_of` finds in its manifests.
+pub fn folder_units(
+    repo: &str,
+    tree: &Tree,
+    read: &[TreeFile],
+    hint_of: &mut dyn FnMut(&TreeFile) -> Option<ModuleHint>,
+) -> Vec<FolderUnit> {
     let mut by_dir: BTreeMap<String, Vec<&TreeFile>> = BTreeMap::new();
     for file in read {
         by_dir.entry(dir_of(&file.path)).or_default().push(file);
@@ -83,28 +79,24 @@ pub fn folder_units(repo: &str, tree: &Tree, read: &[TreeFile]) -> Vec<FolderUni
                     format!("{repo}/{path}{slash}")
                 })
                 .collect();
-            let anchor = choose_anchor(&direct).map(shown);
-            let manifests: Vec<ShownFile> = direct
+            let module_hint = direct
                 .iter()
                 .filter(|f| is_manifest(basename(&f.path)))
-                .map(|f| shown(f))
-                .collect();
+                .find_map(|f| hint_of(f));
             let key = dir_key(
                 &dir,
                 &Listing {
                     total: children.len(),
                     page: &listed,
                 },
-                anchor.as_ref().map(as_shown),
-                &manifests.iter().map(as_shown).collect::<Vec<_>>(),
+                module_hint.as_ref(),
             );
             FolderUnit {
                 repo: repo.to_string(),
                 dir,
                 total: children.len(),
                 listed,
-                anchor,
-                manifests,
+                module_hint,
                 key,
             }
         })
@@ -127,43 +119,14 @@ pub fn workspace_unit(names: &[String]) -> FolderUnit {
             page: &listed,
         },
         None,
-        &[],
     );
     FolderUnit {
         repo: String::new(),
         dir: ".".to_string(),
         total: names.len(),
         listed,
-        anchor: None,
-        manifests: Vec::new(),
+        module_hint: None,
         key,
-    }
-}
-
-/// The file that describes a folder, by [`ANCHOR_NAMES`]' preference: a
-/// README over a crate or module root, and only one directly inside it —
-/// never a subfolder's.
-fn choose_anchor<'a>(direct: &[&'a TreeFile]) -> Option<&'a TreeFile> {
-    ANCHOR_NAMES.iter().find_map(|want| {
-        direct
-            .iter()
-            .find(|f| basename(&f.path).eq_ignore_ascii_case(want))
-            .copied()
-    })
-}
-
-fn shown(file: &TreeFile) -> ShownFile {
-    ShownFile {
-        path: file.path.clone(),
-        blob: file.blob.clone(),
-        language: file.language,
-    }
-}
-
-fn as_shown(file: &ShownFile) -> Shown<'_> {
-    Shown {
-        path: &file.path,
-        blob: &file.blob,
     }
 }
 
@@ -219,9 +182,20 @@ pub(crate) fn test_tree(files: &[(&str, &str)]) -> Tree {
 
 /// The folder units of one repository holding `files` — workspace-relative,
 /// the repository their first segment — the layer reading every one of
-/// them: what a test that needs units without a repository builds.
+/// them, and no manifest giving a hint: what a test that needs units without
+/// a repository builds.
 #[cfg(test)]
 pub(crate) fn test_units(files: &[(&str, Language)]) -> Vec<FolderUnit> {
+    test_units_reading(files, |_| None)
+}
+
+/// As [`test_units`], a manifest's bytes read by its workspace-relative path
+/// through `bytes`.
+#[cfg(test)]
+pub(crate) fn test_units_reading(
+    files: &[(&str, Language)],
+    bytes: impl Fn(&str) -> Option<Vec<u8>>,
+) -> Vec<FolderUnit> {
     const BLOB: &str = "ce013625030ba8dba906f756967f9e9ca394464a";
     let repo = files[0].0.split('/').next().unwrap();
     let inner: Vec<(&str, &str)> = files
@@ -237,7 +211,9 @@ pub(crate) fn test_units(files: &[(&str, Language)]) -> Vec<FolderUnit> {
             language: *language,
         })
         .collect();
-    folder_units(repo, &test_tree(&inner), &read)
+    folder_units(repo, &test_tree(&inner), &read, &mut |f: &TreeFile| {
+        super::manifest::hint(basename(&f.path), &bytes(&f.path)?)
+    })
 }
 
 #[cfg(test)]
@@ -246,6 +222,21 @@ mod tests {
 
     const A: &str = "ce013625030ba8dba906f756967f9e9ca394464a";
     const B: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    /// A third blob: a `Cargo.toml` giving a different hint from `A`'s.
+    const C: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+    /// What each blob holds when it is a `Cargo.toml`: `A` and `B` two
+    /// versions of one crate's manifest — a version raised, the hint the
+    /// same — and `C` a workspace root.
+    fn manifest_bytes(blob: &Oid) -> Option<Vec<u8>> {
+        let text: &[u8] = match blob.as_str() {
+            A => b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            B => b"[package]\nname = \"demo\"\nversion = \"0.2.0\"\n",
+            C => b"[workspace]\nmembers = [\"a\"]\n",
+            _ => return None,
+        };
+        Some(text.to_vec())
+    }
 
     /// The units of repository `r` holding `files` (repository-relative
     /// path, blob), every file read as the language its name says.
@@ -266,7 +257,10 @@ mod tests {
                 language: Language::Rust,
             })
             .collect();
-        folder_units("r", &tree, &read)
+        let mut hints = super::super::manifest::Hints::default();
+        folder_units("r", &tree, &read, &mut |f: &TreeFile| {
+            hints.of(basename(&f.path), &f.blob, manifest_bytes)
+        })
     }
 
     fn dirs(units: &[FolderUnit]) -> Vec<&str> {
@@ -283,31 +277,6 @@ mod tests {
         assert_eq!(units[0].listed, ["r/a/", "r/top.rs"]);
         assert_eq!(units[1].listed, ["r/a/b/", "r/a/x.rs"]);
         assert!(units.iter().all(|u| u.repo == "r"));
-    }
-
-    /// **A README describes its folder over a module root**, and a folder is
-    /// described only by a file directly inside it.
-    #[test]
-    fn a_readme_anchors_its_folder_over_a_module_root() {
-        let units = units(&[
-            ("a/README.md", A),
-            ("a/mod.rs", A),
-            ("b/lib.rs", A),
-            ("b/sub/README.md", A),
-            ("c/thing.rs", A),
-        ]);
-        let anchor = |dir: &str| {
-            units
-                .iter()
-                .find(|u| u.dir == dir)
-                .unwrap()
-                .anchor
-                .as_ref()
-                .map(|a| a.path.as_str())
-        };
-        assert_eq!(anchor("r/a/"), Some("r/a/README.md"));
-        assert_eq!(anchor("r/b/"), Some("r/b/lib.rs"));
-        assert_eq!(anchor("r/c/"), None);
     }
 
     /// **The listing is what the turn shows, not what the layer reads**: a
@@ -344,23 +313,33 @@ mod tests {
         assert_ne!(after[0].key, before[0].key, "the count is shown too");
     }
 
-    /// **An edited anchor or manifest moves the key; an edited file it only
-    /// names does not.**
+    /// **Only a change to what the turns show moves the key.** An edited file
+    /// the folder only names does not — a module root and a README included,
+    /// since the turns never read a file of it — and nor does a manifest edit
+    /// that leaves its hint as it was: the request reads the same. A manifest
+    /// edit that changes the hint does.
+    ///
+    /// The second case is the one that matters for density: keyed on the
+    /// manifest's bytes, every `Cargo.toml` version bump split the folder into
+    /// another conversation saying the same thing — `candle/` stood ten times
+    /// over seven distinct listings across its branches.
     #[test]
     fn what_the_folder_shows_moves_its_key() {
         let key = |files: &[(&str, &str)]| units(files)[0].key.clone();
-        let base = key(&[("a/Cargo.toml", A), ("a/mod.rs", A), ("a/x.rs", A)]);
-        let named_edit = key(&[("a/Cargo.toml", A), ("a/mod.rs", A), ("a/x.rs", B)]);
-        let anchor_edit = key(&[("a/Cargo.toml", A), ("a/mod.rs", B), ("a/x.rs", A)]);
-        let manifest_edit = key(&[("a/Cargo.toml", B), ("a/mod.rs", A), ("a/x.rs", A)]);
-        assert_eq!(base, named_edit);
-        assert_ne!(base, anchor_edit);
-        assert_ne!(base, manifest_edit);
+        let base = key(&[("a/Cargo.toml", A), ("a/mod.rs", A), ("a/README.md", A)]);
+        let module_root_edit = key(&[("a/Cargo.toml", A), ("a/mod.rs", B), ("a/README.md", A)]);
+        let readme_edit = key(&[("a/Cargo.toml", A), ("a/mod.rs", A), ("a/README.md", B)]);
+        let same_hint = key(&[("a/Cargo.toml", B), ("a/mod.rs", A), ("a/README.md", A)]);
+        let new_hint = key(&[("a/Cargo.toml", C), ("a/mod.rs", A), ("a/README.md", A)]);
+        assert_eq!(base, module_root_edit);
+        assert_eq!(base, readme_edit);
+        assert_eq!(base, same_hint, "a version bump gives the same request");
+        assert_ne!(base, new_hint);
         assert_eq!(
-            units(&[("a/Cargo.toml", A), ("a/x.rs", A)])[0]
-                .manifests
-                .len(),
-            1
+            units(&[("a/Cargo.toml", A), ("a/x.rs", A)])[0].module_hint,
+            Some(ModuleHint::CargoPackage {
+                name: "demo".into()
+            })
         );
     }
 

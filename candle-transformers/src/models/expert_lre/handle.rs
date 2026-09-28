@@ -27,7 +27,7 @@ use super::pipeline::prewarm_expert_cache;
 #[cfg(feature = "cuda")]
 use super::pipeline::{
     slot_bytes_for, slot_offsets, startup_from_pack, startup_repack, ColdStaging, StartupTargets,
-    COLD_STAGING_BUFFERS,
+    COLD_STAGING_BUFFERS, PACK_TAIL_STEPS,
 };
 use super::pipeline::{spawn_pipeline_thread, PipelineState};
 use super::transition::TransitionMatrix;
@@ -69,8 +69,8 @@ fn log_dispatch_refusal(reason: &'static str, detail: impl FnOnce() -> String) {
         }
     }
 }
-use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::quantized::Int8Mode;
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::WeightZone;
 #[cfg(feature = "cuda")]
@@ -828,7 +828,27 @@ impl ExpertCache {
                     }
                     PackSource::Build(mut writer) => {
                         startup_repack(targets, &mut writer, cuda_dev, progress)?;
-                        writer.finish()?
+                        // Publishing flushes and `fsync`s the whole pack — tens
+                        // of gigabytes, and the single largest thing that used
+                        // to happen behind a bar already reading 100%. It is
+                        // charged here, where it is paid, against the room
+                        // `startup_repack` left for it.
+                        let total = num_moe_layers * experts_per_layer;
+                        let t_publish = std::time::Instant::now();
+                        let pack = writer.finish()?;
+                        // Timed and named, because the next line printed used to
+                        // be the residency gauge's and the whole flush was read
+                        // off the log as the gauge being slow. The gauge is three
+                        // arithmetic operations.
+                        tracing::info!(
+                            target: "candle_transformers::expert_lre",
+                            secs = t_publish.elapsed().as_secs_f64(),
+                            "expert pack: published (flush + fsync + reopen)"
+                        );
+                        if let Some(cb) = progress {
+                            cb(total + 1, total + PACK_TAIL_STEPS);
+                        }
+                        pack
                     }
                 };
 
@@ -892,10 +912,42 @@ impl ExpertCache {
                 resident_gib = seeded as f64 / 1e9,
                 "expert cache: seeded resident-VRAM gauge"
             );
+            // The last of the tail: the cache is built and reporting itself, so
+            // the bar lands on its total here rather than at the last expert.
+            if let Some(cb) = progress {
+                let total = num_moe_layers * experts_per_layer;
+                cb(total + PACK_TAIL_STEPS, total + PACK_TAIL_STEPS);
+            }
             if let Ok(mut s) = stats.lock() {
                 s.resident_vram_bytes = seeded;
                 s.warm_slots = warm.num_slots();
                 s.total_experts = num_moe_layers * experts_per_layer;
+                s.moe_layers = num_moe_layers;
+                // **The zone's shape, seeded here and not left to the first classify.**
+                //
+                // These four are what `WeightPlan::from_stats` needs, and it refuses the
+                // whole gauge set if any reads zero — correctly, since a zero slot size
+                // makes a routed expert look free. They used to be written only by
+                // `classify_and_load`, which on an all-resident cache does no loading
+                // worth the name: nothing streams, so nothing refreshed them, so they
+                // stayed at zero for the process lifetime.
+                //
+                // The consequence was an inversion. With no weight plan the scheduler's
+                // rate planner cannot be armed, and admission falls back to one prefill
+                // per pass — so a card *large enough to hold the whole checkpoint* ran
+                // waves one row wide, while a card small enough to stream experts
+                // published gauges, planned, and batched. Measured on the 30B-A3B at 72
+                // GiB: `decode seqs avg=1.0 max=1` and 32 t/s against a batched ceiling
+                // of 518.
+                //
+                // Every term is known here — the zone is carved before this point and
+                // `slot_bytes` is the same figure the resident gauge above is a multiple
+                // of — so there was never a reason to wait for a classify.
+                let zone_slot_bytes = inner.zone.slot_bytes();
+                s.expert_slot_bytes = zone_slot_bytes;
+                s.zone_bytes = inner.zone.capacity() * zone_slot_bytes;
+                s.zone_min_bytes = inner.zone.min_capacity() * zone_slot_bytes;
+                s.zone_max_bytes = inner.zone.limit() * zone_slot_bytes;
                 // Which MoE path this cache will take, as a reported gauge.
                 // `all_resident` is the whole of it: a streaming cache's slot
                 // addresses move, so the device tables cannot be captured and
@@ -1131,6 +1183,11 @@ impl ExpertCache {
     /// * `xs` — input hidden states `[num_tokens, hidden_dim]`
     /// * `weights_flat` — flattened routing weights `[num_tokens * k]`
     /// * `assignments` — flat sorted `(expert_id, token_idx, weight_idx)` array
+    /// * `decode_tokens` — count of leading rows (in `assignments`' token
+    ///   order) that are decode-attributed; see
+    ///   [`MoeWorkRequest::decode_tokens`]. A caller that does not know its own
+    ///   split passes the row count, which scores every row as decode did
+    ///   before this existed.
     ///
     /// # Returns
     ///
@@ -1144,6 +1201,7 @@ impl ExpertCache {
         out_dtype: DType,
         weights_flat: &Tensor,
         assignments: Vec<(u32, u32, u32)>,
+        decode_tokens: usize,
         wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         match &self.mode {
@@ -1160,6 +1218,7 @@ impl ExpertCache {
                     out_dtype,
                     weights_flat: weights_flat.clone(),
                     assignments,
+                    decode_tokens,
                     // Captured right before `send` so the worker can split the inbound handoff
                     // (channel wakeup) out of the actual work.
                     wave,

@@ -353,6 +353,24 @@ impl Scheduler {
             .filter(|id| !glue_pending.contains(&id.0))
             .collect();
 
+        // **Why this wave is as wide as it is, in the one place that decides.** A decode
+        // forward's width is the whole of decode throughput, and it is not a cap — it is
+        // whatever survives these filters. Reading it from the outside is guesswork: a
+        // width of four could be four sequences active, or twenty with sixteen held back,
+        // and those are unrelated problems. Every term that removed a row is named.
+        tracing::debug!(
+            target: "candle_conversation::scheduler::throttle",
+            active = self.active_decodes.len(),
+            finished = self
+                .active_decodes
+                .values()
+                .filter(|s| s.finished)
+                .count(),
+            glue_pending = glue_pending.len(),
+            selected = seq_ids.len(),
+            "decode row selection",
+        );
+
         // ── Interactive-decode priority ──────────────────────────────────────
         // A HIGH-priority (interactive dialogue) decode must not be trapped
         // behind a large bulk-INGEST co-batch — a single dialogue token stuck in
@@ -615,6 +633,19 @@ impl Scheduler {
         // sequence, and pricing it as one row each would understate the wave.
         self.wave_stats
             .record(false, seq_ids.len(), wave_rows, kv_len, fwd_ms);
+        // What this step cost, taught to the planner. A bus-bound step says
+        // nothing about the layer time and the model discards it; a
+        // compute-bound one is the only thing that can move an estimate the
+        // decode side was seeded 26x optimistic on. The hit coefficient rides
+        // the same moment because it is read from the counters this forward just
+        // moved.
+        // Microseconds, not the truncated millisecond the stats line uses: the
+        // truncation is a floor, so it teaches the model that every forward was
+        // faster than it was — a 1.4 ms step reads as 1.0, and a sub-millisecond
+        // one as zero and is dropped entirely. That bias lands straight on
+        // `layer_secs`, which is the estimate this wiring exists to correct.
+        self.observe_decode_forward(seq_ids.len(), fwd_us);
+        self.observe_expert_hit_rate();
 
         // Reads the scored rows back and advances each sequence by what the wave
         // actually wrote — the walk below rolls the rejected tail off again.
@@ -1885,7 +1916,7 @@ impl Scheduler {
     }
 
     /// Send an error to all active decodes and mark them finished.
-    fn fail_all_decodes(&mut self, seq_ids: &[SequenceId], msg: &str) {
+    pub(super) fn fail_all_decodes(&mut self, seq_ids: &[SequenceId], msg: &str) {
         for &id in seq_ids {
             if let Some(state) = self.active_decodes.get_mut(&id) {
                 let _ = state

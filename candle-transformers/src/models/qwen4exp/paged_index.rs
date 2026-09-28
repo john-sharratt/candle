@@ -251,7 +251,8 @@ impl PagedIndex {
             .iter()
             .map(|p| PlacePage { keys: &p.keys })
             .collect();
-        let placement = Placement::plan(&jobs)?;
+        // Table building runs outside a forward; no phase is open.
+        let placement = Placement::plan(&jobs, None)?;
         placement.run(PLACE_TILE_R)?;
         let mut desc: Vec<i64> = Vec::with_capacity(self.pages.len().max(1) * PAGE_WORDS);
         for (i, t) in placement.staged().iter().enumerate() {

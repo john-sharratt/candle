@@ -124,21 +124,20 @@ The key is known from a tree listing alone. Deciding whether a file is ingested 
 
 ### 6.2 A folder
 
-A folder's turns show its listing (`file_list`'s first page, and how many entries the folder holds), the anchor excerpt (a README or module doc — `repo_scan/anchor.rs`), and the manifest hint in its request (`(crate: candle-nn)`). The listing is what `file_list` shows, not what the layer reads: every file and subfolder but hidden ones, a `LICENSE` or a `kernels/` folder as much as a `.rs` file. Its key is the SHA-256, in hex, of:
+A folder's turns show its listing (`file_list`'s first page, and how many entries the folder holds) and the manifest hint in its request (`(crate: candle-nn)`) — nothing else. The chain is one `file_list` round-trip and the summary; no file of the folder is read, so no file's content is part of what it shows (`repo_scan/render.rs` records why a README/module-doc read was removed). The listing is what `file_list` shows, not what the layer reads: every file and subfolder but hidden ones, a `LICENSE` or a `kernels/` folder as much as a `.rs` file. Its key is the SHA-256, in hex, of:
 
 ```
 <dir>\n             workspace-relative, `candle/zend/src/`
 <total>\n           how many entries the listing holds
 <entry>\n           one per entry on the first page, workspace-relative, a folder ending in `/`, in the listing's order
-\0anchor\0<path>\0<blob id>
-\0manifest\0<path>\0<blob id>     one per manifest file directly in the folder
+\0hint\0<hint>       the hint the request shows, rendered (`crate: candle-nn`)
 ```
 
-the last two present only when the folder has an anchor or a manifest. The sizes the listing prints beside each file are left out on purpose: they move with every edit of a file the folder only names, and a folder would be read again for each one while what its summary rests on — which files and folders it holds, what its anchor and manifest say — stood still. So an edit to a file the folder only names moves nothing; an entry added or removed (on the page, or past it through the count), an edited anchor or an edited manifest does. The **workspace unit** (`.`) is keyed by the repositories it lists, in the workspace's order, the uploads repository among them.
+the last present only when one of the folder's manifests gives a hint — the first that does, in path order. **The hint, never the manifest's bytes**: the request shows the hint, so two versions of a `Cargo.toml` that give the same one — a dependency bumped, a version raised — make the same turns and must make the same key. Keyed on the manifest's blob, every such edit split the folder into another conversation saying the same thing, and branches that share a lineage but not every manifest byte multiplied it: `candle/` stood ten times over seven distinct listings across its 22 branches. The walk reads each distinct manifest version once, cached by blob id (`branch_ingest::manifest::Hints`), and the retrieval scope derives the same key the same way. The sizes the listing prints beside each file are left out for the same reason: they move with every edit of a file the folder only names, and a folder would be read again for each one while what its summary rests on — which files and folders it holds, what its manifest says — stood still. So an edit to a file the folder only names — a README or module root included — moves nothing, and neither does a manifest edit that leaves its hint alone; an entry added or removed (on the page, or past it through the count) or a changed hint does. The manifest hint states the folder's role and never a magnitude of the checkout: a Cargo workspace is `Cargo workspace root`, not a member count. The **workspace unit** (`.`) is keyed by the repositories it lists, in the workspace's order, the uploads repository among them.
 
 ### 6.3 Where the keys are kept
 
-On the unit's conversation, as metadata: `content_key` (the key), plus `path`, `blob` and `lines` (the line count `file_read` reports for it) for a file, `dir` for a folder, and `kind`. `path`/`dir` is written when the conversation is created and `content_key` only once its ingest succeeds, so a conversation with the first and not the second is a partial. An attempt that fails retires its own conversation; one a crash left is retired at boot, before any pool runs — a pool never retires another's, since an attempt in flight carries exactly the same metadata. A conversation from before this design has no `content_key` and is retired the same way, uploads included: without a key it is in no conversation's scope (§8.2).
+On the unit's conversation, as metadata: `content_key` (the key), plus `path`, `blob` and `lines` (the line count `file_read` reports for it) for a file, `dir` for a folder, and `kind`. `branches` names every branch whose tip holds the unit's version, the default branch first — the walk collects it as it meets the unit on each tip. It is not part of the key: it is written when the unit commits and rewritten by each pass whose walk finds a different set (`branch_ingest/tie.rs`), since branches move without the content changing. A file's conversation also records `commit`, the commit it read the file at: written once and never moved, since it names the version the conversation holds. A pass gives one committed without it a commit the walk found holding the same blob. The substrate viewer's layer view shows `commit` on a file's row — a file's version is shared across branches, so its commit is what tells two readings of one path apart — and `branches` on a folder's row. `path`/`dir` is written when the conversation is created and `content_key` only once its ingest succeeds, so a conversation with the first and not the second is a partial. An attempt that fails retires its own conversation; one a crash left is retired at boot, before any pool runs — a pool never retires another's, since an attempt in flight carries exactly the same metadata. A conversation from before this design has no `content_key` and is retired the same way, uploads included: without a key it is in no conversation's scope (§8.2).
 
 ---
 
@@ -149,7 +148,7 @@ On the unit's conversation, as metadata: `content_key` (the key), plus `path`, `
 ### 7.1 Live, committed, queued
 
 1. **Live** — the corpus's keys (§5).
-2. **Committed** — every live conversation of the layer carrying a `content_key`.
+2. **Committed** — every live conversation of the layer carrying a `content_key`; for `code_reading`, only one whose chain **finished** (`candle_conversation::chain_health`). A file's key is written once its conversation stops calling tools, which is not the same as answering: a read cut off mid-deliberation, with no tool call and no summary, carries the key all the same. Such a chain is not committed, so its key is queued again; its conversation is deferred like a dead key's (§7.2) and retired once the rebuild commits. The resume snapshot and the `file_read` fast path read the same predicate.
 3. **Queued** — live keys not committed, in corpus order.
 4. **Dead** — committed keys not live.
 
@@ -163,7 +162,7 @@ A repository whose branches could not be read this pass — a folder with a `.gi
 
 ### 7.3 Ingesting a unit
 
-A file's hidden conversation and a folder's chain run exactly as before (`code_read`, `repo_scan`) with one change: the tools they call read **the commit the unit was found on**. The unit's conversation is given a file set whose store for its repository is pinned to `at` (`RepoFiles::fresh_at`), so its `file_read` and `file_list` return that commit's bytes — the bytes the key names. The anchor excerpt and manifest hint are read from their blobs.
+A file's hidden conversation and a folder's chain run exactly as before (`code_read`, `repo_scan`) with one change: the tools they call read **the commit the unit was found on**. The unit's conversation is given a file set whose store for its repository is pinned to `at` (`RepoFiles::fresh_at`), so its `file_read` and `file_list` return that commit's bytes — the bytes the key names. A folder's manifest hint is read from its blob.
 
 Before a file's conversation is minted, its blob is sniffed; a binary file is skipped and its key remembered for the life of the process, so it is not read again — and from the next pass on it is not a unit at all, so an older version of its path does not wait on it as a replacement.
 

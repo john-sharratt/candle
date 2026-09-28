@@ -5,7 +5,8 @@
 //! once, and kept between passes while a tip still names it — and filtered by
 //! the layer's [`IngestScope`]. A unit found on several branches is one unit,
 //! found first on the repository's default branch, so the commit its bytes
-//! are read from is the default branch's wherever it can be.
+//! are read from is the default branch's wherever it can be — and it records
+//! every branch it was found on.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use zend_vfs::{GitError, Oid, RecordBranch, Repo, Rev};
 
 use super::filter::IngestScope;
 use super::keys::file_key;
+use super::manifest::Hints;
 use super::units::{folder_units, workspace_unit, FolderUnit, TreeFile};
 
 /// The branches a conversation starts on, most preferred first — they lead
@@ -56,6 +58,8 @@ pub struct FileItem {
     pub at: Oid,
     /// [`file_key`].
     pub key: String,
+    /// Every branch whose tip holds this version, in walk order.
+    pub branches: Vec<String>,
 }
 
 /// A folder unit, and the commit its listing and files are read from —
@@ -64,6 +68,9 @@ pub struct FileItem {
 pub struct UnitItem {
     pub unit: FolderUnit,
     pub at: Option<Oid>,
+    /// Every branch whose tip lists the folder this way, in walk order; empty
+    /// for the workspace's own unit, which is on no repository's branch.
+    pub branches: Vec<String>,
 }
 
 /// Every distinct unit on any branch, in walk order.
@@ -73,10 +80,12 @@ pub struct Corpus {
     pub units: Vec<UnitItem>,
 }
 
-/// The trees of the tips walked, by commit, kept between passes.
+/// The trees of the tips walked, by commit, kept between passes — and each
+/// manifest version's hint, which a blob id fixes for good.
 #[derive(Default)]
 pub struct TreeCache {
     trees: HashMap<Oid, Arc<Tree>>,
+    hints: Hints,
 }
 
 impl TreeCache {
@@ -141,7 +150,14 @@ pub fn walk(
     }
     if failed.is_empty() && held_back.is_empty() && !corpus.units.is_empty() {
         let unit = workspace_unit(workspace_names);
-        corpus.units.insert(0, UnitItem { unit, at: None });
+        corpus.units.insert(
+            0,
+            UnitItem {
+                unit,
+                at: None,
+                branches: Vec::new(),
+            },
+        );
     }
     (corpus, failed)
 }
@@ -154,9 +170,13 @@ fn walk_repo(
     cache: &mut TreeCache,
 ) -> Result<Corpus, GitError> {
     let mut corpus = Corpus::default();
-    let mut seen_files: HashSet<String> = HashSet::new();
-    let mut seen_units: HashSet<String> = HashSet::new();
+    // Key → index into the corpus, so a unit found again on a later branch
+    // adds that branch to the one it already is.
+    let mut seen_files: HashMap<String, usize> = HashMap::new();
+    let mut seen_units: HashMap<String, usize> = HashMap::new();
+    let blobs = repo.repo.blobs();
     for tip in &repo.tips {
+        let branch = tip.name.as_str().to_string();
         let tree = cache.tree(&repo.repo, &tip.tip)?;
         let files: Vec<TreeFile> = tree
             .files()
@@ -170,23 +190,38 @@ fn walk_repo(
                 })
             })
             .collect();
-        for unit in folder_units(&repo.name, &tree, &files) {
-            if seen_units.insert(unit.key.clone()) {
-                corpus.units.push(UnitItem {
-                    unit,
-                    at: Some(tip.tip.clone()),
-                });
+        let hints = &mut cache.hints;
+        let mut hint_of = |f: &TreeFile| {
+            let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+            hints.of(name, &f.blob, |blob| blobs.read_blob(blob).ok().flatten())
+        };
+        for unit in folder_units(&repo.name, &tree, &files, &mut hint_of) {
+            match seen_units.get(&unit.key) {
+                Some(&at) => corpus.units[at].branches.push(branch.clone()),
+                None => {
+                    seen_units.insert(unit.key.clone(), corpus.units.len());
+                    corpus.units.push(UnitItem {
+                        unit,
+                        at: Some(tip.tip.clone()),
+                        branches: vec![branch.clone()],
+                    });
+                }
             }
         }
         for file in files {
             let key = file_key(&file.path, &file.blob);
-            if seen_files.insert(key.clone()) {
-                corpus.files.push(FileItem {
-                    repo: repo.name.clone(),
-                    file,
-                    at: tip.tip.clone(),
-                    key,
-                });
+            match seen_files.get(&key) {
+                Some(&at) => corpus.files[at].branches.push(branch.clone()),
+                None => {
+                    seen_files.insert(key.clone(), corpus.files.len());
+                    corpus.files.push(FileItem {
+                        repo: repo.name.clone(),
+                        file,
+                        at: tip.tip.clone(),
+                        key,
+                        branches: vec![branch.clone()],
+                    });
+                }
             }
         }
     }
@@ -348,6 +383,17 @@ mod tests {
         assert_eq!(got[2].1, a_topic.trim());
         let at: Vec<&Oid> = corpus.files.iter().map(|f| &f.at).collect();
         assert_eq!(at, [&main, &main, &topic, &topic]);
+        let branches: Vec<&[String]> = corpus.files.iter().map(|f| &f.branches[..]).collect();
+        assert_eq!(
+            branches,
+            [
+                &["main".to_string()][..],
+                &["main".to_string(), "topic".to_string()][..],
+                &["topic".to_string()][..],
+                &["topic".to_string()][..],
+            ],
+            "src/b.rs is the same on both, so it is one unit that both branches hold",
+        );
         assert_eq!(corpus.files[0].key, format!("r/a.rs@{}", a_main.trim()));
     }
 
@@ -377,6 +423,16 @@ mod tests {
                 ("r/src/", Some(topic)),
             ],
             "r/ lists the same entries on both, so it is one unit",
+        );
+        let branches: Vec<Vec<&str>> = corpus
+            .units
+            .iter()
+            .map(|u| u.branches.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            branches,
+            [vec![], vec!["main", "topic"], vec!["main"], vec!["topic"]],
+            "each unit names every branch that lists the folder its way",
         );
         assert_eq!(
             corpus.units[1].unit.listed,

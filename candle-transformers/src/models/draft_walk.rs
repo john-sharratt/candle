@@ -70,29 +70,30 @@ pub type DraftStep<'f> = dyn FnMut(
 /// sequence, already stacked.
 ///
 /// The head's KV is left exactly as it was found.
-/// `prepare` runs **after** the walk has reserved its storage and **before**
-/// the first step, and whatever it returns is held for the walk's lifetime.
 ///
-/// That ordering is the whole reason it is a hook rather than something the
-/// caller does around the call. A model that needs a transient arena tier for
-/// the head's attention opens a forward here — and a forward that owns the
-/// partition refuses any arena created inside it, because the wave's storage is
-/// claimed before the forward opens. Reserve first, then open: the other order
-/// works only for as long as every arena the walk touches happens to exist
-/// already, which is true at low compression and false at C8.
-// Eight operands, none of which groups with another: the session, the cohort it
+/// **A walk opens no forward of its own**, and there is no hook for one. A
+/// forward's transient tier stands until the *next* forward's first phase hands
+/// it back, so a caller arriving between forwards — which is what a walk is —
+/// already has ground for the head's attention to lay its spans in. Opening one
+/// here is worse than unnecessary: a forward that owns the partition refuses
+/// every arena created inside it, and a walk cannot avoid creating them, because
+/// a filling chunk gets sealed into a policy-chosen format and the next step
+/// then asks for a chunk of a key that did not exist when the walk began. That
+/// key is not knowable in advance, so no amount of pre-ensuring reaches it.
+/// Uncompressed runs survive because every key they touch already exists; C8
+/// does not. See `qwen4exp::draft::mtp_draft`, which records the measurement.
+// Seven operands, none of which groups with another: the session, the cohort it
 // walks, where that cohort's KV lives, what it has committed, what it seeds
-// from, how far to walk, and the two callbacks. A params struct would name the
+// from, how far to walk, and the step callback. A params struct would name the
 // bundle without making any of them optional or related.
 #[allow(clippy::too_many_arguments)]
-pub fn draft_walk<G>(
+pub fn draft_walk(
     session: &mut BatchedInferenceSession,
     seqs: &[usize],
     kv_layer: usize,
     committed: &[u32],
     seeds: &Tensor,
     max_len: usize,
-    prepare: impl FnOnce() -> Result<G>,
     step: &mut DraftStep<'_>,
 ) -> Result<Vec<Vec<u32>>> {
     let n = seqs.len();
@@ -145,8 +146,6 @@ pub fn draft_walk<G>(
     }
 
     // Everything that allocates has now run; from here the walk only computes.
-    let _prepared = prepare()?;
-
     let generation = session.begin_stager_generation();
     let mut ids = Tensor::from_vec(committed.to_vec(), n, &dev)?;
     let mut h = seeds.clone();

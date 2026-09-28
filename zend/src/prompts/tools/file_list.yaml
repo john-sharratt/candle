@@ -1,6 +1,6 @@
 name: file_list
 questions:
-- list everything under candle-nn/src/kv_cache
+- what's in candle-nn/src/kv_cache
 - show me the files in the migrations folder
 - what's at the top level of the repo
 - enumerate the yaml files under prompts
@@ -14,15 +14,15 @@ questions:
 - trying to find which folder holds the fixtures
 - ls the working directory
 - what files are in this directory
-- show me the directory tree
+- what subdirectories are in here
 - dir listing please
-- what files are in this project
-- list everything under the src directory
+- what files are at the top of this project
+- what's directly in the src directory
 - show me the files I've written this session
 - what's in the tests folder
 - give me a listing of the working directory
-- which files exist under docs/
-- show the project tree from the root
+- which files exist directly under docs/
+- what's at the root of the project
 - what files can you see right now
 category: Files
 mandatory: true

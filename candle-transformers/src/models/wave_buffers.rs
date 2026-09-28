@@ -318,6 +318,64 @@ pub(crate) fn wave_from_vec<'w, D: CudaDType + candle::WithDType, S: Into<Shape>
     }
 }
 
+/// [`wave_from_vec`] for a holder of a [`WaveTicket`] rather than of the guard,
+/// returning a plain [`Tensor`].
+///
+/// This is the form the per-wave **metadata** uploads take — ragged prefill
+/// offsets, page and candidate tables, gathered position ids — which is exactly
+/// what [`candle_nn::kv_cache::WAVE_FORWARD_BYTES`] describes its span as
+/// holding. They are built deep inside the sweep, by functions that have no
+/// business borrowing a generation, and they are `Tensor`-typed because every
+/// consumer downstream of them is; a ticket is a `Copy` coordinate, so it
+/// reaches them without changing a single signature's lifetime.
+///
+/// Sound for the same reason as [`wave_empty_ticketed`]: the lease frees nothing
+/// on drop and the range's only reclaim is the generation's reset, which cannot
+/// happen while the forward that opened it is still running. A ticket whose
+/// generation has closed resolves to `None` and this falls back to an ordinary
+/// upload, which is a correct answer rather than a silent failure.
+pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<Shape>>(
+    data: Vec<D>,
+    shape: S,
+    device: &Device,
+    ticket: Option<WaveTicket>,
+) -> Result<Tensor> {
+    let shape = shape.into();
+    if shape.elem_count() != data.len() {
+        candle::bail!(
+            "wave_from_vec_ticketed: {} elements for a shape of {}",
+            data.len(),
+            shape.elem_count()
+        );
+    }
+    let bytes = std::mem::size_of_val(data.as_slice());
+    let (Device::Cuda(cuda), Some(ticket)) = (device, ticket) else {
+        return Tensor::from_vec(data, shape, device);
+    };
+    let Some(ptr) = wave_alloc(ticket, bytes, WAVE_ALIGN) else {
+        return Tensor::from_vec(data, shape, device);
+    };
+    let stream = cuda.cuda_stream();
+    // SAFETY: `ptr` addresses `bytes` the resolver just carved from the ticket's
+    // arena and nothing else holds that range in this generation. The copy is
+    // issued on the device's own stream, and the call returns only once `data`
+    // has been staged out of the pageable `Vec` — the same property
+    // [`wave_from_vec`] relies on — so the `Vec` may drop when this returns.
+    unsafe {
+        candle::cuda_backend::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            ptr,
+            data.as_ptr() as *const std::ffi::c_void,
+            bytes,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| candle::Error::Msg(format!("uploading a wave table: {e}")))?;
+    }
+    // SAFETY: as above. The lease frees nothing on drop, so the range's only
+    // reclaim is the generation's reset.
+    unsafe { Tensor::from_leased_cuda_ptr(ptr, D::DTYPE, shape, device, LeaseOrigin::Wave(ticket)) }
+}
+
 /// [`wave_empty`] for a holder of a [`WaveTicket`] rather than of the guard.
 ///
 /// The uninitialised twin of [`wave_zeros_ticketed`], and sound for exactly the

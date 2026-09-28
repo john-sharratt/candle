@@ -30,6 +30,7 @@ use serde_json::json;
 use zend_vfs::{Oid, RepoFiles, Workspace};
 
 use crate::branch_ingest::keys::{file_key, CONTENT_KEY, LINES_KEY};
+use crate::code_read::chain_finished;
 use crate::tool_round::{plan, Step};
 use crate::tools::ToolResult;
 
@@ -177,6 +178,10 @@ pub fn screen(
                 let e = engine.lock().unwrap();
                 e.find_conversations_by_metadata(CONTENT_KEY, &file_key(&key, &blob))
                     .into_iter()
+                    // A read whose chain never finished holds no summary: handed
+                    // over as "already read", it would put an assistant that
+                    // deliberates and answers nothing into this conversation.
+                    .filter(|&tl| chain_finished(&e, tl))
                     .find_map(|tl| Some((tl, lines_of(&e, tl)?)))
                     // Admit BEFORE answering, under the same lock: a read the
                     // budget refuses is not in the projection, so claiming it
@@ -272,7 +277,7 @@ pub fn rebuild(
             if let Some(tl) = e
                 .find_conversations_by_metadata(CONTENT_KEY, &file_key(&key, &blob))
                 .into_iter()
-                .next()
+                .find(|&tl| chain_finished(&e, tl))
             {
                 if e.fast_path_admit(target, tl, budget_tokens) {
                     admitted += 1;

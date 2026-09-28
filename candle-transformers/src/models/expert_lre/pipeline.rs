@@ -235,6 +235,22 @@ pub(crate) struct StartupTargets<'a> {
     pub host_refs: &'a [Vec<MmapExpertRef>],
 }
 
+/// Units the startup reports **after** the last expert, so the bar keeps moving
+/// through work that used to happen behind a full one.
+///
+/// The repack is the visible part of loading this model and it is not the last
+/// part: publishing the pack flushes and `fsync`s tens of gigabytes, and seeding
+/// the residency gauge follows it. Measured on a 72 GB card, the bar filled at
+/// 140 s into a 181 s step and the remaining 26 s read as a hang — 11.6 s of it
+/// in the `fsync` alone, which the log then attributed to the gauge, because the
+/// gauge's line is the next one printed.
+///
+/// Two, and they are charged where they are done: [`startup_repack`] leaves room
+/// for them, and the caller that publishes the pack and seeds the gauge reports
+/// each as it finishes.
+#[cfg(feature = "cuda")]
+pub(crate) const PACK_TAIL_STEPS: usize = 2;
+
 /// Repack every expert out of the GGUF, write the pack, and fill both resident
 /// tiers from the bytes as they pass through.
 ///
@@ -248,6 +264,9 @@ pub(crate) struct StartupTargets<'a> {
 /// and installed in VRAM here like any other, and then dropped rather than
 /// written — the pack's invariant is that it holds every expert *that can be
 /// evicted*, and storing the rest is dead disk and a dead warm slot.
+///
+/// Progress is reported against `total_experts + PACK_TAIL_STEPS`, leaving room
+/// for the publish and the gauge seed its caller performs after it returns.
 #[cfg(feature = "cuda")]
 pub(crate) fn startup_repack(
     t: StartupTargets<'_>,
@@ -322,7 +341,10 @@ pub(crate) fn startup_repack(
             }
             t.residency[moe_idx][expert_idx] = res;
             if let Some(cb) = progress {
-                cb(moe_idx * num_experts + expert_idx + 1, total_experts);
+                cb(
+                    moe_idx * num_experts + expert_idx + 1,
+                    total_experts + PACK_TAIL_STEPS,
+                );
             }
         }
         if (moe_idx + 1) % 8 == 0 || moe_idx + 1 == num_moe_layers {
@@ -487,8 +509,15 @@ pub(crate) fn startup_from_pack(
             t.inner.install(slot_idx, moe_idx, expert_idx, slot);
             t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
             vram_count += 1;
+            // The same denominator as the repack path, because the gauge seed
+            // that lands the bar is shared by both and a denominator that
+            // changed at the final callback would make the reported total move
+            // under anything reading the raw pair.
             if let Some(cb) = progress {
-                cb(moe_idx * num_experts + expert_idx + 1, total_experts);
+                cb(
+                    moe_idx * num_experts + expert_idx + 1,
+                    total_experts + PACK_TAIL_STEPS,
+                );
             }
         }
     }
@@ -496,9 +525,12 @@ pub(crate) fn startup_from_pack(
     // is about to drop.
     stream.synchronize().map_err(candle::Error::wrap)?;
     // The fill stops as soon as VRAM is full, so the remaining experts never
-    // reach the progress callback. Land it on the total so a UI bar completes.
+    // reach the progress callback. Land it on the experts so the bar is where
+    // the repack path's is at the same point — there is no pack to publish here,
+    // so that unit is simply already behind us, and the gauge seed reports the
+    // last one.
     if let Some(cb) = progress {
-        cb(total_experts, total_experts);
+        cb(total_experts + 1, total_experts + PACK_TAIL_STEPS);
     }
 
     tracing::info!(
@@ -1299,6 +1331,7 @@ impl PipelineState {
         &mut self,
         moe_idx: usize,
         expert_ids: &[usize],
+        decode_experts: &HashSet<usize>,
     ) -> Result<ClassifiedExperts> {
         if expert_ids.is_empty() {
             return Ok(ClassifiedExperts {
@@ -1340,7 +1373,14 @@ impl PipelineState {
             if let Some(&slot_idx) = self.inner.key_to_slot.get(&(moe_idx, expert_idx)) {
                 if self.inner.slots[slot_idx].is_some() {
                     self.inner.promote(slot_idx);
-                    self.inner.record_hit(moe_idx, expert_idx);
+                    // A decode row's reuse of this expert is near-certain from
+                    // one step to the next; a prefill row's is close to zero,
+                    // so the two must not bid for residency on equal footing.
+                    if decode_experts.contains(&expert_idx) {
+                        self.inner.record_hit(moe_idx, expert_idx);
+                    } else {
+                        self.inner.record_prefill_hit(moe_idx, expert_idx);
+                    }
                     hits.push((expert_idx, slot_idx));
                     continue;
                 }
@@ -1469,6 +1509,14 @@ impl PipelineState {
         let mut loaded: Vec<(usize, usize)> = Vec::with_capacity(loaded_slots.len());
         for (expert_idx, slot_idx, slot) in loaded_slots {
             self.inner.install(slot_idx, moe_idx, expert_idx, slot);
+            // A prefill-only elevation earns no benefit of the doubt: bias it
+            // toward the very next eviction scan rather than leaving its score
+            // at whatever an earlier, unrelated occupancy left behind. A
+            // decode-attributed elevation is unchanged — the expert it just
+            // paid to load is the one decode is about to keep needing.
+            if !decode_experts.contains(&expert_idx) {
+                self.inner.record_prefill_elevate(moe_idx, expert_idx);
+            }
             loaded.push((expert_idx, slot_idx));
 
             // A device copy now exists. Whether a host one also does is a
@@ -1507,11 +1555,24 @@ impl PipelineState {
                 .capacity()
                 .saturating_sub(self.inner.zone.min_capacity())
                 * self.inner.zone.slot_bytes();
+            // The zone's own bounds, in the same currency. The wave rate planner
+            // weighs an admission against the residency it dislodges, so it needs
+            // where the zone stands and the range it may move in — and those are
+            // the zone's to say, not the KV side's, which can only observe what
+            // it was conceded after the fact.
+            let slot_bytes = self.inner.zone.slot_bytes();
+            let zone_bytes = self.inner.zone.capacity() * slot_bytes;
+            let zone_min_bytes = self.inner.zone.min_capacity() * slot_bytes;
+            let zone_max_bytes = self.inner.zone.limit() * slot_bytes;
             if let Ok(mut s) = self.stats.lock() {
                 s.expert_hits += num_hits;
                 s.expert_misses += num_loaded;
                 s.dma_loads += num_loaded;
                 s.zone_cedeable_bytes = cedeable;
+                s.zone_bytes = zone_bytes;
+                s.zone_min_bytes = zone_min_bytes;
+                s.zone_max_bytes = zone_max_bytes;
+                s.expert_slot_bytes = slot_bytes;
                 #[cfg(feature = "cuda")]
                 {
                     s.resident_vram_bytes = resident_vram;
@@ -2195,8 +2256,23 @@ impl PipelineState {
         #[cfg(not(feature = "cuda"))]
         let streamed = 0usize;
 
+        // Which of this request's experts a DECODE-attributed row touched —
+        // the rest are prefill/glue-only. Derived from `assignments` rather
+        // than threaded separately, since it is already the one place a
+        // request ties an expert id back to the token that asked for it.
+        // Drives `classify_and_load`'s residency scoring
+        // (`ExpertCacheInner::record_hit` vs `record_prefill_hit` /
+        // `record_prefill_elevate`) — see `MoeWorkRequest::decode_tokens`.
+        let decode_experts: HashSet<usize> = req
+            .assignments
+            .iter()
+            .filter(|&&(_, tok, _)| (tok as usize) < req.decode_tokens)
+            .map(|&(eid, _, _)| eid as usize)
+            .collect();
+
         let t = profile_now();
-        let classified = self.classify_and_load(req.moe_layer_idx, &req.expert_ids)?;
+        let classified =
+            self.classify_and_load(req.moe_layer_idx, &req.expert_ids, &decode_experts)?;
         self.profile.record("pipe_classify_load", t);
 
         // ── Whole-layer streaming for the NEXT layer, issued HERE — after
@@ -2533,7 +2609,21 @@ impl PipelineState {
         let target = self.inner.zone.capacity_for_frontier(floor);
         if target == before {
             if growing {
-                grow_note(GrowOutcome::TargetUnchanged);
+                // **At the limit is not the same fact as nothing to take, and the
+                // ledger has to say which.** `capacity_for_frontier` clamps to the
+                // zone's limit — the slots the model actually has — so a cache
+                // holding every expert reports an unchanged target however much KV
+                // ground it is offered. Read as `target_unchanged`, that says the KV
+                // side's offer was not worth a slot; read as `at_limit`, it says the
+                // weight side has everything it can use and compaction's gain is
+                // real but unspendable *here*. Measured: 921 unchanged targets
+                // against 1,004,350 regions offered, which is the second fact
+                // wearing the first's name.
+                if before >= self.inner.zone.limit() {
+                    grow_note(GrowOutcome::AtLimit);
+                } else {
+                    grow_note(GrowOutcome::TargetUnchanged);
+                }
             }
             return Ok(0);
         }

@@ -32,6 +32,8 @@ pub mod draft;
 pub mod engine;
 pub mod hyper;
 #[cfg(feature = "cuda")]
+mod index_keys;
+#[cfg(feature = "cuda")]
 pub mod indexer;
 pub mod loader;
 pub mod model;

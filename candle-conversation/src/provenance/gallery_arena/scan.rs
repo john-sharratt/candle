@@ -312,8 +312,15 @@ impl GalleryArena {
         let (idx, reused) = match self.reuse_index(fp) {
             Some(idx) => (idx, true),
             None => {
-                let built = Arc::new(self.build_index(segments)?);
+                // The generation is read BEFORE the build. Read after it, a turn
+                // evicted or re-sealed by another thread mid-build would move the
+                // generation past the addresses this index captured, and the cache
+                // would then vouch for them. Read before, such a move leaves the
+                // entry stale and the next scan rebuilds — as does this build's own
+                // uploads, so an index is reused from the first rescan that uploads
+                // nothing.
                 let gen = self.residency_gen();
+                let built = Arc::new(self.build_index(segments)?);
                 self.store_index(fp, gen, built.clone());
                 (built, false)
             }
@@ -907,6 +914,71 @@ mod tests {
             assert_eq!(b1, b2, "group B cached result must be stable");
         }
         assert_eq!(arena.resident_turns(), 2, "both turns resident, no churn");
+    }
+
+    /// **A compaction must be invisible to the scan.** Score the same segments
+    /// before and after packing the pages and require the vectors to be
+    /// bit-identical.
+    ///
+    /// This is the test that matters for the pass, because it exercises the real
+    /// consumer — the kernel dereferencing the page addresses in `PagedIndex` —
+    /// rather than the bookkeeping that produced them. The two ways a move goes
+    /// wrong both land here and nowhere else: a page copied to the wrong place
+    /// changes the scores, and a page moved without bumping `residency_gen` leaves
+    /// the cached index pointing at the vacated address, which the next scan reads
+    /// as whatever the arena has since put there. Neither is a fault; both are
+    /// quietly wrong retrieval.
+    #[test]
+    fn a_compaction_leaves_every_score_identical() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        // Several turns of differing length, so the runs are ragged.
+        let turns: Vec<Vec<WideQSig>> = (0..5u64)
+            .map(|t| (0..(14 + t * 9)).map(|k| sig((t << 32) + k)).collect())
+            .collect();
+        let windows: Vec<PagedWindow<'_>> = turns
+            .iter()
+            .enumerate()
+            .map(|(i, turn)| PagedWindow {
+                sid: turn_stream_id(40 + i as u64, 0),
+                fingerprint: 100 + i as u64,
+                turn,
+                start: 0,
+                end: turn.len(),
+                case: i,
+            })
+            .collect();
+        let segments = vec![PagedSegment {
+            windows,
+            n_cases: turns.len(),
+        }];
+        let probe = vec![sig(1 << 32), sig((3u64 << 32) + 5), sig(0xFEED)];
+
+        let before = arena
+            .scan_weighted(&segments, &[probe.as_slice()], &[])
+            .unwrap();
+
+        // Scatter: drop two turns from the middle of the corpus, leaving holes
+        // under live pages, then pack. `scan_weighted` unpinned on its way out, so
+        // every survivor is movable.
+        arena.drop_turn(turn_stream_id(41, 0));
+        arena.drop_turn(turn_stream_id(43, 0));
+        let report = arena.compact(0).unwrap();
+        assert!(report.moved > 0, "nothing moved, so nothing is proven");
+
+        // The dropped turns rebuild on demand; the survivors are read at their new
+        // addresses. Either way every score must reproduce exactly.
+        let after = arena
+            .scan_weighted(&segments, &[probe.as_slice()], &[])
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "compaction changed the scan's answer — a page moved to the wrong \
+             place, or a cached index outlived the move",
+        );
     }
 
     fn xorshift(state: &mut u64) -> u64 {

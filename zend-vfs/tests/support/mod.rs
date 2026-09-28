@@ -13,11 +13,23 @@ use zend_vfs::{
     SandboxCommand, SandboxError, VfsStore,
 };
 
+/// Run `git` in `dir` with the host's configuration kept out of the fixture.
+///
+/// **`core.autocrlf` is pinned on every invocation, not set after a clone.**
+/// A host that turns it on (Git for Windows' system config does) checks a
+/// clone out with CRLF endings before any `git config` can run in it. A later
+/// `git add -A` then re-hashes the files that are racily clean — written in
+/// the same second as the index — under the repository's own `false`, and
+/// commits them as CRLF: a file the test never touched arrives changed on one
+/// side, and a merge the test expects clean reports it as a conflict — four
+/// of `work.rs`'s merges did, on `keep.txt`.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args([
+            "-c",
+            "core.autocrlf=false",
             "-c",
             "core.hooksPath=",
             "-c",

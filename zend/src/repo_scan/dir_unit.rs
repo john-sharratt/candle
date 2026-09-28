@@ -1,11 +1,13 @@
 //! A `repo_map` unit ready to render: a folder as a branch lists it
-//! ([`FolderUnit`], `docs/zend_branch_ingest.md` §6.2), with the anchor
-//! excerpt and manifest hint its turns show read from the commit it was
-//! found on.
+//! ([`FolderUnit`], `docs/zend_branch_ingest.md` §6.2), with the manifest hint
+//! its request shows — found by the walk, since the hint is part of the key.
+//!
+//! **No anchor excerpt.** A folder is described from its one-level listing
+//! alone — the chain is a single `file_list` round-trip and the summary — so
+//! names and paths are the whole evidence, and the only file of the folder
+//! anything reads is a manifest, for the hint the request carries.
 
-use super::anchor::{self, Anchor};
 use super::types::ModuleHint;
-use crate::branch_ingest::manifest;
 use crate::branch_ingest::units::FolderUnit;
 
 /// One directory's ingest unit.
@@ -17,8 +19,6 @@ pub struct DirUnit {
     pub dir: String,
     /// The files its listing's first page shows, as the key saw them.
     pub listed: Vec<String>,
-    /// The excerpt describing the folder, when one of its files provides it.
-    pub anchor: Option<Anchor>,
     /// The hint its manifest gives, when it has one that parses.
     pub module_hint: Option<ModuleHint>,
     /// The unit's content key.
@@ -26,23 +26,12 @@ pub struct DirUnit {
 }
 
 impl DirUnit {
-    /// `unit` with its anchor excerpt and manifest hint read through `read`,
-    /// which returns a workspace-relative file's bytes. A file `read` cannot
-    /// return gives no excerpt or hint, as a file that yields none does.
-    pub fn read(unit: &FolderUnit, read: impl Fn(&str) -> Option<Vec<u8>>) -> Self {
-        let anchor = unit
-            .anchor
-            .as_ref()
-            .and_then(|a| anchor::excerpt(&a.path, a.language, &read(&a.path)?));
-        let module_hint = unit.manifests.iter().find_map(|m| {
-            let name = m.path.rsplit('/').next().unwrap_or(&m.path);
-            manifest::hint(name, &read(&m.path)?)
-        });
+    /// `unit`, ready to render.
+    pub fn of(unit: &FolderUnit) -> Self {
         Self {
             dir: unit.dir.clone(),
             listed: unit.listed.clone(),
-            anchor,
-            module_hint,
+            module_hint: unit.module_hint.clone(),
             content_key: unit.key.clone(),
         }
     }
@@ -72,6 +61,7 @@ impl DirUnit {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
 
     use zend_tools::ToolContext;
@@ -80,7 +70,7 @@ mod tests {
     use super::*;
     use crate::branch_ingest::filter::IngestScope;
     use crate::branch_ingest::units::{
-        folder_units, test_tree, test_units, workspace_unit, TreeFile,
+        folder_units, test_tree, test_units, test_units_reading, workspace_unit, TreeFile,
     };
     use crate::repo_scan::types::Language;
 
@@ -90,20 +80,29 @@ mod tests {
         test_units(files).remove(0)
     }
 
-    /// **The anchor and the manifest hint come from the bytes read**, and
-    /// the key is the unit's.
+    /// **The manifest hint comes from the bytes read**, the key is the unit's,
+    /// and the manifest is the ONLY file of the folder read — a module root
+    /// that would once have been the folder's anchor is never opened.
     #[test]
-    fn the_anchor_and_hint_are_read_from_the_units_files() {
-        let u = unit(&[
-            ("a/Cargo.toml", Language::Toml),
-            ("a/lib.rs", Language::Rust),
-            ("a/x.rs", Language::Rust),
-        ]);
+    fn the_hint_is_read_from_the_manifest_and_nothing_else_is_read() {
         let bytes: HashMap<&str, &[u8]> = HashMap::from([
             ("a/Cargo.toml", &b"[package]\nname = \"demo\"\n"[..]),
             ("a/lib.rs", b"//! The demo crate.\npub fn x() {}\n"),
         ]);
-        let d = DirUnit::read(&u, |path| bytes.get(path).map(|b| b.to_vec()));
+        let asked = RefCell::new(Vec::new());
+        let u = test_units_reading(
+            &[
+                ("a/Cargo.toml", Language::Toml),
+                ("a/lib.rs", Language::Rust),
+                ("a/x.rs", Language::Rust),
+            ],
+            |path| {
+                asked.borrow_mut().push(path.to_string());
+                bytes.get(path).map(|b| b.to_vec())
+            },
+        )
+        .remove(0);
+        let d = DirUnit::of(&u);
         assert_eq!(d.dir, "a/");
         assert_eq!(d.content_key, u.key);
         assert_eq!(
@@ -112,19 +111,17 @@ mod tests {
                 name: "demo".into()
             })
         );
-        let anchor = d.anchor.expect("lib.rs describes the folder");
-        assert_eq!(anchor.path, "a/lib.rs");
-        assert!(anchor.body.contains("The demo crate."));
+        assert_eq!(asked.into_inner(), ["a/Cargo.toml"]);
 
-        let unread = DirUnit::read(&u, |_| None);
-        assert_eq!((unread.anchor, unread.module_hint), (None, None));
+        let unread = DirUnit::of(&unit(&[("a/Cargo.toml", Language::Toml)]));
+        assert_eq!(unread.module_hint, None);
     }
 
     #[test]
     fn the_workspace_lists_with_an_empty_path_and_a_folder_with_its_own() {
-        let root = DirUnit::read(&workspace_unit(&["a".into()]), |_| None);
+        let root = DirUnit::of(&workspace_unit(&["a".into()]));
         assert_eq!(root.list_path(), "");
-        let nested = DirUnit::read(&unit(&[("a/zend/src/x.rs", Language::Rust)]), |_| None);
+        let nested = DirUnit::of(&unit(&[("a/zend/src/x.rs", Language::Rust)]));
         assert_eq!(nested.list_path(), "a/zend/src/");
         assert_eq!(nested.label(), "a/zend/src/");
     }
@@ -159,7 +156,7 @@ mod tests {
             .collect();
         assert_eq!(read.len(), 2, "the layer does not read LICENSE");
         let tree = test_tree(&names.map(|name| (name, BLOB)));
-        let u = folder_units("k", &tree, &read).remove(0);
+        let u = folder_units("k", &tree, &read, &mut |_: &TreeFile| None).remove(0);
 
         let workspace = Workspace::new(d.path(), vec![RepoSpec::named("k")]).unwrap();
         let ctx = ToolContext::with_workspace(workspace);

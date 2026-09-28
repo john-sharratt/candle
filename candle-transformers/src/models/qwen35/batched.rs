@@ -33,6 +33,7 @@ use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::RecurrentStateStore;
+use crate::models::delta_net::{compact_stores, RecurrentCompaction};
 use crate::models::draft_ladder::DraftLadder;
 use crate::models::lora::Adapter;
 use crate::models::rope_schedule::{RopeRungs, RopeSchedule};
@@ -291,6 +292,31 @@ impl HybridBatched {
         slot.as_mut().expect("just ensured").begin(blocks)
     }
 
+    /// What a rewind of the armed cohort will **stage** — `(rows, spans)` — or
+    /// `None` when no cohort is armed.
+    ///
+    /// The forward prices this into its Attention span, because the forward is
+    /// what creates the obligation: `replay_accepted_prefixes` carves four
+    /// operands per recurrent layer off that span at accept time, and
+    /// `WaveWidth::replay` is what prices them. A width built with
+    /// `staged_rows: 0` prices that chain at exactly zero — correct for a wave
+    /// that stages nothing, and short by the whole stash for one that does.
+    ///
+    /// **Rows are the stash's CAPACITY, not this cohort's total.** The buffers
+    /// only ever grow, and `stage_on_wave` stages each operand's full shape — so
+    /// a cohort narrower than the high-water mark still carves the high-water
+    /// mark, and pricing the cohort would under-reserve by the difference.
+    pub fn verify_stash_width(&self) -> Result<Option<(usize, usize)>> {
+        let slot = self
+            .verify_stash
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: verify_stash lock poisoned".into()))?;
+        match slot.as_ref() {
+            Some(s) => Ok(Some((s.capacity()?, s.spans.len()))),
+            None => Ok(None),
+        }
+    }
+
     /// Take the cohort stash for the sweep or the replay. Taking rather than
     /// borrowing: a stash span is good for exactly one rewind, and a second use
     /// would replay from a state two waves old — the taker removes the spans it
@@ -473,18 +499,51 @@ impl HybridBatched {
 
     /// Give `child` a copy of `parent`'s recurrent state.
     ///
-    /// Reservation bytes every live sequence's recurrent state holds together.
+    /// Reservation bytes recurrent state holds on this model's device — every state
+    /// arena's regions, whatever is in them.
     ///
-    /// Summed over the map rather than derived from a per-sequence constant:
-    /// a store's region count depends on how its buffers packed, and a forked
-    /// child's need not match its parent's. A poisoned lock reports zero rather
-    /// than failing — this is a report, and a wrong number in it is preferable
-    /// to a scheduler that cannot answer how much memory it is using.
+    /// The arenas and not a sum over the stores: the stores share arenas, so their
+    /// sum leaves out every arena's free slots and unused tail, and any slot a
+    /// handle kept after its store was dropped. See
+    /// [`RecurrentStateStore::arena_reserved_bytes`].
     pub fn recurrent_reserved_bytes(&self) -> usize {
-        self.recurrent
+        RecurrentStateStore::arena_reserved_bytes(&self.model.device)
+    }
+
+    /// Compact the state arenas every sequence's recurrent state lives in — see
+    /// [`compact_stores`]. Between forwards; holds the map for the pass, which is
+    /// what keeps a wave from opening on a store mid-move.
+    pub fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        let mut map = self
+            .recurrent
             .lock()
-            .map(|m| m.values().map(|s| s.reserved_bytes()).sum())
-            .unwrap_or(0)
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        compact_stores(
+            map.values_mut(),
+            &self.model.cfg.delta_net,
+            &self.model.device,
+            max_moves,
+        )
+    }
+
+    /// What one sequence's state costs, whether or not one is standing.
+    ///
+    /// **Priced from the geometry, never from residency.** Every store this
+    /// model builds has the same shape, so the config answers for all of them —
+    /// and it answers at the one moment residency cannot, which is the moment
+    /// admission actually asks. See
+    /// [`RecurrentStateStore::reserved_bytes_for`] for why a mean over the live
+    /// stores is not a substitute: it divides a sum over every store the
+    /// process holds by a count of what is merely in flight, so it climbs with
+    /// the number of *idle* conversations.
+    ///
+    /// This takes no lock, which is the other half of its value here —
+    /// admission asks on the scheduler thread while forwards hold the map.
+    pub fn recurrent_store_bytes(&self) -> usize {
+        RecurrentStateStore::reserved_bytes_for(
+            &self.model.cfg.layer_kinds,
+            &self.model.cfg.delta_net,
+        )
     }
 
     /// The turn loop carves a child slot per turn and decodes on it, borrowing
@@ -1134,7 +1193,10 @@ impl HybridBatched {
     }
 
     pub fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
-        wave_geometry(&self.model.cfg, act_dtype)
+        // The session's int8 mode, not the config's: the KO twins are chosen at
+        // load and decide what each norm's fused epilogue emits, which is a real
+        // difference in what the span holds.
+        wave_geometry(&self.model.cfg, act_dtype, self.int8mode())
     }
 
     /// Re-materialise every norm weight in the session's activation dtype.

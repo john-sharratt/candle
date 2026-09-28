@@ -219,6 +219,7 @@ impl candle::CustomOp3 for RotaryEmbI {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -560,6 +561,7 @@ impl candle::CustomOp3 for RotaryEmb {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -886,6 +888,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, l1.shape().clone()))
     }

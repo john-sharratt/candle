@@ -155,14 +155,14 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
             (
                 "gr_norm",
                 rel_gap(
-                    &cuda_fused::norm(&x, &wn, eps)?,
+                    &cuda_fused::norm(&x, &wn, eps, None)?,
                     &eager_grouped_norm(&x, &wn, eps)?,
                 )?,
             ),
             (
                 "gr_mix",
                 rel_gap(
-                    &cuda_fused::mix(&x, &gate_raw, hc, d)?,
+                    &cuda_fused::mix(&x, &gate_raw, hc, d, None)?,
                     &eager_gate_mean(
                         &x.reshape((GATE_TOKENS, hc_dim))?,
                         &gate_raw,
@@ -175,7 +175,7 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
             (
                 "gr_combine",
                 rel_gap(
-                    &cuda_fused::combine(&x, &out, &inj)?,
+                    &cuda_fused::combine(&x, &out, &inj, None)?,
                     &eager_combine(&x, &out, &inj)?,
                 )?,
             ),
@@ -222,7 +222,7 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
         (
             "gr_norm",
             time_call(dev, &cfg, || {
-                cuda_fused::norm(&x, &wn, eps)?;
+                cuda_fused::norm(&x, &wn, eps, None)?;
                 Ok(())
             })?,
             2.0 * wide,
@@ -230,7 +230,7 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
         (
             "gr_mix",
             time_call(dev, &cfg, || {
-                cuda_fused::mix(&x, &gate_raw, hc, d)?;
+                cuda_fused::mix(&x, &gate_raw, hc, d, None)?;
                 Ok(())
             })?,
             2.0 * wide + narrow,
@@ -238,7 +238,7 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
         (
             "gr_combine",
             time_call(dev, &cfg, || {
-                cuda_fused::combine(&x, &out, &inj)?;
+                cuda_fused::combine(&x, &out, &inj, None)?;
                 Ok(())
             })?,
             2.0 * wide + narrow,
@@ -293,7 +293,7 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
     // The stacked weight is built ONCE, exactly as the loader would build it —
     // timing a per-call concatenation would measure a design nobody proposed.
     let w_stacked = Tensor::cat(&[&w_down, &w_inj], 0)?.contiguous()?;
-    let xn_flat = cuda_fused::norm(&x, &wn, eps)?.reshape((t, hc_dim))?;
+    let xn_flat = cuda_fused::norm(&x, &wn, eps, None)?.reshape((t, hc_dim))?;
     let lo_t = lcg(&[t, lr], cfg.seed ^ 0x34, dev)?;
 
     let down_us = time_call(dev, &cfg, || {

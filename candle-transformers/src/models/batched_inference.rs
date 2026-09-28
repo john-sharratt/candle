@@ -26,7 +26,9 @@
 
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
+use super::expert_lre::WeightPlanning;
 use crate::models::delta_net::ExportedLayerState;
+use crate::models::delta_net::RecurrentCompaction;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::rope_schedule::rung_of;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
@@ -36,8 +38,9 @@ use candle::quantized::pinned_staging::GpuBuf;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
-    ModelGeometry, QuantFormat, WavePlan, WAVE_FFN_BYTES,
+    fragmentation, plan_pool, ArenaKey, ArenaLocation, ChunkedKvBacking, CompressionPolicy,
+    Fragmentation, GpuArenaClassStats, GroundLost, HeadGids, KvCache, KvFormat, ModelGeometry,
+    QuantFormat, SizeClass, WavePlan, WaveWidth, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -1958,6 +1961,29 @@ impl BatchedInferenceSession {
         Ok(total_freed)
     }
 
+    /// Pack the KV pools toward the lowest addresses so the arena frontier falls.
+    ///
+    /// Passes **every** backing, because the pool is shared but the block tables are
+    /// per-layer: a pass that rewrote one layer's view of a relocated chunk and not
+    /// the rest would be wrong attention on every other layer.
+    ///
+    /// `sweep` is where a caller with its own gid holders — a substrate residence, a
+    /// projection cache — applies the same relocation map. A caller whose only block
+    /// tables are these backings' passes a closure that does nothing.
+    ///
+    /// Only legal between forwards; refuses otherwise.
+    #[cfg(feature = "cuda")]
+    pub fn compact_kv(
+        &self,
+        budget: std::time::Duration,
+        sweep: &mut dyn FnMut(&mut candle_nn::kv_cache::Sweep<'_>) -> Result<()>,
+    ) -> std::result::Result<
+        candle_nn::kv_cache::CompactionReport,
+        candle_nn::kv_cache::CompactionRefused,
+    > {
+        candle_nn::kv_cache::compact_backings(&self.backings, budget, sweep)
+    }
+
     /// Create the arenas that mid-wave refusals recorded, and answer with how
     /// many were made.
     ///
@@ -2046,6 +2072,143 @@ impl BatchedInferenceSession {
     /// one backing is the whole model). `None` when there are no backings.
     pub fn kv_gpu_class_stats(&self) -> Option<GpuArenaClassStats> {
         self.backings.first().map(|b| b.gpu_arena_class_stats())
+    }
+
+    /// How fragmented every GPU KV pool is — the arenas a perfect pack would
+    /// empty, per size class.
+    ///
+    /// Reads layer 0's backing for the same reason [`Self::kv_gpu_class_stats`]
+    /// does: arenas pool globally across same-config layers, so one backing's view
+    /// is the whole model's.
+    ///
+    /// Returns `(key, fragmentation)` for every pool holding at least one arena,
+    /// so a caller can report the ladder without a row per empty rung.
+    pub fn kv_fragmentation(&self) -> Vec<(ArenaKey, Fragmentation)> {
+        let Some(b) = self.backings.first() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for class in SizeClass::all() {
+            let key = ArenaKey::new(class, ArenaLocation::Gpu);
+            let Ok(census) = b.compaction_census(key) else {
+                continue;
+            };
+            if census.is_empty() {
+                continue;
+            }
+            let f = fragmentation(&census, key);
+            if f.arenas > 0 {
+                out.push((key, f));
+            }
+        }
+        out
+    }
+
+    /// Chunk moves a perfect pack would cost, across every GPU pool.
+    ///
+    /// The other half of the fragmentation figure: [`Self::kv_fragmentation`] says
+    /// how much ground a pack would return, this says what it would cost to return
+    /// it. Both are wanted before running one — a pass that frees four arenas for
+    /// forty thousand copies is not worth its bandwidth, and the ratio is the only
+    /// thing that says so.
+    ///
+    /// Unbounded (`max_moves = 0`): this is the *whole* cost of reaching a gapless
+    /// prefix, which is the figure to compare a per-pass budget against.
+    pub fn kv_planned_moves(&self) -> usize {
+        let Some(b) = self.backings.first() else {
+            return 0;
+        };
+        let mut moves = 0;
+        for class in SizeClass::all() {
+            let key = ArenaKey::new(class, ArenaLocation::Gpu);
+            let Ok(census) = b.compaction_census(key) else {
+                continue;
+            };
+            if let Some(plan) = plan_pool(&census, key, 0) {
+                moves += plan.moves.len();
+            }
+        }
+        moves
+    }
+
+    /// Everything fragmentation denies the weight side, in regions.
+    ///
+    /// **The highest live arena is the marker.** The wave transient tier must stand
+    /// above it and `weight_floor` is measured from there, so the weight side's
+    /// ground — and therefore expert residency, and therefore decode — is set by
+    /// where the topmost live arena sits. Neither the live arena count nor the
+    /// occupancy ratio matters except through that one number.
+    ///
+    /// Sums the per-pool packed floor across the ladder and reads the frontier from
+    /// the region pool, which is device-global: regions are shared by every pool, so
+    /// the frontier is not a per-class quantity and cannot be derived from
+    /// [`Self::kv_fragmentation`] alone.
+    /// Regions a perfect pack would free, **cheaply** — the gate that decides
+    /// whether a compaction pass is worth its census.
+    ///
+    /// Sums `(arenas_held - arenas_if_packed)` over the GPU pools from the refcount
+    /// tables' live counters, with no occupancy bitmap walked. That distinction is
+    /// the whole point: the exact figure is [`Self::kv_ground_lost`], which *is* the
+    /// census, so it cannot be what decides whether to pay for one. The cheap
+    /// counterpart to the region pool's hole count, which
+    /// [`Self::kv_region_stats`] already gives for free.
+    ///
+    /// Holes alone are not a usable gate. They are self-correcting — the region free
+    /// list is lowest-index-first, so the next claim takes the lowest hole — and a
+    /// steadily-loaded pool sits at zero holes with tens of sparse arenas underneath.
+    /// Measured: 16 passes over 110 s of churn, because the gate read holes and holes
+    /// were zero on all but three samples while 50 arenas of air sat in the pools.
+    pub fn kv_sparse_arenas(&self) -> usize {
+        let Some(b) = self.backings.first() else {
+            return 0;
+        };
+        SizeClass::all()
+            .map(|class| {
+                let (held, packed) = b.pool_sparsity(ArenaKey::new(class, ArenaLocation::Gpu));
+                held.saturating_sub(packed)
+            })
+            .sum()
+    }
+
+    /// The region pool's own counters for this session's device.
+    ///
+    /// The **cheap** half of the fragmentation picture, and the reason it is exposed
+    /// separately from [`Self::kv_ground_lost`]: this is a handful of field reads
+    /// behind one lock, whereas `kv_ground_lost` sums `packed_arenas` across the
+    /// ladder, which means walking every arena's occupancy bitmap. A caller deciding
+    /// *whether* to pay for that walk cannot use the walk to decide.
+    pub fn kv_region_stats(&self) -> Option<candle_nn::kv_cache::RegionStats> {
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() else {
+            return None;
+        };
+        candle_nn::kv_cache::region_stats(gpu_id)
+    }
+
+    pub fn kv_ground_lost(&self) -> Option<GroundLost> {
+        // This session's own device ordinal, not a hardcoded 0: a second engine on
+        // a second card would otherwise report the first card's frontier.
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() else {
+            return None;
+        };
+        let stats = candle_nn::kv_cache::region_stats(gpu_id)?;
+        let packed_arenas = self
+            .kv_fragmentation()
+            .iter()
+            .map(|(_, f)| f.packed_arenas)
+            .sum();
+        Some(GroundLost {
+            watermark: stats.live_watermark,
+            live_arenas: stats.live,
+            packed_arenas,
+            span_regions: stats.span_tenant,
+            // In-use ground that appears in no size-class row, so a consumer summing those
+            // rows would charge it as waste. See `GroundLost::record_regions`.
+            record_regions: self
+                .backings
+                .first()
+                .map(|b| b.record_arena_regions())
+                .unwrap_or(0),
+        })
     }
 
     /// Create a view sequence that borrows KV blocks from a parent.
@@ -3212,14 +3375,27 @@ impl BatchedInferenceSession {
     /// to `recorded_metas`).
     ///
     /// Returns an error if the sequence is not allocated.
+    /// The trailing empty chunk is dropped here for the same reason
+    /// [`Self::snapshot_sequence_per_layer`] drops it, and the two **must** agree:
+    /// they are two views of the same layer, and callers resolve a block range
+    /// against one and then slice the other. Without this they differed by exactly
+    /// one whenever the writer chunk was empty — `record_turn` reports it because the
+    /// slot really holds it — and `resolve_seal_range` clamped a seal to the longer
+    /// count. Measured: `seal range 40..49 is outside layer 0's 48 sealed chunk(s)`,
+    /// deterministic on every boot from a fresh substrate, which made the daemon
+    /// unable to start at all; an existing substrate hid it by leaving nothing to
+    /// ingest. Lossless, by the argument that justifies the drop downstream: an empty
+    /// chunk holds no token, so no range and no position moves.
     pub fn snapshot_sequence(&self, idx: usize) -> Result<candle_nn::kv_cache::SealedSequence> {
         let backing = self
             .backings
             .first()
             .ok_or_else(|| candle::Error::Msg("snapshot_sequence: no backings".into()))?;
-        backing
+        let mut seq = backing
             .record_turn(idx)
-            .map_err(|e| candle::Error::Msg(format!("snapshot_sequence: {e}")))
+            .map_err(|e| candle::Error::Msg(format!("snapshot_sequence: {e}")))?;
+        seq.drop_empty_tail();
+        Ok(seq)
     }
 
     /// Snapshot a sequence into per-layer `SealedSequence`s, one
@@ -3770,7 +3946,10 @@ pub trait ManagedBatchedModel {
     /// a forward that can still run.
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
         let mut cap = MAX_PREFILL_TOKENS;
-        let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_within(WAVE_FFN_BYTES);
+        // Priced from an empty wave: this cap is the model's own bound, asked
+        // before any wave is composed, so there is no head to widen from.
+        let fits = WavePlan::new(self.wave_geometry(act_dtype))
+            .max_rows_within(WAVE_FFN_BYTES, WaveWidth::default());
         if fits > 0 {
             cap = cap.min(fits);
         }
@@ -3778,6 +3957,27 @@ pub trait ManagedBatchedModel {
             cap = cap.min(kv_fits);
         }
         cap
+    }
+
+    /// The wave transient tier a prefill of `rows` rows across `sequences`
+    /// would need, in bytes.
+    ///
+    /// **The same function the tier is actually placed from**, not an estimate
+    /// of it: admission judges an offer on the residency it dislodges, and the
+    /// tier dislodges weights exactly as a region claim does. Pricing it any
+    /// other way lets the two figures drift, and the one that drifts is the one
+    /// the placement then refuses.
+    ///
+    /// The tier is superlinear in *spans*, not only in rows — the mixer's span
+    /// tables hold an entry per span and the prefill scan's transients turn on
+    /// with the first — so `sequences` is not decoration, and a caller that
+    /// prices N admissions as N separate one-sequence waves understates the wave
+    /// they compose.
+    fn wave_tier_bytes(&self, rows: usize, sequences: usize, act_dtype: DType) -> Option<u64> {
+        Some(
+            WavePlan::new(self.wave_geometry(act_dtype))
+                .tier_bytes(WaveWidth::prefill(rows, sequences.max(1))) as u64,
+        )
     }
 
     /// Rows the KV side has room to admit, or `None` when it cannot say.
@@ -5045,6 +5245,20 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// The weight side as the wave rate planner prices it — MoE geometry, and
+    /// the range the expert zone may move in.
+    ///
+    /// [`WeightPlanning::Dense`] by default: a stack with no expert cache has no
+    /// residency to trade a wave's rows against, so not planning is the correct
+    /// answer and the width backstop is the only bound.
+    ///
+    /// A routed model overrides this, and the distinction between "nothing to plan"
+    /// and "the gauges are broken" lives in [`WeightPlanning`] rather than in an
+    /// `Option` — see that type for what the conflation cost.
+    fn weight_plan(&self) -> WeightPlanning {
+        WeightPlanning::Dense
+    }
+
     /// Reservation bytes held by per-sequence recurrent state, for the same
     /// decomposition.
     ///
@@ -5058,6 +5272,24 @@ pub trait ManagedBatchedModel {
     /// than it is — the same class of blindness that let the dense weights hide.
     fn recurrent_reserved_bytes(&self) -> usize {
         0
+    }
+
+    /// What **one** sequence's carried state costs, from the model's geometry.
+    ///
+    /// The admission figure, and not derivable from
+    /// [`Self::recurrent_reserved_bytes`]: that total is zero before the first
+    /// store is built, and dividing it by the sequences in flight answers with
+    /// a number that climbs as conversations go idle, since the sum counts
+    /// every store held and the divisor only those in flight.
+    fn recurrent_store_bytes(&self) -> usize {
+        0
+    }
+
+    /// Compact the arenas per-sequence recurrent state lives in, moving at most
+    /// `max_moves` layer states (zero for no bound). Between forwards only — the
+    /// scheduler runs it in the same gap as the KV compaction, for the same holes.
+    fn compact_recurrent(&self, _max_moves: usize) -> Result<RecurrentCompaction> {
+        Ok(RecurrentCompaction::default())
     }
 
     /// Reset expert pipeline telemetry counters to zero.
@@ -5267,8 +5499,20 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().resident_weight_bytes()
     }
 
+    fn weight_plan(&self) -> WeightPlanning {
+        self.model().weight_plan()
+    }
+
     fn recurrent_reserved_bytes(&self) -> usize {
         self.model().recurrent_reserved_bytes()
+    }
+
+    fn recurrent_store_bytes(&self) -> usize {
+        self.model().recurrent_store_bytes()
+    }
+
+    fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        self.model().compact_recurrent(max_moves)
     }
 
     fn reset_expert_stats(&self) {

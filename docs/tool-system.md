@@ -685,7 +685,7 @@ Replace one piece of text in an existing VFS file with another. `old_text` is th
 
 ### `file_list`
 
-Enumerate the files in a directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Use for: seeing what is in a specific directory, checking what the session has created, getting an overview of a subtree you have already located. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path and byte size per entry, paged. **No line count** — for the reason `file_search` gives below: the walk has each entry's size from its directory metadata, but a line count means opening and decoding the file, and the listing then pages down to 50 entries and discards the rest. On this workspace that was ~2,900 files read to fill fifty rows. A file's length reaches the model through `file_read`'s header instead (`(lines 1-200 of 2499)`), which is exact and arrives when the number is actually needed. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
+Enumerate **one** directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Its files come back, and its immediate subdirectories come back as names to list in turn; nothing from inside them does. Use for: seeing what is in a specific directory, checking what the session has created, stepping down a path one level at a time. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path and byte size per entry, paged. **No line count** — for the reason `file_search` gives below: the walk has each entry's size from its directory metadata, but a line count means opening and decoding the file, and the listing then pages down to 50 entries and discards the rest. On this workspace that was ~2,900 files read to fill fifty rows. A file's length reaches the model through `file_read`'s header instead (`(lines 1-200 of 2499)`), which is exact and arrives when the number is actually needed. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
 
 **To *find* a file rather than enumerate one, use `file_search`; to find code by its contents, use `file_grep`.** Calling `file_list` on a guessed directory name is the slow way to answer either question — an empty result is indistinguishable from a wrong guess. For listing remote directories use `remote_fs_session_list_dir`.
 
@@ -697,7 +697,7 @@ Enumerate the files in a directory you already know the name of — the project'
   "properties": {
     "prefix": {
       "type": "string",
-      "description": "Optional path prefix filter (e.g. 'src/' to list only files under src/).",
+      "description": "The directory to list (e.g. 'src/'), or a partial name within one ('src/ma') to filter it. Only this directory is listed.",
       "default": ""
     }
   },
@@ -705,21 +705,34 @@ Enumerate the files in a directory you already know the name of — the project'
 }
 ```
 
-**Returns**
+**Returns** — one directory: its own files, and its immediate subdirectories as
+entries carrying `dir: true`, a trailing `/`, and no `bytes`.
 
 ```json
 {
   "files": [
     {"path": "Cargo.toml", "bytes": 142},
-    {"path": "src/lib.rs", "bytes": 312},
-    {"path": "src/main.rs", "bytes": 1289, "modified": true}
+    {"path": "docs/", "dir": true},
+    {"path": "src/", "dir": true}
   ],
   "paging": {"page": 0, "pages": 1, "per_page": 50, "total": 3, "next_page": null},
-  "total_bytes": 1743
+  "total_bytes": 0
 }
 ```
 
 **Implementation.** Union of the session layer with an `ignore`-driven walk of the working directory (the crate ripgrep uses, so `.gitignore`, `.ignore`, git's global excludes and hidden-file rules all apply), the session layer shadowing the workspace, sorted by path and paged at 50 entries. `modified: true` marks an entry the session has changed; it is omitted when false. `total_bytes` is the session layer's 10 MiB budget denominator — workspace files are read on demand and cost nothing against it.
+
+**One level, like `ls`.** The walk is bounded to the listed directory
+(`WalkBuilder::max_depth(1)`), and a path that continues below it contributes its
+first segment as a directory entry instead of the file itself. It was a
+*recursive* walk filtered by a plain string prefix, which made the documented way
+to ask for the project root — an empty prefix — enumerate every file in the
+repository; sorted and paged at 50, the answer to "list the root" was fifty files
+from wherever the alphabet started and not one of the root's own. A prefix is
+resolved to a directory when one exists by that name (on disk or in the session
+layer), otherwise to its parent plus a partial-name filter, which is what keeps
+`src/ma` cheap. `file_search` remains the way to find a file whose directory is
+unknown — descending level by level is the slow way and usually the wrong one.
 
 ---
 

@@ -243,7 +243,8 @@ impl GuestGround {
     /// error reaches the caller.
     pub fn claim(device: &Device, bytes: usize) -> Result<Self, GroundError> {
         let want = bytes.div_ceil(SpanRegion::bytes());
-        let claims = SpanClaims::open(device).map_err(|e| GroundError::Window(e.to_string()))?;
+        let claims = SpanClaims::open(device, "a guest's ground")
+            .map_err(|e| GroundError::Window(e.to_string()))?;
         let mut regions = Vec::with_capacity(want);
         for _ in 0..want {
             match claims.claim() {

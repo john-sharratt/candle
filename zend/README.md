@@ -13,9 +13,9 @@ On startup `zend` resolves a **workspace** directory (see `--working-dir` below)
 
 Every layer the projection schema declares is filled by convention rather than annotation — `src/ingest.rs` derives the load plan from the schema's shape, not from extra YAML metadata:
 
-- `repo_map` — one conversation per folder a branch lists (`src/repo_scan/`), explored as two `code_read`-shaped tool round-trips (`file_list` the folder, then `file_read` its `README`/module-doc anchor), the last of which **decodes** a two-sentence summary of what the folder is for. Both tool responses are produced by running the real tools at the commit the folder was found on, so a prefilled response cannot drift from the live one.
-- `code_reading` — one conversation per file a branch holds (`src/code_read/`): a hidden tool-using conversation that reads the file with real `file_read` calls, at the commit it was found on, and answers with its summary.
-- Both are keyed by what they show — a file by its path and blob id, a folder by its listing and the blobs its turns show — so a unit on many branches is one conversation, a branch moving forward re-reads only what changed, and a conversation retrieves only the units its own base holds.
+- `repo_map` — one conversation per folder a branch lists (`src/repo_scan/`), explored as ONE `code_read`-shaped tool round-trip (`file_list` the folder, listing its own entries and naming its subfolders without descending), which then **decodes** a one-sentence summary of what the folder is for. The folder is described from names and paths alone — nothing reads a file — and the tool response is produced by running the real tool at the commit the folder was found on, so a prefilled response cannot drift from the live one.
+- `code_reading` — one conversation per file a branch holds (`src/code_read/`): a hidden tool-using conversation that reads the file with real `file_read` calls, at the commit it was found on, and answers with its summary. A file counts as read only once that conversation's chain finished; one that stopped part-way is queued again.
+- Both are keyed by what they show — a file by its path and blob id, a folder by its listing and its manifest — so a unit on many branches is one conversation, a branch moving forward re-reads only what changed, and a conversation retrieves only the units its own base holds.
 - Any other declared turn-sink layer reads raw ChatML records from a same-named folder — but only for a **mind** workspace (one carrying its own `<workspace>/projection.yaml`), never for an arbitrary coding-agent project directory.
 
 **Ingest layers are append-only.** `repo_map` and `code_reading` are explicitly marked append-only cumulative content (`session.rs` calls `engine.mark_layer_append_only(layer_id)` before ingest runs) — a pass ingests new units and tombstones those no branch holds, but never rewrites history in place; this is also what the summariser and provenance self-locality logic key off of to exclude ingest content from certain live-dialogue-only behaviors.
@@ -32,8 +32,8 @@ Every layer the projection schema declares is filled by convention rather than a
 | `src/branch_ingest/` | The ingest pass: every branch's tree, content keys, the plan (what to ingest, what to tombstone) |
 | `src/origin_watch/` | Per-repository origin watchers: the `ls-refs` probe, cadence and backoff, fetch on change |
 | `src/retrieval_scope.rs` | Which ingested units a conversation may retrieve — those its own base holds |
-| `src/repo_scan/` | `repo_map` per-directory ingest: the unit's anchor excerpt, turn rendering, the directory pool |
-| `src/code_read/` | `code_reading` per-file ingest: the hidden reading conversations and their pool |
+| `src/repo_scan/` | `repo_map` per-directory ingest: the unit's manifest hint, turn rendering, the folder tool loop, the directory pool |
+| `src/code_read/` | `code_reading` per-file ingest: the hidden reading conversations, their pool, and which chains finished |
 | `src/tools.rs`, `tool_def.rs`, `tool_summary.rs` | Tool catalog installation into the projection schema, tool-call extraction/execution loop, deterministic catalog summaries |
 | `src/stencil` (in `candle-conversation`) | Constrained decoding backing the tool-call/think steering `zend` compiles at load |
 | `src/config.rs` | `DaemonConfig` — workspace path, port, disabled layers, ingest-dir overrides |
@@ -81,7 +81,9 @@ GET    /ws/logs                          WebSocket log tail (backlog replay + li
 
 Anything not matched falls back to the embedded `web/` frontend (`GET /`, `/perf`, `/substrate`, `/project`, resolved to their `.html` files).
 
-`POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: `conv_id`, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
+`POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: **`conv_id` (required)**, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
+
+Every conversation is addressed by its own `conv_id`; there is no default conversation for unaddressed turns to accumulate on, so a request that omits it or sends it blank is refused with `400 missing_conv_id`. The one exception is `model: "passthrough"`, which runs the client's own context and never reaches the substrate.
 
 ### Tools modes and who may use them
 

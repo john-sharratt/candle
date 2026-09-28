@@ -89,6 +89,59 @@ pub(super) struct SlotState {
     pub(super) placed: usize,
 }
 
+impl SlotState {
+    /// Rewrite every sealed chunk this slot's caches hold through a compaction
+    /// sweep, returning the captured spans that moved.
+    ///
+    /// **These caches are holders, and the sweep did not know about them.** Both
+    /// `pending_user_part` and each cached glue island keep an
+    /// `Arc<Vec<SealedSequence>>` of K/V that a later projection Arc-injects into a
+    /// slot instead of recomputing it. A compaction relocates those chunks; unless
+    /// the cache is rewritten it goes on naming the slots the pass vacated, and the
+    /// pool hands that ground to the next claim. The injected span then decodes
+    /// against another sequence's K/V — finite, plausibly shaped and wrong, which
+    /// is why it surfaces as a NaN in the first attention layer rather than as a
+    /// fault, and why it took a completeness check to find rather than a crash.
+    ///
+    /// Shares the pass's one `Sweep`, like every other holder: these caches
+    /// routinely hold the very same `Arc<Vec<ChunkGid>>` allocation a residence
+    /// holds, and a second sweep would hand each its own equal-but-distinct
+    /// replacement, leaving refcounts that disagree with the sharing the cache
+    /// believes exists.
+    pub(super) fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        let mut moved = 0usize;
+        if let Some(span) = self.pending_user_part.as_mut() {
+            moved += span.rewrite_for_compaction(sweep)?;
+        }
+        for (_, span) in self.glue_islands.values_mut() {
+            moved += span.rewrite_for_compaction(sweep)?;
+        }
+        Ok(moved)
+    }
+}
+
+impl CapturedSpan {
+    /// Install the sweep's replacement for this span's K/V, if any of it moved.
+    ///
+    /// The index page beside it is position-free and names no chunk, so a
+    /// relocation does not touch it.
+    fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        match candle_nn::kv_cache::rewrite_sealed(&self.kv, sweep)? {
+            Some(next) => {
+                self.kv = Arc::new(next);
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+}
+
 /// How many projections an unused cached glue island survives before it is
 /// dropped. Covers selection shapes that alternate every few reprojections
 /// while keeping the pinned-chunk footprint bounded (~shapes x islands).
@@ -1227,20 +1280,36 @@ fn inject_sealed_section(
         }
     };
     inject_arc_sealed(ctx.session, parent_id, &sealed)?;
-    // Unconditional, because the interesting case is the one that logs nothing.
-    // A section reaching here with no blob takes the gap branch and says so; a
-    // section that never reaches here at all is invisible, and telling those two
-    // apart is the whole question when a slot ends up holding an unindexed
-    // prefix. `section_positional` is filled by `ingest_section` and by nothing
-    // else, so a RECOVERED section — one the substrate reload brought back
-    // rather than re-ingested — has no entry no matter how sound its K/V is.
-    tracing::debug!(
-        target: "candle_conversation::scheduler::reproject",
-        slot = parent_id.0,
-        section = sid.raw(),
-        has_page = ctx.section_positional.contains_key(&sid),
-        "apply_projection: injecting section K/V",
-    );
+    // **Only the anomaly earns a debug line.** The case worth seeing is a section
+    // that reaches here with no positional blob: `section_positional` is filled by
+    // `ingest_section` and by nothing else, so a RECOVERED section — one the
+    // substrate reload brought back rather than re-ingested — has no entry no
+    // matter how sound its K/V is, and that is what leaves a slot holding an
+    // unindexed prefix.
+    //
+    // This was unconditional, on the reasoning that a section which never reaches
+    // here at all is invisible and telling the two apart is the whole question.
+    // Measured over one daemon run, that cost 1,609 lines of a 4,315-line log —
+    // 37% of it — and the anomaly fired **zero** times, so the volume was paid
+    // entirely to restate the ordinary case. The count is not lost: the
+    // `reproject (zero-copy rebuild)` line already carries `sections`, so "did
+    // sections reach here" is answerable at debug without a line each.
+    let has_page = ctx.section_positional.contains_key(&sid);
+    if has_page {
+        tracing::trace!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            section = sid.raw(),
+            "apply_projection: injecting section K/V",
+        );
+    } else {
+        tracing::debug!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            section = sid.raw(),
+            "apply_projection: injecting section K/V with no positional page",
+        );
+    }
     // The rows that go with those chunks. Borrowing the K/V is what makes this
     // path cheap; the index cannot be borrowed the same way, because its keys
     // come from hidden states this slot never computed.
@@ -1763,7 +1832,7 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
         {
-            let _g = profile::span("prefill:forward");
+            let _g = profile::span("loop:prefill:forward");
             let nl = ctx.model.num_layers().max(1);
             let _logits = ctx
                 .model
@@ -1803,7 +1872,7 @@ fn push_empty_if_sealed(
     last_was_sealed: bool,
 ) -> Result<(), ConversationError> {
     if last_was_sealed {
-        let _g = profile::span("prefill:push_empty");
+        let _g = profile::span("loop:prefill:push_empty");
         ctx.session
             .push_empty_writer_chunk(ctx.parent_id.0)
             .map_err(ConversationError::Model)?;
@@ -1848,23 +1917,39 @@ fn drive_prefill_and_capture(
             ))
         })?;
     forward_tokens(ctx, tokens)?;
-    let end_block = ctx
-        .session
-        .sequence_block_count(parent_id.0)
-        .ok_or_else(|| {
-            ConversationError::Channel(format!(
-                "apply_projection: slot {} not in session",
-                parent_id
-            ))
-        })?;
 
     let captured = {
-        let _g = profile::span("prefill:snapshot");
+        let _g = profile::span("loop:prefill:snapshot");
         let full = ctx
             .session
             .snapshot_sequence_per_layer(parent_id.0)
             .map_err(ConversationError::Model)?;
-        slice_per_layer_sealed(&full, start_block, end_block)
+        // **The end of the range comes from the SNAPSHOT, never from the live
+        // slot.** `snapshot_sequence_per_layer` drops each layer's trailing empty
+        // chunk (`SealedSequence::drop_empty_tail`) so a skew can never be captured
+        // into a `CapturedSpan` and re-injected; `sequence_block_count` counts that
+        // chunk, because the slot really does hold it. Asking the slot and slicing
+        // the snapshot therefore disagreed by exactly one whenever the tail chunk was
+        // empty — which `reconcile_block_counts` above can make true on *every* layer
+        // at once, so all of them dropped it and the range ran one past all of them.
+        // That is a hard refusal from `slice_per_layer_sealed`, and it made a boot
+        // from a fresh substrate impossible: measured `seal range 40..49 is outside
+        // layer 0's 48 sealed chunk(s)`, identical on every attempt, while the old
+        // substrate masked it by having nothing left to ingest.
+        //
+        // Deriving it here is what the two sibling seal paths already do
+        // (`start_block + sealed[0].chunks.len()`), and it is lossless by the same
+        // argument that justifies the drop: an empty chunk holds no token and no
+        // position moves. The minimum across layers rather than layer 0's, so a
+        // layer that dropped one while others did not still yields a range every
+        // layer can satisfy — and a `min` that lands *below* `start_block` is left to
+        // fail, because that is a real divergence and not a tail to trim.
+        let end_block = full
+            .iter()
+            .map(|s| s.chunks.len())
+            .min()
+            .unwrap_or(start_block);
+        slice_per_layer_sealed(&full, start_block, end_block)?
     };
     // The index rows this forward just built, taken as a page so a later
     // re-inject of the same K/V can hand them over with it. Without this the
@@ -1945,12 +2030,19 @@ pub(super) fn fire_gap_fill_batch(
     // every column by its chunk `rope_base`, and masks each glue token by
     // `cpos > row_pos + fwd_ahead[t]`.
     session.set_pending_glue(pending);
-    // Clear the per-op pipeline profile so the snapshot below covers only this
+    // Read the per-op pipeline profile so the delta below covers only this
     // gap-fill forward (attn_core / mlp_ffn / qkv / out_proj, summed over layers).
+    //
+    // **A snapshot, not a snapshot-and-reset.** The reset is all-thread, so
+    // bracketing this one forward with it wiped every `loop:*` and `drain:*` span
+    // the run had accumulated — the engine's own profile table then covered only
+    // the window since the last gap-fill, which is a partial window dressed as a
+    // whole run. Subtracting two readings gives the same interval and destroys
+    // nothing.
     #[cfg(feature = "profile")]
-    let _ = candle_transformers::models::profile::pipeline_snapshot_and_reset();
+    let prof_before = candle_transformers::models::profile::pipeline_snapshot();
     {
-        let _g = profile::span("prefill:gap_fill");
+        let _g = profile::span("loop:prefill:gap_fill");
         // Route the glue islands through the wave's GLUE group so the pending
         // per-slot scatter descriptors (staged above) drive the paged-glue kernel.
         // A glue-only wave carries no logits (it only scatters K/V) and the result
@@ -1985,11 +2077,22 @@ pub(super) fn fire_gap_fill_batch(
     }
     #[cfg(feature = "profile")]
     {
-        let snap = candle_transformers::models::profile::pipeline_snapshot_and_reset();
-        let mut parts: Vec<String> = snap
+        let after = candle_transformers::models::profile::pipeline_snapshot();
+        // Only what this forward added: spans absent before, and the increase on
+        // spans already there. A span whose total did not move is left out.
+        let before: std::collections::HashMap<&str, (f64, u64)> = prof_before
             .entries
             .iter()
-            .map(|(n, ms, c)| format!("{n}={ms:.1}ms({c})"))
+            .map(|(n, ms, c)| (n.as_str(), (*ms, *c)))
+            .collect();
+        let mut parts: Vec<String> = after
+            .entries
+            .iter()
+            .filter_map(|(n, ms, c)| {
+                let (ms0, c0) = before.get(n.as_str()).copied().unwrap_or((0.0, 0));
+                let (d_ms, d_c) = (ms - ms0, c.saturating_sub(c0));
+                (d_c > 0).then(|| format!("{n}={d_ms:.1}ms({d_c})"))
+            })
             .collect();
         parts.sort_by(|a, b| b.cmp(a));
         tracing::info!(

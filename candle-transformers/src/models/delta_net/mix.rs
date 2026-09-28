@@ -41,9 +41,16 @@
 #[cfg(feature = "cuda")]
 use std::cmp::Reverse;
 use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
+use candle::wave_provenance::WaveTicket;
+#[cfg(feature = "cuda")]
+use candle::LeaseAnchor;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
 
 use super::types::{DeltaNetDims, ZGate};
 
@@ -131,32 +138,40 @@ impl DeltaNetState {
     /// and which WDDM demotes to host RAM rather than refusing. On a hybrid
     /// stack that is three quarters of the model's per-sequence memory.
     ///
-    /// [`LeaseOrigin::Foreign`] because the owner is not an allocator to carve
-    /// from: an op reading this state takes its output from the wave arena, not
-    /// from the sequence's state block, and `Foreign` is what says so.
+    /// **Anchored to its owner.** Both buffers hold `anchor`, and so does every
+    /// clone, view and re-lease of them, so the memory's owner cannot hand it to
+    /// another sequence while anything still reads this state through a handle it
+    /// took along the way — a `write_half`, a captured view, a re-lease. The worst a
+    /// forgotten handle can then cost is ground not yet reclaimed, never a read of
+    /// someone else's state.
     ///
     /// # Safety
     ///
-    /// Both pointers must name at least [`Self::byte_sizes`] bytes of live,
-    /// correctly aligned memory that outlives this state and every view of it,
-    /// and that nothing else writes through another alias.
+    /// Both pointers must name at least [`Self::byte_sizes`] bytes of correctly
+    /// aligned memory that stays live while `anchor` is held, and that nothing
+    /// else writes through another alias.
     #[cfg(feature = "cuda")]
-    pub unsafe fn at(dims: &DeltaNetDims, dev: &Device, s_ptr: u64, conv_ptr: u64) -> Result<Self> {
-        use candle::cuda_backend::wave_provenance::LeaseOrigin;
+    pub unsafe fn at(
+        dims: &DeltaNetDims,
+        dev: &Device,
+        s_ptr: u64,
+        conv_ptr: u64,
+        anchor: LeaseAnchor,
+    ) -> Result<Self> {
         Ok(Self {
-            s: Tensor::from_leased_cuda_ptr(
+            s: Tensor::from_anchored_cuda_ptr(
                 s_ptr,
                 DType::F32,
                 (dims.n_v_heads, dims.head_dim, dims.head_dim),
                 dev,
-                LeaseOrigin::Foreign,
+                anchor.clone(),
             )?,
-            conv_tail: Tensor::from_leased_cuda_ptr(
+            conv_tail: Tensor::from_anchored_cuda_ptr(
                 conv_ptr,
                 DType::F32,
                 (dims.conv_dim(), dims.conv_kernel - 1),
                 dev,
-                LeaseOrigin::Foreign,
+                anchor,
             )?,
         })
     }
@@ -958,19 +973,33 @@ impl SpanOperands {
     /// — see [`DeltaNetSeq::stash`].
     ///
     /// Driver memory, for a caller with no reservation to carve from — a CPU
-    /// device, or a unit test. Production takes [`Self::in_regions`]; see there
+    /// device, or a unit test. Production takes [`Self::in_slots`]; see there
     /// for why the difference matters.
     pub fn zeros(dims: &DeltaNetDims, cap: usize, dev: &Device) -> Result<Self> {
-        let f = |cols: usize| Tensor::zeros((cap, cols), DType::F32, dev);
+        let [qkv, z, beta_lin, alpha_lin] =
+            Self::widths(dims).map(|cols| Tensor::zeros((cap, cols), DType::F32, dev));
         Ok(Self {
-            qkv: f(dims.conv_dim())?,
-            z: f(dims.value_dim())?,
-            beta_lin: f(dims.n_v_heads)?,
-            alpha_lin: f(dims.n_v_heads)?,
+            qkv: qkv?,
+            z: z?,
+            beta_lin: beta_lin?,
+            alpha_lin: alpha_lin?,
         })
     }
 
-    /// [`Self::zeros`], carved from the **reservation** rather than the driver.
+    /// Columns of each operand, in field order: `qkv`, `z`, `beta_lin`, `alpha_lin`.
+    /// Each buffer is `[cap, width]` F32.
+    pub fn widths(dims: &DeltaNetDims) -> [usize; 4] {
+        [
+            dims.conv_dim(),
+            dims.value_dim(),
+            dims.n_v_heads,
+            dims.n_v_heads,
+        ]
+    }
+
+    /// [`Self::zeros`], in **rewind-stash arena slots** of the reservation rather
+    /// than driver memory — one slot per operand, in [`Self::widths`] order, each
+    /// zeroed and viewed as an anchored tensor so no view of it outlives the slot.
     ///
     /// The stash is long-lived per-cohort state: it must outlive the wave (that
     /// is what it is *for*), so it cannot come from the wave arena, and until
@@ -991,31 +1020,58 @@ impl SpanOperands {
     /// Inside the reservation it is visible to the partition instead of
     /// competing with it: the region claim is counted, and a claim that runs
     /// short asks the weight side to concede layers rather than failing the
-    /// device. Same tier, same lifetime class, and the same allocator as the
-    /// recurrent state it exists to rewind.
+    /// device. In an arena of its own tenant, so its slots are counted and packed
+    /// apart from the recurrent state it exists to rewind; its stride follows the
+    /// verify cap, which is why each width is a pool of its own.
     ///
-    /// `pub(crate)` rather than `pub`: it takes the region allocator, which is
-    /// this crate's own partition machinery and not something an external caller
-    /// could hold.
+    /// **Zeroed, unlike a wave buffer.** The replay hands the mixer the whole
+    /// `cap`-row buffer while only the captured spans were filled, so these are
+    /// zeros read before being written — hot-path invariant 6's exemption.
     #[cfg(feature = "cuda")]
-    pub(crate) fn in_regions(
+    pub fn in_slots(
         dims: &DeltaNetDims,
         cap: usize,
         dev: &Device,
-        bump: &mut super::state_store::RegionBump,
+        slots: [Arc<ArenaSlot>; 4],
     ) -> Result<Self> {
-        let mut f = |cols: usize| bump.take_zeroed((cap, cols), DType::F32, dev);
+        let mut out = Vec::with_capacity(4);
+        for (slot, cols) in slots.iter().zip(Self::widths(dims)) {
+            slot.zero(cap * cols * DType::F32.size_in_bytes(), dev)?;
+            out.push(slot.tensor(0, DType::F32, (cap, cols), dev)?);
+        }
+        let [qkv, z, beta_lin, alpha_lin]: [Tensor; 4] =
+            out.try_into().expect("four operands, four slots");
         Ok(Self {
-            qkv: f(dims.conv_dim())?,
-            z: f(dims.value_dim())?,
-            beta_lin: f(dims.n_v_heads)?,
-            alpha_lin: f(dims.n_v_heads)?,
+            qkv,
+            z,
+            beta_lin,
+            alpha_lin,
         })
     }
 
     /// How many rows these buffers hold.
     pub fn capacity(&self) -> Result<usize> {
         self.qkv.dim(0)
+    }
+
+    /// Move any of the four buffers whose slot is a planned source onto its
+    /// destination — see [`relocate_tensor`]. Answers how many moved.
+    ///
+    /// Each buffer is its own slot, so a pass may move one, some or none of them;
+    /// the set that moves is whatever the walk chose, and the four stay
+    /// independently addressable either way.
+    #[cfg(feature = "cuda")]
+    pub fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
+        let mut moved = 0usize;
+        for t in [
+            &mut self.qkv,
+            &mut self.z,
+            &mut self.beta_lin,
+            &mut self.alpha_lin,
+        ] {
+            moved += usize::from(relocate_tensor(t, moves)?);
+        }
+        Ok(moved)
     }
 
     /// Copy `len` rows of `p`, starting at wave row `start`, into these buffers
@@ -1128,8 +1184,9 @@ pub fn seq_spans(seqs: &[usize], q_lens: &[usize]) -> Result<Vec<SeqSpan>> {
 /// upload before the layer sweep ([`super::cuda::build_wave_table`]) — never
 /// per layer, where the upload's stream sync would serialise the launch
 /// pipeline — and each layer receives its slice. State pointers are stable
-/// across the forward because a sequence's state buffers are allocated once
-/// and keep their identity (the store's standing rule).
+/// within the forward — the store holds the buffers and their anchors keep the
+/// slots held — but not across one: `commit_wave` exchanges each layer's halves
+/// after the sweep, so a table is never kept past the forward that built it.
 /// `'w` because a slice of [`super::cuda::DeltaNetWaveTable`] borrows it, and
 /// that table lives on the forward-phase span — so this must not outlive the
 /// generation whose reset reclaims it. A per-layer table built standalone is
@@ -1322,7 +1379,8 @@ pub fn delta_net_mix<'w>(
         out,
         stash: None,
     }];
-    let mixed = delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None, zgate)?;
+    // The single-sequence reference path, off the sweep: no phase is open.
+    let mixed = delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None, zgate, None)?;
     let [seq] = one;
     seq.state.absorb_solo(&seq.out)?;
     Ok(mixed)
@@ -1350,6 +1408,7 @@ pub fn delta_net_mix<'w>(
 // `table` is the pre-uploaded per-sequence pointer table the batched decode
 // kernel reads; without `cuda` there is no kernel to hand it to.
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 pub fn delta_net_mix_spans<'w>(
     p: &DeltaNetProjections<'w>,
     c: &DeltaNetConstants<'_>,
@@ -1358,6 +1417,8 @@ pub fn delta_net_mix_spans<'w>(
     rms_eps: f64,
     table: Option<&DeltaNetLayerTable>,
     zgate: ZGate,
+    // The open layer phase, for the per-layer tables built below.
+    ticket: Option<WaveTicket>,
 ) -> Result<LiveTensor<'w>> {
     let (t, _) = p.qkv.dims2()?;
     let (h_k, h_v, d) = (dims.n_k_heads, dims.n_v_heads, dims.head_dim);
@@ -1428,7 +1489,9 @@ pub fn delta_net_mix_spans<'w>(
         // the upload merely happens closer to the launch.
         let local = match table {
             Some(_) => None,
-            None if seqs.iter().any(|s| s.len == 1) => Some(super::cuda::build_layer_table(seqs)?),
+            None if seqs.iter().any(|s| s.len == 1) => {
+                Some(super::cuda::build_layer_table(seqs, ticket)?)
+            }
             None => None,
         };
         let table = table.or(local.as_ref());
@@ -1715,7 +1778,7 @@ pub fn delta_net_advance_spans(
         }];
         // The activations — and with them the z-gate — are discarded; only the
         // advanced state is wanted, so the gate kind cannot matter here.
-        let _ = delta_net_mix_spans(&view, c, dims, &mut one, rms_eps, None, ZGate::Silu)?;
+        let _ = delta_net_mix_spans(&view, c, dims, &mut one, rms_eps, None, ZGate::Silu, None)?;
     }
     Ok(())
 }
@@ -2143,8 +2206,8 @@ mod tests {
                     stash: None,
                 },
             ];
-            let mixed =
-                delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None, ZGate::Silu).unwrap();
+            let mixed = delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None, ZGate::Silu, None)
+                .unwrap();
             for s in seqs.iter_mut() {
                 s.state.absorb_solo(&s.out).unwrap();
             }
@@ -2236,7 +2299,7 @@ mod tests {
             // with the same capture it would have made.
             let slot = seqs[0].stash.as_ref().unwrap();
             slot.ops.capture(&p, 0, slot.row, block).unwrap();
-            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
+            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
         }
 
         // The replay: `kept` rows, from the entering state, into a fresh half.
@@ -2251,7 +2314,7 @@ mod tests {
                 out: replayed.write_half(),
                 stash: None,
             }];
-            delta_net_mix_spans(&pr, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
+            delta_net_mix_spans(&pr, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
         }
 
         // The oracle: the same `kept` rows, nothing else, same entering state.
@@ -2276,7 +2339,7 @@ mod tests {
                 out: want.write_half(),
                 stash: None,
             }];
-            delta_net_mix_spans(&po, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).unwrap();
+            delta_net_mix_spans(&po, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
         }
 
         assert_close(&replayed.s, &want.s, 1e-6, "replayed state");
@@ -2422,8 +2485,8 @@ mod tests {
                 out: want.write_half(),
                 stash: None,
             }];
-            let _ =
-                delta_net_mix_spans(&view, &c, &dims, &mut one, 1e-6, None, ZGate::Silu).unwrap();
+            let _ = delta_net_mix_spans(&view, &c, &dims, &mut one, 1e-6, None, ZGate::Silu, None)
+                .unwrap();
 
             let got_s = batched_outs[i].write_half().s;
             let got_t = batched_outs[i].write_half().conv_tail;
@@ -2492,7 +2555,7 @@ mod tests {
                     stash: None,
                 },
             ];
-            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu).map(|_| ())
+            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).map(|_| ())
         };
 
         // A gap: rows 5..6 belong to nobody.

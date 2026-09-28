@@ -24,13 +24,13 @@
 //! sequences, exactly like any other batch of concurrent conversations the
 //! engine wave-batches together.
 
-pub mod carve;
 mod lines;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use candle_conversation::chain_health::{chain_break, ChainBreak};
 use candle_conversation::projection::{
     OptionalState, SelectionState, TimelineId, FORCE_TOOL_SELECTOR, NO_THINK_SELECTOR,
     TOOLS_ENABLED_SELECTOR,
@@ -38,11 +38,14 @@ use candle_conversation::projection::{
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
 use zend_tools::ToolContext;
+use zend_vfs::vfs::PAGE_LINES;
 use zend_vfs::Oid;
 
 use self::lines::line_count;
 use crate::branch_ingest::filter::{language_of, MAX_FILE_BYTES};
-use crate::branch_ingest::keys::{file_key, BLOB_KEY, CONTENT_KEY, LINES_KEY};
+use crate::branch_ingest::keys::{
+    branches_value, file_key, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY, LINES_KEY,
+};
 use crate::branch_ingest::plan::Committed;
 use crate::ingest_report::Failures;
 use crate::loading::LoadProgress;
@@ -65,6 +68,9 @@ pub struct FileJob {
     pub blob: Oid,
     pub language: Language,
     pub at: Option<Oid>,
+    /// Every branch whose tip holds this version, recorded on the
+    /// conversation ([`BRANCHES_KEY`]); empty for an upload, which is on none.
+    pub branches: Vec<String>,
 }
 
 impl FileJob {
@@ -74,26 +80,112 @@ impl FileJob {
     }
 }
 
-/// Every committed `code_reading` conversation of a repository's branches:
-/// its content key and path — what the pass plans against. Uploads are not
-/// among them: their endpoint keeps them, never the pass.
+/// Every committed `code_reading` conversation of a repository's branches
+/// whose chain FINISHED: its content key and path — what the pass plans
+/// against. Uploads are not among them: their endpoint keeps them, never the
+/// pass.
+///
+/// # A file counts as read only once its chain finished
+///
+/// The content key is written once the file's conversation stops calling
+/// tools, and that is not the same thing as answering. A README read spent its
+/// whole decode budget deliberating over how many `file_read` calls to issue,
+/// was cut off mid-word, and emitted no tool call — so no coupling, no second
+/// turn and no summary, yet the turn came back `Ok` and the key was written.
+/// The substrate stored it faithfully (CRC-clean, chunk counts consistent), the
+/// file counted as read forever, and its one turn stayed in the corpus as a
+/// worked example of an assistant that deliberates and produces nothing, which
+/// later conversations then imitated.
+///
+/// So each keyed timeline is asked whether its chain finished
+/// ([`chain_break`]). An unfinished one is left out of what the pass plans
+/// against, so its key reads as held by nothing and the file is queued again;
+/// [`process_one_file`] defers the unfinished generation and retires it only
+/// once the rebuild commits — recovery with nothing lost in between.
+///
+/// **One predicate for every gate.** The plan (this), the resume snapshot
+/// ([`finished_content_keys`]) and the fast path ([`chain_finished`]) each ask
+/// "is this file already read?" from their own query. A gate left reading the
+/// bare key would announce the file as queued and then skip it as present,
+/// which reports recovery that never happens — or, for the fast path, hands the
+/// unfinished chain to a live conversation as a file it has read.
 pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
+    let scan = scan_ingest_chains(engine);
+    // One line per unfinished chain per pass. A handful is ordinary recovery; a
+    // corpus-wide sweep of them means the decode budget or the opening prompt
+    // is wrong for this model, and every pass will keep redoing the same work.
+    for (path, why) in &scan.broken {
+        if scan.finished.iter().any(|c| c.subject == *path) {
+            continue; // a complete chain for the same file covers it
+        }
+        tracing::info!(
+            target: "zend::code_read::ingest",
+            file = %path,
+            ?why,
+            "ingest chain unfinished — the file is queued again and will be rebuilt",
+        );
+    }
+    scan.finished
+        .into_iter()
+        .filter(|c| !is_upload_path(&c.subject))
+        .collect()
+}
+
+/// What [`scan_ingest_chains`] found: the keyed conversations whose chain
+/// finished, and the paths whose chain stopped part-way.
+struct IngestChains {
+    finished: Vec<Committed>,
+    broken: Vec<(String, ChainBreak)>,
+}
+
+/// Every keyed `code_reading` conversation, uploads included, sorted by
+/// whether the chain that wrote it finished ([`chain_break`]).
+fn scan_ingest_chains(engine: &Mutex<ConversationEngine>) -> IngestChains {
     let eng = engine.lock().unwrap();
     let keys: HashMap<TimelineId, String> = eng
         .conversations_with_metadata_key(CONTENT_KEY)
         .into_iter()
         .collect();
-    eng.conversations_with_metadata_key(PATH_KEY)
-        .into_iter()
-        .filter(|(_, path)| !is_upload_path(path))
-        .filter_map(|(timeline, path)| {
-            Some(Committed {
+    let conv = eng.conversation();
+    let substrate = conv.read();
+    let mut out = IngestChains {
+        finished: Vec::new(),
+        broken: Vec::new(),
+    };
+    for (timeline, path) in eng.conversations_with_metadata_key(PATH_KEY) {
+        let Some(key) = keys.get(&timeline) else {
+            continue;
+        };
+        match chain_break(&substrate, timeline) {
+            Some(why) => out.broken.push((path, why)),
+            None => out.finished.push(Committed {
                 timeline,
-                key: keys.get(&timeline)?.clone(),
+                key: key.clone(),
                 subject: path,
-            })
-        })
+            }),
+        }
+    }
+    out
+}
+
+/// Content keys whose ingest chain finished, uploads included — the snapshot
+/// [`ingest_jobs`] probes before spending a conversation on a file.
+///
+/// Replaces a bare sweep of every content key, which counted an unfinished
+/// chain's key as present and so skipped the very file the plan had just
+/// queued for rebuild.
+fn finished_content_keys(engine: &Mutex<ConversationEngine>) -> HashSet<String> {
+    scan_ingest_chains(engine)
+        .finished
+        .into_iter()
+        .map(|c| c.key)
         .collect()
+}
+
+/// Whether `timeline`'s ingest chain finished — the fast path's gate before it
+/// hands a file conversation to a live one as already read (see [`committed`]).
+pub(crate) fn chain_finished(engine: &ConversationEngine, timeline: TimelineId) -> bool {
+    chain_break(&engine.conversation().read(), timeline).is_none()
 }
 
 /// Maximum tolerated per-file summary decode failures in a single
@@ -120,8 +212,8 @@ const FILE_READ_TOOL: &str = "file_read";
 const FILE_TURN_MAX_TOKENS: usize = 1536;
 
 /// Real `file_read` rounds a single file's conversation may run before being
-/// forced to answer on whatever it has already seen. The tool caps a single
-/// response at `MAX_READ_LINES` lines (`zend-tools`), so a genuinely large
+/// forced to answer on whatever it has already seen. The tool returns one
+/// [`PAGE_LINES`]-line page per call (`zend-vfs`), so a genuinely large
 /// file may take several calls to read in full; this bounds the pathological
 /// case (or a model that keeps re-reading) rather than the ordinary one, which
 /// typically answers well before the cap.
@@ -134,6 +226,28 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// one-line `CHANGELOG.md` "summary" with no `file_read` call at all). "This
 /// file, and only this file" also heads off a model wandering into whatever
 /// else the workspace prompt might make it curious about.
+///
+/// **It names the file's LENGTH, and that is not a nicety.** Naming only the
+/// per-call cap leaves the model to guess how many calls cover the file, and a
+/// guess is a decision it can spend its whole decode budget failing to make: a
+/// README read deliberated over whether the file was under the cap, whether a
+/// read past EOF would error, and whether to risk it — until the token budget
+/// cut it off mid-word, before any `file_read` call was emitted. It produced no
+/// tool call, so no coupling and no second turn, and the chain stood in the
+/// corpus as an assistant that deliberates and answers nothing. With the length
+/// given, the arithmetic is settled before the model starts.
+///
+/// **It asks for the calls in PARALLEL, and that is a round-count decision.**
+/// `file_read` serves one [`PAGE_LINES`]-line page per call, so a long file
+/// needs several — and a round is one decode plus one tool dispatch, so reading
+/// a 2,000-line file one call per turn costs ten decodes where a single turn
+/// carrying ten calls costs one. The loop already supports it in full:
+/// `tool_round::plan` returns every call an answer makes, `tool_round::run`
+/// executes them in order, and `format_tool_responses` hands back one
+/// `<tool_response>` block per result, so the whole file arrives in the next
+/// turn's context together. Naming the page size and the page count in the
+/// prompt is what lets the model issue every call at once rather than
+/// discovering the file's length from the first page's header.
 ///
 /// A model losing track of its own earlier rounds several turns into a long
 /// file was once worked around here, with prose telling it no further
@@ -148,14 +262,20 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 ///
 /// `key` is workspace-relative; the prompt names the repository and the path
 /// inside it separately, the two arguments the call it asks for takes.
-fn opening_prompt(key: &str) -> String {
+fn opening_prompt(key: &str, lines: usize) -> String {
     let (repo, path) = split(key);
+    let pages = lines.div_ceil(PAGE_LINES as usize).max(1);
+    let last = pages - 1;
     format!(
         "Read the entire contents of `{path}` in the `{repo}` repository — and only \
-         this file — using {FILE_READ_TOOL}, calling it as many times as needed to see \
-         all of it if it's long. Once you've read the whole thing, summarize what it \
-         contains: its purpose, its main structures or functions, and how it fits into \
-         the codebase."
+         this file — using {FILE_READ_TOOL}. The file is {lines} lines long and each \
+         call returns one {PAGE_LINES}-line page, so it takes exactly {pages} \
+         {FILE_READ_TOOL} call(s): issue all {pages} in the SAME reply, one per page \
+         from page 0 to page {last}, instead of one call per reply. \
+         Every call you make in a reply is run together and all of their results \
+         come back to you at once. Once you've read the whole thing, summarize what \
+         it contains: its purpose, its main structures or functions, and how it fits \
+         into the codebase."
     )
 }
 
@@ -170,7 +290,26 @@ fn opening_prompt(key: &str) -> String {
 /// must stay under the model's sequence-slot capacity with headroom for the
 /// non-ingest slots the engine also needs concurrently: the live dialogue
 /// session, the async summariser's compression passes, etc.
-pub const CODE_READ_PARALLELISM: usize = 12;
+///
+/// **16, and the ceiling here is VRAM rather than throughput.** Each worker is
+/// serialised on its own file's whole turn — a prefill that attends over the
+/// inherited priming chain (~32k KV, ~9.4 s) and then a decode — so the pool
+/// width, not the wave, is what bounds the file phase.
+///
+/// Measured on the 72 GB card over the same corpus:
+///
+///   12   0.58 files/min   stable for three hours
+///   32   1.66 files/min   K/V ran 13.9 GB against a 2.5 GB budget, the weight
+///                         zone slid to 30.6 GB against a 28.8 GB floor, and the
+///                         daemon died after ~30 minutes — no panic, no poison,
+///                         the log simply stops
+///
+/// A file conversation is not a directory conversation: it carries 876k KV per
+/// decode forward against a directory's 25k, so a width that is comfortable for
+/// `repo_map` exhausts the card here. 16 keeps most of the gain over 12 with
+/// margin against the floor, which matters more than rate — a dead daemon
+/// ingests nothing.
+pub const CODE_READ_PARALLELISM: usize = 16;
 
 /// Worker count for the parallel ingest — [`CODE_READ_PARALLELISM`].
 fn parallelism() -> usize {
@@ -211,6 +350,7 @@ pub fn ingest_files(
                 blob,
                 language,
                 at: None,
+                branches: Vec::new(),
             }),
             Ok(_) => {
                 tracing::debug!(file = %path, "code_read: skip an upload missing or over the size cap");
@@ -364,12 +504,9 @@ pub fn ingest_jobs(
     let total = jobs.len();
     let keys: Vec<String> = jobs.iter().map(FileJob::key).collect();
     // One snapshot of the committed keys: a file committed since the caller
-    // planned is not read twice.
-    let present_keys = ctx
-        .engine
-        .lock()
-        .unwrap()
-        .conversation_metadata_values(CONTENT_KEY);
+    // planned is not read twice. Finished chains only (see `committed`), so a
+    // file queued for rebuild is not skipped here as present.
+    let present_keys = finished_content_keys(ctx.engine);
     tracing::info!(
         n_workers = n_workers,
         n_files = total,
@@ -576,6 +713,10 @@ fn process_one_file(
     //     intact instead of destroying it. Its tombstone ACTIVATES only after
     //     this ingest commits its own key (see the success path below) — an
     //     atomic swap, "stale-but-present" over "gone";
+    //   * a generation carrying THIS file's key is one whose chain never
+    //     finished — a finished one would have been in `present_keys` and
+    //     skipped above — so it is deferred the same way: the rebuild replaces
+    //     it, and until the rebuild commits nothing is lost;
     //   * a committed generation whose key is still live is the file as
     //     another branch holds it, and is left alone;
     //   * one with no content key yet is another worker's, reading the file
@@ -592,7 +733,7 @@ fn process_one_file(
             .filter(|&tl| {
                 e.conversation_metadata(tl)
                     .and_then(|m| m.get(CONTENT_KEY).cloned())
-                    .is_some_and(|key| !job.live.contains(&key))
+                    .is_some_and(|key| key == job.key || !job.live.contains(&key))
             })
             .collect();
         // Forks off `base` — this layer's prefilled template, `base_conv`'s
@@ -644,8 +785,13 @@ fn process_one_file(
     // stores of its own — reading the commit the file was found on: nothing
     // another unit, or a live dialogue, changed is what it reads.
     let unit_ctx = Arc::new(tools);
-    let summary = match run_file_conversation(&mut conv, &file.path, &ctx.think_triggers, &unit_ctx)
-    {
+    let summary = match run_file_conversation(
+        &mut conv,
+        &file.path,
+        lines,
+        &ctx.think_triggers,
+        &unit_ctx,
+    ) {
         Ok(text) => text,
         Err(e) => {
             // The deferred tombstone is the safety net here: the prior good
@@ -713,6 +859,12 @@ fn process_one_file(
     tags.insert(LINES_KEY.to_string(), lines.to_string());
     tags.insert(CONTENT_KEY.to_string(), job.key.to_string());
     tags.insert("lang".to_string(), format!("{:?}", file.language));
+    if !file.branches.is_empty() {
+        tags.insert(BRANCHES_KEY.to_string(), branches_value(&file.branches));
+    }
+    if let Some(at) = &file.at {
+        tags.insert(COMMIT_KEY.to_string(), at.to_string());
+    }
     if let Err(err) = conv.set_metadata_many(&tags) {
         // Not committed: no pass, fast path or scope will find it. The prior
         // generation stays live, exactly as on the failure path, and this
@@ -794,6 +946,7 @@ fn process_one_file(
 fn run_file_conversation(
     conv: &mut Sequence,
     path: &str,
+    lines: usize,
     triggers: &Arc<TriggerRegistry>,
     tool_ctx: &Arc<ToolContext>,
 ) -> anyhow::Result<String> {
@@ -807,7 +960,7 @@ fn run_file_conversation(
     // schema's own default happens to be.
     selection.set_optional(NO_THINK_SELECTOR, OptionalState::Absent);
 
-    let mut current_message: TurnText = TurnText::from(opening_prompt(path));
+    let mut current_message: TurnText = TurnText::from(opening_prompt(path, lines));
     let mut closing = false;
     for round in 0..=MAX_FILE_READ_ROUNDS {
         if candle_conversation::ingest_cancelled() {
@@ -880,44 +1033,6 @@ fn run_file_conversation(
     unreachable!("the closing round at MAX_FILE_READ_ROUNDS always returns")
 }
 
-/// Byte offset of the start of each line.  `offsets[i]` is the start
-/// of line `i + 1` (1-indexed).  Final entry is the source length.
-///
-/// Kept for [`crate::repo_scan::anchor`], which slices a folder's anchor
-/// excerpt the same way — no longer used inside this module (the model reads
-/// files for itself now, rather than a pre-sliced excerpt being shown to it).
-pub(crate) fn compute_line_offsets(bytes: &[u8]) -> Vec<usize> {
-    let mut offsets = Vec::with_capacity(bytes.len() / 40 + 1);
-    offsets.push(0);
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            offsets.push(i + 1);
-        }
-    }
-    if offsets.last().copied() != Some(bytes.len()) {
-        offsets.push(bytes.len());
-    }
-    offsets
-}
-
-pub(crate) fn slice_lines(
-    bytes: &[u8],
-    offsets: &[usize],
-    start_line: u32,
-    end_line: u32,
-) -> String {
-    // 1-indexed inclusive.  Last entry of `offsets` is bytes.len().
-    let lines_total = offsets.len().saturating_sub(1) as u32;
-    if lines_total == 0 || start_line > lines_total {
-        return String::new();
-    }
-    let start_idx = (start_line as usize - 1).min(offsets.len() - 1);
-    let end_idx = (end_line as usize).min(offsets.len() - 1);
-    let start_byte = offsets[start_idx];
-    let end_byte = offsets[end_idx];
-    String::from_utf8_lossy(&bytes[start_byte..end_byte]).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,6 +1046,7 @@ mod tests {
             blob: Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap(),
             language: Language::Rust,
             at: None,
+            branches: Vec::new(),
         };
         assert_eq!(
             job.key(),
@@ -953,36 +1069,56 @@ mod tests {
     }
 
     #[test]
-    fn slice_lines_returns_exact_line_range() {
-        let src = b"alpha\nbeta\ngamma\ndelta\n";
-        let offsets = compute_line_offsets(src);
-        let s = slice_lines(src, &offsets, 2, 3);
-        assert_eq!(s, "beta\ngamma\n");
-    }
-
-    #[test]
-    fn slice_lines_handles_no_trailing_newline() {
-        let src = b"alpha\nbeta\ngamma";
-        let offsets = compute_line_offsets(src);
-        let s = slice_lines(src, &offsets, 2, 3);
-        assert_eq!(s, "beta\ngamma");
-    }
-
-    #[test]
-    fn slice_lines_clips_at_eof() {
-        let src = b"alpha\nbeta\n";
-        let offsets = compute_line_offsets(src);
-        let s = slice_lines(src, &offsets, 1, 100);
-        assert_eq!(s, "alpha\nbeta\n");
-    }
-
-    #[test]
     fn opening_prompt_names_the_path_and_the_one_tool() {
-        let p = opening_prompt("candle/src/lib.rs");
+        let p = opening_prompt("candle/src/lib.rs", 120);
         assert!(
             p.starts_with("Read the entire contents of `src/lib.rs` in the `candle` repository")
         );
         assert!(p.contains(FILE_READ_TOOL));
+    }
+
+    /// **The prompt must state the file's length and the exact number of calls.**
+    ///
+    /// Told only the per-call cap, a model has to guess how many calls cover the
+    /// file — and that guess is a decision it can spend its entire decode budget
+    /// failing to reach. A README read did exactly that: it weighed whether the
+    /// file was under the cap and whether a read past EOF would error until the
+    /// budget cut it off mid-word, with no `file_read` call emitted, no coupling,
+    /// no second turn and no summary. The arithmetic belongs in the prompt.
+    ///
+    /// Pages are 200 lines and 0-based, so the boundaries are pinned as text.
+    #[test]
+    fn opening_prompt_states_the_length_and_the_call_count() {
+        assert_eq!(
+            PAGE_LINES, 200,
+            "the expected text below is written for 200-line pages"
+        );
+        // Exactly one page's worth: one call, not two.
+        let one = opening_prompt("candle/src/small.rs", 200);
+        assert!(
+            one.contains(
+                "The file is 200 lines long and each call returns one 200-line page, \
+                 so it takes exactly 1 file_read call(s): issue all 1 in the SAME \
+                 reply, one per page from page 0 to page 0,"
+            ),
+            "{one:?}",
+        );
+        // One line over: two calls, pages 0 and 1.
+        let two = opening_prompt("candle/src/mid.rs", 201);
+        assert!(
+            two.contains(
+                "The file is 201 lines long and each call returns one 200-line page, \
+                 so it takes exactly 2 file_read call(s): issue all 2 in the SAME \
+                 reply, one per page from page 0 to page 1,"
+            ),
+            "{two:?}",
+        );
+        // An empty file still asks for one call rather than zero.
+        let empty = opening_prompt("candle/src/empty.rs", 0);
+        assert!(
+            empty.contains("exactly 1 file_read call(s)") && empty.contains("page 0 to page 0,"),
+            "never zero calls: {empty:?}",
+        );
     }
 
     /// The measured failure this prompt exists to close: left as "read as much
@@ -991,7 +1127,7 @@ mod tests {
     /// reading the file, not merely permit it.
     #[test]
     fn opening_prompt_requires_reading_the_whole_file() {
-        let p = opening_prompt("candle/CHANGELOG.md");
+        let p = opening_prompt("candle/CHANGELOG.md", 40);
         assert!(
             p.contains("entire") || p.contains("whole"),
             "must ask for the whole file, not an unspecified amount: {p:?}",
@@ -999,6 +1135,34 @@ mod tests {
         assert!(
             p.contains("only this file"),
             "must scope the read to this file alone: {p:?}",
+        );
+    }
+
+    /// **The prompt must ask for the calls in ONE reply, and must name the cap.**
+    ///
+    /// A round is a decode plus a tool dispatch, so a file read one call per reply
+    /// costs a decode per page — ten for a 2,000-line file where one reply
+    /// carrying ten calls costs one. The loop has always run every call an answer
+    /// makes (`tool_round::plan` → `tool_round::run`); it was the prompt that
+    /// asked for them one at a time. Naming the page size and count is what lets
+    /// the model issue every call up front instead of learning the file's length
+    /// from the first page's header.
+    #[test]
+    fn opening_prompt_asks_for_parallel_reads_and_names_the_cap() {
+        let p = opening_prompt("candle/src/big.rs", 2000);
+        assert!(
+            p.contains("one 200-line page, so it takes exactly 10 file_read call(s)"),
+            "must name the page size and the call count so every call can be issued \
+             up front: {p:?}",
+        );
+        assert!(
+            p.contains("SAME reply"),
+            "must ask for several calls in one reply: {p:?}",
+        );
+        assert!(
+            p.contains("instead of one call per reply"),
+            "must say what it is asking INSTEAD of — one call per reply is the \
+             behaviour this prompt exists to replace: {p:?}",
         );
     }
 }

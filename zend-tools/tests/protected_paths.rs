@@ -173,6 +173,14 @@ fn file_list_never_lists_a_protected_path() {
             !text(&resp).contains("tools.yaml") && !text(&resp).contains("auth.yaml"),
             "path {path:?} surfaced a protected path: {resp}"
         );
+        // The directory itself, not only the files in it. A listing now names
+        // subdirectories as entries of their own, which is a second way for a
+        // protected path to reach the model — the `secrets/` name alone says
+        // there is something there to ask for.
+        assert!(
+            !text(&resp).contains("secrets"),
+            "path {path:?} named a protected directory: {resp}"
+        );
     }
 }
 

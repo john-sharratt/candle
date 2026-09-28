@@ -1,7 +1,7 @@
 //! Tier-2 integration test for the `repo_map` layer's per-directory ingest.
 //!
 //! Drives the real branch walk → unit → render pipeline against synthetic
-//! repositories and pushes each directory's chain through a
+//! repositories and pushes each directory's seed chain through a
 //! [`RecordingTurnSink`], so the turn shape the daemon will prefill is asserted
 //! end-to-end with no model load. The engine-bound half (conversation minting,
 //! the summary decode, the content keys landing) is covered by the live daemon
@@ -19,16 +19,11 @@ use candle_conversation::models::Dialect;
 use candle_conversation::stencil::ToolCallEnvelope;
 use zend::branch_ingest::filter::IngestScope;
 use zend::branch_ingest::walk::{walk, RepoBranches, TreeCache, UnitItem};
-use zend::repo_path::split;
-use zend::repo_scan::render::{render_chain, CHAIN_TOOLS};
+use zend::repo_scan::render::render_chain;
 use zend::repo_scan::DirUnit;
 use zend::turn_sink::{InsertTurnSink, RecordingTurnSink};
 use zend_tools::ToolContext;
 use zend_vfs::{Repo, RepoSpec, Workspace};
-
-/// Same budget the daemon passes; irrelevant to a model-less sink but keeps the
-/// call identical to the production one.
-const SUMMARY_TOKENS: usize = 200;
 
 /// The one repository each test workspace holds.
 const REPO: &str = "demo";
@@ -121,12 +116,15 @@ fn keys_of(root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Run every unit's chain through a recording sink, exactly as
-/// `process_one_dir` runs it through the live one: tools reading the commit
-/// the unit was found on, the anchor and manifest read from it.
+/// Record every unit's SEED chain — the prefilled request/`file_list` pair and
+/// the listing response whose assistant half `converse::run_folder_conversation`
+/// decodes — exactly as `process_one_dir` renders it: tools reading the commit
+/// the unit was found on, the hint the walk read from its manifest. The decode and any
+/// follow-up tool round it drives need a model, so they are the live daemon's
+/// half; what is asserted here is the turn shape that reaches the conversation
+/// before the first decode, which is where every rendering defect lives.
 fn record(root: &Path) -> RecordingTurnSink {
     let ctx = ToolContext::with_workspace(workspace_of(root));
-    let force: Vec<String> = CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
     let mut sink = RecordingTurnSink::new();
     // ChatML's envelope, matching this suite's existing JSON-shaped
     // expectations; `render::tests::tool_calls_follow_the_dialects_call_style`
@@ -138,19 +136,14 @@ fn record(root: &Path) -> RecordingTurnSink {
             None => ctx.files.fresh(),
         };
         let tools = ctx.with_files(Arc::new(files));
-        let unit = DirUnit::read(&item.unit, |path| {
-            let (repo, inner) = split(path);
-            tools.files.repo(repo).ok()?.read_bytes(inner).ok()?
-        });
+        let unit = DirUnit::of(&item.unit);
+        let tags = vec!["repo_map".to_string(), unit.dir.clone()];
         let (prefilled, decode_user) = render_chain(&tools, &unit, &env);
-        sink.ingest_chain(
-            &prefilled,
-            &decode_user,
-            vec!["repo_map".to_string(), unit.dir.clone()],
-            SUMMARY_TOKENS,
-            &force,
-        )
-        .unwrap();
+        for (user, assistant) in &prefilled {
+            sink.insert_prefill_turn(user, assistant, tags.clone())
+                .unwrap();
+        }
+        sink.insert_prefill_turn(&decode_user, "", tags).unwrap();
     }
     sink
 }
@@ -175,11 +168,11 @@ fn one_unit_per_directory_holding_files() {
     );
 }
 
-/// One chain per folder: request → list → read → DECODE. It lists BEFORE it
-/// reads — a `file_read` naming `lib.rs` before anything revealed the file
-/// exists would teach the model to guess paths.
+/// One chain per folder, and it is ONE pair: request → `file_list` /
+/// listing → DECODED summary. A folder is described from names and paths alone,
+/// so nothing in the chain reads a file — the listing is the whole evidence.
 #[test]
-fn each_directory_lists_before_it_reads() {
+fn each_directory_lists_once_and_then_summarises() {
     let dir = small_workspace();
     let sink = record(dir.path());
     let src = sink
@@ -187,7 +180,7 @@ fn each_directory_lists_before_it_reads() {
         .iter()
         .filter(|(_, _, tags)| tags[1] == "demo/src/")
         .collect::<Vec<_>>();
-    assert_eq!(src.len(), 3, "request+list, listing+read, excerpt+summary");
+    assert_eq!(src.len(), 2, "request+list, then listing+summary");
 
     assert!(src[0]
         .0
@@ -196,12 +189,25 @@ fn each_directory_lists_before_it_reads() {
         "{\"name\": \"file_list\", \"arguments\": {\"repo\": \"demo\", \"path\": \"src\"}}"
     ));
     assert!(src[1].0.starts_with("<tool_response>{"), "the listing");
-    assert!(src[1].1.contains(
-        "{\"name\": \"file_read\", \"arguments\": {\"repo\": \"demo\", \"path\": \"src/lib.rs\", \
-         \"page\": 0}}"
-    ));
-    assert!(src[2].0.contains("```rust"), "the anchor excerpt");
-    assert!(src[2].1.is_empty(), "the folder summary is DECODED");
+    assert!(src[1].1.is_empty(), "the folder summary is DECODED");
+}
+
+/// No folder turn reads a file or carries file content. The read round-trip and
+/// its fenced excerpt were removed: a folder is summarised from its listing, and
+/// prefilling a `file_read` taught the model to read a file per folder.
+#[test]
+fn no_folder_turn_reads_a_file() {
+    let dir = small_workspace();
+    for (user, assistant, tags) in &record(dir.path()).turns {
+        assert!(
+            !assistant.contains("file_read"),
+            "{tags:?} prefilled a file_read: {assistant}",
+        );
+        assert!(
+            !user.contains("```"),
+            "{tags:?} carries a file excerpt: {user}",
+        );
+    }
 }
 
 /// The repository's root carries its manifest's hint, read from the commit.
@@ -247,26 +253,6 @@ fn the_workspace_root_lists_the_repositories() {
     );
 }
 
-/// `src/lib.rs` carries a `//!` block, so the anchor is placed at it — the
-/// excerpt then widens to that block's containing page, which for a file this
-/// small is the whole file.
-#[test]
-fn the_anchor_excerpt_is_the_module_docs_page() {
-    let dir = small_workspace();
-    let sink = record(dir.path());
-    let excerpt = sink
-        .turns
-        .iter()
-        .find(|(u, _, tags)| tags[1] == "demo/src/" && u.contains("```"))
-        .map(|(u, _, _)| u.clone())
-        .expect("the excerpt turn");
-    assert!(
-        excerpt.contains("src/lib.rs in demo (page 0 of 1, lines 1-3 of 3):"),
-        "{excerpt}"
-    );
-    assert!(excerpt.contains("//! The demo crate."));
-}
-
 /// The listing is produced by running the real `file_list` at the unit's
 /// commit, so it names the directory's own committed files — never what the
 /// folder holds uncommitted.
@@ -309,10 +295,10 @@ fn rendering_is_byte_identical_on_repeat() {
     assert_eq!(record(dir.path()).turns, record(dir.path()).turns);
 }
 
-/// A folder with no README / module root still gets a conversation — it just
-/// summarises from the listing alone.
+/// A folder with no README / module root gets exactly the same chain as one
+/// with — the listing is all any folder shows.
 #[test]
-fn a_directory_with_no_anchor_still_ingests() {
+fn a_directory_with_no_readme_ingests_the_same_way() {
     let dir = repository(&[("src/thing.rs", b"pub fn t() {}\n")]);
     let sink = record(dir.path());
     let src: Vec<_> = sink
@@ -355,22 +341,25 @@ fn a_folder_key_is_stable_when_an_unshown_file_changes() {
     assert_eq!(keys_of(dir.path()), before);
 }
 
+/// Rewriting `src/lib.rs`'s module doc does NOT re-ingest. The doc block used
+/// to be the folder's anchor excerpt and part of its key; the chain no longer
+/// shows it, so the sealed summary still answers the request this unit
+/// renders, and re-decoding would pay full cost for the same answer.
 #[test]
-fn a_folder_key_moves_when_the_anchor_changes() {
+fn a_folder_key_is_stable_when_the_former_anchor_text_changes() {
     let dir = small_workspace();
     let before = keys_of(dir.path());
-    // The module doc IS the summary's evidence — editing it must re-ingest.
     write(
         dir.path(),
         "src/lib.rs",
         b"//! The demo crate, rewritten.\n//! Now says goodbye.\npub fn hello() {}\n",
     );
-    commit(dir.path(), "anchor");
-    assert_eq!(moved(&before, &keys_of(dir.path())), ["demo/src/"]);
+    commit(dir.path(), "module doc");
+    assert_eq!(keys_of(dir.path()), before);
 }
 
 /// `file_list` is one level deep, so a folder's listing is only its own direct
-/// files — a file added under `src/` moves only `src/`'s key. Neither the
+/// entries — a file added under `src/` moves only `src/`'s key. Neither the
 /// repository's root nor the workspace root ever showed `src/`'s files, so
 /// they have nothing to re-ingest.
 #[test]
@@ -380,6 +369,95 @@ fn a_folder_key_moves_when_a_file_is_added() {
     write(dir.path(), "src/new_module.rs", b"pub fn n() {}\n");
     commit(dir.path(), "added");
     assert_eq!(moved(&before, &keys_of(dir.path())), ["demo/src/"]);
+}
+
+/// The module hint is spliced into the request the model reads, so it is part
+/// of what the turn shows and therefore part of the key. A `[workspace]` table
+/// replacing the root manifest's package changes the question — `(Cargo
+/// workspace root)` appears — without changing the listing, and the plan must
+/// not treat the summary that answered the older request as current.
+#[test]
+fn a_folder_key_moves_when_the_module_hint_changes() {
+    let dir = small_workspace();
+    let before = keys_of(dir.path());
+    write(
+        dir.path(),
+        "Cargo.toml",
+        b"[workspace]\nmembers = [\"a\", \"b\"]\n",
+    );
+    commit(dir.path(), "workspace");
+    assert_eq!(moved(&before, &keys_of(dir.path())), ["demo/"]);
+}
+
+/// **Branches sharing a lineage share their units.** A `topic` branch whose
+/// only change is a `Cargo.toml` version bump lists every folder the way
+/// `main` does and asks the same question of it — the hint is `(crate: demo)`
+/// either way — so each folder is ONE unit that both branches hold, and every
+/// file they share is one reading; only the manifest itself, whose bytes
+/// differ, is read twice. Keyed on the manifest's bytes the repository's root
+/// was two conversations saying the same thing, and that is what multiplied
+/// `candle/` across its branches.
+#[test]
+fn branches_that_share_a_lineage_share_their_units() {
+    let dir = small_workspace();
+    let repo = dir.path().join(REPO);
+    git(&repo, &["checkout", "-q", "-b", "topic"]);
+    write(
+        dir.path(),
+        "Cargo.toml",
+        b"[package]\nname = \"demo\"\nversion = \"0.2.0\"\n",
+    );
+    commit(dir.path(), "bump");
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let branches = RepoBranches::read(REPO, Repo::open(&repo).unwrap()).unwrap();
+    let (corpus, failed) = walk(
+        std::slice::from_ref(&branches),
+        &IngestScope::new("", None),
+        &mut TreeCache::default(),
+        &workspace_of(dir.path()).names(),
+        &[],
+    );
+    assert!(failed.is_empty());
+
+    let folders: Vec<(&str, Vec<&str>)> = corpus
+        .units
+        .iter()
+        .map(|u| {
+            (
+                u.unit.dir.as_str(),
+                u.branches.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        folders,
+        [
+            (".", vec![]),
+            ("demo/", vec!["main", "topic"]),
+            ("demo/src/", vec!["main", "topic"]),
+        ],
+        "one unit per folder, held by both branches",
+    );
+
+    let readings = |path: &str| -> Vec<Vec<&str>> {
+        corpus
+            .files
+            .iter()
+            .filter(|f| f.file.path == path)
+            .map(|f| f.branches.iter().map(String::as_str).collect())
+            .collect()
+    };
+    assert_eq!(
+        readings("demo/src/lib.rs"),
+        [vec!["main", "topic"]],
+        "an unchanged file is one reading on both branches"
+    );
+    assert_eq!(
+        readings("demo/Cargo.toml"),
+        [vec!["main"], vec!["topic"]],
+        "the manifest's bytes differ, so it is read once per version"
+    );
 }
 
 #[test]

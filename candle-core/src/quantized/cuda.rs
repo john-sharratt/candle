@@ -3030,6 +3030,7 @@ fn dense_qmatmul_float(
         },
         device: device.clone(),
         backing: out_backing,
+        anchor: None,
     };
     let mut out_shape = rhs_l.shape().dims().to_vec();
     out_shape.pop();

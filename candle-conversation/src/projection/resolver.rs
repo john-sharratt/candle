@@ -2387,7 +2387,13 @@ impl Conversation {
             // normalization lock and — on the seal scan only — observes into the
             // hit levels. The counts say whether a phase grew because the corpus
             // did.
-            tracing::debug!(
+            //
+            // `trace!`, because this is per group and there are ~17 of them per
+            // scan: it was 1,262 lines of a 4,315-line daemon log, and the
+            // `belief scan phase split` line above already carries the per-scan
+            // totals that answer "did a phase grow". Raise the target to trace
+            // when the question is which *group* grew.
+            tracing::trace!(
                 target: "candle_conversation::provenance",
                 layer = %layer.name,
                 group = group.id.raw(),
@@ -3637,6 +3643,21 @@ impl Conversation {
     /// RAM (at cold-land), leaving them cold-only. Returns the count flagged.
     pub fn mark_timeline_evict_when_cold(&self, timeline: TimelineId) -> usize {
         self.write().mark_timeline_evict_when_cold(timeline)
+    }
+
+    /// Rewrite every residence's gids through a KV compaction's map — the
+    /// substrate's half of the sweep. See
+    /// [`crate::substrate::Substrate::rewrite_for_compaction`].
+    ///
+    /// Holds the substrate write lock for the whole rewrite, which is what makes it
+    /// atomic with respect to a projection reading residences: a reader must see
+    /// either every old gid or every new one, never a mixture, because a mixture is
+    /// one turn's KV read through another turn's addresses.
+    pub fn rewrite_for_compaction(
+        &self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        self.write().rewrite_for_compaction(sweep)
     }
 
     /// Set the substrate-side resume key (`debug_id`) for `timeline`
