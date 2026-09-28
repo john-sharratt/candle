@@ -44,6 +44,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use candle::wave_provenance::WaveTicket;
+#[cfg(feature = "cuda")]
+use candle::LeaseAnchor;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
 
 use super::types::{DeltaNetDims, ZGate};
@@ -132,32 +134,40 @@ impl DeltaNetState {
     /// and which WDDM demotes to host RAM rather than refusing. On a hybrid
     /// stack that is three quarters of the model's per-sequence memory.
     ///
-    /// [`LeaseOrigin::Foreign`] because the owner is not an allocator to carve
-    /// from: an op reading this state takes its output from the wave arena, not
-    /// from the sequence's state block, and `Foreign` is what says so.
+    /// **Anchored to its owner.** Both buffers hold `anchor`, and so does every
+    /// clone, view and re-lease of them, so the memory's owner cannot hand it to
+    /// another sequence while anything still reads this state through a handle it
+    /// took along the way — a `write_half`, a captured view, a re-lease. The worst a
+    /// forgotten handle can then cost is ground not yet reclaimed, never a read of
+    /// someone else's state.
     ///
     /// # Safety
     ///
-    /// Both pointers must name at least [`Self::byte_sizes`] bytes of live,
-    /// correctly aligned memory that outlives this state and every view of it,
-    /// and that nothing else writes through another alias.
+    /// Both pointers must name at least [`Self::byte_sizes`] bytes of correctly
+    /// aligned memory that stays live while `anchor` is held, and that nothing
+    /// else writes through another alias.
     #[cfg(feature = "cuda")]
-    pub unsafe fn at(dims: &DeltaNetDims, dev: &Device, s_ptr: u64, conv_ptr: u64) -> Result<Self> {
-        use candle::cuda_backend::wave_provenance::LeaseOrigin;
+    pub unsafe fn at(
+        dims: &DeltaNetDims,
+        dev: &Device,
+        s_ptr: u64,
+        conv_ptr: u64,
+        anchor: LeaseAnchor,
+    ) -> Result<Self> {
         Ok(Self {
-            s: Tensor::from_leased_cuda_ptr(
+            s: Tensor::from_anchored_cuda_ptr(
                 s_ptr,
                 DType::F32,
                 (dims.n_v_heads, dims.head_dim, dims.head_dim),
                 dev,
-                LeaseOrigin::Foreign,
+                anchor.clone(),
             )?,
-            conv_tail: Tensor::from_leased_cuda_ptr(
+            conv_tail: Tensor::from_anchored_cuda_ptr(
                 conv_ptr,
                 DType::F32,
                 (dims.conv_dim(), dims.conv_kernel - 1),
                 dev,
-                LeaseOrigin::Foreign,
+                anchor,
             )?,
         })
     }
@@ -992,8 +1002,9 @@ impl SpanOperands {
     /// Inside the reservation it is visible to the partition instead of
     /// competing with it: the region claim is counted, and a claim that runs
     /// short asks the weight side to concede layers rather than failing the
-    /// device. Same tier, same lifetime class, and the same allocator as the
-    /// recurrent state it exists to rewind.
+    /// device. Same tier and the same lifetime class as the recurrent state it
+    /// exists to rewind, carved by a region bump rather than from a state arena
+    /// because its rows are sized by the verify cap, not by the model's geometry.
     ///
     /// `pub(crate)` rather than `pub`: it takes the region allocator, which is
     /// this crate's own partition machinery and not something an external caller
@@ -1129,8 +1140,9 @@ pub fn seq_spans(seqs: &[usize], q_lens: &[usize]) -> Result<Vec<SeqSpan>> {
 /// upload before the layer sweep ([`super::cuda::build_wave_table`]) — never
 /// per layer, where the upload's stream sync would serialise the launch
 /// pipeline — and each layer receives its slice. State pointers are stable
-/// across the forward because a sequence's state buffers are allocated once
-/// and keep their identity (the store's standing rule).
+/// within the forward — the store holds the buffers and their anchors keep the
+/// slots held — but not across one: `commit_wave` exchanges each layer's halves
+/// after the sweep, so a table is never kept past the forward that built it.
 /// `'w` because a slice of [`super::cuda::DeltaNetWaveTable`] borrows it, and
 /// that table lives on the forward-phase span — so this must not outlive the
 /// generation whose reset reclaims it. A per-layer table built standalone is

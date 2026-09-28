@@ -201,9 +201,11 @@ pub fn f32_ptr(t: &LiveTensor<'_>, what: &str) -> Result<u64> {
 /// thing this exists to avoid: a host→device copy syncs the stream, and 24 of
 /// them per token would serialise the launch pipeline.
 ///
-/// Pointers stay valid for the whole forward because a sequence's state
-/// buffers are allocated once and mutated in place — the store's standing
-/// rule, which `begin_wave`/`rollback_wave` also rely on.
+/// **Valid for this forward only, and rebuilt every forward.** A layer's two
+/// halves exchange roles at `commit_wave`, which runs after the sweep, so a table
+/// kept into the next forward would read the advanced half as the entering one.
+/// The buffers themselves do not move during a forward: the store holds them, and
+/// each tensor's anchor keeps its state-arena slot held while anything can read it.
 /// Built once per forward and read by **every** layer, which is what
 /// [`LayerPhase::Forward`] exists for: a buffer carved from the attention span
 /// is reclaimed when layer 0's guard drops, and layer 1 would overwrite the

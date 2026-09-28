@@ -1,6 +1,8 @@
 //! Tensors are N-dimensional matrixes of elements using a single data type.
 #![allow(clippy::redundant_closure_call)]
 use crate::backend::{BackendDevice, BackendStorage};
+#[cfg(feature = "cuda")]
+use crate::cuda_backend::{CudaStorage, LeaseAnchor};
 use crate::op::{BackpropOp, BinaryOp, CmpOp, Op, ReduceOp, UnaryOp};
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims, ShapeWithOneHole};
@@ -307,13 +309,56 @@ impl<'w> LiveTensor<'w> {
         let dtype = self.dtype();
         let base = cuda.slice.device_ptr(&cuda.device().cuda_stream());
         let ptr = base + (layout.start_offset() * dtype.size_in_bytes()) as u64;
-        Tensor::from_leased_cuda_ptr(
-            ptr,
-            dtype,
-            self.shape().clone(),
-            self.device(),
-            crate::cuda_backend::wave_provenance::LeaseOrigin::Foreign,
-        )
+        // An anchored lease stays anchored: the re-lease is one more view of the
+        // same memory, and dropping the anchor here would let its owner hand the
+        // memory on while this view still reads it.
+        match &cuda.anchor {
+            Some(anchor) => Tensor::from_anchored_cuda_ptr(
+                ptr,
+                dtype,
+                self.shape().clone(),
+                self.device(),
+                anchor.clone(),
+            ),
+            None => Tensor::from_leased_cuda_ptr(
+                ptr,
+                dtype,
+                self.shape().clone(),
+                self.device(),
+                crate::cuda_backend::wave_provenance::LeaseOrigin::Foreign,
+            ),
+        }
+    }
+
+    /// [`Self::from_leased_cuda_ptr`] for memory whose owner can let it go: the
+    /// tensor's storage holds `anchor`, and every view, clone and re-lease of it
+    /// shares that storage — so the owner cannot hand the memory to anyone else while
+    /// any of them exists. See [`LeaseAnchor`].
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `shape.elem_count()` elements of `dtype`, be
+    /// correctly aligned, and stay live while `anchor` is held; nothing may write it
+    /// through another alias for as long as this tensor or any view of it exists.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn from_anchored_cuda_ptr<S: Into<Shape>>(
+        ptr: u64,
+        dtype: DType,
+        shape: S,
+        device: &Device,
+        anchor: LeaseAnchor,
+    ) -> Result<Self> {
+        let Device::Cuda(cuda) = device else {
+            bail!("from_anchored_cuda_ptr: expected a CUDA device, got {device:?}");
+        };
+        let shape = shape.into();
+        let storage =
+            CudaStorage::from_anchored_device_ptr(ptr, shape.elem_count(), dtype, cuda, anchor)?;
+        Ok(from_storage(
+            Storage::Cuda(storage),
+            shape,
+            BackpropOp::none(),
+            false,
+        ))
     }
 
     /// The wave generation this tensor's storage was carved from, if any — what

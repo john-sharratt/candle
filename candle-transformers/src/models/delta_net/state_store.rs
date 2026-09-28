@@ -64,10 +64,19 @@
 #[cfg(feature = "cuda")]
 use candle::DType;
 #[cfg(feature = "cuda")]
-use candle::{cuda_backend::cudarc::driver::result::memcpy_dtod_sync, CudaDevice, Error, Storage};
+use std::sync::Arc;
+
+#[cfg(feature = "cuda")]
+use candle::{
+    cuda_backend::cudarc::driver::result::{memcpy_dtod_sync, memset_d8_async},
+    CudaDevice, Error, LeaseAnchor, Storage,
+};
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::{span_region_refusal, SpanClaims, SpanRegion};
+use candle_nn::kv_cache::{
+    claim_state_slots, span_region_refusal, state_arena_regions, state_stride, SpanClaims,
+    SpanRegion, StateSlot, STATE_ALIGN,
+};
 
 use super::mix::{DeltaNetOut, DeltaNetState};
 use super::types::{DeltaNetDims, LayerKind};
@@ -151,25 +160,124 @@ pub struct RecurrentStateStore {
     /// the whole state came from rather than of which layers a sweep reached.
     seeded: bool,
     device: Device,
-    /// The reservation regions every buffer above is a view into.
+    /// The state-arena slots every buffer above is a view into — one per layer
+    /// state, the live and the write half of each layer alike.
     ///
-    /// **This is the store's lifetime, and its cleanup.** Held for as long as
-    /// the sequence has recurrent memory; dropping the store returns them to
-    /// the region free list, exactly as a KV arena's handles do. There is no
-    /// eviction path and nothing to remember to call — the state is reclaimed
-    /// by the store ceasing to exist, which is the only moment at which it is
-    /// certainly dead.
+    /// **Not the only holder, by design.** Every tensor built on a slot holds a
+    /// share of it too (`DeltaNetState::at` anchors the lease), as does every clone,
+    /// view and re-lease of those tensors. A slot therefore goes back to its arena
+    /// only when the last thing that could read it has gone — dropping the store is
+    /// what normally ends that, but a handle taken along the way cannot end up
+    /// reading a slot another sequence now holds. An arena whose last slot goes
+    /// returns its region to the span, exactly as a KV arena does.
     ///
-    /// Empty on a CPU device, where the buffers are ordinary allocations.
+    /// Held here as well so the store can say what it costs without walking its
+    /// tensors. Empty on a CPU device, where the buffers are ordinary allocations.
     #[cfg(feature = "cuda")]
-    regions: Vec<SpanRegion>,
+    state_slots: Vec<Arc<StateSlot>>,
+}
+
+/// Where one layer state sits in its arena slot: `s` at the start, the conv tail
+/// after it on the next [`STATE_ALIGN`] boundary. Answers `(conv tail offset, slot
+/// bytes)` — the second is what a state-arena slot for this geometry must hold.
+#[cfg(feature = "cuda")]
+fn state_block(dims: &DeltaNetDims) -> (usize, usize) {
+    let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(dims);
+    let conv_off = s_bytes.next_multiple_of(STATE_ALIGN);
+    (conv_off, conv_off + conv_bytes)
+}
+
+/// Two state-arena slots per recurrent layer — the live state and the half a wave
+/// writes — or `None` on a device with no reservation to carve from (a CPU device in
+/// a CUDA build, which is every unit test here).
+#[cfg(feature = "cuda")]
+fn claim_layer_states(
+    dims: &DeltaNetDims,
+    device: &Device,
+    layers: usize,
+) -> Result<Option<Vec<Arc<StateSlot>>>> {
+    if !matches!(device, Device::Cuda(_)) {
+        return Ok(None);
+    }
+    // No recurrent layer, no state, and no stride to key an arena by.
+    if layers == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    // **The store is the authority that refuses a geometry with an empty half.** A
+    // buffer of no bytes has no address that is not some other buffer's: an empty
+    // conv tail (`conv_kernel == 1`) would be leased at the end of `s`, which is the
+    // next slot's base, and the kernels would be handed that as a tail pointer.
+    let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(dims);
+    if s_bytes == 0 || conv_bytes == 0 {
+        candle::bail!(
+            "recurrent state: the geometry asks for a state with an empty half \
+             ({s_bytes} B `s`, {conv_bytes} B conv tail — conv_kernel = 1?), which has \
+             no address of its own"
+        );
+    }
+    match device {
+        Device::Cuda(_) => Ok(Some(
+            claim_state_slots(
+                device,
+                state_block(dims).1,
+                2 * layers,
+                "a sequence's recurrent store",
+            )?
+            .into_iter()
+            .map(Arc::new)
+            .collect(),
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// The layer state living in `slot`, its tensors anchored to the slot so no view of
+/// them can outlive it.
+#[cfg(feature = "cuda")]
+fn state_in(dims: &DeltaNetDims, device: &Device, slot: &Arc<StateSlot>) -> Result<DeltaNetState> {
+    let (conv_off, bytes) = state_block(dims);
+    debug_assert!(slot.stride() >= bytes, "a slot narrower than its state");
+    // SAFETY: the slot spans at least `bytes` from its 256-aligned base — `s` at the
+    // start, the tail at `conv_off` — and the anchor keeps it held for as long as any
+    // view of these tensors exists.
+    unsafe {
+        DeltaNetState::at(
+            dims,
+            device,
+            slot.ptr(),
+            slot.ptr() + conv_off as u64,
+            LeaseAnchor::new(Arc::clone(slot)),
+        )
+    }
+}
+
+/// Zero one layer state's slot — for a `live` half, which is genuinely READ at zero,
+/// being the sequence-start state (hot-path invariant 6's read-before-write case).
+///
+/// Needed because a slot is recycled: it last held some other sequence's state.
+#[cfg(feature = "cuda")]
+fn zero_state(dims: &DeltaNetDims, device: &Device, slot: &StateSlot) -> Result<()> {
+    let Device::Cuda(cuda) = device else {
+        candle::bail!("recurrent state: a state-arena slot needs a CUDA device");
+    };
+    // SAFETY: the range is the slot this store holds, and the stream orders the fill
+    // ahead of every reader.
+    unsafe {
+        memset_d8_async(
+            slot.ptr(),
+            0,
+            state_block(dims).1,
+            cuda.cuda_stream().cu_stream(),
+        )
+    }
+    .map_err(|e| Error::Msg(format!("zeroing a recurrent state slot: {e}")))
 }
 
 /// Copy one state's two buffers into another's, device to device.
 ///
 /// The fork path's replacement for `DeltaNetState::snapshot`, which allocates.
 /// Here the destination already exists — it is a view into the child's own
-/// regions — so the copy writes into it rather than producing a new buffer
+/// state-arena slot — so the copy writes into it rather than producing a new buffer
 /// somewhere the reservation does not cover.
 #[cfg(feature = "cuda")]
 fn copy_state_into(device: &Device, src: &DeltaNetState, dst: &DeltaNetState) -> Result<()> {
@@ -206,22 +314,24 @@ fn tensor_device_ptr(cuda: &CudaDevice, t: &Tensor) -> Result<u64> {
     Ok(base + (layout.start_offset() * t.dtype().size_in_bytes()) as u64)
 }
 
-/// A bump allocator over freshly claimed reservation regions.
+/// A bump allocator over freshly claimed reservation regions, for a buffer that
+/// outlives the wave but has no arena of its own — the speculative rewind stash
+/// (`qwen35::spec::VerifyStash`).
 ///
-/// One store's buffers are laid down left to right; a buffer that would cross a
-/// region boundary starts the next region instead. The waste that costs is
-/// bounded by one buffer per region and is the price of every buffer being a
-/// single contiguous range — which the kernels require, since they take a base
-/// pointer and a stride, not a scatter list.
+/// Buffers are laid down left to right; a buffer that would cross a region boundary
+/// starts the next region instead. The waste that costs is bounded by one buffer per
+/// region and is the price of every buffer being a single contiguous range — which
+/// the kernels require, since they take a base pointer and a stride, not a scatter
+/// list.
 #[cfg(feature = "cuda")]
 pub(crate) struct RegionBump {
     pub(crate) device: Device,
-    /// The arena window, open for the whole store.
+    /// The arena window, open for as long as the bump is.
     ///
     /// One window rather than one per region: entering it hands back a standing
     /// tier, so claiming a region at a time would release and re-place the tier
-    /// once per region, each carrying a device-wide quiesce. A store takes eight
-    /// or so, and that much churn reaches the WDDM watchdog.
+    /// once per region, each carrying a device-wide quiesce — churn that, over a
+    /// stash of several regions, reaches the WDDM watchdog.
     claims: SpanClaims,
     pub(crate) regions: Vec<SpanRegion>,
     /// Bytes used in the last region.
@@ -239,9 +349,7 @@ impl RegionBump {
     /// 58-minute hang with the process alive and no output.
     ///
     /// So a caller that needs the regions to outlive the allocation takes them
-    /// this way rather than storing the bump. `RecurrentStateStore` has always
-    /// done exactly this (`regions: bump.map_or_else(Vec::new, |b| b.regions)`);
-    /// this names the operation so the next caller does not have to notice.
+    /// this way rather than storing the bump.
     pub(crate) fn into_regions(self) -> Vec<SpanRegion> {
         self.regions
     }
@@ -252,7 +360,7 @@ impl RegionBump {
     fn new(device: &Device) -> Result<Self> {
         Ok(Self {
             device: device.clone(),
-            claims: SpanClaims::open(device, "a sequence's recurrent store")?,
+            claims: SpanClaims::open(device, "a speculative rewind stash")?,
             regions: Vec::new(),
             // Forces the first `take` to claim, so there is no empty-vec case.
             cursor: SpanRegion::bytes(),
@@ -268,35 +376,9 @@ impl RegionBump {
         }
     }
 
-    /// One layer's `(live, backup)` pair, laid down in one fixed order so the
-    /// layout is identical for every layer and every sequence.
-    fn take_state_pair(
-        &mut self,
-        dims: &DeltaNetDims,
-        device: &Device,
-    ) -> Result<(DeltaNetState, DeltaNetState)> {
-        let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(dims);
-        let live_s = self.take(s_bytes)?;
-        let live_conv = self.take(conv_bytes)?;
-        let backup_s = self.take(s_bytes)?;
-        let backup_conv = self.take(conv_bytes)?;
-        // SAFETY: every address names a distinct, non-overlapping range of a
-        // region this store holds for its whole life, sized by `byte_sizes` for
-        // exactly this state.
-        unsafe {
-            Ok((
-                DeltaNetState::at(dims, device, live_s, live_conv)?,
-                DeltaNetState::at(dims, device, backup_s, backup_conv)?,
-            ))
-        }
-    }
-
-    /// A **zeroed** tensor of `shape` on region memory.
-    ///
-    /// The general-purpose form of [`Self::take_state_pair`], for a buffer that
-    /// outlives the wave and so cannot come from the wave arena, but must still
-    /// be inside the reservation so the partition can see it. The rewind stash
-    /// is the other user (`qwen35::spec::VerifyStash`).
+    /// A **zeroed** tensor of `shape` on region memory, for a buffer that outlives
+    /// the wave and so cannot come from the wave arena, but must still be inside the
+    /// reservation so the partition can see it.
     ///
     /// **Zeroed, unlike a wave buffer.** Its consumers read rows they did not
     /// write — the replay hands the mixer the whole `cap`-row buffer while only
@@ -342,21 +424,18 @@ impl RegionBump {
         let cap = SpanRegion::bytes();
         if bytes > cap {
             candle::bail!(
-                "recurrent state: a {bytes} B buffer exceeds the {cap} B region size — \
-                 the state no longer fits the allocator's unit"
+                "region bump: a {bytes} B buffer exceeds the {cap} B region size — \
+                 it no longer fits the allocator's unit"
             );
         }
         // A zero-byte request would take the `else` branch on the very first
         // call — the cursor starts AT `cap` precisely so the first `take`
-        // claims — and then read `regions.last()` of an empty vec. Reachable
-        // from `byte_sizes` with `conv_kernel == 1`, where the conv tail has no
-        // history to keep. There is no address to hand back for no bytes, and
-        // inventing one inside a region nobody claimed is worse than saying so.
+        // claims — and then read `regions.last()` of an empty vec. There is no
+        // address to hand back for no bytes, and inventing one inside a region
+        // nobody claimed is worse than saying so; `take_zeroed` answers the empty
+        // case before it gets here.
         if bytes == 0 {
-            candle::bail!(
-                "recurrent state: a zero-byte buffer has no address — the geometry \
-                 asks for a state with an empty half (conv_kernel = 1?)"
-            );
+            candle::bail!("region bump: a zero-byte buffer has no address");
         }
         // 256-byte aligned: what the CUDA driver guarantees a fresh allocation
         // and what the kernels' vectorised loads assume of a base pointer.
@@ -364,7 +443,7 @@ impl RegionBump {
         if aligned + bytes > cap {
             let Some(region) = self.claims.claim()? else {
                 candle::bail!(
-                    "recurrent state: no region for this sequence after {} claimed — {}",
+                    "region bump: no region after {} claimed — {}",
                     self.regions.len(),
                     span_region_refusal(&self.device),
                 );
@@ -389,21 +468,37 @@ impl RecurrentStateStore {
     /// Fresh zeros for every recurrent layer in `layer_kinds`.
     pub fn new(layer_kinds: &[LayerKind], dims: &DeltaNetDims, device: &Device) -> Result<Self> {
         let mut slots = Vec::new();
-        // On CUDA the whole store is carved from the device reservation. A
-        // region arrives zeroed, which is what `live` needs — it is genuinely
-        // READ at zero, being the sequence-start state — so no fill is issued
-        // for it and `backup` needs none either, being fully stamped by the
-        // first wave before anything reads it (invariant 6).
+        // On CUDA every layer state is a state-arena slot inside the device
+        // reservation. `live` is zeroed — it is genuinely READ at zero, being the
+        // sequence-start state, and a slot is recycled from whatever sequence held
+        // it last — while `backup` is not, being fully stamped by the first wave
+        // before anything reads it (invariant 6).
         // The cfg gates COMPILATION; the device gates behaviour. A CUDA build
         // still runs on a CPU device — every unit test here does — and there is
         // no reservation there to carve from.
         #[cfg(feature = "cuda")]
-        let mut bump = RegionBump::for_device(device)?;
+        let state_slots = claim_layer_states(
+            dims,
+            device,
+            layer_kinds
+                .iter()
+                .filter(|k| **k == LayerKind::DeltaNet)
+                .count(),
+        )?;
+        #[cfg(feature = "cuda")]
+        let mut pairs = state_slots.as_deref().map(|s| s.chunks_exact(2));
         for (i, k) in layer_kinds.iter().enumerate() {
             if *k == LayerKind::DeltaNet {
                 #[cfg(feature = "cuda")]
-                let (live, backup) = match bump.as_mut() {
-                    Some(bump) => bump.take_state_pair(dims, device)?,
+                let (live, backup) = match pairs.as_mut().and_then(Iterator::next) {
+                    Some([live, backup]) => {
+                        zero_state(dims, device, live)?;
+                        (
+                            state_in(dims, device, live)?,
+                            state_in(dims, device, backup)?,
+                        )
+                    }
+                    Some(_) => unreachable!("`chunks_exact(2)` yields pairs"),
                     None => (
                         DeltaNetState::zeros(dims, device)?,
                         DeltaNetState::uninit(dims, device)?,
@@ -432,7 +527,7 @@ impl RecurrentStateStore {
             seeded: false,
             device: device.clone(),
             #[cfg(feature = "cuda")]
-            regions: bump.map_or_else(Vec::new, |b| b.regions),
+            state_slots: state_slots.unwrap_or_default(),
         })
     }
 
@@ -701,28 +796,34 @@ impl RecurrentStateStore {
             );
         }
         let mut slots = Vec::with_capacity(self.slots.len());
-        // The child's memory comes from the reservation for the same reason the
+        // The child's memory comes from the state arenas for the same reason the
         // parent's does — a fork is another sequence, and at ~3 forks per turn
         // this was ~126 MiB of pool traffic each.
         #[cfg(feature = "cuda")]
-        let mut bump = RegionBump::for_device(&self.device)?;
+        let state_slots = claim_layer_states(&self.dims, &self.device, self.slots.len())?;
+        #[cfg(feature = "cuda")]
+        let mut pairs = state_slots.as_deref().map(|s| s.chunks_exact(2));
         for slot in &self.slots {
             // Scratch, not state, in either arm: the kernels fully overwrite
             // the write buffer before anything reads it, so copying it would be
             // ~2 MB per layer of device traffic for bytes nobody reads — and
             // for the same reason it is left UNINITIALISED (invariant 6).
             #[cfg(feature = "cuda")]
-            let (live, backup) = match bump.as_mut() {
-                Some(bump) => {
-                    let (live, backup) = bump.take_state_pair(&self.dims, &self.device)?;
+            let (live, backup) = match pairs.as_mut().and_then(Iterator::next) {
+                Some([live_slot, backup_slot]) => {
+                    let (live, backup) = (
+                        state_in(&self.dims, &self.device, live_slot)?,
+                        state_in(&self.dims, &self.device, backup_slot)?,
+                    );
                     // The fork's whole point: the child starts from the
                     // parent's state. A device-to-device copy into the child's
-                    // own range, rather than `snapshot()`, which would allocate
+                    // own slot, rather than `snapshot()`, which would allocate
                     // a fresh pool buffer and hand back a tensor pointing
                     // outside the span.
                     copy_state_into(&self.device, &slot.live, &live)?;
                     (live, backup)
                 }
+                Some(_) => unreachable!("`chunks_exact(2)` yields pairs"),
                 None => (
                     slot.live.snapshot()?,
                     DeltaNetState::uninit(&self.dims, &self.device)?,
@@ -748,23 +849,45 @@ impl RecurrentStateStore {
             seeded: true,
             device: self.device.clone(),
             #[cfg(feature = "cuda")]
-            regions: bump.map_or_else(Vec::new, |b| b.regions),
+            state_slots: state_slots.unwrap_or_default(),
         })
     }
 
-    /// Reservation bytes this sequence's recurrent memory holds.
+    /// Reservation bytes this sequence's recurrent memory holds — its state-arena
+    /// slots, at their stride. Zero off CUDA, where the buffers are ordinary
+    /// allocations.
     ///
-    /// Zero off CUDA, where the buffers are ordinary allocations. Reported
-    /// rather than merely held so a whole-card accounting can name it: this is
-    /// several GiB across a wide wave, and memory nothing can total is memory
-    /// that goes missing (`AccountingSection`).
+    /// A per-sequence figure, so it leaves out what no one sequence holds: an arena's
+    /// free slots and unused tail, and slots kept by a handle that outlived its
+    /// store. [`Self::arena_reserved_bytes`] is the whole-card figure that includes
+    /// them.
     pub fn reserved_bytes(&self) -> usize {
         #[cfg(feature = "cuda")]
         {
-            self.regions.len() * SpanRegion::bytes()
+            self.state_slots.iter().map(|s| s.stride()).sum()
         }
         #[cfg(not(feature = "cuda"))]
         {
+            0
+        }
+    }
+
+    /// Reservation bytes every state arena on `device` holds — whole regions,
+    /// whatever is in them.
+    ///
+    /// **The accounting figure.** It is what recurrent state denies the rest of the
+    /// span: the slots every store holds, the free slots and unused tails of their
+    /// arenas, and any slot a handle kept after its store went. Memory nothing can
+    /// total is memory that goes missing (`AccountingSection`), and summing stores
+    /// would miss all but the first. Zero off CUDA.
+    pub fn arena_reserved_bytes(device: &Device) -> usize {
+        #[cfg(feature = "cuda")]
+        {
+            state_arena_regions(device) * SpanRegion::bytes()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device;
             0
         }
     }
@@ -789,46 +912,21 @@ impl RecurrentStateStore {
     /// throughput-worse on fifteen consecutive passes, seven turns queued
     /// behind it and 20 GiB standing free above the floor.
     ///
-    /// The packing is [`RegionBump::take`]'s, restated as arithmetic: each
-    /// DeltaNet layer lays `s` then its conv tail for the live state and again
-    /// for the backup, each 256-aligned, and a buffer that would cross the
-    /// region's end starts a fresh region rather than splitting across two.
-    /// Nothing here reads the device, so it answers on any backend and at any
-    /// moment.
-    ///
-    /// A zero-length half costs no reservation here, where [`RegionBump::take`]
-    /// refuses it outright: `take` has no address to hand back for no bytes and
-    /// must say so, but a buffer of no bytes genuinely occupies nothing. Store
-    /// construction stays the authority that rejects such a geometry — this
-    /// only declines to invent a price for it.
+    /// The price is the store's slots at their stride: two per DeltaNet layer,
+    /// each [`state_stride`] of the layer's block (`s`, then its conv tail on the
+    /// next 256-byte boundary) — exactly what [`Self::reserved_bytes`] reports once
+    /// the store stands. The arenas those slots live in are shared by every
+    /// sequence of the geometry, so a region's unused tail is not charged to any one
+    /// of them. Nothing here reads the device, so it answers on any backend and at
+    /// any moment.
     pub fn reserved_bytes_for(layer_kinds: &[LayerKind], dims: &DeltaNetDims) -> usize {
         #[cfg(feature = "cuda")]
         {
-            let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(dims);
-            let cap = SpanRegion::bytes();
-            let mut regions = 0usize;
-            // The bump starts its cursor at `cap` so that the first take claims
-            // rather than reading the base of a region nobody holds.
-            let mut cursor = cap;
             let layers = layer_kinds
                 .iter()
                 .filter(|k| **k == LayerKind::DeltaNet)
                 .count();
-            for _ in 0..layers {
-                for bytes in [s_bytes, conv_bytes, s_bytes, conv_bytes] {
-                    if bytes == 0 {
-                        continue;
-                    }
-                    let aligned = cursor.next_multiple_of(256);
-                    if aligned + bytes > cap {
-                        regions += 1;
-                        cursor = bytes;
-                    } else {
-                        cursor = aligned + bytes;
-                    }
-                }
-            }
-            regions * cap
+            2 * layers * state_stride(state_block(dims).1)
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -1496,16 +1594,17 @@ mod tests {
 
     /// The whole point of the geometry price: it answers the same for a process
     /// holding no stores as for one holding a hundred, because it never looks at
-    /// them. Three DeltaNet layers of 256 B halves is 3,072 B of takes, which is
-    /// one 16 MiB region.
+    /// them. Three DeltaNet layers, two 512 B slots each (a 256 B `s` and a 256 B
+    /// conv tail), is 3,072 B.
     #[cfg(feature = "cuda")]
     #[test]
     fn a_store_is_priced_from_geometry_not_from_what_is_resident() {
         let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(&dims());
         assert_eq!((s_bytes, conv_bytes), (256, 256), "the fixture's halves");
+        assert_eq!(state_block(&dims()), (256, 512), "one slot per layer state");
 
         let priced = RecurrentStateStore::reserved_bytes_for(&kinds(), &dims());
-        assert_eq!(priced, 16 * 1024 * 1024, "one region");
+        assert_eq!(priced, 3 * 2 * 512, "six slots");
 
         // Nothing in the call depends on a store existing, so building some
         // cannot move it. This is the property the scheduler relies on.
@@ -1519,13 +1618,12 @@ mod tests {
         );
     }
 
-    /// A half that would cross the region end starts a fresh region rather than
-    /// splitting, and a zero-length half costs nothing. With `conv_kernel = 1`
-    /// the conv tail is empty, so each layer is two 6 MiB takes: two fit in a
-    /// 16 MiB region, the third starts the second region.
+    /// An empty conv tail costs nothing beyond its `s`, and the price is slots, not
+    /// regions. With `conv_kernel = 1` each layer state is a bare 6 MiB `s`, so a
+    /// layer is two 6 MiB slots however the arenas they land in are shared.
     #[cfg(feature = "cuda")]
     #[test]
-    fn an_oversized_half_starts_a_region_and_an_empty_half_costs_nothing() {
+    fn an_empty_conv_tail_costs_nothing_and_the_price_is_slots() {
         let d = DeltaNetDims {
             head_dim: 64,
             n_k_heads: 1,
@@ -1534,19 +1632,20 @@ mod tests {
         };
         let (s_bytes, conv_bytes) = DeltaNetState::byte_sizes(&d);
         assert_eq!((s_bytes, conv_bytes), (6 * 1024 * 1024, 0), "6 MiB, empty");
+        assert_eq!(state_block(&d), (6 * 1024 * 1024, 6 * 1024 * 1024));
 
         let one = vec![LayerKind::DeltaNet];
         assert_eq!(
             RecurrentStateStore::reserved_bytes_for(&one, &d),
-            16 * 1024 * 1024,
-            "two 6 MiB takes share one region"
+            12 * 1024 * 1024,
+            "two 6 MiB slots"
         );
 
         let two = vec![LayerKind::DeltaNet, LayerKind::DeltaNet];
         assert_eq!(
             RecurrentStateStore::reserved_bytes_for(&two, &d),
-            32 * 1024 * 1024,
-            "the third take crosses the end and claims"
+            24 * 1024 * 1024,
+            "four 6 MiB slots"
         );
 
         // An attention-only stack carries no recurrent state and costs nothing.

@@ -651,3 +651,44 @@ What differs is how a holder follows the move, and it is the minting argument ag
   address, and would put fresh mints in the very arena the pass is draining. It never
   takes one of the pass's planned record sources, whose record may have died after the
   census: that slot is ground the pass has declared it is reading.
+
+## 9. Recurrent state: the third arena kind
+
+A DeltaNet layer's state — the `s` accumulator plus its conv tail — is a fixed-size
+block of model geometry (3.12 MiB on Flash-Next, 2.09 MiB on Qwen3.5), and a sequence
+holds two per recurrent layer: the live state and the half a wave writes. They are
+**state arenas** (`chunked::state_arena`): one 16 MiB region cut into slots of one
+stride, the block rounded up to 256 B, shared by every sequence of that geometry. A
+sequence holds slots, not regions. Five fit a region on Flash-Next (2.6 % unused),
+seven on Qwen3.5 (8.4 %).
+
+- **Device-global, not the KV backing's.** A model's recurrent stores outlive every
+  session, while a KV backing and its arena storage belong to one; so the arenas are
+  keyed by `(device, stride)` and each holds its region as a `SpanRegion`, claimed
+  through `SpanClaims` between forwards like every other tenant of the span. The
+  window is opened only when a new arena is needed.
+- **One slot per layer state.** The live and write halves need not be adjacent — the
+  kernels take a pointer per buffer — so each is its own slot, which is what lets a
+  slot be a fifth of a region instead of two-fifths.
+- **RAII.** A `StateSlot` returns itself on drop, and the drop that empties an arena
+  releases its region. A recycled slot holds its last tenant's state, so a store zeroes
+  its `live` slots (read at zero, invariant 6's exemption) and leaves the write halves
+  alone.
+- **Priced as slots, accounted as regions.** Admission prices a store at two slots per
+  recurrent layer at the stride — an arena's unused tail is shared and charged to no
+  one sequence. The whole-card report counts every state arena's regions instead
+  (`RecurrentStateStore::arena_reserved_bytes`), because that is what recurrent state
+  denies the rest of the span: a sum over stores would leave out every free slot and
+  unused tail, and any slot a handle kept past its store.
+- **An empty half is refused.** A geometry whose `s` or conv tail is zero bytes
+  (`conv_kernel = 1`) has no address to give that buffer that is not the next slot's,
+  so the store refuses to build rather than hand the kernels an aliasing pointer.
+- **The tensors own their slots.** Each state tensor's storage holds an `Arc` of its
+  slot (`LeaseAnchor`), and every clone, view and re-lease shares it, so a slot returns
+  to its arena only when nothing can read it any more. A slot is returned on the host
+  while kernels may still be in flight: its next tenant in the arena works on the same
+  primary stream, and a region released by an emptied arena is stamped dirty, so its
+  next claim synchronises before zeroing it — the same fence every arena relies on.
+- **Not compacted yet.** The arenas are enumerable, every slot has an address and every
+  arena a position — the census a compaction plans from — but no pass moves them, so
+  their regions still count as span tenants in the efficiency report.

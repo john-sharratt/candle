@@ -2588,6 +2588,11 @@ impl SpanRegion {
         self.inner.base()
     }
 
+    /// The region's position in the span, ascending with address.
+    pub fn index(&self) -> usize {
+        self.inner.index()
+    }
+
     /// Bytes in a region — the unit this allocator deals in.
     pub const fn bytes() -> usize {
         REGION_BYTES

@@ -1065,11 +1065,9 @@ impl Qwen4ExpBatched {
     /// tenant, and a total that omits it makes the partition look emptier than
     /// it is — the same blindness that let the dense weights hide.
     pub fn recurrent_reserved_bytes(&self) -> usize {
-        let gdn: usize = self
-            .recurrent
-            .read()
-            .map(|m| m.values().map(|s| s.reserved_bytes()).sum())
-            .unwrap_or(0);
+        // Every state arena's regions, not a sum over the stores: the stores share
+        // arenas, so their sum leaves out the free slots and unused tails.
+        let gdn = RecurrentStateStore::arena_reserved_bytes(&self.model.device);
         let idx: usize = self
             .index
             .read()
@@ -2174,9 +2172,10 @@ impl WaveSweep for Qwen4ExpBatched {
         //
         // **A claim, so it belongs with the other claims — before the tier is
         // placed and before the forward opens.** A sequence entering the wave
-        // without a store builds one here, and a store is a span tenant: it
-        // carves reservation regions through `RegionBump`, which takes the same
-        // arena window `admit_wave_kv` does. Run after `begin_forward` this asks
+        // without a store builds one here, and a store takes state-arena slots —
+        // which, when no arena of its geometry has room, claims a reservation region
+        // through the same arena window `admit_wave_kv` does. Run after
+        // `begin_forward` that claim asks
         // the partition for ground while holding the window that decides who
         // gets it, and the refusal is the unrecoverable one — the thread that
         // would have to end the wave is the thread asking.

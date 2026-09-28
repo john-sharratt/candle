@@ -498,18 +498,15 @@ impl HybridBatched {
 
     /// Give `child` a copy of `parent`'s recurrent state.
     ///
-    /// Reservation bytes every live sequence's recurrent state holds together.
+    /// Reservation bytes recurrent state holds on this model's device — every state
+    /// arena's regions, whatever is in them.
     ///
-    /// Summed over the map rather than derived from a per-sequence constant:
-    /// a store's region count depends on how its buffers packed, and a forked
-    /// child's need not match its parent's. A poisoned lock reports zero rather
-    /// than failing — this is a report, and a wrong number in it is preferable
-    /// to a scheduler that cannot answer how much memory it is using.
+    /// The arenas and not a sum over the stores: the stores share arenas, so their
+    /// sum leaves out every arena's free slots and unused tail, and any slot a
+    /// handle kept after its store was dropped. See
+    /// [`RecurrentStateStore::arena_reserved_bytes`].
     pub fn recurrent_reserved_bytes(&self) -> usize {
-        self.recurrent
-            .lock()
-            .map(|m| m.values().map(|s| s.reserved_bytes()).sum())
-            .unwrap_or(0)
+        RecurrentStateStore::arena_reserved_bytes(&self.model.device)
     }
 
     /// What one sequence's state costs, whether or not one is standing.

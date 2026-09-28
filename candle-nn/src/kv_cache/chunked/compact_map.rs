@@ -807,6 +807,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cuda")]
     fn sealed(chunk: SealedChunk) -> SealedSequence {
         SealedSequence {
             chunks: vec![chunk],
