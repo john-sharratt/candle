@@ -31,6 +31,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use candle_conversation::chain_health::{chain_break, ChainBreak};
 use candle_conversation::projection::{
     OptionalState, SelectionState, TimelineId, FORCE_TOOL_SELECTOR, NO_THINK_SELECTOR,
     TOOLS_ENABLED_SELECTOR,
@@ -107,19 +108,107 @@ impl CodeReadState {
 /// what [`refresh_code_reading`]'s first (and every later) pass diffs the
 /// freshly-walked files against, entirely off zend's load-to-`ready` critical
 /// path. Empty ⇒ nothing ingested yet ⇒ the next pass reads every file as new.
+///
+/// # A file counts as ingested only once its chain FINISHED
+///
+/// The metadata this joins (`path`, `content_sha256`) is written when the file's
+/// hidden conversation is minted, not when it answers — so a read that died
+/// part-way carries exactly the same keys as one that succeeded, and the file
+/// then counts as done forever. That is not hypothetical: a README read spent
+/// its whole decode budget deliberating over how many `file_read` ranges to
+/// issue, was cut off mid-word, and emitted no tool call — so no coupling, no
+/// second turn, and no summary. The substrate stored it faithfully (CRC-clean,
+/// chunk counts consistent), the file counted as ingested, and its one turn
+/// stayed in the corpus as a worked example of an assistant that deliberates
+/// and produces nothing, which later conversations then imitated.
+///
+/// So each candidate timeline is asked whether its chain finished
+/// ([`chain_break`]). An unfinished one is left out of the state, which makes
+/// the file read as NEW to the next pass and rebuilds it — recovery with no
+/// tombstone and nothing deleted.
+///
+/// **A complete chain wins over an incomplete one for the same path.** A path
+/// may carry more than one timeline (a failed attempt and the rebuild that
+/// followed it), and whichever the iteration happens to reach last must not
+/// decide the answer.
 pub fn code_read_state_from_substrate(engine: &Mutex<ConversationEngine>) -> CodeReadState {
+    let scan = scan_ingest_chains(engine);
+    let mut state = CodeReadState::default();
+    for (path, hash) in scan.finished {
+        state.file_hashes.insert(path, hash);
+    }
+    // Reported here and not in the scan, which the resume gate also calls: one
+    // line per unfinished chain per boot. A handful is ordinary recovery, while a
+    // corpus-wide sweep of them means the decode budget or the opening prompt is
+    // wrong for this model and every pass will keep redoing the same work.
+    for (path, why) in &scan.broken {
+        if state.file_hashes.contains_key(path) {
+            continue; // a later, complete chain for the same file covers it
+        }
+        tracing::info!(
+            file = %path,
+            ?why,
+            "code_read: ingest chain unfinished — the file reads as new and will be rebuilt",
+        );
+    }
+    state
+}
+
+/// What [`scan_ingest_chains`] found: the files whose ingest finished, and the
+/// ones whose chain stopped part-way.
+struct IngestChains {
+    /// `(path, content hash)` per finished chain.
+    finished: Vec<(String, String)>,
+    broken: Vec<(String, ChainBreak)>,
+}
+
+/// Join every ingested file's `path` and `content_sha256` metadata by timeline
+/// and sort them by whether the chain that wrote them finished
+/// ([`chain_break`]).
+///
+/// **The one place both resume gates read**, which is the whole point of
+/// factoring it: a pass asks two separate questions — "which files changed?"
+/// (the [`CodeReadState`] diff) and "which content is already in the substrate?"
+/// (the [`process_one_file`] resume cache) — and they are computed from
+/// different queries. Fixing only the diff makes a pass announce the file as
+/// changed and then skip it on the resume hit, which is worse than not fixing it
+/// at all: it reports recovery that never happens.
+fn scan_ingest_chains(engine: &Mutex<ConversationEngine>) -> IngestChains {
     let eng = engine.lock().unwrap();
     let hashes: HashMap<TimelineId, String> = eng
         .conversations_with_metadata_key("content_sha256")
         .into_iter()
         .collect();
-    let mut state = CodeReadState::default();
+    let conv = eng.conversation();
+    let substrate = conv.read();
+    let mut out = IngestChains {
+        finished: Vec::new(),
+        broken: Vec::new(),
+    };
     for (tl, path) in eng.conversations_with_metadata_key("path") {
-        if let Some(hash) = hashes.get(&tl) {
-            state.file_hashes.insert(path, hash.clone());
+        let Some(hash) = hashes.get(&tl) else {
+            continue;
+        };
+        match chain_break(&substrate, tl) {
+            Some(why) => out.broken.push((path, why)),
+            None => out.finished.push((path, hash.clone())),
         }
     }
-    state
+    out
+}
+
+/// Content hashes whose ingest chain finished — the resume cache
+/// [`process_one_file`] probes before spending a decode on a file.
+///
+/// Replaces a bare sweep of every `content_sha256` value, which counted a
+/// half-written chain's hash as present and so skipped the very file the diff
+/// had just marked for rebuild.
+fn finished_content_hashes(engine: &Mutex<ConversationEngine>) -> HashSet<String> {
+    scan_ingest_chains(engine)
+        .finished
+        .into_iter()
+        .map(|(_, hash)| hash)
+        .collect()
 }
 
 /// Maximum tolerated per-file summary decode failures in a single
@@ -161,6 +250,16 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// file, and only this file" also heads off a model wandering into whatever
 /// else the workspace prompt might make it curious about.
 ///
+/// **It names the file's LENGTH, and that is not a nicety.** Naming only the
+/// per-call cap leaves the model to guess how many ranges cover the file, and a
+/// guess is a decision it can spend its whole decode budget failing to make: a
+/// README read deliberated over whether the file was under the cap, whether a
+/// range past EOF would error, and whether to risk it — until the token budget
+/// cut it off mid-word, before any `file_read` call was emitted. It produced no
+/// tool call, so no coupling and no second turn, and the chain stood in the
+/// corpus as an assistant that deliberates and answers nothing. With the length
+/// given, the arithmetic is settled before the model starts.
+///
 /// **It asks for the calls in PARALLEL, and that is a round-count decision.**
 /// `file_read` serves at most [`MAX_READ_LINES`] lines per call, so a long file
 /// needs several — and a round is one decode plus one tool dispatch, so reading
@@ -183,16 +282,19 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// `ingest_bases`, `resolver.rs`'s `score_belief_groups` target exemption,
 /// and `code_reading`'s `window` in `projection.yaml`). With those fixed,
 /// the model correctly recalls its own earlier rounds without being told to.
-fn opening_prompt(path: &str) -> String {
+fn opening_prompt(path: &str, lines: usize) -> String {
+    let calls = lines.div_ceil(MAX_READ_LINES as usize).max(1);
     format!(
         "Read the entire contents of `{path}` — and only this file — using \
-         {FILE_READ_TOOL}. Each call returns at most {MAX_READ_LINES} lines, so if \
-         the file is longer than that, issue SEVERAL {FILE_READ_TOOL} calls in the \
-         SAME reply — one per consecutive {MAX_READ_LINES}-line range, covering the \
-         whole file — instead of one call per reply. Every call you make in a reply \
-         is run together and all of their results come back to you at once. Once \
-         you've read the whole thing, summarize what it contains: its purpose, its \
-         main structures or functions, and how it fits into the codebase."
+         {FILE_READ_TOOL}. The file is {lines} lines long and each call returns at \
+         most {MAX_READ_LINES} lines, so it takes exactly {calls} \
+         {FILE_READ_TOOL} call(s): issue all {calls} in the SAME reply, one per \
+         consecutive {MAX_READ_LINES}-line range covering lines 1 to {lines}, \
+         instead of one call per reply. \
+         Every call you make in a reply is run together and all of their results \
+         come back to you at once. Once you've read the whole thing, summarize \
+         what it contains: its purpose, its main structures or functions, and how \
+         it fits into the codebase."
     )
 }
 
@@ -251,11 +353,20 @@ pub(crate) fn file_content_hash(path: &str, bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// One file queued for ingest: its repo-map entry and content hash. Bytes are
-/// read once, here, only to pass the size/binary guards and compute the hash
-/// — never shown to the model directly; the model reads the file for itself
-/// via a real `file_read` call, so there is nothing else to carry forward.
-type QueuedFile = (FileEntry, String);
+/// One file queued for ingest: its repo-map entry, content hash, and length in
+/// lines. Bytes are read once, here, only to pass the size/binary guards and
+/// compute the hash — never shown to the model directly; the model reads the
+/// file for itself via a real `file_read` call.
+///
+/// The line count travels because [`opening_prompt`] needs it: the model has to
+/// choose its `file_read` ranges in its FIRST reply, and a model told only the
+/// per-call cap has to guess how many ranges cover the file. Counting the
+/// newlines of bytes already in hand costs nothing and removes the guess.
+struct QueuedFile {
+    file: FileEntry,
+    hash: String,
+    lines: usize,
+}
 
 /// Scan `map`'s files: size-guard, binary-sniff, and hash each one, recording
 /// every hash into a fresh [`CodeReadState`]. Files that fail either guard are
@@ -300,7 +411,15 @@ fn scan_workspace(workspace: &Path, map: &RepoMap) -> (Vec<QueuedFile>, CodeRead
         }
         let fhash = file_content_hash(&file.path, &bytes);
         state.file_hashes.insert(file.path.clone(), fhash.clone());
-        per_file.push((file.clone(), fhash));
+        // What `file_read` will report as the file's length: its lines, counting
+        // a final line that carries no trailing newline.
+        let lines = bytes.iter().filter(|&&b| b == b'\n').count()
+            + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
+        per_file.push(QueuedFile {
+            file: file.clone(),
+            hash: fhash,
+            lines,
+        });
     }
     (per_file, state)
 }
@@ -369,11 +488,7 @@ pub fn ingest_files(
     // Dedup against already-ingested content so re-uploading identical bytes is
     // a no-op — but NO `reconcile_deleted`: a partial file set must never
     // tombstone the rest of the corpus.
-    let present_hashes = ctx
-        .engine
-        .lock()
-        .unwrap()
-        .conversation_metadata_values("content_sha256");
+    let present_hashes = finished_content_hashes(ctx.engine);
 
     let n_failed = run_file_pool(
         ctx,
@@ -416,30 +531,19 @@ pub(crate) fn ingest_chain_file(
         module_hint: None,
     });
     let (per_file, _state) = scan_workspace(workspace, &map);
-    let Some((file, file_hash)) = per_file.into_iter().next() else {
+    let Some(queued) = per_file.into_iter().next() else {
         return Ok(None);
     };
-    let present_hashes = ctx
-        .engine
-        .lock()
-        .unwrap()
-        .conversation_metadata_values("content_sha256");
+    let present_hashes = finished_content_hashes(ctx.engine);
     // This link's parent is the chain so far, not whatever the daemon-wide
     // chain end will be once it is finished being built.
     let link_ctx = RefreshContext {
         priming_chain_end: Some(predecessor),
         ..ctx.clone()
     };
-    if !present_hashes.contains(&file_hash) {
+    if !present_hashes.contains(&queued.hash) {
         let failures = Failures::new();
-        process_one_file(
-            &link_ctx,
-            base,
-            &file,
-            &file_hash,
-            &present_hashes,
-            &failures,
-        )?;
+        process_one_file(&link_ctx, base, &queued, &present_hashes, &failures)?;
         let report = failures.into_report(1);
         if report.is_incomplete() {
             anyhow::bail!(
@@ -646,7 +750,7 @@ fn run_file_pool(
     // worker probes below, so registration and completion can't disagree.
     let backlog_pending = per_file
         .iter()
-        .filter(|(_, h)| !present_hashes.contains(h))
+        .filter(|q| !present_hashes.contains(&q.hash))
         .count() as u64;
     crate::ingest_backlog::add_pending(backlog_pending);
     let backlog_done = AtomicUsize::new(0);
@@ -675,17 +779,16 @@ fn run_file_pool(
                 if idx >= per_file.len() {
                     return;
                 }
-                let (file, fhash) = &per_file[idx];
-                if let Err(e) = process_one_file(ctx, base, file, fhash, present_hashes, &failures)
-                {
+                let q = &per_file[idx];
+                if let Err(e) = process_one_file(ctx, base, q, present_hashes, &failures) {
                     // An error escaping `process_one_file` is an unexpected one
                     // (its own failure mode records and returns Ok). Record it
                     // so it reaches the report instead of vanishing, and let the
                     // cap decide whether to stop the pass.
-                    let n = failures.record(&file.path, format!("{e:#}"));
+                    let n = failures.record(&q.file.path, format!("{e:#}"));
                     tracing::warn!(
                         target: "zend::code_read::ingest",
-                        file = %file.path,
+                        file = %q.file.path,
                         "file ingest failed (will retry next run): {e:#}",
                     );
                     if n > MAX_DECODE_FAILURES {
@@ -698,9 +801,9 @@ fn run_file_pool(
                 // `process_one_file` above — success, tolerated failure, or a
                 // mid-file shutdown cancel — so the backlog can never wedge
                 // non-empty on a file that will just be retried next pass.
-                if !present_hashes.contains(fhash) {
+                if !present_hashes.contains(&q.hash) {
                     backlog_done.fetch_add(1, Ordering::Relaxed);
-                    crate::ingest_backlog::item_done(&file.path);
+                    crate::ingest_backlog::item_done(&q.file.path);
                 }
             }));
         }
@@ -752,11 +855,16 @@ fn run_file_pool(
 fn process_one_file(
     ctx: &RefreshContext<'_>,
     base: &Mutex<Sequence>,
-    file: &FileEntry,
-    file_hash: &str,
+    queued: &QueuedFile,
     present_hashes: &HashSet<String>,
     failures: &Failures,
 ) -> anyhow::Result<()> {
+    let QueuedFile {
+        file,
+        hash: file_hash,
+        lines,
+    } = queued;
+    let file_hash = file_hash.as_str();
     // Resume cache: this content hash was already in the (live, non-
     // tombstoned) substrate at ingest start — skip the read+decode.
     if present_hashes.contains(file_hash) {
@@ -872,6 +980,7 @@ fn process_one_file(
     let summary = match run_file_conversation(
         &mut conv,
         &file.path,
+        *lines,
         &ctx.think_triggers,
         &ctx.tool_ctx,
     ) {
@@ -1005,6 +1114,7 @@ fn process_one_file(
 fn run_file_conversation(
     conv: &mut Sequence,
     path: &str,
+    lines: usize,
     triggers: &Arc<TriggerRegistry>,
     tool_ctx: &Arc<ToolContext>,
 ) -> anyhow::Result<String> {
@@ -1018,7 +1128,7 @@ fn run_file_conversation(
     // schema's own default happens to be.
     selection.set_optional(NO_THINK_SELECTOR, OptionalState::Absent);
 
-    let mut current_message: TurnText = TurnText::from(opening_prompt(path));
+    let mut current_message: TurnText = TurnText::from(opening_prompt(path, lines));
     let mut closing = false;
     for round in 0..=MAX_FILE_READ_ROUNDS {
         if candle_conversation::ingest_cancelled() {
@@ -1156,13 +1266,9 @@ pub fn refresh_code_reading(
     // Tombstone conversations for deleted files, then snapshot surviving
     // hashes; changed files miss the snapshot and are re-ingested (their
     // stale conversation is tombstoned in process_one_file).
-    let present_paths: HashSet<&str> = per_file.iter().map(|(f, _)| f.path.as_str()).collect();
+    let present_paths: HashSet<&str> = per_file.iter().map(|q| q.file.path.as_str()).collect();
     reconcile_deleted(ctx.engine, map, &present_paths);
-    let present_hashes = ctx
-        .engine
-        .lock()
-        .unwrap()
-        .conversation_metadata_values("content_sha256");
+    let present_hashes = finished_content_hashes(ctx.engine);
 
     run_file_pool(ctx, base, &per_file, &present_hashes, progress, n_workers)?;
 
@@ -1226,9 +1332,39 @@ mod tests {
 
     #[test]
     fn opening_prompt_names_the_path_and_the_one_tool() {
-        let p = opening_prompt("src/lib.rs");
+        let p = opening_prompt("src/lib.rs", 120);
         assert!(p.contains("src/lib.rs"));
         assert!(p.contains(FILE_READ_TOOL));
+    }
+
+    /// **The prompt must state the file's length and the exact number of calls.**
+    ///
+    /// Told only the per-call cap, a model has to guess how many ranges cover the
+    /// file — and that guess is a decision it can spend its entire decode budget
+    /// failing to reach. A README read did exactly that: it weighed whether the
+    /// file was under the cap and whether a range past EOF would error until the
+    /// budget cut it off mid-word, with no `file_read` call emitted, no coupling,
+    /// no second turn and no summary. The arithmetic belongs in the prompt.
+    #[test]
+    fn opening_prompt_states_the_length_and_the_call_count() {
+        let cap = MAX_READ_LINES as usize;
+        // Exactly one cap's worth: one call, not two.
+        let one = opening_prompt("src/small.rs", cap);
+        assert!(one.contains(&cap.to_string()), "{one:?}");
+        assert!(
+            one.contains(" 1 "),
+            "one call for a {cap}-line file: {one:?}"
+        );
+        // One line over: two calls.
+        let two = opening_prompt("src/mid.rs", cap + 1);
+        assert!(
+            two.contains(&(cap + 1).to_string()),
+            "must name the file's own length: {two:?}",
+        );
+        assert!(two.contains(" 2 "), "two calls just past the cap: {two:?}");
+        // An empty file still asks for one call rather than zero.
+        let empty = opening_prompt("src/empty.rs", 0);
+        assert!(empty.contains(" 1 "), "never zero calls: {empty:?}");
     }
 
     /// The measured failure this prompt exists to close: left as "read as much
@@ -1237,7 +1373,7 @@ mod tests {
     /// reading the file, not merely permit it.
     #[test]
     fn opening_prompt_requires_reading_the_whole_file() {
-        let p = opening_prompt("CHANGELOG.md");
+        let p = opening_prompt("CHANGELOG.md", 40);
         assert!(
             p.contains("entire") || p.contains("whole"),
             "must ask for the whole file, not an unspecified amount: {p:?}",
@@ -1259,7 +1395,7 @@ mod tests {
     /// excerpt header in turn.
     #[test]
     fn opening_prompt_asks_for_parallel_reads_and_names_the_cap() {
-        let p = opening_prompt("src/big.rs");
+        let p = opening_prompt("src/big.rs", 2000);
         assert!(
             p.contains(&MAX_READ_LINES.to_string()),
             "must name the per-call line cap so ranges can be chosen up front: {p:?}",

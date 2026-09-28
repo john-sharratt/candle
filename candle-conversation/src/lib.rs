@@ -51,6 +51,8 @@
 mod banned_rows;
 mod batched_sampler;
 mod cancel;
+/// Whether a turn chain finished what it started — the ingest-recovery signal.
+pub mod chain_health;
 mod config;
 mod conversation;
 pub mod conversation_log;
