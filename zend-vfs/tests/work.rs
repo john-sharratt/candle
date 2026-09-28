@@ -29,6 +29,8 @@ struct World {
     other: PathBuf,
     repo: Repo,
     source: Arc<GitSource>,
+    /// The commit everyone started from.
+    start: Oid,
 }
 
 fn configure(root: &Path) {
@@ -62,6 +64,7 @@ impl World {
         put(&seed, "logo.bin", BINARY);
         git(&seed, &["add", "-A"]);
         git(&seed, &["commit", "-q", "-m", "base"]);
+        let start = Oid::parse(git(&seed, &["rev-parse", "HEAD"]).trim()).unwrap();
         if origin {
             git(root, &["clone", "-q", "--bare", "seed", "origin"]);
             for clone in ["local", "other"] {
@@ -83,6 +86,7 @@ impl World {
             other,
             repo,
             source,
+            start,
         }
     }
 
@@ -106,6 +110,23 @@ impl World {
         self.oid(&self.other, "HEAD")
     }
 
+    /// Someone else forces `main` back to the commit everyone started from,
+    /// commits `files` over it — `None` deleting — and force-pushes: every
+    /// commit origin took since is no longer on it.
+    fn force_other(&self, files: &[(&str, Option<&[u8]>)]) -> Oid {
+        git(&self.other, &["reset", "-q", "--hard", self.start.as_str()]);
+        for (path, content) in files {
+            match content {
+                Some(bytes) => put(&self.other, path, bytes),
+                None => std::fs::remove_file(self.other.join(path)).unwrap(),
+            }
+        }
+        git(&self.other, &["add", "-A"]);
+        git(&self.other, &["commit", "-q", "-m", "someone else, forced"]);
+        git(&self.other, &["push", "-q", "--force", "origin", "main"]);
+        self.oid(&self.other, "HEAD")
+    }
+
     /// A commit made on this machine and never pushed: `local`'s `main`
     /// moved by hand.
     fn commit_locally(&self, path: &str, content: &str) -> Oid {
@@ -114,6 +135,15 @@ impl World {
         git(&self.local, &["add", "-A"]);
         git(&self.local, &["commit", "-q", "-m", "local only"]);
         self.oid(&self.local, "HEAD")
+    }
+
+    /// A commit made on this machine and pushed, so origin holds it and a
+    /// conversation on `main` pins it — until [`Self::force_other`] takes it
+    /// off origin again.
+    fn commit_published(&self, path: &str, content: &str) -> Oid {
+        let commit = self.commit_locally(path, content);
+        git(&self.local, &["push", "-q", "origin", "main"]);
+        commit
     }
 
     fn oid(&self, root: &Path, rev: &str) -> Oid {
@@ -684,10 +714,10 @@ fn a_commit_of_no_change_lands_empty() {
 #[test]
 fn a_binary_changed_on_both_sides_refuses_the_merge() {
     let w = World::new();
-    let local_only = w.commit_locally("logo.bin", "\u{0}mine\u{0}");
+    let local_only = w.commit_published("logo.bin", "\u{0}mine\u{0}");
     let conv = w.conversation();
     assert_eq!(conv.base().unwrap().unwrap().commit(), Some(&local_only));
-    w.push_other(&[("logo.bin", Some(&[0, 9, 9, 9, 0]))]);
+    w.force_other(&[("logo.bin", Some(&[0, 9, 9, 9, 0]))]);
     let before = conv.snapshot();
     let pulled = w.repo.pull_branch(&branch("main")).unwrap();
     assert!(pulled.diverged);
@@ -699,17 +729,18 @@ fn a_binary_changed_on_both_sides_refuses_the_merge() {
 
 // ── merges with history of their own ────────────────────────────────────────
 
-/// **A conversation on a commit origin never had merges origin's commits
-/// into a merge being finished**: both parents recorded, the conflict marked
-/// from their merge base, and the merge commit — once settled — landing on
-/// origin and on the local branch, the local commit kept.
+/// **A conversation on a commit origin no longer has — someone forced the
+/// branch back past it — merges origin's commits into a merge being
+/// finished**: both parents recorded, the conflict marked from their merge
+/// base, and the merge commit — once settled — landing on origin and on the
+/// local branch, the lost commit kept.
 #[test]
 fn diverged_history_merges_and_lands_a_merge_commit() {
     let w = World::new();
-    let local_only = w.commit_locally("ten.txt", &TEN.replace("l2\n", "local\n"));
+    let local_only = w.commit_published("ten.txt", &TEN.replace("l2\n", "local\n"));
     let conv = w.conversation();
     conv.write("new.txt", "new\n".into()).unwrap();
-    let theirs = w.push_other(&[
+    let theirs = w.force_other(&[
         ("ten.txt", Some(TEN.replace("l2\n", "theirs\n").as_bytes())),
         ("keep.txt", Some(b"theirs\n")),
     ]);
@@ -765,9 +796,10 @@ fn diverged_history_merges_and_lands_a_merge_commit() {
 #[test]
 fn a_clean_merge_is_finished_by_a_commit_of_its_own() {
     let w = World::new();
-    let local_only = w.commit_locally("new.txt", "local\n");
+    let local_only = w.commit_published("new.txt", "local\n");
     let conv = w.conversation();
-    let theirs = w.push_other(&[("keep.txt", Some(b"theirs\n"))]);
+    assert_eq!(conv.base().unwrap().unwrap().commit(), Some(&local_only));
+    let theirs = w.force_other(&[("keep.txt", Some(b"theirs\n"))]);
     assert_eq!(w.merge(&conv), Merged::Merging { conflicts: vec![] });
     assert!(conv.status().is_empty());
     let landed = w.commit(&conv).unwrap();
@@ -782,9 +814,10 @@ fn a_clean_merge_is_finished_by_a_commit_of_its_own() {
 #[test]
 fn origin_moving_during_a_merge_is_merged_into_it() {
     let w = World::new();
-    let local_only = w.commit_locally("ten.txt", &TEN.replace("l2\n", "local\n"));
+    let local_only = w.commit_published("ten.txt", &TEN.replace("l2\n", "local\n"));
     let conv = w.conversation();
-    w.push_other(&[("ten.txt", Some(TEN.replace("l2\n", "theirs\n").as_bytes()))]);
+    assert_eq!(conv.base().unwrap().unwrap().commit(), Some(&local_only));
+    w.force_other(&[("ten.txt", Some(TEN.replace("l2\n", "theirs\n").as_bytes()))]);
     w.merge(&conv);
     conv.write("ten.txt", TEN.replace("l2\n", "both\n"))
         .unwrap();
@@ -820,9 +853,10 @@ fn origin_moving_during_a_merge_is_merged_into_it() {
 #[test]
 fn a_merge_being_finished_survives_a_restart() {
     let w = World::new();
-    let local_only = w.commit_locally("ten.txt", &TEN.replace("l2\n", "local\n"));
+    let local_only = w.commit_published("ten.txt", &TEN.replace("l2\n", "local\n"));
     let conv = w.conversation();
-    let theirs = w.push_other(&[("ten.txt", Some(TEN.replace("l2\n", "theirs\n").as_bytes()))]);
+    assert_eq!(conv.base().unwrap().unwrap().commit(), Some(&local_only));
+    let theirs = w.force_other(&[("ten.txt", Some(TEN.replace("l2\n", "theirs\n").as_bytes()))]);
     w.merge(&conv);
     let saved = serde_json::to_string(&conv.snapshot()).unwrap();
     drop(conv);
@@ -908,10 +942,10 @@ fn a_conversation_reads_its_base_until_it_merges() {
 #[test]
 fn a_merge_with_nothing_uncommitted_keeps_the_conversations_side() {
     let w = World::new();
-    w.commit_locally("ten.txt", &TEN.replace("l2\n", "mine\n"));
+    w.commit_published("ten.txt", &TEN.replace("l2\n", "mine\n"));
     let conv = w.conversation();
     assert!(conv.status().is_empty(), "nothing uncommitted");
-    w.push_other(&[("ten.txt", Some(TEN.replace("l2\n", "theirs\n").as_bytes()))]);
+    w.force_other(&[("ten.txt", Some(TEN.replace("l2\n", "theirs\n").as_bytes()))]);
 
     let merged = w.merge(&conv);
     assert_eq!(
@@ -931,9 +965,10 @@ fn a_merge_with_nothing_uncommitted_keeps_the_conversations_side() {
 #[test]
 fn a_merge_made_already_is_fast_forwarded_to() {
     let w = World::new();
-    let local_only = w.commit_locally("ten.txt", &TEN.replace("l2\n", "mine\n"));
+    let local_only = w.commit_published("ten.txt", &TEN.replace("l2\n", "mine\n"));
     let conv = w.conversation();
-    w.push_other(&[("ten.txt", Some(TEN.replace("l9\n", "theirs\n").as_bytes()))]);
+    assert_eq!(conv.base().unwrap().unwrap().commit(), Some(&local_only));
+    w.force_other(&[("ten.txt", Some(TEN.replace("l9\n", "theirs\n").as_bytes()))]);
     assert_eq!(w.merge(&conv), Merged::Merging { conflicts: vec![] });
     conv.write("new.txt", "new\n".into()).unwrap();
 
@@ -957,7 +992,6 @@ fn a_merge_made_already_is_fast_forwarded_to() {
     let landed = w.commit(&conv).unwrap();
     assert_eq!(w.parents(&landed.commit), vec![made]);
     assert_eq!(w.origin_file("new.txt").as_deref(), Some("new\n"));
-    let _ = local_only;
 }
 
 /// **A branch with no commit yet takes its first**: a root commit, with the

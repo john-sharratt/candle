@@ -23,26 +23,25 @@ pub struct DaemonConfig {
     pub port: u16,
     /// Projection layers taken OUT OF SERVICE (`--disable-layer <name>`,
     /// repeatable). A disabled layer still exists in the schema, but it is
-    /// inert: not populated at boot, not refreshed by the watcher, **excluded
-    /// from the provenance gather** (`Builder::set_layer_gathered`), not
-    /// normalization-warmed, and not swept for crashed partials. Its turns
-    /// remain in the substrate untouched — nothing is deleted and dropping the
-    /// flag restores them — but while disabled they cannot be selected into any
-    /// projection.
+    /// inert: not ingested from the branches, **excluded from the provenance
+    /// gather** (`Builder::set_layer_gathered`), not normalization-warmed, and
+    /// not swept for crashed partials. Its turns remain in the substrate
+    /// untouched — nothing is deleted and dropping the flag restores them — but
+    /// while disabled they cannot be selected into any projection.
     ///
     /// The one deliberate exception is an EXPLICIT UPLOAD: a bounded `read_file`
-    /// into a disabled per-file layer still runs, seeding that layer's registry
-    /// entry (see `InferenceState::ingest_uploaded_files`), because a user who
-    /// uploads a file has asked for it to be read. Those turns land in the
-    /// substrate like any other and become selectable once the flag is dropped.
+    /// into a disabled per-file layer still runs (see
+    /// `InferenceState::ingest_uploaded_files`), because a user who uploads a
+    /// file has asked for it to be read. Those turns land in the substrate like
+    /// any other and become selectable once the flag is dropped.
     ///
     /// Also names section **collections** (`response`, `mood`), which have no
     /// ingest pass of their own.
     pub disabled_layers: HashSet<String>,
-    /// Turn-sink layers to tombstone COMPLETELY before this load's registry is
-    /// seeded (`--wipe-layer <name>`, repeatable) — every conversation in the
-    /// layer, not just crashed partials, so the background ingest worker's
-    /// first pass re-ingests it from scratch. A targeted alternative to
+    /// Turn-sink layers to tombstone COMPLETELY before the background ingest
+    /// worker's first pass (`--wipe-layer <name>`, repeatable) — every
+    /// conversation in the layer, not just crashed partials, so that pass
+    /// re-ingests it from scratch. A targeted alternative to
     /// [`Self`]-wide `--wipe-substrate`: every other layer's content (the live
     /// dialogue, an unnamed ingest layer, uploads) survives untouched. A layer
     /// also named by [`Self::disabled_layers`] is not wiped — a disabled layer
@@ -57,10 +56,9 @@ pub struct DaemonConfig {
     pub ingest_dirs: HashMap<String, String>,
     /// `--max-depth <N>`: how deep, in path components below each repository's
     /// root (or a layer's `--ingest-dir` folder), the `repo_map` and
-    /// `code_reading` walks read (`1` = the root's own files,
-    /// `2` = one folder down). Content already
-    /// ingested from deeper is FROZEN — kept and still retrievable, but never
-    /// re-read and never retired by the deleted-path sweeps. `None` = unbounded.
+    /// `code_reading` branch walks read (`1` = the root's own files,
+    /// `2` = one folder down). Content ingested from deeper is not found by the
+    /// walk and is retired. `None` = unbounded.
     pub max_depth: Option<usize>,
     /// Force a whole-store redo-log compaction once during load, after the
     /// substrate reload and before serving. Normally reclaim is incremental and

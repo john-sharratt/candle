@@ -1,11 +1,12 @@
 //! Serving a `file_read` from content the corpus has already read.
 //!
 //! A `code_reading` conversation is a whole file, read once, sealed in the
-//! substrate and content-addressed by `content_sha256`. When a dialogue asks
-//! for a file whose bytes hash to a conversation that already exists, the
-//! cheapest correct answer is not to read the file again: it is to carry that
-//! conversation into this one's projection and say so. The K/V is already
-//! there, so the call costs an elevation instead of a prefill and a decode.
+//! substrate and keyed by its path and blob id (`docs/zend_branch_ingest.md`
+//! §6.1). When a dialogue asks for a file its base holds at a blob a
+//! conversation already read, the cheapest correct answer is not to read the
+//! file again: it is to carry that conversation into this one's projection
+//! and say so. The K/V is already there, so the call costs an elevation
+//! instead of a prefill and a decode.
 //!
 //! **The hit test is the whole file; the injection is the whole file.** A call
 //! for page 1 of a file hits on the file's hash, and what lands in context is
@@ -19,25 +20,22 @@
 //! file is already in context when it is not would be worse than any number of
 //! redundant reads — it answers from nothing rather than looking again.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
 use serde_json::json;
-use zend_vfs::{RepoFiles, Workspace};
+use zend_vfs::{Oid, RepoFiles, Workspace};
 
-use crate::code_read::file_content_hash;
-use crate::tool_round::Step;
+use crate::branch_ingest::keys::{file_key, CONTENT_KEY, LINES_KEY};
+use crate::tool_round::{plan, Step};
 use crate::tools::ToolResult;
 
 /// The tool this serves. Only whole-file reads are content-addressed, so this
 /// is the only call whose result another conversation can stand in for.
 const FILE_READ: &str = "file_read";
-
-/// The substrate metadata key a `code_reading` conversation records its
-/// content hash under — the content-addressed key both sides must agree on.
-const HASH_KEY: &str = "content_sha256";
 
 /// Above this estimated size a file is read normally rather than carried.
 ///
@@ -56,8 +54,8 @@ const MAX_FAST_PATH_FILE_TOKENS: usize = 100_000;
 const BYTES_PER_TOKEN: usize = 4;
 
 /// Whether a file of `bytes` is small enough to carry rather than re-read.
-fn fits_fast_path(bytes: usize) -> bool {
-    bytes / BYTES_PER_TOKEN <= MAX_FAST_PATH_FILE_TOKENS
+fn fits_fast_path(bytes: u64) -> bool {
+    bytes / BYTES_PER_TOKEN as u64 <= MAX_FAST_PATH_FILE_TOKENS as u64
 }
 
 /// The answer a served call gets.
@@ -91,7 +89,7 @@ pub struct Served {
 
 /// The repository-relative form of a `path` argument.
 ///
-/// The hash is path-qualified, so a call that names the same file differently —
+/// The key is path-qualified, so a call that names the same file differently —
 /// a leading `./`, a backslash separator, an absolute path inside the
 /// repository — hashes to something else and misses every time, silently and
 /// forever. Normalising here is what keeps the two sides addressing the same
@@ -119,7 +117,7 @@ fn read_target(step: &Step) -> Option<(&str, &str)> {
     }
 }
 
-/// The workspace-relative key `code_reading` hashes a `file_read`'s file
+/// The workspace-relative path `code_reading` keys a `file_read`'s file
 /// under — the repository, then the normalised path inside it — with the
 /// repository and inner path beside it. `None` for a repository the workspace
 /// does not list: the call then runs for real and the tool refuses it, rather
@@ -137,12 +135,14 @@ fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, Strin
 ///
 /// A call is left alone — and so runs for real — whenever anything is unsure:
 /// the conversation has changed the file in `files` (so its copy is not the
-/// committed one the corpus read), the file cannot be read, no conversation
-/// carries its hash, or the read does not fit `budget_tokens`.
-/// Takes the engine's `Mutex` rather than a locked engine: the file reads and
-/// hashing below are git work, and holding the engine across them would stall
-/// every other conversation and the ingest worker for the length of a round.
-/// The lock is taken per candidate, around the lookup and admit only.
+/// committed one the corpus read), its base holds no such file, no
+/// conversation carries its key and its line count, or the read does not fit
+/// `budget_tokens`. Nothing is read: the key comes from the base's tree, the
+/// line count from the conversation that read the file.
+/// Takes the engine's `Mutex` rather than a locked engine: the lookups below
+/// are git work, and holding the engine across them would stall every other
+/// conversation and the ingest worker for the length of a round. The lock is
+/// taken per candidate, around the lookup and admit only.
 pub fn screen(
     engine: &Mutex<ConversationEngine>,
     target: TimelineId,
@@ -161,30 +161,29 @@ pub fn screen(
             let Some((key, repo, rel)) = read_key(&step, workspace) else {
                 return step;
             };
-            let Some(bytes) = committed(files, &repo, &rel) else {
+            let Some((blob, size)) = committed(files, &repo, &rel) else {
                 return step;
             };
-            if !fits_fast_path(bytes.len()) {
+            if !fits_fast_path(size) {
                 tracing::debug!(
                     target: "zend::fast_path",
                     path = %key,
-                    bytes = bytes.len(),
+                    bytes = size,
                     "file is past the fast-path size cap — reading it for real",
                 );
                 return step;
             }
-            let hash = file_content_hash(&key, &bytes);
             let looked_up = {
                 let e = engine.lock().unwrap();
-                e.find_conversations_by_metadata(HASH_KEY, &hash)
+                e.find_conversations_by_metadata(CONTENT_KEY, &file_key(&key, &blob))
                     .into_iter()
-                    .next()
+                    .find_map(|tl| Some((tl, lines_of(&e, tl)?)))
                     // Admit BEFORE answering, under the same lock: a read the
                     // budget refuses is not in the projection, so claiming it
                     // would be a lie.
-                    .filter(|tl| e.fast_path_admit(target, *tl, budget_tokens))
+                    .filter(|(tl, _)| e.fast_path_admit(target, *tl, budget_tokens))
             };
-            let Some(timeline) = looked_up else {
+            let Some((timeline, lines)) = looked_up else {
                 tracing::debug!(
                     target: "zend::fast_path",
                     path = %key,
@@ -192,7 +191,6 @@ pub fn screen(
                 );
                 return step;
             };
-            let lines = bytes.iter().filter(|b| **b == b'\n').count() + 1;
             let Step::Run(call) = step else {
                 unreachable!("read_target matched a Run step")
             };
@@ -209,16 +207,23 @@ pub fn screen(
     (out, served)
 }
 
-/// The file `rel` in `repo` as its branch holds it, through the
-/// conversation's store — `None` when the conversation has changed it (its
-/// own copy is what its read must return, and no corpus read that), or when
-/// there is no such file.
-fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<Vec<u8>> {
-    let store = files.repo(repo).ok()?;
-    if store.is_modified(rel) {
-        return None;
-    }
-    store.read_bytes(rel).ok()?
+/// The blob id and size of the file `rel` in `repo` as the conversation's
+/// base holds it — `None` when the conversation has changed it (its own copy
+/// is what its read must return, and no corpus read that), or when there is
+/// no such file.
+fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<(Oid, u64)> {
+    files.repo(repo).ok()?.content_id(rel).ok()?
+}
+
+/// How many lines the file `timeline` read holds, as its ingest recorded it.
+/// `None` for a conversation that recorded none: an answer that cannot say
+/// how much the model already has is not given.
+fn lines_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<usize> {
+    lines_in(&engine.conversation_metadata(timeline)?)
+}
+
+fn lines_in(meta: &BTreeMap<String, String>) -> Option<usize> {
+    meta.get(LINES_KEY)?.parse().ok()
 }
 
 /// Rebuild `target`'s fast-path set by replaying its own `file_read` calls.
@@ -229,10 +234,10 @@ fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<Vec<u8>> {
 ///
 /// The conversation's turns are the record: each assistant turn carries the
 /// `<tool_call>` blocks it wrote, which `tool_round::plan` already parses. The
-/// hashes are recomputed from `files` — the conversation's own view of each
-/// branch — rather than stored, so a file committed anew while the daemon was
-/// down re-hashes to a miss and is read again — which is the correct answer,
-/// and one no persisted table could have given.
+/// keys are taken again from `files` — the conversation's own view of each
+/// branch — rather than stored, so a file its base holds at another blob now
+/// keys to a miss and is read again — which is the correct answer, and one no
+/// persisted table could have given.
 ///
 /// Oldest turn first, so the most recent read ends up at the front of the set
 /// exactly as it would have during the live conversation.
@@ -253,20 +258,19 @@ pub fn rebuild(
     };
     let mut admitted = 0usize;
     for text in texts {
-        for step in crate::tool_round::plan(&text) {
+        for step in plan(&text) {
             let Some((key, repo, rel)) = read_key(&step, workspace) else {
                 continue;
             };
-            let Some(bytes) = committed(files, &repo, &rel) else {
+            let Some((blob, size)) = committed(files, &repo, &rel) else {
                 continue;
             };
-            if !fits_fast_path(bytes.len()) {
+            if !fits_fast_path(size) {
                 continue;
             }
-            let hash = file_content_hash(&key, &bytes);
             let e = engine.lock().unwrap();
             if let Some(tl) = e
-                .find_conversations_by_metadata(HASH_KEY, &hash)
+                .find_conversations_by_metadata(CONTENT_KEY, &file_key(&key, &blob))
                 .into_iter()
                 .next()
             {
@@ -291,7 +295,7 @@ pub fn rebuild(
 mod tests {
     use super::*;
 
-    use zend_vfs::RepoSpec;
+    use zend_vfs::{ObjectFormat, RepoSpec};
 
     /// A repository's folder, the base [`normalise`] strips.
     fn ws() -> &'static Path {
@@ -403,10 +407,9 @@ mod tests {
     /// exactly the ceiling is still carried, one token past it is not.
     #[test]
     fn the_size_cap_admits_up_to_the_ceiling_and_no_further() {
-        assert!(fits_fast_path(MAX_FAST_PATH_FILE_TOKENS * BYTES_PER_TOKEN));
-        assert!(!fits_fast_path(
-            MAX_FAST_PATH_FILE_TOKENS * BYTES_PER_TOKEN + BYTES_PER_TOKEN
-        ));
+        let ceiling = (MAX_FAST_PATH_FILE_TOKENS * BYTES_PER_TOKEN) as u64;
+        assert!(fits_fast_path(ceiling));
+        assert!(!fits_fast_path(ceiling + BYTES_PER_TOKEN as u64));
         assert!(fits_fast_path(0), "an empty file is not oversized");
     }
 
@@ -438,7 +441,7 @@ mod tests {
         assert_eq!(read_target(&step), None);
     }
 
-    /// **A file is hashed as the conversation's store reads it, and never once
+    /// **A file is keyed as the conversation's store holds it, and never once
     /// the conversation has changed it** — its own copy is what it must read.
     #[test]
     fn only_a_file_the_conversation_left_alone_is_offered() {
@@ -453,10 +456,25 @@ mod tests {
             .unwrap()
             .write("b.rs", "mine\n".into())
             .unwrap();
-        assert_eq!(committed(&files, "candle", "a.rs"), Some(b"a\n".to_vec()));
+        assert_eq!(
+            committed(&files, "candle", "a.rs"),
+            Some((ObjectFormat::Sha1.blob_id(b"a\n"), 2))
+        );
         assert_eq!(committed(&files, "candle", "b.rs"), None);
         assert_eq!(committed(&files, "candle", "nope.rs"), None);
         assert_eq!(committed(&files, "other", "a.rs"), None);
+    }
+
+    /// **The line count is the one the ingest recorded**, and a conversation
+    /// that recorded none — or something that is no count — answers nothing.
+    #[test]
+    fn the_line_count_is_the_one_the_ingest_recorded() {
+        let mut meta = BTreeMap::from([(CONTENT_KEY.to_string(), "k".to_string())]);
+        assert_eq!(lines_in(&meta), None);
+        meta.insert(LINES_KEY.to_string(), "42".to_string());
+        assert_eq!(lines_in(&meta), Some(42));
+        meta.insert(LINES_KEY.to_string(), "many".to_string());
+        assert_eq!(lines_in(&meta), None);
     }
 
     /// An already-answered step is never re-examined — it has no file to read.

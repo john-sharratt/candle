@@ -79,9 +79,9 @@ struct Cli {
     /// `repo_map`, `code_reading`) or a section **collection** (e.g. `response`,
     /// `mood`), by its schema name. Repeatable.
     ///
-    /// The layer still exists in the schema, but it is inert: not populated at
-    /// boot, skipped by the watcher refresh and uploads, **excluded from the
-    /// provenance gather**, and not normalization-warmed. Its turns stay in the
+    /// The layer still exists in the schema, but it is inert: not ingested from
+    /// the branches, **excluded from the provenance gather**, and not
+    /// normalization-warmed. Its turns stay in the
     /// substrate untouched — nothing is deleted, and re-enabling restores them —
     /// but while disabled they cannot be selected into any projection.
     ///
@@ -93,15 +93,15 @@ struct Cli {
     disable_layer: Vec<String>,
 
     /// Tombstone EVERY conversation in a turn-sink layer, by its schema name
-    /// (e.g. `repo_map`, `code_reading`), before this load's registry is
-    /// seeded from the substrate. Repeatable.
+    /// (e.g. `repo_map`, `code_reading`), before the background ingest worker's
+    /// first pass. Repeatable.
     ///
     /// Unlike `--wipe-substrate`, this is targeted: only the named layer's
     /// content is destroyed — the live dialogue, any other ingest layer, and
-    /// uploads all survive untouched. Once wiped, the background ingest
-    /// worker's first pass reads the whole layer as new and rebuilds it from
-    /// disk. Exists for exercising a full background-ingest run without
-    /// paying for (or losing) a whole-substrate wipe.
+    /// uploads all survive untouched. Once wiped, the worker's first pass finds
+    /// the layer empty and rebuilds it from the branches. Exists for exercising
+    /// a full background-ingest run without paying for (or losing) a
+    /// whole-substrate wipe.
     ///
     /// A layer named by `--disable-layer` is not wiped — a disabled layer gets
     /// no cleanup of any kind. Raw (ChatML) layers are not wipeable this way;
@@ -122,15 +122,12 @@ struct Cli {
     /// Bound how deep the `repo_map` and `code_reading` layers read, in path
     /// components below each repository's root (or a layer's `--ingest-dir`
     /// folder) — `1` is the root's own files, `2` adds one folder down
-    /// (`src/main.rs`), and so on, like `find -maxdepth`. Applies to the startup ingest, the watcher-driven
-    /// refresh and the watcher itself: nothing deeper is read, and filesystem
-    /// events deeper down are ignored.
+    /// (`src/main.rs`), and so on, like `find -maxdepth`. Applies to every
+    /// branch: nothing deeper is read.
     ///
-    /// Content already ingested from below the bound is FROZEN, not deleted: it
-    /// stays in the substrate and remains retrievable, but is never refreshed
-    /// and never retired by the deleted-file sweep. Changing or dropping the bound
-    /// changes the listing of the root and of every folder with subfolders, so
-    /// those folders are re-summarised once. Unbounded when omitted.
+    /// Content already ingested from below the bound is not found by the walk,
+    /// and so is retired like anything else no branch holds within the layer's
+    /// reach. Unbounded when omitted.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     max_depth: Option<u32>,
 

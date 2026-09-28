@@ -100,6 +100,10 @@ pub(super) struct Journal {
     /// Captured links that pointed at a folder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub link_dirs: Vec<String>,
+    /// Captured paths the checkout had not changed, taken only to keep
+    /// their bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unchanged: Vec<String>,
     /// `.git/info/exclude` as it was, base64; absent when there was none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<String>,
@@ -268,6 +272,7 @@ mod tests {
             intent_to_add: vec!["later.txt".into()],
             perms: [("secret.key".to_string(), 0o600)].into(),
             link_dirs: vec!["linked".into()],
+            unchanged: vec!["a.txt".into()],
             exclude: None,
             vacant: vec!["new.txt".into()],
             moved: vec![".env".into()],

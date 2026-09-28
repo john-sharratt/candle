@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use super::base::Base;
 use super::tree::Tree;
-use crate::{BlobReader, GitError, Oid, Repo, Rev};
+use crate::{BlobReader, GitError, Oid, RemoteName, Repo, Rev, ORIGIN};
 
 /// How many parsed trees a source keeps: a branch's tree and the one before
 /// it, for a handful of branches read at once.
@@ -76,8 +76,23 @@ impl GitSource {
 
     /// Where `rev` stands now, as a store's base: its commit and that
     /// commit's tree, or [`Base::empty`] when `rev` names nothing.
+    ///
+    /// A branch is read as its record holds it: origin's copy
+    /// (`refs/remotes/origin/<b>`) when there is one, the local branch
+    /// otherwise — the copy the ingest covered, the copy `git_status`
+    /// compares against, and the copy a commit must descend from to publish.
     pub(crate) fn base_at(&self, rev: &Rev) -> Result<Base, GitError> {
-        Ok(match self.blobs.commit_of(rev)? {
+        let found = match rev {
+            Rev::Branch(branch) => {
+                let record = RemoteName::parse(ORIGIN)?.tracking(branch);
+                match self.blobs.commit_of(&Rev::Ref(record))? {
+                    Some(on_origin) => Some(on_origin),
+                    None => self.blobs.commit_of(rev)?,
+                }
+            }
+            other => self.blobs.commit_of(other)?,
+        };
+        Ok(match found {
             Some((commit, tree)) => Base::at(commit, tree),
             None => Base::empty(),
         })
@@ -165,6 +180,40 @@ mod tests {
         assert_ne!(moved.id(), tree.id());
         let (blob, _) = moved.file("a.txt").unwrap();
         assert_eq!(source.blob(blob).unwrap(), b"two!\n");
+    }
+
+    /// **A branch is pinned as origin holds it.** Origin's copy is ahead of
+    /// the local branch here — someone pushed and the fetch brought it in —
+    /// and a store reading the branch takes origin's commit; a branch origin
+    /// does not have reads as the local branch.
+    #[test]
+    fn a_branch_reads_as_its_record_holds_it() {
+        let origin = TestRepo::bare();
+        let t = TestRepo::init();
+        t.write("a.txt", b"one\n");
+        let first = t.commit_all("first");
+        t.git(&["remote", "add", "origin", &origin.url()]);
+        t.git(&["push", "-q", "origin", "main"]);
+        t.write("a.txt", b"two\n");
+        let second = t.commit_all("second");
+        t.git(&["push", "-q", "origin", "main"]);
+        t.git(&["reset", "-q", "--hard", first.as_str()]);
+        t.git(&["branch", "local-only"]);
+
+        let source = GitSource::open(&t.path).unwrap();
+        assert_eq!(
+            source.base_at(&branch("main")).unwrap().parents,
+            vec![second]
+        );
+        assert_eq!(
+            source.base_at(&branch("local-only")).unwrap().parents,
+            vec![first.clone()]
+        );
+        assert_eq!(
+            source.base_at(&Rev::Oid(first.clone())).unwrap().parents,
+            vec![first],
+            "a commit is read as itself"
+        );
     }
 
     /// **The working tree is never read** — only what the branch committed.

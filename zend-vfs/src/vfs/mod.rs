@@ -121,7 +121,7 @@ mod carry;
 mod conflict;
 mod folder;
 pub mod git_source;
-mod tree;
+pub mod tree;
 mod view;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -135,10 +135,10 @@ pub use self::base::{Base, SavedBase};
 pub use self::carry::{Carried, Resolved, Resolver, Side};
 pub use self::conflict::has_markers;
 use self::git_source::GitSource;
-use self::tree::Tree;
+pub use self::tree::Tree;
 use self::view::View;
 use super::file_delta::{self, FileDelta, FileTimes, ReplayError, TimedDelta};
-use crate::{BranchName, FileChanges, Rev};
+use crate::{BranchName, FileChanges, ObjectFormat, Oid, Rev};
 
 const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
@@ -547,18 +547,73 @@ impl VfsStore {
         }
     }
 
+    /// What the session's changes are made on, without taking it: the base
+    /// the store holds, or — for a store that has not read its branch yet —
+    /// where the branch stands now, which its first read would take. The
+    /// store is left as it was either way. `None` for a store over a folder
+    /// or nothing.
+    pub fn peek_base(&self) -> Result<Option<Base>, VfsError> {
+        let Lower::Branch { source, rev } = &self.lower else {
+            return Ok(None);
+        };
+        if let Some(base) = &self.upper.read().unwrap().base {
+            return Ok(Some(base.clone()));
+        }
+        Ok(Some(Self::branch_base(source, rev)?))
+    }
+
+    /// Every file of `base`, as its tree lists them — over a branch; `None`
+    /// for a store over a folder or nothing. The session's changes are not in
+    /// it. A tree read recently is answered from memory.
+    pub fn tree_at(&self, base: &Base) -> Result<Option<Arc<Tree>>, VfsError> {
+        let Lower::Branch { source, .. } = &self.lower else {
+            return Ok(None);
+        };
+        let tree = source.tree_of(base).map_err(|e| {
+            VfsError::Unreadable(format!("the base could not be read from git: {e}"))
+        })?;
+        Ok(Some(tree))
+    }
+
+    /// What names `path`'s content as the lower layer holds it: its blob id
+    /// and size. Over a branch the base's tree says, with nothing read; over
+    /// a folder the file is read and its id computed as git would
+    /// ([`ObjectFormat::blob_id`], SHA-1). `None` when the session has
+    /// changed the path — its own copy is not the lower layer's — or when
+    /// there is no such file.
+    pub fn content_id(&self, path: &str) -> Result<Option<(Oid, u64)>, VfsError> {
+        let norm = Self::normalize(path);
+        Self::guard(&norm)?;
+        if self.holds(&norm) {
+            return Ok(None);
+        }
+        match self.view()? {
+            View::Empty => Ok(None),
+            View::Branch { tree, .. } => {
+                Ok(tree.file(&norm).map(|(blob, size)| (blob.clone(), size)))
+            }
+            View::Folder(root) => Ok(folder::read_bytes(root, &norm)?
+                .map(|bytes| (ObjectFormat::Sha1.blob_id(&bytes), bytes.len() as u64))),
+        }
+    }
+
     /// The store's base, taken from the branch it names the first time.
     fn pinned(&self, source: &GitSource, rev: &RwLock<Rev>) -> Result<Base, VfsError> {
         if let Some(base) = &self.upper.read().unwrap().base {
             return Ok(base.clone());
         }
-        let rev = rev.read().unwrap().clone();
-        let found = source.base_at(&rev).map_err(|e| {
-            VfsError::Unreadable(format!("the branch could not be read from git: {e}"))
-        })?;
+        let found = Self::branch_base(source, rev)?;
         let mut upper = self.upper.write().unwrap();
         // Another caller may have taken it between the two locks.
         Ok(upper.base.get_or_insert(found).clone())
+    }
+
+    /// Where the branch the store names stands now.
+    fn branch_base(source: &GitSource, rev: &RwLock<Rev>) -> Result<Base, VfsError> {
+        let rev = rev.read().unwrap().clone();
+        source.base_at(&rev).map_err(|e| {
+            VfsError::Unreadable(format!("the branch could not be read from git: {e}"))
+        })
     }
 
     /// The lower layer: over a branch, the tree of the store's base.
@@ -762,6 +817,13 @@ impl VfsStore {
     /// so that what a read returns is no longer the lower layer's copy.
     pub fn is_modified(&self, path: &str) -> bool {
         self.holds(&Self::normalize(path))
+    }
+
+    /// Every path the session has changed, sorted.
+    pub fn changed_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.upper.read().unwrap().chains.keys().cloned().collect();
+        paths.sort();
+        paths
     }
 
     /// Whether the session layer holds a chain for `norm`.

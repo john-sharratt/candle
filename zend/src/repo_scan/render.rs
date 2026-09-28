@@ -276,8 +276,8 @@ pub fn chain_error(prefilled: &[(TurnText, String)], decode_user: &TurnText) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo_scan::dir_unit::{build_units, workspace_unit};
-    use crate::repo_scan::types::{FileEntry, Language, ModuleHint, RepoMap};
+    use crate::branch_ingest::units::{test_units, workspace_unit};
+    use crate::repo_scan::types::Language;
     use candle_conversation::models::Dialect;
     use std::path::Path;
     use zend_vfs::{RepoSpec, Workspace};
@@ -311,28 +311,19 @@ mod tests {
         dir
     }
 
-    fn map_of(root: &Path, paths: &[(&str, Language)]) -> RepoMap {
-        let _ = root;
-        RepoMap {
-            files: paths
-                .iter()
-                .map(|(p, l)| FileEntry {
-                    path: p.to_string(),
-                    line_count: 1,
-                    language: *l,
-                    size_bytes: 1,
-                    module_hint: None,
-                })
-                .collect(),
-            ..Default::default()
-        }
+    /// The folder units of one repository's files, each read from `root` as
+    /// the ingest reads a unit from its commit.
+    fn build_units(root: &Path, paths: &[(&str, Language)]) -> Vec<DirUnit> {
+        test_units(paths)
+            .iter()
+            .map(|u| DirUnit::read(u, |path| std::fs::read(root.join(path)).ok()))
+            .collect()
     }
 
     #[test]
     fn request_names_the_folder_and_asks_for_complete_sentences() {
         let d = workspace(&[("a/src/x.rs", "fn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/src/x.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/src/x.rs", Language::Rust)]);
         assert_eq!(
             render_request(&units[0]),
             format!("Summarize the `src/` folder in the `a` repository {SUMMARY_ASK}"),
@@ -343,8 +334,7 @@ mod tests {
     #[test]
     fn a_repository_root_is_named_as_the_repository() {
         let d = workspace(&[("a/x.rs", "fn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/x.rs", Language::Rust)]);
         assert_eq!(
             render_request(&units[0]),
             format!("Summarize the `a` repository {SUMMARY_ASK}"),
@@ -381,11 +371,7 @@ mod tests {
     #[test]
     fn the_workspace_root_is_named_in_words_not_as_a_dot() {
         let d = workspace(&[("a/x.rs", "fn x() {}\n"), ("b/y.rs", "fn y() {}\n")]);
-        let m = map_of(
-            d.path(),
-            &[("a/x.rs", Language::Rust), ("b/y.rs", Language::Rust)],
-        );
-        let root = workspace_unit(&m).unwrap();
+        let root = DirUnit::read(&workspace_unit(&["a".into(), "b".into()]), |_| None);
         assert_eq!(root.dir, ".", "the tag/cache key stays `.`");
 
         let request = render_request(&root);
@@ -411,12 +397,14 @@ mod tests {
     /// from a `Cargo.toml` in the listing.
     #[test]
     fn request_carries_a_manifest_hint_when_the_folder_has_one() {
-        let d = workspace(&[("a/x.rs", "fn x() {}\n")]);
-        let mut m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
-        m.files[0].module_hint = Some(ModuleHint::CargoPackage {
-            name: "demo".to_string(),
-        });
-        let units = build_units(&m, d.path());
+        let d = workspace(&[
+            ("a/Cargo.toml", "[package]\nname = \"demo\"\n"),
+            ("a/x.rs", "fn x() {}\n"),
+        ]);
+        let units = build_units(
+            d.path(),
+            &[("a/Cargo.toml", Language::Toml), ("a/x.rs", Language::Rust)],
+        );
         assert_eq!(
             render_request(&units[0]),
             format!("Summarize the `a` repository (crate: demo) {SUMMARY_ASK}"),
@@ -436,8 +424,7 @@ mod tests {
     fn tool_calls_are_hermes_json_on_a_json_dialect() {
         let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
         let d = workspace(&[("a/src/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/src/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/src/mod.rs", Language::Rust)]);
         let call = render_list_call(&env, &units[0]);
         assert_eq!(
             call,
@@ -469,8 +456,7 @@ mod tests {
     #[test]
     fn tool_calls_follow_the_dialects_call_style() {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
         let anchor = units[0].anchor.as_ref().unwrap();
 
         // What the ingest prefills must equal what the DIALECT's envelope
@@ -543,8 +529,7 @@ mod tests {
     #[test]
     fn read_response_is_the_shared_excerpt_format() {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
         let response = render_read_response(units[0].anchor.as_ref().unwrap());
         assert_eq!(
             response.text(),
@@ -563,11 +548,10 @@ mod tests {
             ("a/mod.rs", "//! One.\n//! Two.\n"),
             ("a/x.rs", "fn x() {}\n"),
         ]);
-        let m = map_of(
+        let units = build_units(
             d.path(),
             &[("a/mod.rs", Language::Rust), ("a/x.rs", Language::Rust)],
         );
-        let units = build_units(&m, d.path());
         let ctx = ctx_for(&d);
         let out = render_list_response(&ctx, &units[0]).text();
         assert!(out.starts_with("<tool_response>{"), "{out}");
@@ -588,8 +572,7 @@ mod tests {
 fn x() {}
 ",
         )]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
         let ctx = ctx_for(&d);
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(prefilled.len(), 2, "request+list, listing+read");
@@ -617,8 +600,7 @@ fn x() {}
             "fn x() {}
 ",
         )]);
-        let m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/x.rs", Language::Rust)]);
         let ctx = ctx_for(&d);
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(prefilled.len(), 1);
@@ -636,8 +618,7 @@ fn x() {}
 fn x() {}
 ",
         )]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
         let ctx = ctx_for(&d);
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(chain_error(&prefilled, &decode_user), None);
@@ -667,18 +648,17 @@ fn x() {}
     #[test]
     fn an_excerpt_response_is_not_an_error() {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
         let excerpt = render_read_response(units[0].anchor.as_ref().unwrap());
         assert_eq!(chain_error(&[], &excerpt), None);
     }
 
-    /// Rendering is deterministic — the resume cache depends on it.
+    /// Rendering is deterministic — a unit's content key stands for the turns
+    /// it shows, so the same unit must render the same bytes every time.
     #[test]
     fn rendering_is_byte_identical_on_repeat() {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m, d.path());
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
         let ctx = ctx_for(&d);
         assert_eq!(
             render_chain(&ctx, &units[0], &env()),

@@ -21,6 +21,17 @@
 //! line endings do not — and which neither the caller named nor `status`
 //! reports — comes back as a checkout writes it; and two paths hard-linked
 //! to one file come back as two files with the same bytes.
+//!
+//! **Onto a branch that moved on.** A checkout is put back on its branch as
+//! it stands, and the branch may have moved on from the commit the snapshot
+//! was taken over — a commit published to it, or the branch following its
+//! record, while the checkout was set aside. The index tree then holds the
+//! old commit's files, and reading it back whole would stage the reverse of
+//! everything the branch gained. So the checkout's own staged changes — the
+//! index tree against the commit it was taken over — are laid onto the
+//! branch as it stands instead, and a file captured only to keep its bytes,
+//! which the checkout had not changed, is not written over a path the branch
+//! changed since.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -34,7 +45,10 @@ use crate::checkout::target::{self, Found};
 use crate::checkout::CheckoutError;
 use crate::runner::utf8;
 use crate::write::scratch::PrivateIndex;
-use crate::{FileMode, GitError, GitTime, Oid, Repo, Signature, StatusCode, StatusEntry};
+use crate::{
+    DiffEntry, DiffStatus, FileMode, GitError, GitTime, Oid, Repo, Rev, Signature, StatusCode,
+    StatusEntry,
+};
 
 /// Who the captured commits are recorded as, whatever identity the
 /// repository has — or lacks.
@@ -56,6 +70,38 @@ pub(super) struct Snapshot {
     pub intent_to_add: Vec<String>,
     pub perms: BTreeMap<String, u32>,
     pub link_dirs: Vec<String>,
+    /// Captured paths the checkout had not changed — taken only so that
+    /// their bytes, line endings and all, come back exactly.
+    pub unchanged: Vec<String>,
+}
+
+impl Snapshot {
+    /// Every path the checkout had changed itself over `taken_over`, the
+    /// commit the snapshot was taken over: staged, in the working tree,
+    /// deleted, added with `-N`, or flagged to be left alone.
+    pub fn own_changes(
+        &self,
+        repo: &Repo,
+        taken_over: &Oid,
+    ) -> Result<BTreeSet<String>, CheckoutError> {
+        let mut own: BTreeSet<String> = staged(repo, taken_over, &self.index)?
+            .iter()
+            .flat_map(|e| e.old.iter().chain(&e.new))
+            .map(|side| side.path.as_str().to_string())
+            .collect();
+        if let Some(files) = &self.files {
+            own.extend(
+                repo.ls_tree_all(files)?
+                    .into_iter()
+                    .map(|sized| sized.entry.path.as_str().to_string())
+                    .filter(|path| !self.unchanged.contains(path)),
+            );
+        }
+        own.extend(self.deleted.iter().cloned());
+        own.extend(self.intent_to_add.iter().cloned());
+        own.extend(self.flags.iter().map(|f| f.path.clone()));
+        Ok(own)
+    }
 }
 
 /// Capture `repo`'s index and working-tree changes over `head`, and the
@@ -112,6 +158,12 @@ pub(super) fn capture(
     }
     let mut present_only: BTreeSet<String> = flags.iter().map(|f| f.path.clone()).collect();
     present_only.extend(also.iter().cloned());
+
+    let unchanged: Vec<String> = also
+        .iter()
+        .filter(|p| !named.contains(*p) && !flags.iter().any(|f| &f.path == *p))
+        .cloned()
+        .collect();
 
     let root = repo.dir().to_path_buf();
     let mut regular: Vec<(String, FileMode)> = Vec::new();
@@ -191,12 +243,32 @@ pub(super) fn capture(
         intent_to_add,
         perms,
         link_dirs,
+        unchanged,
     })
 }
 
-/// Put `snapshot` back into `repo`'s checkout. See the module. Every step is
-/// safe to repeat.
-pub(super) fn restore(repo: &Repo, snapshot: &Snapshot) -> Result<(), CheckoutError> {
+/// Put `snapshot`, taken over the commit `taken_over`, back into `repo`'s
+/// checkout, which a checkout of its branch has just put at `now` — that
+/// commit, or one the branch moved on to. See the module. Every step is safe
+/// to repeat.
+pub(super) fn restore(
+    repo: &Repo,
+    snapshot: &Snapshot,
+    taken_over: &Oid,
+    now: &Oid,
+) -> Result<(), CheckoutError> {
+    let moved_on = now != taken_over;
+    // What the branch changed since: a file the checkout had not changed is
+    // the branch's there now.
+    let gained: BTreeSet<String> = if moved_on {
+        repo.diff(&Rev::Oid(taken_over.clone()), &Rev::Oid(now.clone()), &[])?
+            .iter()
+            .flat_map(|e| e.old.iter().chain(&e.new))
+            .map(|side| side.path.as_str().to_string())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let root = repo.dir().to_path_buf();
     let mut cleared = Vec::new();
     // What held no file first: a file standing where a captured folder's
@@ -211,6 +283,9 @@ pub(super) fn restore(repo: &Repo, snapshot: &Snapshot) -> Result<(), CheckoutEr
                 continue;
             }
             let path = entry.path.as_str();
+            if gained.contains(path) && snapshot.unchanged.iter().any(|u| u == path) {
+                continue;
+            }
             materialize::clear_the_way(&root, path, &mut cleared)?;
             let bytes = repo
                 .git("cat-file")
@@ -238,13 +313,33 @@ pub(super) fn restore(repo: &Repo, snapshot: &Snapshot) -> Result<(), CheckoutEr
             }
         }
     }
+    // Read before the write lock: the diff runs git of its own.
+    let own_staged = if moved_on {
+        Some(staged(repo, taken_over, &snapshot.index)?)
+    } else {
+        None
+    };
     {
         let _write = repo.write_lock();
-        repo.git("read-tree")
-            .arg("--end-of-options")
-            .arg(snapshot.index.as_str())
-            .about_rev(snapshot.index.as_str())
-            .run_ok()?;
+        match &own_staged {
+            // The checkout's index, as it was over the commit it stands on.
+            None => {
+                repo.git("read-tree")
+                    .arg("--end-of-options")
+                    .arg(snapshot.index.as_str())
+                    .about_rev(snapshot.index.as_str())
+                    .run_ok()?;
+            }
+            // Its staged changes, laid onto the branch as it stands: the
+            // checkout of `now` left the index at `now`'s tree.
+            Some(entries) if !entries.is_empty() => {
+                repo.git("update-index")
+                    .args(["-z", "--index-info"])
+                    .stdin(index_info(entries))
+                    .run_ok()?;
+            }
+            Some(_) => {}
+        }
         for batch in snapshot.intent_to_add.chunks(BATCH) {
             repo.git("add")
                 .args(["--intent-to-add", "--"])
@@ -277,6 +372,36 @@ pub(super) fn restore(repo: &Repo, snapshot: &Snapshot) -> Result<(), CheckoutEr
             .run_accepting(&[0, 1])?;
     }
     Ok(())
+}
+
+/// The checkout's staged changes: its index, held by the commit `index`,
+/// against the commit it was taken over.
+fn staged(repo: &Repo, taken_over: &Oid, index: &Oid) -> Result<Vec<DiffEntry>, CheckoutError> {
+    Ok(repo.diff(&Rev::Oid(taken_over.clone()), &Rev::Oid(index.clone()), &[])?)
+}
+
+/// `update-index --index-info` input setting each of `entries`' paths as
+/// the change leaves it: a path it removes — deleted, or the source of a
+/// rename — is dropped from the index, one it leaves in place is set.
+fn index_info(entries: &[DiffEntry]) -> Vec<u8> {
+    let mut info = Vec::new();
+    for entry in entries {
+        let kept = matches!(entry.status, DiffStatus::Copied(_));
+        if let Some(old) = entry.old.as_ref().filter(|_| !kept) {
+            let moved = entry.new.as_ref().is_none_or(|new| new.path != old.path);
+            if moved {
+                let none = "0".repeat(old.oid.as_ref().map_or(40, |o| o.as_str().len()));
+                info.extend(format!("0 {none}\t{}\0", old.path.as_str()).into_bytes());
+            }
+        }
+        if let Some(new) = &entry.new {
+            if let Some(oid) = &new.oid {
+                let line = format!("{} {oid}\t{}\0", new.mode.as_str(), new.path.as_str());
+                info.extend(line.into_bytes());
+            }
+        }
+    }
+    info
 }
 
 fn recorder() -> Result<Signature, CheckoutError> {

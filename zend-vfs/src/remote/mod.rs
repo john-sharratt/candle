@@ -4,4 +4,5 @@
 pub mod fetch;
 pub mod ls_remote;
 pub mod manage;
+pub mod probe;
 pub mod push;

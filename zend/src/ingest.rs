@@ -10,10 +10,11 @@
 //! * **Turn-sinks** ([`ingest_layers`]) — a layer whose group takes loaded turns.
 //!   The live conversation layer (identified by a `Sequence`-rule group) is
 //!   excluded. The rest resolve by convention: the built-in `repo_map`
-//!   (folder-scan of every repository) and `code_reading` (per-file read of every
-//!   repository) pipelines are recognised by name; every other turn-sink layer
-//!   reads ChatML records from a folder named after it (`<name>/`) in the
-//!   workspace folder.
+//!   (every folder of every repository's branches) and `code_reading` (every
+//!   file of them) pipelines are recognised by name — both ingested from the
+//!   branches (`crate::branch_ingest`); every other turn-sink layer reads
+//!   ChatML records from a folder named after it (`<name>/`) in the workspace
+//!   folder.
 //! * **Section-collection sinks** ([`section_sinks`]) — an empty collection in a
 //!   layer's system prompt, other than the registry-backed `tools`. Each is filled
 //!   with calibrated sections from a folder named after it (`<name>s/`).
@@ -24,9 +25,7 @@ use std::path::Path;
 use candle_conversation::projection::{LayerSchema, Schema, SelectionRule, SystemPromptItem};
 use candle_conversation::Sequence;
 
-use crate::code_read::CodeReadState;
 use crate::raw_read::RawState;
-use crate::repo_scan::DirState;
 
 /// The built-in section collection filled from a non-folder source (the tool
 /// registry), so it is never treated as a folder-backed section sink.
@@ -42,10 +41,9 @@ const IDENTITY_ANCHOR_COLLECTION: &str = "identity_anchor";
 /// identity, never annotated in the schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngestMode {
-    /// Walk the content root and summarise each of its directories (the built-in
-    /// `repo_map`).
+    /// Summarise every folder of every branch (the built-in `repo_map`).
     Folders,
-    /// Per-file scope-aware carve of the content root (the built-in `code_reading`).
+    /// Read every file of every branch (the built-in `code_reading`).
     Files,
     /// Hold ChatML records directly from the content folder.
     Raw,
@@ -59,9 +57,9 @@ pub struct IngestLayer {
     pub group: String,
     pub mode: IngestMode,
     /// Workspace-relative. For [`IngestMode::Folders`] and [`IngestMode::Files`]
-    /// it is the walk's scope — empty for every repository, or one folder inside
-    /// a repository (`candle/zend/src`); for [`IngestMode::Raw`] it is the
-    /// folder the records are read from.
+    /// it is the branch walk's scope — empty for every repository, or one folder
+    /// inside a repository (`candle/zend/src`); for [`IngestMode::Raw`] it is
+    /// the folder the records are read from.
     pub folder: String,
     pub display: String,
     /// Noun for the startup loading screen's absolute readout ("N / M <unit>").
@@ -69,20 +67,14 @@ pub struct IngestLayer {
     pub unit: String,
 }
 
-/// A live turn-sink's mutable state, held between refreshes and keyed by layer
-/// name in the session's registry. The variant mirrors the layer's [`IngestMode`].
-#[allow(clippy::large_enum_variant)]
-pub enum IngestConv {
-    /// A folder-scan layer: only the per-directory content-hash record — each
-    /// directory's conversation is freed once its turns seal into the substrate,
-    /// exactly as the per-file layer's are.
-    Folders { state: DirState },
-    /// A per-file layer: only the merged per-file content-hash record — the
-    /// per-file conversations are freed after their turns seal into the substrate.
-    Files { state: CodeReadState },
-    /// A raw-ChatML layer: the owning conversation (holding the prefilled record
-    /// turns) plus the per-file content-hash record for refresh.
-    Raw { sequence: Sequence, state: RawState },
+/// A raw-ChatML layer's live state, held between refreshes and keyed by layer
+/// name in the session's registry: the owning conversation (holding the
+/// prefilled record turns) plus the per-file content-hash record for refresh.
+/// The branch layers keep no such state — what they hold is read from the
+/// substrate by each pass (`crate::branch_ingest`).
+pub struct IngestConv {
+    pub sequence: Sequence,
+    pub state: RawState,
 }
 
 /// A section-collection sink: an empty collection to be filled with calibrated

@@ -14,6 +14,8 @@ use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend_tools::ToolContext;
 
+use crate::retrieval_scope::RetrievalScope;
+
 /// Refresh-time context.  Borrows the engine's `Mutex` so the
 /// refresh helpers can lock it briefly for the two engine API calls
 /// (`new_conversation_with_projection` at the start, then
@@ -46,4 +48,6 @@ pub struct RefreshContext<'a> {
     /// dialogue turn runs tools in). Each unit's conversation runs in a copy
     /// of it with file stores of its own, as every conversation does.
     pub tool_ctx: Arc<ToolContext>,
+    /// Told whenever a unit commits, so the next turn's scope can find it.
+    pub retrieval: &'a RetrievalScope,
 }

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
@@ -14,7 +14,7 @@ use futures::future::select_all;
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as ConvLock;
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::{Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle as TaskHandle;
 
 use candle::vram;
@@ -51,6 +51,8 @@ use crate::api::substrate::{
     SectionView, SegmentView, SelectedNodeView, SelectionView, Storage, SubstrateOverview,
     SystemPromptView, TimelineDetail, ToolView, ToolsView, TurnView,
 };
+use crate::branch_ingest::filter::IngestScope;
+use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
 use crate::coding_sampling;
 use crate::config::DaemonConfig;
 use crate::conv_branches::{self, BaseBranches};
@@ -60,12 +62,13 @@ use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
 use crate::model_choice;
+use crate::origin_watch::OriginWatch;
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repeat_guard::{self, RepeatGuard, Verdict};
-use crate::repo_scan::RepoMap;
 use crate::resume;
+use crate::retrieval_scope::RetrievalScope;
 use crate::think_budget;
 use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tool_round;
@@ -100,12 +103,11 @@ enum TitleJob {
     Shutdown,
 }
 
-// Per-layer ingest state ([`IngestConv`]) and the schema-driven ingest registry
-// live in [`crate::ingest`]. A layer's live state is keyed by layer name in
-// `InferenceState::ingest_convs`; the folder-scan variant holds an owning
-// `Sequence` (so its sealed K/V stays reachable by dialogue retrieval), the
-// per-file variant holds only its content-hash record (its per-file
-// conversations are freed after their turns seal into the substrate).
+// The schema-driven ingest registry lives in [`crate::ingest`]; a raw layer's
+// live state ([`IngestConv`]) is keyed by layer name in
+// `InferenceState::ingest_convs`. The branch layers (`repo_map`,
+// `code_reading`) keep no live state: each pass reads what they hold from the
+// substrate ([`crate::branch_ingest`]).
 
 // The number of tools surfaced into the system prompt is governed by
 // the `selection: { kind: top_k, k: N }` rule on the `tools` collection
@@ -468,32 +470,26 @@ struct InferenceState {
     /// Set once shutdown begins. The titler worker checks it between jobs and
     /// stops draining; the request path stops enqueuing new title jobs.
     shutting_down: AtomicBool,
-    /// Live per-layer ingest state, keyed by projection layer name. One entry
-    /// per enabled, non-skipped schema ingest layer — seeded at boot from the
-    /// substrate's durable record (`repo_scan::dir_state_from_substrate` /
-    /// `code_read::code_read_state_from_substrate`), whether or not any ingest
-    /// pass has ever actually run for it, so a fresh install seeds an empty
-    /// state that reads as "everything changed" on the background worker's
-    /// first pass. `Raw` entries are the exception: they are minted by the
-    /// still-blocking Raw ingest because they hold a live `Sequence`, which
-    /// can't be reconstructed from the substrate alone.
-    ///
-    /// A layer named by `--disable-layer` OR `--skip-layer` is ABSENT, which is
-    /// also what suppresses its watcher/background-worker refresh: the refresh
-    /// dispatch reads each layer's prior state from here and skips any layer
-    /// that has none, so "not loaded" implies "not refreshed" without either
-    /// flag being consulted a second time. The upload path also iterates this
-    /// registry, but it SEEDS a missing entry rather than skipping it (an
-    /// upload is a deliberate write, not a disk re-read), so that path checks
-    /// `disabled_layers` itself. A projection with no ingest layers leaves this
-    /// empty.
+    /// Live raw-layer ingest state, keyed by projection layer name. A raw
+    /// layer absent here is not refreshed. A projection with no raw layers
+    /// leaves this empty.
     ingest_convs: Mutex<HashMap<String, IngestConv>>,
     /// The schema's ingest layers in declaration order (identity + strategy +
-    /// display label), resolved once at load. Drives the refresh dispatch —
-    /// each entry names how to re-ingest the matching [`IngestConv`].
+    /// display label), resolved once at load.
     ingest_layers: Vec<IngestLayer>,
-    /// The workspace captured at startup — its folder and repositories. The
-    /// refresh path re-walks its repositories on every filesystem event.
+    /// The branch layers this boot ingests — `repo_map` and `code_reading`,
+    /// less any `--disable-layer` names — with the scope each is walked under.
+    branch_layers: Vec<(IngestLayer, IngestScope)>,
+    /// The branch ingest's state between passes (`crate::branch_ingest`).
+    branch_ingest: BranchIngest,
+    /// Which ingested units each conversation may retrieve
+    /// (`crate::retrieval_scope`), set on the engine before every turn.
+    retrieval_scope: RetrievalScope,
+    /// The ingest worker's wake, once it is running: a `git_*` tool round
+    /// that can move a branch wakes it, since a push moves the tracking refs
+    /// itself and no origin probe will see a difference afterwards.
+    ingest_wake: OnceLock<Arc<Notify>>,
+    /// The workspace captured at startup — its folder and repositories.
     workspace: Workspace,
     /// The branch a conversation starts on in each git repository — `main`,
     /// else `master`, else the checkout — read once at startup. A
@@ -501,9 +497,6 @@ struct InferenceState {
     /// yet: every live one at startup, and each new one as it is created.
     /// See [`conv_branches`].
     base_branches: BaseBranches,
-    /// `--max-depth`: the path-component bound the `repo_map` / `code_reading`
-    /// walks run under, and the watcher's event filter. `None` = unbounded.
-    max_depth: Option<usize>,
     /// Projection builder + sequence config kept alive for the
     /// atomic refresh paths.  Minting a fresh ingest-layer timeline
     /// after a file change reuses the same schema clone and the same
@@ -1151,7 +1144,7 @@ impl InferenceState {
         // Every schema that resolves a projection later is a copy of this one:
         // `base_conv` is built from `proj_builder` itself, and the clone below
         // feeds the ingest passes, the per-mode turn builders
-        // (`ModeBuilders::build`) and the watcher's `refresh_builder`. Setting
+        // (`ModeBuilders::build`) and the ingest worker's `refresh_builder`. Setting
         // `gathered` after the clone would leave the base conversation — the very
         // schema the live dialogue projects against — still gathering the layer,
         // which is the half that mattered.
@@ -1172,24 +1165,6 @@ impl InferenceState {
                 );
             }
         }
-        // `repo_map` and `code_reading` are excluded from the gather
-        // UNCONDITIONALLY — not behind `--disable-layer` — while their ingest
-        // shape is mid-rewrite (real hidden tool-using conversations replacing
-        // synthetic prefill). Their turns still ingest and persist normally;
-        // they simply never compete for selection into a live dialogue's
-        // context. A future explicit mechanism (naming specific conversations
-        // to project, not a blanket gather) is what re-admits them — this is
-        // not that, and is meant to be temporary.
-        for name in ["repo_map", "code_reading"] {
-            if proj_builder.set_layer_gathered(name, false) {
-                tracing::info!(
-                    layer = name,
-                    "layer permanently excluded from the provenance gather \
-                     (ingest shape mid-rewrite)",
-                );
-            }
-        }
-
         // The dialogue layer's `system_prompt.items` start with a static
         // prelude (mode/frame/grounding/tools_intro) →
         // then the `tools` collection (90+ tool sections, top_k=3) →
@@ -1420,8 +1395,8 @@ impl InferenceState {
         // A clone of the (tools-installed + templates-tokenised) projection
         // builder is kept for the schema-driven ingest passes (one cheap clone
         // per ingest layer below — schemas are `Arc`-backed) and stays on
-        // `InferenceState` afterwards for the atomic refresh paths to mint fresh
-        // ingest-layer timelines when the watcher fires.
+        // `InferenceState` afterwards for the ingest worker's passes to mint
+        // fresh ingest-layer timelines.
         let proj_builder_refresh = proj_builder.clone();
         let mut base_conv = engine
             .new_conversation_with_projection_progress(
@@ -2227,47 +2202,20 @@ impl InferenceState {
 
         // Structure-derived ingestion. The load plan is derived from the declared
         // schema (see `crate::ingest`), not annotated in it: each turn-sink layer
-        // is populated here, in schema order, skipping any named by
-        // `--disable-layer`. The folder and file layers walk every repository
-        // (or the `--ingest-dir` scope inside one); a raw layer reads its
-        // content folder under the workspace. A projection with no turn-sinks (a
-        // pure conversational mind) does no filesystem reading here.
+        // is prepared here, in schema order, skipping any named by
+        // `--disable-layer`. The folder and file layers are ingested from every
+        // repository's branches (or the `--ingest-dir` scope inside one) by the
+        // background worker; a raw layer reads its content folder under the
+        // workspace.
         let ingest_layers =
             crate::ingest::ingest_layers(proj_builder_refresh.schema(), &root, &ingest_dirs);
-        // Mark EVERY ingest layer append-only UP FRONT — deterministically, before
-        // any ingest AND before `warm_ingest_normalization` runs — using the SAME
-        // builder (`proj_builder_refresh`) whose layer ids the warm-up checks. The
-        // per-layer marks inside the ingest/skip loop below run on only the branch
-        // actually taken and, on the ingest branch, via the ingest builder's id.
-        // A boot that RE-INGESTS then marks via an id the warm-up doesn't read, so
-        // the warm sees 0 append-only layers, leaves every code scope COLD, and the
-        // most promiscuous file tops every query at an un-normalized score (the
-        // observed 0% retrieval after a re-ingest). Marking here, once, from the
-        // warm's own builder keeps the append-only set consistent on every load path.
-        //
-        // **This is where the two flags part company**, and the split is the whole
-        // point of having two:
-        //
-        // - `--skip-layer` means "the corpus is built, stop re-reading the disk".
-        //   The layer is otherwise FULLY LIVE, so it is marked append-only here
-        //   (hence warmed, hence normalized, hence gathered at sane scores) and its
-        //   crashed partials are retired. Only the read is skipped, below.
-        // - `--disable-layer` means "this layer is out of service". No mark, so no
-        //   normalization warm; `gathered = false` (set before the builder was
-        //   cloned, far above), so no gather; and no sweep, because sweeping
-        //   tombstones turns, which is a MUTATION — the one thing an out-of-service
-        //   layer must not suffer. Its substrate is left exactly as it stands, so
-        //   dropping the flag restores the layer whole.
-        //
-        // The append-only mark must be taken from THIS builder
-        // (`proj_builder_refresh`) — the same one whose layer ids
-        // `warm_ingest_normalization` checks — and up front, before any ingest. The
-        // per-layer marks inside the loop below run on only the branch actually
-        // taken and, on the ingest branch, via the ingest builder's id; a boot that
-        // RE-INGESTS then marks via an id the warm-up doesn't read, the warm sees 0
-        // append-only layers, every content scope stays COLD, and the most
-        // promiscuous file tops every query at an un-normalized score (the observed
-        // 0% retrieval after a re-ingest). Marking here, once, from the warm's own
+        // Mark EVERY enabled ingest layer append-only UP FRONT — deterministically,
+        // before any ingest AND before `warm_ingest_normalization` runs — using
+        // the SAME builder (`proj_builder_refresh`) whose layer ids the warm-up
+        // checks. Marking via any other builder's id leaves the warm seeing 0
+        // append-only layers, every code scope COLD, and the most promiscuous
+        // file topping every query at an un-normalized score (the observed 0%
+        // retrieval after a re-ingest). Marking here, once, from the warm's own
         // builder keeps the append-only set consistent on every load path.
         //
         // That consistency is what the mark buys, and it is expensive to lose: it
@@ -2275,11 +2223,15 @@ impl InferenceState {
         // the gather divides raw scores in the millions by the `hit_prior` of 400 —
         // a ~13,000x under-correction that put a repo_map file listing, the most
         // promiscuous member in the corpus, at the top of an unrelated dialogue's
-        // context at a score of 13,315,007 against the live conversation's 0. A
-        // layer the operator declined to RE-READ still has a substrate full of
-        // turns that answer queries, and those turns need their levels — which is
-        // exactly why `--skip-layer` keeps the mark and `--disable-layer`, which
-        // also leaves nothing in the gather to score, does not.
+        // context at a score of 13,315,007 against the live conversation's 0.
+        //
+        // `--disable-layer` means "this layer is out of service". No mark, so no
+        // normalization warm; `gathered = false` (set before the builder was
+        // cloned, far above), so no gather; and no sweep, because sweeping
+        // tombstones turns, which is a MUTATION — the one thing an out-of-service
+        // layer must not suffer. Its substrate is left exactly as it stands, so
+        // dropping the flag restores the layer whole.
+        //
         // `base_conv`'s counterpart for ingestion — one prefilled template per
         // `Folders`/`Files` layer, built here exactly as `base_conv` itself was
         // built above, so `repo_scan`/`code_read` can fork a unit's conversation
@@ -2288,9 +2240,9 @@ impl InferenceState {
         // ingestion". See `InferenceState::ingest_bases`.
         //
         // Built unconditionally, even for a `--disable-layer` layer: the upload
-        // path (`ZendSession::ingest_uploaded_files`) bypasses the
-        // disabled/skipped dispatch below entirely and still needs a `Files`
-        // layer's base to fork from on the first upload. `Raw` is excluded — it
+        // path (`ZendSession::ingest_uploaded_files`) bypasses the disabled
+        // layers' passes entirely and still needs a `Files` layer's base to fork
+        // from on the first upload. `Raw` is excluded — it
         // only ever prefills records and never decodes, so it has no reasoning
         // to protect and stays on `raw_read::ingest_raw`'s existing construction.
         let mut ingest_bases: HashMap<String, Mutex<Sequence>> = HashMap::new();
@@ -2329,8 +2281,7 @@ impl InferenceState {
             // still carries its `WideQSig`s, so until it is tombstoned it competes
             // in the gather with a promiscuous file listing and no summary. Nothing
             // is in flight at this point, which is why the sweep lives here and not
-            // inside the ingest passes (those run only when the read runs, which is
-            // precisely not the `--skip-layer` case that needs it).
+            // inside the ingest passes, which can overlap a pool mid-flight.
             match il.mode {
                 IngestMode::Folders => crate::repo_scan::retire_crashed_partials(&engine),
                 IngestMode::Files => crate::code_read::retire_crashed_partials(&engine),
@@ -2343,11 +2294,10 @@ impl InferenceState {
             // not just crashed partials — a targeted alternative to
             // `--wipe-substrate` for exercising the background ingest worker
             // against a real, full-layer backlog without touching anything else
-            // (dialogue, the other ingest layers, uploads). Must run before the
-            // registry seed below, whose `dir_state_from_substrate` /
-            // `code_read_state_from_substrate` call needs to see the now-empty
-            // layer. `--disable-layer` still wins: a disabled layer gets no
-            // cleanup of any kind, wipe included (see the `continue` above).
+            // (dialogue, the other ingest layers, uploads). Runs before the ingest
+            // worker's first pass, which then finds the layer empty.
+            // `--disable-layer` still wins: a disabled layer gets no cleanup of
+            // any kind, wipe included (see the `continue` above).
             if wiped_layers.contains(&il.name) {
                 match il.mode {
                     IngestMode::Folders => crate::repo_scan::wipe_layer(&engine),
@@ -2360,12 +2310,40 @@ impl InferenceState {
                 }
             }
         }
-        // The registry starts empty for every layer, which is the one gate
-        // `refresh_ingest_layers` reads as "never re-read": the repositories'
-        // folders belong to the sandbox's jobs and hold whatever the last job
-        // left there, so nothing ingests from them. What the substrate already
-        // holds stays live — marked, swept and warmed above and after `ready`.
+        // The raw-layer registry starts empty: a raw layer's records are read
+        // only when a mind's folder is read for them.
         let ingest_convs: HashMap<String, IngestConv> = HashMap::new();
+
+        // The branch layers this boot ingests, each with the scope its walk runs
+        // under, and each one's group SCOPED: a conversation may retrieve only
+        // the units its own base holds (`docs/zend_branch_ingest.md` §8.2), set
+        // before each of its turns by `retrieval_scope`. Marked for a disabled
+        // layer too — it is out of the gather already, and scoped it could
+        // never offer another branch's content if it came back.
+        let mut branch_layers: Vec<(IngestLayer, IngestScope)> = Vec::new();
+        let mut files_group = None;
+        let mut folders_group = None;
+        for il in &ingest_layers {
+            if il.mode == IngestMode::Raw {
+                continue;
+            }
+            let group = proj_builder_refresh
+                .id_for_group(&il.group)
+                .ok_or_else(|| anyhow::anyhow!("projection schema missing '{}' group", il.group))?;
+            engine.lock().unwrap().mark_group_scoped(group);
+            if disabled_layers.contains(&il.name) {
+                continue;
+            }
+            let scope = IngestScope::new(&il.folder, max_depth);
+            match il.mode {
+                IngestMode::Files => files_group = Some(group),
+                IngestMode::Folders => folders_group = Some((group, scope.clone())),
+                IngestMode::Raw => {}
+            }
+            branch_layers.push((il.clone(), scope));
+        }
+        let retrieval_scope = RetrievalScope::new(files_group, folders_group);
+        retrieval_scope.refresh(&engine);
 
         // Cooperative shutdown during the (long) startup ingest: if a Ctrl-C
         // arrived while ingesting, the loop above broke early. Don't finish
@@ -2428,7 +2406,10 @@ impl InferenceState {
             shutting_down: AtomicBool::new(false),
             ingest_convs: Mutex::new(ingest_convs),
             ingest_layers,
-            max_depth,
+            branch_layers,
+            branch_ingest: BranchIngest::default(),
+            retrieval_scope,
+            ingest_wake: OnceLock::new(),
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
             formatted_prompt,
@@ -2469,6 +2450,7 @@ impl InferenceState {
             tool_ctx: self
                 .tool_host
                 .context_for(ToolMode::Restricted, &self.tool_host.conversation_files()),
+            retrieval: &self.retrieval_scope,
         }
     }
 
@@ -2482,44 +2464,45 @@ impl InferenceState {
             .ok_or_else(|| anyhow::anyhow!("no ingest base built for layer '{layer_name}'"))
     }
 
-    /// Refresh every populated ingest layer — one pass of the background
-    /// ingest worker (`crate::ingest_worker`). Every ingest that happens after
-    /// `InferenceState::load` returns goes through this: the worker's initial
-    /// post-startup backlog pass and every later filesystem-event-triggered
-    /// pass take the identical path, so a redundant wake (nothing actually
-    /// changed) costs only the two hash-equality short-circuits inside
-    /// `refresh_repo_map`/`refresh_code_reading`.
+    /// One pass of the background ingest worker (`crate::ingest_worker`) —
+    /// at startup, and after every fetch that moved a branch on origin.
     ///
-    /// Iterates the live [`IngestConv`] registry — populated at boot from the
-    /// substrate's durable state for every enabled, non-skipped layer, whether
-    /// or not any pass has run yet — and dispatches each layer to its loading
-    /// mode's atomic refresh:
-    ///  * **folder-scan** — re-derive the directory units; each whose content
-    ///    hash moved re-ingests into a fresh conversation that supersedes the old,
-    ///    and swap the new `Sequence` into the registry entry.
-    ///  * **per-file** — reconcile deleted files, then re-ingest the changed
-    ///    ones (each into a fresh per-file conversation that tombstones its
-    ///    predecessor), merging the new content-hash record into the entry.
-    ///  * **raw** — re-read the folder's ChatML records; on a content-hash change
-    ///    mint a fresh timeline, re-prefill, tombstone the old, and swap it in.
+    /// The branch layers (`repo_map`, `code_reading`) are planned against
+    /// every record branch together (`crate::branch_ingest`): what no branch
+    /// holds is tombstoned, what nothing holds yet is ingested, each unit at
+    /// the commit it was found on. A raw layer in the registry re-reads its
+    /// folder's ChatML records; on a content-hash change it mints a fresh
+    /// timeline, re-prefills, tombstones the old, and swaps it in.
     ///
-    /// The folder and file layers walk the repositories within their `folder`
-    /// scope; a raw layer reads `<workspace>/<folder>`. Walks are cached per
-    /// scope so co-located layers share one walk. Stale-better-than-
-    /// missing holds throughout: the old timeline stays alive (and is what the
-    /// resolver picks) until its replacement's tombstone fires. Returns
-    /// `Ok(true)` if any layer was replaced. No ingest layers → a cheap no-op.
+    /// Stale-better-than-missing holds throughout: an old generation stays
+    /// alive until its replacement commits. Returns `Ok(true)` if any layer
+    /// changed.
     pub(crate) fn refresh_ingest_layers(&self) -> anyhow::Result<bool> {
         if self.ingest_layers.is_empty() {
             return Ok(false);
         }
         // Throwaway progress sink (a refresh, not the model-load lifecycle) —
-        // silent so a watcher burst doesn't log "load step started Loading model".
+        // silent so a pass doesn't log "load step started Loading model".
         let progress = Arc::new(LoadProgress::silent());
-        // Walk each distinct content folder at most once per burst.
-        let mut walk_cache: HashMap<String, RepoMap> = HashMap::new();
-        let max_depth = self.max_depth;
         let mut any = false;
+        if !self.branch_layers.is_empty() {
+            let passes = self
+                .branch_layers
+                .iter()
+                .map(|(il, scope)| {
+                    Ok(LayerPass {
+                        name: &il.name,
+                        mode: il.mode,
+                        scope: scope.clone(),
+                        base: self.ingest_base(&il.name)?,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let ctx = self.refresh_ctx();
+            any |= self
+                .branch_ingest
+                .pass(&ctx, &self.workspace, &passes, &progress)?;
+        }
         for il in &self.ingest_layers {
             // Cooperative shutdown: stop the background reconcile between layers so
             // a Ctrl-C during a post-`ready` re-ingest stops promptly (the per-file
@@ -2528,124 +2511,52 @@ impl InferenceState {
             if candle_conversation::ingest_cancelled() {
                 break;
             }
-            let root = self.workspace.root();
-            match il.mode {
-                IngestMode::Folders => {
-                    let prior_state = {
-                        let convs = self.ingest_convs.lock().unwrap();
-                        match convs.get(&il.name) {
-                            Some(IngestConv::Folders { state }) => Some(state.clone()),
-                            _ => None,
-                        }
-                    };
-                    let Some(prior_state) = prior_state else {
-                        continue;
-                    };
-                    let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
-                        crate::repo_scan::walk_workspace(&self.workspace, &il.folder, max_depth)
-                    });
-                    let ctx = self.refresh_ctx();
-                    let outcome = crate::repo_scan::refresh_repo_map(
-                        &ctx,
-                        &self.workspace,
-                        map,
-                        &prior_state,
-                        &progress,
-                        &il.name,
-                        self.ingest_base(&il.name)?,
-                    )?;
-                    if let crate::repo_scan::RefreshOutcome::Replaced { state } = outcome {
-                        self.ingest_convs
-                            .lock()
-                            .unwrap()
-                            .insert(il.name.clone(), IngestConv::Folders { state });
-                        any = true;
-                        tracing::info!(layer = %il.name, "ingest layer refreshed after fs event burst");
-                    }
-                }
-                IngestMode::Files => {
-                    let prior_state = {
-                        let convs = self.ingest_convs.lock().unwrap();
-                        match convs.get(&il.name) {
-                            Some(IngestConv::Files { state }) => Some(state.clone()),
-                            _ => None,
-                        }
-                    };
-                    let Some(prior_state) = prior_state else {
-                        continue;
-                    };
-                    let map = walk_cache.entry(il.folder.clone()).or_insert_with(|| {
-                        crate::repo_scan::walk_workspace(&self.workspace, &il.folder, max_depth)
-                    });
-                    let ctx = self.refresh_ctx();
-                    let outcome = crate::code_read::refresh_code_reading(
-                        &ctx,
-                        root,
-                        map,
-                        &prior_state,
-                        &progress,
-                        self.ingest_base(&il.name)?,
-                    )?;
-                    if let crate::code_read::RefreshOutcome::Replaced { state } = outcome {
-                        self.ingest_convs
-                            .lock()
-                            .unwrap()
-                            .insert(il.name.clone(), IngestConv::Files { state });
-                        any = true;
-                        tracing::info!(layer = %il.name, "ingest layer refreshed after fs event burst");
-                    }
-                }
-                IngestMode::Raw => {
-                    let snapshot = {
-                        let convs = self.ingest_convs.lock().unwrap();
-                        match convs.get(&il.name) {
-                            Some(IngestConv::Raw { sequence, state }) => {
-                                Some((sequence.timeline_id(), state.clone()))
-                            }
-                            _ => None,
-                        }
-                    };
-                    let Some((old_timeline, prior_state)) = snapshot else {
-                        continue;
-                    };
-                    let ctx = self.refresh_ctx();
-                    let outcome = crate::raw_read::refresh_raw(
-                        &ctx,
-                        &root.join(&il.folder),
-                        &prior_state,
-                        old_timeline,
-                        &progress,
-                        &il.name,
-                        &il.group,
-                    )?;
-                    if let crate::raw_read::RefreshOutcome::Replaced { sequence, state } = outcome {
-                        self.ingest_convs
-                            .lock()
-                            .unwrap()
-                            .insert(il.name.clone(), IngestConv::Raw { sequence, state });
-                        any = true;
-                        tracing::info!(layer = %il.name, "ingest layer refreshed after fs event burst");
-                    }
-                }
+            if il.mode != IngestMode::Raw {
+                continue;
+            }
+            let snapshot = {
+                let convs = self.ingest_convs.lock().unwrap();
+                convs
+                    .get(&il.name)
+                    .map(|c| (c.sequence.timeline_id(), c.state.clone()))
+            };
+            let Some((old_timeline, prior_state)) = snapshot else {
+                continue;
+            };
+            let ctx = self.refresh_ctx();
+            let outcome = crate::raw_read::refresh_raw(
+                &ctx,
+                &self.workspace.root().join(&il.folder),
+                &prior_state,
+                old_timeline,
+                &progress,
+                &il.name,
+                &il.group,
+            )?;
+            if let crate::raw_read::RefreshOutcome::Replaced { sequence, state } = outcome {
+                self.ingest_convs
+                    .lock()
+                    .unwrap()
+                    .insert(il.name.clone(), IngestConv { sequence, state });
+                any = true;
+                tracing::info!(layer = %il.name, "raw ingest layer refreshed");
             }
         }
         Ok(any)
     }
 
-    /// Ingest **only** the given workspace-relative files into the projection's
-    /// per-file ingest layer — the upload's read_file phase. Bounded to those
-    /// files (never a whole-workspace re-ingest, never a tombstone sweep), so it
-    /// can't overload the model with the entire repo. Merges the ingested files'
-    /// content hashes into that layer's running record so the resume cache and
-    /// future watcher refreshes skip them. Reports per-scope progress into
-    /// `progress`. Returns `(ingested, failed)`: whether anything was newly
-    /// ingested, and whether at least one file's ingest tolerated-failed (e.g.
+    /// Ingest **only** the given workspace-relative files — in the uploads
+    /// repository — into the projection's per-file ingest layer: the upload's
+    /// read_file phase. Bounded to those files (no branch walk, no sweep), so
+    /// it can't overload the model with the entire repo. Reports per-file
+    /// progress into `progress`. Returns `(ingested, failed)`: whether anything
+    /// was read, and whether at least one file's ingest tolerated-failed (e.g.
     /// out of KV VRAM) — so the upload can report a real failure.
     ///
     /// If the projection declares no per-file ingest layer (a pure conversational
     /// mind), there is nowhere to read uploads into — a no-op. A per-file layer
     /// suppressed by `--disable-layer` still accepts uploads (they're bounded and
-    /// safe): its registry entry is seeded on first upload.
+    /// safe).
     pub(crate) fn ingest_uploaded_files(
         &self,
         rel_paths: &[String],
@@ -2662,52 +2573,35 @@ impl InferenceState {
             return Ok((false, false));
         };
         let ctx = self.refresh_ctx();
-        let (state, n_failed) = crate::code_read::ingest_files(
+        let (ingested, n_failed) = crate::code_read::ingest_files(
             &ctx,
-            self.workspace.root(),
             rel_paths,
             progress,
             &files_layer.name,
             self.ingest_base(&files_layer.name)?,
         )?;
-        let failed = n_failed > 0;
-        if state.file_hashes.is_empty() {
-            return Ok((false, failed));
+        if ingested {
+            // An upload is in every conversation's scope once it is committed.
+            self.retrieval_scope.refresh(&self.engine);
         }
-        let mut convs = self.ingest_convs.lock().unwrap();
-        match convs.get_mut(&files_layer.name) {
-            Some(IngestConv::Files { state: existing }) => {
-                for (path, hash) in state.file_hashes {
-                    existing.file_hashes.insert(path, hash);
-                }
-            }
-            // Layer declared but not populated at boot (disabled) — seed it now.
-            _ => {
-                convs.insert(files_layer.name.clone(), IngestConv::Files { state });
-            }
-        }
-        Ok((true, failed))
+        Ok((ingested, n_failed > 0))
     }
 
     /// Tombstone the per-file `code_read` conversation of every uploaded file
     /// that has since been deleted from the `uploads/` folder.
     ///
-    /// Uploads are endpoint-managed and deliberately excluded from the workspace
-    /// walk (so `refresh_code_reading`'s `reconcile_deleted` never retires them —
-    /// that would delete freshly-uploaded content on the next refresh). But a
-    /// genuine deletion of an uploaded file — whether from the filesystem or via
-    /// the GUI — must still retire its conversation; otherwise deleted uploads
-    /// accumulate live turns forever, growing the redo log and the projection
-    /// candidate set without bound.
+    /// Uploads are endpoint-managed and on no branch, so the branch pass never
+    /// retires them — that would delete uploaded content on the next pass. But
+    /// a genuine deletion of an uploaded file — whether from the filesystem or
+    /// via the GUI — must still retire its conversation; otherwise deleted
+    /// uploads accumulate live turns forever, growing the redo log and the
+    /// projection candidate set without bound.
     ///
     /// Cheap and self-limiting: a metadata scan plus one `Path::exists` probe per
-    /// upload conversation, no workspace walk and no re-ingest. Tombstoning only
-    /// *absent* files makes it a no-op for still-present uploads, so the watcher
-    /// can fire it on any `uploads/` event (create / modify / delete) — an
-    /// in-flight upload's own create events simply match nothing.
+    /// upload conversation, no walk and no re-ingest. Tombstoning only *absent*
+    /// files makes it a no-op for still-present uploads.
     ///
-    /// Runs at startup (to retire uploads deleted while the daemon was down) and
-    /// on every `uploads/` watcher burst.
+    /// Runs at startup, to retire uploads deleted while the daemon was down.
     pub(crate) fn reconcile_uploaded_files(&self) {
         let engine = self.engine.lock().unwrap();
         let mut tombstoned = 0usize;
@@ -3503,6 +3397,21 @@ fn run_inference_stream(
                 triggers: turn_triggers(&state, think_mode),
                 ..Default::default()
             };
+            // What this turn may retrieve from the branch layers: the units its
+            // own base holds. Set before every submit — a tool round can move
+            // the base (a commit, a merge, a switch) or change a file. Git reads
+            // on a base not yet listed, so on the blocking pool.
+            let scope_state = Arc::clone(&state);
+            let scope_files = Arc::clone(&cs.files);
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                scope_state
+                    .retrieval_scope
+                    .apply(&scope_state.engine, timeline, &scope_files)
+            })
+            .await
+            {
+                tracing::warn!(conv_id = %conv_id, "retrieval scope panicked: {e}");
+            }
             let handle = match cs
                 .conv
                 .submit_turn_with_options(current_message.clone(), options)
@@ -3757,8 +3666,11 @@ fn run_inference_stream(
                     // Evict the conversation so the next request forks fresh
                     // rather than hitting the in-flight guard.  Dropping `handle`
                     // here (via return) closes event_rx and stops the scheduler.
+                    // The scope it was given goes with it: the next request
+                    // sets its own before its first turn.
                     drop(cs);
                     state.conversations.lock().unwrap().remove(&conv_id);
+                    state.engine.lock().unwrap().clear_retrieval_scope(timeline);
                     return;
                 }
             };
@@ -3964,6 +3876,14 @@ fn run_inference_stream(
                     break;
                 }
             };
+            // A round that published to origin or fetched from it moved the
+            // tracking refs itself, so no origin probe will see a difference:
+            // wake the ingest worker, which reads branches from those refs.
+            if results.iter().any(|r| moves_branches(&r.call.name)) {
+                if let Some(wake) = state.ingest_wake.get() {
+                    wake.notify_one();
+                }
+            }
             if repeat_guard.screen(&mut results) == Verdict::Close {
                 tracing::warn!(
                     conv_id = %conv_id,
@@ -4536,15 +4456,17 @@ pub struct ZendSession {
     /// loader thread, which owns it) before the process exits.
     load_thread: Mutex<Option<JoinHandle<()>>>,
     /// The daemon's single background ingest worker (`crate::ingest_worker`).
-    /// Owns every post-startup ingest pass — the initial backlog left by the
-    /// registry-seeding above, and every later filesystem-event-triggered
-    /// pass — plus the ingest normalization warm-up that follows its first
-    /// pass. `None` under `--read-only-substrate` (nothing re-reads the disk
-    /// there) and while shutdown is tearing it down. [`Self::shutdown`] stops
-    /// and joins it before draining the engine, so a stopped session never
-    /// keeps its model resident — or its scan on the device — behind the
-    /// next one.
+    /// Owns every post-startup ingest pass — the startup pass over every
+    /// branch, and every pass a fetch or a published branch wakes — plus the
+    /// ingest normalization warm-up that follows its first pass. `None` under
+    /// `--read-only-substrate` (nothing ingests there) and while shutdown is
+    /// tearing it down. [`Self::shutdown`] stops and joins it before draining
+    /// the engine, so a stopped session never keeps its model resident — or
+    /// its scan on the device — behind the next one.
     ingest_worker: Mutex<Option<crate::ingest_worker::IngestWorker>>,
+    /// The origin watchers (`crate::origin_watch`), started with the ingest
+    /// worker they wake and stopped before it.
+    origin_watch: Mutex<Option<OriginWatch>>,
 }
 
 /// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
@@ -4679,6 +4601,7 @@ impl ZendSession {
             file_store,
             load_thread: Mutex::new(None),
             ingest_worker: Mutex::new(None),
+            origin_watch: Mutex::new(None),
         }
     }
 
@@ -5963,13 +5886,13 @@ impl ZendSession {
                             state.reconcile_uploaded_files();
                         }
 
-                        // The single background ingest worker. Its one pass at
-                        // startup finds the layer registry empty — nothing reads
-                        // the repositories' folders, which are the jobs' own (see
-                        // `InferenceState::load`) — and is followed by the ingest
-                        // normalization warm-up over what the substrate already
-                        // holds.
-                        let wake = Arc::new(tokio::sync::Notify::new());
+                        // The single background ingest worker. Its pass at
+                        // startup reads every branch as the tracking refs hold
+                        // it (`crate::branch_ingest`), and is followed by the
+                        // ingest normalization warm-up; after that it runs when
+                        // an origin watcher fetched a moved branch, or a tool
+                        // round published one.
+                        let wake = Arc::new(Notify::new());
                         if !read_only_substrate {
                             let pass_state = Arc::clone(&state);
                             let pass: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -6006,6 +5929,19 @@ impl ZendSession {
                             // below take the daemon to `ready` without waiting on it.
                             worker.wake();
                             *session_for_loader.ingest_worker.lock().unwrap() = Some(worker);
+                            let _ = state.ingest_wake.set(Arc::clone(&wake));
+                            // Origin, watched: a branch moved there is fetched
+                            // within seconds, and the fetch wakes the worker.
+                            let on_change: Arc<dyn Fn() + Send + Sync> = {
+                                let wake = Arc::clone(&wake);
+                                Arc::new(move || wake.notify_one())
+                            };
+                            let watch = OriginWatch::start(
+                                &state.workspace,
+                                session_for_loader.config.secrets.github_token(),
+                                on_change,
+                            );
+                            *session_for_loader.origin_watch.lock().unwrap() = Some(watch);
                         }
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
@@ -6077,12 +6013,18 @@ impl ZendSession {
             })
             .await;
         }
+        //    Then the origin watchers, so no fetch wakes a worker being stopped;
+        //    a probe in flight is bounded by its timeout.
+        let watch = self.origin_watch.lock().unwrap().take();
+        if let Some(w) = watch {
+            w.stop().await;
+        }
         //    Then the ingest worker. It holds the inference state for its whole
         //    life, so nothing outside this call may keep the engine alive past
         //    the drain below. `stop` sets its flag, wakes it, and AWAITS the
         //    task: if a pass is in flight, the pool breaks at its next unit
         //    boundary on the cancel raised in step 1 (`repo_scan::run_dir_pool`,
-        //    `code_read::run_file_pool`) and the warm-up scan stops between
+        //    `code_read::ingest_jobs`) and the warm-up scan stops between
         //    probes, so the await is bounded. It is an await and never an
         //    `abort()`: Tokio cannot cancel the `spawn_blocking` a pass runs on,
         //    so aborting would return here with a pool still minting

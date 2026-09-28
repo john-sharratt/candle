@@ -1,8 +1,8 @@
 //! Workspace-relative paths as tool arguments.
 //!
 //! The ingest layers key everything by its path relative to the workspace
-//! folder — `candle/src/lib.rs` — because that is what the walk, the watcher and
-//! the resume cache all see on disk. The file tools address the same file as a
+//! folder — `candle/src/lib.rs` — one key form for every repository's branches
+//! and the uploads folder alike. The file tools address the same file as a
 //! repository plus a path inside it: `repo: candle, path: src/lib.rs`. A
 //! repository's folder is its name ([`zend_vfs::workspace`]), so the
 //! first segment of a key IS its repository and the conversion is a split.

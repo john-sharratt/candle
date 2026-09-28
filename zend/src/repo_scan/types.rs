@@ -1,4 +1,4 @@
-//! Data types shared by the workspace walker and the per-directory unit builder.
+//! The languages the ingest layers read, and the hint a manifest gives.
 
 /// Languages we recognise by extension.  Each variant either maps to
 /// a tree-sitter grammar (proper scope-aware carving) or to a
@@ -135,100 +135,9 @@ impl ModuleHint {
     }
 }
 
-/// One file in the repo map.  Path is always relative to the workspace
-/// root so the tree renders the same regardless of where the daemon
-/// was launched from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileEntry {
-    /// Workspace-relative path with `/` separators (normalised on Windows).
-    pub path: String,
-    /// Newline-count + 1.  Empty files are reported as `0`.
-    pub line_count: u32,
-    pub language: Language,
-    /// File size in bytes — used to filter oversize files before they
-    /// reach the carver.
-    pub size_bytes: u64,
-    /// Module-structure hint for manifest files; `None` for ordinary
-    /// source files.
-    pub module_hint: Option<ModuleHint>,
-}
-
-/// The full set of files surveyed by the workspace walker.
-/// Sorted ascending by `path` so the unit builder's output is
-/// byte-identical across runs on the same tree.
-#[derive(Debug, Clone, Default)]
-pub struct RepoMap {
-    /// Every retained file in `path` order.
-    pub files: Vec<FileEntry>,
-    /// Number of files surfaced by the walker before the allowlist /
-    /// size-cap filters fired.  Used for the load-progress denominator.
-    pub files_scanned: usize,
-    /// Files skipped because their size exceeded `MAX_FILE_BYTES`.
-    pub files_skipped_oversize: usize,
-    /// Files skipped because their extension wasn't allowlisted.
-    pub files_skipped_extension: usize,
-    /// Files skipped because their content classified as binary (the
-    /// statistical NUL-count + non-text-byte-ratio classifier in
-    /// [`super::binary_sniff::is_binary_sample`]) despite carrying an
-    /// allowlisted extension — e.g. a compiled CUDA fatbin ELF dump checked in
-    /// as `*.txt`. Carving one produces hundreds of garbage scopes that blow
-    /// the ingest co-batch's VRAM budget.
-    pub files_skipped_binary: usize,
-    /// The `--max-depth` bound the walk ran under, in path components below the
-    /// content root (`None` = unbounded). Nothing deeper was read — which is not
-    /// the same as absent: see [`RepoMap::is_frozen_file`].
-    pub max_depth: Option<usize>,
-}
-
-impl RepoMap {
-    /// Whether a root-relative file `path` lies past the depth bound. Its
-    /// ingested content is FROZEN: never re-read, and never retired by the
-    /// deleted-path sweep either, because the walk not seeing it says nothing
-    /// about whether it still exists.
-    pub fn is_frozen_file(&self, path: &str) -> bool {
-        self.max_depth.is_some_and(|d| path_depth(path) > d)
-    }
-
-    /// Whether directory `dir` (`zend/src/`, or `"."` for the root) was cut off
-    /// by the depth bound. A directory's own files sit one component deeper
-    /// than it, so a directory AT the bound had none walked. Frozen for the same
-    /// reason as [`Self::is_frozen_file`].
-    pub fn is_frozen_dir(&self, dir: &str) -> bool {
-        self.max_depth.is_some_and(|d| path_depth(dir) >= d)
-    }
-}
-
-/// Path components in a `/`-separated root-relative path; the root (`"."`) is 0.
-fn path_depth(path: &str) -> usize {
-    path.split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Language, RepoMap};
-
-    /// With `--max-depth 2`: the root's files and one folder down are walked;
-    /// anything deeper — and a directory at the bound, whose files are deeper —
-    /// is frozen. Unbounded, nothing is.
-    #[test]
-    fn the_depth_bound_freezes_what_lies_past_it() {
-        let bounded = RepoMap {
-            max_depth: Some(2),
-            ..RepoMap::default()
-        };
-        assert!(!bounded.is_frozen_file("a.rs"));
-        assert!(!bounded.is_frozen_file("src/b.rs"));
-        assert!(bounded.is_frozen_file("src/deep/c.rs"));
-        assert!(!bounded.is_frozen_dir("."));
-        assert!(!bounded.is_frozen_dir("src/"));
-        assert!(bounded.is_frozen_dir("src/deep/"));
-
-        let open = RepoMap::default();
-        assert!(!open.is_frozen_file("a/b/c/d/e.rs"));
-        assert!(!open.is_frozen_dir("a/b/c/d/"));
-    }
+    use super::Language;
 
     /// The kernels are the engine. While `.cu`/`.cuh` were off the allowlist the
     /// walk dropped all 293 of them, which took them out of BOTH layers built

@@ -1906,10 +1906,15 @@ impl Conversation {
             // A belief group is never the projection target (the target is the
             // Sequence dialogue group, skipped above), but mirror the target mask
             // anyway so the invariant holds if that ever changes.
+            // A scoped group offers only what the target's own scope names —
+            // `Substrate::scoped_timelines_for_group` — so an out-of-scope
+            // conversation is never scanned, and never teaches the group's
+            // hit levels on this target's behalf.
             let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
             } else {
-                sub.active_timelines_for_group(group.id).collect()
+                sub.scoped_timelines_for_group(group.id, target.timeline)
+                    .collect()
             };
             // A tagged group reads only the conversations carrying its tags — the
             // same scope projection applies to its candidates, applied here so an
@@ -4519,8 +4524,10 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             keys.extend(injected.into_iter().flat_map(turns_of));
             return keys;
         }
+        // The same scope the belief scan applied: what was never scored for
+        // this target is never selected for it either.
         self.read
-            .active_timelines_for_group(group)
+            .scoped_timelines_for_group(group, self.target.timeline)
             .flat_map(turns_of)
             .collect()
     }

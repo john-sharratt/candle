@@ -3,9 +3,10 @@
 //!
 //! A listing tells you a folder's shape; it does not tell you its purpose. One
 //! file per directory usually does: a `README.md`, or the module doc block at the
-//! top of `lib.rs` / `main.rs` / `mod.rs`. [`pick`] finds that file and returns
-//! the excerpt worth reading, so the folder's summary turn is grounded in the
-//! author's own description rather than inferred from filenames.
+//! top of `lib.rs` / `main.rs` / `mod.rs` ([`ANCHOR_NAMES`], chosen by
+//! `branch_ingest::units`). [`excerpt`] returns the part of that file worth
+//! reading, so the folder's summary turn is grounded in the author's own
+//! description rather than inferred from filenames.
 //!
 //! **The module doc outranks the leading comment block.** A crate root often
 //! opens with an ordinary `//` note — a licence header, a block of lint
@@ -13,7 +14,7 @@
 //! below them. Taking the file's first comment run would then describe the
 //! folder by whatever housekeeping happened to sit at the top:
 //! `candle-conversation/src/` summarised as "a Rust library file that includes
-//! several Clippy lint suppressions". [`pick`] therefore looks for the `//!`
+//! several Clippy lint suppressions". [`excerpt`] therefore looks for the `//!`
 //! block wherever it sits in the file's prelude and excerpts *that*.
 //!
 //! Reuses the `code_reading` carve helpers rather than re-deriving them:
@@ -23,29 +24,28 @@
 //! language-aware, line-based rule that gives every carved file its
 //! `ChunkKind::FileHeader` first turn.
 
-use std::path::Path;
-
 use zend_vfs::vfs::PAGE_LINES;
 
 use crate::code_read::carve::{file_header_end, split_long_lines};
 use crate::code_read::{compute_line_offsets, slice_lines};
-use crate::repo_scan::types::{FileEntry, Language};
+use crate::repo_scan::types::Language;
 
 /// Most lines an anchor excerpt carries. The excerpt exists to say what the
 /// folder is, which a module doc or a README's opening states well inside this;
 /// past it we are reading the file, not its description.
 pub const MAX_ANCHOR_LINES: u32 = 200;
 
-/// Filenames that describe their directory, in preference order. A README is
-/// prose written for exactly this purpose, so it wins; otherwise the crate or
-/// module root carries the `//!` block.
-const ANCHOR_NAMES: &[&str] = &["readme.md", "lib.rs", "main.rs", "mod.rs"];
+/// Filenames that describe their directory, in preference order, matched
+/// without regard to case. A README is prose written for exactly this
+/// purpose, so it wins; otherwise the crate or module root carries the `//!`
+/// block.
+pub const ANCHOR_NAMES: &[&str] = &["readme.md", "lib.rs", "main.rs", "mod.rs"];
 
 /// A directory's chosen anchor excerpt, ready to render.
 ///
 /// `start_line`/`end_line`/`body` are the CONTAINING PAGE's bounds
 /// ([`PAGE_LINES`]-line stride), not the narrower
-/// meaningful excerpt [`pick`] found — `file_read` only ever returns a whole
+/// meaningful excerpt [`excerpt`] found — `file_read` only ever returns a whole
 /// page, and a prefilled response has to be what a live call would actually
 /// return. In practice the excerpt (capped at [`MAX_ANCHOR_LINES`], almost
 /// always starting at line 1) sits well inside page 0, so this is page 0's
@@ -66,29 +66,21 @@ pub struct Anchor {
     pub language: Language,
 }
 
-/// Choose and read the anchor excerpt for a directory, or `None` when no
-/// candidate file is present (most leaf directories) or it yields nothing.
-///
-/// `files` are the entries **directly inside** the directory; `workspace` is the
-/// root the paths are relative to.
-pub fn pick(files: &[&FileEntry], workspace: &Path) -> Option<Anchor> {
-    let file = ANCHOR_NAMES.iter().find_map(|want| {
-        files
-            .iter()
-            .find(|f| basename(&f.path).eq_ignore_ascii_case(want))
-    })?;
-    let bytes = std::fs::read(workspace.join(&file.path)).ok()?;
+/// The anchor excerpt of the file at `path` (workspace-relative) in
+/// `language`, from its `bytes` — `None` when it yields nothing worth
+/// showing.
+pub fn excerpt(path: &str, language: Language, bytes: &[u8]) -> Option<Anchor> {
     // Bound every line BEFORE measuring, so a generated one-liner can't make the
     // whole excerpt one unbounded line. The split bytes are what we slice and
     // show, so the line numbers we report are the ones the reader sees.
-    let bytes = split_long_lines(&bytes);
+    let bytes = split_long_lines(bytes);
     let offsets = compute_line_offsets(&bytes);
     let total_lines = line_count(&bytes);
     if total_lines == 0 {
         return None;
     }
 
-    let (start_line, end_line) = excerpt_bounds(&bytes, file.language, total_lines);
+    let (start_line, end_line) = excerpt_bounds(&bytes, language, total_lines);
     // The meaningful excerpt decided WHICH page to anchor on; what gets
     // rendered is that whole page, matching what a live `file_read` call
     // would actually return (see the struct doc). `excerpt_bounds` can select
@@ -99,25 +91,25 @@ pub fn pick(files: &[&FileEntry], workspace: &Path) -> Option<Anchor> {
     let page = start_line.saturating_sub(1) / PAGE_LINES;
     let page_start = page * PAGE_LINES + 1;
     let page_end = ((page + 1) * PAGE_LINES).min(total_lines);
-    let excerpt = slice_lines(&bytes, &offsets, start_line, end_line.min(page_end));
-    if excerpt.trim().is_empty() {
+    let selected = slice_lines(&bytes, &offsets, start_line, end_line.min(page_end));
+    if selected.trim().is_empty() {
         return None;
     }
     let body = slice_lines(&bytes, &offsets, page_start, page_end);
     Some(Anchor {
-        path: file.path.clone(),
+        path: path.to_string(),
         start_line: page_start,
         end_line: page_end,
         total_lines,
         body,
-        language: file.language,
+        language,
     })
 }
 
 /// The meaningful excerpt's own bounds — a README's head, a module doc block,
 /// a leading comment, or (failing all of those) the doc comment on the first
 /// item — capped at [`MAX_ANCHOR_LINES`]. This is the "which page to anchor
-/// on" decision; [`pick`] widens the result to that page's full content
+/// on" decision; [`excerpt`] widens the result to that page's full content
 /// afterward, since `file_read` only ever returns a whole page.
 fn excerpt_bounds(bytes: &[u8], language: Language, total_lines: u32) -> (u32, u32) {
     // Markdown has no comment syntax to peel — a README's opening IS the
@@ -299,54 +291,54 @@ fn line_count(bytes: &[u8]) -> u32 {
     }
 }
 
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use std::path::PathBuf;
 
-    fn entry(path: &str, language: Language) -> FileEntry {
-        FileEntry {
-            path: path.to_string(),
-            line_count: 0,
-            language,
-            size_bytes: 0,
-            module_hint: None,
-        }
+    /// A file an excerpt is taken from: its path and language.
+    struct Fixture {
+        path: &'static str,
+        language: Language,
     }
 
-    fn workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        for (rel, body) in files {
-            let p = dir.path().join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, body).unwrap();
-        }
-        let root = dir.path().to_path_buf();
-        (dir, root)
+    fn entry(path: &'static str, language: Language) -> Fixture {
+        Fixture { path, language }
     }
 
+    /// Each file's bytes by path — what a folder's anchor is read from.
+    fn workspace(files: &[(&str, &str)]) -> ((), HashMap<String, Vec<u8>>) {
+        let bytes = files
+            .iter()
+            .map(|(path, body)| (path.to_string(), body.as_bytes().to_vec()))
+            .collect();
+        ((), bytes)
+    }
+
+    /// The excerpt of the first of `refs`, from its bytes in `root`.
+    fn read_anchor(refs: &[&Fixture], root: &HashMap<String, Vec<u8>>) -> Option<Anchor> {
+        let file = refs.first()?;
+        excerpt(file.path, file.language, root.get(file.path)?)
+    }
+
+    /// The path and language an excerpt is taken as are the ones it is
+    /// given.
     #[test]
-    fn prefers_a_readme_over_a_module_root() {
-        let (_d, root) = workspace(&[
-            ("a/README.md", "# a\n\nWhat this folder does.\n"),
-            ("a/mod.rs", "//! module doc\n//! more\npub fn x() {}\n"),
-        ]);
-        let files = [
-            entry("a/README.md", Language::Markdown),
-            entry("a/mod.rs", Language::Rust),
-        ];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+    fn an_excerpt_carries_its_file() {
+        let a = excerpt(
+            "a/README.md",
+            Language::Markdown,
+            b"# a\n\nWhat this folder does.\n",
+        )
+        .expect("anchor");
         assert_eq!(a.path, "a/README.md");
+        assert_eq!(a.language, Language::Markdown);
         assert!(a.body.contains("What this folder does."));
     }
 
     /// A module root's excerpt SELECTION takes its `//!` block, not the code
-    /// beneath it — `pick` then widens whatever that selection found to a
+    /// beneath it — `excerpt` then widens whatever that selection found to a
     /// whole page, so a small fixture like this one ends up rendering the
     /// entire (5-line) file anyway. See [`excerpt_bounds`] for the narrow
     /// selection this widening starts from.
@@ -361,8 +353,8 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/mod.rs", std::str::from_utf8(src).unwrap())]);
         let files = [entry("a/mod.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         assert_eq!((a.start_line, a.end_line), (1, 5), "widened to page 0");
         assert_eq!(a.total_lines, 5);
         assert_eq!(a.body, std::str::from_utf8(src).unwrap());
@@ -392,8 +384,8 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/lib.rs", src)]);
         let files = [entry("a/lib.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         // Widened to the whole (9-line) page 0 — `file_read` only ever
         // returns whole pages, so the rendered excerpt necessarily includes
         // the preamble the selection itself correctly skipped past.
@@ -427,8 +419,8 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/lib.rs", std::str::from_utf8(src).unwrap())]);
         let files = [entry("a/lib.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         // Widened to the whole (10-line) page 0.
         assert_eq!((a.start_line, a.end_line), (1, 10));
         assert!(a.body.starts_with("/*\n"));
@@ -447,8 +439,8 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/lib.rs", src)]);
         let files = [entry("a/lib.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         assert_eq!((a.start_line, a.end_line), (1, 5), "widened to page 0");
         assert!(a.body.contains("//! Generated bindings."));
     }
@@ -511,15 +503,15 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/mod.rs", std::str::from_utf8(src).unwrap())]);
         let files = [entry("a/mod.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         assert_eq!((a.start_line, a.end_line), (1, 3), "widened to page 0");
         assert!(a.body.contains("Copyright the authors."));
     }
 
     /// The excerpt cap counts lines of excerpt, not lines of file, so a module
     /// doc that starts deep in the prelude is still capped at
-    /// [`MAX_ANCHOR_LINES`] worth of SELECTION — independent of `pick`'s
+    /// [`MAX_ANCHOR_LINES`] worth of SELECTION — independent of `excerpt`'s
     /// separate page-width cap, which is what actually bounds the rendered
     /// body here (`PAGE_LINES` < the file's own length).
     #[test]
@@ -533,8 +525,8 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/lib.rs", body.as_str())]);
         let files = [entry("a/lib.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         assert_eq!((a.start_line, a.end_line), (1, 200), "widened to page 0");
         assert_eq!(a.body.lines().count(), 200);
     }
@@ -551,18 +543,18 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/lib.rs", std::str::from_utf8(src).unwrap())]);
         let files = [entry("a/lib.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         assert_eq!((a.start_line, a.end_line), (1, 5), "widened to page 0");
         assert!(a.body.contains("Does the thing."));
     }
 
     /// Nothing documented at all — the head of the file is still better than
-    /// nothing, bounded by the selection cap. `pick` then widens the
+    /// nothing, bounded by the selection cap. `excerpt` then widens the
     /// selection to the whole page it falls on, regardless of how the
     /// selection itself was bounded — `MAX_ANCHOR_LINES` and `PAGE_LINES`
     /// happen to share a value, so this case cannot show the two caps
-    /// disagree, but it still pins the number `pick` actually returns.
+    /// disagree, but it still pins the number `excerpt` actually returns.
     #[test]
     fn falls_back_to_the_file_head_when_undocumented() {
         let body: String = (1..=400).map(|i| format!("pub fn f{i}() {{}}\n")).collect();
@@ -573,8 +565,8 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/mod.rs", body.as_str())]);
         let files = [entry("a/mod.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         assert_eq!(
             a.end_line, 200,
             "capped at the page width, not the selection width"
@@ -583,7 +575,7 @@ mod tests {
     }
 
     /// A module doc starting in a page's back half can run past the page
-    /// boundary — `excerpt_bounds` selected it as a whole, but `pick` still
+    /// boundary — `excerpt_bounds` selected it as a whole, but `excerpt` still
     /// widens to (and caps at) the page, exactly as it does for a selection
     /// narrower than the page: the render is always one page, never a wider
     /// one stretched to fit the whole selection.
@@ -608,8 +600,8 @@ mod tests {
 
         let (_d, root) = workspace(&[("a/mod.rs", src.as_str())]);
         let files = [entry("a/mod.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("the excerpt's page-0 portion is still non-empty");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("the excerpt's page-0 portion is still non-empty");
         assert_eq!(
             (a.start_line, a.end_line),
             (1, 200),
@@ -627,19 +619,11 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_with_no_candidate_has_no_anchor() {
-        let (_d, root) = workspace(&[("a/thing.rs", "pub fn x() {}\n")]);
-        let files = [entry("a/thing.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        assert!(pick(&refs, &root).is_none());
-    }
-
-    #[test]
     fn an_empty_anchor_file_yields_nothing() {
         let (_d, root) = workspace(&[("a/mod.rs", "")]);
         let files = [entry("a/mod.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        assert!(pick(&refs, &root).is_none());
+        let refs: Vec<&Fixture> = files.iter().collect();
+        assert!(read_anchor(&refs, &root).is_none());
     }
 
     /// A generated one-liner is split before measuring, so the excerpt is a
@@ -649,8 +633,8 @@ mod tests {
         let long = format!("pub const T: &str = \"{}\";\n", "x".repeat(4000));
         let (_d, root) = workspace(&[("a/mod.rs", long.as_str())]);
         let files = [entry("a/mod.rs", Language::Rust)];
-        let refs: Vec<&FileEntry> = files.iter().collect();
-        let a = pick(&refs, &root).expect("anchor");
+        let refs: Vec<&Fixture> = files.iter().collect();
+        let a = read_anchor(&refs, &root).expect("anchor");
         assert!(a.total_lines > 1, "the single line was split");
         assert!(
             a.body.lines().all(|l| l.chars().count() <= 200),

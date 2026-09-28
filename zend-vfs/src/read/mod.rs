@@ -10,6 +10,7 @@ pub mod head;
 pub mod identity;
 pub mod log;
 pub mod patch;
+pub mod record;
 pub mod refs;
 pub mod remote_branches;
 pub mod status;

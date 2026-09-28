@@ -1,14 +1,14 @@
 //! The daemon's single background ingest worker — the ONLY thing that runs
 //! an ingest pass after startup.
 //!
-//! Before this, a filesystem-event burst (`crate::watcher`) and the startup
-//! background reconcile could both call `InferenceState::refresh_ingest_layers`
-//! at once, running two overlapping `run_dir_pool`/`run_file_pool` calls.
-//! `repo_scan`'s process-global pricing statics (`SCAN_KV_BASELINE` /
-//! `SCAN_LIVE_CONVS`, re-anchored once per pool call on the assumption that
-//! the call is one fresh, non-overlapping pass) and `ingest_report`'s
-//! last-write-wins publish are both sound only when passes never overlap.
-//! Serialising every pass behind one worker task is what makes that true.
+//! Several things ask for a pass — startup, an origin watcher's fetch
+//! (`crate::origin_watch`), a tool round that published a branch — and any
+//! of them can ask while another pass runs. `repo_scan`'s process-global
+//! pricing statics (`SCAN_KV_BASELINE` / `SCAN_LIVE_CONVS`, re-anchored once
+//! per pool call on the assumption that the call is one fresh,
+//! non-overlapping pass) and `ingest_report`'s last-write-wins publish are
+//! both sound only when passes never overlap. Serialising every pass behind
+//! one worker task is what makes that true.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,15 +31,15 @@ pub struct IngestWorker {
 /// can never overlap a pass without any extra locking.
 ///
 /// `wake` is supplied by the caller (rather than returned only on
-/// [`IngestWorker`]) so the watcher's debounced callback can hold its own
+/// [`IngestWorker`]) so the origin watchers and the session can each hold a
 /// clone and wake the worker without reaching back through it.
 /// `tokio::sync::Notify::notify_one` stores one permit when nothing is
 /// waiting, so a wake that lands before the worker's first `.await`, or while
 /// a pass is already running, is coalesced rather than lost.
 ///
-/// `pass` and `after_first_pass` are blocking (worker-pool spin-up, GPU
-/// prefill/decode) exactly like the watcher's own callback, so each runs on
-/// `spawn_blocking` rather than the async task itself.
+/// `pass` and `after_first_pass` are blocking (git reads, worker-pool
+/// spin-up, GPU prefill/decode), so each runs on `spawn_blocking` rather than
+/// the async task itself.
 pub fn spawn(
     wake: Arc<Notify>,
     pass: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -85,7 +85,7 @@ pub fn spawn(
 
 impl IngestWorker {
     /// Ask for a pass. Cheap and synchronous — callable from anywhere,
-    /// including the watcher's blocking-pool callback.
+    /// including a blocking-pool callback.
     pub fn wake(&self) {
         self.wake.notify_one();
     }

@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use super::VfsStore;
-use crate::{FileMode, ObjectKind, Oid, SizedEntry};
+use crate::{FileMode, GitError, ObjectKind, Oid, Repo, SizedEntry};
 
 /// One path in a tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +32,7 @@ enum Node {
 
 /// Every file and folder of one tree, by repository-relative path.
 #[derive(Debug, Default)]
-pub(crate) struct Tree {
+pub struct Tree {
     /// `None` for the tree of a branch that does not exist: no files.
     id: Option<Oid>,
     nodes: BTreeMap<String, Node>,
@@ -45,8 +45,13 @@ impl Tree {
         Self::default()
     }
 
+    /// The tree `id` of `repo`, listed whole in one process.
+    pub fn read(repo: &Repo, id: &Oid) -> Result<Self, GitError> {
+        Ok(Self::from_listing(id.clone(), repo.ls_tree_all(id)?))
+    }
+
     /// The tree `id`, from its whole listing ([`crate::Repo::ls_tree_all`]).
-    pub(crate) fn from_listing(id: Oid, listing: Vec<SizedEntry>) -> Self {
+    pub fn from_listing(id: Oid, listing: Vec<SizedEntry>) -> Self {
         let mut nodes = BTreeMap::new();
         for SizedEntry { entry, size } in listing {
             let path = entry.path.as_str();
@@ -70,13 +75,22 @@ impl Tree {
     }
 
     /// The tree's id; `None` for [`Self::empty`].
-    pub(crate) fn id(&self) -> Option<&Oid> {
+    pub fn id(&self) -> Option<&Oid> {
         self.id.as_ref()
+    }
+
+    /// Every file, hidden ones included, as `(path, blob, size)` in path
+    /// order.
+    pub fn files(&self) -> impl Iterator<Item = (&str, &Oid, u64)> {
+        self.nodes.iter().filter_map(|(path, node)| match node {
+            Node::File { blob, size } => Some((path.as_str(), blob, *size)),
+            Node::Dir => None,
+        })
     }
 
     /// The blob holding the file at `norm`, and its size — `None` when
     /// `norm` is no file here.
-    pub(crate) fn file(&self, norm: &str) -> Option<(&Oid, u64)> {
+    pub fn file(&self, norm: &str) -> Option<(&Oid, u64)> {
         match self.nodes.get(norm)? {
             Node::File { blob, size } => Some((blob, *size)),
             Node::Dir => None,
@@ -90,8 +104,8 @@ impl Tree {
 
     /// The files and folders directly inside the folder `dir`, as `(path,
     /// bytes, is_dir)` — `bytes` is `None` for a folder — sorted by path,
-    /// hidden ones left out.
-    pub(crate) fn children(&self, dir: &str) -> Vec<(String, Option<usize>, bool)> {
+    /// hidden ones left out: what `file_list` shows of it.
+    pub fn children(&self, dir: &str) -> Vec<(String, Option<usize>, bool)> {
         let inside = if dir.is_empty() {
             String::new()
         } else {
@@ -272,6 +286,25 @@ mod tests {
         assert_eq!(t.files_under(""), vec!["kept.txt", "run.sh"]);
         assert_eq!(t.file("link"), None);
         assert!(!t.is_dir("secrets"));
+    }
+
+    /// **Every file is enumerated, hidden ones too, in path order** — folders
+    /// are not files, and what no tool may read was never kept.
+    #[test]
+    fn every_file_is_enumerated_in_path_order() {
+        let t = sample();
+        let files: Vec<(&str, u64)> = t.files().map(|(p, _, s)| (p, s)).collect();
+        assert_eq!(
+            files,
+            vec![
+                (".github/ci.yml", 4),
+                (".gitignore", 3),
+                ("README.md", 10),
+                ("src/main.rs", 12),
+                ("src/util/helper.rs", 14),
+                ("srcx/other.rs", 5),
+            ]
+        );
     }
 
     #[test]

@@ -7,11 +7,11 @@
 //! linear step's `(progressed, total)` at a time; this counter empties and
 //! refills indefinitely while the daemon stays `ready`, spans both ingest
 //! layers plus uploads at once, and counts only units that are actually RUN —
-//! a resume-cache hit is not backlog.
+//! a unit already committed is not backlog.
 //!
 //! A process-global, mirroring [`crate::ingest_report`]'s `publish`/`latest`
 //! shape: the counter is written from deep inside `repo_scan::run_dir_pool`
-//! and `code_read::run_file_pool` and read by the status API, with nothing in
+//! and `code_read::ingest_jobs` and read by the status API, with nothing in
 //! between that could usefully hold an `Arc` to it instead.
 
 use std::sync::{Mutex, OnceLock};

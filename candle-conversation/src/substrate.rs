@@ -166,6 +166,19 @@ pub struct Substrate {
     /// costs a re-read, never correctness.
     fast_path: HashMap<TimelineId, Vec<TimelineId>>,
 
+    /// Groups whose conversations are offered to a projection only as its
+    /// target's scope names them ([`Self::set_retrieval_scope`]). Ingested
+    /// content keyed by what it shows — a file as one branch holds it — is
+    /// only right for a conversation whose own files hold the same, so such a
+    /// group offers nothing a target was not given. In-memory only, marked
+    /// once at engine setup.
+    scoped_groups: HashSet<GroupId>,
+
+    /// Per target, per scoped group, the conversations that group may offer
+    /// it ([`Self::scoped_timelines_for_group`]). In-memory only and derived:
+    /// the embedder sets it before each turn from the target's own files.
+    retrieval_scopes: HashMap<TimelineId, HashMap<GroupId, Arc<HashSet<TimelineId>>>>,
+
     /// Hot-tier LRU list, most-recently-used at the front.
     /// `front()` = MRU, `back()` = next eviction victim. Membership
     /// mirrors `residence[idx].hot.is_some()` for every index in the
@@ -3001,6 +3014,60 @@ impl Substrate {
         self.fast_path.remove(&target);
     }
 
+    // ── retrieval scope ─────────────────────────────────────────────────────
+
+    /// Offer `group`'s conversations to a projection only as its target's
+    /// scope names them. Idempotent.
+    pub fn mark_group_scoped(&mut self, group: GroupId) {
+        self.scoped_groups.insert(group);
+    }
+
+    /// Whether `group` offers only what a target's scope names.
+    pub fn is_group_scoped(&self, group: GroupId) -> bool {
+        self.scoped_groups.contains(&group)
+    }
+
+    /// Name the conversations the scoped `group` may offer `target`,
+    /// replacing whatever it named before.
+    pub fn set_retrieval_scope(
+        &mut self,
+        target: TimelineId,
+        group: GroupId,
+        allowed: Arc<HashSet<TimelineId>>,
+    ) {
+        self.retrieval_scopes
+            .entry(target)
+            .or_default()
+            .insert(group, allowed);
+    }
+
+    /// Forget every scope `target` was given — it is going away.
+    pub fn clear_retrieval_scope(&mut self, target: TimelineId) {
+        self.retrieval_scopes.remove(&target);
+    }
+
+    /// [`Self::active_timelines_for_group`] as `target` may see it: all of
+    /// them for a group that is not scoped, only those `target`'s scope names
+    /// for one that is — and none when it names none.
+    pub fn scoped_timelines_for_group(
+        &self,
+        group: GroupId,
+        target: TimelineId,
+    ) -> impl Iterator<Item = TimelineId> + '_ {
+        let scope: Option<Option<&Arc<HashSet<TimelineId>>>> =
+            self.scoped_groups.contains(&group).then(|| {
+                self.retrieval_scopes
+                    .get(&target)
+                    .and_then(|by_group| by_group.get(&group))
+            });
+        self.active_timelines_for_group(group)
+            .filter(move |tl| match scope {
+                None => true,
+                Some(None) => false,
+                Some(Some(allowed)) => allowed.contains(tl),
+            })
+    }
+
     /// `tl` together with the ancestors it inherits, **oldest first**.
     ///
     /// This is what "my own history" means once conversations fork from one
@@ -3997,6 +4064,8 @@ impl Substrate {
         // know which of its turns were retired first.
         self.tombstoned_turns.retain(|(tl, _)| *tl != timeline);
         self.splice_source_timelines.remove(&timeline);
+        // A tombstoned conversation is never a projection's target again.
+        self.retrieval_scopes.remove(&timeline);
         // A tombstoned timeline's KV is dead — release its resident VRAM now.
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
             Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
@@ -5396,6 +5465,11 @@ impl Substrate {
             return false;
         }
         entry.archived = archived;
+        // An archived conversation takes no more turns: no scope of its is
+        // read again.
+        if archived {
+            self.retrieval_scopes.remove(&timeline);
+        }
         true
     }
 
@@ -6315,6 +6389,91 @@ mod tests {
             parent.raw().to_string(),
         );
         sub.merge_custom(child, &kv);
+    }
+
+    // ── retrieval scope ─────────────────────────────────────────────────────
+
+    /// Two targets and three ingest conversations in one group.
+    fn scope_fixture() -> (Substrate, GroupId, [TimelineId; 2], [TimelineId; 3]) {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+        let targets = [alloc.next(), alloc.next()];
+        let ingested = [alloc.next(), alloc.next(), alloc.next()];
+        for tl in ingested {
+            sub.register_timeline(tl, layer, group);
+        }
+        (sub, group, targets, ingested)
+    }
+
+    fn scoped(sub: &Substrate, group: GroupId, target: TimelineId) -> Vec<TimelineId> {
+        sub.scoped_timelines_for_group(group, target).collect()
+    }
+
+    /// **A group that is not scoped offers every live conversation**, to
+    /// every target — a scope given to it changes nothing.
+    #[test]
+    fn an_unscoped_group_offers_everything() {
+        let (mut sub, group, [a, _], ingested) = scope_fixture();
+        sub.set_retrieval_scope(a, group, Arc::new(HashSet::from([ingested[0]])));
+        assert!(!sub.is_group_scoped(group));
+        assert_eq!(scoped(&sub, group, a), ingested.to_vec());
+    }
+
+    /// **A scoped group offers each target exactly what its scope names**,
+    /// nothing to a target with no scope, and never a tombstoned conversation
+    /// even when named.
+    #[test]
+    fn a_scoped_group_offers_each_target_its_own_scope() {
+        let (mut sub, group, [a, b], ingested) = scope_fixture();
+        sub.mark_group_scoped(group);
+        assert!(sub.is_group_scoped(group));
+        assert!(
+            scoped(&sub, group, a).is_empty(),
+            "no scope, nothing offered"
+        );
+
+        sub.set_retrieval_scope(
+            a,
+            group,
+            Arc::new(HashSet::from([ingested[0], ingested[2]])),
+        );
+        sub.set_retrieval_scope(b, group, Arc::new(HashSet::from([ingested[1]])));
+        assert_eq!(scoped(&sub, group, a), vec![ingested[0], ingested[2]]);
+        assert_eq!(scoped(&sub, group, b), vec![ingested[1]]);
+
+        sub.tombstoned_timelines.insert(ingested[2]);
+        assert_eq!(scoped(&sub, group, a), vec![ingested[0]]);
+
+        sub.set_retrieval_scope(a, group, Arc::new(HashSet::from([ingested[1]])));
+        assert_eq!(
+            scoped(&sub, group, a),
+            vec![ingested[1]],
+            "replaced, not merged"
+        );
+
+        sub.clear_retrieval_scope(a);
+        assert!(scoped(&sub, group, a).is_empty());
+        assert_eq!(scoped(&sub, group, b), vec![ingested[1]], "b's is its own");
+    }
+
+    /// **A target that can take no more turns keeps no scope**: archiving it
+    /// or tombstoning it lets every scope it was given go.
+    #[test]
+    fn an_archived_or_tombstoned_target_lets_its_scope_go() {
+        let (mut sub, group, [a, b], ingested) = scope_fixture();
+        sub.mark_group_scoped(group);
+        let dialogue = GroupId::for_test(2);
+        for target in [a, b] {
+            sub.register_timeline(target, LayerId::for_test(2), dialogue);
+            sub.set_retrieval_scope(target, group, Arc::new(HashSet::from([ingested[0]])));
+        }
+        assert!(sub.set_archived(a, true));
+        assert!(scoped(&sub, group, a).is_empty());
+        assert_eq!(scoped(&sub, group, b), vec![ingested[0]]);
+        sub.tombstone_timeline(b);
+        assert!(sub.retrieval_scopes.is_empty());
     }
 
     // ── fast-path tool reads ────────────────────────────────────────────────

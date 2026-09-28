@@ -30,7 +30,7 @@ use crate::turn_text::literal_tokenizer;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use flume::{Receiver, Sender};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -977,6 +977,32 @@ impl ConversationEngine {
         self.conversation.write().fast_path_clear(target);
     }
 
+    /// Offer `group`'s conversations to a projection only as its target's
+    /// scope names them ([`Self::set_retrieval_scope`]) — for ingested
+    /// content that is only right for a conversation whose own files hold the
+    /// same. Idempotent; in-memory, so it is marked at every setup.
+    pub fn mark_group_scoped(&self, group: GroupId) {
+        self.conversation.write().mark_group_scoped(group);
+    }
+
+    /// Name the conversations the scoped `group` may offer `target`, replacing
+    /// what it named before. Both the belief scan and selection honour it.
+    pub fn set_retrieval_scope(
+        &self,
+        target: TimelineId,
+        group: GroupId,
+        allowed: Arc<HashSet<TimelineId>>,
+    ) {
+        self.conversation
+            .write()
+            .set_retrieval_scope(target, group, allowed);
+    }
+
+    /// Forget every scope `target` was given.
+    pub fn clear_retrieval_scope(&self, target: TimelineId) {
+        self.conversation.write().clear_retrieval_scope(target);
+    }
+
     /// Every assistant turn's text on `timeline`, oldest first.
     ///
     /// The durable record of what a conversation asked for: the `<tool_call>`
@@ -1009,7 +1035,7 @@ impl ConversationEngine {
 
     /// One-pass snapshot of the distinct `custom[key]` values across live
     /// conversations — for O(1) resume-cache membership probing.
-    pub fn conversation_metadata_values(&self, key: &str) -> std::collections::HashSet<String> {
+    pub fn conversation_metadata_values(&self, key: &str) -> HashSet<String> {
         self.conversation.metadata_values_for_key(key)
     }
 

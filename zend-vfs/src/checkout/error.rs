@@ -27,6 +27,16 @@ pub enum CheckoutError {
     /// laid over. Nothing of the conversation's has been written.
     #[error("{branch} moved while the checkout was being put on it; run again")]
     BranchMoved { branch: String },
+    /// `branch` is checked out with changes of the owner's, not committed,
+    /// to `paths` — files the commits it would follow its record to change
+    /// too, so following would put the owner's copies back over what the
+    /// branch gained. Nothing was moved.
+    #[error(
+        "{branch} is checked out with changes not yet committed to {} — files that origin's \
+         newer commits change too; commit or set those changes aside, then run again",
+        paths.join(", ")
+    )]
+    OwnWorkInTheWay { branch: String, paths: Vec<String> },
     /// The checkout's own state, set aside while a run used it, could not be
     /// put back. It is kept whole — the journal in `journal` names the
     /// commits under `refs/zend/preserved/` and the files moved aside beside

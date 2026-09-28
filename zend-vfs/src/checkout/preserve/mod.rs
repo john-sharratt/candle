@@ -27,9 +27,10 @@
 //! commit if the run deleted it, and put back if the run took commits off
 //! it), the run's untracked files removed — never one that was ignored when
 //! the state was set aside — the moved files back, and the snapshot written
-//! back exactly. Every step is safe to repeat, and a failing restore is
-//! tried again; one that still fails leaves the journal and the refs in
-//! place and names them.
+//! back exactly: or, on a branch that moved on meanwhile, the checkout's own
+//! changes laid onto it (`snapshot`). Every step is safe to repeat, and a
+//! failing restore is tried again; one that still fails leaves the journal
+//! and the refs in place and names them.
 //!
 //! The next [`preserve`] — or [`recover`] — finishes what a crash or a
 //! failed restore left, and never over anyone's work: a checkout that has
@@ -45,6 +46,7 @@ mod lock;
 mod raw;
 mod snapshot;
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,6 +142,7 @@ pub fn preserve(
         intent_to_add: Vec::new(),
         perms: Default::default(),
         link_dirs: Vec::new(),
+        unchanged: Vec::new(),
         exclude: None,
         vacant: Vec::new(),
         moved: Vec::new(),
@@ -167,6 +170,7 @@ pub fn preserve(
     preserved.journal.intent_to_add = snapshot.intent_to_add;
     preserved.journal.perms = snapshot.perms;
     preserved.journal.link_dirs = snapshot.link_dirs;
+    preserved.journal.unchanged = snapshot.unchanged;
     preserved.place.save(&preserved.journal)?;
 
     aside::set_aside(
@@ -381,11 +385,12 @@ impl Preserved {
                 write_exclude(&self.repo, self.journal.exclude_bytes()?.as_deref())?;
                 let kept = Ignored::kept_in(&self.repo)?;
                 self.unlink_the_run(&kept)?;
-                self.check_out_head()?;
+                let now = self.check_out_head()?;
                 self.clear_the_run(&kept)?;
                 aside::put_back(&self.repo, &self.place, &mut self.journal, true)?;
                 if let Some(snapshot) = self.snapshot()? {
-                    snapshot::restore(&self.repo, &snapshot)?;
+                    let taken_over = Oid::parse(&self.journal.head.commit)?;
+                    snapshot::restore(&self.repo, &snapshot, &taken_over, &now)?;
                 }
             }
         }
@@ -427,15 +432,19 @@ impl Preserved {
     /// was at should the run have deleted it, and put back there should the
     /// run have taken commits off it — or detached at its commit. A branch
     /// that only moved on from that commit keeps what it gained: a commit
-    /// published meanwhile moves it so.
-    fn check_out_head(&self) -> Result<(), CheckoutError> {
+    /// published meanwhile moves it so, and so does the branch following its
+    /// record. Returns the commit `HEAD` is at.
+    fn check_out_head(&self) -> Result<Oid, CheckoutError> {
         let repo = &self.repo;
         let commit = Oid::parse(&self.journal.head.commit)?;
-        let target: Vec<String> = match &self.journal.head.branch {
+        let (target, at): (Vec<String>, Oid) = match &self.journal.head.branch {
             Some(name) => {
                 let branch = BranchName::parse(name)?;
-                match repo.ref_target(&branch.to_ref())? {
-                    None => repo.force_branch_tip(&branch, None, &commit)?,
+                let at = match repo.ref_target(&branch.to_ref())? {
+                    None => {
+                        repo.force_branch_tip(&branch, None, &commit)?;
+                        commit
+                    }
                     Some(now)
                         if now != commit
                             && !repo.is_ancestor(
@@ -443,13 +452,17 @@ impl Preserved {
                                 &Rev::Oid(now.clone()),
                             )? =>
                     {
-                        repo.force_branch_tip(&branch, Some(&now), &commit)?
+                        repo.force_branch_tip(&branch, Some(&now), &commit)?;
+                        commit
                     }
-                    Some(_) => {}
-                }
-                vec![name.clone()]
+                    Some(now) => now,
+                };
+                (vec![name.clone()], at)
             }
-            None => vec!["--detach".to_string(), commit.as_str().to_string()],
+            None => (
+                vec!["--detach".to_string(), commit.as_str().to_string()],
+                commit,
+            ),
         };
         let _write = repo.write_lock();
         repo.git("checkout")
@@ -457,7 +470,23 @@ impl Preserved {
             .args(target)
             .arg("--")
             .run_ok()?;
-        Ok(())
+        Ok(at)
+    }
+
+    /// Whether the checkout was on `branch` when its state was set aside.
+    pub fn is_on(&self, branch: &BranchName) -> bool {
+        self.journal.head.branch.as_deref() == Some(branch.as_str())
+    }
+
+    /// Every path the checkout had changed itself when its state was set
+    /// aside: staged, in the working tree, deleted, added with `-N`, or
+    /// flagged to be left alone.
+    pub fn own_changes(&self) -> Result<BTreeSet<String>, CheckoutError> {
+        let Some(snapshot) = self.snapshot()? else {
+            return Ok(BTreeSet::new());
+        };
+        let taken_over = Oid::parse(&self.journal.head.commit)?;
+        snapshot.own_changes(&self.repo, &taken_over)
     }
 
     fn snapshot(&self) -> Result<Option<Snapshot>, CheckoutError> {
@@ -472,6 +501,7 @@ impl Preserved {
             intent_to_add: self.journal.intent_to_add.clone(),
             perms: self.journal.perms.clone(),
             link_dirs: self.journal.link_dirs.clone(),
+            unchanged: self.journal.unchanged.clone(),
         }))
     }
 

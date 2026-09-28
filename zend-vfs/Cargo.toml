@@ -18,6 +18,9 @@ regex = "1"
 ignore = "0.4"
 # Line diff that turns an edit into the splices the overlay records.
 similar = "2"
+# A blob's id computed from bytes a folder holds, in either object format.
+sha1 = "0.10"
+sha2 = "0.10"
 # The sandbox: a command run as a child process, its output read and its
 # timeout kept without a thread per run, one run per checkout at a time.
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }

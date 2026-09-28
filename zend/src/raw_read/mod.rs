@@ -23,9 +23,9 @@ use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnText};
 
+use crate::branch_ingest::filter::MAX_FILE_BYTES;
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_scan::walk::MAX_FILE_BYTES;
 use crate::repo_scan::{shared_system_prompt, utility_config};
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 use crate::types::Role;
@@ -236,10 +236,10 @@ pub fn ingest_raw(
     Ok((sequence, state))
 }
 
-/// Atomic refresh of a raw layer when any record file's content hash changed.
-/// Mirrors [`crate::repo_scan::refresh_repo_map`]: re-read the folder, and on a
-/// hash change mint a fresh timeline, re-prefill every record, then tombstone the
-/// old timeline. Stale-better-than-missing holds throughout.
+/// Atomic refresh of a raw layer when any record file's content hash changed:
+/// re-read the folder, and on a hash change mint a fresh timeline, re-prefill
+/// every record, then tombstone the old timeline. Stale-better-than-missing
+/// holds throughout.
 pub fn refresh_raw(
     ctx: &RefreshContext<'_>,
     root: &Path,

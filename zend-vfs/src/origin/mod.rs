@@ -29,9 +29,11 @@
 //! out: the only working trees here are the sandbox's own, and each job puts
 //! its checkout on its branch as it finds it.
 
+mod follow;
 mod publish;
 mod pull;
 
+pub use follow::Followed;
 pub use publish::Published;
 pub use pull::Pulled;
 

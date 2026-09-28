@@ -1,6 +1,10 @@
 //! Full object ids, and the hash a repository uses.
 
 use std::fmt;
+use std::fmt::Write;
+
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 
 use crate::error::GitError;
 
@@ -29,6 +33,33 @@ impl ObjectFormat {
                 "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321".to_string()
             }
         })
+    }
+
+    /// The id git gives a blob holding exactly `bytes` — the hash of
+    /// `blob <length>\0` followed by the bytes, as `hash-object` computes it
+    /// with no filters. What names a file's content without asking git, for
+    /// bytes that come from a folder rather than a repository.
+    pub fn blob_id(self, bytes: &[u8]) -> Oid {
+        let header = format!("blob {}\0", bytes.len());
+        let digest: Vec<u8> = match self {
+            Self::Sha1 => {
+                let mut h = Sha1::new();
+                h.update(header.as_bytes());
+                h.update(bytes);
+                h.finalize().to_vec()
+            }
+            Self::Sha256 => {
+                let mut h = Sha256::new();
+                h.update(header.as_bytes());
+                h.update(bytes);
+                h.finalize().to_vec()
+            }
+        };
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            let _ = write!(hex, "{b:02x}");
+        }
+        Oid(hex)
     }
 
     /// Parse `rev-parse --show-object-format` output.
@@ -145,6 +176,29 @@ mod tests {
         assert_eq!(ObjectFormat::parse("sha1").unwrap().hex_len(), 40);
         assert_eq!(ObjectFormat::parse("sha256").unwrap().hex_len(), 64);
         assert!(ObjectFormat::parse("md5").is_err());
+    }
+
+    /// **A blob id is `hash-object`'s, byte for byte** — the expected ids are
+    /// what git itself printed for the same bytes, in a SHA-1 and a SHA-256
+    /// repository.
+    #[test]
+    fn a_blob_id_is_the_one_git_computes() {
+        assert_eq!(
+            ObjectFormat::Sha1.blob_id(b"hello\n").as_str(),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
+        assert_eq!(
+            ObjectFormat::Sha1.blob_id(b"").as_str(),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+        assert_eq!(
+            ObjectFormat::Sha256.blob_id(b"hello\n").as_str(),
+            "2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4"
+        );
+        assert_eq!(
+            ObjectFormat::Sha256.blob_id(b"").as_str(),
+            "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813"
+        );
     }
 
     #[test]

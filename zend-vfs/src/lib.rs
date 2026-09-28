@@ -81,7 +81,7 @@ pub use error::GitError;
 pub use file_changes::FileChanges;
 pub use file_delta::{FileDelta, FileTimes, Splice, TimedDelta};
 pub use files::{RepoFiles, UnknownRepo};
-pub use origin::{Published, Pulled, ORIGIN};
+pub use origin::{Followed, Published, Pulled, ORIGIN};
 pub use read::blame::{BlameLine, LineRange};
 pub use read::blob_reader::BlobReader;
 pub use read::diff::{DiffEntry, DiffSide, DiffStatus};
@@ -89,6 +89,7 @@ pub use read::grep::{GrepHit, GrepQuery};
 pub use read::head::Head;
 pub use read::log::{CommitInfo, LogRange};
 pub use read::patch::{FilePatch, Hunk, LineKind, PatchLine};
+pub use read::record::RecordBranch;
 pub use read::refs::{Ancestor, Branch, Remote, Upstream};
 pub use read::remote_branches::RemoteBranch;
 pub use read::status::{StatusCode, StatusEntry, Xy};
@@ -97,6 +98,7 @@ pub use read::tree::{ObjectKind, SizedEntry, TreeEntry};
 pub use remote::fetch::{FetchFlag, FetchSpec, RefUpdate};
 pub use remote::ls_remote::RemoteRefs;
 pub use remote::manage::UrlKind;
+pub use remote::probe;
 pub use remote::push::{
     Lease, PushAction, PushOutcome, PushResult, PushSpec, PushTarget, Rejection,
 };

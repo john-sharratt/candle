@@ -555,6 +555,7 @@ fn a_move_journalled_but_never_made_leaves_the_file() {
         intent_to_add: Vec::new(),
         perms: Default::default(),
         link_dirs: Vec::new(),
+        unchanged: Vec::new(),
         exclude: None,
         vacant: vec!["fresh.local".into()],
         moved: vec!["x.local".into()],
@@ -644,6 +645,40 @@ fn a_branch_the_run_rewound_is_put_back() {
     t.git(&["checkout", "-q", "-f", "job"]);
     kept.restore().unwrap();
     assert_eq!(t.oid("mine"), gained, "moved on, so kept");
+    assert_eq!(status(&t), "## mine\n", "and nothing it gained staged away");
+}
+
+/// **The checkout's own changes are carried onto a branch that moved on**
+/// while it was set aside — a staged change staged, an untracked file
+/// untracked — and nothing the branch gained comes back reverted, not even
+/// a file captured only to keep its bytes.
+#[test]
+fn own_changes_are_carried_onto_a_branch_that_moved_on() {
+    let t = repo();
+    t.git(&["checkout", "-q", "-b", "mine"]);
+    t.write("a.txt", b"staged\n");
+    t.git(&["add", "a.txt"]);
+    t.write("new.txt", b"not added yet\n");
+    let mut kept = keep(&t, &["b.txt"]);
+
+    // While it is set aside the branch moves on: `b.txt` changed, `c.txt`
+    // added.
+    t.git(&["checkout", "-q", "-f", "mine"]);
+    t.write("b.txt", b"b, moved on\n");
+    t.write("c.txt", b"c\n");
+    t.git(&["add", "b.txt", "c.txt"]);
+    t.git(&["commit", "-q", "-m", "moved on"]);
+    let moved = t.oid("mine");
+    t.git(&["checkout", "-q", "-f", "job"]);
+    kept.restore().unwrap();
+
+    assert_eq!(t.oid("mine"), moved);
+    assert_eq!(status(&t), "## mine\nM  a.txt\n?? new.txt\n");
+    assert_eq!(t.read("a.txt"), b"staged\n");
+    assert_eq!(t.read("b.txt"), b"b, moved on\n");
+    assert_eq!(t.read("c.txt"), b"c\n");
+    assert_eq!(t.read("new.txt"), b"not added yet\n");
+    assert_released(&t);
 }
 
 /// **A file added with `git add -N` comes back added so.**

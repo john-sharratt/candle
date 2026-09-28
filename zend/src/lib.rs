@@ -12,6 +12,7 @@
 //! `response_section`).
 pub mod access;
 pub mod api;
+pub mod branch_ingest;
 pub mod chatml;
 pub mod code_read;
 pub mod coding_sampling;
@@ -32,6 +33,7 @@ pub mod log_broadcast;
 pub mod log_line;
 pub mod model_choice;
 pub mod openai_tools;
+pub mod origin_watch;
 pub mod passthrough;
 pub mod projection_event;
 pub mod raw_read;
@@ -42,6 +44,7 @@ pub mod repo_path;
 pub mod repo_scan;
 pub mod response_section;
 pub mod resume;
+pub mod retrieval_scope;
 pub mod sandbox_programs;
 pub mod secrets;
 pub mod session;

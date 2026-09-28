@@ -16,7 +16,8 @@
 //!    byte under refs of the layer's own, and a journal written that a
 //!    crash can be recovered from ([`preserve`]);
 //! 3. **put the checkout on the conversation's branch**, at the commit the
-//!    conversation's files are based on;
+//!    conversation's files are based on — the local branch first brought up
+//!    to it where origin already holds it and the branch lags (`follow`);
 //! 4. **apply** the conversation's changes onto it, writing only the files
 //!    whose bytes are wrong (steps 3 and 4 are [`materialize`]);
 //! 5. **check** the command ([`CommandPolicy`]). Every rule that reads the
@@ -48,6 +49,7 @@
 //! | Module | Concern |
 //! |---|---|
 //! | [`command`] | The program, its arguments and its timeout |
+//! | `follow` | Bringing a lagging local branch up to the conversation's base |
 //! | [`policy`] | The security check a command passes before it runs |
 //! | `git_use` | Finding git run directly — as the program, or in a shell's script |
 //! | [`process`] | Starting it, passing on its output, killing its process tree |
@@ -60,6 +62,9 @@
 
 pub mod command;
 mod error;
+mod follow;
+#[cfg(test)]
+mod follow_tests;
 mod git_use;
 pub mod outcome;
 pub mod policy;
@@ -221,6 +226,15 @@ impl Sandbox {
     /// Put the checkout on `branch` with `changes` laid over it. The changes
     /// are made on `base`: a branch that moved off it before the checkout was
     /// put in place fails the job.
+    ///
+    /// A local branch behind `base` where origin already holds `base` is
+    /// brought up to it here ([`follow::follow`]) — under the checkout's
+    /// lock and after [`preserve`] recorded where the owner's `HEAD` stood, so
+    /// the owner's checkout comes back as a branch that only moved on, its
+    /// own changes carried onto it, never as uncommitted work reverting what
+    /// origin gained.
+    ///
+    /// [`preserve`]: crate::checkout::preserve()
     async fn put_on(
         &self,
         session: Session,
@@ -232,6 +246,7 @@ impl Sandbox {
         let branch = branch.clone();
         let base = base.clone();
         let (session, ()) = off_runtime(session, move |session| {
+            follow::follow(&repo, &session.preserved, &branch, &base)?;
             let grant = DiskWriteGrant::issue();
             let (ledger, _) = checkout::materialize(&repo, &grant, &branch, &changes)?;
             let at_base = ledger.base() == base.as_str();
@@ -279,6 +294,27 @@ impl Sandbox {
             });
         }
         let made_on = base.as_ref().and_then(|b| b.commit()).cloned();
+        // The conversation pinned its branch's record — origin's copy — which
+        // can be ahead of the local branch the checkout is put on. When origin
+        // already holds the base and the local branch is behind it, the job
+        // may run: the local branch follows it once the checkout is locked and
+        // set aside (`put_on`), never here, where another job may hold it.
+        if let Some(made_on) = made_on.as_ref().filter(|m| tip.as_ref() != Some(*m)) {
+            let behind = match &tip {
+                Some(tip) => self
+                    .repo
+                    .is_ancestor(&Rev::Oid(tip.clone()), &Rev::Oid(made_on.clone()))
+                    .map_err(|e| store(e.to_string()))?,
+                None => true,
+            };
+            let on_record = self
+                .repo
+                .on_record(branch, made_on)
+                .map_err(|e| store(e.to_string()))?;
+            if behind && on_record {
+                return Ok(made_on.clone());
+            }
+        }
         let named = |oid: &Option<Oid>| {
             oid.as_ref()
                 .map_or_else(|| "no commit".to_string(), |o| o.to_string())

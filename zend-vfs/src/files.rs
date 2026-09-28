@@ -31,7 +31,7 @@ use std::sync::{Arc, RwLock};
 use super::vfs::git_source::GitSource;
 use super::vfs::{Snapshot, VfsStore};
 use super::workspace::{Workspace, ALL_REPOS};
-use crate::{BranchName, Rev};
+use crate::{BranchName, Oid, Rev};
 
 /// Each git repository's source, by repository name.
 type Sources = BTreeMap<String, Arc<GitSource>>;
@@ -118,6 +118,25 @@ impl RepoFiles {
             Some(workspace) => Self::over(workspace.clone(), Arc::clone(&self.sources)),
             None => Self::detached(),
         }
+    }
+
+    /// A [`Self::fresh`] set whose store for the git repository `name` reads
+    /// the commit `at` rather than a branch — what a conversation that must
+    /// see exactly one commit's files is given. `None` when the set has no
+    /// git repository called `name`.
+    pub fn fresh_at(&self, name: &str, at: &Oid) -> Option<Self> {
+        let source = self.sources.get(name)?;
+        let fresh = self.fresh();
+        let pinned = Arc::new(VfsStore::on_branch(
+            Arc::clone(source),
+            Rev::Oid(at.clone()),
+        ));
+        {
+            let mut stores = fresh.stores.write().unwrap();
+            let slot = stores.iter_mut().find(|(n, _)| n == name)?;
+            slot.1 = pinned;
+        }
+        Some(fresh)
     }
 
     /// Read each named repository through the branch `branches` gives it —
@@ -250,6 +269,8 @@ impl Default for RepoFiles {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     use crate::testing::{scratch, TestRepo};
@@ -434,7 +455,7 @@ mod tests {
             .tempdir_in(scratch())
             .unwrap();
         std::fs::write(plain.path().join("b.txt"), b"on disk\n").unwrap();
-        let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
         let (repo, folder) = (name(&t.path), name(plain.path()));
         let ws = Workspace::new(
             scratch(),
@@ -471,6 +492,112 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(names, expected);
         assert_eq!(read(&fresh, &repo, "a.txt").as_deref(), Some("topic\n"));
+    }
+
+    /// **A set pinned at a commit reads that commit**, whatever its branch
+    /// holds since, and the other repositories read as a fresh set does; a
+    /// folder that is not under git cannot be pinned.
+    #[test]
+    fn a_set_pinned_at_a_commit_reads_that_commit() {
+        let t = TestRepo::init();
+        t.write("a.txt", b"first\n");
+        let first = t.commit_all("first");
+        t.write("a.txt", b"second\n");
+        t.commit_all("second");
+        let plain = tempfile::Builder::new()
+            .prefix("plain-")
+            .tempdir_in(scratch())
+            .unwrap();
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        let (repo, folder) = (name(&t.path), name(plain.path()));
+        let ws = Workspace::new(
+            scratch(),
+            vec![RepoSpec::named(&repo), RepoSpec::named(&folder)],
+        )
+        .unwrap();
+        let files = RepoFiles::overlay(ws);
+
+        let pinned = files.fresh_at(&repo, &first).expect("a git repository");
+        let read = |files: &RepoFiles| files.repo(&repo).unwrap().read("a.txt").unwrap();
+        assert_eq!(read(&pinned).as_deref(), Some("first\n"));
+        assert_eq!(read(&files).as_deref(), Some("second\n"));
+        assert_eq!(pinned.names(), files.names());
+        assert!(files.fresh_at(&folder, &first).is_none());
+        assert!(files.fresh_at("nope", &first).is_none());
+    }
+
+    /// **A file's content id is its blob id** — from the base's tree over a
+    /// branch, computed from the bytes over a folder, the same id both ways —
+    /// and there is none for a file the session changed or one that is not
+    /// there. Only a branch has a base tree.
+    #[test]
+    fn a_files_content_id_is_its_blob_id_either_way() {
+        let t = TestRepo::init();
+        t.write("a.txt", b"hello\n");
+        t.write("b.txt", b"b\n");
+        t.commit_all("first");
+        let plain = tempfile::Builder::new()
+            .prefix("plain-")
+            .tempdir_in(scratch())
+            .unwrap();
+        std::fs::write(plain.path().join("a.txt"), b"hello\n").unwrap();
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        let (repo, folder) = (name(&t.path), name(plain.path()));
+        let ws = Workspace::new(
+            scratch(),
+            vec![RepoSpec::named(&repo), RepoSpec::named(&folder)],
+        )
+        .unwrap();
+        let files = RepoFiles::overlay(ws);
+        let hello = Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap();
+
+        let git = files.repo(&repo).unwrap();
+        assert_eq!(git.content_id("a.txt").unwrap(), Some((hello.clone(), 6)));
+        git.write("b.txt", "mine\n".into()).unwrap();
+        assert_eq!(git.content_id("b.txt").unwrap(), None, "the session's copy");
+        assert_eq!(git.changed_paths(), ["b.txt"]);
+        assert_eq!(git.content_id("nope.txt").unwrap(), None);
+        let base = git.peek_base().unwrap().expect("a branch has a base");
+        let tree = git.tree_at(&base).unwrap().expect("a branch has a tree");
+        assert_eq!(tree.file("a.txt"), Some((&hello, 6)));
+
+        let disk = files.repo(&folder).unwrap();
+        assert_eq!(disk.content_id("a.txt").unwrap(), Some((hello, 6)));
+        assert!(disk.peek_base().unwrap().is_none());
+        assert!(disk.tree_at(&base).unwrap().is_none());
+    }
+
+    /// **Peeking at a base takes none**: a store that has not read its branch
+    /// sees the branch move under the peek, and holds still once a read has
+    /// taken the base.
+    #[test]
+    fn peeking_at_the_base_takes_none() {
+        let t = TestRepo::init();
+        t.write("a.txt", b"one\n");
+        t.commit_all("first");
+        let repo = t.path.file_name().unwrap().to_string_lossy().into_owned();
+        let ws = Workspace::new(scratch(), vec![RepoSpec::named(&repo)]).unwrap();
+        let files = RepoFiles::overlay(ws);
+        let store = files.repo(&repo).unwrap();
+
+        let first = store.peek_base().unwrap().unwrap();
+        t.write("a.txt", b"two\n");
+        let second = t.commit_all("second");
+        let peeked = store.peek_base().unwrap().unwrap();
+        assert_ne!(
+            peeked, first,
+            "nothing was taken, so the peek follows the branch"
+        );
+        assert_eq!(peeked.commit(), Some(&second));
+
+        assert_eq!(store.read("a.txt").unwrap().as_deref(), Some("two\n"));
+        t.write("a.txt", b"three\n");
+        t.commit_all("third");
+        assert_eq!(
+            store.peek_base().unwrap().unwrap(),
+            peeked,
+            "a read took the base"
+        );
     }
 
     /// **A detached set makes a store per name on first use**, since there is

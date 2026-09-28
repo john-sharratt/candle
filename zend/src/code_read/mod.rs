@@ -13,10 +13,11 @@
 //! tool-using conversation that happens not to be shown to anyone (see
 //! [`run_file_conversation`], [`opening_prompt`]).
 //!
-//! Refresh is per-file: content hashes ([`CodeReadState`]) decide which files
-//! changed; deleted files' conversations are tombstoned, changed files are
-//! re-ingested, and unchanged files are skipped via the substrate resume
-//! cache (the per-file `content_sha256` tag).
+//! What to read comes from the branches (`crate::branch_ingest`): each file
+//! is keyed by its path and blob id, a conversation carrying that key is the
+//! file read, and one is ingested only when no conversation carries it. Its
+//! `file_read` calls read the commit it was found on, so the conversation
+//! holds exactly the bytes its key names.
 //!
 //! **Parallel ingest.** [`CODE_READ_PARALLELISM`] workers each own one file's
 //! conversation and drive it to completion — a bounded pool of real
@@ -24,12 +25,9 @@
 //! engine wave-batches together.
 
 pub mod carve;
+mod lines;
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::fs;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,89 +37,63 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
-use sha2::{Digest, Sha256};
 use zend_tools::ToolContext;
+use zend_vfs::Oid;
 
+use self::lines::line_count;
+use crate::branch_ingest::filter::{language_of, MAX_FILE_BYTES};
+use crate::branch_ingest::keys::{file_key, BLOB_KEY, CONTENT_KEY, LINES_KEY};
+use crate::branch_ingest::plan::Committed;
 use crate::ingest_report::Failures;
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_path::split;
-use crate::repo_scan::{is_binary_sample, FileEntry, Language, RepoMap, MAX_FILE_BYTES};
+use crate::repo_scan::{is_binary_sample, Language};
 use crate::tool_round;
 use crate::tools::format_tool_responses;
+use crate::workspace::UPLOADS_REPO;
 
-/// Per-file content hash record consulted by the refresh path so a
-/// burst of editor saves doesn't trigger a re-prefill of unchanged
-/// files.  Keyed by workspace-relative path.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CodeReadState {
-    pub file_hashes: BTreeMap<String, String>,
+/// Metadata key holding a file conversation's workspace-relative path.
+pub(crate) const PATH_KEY: &str = "path";
+
+/// One file to read: its workspace-relative path, its blob, its language, and
+/// the commit its bytes are read from — `None` for an upload, which is read
+/// from the uploads folder as it stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileJob {
+    pub path: String,
+    pub blob: Oid,
+    pub language: Language,
+    pub at: Option<Oid>,
 }
 
-impl CodeReadState {
-    /// Whether `self` and the freshly-walked map name the same files
-    /// with the same content hashes.  Drives the no-op short-circuit
-    /// in [`refresh_code_reading`].
-    pub fn equivalent_to(&self, other: &CodeReadState) -> bool {
-        self.file_hashes == other.file_hashes
-    }
-
-    /// Workspace-relative paths whose content hash differs (added,
-    /// removed, or rewritten).  Informational — the refresh itself
-    /// is wholesale.
-    pub fn changed_files(&self, other: &CodeReadState) -> Vec<String> {
-        let mut out = Vec::new();
-        for (p, h) in &other.file_hashes {
-            match self.file_hashes.get(p) {
-                Some(prev) if prev == h => {}
-                _ => out.push(p.clone()),
-            }
-        }
-        for p in self.file_hashes.keys() {
-            if !other.file_hashes.contains_key(p) {
-                out.push(p.clone());
-            }
-        }
-        out
-    }
-
-    /// This state without the files `map`'s `--max-depth` bound froze. A frozen
-    /// file stays in the substrate, but the bounded walk never carves it — so
-    /// comparing the whole state against the walk would read it as removed.
-    pub fn without_frozen(&self, map: &RepoMap) -> Self {
-        Self {
-            file_hashes: self
-                .file_hashes
-                .iter()
-                .filter(|(path, _)| !map.is_frozen_file(path))
-                .map(|(path, hash)| (path.clone(), hash.clone()))
-                .collect(),
-        }
+impl FileJob {
+    /// The file's content key.
+    pub fn key(&self) -> String {
+        file_key(&self.path, &self.blob)
     }
 }
 
-/// Rebuild the [`CodeReadState`] from what the substrate has ALREADY ingested,
-/// joining each conversation's `path` and `content_sha256` metadata by timeline.
-///
-/// This is the durable record of the last (partial or complete) ingest. It is
-/// what `session.rs` seeds the in-memory `IngestConv` registry from at boot —
-/// unconditionally, whether or not any pass has run this process — and it is
-/// what [`refresh_code_reading`]'s first (and every later) pass diffs the
-/// freshly-walked files against, entirely off zend's load-to-`ready` critical
-/// path. Empty ⇒ nothing ingested yet ⇒ the next pass reads every file as new.
-pub fn code_read_state_from_substrate(engine: &Mutex<ConversationEngine>) -> CodeReadState {
+/// Every committed `code_reading` conversation of a repository's branches:
+/// its content key and path — what the pass plans against. Uploads are not
+/// among them: their endpoint keeps them, never the pass.
+pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
     let eng = engine.lock().unwrap();
-    let hashes: HashMap<TimelineId, String> = eng
-        .conversations_with_metadata_key("content_sha256")
+    let keys: HashMap<TimelineId, String> = eng
+        .conversations_with_metadata_key(CONTENT_KEY)
         .into_iter()
         .collect();
-    let mut state = CodeReadState::default();
-    for (tl, path) in eng.conversations_with_metadata_key("path") {
-        if let Some(hash) = hashes.get(&tl) {
-            state.file_hashes.insert(path, hash.clone());
-        }
-    }
-    state
+    eng.conversations_with_metadata_key(PATH_KEY)
+        .into_iter()
+        .filter(|(_, path)| !is_upload_path(path))
+        .filter_map(|(timeline, path)| {
+            Some(Committed {
+                timeline,
+                key: keys.get(&timeline)?.clone(),
+                subject: path,
+            })
+        })
+        .collect()
 }
 
 /// Maximum tolerated per-file summary decode failures in a single
@@ -205,120 +177,49 @@ fn parallelism() -> usize {
     CODE_READ_PARALLELISM
 }
 
-/// Per-file content hash (path-qualified) — the conversation's
-/// content-addressed cache key. A file move/rename or any content edit
-/// changes it, so the resume cache and the change-detection both key on
-/// it. Doubles as the [`CodeReadState`] change-detection digest (keyed by
-/// path), so a single hash per file serves both the resume cache and
-/// refresh. Path-qualified, so a move/rename re-ingests and the per-path
-/// invalidation scan is exact.
-pub(crate) fn file_content_hash(path: &str, bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(path.as_bytes());
-    h.update(bytes);
-    format!("{:x}", h.finalize())
-}
-
-/// One file queued for ingest: its repo-map entry and content hash. Bytes are
-/// read once, here, only to pass the size/binary guards and compute the hash
-/// — never shown to the model directly; the model reads the file for itself
-/// via a real `file_read` call, so there is nothing else to carry forward.
-type QueuedFile = (FileEntry, String);
-
-/// Scan `map`'s files: size-guard, binary-sniff, and hash each one, recording
-/// every hash into a fresh [`CodeReadState`]. Files that fail either guard are
-/// skipped (never queued, never marked as covered).
-fn scan_workspace(workspace: &Path, map: &RepoMap) -> (Vec<QueuedFile>, CodeReadState) {
-    let mut per_file = Vec::with_capacity(map.files.len());
-    let mut state = CodeReadState::default();
-    for file in &map.files {
-        let path = workspace.join(&file.path);
-        // Size guard (defense-in-depth with `walk_workspace`): the explicit-path
-        // ingest builds its own `FileEntry` list and bypasses the walk's size cap,
-        // so re-enforce it here.
-        match fs::metadata(&path) {
-            Ok(m) if m.len() > MAX_FILE_BYTES => {
-                tracing::debug!(
-                    file = %file.path,
-                    bytes = m.len(),
-                    "code_read: skip oversize file (> MAX_FILE_BYTES)",
-                );
-                continue;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(file = %file.path, "code_read: skip unreadable file: {e}");
-                continue;
-            }
-        }
-        let bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(file = %file.path, "code_read: skip unreadable file: {e}");
-                continue;
-            }
-        };
-        // Content guard (defense-in-depth with `walk_workspace`'s sniff): a binary
-        // blob that reached here via the explicit-path ingest — which builds its
-        // own `FileEntry` list and bypasses the walk — is rejected before its
-        // hash is ever recorded.
-        if is_binary_sample(&bytes) {
-            tracing::debug!(file = %file.path, "code_read: skip binary file (content sniff)");
-            continue;
-        }
-        let fhash = file_content_hash(&file.path, &bytes);
-        state.file_hashes.insert(file.path.clone(), fhash.clone());
-        per_file.push((file.clone(), fhash));
-    }
-    (per_file, state)
-}
-
-/// Ingest ONLY `rel_paths` into the `code_reading` layer — the upload
-/// pipeline's read_file phase.
+/// Ingest ONLY `rel_paths` — workspace-relative, in the uploads repository —
+/// into the `code_reading` layer: the upload pipeline's read_file phase.
 ///
-/// Unlike [`refresh_code_reading`], this does **not**
-/// walk or reconcile the whole workspace: it scans and ingests just these
-/// files, dedupes against already-ingested identical content, and **never**
-/// tombstones anything. That matters for two reasons: (1) a full-workspace
-/// re-ingest triggered by one upload is a huge, GPU-overloading amount of work
-/// (and with `--skip-code-read` the empty prior state makes the refresh treat
-/// *every* file as new — the exact overload that killed the expert pipeline
-/// thread); (2) a partial file set fed to the workspace refresh would make
-/// `reconcile_deleted` tombstone the entire rest of the corpus. This path is
-/// bounded to the uploaded files and safe under `--skip-code-read`.
+/// Bounded to these files: no branch is walked and nothing else is
+/// tombstoned. Each file is keyed the way a branch's file is — its path and
+/// blob id, the id computed from the bytes on disk — so identical bytes
+/// uploaded again are not read again, and an upload that replaces a path
+/// retires the conversation of what that path held before.
 ///
-/// Files whose extension isn't a recognised code language are skipped (there is
-/// nothing to read). Returns the per-file content-hash state for the files that
-/// were ingested (to merge into the running [`CodeReadState`]) plus the count of
-/// files whose ingest tolerated-failed (e.g. out of KV VRAM), so the upload can
-/// surface a real failure.
+/// Files whose extension isn't a recognised code language, and files over
+/// [`MAX_FILE_BYTES`], are skipped. Returns whether any file was read, and
+/// how many files' ingest tolerated-failed (e.g. out of KV VRAM), so the
+/// upload can surface a real failure.
 pub fn ingest_files(
     ctx: &RefreshContext<'_>,
-    workspace: &Path,
     rel_paths: &[String],
     progress: &Arc<LoadProgress>,
     layer_name: &str,
     base: &Mutex<Sequence>,
-) -> anyhow::Result<(CodeReadState, usize)> {
-    // Build a minimal RepoMap for just these files — `scan_workspace` needs
-    // only the path + language; the other `FileEntry` fields are unused.
-    let mut map = RepoMap::default();
+) -> anyhow::Result<(bool, usize)> {
+    let uploads = ctx.tool_ctx.files.repo(UPLOADS_REPO)?;
+    let mut jobs = Vec::new();
     for rel in rel_paths {
-        let norm = rel.replace('\\', "/");
-        let ext = norm.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-        let Some(language) = Language::from_extension(&ext) else {
+        let path = rel.replace('\\', "/");
+        let (_, inner) = split(&path);
+        let Some(language) = language_of(&path) else {
             continue; // not a recognised code language — nothing to read
         };
-        map.files.push(FileEntry {
-            path: norm,
-            line_count: 0,
-            language,
-            size_bytes: 0,
-            module_hint: None,
-        });
+        match uploads.content_id(inner) {
+            Ok(Some((blob, size))) if size <= MAX_FILE_BYTES => jobs.push(FileJob {
+                path,
+                blob,
+                language,
+                at: None,
+            }),
+            Ok(_) => {
+                tracing::debug!(file = %path, "code_read: skip an upload missing or over the size cap");
+            }
+            Err(e) => tracing::debug!(file = %path, "code_read: skip an unreadable upload: {e}"),
+        }
     }
-    if map.files.is_empty() {
-        return Ok((CodeReadState::default(), 0));
+    if jobs.is_empty() {
+        return Ok((false, 0));
     }
 
     let layer = ctx
@@ -331,113 +232,51 @@ pub fn ingest_files(
     // cross-file retrieval.
     ctx.engine.lock().unwrap().mark_layer_append_only(layer);
 
-    let (per_file, state) = scan_workspace(workspace, &map);
-    progress.set_step_progress(0, per_file.len() as u64);
-
-    // Dedup against already-ingested content so re-uploading identical bytes is
-    // a no-op — but NO `reconcile_deleted`: a partial file set must never
-    // tombstone the rest of the corpus.
-    let present_hashes = ctx
-        .engine
-        .lock()
-        .unwrap()
-        .conversation_metadata_values("content_sha256");
-
-    let n_failed = run_file_pool(
-        ctx,
-        base,
-        &per_file,
-        &present_hashes,
-        progress,
-        parallelism(),
-    )?;
-    Ok((state, n_failed))
+    let live: HashSet<String> = jobs.iter().map(FileJob::key).collect();
+    let n_failed = ingest_jobs(ctx, &jobs, &live, progress, base, &Mutex::default())?;
+    Ok((true, n_failed))
 }
 
 /// Whether a workspace-relative `path` (with `/` separators) lives in the
-/// daemon's `uploads` repository ([`crate::workspace::UPLOADS_REPO`]). Matched
-/// on the FIRST segment only, and case-insensitively (the win32 FS is
-/// case-insensitive, so an existing `Uploads/` dir still resolves to the
-/// daemon's uploads dir) — so an `uploads/` folder inside a repository is NOT
-/// matched. Keeps `reconcile_deleted` in step with
-/// [`crate::repo_scan::walk_workspace`], which never walks that repository:
-/// uploads are endpoint-managed and deliberately absent from the walk, so they
-/// must never be tombstoned merely for being absent from `present_paths`.
+/// daemon's `uploads` repository ([`UPLOADS_REPO`]). Matched on the FIRST
+/// segment only, and case-insensitively (the win32 FS is case-insensitive, so
+/// an existing `Uploads/` dir still resolves to the daemon's uploads dir) — so
+/// an `uploads/` folder inside a repository is NOT matched. Uploads are
+/// endpoint-managed and on no branch, so the branch pass must never read their
+/// absence from the branches as a deletion.
 pub(crate) fn is_upload_path(path: &str) -> bool {
     path.split('/')
         .next()
         .unwrap_or("")
-        .eq_ignore_ascii_case("uploads")
-}
-
-/// Tombstone every live `code_read` conversation whose `path` is no longer
-/// present in `present_paths`. Covers files deleted while the daemon was
-/// down (the startup ingest only visits files that still exist) and files
-/// removed between fs-watcher refreshes. Still-present *changed* files are
-/// handled by [`process_one_file`], which tombstones a path's stale
-/// conversation before re-ingesting it.
-///
-/// A path past `map`'s `--max-depth` bound is FROZEN, not deleted: the walk
-/// never looked there, so its absence from `present_paths` proves nothing.
-fn reconcile_deleted(
-    engine: &Mutex<ConversationEngine>,
-    map: &RepoMap,
-    present_paths: &HashSet<&str>,
-) {
-    let e = engine.lock().unwrap();
-    for (tl, path) in e.conversations_with_metadata_key("path") {
-        // Uploaded files live under the endpoint-managed `uploads/` dir, which
-        // `walk_workspace` deliberately skips — so they're always absent from
-        // `present_paths`. Never tombstone them here; that would delete
-        // freshly-uploaded content on the next workspace refresh.
-        if is_upload_path(&path) || map.is_frozen_file(&path) {
-            continue;
-        }
-        if !present_paths.contains(path.as_str()) {
-            if let Err(err) = e.tombstone_timeline(tl) {
-                tracing::warn!(
-                    target: "zend::code_read::ingest",
-                    path = %path,
-                    "tombstone of deleted file's conversation failed: {err:#}",
-                );
-            }
-        }
-    }
+        .eq_ignore_ascii_case(UPLOADS_REPO)
 }
 
 /// Retire every crashed-partial `code_read` conversation, up front.
 ///
 /// The `code_read` twin of `repo_scan::retire_crashed_partials`, and the same
-/// completion protocol: `path` is written at conversation creation and
-/// `content_sha256` only once the file's ingest succeeds, so `path` without a
-/// hash means "started, never committed". [`process_one_file`] already retires
-/// one such partial per path, but only when that path comes back through the
-/// pool — so with `--skip-layer code_reading`, an aborted pass, or the failure
-/// cap tripped, the debris stays live and keeps competing in the provenance
-/// gather with turns whose answer was never decoded.
+/// completion protocol: `path` is written at conversation creation and the
+/// content key only once the file's ingest succeeds, so `path` without a key
+/// means "started, never committed". A conversation ingested before files
+/// were keyed by content carries no key either, and goes the same way. An
+/// attempt that fails retires its own conversation ([`process_one_file`]), so
+/// what is left for here is what a crash left: the debris would otherwise
+/// stay live and keep competing in the provenance gather.
 ///
-/// **Uploads are exempt, for the reason [`reconcile_deleted`] exempts them.**
-/// They live under the endpoint-managed `uploads/` dir that `walk_workspace`
-/// skips, so they never come back through the pool to be re-ingested — and
-/// tombstoning one here would delete freshly-uploaded content with nothing to
-/// rebuild it from. `reconcile_deleted` guards against exactly this and the
-/// guard has to travel with the second sweep.
+/// **Uploads are not exempt.** An upload's conversation without a content
+/// key is in no conversation's scope (`crate::retrieval_scope`) — it holds
+/// nothing anything retrieves.
 ///
 /// Called ONCE per boot from the session's ingest pre-loop, for every layer not
-/// named by `--disable-layer` — including a `--skip-layer` layer, which runs no
-/// pass and so would otherwise never sweep. Never called from
-/// [`refresh_code_reading`]: a refresh can overlap a live pool, and an in-flight
-/// file is indistinguishable from a crashed one by metadata alone.
+/// named by `--disable-layer`, before any pool or upload runs. Never called
+/// from [`ingest_jobs`]: a pass can overlap a live pool, and an in-flight file
+/// is indistinguishable from a crashed one by metadata alone.
 pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
     let e = engine.lock().unwrap();
     let mut retired = 0usize;
-    for (tl, path) in e.conversations_with_metadata_key("path") {
-        if is_upload_path(&path) {
-            continue;
-        }
+    for (tl, path) in e.conversations_with_metadata_key(PATH_KEY) {
         let committed = e
             .conversation_metadata(tl)
-            .is_some_and(|m| m.contains_key("content_sha256"));
+            .is_some_and(|m| m.contains_key(CONTENT_KEY));
         if committed {
             continue;
         }
@@ -454,26 +293,29 @@ pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
         tracing::info!(
             target: "zend::code_read::ingest",
             retired,
-            "retired crashed-partial code_read conversations (no content hash) \
-             so their half-built chains leave the provenance gather",
+            "retired code_read conversations with no content key (crashed partials, \
+             or ingested before files were keyed by content) so they leave the \
+             provenance gather",
         );
     }
 }
 
-/// Tombstone EVERY `code_reading` conversation, committed or not (uploads
-/// exempt, for the reason [`retire_crashed_partials`] exempts them) —
+/// Tombstone EVERY `code_reading` conversation, committed or not —
 /// `--wipe-layer code_reading`'s targeted counterpart to
 /// [`retire_crashed_partials`], which only removes the never-committed half.
 ///
-/// Called from the session's ingest pre-loop, before the registry is seeded
-/// from the substrate (`code_read_state_from_substrate`) — so once this
-/// returns, that seed is empty and the background ingest worker's first pass
-/// reads every file as new, exactly as it would on a truly fresh install.
-/// Unlike `--wipe-substrate`, every other layer's content survives untouched.
+/// **Uploads are exempt.** They live in the endpoint-managed uploads folder,
+/// on no branch, so no pass reads them again: tombstoning one would delete
+/// uploaded content with nothing to rebuild it from.
+///
+/// Called from the session's ingest pre-loop, before the background ingest
+/// worker's first pass — which then finds nothing committed and reads every
+/// file as new, exactly as it would on a truly fresh install. Unlike
+/// `--wipe-substrate`, every other layer's content survives untouched.
 pub(crate) fn wipe_layer(engine: &Mutex<ConversationEngine>) {
     let e = engine.lock().unwrap();
     let mut wiped = 0usize;
-    for (tl, path) in e.conversations_with_metadata_key("path") {
+    for (tl, path) in e.conversations_with_metadata_key(PATH_KEY) {
         if is_upload_path(&path) {
             continue;
         }
@@ -494,43 +336,52 @@ pub(crate) fn wipe_layer(engine: &Mutex<ConversationEngine>) {
     );
 }
 
-/// Drive a bounded worker pool over `per_file`: each worker pulls the
-/// next file from a shared cursor and runs [`process_one_file`]. Workers
-/// share progress / decode-failure counters and an abort flag (first
-/// error stops the rest). Returns once every file is processed, yielding
-/// the number of files whose ingest was *tolerated-failed* (e.g. the GPU
-/// ran out of KV VRAM mid-decode) — so the upload can surface a real
-/// failure instead of a silent "done".
+/// Ingest `jobs`: a bounded worker pool, each worker pulling the next file
+/// from a shared cursor and running [`process_one_file`]. Workers share
+/// progress / decode-failure counters and an abort flag (first error stops
+/// the rest). Returns once every file is processed, yielding the number of
+/// files whose ingest was *tolerated-failed* (e.g. the GPU ran out of KV VRAM
+/// mid-decode) — so the upload can surface a real failure instead of a silent
+/// "done".
 ///
-/// The sole caller of this pool: [`refresh_code_reading`] (the background
-/// worker's whole-workspace pass) and [`ingest_files`] (the upload path's
-/// bounded file set) both funnel through here, so both drive the same
-/// `crate::ingest_backlog` counter and get this same logging.
-fn run_file_pool(
+/// `live` is every file key the caller holds current: when a file commits,
+/// each other conversation of its path whose key is not in it is tombstoned.
+/// `binary` remembers the keys found to be binary, so a later pass does not
+/// read them again.
+///
+/// The branch pass and the upload path ([`ingest_files`]) both funnel
+/// through here, so both drive the same `crate::ingest_backlog` counter and
+/// get this same logging.
+pub fn ingest_jobs(
     ctx: &RefreshContext<'_>,
-    base: &Mutex<Sequence>,
-    per_file: &[QueuedFile],
-    present_hashes: &HashSet<String>,
+    jobs: &[FileJob],
+    live: &HashSet<String>,
     progress: &Arc<LoadProgress>,
-    n_workers: usize,
+    base: &Mutex<Sequence>,
+    binary: &Mutex<HashSet<String>>,
 ) -> anyhow::Result<usize> {
-    let total = per_file.len();
+    let n_workers = parallelism();
+    let total = jobs.len();
+    let keys: Vec<String> = jobs.iter().map(FileJob::key).collect();
+    // One snapshot of the committed keys: a file committed since the caller
+    // planned is not read twice.
+    let present_keys = ctx
+        .engine
+        .lock()
+        .unwrap()
+        .conversation_metadata_values(CONTENT_KEY);
     tracing::info!(
         n_workers = n_workers,
         n_files = total,
-        n_cached = present_hashes.len(),
         "code_read: per-file ingest across {n_workers} file workers; each file is \
          a real hidden conversation that reads the file via file_read and answers \
          with its own summary",
     );
 
     // The GUI's merged background-ingest bar counts only files that will
-    // REALLY run — a resume-cache hit is not backlog. Same snapshot every
-    // worker probes below, so registration and completion can't disagree.
-    let backlog_pending = per_file
-        .iter()
-        .filter(|(_, h)| !present_hashes.contains(h))
-        .count() as u64;
+    // REALLY run. Same snapshot every worker probes below, so registration
+    // and completion can't disagree.
+    let backlog_pending = keys.iter().filter(|k| !present_keys.contains(*k)).count() as u64;
     crate::ingest_backlog::add_pending(backlog_pending);
     let backlog_done = AtomicUsize::new(0);
 
@@ -555,12 +406,17 @@ fn run_file_pool(
                     return;
                 }
                 let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                if idx >= per_file.len() {
+                if idx >= jobs.len() {
                     return;
                 }
-                let (file, fhash) = &per_file[idx];
-                if let Err(e) = process_one_file(ctx, base, file, fhash, present_hashes, &failures)
-                {
+                let (file, key) = (&jobs[idx], &keys[idx]);
+                let job = Job {
+                    file,
+                    key,
+                    live,
+                    binary,
+                };
+                if let Err(e) = process_one_file(ctx, base, &job, &present_keys, &failures) {
                     // An error escaping `process_one_file` is an unexpected one
                     // (its own failure mode records and returns Ok). Record it
                     // so it reaches the report instead of vanishing, and let the
@@ -581,7 +437,7 @@ fn run_file_pool(
                 // `process_one_file` above — success, tolerated failure, or a
                 // mid-file shutdown cancel — so the backlog can never wedge
                 // non-empty on a file that will just be retried next pass.
-                if !present_hashes.contains(fhash) {
+                if !present_keys.contains(key) {
                     backlog_done.fetch_add(1, Ordering::Relaxed);
                     crate::ingest_backlog::item_done(&file.path);
                 }
@@ -626,62 +482,119 @@ fn run_file_pool(
     Ok(n_failed)
 }
 
-/// Ingest one file into a fresh per-file conversation: skip via the
-/// resume-cache snapshot if its content hash is already present; otherwise
-/// mint the conversation, run it as a real tool-using exchange
-/// ([`run_file_conversation`]), tag it with its content hash + metadata, then
-/// drop it (freeing the GPU slot; the sealed turns + tags persist in the
-/// substrate).
+/// One file for [`process_one_file`], with what the pool shares across files.
+struct Job<'a> {
+    file: &'a FileJob,
+    /// The file's content key.
+    key: &'a str,
+    /// Every key the caller holds current.
+    live: &'a HashSet<String>,
+    /// Keys found to be binary, kept for the life of the process.
+    binary: &'a Mutex<HashSet<String>>,
+}
+
+/// The tools a file's conversation runs against: file stores reading the
+/// commit the file was found on, so its `file_read` returns the bytes its key
+/// names — or, for an upload, a fresh set over the uploads folder. `None`
+/// when the file's repository is not read through git.
+fn file_tools(tools: &ToolContext, file: &FileJob) -> Option<ToolContext> {
+    let files = match &file.at {
+        Some(at) => tools.files.fresh_at(split(&file.path).0, at)?,
+        None => tools.files.fresh(),
+    };
+    Some(tools.with_files(Arc::new(files)))
+}
+
+/// Ingest one file into a fresh per-file conversation: skip it when its key
+/// is already committed or it is binary; otherwise mint the conversation, run
+/// it as a real tool-using exchange ([`run_file_conversation`]), tag it with
+/// its content key + metadata, then drop it (freeing the GPU slot; the sealed
+/// turns + tags persist in the substrate).
 fn process_one_file(
     ctx: &RefreshContext<'_>,
     base: &Mutex<Sequence>,
-    file: &FileEntry,
-    file_hash: &str,
-    present_hashes: &HashSet<String>,
+    job: &Job<'_>,
+    present_keys: &HashSet<String>,
     failures: &Failures,
 ) -> anyhow::Result<()> {
-    // Resume cache: this content hash was already in the (live, non-
-    // tombstoned) substrate at ingest start — skip the read+decode.
-    if present_hashes.contains(file_hash) {
+    let file = job.file;
+    if present_keys.contains(job.key) {
         tracing::debug!(
             target: "zend::code_read::ingest",
             file = %file.path,
-            "skip: file already in substrate (resume cache hit)",
+            "skip: file already committed",
         );
         return Ok(());
     }
+    if job.binary.lock().unwrap().contains(job.key) {
+        return Ok(());
+    }
+    let Some(tools) = file_tools(&ctx.tool_ctx, file) else {
+        failures.record(
+            &file.path,
+            "its repository is not read through git".to_string(),
+        );
+        return Ok(());
+    };
+    // Content guard: an allowlisted extension does NOT guarantee text. A
+    // compiled fatbin / object dump committed as `*.txt` clears both the
+    // extension gate and the size gate, and a hidden conversation told to
+    // read it would read noise. Sniffed from the blob before any
+    // conversation is minted, and remembered, so it is read once. The same
+    // bytes give the line count a fast-path answer reports.
+    let (repo, inner) = split(&file.path);
+    let bytes = tools
+        .files
+        .repo(repo)
+        .ok()
+        .and_then(|store| store.read_bytes(inner).ok().flatten());
+    let lines = match bytes {
+        Some(bytes) if is_binary_sample(&bytes) => {
+            tracing::debug!(
+                target: "zend::code_read::ingest",
+                file = %file.path,
+                "skip: binary content behind a text extension",
+            );
+            job.binary.lock().unwrap().insert(job.key.to_string());
+            return Ok(());
+        }
+        Some(bytes) => line_count(&bytes),
+        None => {
+            failures.record(
+                &file.path,
+                "the file could not be read at its commit".to_string(),
+            );
+            return Ok(());
+        }
+    };
 
-    // Cache miss → new / changed / crashed-partial file. Reconcile the existing
-    // conversations for this path WITHOUT invalidating good content up front — a
-    // DEFERRED tombstone:
-    //   * a PARTIAL (has `path` but no `content_sha256` — a crashed/failed prior
-    //     attempt) carries nothing to lose, so tombstone it now; and
-    //   * a GOOD generation (has `content_sha256`) is DEFERRED into `superseded`:
-    //     it stays live as the file's fallback content, and its resume hash stays
-    //     in the cache, so a failed re-ingest below (e.g. a VRAM OOM) leaves the
-    //     prior generation intact instead of destroying it. Its tombstone
-    //     ACTIVATES only after this ingest commits its own `content_sha256` (see
-    //     the success path below) — an atomic swap, "stale-but-present" over
-    //     "gone", mirroring the repo_map refresh's keep-old-until-new-ready.
+    // Reconcile the existing conversations for this path WITHOUT invalidating
+    // good content up front — a DEFERRED tombstone:
+    //   * a committed generation whose key no branch holds any more is
+    //     DEFERRED into `superseded`: it stays live as the file's fallback
+    //     content, so a failed re-ingest below (e.g. a VRAM OOM) leaves it
+    //     intact instead of destroying it. Its tombstone ACTIVATES only after
+    //     this ingest commits its own key (see the success path below) — an
+    //     atomic swap, "stale-but-present" over "gone";
+    //   * a committed generation whose key is still live is the file as
+    //     another branch holds it, and is left alone;
+    //   * one with no content key yet is another worker's, reading the file
+    //     as another branch holds it, and is left alone too — an attempt
+    //     that fails retires its own, and a crash's are retired at boot
+    //     ([`retire_crashed_partials`]).
     // The engine lock covers only these quick ops and is released before the
     // decode-heavy body below.
     let (mut conv, superseded) = {
         let e = ctx.engine.lock().unwrap();
-        let mut superseded = Vec::new();
-        for tl in e.find_conversations_by_metadata("path", &file.path) {
-            let is_good = e
-                .conversation_metadata(tl)
-                .is_some_and(|m| m.contains_key("content_sha256"));
-            if is_good {
-                superseded.push(tl);
-            } else if let Err(err) = e.tombstone_timeline(tl) {
-                tracing::warn!(
-                    target: "zend::code_read::ingest",
-                    file = %file.path,
-                    "tombstone of stale partial conversation failed: {err:#}",
-                );
-            }
-        }
+        let superseded: Vec<TimelineId> = e
+            .find_conversations_by_metadata(PATH_KEY, &file.path)
+            .into_iter()
+            .filter(|&tl| {
+                e.conversation_metadata(tl)
+                    .and_then(|m| m.get(CONTENT_KEY).cloned())
+                    .is_some_and(|key| !job.live.contains(&key))
+            })
+            .collect();
         // Forks off `base` — this layer's prefilled template, `base_conv`'s
         // exact counterpart for ingestion (see `InferenceState::ingest_bases`)
         // — so this conversation shares the SAME already-computed prefix a
@@ -708,16 +621,16 @@ fn process_one_file(
     };
 
     // Tag the `path` IMMEDIATELY — before the decode-heavy run below that can
-    // fail (GPU OOM mid-decode, a decode error). A partial left by such a failure
-    // then still carries its path, so it (a) shows in the substrate as the file it
-    // covers rather than "(untitled)", and (b) is found by the path-invalidation
-    // scan above on the next run, which tombstones it and retries the file. The
-    // resume-cache key (`content_sha256`) is deliberately withheld until success
-    // (below), so a partial is never mistaken for a completed ingest and skipped.
+    // fail (GPU OOM mid-decode, a decode error). A partial left by a crash then
+    // still carries its path, so it (a) shows in the substrate as the file it
+    // covers rather than "(untitled)", and (b) is found by the next boot's
+    // [`retire_crashed_partials`]. The content key is deliberately withheld
+    // until success (below), so a partial is never mistaken for a completed
+    // ingest and skipped.
     {
         let mut early = BTreeMap::new();
         early.insert("kind".to_string(), "code_read".to_string());
-        early.insert("path".to_string(), file.path.clone());
+        early.insert(PATH_KEY.to_string(), file.path.clone());
         if let Err(e) = conv.set_metadata_many(&early) {
             tracing::warn!(
                 target: "zend::code_read::ingest",
@@ -728,21 +641,18 @@ fn process_one_file(
     }
 
     // Each file's conversation is a conversation like any other, with file
-    // stores of its own: nothing another unit — or a live dialogue — changed
-    // is what it reads.
-    let unit_ctx = Arc::new(
-        ctx.tool_ctx
-            .with_files(Arc::new(ctx.tool_ctx.files.fresh())),
-    );
+    // stores of its own — reading the commit the file was found on: nothing
+    // another unit, or a live dialogue, changed is what it reads.
+    let unit_ctx = Arc::new(tools);
     let summary = match run_file_conversation(&mut conv, &file.path, &ctx.think_triggers, &unit_ctx)
     {
         Ok(text) => text,
         Err(e) => {
             // The deferred tombstone is the safety net here: the prior good
             // generation in `superseded` was NEVER tombstoned, so it stays
-            // live as the file's content and its resume hash stays in the
-            // cache — this failed attempt invalidates nothing. Drop only
-            // THIS attempt's partial; the retry re-mints cleanly.
+            // live as the file's content — this failed attempt invalidates
+            // nothing. Drop only THIS attempt's partial; the retry re-mints
+            // cleanly.
             {
                 let e2 = ctx.engine.lock().unwrap();
                 if let Err(err) = e2.tombstone_timeline(conv.timeline_id()) {
@@ -792,31 +702,49 @@ fn process_one_file(
         "file conversation answered",
     );
 
-    // Tag the conversation: `content_sha256` is the resume-cache key,
-    // `path` is the invalidation-scan key, the rest is diagnostic.
+    // Tag the conversation: the content key commits it — what the pass plans
+    // against, the fast path finds and retrieval scopes by — `path` and `blob`
+    // are its parts, `lines` is what a fast-path answer reports, the rest is
+    // diagnostic. One record, so the line count lands with the key.
     let mut tags = BTreeMap::new();
     tags.insert("kind".to_string(), "code_read".to_string());
-    tags.insert("path".to_string(), file.path.clone());
-    tags.insert("content_sha256".to_string(), file_hash.to_string());
+    tags.insert(PATH_KEY.to_string(), file.path.clone());
+    tags.insert(BLOB_KEY.to_string(), file.blob.to_string());
+    tags.insert(LINES_KEY.to_string(), lines.to_string());
+    tags.insert(CONTENT_KEY.to_string(), job.key.to_string());
     tags.insert("lang".to_string(), format!("{:?}", file.language));
-    let committed = match conv.set_metadata_many(&tags) {
-        Ok(()) => true,
-        Err(e) => {
+    if let Err(err) = conv.set_metadata_many(&tags) {
+        // Not committed: no pass, fast path or scope will find it. The prior
+        // generation stays live, exactly as on the failure path, and this
+        // attempt's conversation goes — nothing else retires it before the
+        // next boot.
+        tracing::warn!(
+            target: "zend::code_read::ingest",
+            file = %file.path,
+            "failed to tag conversation metadata (content key): {err:#}",
+        );
+        if let Err(err) = ctx
+            .engine
+            .lock()
+            .unwrap()
+            .tombstone_timeline(conv.timeline_id())
+        {
             tracing::warn!(
                 target: "zend::code_read::ingest",
                 file = %file.path,
-                "failed to tag conversation metadata (resume cache): {e:#}",
+                "tombstone of the untagged attempt failed: {err:#}",
             );
-            false
         }
-    };
+        failures.record(
+            &file.path,
+            format!("the content key was not written: {err:#}"),
+        );
+        return Ok(());
+    }
+    ctx.retrieval.mark_stale();
 
-    // Deferred tombstone ACTIVATES — but ONLY once the new generation is truly
-    // committed (its `content_sha256` landed above). If that tag write failed the
-    // replacement isn't resume-cached, so treat it as not-yet-committed and KEEP
-    // the prior generation live (exactly as the failure path does) rather than
-    // swapping to an untagged replacement.
-    if committed && !superseded.is_empty() {
+    // Deferred tombstone ACTIVATES, now that the new generation is committed.
+    if !superseded.is_empty() {
         let e = ctx.engine.lock().unwrap();
         for tl in &superseded {
             if let Err(err) = e.tombstone_timeline(*tl) {
@@ -952,84 +880,6 @@ fn run_file_conversation(
     unreachable!("the closing round at MAX_FILE_READ_ROUNDS always returns")
 }
 
-/// Outcome of a [`refresh_code_reading`] call. `Replaced` carries only
-/// the new content-hash `state` — per-file conversations are freed after
-/// seal and persist in the substrate, so there's no sequence list to swap.
-pub enum RefreshOutcome {
-    NoOp,
-    Replaced {
-        /// The merged per-file content-hash record after the refresh.
-        /// No live sequences: per-file conversations are freed after seal
-        /// and live in the substrate, so the caller just swaps in `state`.
-        state: CodeReadState,
-    },
-}
-
-/// Sole entry point for `code_reading` ingestion — startup's first pass,
-/// every later filesystem-event-triggered pass, and (once seeded) a totally
-/// fresh install all call this the same way. `prior` comes from
-/// [`code_read_state_from_substrate`], so an empty prior (nothing durable
-/// yet) makes every file read as changed — exactly the first-ever-boot
-/// behavior, with no separate "ingest" variant needed.
-///
-/// Re-scans `map`. Returns `NoOp` when no file hash changed. Otherwise
-/// `reconcile_deleted` tombstones conversations for files now gone, and the
-/// pool re-ingests over all files — unchanged files hit the resume-cache
-/// snapshot and are skipped, while a changed file misses the snapshot,
-/// tombstones its stale conversation, and re-ingests. So only changed/added
-/// files actually re-run.
-///
-/// The layer's append-only mark is NOT taken here: the session's ingest
-/// pre-loop marks every enabled, non-skipped layer from the same builder
-/// before any pool can start, for every layer and every restart alike (see
-/// `session.rs`) — a second marking site here would be exactly the
-/// duplicate path this repo's engineering rules forbid, and the mark's
-/// absence was once responsible for ingest-layer scores going un-normalized
-/// by a ~13,000x factor.
-///
-/// The engine mutex is taken only for the quick create/tombstone ops inside
-/// the pool (released across each decode), so chat consumers keep running.
-pub fn refresh_code_reading(
-    ctx: &RefreshContext<'_>,
-    workspace: &Path,
-    map: &RepoMap,
-    prior: &CodeReadState,
-    progress: &Arc<LoadProgress>,
-    base: &Mutex<Sequence>,
-) -> anyhow::Result<RefreshOutcome> {
-    // Scan once — drives both the change comparison and the re-ingest.
-    let (per_file, next) = scan_workspace(workspace, map);
-    let prior = prior.without_frozen(map);
-    if prior.equivalent_to(&next) {
-        tracing::debug!("code_read refresh: no file hash changed, skipping refresh");
-        return Ok(RefreshOutcome::NoOp);
-    }
-
-    let changed = prior.changed_files(&next);
-    tracing::info!(
-        n_changed = changed.len(),
-        sample_changed = ?changed.iter().take(5).collect::<Vec<_>>(),
-        "code_read refresh: reconciling + re-ingesting changed files",
-    );
-
-    let n_workers = parallelism();
-
-    // Tombstone conversations for deleted files, then snapshot surviving
-    // hashes; changed files miss the snapshot and are re-ingested (their
-    // stale conversation is tombstoned in process_one_file).
-    let present_paths: HashSet<&str> = per_file.iter().map(|(f, _)| f.path.as_str()).collect();
-    reconcile_deleted(ctx.engine, map, &present_paths);
-    let present_hashes = ctx
-        .engine
-        .lock()
-        .unwrap()
-        .conversation_metadata_values("content_sha256");
-
-    run_file_pool(ctx, base, &per_file, &present_hashes, progress, n_workers)?;
-
-    Ok(RefreshOutcome::Replaced { state: next })
-}
-
 /// Byte offset of the start of each line.  `offsets[i]` is the start
 /// of line `i + 1` (1-indexed).  Final entry is the source length.
 ///
@@ -1072,27 +922,20 @@ pub(crate) fn slice_lines(
 mod tests {
     use super::*;
 
-    /// With `--max-depth 2`, a file past the bound (`src/deep/c.rs`) is frozen:
-    /// it leaves the state the refresh compares, so a bounded walk that never
-    /// visits it cannot read it as removed. Unbounded, the state is untouched.
+    /// A file job's key is the branch walk's key for the same file — the one
+    /// the pass plans with and the fast path looks up.
     #[test]
-    fn a_frozen_file_leaves_the_compared_state() {
-        let state = |pairs: &[(&str, &str)]| CodeReadState {
-            file_hashes: pairs
-                .iter()
-                .map(|(path, hash)| (path.to_string(), hash.to_string()))
-                .collect(),
-        };
-        let prior = state(&[("a.rs", "1"), ("src/b.rs", "2"), ("src/deep/c.rs", "3")]);
-        let bounded = RepoMap {
-            max_depth: Some(2),
-            ..RepoMap::default()
+    fn a_file_jobs_key_is_its_path_and_blob() {
+        let job = FileJob {
+            path: "candle/src/lib.rs".into(),
+            blob: Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap(),
+            language: Language::Rust,
+            at: None,
         };
         assert_eq!(
-            prior.without_frozen(&bounded),
-            state(&[("a.rs", "1"), ("src/b.rs", "2")])
+            job.key(),
+            "candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
-        assert_eq!(prior.without_frozen(&RepoMap::default()), prior);
     }
 
     #[test]
@@ -1107,20 +950,6 @@ mod tests {
         assert!(!is_upload_path("uploadsx/a.py"));
         assert!(!is_upload_path("docs/uploads.md"));
         assert!(!is_upload_path("src/main.rs"));
-    }
-
-    #[test]
-    fn file_content_hash_deterministic_path_and_content_sensitive() {
-        let h = file_content_hash("src/a.rs", b"fn x() {}");
-        // Deterministic.
-        assert_eq!(h, file_content_hash("src/a.rs", b"fn x() {}"));
-        // SHA-256 hex.
-        assert_eq!(h.len(), 64);
-        // Content edit → different hash.
-        assert_ne!(h, file_content_hash("src/a.rs", b"fn y() {}"));
-        // Path-qualified: same content at a different path → different hash
-        // (so a move/rename re-ingests, and per-path invalidation is exact).
-        assert_ne!(h, file_content_hash("src/b.rs", b"fn x() {}"));
     }
 
     #[test]
