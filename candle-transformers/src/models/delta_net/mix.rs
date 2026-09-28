@@ -50,7 +50,7 @@ use candle::wave_provenance::WaveTicket;
 use candle::LeaseAnchor;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::ArenaSlot;
+use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
 
 use super::types::{DeltaNetDims, ZGate};
 
@@ -1052,6 +1052,26 @@ impl SpanOperands {
     /// How many rows these buffers hold.
     pub fn capacity(&self) -> Result<usize> {
         self.qkv.dim(0)
+    }
+
+    /// Move any of the four buffers whose slot is a planned source onto its
+    /// destination — see [`relocate_tensor`]. Answers how many moved.
+    ///
+    /// Each buffer is its own slot, so a pass may move one, some or none of them;
+    /// the set that moves is whatever the walk chose, and the four stay
+    /// independently addressable either way.
+    #[cfg(feature = "cuda")]
+    pub fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
+        let mut moved = 0usize;
+        for t in [
+            &mut self.qkv,
+            &mut self.z,
+            &mut self.beta_lin,
+            &mut self.alpha_lin,
+        ] {
+            moved += usize::from(relocate_tensor(t, moves)?);
+        }
+        Ok(moved)
     }
 
     /// Copy `len` rows of `p`, starting at wave row `start`, into these buffers

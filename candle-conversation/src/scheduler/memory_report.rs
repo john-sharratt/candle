@@ -328,6 +328,36 @@ pub struct KvSection {
     /// [`Self::classes`] — which reports band pools only — so a consumer summing those rows
     /// must add this or it charges live records as waste.
     pub record_regions: usize,
+    /// [`Self::span_regions`] broken down by tenant, from the SAME publish.
+    ///
+    /// **Which tenant holds the ground is not answerable from the total.** A tenant
+    /// on thirty mostly-empty arenas and one on thirty full ones give the same
+    /// `span_regions`, so an optimisation cannot be aimed at a tenant or
+    /// attributed to one. Each row also carries what its holders occupy and how
+    /// many strides it spans, which is what separates ground a packing walk could
+    /// reclaim from ground only a different slot layout could.
+    ///
+    /// Published here rather than sampled by the consumer because the two figures
+    /// must be one moment: read a publish interval apart, the difference between
+    /// the total and the rows reads exactly like an uncounted tenant instead of
+    /// like sampling skew — the same trap [`Self::frontier_regions`] records.
+    pub span_tenants: Vec<SpanTenantRow>,
+}
+
+/// One span tenant's arenas at the moment of a publish.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpanTenantRow {
+    /// The tenant's name, as `SlotTenant::label` gives it.
+    pub tenant: &'static str,
+    /// Whole regions its arenas stand on.
+    pub regions: usize,
+    /// Bytes its holders actually occupy. The shortfall against `regions` is free
+    /// slots plus every arena's unused tail.
+    pub held_bytes: usize,
+    /// Distinct strides. A tenant spread over several pools pays at least one
+    /// region per pool however small its slots are, which no packing walk
+    /// recovers — only giving it fewer strides does.
+    pub pools: usize,
 }
 
 /// One size class's share of the resident GPU arenas.
@@ -548,6 +578,18 @@ impl Scheduler {
         // Sampled here, in the same breath as the class rows above, so a consumer
         // dividing one by the other is dividing two halves of one snapshot.
         let ground = self.session.kv_ground_lost().unwrap_or_default();
+        // In the same breath as `span_regions` above, for the reason on
+        // `KvSection::span_tenants`: the total and its breakdown have to be one
+        // moment or their difference reads as an uncounted tenant.
+        let span_tenants = candle_nn::kv_cache::arena_census(&self.device)
+            .into_iter()
+            .map(|t| SpanTenantRow {
+                tenant: t.tenant.label(),
+                regions: t.regions,
+                held_bytes: t.held_bytes,
+                pools: t.pools,
+            })
+            .collect();
         let kv = KvSection {
             classes,
             arenas,
@@ -555,6 +597,7 @@ impl Scheduler {
             live_regions: ground.live_arenas,
             span_regions: ground.span_regions,
             record_regions: ground.record_regions,
+            span_tenants,
         };
 
         // ── Warm tier ───────────────────────────────────────────────────────
@@ -786,6 +829,9 @@ mod tests {
                 live_regions: 1,
                 span_regions: 0,
                 record_regions: 0,
+                // No span tenant in the fixture: the breakdown sums to
+                // `span_regions`, so an empty list is the consistent pairing.
+                span_tenants: Vec::new(),
             },
             warm: WarmSection {
                 resident_count: 7,

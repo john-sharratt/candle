@@ -29,7 +29,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use candle::{Device, Result};
 use candle_nn::kv_cache::{
-    arena_held_bytes, arena_regions, claim_arena_slots, ArenaSlot, SlotTenant, SpanRegion,
+    arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves, ArenaSlot, SlotTenant,
+    SpanRegion,
 };
 
 use crate::persistence::streams::StreamId;
@@ -39,6 +40,25 @@ use super::WideQSig;
 /// Max distinct segment-set indices cached at once — a handful of belief groups
 /// per reprojection, so this comfortably covers a whole reproject's scans.
 const INDEX_CACHE_CAP: usize = 16;
+
+/// What one gallery compaction pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GalleryCompaction {
+    /// Moves planned, each with its destination claimed.
+    pub planned: usize,
+    /// Pages that moved. Short of `planned` when a source belonged to a pinned
+    /// turn, or to one evicted between the plan and the apply.
+    pub moved: usize,
+    pub regions_before: usize,
+    pub regions_after: usize,
+}
+
+impl GalleryCompaction {
+    /// Regions the pass handed back to the span.
+    pub fn regions_released(&self) -> usize {
+        self.regions_before.saturating_sub(self.regions_after)
+    }
+}
 
 /// A turn's owned run of page slots, in page order. Dropping it returns every slot
 /// to the gallery's arenas — so evicting a turn is just dropping its
@@ -385,6 +405,95 @@ impl GalleryArena {
         cache.insert(fingerprint, scan::CachedIndex { gen, idx });
     }
 
+    /// Pack the gallery's pages toward the low end of the span — the two-cursor
+    /// pass the KV pools and the recurrent state run, applied to page slots.
+    ///
+    /// # Why this is needed even when the gallery reads nearly full
+    ///
+    /// A snapshot of a *growing* gallery is dense: pages are claimed in runs and
+    /// nothing has been freed yet. The scattered state is what churn produces —
+    /// runs are **variable length** (a short turn is one page, a long one
+    /// hundreds) and they are freed in a different order than they were claimed
+    /// (LRU eviction, and a re-seal freeing a turn's old run mid-corpus). That is
+    /// the classic external-fragmentation generator, and its effect is not lost
+    /// capacity but a **held frontier**: a handful of live pages in a high arena
+    /// denies the weight side every region below them. Measuring a young corpus
+    /// and concluding there is nothing to pack is measuring the wrong phase.
+    ///
+    /// # What makes the move safe
+    ///
+    /// - **A page copy is exact.** Its bytes are folded signature words and encode
+    ///   nothing about their own address — unlike a `KvHead` record, whose bytes
+    ///   *are* addresses — so there is no fill step and no minting.
+    /// - **Pinned turns are never moved.** A scan pins every turn it reads and
+    ///   unpins only after its launch has synchronised, so a pinned turn's pages
+    ///   are being dereferenced right now. Their sources stay put and the
+    ///   destinations claimed for them go back unused.
+    /// - **The generation is bumped when anything moved.** [`scan::PagedIndex`]
+    ///   caches raw page addresses and `reuse_index` revalidates them only by an
+    ///   unchanged `residency_gen`. A page that moved without the bump would hand
+    ///   the scan kernel a stale address — the one failure here that surfaces as
+    ///   quietly wrong retrieval rather than as a fault.
+    ///
+    /// Planning happens **before** the residency lock is taken, because a claim
+    /// opens the arena window and quiesces the device; holding `residency` across
+    /// that would block every scan. A turn evicted in that gap simply loses its
+    /// move.
+    pub fn compact(&self, max_moves: usize) -> Result<GalleryCompaction> {
+        let regions_before = arena_regions(&self.device, SlotTenant::Gallery);
+        let moves = plan_slot_moves(
+            &self.device,
+            SlotTenant::Gallery,
+            self.page_bytes as usize,
+            max_moves,
+        )?;
+        let planned = moves.len();
+        let mut by_src: HashMap<u64, ArenaSlot> =
+            moves.into_iter().map(|m| (m.src, m.dst)).collect();
+        let mut moved = 0usize;
+        let outcome = {
+            let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+            // **The generation is bumped on the way out, failure included.** A copy
+            // that errors part-way has already reassigned every slot before it, so
+            // returning straight to the caller would leave a cached `PagedIndex`
+            // vouching for addresses those turns no longer occupy — the one failure
+            // here that surfaces as quietly wrong retrieval rather than as a fault.
+            // The result is carried past the bump instead of propagated through it.
+            let mut outcome = Ok(());
+            'pass: for rt in res.values_mut() {
+                if rt.pinned != 0 {
+                    continue;
+                }
+                for slot in &mut rt.run.slots {
+                    let Some(dst) = by_src.remove(&slot.ptr()) else {
+                        continue;
+                    };
+                    if let Err(e) = slot.copy_into(&dst, self.page_bytes as usize, &self.device) {
+                        outcome = Err(e);
+                        break 'pass;
+                    }
+                    *slot = dst;
+                    moved += 1;
+                }
+            }
+            if moved > 0 {
+                // Under the residency lock, with the moves: a scan taking the lock
+                // after this sees both the new addresses and the new generation.
+                self.residency_gen.fetch_add(1, Ordering::Relaxed);
+            }
+            outcome
+        };
+        outcome?;
+        // Destinations nothing claimed go back to their arenas.
+        drop(by_src);
+        Ok(GalleryCompaction {
+            planned,
+            moved,
+            regions_before,
+            regions_after: arena_regions(&self.device, SlotTenant::Gallery),
+        })
+    }
+
     /// Evict least-recently-used turns until at least `want` bytes are freed.
     /// Returns the bytes freed. This is the governor's cheap-rung relief: the
     /// dropped pages recycle and the turns rebuild on demand from the substrate
@@ -604,5 +713,120 @@ mod tests {
         let freed2 = arena.evict_lru(u64::MAX);
         assert!(freed2 > 0);
         assert_eq!(arena.resident_turns(), 0, "unpinned turns now evict");
+    }
+
+    /// **A compaction moves pages and changes nothing a reader can see.**
+    ///
+    /// Scatter first — upload several turns, then drop alternate ones, which is
+    /// the churn shape the pass exists for (variable-length runs freed out of
+    /// claim order) — then pack, and read every surviving page back. Compared
+    /// against the expected group-major transpose as **raw words**, not a
+    /// tolerance: a page is bytes, and a copy that alters one is a corrupted
+    /// signature, not an approximation.
+    #[test]
+    fn compaction_moves_pages_without_changing_them() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        // Runs of different lengths, so the freed holes are ragged.
+        let sigs = |t: u64, n: usize| -> Vec<WideQSig> {
+            (0..n).map(|k| sig((t << 40) + k as u64)).collect()
+        };
+        let plan = [(0u64, 40usize), (1, 80), (2, 33), (3, 96), (4, 64)];
+        for &(t, n) in &plan {
+            arena.ensure_resident(sid(t), &sigs(t, n), t + 1).unwrap();
+        }
+        // Free every other turn: holes below live pages.
+        arena.drop_turn(sid(1));
+        arena.drop_turn(sid(3));
+        let live_before = arena.live_pages();
+
+        let report = arena.compact(0).unwrap();
+        // **The test is worthless unless the pass actually moved something.** The
+        // holes above are below live pages by construction, so a pass that plans
+        // nothing here means the walk never saw them.
+        assert!(
+            report.moved > 0 && report.moved == report.planned,
+            "expected real moves, got {report:?}",
+        );
+        assert_eq!(arena.live_pages(), live_before, "a move frees no page");
+
+        // Every surviving turn still reads back exactly its own transpose.
+        let res = arena.residency.lock().unwrap();
+        for &(t, n) in &plan {
+            if t == 1 || t == 3 {
+                assert!(!res.contains_key(&sid(t)), "dropped turn is gone");
+                continue;
+            }
+            let expect = transpose_to_pages(&sigs(t, n), 24, 3);
+            let run = &res.get(&sid(t)).expect("survivor").run;
+            assert_eq!(run.slots.len(), expect.len());
+            for (p, slot) in run.slots.iter().enumerate() {
+                let got = page_io::read_page(&device, slot, page_u64(24)).unwrap();
+                assert_eq!(got, expect[p], "turn {t} page {p} after compaction");
+            }
+        }
+    }
+
+    /// A pinned turn is never moved — a scan is dereferencing its pages — and the
+    /// generation moves only when something actually did.
+    #[test]
+    fn compaction_skips_pins_and_bumps_the_generation_only_on_a_move() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let rows: Vec<WideQSig> = (0..64).map(sig).collect();
+        for t in 0..4u64 {
+            arena.ensure_resident(sid(t), &rows, t + 1).unwrap();
+        }
+        arena.drop_turn(sid(0));
+        arena.drop_turn(sid(2));
+        // Pin one survivor; record where its pages sit.
+        arena.scan_ensure(sid(1), &rows, 2).unwrap();
+        let pinned_addrs: Vec<u64> = {
+            let res = arena.residency.lock().unwrap();
+            res.get(&sid(1)).unwrap().run.addrs()
+        };
+
+        let gen_before = arena.residency_gen();
+        let report = arena.compact(0).unwrap();
+        let res = arena.residency.lock().unwrap();
+        assert_eq!(
+            res.get(&sid(1)).unwrap().run.addrs(),
+            pinned_addrs,
+            "a pinned turn's pages must not move under an in-flight scan",
+        );
+        drop(res);
+        if report.moved > 0 {
+            assert!(
+                arena.residency_gen() > gen_before,
+                "a cached index must be invalidated when a page moves",
+            );
+        } else {
+            assert_eq!(arena.residency_gen(), gen_before, "no move, no bump");
+        }
+    }
+
+    /// A gallery with nothing to pack plans nothing and bumps nothing — the pass
+    /// has to be free to run every relief episode.
+    #[test]
+    fn compaction_of_a_packed_gallery_is_a_no_op() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let rows: Vec<WideQSig> = (0..32).map(sig).collect();
+        for t in 0..3u64 {
+            arena.ensure_resident(sid(t), &rows, t + 1).unwrap();
+        }
+        let gen_before = arena.residency_gen();
+        let report = arena.compact(0).unwrap();
+        assert_eq!((report.planned, report.moved), (0, 0));
+        assert_eq!(arena.residency_gen(), gen_before);
     }
 }

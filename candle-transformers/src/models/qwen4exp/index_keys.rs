@@ -24,9 +24,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_async;
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::kv_cache::{claim_arena_slots, ArenaSlot, SlotTenant};
+use candle_nn::kv_cache::{claim_arena_slots, relocate_tensor, ArenaSlot, SlotTenant};
 
 use super::indexer::tensor_ptr;
 
@@ -75,34 +74,6 @@ pub(super) fn alloc_buffers(
             .map(|_| Tensor::zeros((rows, d), DType::F32, device))
             .collect(),
     }
-}
-
-/// Move the `[rows, d]` buffer `t` onto its planned destination if its slot is the
-/// source of a move in `moves`, taking the destination out of the map; answers
-/// whether it moved.
-///
-/// One device copy on the primary stream, then `t` is rebuilt as a view of the
-/// destination. The source slot goes back when its last view drops — on the host,
-/// with the copy possibly still queued, which is sound because the slot's next
-/// tenant works on the same stream (see `ArenaSlot`). A buffer on a device with no
-/// reservation, or whose slot is not a source, stays where it is.
-pub(super) fn relocate_buffer(t: &mut Tensor, moves: &mut HashMap<u64, ArenaSlot>) -> Result<bool> {
-    let device = t.device().clone();
-    let Device::Cuda(cuda) = &device else {
-        return Ok(false);
-    };
-    let at = tensor_ptr(t)?;
-    let Some(dst) = moves.remove(&at) else {
-        return Ok(false);
-    };
-    let (rows, d) = t.dims2()?;
-    let bytes = rows * d * DType::F32.size_in_bytes();
-    // SAFETY: both ranges are `bytes` of distinct QSA-index slots — the source
-    // held by `t`, the destination claimed for this move — so they do not overlap.
-    unsafe { memcpy_dtod_async(dst.ptr(), at, bytes, cuda.cuda_stream().cu_stream()) }
-        .map_err(|e| candle::Error::Msg(format!("relocating a qsa index buffer: {e}")))?;
-    *t = Arc::new(dst).tensor(0, DType::F32, (rows, d), &device)?;
-    Ok(true)
 }
 
 /// The live tail's block keys: page `p` holds blocks `[p·PAGE_BLOCKS,
@@ -217,14 +188,14 @@ impl KeyPages {
         self.pages.clear();
     }
 
-    /// Move every page whose slot is a planned source — see [`relocate_buffer`].
+    /// Move every page whose slot is a planned source — see [`relocate_tensor`].
     /// Answers how many moved. Every page moves whole, the dead rows above the
     /// live tail included: which rows are live is the cache's to know, not the
     /// page's, and a page is one copy either way.
     pub(super) fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
         let mut moved = 0;
         for page in &mut self.pages {
-            moved += usize::from(relocate_buffer(page, moves)?);
+            moved += usize::from(relocate_tensor(page, moves)?);
         }
         Ok(moved)
     }
@@ -284,7 +255,7 @@ impl SnapshotBuffers {
         let mut free = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let mut moved = 0;
         for buf in free.iter_mut() {
-            moved += usize::from(relocate_buffer(buf, moves)?);
+            moved += usize::from(relocate_tensor(buf, moves)?);
         }
         Ok(moved)
     }

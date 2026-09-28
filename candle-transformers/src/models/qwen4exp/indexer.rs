@@ -46,8 +46,7 @@ use super::config::IndexerConfig;
 /// Block keys per live-tail key page — see `index_keys`.
 pub use super::index_keys::PAGE_BLOCKS;
 use super::index_keys::{
-    alloc_buffers, relocate_buffer, row_addr, KeyPages, SnapshotBuffer, SnapshotBuffers,
-    SNAPSHOT_BUFFERS,
+    alloc_buffers, row_addr, KeyPages, SnapshotBuffer, SnapshotBuffers, SNAPSHOT_BUFFERS,
 };
 use super::place::{PlacePage, Placement, PLACE_TILE_R};
 use super::qsa::{rms_norm_last, IndexerWeights};
@@ -59,7 +58,7 @@ use crate::models::operand_guard::expect_dense;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::wave_buffers::wave_from_vec_ticketed;
 use candle::wave_provenance::WaveTicket;
-use candle_nn::kv_cache::{arena_regions, plan_slot_moves, ArenaSlot, SlotTenant};
+use candle_nn::kv_cache::{arena_regions, plan_slot_moves, relocate_tensor, ArenaSlot, SlotTenant};
 
 use crate::models::rope_schedule::FactoredRope;
 
@@ -771,7 +770,7 @@ impl IndexCache {
     /// as it runs, and between forwards nothing holds one.
     pub fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
         Ok(self.keys.relocate(moves)?
-            + usize::from(relocate_buffer(&mut self.raw, moves)?)
+            + usize::from(relocate_tensor(&mut self.raw, moves)?)
             + self.snaps.relocate(moves)?)
     }
 

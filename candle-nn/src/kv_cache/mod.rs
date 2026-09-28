@@ -68,7 +68,8 @@ pub use chunked::wave_plan::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves, ArenaSlot, SlotMove,
+    arena_census, arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves,
+    relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

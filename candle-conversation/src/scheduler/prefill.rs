@@ -255,6 +255,16 @@ impl Scheduler {
         /// handful of passes.
         const MAX_STATE_MOVES: usize = 256;
 
+        /// Gallery pages a single pass may move.
+        ///
+        /// A page is 6 KiB against a recurrent state block's 3 MiB, so this is a
+        /// budget in the same class of copy — ~24 MiB — while being enough moves
+        /// that a badly scattered gallery converges in a handful of passes rather
+        /// than hundreds. The gallery's own ceiling is 512 MiB, or ~87k pages, so
+        /// this is deliberately a fraction of the worst case: the pass runs every
+        /// relief episode and must never be the thing that makes one slow.
+        const MAX_GALLERY_MOVES: usize = 4096;
+
         // **A cheap gate, because this is consulted every wave.** `kv_ground_lost`
         // is not cheap — it sums `packed_arenas` across the ladder, which is the
         // census — so it cannot be the thing that decides whether to census.
@@ -341,6 +351,37 @@ impl Scheduler {
                 target: "candle_conversation::scheduler::vram_relief",
                 "recurrent state compaction failed: {e}",
             ),
+        }
+
+        // **The gallery's pages fragment from churn, not from size.** Its runs are
+        // variable length and are freed out of claim order — LRU eviction, and a
+        // re-seal freeing a turn's old run mid-corpus — so a corpus that reads
+        // nearly full while it is still growing ends up with live pages scattered
+        // across arenas, a few of them pinning the frontier above everything below.
+        // Pages a scan is reading are skipped, so this cannot move ground out from
+        // under an in-flight launch.
+        if let Some(arena) = self.gallery_arena.as_ref() {
+            match arena.compact(MAX_GALLERY_MOVES) {
+                Ok(r) if r.planned > 0 => {
+                    tracing::info!(
+                        target: "candle_conversation::scheduler::vram_relief",
+                        planned = r.planned,
+                        moved = r.moved,
+                        regions_before = r.regions_before,
+                        regions_after = r.regions_after,
+                        "gallery compaction packed the page arenas",
+                    );
+                    if r.regions_released() > 0 {
+                        let _g = super::profile::span("compact:reclaim_weights");
+                        self.model.reclaim_spare_ground();
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    "gallery compaction failed: {e}",
+                ),
+            }
         }
 
         let substrates: Vec<_> = self.slot_conversations.values().cloned().collect();

@@ -69,7 +69,7 @@ use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
-use crate::models::qwen35::spec::split_block_rows;
+use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule};
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
@@ -1072,10 +1072,19 @@ impl Qwen4ExpBatched {
         gdn + idx
     }
 
-    /// Compact the arenas the carried state lives in: every sequence's GDN state
-    /// ([`compact_stores`]), then every QSA index cache ([`compact_index_caches`]).
-    /// The report sums both. Between forwards; holds both maps for the pass, which
-    /// is what keeps a wave from opening on a store or a cache mid-move.
+    /// Compact every arena the carried state lives in: each sequence's GDN state
+    /// ([`compact_stores`]), each QSA index cache ([`compact_index_caches`]), and
+    /// the speculative rewind stash ([`compact_verify_stash`]). The report sums all
+    /// three. Between forwards; the locks are held for the pass, which is what
+    /// keeps a wave from opening on a store, a cache or a stash mid-move.
+    ///
+    /// The stash's regions are counted into the recurrent-state figure rather than
+    /// its own, matching `RecurrentStateStore::arena_reserved_bytes` — it is the
+    /// buffer set that exists to rewind that state, and splitting the two across
+    /// reports would leave neither total reconcilable. They are read here rather
+    /// than inside `compact_stores`, because a `regions_released` that omitted the
+    /// stash would leave `reclaim_spare_ground` unrun on exactly the passes that
+    /// freed stash ground.
     pub fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
         let mut map = self
             .recurrent
@@ -1098,11 +1107,31 @@ impl Qwen4ExpBatched {
             &self.model.device,
             max_moves,
         )?;
+        // The stash only exists while a verify is armed, and only a stash with no
+        // outstanding span may move — `compact_verify_stash` enforces that itself
+        // and answers (0, 0) otherwise.
+        let stash_before = arena_regions(&self.model.device, SlotTenant::RewindStash);
+        let stash = {
+            let mut g = self
+                .verify
+                .write()
+                .map_err(|_| candle::Error::Msg("verify lock poisoned".into()))?;
+            match g.as_mut() {
+                Some(cap) => compact_verify_stash(
+                    &mut cap.delta,
+                    &self.model.cfg.delta_net,
+                    &self.model.device,
+                    max_moves,
+                )?,
+                None => (0, 0),
+            }
+        };
+        let stash_after = arena_regions(&self.model.device, SlotTenant::RewindStash);
         Ok(RecurrentCompaction {
-            planned: gdn.planned + qsa.planned,
-            moved: gdn.moved + qsa.moved,
-            regions_before: gdn.regions_before + qsa.regions_before,
-            regions_after: gdn.regions_after + qsa.regions_after,
+            planned: gdn.planned + qsa.planned + stash.0,
+            moved: gdn.moved + qsa.moved + stash.1,
+            regions_before: gdn.regions_before + qsa.regions_before + stash_before,
+            regions_after: gdn.regions_after + qsa.regions_after + stash_after,
         })
     }
 

@@ -191,7 +191,8 @@ pub use region_pool::{
 pub use slot_state_arena::stats as slot_state_stats;
 #[cfg(feature = "cuda")]
 pub use tenant_arena::{
-    arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves, ArenaSlot, SlotMove,
+    arena_census, arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves,
+    relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
 };
 pub use tenant_arena::{slot_stride, SlotTenant, SLOT_ALIGN};
 pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};

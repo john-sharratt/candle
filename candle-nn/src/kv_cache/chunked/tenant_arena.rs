@@ -57,7 +57,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cuda")]
-use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
+use candle::cuda_backend::cudarc::driver::result::{memcpy_dtod_async, memset_d8_async};
 #[cfg(feature = "cuda")]
 use candle::{DType, Device, DeviceLocation, LeaseAnchor, Shape, Tensor};
 
@@ -87,6 +87,17 @@ pub enum SlotTenant {
 }
 
 impl SlotTenant {
+    /// Every tenant, for the census that says which of them holds the span's
+    /// ground. Exhaustive by construction — a new variant that is not added here
+    /// goes missing from the accounting, and ground nothing can total is ground
+    /// that goes missing.
+    pub const ALL: [SlotTenant; 4] = [
+        Self::RecurrentState,
+        Self::RewindStash,
+        Self::Gallery,
+        Self::QsaIndex,
+    ];
+
     /// The tenant's name, for the arena window and for errors.
     pub fn label(self) -> &'static str {
         match self {
@@ -439,15 +450,138 @@ impl ArenaSlot {
             |e| candle::Error::Msg(format!("zeroing a slot of {}: {e}", self.tenant.label())),
         )
     }
+
+    /// Copy `bytes` of this slot into `dst`, on the device's primary stream — the
+    /// move a compaction pass applies for a holder whose slot carries raw bytes
+    /// rather than a tensor (a gallery page).
+    ///
+    /// The source may be dropped on the host as soon as this returns even though
+    /// the copy is still queued: the slot's next tenant works on the same stream,
+    /// so its writes are ordered behind this, and a slot that empties its arena
+    /// releases a region the pool stamps dirty and synchronises before reissuing.
+    pub fn copy_into(&self, dst: &ArenaSlot, bytes: usize, device: &Device) -> Result<()> {
+        let Device::Cuda(cuda) = device else {
+            candle::bail!("slot arena: a slot is copied on a CUDA device");
+        };
+        if bytes > self.stride || bytes > dst.stride {
+            candle::bail!(
+                "slot arena: copying {bytes} B between a {} B and a {} B slot of {}",
+                self.stride,
+                dst.stride,
+                self.tenant.label()
+            );
+        }
+        if self.ptr == dst.ptr {
+            candle::bail!("slot arena: a slot cannot be copied onto itself");
+        }
+        // SAFETY: both ranges are `bytes` inside distinct live slots — the source
+        // held by the caller, the destination claimed for this move — so they do
+        // not overlap.
+        unsafe { memcpy_dtod_async(dst.ptr, self.ptr, bytes, cuda.cuda_stream().cu_stream()) }
+            .map_err(|e| {
+                candle::Error::Msg(format!("relocating a slot of {}: {e}", self.tenant.label()))
+            })
+    }
+}
+
+/// Move `t` onto its planned destination if the slot it views is the source of a
+/// move in `moves`, taking that destination out of the map; answers whether it
+/// moved.
+///
+/// For a holder whose slot is viewed as a tensor — a QSA key page, a rewind
+/// stash operand. One device copy of the tensor's own bytes, then `t` is rebuilt
+/// as an anchored view of the destination, so every later reader resolves the new
+/// address and the old slot goes back when its last view drops.
+///
+/// A tensor on a device with no reservation, or whose slot is not a planned
+/// source, is left exactly as it was.
+#[cfg(feature = "cuda")]
+pub fn relocate_tensor(t: &mut Tensor, moves: &mut HashMap<u64, ArenaSlot>) -> Result<bool> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    let device = t.device().clone();
+    let Device::Cuda(cuda) = &device else {
+        return Ok(false);
+    };
+    // **A holder that is not dense is not relocatable by this.** The copy below
+    // moves `elem_count × size` contiguous bytes and the tensor is rebuilt as a
+    // dense view of the destination, so a strided or offset holder would come back
+    // with different values under the same shape — silent, and exactly the class of
+    // corruption a compaction must never introduce. Refused rather than tolerated:
+    // every tenant's buffers are dense by construction, so this firing means a
+    // holder changed shape, not that a fallback is wanted.
+    if !t.layout().is_contiguous() {
+        candle::bail!(
+            "slot arena: a {:?} holder is not contiguous, so it cannot be relocated",
+            t.dims()
+        );
+    }
+    let (storage, layout) = t.storage_and_layout();
+    let candle::Storage::Cuda(c) = &*storage else {
+        return Ok(false);
+    };
+    let stream = cuda.cuda_stream();
+    // The base address through the storage's own slice variant rather than a fixed
+    // element type: the slot arenas are dtype-agnostic, and a holder is free to be
+    // whatever its kernels read. Reading an F16 holder through an `f32` slice would
+    // both mis-scale the start offset and refuse outright.
+    let at = {
+        use candle::cuda_backend::CudaStorageSlice as S;
+        let start = layout.start_offset();
+        macro_rules! base_of {
+            ($s:expr) => {{
+                let slice = $s.slice(start..);
+                let (ptr, _guard) = slice.device_ptr(&stream);
+                ptr
+            }};
+        }
+        match &c.slice {
+            S::U8(s) => base_of!(s),
+            S::U32(s) => base_of!(s),
+            S::I64(s) => base_of!(s),
+            S::BF16(s) => base_of!(s),
+            S::F16(s) => base_of!(s),
+            S::F32(s) => base_of!(s),
+            S::F64(s) => base_of!(s),
+            S::F8E4M3(s) => base_of!(s),
+            // The tombstone a leased storage's drop leaves behind, and never
+            // observable from a live tensor.
+            _ => return Ok(false),
+        }
+    };
+    drop(storage);
+    let Some(dst) = moves.remove(&at) else {
+        return Ok(false);
+    };
+    let dims = t.dims().to_vec();
+    let bytes = t.elem_count() * t.dtype().size_in_bytes();
+    // SAFETY: `at` is this tensor's own base inside a live slot of `bytes`, and
+    // `dst` is a distinct slot claimed for this move.
+    unsafe { memcpy_dtod_async(dst.ptr(), at, bytes, stream.cu_stream()) }
+        .map_err(|e| candle::Error::Msg(format!("relocating a tenant tensor: {e}")))?;
+    let dtype = t.dtype();
+    *t = Arc::new(dst).tensor(0, dtype, dims, &device)?;
+    Ok(true)
 }
 
 #[cfg(feature = "cuda")]
 impl Drop for ArenaSlot {
     fn drop(&mut self) {
         let emptied = {
+            let key = (self.gpu, self.tenant, self.stride);
             let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
-            map.get_mut(&(self.gpu, self.tenant, self.stride))
-                .and_then(|set| set.give_back(self.arena, self.index))
+            let region = map
+                .get_mut(&key)
+                .and_then(|set| set.give_back(self.arena, self.index));
+            // **A pool that holds no arenas is removed, not left behind.** A stride
+            // is not a fixed set: the rewind stash's follows its verify cap, so a
+            // long run meets a new one whenever a cohort width does, and entries
+            // that are never removed grow without bound. They also skew the census
+            // — `pools` is meant to say how many strides a tenant is spread over,
+            // and an emptied entry is a stride it no longer occupies.
+            if map.get(&key).is_some_and(|set| set.regions() == 0) {
+                map.remove(&key);
+            }
+            region
         };
         // Released outside this module's lock: the region's own drop takes the
         // region pool's.
@@ -675,6 +809,64 @@ pub fn arena_held_bytes(device: &Device, tenant: SlotTenant) -> usize {
         .sum()
 }
 
+/// One tenant's ground: the regions its arenas hold, what its holders actually
+/// occupy, and how many pools (strides) it is spread over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantArenas {
+    pub tenant: SlotTenant,
+    /// Whole regions the tenant's arenas stand on — what it denies the rest of
+    /// the span.
+    pub regions: usize,
+    /// Bytes of slots actually held. The shortfall against `regions` is free
+    /// slots plus every arena's unused tail.
+    pub held_bytes: usize,
+    /// Distinct strides. A tenant spread over several pools pays at least one
+    /// region per pool however small its slots are, which no packing walk can
+    /// recover — only giving it fewer strides can.
+    pub pools: usize,
+}
+
+/// Every tenant's ground on `device`, in one pass under one lock.
+///
+/// **The question "which tenant holds the span" had no answer before this.** The
+/// fragmentation probe reports the span tenants' regions as a single figure and
+/// counts all of it as legitimately in use, so a tenant holding thirty
+/// mostly-empty arenas and one holding thirty full ones read identically — and a
+/// pass that reclaimed nothing looked the same as one that reclaimed everything.
+/// Per-tenant is the granularity an optimisation can be aimed at or attributed
+/// to.
+///
+/// Tenants with no arenas are included at zero, so the census always names every
+/// tenant and a reader can tell "holds nothing" from "was never counted".
+#[cfg(feature = "cuda")]
+pub fn arena_census(device: &Device) -> Vec<TenantArenas> {
+    let mut out: Vec<TenantArenas> = SlotTenant::ALL
+        .iter()
+        .map(|&tenant| TenantArenas {
+            tenant,
+            regions: 0,
+            held_bytes: 0,
+            pools: 0,
+        })
+        .collect();
+    let DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return out;
+    };
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    for ((g, tenant, stride), set) in map.iter() {
+        if *g != gpu_id {
+            continue;
+        }
+        let Some(row) = out.iter_mut().find(|r| r.tenant == *tenant) else {
+            continue;
+        };
+        row.regions += set.regions();
+        row.held_bytes += set.held() * stride;
+        row.pools += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +1057,29 @@ mod tests {
         let _b = set.take().unwrap();
         set.give_back(a.0, a.1);
         set.give_back(a.0, a.1);
+    }
+
+    /// **The census names every tenant, including the ones holding nothing.**
+    /// A tenant missing from the list is indistinguishable from one at zero, and
+    /// ground nothing can total is ground that goes missing.
+    #[test]
+    fn the_census_covers_every_tenant() {
+        use std::collections::HashSet;
+        let named: HashSet<_> = SlotTenant::ALL.iter().copied().collect();
+        assert_eq!(named.len(), SlotTenant::ALL.len(), "no duplicates in ALL");
+        // Off CUDA the census still answers, one row per tenant at zero, rather
+        // than an empty vec a reader could mistake for "not measured". The census
+        // itself is CUDA-only (it reads the region pools), so this half of the
+        // test is too — the `ALL` check above holds on any build.
+        #[cfg(feature = "cuda")]
+        {
+            let rows = arena_census(&candle::Device::Cpu);
+            assert_eq!(rows.len(), SlotTenant::ALL.len());
+            for row in &rows {
+                assert!(named.contains(&row.tenant));
+                assert_eq!((row.regions, row.held_bytes, row.pools), (0, 0, 0));
+            }
+        }
     }
 
     /// Every tenant has its own name for the arena window and for errors.
