@@ -1,0 +1,46 @@
+name: run_output
+questions:
+- show me the rest of the test output
+- what failed at the end of that run
+- next page of the build log
+- the output was cut off, read more of it
+- scroll to the bottom of the command's output
+- read page two of that job's log
+- what did the last lines of the build say
+- is that run still going
+- show the final summary the test runner printed
+- the compiler errors are further down, fetch them
+- read the remaining output of the job
+- what was on the last page of that output
+- get me the tail of the log from that command
+- continue reading where the output stopped
+- what exit status did that job end with
+- give me the later part of the npm output
+category: Commands
+description: 'Read one page of what a program started with run_command printed, by the `job` its result gave — both output streams, in the order printed, 200 lines to a page. A page past the end is the last page. Use for: the rest of a long test run or build log, the failures at the end of the output. Triggered by "show the rest of the output", "what failed at the end", "next page of the log". Returns the page, which lines of how many it holds, and how the run stands.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    repo:
+      description: The repository the program ran in. Required.
+      minLength: 1
+      type: string
+    job:
+      description: The `job` a run_command result gave. Required.
+      minLength: 1
+      type: string
+    page:
+      description: Which page of the output, 0-based; a page past the end is the last. Required.
+      format: uint
+      minimum: 0.0
+      type: integer
+  required:
+  - repo
+  - job
+  - page
+  title: OutputRequest
+  type: object
+examples:
+- show me the rest of that test run's output<|im_end|>
+- what failed at the end of the build log?<|im_end|>

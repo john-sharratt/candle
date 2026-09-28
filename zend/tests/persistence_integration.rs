@@ -85,7 +85,7 @@ mod persistence {
             .build()
             .expect("failed to build tokio runtime");
 
-        // A throwaway workspace — the substrate log lands in its `.substrate/`.
+        // A throwaway workspace — the substrate log lands in its `substrate/`.
         let workspace = std::env::temp_dir().join(format!(
             "zend_p8_{}",
             std::time::SystemTime::now()
@@ -144,11 +144,9 @@ mod persistence {
 
     async fn run_session(workspace: std::path::PathBuf) {
         let log = LogBus::new();
-        let config = DaemonConfig {
-            workspace,
-            port: 0,
-            ..Default::default()
-        };
+        let config = DaemonConfig::new(
+            zend::workspace::single_repo(&workspace, "project").expect("workspace"),
+        );
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();
 

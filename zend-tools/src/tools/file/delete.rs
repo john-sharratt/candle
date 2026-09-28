@@ -9,13 +9,17 @@ use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DeleteRequest {
-    /// Path of the file to remove from this session's view (e.g. `src/main.rs`). A project file is hidden, not erased from disk. Required.
+    /// The repository the file belongs to. Required.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// Path of the file to remove from this session's view, relative to the repository (e.g. `src/main.rs`). A project file is hidden, not erased from disk. Required.
     #[validate(length(min = 1))]
     pub path: String,
 }
 
 #[derive(Serialize)]
 pub struct DeleteResponse {
+    pub repo: String,
     pub path: String,
     pub deleted: bool,
 }
@@ -28,8 +32,8 @@ impl Tool for FileDelete {
         "Remove a file from this session's view. Use for: removing a draft that's no longer \
          needed, cleaning up before exporting, getting rid of an uploaded file the user wants \
          gone, freeing space within the 10 MiB session budget. Triggered by \"delete the \
-         file\", \"remove\", \"rm\", \"get rid of the file called\". Returns the path and a \
-         deleted flag. A project file on disk is NOT erased — it is only hidden from this \
+         file\", \"remove\", \"rm\", \"get rid of the file called\". Returns the repo, the \
+         path and a deleted flag. A project file on disk is NOT erased — it is only hidden from this \
          session, and reappears in a new one. For removing files on remote systems use \
          remote_fs_session_delete.";
 
@@ -45,11 +49,12 @@ impl Tool for FileDelete {
     }
 
     fn run(ctx: &ToolContext, req: DeleteRequest) -> Result<DeleteResponse, FileError> {
-        let deleted = ctx.vfs.delete(&req.path);
+        let deleted = ctx.files.repo(&req.repo)?.delete(&req.path);
         if !deleted {
             return Err(FileError::NotFound(req.path));
         }
         Ok(DeleteResponse {
+            repo: req.repo,
             path: req.path,
             deleted: true,
         })

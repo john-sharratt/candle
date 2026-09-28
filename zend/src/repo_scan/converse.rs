@@ -70,8 +70,8 @@ pub struct FolderSummary {
 /// Fails when the conversation never produces a summary (see
 /// [`check_summary`]). That is deliberately the same `Err` a decode failure
 /// returns, so `process_one_dir`'s existing handling applies unchanged: this
-/// attempt's partial is tombstoned, the prior generation stays live, the resume
-/// hash is NOT written, and the unit is retried on the next pass. A unit that
+/// attempt's partial is tombstoned, the prior generation stays live, the content
+/// key is NOT written, and the unit is retried on the next pass. A unit that
 /// ends on a tool call must not be able to commit itself as done.
 pub fn run_folder_conversation(
     conv: &mut Sequence,
@@ -161,7 +161,7 @@ pub fn run_folder_conversation(
 /// `repo_map` entry: a `<tool_call>` (the model asking for more evidence, with
 /// nowhere left to send the request), and nothing at all (a decode that spent its
 /// whole budget elsewhere). Neither is a summary, and a unit holding one is worse
-/// than a unit holding nothing — the resume hash would retire it from every
+/// than a unit holding nothing — its content key would retire it from every
 /// later pass.
 fn check_summary(text: &str) -> anyhow::Result<()> {
     if !tool_round::plan(text).is_empty() {

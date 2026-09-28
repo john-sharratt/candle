@@ -73,6 +73,9 @@ fn payload_needed(rt: RecordType) -> bool {
             // Snapshots are indexed by header key alone; the multi-MB state
             // payload is read only when a conversation actually resumes.
             | RecordType::Snapshot
+            // A conversation's file events likewise: indexed by timeline and
+            // sequence number from the header, bodies read on resume.
+            | RecordType::VfsEvent
     )
 }
 

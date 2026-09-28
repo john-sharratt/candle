@@ -99,7 +99,7 @@ export async function render(_params, q) {
           h('span', { class: 'chip' }, 'not opened')),
         h('div', { class: 'tiny dim', style: 'margin-top:8px' },
           'No substrate has been written yet — nothing has run an engine against this daemon. '
-          + 'It would live at ', h('code', { class: 'mono' }, (s && s.path) || '.substrate'), '.')));
+          + 'It would live at ', h('code', { class: 'mono' }, (s && s.path) || 'substrate'), '.')));
       return;
     }
 

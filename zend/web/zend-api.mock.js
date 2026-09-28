@@ -158,7 +158,7 @@
     getMe() {
       const admin = window.__ZEND_MOCK_ROLE__ !== 'user';
       return Promise.resolve(admin
-        ? { role: 'creator', tool_modes: ['none', 'restricted', 'comprehensive', 'mutable'], default_tools: 'comprehensive' }
+        ? { role: 'creator', tool_modes: ['none', 'restricted', 'comprehensive'], default_tools: 'comprehensive' }
         : { role: 'user', tool_modes: ['none', 'restricted'], default_tools: 'restricted' });
     },
 

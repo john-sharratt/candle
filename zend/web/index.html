@@ -88,6 +88,7 @@
   .zmd .tool-call-arg.dflt .tool-call-arg-key, .zmd .tool-call-arg.dflt .tool-call-arg-val { color: #6f6a64; }
   .zmd .tool-call-arg.dflt .tool-call-arg-val { font-style: italic; }
   .zmd .tool-call-name, .zmd .tool-call-badge { flex-shrink: 0; }
+  .zmd .tool-call-repo { color: #9a9490; font-size: .74rem; padding: 0 .35rem; border: 1px solid #3a3632; border-radius: 3px; white-space: nowrap; flex-shrink: 0; }
   .zmd .tool-call-subject { color: #c7bdb0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .zmd .tool-call-detail { color: #7d766e; font-size: .76rem; white-space: nowrap; flex-shrink: 0; }
   .zmd details.tool-call-card > summary.tool-call-header { cursor: pointer; list-style: none; user-select: none; }
@@ -392,7 +393,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     try { localStorage.setItem(key, String(value)); } catch (_) {}
   }
   // The tools modes, by wire id, in dial order — a mode's level is its index.
-  const TOOL_MODE_IDS = ['none', 'restricted', 'comprehensive', 'mutable'];
+  const TOOL_MODE_IDS = ['none', 'restricted', 'comprehensive'];
   // Which of those this caller may use, and the one it starts at: from
   // GET /v1/me (`loadAccess`). Until that answers the page assumes the least —
   // the daemon holds a mode above the caller's role to Restricted regardless,
@@ -579,7 +580,12 @@ import { estateSwitcher } from './common/lib/estate.js';
     hideProjPopover();
     zmd.innerHTML = nodeHtml(m, open);
     restoreToolOpen(zmd, conv.id, idx);
-    if (!S.narrow) applyProjSegments(zmd, m);
+    // The bars are measured against the DOM's current layout, which keeps
+    // shifting turn by turn while this message is still streaming — showing
+    // them mid-stream means they never line up with what they're pointing
+    // at. Skip while active; the completed-turn render below draws them once
+    // the layout has settled.
+    if (!S.narrow && !m.streaming) applyProjSegments(zmd, m);
     // Keep any live thinking ticker scrolled to its tail so the newest words sit at
     // the right and roll leftward through the fade as more stream in.
     zmd.querySelectorAll('.think-ticker').forEach((t) => { t.scrollLeft = t.scrollWidth; });
@@ -716,28 +722,44 @@ import { estateSwitcher } from './common/lib/estate.js';
     return { raw, isError, obj };
   }
   // A one-line account of what a call touched, for the collapsed header: the
-  // file or folder it named, then what came back — the excerpt's line range for
-  // a read, the entry count for a listing. Any other tool shows its first string
-  // argument. Either part is empty when there is nothing to say.
+  // file or folder it named, then what came back — the excerpt's page and line
+  // range for a read, the entry count for a listing. Any other tool shows its
+  // first string argument. Either part is empty when there is nothing to say.
+  // A read or a listing also names its repository: a workspace holds several,
+  // and `src/lib.rs` alone does not say which one's was read.
   function toolSubject(name, args, resp) {
+    const repo = (name === 'file_read' || name === 'file_list') && typeof args.repo === 'string' ? args.repo : '';
     let subject = '';
-    if (typeof args.path === 'string') subject = args.path;
-    else if ('prefix' in args || name === 'file_list') subject = args.prefix || 'project root';
-    else {
+    if (name === 'file_list') {
+      // Only file_list gives an empty path a meaning of its own ("the
+      // project root") — anything else with an empty path just has an
+      // empty subject, handled by the branch below like any other string.
+      subject = (typeof args.path === 'string' && args.path) ? args.path : 'project root';
+    } else if (typeof args.path === 'string') {
+      subject = args.path;
+    } else {
       const first = Object.values(args).find((v) => typeof v === 'string' && v);
       if (first) subject = first;
     }
+    // The call's own page, shown even before a response has come back —
+    // `file_read`'s `page` is a required argument, so it is always present.
+    // The wire value is zero-based (page 0 is the top of the file); shown
+    // as one-based here, matching file_list's `paging.page + 1` below —
+    // "page 0" reads as a computer's off-by-one to a human, not the top.
     let detail = '';
-    // file_read's excerpt header: `\npath (lines 1-900):` / `(lines 47-93 of 900)` / `(empty)`.
-    const hdr = resp && /^\s*\S[^\n]*? \((lines \d+-\d+(?: of \d+)?|empty)\):/.exec(resp.raw);
-    if (hdr) detail = hdr[1];
+    if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + (args.page + 1);
+    // file_read's excerpt header, once the response lands: `\npath (page 0 of
+    // 5, lines 301-600 of 1420):` / `(empty)` — richer than the call alone.
+    // The page number is captured on its own so it can be shown one-based
+    // too; the rest of the header (total pages, line range) passes through
+    // as the tool itself renders it.
+    const hdr = resp && /^\s*\S[^\n]*? \((?:page (\d+) (of \d+, lines \d+-\d+ of \d+)|(empty))\):/.exec(resp.raw);
+    if (hdr) detail = hdr[3] || ('page ' + (Number(hdr[1]) + 1) + ' ' + hdr[2]);
     else if (resp && resp.obj && resp.obj.paging && typeof resp.obj.paging.total === 'number') {
       const p = resp.obj.paging;
       detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + (p.page + 1) + '/' + p.pages : '');
-    } else if (args.start_line != null || args.end_line != null) {
-      detail = 'lines ' + (args.start_line != null ? args.start_line : 1) + '-' + (args.end_line != null ? args.end_line : 'end');
     }
-    return { subject, detail };
+    return { repo, subject, detail };
   }
   // Every parameter the tool takes: the ones the call passed, in call order,
   // then the ones it left out — dimmed, with the default they took (the schema's
@@ -830,7 +852,8 @@ import { estateSwitcher } from './common/lib/estate.js';
         '</div><pre class="tool-call-out-body">' + esc(resp.raw) + '</pre></div>'
       : '';
     const sub = toolSubject(name, args, resp);
-    const subHtml = (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
+    const subHtml = (sub.repo ? '<span class="tool-call-repo">' + esc(sub.repo) + '</span>' : '') +
+      (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
       (sub.detail ? '<span class="tool-call-detail">' + esc(sub.detail) + '</span>' : '');
     return '<details class="tool-call-card" data-tool="' + idx + '">' +
       '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + subHtml + badge +
@@ -1924,9 +1947,12 @@ import { estateSwitcher } from './common/lib/estate.js';
         // the next frame because `zmd` isn't in the document yet (the scroller is
         // attached by the caller after buildChat returns), and getBoundingClientRect
         // needs it laid out. The live-stream path measures an already-attached
-        // node, so it calls applyProjSegments synchronously.
+        // node, so it calls applyProjSegments synchronously. Skipped for the
+        // turn still streaming — its layout keeps shifting token by token, so
+        // the bars would never stay aligned with what they're marking; it
+        // gets its bars once it finishes and this runs again as a settled turn.
         restoreToolOpen(zmd, conv.id, idx);
-        if (!S.narrow) applyProjSegments(zmd, m);
+        if (!S.narrow && !m.streaming) applyProjSegments(zmd, m);
         scroller.appendChild(h('div', { 'data-msg': idx, class: 'z-turn z-selectable', style: 'display:flex; margin-bottom:2rem; padding-right:2rem;' }, zmd,
           turnCopyBtn(m, 'right:2rem;')));
       }
@@ -2407,7 +2433,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', pref: 'zend.verbosity', ticksGrow: false, glyph: GLYPH_LINES },
     // `allowed` limits the menu to the levels this caller may use, and `clamp`
     // turns the level asked for into the one a turn will use (GET /v1/me).
-    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive', 'Mutable'], subs: ['no tools', 'safe tools only', 'every tool', 'every tool, edits files on disk'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true, allowed: toolsAllowed, clamp: clampTools },
+    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive'], subs: ['no tools', 'files and git reads', 'every tool'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true, allowed: toolsAllowed, clamp: clampTools },
   };
   function buildDial(which) {
     const d = DIALS[which];

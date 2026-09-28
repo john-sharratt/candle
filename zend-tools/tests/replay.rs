@@ -13,15 +13,19 @@ mod harness;
 
 use zend_tools::Replay;
 
-/// A patch is located by its context and a hunk already present is reported
-/// rather than applied twice, so the same patch re-sent leaves the same file.
-/// This is the whole reason `file_edit` takes a diff instead of a
-/// find-and-replace: the old shape compounded on re-issue (`3` → `30` → `300`).
+use harness::REPO;
+
+/// An edit whose result is already in the file is reported rather than
+/// applied twice — an occurrence of the old text inside the new is the edit's
+/// own result — so the same edit re-sent leaves the same file rather than
+/// compounding (`3` → `30` → `300`).
 #[test]
-fn a_file_patch_may_be_re_issued() {
+fn a_file_edit_may_be_re_issued() {
     let args = serde_json::json!({
+        "repo": REPO,
         "path": "src/main.rs",
-        "patch": "@@ -1 +1 @@\n-old\n+new\n",
+        "old_text": "old",
+        "new_text": "new",
     });
     assert_eq!(harness::replay("file_edit", args), Replay::Safe);
 }
@@ -29,7 +33,7 @@ fn a_file_patch_may_be_re_issued() {
 /// Reads change nothing, so a resumed turn simply reads again.
 #[test]
 fn a_read_may_be_re_issued() {
-    let args = serde_json::json!({ "path": "src/main.rs" });
+    let args = serde_json::json!({ "repo": REPO, "path": "src/main.rs", "page": 0 });
     assert_eq!(harness::replay("file_read", args), Replay::Safe);
 }
 

@@ -1652,6 +1652,12 @@ fn archive_state_survives_restart() {
         // thread's tick + per-turn-seal trigger to take care of this
         // routinely — here we drive it explicitly.)
         conv.set_conversation_archived(timeline, true).unwrap();
+        // A branch rides the same record, and the archive after it must not
+        // lose it: each record carries the whole state.
+        conv.set_conversation_branches(
+            timeline,
+            &[("candle".to_string(), "zen/work".to_string())].into(),
+        );
         conv.commit_persistence().unwrap();
         assert!(conv.is_conversation_archived(timeline));
     }
@@ -1665,6 +1671,11 @@ fn archive_state_survives_restart() {
             conv.is_conversation_archived(timeline),
             "archived flag must survive the restart-reload"
         );
+        let branch_of = |conv: &Conversation| {
+            conv.conversation_state(timeline)
+                .and_then(|s| s.branches.get("candle").cloned())
+        };
+        assert_eq!(branch_of(&conv).as_deref(), Some("zen/work"));
 
         // Unarchive — last-writer-wins on the next reload.
         conv.set_conversation_archived(timeline, false).unwrap();
@@ -1680,6 +1691,13 @@ fn archive_state_survives_restart() {
         assert!(
             !conv.is_conversation_archived(timeline),
             "unarchive must also survive — last-writer-wins on ConvState"
+        );
+        assert_eq!(
+            conv.conversation_state(timeline)
+                .and_then(|s| s.branches.get("candle").cloned())
+                .as_deref(),
+            Some("zen/work"),
+            "the unarchive record carried the branch forward"
         );
     }
 }

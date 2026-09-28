@@ -12,21 +12,13 @@ process (or the test's `ToolContext`).
 
 | Module | Struct | Purpose |
 |--------|--------|---------|
-| `vfs.rs` | `VfsStore` | Per-session in-memory virtual filesystem |
 | `credentials.rs` | `CredentialStore` | Named authentication material |
 | `notes.rs` | `NotesStore` | Cross-conversation persistent key-value notes |
 | `sessions.rs` | `SessionRegistry` | All open protocol sessions |
 | `hash_state.rs` | `HashStateStore` | Running hash contexts for streaming digest tools |
 
----
-
-## VfsStore (`vfs.rs`)
-
-`HashMap<String, String>` — normalised path → UTF-8 content.
-
-- **Cap**: 10 MiB total content per instance (enforced on `write`)
-- **Normalisation**: leading `/` stripped; `.`/`..` resolved
-- **Methods**: `write`, `read`, `list`, `delete`, `total_bytes`
+The file overlay the `file_*` tools work through (`VfsStore`, `RepoFiles`,
+the workspace manifest) lives in the `zend-vfs` crate.
 
 ---
 

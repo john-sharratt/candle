@@ -1723,7 +1723,7 @@ pub struct EngineConfig {
     /// `health.enabled == true`. Safe to set unconditionally.
     pub health: DecodeHealthConfig,
 
-    /// Workspace root whose `.substrate/` directory backs the persistence
+    /// Workspace root whose `substrate/` directory backs the persistence
     /// redo log. When `None`, the engine opens the substrate under the
     /// process working directory (`SubstratePersistence::open`).
     ///
@@ -1734,7 +1734,7 @@ pub struct EngineConfig {
     ///
     /// `None` — the ordinary case — and the engine opens
     /// [`Self::workspace_path`] itself. `Some` is for a host with its own
-    /// record classes in the same log: one `.substrate/` admits exactly one
+    /// record classes in the same log: one `substrate/` admits exactly one
     /// writable handle per process, and a second silently loses records rather
     /// than failing. See [`SharedSubstrate`].
     pub substrate: Option<SharedSubstrate>,
@@ -1744,7 +1744,7 @@ pub struct EngineConfig {
     ///
     /// For a tool that reads a workspace another process — the daemon — may be
     /// appending to at the same time. The store must already exist, and nothing
-    /// under `.substrate/` is created, renamed, deleted, truncated, grown or
+    /// under `substrate/` is created, renamed, deleted, truncated, grown or
     /// written from engine start through shutdown. Everything in RAM works as it
     /// does on a writable substrate — seals update the substrate mirror; labels,
     /// tombstones and projection events apply — and a turn that would have gone

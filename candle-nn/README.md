@@ -86,7 +86,7 @@ handles sparse, batch-masked writes.
 ## Three-tier residency
 
 Chunks migrate GPU (hot) → RAM (warm, pageable CPU arenas) → NVMe (cold, the
-append-only redo log at `.substrate/substrate.log`, owned by
+append-only redo log at `substrate/substrate.log`, owned by
 `candle-conversation`'s persistence layer). Hot→warm quantizes in place via
 `quantize_sealed_in_place` when a `CompressionPolicy` is active, then does a
 format-preserving device-to-host copy; warm→hot elevates back on demand. Two

@@ -3,7 +3,7 @@
 **Status:** shipped, 2026-07-06. Live harness: the `belief-*` subcommands of
 `candle-conversation/examples/substrate_inspect.rs` (`belief-eval`, `belief-probe`,
 `belief-dissect`, `belief-sweep`, `belief-decay`) — load-once, model-free, run on CPU against
-the workspace `.substrate/substrate.log`. Companion to the idea catalogue in
+the workspace `substrate/substrate.log`. Companion to the idea catalogue in
 [`tool_selection_provenance_ideas.md`](tool_selection_provenance_ideas.md). §§1–22 are the
 research record that led here; the shipped design is §23–§24.8, summarised next.
 **§25 (added 2026-08-02):** the content-axis generalization — harness
@@ -136,7 +136,7 @@ genuine information limit in §22.6). Family-level (~80 %) is the metric that ma
 
 ## 1. Setup, data, methodology
 
-### Data (all read once from `.substrate/substrate.log`)
+### Data (all read once from `substrate/substrate.log`)
 
 | Asset | Count | What it is |
 |---|---|---|
@@ -717,10 +717,10 @@ PCA-aligned. Storage: 32 B/token × 10 M = 320 MB.
 ## 11. Reproduction
 
 **Shipped design (§23–§24.8)** — the `belief-*` subcommands of `substrate_inspect` reproduce every
-current number against a workspace `.substrate/substrate.log`:
+current number against a workspace `substrate/substrate.log`:
 
 ```bash
-cd <workspace>   # holds .substrate/substrate.log
+cd <workspace>   # holds substrate/substrate.log
 E="cargo run -q --release -p candle-conversation --example substrate_inspect --"
 
 $E belief-eval                              # §80: leave-one-out Tool-1/3/5, MRR, per-tool, hardest

@@ -62,16 +62,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
-use super::manifest::{
-    encode_conv_state_payload, encode_label_payload, ChunkLoc, ConvState, RecordLoc,
-};
+use super::content_hash::section_stream_id;
+use super::manifest::{encode_conv_state_payload, encode_label_payload, ChunkLoc, RecordLoc};
 use super::record::{
-    DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, TombstonePayload,
-    TurnCouplingPayload,
+    DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, SectionTombstonePayload,
+    TombstonePayload, TurnCouplingPayload,
 };
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
+use super::stripes::{stripes, MAX_STRIPE_BYTES};
 use super::survival::RecordCensus;
+use super::vfs::carried as vfs_carried;
 use super::{PersistenceError, Result, SubstratePersistence};
 use crate::substrate::Substrate;
 
@@ -203,8 +204,15 @@ pub fn pick_maintenance_op(stats: &[SegmentStat], force: bool) -> Option<Mainten
 /// and stopped only when the disk did.
 #[derive(Clone, Copy)]
 struct Shed {
-    /// The whole timeline is gone — the stream goes wholesale, unless it is
-    /// also distilled (the provenance corpus).
+    /// The whole timeline (or, for a section stream, the section itself) is
+    /// gone — the stream goes wholesale, unless it is also distilled (the
+    /// provenance corpus; sections are never distilled, so for a section
+    /// this field alone decides). Doubles for both kinds rather than adding
+    /// a parallel `section_dead` field because the two are mutually
+    /// exclusive per stream (`classify` sets it from whichever `StreamDecl`
+    /// variant the stream actually declares) and `dropped_wholesale` already
+    /// reduces to exactly this field when `distill` is `None`, which it
+    /// always is for a section.
     timeline_dead: bool,
     /// This one turn was retired from a timeline that is still live.
     turn_dead: bool,
@@ -234,6 +242,7 @@ fn classify(
     tombstoned: &HashSet<u64>,
     distilled: &HashMap<u64, DistillMode>,
     dead_turns: &HashSet<(u64, u32)>,
+    tombstoned_sections: &HashSet<u64>,
 ) -> Shed {
     match entry_decl {
         Some(StreamDecl::Turn(t)) => Shed {
@@ -241,7 +250,16 @@ fn classify(
             turn_dead: dead_turns.contains(&(t.timeline_id, t.turn_index)),
             distill: distilled.get(&t.timeline_id).copied(),
         },
-        _ => Shed {
+        // A tombstoned section drops wholesale, the same as a tombstoned
+        // timeline — its `Chunk`/`Tokens`/`StreamDecl` are the corrupted
+        // bytes the tombstone exists to keep unread, and a section carries
+        // no turn-numbering that a placeholder would need to preserve.
+        Some(StreamDecl::PromptSection(s)) => Shed {
+            timeline_dead: tombstoned_sections.contains(&section_stream_id(s.address).0),
+            turn_dead: false,
+            distill: None,
+        },
+        None => Shed {
             timeline_dead: false,
             turn_dead: false,
             distill: None,
@@ -308,8 +326,23 @@ pub struct MaintenancePlan {
     /// while `Compact` and `Combine` qualify on a dead *ratio* and retire the
     /// segment just the same.
     npc_relocs: Vec<(StreamId, RecordLoc)>,
+    /// A live conversation's file events and tombstones to relocate —
+    /// carried by location for the reason characters are: their bodies are
+    /// not in this process's RAM. A tombstone is carried as long as its
+    /// conversation lives, because copies of the events it killed can sit in
+    /// segments this op leaves alone, and it has to stay after them.
+    vfs_relocs: Vec<VfsReloc>,
     /// `(type, source_loc)` singleton records to relocate.
     singleton_relocs: Vec<(RecordType, RecordLoc)>,
+}
+
+/// One file event or tombstone to relocate, keyed as the index keys it.
+#[derive(Clone, Copy, Debug)]
+struct VfsReloc {
+    rt: RecordType,
+    timeline: u64,
+    seq: u64,
+    loc: RecordLoc,
 }
 
 impl MaintenancePlan {
@@ -390,11 +423,22 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
         .iter()
         .map(|(t, m)| (t.raw(), *m))
         .collect();
+    let tombstoned_sections: HashSet<u64> = substrate
+        .tombstoned_sections()
+        .iter()
+        .map(|s| s.0)
+        .collect();
 
     let mut out: Vec<Resident> = Vec::new();
     let dead_turns = dead_turns_of(substrate);
     for (stream_id, entry) in substrate.all_streams() {
-        let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
+        let shed = classify(
+            &entry.decl,
+            &tombstoned,
+            &distilled,
+            &dead_turns,
+            &tombstoned_sections,
+        );
         // Tombstoned AND undistilled goes; tombstoned-but-distilled is the
         // provenance corpus and is retained by its mode. See the same gate in
         // `compaction::collect_live_records`.
@@ -459,7 +503,7 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             });
         }
     }
-    for (tl, conv, label, archived, custom) in substrate.live_conv_meta() {
+    for (tl, conv, label, custom) in substrate.live_conv_meta() {
         // A tombstoned timeline that is ALSO distilled is the provenance corpus
         // (calibration exemplars: archived, distilled, then tombstoned out of the
         // live gather while their signatures keep answering the belief scan).
@@ -475,14 +519,19 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             chunk_index: 0,
             payload: encode_label_payload(tl, &conv, &label, &custom),
         });
-        if archived {
-            out.push(Resident {
-                rt: RecordType::ConvState,
-                stream_id: 0,
-                chunk_index: 0,
-                payload: encode_conv_state_payload(tl, ConvState { archived: true }),
-            });
+    }
+    // The whole conversation state, keyed in the header by timeline — see
+    // `ConvState`. Same retirement rule as the labels above.
+    for (tl, state) in substrate.live_conv_states() {
+        if tombstoned.contains(&tl) && !distilled.contains_key(&tl) {
+            continue;
         }
+        out.push(Resident {
+            rt: RecordType::ConvState,
+            stream_id: tl,
+            chunk_index: 0,
+            payload: encode_conv_state_payload(tl, &state),
+        });
     }
     for p in substrate.live_tree_metadata_payloads() {
         if tombstoned.contains(&p.timeline_id) {
@@ -596,6 +645,23 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             .encode(),
         });
     }
+    // Tombstoned section streams — the section counterpart of the two
+    // `Tombstone` loops above, and the incremental path's half of the same
+    // pair `compaction::collect_live_records` carries. Losing this on a
+    // relocation sweep is the exact bug this file's own history warns
+    // about (`Npc`, `TurnCoupling`): the corrupted section's `Chunk`
+    // records would still be shed here as ordinary dead weight, but with
+    // the marker gone the next reload would find no tombstone, treat the
+    // section as merely absent, and the next ingest would re-persist and
+    // eventually re-corrupt the same content address.
+    for &stream_id in substrate.tombstoned_sections() {
+        out.push(Resident {
+            rt: RecordType::SectionTombstone,
+            stream_id: stream_id.0,
+            chunk_index: 0,
+            payload: SectionTombstonePayload { reason: None }.encode(),
+        });
+    }
     // Tool-round-trip couplings — see the twin loop in
     // `compaction::collect_live_records`. Payload-keyed, so no supersession
     // accounting protects them and no location map relocates them; re-emitting
@@ -693,6 +759,7 @@ impl SubstratePersistence {
             singleton_relocs,
         ) = self.gather_relocations(substrate, &op.targets());
         let npc_relocs = self.npc_relocations(&op.targets());
+        let vfs_relocs = self.vfs_relocations(substrate, &op.targets());
         // What this op carries off the target segments, by type. The incremental
         // path is the one that actually runs on a busy store — the 143 GB store
         // burned through ~370 segment generations without a single full
@@ -733,6 +800,7 @@ impl SubstratePersistence {
             branches = branch_checkpoint_relocs.len(),
             singletons = singleton_relocs.len(),
             npcs = npc_relocs.len(),
+            vfs = vfs_relocs.len(),
             "maintenance {:?}: re-emitting {}",
             op,
             resident_census.summary()
@@ -746,6 +814,7 @@ impl SubstratePersistence {
             branch_checkpoint_relocs,
             singleton_relocs,
             npc_relocs,
+            vfs_relocs,
         }))
     }
 
@@ -950,6 +1019,62 @@ impl SubstratePersistence {
             self.relocate_raw_from_segment(source, &items)?;
         }
 
+        // A conversation's file events and tombstones — carried verbatim, and
+        // behind the same check characters take: the plan was read without the
+        // persistence lock, so a tombstone written since may have killed a
+        // planned event, or a conversation been tombstoned since. The index
+        // names only what is still live where the plan found it; relocating
+        // anything else would put a dead record after the tombstone that
+        // killed it.
+        let still_live = |r: &VfsReloc| {
+            self.vfs_index.timeline(r.timeline).is_some_and(|tl| {
+                let at = if r.rt == RecordType::VfsEvent {
+                    tl.events()
+                } else {
+                    tl.tombstones()
+                };
+                at.get(&r.seq) == Some(&r.loc)
+            })
+        };
+        let mut vfs_by_seg: BTreeMap<SegmentId, Vec<VfsReloc>> = BTreeMap::new();
+        for r in plan.vfs_relocs.iter().filter(|r| still_live(r)) {
+            vfs_by_seg.entry(r.loc.segment).or_default().push(*r);
+        }
+        for (source, recs) in vfs_by_seg {
+            let items: Vec<RawReloc> = recs
+                .iter()
+                .map(|r| RawReloc {
+                    offset: r.loc.offset,
+                    record_size: r.loc.record_size,
+                    header: RecordHeader {
+                        record_type: r.rt,
+                        format: 0,
+                        payload_len: r.loc.payload_len,
+                        crc: 0,
+                        stream_id: r.timeline,
+                        chunk_index: r.seq,
+                        token_count: 0,
+                    },
+                })
+                .collect();
+            let new = self.relocate_raw_from_segment(source, &items)?;
+            for (r, (segment, offset, record_size)) in recs.into_iter().zip(new) {
+                let moved = RecordLoc {
+                    segment,
+                    offset,
+                    payload_len: r.loc.payload_len,
+                    record_size,
+                };
+                if r.rt == RecordType::VfsEvent {
+                    self.vfs_index
+                        .repoint_event(r.timeline, r.seq, r.loc, moved);
+                } else {
+                    self.vfs_index
+                        .repoint_tombstone(r.timeline, r.seq, r.loc, moved);
+                }
+            }
+        }
+
         // Durability barrier: relocated copies are fsynced before any source is
         // unlinked (in `finish_maintenance`).
         self.commit()?;
@@ -973,18 +1098,15 @@ impl SubstratePersistence {
     ) -> Result<Vec<(SegmentId, u64, u64)>> {
         let mut order: Vec<usize> = (0..items.len()).collect();
         order.sort_unstable_by_key(|&i| items[i].offset);
+        let spans: Vec<(u64, u64)> = order
+            .iter()
+            .map(|&k| (items[k].offset, items[k].record_size))
+            .collect();
         let mut new_locs = vec![(source, 0u64, 0u64); items.len()];
         let mut buf: Vec<u8> = Vec::new();
-        let mut i = 0;
-        while i < order.len() {
-            // Coalesce a contiguous run of records into one stripe read.
-            let start = items[order[i]].offset;
-            let mut end = start + items[order[i]].record_size;
-            let mut j = i + 1;
-            while j < order.len() && items[order[j]].offset == end {
-                end += items[order[j]].record_size;
-                j += 1;
-            }
+        for (i, j) in stripes(&spans, MAX_STRIPE_BYTES) {
+            let start = spans[i].0;
+            let end = spans[j - 1].0 + spans[j - 1].1;
             let len = (end - start) as usize;
             if buf.len() < len {
                 buf.resize(len, 0);
@@ -996,7 +1118,6 @@ impl SubstratePersistence {
                 let raw = &buf[within..within + it.record_size as usize];
                 new_locs[k] = self.append_raw_record(&it.header, raw)?;
             }
-            i = j;
         }
         Ok(new_locs)
     }
@@ -1112,6 +1233,7 @@ impl SubstratePersistence {
             branch_checkpoint_relocs,
             singleton_relocs,
             npc_relocs: self.npc_relocations(&op.targets()),
+            vfs_relocs: self.vfs_relocations(substrate, &op.targets()),
         };
         let result = self.execute_maintenance(&plan)?;
         result.apply_to_substrate(substrate);
@@ -1142,6 +1264,32 @@ impl SubstratePersistence {
         out
     }
 
+    /// The file events and tombstones of live conversations physically inside
+    /// a target segment — by the one rule compaction and liveness read
+    /// ([`vfs_carried`]). In timeline and sequence order, so the same store plans
+    /// the same work twice running.
+    fn vfs_relocations(&self, substrate: &Substrate, targets: &[SegmentId]) -> Vec<VfsReloc> {
+        let mut out = Vec::new();
+        for (timeline, tl) in vfs_carried(substrate, &self.vfs_index) {
+            for (rt, at) in [
+                (RecordType::VfsEvent, tl.events()),
+                (RecordType::VfsTombstone, tl.tombstones()),
+            ] {
+                for (&seq, &loc) in at {
+                    if targets.contains(&loc.segment) {
+                        out.push(VfsReloc {
+                            rt,
+                            timeline,
+                            seq,
+                            loc,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Gather the relocation worklist for `targets` — the live read-back records
     /// (`Chunk` / `Tokens` / singletons) physically in those segments, with the
     /// same distill/tombstone filter as [`Self::segment_liveness`]. Read-only.
@@ -1166,17 +1314,30 @@ impl SubstratePersistence {
             .iter()
             .map(|(t, m)| (t.raw(), *m))
             .collect();
+        let tombstoned_sections: HashSet<u64> = substrate
+            .tombstoned_sections()
+            .iter()
+            .map(|s| s.0)
+            .collect();
         let in_target = |seg: SegmentId| targets.contains(&seg);
 
         let mut chunks: Vec<(StreamId, u64, ChunkLoc)> = Vec::new();
         let mut tokens: Vec<(StreamId, RecordLoc)> = Vec::new();
         let dead_turns = dead_turns_of(substrate);
         for (stream_id, entry) in substrate.all_streams() {
-            let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
+            let shed = classify(
+                &entry.decl,
+                &tombstoned,
+                &distilled,
+                &dead_turns,
+                &tombstoned_sections,
+            );
             // Same rule as the re-emit path: a tombstoned-but-DISTILLED timeline
             // is the provenance corpus, so it is relocated by its mode (the
             // per-mode gates below already withhold its chunks/tokens) rather
             // than abandoned. Only an undistilled tombstone is skipped outright.
+            // A tombstoned section is never distilled, so it always takes this
+            // branch — its corrupted chunks are never relocated forward.
             if shed.dropped_wholesale() {
                 continue;
             }
@@ -1262,6 +1423,11 @@ impl SubstratePersistence {
             .iter()
             .map(|(t, m)| (t.raw(), *m))
             .collect();
+        let tombstoned_sections: HashSet<u64> = substrate
+            .tombstoned_sections()
+            .iter()
+            .map(|s| s.0)
+            .collect();
 
         let mut live: HashMap<SegmentId, u64> = HashMap::new();
         for loc in [
@@ -1298,7 +1464,13 @@ impl SubstratePersistence {
         let mut carried: HashMap<u64, bool> = HashMap::new();
         let dead_turns = dead_turns_of(substrate);
         for (sid, entry) in substrate.all_streams() {
-            let shed = classify(&entry.decl, &tombstoned, &distilled, &dead_turns);
+            let shed = classify(
+                &entry.decl,
+                &tombstoned,
+                &distilled,
+                &dead_turns,
+                &tombstoned_sections,
+            );
             if shed.dropped_wholesale() || entry.decl.is_none() {
                 continue;
             }
@@ -1354,6 +1526,14 @@ impl SubstratePersistence {
         // whole cast forward on every pass, and the log churns.
         for loc in self.npc_locs.values() {
             *live.entry(loc.segment).or_default() += loc.record_size;
+        }
+        // A live conversation's file events and tombstones — exactly what
+        // `vfs_relocations` carries, so a segment holding only a retired
+        // conversation's, or only events a tombstone killed, reads as dead.
+        for (_, tl) in vfs_carried(substrate, &self.vfs_index) {
+            for loc in tl.events().values().chain(tl.tombstones().values()) {
+                *live.entry(loc.segment).or_default() += loc.record_size;
+            }
         }
         live
     }
@@ -2499,6 +2679,73 @@ mod tests {
                 chunk_payload(12)
             );
             assert_eq!(substrate.live_chunk_count(), 2);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A live run longer than one read stripe is relocated whole.** Seventy
+    /// one-MiB chunks stand back to back in a sealed segment — one run past
+    /// [`MAX_STRIPE_BYTES`] — beside a superseded record that makes it worth
+    /// compacting. Every chunk reads back byte for byte after the relocation
+    /// and after a reload.
+    #[test]
+    fn a_live_run_past_one_stripe_is_relocated_whole() {
+        let dir = tmp_dir("stripes");
+        let decl = turn_decl(303, 0);
+        let sid = decl.stream_id();
+        let big = |index: u64| ChunkPayload {
+            kv_bytes: (0..1024 * 1024u64)
+                .map(|i| ((i + index * 13) % 251) as u8)
+                .collect(),
+            ..chunk_payload(index as u32)
+        };
+        const LIVE: u64 = 70;
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            for i in 0..LIVE {
+                sp.write_chunk(sid, i, 32, 4, None, &big(i)).unwrap();
+            }
+            sp.write_chunk(sid, LIVE, 32, 4, None, &chunk_payload(1))
+                .unwrap(); // superseded below
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, LIVE, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.apply_maintenance_op(&mut substrate, &MaintenanceOp::Compact(SegmentId(1)))
+                .unwrap();
+            assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
+            for i in 0..LIVE {
+                assert_eq!(
+                    sp.read_chunk(&substrate, sid, i).unwrap(),
+                    big(i),
+                    "chunk {i}"
+                );
+            }
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            for i in 0..LIVE {
+                assert_eq!(
+                    sp.read_chunk(&substrate, sid, i).unwrap(),
+                    big(i),
+                    "chunk {i}"
+                );
+            }
+            assert_eq!(
+                sp.read_chunk(&substrate, sid, LIVE).unwrap(),
+                chunk_payload(2)
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

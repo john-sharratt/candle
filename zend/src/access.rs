@@ -1,10 +1,10 @@
 //! Who may use which tools mode.
 //!
-//! The tools dial decides how far a conversation's tools reach, and its top two
-//! settings reach a long way: Comprehensive offers the high-risk tools, and
-//! Mutable lets the file tools change the project on disk. Both are for the
-//! estate's admins. Everyone else — signed in or not — gets Restricted by
-//! default and may go no further than it.
+//! The tools dial decides how far a conversation's tools reach, and its top
+//! setting reaches a long way: Comprehensive offers the high-risk tools — the
+//! network, credentials, code, the git writers and programs on this host. It is
+//! for the estate's admins. Everyone else — signed in or not — gets Restricted
+//! by default and may go no further than it.
 //!
 //! # Where the caller comes from
 //!
@@ -17,10 +17,24 @@
 //!
 //! # A mode the caller may not use
 //!
-//! Asked for by a non-admin, Comprehensive or Mutable is **served as
-//! Restricted**, not refused: the turn still runs, on the tools the caller is
-//! entitled to. A refusal would cost the whole turn for a dial set too high,
-//! and the GUI never offers those modes to a non-admin in the first place.
+//! Asked for by a non-admin, Comprehensive is **served as Restricted**, not
+//! refused: the turn still runs, on the tools the caller is entitled to. A
+//! refusal would cost the whole turn for a dial set too high, and the GUI never
+//! offers that mode to a non-admin in the first place.
+//!
+//! # `--local-signin` — standing in for a gateway that isn't there
+//!
+//! A developer running zend directly, with no Tokera gateway in front of it,
+//! has no way to arrive with `x-tokera-*` headers and so is always
+//! [`Role::Unauthenticated`] — there is deliberately no API that grants a
+//! role. `--local-signin <email>` is the one boot-time way out: it resolves
+//! `email` against [`ZEND_ROLES`] and applies **only** to a request whose
+//! peer is genuine loopback (this machine, not a configured `--gateway`) and
+//! that carries no forwarded identity headers of its own. Any real forwarded
+//! identity, from any trusted peer, always takes precedence. It is still a
+//! widening of trust on this box — any other local process or user account
+//! can now also reach zend's port and be recognized as that email — which is
+//! why it is off by default and logged loudly at startup when set.
 
 use std::fmt::{self, Display, Formatter};
 use std::iter;
@@ -28,6 +42,7 @@ use std::net::IpAddr;
 
 use axum::http::HeaderMap;
 use web::auth::forwarded::identify;
+use web::auth::session::Identity;
 use web::auth::{Role, Roles};
 use zend_tools::{Capability, Grants};
 
@@ -49,7 +64,7 @@ pub fn roles() -> Roles {
 /// The gateway strips any identity a client sends and sets its own, but that
 /// protects only requests that pass through it. zend listens on a LAN address,
 /// and any machine that can reach that port directly could otherwise send
-/// `x-tokera-email` naming an admin and be served Mutable. The gateway on this
+/// `x-tokera-email` naming an admin and be served Comprehensive. The gateway on this
 /// box connects from the bound address itself, so that is trusted by default.
 #[derive(Debug, Clone, Default)]
 pub struct Gateways(Vec<IpAddr>);
@@ -91,13 +106,65 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Whether `peer` is this machine, not merely a configured `--gateway`.
+///
+/// `--local-signin` stands in for a gateway on the box that would otherwise
+/// run one, so it must not reach further than loopback already does — a
+/// `--gateway` IP is a *different* machine the operator has chosen to trust
+/// for forwarded headers, and letting a flag on this process grant an
+/// identity to callers arriving over the network would widen that trust
+/// silently.
+fn is_loopback(peer: IpAddr) -> bool {
+    canonical(peer).is_loopback()
+}
+
+/// The synthetic identity `--local-signin <email>` presents on behalf of a
+/// loopback caller that sent no `x-tokera-*` headers of its own.
+///
+/// `sub` is a fixed placeholder rather than empty: [`Roles::of`] treats an
+/// empty subject as no identity at all (mirroring the real gateway, which
+/// never forwards one), and this identity is deliberately real. The table is
+/// keyed on email for this path — `zend.roles.yaml` names people by email —
+/// so the placeholder subject never needs to match anything itself.
+fn local_identity(email: &str) -> Identity {
+    Identity {
+        provider: "local-signin".to_string(),
+        sub: "local-signin".to_string(),
+        email: email.to_string(),
+        name: String::new(),
+        picture: String::new(),
+        exp: 0,
+    }
+}
+
 /// The caller's role, from the gateway's headers — believed only when `peer`
 /// is a trusted gateway. A request from anywhere else, or with no known peer,
 /// is [`Role::Unauthenticated`] whatever it claims.
-pub fn role(headers: &HeaderMap, peer: Option<IpAddr>, gateways: &Gateways, roles: &Roles) -> Role {
+///
+/// `local_signin` is `--local-signin`'s email, if the daemon was started with
+/// it. It applies only when every one of these holds: the peer is truly
+/// loopback (not merely a trusted `--gateway`), and the request carries no
+/// `x-tokera-*` headers at all — a forwarded identity, however it resolves,
+/// always wins over the flag.
+pub fn role(
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+    gateways: &Gateways,
+    roles: &Roles,
+    local_signin: Option<&str>,
+) -> Role {
     let claimed = identify(headers).ok();
     match peer {
-        Some(p) if gateways.trusts(p) => roles.of(claimed.as_ref()),
+        Some(p) if gateways.trusts(p) => {
+            if claimed.is_none() {
+                if let Some(email) = local_signin {
+                    if is_loopback(p) {
+                        return roles.of(Some(&local_identity(email)));
+                    }
+                }
+            }
+            roles.of(claimed.as_ref())
+        }
         _ => {
             if let Some(id) = &claimed {
                 tracing::warn!(
@@ -116,7 +183,7 @@ pub fn role(headers: &HeaderMap, peer: Option<IpAddr>, gateways: &Gateways, role
 pub fn allows(role: Role, mode: ToolMode) -> bool {
     match mode {
         ToolMode::None | ToolMode::Restricted => true,
-        ToolMode::Comprehensive | ToolMode::Mutable => role.at_least(Role::Admin),
+        ToolMode::Comprehensive => role.at_least(Role::Admin),
     }
 }
 
@@ -143,21 +210,16 @@ pub fn default_mode(role: Role) -> ToolMode {
 /// disk primitives check again where the action happens.
 ///
 /// - None and Restricted grant nothing: their tools answer from the
-///   conversation, the overlay and the workspace as read.
-/// - Comprehensive grants the network, stored credentials and the JS sandbox.
-///   Its file changes stay in the overlay, so it grants neither the disk nor
-///   execution on this host: a program that runs here reaches the real
-///   filesystem, which no overlay can stand in front of. The sandbox can —
-///   its only filesystem is the context's file store, the overlay itself.
-/// - Mutable grants everything, the disk and execution included.
+///   conversation and the workspace as read, and their file changes stay in
+///   the conversation's overlay, which needs no grant — it never writes the
+///   disk. No git writer and no program on this host runs without one.
+/// - Comprehensive grants everything: the network, stored credentials, the JS
+///   sandbox, the disk (which the git writers' checkout runs and SQLite need)
+///   and programs on this host.
 pub fn grants(mode: ToolMode) -> Grants {
     match mode {
         ToolMode::None | ToolMode::Restricted => Grants::NONE,
-        ToolMode::Comprehensive => Grants::NONE
-            .with(Capability::Network)
-            .with(Capability::Sandbox)
-            .with(Capability::Secrets),
-        ToolMode::Mutable => Grants::ALL,
+        ToolMode::Comprehensive => Grants::ALL,
     }
 }
 
@@ -169,7 +231,7 @@ pub fn offers(mode: ToolMode, requires: &[Capability], high_risk: bool) -> bool 
     match mode {
         ToolMode::None => false,
         ToolMode::Restricted => within && !high_risk,
-        ToolMode::Comprehensive | ToolMode::Mutable => within,
+        ToolMode::Comprehensive => within,
     }
 }
 
@@ -210,45 +272,35 @@ mod tests {
             assert_eq!(default_mode(role), ToolMode::Comprehensive);
             assert_eq!(effective_mode(role, None), ToolMode::Comprehensive);
             assert_eq!(
-                effective_mode(role, Some(ToolMode::Mutable)),
-                ToolMode::Mutable
+                effective_mode(role, Some(ToolMode::Restricted)),
+                ToolMode::Restricted
             );
         }
     }
 
     /// **Everyone else gets Restricted, and cannot climb above it.** Asking for
-    /// Comprehensive or Mutable runs the turn restricted rather than refusing it.
+    /// Comprehensive runs the turn restricted rather than refusing it.
     #[test]
     fn everyone_else_defaults_to_restricted_and_is_held_there() {
         for role in OTHERS {
             assert_eq!(allowed_modes(role), [ToolMode::None, ToolMode::Restricted]);
             assert_eq!(effective_mode(role, None), ToolMode::Restricted);
-            for above in [ToolMode::Comprehensive, ToolMode::Mutable] {
-                assert_eq!(effective_mode(role, Some(above)), ToolMode::Restricted);
-            }
+            assert_eq!(
+                effective_mode(role, Some(ToolMode::Comprehensive)),
+                ToolMode::Restricted
+            );
             assert_eq!(effective_mode(role, Some(ToolMode::None)), ToolMode::None);
         }
     }
 
-    /// **Only Mutable may touch the disk or run code here, and nothing below
-    /// Comprehensive may reach past the conversation.** A non-admin is held to
-    /// Restricted, so a non-admin's round runs with no grant at all.
+    /// **Comprehensive holds everything, and nothing below it may reach past
+    /// the conversation.** A non-admin is held to Restricted, so a non-admin's
+    /// round runs with no grant at all.
     #[test]
     fn each_mode_grants_what_it_offers_and_no_more() {
         assert_eq!(grants(ToolMode::None), Grants::NONE);
         assert_eq!(grants(ToolMode::Restricted), Grants::NONE);
-        let comprehensive = grants(ToolMode::Comprehensive);
-        for cap in [Capability::DiskWrite, Capability::Exec] {
-            assert!(!comprehensive.has(cap), "comprehensive holds {cap}");
-        }
-        for cap in [
-            Capability::Network,
-            Capability::Sandbox,
-            Capability::Secrets,
-        ] {
-            assert!(comprehensive.has(cap), "comprehensive lacks {cap}");
-        }
-        assert_eq!(grants(ToolMode::Mutable), Grants::ALL);
+        assert_eq!(grants(ToolMode::Comprehensive), Grants::ALL);
         for role in OTHERS {
             for asked in ToolMode::ALL {
                 assert_eq!(grants(effective_mode(role, Some(asked))), Grants::NONE);
@@ -257,17 +309,16 @@ mod tests {
         }
     }
 
-    /// A mode offers exactly the tools its grants cover: code execution only
-    /// in Mutable, the network from Comprehensive up, high-risk tools never
-    /// in Restricted, and nothing at all in None.
+    /// A mode offers exactly the tools its grants cover: everything in
+    /// Comprehensive, no tool needing a grant and no high-risk tool in
+    /// Restricted, and nothing at all in None.
     #[test]
     fn a_mode_offers_only_what_it_would_run() {
-        let exec = [Capability::Exec];
-        let net = [Capability::Network];
-        assert!(offers(ToolMode::Mutable, &exec, true));
-        assert!(!offers(ToolMode::Comprehensive, &exec, true));
-        assert!(offers(ToolMode::Comprehensive, &net, true));
-        assert!(!offers(ToolMode::Restricted, &net, false));
+        for cap in Capability::ALL {
+            assert!(offers(ToolMode::Comprehensive, &[cap], true), "{cap}");
+            assert!(!offers(ToolMode::Restricted, &[cap], false), "{cap}");
+        }
+        assert!(offers(ToolMode::Comprehensive, &[], false));
         assert!(offers(ToolMode::Restricted, &[], false));
         assert!(!offers(ToolMode::Restricted, &[], true));
         assert!(!offers(ToolMode::None, &[], false));
@@ -281,13 +332,13 @@ mod tests {
         let gw = Gateways::new(ip("192.168.0.5"), &[]);
         let from_gw = Some(ip("192.168.0.5"));
         let mut h = HeaderMap::new();
-        assert_eq!(role(&h, from_gw, &gw, &table), Role::Unauthenticated);
+        assert_eq!(role(&h, from_gw, &gw, &table, None), Role::Unauthenticated);
         h.insert("x-tokera-user", "g-1".parse().unwrap());
         h.insert("x-tokera-provider", "google".parse().unwrap());
         h.insert("x-tokera-email", "someone@example.com".parse().unwrap());
-        assert_eq!(role(&h, from_gw, &gw, &table), Role::User);
+        assert_eq!(role(&h, from_gw, &gw, &table, None), Role::User);
         h.insert("x-tokera-email", "admin@example.com".parse().unwrap());
-        assert_eq!(role(&h, from_gw, &gw, &table), Role::Admin);
+        assert_eq!(role(&h, from_gw, &gw, &table, None), Role::Admin);
     }
 
     /// **A peer that is not the gateway cannot claim an identity.** Another
@@ -303,7 +354,7 @@ mod tests {
         h.insert("x-tokera-email", "admin@example.com".parse().unwrap());
         for forger in [Some(ip("192.168.0.77")), Some(ip("10.0.0.8")), None] {
             assert_eq!(
-                role(&h, forger, &gw, &table),
+                role(&h, forger, &gw, &table, None),
                 Role::Unauthenticated,
                 "{forger:?}"
             );
@@ -316,7 +367,7 @@ mod tests {
             "10.0.0.9",
         ] {
             assert_eq!(
-                role(&h, Some(ip(trusted)), &gw, &table),
+                role(&h, Some(ip(trusted)), &gw, &table, None),
                 Role::Admin,
                 "{trusted}"
             );
@@ -333,6 +384,92 @@ mod tests {
         assert!(gw.trusts(ip("127.0.0.1")));
         assert!(Gateways::default().trusts(ip("127.0.0.1")));
         assert!(!Gateways::default().trusts(ip("192.168.0.5")));
+    }
+
+    /// **The whole point of `--local-signin`.** A loopback caller with no
+    /// forwarded identity resolves the flag's email against the roles table,
+    /// same as a real gateway would have resolved it.
+    #[test]
+    fn local_signin_resolves_a_loopback_caller_with_no_headers() {
+        let table: Roles = serde_yaml::from_str("creators:\n  - email: me@example.com\n").unwrap();
+        let gw = Gateways::default();
+        let h = HeaderMap::new();
+        assert_eq!(
+            role(
+                &h,
+                Some(ip("127.0.0.1")),
+                &gw,
+                &table,
+                Some("me@example.com")
+            ),
+            Role::Creator
+        );
+        assert_eq!(
+            role(&h, Some(ip("::1")), &gw, &table, Some("me@example.com")),
+            Role::Creator
+        );
+    }
+
+    /// An email the flag names that is not in the table is a real, signed-in
+    /// nobody — `User`, not an error and not `Unauthenticated`.
+    #[test]
+    fn local_signin_for_an_unlisted_email_is_a_plain_user() {
+        let table: Roles = serde_yaml::from_str("creators:\n  - email: me@example.com\n").unwrap();
+        let gw = Gateways::default();
+        let h = HeaderMap::new();
+        assert_eq!(
+            role(
+                &h,
+                Some(ip("127.0.0.1")),
+                &gw,
+                &table,
+                Some("nobody@example.com")
+            ),
+            Role::User
+        );
+    }
+
+    /// A real forwarded identity always wins — the flag never overrides
+    /// headers the request actually carried, whatever they resolve to.
+    #[test]
+    fn local_signin_never_overrides_a_forwarded_identity() {
+        let table: Roles = serde_yaml::from_str(
+            "creators:\n  - email: me@example.com\nadmins:\n  - email: other@example.com\n",
+        )
+        .unwrap();
+        let gw = Gateways::default();
+        let mut h = HeaderMap::new();
+        h.insert("x-tokera-user", "g-1".parse().unwrap());
+        h.insert("x-tokera-provider", "google".parse().unwrap());
+        h.insert("x-tokera-email", "other@example.com".parse().unwrap());
+        assert_eq!(
+            role(
+                &h,
+                Some(ip("127.0.0.1")),
+                &gw,
+                &table,
+                Some("me@example.com")
+            ),
+            Role::Admin,
+            "the forwarded admin identity must win over the flag's creator email",
+        );
+    }
+
+    /// **The flag must not reach past loopback.** A `--gateway` peer is a
+    /// different machine the operator chose to trust for *forwarded* headers;
+    /// it must not also gain the local flag's identity when it sends none.
+    #[test]
+    fn local_signin_does_not_apply_to_a_trusted_gateway_peer() {
+        let table: Roles = serde_yaml::from_str("creators:\n  - email: me@example.com\n").unwrap();
+        let gw = Gateways::new(ip("192.168.0.5"), &[ip("10.0.0.9")]);
+        let h = HeaderMap::new();
+        for peer in ["192.168.0.5", "10.0.0.9"] {
+            assert_eq!(
+                role(&h, Some(ip(peer)), &gw, &table, Some("me@example.com")),
+                Role::Unauthenticated,
+                "{peer}"
+            );
+        }
     }
 
     fn ip(s: &str) -> IpAddr {

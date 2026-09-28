@@ -116,7 +116,7 @@ reading always looks "pressured". Per-wave phase timings (`Decode` / `Prefill` /
 ### Persistence: the mandatory redo log
 
 There is **no in-memory-only mode**. `ConversationEngine::new` unconditionally opens a `SubstratePersistence` at
-`<workspace>/.substrate/` and replays it into a `Substrate` in one walker pass before serving any turn. The store
+`<workspace>/substrate/` and replays it into a `Substrate` in one walker pass before serving any turn. The store
 is an append-only, content-addressed, **segmented** redo log — many sealed `seg-*.log` files plus one
 `seg-*.active`, rotated at a size target — that is a complete, self-contained image of the substrate: every K/V
 chunk, token blob, projection-event log, wide-Q signature, label, and turn-metadata record needed to reconstruct
@@ -163,7 +163,7 @@ fallback for any un-indexed tail. A background `PersistenceThread` drives hot→
   workspace-shared handle every `Sequence` clones.
 - `provenance::WideQSig`, `fold_provenance`, `score_provenance_late_fusion`, `GalleryArena` — the retrieval
   fingerprint and scan.
-- `persistence::SubstratePersistence::open_in_with_substrate` — open (or create) `.substrate/` and fully replay
+- `persistence::SubstratePersistence::open_in_with_substrate` — open (or create) `substrate/` and fully replay
   it into a `Substrate`.
 
 ## How it is used

@@ -1,0 +1,79 @@
+name: git_switch
+questions:
+- switch to the main branch
+- start a new branch for this work
+- move me onto feature/login
+- check out the release branch
+- make a branch called fix/timeout and work on it
+- I want to work on the branch my colleague pushed
+- go back to main
+- branch off from the previous commit and switch to it
+- create a hotfix branch from the release tag and switch to it
+- which branch should this change go on, put me on it
+- continue on the experiment branch
+- switch branches but keep what I have changed
+- work on a fresh branch so main stays clean
+- put me on origin's feature branch
+- start a topic branch from where I am
+- change which branch I am working on
+category: Git
+description: 'Switch to another branch in a repository, taking your uncommitted changes with you — merged onto that branch''s files, and where it changed the same lines, both kept between markers and listed in `conflicts` to settle: from then on you read, change and commit on that branch. A merge being finished must be committed or discarded first, and files in conflict settled. The branch is brought up to date with origin first, so a branch that only exists on origin works too. `create` is required: `true` makes a new branch on origin, starting at `from` (which defaults to your own commit); `false` switches to one that exists. Use for "switch to main", "start a branch for this", "work on feature/x", "go back to main". To make a branch without switching to it, use git_ref. Writes to origin when it makes the branch.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    RevArg:
+      description: 'A revision. `kind` picks the form and `name` carries its value.'
+      properties:
+        back:
+          description: For `parent` only — how many commits back. Defaults to 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        kind:
+          description: 'Which form: `head` (your own commit — the branch you are on as your files have it — needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          enum:
+          - head
+          - branch
+          - tag
+          - ref
+          - commit
+          - remote_branch
+          - upstream
+          - parent
+          type: string
+        name:
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
+          type: string
+      required:
+      - kind
+      type: object
+  properties:
+    branch:
+      description: The branch to switch to, by short name — `main`, `feature/login`. Required.
+      minLength: 1
+      type: string
+    create:
+      description: '`true` to make the branch first, on origin — a new branch; `false` to switch to a branch that already exists. Required.'
+      type: boolean
+    from:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: 'For `create` only — where the new branch starts. Leave it out for the branch you are on.'
+    repo:
+      description: The repository. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - branch
+  - create
+  title: SwitchRequest
+  type: object
+examples:
+- switch to main in candle<|im_end|>
+- start a new branch called feature/login for this<|im_end|>
+- put me on the release branch<|im_end|>
+- make a hotfix branch from the release tag and work on it<|im_end|>
+- go back to main but keep my changes<|im_end|>
+- work on the branch my colleague pushed to origin<|im_end|>

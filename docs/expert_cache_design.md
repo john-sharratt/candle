@@ -247,9 +247,9 @@ miss. Records are padded to a 4 KiB sector because the reads bypass the page
 cache (§12.1), which also makes the warm pool's slots the right size to be read
 into directly.
 
-### 5.2 Where it lives — and why not `.substrate/`
+### 5.2 Where it lives — and why not `substrate/`
 
-**Not under `.substrate/`.** The pack is a pure function of the *checkpoint*; the
+**Not under `substrate/`.** The pack is a pure function of the *checkpoint*; the
 substrate directory holds conversation state, which is a different thing with a
 different lifetime. Putting it there gets two things wrong at once:
 
@@ -630,7 +630,7 @@ free; if not, the warm tier has to be large enough to make them rare.
 
 ## 11. Risks
 
-**The pack file is a new artefact with a lifecycle.** 16.6 GiB in `.substrate`,
+**The pack file is a new artefact with a lifecycle.** 16.6 GiB in `substrate`,
 needing invalidation on checkpoint change, and a story for two daemons on one
 workspace. Not hard; the kind of thing that bites later if it is not decided now.
 

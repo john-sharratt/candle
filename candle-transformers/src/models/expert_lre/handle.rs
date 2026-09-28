@@ -123,6 +123,21 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// pages taken past that point come out of the page cache and the warm KV tier,
 /// which this gate barely exercises and a daemon workload does. When the
 /// performance argument is a wash, the safety argument decides.
+///
+/// **Deliberately NOT raised for calibration's sake.** A from-empty full tool
+/// calibration (`zend::session`'s "Calibrating sections", thousands of
+/// `kv_lossless`-pinned cases) needs several GiB more transient room than this
+/// figure leaves and starved on a 31.5 GiB box (`memory allocation of 16777216
+/// bytes failed` 15–51 % through the corpus, `vram::available_low_water` reading
+/// single-digit MiB). Raising this constant to cover it was tried and reverted:
+/// `the_expert_tier_and_the_kv_tier_fit_the_machine_together` — this crate's own
+/// regression test for the everyday case, a 31.5 GiB box with 20 GiB free at
+/// launch — measured the tier dropping to exactly the new headroom's shortfall,
+/// "too tight to be worth the pack-file misses it avoids". This headroom taxes
+/// every boot; calibration's much larger, one-time transient is the exception,
+/// not the common case, and belongs in the exception's own code —
+/// `zend::session`'s calibration loop backs its concurrency window off directly
+/// against live free RAM instead. See `zend_run_iteration_traps.md` §4.
 pub const WARM_TIER_HEADROOM: u64 = 4 * 1024 * 1024 * 1024;
 
 use candle::vram::PAGEABLE_RESERVE;

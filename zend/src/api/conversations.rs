@@ -189,11 +189,13 @@ pub async fn get(
     }
 
     let title = session.conversation_label(&id);
+    let branches = session.conversation_branches(&id);
     let dials = session.conversation_dials(&id);
     Ok(compressed::json(
         &HistoryBody {
             id,
             title,
+            branches,
             messages,
             uploads,
             dials,
@@ -231,6 +233,11 @@ pub struct HistoryBody {
     /// label the sidebar lists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The branch this conversation works on in each repository, by
+    /// repository name. Absent when it has none — a workspace with no git
+    /// repository, or a conversation the model has not loaded.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub branches: BTreeMap<String, String>,
     pub messages: Vec<HistoryMessage>,
     /// Every file uploaded to this conversation (recovered from the
     /// substrate), newest-last — hydrates the files pane on resume.

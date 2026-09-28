@@ -42,7 +42,7 @@ use candle::{DType, Device};
 use candle_conversation::persistence::record::ChunkPayload;
 use candle_conversation::persistence::resume::decode_token_ids;
 use candle_conversation::persistence::streams::{StreamDecl, StreamId};
-use candle_conversation::persistence::SubstratePersistence;
+use candle_conversation::persistence::{SubstratePersistence, SUBSTRATE_DIR};
 use candle_conversation::substrate::Substrate;
 use candle_nn::kv_cache::KvFormat;
 use tokenizers::Tokenizer;
@@ -610,7 +610,7 @@ fn main() -> anyhow::Result<()> {
     let mut substrate = Substrate::new();
     let mut persistence = SubstratePersistence::open_in_with_substrate(&workspace, &mut substrate)
         .map_err(|e| anyhow::anyhow!("open: {e}"))?;
-    let tok = Tokenizer::from_file(workspace.join(".substrate").join("tokenizer.json"))
+    let tok = Tokenizer::from_file(workspace.join(SUBSTRATE_DIR).join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tok: {e}"))?;
 
     // ── KCHECK: for a turn with dead wide-Q tokens, are the K values also zero? ──

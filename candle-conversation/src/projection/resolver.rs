@@ -2,7 +2,7 @@
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -21,17 +21,19 @@ use super::warm_pool;
 use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDivergence};
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
-use crate::persistence::manifest::{self, RecordLoc};
+use crate::persistence::manifest::{self, ConvState, RecordLoc};
 use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SnapshotPayload,
     TreeMetadataPayload,
 };
-use crate::persistence::resume::TurnChunkGrid;
+use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
+use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::{SharedSubstrate, SubstratePersistence};
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
@@ -339,6 +341,14 @@ pub struct Conversation {
     /// turn or chunk stays RAM-resident. Read once from the handle at
     /// construction; a handle's mode never changes.
     read_only: bool,
+    /// Serialises conversation-state writes, from the in-RAM change to the
+    /// enqueue of the record carrying it. A `ConvState` record holds the whole
+    /// state, so two updates enqueued in the opposite order to the one they
+    /// changed RAM in would leave the older state winning on replay — a
+    /// branch set, then lost to an archive that read the state before it.
+    /// Held only by these writes, never by the writer thread, so holding it
+    /// across an enqueue that waits on backpressure cannot deadlock.
+    conv_state_writes: Arc<Mutex<()>>,
     /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
     /// in, removed when the last clone of that conversation drops.
     ///
@@ -487,6 +497,7 @@ impl Conversation {
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
             read_only: false,
+            conv_state_writes: Arc::default(),
             // The directory goes when the last clone of this conversation does.
             // See the field's own note for what it cost not to have this.
             ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
@@ -534,6 +545,7 @@ impl Conversation {
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
             read_only,
+            conv_state_writes: Arc::default(),
         }
     }
 
@@ -1894,10 +1906,15 @@ impl Conversation {
             // A belief group is never the projection target (the target is the
             // Sequence dialogue group, skipped above), but mirror the target mask
             // anyway so the invariant holds if that ever changes.
+            // A scoped group offers only what the target's own scope names —
+            // `Substrate::scoped_timelines_for_group` — so an out-of-scope
+            // conversation is never scanned, and never teaches the group's
+            // hit levels on this target's behalf.
             let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
             } else {
-                sub.active_timelines_for_group(group.id).collect()
+                sub.scoped_timelines_for_group(group.id, target.timeline)
+                    .collect()
             };
             // A tagged group reads only the conversations carrying its tags — the
             // same scope projection applies to its candidates, applied here so an
@@ -3316,32 +3333,100 @@ impl Conversation {
         self.read().live_timeline_ids()
     }
 
-    /// Set a conversation's `archived` lifecycle flag and persist it
-    /// as a `RecordType::ConvState` record. Idempotent: if the
-    /// substrate already holds the requested state, the record is
-    /// not written and the call returns `Ok(())` without touching the
-    /// log.
-    ///
-    /// Last-write-wins on replay — toggling archive↔unarchive each
-    /// appends one small record (~ 16 bytes payload + framing); a
-    /// subsequent compaction collapses the chain to one record per
-    /// timeline.
+    /// Set a conversation's `archived` lifecycle flag and persist its
+    /// state. Idempotent: if the substrate already holds the requested
+    /// flag, nothing is written.
     pub fn set_conversation_archived(
         &self,
         timeline: TimelineId,
         archived: bool,
     ) -> candle::Result<()> {
-        let changed = self.write().set_archived(timeline, archived);
-        if !changed {
-            return Ok(());
-        }
-        let state = crate::persistence::manifest::ConvState { archived };
-        let payload = manifest::encode_conv_state_payload(timeline.raw(), state);
-        self.writer.enqueue(WriteJob::ConvMeta {
-            record: RecordType::ConvState,
-            payload,
-        });
+        self.update_conv_state(timeline, |sub| sub.set_archived(timeline, archived));
         Ok(())
+    }
+
+    /// Set the branch `timeline` works on in each repository `branches`
+    /// names — repository name to branch — leaving any other repository's as
+    /// it is, and persist the state once. Idempotent: when nothing changes,
+    /// nothing is written.
+    pub fn set_conversation_branches(
+        &self,
+        timeline: TimelineId,
+        branches: &BTreeMap<String, String>,
+    ) {
+        self.update_conv_state(timeline, |sub| {
+            let mut changed = false;
+            for (repo, branch) in branches {
+                changed |= sub.set_branch(timeline, repo, branch);
+            }
+            changed
+        });
+    }
+
+    /// Stage `write` — a set of `timeline`'s changes to its files — as
+    /// events on the timeline, events before tombstones, for the persistence
+    /// thread's group commit to make durable. Returns the sequence numbers
+    /// the events took. A read-only substrate refuses: the
+    /// caller mirrors what was written, and nothing was.
+    pub fn write_conversation_files(
+        &self,
+        timeline: TimelineId,
+        write: &VfsWrite,
+    ) -> candle::Result<Vec<u64>> {
+        if self.read_only {
+            return Err(candle::Error::Msg(
+                "write_conversation_files: the substrate is read-only".to_string(),
+            ));
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_vfs(timeline.raw(), write)
+            .map_err(|e| candle::Error::Msg(format!("write_conversation_files: {e}")))
+    }
+
+    /// Every live event of `timeline`'s files, read back in
+    /// `(repo, key, seq)` order.
+    pub fn conversation_files(&self, timeline: TimelineId) -> candle::Result<Vec<VfsEventPayload>> {
+        let mut p = self.persistence.lock().unwrap();
+        p.vfs_events(timeline.raw())
+            .map_err(|e| candle::Error::Msg(format!("conversation_files: {e}")))
+    }
+
+    /// `timeline`'s conversation state — archived flag and branches — or
+    /// `None` for an unregistered timeline.
+    pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.read().conv_state(timeline)
+    }
+
+    /// Apply `change` to the substrate and, when it reports a change, persist
+    /// `timeline`'s whole resulting state as a `RecordType::ConvState` record.
+    ///
+    /// Every record carries the complete state, so replay is last-writer-wins
+    /// on the whole of it and a later compaction keeps one record per
+    /// timeline. The state is read in the same write-lock hold that changed
+    /// it, and `conv_state_writes` keeps the enqueue order equal to that
+    /// order — see the field.
+    fn update_conv_state(&self, timeline: TimelineId, change: impl FnOnce(&mut Substrate) -> bool) {
+        let _ordered = self
+            .conv_state_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = {
+            let mut sub = self.write();
+            if !change(&mut sub) {
+                return;
+            }
+            sub.conv_state(timeline)
+        };
+        let Some(state) = state else {
+            return;
+        };
+        if self.read_only {
+            return;
+        }
+        self.writer.enqueue(WriteJob::ConvState {
+            timeline: timeline.raw(),
+            payload: manifest::encode_conv_state_payload(timeline.raw(), &state),
+        });
     }
 
     /// Whether `timeline` is currently archived. Untouched / unknown
@@ -3366,6 +3451,56 @@ impl Conversation {
         p.write_tombstone(timeline.raw(), None)
             .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
         Ok(())
+    }
+
+    /// Tombstone a section stream — the section counterpart of
+    /// [`Self::tombstone_timeline`]. Marks it logically deleted both in-RAM
+    /// (so the ingest triage's `section_exists` / `section_stream_is_persisted`
+    /// checks stop treating it as present or restorable on the very next
+    /// request, in this same process) and on disk (via a
+    /// [`crate::persistence::record::RecordType::SectionTombstone`] record,
+    /// so a restarted daemon doesn't reload the same corruption). The
+    /// compactor drops the underlying `Chunk`/`Tokens`/`StreamDecl` records
+    /// on the next compaction pass; ordinary reads never see them once this
+    /// lands.
+    pub fn tombstone_section(
+        &self,
+        stream_id: StreamId,
+        reason: Option<&str>,
+    ) -> candle::Result<()> {
+        self.write().tombstone_section(stream_id);
+        if self.read_only {
+            return Ok(());
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_section_tombstone(stream_id.0, reason)
+            .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+        Ok(())
+    }
+
+    /// Re-read a persisted section's per-layer chunk windows off disk and
+    /// run the generic [`first_divergent_chunk`] check against them —
+    /// confirmation from what is actually persisted, not a trust of a live
+    /// seal failure alone. Returns the first divergence found, or `None`
+    /// when the stream holds no durable chunks (nothing to confirm) or its
+    /// persisted layers agree (the seal failure that prompted the caller to
+    /// ask must have another cause — see the reactive hook at
+    /// `scheduler::Scheduler::perform_seal_and_write`).
+    ///
+    /// Read-only by design: this only answers the question. A caller that
+    /// wants to act on a confirmed divergence calls [`Self::tombstone_section`]
+    /// itself, so a caller that only wants the answer (a future boot-time
+    /// pass, a diagnostic) never also accepts the side effect.
+    pub fn check_section_window_integrity(
+        &self,
+        stream_id: StreamId,
+        n_layers: usize,
+    ) -> candle::Result<Option<WindowDivergence>> {
+        let mut p = self.persistence.lock().unwrap();
+        let substrate = self.read();
+        let windows = read_persisted_section_windows(&mut p, &substrate, stream_id, n_layers)
+            .map_err(|e| candle::Error::Msg(format!("check_section_window_integrity: {e}")))?;
+        Ok(windows.and_then(|w| first_divergent_chunk(&w)))
     }
 
     /// Tombstone **one turn** of a live timeline — in-RAM and on disk — leaving
@@ -4001,10 +4136,20 @@ impl Conversation {
     /// address has been persisted and can be cold-loaded back into
     /// hot without re-prefilling.  The check matches the ingest
     /// loop's skip-if-present gate.
+    ///
+    /// A tombstoned stream (see [`Substrate::tombstone_section`]) always
+    /// reads `false` here, even though its `Chunk` records are still on
+    /// disk until the next compaction pass physically drops them — the
+    /// whole point of the tombstone is that those chunks must never be
+    /// restored again, so the triage that reads this must see "not
+    /// persisted" and fall through to a fresh prefill instead.
     pub fn section_stream_is_persisted(&self, stream_id: StreamId) -> bool {
         drop(self.persistence.lock().unwrap());
-        self.read()
-            .stream_of(stream_id)
+        let view = self.read();
+        if view.is_section_tombstoned(stream_id) {
+            return false;
+        }
+        view.stream_of(stream_id)
             .map(|s| s.committed_through.is_some() && !s.chunks.is_empty())
             .unwrap_or(false)
     }
@@ -4400,8 +4545,10 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             keys.extend(injected.into_iter().flat_map(turns_of));
             return keys;
         }
+        // The same scope the belief scan applied: what was never scored for
+        // this target is never selected for it either.
         self.read
-            .active_timelines_for_group(group)
+            .scoped_timelines_for_group(group, self.target.timeline)
             .flat_map(turns_of)
             .collect()
     }
@@ -4530,9 +4677,12 @@ mod tests {
         warmable, Conversation, Observe,
     };
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use crate::persistence::content_hash::turn_stream_id;
+    use crate::persistence::manifest::ConvState;
+    use crate::persistence::vfs::{VfsAppend, VfsWrite};
     use crate::persistence::{dir_fingerprint, SharedSubstrate, SubstratePersistence};
     use crate::projection::{GroupId, LayerId, TimelineId};
     use crate::substrate::{Substrate, TurnPartWrite};
@@ -4753,6 +4903,70 @@ mod tests {
             dir.is_dir(),
             "a workspace conversation deleted the directory it was opened on"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A conversation's state survives a reopen whole.** Branches set, a
+    /// file event written, an archive after them, then one branch moved: each
+    /// record carries the whole state, so the archive keeps the branches, the
+    /// move keeps the archive, and the log replays to exactly the state RAM
+    /// held — and the file event reads back beside it.
+    #[test]
+    fn conversation_state_survives_a_reopen_whole() {
+        let dir = std::env::temp_dir().join(format!(
+            "candle-conv-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let tl = TimelineId::from_raw(7).expect("timeline id");
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(r, b)| (r.to_string(), b.to_string()))
+                .collect()
+        };
+        let expected = ConvState {
+            archived: true,
+            branches: map(&[("candle", "zen/work"), ("mind", "master")]),
+        };
+        let write = VfsWrite {
+            tombstones: Vec::new(),
+            events: vec![VfsAppend {
+                repo: "candle".into(),
+                key: "src/lib.rs".into(),
+                body: serde_json::json!({ "kind": "state", "size": 3, "conflict": false }),
+            }],
+        };
+        {
+            let mut substrate = Substrate::new();
+            let p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let conv = Conversation::from_parts(substrate, p);
+            conv.register_timeline(tl, layer, group);
+            conv.set_conversation_branches(tl, &map(&[("candle", "main"), ("mind", "master")]));
+            assert_eq!(conv.write_conversation_files(tl, &write).unwrap(), vec![0]);
+            conv.set_conversation_archived(tl, true).unwrap();
+            conv.set_conversation_branches(tl, &map(&[("candle", "zen/work")]));
+            assert_eq!(conv.conversation_state(tl), Some(expected.clone()));
+            conv.flush_writer();
+            conv.commit_persistence().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let conv = Conversation::from_parts(substrate, p);
+            conv.register_timeline(tl, layer, group);
+            assert_eq!(conv.conversation_state(tl), Some(expected));
+            let files = conv.conversation_files(tl).unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].key, "src/lib.rs");
+            assert_eq!(files[0].body, write.events[0].body);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

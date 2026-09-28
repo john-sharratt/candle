@@ -1,0 +1,122 @@
+name: git_log
+questions:
+- what were the last few commits on this branch
+- who wrote the most recent changes here
+- show me the commit history for that file
+- when was this function first introduced
+- what is on my branch that main does not have
+- list the commits since we branched off
+- find the commit that touched this config
+- what landed in the repo this week
+- give me the commit ids for the last ten changes
+- trace this file back through its renames
+- which commits mention that ticket number
+- what was the last thing merged
+- show the history of src/lib.rs including older names
+- how many commits are ahead of the release branch
+- what changed in the repository recently
+- I need the sha of the commit that added this
+- walk back through the revisions of that module
+- what work is unmerged on this feature branch
+- show commits by date with their authors
+- which revision introduced the regression
+- which commits are behind that block of lines in the config
+- who wrote the opening lines of this module, and in which commit
+category: Git
+description: 'Read a repository''s commit history, newest first, 20 commits a page: each commit''s full object id, author, ISO date and subject line (a merge also lists its parents as `merge_of`), plus a `count` of how many commits the range holds (`counted_all` says whether the walk reached the end of history). A commit''s full message is git_show''s, on the first page of its `changes`. Narrow it with `rev` (start walking from a branch, tag or commit instead of HEAD), `since` (exclude commits already reachable from another revision) and `paths` (only commits that touched those files), with `follow_renames` to track one file back across its renames. **`since` is how to answer "what is on this branch that main does not have" and "how far ahead am I": set `rev` to the branch and `since` to what you are comparing against, then READ the `count`** — the number is reported, never counted off the listing, and never guessed. To compare against a remote, `since` is `{"kind":"remote_branch","name":"origin/main"}`, or `{"kind":"upstream"}` for whatever the branch tracks; both are revisions like any other, so neither needs an object id. Object ids come back in full, so the id you get is the one git_show will accept. With one file in `paths`, `lines` narrows the history to the commits that last changed those lines — who wrote them and when, rather than whoever last touched the file anywhere — and `line_runs` says which commit owns which lines. Use for "what changed recently", "when was this introduced", "what are the last few commits", "who changed these lines", or to get a commit id for another call. `page` is required: pass 0 for the newest commits, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    LineSpan:
+      description: A span of a file's lines, 1-based and inclusive.
+      properties:
+        end:
+          description: The last line, inclusive. Past the end of the file reads as the end.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        start:
+          description: The first line, counting from 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+      required:
+      - start
+      - end
+      type: object
+    RevArg:
+      description: 'A revision. `kind` picks the form and `name` carries its value.'
+      properties:
+        back:
+          description: For `parent` only — how many commits back. Defaults to 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        kind:
+          description: 'Which form: `head` (your own commit — the branch you are on as your files have it — needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          enum:
+          - head
+          - branch
+          - tag
+          - ref
+          - commit
+          - remote_branch
+          - upstream
+          - parent
+          type: string
+        name:
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
+          type: string
+      required:
+      - kind
+      type: object
+  properties:
+    follow_renames:
+      description: Follow one file back through its renames. Needs exactly one entry in `paths` and no `since`.
+      type: boolean
+    page:
+      description: Zero-based page of commits, 20 a page. Required — pass 0 for the newest. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
+      format: uint32
+      minimum: 0.0
+      type: integer
+    paths:
+      description: Only commits that touched these repository-relative paths. Leave it out for every commit.
+      items:
+        type: string
+      type: array
+    lines:
+      allOf:
+      - $ref: '#/definitions/LineSpan'
+      description: Only the commits that last changed these lines of the one file in `paths` — who wrote them and when, rather than who last touched the file anywhere. 1-based and inclusive, at most 200 lines. Needs exactly one entry in `paths` and no `since`.
+    repo:
+      description: The repository to read. Required.
+      minLength: 1
+      type: string
+    rev:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: Where to start walking back from. Leave it out for the branch you are on.
+    since:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: Stop at commits already reachable from this revision — how to ask "what is on my branch that main does not have" and, through the reply's `count`, how far ahead it is; against a remote that is `{"kind":"remote_branch","name":"origin/main"}`. Leave it out for the whole history behind `rev`.
+  required:
+  - repo
+  - page
+  title: LogRequest
+  type: object
+examples:
+- what were the last few commits in candle<|im_end|>
+- show me the history of src/lib.rs<|im_end|>
+- what is on this feature branch that main does not have<|im_end|>
+- who last changed the deployment doc and when<|im_end|>
+- find the commit that introduced the timeout constant<|im_end|>
+- how many commits am I ahead of main<|im_end|>
+- follow that file back through its renames<|im_end|>
+- what has landed on the release tag since the last one<|im_end|>
+- which commits wrote lines 10 to 30 of the scheduler module<|im_end|>
+- list the commits on origin's docs branch that I do not have locally<|im_end|>
+- what is new on the remote hotfix branch<|im_end|>
+- what does the docs branch on origin add over main<|im_end|>
+- which commits would I get from the perf branch that main does not have yet<|im_end|>

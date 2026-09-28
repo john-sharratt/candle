@@ -36,6 +36,7 @@ use candle_conversation::persistence::record::SnapshotPayload;
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, SequenceConfig};
+use zend_vfs::Workspace as ServedWorkspace;
 
 const PROJECTION_YAML: &str = include_str!("../../src/prompts/projection.yaml");
 
@@ -301,7 +302,7 @@ impl Default for Workspace {
 /// **Never the source tree.** A daemon writes its substrate, logs and uploads
 /// into its workspace. Booting on the repo root writes into the user's live
 /// substrate; booting on `current_dir()` — the crate directory under
-/// `cargo test` — is how a 3.2 GB `zend/.substrate` came to sit in the tree.
+/// `cargo test` — is how a 3.2 GB `zend/substrate` came to sit in the tree.
 ///
 /// **Not a fresh temp dir either.** The tool catalog calibrates into the
 /// substrate — ~17 min for the production model on the 16 GB card — and a
@@ -313,6 +314,16 @@ pub fn production_workspace() -> PathBuf {
     std::fs::create_dir_all(&ws).expect("create the production workspace");
     ws
 }
+
+/// The daemon's view of the test workspace at `ws`: one repository, `project`
+/// (its folder created, empty unless a test writes into it), plus uploads.
+pub fn served(ws: &Path) -> ServedWorkspace {
+    zend::workspace::single_repo(ws, PROJECT_REPO).expect("the test workspace")
+}
+
+/// The one repository a test workspace holds — where a test writes the files
+/// its tools should see.
+pub const PROJECT_REPO: &str = "project";
 
 /// Past this size a reused workspace is compacted on its next boot.
 ///

@@ -400,12 +400,13 @@ mod tests {
     /// **A delimiter the grammar does not continue with reaches the decode loop
     /// as a drop**, so it is never committed, and the grammar's own structure is
     /// the next thing written. Here the model ends a number with `]` inside an
-    /// object whose `}` comes next.
+    /// object whose `}` comes next. (A `number`: an integer's digits and its
+    /// ending are masked, so a stray `]` cannot be sampled there at all.)
     #[test]
     fn a_misplaced_delimiter_after_a_value_is_dropped() {
         let v = TestVocab::new();
         let tree = tool_tree(
-            r#"[{"name":"seek","params":[{"name":"at","type":"integer","required":true}]}]"#,
+            r#"[{"name":"seek","params":[{"name":"at","type":"number","required":true}]}]"#,
         );
         let mut driver = StencilDriver::new(tree);
         let mut text: Vec<u8> = Vec::new();
@@ -499,16 +500,82 @@ mod tests {
                     text.starts_with("<tool_call>\n{\"name\": \"ping\""),
                     "unexpected run: {text:?}"
                 );
-                // Up to the colon: the value's leading space is the model's.
+                // Through the key; in this byte vocabulary the space every
+                // digit arm shares is prefilled with it.
                 assert!(
-                    text.ends_with("\"n\":"),
+                    text.trim_end().ends_with("\"n\":"),
                     "run should reach the value: {text:?}"
                 );
             }
             other => panic!("expected a single Prefill run, got {other:?}"),
         }
-        // After the run, the next step is the integer value's free decode.
-        assert!(matches!(driver.step(), StepMask::Free { .. }));
+        // After the run, the integer's first digit is a masked choice: a digit
+        // or a sign, and nothing that could open a string.
+        let StepMask::Branch(set) = driver.step() else {
+            panic!("an integer value begins with a masked choice");
+        };
+        assert!(set.contains(b'7' as TokenId), "{set:?}");
+        assert!(
+            set.contains(b'-' as TokenId),
+            "unsigned only with a minimum"
+        );
+        assert!(!set.contains(b'"' as TokenId), "{set:?}");
+    }
+
+    /// A driver stepped to an integer value's first masked choice.
+    fn at_integer(catalog: &str) -> (StencilDriver, AllowedSet) {
+        let mut driver = StencilDriver::new(tool_tree(catalog));
+        assert!(matches!(driver.step(), StepMask::Prefill(_)));
+        let StepMask::Branch(set) = driver.step() else {
+            panic!("an integer value begins with a masked choice");
+        };
+        (driver, set)
+    }
+
+    /// **A `minimum` of zero — every `u32` in the catalog — offers no sign**, so
+    /// a page, a line number or a count cannot be decoded negative.
+    #[test]
+    fn an_unsigned_integer_is_offered_no_sign() {
+        let (_, set) = at_integer(
+            r#"[{"name":"read","params":[
+                 {"name":"page","type":"integer","minimum":0.0,"required":true}]}]"#,
+        );
+        assert!(!set.contains(b'-' as TokenId), "{set:?}");
+        for d in b'0'..=b'9' {
+            assert!(set.contains(d as TokenId), "digit {}", d as char);
+        }
+    }
+
+    /// **A leading zero ends the number**, as JSON requires — `07` is not a
+    /// number — so after it only what follows the value can be written.
+    #[test]
+    fn a_leading_zero_ends_the_number() {
+        let (mut driver, _) = at_integer(
+            r#"[{"name":"read","params":[
+                 {"name":"page","type":"integer","minimum":0.0,"required":true}]}]"#,
+        );
+        assert_eq!(driver.accept(b'0' as TokenId, b"0"), Healed::No);
+        let after = driver.step();
+        let allowed = match &after {
+            StepMask::Branch(set) => set.clone(),
+            StepMask::Prefill(_) => return, // the close is the only way on
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(!allowed.contains(b'5' as TokenId), "{allowed:?}");
+    }
+
+    /// **Past the first digit, each step is another digit or the value's end**,
+    /// and the end carries what follows it: here the call's close.
+    #[test]
+    fn an_integer_writes_its_digits_then_what_follows() {
+        let v = TestVocab::new();
+        let tree = tool_tree(
+            r#"[{"name":"read","params":[
+                 {"name":"page","type":"integer","minimum":0.0,"required":true}]}]"#,
+        );
+        let target =
+            "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"page\": 42}}\n</tool_call>";
+        assert_eq!(follow(tree, target, &v), target);
     }
 
     // ── Free-text exit healing (the merged exit-token edge cases) ───────────
@@ -530,8 +597,11 @@ mod tests {
         {"name":"create","type":"boolean","required":false}]}]"#;
     const STR_ONLY: &str = r#"[{"name":"read_file","params":[
         {"name":"path","type":"string","required":true}]}]"#;
-    const INT_ONLY: &str = r#"[{"name":"wait","params":[
-        {"name":"secs","type":"integer","required":true}]}]"#;
+    /// A `number` is still a free, lookahead-terminated value — an integer is
+    /// not (it is written under the mask) — so the lookahead mechanics are
+    /// exercised through one.
+    const NUM_ONLY: &str = r#"[{"name":"wait","params":[
+        {"name":"secs","type":"number","required":true}]}]"#;
 
     #[test]
     fn tool_call_value_span_is_never_a_terminal_close_span() {
@@ -661,10 +731,10 @@ mod tests {
 
     #[test]
     fn lookahead_value_merged_with_delimiter() {
-        // Integer value: lookahead terminator.  `30}` is one token — the `30`
+        // Number value: lookahead terminator.  `30}` is one token — the `30`
         // is the value (consumed=2), the `}` is the lookahead delimiter.
         let v = TestVocab::new().with_special("30}", 300);
-        let mut d = driver_at_first_value(INT_ONLY, &v);
+        let mut d = driver_at_first_value(NUM_ONLY, &v);
         assert_eq!(
             d.accept(300, b"30}"),
             Healed::Rewrite {
@@ -678,7 +748,7 @@ mod tests {
         // The delimiter arrives as its own token: a clean lookahead (consumed=0),
         // handled by push-back — not a heal.
         let v = TestVocab::new();
-        let mut d = driver_at_first_value(INT_ONLY, &v);
+        let mut d = driver_at_first_value(NUM_ONLY, &v);
         assert_eq!(d.accept(b'3' as TokenId, b"3"), Healed::No);
         assert_eq!(d.accept(b'0' as TokenId, b"0"), Healed::No);
         assert_eq!(d.accept(b'}' as TokenId, b"}"), Healed::No); // whole token = delimiter

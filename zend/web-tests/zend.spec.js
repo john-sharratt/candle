@@ -237,12 +237,12 @@ test.describe('1.5c the tools dial follows the caller role', () => {
     await page.getByTitle('Tools').click();
     return page.evaluate(() => [...document.querySelectorAll('button span')]
       .map((s) => s.textContent.trim())
-      .filter((t) => ['None', 'Restricted', 'Comprehensive', 'Mutable'].includes(t)));
+      .filter((t) => ['None', 'Restricted', 'Comprehensive'].includes(t)));
   };
 
-  test('an admin is offered every mode, Mutable included', async ({ page }) => {
+  test('an admin is offered every mode, Comprehensive included', async ({ page }) => {
     await boot(page);
-    await expect.poll(() => toolsMenu(page)).toEqual(['None', 'Restricted', 'Comprehensive', 'Mutable']);
+    await expect.poll(() => toolsMenu(page)).toEqual(['None', 'Restricted', 'Comprehensive']);
   });
 
   test('a non-admin is offered None and Restricted, and starts at Restricted', async ({ page }) => {

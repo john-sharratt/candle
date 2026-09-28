@@ -244,7 +244,7 @@ across the warp.
   evicted `SealedSequence` becomes `ArenaLocation::Cpu` with its GIDs
   re-pointed via `HeadGids::map_unique`; the original GPU GIDs drop,
   reclaiming VRAM through the allocator's RAII.
-- **Cold** — the append-only redo log at `.substrate/substrate.log` (§8.3).
+- **Cold** — the append-only redo log at `substrate/substrate.log` (§8.3).
   Cold storage persists **KV cache blocks, not raw tokens** —
   `docs/unbounded_agents.md` §7 explains why: replaying prefill over stored
   tokens would not reproduce the same KV values the model attended with
@@ -457,7 +457,7 @@ YAML itself.
 
 `candle-conversation/src/persistence/` is a generalized (not
 conversation-specific) module: an append-only, content-addressed redo log at
-`.substrate/substrate.log`, split into ~4 GiB segment files (`segment.rs`,
+`substrate/substrate.log`, split into ~4 GiB segment files (`segment.rs`,
 `segmented_log.rs` — [`docs/archived/segmented_substrate_log.md`](docs/archived/segmented_substrate_log.md))
 once large. **There is no in-memory-only mode** — `Substrate` cannot be
 constructed without a backing log; every turn append and section ingest goes

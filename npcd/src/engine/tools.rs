@@ -1778,8 +1778,11 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
                     // An act's arguments are scalars; none is a container, and
                     // none may be null.
                     items: None,
+                    min_items: 0,
                     properties: None,
                     nullable: false,
+                    minimum: None,
+                    requires: Vec::new(),
                 })
                 .collect(),
         })

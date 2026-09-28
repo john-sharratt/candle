@@ -10,8 +10,9 @@
 //! Keys are derived from the record header alone: `Chunk` is keyed by
 //! `(stream_id, chunk_index)`; the per-stream last-writer-wins types
 //! (`Tokens`, `StreamDecl`, `Commit`, `ProjectionEvents`, `WideQSig`)
-//! by `stream_id`; the workspace singletons by type. The timeline-keyed
-//! metadata types (`Label`, `ConvState`, `TreeMetadata`, `DebugId`,
+//! by `stream_id`; the workspace singletons by type. `ConvState` carries its
+//! timeline in the header's `stream_id` and is keyed by it. The other
+//! timeline-keyed metadata types (`Label`, `TreeMetadata`, `DebugId`,
 //! `Tombstone`) carry their key inside the payload, which the header
 //! scan doesn't decode — they are sector-sized records whose dead
 //! weight is negligible next to chunk bytes, so they are left out and
@@ -47,6 +48,13 @@ impl RecordAccounting {
     pub fn record(&mut self, header: &RecordHeader, padded_size: u64) {
         let key = match header.record_type {
             RecordType::Chunk => (RecordType::Chunk, header.stream_id, header.chunk_index),
+            // A conversation's file events and tombstones are keyed by timeline
+            // and sequence number, each unique: nothing supersedes one. An
+            // event dies by a tombstone or with its timeline, and the index
+            // that sees that says so through `retire`.
+            RecordType::VfsEvent | RecordType::VfsTombstone => {
+                (header.record_type, header.stream_id, header.chunk_index)
+            }
             // `Snapshot` is header-keyed by a synthetic per-timeline stream
             // id: the newest snapshot supersedes the previous one here — this
             // insert-returning-old IS the single-tail tombstone (design doc
@@ -66,7 +74,15 @@ impl RecordAccounting {
             | RecordType::Snapshot
             // A branch checkpoint supersedes by the same rule: one live record
             // per branch, keyed by the branch's content prefix in the header.
-            | RecordType::BranchCheckpoint => (header.record_type, header.stream_id, 0),
+            | RecordType::BranchCheckpoint
+            // A section tombstone is keyed by the section's `StreamId` in the
+            // header too — one live marker per section, same mechanical
+            // supersession as `Npc` and the branch checkpoint.
+            | RecordType::SectionTombstone
+            // A conversation's state carries its timeline id in the header's
+            // `stream_id` and is written whole every time, so the newest record
+            // supersedes the last by the same rule.
+            | RecordType::ConvState => (header.record_type, header.stream_id, 0),
             RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => {
                 (header.record_type, 0, 0)
             }
@@ -76,7 +92,6 @@ impl RecordAccounting {
             // compaction. `Distilled` markers are payload-keyed and
             // consumed by the next compaction pass.
             RecordType::Label
-            | RecordType::ConvState
             | RecordType::TreeMetadata
             | RecordType::DebugId
             | RecordType::Tombstone
@@ -87,6 +102,16 @@ impl RecordAccounting {
         };
         if let Some(old) = self.live_sizes.insert(key, padded_size) {
             self.dead_bytes += old;
+        }
+    }
+
+    /// Count the live record keyed `(rt, stream_id, index)` as dead — for a
+    /// record nothing supersedes but something else killed: a file event its
+    /// tombstone named, or whose timeline was tombstoned. A key not live is
+    /// left alone, so retiring twice counts once.
+    pub fn retire(&mut self, rt: RecordType, stream_id: u64, index: u64) {
+        if let Some(size) = self.live_sizes.remove(&(rt, stream_id, index)) {
+            self.dead_bytes += size;
         }
     }
 
@@ -153,6 +178,18 @@ mod tests {
         assert_eq!(acc.dead_bytes(), 4096);
     }
 
+    /// **A conversation's new state supersedes its last**, keyed by the
+    /// timeline in the header, and never another conversation's.
+    #[test]
+    fn conv_state_supersedes_per_timeline() {
+        let mut acc = RecordAccounting::new();
+        acc.record(&header(RecordType::ConvState, 11, 0), 4096);
+        acc.record(&header(RecordType::ConvState, 12, 0), 4096);
+        assert_eq!(acc.dead_bytes(), 0, "two conversations, both live");
+        acc.record(&header(RecordType::ConvState, 11, 0), 4096);
+        assert_eq!(acc.dead_bytes(), 4096, "11's first state is dead");
+    }
+
     /// Payload-keyed metadata types and the derived `HeaderIndex`
     /// records are excluded — never counted dead.
     #[test]
@@ -164,6 +201,22 @@ mod tests {
             acc.record(&header(RecordType::HeaderIndex, 0, 0), 4096);
         }
         assert_eq!(acc.dead_bytes(), 0);
+    }
+
+    /// **A file event is live until something retires it** — its sequence
+    /// number is unique, so no later record supersedes it — and retiring it
+    /// twice counts it once.
+    #[test]
+    fn a_file_event_is_live_until_retired() {
+        let mut acc = RecordAccounting::new();
+        acc.record(&header(RecordType::VfsEvent, 7, 1), 4096);
+        acc.record(&header(RecordType::VfsEvent, 7, 2), 8192);
+        assert_eq!(acc.dead_bytes(), 0);
+        acc.retire(RecordType::VfsEvent, 7, 2);
+        acc.retire(RecordType::VfsEvent, 7, 2);
+        assert_eq!(acc.dead_bytes(), 8192);
+        acc.retire(RecordType::VfsEvent, 7, 9);
+        assert_eq!(acc.dead_bytes(), 8192, "a key never live retires nothing");
     }
 
     #[test]

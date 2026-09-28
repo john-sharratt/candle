@@ -1,67 +1,64 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use candle_conversation::models::Model;
 use web::auth::Roles;
+use zend_tools::state::Secrets;
+use zend_vfs::Workspace;
 
 use crate::access::Gateways;
 
 /// Runtime configuration for the zend daemon.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DaemonConfig {
-    /// Absolute path to the root of the workspace being served.
-    pub workspace: PathBuf,
+    /// The workspace being served: its folder (absolute) — where `substrate/`
+    /// and an optional `projection.yaml` live — and its repositories, the
+    /// uploads repository included ([`crate::workspace::open`]).
+    pub workspace: Workspace,
+    /// The API keys and tokens the tools and the git layer present, read once
+    /// at launch from `~/.zend/secrets.yaml` or the file `--secrets` names
+    /// ([`crate::secrets::load`]). Every context the daemon builds shares it.
+    pub secrets: Arc<Secrets>,
     /// TCP port the HTTP server listens on.
     pub port: u16,
     /// Projection layers taken OUT OF SERVICE (`--disable-layer <name>`,
     /// repeatable). A disabled layer still exists in the schema, but it is
-    /// inert: not populated at boot, not refreshed by the watcher, **excluded
-    /// from the provenance gather** (`Builder::set_layer_gathered`), not
-    /// normalization-warmed, and not swept for crashed partials. Its turns
-    /// remain in the substrate untouched — nothing is deleted and dropping the
-    /// flag restores them — but while disabled they cannot be selected into any
-    /// projection.
+    /// inert: not ingested from the branches, **excluded from the provenance
+    /// gather** (`Builder::set_layer_gathered`), not normalization-warmed, and
+    /// not swept for crashed partials. Its turns remain in the substrate
+    /// untouched — nothing is deleted and dropping the flag restores them — but
+    /// while disabled they cannot be selected into any projection.
     ///
     /// The one deliberate exception is an EXPLICIT UPLOAD: a bounded `read_file`
-    /// into a disabled per-file layer still runs, seeding that layer's registry
-    /// entry (see `InferenceState::ingest_uploaded_files`), because a user who
-    /// uploads a file has asked for it to be read. Those turns land in the
-    /// substrate like any other and become selectable once the flag is dropped.
+    /// into a disabled per-file layer still runs (see
+    /// `InferenceState::ingest_uploaded_files`), because a user who uploads a
+    /// file has asked for it to be read. Those turns land in the substrate like
+    /// any other and become selectable once the flag is dropped.
     ///
     /// Also names section **collections** (`response`, `mood`), which have no
     /// ingest pass of their own.
     pub disabled_layers: HashSet<String>,
-    /// Turn-sink layers kept IN SERVICE but not loaded (`--skip-layer <name>`,
-    /// repeatable). Disjoint from [`Self::disabled_layers`] — the stronger flag
-    /// wins, and `main` subtracts it — so consumers never have to encode the
-    /// precedence.
-    ///
-    /// A skipped layer is fully live: its existing turns compete in the gather,
-    /// its hit levels are warmed every boot, and its crashed-partial
-    /// conversations are retired. Only the READING is skipped: no startup
-    /// ingest pass and no watcher-driven refresh. The flag for "the corpus is
-    /// built, stop re-reading the disk".
-    pub skipped_layers: HashSet<String>,
-    /// Turn-sink layers to tombstone COMPLETELY before this load's registry is
-    /// seeded (`--wipe-layer <name>`, repeatable) — every conversation in the
-    /// layer, not just crashed partials, so the background ingest worker's
-    /// first pass re-ingests it from scratch. A targeted alternative to
+    /// Turn-sink layers to tombstone COMPLETELY before the background ingest
+    /// worker's first pass (`--wipe-layer <name>`, repeatable) — every
+    /// conversation in the layer, not just crashed partials, so that pass
+    /// re-ingests it from scratch. A targeted alternative to
     /// [`Self`]-wide `--wipe-substrate`: every other layer's content (the live
     /// dialogue, an unnamed ingest layer, uploads) survives untouched. A layer
     /// also named by [`Self::disabled_layers`] is not wiped — a disabled layer
     /// gets no cleanup of any kind. `Raw` layers are not wipeable this way.
     pub wiped_layers: HashSet<String>,
-    /// Content-root overrides for derived ingest layers (`--ingest-dir
+    /// Folder overrides for derived ingest layers (`--ingest-dir
     /// <layer>=<path>`, repeatable), keyed by layer name. Each replaces the
-    /// folder that layer ingests from — relative to the workspace, or absolute.
-    /// Scopes a rebuild to a subtree (e.g. `code_reading=zend/src`) so the
-    /// substrate stays small instead of absorbing the whole workspace.
+    /// folder that layer ingests from, relative to the workspace folder — for
+    /// the code layers, one folder inside a repository. Scopes a rebuild to a
+    /// subtree (e.g. `code_reading=candle/zend/src`) so the substrate stays
+    /// small instead of absorbing every repository.
     pub ingest_dirs: HashMap<String, String>,
-    /// `--max-depth <N>`: how deep, in path components below each layer's
-    /// content root, the `repo_map` and `code_reading` walks and the watcher
-    /// read (`1` = the root's own files, `2` = one folder down). Content already
-    /// ingested from deeper is FROZEN — kept and still retrievable, but never
-    /// re-read and never retired by the deleted-path sweeps. `None` = unbounded.
+    /// `--max-depth <N>`: how deep, in path components below each repository's
+    /// root (or a layer's `--ingest-dir` folder), the `repo_map` and
+    /// `code_reading` branch walks read (`1` = the root's own files,
+    /// `2` = one folder down). Content ingested from deeper is not found by the
+    /// walk and is retired. `None` = unbounded.
     pub max_depth: Option<usize>,
     /// Force a whole-store redo-log compaction once during load, after the
     /// substrate reload and before serving. Normally reclaim is incremental and
@@ -71,8 +68,8 @@ pub struct DaemonConfig {
     pub compact_substrate: bool,
     /// Open the workspace's substrate READ-ONLY and write nothing to disk
     /// (`ModelBuilder::read_only_substrate`): every turn lives in RAM, and the
-    /// boot steps that exist to write — calibration, compaction, the watcher,
-    /// the upload reconcile and the background re-ingest — do not run. For a
+    /// boot steps that exist to write — calibration, compaction, the upload
+    /// reconcile and the background ingest worker — do not run. For a
     /// tool that reads a substrate the running daemon owns, beside it.
     pub read_only_substrate: bool,
     /// Which model the daemon runs (`--model <PRESET>`). Defaults to the
@@ -104,6 +101,35 @@ pub struct DaemonConfig {
     /// The peers whose identity headers are believed — see
     /// [`crate::access::Gateways`]. Loopback only unless the daemon names more.
     pub gateways: Gateways,
+    /// `--local-signin <email>`: the identity a loopback caller with no
+    /// forwarded `x-tokera-*` headers is recognized as — see
+    /// [`crate::access::role`]. `None` unless the daemon was started with it.
+    pub local_signin: Option<String>,
+}
+
+impl DaemonConfig {
+    /// A config serving `workspace` with every flag at its default: no
+    /// secrets, port 0, no layer flags, no depth bound, the measured-VRAM
+    /// model, nobody an admin, loopback the only trusted peer.
+    pub fn new(workspace: Workspace) -> Self {
+        Self {
+            workspace,
+            secrets: Arc::new(Secrets::empty()),
+            port: 0,
+            disabled_layers: HashSet::new(),
+            wiped_layers: HashSet::new(),
+            ingest_dirs: HashMap::new(),
+            max_depth: None,
+            compact_substrate: false,
+            read_only_substrate: false,
+            model: ModelChoice::default(),
+            qsa_selection_budget: None,
+            summarize: false,
+            roles: Roles::default(),
+            gateways: Gateways::default(),
+            local_signin: None,
+        }
+    }
 }
 
 /// Which model a daemon runs.
@@ -117,63 +143,4 @@ pub enum ModelChoice {
     /// `ModelSpec` in its `Custom` variant, which would otherwise size every
     /// `DaemonConfig` to it.
     Preset(Box<Model>),
-}
-
-/// Split the two layer flags into their final, DISJOINT sets: `(disabled,
-/// skipped)`.
-///
-/// `--disable-layer` is the stronger of the two and subsumes `--skip-layer` —
-/// inert beats merely unread — so a layer named in both is simply disabled, and
-/// the subtraction happens HERE, once, at the edge. Every consumer downstream
-/// then treats the sets as disjoint instead of re-deriving the precedence
-/// itself, which is the kind of duplicated rule that gets honoured on one branch
-/// and forgotten on the next.
-pub fn layer_flag_sets(disable: &[String], skip: &[String]) -> (HashSet<String>, HashSet<String>) {
-    let disabled: HashSet<String> = disable.iter().cloned().collect();
-    let skipped: HashSet<String> = skip
-        .iter()
-        .filter(|n| !disabled.contains(n.as_str()))
-        .cloned()
-        .collect();
-    (disabled, skipped)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::layer_flag_sets;
-
-    fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| (*s).to_string()).collect()
-    }
-
-    #[test]
-    fn a_layer_named_by_both_flags_is_disabled_not_skipped() {
-        let (disabled, skipped) = layer_flag_sets(&names(&["repo_map"]), &names(&["repo_map"]));
-        assert!(disabled.contains("repo_map"));
-        assert!(
-            skipped.is_empty(),
-            "disable subsumes skip, so the skip set must not also carry the layer: {skipped:?}",
-        );
-    }
-
-    #[test]
-    fn each_set_keeps_its_own_members_and_they_stay_disjoint() {
-        let (disabled, skipped) = layer_flag_sets(
-            &names(&["code_reading"]),
-            &names(&["repo_map", "code_reading"]),
-        );
-        assert_eq!(disabled.len(), 1);
-        assert!(disabled.contains("code_reading"));
-        // `repo_map` was only skipped, so it survives as skipped; `code_reading`
-        // is subtracted from the skip set because it is disabled outright.
-        assert_eq!(skipped.len(), 1);
-        assert!(skipped.contains("repo_map"));
-        assert!(disabled.is_disjoint(&skipped));
-    }
-
-    #[test]
-    fn no_flags_yields_two_empty_sets() {
-        let (disabled, skipped) = layer_flag_sets(&[], &[]);
-        assert!(disabled.is_empty() && skipped.is_empty());
-    }
 }

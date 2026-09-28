@@ -785,7 +785,7 @@ decisions; 12 is a perf guard.
 
 - **Conversation files (§2.5) — complete.** `conv_files` storage core
   (binary→hex→tokenizable→reconstruct, byte-exact, 6 tests) + a persistent
-  `ConvFileStore` under `.substrate/conv-files/` (model-independent, 4 tests) +
+  `ConvFileStore` under `substrate/conv-files/` (model-independent, 4 tests) +
   routes `POST/GET/GET content/DELETE` with **multipart upload → SSE per-part
   progress** + GUI live adapter (`uploadFiles`/`getFileContent`/`deleteFile`).
   **Full lifecycle harness-tested over real HTTP, no model** (upload → progress →

@@ -1,10 +1,13 @@
 //! Every way a tool starts a program, refused without [`Capability::Exec`].
 //!
 //! The JS VM checks the same capability itself (`tools::code::engine`); this
-//! module covers local subprocesses. Remote execution over SSH or telnet runs
-//! on the remote host, and reaches it only through [`crate::net`].
+//! module covers local subprocesses — started directly, or by a repository's
+//! sandbox. Remote execution over SSH or telnet runs on the remote host, and
+//! reaches it only through [`crate::net`].
 
 use std::process::Command;
+
+use zend_vfs::SandboxCommand;
 
 use crate::grants::{Capability, Grants, NotPermitted};
 
@@ -12,6 +15,13 @@ use crate::grants::{Capability, Grants, NotPermitted};
 pub fn command(grants: Grants, program: &str) -> Result<Command, NotPermitted> {
     grants.require(Capability::Exec)?;
     Ok(Command::new(program))
+}
+
+/// A [`SandboxCommand`] for `program`, when the context may run programs —
+/// what a repository's sandbox starts.
+pub fn sandbox_command(grants: Grants, program: &str) -> Result<SandboxCommand, NotPermitted> {
+    grants.require(Capability::Exec)?;
+    Ok(SandboxCommand::new(program))
 }
 
 #[cfg(test)]
@@ -26,6 +36,16 @@ mod tests {
             NotPermitted(Capability::Exec)
         );
         assert!(command(Grants::NONE.with(Capability::Exec), "ping").is_ok());
+        assert_eq!(
+            sandbox_command(Grants::NONE, "npm").unwrap_err(),
+            NotPermitted(Capability::Exec)
+        );
+        assert_eq!(
+            sandbox_command(Grants::NONE.with(Capability::Exec), "npm")
+                .unwrap()
+                .program,
+            "npm"
+        );
     }
 
     /// **Tool code starts programs only through this module.**

@@ -123,7 +123,13 @@ pub async fn completions(
     // projects, and whether its file tools change the disk. Resolved against
     // the caller's role (`crate::access`): absent is the role's default, and a
     // mode above the role runs as Restricted.
-    let role = access::role(&headers, peer, session.gateways(), session.roles());
+    let role = access::role(
+        &headers,
+        peer,
+        session.gateways(),
+        session.roles(),
+        session.local_signin(),
+    );
     let tools_mode = access::effective_mode(role, req.tools.as_ref().and_then(RequestTools::mode));
     // A client that runs its own tools sends their definitions instead.
     let client_tools = match req.tools {

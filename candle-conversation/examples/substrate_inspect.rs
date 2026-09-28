@@ -2,12 +2,12 @@
 //!
 //! The substrate persistence layer (`docs/archived/kv_tier_migration.md`) stores a
 //! conversation workspace as an append-only log of content-addressed
-//! records under `<workspace>/.substrate/substrate.log`. This tool opens
+//! records under `<workspace>/substrate/substrate.log`. This tool opens
 //! such a log read-only and renders it from several angles.
 //!
 //! ```text
 //! cargo run -p candle-conversation --example substrate_inspect -- \
-//!     .substrate/substrate.log summary
+//!     substrate/substrate.log summary
 //!
 //! Commands:
 //!   summary               file + superblock overview, record histogram, live/dead
@@ -52,7 +52,7 @@ use candle_conversation::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, Manifest,
 };
 use candle_conversation::persistence::record::{
-    ChunkPayload, DistillMode, DistillPayload, Record, RecordType, TombstonePayload,
+    ChunkPayload, DistillMode, DistillPayload, Record, RecordHeader, RecordType, TombstonePayload,
     TurnCouplingPayload,
 };
 use candle_conversation::persistence::recovery;
@@ -76,9 +76,9 @@ use tokenizers::Tokenizer;
     about = "Read-only inspector for a substrate redo log"
 )]
 struct Cli {
-    /// Path to inspect: the `.substrate` **directory** (the segmented redo
+    /// Path to inspect: the `substrate` **directory** (the segmented redo
     /// log) or a single `seg-*.log` / `seg-*.active` segment file. Defaults to
-    /// `.substrate` under the current directory. For a directory, `summary`
+    /// `substrate` under the current directory. For a directory, `summary`
     /// aggregates every segment; the other views open the active segment (pass
     /// a segment file to inspect a specific sealed segment).
     #[arg(short, long, global = true)]
@@ -87,7 +87,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-/// The default inspect target — `<cwd>/.substrate`, the segmented redo-log
+/// The default inspect target — `<cwd>/substrate`, the segmented redo-log
 /// directory the daemon writes.
 fn default_log_path() -> PathBuf {
     use candle_conversation::persistence::SUBSTRATE_DIR;
@@ -171,8 +171,15 @@ struct ConvRow {
     /// Winning `archived` flag — the last `ConvState` in ascending
     /// (segment, offset) order, exactly as the substrate reconstruct resolves it.
     archived: bool,
+    /// Winning branch per repository, from the same `ConvState` record — each
+    /// record carries the whole state, so these come from the winner alone.
+    branches: BTreeMap<String, String>,
     /// `(segment_id, offset)` of the `ConvState` that set the winning flag.
     state_loc: Option<(u64, u64)>,
+    /// The winning `ConvState`'s header `stream_id` — the timeline it is
+    /// keyed by for supersession accounting; `0` on a record written before
+    /// the key moved into the header.
+    state_key: u64,
     /// Total `ConvState` records seen for this timeline (across all segments).
     state_count: usize,
     /// Distill mode + `(segment_id, offset)` of the most recent `Distilled` marker.
@@ -253,13 +260,7 @@ fn fold_conversations(
 ) -> Result<()> {
     let (entries, _outcome) = walker::collect(log, FIRST_SEGMENT, SUPERBLOCK_SIZE)?;
     for e in &entries {
-        fold_one_conversation_record(
-            seg_id,
-            e.offset,
-            &e.record.header.record_type,
-            &e.record.payload,
-            rows,
-        )?;
+        fold_one_conversation_record(seg_id, e.offset, &e.record.header, &e.record.payload, rows)?;
     }
     Ok(())
 }
@@ -270,11 +271,11 @@ fn fold_conversations(
 fn fold_one_conversation_record(
     seg_id: u64,
     offset: u64,
-    record_type: &RecordType,
+    header: &RecordHeader,
     payload: &[u8],
     rows: &mut BTreeMap<u64, ConvRow>,
 ) -> Result<()> {
-    match record_type {
+    match header.record_type {
         RecordType::Label => {
             let (tl, meta) = decode_label_payload(payload)?;
             let row = rows.entry(tl).or_default();
@@ -292,7 +293,9 @@ fn fold_one_conversation_record(
             let (tl, st) = decode_conv_state_payload(payload)?;
             let row = rows.entry(tl).or_default();
             row.archived = st.archived;
+            row.branches = st.branches;
             row.state_loc = Some((seg_id, offset));
+            row.state_key = header.stream_id;
             row.state_count += 1;
         }
         RecordType::Distilled => {
@@ -379,6 +382,19 @@ fn print_conversations(rows: &BTreeMap<u64, ConvRow>, filters: &[String], limit:
         let meta = row.custom_summary();
         if !meta.is_empty() {
             println!("                     meta: {meta}");
+        }
+        if !row.branches.is_empty() {
+            let branches: Vec<String> = row
+                .branches
+                .iter()
+                .map(|(repo, branch)| format!("{repo}={branch}"))
+                .collect();
+            let keyed = if row.state_key == *tl {
+                "keyed by timeline".to_string()
+            } else {
+                format!("header key {:#x}", row.state_key)
+            };
+            println!("    branches: {}  ({keyed})", branches.join(", "));
         }
         shown += 1;
     }
@@ -596,13 +612,7 @@ fn fold_conversations_indexed(
             continue;
         }
         let rec = read_record_at(log, d.offset, d.record_size as u64)?;
-        fold_one_conversation_record(
-            seg_id,
-            d.offset,
-            &rec.header.record_type,
-            &rec.payload,
-            rows,
-        )?;
+        fold_one_conversation_record(seg_id, d.offset, &rec.header, &rec.payload, rows)?;
     }
     // **Then the un-indexed tail, which is where the newest records are.**
     //
@@ -621,7 +631,7 @@ fn fold_conversations_indexed(
             fold_one_conversation_record(
                 seg_id,
                 e.offset,
-                &e.record.header.record_type,
+                &e.record.header,
                 &e.record.payload,
                 rows,
             )?;
@@ -707,7 +717,8 @@ enum Cmd {
     /// for every timeline carrying a `Label` / `ConvState` / `Distilled` record,
     /// show conv_id, label, the winning `archived` flag with the exact
     /// `(segment,offset)` of the ConvState that set it (and how many ConvState
-    /// records exist), and the distill mode if any. Last-writer-wins across
+    /// records exist), the branch it works on in each repository with the
+    /// record's header key, and the distill mode if any. Last-writer-wins across
     /// segments in ascending id order — so this answers "why does the reload
     /// think this conversation is archived, and where does that record live".
     Conversations {
@@ -1240,13 +1251,13 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Summary => summary(&log_path, &mut log)?,
         Cmd::ExportReplay { .. } => {
-            anyhow::bail!("export-replay requires the segmented `.substrate` DIRECTORY target")
+            anyhow::bail!("export-replay requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Orphans => {
-            anyhow::bail!("orphans requires the segmented `.substrate` DIRECTORY target")
+            anyhow::bail!("orphans requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Couplings { .. } => {
-            anyhow::bail!("couplings requires the segmented `.substrate` DIRECTORY target")
+            anyhow::bail!("couplings requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Headers => headers(&mut log)?,
         Cmd::Validate { layers } => validate(&mut log, layers)?,
@@ -5391,10 +5402,10 @@ fn validate(log: &mut LogFile, layers_override: Option<usize>) -> Result<()> {
     // boundary has only part of its chunks here and reads as a torn write.
     // Measured: two turns reported torn in BOTH seg-320 and seg-323 with
     // *different* partial counts (233 vs 295) — a real torn write exists once.
-    // Point the tool at the `.substrate` DIRECTORY for the answer that counts.
+    // Point the tool at the `substrate` DIRECTORY for the answer that counts.
     println!(
         "note: single-segment scope — a turn whose chunks straddle a segment boundary \
-         will read as a torn write here; run against the .substrate directory for the \
+         will read as a torn write here; run against the substrate directory for the \
          whole-substrate answer"
     );
     let substrate = build_substrate(log)?;
@@ -5992,7 +6003,7 @@ fn tokens(log: &mut LogFile, stream_id: StreamId, as_ids: bool) -> Result<()> {
 /// Load the tokenizer embedded in the log's `Tokenizer` record. Returns
 /// `Ok(None)` when the log has no such record — the substrate is then
 /// opaque to text decoding and the caller should fall back to `--ids`.
-/// The segmented store's directory, set in `main` when the target is a `.substrate`
+/// The segmented store's directory, set in `main` when the target is a `substrate`
 /// dir. Lets [`load_log_tokenizer`] fall back to sibling segments: the `Tokenizer`
 /// record is a singleton written ONCE at engine init (deduped by SHA), so on a
 /// segmented store it lives in an early sealed segment — NOT the active segment a

@@ -1,7 +1,7 @@
 //! Size-rotated file log sink for the daemon.
 //!
 //! A third tracing subscriber (alongside stdout and the WebSocket bus) writes
-//! the full configured log stream to `<workspace>/.substrate/zend.log`. The
+//! the full configured log stream to `<workspace>/substrate/zend.log`. The
 //! active file is truncated on every ORDINARY daemon start — and any archives
 //! from the prior run are removed — so each run begins from a clean set. When
 //! the active file would exceed [`MAX_BYTES`] it rotates: `zend.log.{N-1}` →
@@ -28,14 +28,14 @@ use tracing_subscriber::fmt::MakeWriter;
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Number of rotated archives kept (`zend.log.1` … `zend.log.N`).
 const MAX_ARCHIVES: usize = 4;
-/// Active log file name under `.substrate/`.
+/// Active log file name under `substrate/`.
 pub const LOG_NAME: &str = "zend.log";
 /// Dropped next to the log by `self_heal` right before it relaunches the
 /// process. Its presence on the NEXT start means "this run continues one that
 /// just crashed" — see the module doc.
 pub const RESTART_MARKER_NAME: &str = ".self_heal_restart";
 
-/// Whether `dir` (the daemon's `.substrate`) carries the self-heal restart
+/// Whether `dir` (the daemon's `substrate`) carries the self-heal restart
 /// marker — checked BEFORE [`RotatingFileLog::new`] (which consumes it), so
 /// the caller can still tell whether this start is a resume after logging is
 /// up and log the boundary itself.

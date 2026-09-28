@@ -298,7 +298,7 @@ function mockProject(text){
   return { query_tokens: Math.max(1, Math.round(q.length/4)), tiles:[
     {kind:'normal',score:1840,selected:true,layer:'dialogue',group:'primary_conversation',
       label:'Trace the substrate redo log replay',tokens:340,timeline:'8421990033112233445',index:5,
-      text:'user: '+clip+'\nassistant: On boot the daemon opens .substrate, enumerates seg-*.log files, and runs a single walker pass driving every record into the in-RAM Substrate; torn tail frames are skipped.'},
+      text:'user: '+clip+'\nassistant: On boot the daemon opens substrate, enumerates seg-*.log files, and runs a single walker pass driving every record into the in-RAM Substrate; torn tail frames are skipped.'},
     {kind:'sot',score:1120,selected:true,layer:'dialogue',group:'primary_conversation',
       label:'summary #8 (compresses turn 0)',tokens:96,timeline:'8421990033112233445',index:8,
       text:'Explained boot-time replay: enumerate segments, single walker pass populates the in-RAM Substrate; torn tail frames skipped.'},

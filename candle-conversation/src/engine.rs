@@ -4,8 +4,10 @@ use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
+use crate::persistence::manifest::ConvState;
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
+use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
     Builder, CollectionWarm, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget,
@@ -28,6 +30,7 @@ use crate::turn_text::literal_tokenizer;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use flume::{Receiver, Sender};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -366,14 +369,14 @@ impl ConversationEngine {
         // substrate.
         //
         // Mandatory substrate persistence — the redo log under the
-        // workspace's `.substrate/` directory (or the process CWD).
+        // workspace's `substrate/` directory (or the process CWD).
         // Open persistence and drive every record straight into the
         // substrate's in-RAM state in one walker pass — no manifest
         // mirror, no `reconstruct → collected_*` second pass.
         //
         // A host that writes its own record classes into this same log opens it
         // first and hands the open pair over ([`SharedSubstrate`]) — one
-        // `.substrate/` admits exactly one writable handle per process. Everyone
+        // `substrate/` admits exactly one writable handle per process. Everyone
         // else names a directory and the engine opens it here. Resolved once,
         // into the same pair either way, so nothing downstream knows which.
         let open_start = std::time::Instant::now();
@@ -387,7 +390,7 @@ impl ConversationEngine {
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
                     }
                 };
-                // A read-only open writes nothing under `.substrate/` and
+                // A read-only open writes nothing under `substrate/` and
                 // requires the store to exist — see
                 // `EngineConfig::read_only_substrate`.
                 let opened = if config.read_only_substrate {
@@ -974,6 +977,32 @@ impl ConversationEngine {
         self.conversation.write().fast_path_clear(target);
     }
 
+    /// Offer `group`'s conversations to a projection only as its target's
+    /// scope names them ([`Self::set_retrieval_scope`]) — for ingested
+    /// content that is only right for a conversation whose own files hold the
+    /// same. Idempotent; in-memory, so it is marked at every setup.
+    pub fn mark_group_scoped(&self, group: GroupId) {
+        self.conversation.write().mark_group_scoped(group);
+    }
+
+    /// Name the conversations the scoped `group` may offer `target`, replacing
+    /// what it named before. Both the belief scan and selection honour it.
+    pub fn set_retrieval_scope(
+        &self,
+        target: TimelineId,
+        group: GroupId,
+        allowed: Arc<HashSet<TimelineId>>,
+    ) {
+        self.conversation
+            .write()
+            .set_retrieval_scope(target, group, allowed);
+    }
+
+    /// Forget every scope `target` was given.
+    pub fn clear_retrieval_scope(&self, target: TimelineId) {
+        self.conversation.write().clear_retrieval_scope(target);
+    }
+
     /// Every assistant turn's text on `timeline`, oldest first.
     ///
     /// The durable record of what a conversation asked for: the `<tool_call>`
@@ -1006,7 +1035,7 @@ impl ConversationEngine {
 
     /// One-pass snapshot of the distinct `custom[key]` values across live
     /// conversations — for O(1) resume-cache membership probing.
-    pub fn conversation_metadata_values(&self, key: &str) -> std::collections::HashSet<String> {
+    pub fn conversation_metadata_values(&self, key: &str) -> HashSet<String> {
         self.conversation.metadata_values_for_key(key)
     }
 
@@ -1045,6 +1074,48 @@ impl ConversationEngine {
     /// `npc-<id>-day-*` conversations this way.
     pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
         self.conversation.conversations_with_conv_id_prefix(prefix)
+    }
+
+    /// Set the branch a conversation works on in each repository `branches`
+    /// names (repository workspace name → branch), leaving any other
+    /// repository's as it is. Persisted with the rest of the conversation's
+    /// state as one `RecordType::ConvState` record (last-writer-wins); a call
+    /// that changes nothing writes nothing.
+    pub fn set_conversation_branches(
+        &self,
+        timeline: TimelineId,
+        branches: &BTreeMap<String, String>,
+    ) {
+        self.conversation
+            .set_conversation_branches(timeline, branches)
+    }
+
+    /// Stage a set of a conversation's changes to its files as events on its
+    /// timeline, events before tombstones, for the group commit to make
+    /// durable — see `docs/zend_vfs_events.md`. Returns the sequence numbers
+    /// the events took, in order.
+    pub fn write_conversation_files(
+        &self,
+        timeline: TimelineId,
+        write: &VfsWrite,
+    ) -> crate::Result<Vec<u64>> {
+        self.conversation
+            .write_conversation_files(timeline, write)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Every live event of a conversation's files, in `(repo, key, seq)`
+    /// order — what building the conversation again replays.
+    pub fn conversation_files(&self, timeline: TimelineId) -> crate::Result<Vec<VfsEventPayload>> {
+        self.conversation
+            .conversation_files(timeline)
+            .map_err(ConversationError::Model)
+    }
+
+    /// A conversation's state — archived flag and the branch it works on in
+    /// each repository — or `None` for an unknown timeline.
+    pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.conversation.conversation_state(timeline)
     }
 
     /// Toggle the archived lifecycle flag for a conversation. Persists

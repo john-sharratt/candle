@@ -1,70 +1,148 @@
 //! Tier-2 integration test for the `repo_map` layer's per-directory ingest.
 //!
-//! Drives the real walk → unit → render pipeline against synthetic workspaces
-//! and pushes each directory's chain through a [`RecordingTurnSink`], so the
-//! turn shape the daemon will prefill is asserted end-to-end with no model load.
-//! The engine-bound half (conversation minting, the summary decode, the resume
-//! cache) is covered by the live daemon run; everything up to the turns is here.
+//! Drives the real branch walk → unit → render pipeline against synthetic
+//! repositories and pushes each directory's seed chain through a
+//! [`RecordingTurnSink`], so the turn shape the daemon will prefill is asserted
+//! end-to-end with no model load. The engine-bound half (conversation minting,
+//! the summary decode, the content keys landing) is covered by the live daemon
+//! run; everything up to the turns is here.
+//!
+//! Every workspace here holds one git repository, [`REPO`], so every key and
+//! tag is workspace-relative (`demo/src/`).
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
+use std::sync::Arc;
 
 use candle_conversation::models::Dialect;
 use candle_conversation::stencil::ToolCallEnvelope;
+use zend::branch_ingest::filter::IngestScope;
+use zend::branch_ingest::walk::{walk, RepoBranches, TreeCache, UnitItem};
+use zend::repo_path::split;
 use zend::repo_scan::render::render_chain;
-use zend::repo_scan::{build_units, walk_workspace, DirState, DirUnit};
+use zend::repo_scan::DirUnit;
 use zend::turn_sink::{InsertTurnSink, RecordingTurnSink};
 use zend_tools::ToolContext;
+use zend_vfs::{Repo, RepoSpec, Workspace};
+
+/// The one repository each test workspace holds.
+const REPO: &str = "demo";
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "core.hooksPath=", "-c", "core.autocrlf=false"])
+        .args(["-c", "user.name=T", "-c", "user.email=t@x"])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
 
 fn write(root: &Path, rel: &str, body: &[u8]) {
-    let path = root.join(rel);
+    let path = root.join(REPO).join(rel);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, body).unwrap();
 }
 
-fn small_workspace() -> tempfile::TempDir {
+/// Commit everything in the repository on `main`.
+fn commit(root: &Path, message: &str) {
+    let dir = root.join(REPO);
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", message]);
+}
+
+fn workspace_of(root: &Path) -> Workspace {
+    Workspace::new(root, vec![RepoSpec::named(REPO)]).unwrap()
+}
+
+/// A repository on `main`, its first commit holding `files`.
+fn repository(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
-    write(
-        &root,
-        "Cargo.toml",
-        b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-    );
-    write(
-        &root,
-        "src/lib.rs",
-        b"//! The demo crate.\n//! Says hello.\npub fn hello() {}\n",
-    );
-    write(&root, "src/handler.rs", b"pub fn handle() {}\n");
-    write(&root, "README.md", b"# demo\n\nhello world\n");
-    write(&root, ".gitignore", b"target/\n");
-    write(&root, "target/should_be_skipped.rs", b"unreachable\n");
+    let repo = dir.path().join(REPO);
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    for (rel, body) in files {
+        write(dir.path(), rel, body);
+    }
+    commit(dir.path(), "first");
     dir
 }
 
-/// Walk + build the units the daemon would ingest.
-fn units_of(root: &Path) -> Vec<DirUnit> {
-    build_units(&walk_workspace(root, None))
+fn small_workspace() -> tempfile::TempDir {
+    repository(&[
+        (
+            "Cargo.toml",
+            b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            b"//! The demo crate.\n//! Says hello.\npub fn hello() {}\n",
+        ),
+        ("src/handler.rs", b"pub fn handle() {}\n"),
+        ("README.md", b"# demo\n\nhello world\n"),
+        (".gitignore", b"target/\n"),
+        ("target/should_be_skipped.rs", b"unreachable\n"),
+    ])
+}
+
+/// The folder units every branch lists, as the daemon's pass walks them.
+fn units_of(root: &Path) -> Vec<UnitItem> {
+    let branches = RepoBranches::read(REPO, Repo::open(&root.join(REPO)).unwrap()).unwrap();
+    walk(
+        std::slice::from_ref(&branches),
+        &IngestScope::new("", None),
+        &mut TreeCache::default(),
+        &workspace_of(root).names(),
+        &[],
+    )
+    .0
+    .units
+}
+
+/// Each folder's key, by folder.
+fn keys_of(root: &Path) -> Vec<(String, String)> {
+    units_of(root)
+        .into_iter()
+        .map(|u| (u.unit.dir, u.unit.key))
+        .collect()
 }
 
 /// Record every unit's SEED chain — the prefilled request/`file_list` pair and
 /// the listing response whose assistant half `converse::run_folder_conversation`
-/// decodes. The decode and any follow-up tool round it drives need a model, so
-/// they are the live daemon's half; what is asserted here is the turn shape that
-/// reaches the conversation before the first decode, which is where every
-/// rendering defect lives.
+/// decodes — exactly as `process_one_dir` renders it: tools reading the commit
+/// the unit was found on, the manifest read from it. The decode and any
+/// follow-up tool round it drives need a model, so they are the live daemon's
+/// half; what is asserted here is the turn shape that reaches the conversation
+/// before the first decode, which is where every rendering defect lives.
 fn record(root: &Path) -> RecordingTurnSink {
-    let ctx = ToolContext::with_workspace(root);
+    let ctx = ToolContext::with_workspace(workspace_of(root));
     let mut sink = RecordingTurnSink::new();
     // ChatML's envelope, matching this suite's existing JSON-shaped
     // expectations; `render::tests::tool_calls_follow_the_dialects_call_style`
     // is what holds the other style.
     let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
-    for unit in units_of(root) {
+    for item in units_of(root) {
+        let files = match &item.at {
+            Some(at) => ctx.files.fresh_at(REPO, at).expect("a git repository"),
+            None => ctx.files.fresh(),
+        };
+        let tools = ctx.with_files(Arc::new(files));
+        let unit = DirUnit::read(&item.unit, |path| {
+            let (repo, inner) = split(path);
+            tools.files.repo(repo).ok()?.read_bytes(inner).ok()?
+        });
         let tags = vec!["repo_map".to_string(), unit.dir.clone()];
-        let (prefilled, decode_user) = render_chain(&ctx, &unit, &env);
+        let (prefilled, decode_user) = render_chain(&tools, &unit, &env);
         for (user, assistant) in &prefilled {
             sink.insert_prefill_turn(user, assistant, tags.clone())
                 .unwrap();
@@ -77,10 +155,21 @@ fn record(root: &Path) -> RecordingTurnSink {
 #[test]
 fn one_unit_per_directory_holding_files() {
     let dir = small_workspace();
-    let dirs: Vec<String> = units_of(dir.path()).into_iter().map(|u| u.dir).collect();
-    // The root (Cargo.toml, README.md, .gitignore) and `src/`. `target/` is
-    // gitignored, so it contributes no unit at all.
-    assert_eq!(dirs, vec![".".to_string(), "src/".to_string()]);
+    let dirs: Vec<String> = units_of(dir.path())
+        .into_iter()
+        .map(|u| u.unit.dir)
+        .collect();
+    // The workspace root (listing the repository), the repository's root
+    // (Cargo.toml, README.md) and its `src/`. `target/` is ignored, so it was
+    // never committed and contributes no unit; `.gitignore` is hidden.
+    assert_eq!(
+        dirs,
+        vec![
+            ".".to_string(),
+            "demo/".to_string(),
+            "demo/src/".to_string()
+        ]
+    );
 }
 
 /// One chain per folder, and it is ONE pair: request → `file_list` /
@@ -93,12 +182,16 @@ fn each_directory_lists_once_and_then_summarises() {
     let src = sink
         .turns
         .iter()
-        .filter(|(_, _, tags)| tags[1] == "src/")
+        .filter(|(_, _, tags)| tags[1] == "demo/src/")
         .collect::<Vec<_>>();
     assert_eq!(src.len(), 2, "request+list, then listing+summary");
 
-    assert!(src[0].0.starts_with("Summarize the `src/` folder"));
-    assert!(src[0].1.contains("\"name\": \"file_list\""));
+    assert!(src[0]
+        .0
+        .starts_with("Summarize the `src/` folder in the `demo` repository"));
+    assert!(src[0].1.contains(
+        "{\"name\": \"file_list\", \"arguments\": {\"repo\": \"demo\", \"path\": \"src\"}}"
+    ));
     assert!(src[1].0.starts_with("<tool_response>{"), "the listing");
     assert!(src[1].1.is_empty(), "the folder summary is DECODED");
 }
@@ -121,11 +214,56 @@ fn no_folder_turn_reads_a_file() {
     }
 }
 
-/// The listing is produced by running the real `file_list`, so it names the
-/// directory's own files and honours the walk's `.gitignore` exclusion.
+/// The repository's root carries its manifest's hint, read from the commit.
 #[test]
-fn the_listing_names_the_directorys_files() {
+fn the_manifest_hint_is_read_from_the_commit() {
     let dir = small_workspace();
+    let sink = record(dir.path());
+    let root = sink
+        .turns
+        .iter()
+        .find(|(_, _, tags)| tags[1] == "demo/")
+        .expect("the repository's root");
+    assert!(
+        root.0
+            .starts_with("Summarize the `demo` repository (crate: demo)"),
+        "{}",
+        root.0
+    );
+}
+
+/// The workspace root's chain lists the repositories — `file_list` with repo
+/// `*` — and summarises from that listing alone.
+#[test]
+fn the_workspace_root_lists_the_repositories() {
+    let dir = small_workspace();
+    let sink = record(dir.path());
+    let root = sink
+        .turns
+        .iter()
+        .filter(|(_, _, tags)| tags[1] == ".")
+        .collect::<Vec<_>>();
+    assert_eq!(root.len(), 2, "request+list, then listing+summary");
+    assert!(root[0]
+        .0
+        .starts_with("Summarize the workspace and the repositories it holds"));
+    assert!(root[0]
+        .1
+        .contains("{\"name\": \"file_list\", \"arguments\": {\"repo\": \"*\"}}"));
+    assert!(
+        root[1].0.contains("{\"repo\":\"demo\",\"dir\":true}"),
+        "{}",
+        root[1].0
+    );
+}
+
+/// The listing is produced by running the real `file_list` at the unit's
+/// commit, so it names the directory's own committed files — never what the
+/// folder holds uncommitted.
+#[test]
+fn the_listing_names_the_directorys_committed_files() {
+    let dir = small_workspace();
+    write(dir.path(), "src/uncommitted.rs", b"pub fn u() {}\n");
     let sink = record(dir.path());
     let listings: String = sink
         .turns
@@ -138,6 +276,7 @@ fn the_listing_names_the_directorys_files() {
     assert!(listings.contains("lib.rs"));
     assert!(listings.contains("handler.rs"));
     assert!(!listings.contains("should_be_skipped"));
+    assert!(!listings.contains("uncommitted.rs"));
 }
 
 /// Every turn carries `["repo_map", <dir>]` so a tag-scoped provenance gallery
@@ -152,115 +291,116 @@ fn every_turn_carries_the_layer_and_directory_tags() {
     }
 }
 
-/// The resume cache and the refresh both key on rendering being deterministic.
+/// A unit's key names what its turns show, so its rendering must be
+/// deterministic.
 #[test]
 fn rendering_is_byte_identical_on_repeat() {
     let dir = small_workspace();
     assert_eq!(record(dir.path()).turns, record(dir.path()).turns);
 }
 
-/// A folder with no README / module root still gets a conversation — it just
-/// summarises from the listing alone.
+/// A folder with no README / module root gets exactly the same chain as one
+/// with — the listing is all any folder shows.
 #[test]
-fn a_directory_with_no_anchor_still_ingests() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "src/thing.rs", b"pub fn t() {}\n");
+fn a_directory_with_no_readme_ingests_the_same_way() {
+    let dir = repository(&[("src/thing.rs", b"pub fn t() {}\n")]);
     let sink = record(dir.path());
-    assert_eq!(sink.turns.len(), 2, "request+list, then listing+summary");
-    assert!(sink.turns[0].1.contains("\"name\": \"file_list\""));
-    assert!(sink.turns[1].0.starts_with("<tool_response>{"));
-    assert!(sink.turns[1].1.is_empty(), "the summary is decoded");
+    let src: Vec<_> = sink
+        .turns
+        .iter()
+        .filter(|(_, _, tags)| tags[1] == "demo/src/")
+        .collect();
+    assert_eq!(src.len(), 2, "request+list, then listing+summary");
+    assert!(src[0].1.contains("\"name\": \"file_list\""));
+    assert!(src[1].0.starts_with("<tool_response>{"));
+    assert!(src[1].1.is_empty(), "the summary is decoded");
 }
 
-// ── DirState: what re-ingests and what does not ──────────────────────────────
+// ── Keys: what re-ingests and what does not ──────────────────────────────────
+
+/// The folders whose key differs between two walks.
+fn moved(before: &[(String, String)], after: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = after
+        .iter()
+        .filter(|a| !before.contains(a))
+        .map(|(dir, _)| dir.clone())
+        .collect();
+    for (dir, _) in before {
+        if !after.iter().any(|(d, _)| d == dir) {
+            out.push(dir.clone());
+        }
+    }
+    out
+}
 
 #[test]
-fn state_is_stable_when_an_unshown_file_changes() {
+fn a_folder_key_is_stable_when_an_unshown_file_changes() {
     let dir = small_workspace();
-    let before = DirState::from_units(&units_of(dir.path()));
+    let before = keys_of(dir.path());
     // `handler.rs` is listed by name but its CONTENT is never shown, so the
     // folder's summary is still accurate and re-decoding it would cost for
     // nothing.
     write(dir.path(), "src/handler.rs", b"pub fn handle_v2() {}\n");
-    assert!(before.equivalent_to(&units_of(dir.path())));
+    commit(dir.path(), "handler");
+    assert_eq!(keys_of(dir.path()), before);
 }
 
-/// Rewriting `src/lib.rs`'s module doc does NOT re-ingest. It used to: the doc
-/// block was the folder's anchor excerpt and part of the hash. The chain no
-/// longer shows it, so the sealed summary still answers the request this unit
+/// Rewriting `src/lib.rs`'s module doc does NOT re-ingest. The doc block used
+/// to be the folder's anchor excerpt and part of its key; the chain no longer
+/// shows it, so the sealed summary still answers the request this unit
 /// renders, and re-decoding would pay full cost for the same answer.
 #[test]
-fn state_is_stable_when_the_former_anchor_text_changes() {
+fn a_folder_key_is_stable_when_the_former_anchor_text_changes() {
     let dir = small_workspace();
-    let before = DirState::from_units(&units_of(dir.path()));
+    let before = keys_of(dir.path());
     write(
         dir.path(),
         "src/lib.rs",
         b"//! The demo crate, rewritten.\n//! Now says goodbye.\npub fn hello() {}\n",
     );
-    assert!(before.equivalent_to(&units_of(dir.path())));
+    commit(dir.path(), "module doc");
+    assert_eq!(keys_of(dir.path()), before);
 }
 
-/// A unit's hash covers ONE level, because its turn shows one level: adding
-/// `src/new_module.rs` moves `src/` and leaves the root alone, whose listing
-/// still names `src/` and nothing else about it. Under the old subtree hash a
-/// file three levels down moved every ancestor and re-decoded the whole spine.
+/// `file_list` is one level deep, so a folder's listing is only its own direct
+/// entries — a file added under `src/` moves only `src/`'s key. Neither the
+/// repository's root nor the workspace root ever showed `src/`'s files, so
+/// they have nothing to re-ingest.
 #[test]
-fn a_new_file_moves_only_its_own_directory() {
+fn a_folder_key_moves_when_a_file_is_added() {
     let dir = small_workspace();
-    let before = DirState::from_units(&units_of(dir.path()));
+    let before = keys_of(dir.path());
     write(dir.path(), "src/new_module.rs", b"pub fn n() {}\n");
-    let after = units_of(dir.path());
-    assert!(!before.equivalent_to(&after));
-    assert_eq!(before.changed_dirs(&after), vec!["src/".to_string()]);
+    commit(dir.path(), "added");
+    assert_eq!(moved(&before, &keys_of(dir.path())), ["demo/src/"]);
 }
 
-/// A new SUBDIRECTORY does move its parent — the parent's listing names one
-/// entry per subdirectory, so the entry is new content in the turn the parent
-/// shows. This is the boundary of the one-level rule above.
+/// The module hint is spliced into the request the model reads, so it is part
+/// of what the turn shows and therefore part of the key. A `[workspace]` table
+/// replacing the root manifest's package changes the question — `(Cargo
+/// workspace root)` appears — without changing the listing, and the plan must
+/// not treat the summary that answered the older request as current.
 #[test]
-fn a_new_subdirectory_moves_its_parent() {
+fn a_folder_key_moves_when_the_module_hint_changes() {
     let dir = small_workspace();
-    let before = DirState::from_units(&units_of(dir.path()));
-    write(dir.path(), "src/inner/deep.rs", b"pub fn d() {}\n");
-    let after = units_of(dir.path());
-    assert!(before.changed_dirs(&after).contains(&"src/".to_string()));
-}
-
-/// The module hint is spliced into the request the model reads, so it is part of
-/// what the turn shows and therefore part of the hash. A `[workspace]` table
-/// added to the root manifest changes the question — `(Cargo workspace root)`
-/// appears — without changing the listing, and the resume cache must not report
-/// a hit on a summary that answered the older request.
-#[test]
-fn state_moves_when_the_module_hint_changes() {
-    let dir = small_workspace();
-    let before = DirState::from_units(&units_of(dir.path()));
+    let before = keys_of(dir.path());
     write(
         dir.path(),
         "Cargo.toml",
         b"[workspace]\nmembers = [\"a\", \"b\"]\n",
     );
-    let after = units_of(dir.path());
-    assert_eq!(before.changed_dirs(&after), vec![".".to_string()]);
+    commit(dir.path(), "workspace");
+    assert_eq!(moved(&before, &keys_of(dir.path())), ["demo/"]);
 }
 
 #[test]
-fn a_removed_directory_is_reported_as_changed() {
+fn a_removed_directory_leaves_the_corpus() {
     let dir = small_workspace();
-    let before = DirState::from_units(&units_of(dir.path()));
-    fs::remove_dir_all(dir.path().join("src")).unwrap();
-    let after = units_of(dir.path());
-    // `src/` is gone entirely; the root's listing lost those files.
-    assert_eq!(
-        before.changed_dirs(&after),
-        vec![".".to_string(), "src/".to_string()],
-    );
-}
-
-#[test]
-fn refresh_returns_no_op_outcome_variant() {
-    // `refresh_repo_map` needs a live engine (it mints conversations), but the
-    // outcome enum is the caller's contract — keep the symbol public.
-    let _: zend::repo_scan::RefreshOutcome = zend::repo_scan::RefreshOutcome::NoOp;
+    let before = keys_of(dir.path());
+    fs::remove_dir_all(dir.path().join(REPO).join("src")).unwrap();
+    commit(dir.path(), "removed");
+    // `src/`'s unit vanishes entirely, and the repository's root — whose
+    // listing showed `src/` as a folder — moves with it. The workspace root
+    // listed only the repository, so it stays.
+    assert_eq!(moved(&before, &keys_of(dir.path())), ["demo/", "demo/src/"]);
 }

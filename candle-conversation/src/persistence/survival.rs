@@ -47,6 +47,14 @@ pub enum Survival {
     /// and the copy in a retired segment is not the only one.
     Resident,
 
+    /// Relocated by maintenance, left behind by compaction — for a marker
+    /// that exists only to keep records it killed dead while copies of them
+    /// can still sit in older segments. Maintenance rewrites some segments
+    /// and leaves the rest, so the marker must follow it forward; compaction
+    /// rewrites everything and carries none of what the marker killed, so
+    /// nothing is left for it to do.
+    Maintained,
+
     /// Derived data with no supersession key. Every copy is dropped and the
     /// writer rebuilds the chain in the new file.
     Regenerated,
@@ -77,6 +85,9 @@ pub fn survival(rt: RecordType) -> Survival {
         // Owned by the daemon's registry, not the substrate — nothing here can
         // re-encode a character, so the winner is carried byte-for-byte.
         RecordType::Npc => Survival::Relocated,
+        // A conversation's file events: bodies owned by the daemon above and
+        // never in RAM here, located through `VfsIndex`.
+        RecordType::VfsEvent => Survival::Relocated,
         // Workspace singletons, located through the manifest.
         RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => Survival::Relocated,
 
@@ -98,9 +109,18 @@ pub fn survival(rt: RecordType) -> Survival {
         // merely forget a deletion — the rewrite carries the turn's content
         // forward regardless, so the condemned turn returns on the next reload.
         RecordType::Tombstone => Survival::Resident,
+        // The section counterpart of `Tombstone`, re-emitted from
+        // `tombstoned_sections` for the same reason: losing this marker does
+        // not merely forget a deletion, it resurrects the corrupted chunks
+        // the marker exists to keep unread.
+        RecordType::SectionTombstone => Survival::Resident,
         // The exchange grouping for a tool round-trip, held in
         // `Timeline::couplings` and re-emitted from `live_couplings`.
         RecordType::TurnCoupling => Survival::Resident,
+
+        // ── Maintained, not compacted ───────────────────────────────────────
+        // Kills file events by sequence number; located through `VfsIndex`.
+        RecordType::VfsTombstone => Survival::Maintained,
 
         // ── Rebuilt by the writer ───────────────────────────────────────────
         RecordType::HeaderIndex => Survival::Regenerated,
@@ -138,6 +158,9 @@ pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
     RecordType::BranchCheckpoint,
     RecordType::Npc,
     RecordType::TurnIndexPage,
+    RecordType::SectionTombstone,
+    RecordType::VfsEvent,
+    RecordType::VfsTombstone,
 ];
 
 /// A per-record-type tally, for reporting what a store holds and what a rewrite
@@ -242,6 +265,9 @@ pub fn type_label(rt: RecordType) -> &'static str {
         RecordType::BranchCheckpoint => "branch_checkpoint",
         RecordType::Npc => "npc",
         RecordType::TurnIndexPage => "turn_index_page",
+        RecordType::SectionTombstone => "section_tombstone",
+        RecordType::VfsEvent => "vfs_event",
+        RecordType::VfsTombstone => "vfs_tombstone",
         RecordType::Unknown => "unknown",
     }
 }

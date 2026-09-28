@@ -14,12 +14,13 @@
 //! data-side of resume is what this test pins down.
 //!
 //! The workspace is ALWAYS an explicit `TempDir`: `workspace_path` unset
-//! silently roots `.substrate/` in the current directory.
+//! silently roots `substrate/` in the current directory.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_conversation::models::{Model, ModelArch, ModelSpec, RopePreset};
+use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::SamplingConfig;
 use candle_transformers::models::dialect::{Dialect, DialectType};
 
@@ -177,7 +178,7 @@ fn deepseek_rung4_part2_reboot() -> candle_conversation::Result<()> {
         return Ok(());
     };
     let ws = rung4_workspace();
-    if !ws.join(".substrate").exists() {
+    if !ws.join(SUBSTRATE_DIR).exists() {
         eprintln!("[skip] part1's workspace absent — run part1 first");
         return Ok(());
     }

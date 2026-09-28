@@ -118,6 +118,7 @@ fn main() -> Result<()> {
         name: String,
         kernels: Vec<String>,
         compile_args: Vec<String>,
+        include_dirs: Vec<String>,
         aggregate_hash: String,
         kernel_hashes: Vec<(String, String)>,
     }
@@ -139,7 +140,10 @@ fn main() -> Result<()> {
 
         let build_lib = build_dir.join(format!("lib{}.a", group.name));
 
-        if is_archive_cache_valid(&group.name, &precompiled_dir, &aggregate_hash) {
+        let sources = group_sources(group, &base_dir)?;
+        if is_archive_cache_valid(&group.name, &precompiled_dir, &aggregate_hash, &sources)
+            && staged_objects_are_fresh(group, &kernel_hashes, &staged_dir, &base_dir)?
+        {
             // FAST PATH: decompress .a.gz into build_dir if needed
             let gz = precompiled_dir.join(format!("lib{}.a.gz", group.name));
             let needs_decompress = if build_lib.exists() {
@@ -166,6 +170,7 @@ fn main() -> Result<()> {
                 name: group.name.clone(),
                 kernels: group.kernels.clone(),
                 compile_args: group.compile_args.clone(),
+                include_dirs: group.include_dirs.clone(),
                 aggregate_hash,
                 kernel_hashes,
             });
@@ -193,8 +198,9 @@ fn main() -> Result<()> {
             for kernel_path in &dg.kernels {
                 let name = kernel_stem(kernel_path);
                 let current_hash = kernel_hash_map.get(kernel_path).unwrap();
+                let sources = kernel_sources(kernel_path, &base_dir, &dg.include_dirs)?;
 
-                if is_staged_kernel_valid(&staged_dir, &name, current_hash) {
+                if is_staged_kernel_valid(&staged_dir, &name, current_hash, &sources) {
                     staged_hits += 1;
                 } else {
                     let _ = fs::remove_file(build_dir.join(format!("{}.o", name)));
@@ -242,11 +248,28 @@ fn main() -> Result<()> {
                 compile_elapsed.as_secs_f64()
             );
 
-            // Save newly compiled .o files to staged cache
+            // Save newly compiled .o files to staged cache. A failure here is a
+            // build failure: it means an object nvcc was asked to write is
+            // missing or older than its sources, and swallowing that would link
+            // (and label as current) a kernel that does not match the source.
+            let include_dirs_of: HashMap<&str, &Vec<String>> = dirty_groups
+                .iter()
+                .flat_map(|dg| {
+                    dg.kernels
+                        .iter()
+                        .map(move |k| (k.as_str(), &dg.include_dirs))
+                })
+                .collect();
             for (kernel_path, _) in &compile_jobs {
                 let name = kernel_stem(kernel_path);
                 if let Some(hash) = kernel_hash_map.get(kernel_path) {
-                    let _ = save_to_staged_cache(&build_dir, &staged_dir, &name, hash);
+                    let include_dirs = include_dirs_of
+                        .get(kernel_path.as_str())
+                        .copied()
+                        .cloned()
+                        .unwrap_or_default();
+                    let sources = kernel_sources(kernel_path, &base_dir, &include_dirs)?;
+                    save_to_staged_cache(&build_dir, &staged_dir, &name, hash, &sources)?;
                 }
             }
         } else {

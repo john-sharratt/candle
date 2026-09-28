@@ -6,14 +6,27 @@ whenever what is actually running differs from what is written here. If this fil
 running process disagree, the process is the fact and this file is corrected.
 
 Secrets are not in this file and never go in it: the gateway's sign-in config is
-`web/secrets/auth.yaml` (gitignored, on the gateway only), zend's tool API keys are
-`secrets/tools.yaml` at the repository root (gitignored; the Tavily key for `web_search`),
-and the DNS updater's Cloudflare token is `D:\prog\cf-ddns\.env`.
+`web/secrets/auth.yaml` (gitignored, on the gateway only), zend's API keys and tokens are
+`~/.zend/secrets.yaml` for the user running it (the Tavily key for `web_search` and a
+GitHub token; `zend --secrets <path>` names another file), and the DNS updater's
+Cloudflare token is `D:\prog\cf-ddns\.env`.
 
-Every one of those paths has a `secrets` segment, and that is load-bearing rather than
-tidy: zend's `file_*` tools resolve a path straight to disk and never consult `.gitignore`,
-so `VfsStore` refuses any path containing that segment. A secret kept anywhere else in the
-workspace is readable by the model.
+The `git_*` tools do **not** read that GitHub token. `git_fetch` and `git_push` run the
+`git` program, which authenticates the way it always does for that remote — the
+workspace's repositories use SSH remotes (`git@github.com:…`), so the key in `~/.ssh`
+is what authorises a push, and nothing puts a credential on a command line or into a
+URL. The token in the secrets file is there for a future GitHub API consumer; a
+repository configured with an HTTPS remote and no credential helper would fail to push
+rather than fall back to it, because the git layer sets `GIT_TERMINAL_PROMPT=0` and
+never prompts.
+
+zend's file sits outside every workspace, so no repository the `file_*` tools mount can
+reach it — they follow symlinks and junctions and refuse any path that leads outside its
+repository — and zend refuses to load it unless it is private to zend's user. Inside a
+repository, a `secrets` path segment is load-bearing rather than tidy:
+zend's `file_*` tools resolve a path straight to disk and never consult `.gitignore`, so
+`VfsStore` refuses any path containing that segment. A secret kept anywhere else in a
+repository is readable by the model.
 
 ## Topology
 
@@ -76,10 +89,10 @@ Paths are relative to the repo root.
 
 Notes on the arguments:
 
-- **`--skip-layer`** (zend) keeps a layer in service but stops re-reading it from disk at
-  boot — "the corpus is built". It is not `--disable-layer`, which removes the layer from
-  retrieval. npcd has no such flag; pass `--skip-layer` only to a binary whose `--help`
-  lists it.
+- **`--disable-layer`** (zend) removes a layer from retrieval. zend reads no layer from the
+  repositories' folders at boot — they belong to the sandbox's jobs — so there is no flag
+  for "stop re-reading the disk"; a recorded line carrying `--skip-layer` must drop it, as
+  zend no longer accepts it.
 - **`--mind`** (npcd) names the mind directory: a directory holding `projection.yaml`
   beside its content libraries (`personalities/`, `worlds/`, `responses/`, `moods/`).
   npcd refuses to start on a directory without `projection.yaml`, and without `--mind` it
@@ -140,7 +153,7 @@ between (`candle_core::gpu_poison::OOM_STICKY_AFTER`) — a single large-request
 sticky on its own and is left to admission control. On either, `zend/src/self_heal.rs`:
 
 1. logs the root fault (plus the recent-kernel-launch breadcrumb);
-2. drops a marker next to `.substrate/zend.log` so the relaunch **appends** instead of the
+2. drops a marker next to `substrate/zend.log` so the relaunch **appends** instead of the
    ordinary fresh-boot truncate — the whole point is to keep the evidence readable across the
    restart, in one file;
 3. spawns an identical process — same executable, same argv (captured from its own launch,
@@ -154,7 +167,7 @@ so the abrupt exit loses nothing durable.
 
 **Relaunching is capped at 5 consecutive fast poisonings** (one within 5 minutes of the
 relaunched process's own start) — `zend/src/self_heal.rs`'s `relaunch_decision`, count
-persisted in `.substrate/.self_heal_attempts`. Past the cap it stays down and exits 76
+persisted in `substrate/.self_heal_attempts`. Past the cap it stays down and exits 76
 instead of relaunching again: a genuinely broken card or driver poisons every fresh process
 within moments, and an uncapped watchdog would crash-loop on that forever rather than
 surfacing "a human needs to look at this machine." A poisoning after a healthy multi-minute

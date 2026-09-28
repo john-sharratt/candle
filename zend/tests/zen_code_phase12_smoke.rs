@@ -12,31 +12,41 @@
 //!
 //! What this test guards:
 //!
-//! 1. `refresh_repo_map` and `refresh_code_reading` — the sole ingestion
-//!    entry points, also used by the daemon's background ingest worker —
-//!    complete without error against a real engine, starting from an
-//!    empty prior state (a fresh install).
-//! 2. The two foundational layers' turns are reachable from the
-//!    `dialogue` layer's BDP retrieval — a query that names a
-//!    unique identifier surfaces the file that defines it.
+//! 1. `BranchIngest::pass` — the sole ingestion entry point, also run by the
+//!    daemon's background ingest worker — completes without error against a
+//!    real engine over the fixture's branch, starting from an empty substrate
+//!    (a fresh install).
+//! 2. The two foundational layers' turns are reachable from the `dialogue`
+//!    layer's BDP retrieval, scoped to the dialogue's own base — a query that
+//!    names a unique identifier surfaces the file that defines it.
 //!
 //! `phase12_recovers_from_substrate_restart` extends this to the
 //! cross-restart path.
 
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::process::Command;
+use std::sync::{Arc, Mutex, Once};
+use std::time::Instant;
 
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection;
 use candle_conversation::stencil::ThinkMode;
-use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent};
+use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent, TurnOptions};
+use tempfile::TempDir;
+use tracing::Level;
 
-use zend::code_read::{CodeReadState, RefreshOutcome as CodeReadOutcome};
+use zend::branch_ingest::filter::IngestScope;
+use zend::branch_ingest::{BranchIngest, LayerPass};
+use zend::ingest::IngestMode;
 use zend::loading::LoadProgress;
 use zend::refresh_ctx::RefreshContext;
-use zend::repo_scan::{DirState, RefreshOutcome as RepoMapOutcome};
+use zend::retrieval_scope::RetrievalScope;
+use zend::tools::{install_tool_catalog, tool_catalog, ToolHost};
+use zend::types::ToolMode;
+use zend::workspace::single_repo;
+use zend_tools::state::Secrets;
 
 const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
 
@@ -55,19 +65,21 @@ fn cuda_device() -> Option<Device> {
 }
 
 fn init_tracing() {
-    use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(Level::WARN)
             .with_test_writer()
             .try_init();
     });
 }
 
-fn build_fixture_workspace() -> tempfile::TempDir {
+/// The fixture workspace's one repository, where every file is planted.
+const FIXTURE_REPO: &str = "demo-app";
+
+fn build_fixture_workspace() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
+    let root = dir.path().join(FIXTURE_REPO);
     write(
         &root,
         "Cargo.toml",
@@ -101,6 +113,33 @@ fn build_fixture_workspace() -> tempfile::TempDir {
         b"pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
     );
     write(&root, "README.md", b"# demo-app\n\nA tiny fixture repo.\n");
+    // The ingest reads branches, never the folder: commit it on `main`.
+    for args in [
+        &["init", "-q"][..],
+        &["symbolic-ref", "HEAD", "refs/heads/main"],
+        &["add", "-A"],
+        &["commit", "-q", "-m", "fixture"],
+    ] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "-c",
+                "core.hooksPath=",
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@x",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     dir
 }
 
@@ -112,17 +151,12 @@ fn write(root: &Path, rel: &str, body: &[u8]) {
     fs::write(path, body).unwrap();
 }
 
+/// Neither ingest layer holds a live Sequence: each per-directory / per-file
+/// conversation's slot is freed after ingest while the substrate retains its
+/// sealed K/V, so retrieval reads it back from there.
 struct LoadedDaemon {
     engine: ConversationEngine,
     dialogue: Sequence,
-    /// Neither ingest pass holds a live Sequence: each per-directory /
-    /// per-file conversation's slot is freed after ingest while the substrate
-    /// retains its sealed K/V, so retrieval reads it back from there. The hash
-    /// records are kept purely so the fields document the passes.
-    #[allow(dead_code)]
-    repo_map_state: DirState,
-    #[allow(dead_code)]
-    code_read_state: CodeReadState,
 }
 
 fn load_daemon(workspace: &Path) -> LoadedDaemon {
@@ -132,7 +166,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         "=== Loading Qwen3-30B-A3B against {} ===",
         workspace.display()
     );
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     let dialect = Model::Qwen3_30B_A3B_Q4.spec().dialect.clone();
     let workspace_str = workspace.display().to_string();
@@ -144,7 +178,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     .expect("parse projection.yaml");
     let dialogue_layer = proj_builder.id_for_layer("dialogue").unwrap();
     let primary_group = proj_builder.id_for_group("primary_conversation").unwrap();
-    let _ = zend::tools::install_tool_catalog(&mut proj_builder).expect("install tool catalog");
+    let _ = install_tool_catalog(&mut proj_builder).expect("install tool catalog");
 
     let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()
@@ -175,7 +209,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // through `RefreshContext` — see `session.rs`. `code_reading`'s hidden
     // per-file conversations use these to frame identically to `dialogue`.
     let tool_stencil = engine
-        .compile_tool_stencil(zend::tools::tool_catalog())
+        .compile_tool_stencil(tool_catalog())
         .expect("tool stencil compile");
     let think_steering = engine
         .compile_think_steering()
@@ -183,10 +217,11 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // `Quick`, not `Off` — see `RefreshContext::think_triggers`'s doc.
     let think_triggers = match &think_steering {
         Some(ts) => ts.registry_for(&tool_stencil, ThinkMode::Quick),
-        None => std::sync::Arc::clone(&tool_stencil),
+        None => Arc::clone(&tool_stencil),
     };
-    let tool_host = zend::tools::ToolHost::new(workspace);
-    let tool_ctx = std::sync::Arc::clone(tool_host.context_for(zend::types::ToolMode::Restricted));
+    let served = single_repo(workspace, FIXTURE_REPO).expect("workspace");
+    let tool_host = ToolHost::new(&served, Arc::new(Secrets::empty())).expect("tool host");
+    let tool_ctx = tool_host.context_for(ToolMode::Restricted, &tool_host.conversation_files());
     let dialogue = engine
         .new_conversation_with_projection(
             &formatted_prompt,
@@ -202,9 +237,9 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     );
 
     // `base_conv`'s counterpart for ingestion — see `InferenceState::ingest_bases`
-    // in `session.rs`. `refresh_repo_map`/`refresh_code_reading` fork a unit's
-    // conversation off these instead of each independently re-running the
-    // schema's "eager section ingestion", exactly mirroring `dialogue` above.
+    // in `session.rs`. The pass forks each unit's conversation off these
+    // instead of each independently re-running the schema's "eager section
+    // ingestion", exactly mirroring `dialogue` above.
     let repo_map_layer = proj_builder_repo_map.id_for_layer("repo_map").unwrap();
     let repo_map_group = proj_builder_repo_map.id_for_group("structure").unwrap();
     let repo_map_base = Mutex::new(
@@ -233,82 +268,64 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     );
 
     let progress = Arc::new(LoadProgress::new());
-    // Both refreshes lock the engine for their brief create/tombstone ops, so
-    // they take a `&Mutex<ConversationEngine>` via `RefreshContext`. Mirror
-    // the daemon's background ingest worker: wrap for the passes, then
-    // unwrap to hold on. `refresh_repo_map`/`refresh_code_reading` are the
-    // SOLE ingestion entry points now (see `zend::ingest_worker`) — called
-    // here exactly as the worker's first pass calls them, with an empty
-    // prior state standing in for a fresh install's seeded-but-empty
-    // registry entry.
+    // The pass locks the engine for its brief create/tombstone ops, so it
+    // takes a `&Mutex<ConversationEngine>` via `RefreshContext`. Mirror the
+    // daemon: both layers' groups scoped, one pass of the branch ingest over
+    // both layers — exactly as the worker's first pass runs it on a fresh
+    // install — then the dialogue's scope set from its own files before it
+    // is asked anything.
+    engine.mark_group_scoped(repo_map_group);
+    engine.mark_group_scoped(code_read_group);
     let engine = Mutex::new(engine);
-    let walked = zend::repo_scan::walk_workspace(workspace, None);
-    let repo_map_ctx = RefreshContext {
-        engine: &engine,
-        proj_builder: proj_builder_repo_map,
-        config: conv_config.clone(),
-        formatted_prompt: &formatted_prompt,
-        think_triggers: std::sync::Arc::clone(&think_triggers),
-        tool_ctx: std::sync::Arc::clone(&tool_ctx),
-        priming_chain_end: None,
-    };
-    let repo_map_state = match zend::repo_scan::refresh_repo_map(
-        &repo_map_ctx,
-        workspace,
-        &walked,
-        &DirState::default(),
-        &progress,
-        "repo_map",
-        &repo_map_base,
-    )
-    .expect("repo map ingest")
-    {
-        RepoMapOutcome::Replaced { state } => state,
-        RepoMapOutcome::NoOp => panic!("empty prior state must always report changed directories"),
-    };
-    eprintln!(
-        "repo_map ingestion done ({:.1}s) — {} files walked",
-        start.elapsed().as_secs_f64(),
-        walked.files.len()
-    );
-    let code_read_ctx = RefreshContext {
+    let scope = IngestScope::new("", None);
+    let retrieval =
+        RetrievalScope::new(Some(code_read_group), Some((repo_map_group, scope.clone())));
+    let ctx = RefreshContext {
         engine: &engine,
         proj_builder: proj_builder_code_read,
         config: conv_config,
         formatted_prompt: &formatted_prompt,
         think_triggers,
         tool_ctx,
-        priming_chain_end: None,
+        retrieval: &retrieval,
     };
-    let code_read_state = match zend::code_read::refresh_code_reading(
-        &code_read_ctx,
-        workspace,
-        &walked,
-        &CodeReadState::default(),
-        &progress,
-        &code_read_base,
-    )
-    .expect("code reading ingest")
-    {
-        CodeReadOutcome::Replaced { state } => state,
-        CodeReadOutcome::NoOp => panic!("empty prior state must always report changed files"),
-    };
-    let engine = engine.into_inner().expect("engine mutex not poisoned");
+    let layers = [
+        LayerPass {
+            name: "repo_map",
+            mode: IngestMode::Folders,
+            scope: scope.clone(),
+            base: &repo_map_base,
+        },
+        LayerPass {
+            name: "code_reading",
+            mode: IngestMode::Files,
+            scope: scope.clone(),
+            base: &code_read_base,
+        },
+    ];
+    let changed = BranchIngest::default()
+        .pass(&ctx, &served, &layers, &progress)
+        .expect("branch ingest");
     eprintln!(
-        "code_reading ingestion done ({:.1}s)",
-        start.elapsed().as_secs_f64()
+        "branch ingestion done ({:.1}s) — {}",
+        start.elapsed().as_secs_f64(),
+        if changed {
+            "units ingested"
+        } else {
+            "every unit already committed"
+        },
     );
+    retrieval.apply(
+        &engine,
+        dialogue.timeline_id(),
+        &tool_host.conversation_files(),
+    );
+    let engine = engine.into_inner().expect("engine mutex not poisoned");
 
-    LoadedDaemon {
-        engine,
-        dialogue,
-        repo_map_state,
-        code_read_state,
-    }
+    LoadedDaemon { engine, dialogue }
 }
 
 fn ask(seq: &mut Sequence, prompt: &str) -> String {
-    use candle_conversation::TurnOptions;
     let handle = seq
         .submit_turn_with_options(
             prompt,
@@ -374,8 +391,9 @@ fn phase12_recovers_from_substrate_restart() {
         // the engine, then the redo log is durable.
     }
 
-    // Second load — same workspace.  The walker re-ingests; the
-    // substrate restores prior turns.  Recall must still work.
+    // Second load — same workspace. Every unit is already committed, so the
+    // pass ingests nothing; the substrate restores prior turns. Recall must
+    // still work.
     let mut daemon = load_daemon(&workspace);
     let prompt = format!(
         "Which file in this codebase defines `{PLANTED_FN_NAME}`? \

@@ -55,8 +55,8 @@ use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
-    DebugIdPayload, DistillMode, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
-    TurnCouplingPayload,
+    DebugIdPayload, DistillMode, DistillPayload, RecordType, SectionTombstonePayload,
+    TombstonePayload, TreeMetadataPayload, TurnCouplingPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
@@ -165,6 +165,19 @@ pub struct Substrate {
     /// rebuilt by replaying the conversation's own tool calls, so losing it
     /// costs a re-read, never correctness.
     fast_path: HashMap<TimelineId, Vec<TimelineId>>,
+
+    /// Groups whose conversations are offered to a projection only as its
+    /// target's scope names them ([`Self::set_retrieval_scope`]). Ingested
+    /// content keyed by what it shows — a file as one branch holds it — is
+    /// only right for a conversation whose own files hold the same, so such a
+    /// group offers nothing a target was not given. In-memory only, marked
+    /// once at engine setup.
+    scoped_groups: HashSet<GroupId>,
+
+    /// Per target, per scoped group, the conversations that group may offer
+    /// it ([`Self::scoped_timelines_for_group`]). In-memory only and derived:
+    /// the embedder sets it before each turn from the target's own files.
+    retrieval_scopes: HashMap<TimelineId, HashMap<GroupId, Arc<HashSet<TimelineId>>>>,
 
     /// Hot-tier LRU list, most-recently-used at the front.
     /// `front()` = MRU, `back()` = next eviction victim. Membership
@@ -306,6 +319,18 @@ pub struct Substrate {
     /// tokens, and [`Self::retire_section`] removes them outright. See
     /// [`Self::mark_section_transient`]. In-memory only.
     transient_sections: HashSet<SectionId>,
+    /// Section streams flagged by [`RecordType::SectionTombstone`] as
+    /// logically deleted — the section counterpart of
+    /// [`Self::tombstoned_timelines`]. Set by the reactive repair that
+    /// confirms a section's persisted per-layer chunks disagree across
+    /// layers (`candle-conversation/src/scheduler/mod.rs`'s
+    /// `snapshot_sequence_per_layer` failure hook). [`Self::section_exists`]
+    /// and `Conversation::section_stream_is_persisted` both read this so a
+    /// tombstoned section is neither "already present" nor "restorable" on
+    /// the next ingest triage — the request falls through to a fresh
+    /// prefill instead of reloading the corrupted chunks, in this same
+    /// process as well as after a restart.
+    tombstoned_sections: HashSet<StreamId>,
     /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
     /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
@@ -1220,6 +1245,10 @@ pub struct TimelineEntry {
     /// them back in. Persisted as `RecordType::ConvState`,
     /// last-write-wins.
     pub archived: bool,
+    /// The branch this conversation works on in each repository, keyed by
+    /// the repository's workspace name. Persisted with `archived` in the same
+    /// `RecordType::ConvState` record — see [`ConvState`].
+    pub branches: BTreeMap<String, String>,
     /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
@@ -1391,6 +1420,7 @@ impl TimelineEntry {
             order: 0,
             custom: BTreeMap::new(),
             archived: false,
+            branches: BTreeMap::new(),
             turns: BTreeMap::new(),
             tree_meta: BTreeMap::new(),
             debug_id: None,
@@ -2791,7 +2821,7 @@ impl Substrate {
             }
         }
         if let Some(state) = self.pending_conv_state.remove(&timeline.raw()) {
-            let _ = self.set_archived(timeline, state.archived);
+            self.replace_conv_state(timeline, state);
         }
     }
 
@@ -3022,6 +3052,60 @@ impl Substrate {
     /// set is about to be rebuilt from its own history.
     pub fn fast_path_clear(&mut self, target: TimelineId) {
         self.fast_path.remove(&target);
+    }
+
+    // ── retrieval scope ─────────────────────────────────────────────────────
+
+    /// Offer `group`'s conversations to a projection only as its target's
+    /// scope names them. Idempotent.
+    pub fn mark_group_scoped(&mut self, group: GroupId) {
+        self.scoped_groups.insert(group);
+    }
+
+    /// Whether `group` offers only what a target's scope names.
+    pub fn is_group_scoped(&self, group: GroupId) -> bool {
+        self.scoped_groups.contains(&group)
+    }
+
+    /// Name the conversations the scoped `group` may offer `target`,
+    /// replacing whatever it named before.
+    pub fn set_retrieval_scope(
+        &mut self,
+        target: TimelineId,
+        group: GroupId,
+        allowed: Arc<HashSet<TimelineId>>,
+    ) {
+        self.retrieval_scopes
+            .entry(target)
+            .or_default()
+            .insert(group, allowed);
+    }
+
+    /// Forget every scope `target` was given — it is going away.
+    pub fn clear_retrieval_scope(&mut self, target: TimelineId) {
+        self.retrieval_scopes.remove(&target);
+    }
+
+    /// [`Self::active_timelines_for_group`] as `target` may see it: all of
+    /// them for a group that is not scoped, only those `target`'s scope names
+    /// for one that is — and none when it names none.
+    pub fn scoped_timelines_for_group(
+        &self,
+        group: GroupId,
+        target: TimelineId,
+    ) -> impl Iterator<Item = TimelineId> + '_ {
+        let scope: Option<Option<&Arc<HashSet<TimelineId>>>> =
+            self.scoped_groups.contains(&group).then(|| {
+                self.retrieval_scopes
+                    .get(&target)
+                    .and_then(|by_group| by_group.get(&group))
+            });
+        self.active_timelines_for_group(group)
+            .filter(move |tl| match scope {
+                None => true,
+                Some(None) => false,
+                Some(Some(allowed)) => allowed.contains(tl),
+            })
     }
 
     /// `tl` together with the ancestors it inherits, **oldest first**.
@@ -3574,6 +3658,7 @@ impl Substrate {
             tl.label = None;
             tl.conv_id = None;
             tl.archived = false;
+            tl.branches.clear();
             tl.debug_id = None;
             tl.tree_meta.clear();
             tl.pending_summary_queue.clear();
@@ -3581,10 +3666,10 @@ impl Substrate {
         }
     }
 
-    /// Emit `(timeline_id, conv_id, label, archived, custom)` tuples for
-    /// every timeline that holds non-default values.  Used by compaction
-    /// to re-emit live `Label` / `ConvState` records.
-    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, bool, BTreeMap<String, String>)> {
+    /// Emit `(timeline_id, conv_id, label, custom)` tuples for every timeline
+    /// that holds non-default values.  Used by compaction to re-emit live
+    /// `Label` records; the `ConvState` side is [`Self::live_conv_states`].
+    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, BTreeMap<String, String>)> {
         // Emit in creation `order`, not `timelines` (HashMap) iteration order:
         // the compactor writes these as `Label` records, and reload re-derives
         // each timeline's `order` from the order its `conv_id` Label replays
@@ -3592,31 +3677,22 @@ impl Substrate {
         // sidebar's creation-order sort on every compaction. `order` is 0 for
         // timelines that never got a conv_id (label/custom only); they sort
         // first and their relative order is immaterial.
-        let mut out: Vec<(u64, u64, String, String, bool, BTreeMap<String, String>)> = self
+        let mut out: Vec<(u64, u64, String, String, BTreeMap<String, String>)> = self
             .timelines
             .iter()
             .filter_map(|(tid, tl)| {
                 let conv_id = tl.conv_id.clone().unwrap_or_default();
                 let label = tl.label.clone().unwrap_or_default();
-                if conv_id.is_empty() && label.is_empty() && !tl.archived && tl.custom.is_empty() {
+                if conv_id.is_empty() && label.is_empty() && tl.custom.is_empty() {
                     None
                 } else {
-                    Some((
-                        tl.order,
-                        tid.raw(),
-                        conv_id,
-                        label,
-                        tl.archived,
-                        tl.custom.clone(),
-                    ))
+                    Some((tl.order, tid.raw(), conv_id, label, tl.custom.clone()))
                 }
             })
             .collect();
         out.sort_by_key(|(order, tid, ..)| (*order, *tid));
         out.into_iter()
-            .map(|(_, tid, conv_id, label, archived, custom)| {
-                (tid, conv_id, label, archived, custom)
-            })
+            .map(|(_, tid, conv_id, label, custom)| (tid, conv_id, label, custom))
             .collect()
     }
 
@@ -3803,17 +3879,26 @@ impl Substrate {
         }
     }
 
-    /// Apply a decoded `ConvState` payload.  Same stash-and-drain
-    /// pattern as [`Self::apply_conv_meta`] for unregistered
-    /// timelines.
+    /// Apply a decoded `ConvState` payload — the whole state, replacing
+    /// whatever an earlier record set. Same stash-and-drain pattern as
+    /// [`Self::apply_conv_meta`] for unregistered timelines, except that a
+    /// later stashed state replaces an earlier one rather than merging.
     pub fn apply_conv_state(&mut self, timeline_raw: u64, state: ConvState) {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
         if self.timelines.contains_key(&timeline) {
-            let _ = self.set_archived(timeline, state.archived);
+            self.replace_conv_state(timeline, state);
         } else {
             self.pending_conv_state.insert(timeline_raw, state);
+        }
+    }
+
+    /// Install `state` as `timeline`'s whole conversation state.
+    fn replace_conv_state(&mut self, timeline: TimelineId, state: ConvState) {
+        if let Some(entry) = self.timelines.get_mut(&timeline) {
+            entry.archived = state.archived;
+            entry.branches = state.branches;
         }
     }
 
@@ -4019,6 +4104,8 @@ impl Substrate {
         // know which of its turns were retired first.
         self.tombstoned_turns.retain(|(tl, _)| *tl != timeline);
         self.splice_source_timelines.remove(&timeline);
+        // A tombstoned conversation is never a projection's target again.
+        self.retrieval_scopes.remove(&timeline);
         // A tombstoned timeline's KV is dead — release its resident VRAM now.
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
             Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
@@ -4027,6 +4114,64 @@ impl Substrate {
         for r in residences {
             self.release_dead_residence(r);
         }
+    }
+
+    /// Mark the section stream `stream_id` as tombstoned in-RAM — the
+    /// section counterpart of [`Self::tombstone_timeline`]. Callers writing
+    /// the matching [`RecordType::SectionTombstone`] record to the redo log
+    /// invoke this to keep the live ingest triage in sync — without it the
+    /// section would only read as gone on the next reload, and a request in
+    /// this same process would restore the corrupted chunks again.
+    ///
+    /// Releases any hot/warm VRAM a currently-registered section pointing at
+    /// this stream holds. A tombstoned section is never legitimately read
+    /// again, so there is nothing later that depends on keeping its resident
+    /// bytes around — unlike an ordinary LRU eviction, this is not something
+    /// a future projection will need back.
+    pub fn tombstone_section(&mut self, stream_id: StreamId) {
+        self.tombstoned_sections.insert(stream_id);
+        let residences: Vec<ResidenceIndex> = self
+            .sections
+            .values()
+            .map(|e| e.residence)
+            .filter(|&r| self.residence[r.0].stream_id == stream_id)
+            .collect();
+        for r in residences {
+            self.release_dead_residence(r);
+        }
+    }
+
+    /// Whether the section stream `stream_id` has been tombstoned.
+    pub fn is_section_tombstoned(&self, stream_id: StreamId) -> bool {
+        self.tombstoned_sections.contains(&stream_id)
+    }
+
+    /// Direct read of the tombstoned-section-stream set. Used by the
+    /// compactor to re-emit one [`RecordType::SectionTombstone`] marker per
+    /// entry (the same role [`Self::tombstoned_timelines`] plays for
+    /// timeline tombstones) and by a future boot-time integrity pass that
+    /// wants the same set the reactive repair maintains.
+    pub fn tombstoned_sections(&self) -> &HashSet<StreamId> {
+        &self.tombstoned_sections
+    }
+
+    /// Apply a decoded [`SectionTombstonePayload`] read back from the redo
+    /// log. Sets the in-RAM flag only — replay runs before anything is
+    /// restored, so there is no VRAM to release the way the live
+    /// [`Self::tombstone_section`] does mid-process.
+    pub fn apply_section_tombstone(
+        &mut self,
+        stream_id: StreamId,
+        payload: &SectionTombstonePayload,
+    ) {
+        if let Some(reason) = &payload.reason {
+            tracing::debug!(
+                stream_id = stream_id.0,
+                reason = %reason,
+                "replaying section tombstone with recorded reason",
+            );
+        }
+        self.tombstoned_sections.insert(stream_id);
     }
 
     /// Mark `timeline`'s durable state as **ephemeral**: nothing will ever read
@@ -4284,14 +4429,17 @@ impl Substrate {
         &self.distilled_timelines
     }
 
-    /// On-disk bytes held by streams of tombstoned timelines — dead
-    /// weight the header-keyed accounting can't see (a tombstone names
-    /// its timeline in the payload, and the doomed records were live
-    /// appends at write time).  Summed from the in-RAM stream index, no
-    /// disk I/O; the compaction trigger adds this to the incremental
-    /// dead-byte counter.
+    /// On-disk bytes held by streams of tombstoned timelines and tombstoned
+    /// section streams — dead weight the header-keyed accounting can't see
+    /// (a tombstone names its target in the payload, not the header, and the
+    /// doomed records were live appends at write time). Summed from the
+    /// in-RAM stream index, no disk I/O; the compaction trigger adds this to
+    /// the incremental dead-byte counter.
     pub fn tombstoned_stream_bytes(&self) -> u64 {
-        if self.tombstoned_timelines.is_empty() && self.tombstoned_turns.is_empty() {
+        if self.tombstoned_timelines.is_empty()
+            && self.tombstoned_turns.is_empty()
+            && self.tombstoned_sections.is_empty()
+        {
             return 0;
         }
         self.streams
@@ -4303,7 +4451,10 @@ impl Substrate {
                             || self.tombstoned_turns.contains(&(tl, t.turn_index))
                     })
                 }
-                _ => false,
+                Some(decl @ StreamDecl::PromptSection(_)) => {
+                    self.tombstoned_sections.contains(&decl.stream_id())
+                }
+                None => false,
             })
             .map(|s| {
                 s.chunks.values().map(|c| c.record_size).sum::<u64>()
@@ -4461,6 +4612,11 @@ impl Substrate {
                     self.apply_tombstone(&payload);
                 }
             }
+            RecordType::SectionTombstone => {
+                if let Ok(payload) = SectionTombstonePayload::decode(&entry.record.payload) {
+                    self.apply_section_tombstone(stream_id, &payload);
+                }
+            }
             RecordType::Distilled => {
                 if let Ok(payload) = DistillPayload::decode(&entry.record.payload) {
                     self.apply_distill(&payload);
@@ -4503,6 +4659,11 @@ impl Substrate {
             // the same walk through its own sink. The substrate holds no
             // opinion about a character.
             | RecordType::Npc
+            // A conversation's file events belong to the daemon above; the
+            // persistence layer locates them (`VfsIndex`) and the substrate
+            // holds no opinion about them either.
+            | RecordType::VfsEvent
+            | RecordType::VfsTombstone
             | RecordType::Unknown => {}
         }
     }
@@ -5423,7 +5584,51 @@ impl Substrate {
             return false;
         }
         entry.archived = archived;
+        // An archived conversation takes no more turns: no scope of its is
+        // read again.
+        if archived {
+            self.retrieval_scopes.remove(&timeline);
+        }
         true
+    }
+
+    /// `timeline`'s whole conversation state — what its `ConvState` record
+    /// carries — or `None` for an unregistered timeline.
+    pub fn conv_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.timelines.get(&timeline).map(|e| ConvState {
+            archived: e.archived,
+            branches: e.branches.clone(),
+        })
+    }
+
+    /// Set the branch `timeline` works on in `repo`. No-op when the timeline
+    /// isn't registered. Returns `true` when the branch actually changed, so
+    /// the caller can skip the persistence write when nothing did.
+    pub fn set_branch(&mut self, timeline: TimelineId, repo: &str, branch: &str) -> bool {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            return false;
+        };
+        if entry.branches.get(repo).map(String::as_str) == Some(branch) {
+            return false;
+        }
+        entry.branches.insert(repo.to_string(), branch.to_string());
+        true
+    }
+
+    /// Every live timeline's conversation state that differs from an
+    /// untouched one, as `(timeline_id, state)` in timeline order — what
+    /// compaction and maintenance re-emit as `ConvState` records.
+    pub fn live_conv_states(&self) -> Vec<(u64, ConvState)> {
+        let mut out: Vec<(u64, ConvState)> = self
+            .timelines
+            .keys()
+            .filter_map(|tl| {
+                let state = self.conv_state(*tl)?;
+                (!state.is_default()).then_some((tl.raw(), state))
+            })
+            .collect();
+        out.sort_by_key(|(tl, _)| *tl);
+        out
     }
 
     /// Every **live** timeline that has a `conv_id` recorded, paired
@@ -5721,8 +5926,20 @@ impl Substrate {
     /// it to hot.  Used by the ingest loop to skip re-issuing a
     /// `RestoreSection` for a section the substrate already knows
     /// about (preventing duplicate residence allocations).
+    ///
+    /// A tombstoned section (see [`Self::tombstone_section`]) reads as
+    /// absent here even though its entry is still in [`Self::sections`] —
+    /// mirroring how a tombstoned timeline stays in [`Self::timelines`] and
+    /// is filtered at every read site instead of being purged. The next
+    /// triage that asks for this section id falls through to the ingest
+    /// path, which re-prefills fresh and overwrites the tombstoned entry.
     pub fn section_exists(&self, section: SectionId) -> bool {
-        self.sections.contains_key(&section)
+        match self.sections.get(&section) {
+            Some(entry) => !self
+                .tombstoned_sections
+                .contains(&self.residence[entry.residence.0].stream_id),
+            None => false,
+        }
     }
 
     /// Per-layer chunk count for the section's hot residence, or
@@ -6299,6 +6516,91 @@ mod tests {
             parent.raw().to_string(),
         );
         sub.merge_custom(child, &kv);
+    }
+
+    // ── retrieval scope ─────────────────────────────────────────────────────
+
+    /// Two targets and three ingest conversations in one group.
+    fn scope_fixture() -> (Substrate, GroupId, [TimelineId; 2], [TimelineId; 3]) {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+        let targets = [alloc.next(), alloc.next()];
+        let ingested = [alloc.next(), alloc.next(), alloc.next()];
+        for tl in ingested {
+            sub.register_timeline(tl, layer, group);
+        }
+        (sub, group, targets, ingested)
+    }
+
+    fn scoped(sub: &Substrate, group: GroupId, target: TimelineId) -> Vec<TimelineId> {
+        sub.scoped_timelines_for_group(group, target).collect()
+    }
+
+    /// **A group that is not scoped offers every live conversation**, to
+    /// every target — a scope given to it changes nothing.
+    #[test]
+    fn an_unscoped_group_offers_everything() {
+        let (mut sub, group, [a, _], ingested) = scope_fixture();
+        sub.set_retrieval_scope(a, group, Arc::new(HashSet::from([ingested[0]])));
+        assert!(!sub.is_group_scoped(group));
+        assert_eq!(scoped(&sub, group, a), ingested.to_vec());
+    }
+
+    /// **A scoped group offers each target exactly what its scope names**,
+    /// nothing to a target with no scope, and never a tombstoned conversation
+    /// even when named.
+    #[test]
+    fn a_scoped_group_offers_each_target_its_own_scope() {
+        let (mut sub, group, [a, b], ingested) = scope_fixture();
+        sub.mark_group_scoped(group);
+        assert!(sub.is_group_scoped(group));
+        assert!(
+            scoped(&sub, group, a).is_empty(),
+            "no scope, nothing offered"
+        );
+
+        sub.set_retrieval_scope(
+            a,
+            group,
+            Arc::new(HashSet::from([ingested[0], ingested[2]])),
+        );
+        sub.set_retrieval_scope(b, group, Arc::new(HashSet::from([ingested[1]])));
+        assert_eq!(scoped(&sub, group, a), vec![ingested[0], ingested[2]]);
+        assert_eq!(scoped(&sub, group, b), vec![ingested[1]]);
+
+        sub.tombstoned_timelines.insert(ingested[2]);
+        assert_eq!(scoped(&sub, group, a), vec![ingested[0]]);
+
+        sub.set_retrieval_scope(a, group, Arc::new(HashSet::from([ingested[1]])));
+        assert_eq!(
+            scoped(&sub, group, a),
+            vec![ingested[1]],
+            "replaced, not merged"
+        );
+
+        sub.clear_retrieval_scope(a);
+        assert!(scoped(&sub, group, a).is_empty());
+        assert_eq!(scoped(&sub, group, b), vec![ingested[1]], "b's is its own");
+    }
+
+    /// **A target that can take no more turns keeps no scope**: archiving it
+    /// or tombstoning it lets every scope it was given go.
+    #[test]
+    fn an_archived_or_tombstoned_target_lets_its_scope_go() {
+        let (mut sub, group, [a, b], ingested) = scope_fixture();
+        sub.mark_group_scoped(group);
+        let dialogue = GroupId::for_test(2);
+        for target in [a, b] {
+            sub.register_timeline(target, LayerId::for_test(2), dialogue);
+            sub.set_retrieval_scope(target, group, Arc::new(HashSet::from([ingested[0]])));
+        }
+        assert!(sub.set_archived(a, true));
+        assert!(scoped(&sub, group, a).is_empty());
+        assert_eq!(scoped(&sub, group, b), vec![ingested[0]]);
+        sub.tombstone_timeline(b);
+        assert!(sub.retrieval_scopes.is_empty());
     }
 
     // ── fast-path tool reads ────────────────────────────────────────────────
@@ -8947,6 +9249,62 @@ mod tests {
         );
     }
 
+    /// The section counterpart of [`tombstoned_stream_bytes_sums_dead_timelines`]
+    /// — a tombstoned section's on-disk bytes must count as dead weight too,
+    /// or the compaction trigger never sees the corrupted chunks a reactive
+    /// repair leaves behind.
+    #[test]
+    fn tombstoned_stream_bytes_sums_dead_sections() {
+        use crate::persistence::content_hash::ContentHash;
+        use crate::persistence::streams::{ContentAddress, SectionDecl};
+
+        let mut sub = Substrate::new();
+        let decl_for = |lo: u64| {
+            StreamDecl::PromptSection(SectionDecl {
+                address: ContentAddress {
+                    prefix_hash: ContentHash { lo: 1, hi: 0 },
+                    section_hash: ContentHash { lo, hi: 0 },
+                },
+                debug_name: "tool_catalog".to_string(),
+            })
+        };
+        let dead_decl = decl_for(7);
+        let live_decl = decl_for(8);
+        let dead_sid = dead_decl.stream_id();
+        let live_sid = live_decl.stream_id();
+        for (sid, decl) in [(dead_sid, dead_decl), (live_sid, live_decl)] {
+            sub.apply_stream_decl(sid, decl);
+            sub.apply_chunk_loc(
+                sid,
+                0,
+                ChunkLoc {
+                    segment: FIRST_SEGMENT,
+                    offset: 4096,
+                    payload_len: 100,
+                    record_size: 8192,
+                    token_count: 32,
+                    format: 4,
+                },
+            );
+            sub.apply_tokens_loc(
+                sid,
+                RecordLoc {
+                    segment: FIRST_SEGMENT,
+                    offset: 20_480,
+                    payload_len: 64,
+                    record_size: 4096,
+                },
+            );
+        }
+        assert_eq!(sub.tombstoned_stream_bytes(), 0, "nothing tombstoned yet");
+        sub.tombstone_section(dead_sid);
+        assert_eq!(
+            sub.tombstoned_stream_bytes(),
+            8192 + 4096,
+            "only the tombstoned section's chunk + tokens bytes count"
+        );
+    }
+
     /// Gather-scope tag semantics, pinned.
     ///
     /// `SelectionPolicy.tags` documents an empty list as "all projections in
@@ -9235,7 +9593,7 @@ mod tests {
             custom: Default::default(),
         };
         sub.apply_conv_meta(timeline.raw(), &meta);
-        sub.apply_conv_state(timeline.raw(), super::ConvState { archived: false });
+        sub.apply_conv_state(timeline.raw(), super::ConvState::default());
         assert!(
             sub.known_conversations().is_empty(),
             "pre-registration: meta stashed, not visible yet"
@@ -9371,7 +9729,57 @@ mod tests {
             .iter()
             .find(|e| e.0 == tl.raw())
             .expect("timeline in live meta");
-        assert_eq!(entry.4.get("path").map(String::as_str), Some("src/lib.rs"));
+        assert_eq!(entry.3.get("path").map(String::as_str), Some("src/lib.rs"));
+    }
+
+    // ── Conversation state (archived + branches) ────────────────────────
+
+    /// **A branch is set per repository, and only a change counts.** The
+    /// state carries it beside `archived`, and `live_conv_states` — what
+    /// compaction and maintenance re-emit — carries every non-default state
+    /// whole, so a branch survives a rewrite of the log.
+    #[test]
+    fn branches_are_set_per_repository_and_re_emitted_whole() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let (a, b) = (alloc.next(), alloc.next());
+        let mut sub = Substrate::new();
+        sub.register_timeline(a, layer, group);
+        sub.register_timeline(b, layer, group);
+
+        assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
+        assert!(sub.set_branch(a, "candle", "main"));
+        assert!(!sub.set_branch(a, "candle", "main"), "no change, no write");
+        assert!(sub.set_branch(a, "mind", "master"));
+        assert!(sub.set_branch(a, "candle", "zen/work"));
+        assert!(sub.set_archived(b, true));
+        assert!(
+            !sub.set_branch(alloc.next(), "candle", "main"),
+            "unregistered"
+        );
+
+        let a_state = super::ConvState {
+            archived: false,
+            branches: [("candle", "zen/work"), ("mind", "master")]
+                .into_iter()
+                .map(|(r, b)| (r.to_string(), b.to_string()))
+                .collect(),
+        };
+        assert_eq!(sub.conv_state(a), Some(a_state.clone()));
+        let b_state = super::ConvState {
+            archived: true,
+            branches: Default::default(),
+        };
+        assert_eq!(
+            sub.live_conv_states(),
+            vec![(a.raw(), a_state), (b.raw(), b_state)]
+        );
+
+        // A replayed record replaces the state whole.
+        sub.apply_conv_state(a.raw(), super::ConvState::default());
+        assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
+        assert_eq!(sub.live_conv_states().len(), 1, "a is untouched again");
     }
 
     #[test]

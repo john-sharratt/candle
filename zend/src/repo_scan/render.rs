@@ -4,10 +4,11 @@
 //! `request → <tool_call> → <tool_response> → DECODED answer`:
 //!
 //! ````text
-//!   user       Summarize the `zend/src/code_read/` folder in ONE complete
-//!              sentence, ending with a full stop. …
-//!   assistant  <tool_call>{"name":"file_list","arguments":{"prefix":"zend/src/code_read/"}}</tool_call>
-//!   user       <tool_response>{"files":[…],"paging":{…},"total_bytes":0}</tool_response>
+//!   user       Summarize the `zend/src/code_read/` folder in the `candle`
+//!              repository in ONE complete sentence, ending with a full stop. …
+//!   assistant  <tool_call>{"name":"file_list","arguments":{"repo":"candle",
+//!                          "path":"zend/src/code_read"}}</tool_call>
+//!   user       <tool_response>{"repo":"candle","entries":[…],"paging":{…},…}</tool_response>
 //!   assistant  ← DECODED: the one-sentence folder summary this layer retrieves
 //! ````
 //!
@@ -22,49 +23,51 @@
 //! three turns reading `README.md` — the second time for its last five lines —
 //! and never wrote a summary at all.
 //!
-//! **Every decode answers a request one turn back** — see
-//! [`render_round_trips`] for why that invariant, and not the prose of any one
-//! prompt, is what keeps the closing decode on task.
-//!
-//! Both tool responses are produced by invoking the REAL tools
+//! The tool response is produced by invoking the REAL tool
 //! ([`zend_tools::run`]) rather than hand-written here, so a prefilled response
 //! cannot drift from what the model will see at runtime — including details no
-//! hand-written copy would keep in step, like `serde_json` emitting object keys
-//! in sorted order.
+//! hand-written copy would keep in step, like the order `serde_json` emits a
+//! response's keys in (the struct's field order — the workspace builds it with
+//! `preserve_order`).
+//!
+//! A unit's directory is workspace-relative (`candle/zend/src/`); the call
+//! addresses it as its repository and the path inside it
+//! ([`crate::repo_path::split`]), the arguments the live tool takes. The
+//! workspace root (`.`) lists with `repo: "*"`, which lists the repositories.
 
 use candle_conversation::stencil::ToolCallEnvelope;
 use candle_conversation::TurnText;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use zend_tools::ToolContext;
+use zend_vfs::ALL_REPOS;
 
 use super::dir_unit::DirUnit;
+use crate::repo_path::split;
 
 /// Tools whose definitions must be present for this chain's prefilled calls to
 /// be coherent — pinned into the catalog via `FORCE_TOOL_SELECTOR`.
 pub const CHAIN_TOOLS: &[&str] = &["file_list", "file_read"];
 
 /// User-side request opening the folder's conversation. Mirrors the
-/// `code_reading` scope prompt (`Summarize \`path\` (lines a-b) …`) so both
-/// ingests teach one request→answer shape; the unit here is a folder, not a span.
+/// `code_reading` request so both ingests teach one request→answer shape; the
+/// unit here is a folder, not a file.
 ///
 /// A directory holding a manifest carries its hint in parentheses (`(crate:
 /// candle-nn)`) — the one thing about a folder that the listing states only
 /// obliquely, as a filename.
 ///
-/// **"One or two complete sentences", not "no more than two sentences".** The
-/// old phrasing described a ceiling and got measured against: of 61 summaries
-/// from one pass, 55 were a single sentence and 31 ended with no full stop at
-/// all, on a complete clause — the request said how many sentences were allowed
-/// and nothing about finishing one. Naming *complete* sentences asks for the
-/// property that was actually missing, and costs nothing when the model was
-/// going to write one sentence anyway.
+/// **"ONE complete sentence, ending with a full stop".** An older phrasing
+/// described a ceiling ("no more than two sentences") and got measured against:
+/// of 61 summaries from one pass, 55 were a single sentence and 31 ended with no
+/// full stop at all, on a complete clause — the request said how many sentences
+/// were allowed and nothing about finishing one. Naming a *complete* sentence
+/// asks for the property that was actually missing.
 ///
-/// **And it must not refuse.** The listing is sometimes the only evidence (a
-/// directory with no anchor file is a single round-trip — see the module docs),
-/// and asked to summarize from filenames alone the model has answered "there
-/// isn't enough information available here yet to summarize them accurately",
-/// which seals as that folder's `repo_map` entry. Saying that names and paths
-/// are a legitimate basis removes the excuse.
+/// **And it must not refuse.** The listing is the only evidence, and asked to
+/// summarize from filenames alone the model has answered "there isn't enough
+/// information available here yet to summarize them accurately", which seals as
+/// that folder's `repo_map` entry. Saying that names and paths are a legitimate
+/// basis removes the excuse.
 pub fn render_request(unit: &DirUnit) -> String {
     let folder = folder_phrase(unit);
     let tail = SUMMARY_ASK;
@@ -81,15 +84,28 @@ const SUMMARY_ASK: &str = "in ONE complete sentence, ending with a full stop. \
      The file listing is the evidence — names and paths alone are enough; never reply \
      that there is not enough information, and do not read any file.";
 
-/// How a request names the folder. A real directory is named by its path in
-/// backticks; the workspace root is named in words. `.` is the tag and cache key,
-/// not something to show a reader — asked to summarize "the `.` folder" the model
-/// writes about "the `.()` directory".
+/// How a request names the folder. The workspace root and a repository's root
+/// are named in words; any other directory by its path in backticks, with the
+/// repository it is in. `.` is the tag and cache key, not something to show a
+/// reader — asked to summarize "the `.` folder" the model writes about "the
+/// `.()` directory".
 fn folder_phrase(unit: &DirUnit) -> String {
-    if unit.list_prefix().is_empty() {
-        "the root folder of this project".to_string()
-    } else {
-        format!("the `{}` folder", unit.label())
+    match split(unit.list_path()) {
+        ("", _) => "the workspace and the repositories it holds".to_string(),
+        (repo, "") => format!("the `{repo}` repository"),
+        (repo, inner) => format!("the `{inner}/` folder in the `{repo}` repository"),
+    }
+}
+
+/// The `file_list` arguments for `unit`: [`ALL_REPOS`] for the workspace root
+/// (which lists the repositories), the repository for a repository's root, the
+/// repository and path otherwise — in the order the tool's schema declares
+/// them.
+fn list_args(unit: &DirUnit) -> Vec<(&'static str, &str)> {
+    match split(unit.list_path()) {
+        ("", _) => vec![("repo", ALL_REPOS)],
+        (repo, "") => vec![("repo", repo)],
+        (repo, inner) => vec![("repo", repo), ("path", inner)],
     }
 }
 
@@ -106,23 +122,25 @@ fn folder_phrase(unit: &DirUnit) -> String {
 /// answer to that question; see its note on a literal being "a second opinion
 /// about the checkpoint actually loaded".
 pub fn render_list_call(env: &ToolCallEnvelope, unit: &DirUnit) -> String {
-    env.render("file_list", &[("prefix", unit.list_prefix())])
+    env.render("file_list", &list_args(unit))
 }
 
 /// User-side `<tool_response>` for the listing — produced by running the real
 /// `file_list` against `ctx`, so the bytes are the tool's own. The listing is
 /// literal: a file name is the workspace's text, not markup.
 pub fn render_list_response(ctx: &ToolContext, unit: &DirUnit) -> TurnText {
-    let args = json!({ "prefix": unit.list_prefix() });
-    let value = zend_tools::run("file_list", "repo_map_prefill", &args, ctx);
+    let args: Map<String, Value> = list_args(unit)
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), json!(v)))
+        .collect();
+    let value = zend_tools::run("file_list", "repo_map_prefill", &Value::Object(args), ctx);
     let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
     TurnText::markup("<tool_response>")
         .then_literal(body)
         .then_markup("</tool_response>")
 }
 
-/// The `error` field of a `<tool_response>` body, when it carries one. Only a
-/// JSON body can be an error — the excerpt response is raw numbered text.
+/// The `error` field of a `<tool_response>` body, when it carries one.
 fn error_detail(turn: &str) -> Option<String> {
     let body = turn
         .strip_prefix("<tool_response>")?
@@ -133,37 +151,21 @@ fn error_detail(turn: &str) -> Option<String> {
     Some(format!("{error}: {detail}"))
 }
 
-/// The whole chain for one directory: the prefilled `(user, assistant)` pairs
+/// The whole chain for one directory: the prefilled `(user, assistant)` pair
 /// followed by the final user turn whose assistant half the model DECODES.
 ///
-/// ONE request, two tool calls, one decode. The request opens the chain and the
-/// decode closes it, with the listing and the excerpt gathered in between —
-/// which is what a real exploration looks like, and what `code_read`'s scope
-/// read is, one call longer.
+/// **One pair, always: the request and the folder's listing.** A folder is
+/// summarised from what is in it, and `file_list` is what says that. The
+/// request opens the chain and the decode closes it, with the listing in
+/// between — see the module docs for why a second, reading round-trip was
+/// removed.
 ///
 /// This only works because an ingest conversation projects its OWN turns (see
 /// `ContentResolver::target_is_ingest_self`). While those turns were belief-
-/// gated out, the decode could see nothing but the excerpt in its own user turn,
-/// and every workaround for that — restating the ask inside the decode's turn,
-/// splitting into two round-trips so a request sat adjacent — was compensating
-/// for the missing history rather than fixing it. Splitting in particular cost a
-/// throwaway "what is in here" decode whose chatty answer then set the style for
-/// the summary that followed.
-///
-/// **One pair, always: the request and the folder's listing.** A folder is
-/// summarised from what is in it, and `file_list` is what says that.
-///
-/// It used to read an anchor file too — a `README.md` or a module root — as a
-/// second round-trip, on the reasoning that a folder is best described by the
-/// file that describes it. The cost was out of proportion to that: the anchor
-/// excerpt is the whole of a large file pasted into the turn, so the root
-/// folder's unit carried 9,315 characters of README to produce one sentence,
-/// and on a substrate where every unit inherits the priming chain that is paid
-/// again on every projection. Worse, the read is a *suggestion* — the model
-/// answers the tool call it is given, and given a `file_read` it would issue
-/// another, so the root's conversation spent all three of its turns reading
-/// `README.md` (twice, the second for its last five lines) and never wrote a
-/// summary at all.
+/// gated out, the decode could see nothing but the listing in its own user
+/// turn, and every workaround for that — restating the ask inside the decode's
+/// turn, splitting into two round-trips so a request sat adjacent — was
+/// compensating for the missing history rather than fixing it.
 pub fn render_chain(
     ctx: &ToolContext,
     unit: &DirUnit,
@@ -193,10 +195,23 @@ pub fn chain_error(prefilled: &[(TurnText, String)], decode_user: &TurnText) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo_scan::dir_unit::build_units;
-    use crate::repo_scan::types::{FileEntry, Language, ModuleHint, RepoMap};
+    use crate::branch_ingest::units::{test_units, workspace_unit};
+    use crate::repo_scan::types::Language;
     use candle_conversation::models::Dialect;
     use std::path::Path;
+    use zend_vfs::{RepoSpec, Workspace};
+
+    /// A tool context over `d` as a workspace whose repositories are its
+    /// top-level folders — every test here keys its files under repository `a`.
+    fn ctx_for(d: &tempfile::TempDir) -> ToolContext {
+        let repos = std::fs::read_dir(d.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| RepoSpec::named(&e.file_name().to_string_lossy()))
+            .collect();
+        ToolContext::with_workspace(Workspace::new(d.path(), repos).unwrap())
+    }
 
     /// The envelope the chain tests render through. ChatML, so the assertions
     /// that predate the dialect wiring keep asserting the shape they always did;
@@ -215,31 +230,33 @@ mod tests {
         dir
     }
 
-    fn map_of(root: &Path, paths: &[(&str, Language)]) -> RepoMap {
-        let _ = root;
-        RepoMap {
-            files: paths
-                .iter()
-                .map(|(p, l)| FileEntry {
-                    path: p.to_string(),
-                    line_count: 1,
-                    language: *l,
-                    size_bytes: 1,
-                    module_hint: None,
-                })
-                .collect(),
-            ..Default::default()
-        }
+    /// The folder units of one repository's files, each read from `root` as
+    /// the ingest reads a unit from its commit.
+    fn build_units(root: &Path, paths: &[(&str, Language)]) -> Vec<DirUnit> {
+        test_units(paths)
+            .iter()
+            .map(|u| DirUnit::read(u, |path| std::fs::read(root.join(path)).ok()))
+            .collect()
     }
 
     #[test]
     fn request_names_the_folder_and_asks_for_complete_sentences() {
-        let d = workspace(&[("a/x.rs", "fn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
-        let units = build_units(&m);
+        let d = workspace(&[("a/src/x.rs", "fn x() {}\n")]);
+        let units = build_units(d.path(), &[("a/src/x.rs", Language::Rust)]);
         assert_eq!(
             render_request(&units[0]),
-            format!("Summarize the `a/` folder {SUMMARY_ASK}"),
+            format!("Summarize the `src/` folder in the `a` repository {SUMMARY_ASK}"),
+        );
+    }
+
+    /// A repository's own root is named as the repository.
+    #[test]
+    fn a_repository_root_is_named_as_the_repository() {
+        let d = workspace(&[("a/x.rs", "fn x() {}\n")]);
+        let units = build_units(d.path(), &[("a/x.rs", Language::Rust)]);
+        assert_eq!(
+            render_request(&units[0]),
+            format!("Summarize the `a` repository {SUMMARY_ASK}"),
         );
     }
 
@@ -274,39 +291,48 @@ mod tests {
 
     /// The workspace root is named in words. Asked to summarize "the `.` folder"
     /// the model writes about "the `.()` directory" — `.` is the tag and cache
-    /// key, never something to put in front of a reader.
+    /// key, never something to put in front of a reader. Its listing is
+    /// `repo: "*"`, which lists the repositories.
     #[test]
     fn the_workspace_root_is_named_in_words_not_as_a_dot() {
-        let d = workspace(&[(
-            "top.rs",
-            "fn x() {}
-",
-        )]);
-        let m = map_of(d.path(), &[("top.rs", Language::Rust)]);
-        let units = build_units(&m);
-        assert_eq!(units[0].dir, ".", "the tag/cache key stays `.`");
+        let d = workspace(&[("a/x.rs", "fn x() {}\n"), ("b/y.rs", "fn y() {}\n")]);
+        let root = DirUnit::read(&workspace_unit(&["a".into(), "b".into()]), |_| None);
+        assert_eq!(root.dir, ".", "the tag/cache key stays `.`");
 
-        let request = render_request(&units[0]);
+        let request = render_request(&root);
         assert_eq!(
             request,
-            format!("Summarize the root folder of this project {SUMMARY_ASK}"),
+            format!("Summarize the workspace and the repositories it holds {SUMMARY_ASK}"),
         );
         assert!(!request.contains('`'), "no backticked path for the root");
+        assert_eq!(
+            render_list_call(&env(), &root),
+            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"*\"}}\n</tool_call>",
+        );
+        let listing = render_list_response(&ctx_for(&d), &root).text();
+        assert_eq!(
+            listing,
+            "<tool_response>{\"repo\":\"*\",\"entries\":[{\"repo\":\"a\",\"dir\":true},{\"repo\":\"b\",\"dir\":true}],\
+             \"paging\":{\"page\":0,\"pages\":1,\"per_page\":50,\"total\":2,\"next_page\":null},\
+             \"total_bytes\":0}</tool_response>",
+        );
     }
 
     /// A crate root announces itself rather than leaving the model to infer it
     /// from a `Cargo.toml` in the listing.
     #[test]
     fn request_carries_a_manifest_hint_when_the_folder_has_one() {
-        let d = workspace(&[("a/x.rs", "fn x() {}\n")]);
-        let mut m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
-        m.files[0].module_hint = Some(ModuleHint::CargoPackage {
-            name: "demo".to_string(),
-        });
-        let units = build_units(&m);
+        let d = workspace(&[
+            ("a/Cargo.toml", "[package]\nname = \"demo\"\n"),
+            ("a/x.rs", "fn x() {}\n"),
+        ]);
+        let units = build_units(
+            d.path(),
+            &[("a/Cargo.toml", Language::Toml), ("a/x.rs", Language::Rust)],
+        );
         assert_eq!(
             render_request(&units[0]),
-            format!("Summarize the `a/` folder (crate: demo) {SUMMARY_ASK}"),
+            format!("Summarize the `a` repository (crate: demo) {SUMMARY_ASK}"),
         );
     }
 
@@ -322,13 +348,13 @@ mod tests {
     #[test]
     fn tool_calls_are_hermes_json_on_a_json_dialect() {
         let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
-        let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m);
+        let d = workspace(&[("a/src/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
+        let units = build_units(d.path(), &[("a/src/mod.rs", Language::Rust)]);
         let call = render_list_call(&env, &units[0]);
         assert_eq!(
             call,
-            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"prefix\": \"a/\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"a\", \
+             \"path\": \"src\"}}\n</tool_call>",
         );
     }
 
@@ -344,8 +370,7 @@ mod tests {
     #[test]
     fn tool_calls_follow_the_dialects_call_style() {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m);
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
 
         // What the ingest prefills must equal what the DIALECT's envelope
         // renders — asserted against the envelope rather than against a literal
@@ -356,7 +381,7 @@ mod tests {
         let env = ToolCallEnvelope::for_dialect(&Dialect::qwen35());
         assert_eq!(
             render_list_call(&env, &units[0]),
-            env.render("file_list", &[("prefix", units[0].list_prefix())]),
+            env.render("file_list", &[("repo", "a")]),
             "the listing call must be the dialect envelope's own rendering",
         );
         // And it is the CHECKPOINT's envelope, not a hardcoded family: ask the
@@ -364,29 +389,23 @@ mod tests {
         let lines = ToolCallEnvelope::for_dialect(&Dialect::llama3());
         assert_eq!(
             render_list_call(&lines, &units[0]),
-            lines.render("file_list", &[("prefix", units[0].list_prefix())]),
+            lines.render("file_list", &[("repo", "a")]),
         );
     }
 
     /// A path is the one part of a call an author does not control. Spliced in
     /// raw, a quote or backslash would emit a `<tool_call>` the extractor cannot
     /// parse — so the arguments must be JSON-escaped and stay round-trippable.
-    ///
-    /// This is the surviving form of a concern that used to need two tests. While
-    /// `Dialect::qwen35` declared `CallStyle::FunctionBlock`, values rode raw and
-    /// the hazard was a value containing `</parameter>` and closing its own span;
-    /// that dialect now declares `JsonBlock`, so there are no raw values and no
-    /// `</parameter>` anywhere, and escaping is the whole of the question.
     #[test]
     fn a_path_with_json_metacharacters_stays_parseable() {
         // The unit is built by hand rather than from a real directory: Windows
         // refuses a filename containing `"`, and the escaping under test is the
         // renderer's, not the filesystem's.
         let unit = DirUnit {
-            dir: "we\"ird\\dir/".to_string(),
-            files: Vec::new(),
+            dir: "a/we\"ird\\dir/".to_string(),
             listed: Vec::new(),
-            content_hash: "abc".to_string(),
+            module_hint: None,
+            content_key: "abc".to_string(),
         };
         let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
         let call = render_list_call(&env, &unit);
@@ -397,7 +416,8 @@ mod tests {
             .expect("tag wrapper");
         let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
         assert_eq!(parsed["name"], "file_list");
-        assert_eq!(parsed["arguments"]["prefix"], "we\"ird\\dir/");
+        assert_eq!(parsed["arguments"]["repo"], "a");
+        assert_eq!(parsed["arguments"]["path"], "we\"ird\\dir");
     }
 
     /// The listing response is the live tool's own bytes — the test asserts the
@@ -408,83 +428,58 @@ mod tests {
             ("a/mod.rs", "//! One.\n//! Two.\n"),
             ("a/x.rs", "fn x() {}\n"),
         ]);
-        let m = map_of(
+        let units = build_units(
             d.path(),
             &[("a/mod.rs", Language::Rust), ("a/x.rs", Language::Rust)],
         );
-        let units = build_units(&m);
-        let ctx = ToolContext::with_workspace(d.path());
+        let ctx = ctx_for(&d);
         let out = render_list_response(&ctx, &units[0]).text();
         assert!(out.starts_with("<tool_response>{"), "{out}");
         assert!(out.ends_with("</tool_response>"));
-        assert!(out.contains("\"path\":\"a/mod.rs\""), "{out}");
+        assert!(out.contains("\"path\":\"mod.rs\""), "{out}");
+        assert!(out.contains("\"repo\":\"a\""), "{out}");
         assert!(out.contains("\"paging\""), "{out}");
     }
 
-    /// The chain lists BEFORE it reads: a `file_read` naming `mod.rs` before
-    /// anything revealed the file exists teaches the model to guess paths.
+    /// **A folder holding a README still only lists.** The README is named in
+    /// the listing and never opened: no read call, and no excerpt of it anywhere
+    /// in the turns.
     #[test]
     fn a_folder_with_a_readme_still_only_lists() {
         let d = workspace(&[
             ("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n"),
             ("a/README.md", "# a\n\nHolds the widgets.\n"),
         ]);
-        let m = map_of(
+        let units = build_units(
             d.path(),
             &[
                 ("a/mod.rs", Language::Rust),
-                ("a/README.md", Language::Rust),
+                ("a/README.md", Language::Markdown),
             ],
         );
-        let units = build_units(&m);
-        let ctx = ToolContext::with_workspace(d.path());
+        let ctx = ctx_for(&d);
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(prefilled.len(), 1, "request+list, and nothing after it");
         assert!(prefilled[0]
             .0
             .text()
-            .starts_with("Summarize the `a/` folder"));
+            .starts_with("Summarize the `a` repository"));
         assert!(prefilled[0].1.contains("\"name\": \"file_list\""));
         assert!(
             decode_user.text().starts_with("<tool_response>{"),
             "the decode follows the listing",
         );
-        // The README is named and never opened — no excerpt reaches the turn.
         let whole = format!("{}{}", prefilled[0].1, decode_user.text());
         assert!(!whole.contains("file_read"), "no read call: {whole}");
         assert!(!whole.contains("Holds the widgets"), "no excerpt: {whole}");
     }
 
-    /// No anchor: one prefilled pair, and the listing is the last evidence.
-    #[test]
-    fn a_folder_without_an_anchor_stops_at_the_listing() {
-        let d = workspace(&[(
-            "a/x.rs",
-            "fn x() {}
-",
-        )]);
-        let m = map_of(d.path(), &[("a/x.rs", Language::Rust)]);
-        let units = build_units(&m);
-        let ctx = ToolContext::with_workspace(d.path());
-        let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
-        assert_eq!(prefilled.len(), 1);
-        assert!(prefilled[0].1.contains("\"name\": \"file_list\""));
-        assert!(decode_user.text().starts_with("<tool_response>{"));
-    }
-
     /// A healthy chain reports no tool error.
     #[test]
     fn a_successful_chain_carries_no_tool_error() {
-        let d = workspace(&[(
-            "a/mod.rs",
-            "//! One.
-//! Two.
-fn x() {}
-",
-        )]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m);
-        let ctx = ToolContext::with_workspace(d.path());
+        let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
+        let ctx = ctx_for(&d);
         let (prefilled, decode_user) = render_chain(&ctx, &units[0], &env());
         assert_eq!(chain_error(&prefilled, &decode_user), None);
     }
@@ -508,13 +503,13 @@ fn x() {}
         );
     }
 
-    /// Rendering is deterministic — the resume cache depends on it.
+    /// Rendering is deterministic — a unit's content key stands for the turns
+    /// it shows, so the same unit must render the same bytes every time.
     #[test]
     fn rendering_is_byte_identical_on_repeat() {
         let d = workspace(&[("a/mod.rs", "//! One.\n//! Two.\nfn x() {}\n")]);
-        let m = map_of(d.path(), &[("a/mod.rs", Language::Rust)]);
-        let units = build_units(&m);
-        let ctx = ToolContext::with_workspace(d.path());
+        let units = build_units(d.path(), &[("a/mod.rs", Language::Rust)]);
+        let ctx = ctx_for(&d);
         assert_eq!(
             render_chain(&ctx, &units[0], &env()),
             render_chain(&ctx, &units[0], &env())
