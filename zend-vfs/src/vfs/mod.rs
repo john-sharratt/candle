@@ -575,6 +575,20 @@ impl VfsStore {
         Ok(Some(tree))
     }
 
+    /// The bytes of the blob `id` from the repository behind a store over a
+    /// branch; `None` for a store over a folder or nothing. The session's
+    /// changes are never consulted: a blob id names bytes, which no change
+    /// the session makes can alter.
+    pub fn blob_at(&self, id: &Oid) -> Result<Option<Vec<u8>>, VfsError> {
+        let Lower::Branch { source, .. } = &self.lower else {
+            return Ok(None);
+        };
+        let bytes = source.blob(id).map_err(|e| {
+            VfsError::Unreadable(format!("blob {id} could not be read from git: {e}"))
+        })?;
+        Ok(Some(bytes))
+    }
+
     /// What names `path`'s content as the lower layer holds it: its blob id
     /// and size. Over a branch the base's tree says, with nothing read; over
     /// a folder the file is read and its id computed as git would

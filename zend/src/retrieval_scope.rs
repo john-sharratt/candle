@@ -41,7 +41,8 @@ use self::index::IngestIndex;
 use self::kept::Kept;
 use self::tree_scope::TreeScope;
 use crate::branch_ingest::filter::IngestScope;
-use crate::branch_ingest::units::{dir_of, workspace_unit};
+use crate::branch_ingest::manifest::Hints;
+use crate::branch_ingest::units::{dir_of, workspace_unit, TreeFile};
 use crate::code_read::is_upload_path;
 
 /// The least time between two rebuilds a turn asks for.
@@ -92,6 +93,8 @@ pub struct RetrievalScope {
     trees: Mutex<Kept<(String, Oid, u64), Arc<TreeScope>>>,
     /// Whole scopes, by index generation and every repository's base tree.
     shared: Mutex<Kept<ScopeKey, Scope>>,
+    /// Each manifest version's hint — part of a folder's key, as in the walk.
+    hints: Mutex<Hints>,
 }
 
 impl RetrievalScope {
@@ -104,6 +107,7 @@ impl RetrievalScope {
             rebuilt: Mutex::new(None),
             trees: Mutex::new(Kept::new(KEPT_TREES)),
             shared: Mutex::new(Kept::new(KEPT_SCOPES)),
+            hints: Mutex::new(Hints::default()),
         }
     }
 
@@ -251,7 +255,21 @@ impl RetrievalScope {
             }
         };
         let folder_scope = self.folders.as_ref().map(|(_, s)| s);
-        let built = Arc::new(TreeScope::of(index, &repo.name, &tree, folder_scope));
+        let mut hints = self.hints.lock().unwrap();
+        let mut hint_of = |f: &TreeFile| {
+            let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+            hints.of(name, &f.blob, |blob| {
+                repo.store.blob_at(blob).ok().flatten()
+            })
+        };
+        let built = Arc::new(TreeScope::of(
+            index,
+            &repo.name,
+            &tree,
+            folder_scope,
+            &mut hint_of,
+        ));
+        drop(hints);
         self.trees.lock().unwrap().insert(at, Arc::clone(&built));
         Some(built)
     }
@@ -368,7 +386,10 @@ mod tests {
                 tl(3),
             ),
         ]);
-        for (n, unit) in folder_units("r", &tree, &read).into_iter().enumerate() {
+        for (n, unit) in folder_units("r", &tree, &read, &mut |_: &TreeFile| None)
+            .into_iter()
+            .enumerate()
+        {
             by_key.insert(unit.key, tl(10 + n as u64));
         }
         by_key.insert(workspace_unit(&["r".into()]).key, tl(20));

@@ -729,8 +729,8 @@ enum Cmd {
         /// Anything else is a substring test over conv_id, label, the timeline
         /// id (decimal and `0x`-hex), and every metadata key and value.
         ///
-        /// Repeatable, and every one must match (AND): `--filter kind=repo_map
-        /// --filter anchor=README.md` is the folders described by a README.
+        /// Repeatable, and every one must match (AND): `--filter kind=code_read
+        /// --filter lang=Markdown` is the Markdown files read.
         #[arg(long)]
         filter: Vec<String>,
         /// Stop after this many matching conversations.

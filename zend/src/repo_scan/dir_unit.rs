@@ -1,6 +1,6 @@
 //! A `repo_map` unit ready to render: a folder as a branch lists it
 //! ([`FolderUnit`], `docs/zend_branch_ingest.md` §6.2), with the manifest hint
-//! its request shows read from the commit it was found on.
+//! its request shows — found by the walk, since the hint is part of the key.
 //!
 //! **No anchor excerpt.** A folder is described from its one-level listing
 //! alone — the chain is a single `file_list` round-trip and the summary — so
@@ -8,7 +8,6 @@
 //! anything reads is a manifest, for the hint the request carries.
 
 use super::types::ModuleHint;
-use crate::branch_ingest::manifest;
 use crate::branch_ingest::units::FolderUnit;
 
 /// One directory's ingest unit.
@@ -27,18 +26,12 @@ pub struct DirUnit {
 }
 
 impl DirUnit {
-    /// `unit` with its manifest hint read through `read`, which returns a
-    /// workspace-relative file's bytes. A manifest `read` cannot return gives
-    /// no hint, as one that does not parse gives none.
-    pub fn read(unit: &FolderUnit, read: impl Fn(&str) -> Option<Vec<u8>>) -> Self {
-        let module_hint = unit.manifests.iter().find_map(|m| {
-            let name = m.path.rsplit('/').next().unwrap_or(&m.path);
-            manifest::hint(name, &read(&m.path)?)
-        });
+    /// `unit`, ready to render.
+    pub fn of(unit: &FolderUnit) -> Self {
         Self {
             dir: unit.dir.clone(),
             listed: unit.listed.clone(),
-            module_hint,
+            module_hint: unit.module_hint.clone(),
             content_key: unit.key.clone(),
         }
     }
@@ -77,7 +70,7 @@ mod tests {
     use super::*;
     use crate::branch_ingest::filter::IngestScope;
     use crate::branch_ingest::units::{
-        folder_units, test_tree, test_units, workspace_unit, TreeFile,
+        folder_units, test_tree, test_units, test_units_reading, workspace_unit, TreeFile,
     };
     use crate::repo_scan::types::Language;
 
@@ -92,20 +85,24 @@ mod tests {
     /// that would once have been the folder's anchor is never opened.
     #[test]
     fn the_hint_is_read_from_the_manifest_and_nothing_else_is_read() {
-        let u = unit(&[
-            ("a/Cargo.toml", Language::Toml),
-            ("a/lib.rs", Language::Rust),
-            ("a/x.rs", Language::Rust),
-        ]);
         let bytes: HashMap<&str, &[u8]> = HashMap::from([
             ("a/Cargo.toml", &b"[package]\nname = \"demo\"\n"[..]),
             ("a/lib.rs", b"//! The demo crate.\npub fn x() {}\n"),
         ]);
         let asked = RefCell::new(Vec::new());
-        let d = DirUnit::read(&u, |path| {
-            asked.borrow_mut().push(path.to_string());
-            bytes.get(path).map(|b| b.to_vec())
-        });
+        let u = test_units_reading(
+            &[
+                ("a/Cargo.toml", Language::Toml),
+                ("a/lib.rs", Language::Rust),
+                ("a/x.rs", Language::Rust),
+            ],
+            |path| {
+                asked.borrow_mut().push(path.to_string());
+                bytes.get(path).map(|b| b.to_vec())
+            },
+        )
+        .remove(0);
+        let d = DirUnit::of(&u);
         assert_eq!(d.dir, "a/");
         assert_eq!(d.content_key, u.key);
         assert_eq!(
@@ -116,15 +113,15 @@ mod tests {
         );
         assert_eq!(asked.into_inner(), ["a/Cargo.toml"]);
 
-        let unread = DirUnit::read(&u, |_| None);
+        let unread = DirUnit::of(&unit(&[("a/Cargo.toml", Language::Toml)]));
         assert_eq!(unread.module_hint, None);
     }
 
     #[test]
     fn the_workspace_lists_with_an_empty_path_and_a_folder_with_its_own() {
-        let root = DirUnit::read(&workspace_unit(&["a".into()]), |_| None);
+        let root = DirUnit::of(&workspace_unit(&["a".into()]));
         assert_eq!(root.list_path(), "");
-        let nested = DirUnit::read(&unit(&[("a/zend/src/x.rs", Language::Rust)]), |_| None);
+        let nested = DirUnit::of(&unit(&[("a/zend/src/x.rs", Language::Rust)]));
         assert_eq!(nested.list_path(), "a/zend/src/");
         assert_eq!(nested.label(), "a/zend/src/");
     }
@@ -159,7 +156,7 @@ mod tests {
             .collect();
         assert_eq!(read.len(), 2, "the layer does not read LICENSE");
         let tree = test_tree(&names.map(|name| (name, BLOB)));
-        let u = folder_units("k", &tree, &read).remove(0);
+        let u = folder_units("k", &tree, &read, &mut |_: &TreeFile| None).remove(0);
 
         let workspace = Workspace::new(d.path(), vec![RepoSpec::named("k")]).unwrap();
         let ctx = ToolContext::with_workspace(workspace);

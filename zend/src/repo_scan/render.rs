@@ -195,7 +195,7 @@ pub fn chain_error(prefilled: &[(TurnText, String)], decode_user: &TurnText) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::branch_ingest::units::{test_units, workspace_unit};
+    use crate::branch_ingest::units::{test_units_reading, workspace_unit};
     use crate::repo_scan::types::Language;
     use candle_conversation::models::Dialect;
     use std::path::Path;
@@ -230,12 +230,12 @@ mod tests {
         dir
     }
 
-    /// The folder units of one repository's files, each read from `root` as
-    /// the ingest reads a unit from its commit.
+    /// The folder units of one repository's files, each manifest read from
+    /// `root` as the walk reads it from its commit.
     fn build_units(root: &Path, paths: &[(&str, Language)]) -> Vec<DirUnit> {
-        test_units(paths)
+        test_units_reading(paths, |path| std::fs::read(root.join(path)).ok())
             .iter()
-            .map(|u| DirUnit::read(u, |path| std::fs::read(root.join(path)).ok()))
+            .map(DirUnit::of)
             .collect()
     }
 
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn the_workspace_root_is_named_in_words_not_as_a_dot() {
         let d = workspace(&[("a/x.rs", "fn x() {}\n"), ("b/y.rs", "fn y() {}\n")]);
-        let root = DirUnit::read(&workspace_unit(&["a".into(), "b".into()]), |_| None);
+        let root = DirUnit::of(&workspace_unit(&["a".into(), "b".into()]));
         assert_eq!(root.dir, ".", "the tag/cache key stays `.`");
 
         let request = render_request(&root);

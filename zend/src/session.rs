@@ -52,6 +52,7 @@ use crate::api::substrate::{
     SystemPromptView, TimelineDetail, ToolView, ToolsView, TurnView,
 };
 use crate::branch_ingest::filter::IngestScope;
+use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
 use crate::coding_sampling;
 use crate::config::DaemonConfig;
@@ -6480,6 +6481,21 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                         .is_some_and(|m| m.kind.is_summary())
                 })
                 .count();
+            let branches = s
+                .custom_of(tl)
+                .and_then(|m| m.get(BRANCHES_KEY))
+                .map(|v| {
+                    v.split(',')
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let commit = s
+                .custom_of(tl)
+                .and_then(|m| m.get(COMMIT_KEY))
+                .cloned()
+                .unwrap_or_default();
             conversations.push(ConvView {
                 timeline: tl.raw().to_string(),
                 conv_id: s.conv_id_of(tl).unwrap_or_default().to_string(),
@@ -6489,6 +6505,8 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                 turns: s.turn_count(tl),
                 tokens: s.total_token_count(tl),
                 summary_nodes,
+                branches,
+                commit,
             });
         }
     }

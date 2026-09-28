@@ -560,10 +560,20 @@ mod tests {
         let base = git.peek_base().unwrap().expect("a branch has a base");
         let tree = git.tree_at(&base).unwrap().expect("a branch has a tree");
         assert_eq!(tree.file("a.txt"), Some((&hello, 6)));
+        assert_eq!(
+            git.blob_at(&hello).unwrap().as_deref(),
+            Some(&b"hello\n"[..]),
+            "a blob is read by id from the repository"
+        );
 
         let disk = files.repo(&folder).unwrap();
         assert_eq!(disk.content_id("a.txt").unwrap(), Some((hello, 6)));
         assert!(disk.peek_base().unwrap().is_none());
+        assert_eq!(
+            disk.blob_at(&base.commit().unwrap().clone()).unwrap(),
+            None,
+            "a folder has no blobs to read"
+        );
         assert!(disk.tree_at(&base).unwrap().is_none());
     }
 

@@ -31,13 +31,12 @@ use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
 use zend_vfs::Oid;
 
-use crate::branch_ingest::keys::CONTENT_KEY;
+use crate::branch_ingest::keys::{branches_value, BRANCHES_KEY, CONTENT_KEY};
 use crate::branch_ingest::plan::Committed;
 use crate::branch_ingest::units::FolderUnit;
 use crate::ingest_report::{Failures, IngestReport};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_path::split;
 
 pub use binary_sniff::is_binary_sample;
 pub use dir_unit::DirUnit;
@@ -550,6 +549,9 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
 pub struct UnitJob {
     pub unit: FolderUnit,
     pub at: Option<Oid>,
+    /// Every branch whose tip lists the folder this way, recorded on the
+    /// conversation ([`BRANCHES_KEY`]); empty for the workspace's own unit.
+    pub branches: Vec<String>,
 }
 
 /// Ingest `jobs` — the units the pass queued (`docs/zend_branch_ingest.md`
@@ -980,13 +982,7 @@ fn process_one_dir(
         );
         return Ok(());
     };
-    // The manifest hint, read from the unit's commit through the same stores
-    // its tool call reads.
-    let unit = DirUnit::read(&job.unit, |path| {
-        let (repo, inner) = split(path);
-        tools.files.repo(repo).ok()?.read_bytes(inner).ok()?
-    });
-    let unit = &unit;
+    let unit = &DirUnit::of(&job.unit);
     // Render BEFORE minting anything: the tool responses come from actually
     // running the tools, so a directory the tools can't read is caught here and
     // costs no conversation. Prefilling an error body would be worse than
@@ -1149,6 +1145,9 @@ fn process_one_dir(
     tags.insert(DIR_KEY.to_string(), unit.dir.clone());
     tags.insert(CONTENT_KEY.to_string(), unit.content_key.clone());
     tags.insert("files".to_string(), unit.listed.len().to_string());
+    if !job.branches.is_empty() {
+        tags.insert(BRANCHES_KEY.to_string(), branches_value(&job.branches));
+    }
     // The tag write is what commits the new generation. If it fails, this
     // attempt has to go: keeping the prior generation live is right, but keeping
     // BOTH is not — the untagged replacement is invisible to the pass's plan and

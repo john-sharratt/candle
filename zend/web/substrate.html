@@ -93,6 +93,8 @@
   .badge.norm{color:var(--ink-faint)}
   .badge.think{color:var(--c-think);border-color:#4a3d1f}
   .badge.peak{color:var(--accent);border-color:#1e3a4a}
+  .branches{display:block;font-family:var(--mono);font-size:11px;font-weight:400;
+    color:var(--ink-dim);margin-top:2px;overflow-wrap:anywhere}
   .chips{display:flex;flex-wrap:wrap;gap:6px;margin:9px 0}
   .chip{font-family:var(--mono);font-size:11px;color:var(--ink-dim);background:#0e141b;
     border:1px solid var(--line);border-radius:6px;padding:3px 8px}
@@ -445,11 +447,28 @@ function layerCard(l, d){
   return card;
 }
 
+// What tells an ingested unit's row from its namesakes. A file reading names
+// the commit it read the file at — the version, which many branches share. A
+// folder names the branches that list it its way: one `candle/` row per
+// distinct listing reads as ten identical rows without them. A long branch
+// list shows its first few and a count, with the whole list on hover.
+const BRANCHES_SHOWN = 3;
+const COMMIT_SHOWN = 10;
+function versionLine(c){
+  if(c.commit) return h('span',{class:'branches',title:c.commit,text:'@ '+c.commit.slice(0, COMMIT_SHOWN)});
+  const branches = c.branches;
+  if(!branches || !branches.length) return null;
+  const shown = branches.slice(0, BRANCHES_SHOWN).join(', ');
+  const more = branches.length > BRANCHES_SHOWN ? ' +'+(branches.length-BRANCHES_SHOWN)+' more' : '';
+  return h('span',{class:'branches',title:branches.join(', '),text:'@ '+shown+more});
+}
+
 function convCard(c){
   const head=[
     h('span',{class:'title'},[
       document.createTextNode(c.label && c.label.trim() ? c.label : '(untitled)'),
-    ]),
+      versionLine(c),
+    ].filter(Boolean)),
     h('div',{class:'meta'},[
       c.archived?badge('arch','archived'):null,
       c.summary_nodes?badge('sum', c.summary_nodes+' summary'):null,
@@ -672,10 +691,13 @@ function mockTools(){
 }
 function mockLayer(name){
   const m={
-    repo_map:[{timeline:'3300220011009988776',conv_id:'',label:'(untitled)',archived:false,group:'structure',turns:22,tokens:14880,summary_nodes:4}],
+    repo_map:[
+      {timeline:'3300220011009988776',conv_id:'',label:'candle/',archived:false,group:'structure',turns:2,tokens:14880,summary_nodes:0,branches:['main']},
+      {timeline:'3300220011009988777',conv_id:'',label:'candle/',archived:false,group:'structure',turns:2,tokens:14880,summary_nodes:0,branches:['cline-passthrough','hunt-snapshot','npc-engine','qwen38-moe','stencil-json-repair']},
+    ],
     code_reading:[
-      {timeline:'2200110099887766554',conv_id:'',label:'candle-conversation/src/substrate.rs',archived:false,group:'scopes',turns:9,tokens:6120,summary_nodes:0},
-      {timeline:'2200110099887766555',conv_id:'',label:'zend/src/session.rs',archived:false,group:'scopes',turns:6,tokens:4310,summary_nodes:0},
+      {timeline:'2200110099887766554',conv_id:'',label:'candle-conversation/src/substrate.rs',archived:false,group:'scopes',turns:9,tokens:6120,summary_nodes:0,branches:['main','qwen38-moe'],commit:'2122c95d9b8e4f1a3c5d7e9f0a1b2c3d4e5f6a7b'},
+      {timeline:'2200110099887766555',conv_id:'',label:'zend/src/session.rs',archived:false,group:'scopes',turns:6,tokens:4310,summary_nodes:0,branches:['main'],commit:'1dda19ce4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c'},
     ],
     dialogue:[
       {timeline:'8421990033112233445',conv_id:'a1b2c3d4e5f6',label:'Trace the substrate redo log replay',archived:false,group:'primary_conversation',turns:18,tokens:24310,summary_nodes:3},

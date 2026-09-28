@@ -84,10 +84,15 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | zend | `target\release\zend.exe D:\prog\candle --host 192.168.0.5 --port 8081 --max-depth 1 --disable-layer code_reading -v` | 2026-09-20, from the running process — `repo_map` bounded to one path component; `code_reading` removed from retrieval at the user's request while that layer is broken; `-v` (DEBUG) added at some point after 2026-09-15, kept on this restart since the process is the fact |
+| .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --max-depth 1 -v` | 2026-09-29, from the running process — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`); its substrate is `D:\prog\substrate`, started blank on this restart. `repo_map` and `code_reading` bounded to one path component; `-v` (DEBUG) |
 | .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind C:/Users/johna/prog/mind --forget-conversations` | 2026-09-13, from the user (not yet confirmed by a `/down`) |
 
 Notes on the arguments:
+
+- **The workspace** (zend's positional argument) is a folder holding `workspace.yaml`, which
+  lists the repositories — each a folder directly inside it (`docs/zend_workspace_execution.md`
+  §3). A repository's own folder is not a workspace: zend refuses to start without the
+  manifest, before the model loads.
 
 - **`--disable-layer`** (zend) removes a layer from retrieval. zend reads no layer from the
   repositories' folders at boot — they belong to the sandbox's jobs — so there is no flag

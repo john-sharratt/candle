@@ -43,7 +43,9 @@ use zend_vfs::Oid;
 
 use self::lines::line_count;
 use crate::branch_ingest::filter::{language_of, MAX_FILE_BYTES};
-use crate::branch_ingest::keys::{file_key, BLOB_KEY, CONTENT_KEY, LINES_KEY};
+use crate::branch_ingest::keys::{
+    branches_value, file_key, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY, LINES_KEY,
+};
 use crate::branch_ingest::plan::Committed;
 use crate::ingest_report::Failures;
 use crate::loading::LoadProgress;
@@ -66,6 +68,9 @@ pub struct FileJob {
     pub blob: Oid,
     pub language: Language,
     pub at: Option<Oid>,
+    /// Every branch whose tip holds this version, recorded on the
+    /// conversation ([`BRANCHES_KEY`]); empty for an upload, which is on none.
+    pub branches: Vec<String>,
 }
 
 impl FileJob {
@@ -345,6 +350,7 @@ pub fn ingest_files(
                 blob,
                 language,
                 at: None,
+                branches: Vec::new(),
             }),
             Ok(_) => {
                 tracing::debug!(file = %path, "code_read: skip an upload missing or over the size cap");
@@ -853,6 +859,12 @@ fn process_one_file(
     tags.insert(LINES_KEY.to_string(), lines.to_string());
     tags.insert(CONTENT_KEY.to_string(), job.key.to_string());
     tags.insert("lang".to_string(), format!("{:?}", file.language));
+    if !file.branches.is_empty() {
+        tags.insert(BRANCHES_KEY.to_string(), branches_value(&file.branches));
+    }
+    if let Some(at) = &file.at {
+        tags.insert(COMMIT_KEY.to_string(), at.to_string());
+    }
     if let Err(err) = conv.set_metadata_many(&tags) {
         // Not committed: no pass, fast path or scope will find it. The prior
         // generation stays live, exactly as on the failure path, and this
@@ -1034,6 +1046,7 @@ mod tests {
             blob: Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap(),
             language: Language::Rust,
             at: None,
+            branches: Vec::new(),
         };
         assert_eq!(
             job.key(),

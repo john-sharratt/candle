@@ -263,6 +263,15 @@ pub struct ConvView {
     pub tokens: usize,
     /// Summary-forest nodes (SoT + SoS) — how much has been compressed.
     pub summary_nodes: usize,
+    /// For an ingested unit, every branch whose tip holds the version this
+    /// conversation read, default branch first — what tells one `candle/`
+    /// row from another. Empty for a dialogue, an upload, and the workspace's
+    /// own unit.
+    pub branches: Vec<String>,
+    /// For a file reading, the commit it read the file at — the version it
+    /// holds, which every branch sharing that version shares, so the view shows
+    /// this rather than [`Self::branches`]. Empty for anything else.
+    pub commit: String,
 }
 
 /// `GET /v1/substrate/system-prompt` — the single shared system prompt. Fetched

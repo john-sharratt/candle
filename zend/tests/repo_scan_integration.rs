@@ -19,7 +19,6 @@ use candle_conversation::models::Dialect;
 use candle_conversation::stencil::ToolCallEnvelope;
 use zend::branch_ingest::filter::IngestScope;
 use zend::branch_ingest::walk::{walk, RepoBranches, TreeCache, UnitItem};
-use zend::repo_path::split;
 use zend::repo_scan::render::render_chain;
 use zend::repo_scan::DirUnit;
 use zend::turn_sink::{InsertTurnSink, RecordingTurnSink};
@@ -120,7 +119,7 @@ fn keys_of(root: &Path) -> Vec<(String, String)> {
 /// Record every unit's SEED chain — the prefilled request/`file_list` pair and
 /// the listing response whose assistant half `converse::run_folder_conversation`
 /// decodes — exactly as `process_one_dir` renders it: tools reading the commit
-/// the unit was found on, the manifest read from it. The decode and any
+/// the unit was found on, the hint the walk read from its manifest. The decode and any
 /// follow-up tool round it drives need a model, so they are the live daemon's
 /// half; what is asserted here is the turn shape that reaches the conversation
 /// before the first decode, which is where every rendering defect lives.
@@ -137,10 +136,7 @@ fn record(root: &Path) -> RecordingTurnSink {
             None => ctx.files.fresh(),
         };
         let tools = ctx.with_files(Arc::new(files));
-        let unit = DirUnit::read(&item.unit, |path| {
-            let (repo, inner) = split(path);
-            tools.files.repo(repo).ok()?.read_bytes(inner).ok()?
-        });
+        let unit = DirUnit::of(&item.unit);
         let tags = vec!["repo_map".to_string(), unit.dir.clone()];
         let (prefilled, decode_user) = render_chain(&tools, &unit, &env);
         for (user, assistant) in &prefilled {
@@ -391,6 +387,77 @@ fn a_folder_key_moves_when_the_module_hint_changes() {
     );
     commit(dir.path(), "workspace");
     assert_eq!(moved(&before, &keys_of(dir.path())), ["demo/"]);
+}
+
+/// **Branches sharing a lineage share their units.** A `topic` branch whose
+/// only change is a `Cargo.toml` version bump lists every folder the way
+/// `main` does and asks the same question of it — the hint is `(crate: demo)`
+/// either way — so each folder is ONE unit that both branches hold, and every
+/// file they share is one reading; only the manifest itself, whose bytes
+/// differ, is read twice. Keyed on the manifest's bytes the repository's root
+/// was two conversations saying the same thing, and that is what multiplied
+/// `candle/` across its branches.
+#[test]
+fn branches_that_share_a_lineage_share_their_units() {
+    let dir = small_workspace();
+    let repo = dir.path().join(REPO);
+    git(&repo, &["checkout", "-q", "-b", "topic"]);
+    write(
+        dir.path(),
+        "Cargo.toml",
+        b"[package]\nname = \"demo\"\nversion = \"0.2.0\"\n",
+    );
+    commit(dir.path(), "bump");
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let branches = RepoBranches::read(REPO, Repo::open(&repo).unwrap()).unwrap();
+    let (corpus, failed) = walk(
+        std::slice::from_ref(&branches),
+        &IngestScope::new("", None),
+        &mut TreeCache::default(),
+        &workspace_of(dir.path()).names(),
+        &[],
+    );
+    assert!(failed.is_empty());
+
+    let folders: Vec<(&str, Vec<&str>)> = corpus
+        .units
+        .iter()
+        .map(|u| {
+            (
+                u.unit.dir.as_str(),
+                u.branches.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        folders,
+        [
+            (".", vec![]),
+            ("demo/", vec!["main", "topic"]),
+            ("demo/src/", vec!["main", "topic"]),
+        ],
+        "one unit per folder, held by both branches",
+    );
+
+    let readings = |path: &str| -> Vec<Vec<&str>> {
+        corpus
+            .files
+            .iter()
+            .filter(|f| f.file.path == path)
+            .map(|f| f.branches.iter().map(String::as_str).collect())
+            .collect()
+    };
+    assert_eq!(
+        readings("demo/src/lib.rs"),
+        [vec!["main", "topic"]],
+        "an unchanged file is one reading on both branches"
+    );
+    assert_eq!(
+        readings("demo/Cargo.toml"),
+        [vec!["main"], vec!["topic"]],
+        "the manifest's bytes differ, so it is read once per version"
+    );
 }
 
 #[test]
