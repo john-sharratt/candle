@@ -34,9 +34,10 @@
 //! fence ring, which is where the fence is recorded).
 
 use super::pack::{ExpertPack, PackRead};
-use super::pinned::{LayerGeometry, WarmPool};
+use super::pinned::LayerGeometry;
 use super::pipeline::{build_slot_from_record_on_stream, ColdStaging};
 use super::types::PipelineStats;
+use super::warm_tier::WarmTier;
 use candle::CudaDevice;
 use cudarc::driver::{CudaEvent, CudaStream};
 use std::sync::mpsc;
@@ -46,7 +47,7 @@ use std::sync::{Arc, Mutex};
 /// path's ring: the streamer's reads overlap compute rather than stalling it,
 /// so ring depth buys concurrency, not latency — and each buffer is a pinned
 /// record stride (~14 MB on the 284B target).
-const STREAM_STAGING_BUFFERS: usize = 16;
+pub(crate) const STREAM_STAGING_BUFFERS: usize = 16;
 
 /// One expert's byte-move: everything resolved by the issuer so the streamer
 /// needs no residency or zone state.
@@ -93,7 +94,7 @@ pub(crate) enum StreamCmd {
 /// its own staging ring and CUDA stream.
 pub(crate) struct StreamerCtx {
     pub pack: Arc<ExpertPack>,
-    pub warm: Arc<WarmPool>,
+    pub warm: Arc<WarmTier>,
     pub layer_geometries: Arc<Vec<LayerGeometry>>,
     pub cuda_dev: CudaDevice,
     pub stream: Arc<CudaStream>,
@@ -125,21 +126,15 @@ impl Drop for StreamerHandle {
     }
 }
 
-/// Spawn the streamer thread. Returns `None` when its staging ring cannot be
-/// allocated — streaming is an optimisation, so the engine simply runs
-/// without it.
-pub(crate) fn spawn_streamer_thread(ctx: StreamerCtx) -> Option<StreamerHandle> {
-    let stride = ctx.pack.stride();
-    let staging = match ColdStaging::new(stride, STREAM_STAGING_BUFFERS) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                target: "candle_transformers::expert_lre::streamer",
-                "streamer staging ring unavailable ({e}); expert streaming disabled"
-            );
-            return None;
-        }
-    };
+/// Spawn the streamer thread over `staging` — a ring of
+/// [`STREAM_STAGING_BUFFERS`] the caller allocated before the warm tier, so it
+/// is never taken from an exhausted page-lock budget. Returns `None` when the
+/// thread cannot be spawned — streaming is an optimisation, so the engine
+/// simply runs without it.
+pub(crate) fn spawn_streamer_thread(
+    ctx: StreamerCtx,
+    staging: ColdStaging,
+) -> Option<StreamerHandle> {
     // Depth 2: the issuer sends at most one plan per layer and joins the
     // previous target before issuing far ahead, so the channel never grows.
     let (tx, rx) = mpsc::sync_channel::<StreamCmd>(2);
@@ -255,11 +250,34 @@ fn run_plan(ctx: &StreamerCtx, staging: &mut ColdStaging, plan: &StreamPlan) -> 
 
     for j in plan.jobs.iter().filter(|j| j.warm_slot.is_some()) {
         let warm_slot = j.warm_slot.expect("filtered Some");
-        // SAFETY: as above; the warm tier is immutable, so the source slice
-        // is stable for the copy's lifetime.
+        let pinned = ctx.warm.is_pinned(warm_slot);
+        // A pageable warm slot is never an upload source: copy it into a
+        // staging buffer first, and hold that buffer until the upload lands.
+        let staged = if pinned {
+            None
+        } else {
+            match staging.acquire_many(1) {
+                Ok(v) => Some(v[0]),
+                Err(_) => {
+                    failed.push((j.expert_idx, j.slot_idx));
+                    continue;
+                }
+            }
+        };
+        if let Some(idx) = staged {
+            staging
+                .buffer_mut(idx, stride)
+                .copy_from_slice(ctx.warm.slot_ref(warm_slot, stride));
+        }
+        let src = match staged {
+            Some(idx) => staging.buffer_ref(idx, stride),
+            None => ctx.warm.slot_ref(warm_slot, stride),
+        };
+        // SAFETY: as above; a pinned warm slot is immutable, and a staging
+        // buffer is not rewritten until the event published below retires.
         let up = unsafe {
             build_slot_from_record_on_stream(
-                ctx.warm.slot_ref(warm_slot, stride),
+                src,
                 layout,
                 geom,
                 &ctx.cuda_dev,
@@ -271,6 +289,9 @@ fn run_plan(ctx: &StreamerCtx, staging: &mut ColdStaging, plan: &StreamPlan) -> 
         match up {
             Ok(_view) => {
                 enqueued += 1;
+                if let (Some(idx), Ok(event)) = (staged, ctx.stream.record_event(None)) {
+                    staging.publish(idx, event);
+                }
                 if let Ok(mut s) = ctx.stats.lock() {
                     s.warm_loads += 1;
                 }

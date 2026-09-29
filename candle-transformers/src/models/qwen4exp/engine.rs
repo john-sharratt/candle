@@ -35,7 +35,7 @@ use candle::{Device, Result, Tensor};
 use super::config::Qwen4ExpConfig;
 use super::hyper::ko::HcWeightsKo;
 use super::hyper::HcWeights;
-use super::loader::{load_headroom_bytes, open_cached_ple};
+use super::loader::{load_headroom_bytes, offloaded_bytes, open_cached_ple};
 use super::model::PleSource;
 use super::mtp::{MtpDense, MtpHead};
 use super::ple::PleWeights;
@@ -475,6 +475,12 @@ impl Qwen4ExpGpu {
             // for a root path.
             merged.parent().filter(|p| !p.as_os_str().is_empty()),
             progress,
+            // Nothing outside the experts is read from the host after load: the
+            // n-gram table is served by its own row cache, and every other
+            // tensor is resident on the card. Counted as live weight, the host
+            // budget would reserve the table's 54 GB and the dense stack's
+            // 5.2 GiB as page cache out of the warm tier's RAM.
+            offloaded_bytes(&content)?,
         )?
         .ok_or_else(|| candle::Error::Msg("qwen4exp engine: no expert tensors found".into()))?;
         let mut layers: Vec<GpuLayer> = trunk

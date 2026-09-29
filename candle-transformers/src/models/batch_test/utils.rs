@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
 use crate::models::batch_test::span_report::print_span;
 use crate::models::batch_test::story_normalize::normalize_story;
 use crate::models::batched_inference::{
@@ -27,6 +28,7 @@ use crate::models::batched_inference::{
 use crate::models::dialect::Dialect;
 use crate::models::expert_lre::PipelineStats;
 use crate::models::speculative_choice::GreedyChooser;
+use candle::vram::process_ram::ProcessRam;
 
 /// How a run decides its draft budget.
 ///
@@ -481,6 +483,9 @@ pub struct TestResults {
     pub compression_ratio: Option<f64>, // Float-equivalent bytes / actual quantized bytes
     pub peak_tokens: usize,         // Total tokens across all sessions at peak (after generation)
     pub expert_stats: Option<PipelineStats>, // Expert cache telemetry (if model has MoE)
+    /// This process's host RAM at the end of the decode. `None` where the
+    /// platform has no address-space walk.
+    pub host_after_decode: Option<ProcessRam>,
     /// `(hits, misses, evictions)` of a disk-resident embedding tier's row
     /// cache, if the model serves one. Cumulative across the run: the cache is
     /// process-wide and deliberately not reset per config, because its hit
@@ -998,6 +1003,7 @@ pub fn account_model_load<M>(device: &Device, load: impl FnOnce() -> Result<M>) 
     let _ = candle::gpu_memory::snapshot("before_model_load", device);
     let model = load()?;
     let _ = candle::gpu_memory::snapshot("after_model_load", device);
+    print_host_ram_line("after model load");
     let free_after = device.mem_get_info().map(|(f, _)| f).unwrap_or(0);
     candle::gpu_memory::register("model weights", free_before.saturating_sub(free_after));
     Ok(model)
@@ -1689,6 +1695,13 @@ impl TestParams {
         self.device.synchronize()?;
         pipeline_record("bench:bulk_total", t_prompt_total);
         let prompt_duration = prompt_start.elapsed();
+        // After the clock stops: the walk visits every page of the address space
+        // — ~17M on Flash-Next's 54 GB mapping — and inside the window it would
+        // be charged to prefill.
+        print_host_ram_line(&format!(
+            "{:?}×{} after prefill",
+            config.mode, config.num_contexts
+        ));
         let prompt_tokens = user_lens.iter().sum::<usize>() * config.num_repeats.max(1);
         let prompt_tokens_per_sec = (prompt_tokens as f64) / prompt_duration.as_secs_f64();
 
@@ -1753,6 +1766,7 @@ impl TestParams {
             &format!("{:?} x{} decode end", config.mode, sequence_indices.len()),
             model.expert_stats().as_ref(),
         );
+        let host_after_decode = ProcessRam::capture();
         let forbidden = forbidden_alloc::take_report();
         if !forbidden.is_clean() {
             eprintln!("[{:?}] {}", config.mode, forbidden);
@@ -1965,7 +1979,8 @@ impl TestParams {
             quantized_token_percent,
             compression_ratio,
             peak_tokens,
-            expert_stats: None,    // Filled by run() after collection
+            expert_stats: None, // Filled by run() after collection
+            host_after_decode,
             row_cache_stats: None, // Likewise
             bulk_profile,
             single_profile,
@@ -2694,6 +2709,19 @@ impl TestParams {
                  arena watermark in 16 MiB regions, Eff% the share of it holding KV."
             );
         }
+        // Where this process's host RAM stood as each config's decode ended —
+        // what the warm expert tier is sized against, beside what it holds.
+        let host: Vec<(String, Option<ProcessRam>)> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                (
+                    format!("#{} {:?}×{}", i + 1, r.config.mode, r.config.num_contexts),
+                    r.host_after_decode.clone(),
+                )
+            })
+            .collect();
+        print_host_ram(&host);
         // **Here, not after the expert table.** The pinned-RAM report carries the
         // boundary's `Spare calc:` attribution — which of the four gates refused
         // the weight side ground — and it used to hang off
@@ -2770,6 +2798,10 @@ impl TestParams {
                         )
                     }
                 }),
+            ),
+            (
+                "  of which pageable",
+                Box::new(|s: &PipelineStats| format!("{}", s.warm_paged_slots)),
             ),
             // Which path the MoE dispatched on. `device` means the grid is
             // fully resident and routing never leaves the card; `host (readback)`
