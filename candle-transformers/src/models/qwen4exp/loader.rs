@@ -211,6 +211,35 @@ fn tensor_bytes(info: &TensorInfo) -> usize {
     info.shape.elem_count() / info.ggml_dtype.block_size() * info.ggml_dtype.type_size()
 }
 
+/// Mapped bytes outside the expert slabs that host RAM never serves after load
+/// — the figure `ExpertCacheSetup::offloaded_bytes` takes, so the host budget
+/// reserves only what this engine really keeps reading from the host.
+///
+/// Two kinds, and between them every non-expert byte but one arena:
+///
+/// - **The n-gram (PLE) table**, read only through the §0.1 row cache, so its
+///   pages are that cache's to serve — less the cache's own arena, which is
+///   real pageable RAM and stays reserved.
+/// - **Every other tensor**, which the load reads once into device memory (the
+///   dense block, or the pool for the embedding) through a per-tensor buffer
+///   that is dropped at upload. Nothing reads them from the file again, so
+///   their pages are the OS file cache's, not this engine's. Reserved, they
+///   were 5.2 GiB of a 31.5 GiB box held back from the warm tier for weights
+///   living on the card.
+pub(crate) fn offloaded_bytes(content: &Content) -> Result<u64> {
+    let table = content
+        .tensor_infos
+        .get(PLE_TABLE)
+        .ok_or_else(|| candle::Error::Msg(format!("qwen4exp: no {PLE_TABLE}")))?;
+    let device_resident: u64 = content
+        .tensor_infos
+        .iter()
+        .filter(|(name, _)| name.as_str() != PLE_TABLE && !name.ends_with("_exps.weight"))
+        .map(|(_, info)| tensor_bytes(info) as u64)
+        .sum();
+    Ok((tensor_bytes(table) as u64).saturating_sub(PLE_CACHE_BYTES as u64) + device_resident)
+}
+
 /// CUDA-pool room the engine's load needs — [`peak_load_pool_bytes`] over every
 /// tensor the load reads to the device, which is every one but the n-gram table,
 /// **plus the resident embedding table**.
@@ -501,5 +530,50 @@ mod tests {
             load_headroom_bytes(&content),
             32 * 34 + 2 * REPACK_BAND_BYTES + 16 * 34
         );
+    }
+
+    /// Offloaded is every non-expert tensor the load puts on the device, plus
+    /// the n-gram table less the row cache's arena — and never an expert slab,
+    /// which the pack serves and the expert cache already subtracts.
+    #[test]
+    fn offloaded_counts_the_device_residents_and_the_table_past_its_cache() {
+        // A table bigger than the cache arena: 2 GiB + 68 000 bytes of Q8_0.
+        let table_rows = PLE_CACHE_BYTES / 68 + 1000;
+        let tensor_infos: HashMap<String, TensorInfo> = [
+            (TOKEN_EMBD, info(GgmlDType::Q8_0, &[8, 64])),
+            ("output.weight", info(GgmlDType::Q8_0, &[16, 64])),
+            (PLE_TABLE, info(GgmlDType::Q8_0, &[table_rows, 64])),
+            (
+                "blk.0.ffn_up_exps.weight",
+                info(GgmlDType::Q8_0, &[4, 64, 64]),
+            ),
+        ]
+        .into_iter()
+        .map(|(n, i)| (n.to_string(), i))
+        .collect();
+        let content = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata: HashMap::new(),
+            tensor_infos,
+            tensor_data_offset: 0,
+        };
+        let table = (table_rows * 68) as u64;
+        assert_eq!(
+            offloaded_bytes(&content).unwrap(),
+            table - PLE_CACHE_BYTES as u64 + (8 + 16) * 68
+        );
+    }
+
+    /// An artifact with no n-gram table is not this engine's; the figure is
+    /// refused rather than guessed.
+    #[test]
+    fn offloaded_requires_the_ngram_table() {
+        let content = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata: HashMap::new(),
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        };
+        assert!(offloaded_bytes(&content).is_err());
     }
 }

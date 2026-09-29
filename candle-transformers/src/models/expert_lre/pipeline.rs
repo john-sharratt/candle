@@ -77,9 +77,11 @@ use super::compute::QMatMul;
 #[cfg(feature = "cuda")]
 use super::pack::{ExpertPack, PackRead, PackWriter, RecordLayout};
 #[cfg(feature = "cuda")]
-use super::pinned::{ExpertResidency, LayerGeometry, WarmPool};
+use super::pinned::{ExpertResidency, LayerGeometry};
 #[cfg(feature = "cuda")]
 use super::streamer::{StreamDone, StreamJob, StreamPlan, StreamerHandle};
+#[cfg(feature = "cuda")]
+use super::warm_tier::WarmTier;
 
 /// Key a fence into the ring by `(target_layer, source)`.
 ///
@@ -219,18 +221,17 @@ fn mmap_evict_expert(mmap: &memmap2::Mmap, r: &MmapExpertRef) {
 #[cfg(feature = "cuda")]
 pub(crate) struct StartupTargets<'a> {
     pub inner: &'a mut ExpertCacheInner,
-    pub warm: &'a mut WarmPool,
+    pub warm: &'a mut WarmTier,
     pub residency: &'a mut [Vec<ExpertResidency>],
     /// Warm slot `i` holds `membership[i]`, decided once by the stratified draw.
     pub membership: &'a [(usize, usize)],
     pub geoms: &'a [LayerGeometry],
     pub layouts: &'a [RecordLayout],
     pub stride: usize,
-    /// The checkpoint, and where each expert's projections sit in it.
-    ///
-    /// Both entry points repack from here: the first-boot path for every expert,
-    /// the restart path for the pinned prefix alone — those experts have no
-    /// record in the pack, so the GGUF is the only place their bytes exist.
+    /// The checkpoint, and where each expert's projections sit in it — the
+    /// first-boot path repacks every evictable expert from here. (The pinned
+    /// prefix, which has no record in the pack, is filled from it before the
+    /// warm tier exists: [`startup_pinned_prefix`].)
     pub mmap: &'a [u8],
     pub host_refs: &'a [Vec<MmapExpertRef>],
 }
@@ -260,10 +261,10 @@ pub(crate) const PACK_TAIL_STEPS: usize = 2;
 /// evicted without losing it, which is the defect this whole design removes.
 ///
 /// The exception is the pinned prefix (`cache::PINNED_LAYERS` leading layers),
-/// which is never evicted and so is never reloaded. Those experts are repacked
-/// and installed in VRAM here like any other, and then dropped rather than
-/// written — the pack's invariant is that it holds every expert *that can be
-/// evicted*, and storing the rest is dead disk and a dead warm slot.
+/// which is never evicted and so is never reloaded. Those experts were filled
+/// into VRAM before the warm tier existed ([`startup_pinned_prefix`]) and are
+/// not written — the pack's invariant is that it holds every expert *that can
+/// be evicted*, and storing the rest is dead disk and a dead warm slot.
 ///
 /// Progress is reported against `total_experts + PACK_TAIL_STEPS`, leaving room
 /// for the publish and the gauge seed its caller performs after it returns.
@@ -271,6 +272,10 @@ pub(crate) const PACK_TAIL_STEPS: usize = 2;
 pub(crate) fn startup_repack(
     t: StartupTargets<'_>,
     writer: &mut PackWriter,
+    // The pipeline's own ring, allocated before the warm tier: every VRAM
+    // upload here goes through it, never straight out of a pageable repack
+    // buffer (see `startup_pinned_prefix`).
+    staging: &mut ColdStaging,
     cuda_dev: &candle::CudaDevice,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<()> {
@@ -301,7 +306,11 @@ pub(crate) fn startup_repack(
     let mut vram_count = 0usize;
     let mut warm_count = 0usize;
 
-    for moe_idx in 0..num_moe_layers {
+    let stream = cuda_dev.cuda_stream();
+    // The pinned prefix was filled from the checkpoint before the warm tier
+    // existed (`startup_pinned_prefix`), and gets no record: nothing can ever
+    // ask the pack for an expert that is never evicted.
+    for moe_idx in pinned..num_moe_layers {
         let geom = &t.geoms[moe_idx];
         let layout = t.layouts[moe_idx];
         for expert_idx in 0..num_experts {
@@ -310,11 +319,7 @@ pub(crate) fn startup_repack(
             // record of zeroes reads back as a plausible expert. There is no
             // partial answer here: the pack is authoritative or it is nothing.
             let (gate, up, down) = repack_expert_projections(mmap, r, geom, cuda_dev)?;
-            // The pinned prefix goes straight to VRAM and stays there, so it
-            // gets no record: nothing can ever ask the pack for it.
-            if moe_idx >= pinned {
-                writer.write_expert(moe_idx, expert_idx, &gate, &up, &down)?;
-            }
+            writer.write_expert(moe_idx, expert_idx, &gate, &up, &down)?;
 
             let mut res = ExpertResidency::default();
             if let Some(warm_slot) = warm_slot_of[moe_idx][expert_idx] {
@@ -328,13 +333,21 @@ pub(crate) fn startup_repack(
             // margin is the last ground to be taken.
             if let Some(slot_idx) = t.inner.take_free() {
                 let slot_base = t.inner.slot_base(slot_idx);
+                let idx = staging.acquire()?;
+                write_record(staging.buffer_mut(idx, t.stride), layout, &gate, &up, &down);
                 // SAFETY: `slot_idx` was just handed out by the zone and is not
-                // reclaimed until an eviction returns it.
+                // reclaimed until an eviction returns it; the staging buffer is
+                // not reused until the event published below has fired.
                 let slot = unsafe {
-                    build_slot_from_repacked_with_device(
-                        &gate, &up, &down, geom, cuda_dev, slot_base,
+                    build_slot_from_record_with_device(
+                        staging.buffer_ref(idx, t.stride),
+                        layout,
+                        geom,
+                        cuda_dev,
+                        slot_base,
                     )?
                 };
+                staging.publish(idx, stream.record_event(None).map_err(candle::Error::wrap)?);
                 t.inner.install(slot_idx, moe_idx, expert_idx, slot);
                 res.vram = Some(slot_idx);
                 vram_count += 1;
@@ -367,7 +380,68 @@ pub(crate) fn startup_repack(
         warm_gib = t.warm.total_bytes() as f64 / 1e9,
         "startup: repack complete"
     );
-    Ok(())
+    // The uploads are asynchronous; the resident tier must be complete before
+    // the pipeline takes it over.
+    stream.synchronize().map_err(candle::Error::wrap)
+}
+
+/// Fill the permanently resident prefix (`cache::PINNED_LAYERS` leading
+/// layers) into VRAM, straight from the checkpoint.
+///
+/// **Before the warm tier is allocated, whichever startup path follows.** These
+/// experts have no record in the pack, so each is repacked from the GGUF
+/// mapping and uploaded out of ordinary host memory — and an upload from
+/// pageable memory needs the driver to page-lock a bounce buffer. With the warm
+/// tier pinned up to the page-lock ceiling and its pageable remainder filled,
+/// there was no RAM left for that, and the load died here with
+/// `CUDA_ERROR_OUT_OF_MEMORY`. Mandatory and fixed-size, so it goes first,
+/// like the staging rings.
+///
+/// Takes zone slots from the right edge in layer order, exactly as the fill
+/// that follows would have; stops if the zone runs out. Progress is reported
+/// against the same `total_experts + PACK_TAIL_STEPS` as the fill after it.
+#[cfg(feature = "cuda")]
+pub(crate) fn startup_pinned_prefix(
+    inner: &mut ExpertCacheInner,
+    residency: &mut [Vec<ExpertResidency>],
+    geoms: &[LayerGeometry],
+    mmap: &[u8],
+    host_refs: &[Vec<MmapExpertRef>],
+    cuda_dev: &candle::CudaDevice,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<()> {
+    let num_moe_layers = host_refs.len();
+    let num_experts = host_refs.first().map_or(0, |l| l.len());
+    let total_experts = num_moe_layers * num_experts;
+    let pinned = pinned_layer_count(num_moe_layers);
+    'fill: for moe_idx in 0..pinned {
+        let geom = &geoms[moe_idx];
+        for expert_idx in 0..num_experts {
+            let Some(slot_idx) = inner.take_free() else {
+                break 'fill;
+            };
+            let slot_base = inner.slot_base(slot_idx);
+            let r = &host_refs[moe_idx][expert_idx];
+            let (gate, up, down) = repack_expert_projections(mmap, r, geom, cuda_dev)?;
+            // SAFETY: `slot_idx` was just handed out by the zone and is not
+            // reclaimed while this runs.
+            let slot = unsafe {
+                build_slot_from_repacked_with_device(&gate, &up, &down, geom, cuda_dev, slot_base)?
+            };
+            inner.install(slot_idx, moe_idx, expert_idx, slot);
+            residency[moe_idx][expert_idx].vram = Some(slot_idx);
+            if let Some(cb) = progress {
+                cb(
+                    moe_idx * num_experts + expert_idx + 1,
+                    total_experts + PACK_TAIL_STEPS,
+                );
+            }
+        }
+    }
+    cuda_dev
+        .cuda_stream()
+        .synchronize()
+        .map_err(candle::Error::wrap)
 }
 
 /// Fill both resident tiers from a pack that already exists.
@@ -379,12 +453,14 @@ pub(crate) fn startup_repack(
 pub(crate) fn startup_from_pack(
     t: StartupTargets<'_>,
     pack: &ExpertPack,
+    // The pipeline's own ring, allocated before the warm tier: a ring taken
+    // after it would come from an exhausted page-lock budget.
+    staging: &mut ColdStaging,
     num_moe_layers: usize,
     num_experts: usize,
     cuda_dev: &candle::CudaDevice,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<()> {
-    let (mmap, host_refs) = (t.mmap, t.host_refs);
     if num_moe_layers == 0 || num_experts == 0 {
         return Ok(());
     }
@@ -406,22 +482,22 @@ pub(crate) fn startup_from_pack(
 
     // ── Warm tier: every membership record at once, at full queue depth ──
     //
-    // The pool's slots are cut to the pack's stride, so each read lands in its
-    // final home with nothing in between: no staging buffer, no host-to-host
-    // copy, one NVMe DMA per expert.
+    // The tier's slots — pinned and pageable alike — are cut to the pack's
+    // stride and sector-aligned, so each read lands in its final home with
+    // nothing in between: no staging buffer, no host-to-host copy, one NVMe DMA
+    // per expert.
     if !t.membership.is_empty() {
         let stride = t.stride;
-        let mut rest = t.warm.span_mut(0, t.membership.len());
-        let mut reads: Vec<PackRead<'_>> = Vec::with_capacity(t.membership.len());
-        for &(layer, expert) in t.membership.iter() {
-            let (head, tail) = rest.split_at_mut(stride);
-            reads.push(PackRead {
+        let reads: Vec<PackRead<'_>> = t
+            .membership
+            .iter()
+            .zip(t.warm.slots_mut(t.membership.len(), stride))
+            .map(|(&(layer, expert), dest)| PackRead {
                 layer,
                 expert,
-                dest: head,
-            });
-            rest = tail;
-        }
+                dest,
+            })
+            .collect();
         pack.read_many(reads)?;
         for (slot, &(layer, expert)) in t.membership.iter().enumerate() {
             t.residency[layer][expert].ram = Some(slot);
@@ -435,7 +511,6 @@ pub(crate) fn startup_from_pack(
     );
 
     // ── Hot tier: fill VRAM in layer order, from warm where possible ──
-    let mut staging = ColdStaging::new(t.stride, COLD_STAGING_BUFFERS)?;
     let stream = cuda_dev.cuda_stream();
     let mut vram_count = 0usize;
     let mut cold_reads = 0usize;
@@ -449,46 +524,63 @@ pub(crate) fn startup_from_pack(
         let geom = &t.geoms[moe_idx];
         let layout = t.layouts[moe_idx];
         for expert_idx in 0..num_experts {
+            // The pinned prefix was filled from the checkpoint before the warm
+            // tier existed (`startup_pinned_prefix`); it has no record here.
+            if moe_idx < pinned {
+                if t.residency[moe_idx][expert_idx].vram.is_some() {
+                    vram_count += 1;
+                    repacked += 1;
+                }
+                continue;
+            }
             let Some(slot_idx) = t.inner.take_free() else {
                 break 'fill;
             };
             let slot_base = t.inner.slot_base(slot_idx);
-            // The pinned prefix has no record in either host tier — it is
-            // permanently resident, so nothing ever reloads it and storing it
-            // would be dead bytes. Its one load is here, from the checkpoint.
-            if moe_idx < pinned {
-                let r = &host_refs[moe_idx][expert_idx];
-                let (gate, up, down) = repack_expert_projections(mmap, r, geom, cuda_dev)?;
-                // SAFETY: `slot_idx` was just handed out by the zone and is not
-                // reclaimed while this runs.
-                let slot = unsafe {
-                    build_slot_from_repacked_with_device(
-                        &gate, &up, &down, geom, cuda_dev, slot_base,
-                    )?
-                };
-                t.inner.install(slot_idx, moe_idx, expert_idx, slot);
-                t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
-                vram_count += 1;
-                repacked += 1;
-                if let Some(cb) = progress {
-                    cb(moe_idx * num_experts + expert_idx + 1, total_experts);
+            // Names the upload that failed: which expert, which source, and how
+            // far the fill had got.
+            let at = |source: &'static str| {
+                move |e: candle::Error| {
+                    e.context(format!(
+                        "startup fill: L{moe_idx}E{expert_idx} from {source} into VRAM slot \
+                         {slot_idx} ({vram_count} resident so far)"
+                    ))
                 }
-                continue;
-            }
-            // SAFETY (both arms): `slot_idx` was just handed out by the zone and
+            };
+            // SAFETY (every arm): `slot_idx` was just handed out by the zone and
             // is not reclaimed while this runs.
             let slot = match t.residency[moe_idx][expert_idx].ram {
-                // The warm pool is written once and never again, so it is a
+                // A pinned warm slot is written once and never again, so it is a
                 // source no later write can race — no event, no wait.
-                Some(warm_slot) => unsafe {
+                Some(warm_slot) if t.warm.is_pinned(warm_slot) => unsafe {
                     build_slot_from_record_with_device(
                         t.warm.slot_ref(warm_slot, t.stride),
                         layout,
                         geom,
                         cuda_dev,
                         slot_base,
-                    )?
+                    )
+                    .map_err(at("a pinned warm slot"))?
                 },
+                // A pageable one is never an upload source: through staging.
+                Some(warm_slot) => {
+                    let idx = staging.acquire()?;
+                    staging
+                        .buffer_mut(idx, t.stride)
+                        .copy_from_slice(t.warm.slot_ref(warm_slot, t.stride));
+                    let slot = unsafe {
+                        build_slot_from_record_with_device(
+                            staging.buffer_ref(idx, t.stride),
+                            layout,
+                            geom,
+                            cuda_dev,
+                            slot_base,
+                        )
+                        .map_err(at("a pageable warm slot, staged"))?
+                    };
+                    staging.publish(idx, stream.record_event(None).map_err(candle::Error::wrap)?);
+                    slot
+                }
                 None => {
                     let idx = staging.acquire()?;
                     pack.read_into(moe_idx, expert_idx, staging.buffer_mut(idx, t.stride))?;
@@ -499,7 +591,8 @@ pub(crate) fn startup_from_pack(
                             geom,
                             cuda_dev,
                             slot_base,
-                        )?
+                        )
+                        .map_err(at("the pack, staged"))?
                     };
                     staging.publish(idx, stream.record_event(None).map_err(candle::Error::wrap)?);
                     cold_reads += 1;
@@ -521,8 +614,8 @@ pub(crate) fn startup_from_pack(
             }
         }
     }
-    // The uploads above are asynchronous against pinned buffers this function
-    // is about to drop.
+    // The uploads above are asynchronous; the resident tier must be complete
+    // before the pipeline takes it over.
     stream.synchronize().map_err(candle::Error::wrap)?;
     // The fill stops as soon as VRAM is full, so the remaining experts never
     // reach the progress callback. Land it on the experts so the bar is where
@@ -561,6 +654,13 @@ pub(crate) fn startup_from_pack(
 /// stride) a burst never rewraps within its own layer, and by the next visit
 /// every event has long retired — still a rounding error against the warm
 /// tier, and the thing that keeps a cold miss from stalling the host.
+///
+/// **Pageable warm slots share the ring, and the burst bound is unchanged by
+/// it.** A warm slot past the page-lock ceiling is staged through here
+/// (`WarmTier::is_pinned`), so a layer's burst is every miss the *pinned* part
+/// does not cover. That is exactly the set that reached this ring as pack reads
+/// before a pageable part existed: each pageable slot turns one of those reads
+/// into a memcpy from RAM, and adds none.
 #[cfg(feature = "cuda")]
 pub(crate) const COLD_STAGING_BUFFERS: usize = 64;
 
@@ -873,14 +973,20 @@ unsafe fn build_slot_from_repacked_on_stream_inner(
 /// Build an `ExpertSlot` from one pack **record** — the form both resident
 /// tiers hold — uploading it into the weight-zone slot at `slot_base`.
 ///
-/// The record is the three projections at the offsets `layout` names, which is
-/// the same arrangement a VRAM slot uses, so this is three subslices and the
-/// ordinary upload. Everything downstream of the pack goes through here: warm
-/// promotions, cold misses, and the startup fill.
+/// **One copy, not three.** The record is the three projections at the offsets
+/// `layout` names, which are the slot's own [`slot_offsets`] — the pack is laid
+/// out as slot images — so the whole record from the gate's start to the down
+/// projection's end goes over in a single `cuMemcpyHtoDAsync`, padding and
+/// all, and the three storages are views over the result
+/// ([`build_slot_view`]). Three copies of ~0.44 MB each were launch-bound:
+/// 20,421 of them took 1.27 s of a BF16×1 prefill, ~62 µs apiece against
+/// ~18 µs of bandwidth. Everything downstream of the pack goes through here:
+/// warm promotions, cold misses, and the startup fill.
 ///
 /// # Safety
 ///
-/// As [`build_slot_from_repacked_with_device`].
+/// As [`build_slot_from_repacked_with_device`]; `record` must stay unwritten
+/// until the copy on `stream` has landed.
 #[cfg(feature = "cuda")]
 pub(crate) unsafe fn build_slot_from_record_on_stream(
     record: &[u8],
@@ -891,17 +997,24 @@ pub(crate) unsafe fn build_slot_from_record_on_stream(
     slot_base: u64,
     profile: Option<&mut ProfileAccumulator>,
 ) -> Result<ExpertSlot> {
-    let at = |s: super::pack::RecordSpan| &record[s.offset..s.offset + s.bytes];
-    build_slot_from_repacked_on_stream_inner(
-        at(layout.gate),
-        at(layout.up),
-        at(layout.down),
-        geom,
-        cuda_dev,
-        stream,
-        slot_base,
-        profile,
-    )
+    let (gate_off, up_off, down_off, _) = slot_offsets(geom);
+    if (layout.gate.offset, layout.up.offset, layout.down.offset) != (gate_off, up_off, down_off) {
+        candle::bail!(
+            "expert record layout ({}, {}, {}) is not the slot's ({gate_off}, {up_off}, \
+             {down_off}); the record cannot be copied into the slot whole",
+            layout.gate.offset,
+            layout.up.offset,
+            layout.down.offset,
+        )
+    }
+    let extent = layout.down.offset + layout.down.bytes;
+    let t = profile_now();
+    cudarc::driver::result::memcpy_htod_async(slot_base, &record[..extent], stream.cu_stream())
+        .map_err(candle::Error::wrap)?;
+    if let Some(p) = profile {
+        p.record("dma_h2d", t);
+    }
+    build_slot_view(geom, cuda_dev, slot_base)
 }
 
 /// [`build_slot_from_record_on_stream`] on the device's default stream.
@@ -1074,7 +1187,7 @@ impl ColdStaging {
         self.events[idx] = Some(event);
     }
 
-    fn buffer_mut(&mut self, idx: usize, len: usize) -> &mut [u8] {
+    pub(crate) fn buffer_mut(&mut self, idx: usize, len: usize) -> &mut [u8] {
         self.bufs[idx].as_mut_slice(len)
     }
 
@@ -1206,13 +1319,14 @@ pub(crate) struct PipelineState {
     pub(crate) copy_stream: Option<Arc<CudaStream>>,
     /// The cold tier: every expert, always, in kernel-ready form. `Arc`
     /// because the expert streamer reads it concurrently (positioned direct
-    /// reads + interior-locked record cache — `&self` throughout).
+    /// reads — `&self` throughout).
     #[cfg(feature = "cuda")]
     pub(crate) pack: Arc<ExpertPack>,
-    /// The warm tier: a stratified subset of the pack, pinned. Filled once,
-    /// immutable after; `Arc`-shared read-only with the expert streamer.
+    /// The warm tier: a stratified subset of the pack, pinned up to the
+    /// page-lock ceiling and pageable past it. Filled once, immutable after;
+    /// `Arc`-shared read-only with the expert streamer.
     #[cfg(feature = "cuda")]
-    pub(crate) warm: Arc<WarmPool>,
+    pub(crate) warm: Arc<WarmTier>,
     /// Pinned landing buffers for reads that miss both resident tiers.
     #[cfg(feature = "cuda")]
     pub(crate) cold_staging: ColdStaging,
@@ -1720,7 +1834,7 @@ impl PipelineState {
         // caller and has not reclaimed. Overwriting it is the point — a miss
         // replaces whatever the previous tenant left, in place.
         match self.residency[moe_idx][expert_idx].ram {
-            Some(warm_slot) => {
+            Some(warm_slot) if self.warm.is_pinned(warm_slot) => {
                 let src = self.warm.slot_ref(warm_slot, stride);
                 if let Ok(mut s) = self.stats.lock() {
                     s.warm_loads += 1;
@@ -1736,6 +1850,32 @@ impl PipelineState {
                         Some(&mut self.profile),
                     )
                 }
+            }
+            // A pageable warm slot goes through the pinned staging ring: a
+            // memcpy in place of the drive read a cold miss would make.
+            Some(warm_slot) => {
+                let idx = self.cold_staging.acquire()?;
+                self.cold_staging
+                    .buffer_mut(idx, stride)
+                    .copy_from_slice(self.warm.slot_ref(warm_slot, stride));
+                let slot = unsafe {
+                    build_slot_from_record_on_stream(
+                        self.cold_staging.buffer_ref(idx, stride),
+                        layout,
+                        geom,
+                        cd,
+                        &stream,
+                        slot_base,
+                        Some(&mut self.profile),
+                    )?
+                };
+                // The buffer cannot be written again until this upload lands.
+                let event = stream.record_event(None).map_err(candle::Error::wrap)?;
+                self.cold_staging.publish(idx, event);
+                if let Ok(mut s) = self.stats.lock() {
+                    s.warm_loads += 1;
+                }
+                Ok(slot)
             }
             None => {
                 let t = profile_now();

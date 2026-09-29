@@ -47,6 +47,9 @@ pub struct PipelineStats {
     /// them in different places is how a warm tier sized at a third of the model
     /// went unnoticed while it sent two thirds of every miss to disk.
     pub warm_slots: usize,
+    /// **Gauge**: of `warm_slots`, those in pageable memory beyond the
+    /// page-lock ceiling — uploaded through the pinned staging ring.
+    pub warm_paged_slots: usize,
     /// Experts in the model, so `warm_slots` reads as a fraction.
     pub total_experts: usize,
     /// **Gauge**: MoE layers in the model. Published beside `total_experts`
@@ -193,6 +196,28 @@ impl PipelineStats {
         } else {
             (self.predicted_hits as f64 / self.predicted_total as f64) * 100.0
         }
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::PipelineStats;
+
+    /// A reset clears the tallies and keeps the gauges — including the warm
+    /// tier's pageable share, which a report reads after every config.
+    #[test]
+    fn a_reset_keeps_the_gauges() {
+        let shared = PipelineStats::new_shared();
+        {
+            let mut s = shared.lock().unwrap();
+            s.warm_slots = 13_508;
+            s.warm_paged_slots = 2_138;
+            s.cold_loads = 11_225;
+        }
+        PipelineStats::reset(&shared);
+        let s = PipelineStats::snapshot(&shared);
+        assert_eq!((s.warm_slots, s.warm_paged_slots), (13_508, 2_138));
+        assert_eq!(s.cold_loads, 0);
     }
 }
 

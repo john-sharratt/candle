@@ -9,6 +9,9 @@
 /// The checked-in prompt bodies, readable outside `#[cfg(test)]` so a harness in
 /// a crate above this one measures the SAME prompt the gates do.
 pub mod fixtures;
+/// This process's host RAM by allocation, printed after load, after each
+/// prefill, and as a table of every config's decode end.
+pub mod host_ram_report;
 /// The depth ladder: the batched forward at 32K–128K of KV, and the filler
 /// that gets it there without the degenerate repetition a tiled corpus gives.
 ///
