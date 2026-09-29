@@ -254,6 +254,7 @@ mod tests {
         let seen = listed_slugs(&html);
 
         let expected = [
+            "what-one-gpu-can-do",
             "waves-and-the-pcie-bottleneck",
             "palquant-per-block",
             "battle-cities-coming-soon",
