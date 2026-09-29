@@ -696,6 +696,8 @@ impl Soak {
             live: self.live,
             free_below_ceiling: free,
             ceiling_blocked: 0,
+            // The model packs its arenas, so every free region is in the gap.
+            free_above_live: free,
             tier_bytes: self.tier_bytes,
             tier_high_water: self.tier_high_water,
         };

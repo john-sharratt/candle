@@ -3,10 +3,15 @@
 
 use crate::repo_scan::types::Language;
 
-/// The largest file an ingest layer reads. Big enough for generated parsers,
-/// vendored single-file libraries and long design documents; an accidentally
-/// committed binary is typically far larger.
-pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// The largest file an ingest layer reads.
+///
+/// Above the largest hand-written source in the workspace
+/// (`candle-conversation/src/scheduler/mod.rs`, ~710 KB) and below the dumps
+/// that are text only by extension: SASS listings (2.3–2.8 MB) and a 13 MB
+/// JSON data file would each be 600K+ tokens, more than a reading chain can
+/// finish or a dialogue can carry, so reading one buys a truncated summary at
+/// the cost of hours of ingest.
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Where one ingest layer reads: a folder of the workspace (`--ingest-dir`)
 /// and a depth bound (`--max-depth`).
@@ -111,6 +116,35 @@ mod tests {
         assert_eq!(
             s.admits("r", "big.rs", MAX_FILE_BYTES),
             Some(Language::Rust)
+        );
+    }
+
+    /// **The gate sits between the largest real source and the dumps.** Sizes
+    /// are the workspace's own: the largest hand-written file is read, a SASS
+    /// listing and a bulk JSON data file are not.
+    #[test]
+    fn the_size_gate_reads_large_source_and_skips_dumps() {
+        let s = IngestScope::new("", None);
+        assert_eq!(MAX_FILE_BYTES, 1_048_576);
+        assert_eq!(
+            s.admits(
+                "candle",
+                "candle-conversation/src/scheduler/mod.rs",
+                709_620
+            ),
+            Some(Language::Rust)
+        );
+        assert_eq!(
+            s.admits(
+                "candle",
+                "candle-flash-attn/precompiled/hdim128_sass.txt",
+                2_807_684
+            ),
+            None
+        );
+        assert_eq!(
+            s.admits("battle-cities", "crates/lore/src/lore.json", 12_961_528),
+            None
         );
     }
 
