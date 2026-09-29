@@ -5346,6 +5346,30 @@ fn rms_norm_q8a128_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// `GgmlDType::dequantizes_to_bf16` must name exactly the types the device path accepts: a
+/// block type the dequantize kernel dispatches (not a KO twin, which refuses), or MXFP4.
+#[test]
+fn the_bf16_dequantize_predicate_matches_the_kernel_dispatch() {
+    // Every code the GGUF reader knows, whatever numbering it uses.
+    for code in 0..=255u32 {
+        let Ok(dtype) = GgmlDType::from_u32(code) else {
+            continue;
+        };
+        let ko = matches!(
+            dtype,
+            GgmlDType::Q4_KO
+                | GgmlDType::Q5_KO
+                | GgmlDType::Q6_KO
+                | GgmlDType::Q8_KO
+                | GgmlDType::MXFP4_KO
+                | GgmlDType::Q2_KO
+                | GgmlDType::Q3_KO
+        );
+        let dispatched = dtype == GgmlDType::MXFP4 || (!ko && dtype_to_qtype(dtype).is_ok());
+        assert_eq!(dtype.dequantizes_to_bf16(), dispatched, "{dtype:?}");
+    }
+}
+
 /// The tile gather must hand the experts **the same bytes** whichever order the work is done
 /// in: quantizing the tokens once and gathering tiles of the result, or gathering the float
 /// rows and quantizing those. Quantization is per 128-element tile, so the two agree exactly —
