@@ -38,8 +38,8 @@ use candle_transformers::models::qwen4exp::config::IndexerConfig;
 use candle_transformers::models::qwen4exp::indexer::{
     append_wave, AppendSpan, IndexCache, TailRoute, PAGE_BLOCKS as KEY_PAGE_BLOCKS,
 };
-use candle_transformers::models::qwen4exp::paged_index::IndexPage;
 use candle_transformers::models::qwen4exp::qsa::IndexerWeights;
+use candle_transformers::models::qwen4exp::resident_page::ResidentPage;
 use candle_transformers::models::rope_schedule::{
     plain_inv_freq, FactoredRope, RopeRungs, RopeSchedule, Rung, ROPE_REACH,
 };
@@ -674,11 +674,13 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
     // pages, so both routes read the tail across page boundaries.
     let pages = contiguous_pages(0, &[40, 23], &[RATIO, 2], 0xB1, D);
     let mut cache = IndexCache::new(D, &dev)?;
-    for p in &pages {
-        let keys = Tensor::from_vec(p.keys.clone(), (p.rows, D), &dev)?;
-        cache.push_page(IndexPage::new(keys, p.last_cells), p.base, RATIO)?;
+    let host: Vec<(&[f32], usize)> = pages
+        .iter()
+        .map(|p| (p.keys.as_slice(), p.last_cells))
+        .collect();
+    for (p, page) in pages.iter().zip(ResidentPage::place_host(&host, D, &dev)?) {
+        cache.push_page(page, p.base, RATIO)?;
     }
-    cache.place_pending()?;
     let tail_tokens = (2 * KEY_PAGE_BLOCKS + 75) * RATIO;
     let raw = Tensor::from_vec(seeded(tail_tokens * D, 0xB2), (tail_tokens, D), &dev)?;
     let mut work = [AppendSpan {
@@ -689,14 +691,14 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
     append_wave(&mut work, &raw, &w, RATIO, 1e-6, None)?;
 
     // The oracle's view: the pages, then the tail's stored rows where they sit.
-    let tail_rows = cache.live_rows()?;
-    let n_tail = tail_rows.dim(0)?;
+    let tail_rows = cache.live_rows_host()?;
+    let n_tail = tail_rows.len() / D;
     let mut all = pages.clone();
     all.push(Page {
         base: cache.page_token_span(),
         rows: n_tail,
         last_cells: RATIO,
-        keys: tail_rows.flatten_all()?.to_vec1::<f32>()?,
+        keys: tail_rows,
         layout: Layout::Blocked,
     });
 

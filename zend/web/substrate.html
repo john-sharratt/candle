@@ -210,7 +210,11 @@ function fmtBytes(b){
   return (b/1073741824).toFixed(2)+' GB';
 }
 function fmtN(n){ return (n==null?0:n).toLocaleString(); }
-function fmtTok(n){ n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+'k' : ''+n; }
+function fmtTok(n){
+  n=n||0;
+  if(n>=1e6) return (n/1e6).toFixed(n>=1e7?0:1)+'M';
+  return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+'k' : ''+n;
+}
 function shortId(s){ return s && s.length>10 ? s.slice(0,8)+'…' : (s||''); }
 
 // ── tiny DOM helper ─────────────────────────────────────────────────────────
@@ -287,7 +291,8 @@ function renderKPIs(d){
     kpi('substrate size', fmtBytes(st.total_bytes), null, st.segments.length+' segment'+(st.segments.length===1?'':'s')),
     kpi('active segment', active?('#'+active.id):'—', null, active?fmtBytes(active.bytes):''),
     kpi('dead / reclaimable', dead==null?'—':(dead*100).toFixed(1), dead==null?null:'%', dead==null?'compacting…':(dead>=0.5?'compaction due':'healthy'), deadCls),
-    kpi('live KV chunks', fmtN(st.live_chunks)),
+    kpi('sealed tokens', fmtTok(c.tokens), null, 'turns + shared sections, once each'),
+    kpi('KV chunk records', fmtN(st.live_chunks), null, '32 tokens × 1 layer each'),
     kpi('conversations', fmtN(c.conversations), null, fmtN(c.timelines)+' timelines'),
     kpi('prompt sections', fmtN(c.sections)),
   );
@@ -658,7 +663,7 @@ function mockOverview(){
   return {
     storage:{ segments:[{id:13,active:false,bytes:4630511616},{id:14,active:true,bytes:1966080000}],
       total_bytes:6596591616, live_chunks:537, dead_ratio:0.18 },
-    counts:{ timelines:9, conversations:5, sections:142 },
+    counts:{ timelines:9, conversations:5, sections:142, tokens:137250 },
     target_layer:'dialogue',
     layers:[
       {name:'repo_map',description:'Structural shape of the repository: directory tree, file types, line counts.',

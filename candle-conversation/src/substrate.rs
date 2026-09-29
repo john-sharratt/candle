@@ -5388,6 +5388,28 @@ impl Substrate {
             + self.section_token_total
     }
 
+    /// `timeline`'s own sealed turn tokens — [`Self::total_token_count`] without the
+    /// shared sections, which belong to no one conversation. What a per-conversation
+    /// figure that is summed across conversations must use, or every conversation
+    /// counts the whole tool catalog again. O(1).
+    pub fn timeline_token_total(&self, timeline: TimelineId) -> usize {
+        self.timeline_token_totals
+            .get(&timeline)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Tokens sealed in the whole substrate: every live timeline's turns and the shared
+    /// sections, each counted once. O(timelines).
+    pub fn corpus_token_total(&self) -> usize {
+        self.timeline_token_totals
+            .iter()
+            .filter(|(tl, _)| !self.tombstoned_timelines.contains(tl))
+            .map(|(_, tokens)| tokens)
+            .sum::<usize>()
+            + self.section_token_total
+    }
+
     pub fn turn_indices(&self, timeline: TimelineId) -> impl Iterator<Item = TurnIndex> + '_ {
         self.timelines
             .get(&timeline)
@@ -7107,6 +7129,29 @@ mod tests {
         };
         assert_eq!(of(None), [plain.0]);
         assert_eq!(of(Some(lossless)), [exact.0]);
+    }
+
+    /// **A conversation's own tokens exclude the shared sections, and the corpus counts
+    /// them once.** `total_token_count` adds the sections to every conversation — right
+    /// for one conversation's "materialized / N" — so a sum of it across a layer counted
+    /// the tool catalog once per conversation: 37 folder units read as 1.5 M tokens.
+    #[test]
+    fn a_conversations_tokens_exclude_the_sections_the_corpus_counts_once() {
+        let (layer, group, first, mut sub) = make_timeline();
+        let second = TimelineAllocator::new().next();
+        let retired = TimelineAllocator::new().next();
+        sub.register_timeline(second, layer, group);
+        sub.register_timeline(retired, layer, group);
+        sub.append_with_blocks(first, 100, 0, 4);
+        sub.append_with_blocks(second, 30, 0, 1);
+        sub.append_with_blocks(retired, 7, 0, 1);
+        sub.tombstone_timeline(retired);
+        sub.section_token_total = 40;
+
+        assert_eq!(sub.total_token_count(first), 140);
+        assert_eq!(sub.timeline_token_total(first), 100);
+        assert_eq!(sub.timeline_token_total(second), 30);
+        assert_eq!(sub.corpus_token_total(), 100 + 30 + 40);
     }
 
     /// `register_timeline` is data-idempotent — calling it again on a

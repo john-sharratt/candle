@@ -80,12 +80,11 @@ pub struct SlotIntegrity {
     /// a holder that is not its owner can disagree legitimately. A *rising* count
     /// across an operation is the signal; an absolute count is not.
     ///
-    /// **A compaction has two routine sources of its own, so read it against them.** A
-    /// chunk the sweep reached but could not mint a record for (`records_declined`) keeps
-    /// gids naming the destination and a record naming the source — safe, because the chunk
-    /// is immutable and both slots are held, and a guaranteed disagreement. So is a
-    /// writer-owned chunk the sweep skipped. Neither is a defect; a rise with
-    /// `records_declined == 0` is.
+    /// **A compaction has one routine source of its own, so read it against it.** A
+    /// writer-owned chunk carrying a record, which the sweep skips, keeps both halves on
+    /// the source and is not a defect. A chunk the sweep could not mint a record for
+    /// (`records_declined`) is not a source: it stays whole on its source, gids and record
+    /// together (`Sweep::remint`).
     pub pointer_disagreements: usize,
 }
 

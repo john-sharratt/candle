@@ -39,18 +39,18 @@
 use candle::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use super::paged_index::IndexPage;
+use std::sync::Arc;
 
 use super::config::IndexerConfig;
 /// Block keys per live-tail key page — see `index_keys`.
 pub use super::index_keys::PAGE_BLOCKS;
 use super::index_keys::{
-    alloc_buffers, row_addr, KeyPages, SnapshotBuffer, SnapshotBuffers, SNAPSHOT_BUFFERS,
+    alloc_buffers, row_addr, write_host, KeyPages, SnapshotBuffer, SnapshotBuffers,
+    SNAPSHOT_BUFFERS,
 };
-use super::place::{PlacePage, Placement, PLACE_TILE_R};
 use super::qsa::{rms_norm_last, IndexerWeights};
 use super::qsa_select::{max_entries, max_keep, selected_width, MAX_RATIO};
+use super::resident_page::ResidentPage;
 use super::spec::SpecCapture;
 use crate::models::delta_net::mix::SeqSpan;
 use crate::models::delta_net::RecurrentCompaction;
@@ -153,6 +153,10 @@ pub struct IndexCache {
     /// Empty for a sequence that forwarded everything it holds, which is every
     /// sequence the gates run — there the walk reduces to the uniform formula
     /// and the scorer sees a single page.
+    ///
+    /// **Shared, not owned.** Each page is resident on the span once and held by
+    /// `Arc`: a fork, a view carve and every other slot that injected the same
+    /// piece read the same rows, exactly as they borrow the same K/V chunks.
     pages: Vec<PlacedPage>,
     /// Exclusive prefix sum of [`Self::pages`] row counts.
     ///
@@ -168,31 +172,12 @@ pub struct IndexCache {
     /// by that span's width; it is now whatever the last placement said, so a
     /// span nothing indexed is a hole and nothing else.
     tail_base: usize,
-    /// The channel-blocked placement every page in [`Self::pages`] is scored
-    /// from, in one buffer per batch.
-    ///
-    /// **One placement per batch of pages, appended — never rebuilt.** A cache
-    /// gains pages a few at a time (a projection injects a run of them; a decode
-    /// closes one at every break token), and re-planning the whole set on each
-    /// arrival would allocate and abandon an arena per page: O(pages²) bytes
-    /// through a pool that does not hand memory back. Placing only what is
-    /// pending keeps it linear, and the batched arena still does its job on the
-    /// path it was measured for — a projection placing every page at once is one
-    /// plan and one launch.
-    ///
-    /// Covers `pages[..placed_pages]`, in order. [`Self::place_pending`] extends
-    /// it; [`Self::score_rows`] refuses to score a cache it does not cover rather
-    /// than extending it itself, so a caller that forgot to place is named
-    /// rather than hidden.
-    placed: Vec<Placement>,
-    /// Pages [`Self::placed`] accounts for.
-    placed_pages: usize,
 }
 
 /// One injected page and where it sits.
 #[derive(Debug, Clone)]
 struct PlacedPage {
-    page: IndexPage,
+    page: Arc<ResidentPage>,
     /// Absolute position this page's first row occupies **in this cache**.
     ///
     /// The authority: the scorer rotates the page's row `j` at
@@ -237,9 +222,12 @@ impl IndexCache {
             pages: Vec::new(),
             page_rows: vec![0],
             tail_base: 0,
-            placed: Vec::new(),
-            placed_pages: 0,
         })
+    }
+
+    /// The indexer head width this cache stores.
+    pub fn head_dim(&self) -> usize {
+        self.keys.head_dim()
     }
 
     /// Blocks the key pages can currently address.
@@ -427,6 +415,10 @@ impl IndexCache {
     /// once the tail has been lifted out there is nothing forwarded left to
     /// precede.
     ///
+    /// **Nothing is copied.** The key pages holding the tail's rows become the
+    /// page's own chunks as they stand, row-major, and the tail opens again on the
+    /// pages above them.
+    ///
     /// A no-op on an empty tail, so a caller may close unconditionally at a
     /// boundary without asking whether one is needed.
     ///
@@ -447,24 +439,22 @@ impl IndexCache {
         if self.n_blocks == 0 {
             return Ok(0);
         }
-        // Gathered out of the key pages, which the next append overwrites from
-        // row 0 once `n_blocks` is reset below.
-        let rows = self.live_rows()?;
         let last = cells.unwrap_or(ratio);
         let tokens = (self.n_blocks - 1) * ratio + last;
+        let chunks = self.keys.detach(self.n_blocks)?;
+        let page = ResidentPage::from_key_pages(chunks, self.n_blocks, last, self.keys.head_dim())?;
         // The page opens where the tail did. Its rows are un-rotated, so it
         // needs nothing but its base to be read where it already sits.
         let base = self.tail_base;
         self.n_blocks = 0;
         self.n_open = 0;
-        self.push_page(IndexPage::new(rows, last), base, ratio)?;
-        self.place_pending()?;
+        self.push_page(page, base, ratio)?;
         Ok(tokens)
     }
 
     /// A cache holding `rows` as its live prefix and `open` as its carried,
     /// un-pooled tail — the resume path, and the exact inverse of
-    /// [`Self::live_rows`] + [`Self::open_rows`].
+    /// [`Self::live_rows_host`] + [`Self::open_rows_host`].
     ///
     /// **`open` is not optional and not decoration.** The cache's arithmetic is
     /// `n_blocks · ratio + n_open == tokens`, and every consumer depends on it:
@@ -473,27 +463,34 @@ impl IndexCache {
     /// that dropped the open rows would put the cache `tokens % ratio` behind
     /// its own K/V and keep it there — internally consistent, wrong against the
     /// sequence, and silent.
-    pub fn from_rows(rows: &Tensor, open: &Tensor, head_dim: usize) -> Result<Self> {
-        let (n, d) = rows.dims2()?;
-        if d != head_dim {
-            candle::bail!("index cache: rows are [{n}, {d}] against head_dim {head_dim}");
+    ///
+    /// `rows` and `open` are host rows, `[n, head_dim]` and `[n_open, head_dim]`
+    /// row-major, written straight into the cache's arena slots.
+    pub fn from_rows(rows: &[f32], open: &[f32], head_dim: usize, device: &Device) -> Result<Self> {
+        if head_dim == 0
+            || !rows.len().is_multiple_of(head_dim)
+            || !open.len().is_multiple_of(head_dim)
+        {
+            candle::bail!(
+                "index cache: {} row values and {} open values against head_dim {head_dim}",
+                rows.len(),
+                open.len()
+            );
         }
-        let (n_open, open_d) = open.dims2()?;
+        let n = rows.len() / head_dim;
+        let n_open = open.len() / head_dim;
         if n_open > MAX_RATIO {
             candle::bail!(
                 "index cache: {n_open} open rows exceeds the {MAX_RATIO}-row block — a full \
                  block would have been pooled into a row instead of carried"
             );
         }
-        if n_open > 0 && open_d != head_dim {
-            candle::bail!("index cache: open rows are [{n_open}, {open_d}] against {head_dim}");
-        }
-        let (raw, snaps) = open_block_buffers(head_dim, rows.device())?;
+        let (raw, snaps) = open_block_buffers(head_dim, device)?;
         if n_open > 0 {
-            raw.slice_set(open, 0, 0)?;
+            write_host(&raw, open)?;
         }
-        let mut keys = KeyPages::new(head_dim, rows.device());
-        keys.write_rows(rows)?;
+        let mut keys = KeyPages::new(head_dim, device);
+        keys.write_host_rows(rows)?;
         Ok(Self {
             keys,
             n_blocks: n,
@@ -503,8 +500,6 @@ impl IndexCache {
             pages: Vec::new(),
             page_rows: vec![0],
             tail_base: 0,
-            placed: Vec::new(),
-            placed_pages: 0,
         })
     }
 
@@ -524,10 +519,9 @@ impl IndexCache {
     /// un-rotated, and the scorer rotates row `j` at `base + j·ratio`. A caller
     /// that knows only "after the last one" passes [`Self::next_base`].
     ///
-    /// Recording only — the staging is built by `place_pending`, so a caller
-    /// pushing a page onto every layer pays one launch per layer rather than one
-    /// per page per layer.
-    pub fn push_page(&mut self, page: IndexPage, base: usize, ratio: usize) -> Result<()> {
+    /// Recording only: the page is already resident, so pushing it moves no
+    /// bytes, and the same page may sit in any number of caches.
+    pub fn push_page(&mut self, page: Arc<ResidentPage>, base: usize, ratio: usize) -> Result<()> {
         if self.n_blocks != 0 || self.n_open != 0 {
             candle::bail!(
                 "qsa index: a page arrived after {} live block(s) and {} carried row(s) — \
@@ -543,13 +537,11 @@ impl IndexCache {
                 self.tail_base,
             );
         }
-        let rows = page.rows()?;
-        let tokens = page.tokens(ratio)?;
+        let rows = page.rows();
+        let tokens = page.tokens(ratio);
         self.page_rows.push(self.page_rows.last().unwrap() + rows);
         self.pages.push(PlacedPage { page, base, tokens });
         self.tail_base = base + tokens;
-        // The placement is not invalidated — it still covers the pages it
-        // covered, and this one joins the pending set. See `Self::placed`.
         Ok(())
     }
 
@@ -587,30 +579,6 @@ impl IndexCache {
         Ok(())
     }
 
-    /// Lay every pending page out in the scorer's channel-blocked layout — **one
-    /// launch for all of this cache's pending pages**.
-    ///
-    /// Idempotent and cheap when nothing changed: a cache whose pages are all
-    /// placed returns without launching.
-    #[cfg(feature = "cuda")]
-    pub fn place_pending(&mut self) -> Result<()> {
-        if self.placed_pages == self.pages.len() {
-            return Ok(());
-        }
-        // Only what is pending. The pages already placed keep the placement
-        // they were given — re-planning them would abandon a live arena per push.
-        let jobs: Vec<PlacePage<'_>> = self.pages[self.placed_pages..]
-            .iter()
-            .map(|p| PlacePage { keys: &p.page.keys })
-            .collect();
-        // Placement runs between forwards, so there is no span to carve from.
-        let placement = Placement::plan(&jobs, None)?;
-        placement.run(PLACE_TILE_R)?;
-        self.placed.push(placement);
-        self.placed_pages = self.pages.len();
-        Ok(())
-    }
-
     /// The position the live tail starts at — everything placed ahead of it.
     pub fn page_token_span(&self) -> usize {
         self.tail_base
@@ -628,7 +596,7 @@ impl IndexCache {
     /// span cannot start partway through one without re-pooling rows across a
     /// boundary the original piece ended at. A caller taking a trailing span
     /// therefore takes whole pages and stops when it has covered enough.
-    pub fn page_at(&self, i: usize) -> Option<(&IndexPage, usize)> {
+    pub fn page_at(&self, i: usize) -> Option<(&Arc<ResidentPage>, usize)> {
         let p = self.pages.get(i)?;
         Some((&p.page, p.tokens))
     }
@@ -680,7 +648,7 @@ impl IndexCache {
             Err(i) => i - 1,
         };
         let placed = &self.pages[p];
-        let rows = placed.page.rows().unwrap_or(0);
+        let rows = placed.page.rows();
         let inside = limit - placed.base;
         // The last row is short — it covers `last_cells`, not `ratio` — so it
         // only counts once the position has reached the page's full width.
@@ -692,23 +660,28 @@ impl IndexCache {
         self.page_rows[p] + whole
     }
 
-    /// The live prefix as one owned `[n_blocks, head_dim]` tensor, gathered out
-    /// of the key pages.
+    /// The live prefix, `[n_blocks, head_dim]` row-major, read back to the host
+    /// out of the key pages.
     ///
-    /// What a seal writes and what a single-page window reads. The rows above
-    /// `n_blocks` are dead until an append writes them, so handing out the whole
-    /// capacity would persist uninitialised memory. The scorer never comes here —
-    /// it reads the pages in place.
-    pub fn live_rows(&self) -> Result<Tensor> {
-        self.keys.gather(self.n_blocks)
+    /// What a seal writes. The rows above `n_blocks` are dead until an append
+    /// writes them, so handing out the whole capacity would persist uninitialised
+    /// memory. The scorer never comes here — it reads the pages in place.
+    pub fn live_rows_host(&self) -> Result<Vec<f32>> {
+        self.keys.host_rows(self.n_blocks)
     }
 
     /// The carried open block as a view — `[n_open, head_dim]`, no copy.
     ///
-    /// The same rule as [`Self::live_rows`]: the rows above `n_open` are dead
-    /// until the next append writes them.
+    /// The same rule as [`Self::live_rows_host`]: the rows above `n_open` are
+    /// dead until the next append writes them.
     pub fn open_rows(&self) -> Result<Tensor> {
         self.raw.narrow(0, 0, self.n_open)
+    }
+
+    /// The carried open block, read back to the host — what a seal writes beside
+    /// [`Self::live_rows_host`].
+    pub fn open_rows_host(&self) -> Result<Vec<f32>> {
+        self.open_rows()?.flatten_all()?.to_vec1::<f32>()
     }
 
     /// Rows the cache has completed, and the tokens still carried in the open
@@ -748,30 +721,33 @@ impl IndexCache {
             n_open: self.n_open,
             snaps,
             // The pages are shared, not copied: a page is a sealed prefix that
-            // nothing appends to, so parent and child read the same rows. Only
-            // the live tail above them is written, and that is copied.
+            // nothing appends to and is resident once, so parent and child read
+            // the same rows through the same `Arc`. Only the live tail above them
+            // is written, and that is copied.
             pages: self.pages.clone(),
             page_rows: self.page_rows.clone(),
             tail_base: self.tail_base,
-            // The staging is NOT shared. It is the child's to rebuild: the pages
-            // sit at the same places, so the rebuild reproduces it exactly, and
-            // sharing a buffer between two caches that each believe they own it
-            // is the kind of aliasing this design exists to remove.
-            placed: Vec::new(),
-            placed_pages: 0,
         })
     }
 
     /// Move every buffer of this cache whose slot is the source of a planned move
-    /// onto that move's destination — key pages, the open block, and the free
-    /// rewind buffers. Answers how many moved.
+    /// onto that move's destination — key pages, the open block, the free rewind
+    /// buffers, and the chunks of the pages it holds. Answers how many moved.
+    ///
+    /// A page shared with other caches is moved by whichever reaches it first;
+    /// the rest find its move already taken and read the new address through the
+    /// same `Arc`.
     ///
     /// Between forwards only: a forward resolves page addresses into its tables
     /// as it runs, and between forwards nothing holds one.
     pub fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
-        Ok(self.keys.relocate(moves)?
+        let mut moved = self.keys.relocate(moves)?
             + usize::from(relocate_tensor(&mut self.raw, moves)?)
-            + self.snaps.relocate(moves)?)
+            + self.snaps.relocate(moves)?;
+        for p in &self.pages {
+            moved += p.page.relocate(moves)?;
+        }
+        Ok(moved)
     }
 
     /// Room for the blocks a sequence at `tokens` tokens will have completed in
@@ -798,8 +774,6 @@ impl IndexCache {
         self.pages.clear();
         self.page_rows.truncate(1);
         self.tail_base = 0;
-        self.placed.clear();
-        self.placed_pages = 0;
     }
 
     /// Blocks this span would complete, and the rows it would leave open.
@@ -1077,42 +1051,32 @@ impl IndexCache {
             ratio,
         } = shape;
         let device = self.keys.device().clone();
-        // A cache that has pages but no placement is a caller that pushed and
-        // did not call `place_pending` — refused, rather than read through a
-        // placement that does not exist.
-        if self.placed_pages != self.pages.len() {
-            candle::bail!(
-                "qsa index: scoring {} page(s) of which only {} have been placed — \
-                 `place_pending` must run after a push and before a score",
-                self.pages.len(),
-                self.placed_pages,
-            );
-        }
+        // One entry per chunk of every page, in row order. A page's rows are
+        // consecutive global rows, so every chunk of it shares the page's
+        // rotation offset; the entries' own row counts come from the chunks.
         let mut desc: Vec<i64> = Vec::with_capacity((self.pages.len() + 1) * PAGE_WORDS);
-        // The placements in order, each covering the batch it was planned for,
-        // so the flattened entries are the pages' own order.
-        let mut i = 0usize;
-        for placement in &self.placed {
-            for staged in placement.staged() {
-                let first = self.page_rows[i];
-                let rows = self.page_rows[i + 1] - first;
-                desc.push(tensor_ptr(staged)? as i64);
-                // Channel-blocked: group `c` of row `j` at `c·rows + j` float4s.
-                desc.push(rows as i64);
-                desc.push(1);
-                desc.push(self.pages[i].base as i64 - (first * ratio) as i64);
-                i += 1;
+        let mut first: Vec<u32> = Vec::with_capacity(self.pages.len() + 2);
+        first.push(0);
+        let mut end = 0usize;
+        for (i, placed) in self.pages.iter().enumerate() {
+            let delta = placed.base as i64 - (self.page_rows[i] * ratio) as i64;
+            for chunk in placed.page.descriptors()? {
+                desc.push(chunk.ptr as i64);
+                desc.push(chunk.group_stride);
+                desc.push(chunk.row_stride);
+                desc.push(delta);
+                end += chunk.rows;
+                first.push(end as u32);
             }
         }
-        if i != self.pages.len() {
+        if end != self.page_row_span() {
             candle::bail!(
-                "qsa index: {i} placement buffer(s) against {} page(s) — the placements \
-                 do not tile the pages they claim to cover",
-                self.pages.len(),
+                "qsa index: the pages' chunks hold {end} rows against the {} the cache \
+                 accounts for",
+                self.page_row_span(),
             );
         }
-        let mut first: Vec<u32> = self.page_rows.iter().map(|&r| r as u32).collect();
-        let mut n_pages = self.pages.len();
+        let mut n_pages = first.len() - 1;
         if with_tail {
             let span = self.page_row_span();
             // One entry per key page the live tail reaches, each row-major as the
@@ -2083,25 +2047,6 @@ pub fn select_layer(
     }
     append_wave(&mut work, &k_all, indexer, compress_ratio, eps, ticket)?;
 
-    // **Place any page that is carrying no placement, before anything scores.**
-    //
-    // A cache can hold pages that have never been through `place_pending`, and
-    // the way in is not the push — `push_positional_state` places as it goes —
-    // but [`IndexCache::fork`]. A fork shares the parent's pages and
-    // deliberately does NOT share its placement (two caches each believing they
-    // own one buffer is the aliasing this design removes), so the child arrives
-    // with pages and nothing to score them from. Every view carve does this, and
-    // a `repo_map` ingest carves one per directory: measured as 27 directories
-    // failing with `scoring 17 page(s) that have not been placed`.
-    //
-    // Idempotent and branch-cheap — a cache whose pages are already placed
-    // returns without launching, which is every wave after the first.
-    for span in spans {
-        if let Some(cache) = idx_map.get_mut(&span.seq).and_then(|c| c.get_mut(kv)) {
-            cache.place_pending()?;
-        }
-    }
-
     if let (Some(table), Some(q_all)) = (table.as_mut(), q_all.as_ref()) {
         // The widest row in the wave sets the score buffer's stride, so every
         // span writes into one buffer and the top-k covers all of it in a
@@ -2234,9 +2179,10 @@ mod tests {
     }
 
     /// **A compaction pass moves buffers, never their contents.** Three caches
-    /// across several key pages, the middle one dropped to leave holes, then a
-    /// pass: every surviving cache reads back exactly the keys and open rows it
-    /// held, and every buffer the pass reached now sits on a slot it planned.
+    /// across several key pages, the middle one dropped to leave holes, plus a
+    /// cache holding a resident page shared with a fork of it, then a pass: every
+    /// surviving cache reads back exactly the keys, open rows and page rows it
+    /// held.
     #[test]
     fn compaction_moves_index_buffers_without_changing_them() -> Result<()> {
         let Some(device) = cuda() else {
@@ -2246,25 +2192,53 @@ mod tests {
         let build = |n: usize, seed: u64| -> Result<(IndexCache, Vec<f32>, Vec<f32>)> {
             let keys = lcg(n * d, seed, 1.0);
             let open = lcg(3 * d, seed ^ 0x55, 1.0);
-            let cache = IndexCache::from_rows(
-                &Tensor::from_vec(keys.clone(), (n, d), &device)?,
-                &Tensor::from_vec(open.clone(), (3, d), &device)?,
-                d,
-            )?;
+            let cache = IndexCache::from_rows(&keys, &open, d, &device)?;
             Ok((cache, keys, open))
         };
         let (mut a, a_keys, a_open) = build(2 * PAGE_BLOCKS + 7, 1)?;
         let hole = build(3 * PAGE_BLOCKS, 2)?;
         let (mut c, c_keys, c_open) = build(PAGE_BLOCKS + 1, 3)?;
+        let page_rows = lcg((PAGE_BLOCKS + 9) * d, 4, 1.0);
+        let mut p = IndexCache::new(d, &device)?;
+        p.push_page(placed_page(&page_rows, 2, d, &device)?, 0, 4)?;
+        let mut p_fork = p.fork()?;
         drop(hole);
 
-        let report = compact_index_caches(&mut [&mut a, &mut c], d, &device, 0)?;
+        let report =
+            compact_index_caches(&mut [&mut a, &mut c, &mut p, &mut p_fork], d, &device, 0)?;
         assert!(report.moved <= report.planned);
         for (cache, keys, open) in [(&a, &a_keys, &a_open), (&c, &c_keys, &c_open)] {
-            assert_eq!(&cache.live_rows()?.flatten_all()?.to_vec1::<f32>()?, keys);
-            assert_eq!(&cache.open_rows()?.flatten_all()?.to_vec1::<f32>()?, open);
+            assert_eq!(&cache.live_rows_host()?, keys);
+            assert_eq!(&cache.open_rows_host()?, open);
+        }
+        for cache in [&p, &p_fork] {
+            let (page, _) = cache.page_at(0).expect("the page survives the pass");
+            assert_eq!(page.host_rows()?, page_rows);
         }
         Ok(())
+    }
+
+    /// A page of `host` rows (`[rows, d]` row-major) whose last row covers
+    /// `last` tokens, placed on `device` the way an injected record is.
+    fn placed_page(
+        host: &[f32],
+        last: usize,
+        d: usize,
+        device: &Device,
+    ) -> Result<Arc<ResidentPage>> {
+        let mut pages = ResidentPage::place_host(&[(host, last)], d, device)?;
+        pages
+            .pop()
+            .ok_or_else(|| candle::Error::Msg("one page placed".into()))
+    }
+
+    /// A page of `rows` zero rows whose last covers `last` tokens, over
+    /// slot-shaped chunks on `device` — the shape a closed tail hands over.
+    fn zero_page(rows: usize, last: usize, d: usize, device: &Device) -> Arc<ResidentPage> {
+        let chunks = (0..rows.div_ceil(PAGE_BLOCKS))
+            .map(|_| Tensor::zeros((PAGE_BLOCKS, d), DType::F32, device).expect("chunk"))
+            .collect();
+        ResidentPage::from_key_pages(chunks, rows, last, d).expect("page")
     }
 
     /// An index cache holding `pages` (by token width) and `open` carried rows,
@@ -2282,9 +2256,8 @@ mod tests {
             // covers the remainder — the shape a real seal produces.
             let rows = w.div_ceil(ratio);
             let last = w - (rows - 1) * ratio;
-            let keys = Tensor::zeros((rows, d), DType::F32, &Device::Cpu).unwrap();
             let base = c.next_base();
-            c.push_page(IndexPage::new(keys, last), base, ratio)
+            c.push_page(zero_page(rows, last, d, &Device::Cpu), base, ratio)
                 .expect("push");
         }
         c
@@ -2305,10 +2278,9 @@ mod tests {
         let mut c = caged(&[], RATIO);
         c.skip_to(40).expect("skip");
         let rows = 20usize.div_ceil(RATIO);
-        let keys = Tensor::zeros((rows, 4), DType::F32, &Device::Cpu).unwrap();
+        let page = zero_page(rows, 20 - (rows - 1) * RATIO, 4, &Device::Cpu);
         let base = c.next_base();
-        c.push_page(IndexPage::new(keys, 20 - (rows - 1) * RATIO), base, RATIO)
-            .expect("page after the span");
+        c.push_page(page, base, RATIO).expect("page after the span");
 
         assert_eq!(
             c.indexed_tokens(RATIO),
@@ -2379,9 +2351,9 @@ mod tests {
     fn a_page_may_not_overlap_the_one_before_it() {
         const RATIO: usize = 4;
         let mut c = caged(&[12], RATIO);
-        let keys = Tensor::zeros((2, 4), DType::F32, &Device::Cpu).unwrap();
+        let page = zero_page(2, RATIO, 4, &Device::Cpu);
         assert!(
-            c.push_page(IndexPage::new(keys, RATIO), 4, RATIO).is_err(),
+            c.push_page(page, 4, RATIO).is_err(),
             "a page placed inside the previous page's span was accepted"
         );
     }
@@ -2512,25 +2484,24 @@ mod tests {
     fn a_page_is_refused_after_live_rows_and_accepted_once_the_tail_is_reset() {
         let ratio = 4;
         let d = 4usize;
-        let rows = Tensor::zeros((2, d), DType::F32, &Device::Cpu).unwrap();
-        let open = Tensor::zeros((0, d), DType::F32, &Device::Cpu).unwrap();
+        let rows = vec![0f32; 2 * d];
 
-        let mut forwarded = IndexCache::from_rows(&rows, &open, d).unwrap();
+        let mut forwarded = IndexCache::from_rows(&rows, &[], d, &Device::Cpu).unwrap();
         assert_eq!(forwarded.live_blocks(), 2);
-        let keys = Tensor::zeros((1, d), DType::F32, &Device::Cpu).unwrap();
         let base = forwarded.next_base();
         assert!(
             forwarded
-                .push_page(IndexPage::new(keys, 1), base, ratio)
+                .push_page(zero_page(1, 1, d, &Device::Cpu), base, ratio)
                 .is_err(),
             "a page landing after live rows would sit at the wrong positions"
         );
 
         // A cache whose tail is empty — what the cut leaves behind — accepts it.
         let mut c = caged(&[8], ratio);
-        let keys = Tensor::zeros((1, d), DType::F32, &Device::Cpu).unwrap();
         let base = c.next_base();
-        assert!(c.push_page(IndexPage::new(keys, 1), base, ratio).is_ok());
+        assert!(c
+            .push_page(zero_page(1, 1, d, &Device::Cpu), base, ratio)
+            .is_ok());
         assert_eq!(c.indexed_tokens(ratio), 9);
     }
 
@@ -2540,10 +2511,9 @@ mod tests {
     #[test]
     fn a_snapshot_restores_the_open_rows_it_copied() {
         let d = 4usize;
-        let rows = Tensor::zeros((2, d), DType::F32, &Device::Cpu).unwrap();
+        let rows = vec![0f32; 2 * d];
         let open_v: Vec<f32> = (0..2 * d).map(|i| i as f32 + 0.5).collect();
-        let open = Tensor::from_vec(open_v.clone(), (2, d), &Device::Cpu).unwrap();
-        let mut cache = IndexCache::from_rows(&rows, &open, d).unwrap();
+        let mut cache = IndexCache::from_rows(&rows, &open_v, d, &Device::Cpu).unwrap();
         let snap = cache.snapshot().unwrap();
 
         let dirty = |c: &mut IndexCache| {
@@ -2561,16 +2531,7 @@ mod tests {
             dirty(&mut cache);
             cache.restore(&snap).unwrap();
             assert_eq!(cache.seal_shape(), (2, 2));
-            assert_eq!(
-                cache
-                    .open_rows()
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap(),
-                open_v
-            );
+            assert_eq!(cache.open_rows_host().unwrap(), open_v);
         }
     }
 
@@ -2580,16 +2541,15 @@ mod tests {
     #[test]
     fn snapshots_draw_on_a_fixed_set_of_rewind_buffers() {
         let d = 4usize;
-        let rows = Tensor::zeros((1, d), DType::F32, &Device::Cpu).unwrap();
-        let empty = Tensor::zeros((0, d), DType::F32, &Device::Cpu).unwrap();
-        let bare = IndexCache::from_rows(&rows, &empty, d).unwrap();
+        let rows = vec![0f32; d];
+        let bare = IndexCache::from_rows(&rows, &[], d, &Device::Cpu).unwrap();
         let free: Vec<_> = (0..2 * SNAPSHOT_BUFFERS)
             .map(|_| bare.snapshot().unwrap())
             .collect();
         assert!(free.iter().all(|s| s.raw.is_none()));
 
-        let open = Tensor::ones((1, d), DType::F32, &Device::Cpu).unwrap();
-        let cache = IndexCache::from_rows(&rows, &open, d).unwrap();
+        let open = vec![1f32; d];
+        let cache = IndexCache::from_rows(&rows, &open, d, &Device::Cpu).unwrap();
         let mut held: Vec<_> = (0..SNAPSHOT_BUFFERS)
             .map(|_| cache.snapshot().unwrap())
             .collect();
@@ -2805,19 +2765,19 @@ mod tests {
         /// The seal's export shape, through the record bytes and back — the
         /// whole persistence path, not a direct field copy.
         fn round_trip(&self, cache: &IndexCache) -> Result<IndexCache> {
-            use crate::models::qwen4exp::paged_index::{decode_page, encode_page};
-            let blob = encode_page(&cache.live_rows()?, self.ratio, &cache.open_rows()?)?;
-            let back = decode_page(&blob, &self.device)?;
-            IndexCache::from_rows(&back.page.keys, &back.open, self.cfg.head_dim)
+            use crate::models::qwen4exp::paged_index::{decode_page, encode_page, SealedIndex};
+            let sealed = SealedIndex {
+                rows: cache.live_rows_host()?,
+                dim: self.cfg.head_dim,
+                last_cells: self.ratio,
+                open: cache.open_rows_host()?,
+            };
+            let back = decode_page(&encode_page(&sealed)?)?;
+            IndexCache::from_rows(&back.rows, &back.open, self.cfg.head_dim, &self.device)
         }
 
         /// Every row's selection, as the model would compute it.
-        ///
-        /// Takes `&mut` because a cache holding pages has to be placed before it
-        /// can be scored — the scorer refuses a cache whose pages carry no
-        /// placement.
         fn select(&self, cache: &mut IndexCache, qpos: &[usize]) -> Result<Vec<Option<Vec<u32>>>> {
-            cache.place_pending()?;
             let t = qpos.len();
             let widest = (cache.page_row_span() + cache.n_blocks).max(1);
             let x = Tensor::from_vec(
@@ -2881,13 +2841,13 @@ mod tests {
                 back.len(rig.ratio)
             );
             assert_eq!(
-                back.live_rows()?.flatten_all()?.to_vec1::<f32>()?,
-                cache.live_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                back.live_rows_host()?,
+                cache.live_rows_host()?,
                 "the completed rows changed"
             );
             assert_eq!(
-                back.open_rows()?.flatten_all()?.to_vec1::<f32>()?,
-                cache.open_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                back.open_rows_host()?,
+                cache.open_rows_host()?,
                 "the open block changed"
             );
         }
@@ -2928,8 +2888,8 @@ mod tests {
                 "after appending {rows} at {start} the two caches are at different shapes"
             );
             assert_eq!(
-                resumed.live_rows()?.flatten_all()?.to_vec1::<f32>()?,
-                live.live_rows()?.flatten_all()?.to_vec1::<f32>()?,
+                resumed.live_rows_host()?,
+                live.live_rows_host()?,
                 "the resumed cache's rows diverged after appending {rows} at {start}"
             );
         }
@@ -2989,8 +2949,8 @@ mod tests {
         let mut at = 0usize;
         for &w in &[16usize, 12, 20] {
             let rows = w.div_ceil(ratio);
-            let keys = Tensor::zeros((rows, rig.cfg.head_dim), DType::F32, &device)?;
-            injected.push_page(IndexPage::new(keys, w - (rows - 1) * ratio), at, ratio)?;
+            let page = zero_page(rows, w - (rows - 1) * ratio, rig.cfg.head_dim, &device);
+            injected.push_page(page, at, ratio)?;
             at += w;
         }
         assert_eq!(injected.live_blocks(), 0, "the fixture forwarded something");
@@ -3007,85 +2967,54 @@ mod tests {
         Ok(())
     }
 
-    /// **Placing incrementally is placing once.**
+    /// **Placing pages together is placing them one by one.**
     ///
-    /// Pages arrive a few at a time — a decode closes one at every break token —
-    /// and the placement extends rather than rebuilds, because re-planning the
-    /// whole set per arrival abandons a staging arena per page: O(pages²) bytes
-    /// through a pool that does not hand memory back. That is an allocation
-    /// argument, and this is the correctness half of it: the pages must score
-    /// the same either way, or the optimisation has changed the answer.
+    /// A projection places every layer's page of a piece in one launch; a single
+    /// page is placed alone. The rows each page holds — and so what it selects —
+    /// must not depend on which pages shared its launch.
     #[test]
-    fn placing_page_by_page_scores_the_same_as_placing_them_together() -> Result<()> {
+    fn pages_placed_together_select_the_same_as_pages_placed_alone() -> Result<()> {
         let Some(device) = cuda() else { return Ok(()) };
         let rig = Rig::new(device.clone(), 256)?;
-        let ratio = rig.ratio;
+        let (ratio, d) = (rig.ratio, rig.cfg.head_dim);
         let widths = [12usize, 8, 20, 4];
 
-        // The pages themselves, built once and shared by both caches so the only
-        // difference is WHEN each was placed.
         let mut made = Vec::new();
-        let mut at = 0usize;
-        for &w in &widths {
+        for (i, &w) in widths.iter().enumerate() {
             let rows = w.div_ceil(ratio);
-            let keys = Tensor::zeros((rows, rig.cfg.head_dim), DType::F32, &device)?;
-            made.push((IndexPage::new(keys, w - (rows - 1) * ratio), at));
+            made.push((lcg(rows * d, 0xA0 + i as u64, 1.0), w - (rows - 1) * ratio));
+        }
+        let host: Vec<(&[f32], usize)> = made.iter().map(|(r, l)| (r.as_slice(), *l)).collect();
+        let together = ResidentPage::place_host(&host, d, &device)?;
+        let alone = host
+            .iter()
+            .map(|&(r, l)| placed_page(r, l, d, &device))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut batched = IndexCache::new(d, &device)?;
+        let mut single = IndexCache::new(d, &device)?;
+        let mut at = 0usize;
+        for ((a, b), &w) in together.into_iter().zip(alone).zip(widths.iter()) {
+            batched.push_page(a, at, ratio)?;
+            single.push_page(b, at, ratio)?;
             at += w;
         }
-
-        // One at a time, placed after each push — the decode shape.
-        let mut incremental = IndexCache::new(rig.cfg.head_dim, &device)?;
-        for (page, base) in &made {
-            incremental.push_page(page.clone(), *base, ratio)?;
-            incremental.place_pending()?;
-        }
+        let qpos: Vec<usize> = (0..at).collect();
         assert_eq!(
-            incremental.placed.len(),
-            widths.len(),
-            "placing after every push should leave one placement per page — a \
-             single placement means the set was re-planned each time"
-        );
-
-        // All at once, placed once — the projection shape.
-        let mut batched = IndexCache::new(rig.cfg.head_dim, &device)?;
-        for (page, base) in &made {
-            batched.push_page(page.clone(), *base, ratio)?;
-        }
-        batched.place_pending()?;
-        assert_eq!(
-            batched.placed.len(),
-            1,
-            "a projection placing every page at once must still be ONE plan and \
-             one launch — that is the shape the batched arena was measured for"
-        );
-
-        let total: usize = widths.iter().sum();
-        let qpos: Vec<usize> = (0..total).collect();
-        assert_eq!(
-            rig.select(&mut incremental, &qpos)?,
             rig.select(&mut batched, &qpos)?,
-            "the same pages selected differently depending on when they were \
-             placed — the incremental path is not equivalent to the batched one"
+            rig.select(&mut single, &qpos)?,
+            "the same pages selected differently depending on which launch placed them"
         );
         Ok(())
     }
 
-    /// **A FORK arrives with pages and no staging, and must be placed before it
-    /// scores.**
+    /// **A fork shares its parent's pages and selects what the parent selects.**
     ///
-    /// The child shares the parent's pages but deliberately not its placement
-    /// buffer — two caches each believing they own one buffer is the aliasing
-    /// this design exists to remove — so a fork is the one way a cache reaches
-    /// the scorer holding pages it cannot read. Nothing rebuilds it implicitly;
-    /// `select_layer` does it explicitly.
-    ///
-    /// This went to production before it was gated: every view carve forks, a
-    /// `repo_map` ingest carves one per directory, and 27 directories failed
-    /// with `scoring 17 page(s) that have not been placed` on a fresh substrate.
-    /// The refusal was right — the alternative is reading through a placement
-    /// that does not exist — but nothing had asked a fork to score.
+    /// Every view carve forks — a `repo_map` ingest carves one per directory —
+    /// so a fork must score with no step of its own between the carve and the
+    /// forward: it holds the parent's resident pages, not copies of them.
     #[test]
-    fn a_forked_cache_must_be_placed_before_it_scores_and_then_matches_its_parent() -> Result<()> {
+    fn a_forked_cache_shares_its_parents_pages_and_selects_the_same() -> Result<()> {
         let Some(device) = cuda() else { return Ok(()) };
         let rig = Rig::new(device.clone(), 256)?;
         let ratio = rig.ratio;
@@ -3099,49 +3028,22 @@ mod tests {
         assert!(parent.has_pages(), "the fixture carved no page to inherit");
 
         let mut child = parent.fork()?;
-        assert!(
-            child.has_pages(),
-            "the fork lost the parent's pages — it would score against a prefix \
-             its K/V still holds"
-        );
+        assert_eq!(child.page_count(), parent.page_count());
+        for i in 0..parent.page_count() {
+            let (a, _) = parent.page_at(i).expect("parent page");
+            let (b, _) = child.page_at(i).expect("child page");
+            assert!(
+                Arc::ptr_eq(a, b),
+                "page {i} of the fork is a copy — every carve would duplicate the \
+                 parent's whole index"
+            );
+        }
 
-        // Unplaced, the scorer must refuse rather than read through a
-        // placement the child does not have.
         let qpos: Vec<usize> = (0..64).step_by(7).collect();
-        let widest = (child.page_row_span() + child.live_blocks()).max(1);
-        let scores = Tensor::empty((qpos.len(), widest), DType::F32, &device)?;
-        let x = Tensor::from_vec(
-            lcg(qpos.len() * rig.w.q_proj.dim(1)?, 0x9A, 1.0),
-            (qpos.len(), rig.w.q_proj.dim(1)?),
-            &device,
-        )?;
-        let q = project_queries(
-            &x,
-            &rig.w,
-            &rig.cfg,
-            &rig.rope,
-            &qpos,
-            RowRungs::Uniform(0),
-            rig.eps,
-            None,
-        )?;
-        let refused = child.score_rows(
-            &q, &qpos, &rig.cfg, ratio, &rig.rope, 0, &scores, widest, 0, None,
-        );
-        assert!(
-            refused.is_err(),
-            "an unplaced fork scored without complaint — it has no placement to \
-             read its pages through"
-        );
-
-        // Placed, it must select exactly what the parent selects: same pages,
-        // same positions, so the staging it builds is the parent's.
-        child.place_pending()?;
         assert_eq!(
             rig.select(&mut child, &qpos)?,
             rig.select(&mut parent, &qpos)?,
-            "a placed fork selected differently than the parent it was carved \
-             from — the child's rebuilt staging is not the parent's"
+            "a fork selected differently than the parent it was carved from"
         );
         Ok(())
     }
@@ -3172,7 +3074,7 @@ mod tests {
         let mut origin = IndexCache::new(rig.cfg.head_dim, &device)?;
         origin.skip_to(made_at)?;
         rig.append(&mut origin, 0, tokens)?;
-        let page = IndexPage::new(origin.live_rows()?.to_owned_tensor()?, ratio);
+        let page = placed_page(&origin.live_rows_host()?, ratio, rig.cfg.head_dim, &device)?;
 
         // Injected at a different offset.
         let mut injected = IndexCache::new(rig.cfg.head_dim, &device)?;
@@ -3253,8 +3155,8 @@ mod tests {
         let mut pos = 0usize;
         for &t in &sections {
             let rows = t.div_ceil(ratio);
-            let keys = Tensor::zeros((rows, head_dim), DType::F32, &device)?;
-            cache.push_page(IndexPage::new(keys, t - (rows - 1) * ratio), pos, ratio)?;
+            let page = zero_page(rows, t - (rows - 1) * ratio, head_dim, &device);
+            cache.push_page(page, pos, ratio)?;
             pos += t;
         }
         let total: usize = sections.iter().sum();
@@ -3300,9 +3202,11 @@ mod tests {
         let page_tokens = 13usize;
         let page_rows = page_tokens.div_ceil(rig.ratio);
         cache.push_page(
-            IndexPage::new(
-                Tensor::zeros((page_rows, rig.cfg.head_dim), DType::F32, &device)?,
+            zero_page(
+                page_rows,
                 page_tokens - (page_rows - 1) * rig.ratio,
+                rig.cfg.head_dim,
+                &device,
             ),
             0,
             rig.ratio,
@@ -3341,10 +3245,7 @@ mod tests {
         let rig = Rig::new(device.clone(), 32)?;
         let mut cache = IndexCache::new(rig.cfg.head_dim, &device)?;
         rig.append(&mut cache, 0, 8)?;
-        let page = IndexPage::new(
-            Tensor::zeros((2, rig.cfg.head_dim), DType::F32, &device)?,
-            rig.ratio,
-        );
+        let page = zero_page(2, rig.ratio, rig.cfg.head_dim, &device);
         let base = cache.next_base();
         let err = cache.push_page(page, base, rig.ratio).unwrap_err();
         assert!(err.to_string().contains("must precede"), "{err}");
@@ -3360,9 +3261,9 @@ mod tests {
     fn an_oversized_open_block_is_refused() -> Result<()> {
         let Some(device) = cuda() else { return Ok(()) };
         let head_dim = 16usize;
-        let rows = Tensor::zeros((4, head_dim), DType::F32, &device)?;
-        let open = Tensor::zeros((MAX_RATIO + 1, head_dim), DType::F32, &device)?;
-        let err = IndexCache::from_rows(&rows, &open, head_dim).unwrap_err();
+        let rows = vec![0f32; 4 * head_dim];
+        let open = vec![0f32; (MAX_RATIO + 1) * head_dim];
+        let err = IndexCache::from_rows(&rows, &open, head_dim, &device).unwrap_err();
         assert!(err.to_string().contains("open rows"), "{err}");
         Ok(())
     }
@@ -3382,7 +3283,11 @@ mod tests {
         cache.skip_to(1000)?;
         rig.append(&mut cache, 0, 7)?;
         rig.append(&mut cache, 7, 13)?;
-        let stored = cache.live_rows()?.to_vec2::<f32>()?;
+        let stored: Vec<Vec<f32>> = cache
+            .live_rows_host()?
+            .chunks_exact(d)
+            .map(<[f32]>::to_vec)
+            .collect();
         assert_eq!(stored.len(), 20 / ratio);
 
         let keys = rig.keys.to_vec2::<f32>()?;

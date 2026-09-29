@@ -1067,16 +1067,16 @@ impl super::backing::ChunkedKvBacking {
             report.records_declined = m.declined();
             report.record_arenas_reserved = m.reserved_arenas();
             if report.records_declined != 0 {
-                // Correct but degraded: those chunks keep the record they have, which
-                // still names their source and still holds it alive, so nothing is
-                // reclaimed for them. A standing non-zero reading means the reservation
-                // is under-provisioning.
+                // Correct but degraded: those chunks stayed whole on their sources —
+                // gids and record together (`Sweep::remint`) — so nothing is reclaimed
+                // for them this pass and a pass with record room moves them. A standing
+                // non-zero reading means the reservation is under-provisioning.
                 tracing::warn!(
                     target: "candle_nn::kv_cache::compact",
                     declined = report.records_declined,
                     minted = m.len(),
                     "compaction ran out of pre-provisioned record slots mid-sweep; those \
-                     chunks keep their old records and their sources are not reclaimed",
+                     chunks stay on their sources until a later pass",
                 );
             }
             match m.flush(self) {

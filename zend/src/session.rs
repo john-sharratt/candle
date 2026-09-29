@@ -4908,6 +4908,7 @@ impl ZendSession {
             timelines: s.timeline_count(),
             conversations: s.conversation_count(),
             sections: s.section_count(),
+            tokens: s.corpus_token_total(),
         };
 
         // Layer metadata only — each layer carries a conversation COUNT, never
@@ -5137,7 +5138,7 @@ impl ZendSession {
             archived: s.is_archived(tl),
             layer,
             group,
-            total_tokens: s.total_token_count(tl),
+            total_tokens: s.timeline_token_total(tl),
             custom: s.custom_of(tl).cloned().unwrap_or_default(),
             inherited_chain: s
                 .inherited_chain(tl)
@@ -6514,7 +6515,7 @@ fn layer_totals(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -> (u
         .flat_map(|g| s.timelines_for_group(g.id))
         .filter(|tl| *tl != titler && !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
         .fold((0, 0), |(n, tok), tl| {
-            (n + 1, tok + s.total_token_count(tl))
+            (n + 1, tok + s.timeline_token_total(tl))
         })
 }
 
@@ -6593,7 +6594,7 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                 archived: s.is_archived(tl),
                 group: g.name.clone(),
                 turns: s.turn_count(tl),
-                tokens: s.total_token_count(tl),
+                tokens: s.timeline_token_total(tl),
                 summary_nodes,
                 branches,
                 commit,
