@@ -435,7 +435,10 @@ import { estateSwitcher } from './common/lib/estate.js';
     toolSchemaGen: 0,    // bumped when toolSchemas lands; part of the render-cache key
     activeId: null,
     loaded: {},
-    showArchived: (function () { try { return localStorage.getItem('zend.showArchived') === '1'; } catch (_) { return false; } })(),
+    // Off at every load, never remembered: left on in one browser, it kept
+    // archived conversations — and each one just archived — in that browser's
+    // list with nothing to say why.
+    showArchived: false,
     sidebarCollapsed: false,
     sidebarDrawer: false,   // narrow only: the conversation list open as an overlay drawer
     confirm: null,          // in-app confirm dialog: { title, body, confirmLabel, danger, onConfirm }
@@ -450,7 +453,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     promptValue: '',
     logsOpen: false,
     // Composer dials are a per-user browser preference (persisted in
-    // localStorage, like theme/show-archived), so a new conversation starts
+    // localStorage, like the theme), so a new conversation starts
     // with the user's last-chosen settings rather than a hardcoded default.
     effortLevel: dialPref('zend.effort', 2),
     verbosityLevel: dialPref('zend.verbosity', 2),
@@ -1196,7 +1199,6 @@ import { estateSwitcher } from './common/lib/estate.js';
   }
   function toggleArchived() {
     const showArchived = !S.showArchived;
-    try { localStorage.setItem('zend.showArchived', showArchived ? '1' : '0'); } catch (_) {}
     let activeId = S.activeId;
     if (!showArchived) { const a = S.conversations.find((c) => c.id === activeId); if (a && a.archived) activeId = null; }
     writeHashConv(activeId);
@@ -1728,7 +1730,9 @@ import { estateSwitcher } from './common/lib/estate.js';
           iconBtn('M9 2L4 7l5 5', drawer ? 'Close' : 'Collapse sidebar', closeSidebar, 27))),
       h('div', { class: 'zscroll-blue', style: 'flex:1; min-height:0; overflow-y:auto; padding:0 0.4rem 0.5rem;' },
         convs.length ? rows : [h('div', { style: 'padding:1rem 0.9rem; font-size:0.775rem; color:#4a6278;' }, 'No conversations yet.')]),
-      h('div', { style: 'flex-shrink:0; padding:0.55rem 0.85rem 0.65rem; border-top:1px solid #2a3848; background:#19222f;' },
+      // The footer clears the phone's home indicator / gesture bar: the page is
+      // `viewport-fit=cover`, so without the inset the checkbox sits under it.
+      h('div', { class: 'z-sbfoot', style: 'flex-shrink:0; padding:0.55rem 0.85rem calc(0.65rem + env(safe-area-inset-bottom, 0px)); border-top:1px solid #2a3848; background:#19222f;' },
         h('label', { onClick: toggleArchived, style: 'display:flex; align-items:center; gap:0.45rem; font-size:0.72rem; color:#6a8098; cursor:pointer; user-select:none;' },
           h('span', { style: 'width:13px; height:13px; border-radius:3px; border:1px solid #445870; background:' + (S.showArchived ? ACCENT : 'transparent') + '; display:flex; align-items:center; justify-content:center; color:#fff; font-size:9px;' }, S.showArchived ? '✓' : ''),
           'Show archived'),
