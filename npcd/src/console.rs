@@ -716,6 +716,71 @@ mod tests {
         }
     }
 
+    /// **Every hand-written page reports to its own site's analytics, once.**
+    ///
+    /// Cloudflare Web Analytics issues one token per hostname and attributes a
+    /// beacon by its token, so a page carrying another site's token counts its
+    /// visits against the wrong site — which looks like traffic, not like a
+    /// bug. Each page is checked against the token of the host that serves it,
+    /// against every other site's token being absent, and against the beacon
+    /// being gated on that public host — these pages are also served by local
+    /// and LAN daemons, whose visits must not be counted.
+    ///
+    /// tokera.com is absent for the same reason as above: its head is
+    /// generated, and `page.rs` checks it per page kind.
+    #[test]
+    fn every_page_reports_to_its_own_analytics_site() {
+        const BOT: &str = "450abe37845347b8a074a7f0b9e3d321";
+        const CODE: &str = "c3851f95a92346c4918e0e2ba7227859";
+        const BATTLECITIES: &str = "139fd6c6afdd49f3aadfd6a8ffad2887";
+        const TOKERA: &str = "d97ee514b3144213aa52da6f83e8af05";
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let pages = [
+            ("../web/content/npcd/index.html", BOT, "bot.tokera.com"),
+            ("../zend/web/index.html", CODE, "code.tokera.com"),
+            ("../zend/web/logs.html", CODE, "code.tokera.com"),
+            ("../zend/web/perf.html", CODE, "code.tokera.com"),
+            ("../zend/web/project.html", CODE, "code.tokera.com"),
+            ("../zend/web/substrate.html", CODE, "code.tokera.com"),
+            (
+                "../web/content/battlecities/index.html",
+                BATTLECITIES,
+                "battlecities.net",
+            ),
+        ];
+
+        for (page, token, host) in pages {
+            let html =
+                std::fs::read_to_string(root.join(page)).unwrap_or_else(|e| panic!("{page}: {e}"));
+            assert_eq!(
+                html.matches("static.cloudflareinsights.com/beacon.min.js")
+                    .count(),
+                1,
+                "{page} must load the analytics beacon exactly once"
+            );
+            let beacon = html
+                .find(&format!(r#""token": "{token}""#))
+                .unwrap_or_else(|| panic!("{page} does not carry its own site's token"));
+            let head_end = html
+                .find("</head>")
+                .unwrap_or_else(|| panic!("{page} has no </head>"));
+            assert!(beacon < head_end, "{page}: beacon outside <head>");
+            assert!(
+                html.contains(&format!(r#"location.hostname!=="{host}")return;"#)),
+                "{page}: beacon is not gated on {host}"
+            );
+            for other in [BOT, CODE, BATTLECITIES, TOKERA] {
+                if other != token {
+                    assert!(
+                        !html.contains(other),
+                        "{page} carries another site's token {other}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The parse itself, pinned against both spellings the files use. Without
     /// this a change of style silently empties the list above and the contract
     /// stops being checked while the test keeps passing.
