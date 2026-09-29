@@ -766,8 +766,8 @@ document.
 | C9 × 2 | 951.4 | 833.7 | **1463.1** (+54 %) |
 | Q4_0 × 20 | 2423.4 | 1655.0 | **2735.1** (+13 %) |
 
-t/s aggregate, `test_parallel_batched_forwarding`, RTX 4090 Mobile,
-Qwen3-30B-A3B. Single-stream t/s rose 20–35 % alongside.
+Aggregate **prefill** t/s (the harness's `t/s (bulk)` column),
+`test_parallel_batched_forwarding`, RTX 4090 Mobile, Qwen3-30B-A3B. Single-stream t/s rose 20–35 % alongside.
 
 **What was wrong was never the architecture — it was that the tier which makes
 the architecture affordable had been sized by three separate guesses.** The

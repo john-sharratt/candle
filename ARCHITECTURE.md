@@ -11,8 +11,10 @@ index, an MoE expert-streaming pipeline, and an on-disk conversation substrate
 understand how those pieces fit together and where to find each one in code.
 
 The canonical technical report is [`docs/unbounded_agents.md`](docs/unbounded_agents.md)
-("One Card, One Stack"); the root [`README.md`](README.md) is a condensed
-summary. This document is the map between that theory and the actual crates,
+("One Card, One Stack", v2 in preparation; the published v1 is
+[`docs/unbounded_agents_v1.md`](docs/unbounded_agents_v1.md)); the root
+[`README.md`](README.md) is a condensed summary, and every measured figure is
+in [`docs/performance.md`](docs/performance.md). This document is the map between that theory and the actual crates,
 modules, and files.
 
 ---
@@ -55,13 +57,13 @@ term requires removing tokens from the working set, not shrinking them.
 Four subsystems implement this thesis:
 
 1. **Provenance-selected attention** (§5) — Q vectors captured live during
-   decode; a Binary Directional Provenance (BDP) scan ranks all KV chunks in
-   3–10 ms regardless of corpus size.
+   decode; a Binary Directional Provenance (BDP) scan on the GPU ranks the whole
+   corpus in ~9.5 ms (RTX 4090 Laptop GPU) regardless of corpus size.
 2. **Three-tier paged KV cache** (§4) — GPU hot / CPU RAM warm / NVMe cold,
    32-token block granularity, async migration.
 3. **Adaptive per-block KV quantization** (§4) — 11 compression levels
-   (`compression_level` 0–10, informally "C0–C9" in the docs), K/V format
-   chosen independently per block from cosine-distance thresholds.
+   (`compression_level` 0–10, "C0–C10"), K/V format chosen independently per
+   block from cosine-distance thresholds.
 4. **Markov expert prediction + wave-batched MoE** (§6) — prior-layer routing
    predicts current-layer expert loads; many sessions step through layers
    together so PCIe expert loads amortise across the whole batch.
@@ -173,7 +175,7 @@ next context window is assembled while the current one is still decoding;
 probe tokens are discarded and never enter the KV cache. **Selection and
 forward execution are decoupled by a full wave**: the scheduler never blocks
 a forward pass on the CPU scan — the scan's result feeds the *next*
-reprojection, which is what keeps the 3–10 ms scan off the GPU's critical
+reprojection, which is what keeps the ~9.5 ms scan off the forward's critical
 path.
 
 ---
