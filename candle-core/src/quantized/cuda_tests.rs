@@ -5346,6 +5346,61 @@ fn rms_norm_q8a128_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// The tile gather must hand the experts **the same bytes** whichever order the work is done
+/// in: quantizing the tokens once and gathering tiles of the result, or gathering the float
+/// rows and quantizing those. Quantization is per 128-element tile, so the two agree exactly —
+/// any difference is a wrong row or a wrong tile, not rounding. Repeated and out-of-order ids
+/// (a token routed to several experts), at the released 2,560 width, whose rows straddle
+/// super-blocks and which the byte-row gather could not serve, and at 2,048, where rows are
+/// whole super-blocks and the tile gather must reproduce the row copy.
+#[test]
+fn q8a128_tile_gather_matches_gather_then_quantize() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let tokens = 5usize;
+    // Eight output rows, so every row count here is a whole number of super-blocks and every
+    // byte of both buffers is written.
+    let ids: Vec<u32> = vec![3, 0, 4, 4, 1, 2, 0, 3];
+    let ids_dev = dev.memcpy_stod(&ids)?;
+    for cols in [2560usize, 2048] {
+        let xf: Vec<f32> = (0..tokens * cols)
+            .map(|i| ((i * 7919 % 2003) as f32 - 1001.0) * 0.003)
+            .collect();
+        let xs = crate::Tensor::from_vec(xf, (tokens, cols), &device)?;
+        let quantize = |t: &crate::Tensor| -> Result<Q8a128Operand<'static>> {
+            match to_dynamic(t, Int8Mode::Precision, &dev, SumScale::Raw)? {
+                DynamicActs::Int8(op) => Ok(op),
+                DynamicActs::Float(_) => unreachable!("Precision mode yields Int8"),
+            }
+        };
+        let want = quantize(&fused_moe_gather(&xs, &ids_dev, ids.len(), &dev)?)?;
+        let got =
+            fused_moe_gather_q8a128(&quantize(&xs)?, &ids_dev, ids.len(), &dev, Backing::Owned)?;
+        let want_bytes = dev.memcpy_dtov(&want.data_slice()?.slice(..))?;
+        let got_bytes = dev.memcpy_dtov(&got.data_slice()?.slice(..))?;
+        assert_eq!(got_bytes.len(), want_bytes.len(), "{cols}");
+        // Only the bytes a quantize defines: each tile's 128 quants and its ds[0]
+        // `{scale, sum}` half2. The other 12 bytes of a tile's ds slot are alignment pad,
+        // which the quantize leaves as allocated.
+        for tile in 0..ids.len() * cols / 128 {
+            let block = (tile / 8) * 1152;
+            let qs = block + (tile % 8) * 128;
+            let ds = block + 1024 + (tile % 8) * 16;
+            assert_eq!(
+                got_bytes[qs..qs + 128],
+                want_bytes[qs..qs + 128],
+                "{cols}: tile {tile} quants differ"
+            );
+            assert_eq!(
+                got_bytes[ds..ds + 4],
+                want_bytes[ds..ds + 4],
+                "{cols}: tile {tile} scale/sum differ"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Phase-2b producer fusion: `silu_mul_q8a128` (fused SwiGLU → q8a128) must match the unfused
 /// `silu(gate)·up` → `quantize_acts_q8a128` oracle within float margin, for BOTH f16 and bf16.
 /// The reference uses exact sigmoid; the kernel uses the production fast-exp silu, so the margin

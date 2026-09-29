@@ -442,14 +442,15 @@ impl Qwen4ExpBatched {
         let candle::Device::Cuda(cuda) = dev else {
             candle::bail!("qwen4exp draft runs on CUDA");
         };
-        // Float activations for the same reason the trunk's MoE uses them: the
-        // int8 expert gather tiles at 1024 and this stack's hidden is 2560.
+        // Quantized once in the session's mode, as the trunk's MoE input is:
+        // the router, the shared expert and the routed experts' tile gather all
+        // read the one operand.
         let acts = to_dynamic(
             &h2.reshape((1, n, n_embd))?,
-            candle::quantized::Int8Mode::Off,
+            m.lm_head.int8mode(),
             cuda,
             // Raw Σx — a language model's block sums stay far below f16's
-            // ceiling. (`Off` produces no q8a128 here anyway.)
+            // ceiling.
             candle::quantized::SumScale::Raw,
         )?;
         let y2 = head

@@ -3107,17 +3107,18 @@ impl Qwen4ExpBatched {
                 probe(site("q4e.hc_ffn.inject2.L", li), &inject2);
             }
             let h2_3d = h2.reshape((1, total_rows, n_embd))?;
-            // Float activations, deliberately: the int8 expert path gathers
-            // token rows as q8a1024 (hidden must tile 1024) and 2560 does not.
-            // The routed experts still run their quantized weights — only the
-            // activation operand stays float. Teaching the gather the 2.5-tile
-            // row is recorded §0.4 work.
+            // Quantized ONCE, in the session's mode, into the one q8a128
+            // operand every consumer of the FFN input reads — the shared
+            // expert, its gate, the router, and the routed experts, whose tile
+            // gather copies the 20 tiles of each 2560-wide row it routes. Handed
+            // over as float, the experts gathered float rows and quantized the
+            // stacked `rows × top_k` block themselves, once per layer.
             // Raw Σx — a language model's block sums stay far below f16's
-            // ceiling. (`Off` produces no q8a128 here anyway.)
+            // ceiling.
             let g_acts = crate::models::profile::gpu_span("q4e:moe_acts", dev);
             let acts = to_dynamic(
                 &h2_3d,
-                candle::quantized::Int8Mode::Off,
+                m.lm_head.int8mode(),
                 cuda,
                 candle::quantized::SumScale::Raw,
             )?;
