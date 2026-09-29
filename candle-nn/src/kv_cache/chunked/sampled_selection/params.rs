@@ -1164,3 +1164,46 @@ pub const QWEN4EXP_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors
     v_hi: 3.0,
     v_low: 3.0,
 };
+
+/// **Qwen3.8-Flash-Next at `Q2_KO` experts** — the 16 GB card's rung
+/// (`quant_ladder`), measured on the RTX 4090 Mobile.
+///
+/// A row per expert format because the design calls for one
+/// (`docs/qwen38_flash_next.md` §Phase 6: "per machine and per expert format"),
+/// and the measurement agrees: at [`QWEN4EXP_KV_FACTORS`] — derived on `Q4_KO`
+/// experts, one notch under C10's edge — the `Q2_KO` model passes BF16 and
+/// C0/C5/C8 at 100% but fails C10 (0/2 at ×2, 3/8 at ×8). Narrower experts
+/// leave the model less margin for K/V error, so the edge moves inward; taking
+/// that from the shared row would charge the `Q4_KO` machines compression at C5
+/// for a margin only this rung needs.
+///
+/// Bracketed on the C-ladder gate (2026-09-19, RTX 4090 Mobile):
+///
+/// | k | v | C10×2 | C10×8 | C10 ratio | C5 ratio |
+/// |---|---|-------|-------|-----------|----------|
+/// | 1.8  | 3.0 | 0/2 | 3/8 | 7.75× | 4.22× |
+/// | 1.8  | 2.7 | 1/2 | 3/8 | 7.41× | 4.20× |
+/// | 1.65 | 2.4 | 2/2 | 4/8 | 6.84× | 4.13× |
+/// | **1.5** | **2.2** | **2/2** | **8/8** | **6.38×** | **4.06×** |
+///
+/// The failures are early — the first divergent character is at 8–84 of ~350
+/// — which is what a row past the edge looks like here, not a slow drift. At
+/// the bracketed row the whole ladder (BF16 ×1/×4/×8, C0/C5/C8/C10×2/C10×8)
+/// passed, and C5 — the level zend runs — gave up 3.8% of its ratio against
+/// the `Q4_KO` row, the price of the narrower experts' margin.
+///
+/// **Re-derived 2026-09-20: v 2.2 → 2.1.** At 1.5 / 2.2 a later gate run
+/// passed C10×2 (6.37×) but failed C10×8 at 7/8 — one session dropped a word at
+/// character 83, the early-divergence shape of a row on the edge. V is the axis
+/// that gives way first at the top rung, so only V moves, by the smallest step
+/// the bracket above resolves.
+///
+/// Reproduced on this branch's engine 2026-09-29 before the row was wired in:
+/// the `Q4_KO` row failed C10 1/2 at ×2 and 3/8 at ×8 with every other rung
+/// passing — the same shape the bracket above starts from.
+pub const QWEN4EXP_Q2KO_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
+    k_hi: 1.5,
+    k_low: 1.5,
+    v_hi: 2.1,
+    v_low: 2.1,
+};

@@ -21,6 +21,8 @@ use candle_nn::kv_cache::WaveGeneration;
 pub mod bench;
 #[cfg(feature = "cuda")]
 mod cuda_fused;
+#[cfg(feature = "cuda")]
+pub mod ko;
 
 /// One hyper-connection module's weights (two per layer: pre-mixer, pre-FFN;
 /// one at the head with no `inject`).
@@ -47,6 +49,13 @@ pub struct HcWeights {
     /// the same last-ulp class as any tile-shape change. Both operands were
     /// already dense F32 (`dequantize` at load), so no quantization scale is
     /// shared between the two halves and there is nothing to re-derive.
+    ///
+    /// **The gate rows carry the read gate's `1/hc`**, folded in by
+    /// [`Self::from_checkpoint`]. The algebra scales the gate projection by
+    /// `1/hc` before its SiLU; with `hc` a power of two that scale is exact in
+    /// floating point, so applying it to the weight once gives the same bits as
+    /// applying it to every output row — and removes a full pass over
+    /// `[rows, low_rank]` per call, 96 times a forward.
     pub down: Tensor,
     /// `[hc_dim, low_rank]`. Its second dimension is what says where
     /// [`Self::down`] splits — see [`HcWeights::low_rank`].
@@ -54,6 +63,32 @@ pub struct HcWeights {
 }
 
 impl HcWeights {
+    /// A module from its checkpoint tensors: the norm gain, the `down`
+    /// projection (gate rows, then — on a module that injects — the inject rows
+    /// stacked beneath), and the `up` projection. The read gate's `1/hc` is
+    /// folded into the gate rows here, once; see [`Self::down`].
+    ///
+    /// Every loader builds a module through this, so the fold cannot be applied
+    /// by one and forgotten by another.
+    pub fn from_checkpoint(norm: Tensor, down: Tensor, up: Tensor, hc: usize) -> Result<Self> {
+        if !hc.is_power_of_two() {
+            candle::bail!(
+                "hc={hc} is not a power of two: folding the gate's 1/hc into its weight would \
+                 round, so the folded and unfolded forms would no longer agree bit for bit"
+            );
+        }
+        let low_rank = up.dim(1)?;
+        let rows = down.dim(0)?;
+        let scale = 1.0 / hc as f64;
+        let gate = (down.narrow(0, 0, low_rank)? * scale)?;
+        let down = if rows > low_rank {
+            Tensor::cat(&[&gate, &down.narrow(0, low_rank, rows - low_rank)?], 0)?
+        } else {
+            gate
+        };
+        Ok(Self { norm, down, up })
+    }
+
     /// The read gate's bottleneck, and the row at which [`Self::down`] splits
     /// into the gate projection and the inject projection.
     ///
@@ -67,6 +102,51 @@ impl HcWeights {
     /// rows beneath the gate's. The head module mixes but never injects.
     pub fn injects(&self) -> Result<bool> {
         Ok(self.down.dim(0)? > self.low_rank()?)
+    }
+}
+
+/// A hyper-connection module's weights, as the read half computes with them.
+///
+/// Two forms, the same split every projection in this stack has: [`HcWeights`]
+/// holds the F32 checkpoint and is the definition the CPU oracle runs;
+/// [`ko::HcWeightsKo`] holds the two projections KO-quantized for the engine's
+/// int8 matmul. The mix is written once against this and cannot tell them
+/// apart.
+pub trait HcProject {
+    /// The `[hc_dim]` grouped-norm gain.
+    fn norm(&self) -> &Tensor;
+    /// `xn_flat · downᵀ`: the gate columns, then the inject columns beneath
+    /// them on a module that injects.
+    fn down<'w>(&self, xn_flat: &LiveTensor<'w>) -> Result<LiveTensor<'w>>;
+    /// `lo · upᵀ`: the raw gate, `[t, hc_dim]`.
+    fn up<'w>(&self, lo: &LiveTensor<'w>) -> Result<LiveTensor<'w>>;
+    /// The leading columns of [`Self::down`]'s output the SiLU takes — the
+    /// gate rank, or a padding of it whose extra columns are exactly zero.
+    fn gate_cols(&self) -> usize;
+    /// Where the inject columns start in [`Self::down`]'s output, on a module
+    /// that injects.
+    fn inject_col(&self) -> Option<usize>;
+}
+
+impl HcProject for HcWeights {
+    fn norm(&self) -> &Tensor {
+        &self.norm
+    }
+
+    fn down<'w>(&self, xn_flat: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
+        xn_flat.matmul(&self.down.t()?)
+    }
+
+    fn up<'w>(&self, lo: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
+        lo.matmul(&self.up.t()?)
+    }
+
+    fn gate_cols(&self) -> usize {
+        self.up.dims()[1]
+    }
+
+    fn inject_col(&self) -> Option<usize> {
+        (self.down.dims()[0] > self.gate_cols()).then(|| self.gate_cols())
     }
 }
 
@@ -116,45 +196,30 @@ fn eager_grouped_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 /// returns is deliberately NOT on it: that crosses every phase boundary.
 pub fn hc_mix(
     x: &Tensor,
-    w: &HcWeights,
+    w: &impl HcProject,
     eps: f64,
     wave: Option<&WaveGeneration>,
 ) -> Result<(Tensor, Option<Tensor>)> {
     let (t, hc, n_embd) = x.dims3()?;
     let dev = x.device();
     let g = crate::models::profile::gpu_span("hc_mix:norm", dev);
-    let xn = hc_grouped_norm(x, &w.norm, eps, wave)?;
+    let xn = hc_grouped_norm(x, w.norm(), eps, wave)?;
     let xn_flat = xn.reshape((t, hc * n_embd))?;
     g.end();
 
     // Low-rank read gate: silu(down(xn)/hc) → up(·), with the inject projection
-    // riding the SAME down GEMM (see [`HcWeights::down`]). The projections stay
-    // in cuBLAS — they are real GEMMs, and `ncu` puts them at ~50% SM and only
-    // 10–14% DRAM, so they are compute-limited on the SIMT F32 pipe rather than
-    // starved of bandwidth. That is why stacking wins: it is not a read that
+    // riding the SAME down GEMM (see [`HcWeights::down`]) and the `1/hc` already
+    // folded into its gate rows. Stacking wins because it is not a read that
     // disappears, it is a whole GEMM's worth of work.
     let g = crate::models::profile::gpu_span("hc_mix:lowrank", dev);
-    let low_rank = w.low_rank()?;
-    let proj = xn_flat.matmul(&w.down.t()?)?;
-    let injects = w.injects()?;
-    // **The one copy this costs, stated rather than hidden.** Splitting the
-    // stacked output leaves both halves with a row stride of `low_rank + hc`,
-    // and candle's matmul refuses a strided operand outright rather than
-    // copying behind the caller's back. So the gate half is compacted here —
-    // an allocate-plus-copy, which invariant 2 forbids as a rule and which is
-    // taken deliberately: `[t, low_rank]` measured 9 µs at 2,048 tokens against
-    // the 215 µs the stacking saves. The alternatives were both worse in the
-    // way the invariant actually cares about — padding `up` with zero columns
-    // so the stride is swallowed, or teaching `gr_combine` a stride argument —
-    // because each bends a shared component to fit one model's weight layout.
-    let lo = if injects {
-        proj.narrow(1, 0, low_rank)?.contiguous()?
-    } else {
-        proj.clone()
-    };
-    let lo = (lo * (1.0 / hc as f64))?;
-    let lo = lo.broadcast_mul(&candle_nn::ops::sigmoid(&lo)?)?; // silu
-    let gate_raw = lo.matmul(&w.up.t()?)?;
+    let proj = w.down(&xn_flat)?;
+    // **One pass for the whole prelude.** The SiLU reads the gate half as a
+    // strided view of the stacked output and writes a dense `[t, gate_cols]` —
+    // which is also the compaction the up-projection needs, since neither
+    // matmul takes a strided operand. One launch where there were three
+    // (compact, sigmoid, multiply) and a scale the weight now carries.
+    let lo = proj.narrow(1, 0, w.gate_cols())?.silu()?;
+    let gate_raw = w.up(&lo)?;
     g.end();
 
     let g = crate::models::profile::gpu_span("hc_mix:gate_mean", dev);
@@ -176,15 +241,13 @@ pub fn hc_mix(
     g.end();
 
     // What used to be a second full-width GEMM over `xn_flat` is now the tail
-    // rows of the one above, so this span holds only the compaction of a
-    // `[t, hc]` slice — `hc` is 4, so it is 32 KiB at prefill width. The span
-    // is kept rather than deleted because its collapse against the profile's
-    // previous run is the visible half of the change.
+    // columns of the one above, so this span holds only the compaction of a
+    // `[t, hc]` slice — `gr_combine` reads the inject densely, and `hc` is 4,
+    // so it is 32 KiB at prefill width.
     let g = crate::models::profile::gpu_span("hc_mix:inject", dev);
-    let inject = if injects {
-        Some(proj.narrow(1, low_rank, hc)?.contiguous()?)
-    } else {
-        None
+    let inject = match w.inject_col() {
+        Some(col) => Some(proj.narrow(1, col, hc)?.contiguous()?),
+        None => None,
     };
     g.end();
     Ok((mixed, inject))
@@ -286,13 +349,47 @@ mod tests {
     fn tiny(hc: usize, n_embd: usize, lr: usize, with_inject: bool, dev: &Device) -> HcWeights {
         let hc_dim = hc * n_embd;
         let rows = lr + if with_inject { hc } else { 0 };
-        HcWeights {
-            norm: lcg_tensor(&[hc_dim], 11, dev).affine(0.2, 1.0).unwrap(),
-            down: lcg_tensor(&[rows, hc_dim], 12, dev)
+        HcWeights::from_checkpoint(
+            lcg_tensor(&[hc_dim], 11, dev).affine(0.2, 1.0).unwrap(),
+            lcg_tensor(&[rows, hc_dim], 12, dev)
                 .affine(0.3, 0.)
                 .unwrap(),
-            up: lcg_tensor(&[hc_dim, lr], 13, dev).affine(0.3, 0.).unwrap(),
-        }
+            lcg_tensor(&[hc_dim, lr], 13, dev).affine(0.3, 0.).unwrap(),
+            hc,
+        )
+        .unwrap()
+    }
+
+    /// The fold scales exactly the gate rows by exactly `1/hc` — raw values, not
+    /// a tolerance: with `hc` a power of two the scale is exact — and leaves the
+    /// inject rows stacked beneath them untouched.
+    #[test]
+    fn the_checkpoint_fold_scales_only_the_gate_rows() {
+        let dev = dev();
+        let down = Tensor::new(&[[4.0f32, -8.0], [1.0, 2.0], [3.0, 5.0]], &dev).unwrap();
+        let up = Tensor::new(&[[1.0f32, 1.0], [1.0, 1.0]], &dev).unwrap();
+        let norm = Tensor::new(&[1.0f32, 1.0], &dev).unwrap();
+        let w = HcWeights::from_checkpoint(norm, down, up, 4).unwrap();
+        assert_eq!(
+            w.down.to_vec2::<f32>().unwrap(),
+            [[1.0, -2.0], [0.25, 0.5], [3.0, 5.0]],
+            "gate rows × 1/4, inject row unchanged"
+        );
+        assert_eq!(w.low_rank().unwrap(), 2);
+        assert!(w.injects().unwrap());
+        assert_eq!(w.gate_cols(), 2);
+        assert_eq!(w.inject_col(), Some(2));
+    }
+
+    /// A non-power-of-two `hc` would make the fold round, so it is refused.
+    #[test]
+    fn a_fold_that_would_round_is_refused() {
+        let dev = dev();
+        let t = |r: usize, c: usize| Tensor::ones((r, c), DType::F32, &dev).unwrap();
+        let err = HcWeights::from_checkpoint(t(1, 6).flatten_all().unwrap(), t(2, 6), t(6, 2), 3)
+            .expect_err("hc = 3 must be refused")
+            .to_string();
+        assert!(err.contains("not a power of two"), "{err}");
     }
 
     #[test]
@@ -390,15 +487,11 @@ mod tests {
         let want_mixed = eager_gate_mean(&xn_flat, &gate_raw, t, hc, n_embd).unwrap();
         let want_inject = xn_flat.matmul(&inj.t().unwrap()).unwrap();
 
-        // The stacked form, through the production entry point.
-        let w = HcWeights {
-            norm,
-            down: Tensor::cat(&[&down, &inj], 0)
-                .unwrap()
-                .contiguous()
-                .unwrap(),
-            up,
-        };
+        // The stacked form, through the production entry point — which also
+        // folds the gate's `1/hc` into the weight the longhand form applies to
+        // the output.
+        let w = HcWeights::from_checkpoint(norm, Tensor::cat(&[&down, &inj], 0).unwrap(), up, hc)
+            .unwrap();
         assert!(
             w.injects().unwrap(),
             "the stacked weight must report inject"

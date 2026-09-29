@@ -54,6 +54,10 @@ pub mod gather_r16_kv;
 // memory — lets a tensor stay in the GGUF mmap instead of occupying VRAM
 pub mod gather_rows;
 
+/// Token-embedding lookup from a quantized table resident in VRAM: gather,
+/// dequantize and replicate across residual streams in one launch.
+pub mod embed_gather_dequant;
+
 // Provenance sign(Q) bit-pack: GPU read+sign+pack, one launch for all layers
 pub mod prov_sign_pack;
 

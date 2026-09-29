@@ -32,20 +32,40 @@
 //! not taking what it released — throughput, not correctness. Read which one failed
 //! before reaching for a threshold.
 
-use candle_conversation::fragmentation_probe::{names, profile, run, run_on_model, Probe};
+use candle_conversation::fragmentation_probe::{
+    names, profile, run, run_on_model, ModelProfile, Probe,
+};
+use candle_conversation::models::Model;
 use candle_transformers::models::batch_test::utils::{TestConfig, TestMode, TestParams};
 use candle_transformers::models::batched_inference::InferenceMode;
 use candle_transformers::models::dialect::Dialect;
+use candle_transformers::models::quant_ladder;
 use candle_transformers::models::quantized_qwen3_moe::batched_forward_configs;
 
 /// Resolve a profile by name, or say what could have been named instead.
-fn resolved(name: &str) -> candle_conversation::fragmentation_probe::ModelProfile {
+fn resolved(name: &str) -> ModelProfile {
     profile(name).unwrap_or_else(|| {
         panic!(
             "no model profile named {name:?}. Known: {}",
             names().join(", ")
         )
     })
+}
+
+/// The Flash-Next row, running the preset this card's rung loads.
+///
+/// Every machine holds only its own rung's engine artifact, so the probe takes the
+/// same `quant_ladder::expert_format` choice the forward gate does — the 16 GB
+/// laptop runs `Q2_KO` experts, the 72 GB card `Q4_KO`, from one row of thresholds.
+fn flash_next_row() -> ModelProfile {
+    let mut row = resolved("qwen38-flash-next");
+    let device = candle::Device::new_cuda(0).expect("CUDA device");
+    let gib = quant_ladder::device_vram_gib(&device).expect("the card's VRAM");
+    let experts = quant_ladder::expert_format(gib);
+    row.model = Model::qwen38_flash_next_for(experts).unwrap_or_else(|| {
+        panic!("a {gib} GiB card's rung ({experts:?}) has no Flash-Next preset")
+    });
+    row
 }
 
 /// Install the log subscriber every probe in this file needs.
@@ -123,13 +143,13 @@ fn qwen3_30b_a3b_q4() {
 /// recurrent state non-finite, an all-NaN logits row, and a turn truncated on a forced EOS.
 /// This test is that sequence, reproducible.
 #[test]
-#[ignore = "loads Qwen3.8-Flash-Next (~56 GiB resident) and runs the engine probe; \
+#[ignore = "loads Qwen3.8-Flash-Next at this card's rung and runs the engine probe; \
             needs the card to itself"]
-fn qwen38_flash_next_q4ko() {
+fn qwen38_flash_next() {
     logging();
-    let probe = Probe::new(resolved("qwen38-flash-next-q4ko"));
+    let probe = Probe::new(flash_next_row());
     let outcome = run(&probe).expect("the probe ran");
-    summarise("qwen38-flash-next-q4ko", &outcome);
+    summarise("qwen38-flash-next", &outcome);
     outcome.assert_passed();
 }
 
@@ -146,13 +166,13 @@ fn qwen38_flash_next_q4ko() {
 #[test]
 #[ignore = "loads Qwen3.8-Flash-Next once and runs both the forward ladder and the \
             engine probe — tens of minutes; needs the card to itself"]
-fn qwen38_flash_next_q4ko_combined() {
-    ladder_and_engine("qwen38-flash-next-q4ko", true);
+fn qwen38_flash_next_combined() {
+    ladder_and_engine(flash_next_row(), true);
 }
 
 /// The flagship's engine phase alone, with the span breakdown.
 ///
-/// Read against [`qwen38_flash_next_q4ko_combined`]'s ladder rows: the ladder is
+/// Read against [`qwen38_flash_next_combined`]'s ladder rows: the ladder is
 /// what the forward costs, this is where the rest of the wall clock goes. The
 /// host and device tables are kept apart by [`print_pipeline_profile`] because
 /// device time overlaps the host and a shared denominator understates every host
@@ -165,11 +185,11 @@ fn qwen38_flash_next_q4ko_combined() {
 #[test]
 #[ignore = "profile run: the flagship's engine probe alone, for the span breakdown. \
             Needs --features hub,profile and the card to itself"]
-fn qwen38_flash_next_q4ko_profile_engine() {
+fn qwen38_flash_next_profile_engine() {
     logging();
-    let probe = Probe::new(resolved("qwen38-flash-next-q4ko"));
+    let probe = Probe::new(flash_next_row());
     let outcome = run(&probe).expect("the probe ran");
-    summarise("qwen38-flash-next-q4ko (profile)", &outcome);
+    summarise("qwen38-flash-next (profile)", &outcome);
     print_pipeline_profile("Flash-Next engine — full wave loop");
 }
 
@@ -187,7 +207,7 @@ fn qwen38_flash_next_q4ko_profile_engine() {
 #[test]
 #[ignore = "loads the 30B-A3B and runs the full forward ladder; minutes, needs the card"]
 fn qwen3_30b_a3b_q4_ladder() {
-    ladder_and_engine("qwen3-30b-a3b-q4", false);
+    ladder_and_engine(resolved("qwen3-30b-a3b-q4"), false);
 }
 
 /// The **combined table**: the forward ladder's ceiling rows and the engine's delivered
@@ -196,7 +216,7 @@ fn qwen3_30b_a3b_q4_ladder() {
 #[ignore = "loads the 30B-A3B once and runs both the forward ladder and the engine \
             probe — tens of minutes; needs the card to itself"]
 fn qwen3_30b_a3b_q4_combined() {
-    ladder_and_engine("qwen3-30b-a3b-q4", true);
+    ladder_and_engine(resolved("qwen3-30b-a3b-q4"), true);
 }
 
 /// **Profile A — one ladder row, alone.** `Q8_0 × 20`: the widest validated row, and the
@@ -435,9 +455,9 @@ fn ladder_rows(
 /// between configs, and it asserts nothing is live before each one. Only then is the model
 /// moved into a `ConversationEngine`, which is where fragmentation becomes possible at
 /// all. Reversed, the ladder's own gate would fail on KV the engine left behind.
-fn ladder_and_engine(name: &str, with_engine: bool) {
+fn ladder_and_engine(model_profile: ModelProfile, with_engine: bool) {
     logging();
-    let model_profile = resolved(name);
+    let name = model_profile.name;
     let probe = Probe::new(model_profile);
     let device = candle::Device::new_cuda(probe.device).expect("CUDA device");
 

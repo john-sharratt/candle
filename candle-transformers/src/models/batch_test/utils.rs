@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+use crate::models::batch_test::span_report::print_span;
 use crate::models::batch_test::story_normalize::normalize_story;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
@@ -1746,6 +1747,12 @@ impl TestParams {
         )?;
         self.device.synchronize()?;
         drop(detector);
+        // Every session of the row is still alive here, so KV stands at its
+        // high-water for the row and the weight zone at what decode ran against.
+        print_span(
+            &format!("{:?} x{} decode end", config.mode, sequence_indices.len()),
+            model.expert_stats().as_ref(),
+        );
         let forbidden = forbidden_alloc::take_report();
         if !forbidden.is_clean() {
             eprintln!("[{:?}] {}", config.mode, forbidden);
@@ -3015,58 +3022,7 @@ impl TestParams {
              SLOTS GAINED {}",
             g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
         );
-        // The span's own accounting, so the whole-card decomposition is read off
-        // the reservation rather than reconstructed from slot and region counts —
-        // the two round in different units, and 80 boundary moves of rounding is
-        // exactly the sort of gap that gets inferred away.
-        if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
-            println!("\n=== Span (device 0) ===");
-            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-            if let Ok((free, total)) = candle::Device::new_cuda(0).and_then(|d| d.mem_get_info()) {
-                println!(
-                    "  CARD                {:>9.1} MiB total | {:>7.1} free | {:>7.1} in use",
-                    mib(total),
-                    mib(free),
-                    mib(total - free),
-                );
-            }
-            println!("  reserved            {:>9.1} MiB", mib(rs.reserved_bytes));
-            println!(
-                "    weight zone       {:>9.1} MiB   (the expert side of the boundary)",
-                mib(rs.weight_bytes)
-            );
-            let region = candle_nn::kv_cache::REGION_BYTES;
-            let kv = rs.total * region;
-            println!(
-                "    KV regions        {:>9.1} MiB   ({} x {:.0} MiB: live {}, free {}, blocked {})",
-                mib(kv),
-                rs.total,
-                mib(region),
-                rs.live,
-                rs.free,
-                rs.blocked,
-            );
-            println!(
-                "    unusable slack    {:>9.1} MiB   (span tail the region count rounds off)",
-                mib(rs.slack_bytes)
-            );
-            // Whatever the reservation holds that is neither side of the moving
-            // boundary: the dense weights, loaded before the boundary existed.
-            println!(
-                "    dense block       {:>9.1} MiB   (loaded before the boundary, immovable)",
-                mib(rs
-                    .reserved_bytes
-                    .saturating_sub(rs.weight_bytes)
-                    .saturating_sub(kv)
-                    .saturating_sub(rs.slack_bytes)),
-            );
-            println!(
-                "  peak KV live        {:>9.1} MiB   ({} regions)   granule {:.0} MiB",
-                mib(rs.peak_live * region),
-                rs.peak_live,
-                mib(rs.granularity),
-            );
-        }
+        print_span("end of run", None);
 
         let s = candle_nn::kv_cache::spare_tally();
         println!(

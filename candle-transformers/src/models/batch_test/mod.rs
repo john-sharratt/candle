@@ -16,6 +16,9 @@ pub mod fixtures;
 #[cfg(test)]
 pub mod long_context;
 pub mod ruler_gen;
+/// The whole-card VRAM decomposition off the span's accounting, printed at each
+/// config's decode end and at the end of the run.
+pub mod span_report;
 /// The StoryRewrite comparison form: whitespace collapsed, gendered words
 /// neutralised at any word boundary.
 ///

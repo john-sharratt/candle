@@ -39,29 +39,19 @@
 //
 // A NOTE ON FUSING THE DEQUANTIZE
 // -------------------------------
-// This header used to claim that fusing dequantization in here would mean
-// re-implementing the ~29 formats `QCudaStorage::dequantize` dispatches, with no
-// way to keep the two numerically identical. That was wrong on both counts, and
-// it is worth recording why so the argument is not made again.
+// Fusing the dequantize in here would remove the staging buffer — the gather
+// writes quantized bytes that a second kernel reads once, immediately. The
+// catch is numerics. The dequantize this path finishes with is the
+// llama.cpp-derived set in `simple/quantized.cu`, and the generic
+// `dequantize_block` overloads in `dequant/dequant.cuh` are a SEPARATE
+// implementation, not a wrapper over it: for Q4_0 they compute `(q - 8) * d`
+// where `quantized.cu` computes `d * q - 8d`, which rounds differently, and at
+// least one of the others faults on the 2-byte-aligned blocks a packed row
+// hands it. A fused kernel over `dequant.cuh` is therefore bit-identical to
+// this path only for the formats a parity test has checked.
 //
-// The per-format dequantize logic is not 29 hand-written kernels. It is a set of
-// templated `__device__` functions, wrapped into `__global__` entry points by the
-// `DEQUANTIZE` / `DEQUANTIZE_K` macros in `simple/quantized.cu`, and exposed to
-// generic code as the overloaded `dequantize_block(src_block, dst)` in
-// `dequant/dequant.cuh` — a header whose stated purpose is exactly this:
-// "enables generic code to dequantize any quantized format".
-//
-// So a fused gather-dequantize is one templated kernel instantiated over the
-// same type list, not a per-format rewrite. And it is numerically identical *by
-// construction* rather than by inspection, because it calls the very same device
-// function this path already calls — the mapping from block bytes to output
-// values is shared code, not a reimplementation of it.
-//
-// The reason to fuse is that the staging buffer disappears entirely: the gather
-// writes quantized bytes that are read once, immediately, by a second kernel.
-// Fused, the quantized bytes never land in VRAM at all, which removes one
-// allocation and one launch per forward while keeping the PCIe traffic
-// quantized — the property this whole design exists to preserve.
+// `simple/embed_gather_dequant.cu` is that fused kernel for a table resident
+// in VRAM, and records which formats it dispatches and why.
 //
 // GRID AND BLOCK CONFIGURATION
 // ----------------------------

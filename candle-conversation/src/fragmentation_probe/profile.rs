@@ -156,8 +156,12 @@ pub fn profiles() -> Vec<ModelProfile> {
         // resident experts leaves far less KV room than the 30B has, so the arena
         // population — and therefore what a burst strands — has not been characterised.
         // Measure them before reading an efficiency failure here as a compaction defect.
+        //
+        // `model` names the widest rung; a caller runs the preset its card's rung
+        // loads (`Model::qwen38_flash_next_for`), because every machine holds only
+        // its own rung's artifact.
         ModelProfile {
-            name: "qwen38-flash-next-q4ko",
+            name: "qwen38-flash-next",
             model: Model::Qwen38_FlashNext_Q4KO,
             max_seq_len: 8192,
             // Narrower than the 30B's, and deliberately: the resident expert grid is 56

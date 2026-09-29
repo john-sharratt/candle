@@ -525,14 +525,18 @@ mod tests {
 
         // `down` carries the inject rows stacked beneath the gate's, which is
         // the layout both loaders build — see `HcWeights::down`.
-        let hcw = |seed: u64, inject: bool| HcWeights {
-            norm: norm1(hc_dim, seed),
-            down: sc(lcg_tensor(
-                &[hcc.low_rank + if inject { hcc.count } else { 0 }, hc_dim],
-                seed + 1,
-                dev,
-            )),
-            up: sc(lcg_tensor(&[hc_dim, hcc.low_rank], seed + 2, dev)),
+        let hcw = |seed: u64, inject: bool| {
+            HcWeights::from_checkpoint(
+                norm1(hc_dim, seed),
+                sc(lcg_tensor(
+                    &[hcc.low_rank + if inject { hcc.count } else { 0 }, hc_dim],
+                    seed + 1,
+                    dev,
+                )),
+                sc(lcg_tensor(&[hc_dim, hcc.low_rank], seed + 2, dev)),
+                hcc.count,
+            )
+            .unwrap()
         };
         let dn = |seed: u64| DeltaNetWeights {
             wqkv: sc(lcg_tensor(&[dims.conv_dim(), hidden], seed, dev)),
