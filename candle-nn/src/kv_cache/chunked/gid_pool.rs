@@ -52,6 +52,7 @@
 //! arena and lets drops touch a single cache line.
 
 use ahash::{AHashMap, AHashSet};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::{
     collections::VecDeque,
@@ -1052,10 +1053,52 @@ impl ArenaPool {
         arenas.saturating_sub(needed)
     }
 
+    /// Add this pool's arenas that hold no chunk to `census`, each counted once more
+    /// under the reason [`Self::try_tombstone`] would pass over it, if it has one.
+    fn count_empty(&self, protected_arenas: &AHashSet<usize>, census: &mut EmptyCensus) {
+        let tables = self.tables.read().unwrap();
+        for (idx, t) in tables.iter() {
+            if t.live_count() != 0 {
+                continue;
+            }
+            census.empty += 1;
+            if t.creation_pending() {
+                census.in_creation += 1;
+            }
+            if protected_arenas.contains(idx) {
+                census.protected += 1;
+            }
+        }
+    }
+
     #[cfg(test)]
     fn free_len(&self) -> usize {
         self.total_free()
     }
+}
+
+/// One key's arenas and how full they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyOccupancy {
+    pub key: ArenaKey,
+    /// Arenas registered for the key.
+    pub arenas: usize,
+    /// Slots holding a chunk, across those arenas.
+    pub live: usize,
+    /// Slots in one arena of the key.
+    pub arena_chunks: usize,
+}
+
+/// The arenas of a pool that hold no chunk, and why the empty sweep would keep any
+/// of them. An arena can be counted under both reasons.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmptyCensus {
+    /// Arenas with no live chunk.
+    pub empty: usize,
+    /// Of those, arenas still inside their creation window.
+    pub in_creation: usize,
+    /// Of those, arenas protected from the sweep.
+    pub protected: usize,
 }
 
 /// Internal state of the GID pool, partitioned by ArenaKey.
@@ -1498,6 +1541,37 @@ impl ChunkGidPool {
                 .store(false, Ordering::Release);
         }
         any
+    }
+
+    /// Every arena holding no chunk, across every key, and why the empty sweep would
+    /// keep any of them — what an out-of-regions report needs before it can claim the
+    /// reservation is occupied.
+    pub fn empty_census(&self) -> EmptyCensus {
+        let state = self.inner.metadata.lock().unwrap();
+        let mut census = EmptyCensus::default();
+        for pool in self.inner.pools.values() {
+            pool.count_empty(&state.protected_arenas, &mut census);
+        }
+        census
+    }
+
+    /// Every key that has an arena, with its arena count and live slots, most arenas
+    /// first — what is holding the reservation at the moment it is read.
+    pub fn occupancy(&self) -> Vec<KeyOccupancy> {
+        let mut out: Vec<KeyOccupancy> = self
+            .inner
+            .pools
+            .iter()
+            .map(|(key, pool)| KeyOccupancy {
+                key: *key,
+                arenas: pool.total_arenas.load(Ordering::Relaxed),
+                live: pool.total_live(),
+                arena_chunks: pool.arena_chunks,
+            })
+            .filter(|o| o.arenas > 0)
+            .collect();
+        out.sort_by_key(|o| Reverse(o.arenas));
+        out
     }
 
     /// True when a forced compaction could free at least one whole arena across
@@ -2026,6 +2100,44 @@ mod tests {
         assert_eq!(b, 1);
         // Each arena contributes `arena_chunks` of capacity.
         assert_eq!(pool.free_list_len_for(key), test_arena_chunks() * 2);
+    }
+
+    /// **The census counts every empty arena, and names what would keep each one from
+    /// the sweep**: an open creation window, a protection, both, or nothing.
+    #[test]
+    fn the_empty_census_names_why_each_empty_arena_is_kept() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let used = pool.register_arena(key);
+        let _live = pool.allocate_from_arena(key, used).unwrap();
+        let _pending = pool.register_arena(key);
+        let released = pool.register_arena(key);
+        pool.finish_creation(key, released);
+        let guarded = pool.register_arena(key);
+        pool.finish_creation(key, guarded);
+        pool.protect_arena(guarded);
+        let both = pool.register_arena(key);
+        pool.protect_arena(both);
+
+        assert_eq!(
+            pool.empty_census(),
+            EmptyCensus {
+                empty: 4,
+                in_creation: 2,
+                protected: 2,
+            }
+        );
+        assert_eq!(pool.next_tombstone(key), Some(released));
+        assert_eq!(pool.next_tombstone(key), None, "the rest are kept");
+        assert_eq!(
+            pool.occupancy(),
+            [KeyOccupancy {
+                key,
+                arenas: 4,
+                live: 1,
+                arena_chunks: test_arena_chunks(),
+            }]
+        );
     }
 
     #[test]

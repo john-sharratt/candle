@@ -1909,6 +1909,16 @@ impl BatchedInferenceSession {
                 }
             }
         }
+        // **The snapshots go before the swap loop, not after it.** Each one holds every
+        // float chunk of its sequence, and the loop below is where those chunks are
+        // meant to die: a sequence's truncate drops the block table's hold, then its
+        // fresh writer is claimed. Kept to the end of the function, the snapshots held
+        // the whole cohort's float copy through every writer claim, so the loop's peak
+        // was float + quantized + writers for every sequence at once — measured on the
+        // Llama-2 MHA gate at Q8_0 x32 on a 16 GB card as all 639 regions live, 322
+        // arenas of them F32. A layer the quantizer skipped still has its snapshot, as
+        // a clone, in `quantized_per_seq`.
+        drop(live_per_layer);
 
         for (s, &seq_idx) in seq_indices.iter().enumerate() {
             let quantized_per_layer = std::mem::take(&mut quantized_per_seq[s]);
