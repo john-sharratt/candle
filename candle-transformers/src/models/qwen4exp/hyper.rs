@@ -12,8 +12,8 @@
 //! contiguously exactly as ggml's `[n_embd, hc, T]` does, and the `[hc_dim]`
 //! norm weights apply as a plain broadcast.
 
+use candle::wave_provenance::WaveTicket;
 use candle::{LiveTensor, Result, Tensor};
-use candle_nn::kv_cache::WaveGeneration;
 
 /// Microbench + `ncu` target for the three fused kernels, with its own
 /// correctness gate (§0.4 rule 4).
@@ -163,13 +163,13 @@ pub fn hc_grouped_norm(
     x: &Tensor,
     weight: &Tensor,
     eps: f64,
-    wave: Option<&WaveGeneration>,
+    root: Option<WaveTicket>,
 ) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if matches!(x.device(), candle::Device::Cuda(_)) {
         // One launch: the reduction and the per-(stream, column) gain in a
         // single pass.
-        return cuda_fused::norm(x, weight, eps, wave);
+        return cuda_fused::norm(x, weight, eps, root);
     }
     eager_grouped_norm(x, weight, eps)
 }
@@ -189,21 +189,23 @@ fn eager_grouped_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 /// The read half: collapse the wide residual `[T, hc, n_embd]` into the block
 /// input `[T, n_embd]`, and produce the `[T, hc]` write weights for
 /// [`hc_combine`] when the module carries an `inject`.
-/// `wave`, when present, is the open layer phase this mix's transients belong
-/// to. Everything it produces is consumed before that phase closes — the block
-/// input by the mixer or the FFN, the inject weights by [`hc_combine`] — which
-/// is what makes rooting them on the span sound. The residual `hc_combine`
-/// returns is deliberately NOT on it: that crosses every phase boundary.
+/// `root`, when present, is the ticket of the open phase this mix's transients
+/// belong to — a layer's attention or FFN phase, or the forward phase the head
+/// scores in. Everything it produces is consumed before that phase closes — the
+/// block input by the mixer, the FFN or the LM head, the inject weights by
+/// [`hc_combine`] — which is what makes rooting them on the span sound. The
+/// residual `hc_combine` updates is deliberately NOT on it: that crosses every
+/// phase boundary.
 pub fn hc_mix(
     x: &Tensor,
     w: &impl HcProject,
     eps: f64,
-    wave: Option<&WaveGeneration>,
+    root: Option<WaveTicket>,
 ) -> Result<(Tensor, Option<Tensor>)> {
     let (t, hc, n_embd) = x.dims3()?;
     let dev = x.device();
     let g = crate::models::profile::gpu_span("hc_mix:norm", dev);
-    let xn = hc_grouped_norm(x, w.norm(), eps, wave)?;
+    let xn = hc_grouped_norm(x, w.norm(), eps, root)?;
     let xn_flat = xn.reshape((t, hc * n_embd))?;
     g.end();
 
@@ -231,7 +233,7 @@ pub fn hc_mix(
             // registers. `gate` arrives RAW from the up-projection here — the
             // kernel applies the sigmoid, so the eager path's separate pass
             // over `[t, hc·n_embd]` disappears with it.
-            cuda_fused::mix(&xn, &gate_raw, hc, n_embd, wave)?
+            cuda_fused::mix(&xn, &gate_raw, hc, n_embd, root)?
         } else {
             eager_gate_mean(&xn_flat, &gate_raw, t, hc, n_embd)?
         }
@@ -241,15 +243,13 @@ pub fn hc_mix(
     g.end();
 
     // What used to be a second full-width GEMM over `xn_flat` is now the tail
-    // columns of the one above, so this span holds only the compaction of a
-    // `[t, hc]` slice — `gr_combine` reads the inject densely, and `hc` is 4,
-    // so it is 32 KiB at prefill width.
-    let g = crate::models::profile::gpu_span("hc_mix:inject", dev);
+    // columns of the one above, handed on as a strided `[t, hc]` view of it:
+    // `gr_combine` reads the inject through its row stride, so there is nothing
+    // to compact.
     let inject = match w.inject_col() {
-        Some(col) => Some(proj.narrow(1, col, hc)?.contiguous()?),
+        Some(col) => Some(proj.narrow(1, col, hc)?),
         None => None,
     };
-    g.end();
     Ok((mixed, inject))
 }
 
@@ -276,47 +276,34 @@ fn eager_gate_mean(
     acc.squeeze(1)? * (1.0 / hc as f64)
 }
 
-/// The write half: scatter the block output back across the streams.
-/// `2·sigmoid(inject/hc)` centres the weights on 1, so a zero injection is a
-/// plain residual add on every stream.
-/// `dst` is the residual's other half. The sweep reserves both on the
-/// forward-scoped span before the layer loop and alternates them, so the wide
-/// stream is allocated twice for a whole forward rather than twice per layer —
-/// and the kernel never reads and writes one buffer. `None` allocates, which is
-/// what the reference path and the tests want.
+/// The write half: scatter the block output back across the streams, into the
+/// residual **in place**. `2·sigmoid(inject/hc)` centres the weights on 1, so a
+/// zero injection is a plain residual add on every stream.
 ///
-/// `block_out` is the mixer's or the MoE's output, which is still on that
-/// phase's arena span, so it is borrowed at the phase's lifetime rather than
-/// taken as an owned `Tensor`. The returned residual is not: it is `dst` or a
-/// fresh allocation, and it crosses every phase boundary.
-pub fn hc_combine(
-    res: &Tensor,
-    block_out: &LiveTensor<'_>,
-    inject: &Tensor,
-    dst: Option<&Tensor>,
-) -> Result<Tensor> {
+/// `res` is the caller's own residual — the wave's buffer, which only this
+/// forward reads — held `&mut` as `Tensor::add_mut` holds it, so the wide stream
+/// is one buffer for the whole forward rather than one per combine. A row-range
+/// view of it is a valid `res`, which is how each of a wave's groups combines
+/// its own rows without a concatenation between. `block_out` and `inject` are
+/// only read, so they may be wave-scoped: this is where a phase's result is
+/// consumed.
+pub fn hc_combine(res: &mut Tensor, block_out: &LiveTensor<'_>, inject: &Tensor) -> Result<()> {
     #[cfg(feature = "cuda")]
     if matches!(res.device(), candle::Device::Cuda(_)) {
         // One launch, one read and one write of the wide buffer, against the
-        // eager chain's four passes below.
-        return cuda_fused::combine(res, block_out, inject, dst);
+        // eager chain's four passes below and the scatter term it allocates.
+        return cuda_fused::combine(res, block_out, inject);
     }
     eager_combine(res, block_out, inject)
 }
 
-/// The scatter as eager ops — the reference [`cuda_fused::combine`] reproduces.
-fn eager_combine(res: &Tensor, block_out: &LiveTensor<'_>, inject: &Tensor) -> Result<Tensor> {
+/// The scatter as eager ops, in place — the reference [`cuda_fused::combine`]
+/// reproduces.
+fn eager_combine(res: &mut Tensor, block_out: &LiveTensor<'_>, inject: &Tensor) -> Result<()> {
     let (t, hc, _n_embd) = res.dims3()?;
     let w = (candle_nn::ops::sigmoid(&(inject * (1.0 / hc as f64))?)? * 2.0)?;
     let w = w.reshape((t, hc, 1))?;
-    // The scatter term is computed at `block_out`'s lifetime and then taken
-    // owned, because the residual this returns outlives the phase. That copy is
-    // free of the hot path by construction: this is the CPU oracle and the
-    // parity reference — `hc_combine` routes every CUDA device to the fused
-    // kernel above — and off CUDA there is no arena, so `block_out` is ordinary
-    // owned memory whose lifetime is a formality.
-    let scattered = block_out.unsqueeze(1)?.broadcast_mul(&w)?;
-    res.add(&scattered.to_owned_tensor()?)
+    res.add_mut(&block_out.unsqueeze(1)?.broadcast_mul(&w)?)
 }
 
 #[cfg(test)]
@@ -392,6 +379,32 @@ mod tests {
         assert!(err.contains("not a power of two"), "{err}");
     }
 
+    /// Combining into a row range of the residual updates those rows and no
+    /// others — how a wave's groups each write their own rows in place.
+    #[test]
+    fn a_row_range_combine_touches_only_its_rows() {
+        let dev = dev();
+        let (t, hc, n_embd) = (4usize, 2usize, 3usize);
+        let res = lcg_tensor(&[t, hc, n_embd], 91, &dev);
+        let before = res.copy().unwrap();
+        let out = lcg_tensor(&[2, n_embd], 92, &dev);
+        let zero = Tensor::zeros((2, hc), DType::F32, &dev).unwrap();
+        let mut rows = res.narrow(0, 1, 2).unwrap();
+        hc_combine(&mut rows, &out, &zero).unwrap();
+        let after = res.to_vec3::<f32>().unwrap();
+        let was = before.to_vec3::<f32>().unwrap();
+        assert_eq!(after[0], was[0], "row 0 is outside the range");
+        assert_eq!(after[3], was[3], "row 3 is outside the range");
+        let o = out.to_vec2::<f32>().unwrap();
+        for (r, orow) in [(1usize, 0usize), (2, 1)] {
+            for s in 0..hc {
+                for j in 0..n_embd {
+                    assert_eq!(after[r][s][j], was[r][s][j] + o[orow][j], "row {r}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_zero_injection_is_a_plain_residual_add() {
         // 2·sigmoid(0) = 1: every stream gains exactly the block output.
@@ -400,7 +413,8 @@ mod tests {
         let res = lcg_tensor(&[t, hc, n_embd], 21, &dev);
         let out = lcg_tensor(&[t, n_embd], 22, &dev);
         let zero_inject = Tensor::zeros((t, hc), DType::F32, &dev).unwrap();
-        let got = hc_combine(&res, &out, &zero_inject, None).unwrap();
+        let mut got = res.copy().unwrap();
+        hc_combine(&mut got, &out, &zero_inject).unwrap();
         let want = res
             .broadcast_add(&out.reshape((t, 1, n_embd)).unwrap())
             .unwrap();
@@ -630,11 +644,95 @@ mod tests {
             let res = lcg_tensor(&[t, hc, d], 75, &gpu);
             let out = lcg_tensor(&[t, d], 76, &gpu);
             let inj = lcg_tensor(&[t, hc], 77, &gpu);
-            let want = eager_combine(&res, &out, &inj).unwrap();
-            let got = cuda_fused::combine(&res, &out, &inj, None).unwrap();
+            let mut want = res.copy().unwrap();
+            eager_combine(&mut want, &out, &inj).unwrap();
+            let mut got = res.copy().unwrap();
+            cuda_fused::combine(&mut got, &out, &inj).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "combine parity {t}x{hc}x{d}: rel gap {gap}");
         }
+    }
+
+    /// The inject as the model hands it over: the tail columns of the pre-mix's
+    /// stacked `[t, low_rank + hc]` projection, read through its row stride.
+    /// Must equal the same values as a dense `[t, hc]` tensor, bit for bit —
+    /// the stride changes which address is read, never the arithmetic.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn fused_combine_reads_a_row_strided_inject() {
+        let Some(gpu) = cuda() else { return };
+        let (t, hc, d, low_rank) = (5usize, 4usize, 258usize, 6usize);
+        let res = lcg_tensor(&[t, hc, d], 91, &gpu);
+        let out = lcg_tensor(&[t, d], 92, &gpu);
+        let proj = lcg_tensor(&[t, low_rank + hc], 93, &gpu);
+        let strided = proj.narrow(1, low_rank, hc).unwrap();
+        assert_eq!(
+            strided.stride(),
+            &[low_rank + hc, 1],
+            "the test's own premise"
+        );
+        let dense =
+            Tensor::from_vec(strided.to_vec2::<f32>().unwrap().concat(), (t, hc), &gpu).unwrap();
+        let mut want = res.copy().unwrap();
+        cuda_fused::combine(&mut want, &out, &dense).unwrap();
+        let mut got = res.copy().unwrap();
+        cuda_fused::combine(&mut got, &out, &strided).unwrap();
+        assert_eq!(
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            want.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    /// A row-range view of a device residual is updated where it stands — the
+    /// kernel's start offset — and the rows around it are untouched.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn fused_combine_updates_a_row_range_in_place() {
+        let Some(gpu) = cuda() else { return };
+        let (t, hc, d) = (4usize, 4usize, 2560usize);
+        let res = lcg_tensor(&[t, hc, d], 101, &gpu);
+        let before = res.copy().unwrap();
+        let out = lcg_tensor(&[2, d], 102, &gpu);
+        let inj = lcg_tensor(&[2, hc], 103, &gpu);
+        let mut rows = res.narrow(0, 1, 2).unwrap();
+        cuda_fused::combine(&mut rows, &out, &inj).unwrap();
+
+        let mut want = before.narrow(0, 1, 2).unwrap().copy().unwrap();
+        eager_combine(&mut want, &out, &inj).unwrap();
+        let gap = rel_gap(&res.narrow(0, 1, 2).unwrap(), &want);
+        assert!(gap < GAP, "row-range combine: rel gap {gap}");
+        let row = |t: &Tensor, r: usize| {
+            t.narrow(0, r, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        for r in [0usize, 3] {
+            assert_eq!(
+                row(&res, r),
+                row(&before, r),
+                "row {r} is outside the range"
+            );
+        }
+    }
+
+    /// The launchers are instantiated only for powers of two up to
+    /// `GR_MAX_HC`; any other count would launch nothing and leave the output
+    /// unwritten, so the host must refuse it rather than return garbage.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn fused_kernels_refuse_an_uninstantiated_stream_count() {
+        let Some(gpu) = cuda() else { return };
+        let (t, hc, d) = (2usize, 3usize, 64usize);
+        let xn = lcg_tensor(&[t, hc, d], 95, &gpu);
+        let gate_raw = lcg_tensor(&[t, hc * d], 96, &gpu);
+        assert!(cuda_fused::mix(&xn, &gate_raw, hc, d, None).is_err());
+        let mut res = lcg_tensor(&[t, hc, d], 97, &gpu);
+        let out = lcg_tensor(&[t, d], 98, &gpu);
+        let inj = lcg_tensor(&[t, hc], 99, &gpu);
+        assert!(cuda_fused::combine(&mut res, &out, &inj).is_err());
     }
 
     #[test]
@@ -647,55 +745,11 @@ mod tests {
         let res = lcg_tensor(&[t, hc, d], 77, &gpu);
         let out = lcg_tensor(&[t, d], 78, &gpu);
         let zero = Tensor::zeros((t, hc), DType::F32, &gpu).unwrap();
-        let got = hc_combine(&res, &out, &zero, None).unwrap();
+        let mut got = res.copy().unwrap();
+        hc_combine(&mut got, &out, &zero).unwrap();
         let want = res.broadcast_add(&out.reshape((t, 1, d)).unwrap()).unwrap();
         let gap = rel_gap(&got, &want);
         assert!(gap < 1e-6, "zero-inject identity broken on device: {gap}");
-    }
-
-    /// **The flip target is written, and it is the value returned.**
-    ///
-    /// The sweep reserves two residual halves on the forward span and alternates
-    /// them, so `combine` must write the caller's buffer rather than one of its
-    /// own — otherwise the reservation is paid for and ignored, and the returned
-    /// residual is pool memory again.
-    #[test]
-    fn combine_writes_the_supplied_flip_target() {
-        let Some(gpu) = cuda() else { return };
-        let (t, hc, d) = (3usize, 4usize, 2560usize);
-        let res = lcg_tensor(&[t, hc, d], 91, &gpu);
-        let blk = lcg_tensor(&[t, d], 92, &gpu);
-        let zero = Tensor::zeros((t, hc), DType::F32, &gpu).unwrap();
-        let dst = Tensor::zeros((t, hc, d), DType::F32, &gpu).unwrap();
-
-        let got = hc_combine(&res, &blk, &zero, Some(&dst)).unwrap();
-        let want = res.broadcast_add(&blk.reshape((t, 1, d)).unwrap()).unwrap();
-        assert!(
-            rel_gap(&got, &want) < 1e-6,
-            "flip target holds the wrong value"
-        );
-        // The returned tensor IS the target, not a copy of it: reading `dst`
-        // afterwards must show the same content.
-        assert!(
-            rel_gap(&dst, &want) < 1e-6,
-            "combine returned a value the caller's buffer does not hold"
-        );
-    }
-
-    /// Reading and writing one buffer is refused rather than raced.
-    #[test]
-    fn combine_refuses_a_flip_target_that_is_the_residual() {
-        let Some(gpu) = cuda() else { return };
-        let (t, hc, d) = (2usize, 4usize, 2560usize);
-        let res = lcg_tensor(&[t, hc, d], 93, &gpu);
-        let blk = lcg_tensor(&[t, d], 94, &gpu);
-        let zero = Tensor::zeros((t, hc), DType::F32, &gpu).unwrap();
-        let err = hc_combine(&res, &blk, &zero, Some(&res))
-            .expect_err("aliasing the residual must be refused");
-        assert!(
-            err.to_string().contains("same buffer"),
-            "unexpected error: {err}"
-        );
     }
 
     /// Operands that start part-way into their storage.

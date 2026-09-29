@@ -692,13 +692,13 @@ mod tests {
             chunks: vec![chunk_with(shared.clone())],
             token_count: 32,
             chunk_size: 32,
-            location: crate::kv_cache::ArenaLocation::Gpu,
+            location: ArenaLocation::Gpu,
         };
         let seq_b = SealedSequence {
             chunks: vec![chunk_with(shared.clone())],
             token_count: 32,
             chunk_size: 32,
-            location: crate::kv_cache::ArenaLocation::Gpu,
+            location: ArenaLocation::Gpu,
         };
 
         let mut map = CompactionMap::new();
@@ -807,7 +807,7 @@ mod tests {
             ))],
             token_count: 32,
             chunk_size: 32,
-            location: crate::kv_cache::ArenaLocation::Gpu,
+            location: ArenaLocation::Gpu,
         };
         let mut map = CompactionMap::new();
         map.insert(raw(2, 0), ChunkGid::detached(raw(0, 0)), 0x10);
@@ -873,7 +873,7 @@ mod tests {
             }],
             token_count: 32,
             chunk_size: 32,
-            location: crate::kv_cache::ArenaLocation::Gpu,
+            location: ArenaLocation::Gpu,
         };
 
         let mut map = CompactionMap::new();

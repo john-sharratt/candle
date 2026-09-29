@@ -2682,43 +2682,25 @@ impl Qwen4ExpBatched {
         }
 
         // ── Residual: the fresh rows as gathered, or resume. ──
+        //
+        // **One buffer for the whole forward, updated in place.** `hc_combine`
+        // adds each block's scatter into `res` where it stands, so the wide
+        // `[rows, hc, hidden]` stream is this one allocation, not one per
+        // combine. It stays on the pool: the residual crosses every phase reset,
+        // and a windowed sweep hands it back as `WavePhase::Residual` for the
+        // next wave to resume from, past the forward span's reset.
+        //
+        // **A resumed residual is copied first.** `x_in` is the caller's tensor:
+        // the residual a previous window handed back to be persisted, which the
+        // driver passes through without a copy. Combining into it in place would
+        // rewrite the persisted state under its owner — and a wave that fails
+        // part-way would leave it advanced by the layers that did run. One copy
+        // per resumed forward is the price; the fresh path writes its gathered
+        // rows straight into a buffer it owns.
         let mut res = match x_in {
-            Some(t) => t.to_tensor().reshape((total_rows, hc, n_embd))?,
+            Some(t) => t.to_tensor().reshape((total_rows, hc, n_embd))?.copy()?,
             None => entry.expect("allocated whenever the residual is fresh"),
         };
-
-        // **The residual's two halves, reserved once for the whole forward.**
-        //
-        // `hc_combine` reads the current residual and writes the next, so the
-        // two cannot be one buffer. Allocating a fresh `[rows, hc, hidden]` F32
-        // per call meant 2 × layers of the widest buffer in the sweep, all of it
-        // from the pool — the residual crosses every phase reset, so no layer
-        // span can hold it. Both halves live on the forward-scoped span, which
-        // is reset once per forward and therefore exactly its lifetime, and
-        // `WaveBuffer::GrResidualPair` prices them there.
-        //
-        // Reserved AFTER the tier is placed and BEFORE the layer loop, which is
-        // the only window in which the span exists and nothing has carved from
-        // it yet. `res` above is the entry residual and is not one of the pair;
-        // the first combine writes half 0, the next half 1, and so on.
-        // **Only when this sweep runs the head.** A windowed sweep
-        // (`layer_end < num_layers`) hands its residual back as
-        // `WavePhase::Residual` for the next wave to resume from, so that
-        // residual outlives this forward — and the forward span is reclaimed by
-        // the next wave's `end_wave_transient`, which runs at the top of `sweep`
-        // BEFORE `x_in` is read. Carving it from the span would hand the caller
-        // ground the next wave re-carves, and it could alias `gr_flip[0]` and
-        // make `hc_combine` read and write one buffer. A windowed sweep
-        // therefore keeps the pool's residual, which is exactly its lifetime.
-        let gr_flip: Option<[Tensor; 2]> = match fwd_ticket {
-            Some(_) if layer_end == num_layers => {
-                let half =
-                    |_| wave_empty_ticketed((total_rows, hc, n_embd), DType::F32, dev, fwd_ticket);
-                Some([half(0)?, half(1)?])
-            }
-            _ => None,
-        };
-        let mut gr_next = 0usize;
 
         // Per-sequence host token ids (the PLE hash side) + row spans.
         let seq_tokens: Vec<Vec<u32>> = inputs
@@ -2890,7 +2872,12 @@ impl Qwen4ExpBatched {
             };
             let g_pre = crate::models::profile::gpu_span("q4e:gr_pre", dev);
             #[cfg(feature = "cuda")]
-            let (h, inject) = hc_mix(&res, &layer.hc_attn, eps, mix_wave.as_ref())?;
+            let (h, inject) = hc_mix(
+                &res,
+                &layer.hc_attn,
+                eps,
+                mix_wave.as_ref().map(|g| g.ticket()),
+            )?;
             #[cfg(not(feature = "cuda"))]
             let (h, inject) = hc_mix(&res, &layer.hc_attn, eps, None)?;
             let inject = inject.expect("layer HC modules carry an inject");
@@ -3103,8 +3090,7 @@ impl Qwen4ExpBatched {
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.mix.y.L", li), &y);
             let g_comb = crate::models::profile::gpu_span("q4e:gr_combine", dev);
-            res = hc_combine(&res, &y, &inject, gr_flip.as_ref().map(|p| &p[gr_next]))?;
-            gr_next ^= 1;
+            hc_combine(&mut res, &y, &inject)?;
             g_comb.end();
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.post_mix.res.L", li), &res);
@@ -3130,7 +3116,12 @@ impl Qwen4ExpBatched {
             };
             let g_pre2 = crate::models::profile::gpu_span("q4e:gr_pre_ffn", dev);
             #[cfg(feature = "cuda")]
-            let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps, ffn_wave.as_ref())?;
+            let (h2, inject2) = hc_mix(
+                &res,
+                &layer.hc_ffn,
+                eps,
+                ffn_wave.as_ref().map(|g| g.ticket()),
+            )?;
             #[cfg(not(feature = "cuda"))]
             let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps, None)?;
             let inject2 = inject2.expect("layer HC modules carry an inject");
@@ -3151,17 +3142,18 @@ impl Qwen4ExpBatched {
                 probe(site("q4e.hc_ffn.inject2.L", li), &inject2);
             }
             let h2_3d = h2.reshape((1, total_rows, n_embd))?;
-            // Float activations, deliberately: the int8 expert path gathers
-            // token rows as q8a1024 (hidden must tile 1024) and 2560 does not.
-            // The routed experts still run their quantized weights — only the
-            // activation operand stays float. Teaching the gather the 2.5-tile
-            // row is recorded §0.4 work.
+            // Quantized ONCE, in the session's mode, into the one q8a128
+            // operand every consumer of the FFN input reads — the shared
+            // expert, its gate, the router, and the routed experts, whose tile
+            // gather copies the 20 tiles of each 2560-wide row it routes. Handed
+            // over as float, the experts gathered float rows and quantized the
+            // stacked `rows × top_k` block themselves, once per layer.
             // Raw Σx — a language model's block sums stay far below f16's
-            // ceiling. (`Off` produces no q8a128 here anyway.)
+            // ceiling.
             let g_acts = crate::models::profile::gpu_span("q4e:moe_acts", dev);
             let acts = to_dynamic(
                 &h2_3d,
-                candle::quantized::Int8Mode::Off,
+                m.lm_head.int8mode(),
                 cuda,
                 candle::quantized::SumScale::Raw,
             )?;
@@ -3201,8 +3193,7 @@ impl Qwen4ExpBatched {
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.moe.y2.L", li), &y2);
             let g_comb2 = crate::models::profile::gpu_span("q4e:gr_combine_ffn", dev);
-            res = hc_combine(&res, &y2, &inject2, gr_flip.as_ref().map(|p| &p[gr_next]))?;
-            gr_next ^= 1;
+            hc_combine(&mut res, &y2, &inject2)?;
             g_comb2.end();
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.post_moe.res.L", li), &res);
@@ -3270,7 +3261,7 @@ impl Qwen4ExpBatched {
 
         // ── Head: the final mix IS the output norm; score decode rows + each
         // prefill's last row through the LM head in one GEMM. ──
-        let (mixed, _) = hc_mix(&res, &m.out_hc, eps, None)?;
+        //
         // Decode rows, then each prefill span's LAST row — except a verifying
         // span, where EVERY row is scored.
         //
@@ -3296,9 +3287,24 @@ impl Qwen4ExpBatched {
             }
             acc += l as u32;
         }
+        // **The rows are chosen BEFORE the mix, not after.** The mix is
+        // row-wise, so mixing only the scored rows gives the same bits, and a
+        // prefill wave scores a handful of its thousands of rows: mixing the
+        // whole residual first ran the head's norm, its two low-rank GEMMs and
+        // the collapse over every row to keep a few. A wave that scores every
+        // row (all decode) takes the residual as it stands.
+        //
+        // The mix runs on the forward span, where the plan prices it at the
+        // scored rows (`WaveBuffer::HyperHead*`). The selected residual comes
+        // off the pool, as the residual itself does.
         let r_total = sel.len();
-        let idx = wave_from_vec_ticketed(sel, r_total, dev, fwd_ticket)?;
-        let scored = mixed.index_select(&idx, 0)?.contiguous()?;
+        let scored_res = if r_total == total_rows {
+            res
+        } else {
+            let idx = Tensor::from_vec(sel, r_total, dev)?;
+            res.index_select(&idx, 0)?
+        };
+        let (scored, _) = hc_mix(&scored_res, &m.out_hc, eps, fwd_ticket)?;
         let acts = {
             let candle::Device::Cuda(cuda) = dev else {
                 candle::bail!("qwen4exp wave runs on CUDA");

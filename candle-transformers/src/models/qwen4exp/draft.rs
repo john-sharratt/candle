@@ -434,7 +434,7 @@ impl Qwen4ExpBatched {
         // above, `'w` would bind and the combine would have to stay inside it.
         let y = forward_attn_batched(&alayer, caches, &x_g, at, params, 0, sel.as_ref(), None)?
             .reshape((n, n_embd))?;
-        res = hc_combine(&res, &y, &inject, None)?;
+        hc_combine(&mut res, &y, &inject)?;
 
         // ── MoE half. ──
         let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps, None)?;
@@ -442,14 +442,15 @@ impl Qwen4ExpBatched {
         let candle::Device::Cuda(cuda) = dev else {
             candle::bail!("qwen4exp draft runs on CUDA");
         };
-        // Float activations for the same reason the trunk's MoE uses them: the
-        // int8 expert gather tiles at 1024 and this stack's hidden is 2560.
+        // Quantized once in the session's mode, as the trunk's MoE input is:
+        // the router, the shared expert and the routed experts' tile gather all
+        // read the one operand.
         let acts = to_dynamic(
             &h2.reshape((1, n, n_embd))?,
-            candle::quantized::Int8Mode::Off,
+            m.lm_head.int8mode(),
             cuda,
             // Raw Σx — a language model's block sums stay far below f16's
-            // ceiling. (`Off` produces no q8a128 here anyway.)
+            // ceiling.
             candle::quantized::SumScale::Raw,
         )?;
         let y2 = head
@@ -460,7 +461,7 @@ impl Qwen4ExpBatched {
             // decode-attributed.
             .forward_dynamic(acts, DType::F32, n, None)?
             .reshape((n, n_embd))?;
-        res = hc_combine(&res, &y2, &inject2, None)?;
+        hc_combine(&mut res, &y2, &inject2)?;
 
         // ── The shared head. ──
         let narrow = head.to_shared_head(&res, eps)?;

@@ -986,23 +986,6 @@ pub enum WaveBuffer {
     /// guards — which is why this follows the session's mode and not the
     /// lifetime.
     HeadLogits,
-    /// **The Gated Residual's stream, both halves of its flip.**
-    ///
-    /// The wide `[rows, streams, hidden]` residual every hyper-connection layer
-    /// reads and rewrites. It belongs to no layer phase: it crosses every phase
-    /// reset and every layer, which is precisely why it cannot be carved from
-    /// one — a per-layer span resets under it and the next layer reads freed
-    /// ground. So it is priced here, on the forward-scoped span, and the sweep
-    /// allocates it ONCE before the layer loop.
-    ///
-    /// Two of them, because `hc_combine` reads the current residual and writes
-    /// the next: one buffer would be read and written by the same kernel. The
-    /// sweep alternates which is the destination, so the pair is the whole
-    /// cost — not two per layer, two for the forward.
-    ///
-    /// Zero on a stack with no hyper-connections, which has one residual and
-    /// carries it as the ordinary activation.
-    GrResidualPair,
 
     /// The MoE result **narrowed to the residual's dtype**, when the experts ran
     /// in a different one. Both paths.
@@ -1169,9 +1152,7 @@ impl WaveBuffer {
             Self::DenseFfnNorm | Self::DenseGateUp | Self::DenseSilu | Self::DenseSwiglu => {
                 Chain::DenseFfn
             }
-            Self::HeadNorm | Self::HeadNormF32 | Self::HeadLogits | Self::GrResidualPair => {
-                Chain::Forward
-            }
+            Self::HeadNorm | Self::HeadNormF32 | Self::HeadLogits => Chain::Forward,
             other => match other.phase() {
                 LayerPhase::Attention => Chain::Attention,
                 LayerPhase::Ffn => Chain::Ffn,
@@ -1282,8 +1263,7 @@ impl WaveBuffer {
             | Self::HyperHeadMixed
             | Self::HeadNorm
             | Self::HeadNormF32
-            | Self::HeadLogits
-            | Self::GrResidualPair => LayerPhase::Forward,
+            | Self::HeadLogits => LayerPhase::Forward,
         }
     }
 
@@ -1677,12 +1657,6 @@ impl WaveBuffer {
             Self::HeadNormF32 if !g.packed_head => dense(w.scored_rows, g.hidden, DType::F32),
             Self::HeadLogits if g.packed_head => dense(w.scored_rows, g.vocab, g.act_dtype),
             Self::HeadNormF32 | Self::HeadLogits => dense(0, 0, g.act_dtype),
-            // Both halves in one term: the flip alternates between them, so
-            // they are live together for the whole forward.
-            Self::GrResidualPair => match g.hyper {
-                Some(h) => dense(w.rows(), 2 * h.streams * g.hidden, DType::F32),
-                None => dense(0, 0, DType::F32),
-            },
         }
     }
 
@@ -2478,10 +2452,6 @@ mod tests {
                             b.chain(),
                             Chain::HyperAttn | Chain::HyperFfn | Chain::HyperHead
                         ) && g.hyper.is_none())
-                        // The residual pair is the Gated Residual's stream, so
-                        // a stack without one carries no such buffer: its single
-                        // residual IS the ordinary activation.
-                        || (b == WaveBuffer::GrResidualPair && g.hyper.is_none())
                         // A float head under the pre-mix: its norm is the mix.
                         || (matches!(b, WaveBuffer::HeadNorm | WaveBuffer::HeadNormF32)
                             && g.hyper.is_some()
