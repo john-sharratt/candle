@@ -59,6 +59,7 @@ use crate::coding_sampling;
 use crate::config::DaemonConfig;
 use crate::conv_branches::{self, BaseBranches};
 use crate::conv_file_store::ConvFileStore;
+use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
@@ -3149,6 +3150,8 @@ fn run_inference_stream(
             // each repository's base; one already working somewhere keeps it,
             // and then this writes nothing.
             conv_branches::seed(&engine, timeline, &state.base_branches);
+            // A turn is a use: the sidebar lists this conversation first.
+            engine.touch_conversation(timeline);
         }
 
         if let Some((files, mirror)) = minted_files {
@@ -4667,11 +4670,10 @@ pub struct ConvEntry {
     /// sidebar hides archived entries by default; the "show archived"
     /// checkbox toggles them back in via `?include_archived=true`.
     pub archived: bool,
-    /// Creation-order rank used by the sidebar to sort newest-first. This is a
-    /// monotonic counter (`TimelineEntry::order`), NOT a millisecond clock — the
-    /// `conv_id` is a random u64 with no time information, so the substrate
-    /// stamps each conversation an increasing rank in redo-log (creation) order.
-    /// The wire name is kept for the frontend's existing sort key.
+    /// The entry's place in the listing, most recently used first — see
+    /// [`crate::conv_order`]. The top entry holds the highest value. A rank,
+    /// NOT a millisecond clock: the substrate keeps no time. The wire name is
+    /// kept for the frontend's existing sort key.
     pub updated_ms: u64,
 }
 
@@ -5410,7 +5412,8 @@ impl ZendSession {
         let passthrough_tagged = engine.conversations_with_metadata_key(passthrough::METADATA_KEY);
         let conv = engine.conversation();
         let view = conv.read();
-        let mut entries: Vec<ConvEntry> = known
+        let active_of = |tl| view.timeline_entry(tl).map_or(0, |e| e.active);
+        let mut entries: Vec<(ConvEntry, conv_order::Ranks)> = known
             .into_iter()
             .filter(|(tl, _, _, _, _)| *tl != titler_timeline)
             .filter(|(_, _, _, archived, _)| include_archived || !*archived)
@@ -5422,18 +5425,14 @@ impl ZendSession {
                 } else {
                     turn_counts.get(&tl).copied().unwrap_or(0)
                 };
-                // `order` is creation rank (see `TimelineEntry::order`) — the
-                // conv_id itself is a random u64 and carries no time. The field
-                // is named `updated_ms` for the wire, but it is a monotonic
-                // rank, not a millisecond clock; the sidebar only ever sorts on
-                // it, never displays it as a time.
-                ConvEntry {
+                let entry = ConvEntry {
                     id: conv_id,
                     label,
                     turn_count,
                     archived,
-                    updated_ms: order,
-                }
+                    updated_ms: 0,
+                };
+                (entry, (active_of(tl), order))
             })
             .collect();
         // Passthrough conversations stored before they carried a `conv_id` are
@@ -5448,17 +5447,18 @@ impl ZendSession {
                 .min()
                 .map(|i| view.user_text_of(tl, i))
                 .unwrap_or_default();
-            Some(ConvEntry {
-                id: passthrough::conv_id_of(tl),
-                label: passthrough::label_for(&first_user),
-                turn_count: view.turn_indices(tl).count() as u32,
-                archived: entry.archived,
-                updated_ms: entry.order,
-            })
+            Some((
+                ConvEntry {
+                    id: passthrough::conv_id_of(tl),
+                    label: passthrough::label_for(&first_user),
+                    turn_count: view.turn_indices(tl).count() as u32,
+                    archived: entry.archived,
+                    updated_ms: 0,
+                },
+                (entry.active, entry.order),
+            ))
         }));
-        // Newest-created first.
-        entries.sort_by_key(|e| std::cmp::Reverse(e.updated_ms));
-        entries
+        conv_order::by_last_use(entries)
     }
 
     /// Archive a conversation — one-way. Sets the archived lifecycle flag and
@@ -5649,6 +5649,7 @@ impl ZendSession {
             tracing::warn!(conv_id = %conv_id, "record_uploads: set conv_id failed: {e}");
         }
         conv_branches::seed(&engine, timeline, &state.base_branches);
+        engine.touch_conversation(timeline);
         // Give it a provisional label from the file(s) if it has none yet, so it
         // shows a sensible name in the sidebar before any chat turn — the titler
         // refines it once the user actually talks. Never overwrite an existing

@@ -2457,6 +2457,7 @@ mod tests {
                 &ConvState {
                     archived: true,
                     branches: [("candle".to_string(), "zen/work".to_string())].into(),
+                    active: 3,
                 },
             ),
         ));
@@ -2585,6 +2586,7 @@ mod tests {
         let state = ConvState {
             archived: true,
             branches: [("candle".to_string(), "zen/work".to_string())].into(),
+            active: 3,
         };
         assert!(has_synth(
             &live,

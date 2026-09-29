@@ -20,6 +20,7 @@ pub mod config;
 pub mod conv_branches;
 pub mod conv_file_store;
 pub mod conv_files;
+pub mod conv_order;
 pub mod conv_overlay;
 pub mod download;
 pub mod fast_path;

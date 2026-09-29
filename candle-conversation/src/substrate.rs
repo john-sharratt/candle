@@ -131,6 +131,12 @@ pub struct Substrate {
     /// sessions — the conversation ids themselves are random u64s and carry no
     /// time information.
     conv_order_counter: u64,
+    /// Monotonic counter stamped onto a [`TimelineEntry::active`] each time the
+    /// conversation is used ([`Self::touch_conversation`]). Unlike `order`, the
+    /// rank is persisted in the `ConvState` record, so replay restores it
+    /// exactly whatever order compaction re-emits those records in; replay
+    /// raises the counter to the highest rank it sees.
+    conv_active_counter: u64,
 
     /// Inverse index: every timeline registered against a given group.
     /// Maintained in lockstep with [`Self::timelines`].
@@ -1231,7 +1237,7 @@ pub struct TimelineEntry {
     pub conv_id: Option<String>,
     /// Creation-order rank, stamped from [`Substrate::conv_order_counter`] the
     /// first time `conv_id` is set. `0` until then. Higher = created later; the
-    /// daemon sidebar sorts on this so newest conversations lead the list.
+    /// daemon sidebar orders conversations with the same [`Self::active`] by it.
     pub order: u64,
     /// Free-form key/value metadata, persisted in the same
     /// `RecordType::Label` record as `label`/`conv_id` and merged
@@ -1249,6 +1255,11 @@ pub struct TimelineEntry {
     /// the repository's workspace name. Persisted with `archived` in the same
     /// `RecordType::ConvState` record — see [`ConvState`].
     pub branches: BTreeMap<String, String>,
+    /// Last-use rank, stamped from [`Substrate::conv_active_counter`] each time
+    /// the conversation is used; higher = used more recently, `0` = not used
+    /// since the rank was kept. Persisted with `archived` in the `ConvState`
+    /// record. The daemon sidebar sorts on it, most recently used first.
+    pub active: u64,
     /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
@@ -1421,6 +1432,7 @@ impl TimelineEntry {
             custom: BTreeMap::new(),
             archived: false,
             branches: BTreeMap::new(),
+            active: 0,
             turns: BTreeMap::new(),
             tree_meta: BTreeMap::new(),
             debug_id: None,
@@ -3936,6 +3948,8 @@ impl Substrate {
         if let Some(entry) = self.timelines.get_mut(&timeline) {
             entry.archived = state.archived;
             entry.branches = state.branches;
+            entry.active = state.active;
+            self.conv_active_counter = self.conv_active_counter.max(state.active);
         }
     }
 
@@ -5657,7 +5671,20 @@ impl Substrate {
         self.timelines.get(&timeline).map(|e| ConvState {
             archived: e.archived,
             branches: e.branches.clone(),
+            active: e.active,
         })
+    }
+
+    /// Mark `timeline` as used now: stamp it with the next last-use rank, so
+    /// it outranks every conversation used before it. Returns `false` for an
+    /// unregistered timeline, which has no state to write.
+    pub fn touch_conversation(&mut self, timeline: TimelineId) -> bool {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            return false;
+        };
+        self.conv_active_counter += 1;
+        entry.active = self.conv_active_counter;
+        true
     }
 
     /// Set the branch `timeline` works on in `repo`. No-op when the timeline
@@ -9886,11 +9913,13 @@ mod tests {
                 .into_iter()
                 .map(|(r, b)| (r.to_string(), b.to_string()))
                 .collect(),
+            active: 0,
         };
         assert_eq!(sub.conv_state(a), Some(a_state.clone()));
         let b_state = super::ConvState {
             archived: true,
             branches: Default::default(),
+            active: 0,
         };
         assert_eq!(
             sub.live_conv_states(),
@@ -9901,6 +9930,42 @@ mod tests {
         sub.apply_conv_state(a.raw(), super::ConvState::default());
         assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
         assert_eq!(sub.live_conv_states().len(), 1, "a is untouched again");
+    }
+
+    /// **The last use outranks every earlier one, and survives replay.** Each
+    /// touch stamps the next rank; a replayed state restores its rank exactly,
+    /// whatever order the records arrive in, and the next touch still lands
+    /// above every rank replayed.
+    #[test]
+    fn a_touch_outranks_every_earlier_use_and_replay_restores_it() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let (a, b) = (alloc.next(), alloc.next());
+        let mut sub = Substrate::new();
+        sub.register_timeline(a, layer, group);
+        sub.register_timeline(b, layer, group);
+
+        assert!(sub.touch_conversation(a));
+        assert!(sub.touch_conversation(b));
+        assert!(sub.touch_conversation(a));
+        assert!(!sub.touch_conversation(alloc.next()), "unregistered");
+        assert_eq!(sub.conv_state(a).unwrap().active, 3);
+        assert_eq!(sub.conv_state(b).unwrap().active, 2);
+
+        // Replay into a fresh substrate, the later-used record first — the
+        // order compaction's timeline-ordered re-emit can produce.
+        let states = sub.live_conv_states();
+        let mut replayed = Substrate::new();
+        replayed.register_timeline(a, layer, group);
+        replayed.register_timeline(b, layer, group);
+        for (tl, state) in states.into_iter().rev() {
+            replayed.apply_conv_state(tl, state);
+        }
+        assert_eq!(replayed.conv_state(a).unwrap().active, 3);
+        assert_eq!(replayed.conv_state(b).unwrap().active, 2);
+        assert!(replayed.touch_conversation(b));
+        assert_eq!(replayed.conv_state(b).unwrap().active, 4);
     }
 
     #[test]

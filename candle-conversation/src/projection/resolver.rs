@@ -3345,6 +3345,12 @@ impl Conversation {
         Ok(())
     }
 
+    /// Mark a conversation used now and persist its state, so the sidebar
+    /// ranks it above every conversation used before it.
+    pub fn touch_conversation(&self, timeline: TimelineId) {
+        self.update_conv_state(timeline, |sub| sub.touch_conversation(timeline));
+    }
+
     /// Set the branch `timeline` works on in each repository `branches`
     /// names — repository name to branch — leaving any other repository's as
     /// it is, and persist the state once. Idempotent: when nothing changes,
@@ -4934,6 +4940,7 @@ mod tests {
         let expected = ConvState {
             archived: true,
             branches: map(&[("candle", "zen/work"), ("mind", "master")]),
+            active: 0,
         };
         let write = VfsWrite {
             tombstones: Vec::new(),

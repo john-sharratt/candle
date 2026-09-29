@@ -1175,7 +1175,12 @@ import { estateSwitcher } from './common/lib/estate.js';
     } });
   }
   function doArchiveConv(id) {
-    API.archiveConversation(id);
+    // The sync never clears the flag (archiving is one-way), so a refused
+    // archive has to put the row back itself.
+    Promise.resolve(API.archiveConversation(id)).catch(() => {
+      S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: false }) : c);
+      render();
+    });
     let conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: true }) : c);
     let activeId = S.activeId;
     if (activeId === id && !S.showArchived) {
@@ -1215,18 +1220,19 @@ import { estateSwitcher } from './common/lib/estate.js';
     // shouldn't drop the active one, but never hard-crash send if it did) both
     // start a fresh conversation rather than dereferencing `undefined`.
     target = activeId !== null ? conversations.find((c) => c.id === activeId) : null;
+    // updated_ms is the listing's most-recently-used rank (the daemon's
+    // conv_order), not a clock. Sending is a use, so the conversation takes
+    // the top at once; the server ranks it first too, so the next sync agrees.
+    const topRank = S.conversations.reduce((m, c) => Math.max(m, c.updated_ms || 0), 0);
     if (!target) {
       const id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'c' + Date.now();
-      // updated_ms is a creation-order rank (see the daemon's TimelineEntry::order),
-      // not a clock. Seat a brand-new conversation just above the current top so it
-      // leads the list; the server's rank (also the new max) keeps it there after hydrate.
-      const topRank = S.conversations.reduce((m, c) => Math.max(m, c.updated_ms || 0), 0);
       target = { id, title: titleOf(text), archived: false, updated_ms: topRank + 1, turn_count: 0, history: [], files: [] };
       conversations = [target].concat(conversations);
       activeId = id;
       S.loaded[id] = true;
-    } else if (target.history.length === 0) {
-      target.title = titleOf(text);
+    } else {
+      if (target.history.length === 0) target.title = titleOf(text);
+      if (target.updated_ms !== topRank) target.updated_ms = topRank + 1;
     }
     target.history = target.history.concat([
       { role: 'user', content: text },
@@ -3614,8 +3620,14 @@ import { estateSwitcher } from './common/lib/estate.js';
         const ex = S.conversations.find((c) => String(c.id) === String(e.id));
         if (ex) {
           if (e.title && e.title !== ex.title) { ex.title = e.title; mutated = true; }   // titler is authoritative
-          if (!!e.archived !== !!ex.archived) { ex.archived = !!e.archived; mutated = true; }
-          if (e.updated_ms) ex.updated_ms = e.updated_ms;
+          // Archiving is one-way, so the sync only ever sets the flag. The
+          // archive POST waits on the engine, and a list served before it lands
+          // still says "not archived" — copying that back resurrected the row
+          // the user had just archived.
+          if (e.archived && !ex.archived) { ex.archived = true; mutated = true; }
+          // The rank moves whenever any conversation is used — from this tab
+          // or another device — so a change reorders the list.
+          if (e.updated_ms && e.updated_ms !== ex.updated_ms) { ex.updated_ms = e.updated_ms; mutated = true; }
         } else {
           S.conversations = S.conversations.concat([Object.assign({}, e, { history: e.history || [] })]);
           mutated = true;

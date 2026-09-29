@@ -201,6 +201,7 @@ mod tests {
         let state = ConvState {
             archived: false,
             branches: BTreeMap::from([("candle".to_string(), "zen/work".to_string())]),
+            active: 0,
         };
         assert_eq!(
             unset(&state, &bases),
@@ -210,6 +211,7 @@ mod tests {
         let full = ConvState {
             archived: true,
             branches: bases.clone(),
+            active: 0,
         };
         assert!(unset(&full, &bases).is_empty());
     }
