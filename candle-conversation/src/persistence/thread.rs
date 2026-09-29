@@ -1050,8 +1050,57 @@ fn run_pass(
         }
     }
 
-    let migrate_guard = candle_nn::kv_cache::migrate_flight();
+    // **Defer rather than race a compaction.** This marker is also the hold that
+    // keeps a KV compaction from relocating the chunks whose addresses the migrate
+    // below is about to capture; a pass in flight means those locations are moving
+    // under us, and the copy would put another sequence's KV in the warm tier. Never
+    // waits — see `migrate_flight` — so the pass ahead of us finishes and the next
+    // persistence round picks this work up unchanged.
+    // **Per group, not per pass, and each group's GPU work is fenced before the
+    // guard goes back.**
+    //
+    // The guard is what keeps a KV compaction from relocating the chunks whose
+    // addresses this migrate has captured — a pin keeps the arena alive and says
+    // nothing about which slot of it the chunk is in, so a relocation underneath
+    // makes the copy put another sequence's KV in the warm tier. Held across the
+    // whole batch it starves compaction exactly when compaction is most needed: a
+    // mass eviction is what produces both the fragmentation and the hot→warm work
+    // that has to precede it. Measured: 50 of 65 passes refused, and the pools at
+    // 72% through the burst.
+    //
+    // Releasing per group is only sound because the fence comes with it. The guard
+    // protects captured *addresses*, and a group's addresses stay live until its
+    // kernels retire, so handing the guard back while its copies are still queued
+    // would hand a compaction ground it is still reading. The batch-wide sync below
+    // stays as well — it is what `install_warm_and_hot` and the next projection
+    // depend on, for reasons that have nothing to do with this guard.
+    //
+    // A group that cannot get the guard is skipped, not abandoned: it is still hot,
+    // still flagged, and the next pass migrates it. Everything after this loop — the
+    // cold writes, the maintenance sweep — reads the substrate rather than raw chunk
+    // addresses, so it is unaffected by a relocation either way.
+    let mut deferred_groups = 0usize;
+    // **Does a compaction land inside this batch?** Every group below snapshots its
+    // turn's sealed sequences under the migrate guard and then releases the guard so
+    // a compaction is free to run — deliberately, because holding it for a whole
+    // batch starved compaction (15 of 52 attempts refused, pools left at 69%). The
+    // price is that the install after the loop writes gids captured before that
+    // relocation, and for the chunks carried through rather than requantised those
+    // gids are the pre-compaction ones. The holder then names one slot while the
+    // patched device record names another, and a reader resolving through the record
+    // gets bytes the selection never chose.
+    //
+    // Measured rather than acted on, because the fix is a merge in `install_hot`
+    // rather than a skip here: dropping the batch whenever a compaction interleaved
+    // would discard the quantise work most of the time, and compaction runs about
+    // once a second. This says how often the window is actually hit, which is the
+    // number that decides whether that merge is worth building.
+    let epoch_at_start = candle_nn::kv_cache::compaction_epoch();
     for (cc, group) in groups {
+        let Some(group_guard) = candle_nn::kv_cache::try_migrate_flight() else {
+            deferred_groups += 1;
+            continue;
+        };
         let effective = if single_latent {
             None
         } else {
@@ -1071,6 +1120,27 @@ fn run_pass(
             &mut select_ms,
             &mut alloc_ms,
             &mut convert_ms,
+        );
+        // The fence that makes the release safe — see above.
+        if let Err(e) = device.synchronize() {
+            tracing::warn!(
+                "cache: device sync after a hot→warm group failed: {e:?} (last CUDA \
+                 kernel on this thread: {})",
+                candle::last_cuda_kernel_launch()
+            );
+            // This group's GPU work is suspect, and the batch-wide sync below will
+            // fail the same way and drop every install. Stop here rather than queue
+            // more work behind a device that is not answering.
+            drop(group_guard);
+            break;
+        }
+        drop(group_guard);
+    }
+    if deferred_groups > 0 {
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            deferred_groups,
+            "hot→warm groups deferred: a KV compaction is relocating chunks",
         );
     }
     let migrate_ms = t_migrate.elapsed().as_millis() as u64;
@@ -1099,15 +1169,34 @@ fn run_pass(
         );
         // The whole batch's GPU work is suspect — don't install any of it.
         installs.clear();
+    } else {
+        // This runs on a fixed cadence regardless of load (see the pass-timing
+        // log below, which fires even with nothing to migrate), so it is the
+        // daemon's most reliable "the device is still alive" heartbeat —
+        // closing any out-of-memory streak `gpu_poison` is tracking before a
+        // resolved episode gets mistaken for a still-open one much later.
+        candle::gpu_poison::note_device_ok();
     }
     let sync_post_ms = t_sync_post.elapsed().as_millis() as u64;
-    // Migrate GPU work has retired (the sync above) — release the guard so the
-    // scheduler's VRAM relief resumes. The install below only drops old hot Arcs
-    // (its own arena frees), which no in-flight kernel is reading.
-    drop(migrate_guard);
+    // No guard to release here: each group took and fenced its own above, so the
+    // scheduler's compaction has been free to run between them. The install below
+    // only drops old hot Arcs (its own arena frees), which no in-flight kernel is
+    // reading.
     let t_install = std::time::Instant::now();
     let mut hot_to_warm_bytes: u64 = 0;
     let mut hot_to_warm_count: usize = 0;
+    let epoch_at_install = candle_nn::kv_cache::compaction_epoch();
+    if epoch_at_install != epoch_at_start && !installs.is_empty() {
+        tracing::error!(
+            target: "candle_conversation::persistence::tier",
+            installs = installs.len(),
+            passes = epoch_at_install - epoch_at_start,
+            "a kv compaction relocated chunks while this hot→warm batch was being \
+             built; the installs below carry gids captured before it, so any chunk \
+             they carried through rather than requantised now names a slot the pass \
+             vacated while its device record names the destination",
+        );
+    }
     if !installs.is_empty() {
         let mut view = conversation.write();
         for (idx, hot, warm) in installs {

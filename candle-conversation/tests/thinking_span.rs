@@ -85,7 +85,7 @@ fn builder() -> ModelBuilder {
 
 /// A private substrate for one test, removed before use.
 ///
-/// **These tests must not share the repo-root `.substrate`.** A substrate is
+/// **These tests must not share the repo-root `substrate`.** A substrate is
 /// bound to the tokenizer that sealed it — deliberately, because every turn in
 /// the log was sealed under that vocabulary — so a suite that inherits whatever
 /// the last run left behind fails on a model mismatch that has nothing to do

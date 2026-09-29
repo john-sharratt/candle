@@ -267,7 +267,7 @@ fn bench_qsa_page_place_tile_sweep() -> Result<()> {
             case.rows,
             bytes / 2.0 / 1e6,
         );
-        let plan = Placement::plan(&pages)?;
+        let plan = Placement::plan(&pages, None)?;
         let mut best = (f64::MAX, 0usize);
         let mut ms_of = Vec::with_capacity(TILES.len());
         for &tile in &TILES {
@@ -320,17 +320,17 @@ fn bench_qsa_page_place_plan_cost() -> Result<()> {
         // and the later ones measure a different allocator state.
         let iters = 20;
         for _ in 0..3 {
-            let _ = Placement::plan(&pages)?;
+            let _ = Placement::plan(&pages, None)?;
         }
         dev.synchronize()?;
         let t = Instant::now();
         for _ in 0..iters {
-            let _ = Placement::plan(&pages)?;
+            let _ = Placement::plan(&pages, None)?;
         }
         dev.synchronize()?;
         let plan_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
 
-        let plan = Placement::plan(&pages)?;
+        let plan = Placement::plan(&pages, None)?;
         let launch_ms = time_launch(&plan, PLACE_TILE_R, &dev)?;
         let total = plan_ms + launch_ms;
         println!(
@@ -361,7 +361,7 @@ fn bench_qsa_page_place_every_shape() -> Result<()> {
         let keys = case_keys(case, &dev)?;
         let pages: Vec<PlacePage<'_>> = keys.iter().map(|k| PlacePage { keys: k }).collect();
         let n_jobs = pages.len();
-        let plan = Placement::plan(&pages)?;
+        let plan = Placement::plan(&pages, None)?;
         plan.run(PLACE_TILE_R)?;
         dev.synchronize()?;
         println!(

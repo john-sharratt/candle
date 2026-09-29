@@ -1,6 +1,6 @@
 name: file_list
 questions:
-- list everything under candle-nn/src/kv_cache
+- what's in candle-nn/src/kv_cache
 - show me the files in the migrations folder
 - what's at the top level of the repo
 - enumerate the yaml files under prompts
@@ -14,22 +14,33 @@ questions:
 - trying to find which folder holds the fixtures
 - ls the working directory
 - what files are in this directory
-- show me the directory tree
+- what subdirectories are in here
 - dir listing please
-- what files are in this project
-- list everything under the src directory
+- what files are at the top of this project
+- what's directly in the src directory
 - show me the files I've written this session
 - what's in the tests folder
 - give me a listing of the working directory
-- which files exist under docs/
-- show the project tree from the root
+- which files exist directly under docs/
+- what's at the root of the project
 - what files can you see right now
 category: Files
 mandatory: true
-description: 'List the files visible to this session: the project''s working directory plus anything written or edited during the session, which shadows the file of the same path on disk. Optionally narrowed to a path prefix — omit it to list from the project root. Ignored paths (per .gitignore and friends) never appear, and hidden dotfiles are omitted the way `ls` omits them though they still read fine by exact path. Results are paged: the response''s `paging` reports the total and, when more remain, a `next_page` to pass back as `page`. Returns names and byte sizes, not file contents or line counts; an entry carries `modified: true` when this session has changed it. Use file_read to get a file''s contents — read from line 1 and its header reports the file''s length, so there is no need to size a file before reading it. This tool ENUMERATES a directory you already know; to FIND a file whose directory you do not know, use file_search, and to find code by its contents use file_grep. Do not guess directory names here instead: an empty listing looks identical whether the directory is empty or the guess was wrong, so guessing never converges, while one file_search or file_grep covers the whole project at once.'
+description: 'List one directory''s immediate contents, as visible to this session: the repository on disk plus anything written or edited during the session, which shadows the file of the same path on disk. `repo` is required: `*` lists the workspace''s repositories; a repository alone lists its root; add a directory `path` to list inside it. A listing is one level deep — a subdirectory appears as its own entry (`dir: true`), never expanded, so list it in turn to go further. `path` must name a real directory; a file path does not resolve. Ignored paths (per .gitignore and friends) never appear, and hidden dotfiles are omitted the way `ls` omits them though they still read fine by exact path. Results are paged: the response''s `paging` reports the total and, when more remain, a `next_page` to pass back as `page`. Returns names and byte sizes, not file contents or line counts; a file entry carries `modified: true` when this session has changed it. Use file_read to get a file''s contents — read page 0 and its header reports the file''s length in pages, so there is no need to size a file before reading it. This tool ENUMERATES a directory you already know; to FIND a file whose directory you do not know, use file_search, and to find code by its contents use file_grep. Do not guess directory names here instead: an empty listing looks identical whether the directory is empty or the guess was wrong, so guessing never converges, while one file_search or file_grep covers the whole workspace at once. Results name the repo.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
+    repo:
+      description: The repository to list inside, or `*` to list the workspace's repositories themselves. Required.
+      enum:
+      - '*'
+      minLength: 1
+      type: string
+    path:
+      description: 'Directory to list, relative to the repository, e.g. `src/util`. Defaults to "" — the repository''s root. Must name a real directory (or the root); a file path does not resolve. Not taken with repo `*`.'
+      type:
+      - string
+      - 'null'
     page:
       description: Zero-based page of results to return. Defaults to 0. When the response's `paging.next_page` is set, pass it here to read the following page.
       format: uint32
@@ -37,147 +48,142 @@ parameters:
       type:
       - integer
       - 'null'
-    prefix:
-      description: 'Path prefix to filter results (e.g. `src/`). Defaults to "" — the project root.'
-      type:
-      - string
-      - 'null'
+  required:
+  - repo
   title: ListRequest
   type: object
 examples:
 - |-
-  list the files in /workspace/src<|im_end|>
+  list the files in src, in the app repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user is asking to list the files in the /workspace/src directory. Let me check the tools available. There's a tool called file_list that enumerates files in the session's virtual filesystem. The parameters include a prefix, which corresponds to the path prefix. The user specified "/workspace/src",<|projection|> so I need to set the prefix to that. I should call file_list with the prefix parameter set to "/workspace/src". That should return the list of files in that directory. Let me make sure I'm using the correct JSON structure for the tool call. Yes, the name is "file_list" and the arguments<|projection|> should be a JSON object with the prefix.
+  Okay, the user is asking to list the files in the src directory, naming the app repository. Let me check the tools available. There's a tool called file_list that lists one directory's immediate contents in a named repository's virtual filesystem. The parameters include repo and path, naming the repository and the directory to list. The user specified repo "app" and path "src",<|projection|> so I need to set those. I should call file_list with repo set to "app" and path set to "src". That should return the files and subfolders directly inside that directory. Let me make sure I'm using the correct JSON structure for the tool call. Yes, the name is "file_list" and the arguments<|projection|> should be a JSON object with repo and path.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/src"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app", "path": "src"}}
   </tool_call><|projection|>
 - |-
-  what files are in /workspace<|im_end|>
+  what repositories are in this workspace<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user is asking "what files are in /workspace". I need to figure out which tool to use here. Looking at the available tools, there's one called file_list. The description says it enumerates files in the session's virtual filesystem, and it can take a prefix parameter.
+  Okay, the user is asking what repositories the workspace holds. I need to figure out which tool to use here. Looking at the available tools, there's one called file_list. Its `repo` is required, and the value `*` lists the workspace's repositories themselves, rather than any one repository's contents.
 
-  The user<|projection|> is asking about the /workspace directory, so the prefix should be "/workspace/". The tool's parameters accept a prefix, which can be a string or null. Since the user specified /workspace, I should set the prefix to that.
+  The user<|projection|> is asking about the workspace as a whole, not a directory inside a particular repository, so repo is `*` and there is no path — a path is relative to one repository.
 
-  Wait, the tool's parameters have a $schema that's a JSON schema<|projection|>. The properties for the tool include a "prefix" property with type ["string", "null"]. So the prefix can be a string or null. The default is an empty string, but in this case, the user is specifying /workspace, so I need to pass that as the prefix.
+  So the arguments for the<|projection|> file_list tool should be {"repo": "*"}. That should list the workspace's repositories, one entry per repo. I need to make sure the JSON is correctly formatted. Let me double-check the syntax.
 
-  So the arguments for the<|projection|> file_list tool should be {"prefix": "/workspace/"}. That should list all files under that path. I need to make sure the JSON is correctly formatted. Let me double-check the syntax. Yes, the key is "prefix" and the value is the string "/workspace/".
-
-  I think that's it. The<|projection|> user wants to know the files in /workspace, so calling file_list with the prefix set to /workspace/ should return the correct list.
+  I think that's it. The<|projection|> user wants to know what repositories exist, so calling file_list with repo `*` returns the correct listing.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "*"}}
   </tool_call><|projection|>
 - |-
-  show me everything under /workspace/tests<|im_end|>
+  show me everything under tests, in the app repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user is asking to see everything under /workspace/tests. I need to use the file_list tool for this. The tool's parameters include a prefix, which in this case is "/workspace/tests". I should structure the tool call with that prefix. Let me make sure the JSON is correctly formatted with<|projection|> the name and arguments. That should retrieve the list of files and their sizes from that directory.
+  Okay, the user is asking to see everything under tests, naming the app repository. I need to use the file_list tool for this. The tool's parameters include repo and path, which in this case are "app" and "tests". I should structure the tool call with those. Let me make sure the JSON is correctly formatted with<|projection|> the name and arguments. That should retrieve what's directly inside that directory and their sizes — a subfolder would come back as its own entry rather than being expanded, so if the user wants what's inside one of those I'd list it next.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/tests"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app", "path": "tests"}}
   </tool_call><|projection|>
 - |-
-  list the files under /workspace/benches<|im_end|>
+  list the files under benches, in the app repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user is asking to list the files under the /workspace/benches directory. Let me check the available tools. There's a tool called file_list that enumerates files in the session's virtual filesystem. The parameters allow specifying a prefix, which in this case should be "/workspace/benches<|projection|>". I need to make sure the prefix is correctly set. The function returns names and sizes, which matches the user's request. So the correct tool call would be file_list with the prefix parameter set to "/workspace/benches".
+  Okay, the user is asking to list the files under the benches directory, naming the app repository. Let me check the available tools. There's a tool called file_list that lists one directory's immediate contents in a named repository's virtual filesystem. The parameters allow specifying repo and path, which in this case should be "app" and "benches<|projection|>". I need to make sure both are correctly set. The function returns names and sizes, which matches the user's request. So the correct tool call would be file_list with repo "app" and path "benches".
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/benches"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app", "path": "benches"}}
   </tool_call><|projection|>
 - |-
-  what's in the /workspace/migrations directory<|im_end|>
+  what's in the migrations directory of the app repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user is asking about the contents of the /workspace/migrations directory. I need to figure out how to list the files there using the available tool.
+  Okay, the user is asking about the contents of the migrations directory, naming the app repository. I need to figure out how to list the files there using the available tool.
 
-  Looking at the tools provided, there's a function called file_list that enumerates files in the virtual filesystem. The parameters include an optional prefix,<|projection|> which matches the user's request for the migrations directory.
+  Looking at the tools provided, there's a function called file_list that lists a directory's immediate contents in a named repository's virtual filesystem. The parameters include the required repo and an optional path,<|projection|> which match the user's request for the app repo's migrations directory.
 
-  So, I should call file_list with the prefix set to "/workspace/migrations". That should return the list of files and their sizes in that specific directory. I need to make sure the JSON structure is correct, with the name as "file_list" and the<|projection|> arguments including the prefix parameter. Let me double-check the schema to ensure the parameters are correctly formatted. Once that's done, the response should provide the user with the necessary information about the directory's contents.
+  So, I should call file_list with repo set to "app" and path set to "migrations". That should return the files and subfolders directly inside that specific directory. I need to make sure the JSON structure is correct, with the name as "file_list" and the<|projection|> arguments including repo and path. Let me double-check the schema to ensure the parameters are correctly formatted. Once that's done, the response should provide the user with the necessary information about the directory's contents.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/migrations"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app", "path": "migrations"}}
   </tool_call><|projection|>
 - |-
-  give me a directory listing of /workspace/assets/images<|im_end|>
+  give me a directory listing of assets/images in the app repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user is asking for a directory listing of /workspace/assets/images. Let me check the tools available. There's a tool called file_list that enumerates files in the session's virtual filesystem. The parameters include a prefix, which matches the path the user provided. So I need to call file_list<|projection|> with the prefix set to "/workspace/assets/images/". I should make sure the JSON is correctly formatted with the prefix parameter. No other tools are needed here. Alright, let's structure the tool call accordingly.
+  Okay, the user is asking for a directory listing of assets/images, naming the app repository. Let me check the tools available. There's a tool called file_list that lists one directory's immediate contents in a named repository's virtual filesystem. The parameters include repo and path, which match the repository and directory the user provided. So I need to call file_list<|projection|> with repo set to "app" and path set to "assets/images". I should make sure the JSON is correctly formatted with both parameters. Alright, let's structure the tool call accordingly.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/assets/images/"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app", "path": "assets/images"}}
   </tool_call><|projection|>
 - |-
-  which files live under /workspace/config<|im_end|>
+  which files live under config, in the app repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user is asking which files are located under the /workspace/config path in the virtual filesystem. I need to use the file_list tool for this. The file_list tool allows enumerating files, and it has a parameter called prefix which can narrow down the results to a specific path prefix. The user<|projection|>'s query specifies the prefix as /workspace/config, so I should set the prefix parameter to that value. If the prefix is empty or not provided, the tool would list all files, but in this case, we need to filter by the given path. So I'll construct the tool call with the prefix set to "/<|projection|>workspace/config".
+  Okay, the user is asking which files are located under the config path, naming the app repository. I need to use the file_list tool for this. The file_list tool lists one directory's immediate contents within a named repository, and it has repo and path parameters. The user<|projection|>'s query specifies the repo as app and the directory as config, so I should set those. If path is empty or not provided, the tool would list the repository root instead, but in this case we need the given directory. So I'll construct the tool call with repo set to "app" and path set to "<|projection|>config".
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/config"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app", "path": "config"}}
   </tool_call><|projection|>
 - |-
-  enumerate the contents of /workspace/scripts<|im_end|>
+  enumerate the contents of scripts, in the app repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to list the contents of the /workspace/scripts directory. Let me check the available tools. There's a tool called file_list that enumerates files in the virtual filesystem. The parameters include a prefix, which defaults to an empty string. Since the user specified /workspace/scripts, I should<|projection|> set the prefix to that path. I need to make sure the JSON is correctly formatted with the prefix parameter. Alright, calling file_list with the prefix should return the list of files and their sizes.
+  Okay, the user wants to list the contents of the scripts directory, naming the app repository. Let me check the available tools. There's a tool called file_list that lists a directory's immediate contents within a named repository's virtual filesystem. The parameters include repo and path, and path defaults to the empty string (the repository root). Since the user specified repo app and path scripts, I should<|projection|> set both. I need to make sure the JSON is correctly formatted with the repo and path parameters. Alright, calling file_list with those should return the files and subfolders directly inside it, with their sizes.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "/workspace/scripts"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app", "path": "scripts"}}
   </tool_call><|projection|>
 - |-
-  use a tool to read the root directory of the project<|im_end|>
+  use a tool to read the root directory of the app repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to see the root directory of the project. Looking at the available tools, file_list is the one that lists files — it enumerates the project's working directory plus anything written or edited during this<|projection|> session. The prefix parameter narrows the results to a path, and omitting it lists from the project root, which is exactly what is being asked for.
+  Okay, the user wants to see the root directory of the app repository, naming it explicitly. Looking at the available tools, file_list is the one that lists directories — it enumerates the repository on disk plus anything written or edited during this<|projection|> session. The repo parameter names which repository, and omitting `path` lists that repository's root, which is exactly what is being asked for.
 
-  So I call file_list with no prefix at all — omitting it is what lists from the root — and get the file names and byte sizes<|projection|> at the top of the project.
+  So I call file_list with repo "app" and no path, and get the file names, byte sizes,<|projection|> and subfolder entries directly at the top of the repository — a subfolder comes back as its own entry, not expanded.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app"}}
   </tool_call><|projection|>
 - |-
-  what files are in this project?<|im_end|>
+  what files are in the app repo?<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user is asking what files the project contains. That is a directory listing, and file_list is the tool for it — it enumerates the working directory and skips anything ignored by .gitignore,<|projection|> so what comes back is the meaningful file set rather than build output.
+  The user is asking what files the app repository contains, naming it explicitly. That is a directory listing, and file_list is the tool for it — it enumerates the repository on disk and skips anything ignored by .gitignore,<|projection|> so what comes back is the meaningful file set rather than build output.
 
-  No subdirectory was named, so the prefix is left out altogether and the listing starts at the project root.<|projection|>
+  No subdirectory was named, so the path should be omitted to list that repository's root. That gives the top-level files and folders; if the user wants what's inside one of the folders I'd list that path next rather than assuming.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app"}}
   </tool_call><|projection|>
 - |-
-  run the file_list tool on the root directory now<|im_end|>
+  run the file_list tool on the root directory of the app repo now<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user has named the tool explicitly: file_list, on the root directory. Its prefix parameter is optional, and leaving it out is what lists the project root.<|projection|> There is nothing to disambiguate — I issue the call with no arguments at all.
+  The user has named the tool explicitly: file_list, on the root directory, and named the app repository. It takes a required repo and an optional path, and an omitted path means that repository's root.<|projection|> There is nothing to disambiguate — I just issue the call with repo set to "app" and no path.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "app"}}
   </tool_call><|projection|>
 - |-
   list the files under candle-core/src<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants a listing beneath candle-core/src. That is a path prefix, which is what file_list's prefix parameter takes, so I pass "candle-core/src" and only files under<|projection|> that directory come back. Each entry carries its path and byte size, plus a modified flag if this session has changed it.
+  The path names candle-core, which is this candle codebase's tensor crate, so the repo is candle. The user wants a listing beneath candle-core/src. That is a directory path, which is what file_list's path parameter takes, so I pass repo "candle" and path "candle-core/src", and only what's directly<|projection|> inside that directory comes back — files with their byte size, and any subdirectory as its own entry rather than expanded into its files. Each file entry also carries a modified flag if this session has changed it.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_list", "arguments": {"prefix": "candle-core/src"}}
+  <|projection|>{"name": "file_list", "arguments": {"repo": "candle", "path": "candle-core/src"}}
   </tool_call><|projection|>

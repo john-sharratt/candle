@@ -30,6 +30,9 @@ safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_plain = { workspace = true }
+# The prepared-engine recipe identity and the source-file checks against the
+# pinned LFS hashes (`qwen4exp::prepare`).
+sha2 = "0.10"
 # `model_overrides` — the gitignored `models.override.yaml` that lets a machine
 # run checkpoints the repository does not name.
 serde_yaml = { workspace = true }
@@ -42,6 +45,7 @@ tokenizers = { workspace = true, optional = true }
 [dev-dependencies]
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }
+tempfile = { workspace = true }
 # `env-filter` so the gate's subscriber takes its level and targets from
 # RUST_LOG. Without it the only thing expressible is a hard max level, which
 # cannot reach a per-target `debug` — and the elastic boundary reports every
@@ -84,3 +88,68 @@ profile = []
 nvtx = ["cuda"]
 huge-context = []
 ruler-bench = ["dep:tokenizers"]
+
+# ── CUDA-only test targets ───────────────────────────────────────────────────
+#
+# Each of these files is `#![cfg(feature = "cuda")]` in its entirety, so without
+# the feature it compiles to a binary holding NO tests — which cargo still links
+# and still launches, to report "0 tests". Declaring the requirement here stops
+# the target being built at all, which is not only faster: launching those empty
+# binaries is what made a CPU-only run FAIL on this machine, where Windows
+# Application Control blocks the freshly-linked unsigned exe (`os error 4551`)
+# for `paged_glue_tests` and `rope_rung_tests`. The tests themselves were never
+# the problem — both pass under `--features cuda` — but a pass that cannot run a
+# binary it did not need to build reads as a red suite.
+#
+# Keep this list in step with the `#![cfg(feature = "cuda")]` files in `tests/`.
+[[test]]
+name = "decode_layout_exact"
+required-features = ["cuda"]
+
+[[test]]
+name = "flat_prefill_probe"
+required-features = ["cuda"]
+
+[[test]]
+name = "kernel_layout_tests"
+required-features = ["cuda"]
+
+[[test]]
+name = "paged_decode_q8_tests"
+required-features = ["cuda"]
+
+[[test]]
+name = "paged_glue_tests"
+required-features = ["cuda"]
+
+[[test]]
+name = "per_layer_chunk_alignment"
+required-features = ["cuda"]
+
+[[test]]
+name = "prefill_replay"
+required-features = ["cuda"]
+
+[[test]]
+name = "qsa_index_bench"
+required-features = ["cuda"]
+
+[[test]]
+name = "qsa_kernel_tests"
+required-features = ["cuda"]
+
+[[test]]
+name = "qsa_page_place_bench"
+required-features = ["cuda"]
+
+[[test]]
+name = "qsa_paged_index_tests"
+required-features = ["cuda"]
+
+[[test]]
+name = "qsa_score_rot_harness"
+required-features = ["cuda"]
+
+[[test]]
+name = "rope_rung_tests"
+required-features = ["cuda"]

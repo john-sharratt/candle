@@ -25,8 +25,8 @@
 //! final natural-language answer.
 
 use std::collections::HashSet;
+use std::io;
 use std::iter;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::models::Dialect;
@@ -39,10 +39,13 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
-use zend_tools::state::ToolSecrets;
-use zend_tools::{registry, replay, Replay, ToolContext};
+use zend_tools::sandboxes::Sandboxes;
+use zend_tools::state::Secrets;
+use zend_tools::{alias_pins, registry, replay, Replay, ToolContext};
+use zend_vfs::{RepoFiles, Workspace};
 
 use crate::access;
+use crate::sandbox_programs;
 use crate::tool_guidance;
 use crate::types::ToolMode;
 
@@ -122,7 +125,7 @@ pub fn install_tool_catalog(
     }
     // This function only lays down the per-tool sections. The tool-catalog
     // *overview* is sealed separately into the `ToolSummaryRestricted` /
-    // `ToolSummary` / `ToolSummaryMutable` reserved sections at session startup and associated
+    // `ToolSummary` reserved sections at session startup and associated
     // with this collection per mode in `build_mode_builder` (via
     // `set_collection_summary_section`), so projection emits the full name listing
     // ahead of the provenance-selected subset.
@@ -471,6 +474,10 @@ pub(crate) fn calls_in_answer(answer: &str) -> Vec<(usize, ToolCall)> {
 /// times, its reasoning saying "write the file now" before every call.
 /// Dispatch already resolves aliases ([`registry::find`]); compiling them
 /// lets the call reach it as the model wrote it.
+///
+/// **An alias whose name fixes an argument is compiled with it fixed**
+/// ([`alias_pins`]): the field is narrowed to that one value, which the grammar
+/// then writes itself. `git_cherry_pick` cannot decode `from: revert`.
 pub fn tool_catalog() -> &'static [ToolSpec] {
     static SPECS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
     SPECS.get_or_init(|| {
@@ -479,10 +486,24 @@ pub fn tool_catalog() -> &'static [ToolSpec] {
             .flat_map(|d| {
                 iter::once(d.name.as_str())
                     .chain(registry::aliases(&d.name).iter().copied())
-                    .map(|name| ToolSpec::from_json_schema(name, &d.parameters))
+                    .map(|name| ToolSpec::from_json_schema(name, &pinned(name, &d.parameters)))
             })
             .collect()
     })
+}
+
+/// `parameters` with each field `name` fixes narrowed to its one value.
+fn pinned(name: &str, parameters: &Value) -> Value {
+    let mut narrowed = parameters.clone();
+    for (field, value) in alias_pins::pins(name) {
+        let property = &mut narrowed["properties"][*field];
+        let description = property.get("description").cloned();
+        *property = serde_json::json!({"type": "string", "enum": [value]});
+        if let Some(description) = description {
+            property["description"] = description;
+        }
+    }
+    narrowed
 }
 
 /// Parse one call object's JSON. `Ok(None)` when it parses but names no tool.
@@ -547,7 +568,12 @@ impl RawCall {
 /// it ([`crate::tool_guidance`]).
 pub fn run_tool(ctx: &ToolContext, call: &ToolCall) -> Value {
     match registry::find(&call.name) {
-        Some(t) => tool_guidance::with_guidance(t.name, t.call(ctx, &call.arguments)),
+        // An alias's name fixes some arguments; a call that contradicts it is
+        // refused before it runs ([`alias_pins`]).
+        Some(t) => match alias_pins::apply(&call.name, &call.arguments) {
+            Ok(args) => tool_guidance::with_guidance(t.name, t.call(ctx, &args)),
+            Err(refusal) => tool_guidance::with_guidance(t.name, refusal),
+        },
         None => tool_guidance::unknown_tool(&call.name, ctx.grants()),
     }
 }
@@ -632,10 +658,11 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
     // the same reason: a structured field beside a rendered string has to be
     // correlated with it, whereas a first line is read in passing.
     //
-    // **Only when there is more than one.** A single-call round keeps the exact
-    // bytes the `code_reading` ingest prefills, so a live response and the tens
-    // of thousands of conditioned ones stay the same object; the header appears
-    // precisely when order alone stops being unambiguous — and it must, because
+    // **Only when there is more than one.** A single-call round is the common
+    // case for both a live turn and `code_reading`'s hidden per-file
+    // conversation (which now runs this same function for its own real
+    // `file_read` calls, not a synthetic prefill) — so the header appears
+    // precisely when order alone stops being unambiguous, and it must, because
     // a failed call returns an error envelope rather than the shape its position
     // would imply.
     let label =
@@ -644,9 +671,8 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
         let body = match &r.response {
             // A string result is already rendered for the model — placed in the
             // block verbatim rather than JSON-encoded. `file_read` returns a
-            // numbered, fenced excerpt this way, so a live response is
-            // byte-identical to the `code_reading` ingest's prefilled ones;
-            // encoding it would collapse the source to one line of `\n` escapes.
+            // numbered, fenced excerpt this way; encoding it would collapse the
+            // source to one line of `\n` escapes.
             Value::String(rendered) => rendered.clone(),
             other => serde_json::to_string(other)
                 .unwrap_or_else(|_| "{\"error\":\"internal_error\"}".to_string()),
@@ -716,77 +742,55 @@ pub fn tool_round_text(text: &str) -> TurnText {
 /// — subagent loops aren't wired yet).  Cloned cheaply (Arc-shared
 /// stores).
 ///
-/// One host serves the whole daemon, so the `file_*` overlay's session layer is
-/// shared across conversations: a file written in one chat is visible in the
-/// next. The lower layer is the daemon's working directory, read-only.
+/// One host serves the whole daemon, but the `file_*` overlay does not: each
+/// conversation has its own file stores ([`Self::conversation_files`]), and a
+/// round runs in a context bound to them ([`Self::context_for`]), so what one
+/// conversation writes, edits or deletes is never what another one reads. The
+/// lower layer is each of the workspace's repositories, read-only.
 ///
-/// It holds one context per tools mode. They share every store and differ only
-/// in their [`Grants`](zend_tools::Grants) ([`access::grants`]) and, for
-/// Mutable, in a file store that writes the disk — so what a round may do is
-/// fixed by the context it is handed, not by which tools its prompt offered.
+/// It holds one context per tools mode. They share every other store and differ
+/// only in their [`Grants`](zend_tools::Grants) ([`access::grants`]) — so what
+/// a round may do is fixed by the context it is handed, not by which tools its
+/// prompt offered. The workspace's command sandboxes are shared by all of
+/// them; only a context granted `Exec` can reach them.
 #[derive(Clone)]
 pub struct ToolHost {
-    /// Indexed by [`ToolMode::level`].
-    contexts: [Arc<ToolContext>; 4],
+    /// Indexed by [`ToolMode::level`]. Each mode's own file stores are never
+    /// handed to a round — a round gets its conversation's.
+    contexts: [Arc<ToolContext>; ToolMode::ALL.len()],
 }
 
 impl ToolHost {
-    /// Build a host whose file tools overlay `workspace` — the daemon's working
-    /// directory, which reads fall through to when the session layer has no entry.
-    ///
-    /// The deployment's secrets are read from that same directory, once, here.
-    pub fn new(workspace: impl Into<PathBuf>) -> Self {
-        let workspace = workspace.into();
-        let secrets = load_tool_secrets(&workspace);
-        let base = ToolContext::with_workspace(workspace).with_secrets(secrets);
-        let contexts = ToolMode::ALL.map(|mode| {
-            let ctx = base.clone().granting(access::grants(mode));
-            let ctx = if mode.writes_disk() {
-                ctx.with_direct_files()
-                    .expect("the mode that writes the disk is granted it")
-                    .expect("a context built on a workspace has one to work on directly")
-            } else {
-                ctx
-            };
-            Arc::new(ctx)
-        });
-        Self { contexts }
+    /// Build a host whose file tools overlay `workspace`'s repositories, which
+    /// reads fall through to when the session layer has no entry, whose every
+    /// context carries `secrets` — read once by the daemon at launch
+    /// ([`crate::secrets::load`]) — and whose commands run in a sandbox per git
+    /// repository, starting the programs [`sandbox_programs`] lists. Fails
+    /// only when the workspace's jobs folder cannot be made.
+    pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> io::Result<Self> {
+        let sandboxes = Sandboxes::for_workspace(workspace, &sandbox_programs::policy())?;
+        let base = ToolContext::with_workspace(workspace.clone())
+            .with_secrets(secrets)
+            .with_sandboxes(Arc::new(sandboxes));
+        let contexts =
+            ToolMode::ALL.map(|mode| Arc::new(base.clone().granting(access::grants(mode))));
+        Ok(Self { contexts })
     }
 
-    /// The context a round of tools in `mode` runs in.
-    pub fn context_for(&self, mode: ToolMode) -> &Arc<ToolContext> {
-        &self.contexts[mode.level() as usize]
+    /// A new conversation's own file stores: an overlay over each repository
+    /// with no changes yet.
+    pub fn conversation_files(&self) -> Arc<RepoFiles> {
+        Arc::new(
+            self.contexts[ToolMode::Restricted.level() as usize]
+                .files
+                .fresh(),
+        )
     }
-}
 
-/// Read `secrets/tools.yaml` from the workspace, reporting what was found.
-///
-/// A malformed document does not stop the daemon: web search is one tool among
-/// ninety-odd, and refusing to boot over a stray character in a file that most
-/// deployments do not even have would be wildly out of proportion. It is a WARN
-/// with the parse error, and every secret reads as unset.
-///
-/// Only the *presence* of a key is logged, never its value — a log line is the
-/// one place a secret reliably escapes a process.
-fn load_tool_secrets(workspace: &Path) -> ToolSecrets {
-    let path = ToolSecrets::path_in(workspace);
-    match ToolSecrets::load(&path) {
-        Ok(secrets) => {
-            tracing::info!(
-                path = %path.display(),
-                tavily = secrets.tavily_api_key().is_some(),
-                "tool secrets loaded"
-            );
-            secrets
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "tool secrets could not be read; every secret reads as unset"
-            );
-            ToolSecrets::empty()
-        }
+    /// The context a round of tools in `mode` runs in, for the conversation
+    /// whose file stores are `files`.
+    pub fn context_for(&self, mode: ToolMode, files: &Arc<RepoFiles>) -> Arc<ToolContext> {
+        Arc::new(self.contexts[mode.level() as usize].with_files(Arc::clone(files)))
     }
 }
 
@@ -796,46 +800,127 @@ fn load_tool_secrets(workspace: &Path) -> ToolSecrets {
 mod tests {
     use super::*;
 
-    // ── The daemon's tool secrets ───────────────────────────────────────────
+    use zend_vfs::RepoSpec;
 
-    /// **`ToolHost::new` hands the workspace's secrets to the tool context.**
-    ///
-    /// The document's parsing is covered in `zend-tools`; what is asserted here
-    /// is the wiring, which nothing else would catch. Dropping the
-    /// `.with_secrets(..)` call leaves every crate compiling and every other
-    /// test passing, and shows up only as `web_search` reporting itself
-    /// unconfigured on a machine whose key is sitting right there in the file.
+    /// `dir` as a workspace holding one repository, `r`.
+    fn workspace_in(dir: &tempfile::TempDir) -> Workspace {
+        std::fs::create_dir_all(dir.path().join("r")).unwrap();
+        Workspace::new(dir.path(), vec![RepoSpec::named("r")]).unwrap()
+    }
+
+    /// No secrets: what every test host that is not about secrets gets.
+    fn no_secrets() -> Arc<Secrets> {
+        Arc::new(Secrets::empty())
+    }
+
+    // ── Aliases that fix an argument ────────────────────────────────────────
+
+    /// **An alias that fixes an argument is compiled with only that value**,
+    /// while the canonical tool keeps every one: `git_cherry_pick` cannot
+    /// decode `from: revert`, and `git_commit` still can.
     #[test]
-    fn the_tool_host_loads_the_workspaces_secrets() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = ToolSecrets::path_in(dir.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "tavily_api_key: tvly-wired-through\n").unwrap();
+    fn an_alias_is_compiled_with_its_fixed_argument() {
+        let values = |tool: &str, field: &str| {
+            tool_catalog()
+                .iter()
+                .find(|s| s.name == tool)
+                .unwrap_or_else(|| panic!("{tool} compiled"))
+                .params
+                .iter()
+                .find(|p| p.name == field)
+                .unwrap_or_else(|| panic!("{tool}.{field}"))
+                .enum_values
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(values("git_cherry_pick", "from"), vec!["cherry_pick"]);
+        assert_eq!(values("git_revert", "from"), vec!["revert"]);
+        assert_eq!(values("delete_tag", "kind"), vec!["tag"]);
+        assert_eq!(values("delete_tag", "action"), vec!["delete"]);
+        assert!(values("git_commit", "from").len() > 1);
+    }
 
-        let host = ToolHost::new(dir.path());
+    /// **Dispatch holds an alias to its name** for a call that did not come
+    /// through the grammar: a contradicting value is refused before the tool
+    /// runs.
+    #[test]
+    fn dispatch_refuses_an_alias_its_arguments_contradict() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        let ctx = host.context_for(ToolMode::Comprehensive, &host.conversation_files());
+        let out = run_tool(
+            &ctx,
+            &ToolCall {
+                name: "git_cherry_pick".to_string(),
+                arguments: serde_json::json!({"repo": "r", "from": "revert", "commit": "c"}),
+            },
+        );
+        assert_eq!(out["error"], "invalid_arguments", "{out}");
+        assert!(
+            out["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("`git_cherry_pick` means `from: cherry_pick`"),
+            "{out}"
+        );
+        // Shaped like every other `invalid_arguments` refusal — `with_guidance`
+        // must enrich this one too, not just the ones `t.call` itself returns.
+        assert_eq!(
+            out["hint"],
+            "call again with arguments that match `parameters`"
+        );
+        assert!(out["parameters"].is_object(), "{out}");
+    }
+
+    // ── The daemon's secrets ────────────────────────────────────────────────
+
+    /// **`ToolHost::new` hands the daemon's secrets to every mode's context.**
+    ///
+    /// The document's parsing is covered in `zend-tools` and the choice of file
+    /// in `crate::secrets`; what is asserted here is the wiring, which nothing
+    /// else would catch. Dropping the `.with_secrets(..)` call leaves every
+    /// crate compiling and every other test passing, and shows up only as
+    /// `web_search` reporting itself unconfigured on a machine whose key is
+    /// sitting right there in the file.
+    #[test]
+    fn the_tool_host_carries_the_daemons_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        std::fs::write(&path, "tavily_api_key: tvly-wired-through\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let secrets = Arc::new(Secrets::load(&path).unwrap());
+
+        let host = ToolHost::new(&workspace_in(&dir), secrets).unwrap();
+        let files = host.conversation_files();
         for mode in ToolMode::ALL {
             assert_eq!(
-                host.context_for(mode).secrets.tavily_api_key(),
+                host.context_for(mode, &files).secrets.tavily_api_key(),
                 Some("tvly-wired-through"),
-                "the daemon must read secrets/tools.yaml from its working directory ({})",
+                "{} lost the daemon's secrets",
                 mode.id()
             );
         }
     }
 
-    /// **Each mode's context carries that mode's grants, and only Mutable's
-    /// file store writes the disk.** A Restricted round handed a gated call
+    /// **Each mode's context carries that mode's grants, over the
+    /// conversation's own files.** A Restricted round handed a gated call —
+    /// the network, code, a database, a git writer, a program on this host —
     /// refuses it at dispatch, whatever the prompt offered.
     #[test]
     fn each_modes_context_carries_its_grants() {
         let dir = tempfile::tempdir().unwrap();
-        let host = ToolHost::new(dir.path());
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        let files = host.conversation_files();
         for mode in ToolMode::ALL {
-            let ctx = host.context_for(mode);
+            let ctx = host.context_for(mode, &files);
             assert_eq!(ctx.grants(), access::grants(mode), "{}", mode.id());
-            assert_eq!(ctx.vfs.is_direct(), mode.writes_disk(), "{}", mode.id());
+            assert!(Arc::ptr_eq(&ctx.files, &files), "{}", mode.id());
         }
-        let restricted = host.context_for(ToolMode::Restricted);
+        let restricted = host.context_for(ToolMode::Restricted, &files);
         for (name, arguments) in [
             (
                 "web_fetch",
@@ -843,20 +928,37 @@ mod tests {
             ),
             (
                 "code_run",
-                serde_json::json!({ "language": "js", "code": "1" }),
+                serde_json::json!({ "repo": "r", "language": "js", "code": "1" }),
             ),
             ("sql_session_open", serde_json::json!({})),
+            (
+                "git_commit",
+                serde_json::json!({ "repo": "r", "message": "m" }),
+            ),
+            ("ping_icmp", serde_json::json!({ "host": "127.0.0.1" })),
+            (
+                "run_command",
+                serde_json::json!({ "repo": "r", "program": "npm", "args": ["test"] }),
+            ),
         ] {
             let call = ToolCall {
                 name: name.to_string(),
                 arguments,
             };
             assert_eq!(
-                run_tool(restricted, &call)["error"],
+                run_tool(&restricted, &call)["error"],
                 "not_permitted",
                 "{name} ran in Restricted"
             );
         }
+        // Comprehensive reaches the sandboxes — here to be told the folder is
+        // not a git repository, so there is none for it.
+        let comprehensive = host.context_for(ToolMode::Comprehensive, &files);
+        let call = ToolCall {
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({ "repo": "r", "program": "npm", "args": ["test"] }),
+        };
+        assert_eq!(run_tool(&comprehensive, &call)["error"], "no_sandbox");
     }
 
     /// A workspace with no document leaves every secret unset and the daemon
@@ -864,12 +966,59 @@ mod tests {
     #[test]
     fn a_workspace_without_secrets_still_builds_a_host() {
         let dir = tempfile::tempdir().unwrap();
-        let host = ToolHost::new(dir.path());
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
         assert_eq!(
-            host.context_for(ToolMode::Restricted)
+            host.context_for(ToolMode::Restricted, &host.conversation_files())
                 .secrets
                 .tavily_api_key(),
             None
+        );
+    }
+
+    /// **A file one conversation writes is never what another reads.** Two
+    /// conversations' rounds run in contexts bound to their own file stores,
+    /// and neither ever changes the file on disk.
+    #[test]
+    fn each_conversation_has_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("r")).unwrap();
+        std::fs::write(dir.path().join("r/shared.txt"), "disk\n").unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        let (a, b) = (host.conversation_files(), host.conversation_files());
+        let in_a = host.context_for(ToolMode::Comprehensive, &a);
+        let in_b = host.context_for(ToolMode::Comprehensive, &b);
+
+        in_a.files
+            .repo("r")
+            .unwrap()
+            .write("shared.txt", "conversation a\n".into())
+            .unwrap();
+        in_a.files
+            .repo("r")
+            .unwrap()
+            .write("only_a.txt", "a\n".into())
+            .unwrap();
+        let b_store = in_b.files.repo("r").unwrap();
+        assert_eq!(
+            b_store.read("shared.txt").unwrap().as_deref(),
+            Some("disk\n")
+        );
+        assert_eq!(b_store.read("only_a.txt").unwrap(), None);
+        // A later round of the same conversation sees its own change.
+        let again = host.context_for(ToolMode::Comprehensive, &a);
+        assert_eq!(
+            again
+                .files
+                .repo("r")
+                .unwrap()
+                .read("shared.txt")
+                .unwrap()
+                .as_deref(),
+            Some("conversation a\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("r/shared.txt")).unwrap(),
+            "disk\n"
         );
     }
 

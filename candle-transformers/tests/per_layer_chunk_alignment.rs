@@ -168,3 +168,58 @@ fn a_snapshot_carries_no_trailing_empty_chunk() -> Result<()> {
     }
     Ok(())
 }
+
+/// The two snapshots are two views of the same layer, and callers resolve a block
+/// range against one before slicing the other — so they must report the same chunk
+/// count.
+///
+/// They did not. `snapshot_sequence` goes through `record_turn`, which reports the
+/// empty writer chunk because the slot genuinely holds it, while
+/// `snapshot_sequence_per_layer` drops it so the skew cannot be persisted. The seal
+/// path clamps its range with `resolve_seal_range` against the *first* and then slices
+/// the *second*, so the range ran one block past every layer whenever that chunk was
+/// empty — which `reconcile_block_counts` can make true on every layer at once.
+/// Measured as `seal range 40..49 is outside layer 0's 48 sealed chunk(s)`, identical on
+/// every attempt, and it made the daemon unable to boot from a fresh substrate at all;
+/// an already-ingested substrate hid it by leaving nothing to seal.
+///
+/// **Two slots, not one.** `snapshot_sequence` also *commits* the turn boundary, so
+/// asking the same slot twice would measure that commit rather than the agreement.
+#[test]
+fn both_snapshots_agree_on_the_chunk_count() -> Result<()> {
+    let mut s = session()?;
+
+    let merged_seq = s.create_sequence()?;
+    fill(&mut s, merged_seq, 0, CHUNK + 8)?;
+    for b in s.backings() {
+        b.push_empty_writer_chunk(merged_seq)?;
+    }
+
+    let per_layer_seq = s.create_sequence()?;
+    fill(&mut s, per_layer_seq, 0, CHUNK + 8)?;
+    for b in s.backings() {
+        b.push_empty_writer_chunk(per_layer_seq)?;
+    }
+
+    let merged = s.snapshot_sequence(merged_seq)?;
+    let per_layer = s.snapshot_sequence_per_layer(per_layer_seq)?;
+
+    assert_eq!(
+        merged.chunks.len(),
+        2,
+        "snapshot_sequence captured its empty writer chunk: {:?}",
+        merged
+            .chunks
+            .iter()
+            .map(|c| c.token_count)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(merged.token_count, CHUNK + 8);
+    assert_eq!(
+        merged.chunks.len(),
+        per_layer[0].chunks.len(),
+        "the two snapshots disagree on layer 0's chunk count — a seal range resolved \
+         against one and sliced against the other is then refused",
+    );
+    Ok(())
+}

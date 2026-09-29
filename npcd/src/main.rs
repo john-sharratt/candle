@@ -64,13 +64,13 @@ struct Cli {
     #[arg(long)]
     content: Option<PathBuf>,
 
-    /// Where the engine's own state lives — `.substrate/` and `accounts/`, the
+    /// Where the engine's own state lives — `substrate/` and `accounts/`, the
     /// things the daemon writes rather than a person. Also the fallback source
     /// for authored content (`worlds/`, `personalities/`) when no `--mind` is
     /// named.
     ///
     /// Defaults to the `--mind` directory, so a mind carries its own substrate
-    /// beside it (a mind ignores `.substrate/` and `accounts/`). With no
+    /// beside it (a mind ignores `substrate/` and `accounts/`). With no
     /// `--mind` either, the `npcd` directory in the source tree.
     #[arg(long)]
     data: Option<PathBuf>,
@@ -454,7 +454,7 @@ async fn main() -> anyhow::Result<()> {
     // what time it is for a character and who that character is.
     let runtime = engine::runtime::Runtime::new(mind_for_engine, &data);
     // The engine adopts the substrate the cast was just loaded from, rather than
-    // opening `--data` a second time. One `.substrate/` takes one writable
+    // opening `--data` a second time. One `substrate/` takes one writable
     // handle per process; two lose records silently. See `Npcs::substrate`.
     runtime.set_substrate(authored.npcs.read().await.substrate());
     // And the cast itself — the same `Arc<RwLock<Npcs>>` the authored state

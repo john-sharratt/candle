@@ -31,7 +31,7 @@ use std::sync::Arc;
 use candle::{Device, Tensor};
 use candle_nn::kv_cache::{SealedSequence, WriterTail};
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel, PendingGlue,
+    BatchedInferenceSession, ManagedBatchedModel, PendingGlue, WINDOW_DIVERGENCE_MARKER,
 };
 
 use crate::conversation::slice_per_layer_sealed;
@@ -87,6 +87,59 @@ pub(super) struct SlotState {
     /// the slot held more than this: a placement is chosen afresh by every
     /// projection, and only the rest exists nowhere but the slot.
     pub(super) placed: usize,
+}
+
+impl SlotState {
+    /// Rewrite every sealed chunk this slot's caches hold through a compaction
+    /// sweep, returning the captured spans that moved.
+    ///
+    /// **These caches are holders, and the sweep did not know about them.** Both
+    /// `pending_user_part` and each cached glue island keep an
+    /// `Arc<Vec<SealedSequence>>` of K/V that a later projection Arc-injects into a
+    /// slot instead of recomputing it. A compaction relocates those chunks; unless
+    /// the cache is rewritten it goes on naming the slots the pass vacated, and the
+    /// pool hands that ground to the next claim. The injected span then decodes
+    /// against another sequence's K/V — finite, plausibly shaped and wrong, which
+    /// is why it surfaces as a NaN in the first attention layer rather than as a
+    /// fault, and why it took a completeness check to find rather than a crash.
+    ///
+    /// Shares the pass's one `Sweep`, like every other holder: these caches
+    /// routinely hold the very same `Arc<Vec<ChunkGid>>` allocation a residence
+    /// holds, and a second sweep would hand each its own equal-but-distinct
+    /// replacement, leaving refcounts that disagree with the sharing the cache
+    /// believes exists.
+    pub(super) fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        let mut moved = 0usize;
+        if let Some(span) = self.pending_user_part.as_mut() {
+            moved += span.rewrite_for_compaction(sweep)?;
+        }
+        for (_, span) in self.glue_islands.values_mut() {
+            moved += span.rewrite_for_compaction(sweep)?;
+        }
+        Ok(moved)
+    }
+}
+
+impl CapturedSpan {
+    /// Install the sweep's replacement for this span's K/V, if any of it moved.
+    ///
+    /// The index page beside it is position-free and names no chunk, so a
+    /// relocation does not touch it.
+    fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        match candle_nn::kv_cache::rewrite_sealed(&self.kv, sweep)? {
+            Some(next) => {
+                self.kv = Arc::new(next);
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
 }
 
 /// How many projections an unused cached glue island survives before it is
@@ -866,7 +919,7 @@ pub(super) fn apply_segments_build(
                     // sees this island. Mirrors the sealed-inject bookkeeping,
                     // the index page included: the wave not seeing the island is
                     // exactly why nothing would otherwise index it.
-                    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &cached.kv)?;
+                    inject_arc_sealed(ctx.session, parent_id, &cached.kv)?;
                     push_captured_page(ctx, &cached, "cached glue island");
                     walker.logical_pos += tokens.len() as u32;
                     walker.last_was_sealed = true;
@@ -1226,21 +1279,37 @@ fn inject_sealed_section(
             return Ok(());
         }
     };
-    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
-    // Unconditional, because the interesting case is the one that logs nothing.
-    // A section reaching here with no blob takes the gap branch and says so; a
-    // section that never reaches here at all is invisible, and telling those two
-    // apart is the whole question when a slot ends up holding an unindexed
-    // prefix. `section_positional` is filled by `ingest_section` and by nothing
-    // else, so a RECOVERED section — one the substrate reload brought back
-    // rather than re-ingested — has no entry no matter how sound its K/V is.
-    tracing::debug!(
-        target: "candle_conversation::scheduler::reproject",
-        slot = parent_id.0,
-        section = sid.raw(),
-        has_page = ctx.section_positional.contains_key(&sid),
-        "apply_projection: injecting section K/V",
-    );
+    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
+    // **Only the anomaly earns a debug line.** The case worth seeing is a section
+    // that reaches here with no positional blob: `section_positional` is filled by
+    // `ingest_section` and by nothing else, so a RECOVERED section — one the
+    // substrate reload brought back rather than re-ingested — has no entry no
+    // matter how sound its K/V is, and that is what leaves a slot holding an
+    // unindexed prefix.
+    //
+    // This was unconditional, on the reasoning that a section which never reaches
+    // here at all is invisible and telling the two apart is the whole question.
+    // Measured over one daemon run, that cost 1,609 lines of a 4,315-line log —
+    // 37% of it — and the anomaly fired **zero** times, so the volume was paid
+    // entirely to restate the ordinary case. The count is not lost: the
+    // `reproject (zero-copy rebuild)` line already carries `sections`, so "did
+    // sections reach here" is answerable at debug without a line each.
+    let has_page = ctx.section_positional.contains_key(&sid);
+    if has_page {
+        tracing::trace!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            section = sid.raw(),
+            "apply_projection: injecting section K/V",
+        );
+    } else {
+        tracing::debug!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            section = sid.raw(),
+            "apply_projection: injecting section K/V with no positional page",
+        );
+    }
     // The rows that go with those chunks. Borrowing the K/V is what makes this
     // path cheap; the index cannot be borrowed the same way, because its keys
     // come from hidden states this slot never computed.
@@ -1296,6 +1365,26 @@ fn inject_sealed_section(
     walker.sealed_tokens += sealed[0].token_count;
     walker.record_sealed(sealed[0].token_count);
     Ok(())
+}
+
+/// Whether a selected turn may be injected WHOLE, reasoning included.
+///
+/// Exactly one turn in a projection may: the newest turn of the timeline the
+/// slot is continuing. Every other turn — older turns of the same
+/// conversation, and every turn borrowed from another one — goes in with its
+/// `<think>` span windowed out.
+///
+/// `slot_timeline` is `None` for a projection with no slot identity (mocks,
+/// structural callers). That cannot be "the turn this slot is continuing", so
+/// nothing keeps its reasoning — the safe direction, since windowing only ever
+/// removes reasoning from the context.
+fn keeps_reasoning(
+    slot_timeline: Option<TimelineId>,
+    turn_timeline: TimelineId,
+    newest_of_turn_timeline: Option<TurnIndex>,
+    index: TurnIndex,
+) -> bool {
+    slot_timeline == Some(turn_timeline) && newest_of_turn_timeline == Some(index)
 }
 
 fn inject_sealed_turn(
@@ -1359,8 +1448,29 @@ fn inject_sealed_turn(
     let (sealed, page) = {
         let conv = ctx.conversation.read();
         let stored = resident.or_else(|| conv.index_page_blob(timeline, index).map(|b| b.to_vec()));
+        // **"Most recent" is the SLOT's most recent, not each timeline's.**
+        //
+        // A projection can span timelines — retrieval pulls in other
+        // conversations' turns, and a forked conversation inherits its
+        // ancestors' (`Substrate::inherited_chain`). `turn_indices(timeline)`
+        // answers "newest turn of ITS OWN timeline", so every foreign
+        // conversation contributed its last turn whole, reasoning included,
+        // and the rule above — reasoning attendable in exactly ONE subsequent
+        // projection — silently became "one per timeline".
+        //
+        // The model then reads someone else's `<think>` as its own most recent
+        // thought. Measured: an inherited block reading "The user wants me to
+        // read ARCHITECTURE.md — I already have lines 1-200 from a previous
+        // read" made the next conversation skip its own `file_read` and
+        // summarise the wrong file, and made a dialogue answer that inherited
+        // instruction instead of the question it was asked.
+        //
+        // Only the turn the slot is actually continuing may keep its
+        // reasoning. Single-timeline projections are unaffected: there the
+        // target IS the only timeline, which is the case this rule was written
+        // for and still behaves exactly as before.
         let newest = conv.turn_indices(timeline).max();
-        if newest == Some(index) {
+        if keeps_reasoning(ctx.slot_target.map(|t| t.timeline), timeline, newest, index) {
             (conv.turn_sealed_of(timeline, index), stored)
         } else {
             // An `Err` here is a turn whose reasoning cannot be windowed. It is
@@ -1433,7 +1543,7 @@ fn inject_sealed_turn(
         );
         return Ok(());
     }
-    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
     // The rows that go with those chunks. Borrowing the K/V is what makes a
     // reprojection cheap; the index cannot be borrowed the same way, because
     // its keys come from hidden states this slot never computed.
@@ -1582,7 +1692,7 @@ fn inject_sealed_turn_half(
             return Ok(());
         }
     };
-    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
     // **No page for a HALF, deliberately.** The stored page covers a whole
     // turn, and this borrows only its user half — handing the whole turn's rows
     // over would claim blocks for positions this slot does not hold, which is a
@@ -1609,10 +1719,22 @@ fn inject_sealed_turn_half(
     Ok(())
 }
 
+/// Inject a piece's already-sealed per-layer K/V onto `parent_id`'s slot.
+///
+/// Passes `sealed` straight through — no per-layer copy. An earlier version
+/// rebuilt a fresh `Vec<SealedSequence>` here solely to override `chunk_size`
+/// and `location`, which meant cloning every chunk's six palette/scale/format
+/// `Arc`s (`SealedChunk` derives `Clone`) for every layer of every piece, on
+/// every projection — work `ChunkedKvBacking::inject_sealed_at_tail` repeats a
+/// moment later when it builds its own `ChunkWindow`s from the same chunks.
+/// Neither `inject_sealed_at_tail` (here or in `candle-nn`) nor
+/// `truncate_sealed_to_tokens` (the one place that constructs a fresh
+/// `SealedSequence` on this path) ever reads a `SealedSequence`'s own
+/// `chunk_size` or `location` — both fields are copied through, never
+/// branched on — so the override was dead work from the moment it ran.
 fn inject_arc_sealed(
     session: &mut BatchedInferenceSession,
     parent_id: SequenceId,
-    chunk_size: usize,
     sealed: &Arc<Vec<SealedSequence>>,
 ) -> Result<(), ConversationError> {
     let _g = profile::span("inject:arc_sealed");
@@ -1625,17 +1747,8 @@ fn inject_arc_sealed(
         );
         return Ok(());
     }
-    let mut per_layer: Vec<SealedSequence> = Vec::with_capacity(n_layers);
-    for layer_seq in sealed.iter() {
-        per_layer.push(SealedSequence {
-            chunks: layer_seq.chunks.clone(),
-            token_count: layer_seq.token_count,
-            chunk_size,
-            location: candle_nn::kv_cache::ArenaLocation::Gpu,
-        });
-    }
     session
-        .inject_sealed_at_tail(parent_id.0, &per_layer)
+        .inject_sealed_at_tail(parent_id.0, sealed)
         .map_err(ConversationError::Model)?;
     Ok(())
 }
@@ -1686,7 +1799,7 @@ fn handle_new_user_message(
         // Mid-decode reproject path: the user's K/V was already
         // captured on an earlier apply.  Re-inject the cached bytes;
         // do not re-run the forward pass.
-        inject_arc_sealed(ctx.session, ctx.parent_id, ctx.chunk_size, &cached.kv)?;
+        inject_arc_sealed(ctx.session, ctx.parent_id, &cached.kv)?;
         // And the rows that go with them — `apply_segments_build` reset the
         // index before this walk, so nothing else puts them back.
         push_captured_page(ctx, &cached, "cached user message");
@@ -1719,7 +1832,7 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
         {
-            let _g = profile::span("prefill:forward");
+            let _g = profile::span("loop:prefill:forward");
             let nl = ctx.model.num_layers().max(1);
             let _logits = ctx
                 .model
@@ -1759,7 +1872,7 @@ fn push_empty_if_sealed(
     last_was_sealed: bool,
 ) -> Result<(), ConversationError> {
     if last_was_sealed {
-        let _g = profile::span("prefill:push_empty");
+        let _g = profile::span("loop:prefill:push_empty");
         ctx.session
             .push_empty_writer_chunk(ctx.parent_id.0)
             .map_err(ConversationError::Model)?;
@@ -1804,23 +1917,39 @@ fn drive_prefill_and_capture(
             ))
         })?;
     forward_tokens(ctx, tokens)?;
-    let end_block = ctx
-        .session
-        .sequence_block_count(parent_id.0)
-        .ok_or_else(|| {
-            ConversationError::Channel(format!(
-                "apply_projection: slot {} not in session",
-                parent_id
-            ))
-        })?;
 
     let captured = {
-        let _g = profile::span("prefill:snapshot");
+        let _g = profile::span("loop:prefill:snapshot");
         let full = ctx
             .session
             .snapshot_sequence_per_layer(parent_id.0)
             .map_err(ConversationError::Model)?;
-        slice_per_layer_sealed(&full, start_block, end_block)
+        // **The end of the range comes from the SNAPSHOT, never from the live
+        // slot.** `snapshot_sequence_per_layer` drops each layer's trailing empty
+        // chunk (`SealedSequence::drop_empty_tail`) so a skew can never be captured
+        // into a `CapturedSpan` and re-injected; `sequence_block_count` counts that
+        // chunk, because the slot really does hold it. Asking the slot and slicing
+        // the snapshot therefore disagreed by exactly one whenever the tail chunk was
+        // empty — which `reconcile_block_counts` above can make true on *every* layer
+        // at once, so all of them dropped it and the range ran one past all of them.
+        // That is a hard refusal from `slice_per_layer_sealed`, and it made a boot
+        // from a fresh substrate impossible: measured `seal range 40..49 is outside
+        // layer 0's 48 sealed chunk(s)`, identical on every attempt, while the old
+        // substrate masked it by having nothing left to ingest.
+        //
+        // Deriving it here is what the two sibling seal paths already do
+        // (`start_block + sealed[0].chunks.len()`), and it is lossless by the same
+        // argument that justifies the drop: an empty chunk holds no token and no
+        // position moves. The minimum across layers rather than layer 0's, so a
+        // layer that dropped one while others did not still yields a range every
+        // layer can satisfy — and a `min` that lands *below* `start_block` is left to
+        // fail, because that is a real divergence and not a tail to trim.
+        let end_block = full
+            .iter()
+            .map(|s| s.chunks.len())
+            .min()
+            .unwrap_or(start_block);
+        slice_per_layer_sealed(&full, start_block, end_block)?
     };
     // The index rows this forward just built, taken as a page so a later
     // re-inject of the same K/V can hand them over with it. Without this the
@@ -1901,12 +2030,19 @@ pub(super) fn fire_gap_fill_batch(
     // every column by its chunk `rope_base`, and masks each glue token by
     // `cpos > row_pos + fwd_ahead[t]`.
     session.set_pending_glue(pending);
-    // Clear the per-op pipeline profile so the snapshot below covers only this
+    // Read the per-op pipeline profile so the delta below covers only this
     // gap-fill forward (attn_core / mlp_ffn / qkv / out_proj, summed over layers).
+    //
+    // **A snapshot, not a snapshot-and-reset.** The reset is all-thread, so
+    // bracketing this one forward with it wiped every `loop:*` and `drain:*` span
+    // the run had accumulated — the engine's own profile table then covered only
+    // the window since the last gap-fill, which is a partial window dressed as a
+    // whole run. Subtracting two readings gives the same interval and destroys
+    // nothing.
     #[cfg(feature = "profile")]
-    let _ = candle_transformers::models::profile::pipeline_snapshot_and_reset();
+    let prof_before = candle_transformers::models::profile::pipeline_snapshot();
     {
-        let _g = profile::span("prefill:gap_fill");
+        let _g = profile::span("loop:prefill:gap_fill");
         // Route the glue islands through the wave's GLUE group so the pending
         // per-slot scatter descriptors (staged above) drive the paged-glue kernel.
         // A glue-only wave carries no logits (it only scatters K/V) and the result
@@ -1941,11 +2077,22 @@ pub(super) fn fire_gap_fill_batch(
     }
     #[cfg(feature = "profile")]
     {
-        let snap = candle_transformers::models::profile::pipeline_snapshot_and_reset();
-        let mut parts: Vec<String> = snap
+        let after = candle_transformers::models::profile::pipeline_snapshot();
+        // Only what this forward added: spans absent before, and the increase on
+        // spans already there. A span whose total did not move is left out.
+        let before: std::collections::HashMap<&str, (f64, u64)> = prof_before
             .entries
             .iter()
-            .map(|(n, ms, c)| format!("{n}={ms:.1}ms({c})"))
+            .map(|(n, ms, c)| (n.as_str(), (*ms, *c)))
+            .collect();
+        let mut parts: Vec<String> = after
+            .entries
+            .iter()
+            .filter_map(|(n, ms, c)| {
+                let (ms0, c0) = before.get(n.as_str()).copied().unwrap_or((0.0, 0));
+                let (d_ms, d_c) = (ms - ms0, c.saturating_sub(c0));
+                (d_c > 0).then(|| format!("{n}={d_ms:.1}ms({d_c})"))
+            })
             .collect();
         parts.sort_by(|a, b| b.cmp(a));
         tracing::info!(
@@ -1999,9 +2146,38 @@ pub(super) fn apply_segments_finish(
                 // Ranged snapshot: records only the island's own chunks on
                 // every layer (a whole-slot record per wave costs tens of ms
                 // at deep slots; the range costs microseconds).
+                //
+                // A window-divergence failure here is NOT the same case
+                // `Scheduler::repair_section_if_window_divergence_confirmed`
+                // handles: that hook tombstones the PERSISTED section a seal
+                // was writing. This range is glue tokens — ephemeral,
+                // in-memory-only cache entries (`state.glue_islands`), never
+                // written to the substrate — built on top of whatever this
+                // slot's prefix already holds, which may include an earlier
+                // injection of a corrupted persisted section. There is no
+                // single `SectionId` to confirm-and-tombstone at this point
+                // without walking back through the slot's own prefix history
+                // (the "prefix chain" tracing the reactive repair's own doc
+                // comment names as future scope, not attempted here) — so
+                // this only logs plainly instead of silently propagating a
+                // bare model error, to leave a trace pointing at the real
+                // mechanism instead of nothing.
                 let sealed = ctx
                     .session
                     .snapshot_sequence_blocks(parent_id.0, isl.start_block, isl.end_block)
+                    .inspect_err(|e| {
+                        if e.to_string().contains(WINDOW_DIVERGENCE_MARKER) {
+                            tracing::warn!(
+                                parent_id = parent_id.0,
+                                start_block = isl.start_block,
+                                end_block = isl.end_block,
+                                err = %e,
+                                "glue-island capture hit a per-layer window divergence — \
+                                 likely rooted in an earlier-injected section this slot's \
+                                 prefix already holds; not repaired from here (see comment)",
+                            );
+                        }
+                    })
                     .map_err(ConversationError::Model)?;
                 // **No page, and today that is provable rather than assumed.**
                 // An island exists only for a model that gap-fills, and
@@ -2205,6 +2381,61 @@ fn log_injected_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) {
 mod tests {
     use super::*;
     use crate::projection::{GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId};
+
+    fn tl(raw: u64) -> TimelineId {
+        TimelineId::from_raw(raw).expect("timeline id")
+    }
+
+    /// The turn the slot is continuing keeps its reasoning — the ordinary
+    /// single-conversation case, unchanged.
+    #[test]
+    fn the_slots_own_newest_turn_keeps_its_reasoning() {
+        let slot = tl(7);
+        assert!(keeps_reasoning(
+            Some(slot),
+            slot,
+            Some(TurnIndex(4)),
+            TurnIndex(4)
+        ));
+    }
+
+    #[test]
+    fn an_older_turn_of_the_slots_own_conversation_is_windowed() {
+        let slot = tl(7);
+        assert!(!keeps_reasoning(
+            Some(slot),
+            slot,
+            Some(TurnIndex(4)),
+            TurnIndex(2)
+        ));
+    }
+
+    /// **The regression this guards.** A projection that spans timelines —
+    /// retrieval, or a forked conversation inheriting its ancestors — must not
+    /// let a borrowed conversation's last turn arrive with its reasoning. Read
+    /// as the slot's own most recent thought, an inherited "I already read that
+    /// file" makes the next turn skip its own work.
+    #[test]
+    fn an_inherited_conversations_newest_turn_is_windowed() {
+        let slot = tl(7);
+        let ancestor = tl(3);
+        assert!(
+            !keeps_reasoning(Some(slot), ancestor, Some(TurnIndex(1)), TurnIndex(1)),
+            "the newest turn of a FOREIGN timeline is not the slot's live turn",
+        );
+    }
+
+    /// With no slot identity there is no turn being continued, so nothing keeps
+    /// its reasoning — windowing is the safe direction.
+    #[test]
+    fn without_a_slot_target_nothing_keeps_its_reasoning() {
+        assert!(!keeps_reasoning(
+            None,
+            tl(3),
+            Some(TurnIndex(1)),
+            TurnIndex(1)
+        ));
+    }
 
     /// The island cache's retention contract: an entry survives exactly
     /// [`GLUE_ISLAND_RETAIN_GENERATIONS`] capture passes untouched, and a

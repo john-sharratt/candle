@@ -88,6 +88,7 @@
   .zmd .tool-call-arg.dflt .tool-call-arg-key, .zmd .tool-call-arg.dflt .tool-call-arg-val { color: #6f6a64; }
   .zmd .tool-call-arg.dflt .tool-call-arg-val { font-style: italic; }
   .zmd .tool-call-name, .zmd .tool-call-badge { flex-shrink: 0; }
+  .zmd .tool-call-repo { color: #9a9490; font-size: .74rem; padding: 0 .35rem; border: 1px solid #3a3632; border-radius: 3px; white-space: nowrap; flex-shrink: 0; }
   .zmd .tool-call-subject { color: #c7bdb0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .zmd .tool-call-detail { color: #7d766e; font-size: .76rem; white-space: nowrap; flex-shrink: 0; }
   .zmd details.tool-call-card > summary.tool-call-header { cursor: pointer; list-style: none; user-select: none; }
@@ -236,6 +237,20 @@
   }
   @media (max-width: 560px) { .z-dial-label { display: none !important; } }
   .z-chatscroll > div:last-child { margin-bottom: 2.5rem !important; }
+  /* The daemon's background ingestion backlog, under the chat and above the
+     composer (GET /v1/status -> `ingest_backlog`). Not the startup screen:
+     this is an already-ready daemon draining a repo-map + code-reading queue,
+     so it is a thin strip that takes its own height out of the chat's,
+     nothing more. `z-index` lifts it over the composer's fade-to-background
+     gradient, which is an absolute child reaching 2rem ABOVE the composer and
+     would otherwise paint across this strip. Fill + track copied from
+     .z-load-bar/.z-load-track so the two bars in this app read as the same bar. */
+  .z-ingest { flex-shrink: 0; position: relative; z-index: 1; display: flex; align-items: center; gap: .6rem; background: #1c1917; border-top: 1px solid #2a2622; }
+  .z-ingest-label { flex-shrink: 0; font-size: .7rem; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: #8a7b6a; }
+  .z-ingest-track { flex: 1; min-width: 0; height: 6px; background: #2a2724; border-radius: 3px; overflow: hidden; }
+  .z-ingest-fill { height: 100%; background: linear-gradient(90deg, #c98a3e, #e0a85a); width: 0%; transition: width .25s ease-out; }
+  .z-ingest-item { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace,monospace; font-size: .7rem; color: #5e554c; }
+  .z-ingest-count { flex-shrink: 0; font-size: .72rem; color: #8a8074; font-variant-numeric: tabular-nums; }
   /* The open conversation's header: its title, which opens the conversation's
      own actions. The padding clears the floating Appearance button on the left
      and the top-right actions, which sit over the header's ends. */
@@ -378,7 +393,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     try { localStorage.setItem(key, String(value)); } catch (_) {}
   }
   // The tools modes, by wire id, in dial order — a mode's level is its index.
-  const TOOL_MODE_IDS = ['none', 'restricted', 'comprehensive', 'mutable'];
+  const TOOL_MODE_IDS = ['none', 'restricted', 'comprehensive'];
   // Which of those this caller may use, and the one it starts at: from
   // GET /v1/me (`loadAccess`). Until that answers the page assumes the least —
   // the daemon holds a mode above the caller's role to Restricted regardless,
@@ -462,7 +477,23 @@ import { estateSwitcher } from './common/lib/estate.js';
     lastUploadedId: null,
     fileView: null,
     thinkOpen: {},
+    // Which tool cards the reader has opened, keyed conv:msg:toolIndex.
+    //
+    // A `<details>` keeps its own open state, and that state lives only in the
+    // element — so every rebuild dropped it. The card is re-emitted from a
+    // string with no `open` attribute by `render()`, by `hydrateConv()`, and,
+    // the one that made it look spontaneous, by `liveUpdateStreaming()`: a
+    // reader opens a finished tool card while the next tool runs, and the next
+    // stream event a few seconds later replaces the bubble's innerHTML and the
+    // card shuts. `thinkOpen` already did this for think blocks; tool cards were
+    // never wired up. Keyed per card rather than per message, so opening one
+    // does not open its siblings.
+    toolOpen: {},
     upload: null,
+    // The daemon's background ingestion backlog (GET /v1/status
+    // `ingest_backlog`) — `{ processed, total, last_item }`, or null when
+    // there is none to show.
+    ingestBacklog: null,
     // `connecting` until the daemon first answers (a quiet splash); the startup
     // card only when it reports that it is actually loading.
     boot: { state: 'connecting' },
@@ -541,8 +572,20 @@ import { estateSwitcher } from './common/lib/estate.js';
     const zmd = row && row.querySelector('.zmd');
     if (!zmd) { render(); return; }   // not laid out yet — fall back to full render
     const open = !!S.thinkOpen[conv.id + ':' + idx];
+    // The hover popover is parented to `<body>` and hidden by the bar's own
+    // `mouseleave`. The write below destroys the hovered bar outright, so that
+    // event never fires and the popover is left floating at fixed coordinates —
+    // over and past the block it described — until the next full `render()`.
+    // `render()` hides it for exactly this reason; the streaming patch did not.
+    hideProjPopover();
     zmd.innerHTML = nodeHtml(m, open);
-    if (!S.narrow) applyProjSegments(zmd, m);
+    restoreToolOpen(zmd, conv.id, idx);
+    // The bars are measured against the DOM's current layout, which keeps
+    // shifting turn by turn while this message is still streaming — showing
+    // them mid-stream means they never line up with what they're pointing
+    // at. Skip while active; the completed-turn render below draws them once
+    // the layout has settled.
+    if (!S.narrow && !m.streaming) applyProjSegments(zmd, m);
     // Keep any live thinking ticker scrolled to its tail so the newest words sit at
     // the right and roll leftward through the fade as more stream in.
     zmd.querySelectorAll('.think-ticker').forEach((t) => { t.scrollLeft = t.scrollWidth; });
@@ -679,28 +722,44 @@ import { estateSwitcher } from './common/lib/estate.js';
     return { raw, isError, obj };
   }
   // A one-line account of what a call touched, for the collapsed header: the
-  // file or folder it named, then what came back — the excerpt's line range for
-  // a read, the entry count for a listing. Any other tool shows its first string
-  // argument. Either part is empty when there is nothing to say.
+  // file or folder it named, then what came back — the excerpt's page and line
+  // range for a read, the entry count for a listing. Any other tool shows its
+  // first string argument. Either part is empty when there is nothing to say.
+  // A read or a listing also names its repository: a workspace holds several,
+  // and `src/lib.rs` alone does not say which one's was read.
   function toolSubject(name, args, resp) {
+    const repo = (name === 'file_read' || name === 'file_list') && typeof args.repo === 'string' ? args.repo : '';
     let subject = '';
-    if (typeof args.path === 'string') subject = args.path;
-    else if ('prefix' in args || name === 'file_list') subject = args.prefix || 'project root';
-    else {
+    if (name === 'file_list') {
+      // Only file_list gives an empty path a meaning of its own ("the
+      // project root") — anything else with an empty path just has an
+      // empty subject, handled by the branch below like any other string.
+      subject = (typeof args.path === 'string' && args.path) ? args.path : 'project root';
+    } else if (typeof args.path === 'string') {
+      subject = args.path;
+    } else {
       const first = Object.values(args).find((v) => typeof v === 'string' && v);
       if (first) subject = first;
     }
+    // The call's own page, shown even before a response has come back —
+    // `file_read`'s `page` is a required argument, so it is always present.
+    // The wire value is zero-based (page 0 is the top of the file); shown
+    // as one-based here, matching file_list's `paging.page + 1` below —
+    // "page 0" reads as a computer's off-by-one to a human, not the top.
     let detail = '';
-    // file_read's excerpt header: `\npath (lines 1-900):` / `(lines 47-93 of 900)` / `(empty)`.
-    const hdr = resp && /^\s*\S[^\n]*? \((lines \d+-\d+(?: of \d+)?|empty)\):/.exec(resp.raw);
-    if (hdr) detail = hdr[1];
+    if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + (args.page + 1);
+    // file_read's excerpt header, once the response lands: `\npath (page 0 of
+    // 5, lines 301-600 of 1420):` / `(empty)` — richer than the call alone.
+    // The page number is captured on its own so it can be shown one-based
+    // too; the rest of the header (total pages, line range) passes through
+    // as the tool itself renders it.
+    const hdr = resp && /^\s*\S[^\n]*? \((?:page (\d+) (of \d+, lines \d+-\d+ of \d+)|(empty))\):/.exec(resp.raw);
+    if (hdr) detail = hdr[3] || ('page ' + (Number(hdr[1]) + 1) + ' ' + hdr[2]);
     else if (resp && resp.obj && resp.obj.paging && typeof resp.obj.paging.total === 'number') {
       const p = resp.obj.paging;
       detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + (p.page + 1) + '/' + p.pages : '');
-    } else if (args.start_line != null || args.end_line != null) {
-      detail = 'lines ' + (args.start_line != null ? args.start_line : 1) + '-' + (args.end_line != null ? args.end_line : 'end');
     }
-    return { subject, detail };
+    return { repo, subject, detail };
   }
   // Every parameter the tool takes: the ones the call passed, in call order,
   // then the ones it left out — dimmed, with the default they took (the schema's
@@ -756,7 +815,12 @@ import { estateSwitcher } from './common/lib/estate.js';
   // `pendingCallCard` instead.
   // `tokens`: the output's length in tokens as it sits in the context, when
   // the daemon reported it.
-  function toolCard(json, complete, output, running, tokens) {
+  // `idx` is the card's position among the tool cards of its own message, and
+  // becomes its identity for the open state `restoreToolOpen` puts back after a
+  // rebuild. It is emitted as `data-tool` rather than resolved to an `open`
+  // attribute here, so the memoised HTML string stays independent of who has
+  // opened what.
+  function toolCard(json, complete, output, running, tokens, idx) {
     if (!complete) return pendingCallCard(json);
     let parsed;
     try { parsed = JSON.parse(json.trim()); } catch (e) { parsed = null; }
@@ -788,9 +852,10 @@ import { estateSwitcher } from './common/lib/estate.js';
         '</div><pre class="tool-call-out-body">' + esc(resp.raw) + '</pre></div>'
       : '';
     const sub = toolSubject(name, args, resp);
-    const subHtml = (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
+    const subHtml = (sub.repo ? '<span class="tool-call-repo">' + esc(sub.repo) + '</span>' : '') +
+      (sub.subject ? '<span class="tool-call-subject">' + esc(sub.subject) + '</span>' : '') +
       (sub.detail ? '<span class="tool-call-detail">' + esc(sub.detail) + '</span>' : '');
-    return '<details class="tool-call-card">' +
+    return '<details class="tool-call-card" data-tool="' + idx + '">' +
       '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + subHtml + badge +
       '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
       (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>';
@@ -882,7 +947,7 @@ import { estateSwitcher } from './common/lib/estate.js';
       else {
         const s = segs[parseInt(parts[i], 10)];
         if (s.kind === 'think') { html += renderThink(s, open); }
-        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running, toolTokens ? toolTokens[toolIdx] : null); toolIdx++; }
+        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running, toolTokens ? toolTokens[toolIdx] : null, toolIdx); toolIdx++; }
       }
     }
     return html;
@@ -916,6 +981,31 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (msg.streaming && msg.prefill && msg.toolOutputs && msg.toolOutputs.length) html += prefillCard(msg.prefill);
     if (msg.streaming) html += '<span class="zcursor"></span>';
     return html;
+  }
+  // A tool card's identity across rebuilds: the conversation, the message it
+  // sits in, and its position among that message's cards. Per card rather than
+  // per message — `thinkOpen` keys only to the message, so every think block in
+  // a bubble shares one flag, and repeating that here would make opening one
+  // tool card open its siblings.
+  function toolOpenKey(convId, msgIdx, toolIdx) {
+    return convId + ':' + msgIdx + ':' + toolIdx;
+  }
+  // Put back what the reader had opened, after any rebuild of a bubble.
+  //
+  // Called wherever `.zmd` innerHTML is written — the full render, and the
+  // streaming patch. Synchronous with the write, so the card never paints shut
+  // first. A card the reader has not touched has no entry and stays closed.
+  //
+  // The message index is passed rather than read from an enclosing
+  // `[data-msg]`: `buildChat` restores into a `zmd` it has not attached yet —
+  // the wrapper carrying `data-msg` is created around it on the next line — so
+  // a `closest` here would find nothing and silently restore nothing.
+  function restoreToolOpen(zmd, convId, msgIdx) {
+    const cards = zmd.querySelectorAll('details.tool-call-card');
+    for (let i = 0; i < cards.length; i++) {
+      const key = toolOpenKey(convId, msgIdx, cards[i].getAttribute('data-tool') || '0');
+      if (S.toolOpen[key]) cards[i].open = true;
+    }
   }
   // Memoized `nodeHtml` for FINISHED messages: a full render re-parses the whole
   // transcript's markdown otherwise, so a menu toggle or a 5s sync re-parses every
@@ -1720,7 +1810,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     if (S.dragActive) dropZone.appendChild(buildDragOverlay());
 
     return h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; background:#1c1917;' },
-      dropZone, buildComposer());
+      dropZone, buildIngestBar(), buildComposer());
   }
 
   // The open conversation's header: its title, which is also the button for
@@ -1857,8 +1947,12 @@ import { estateSwitcher } from './common/lib/estate.js';
         // the next frame because `zmd` isn't in the document yet (the scroller is
         // attached by the caller after buildChat returns), and getBoundingClientRect
         // needs it laid out. The live-stream path measures an already-attached
-        // node, so it calls applyProjSegments synchronously.
-        if (!S.narrow) applyProjSegments(zmd, m);
+        // node, so it calls applyProjSegments synchronously. Skipped for the
+        // turn still streaming — its layout keeps shifting token by token, so
+        // the bars would never stay aligned with what they're marking; it
+        // gets its bars once it finishes and this runs again as a settled turn.
+        restoreToolOpen(zmd, conv.id, idx);
+        if (!S.narrow && !m.streaming) applyProjSegments(zmd, m);
         scroller.appendChild(h('div', { 'data-msg': idx, class: 'z-turn z-selectable', style: 'display:flex; margin-bottom:2rem; padding-right:2rem;' }, zmd,
           turnCopyBtn(m, 'right:2rem;')));
       }
@@ -1965,17 +2059,49 @@ import { estateSwitcher } from './common/lib/estate.js';
     const spans = (m.spans || []).slice().sort((a, b) => (a.start_token || 0) - (b.start_token || 0));
     if (!spans.length) return;
     const isCursor = (el) => el.classList && el.classList.contains('zcursor');
+    // Blocks the projection count never saw, so they must not be indexed as if
+    // it had. `blockCountFor` counts `renderContent` alone; `nodeHtml` appends
+    // the prefill card and the error notice after it, and a `_blockEnd` frozen
+    // against the smaller universe then points past its own block.
+    const isExtra = (el) => el.classList
+      && (el.classList.contains('tool-prefill') || el.classList.contains('zerr'));
     const all = Array.from(zmd.children);
     const cursor = all.find(isCursor);
-    const blocks = all.filter((el) => !isCursor(el));
-    if (!blocks.length) return;
+    // Held aside, NOT dropped: this function rebuilds `zmd` from `blocks`, so
+    // anything filtered out and not put back is destroyed — which for `.zerr`
+    // means a failed turn losing the only thing that says it failed. Both are
+    // trailing elements (`nodeHtml` appends them after the content), so they go
+    // back after the segments and before the cursor.
+    const extras = all.filter(isExtra);
+    const blocks = all.filter((el) => !isCursor(el) && !isExtra(el));
+    if (!blocks.length) {
+      return;
+    }
     // Projections are POINTS at `start_token`; projection i governs `[start_i,
     // start_{i+1})`. Its bar therefore ends at the NEXT projection's position (the
     // last runs to the end). `maxTok` approximates the turn's total by the last
     // projection's position, so the tail past it maps coarsely.
     const maxTok = Math.max(1, ...spans.map((s) => s.start_token || 0));
     const boundTok = (i) => (i + 1 < spans.length ? (spans[i + 1].start_token || 0) : maxTok);
-    const boundary = (i) => spans[i]._blockEnd != null ? spans[i]._blockEnd : Math.round(boundTok(i) / maxTok * blocks.length);
+    // **Frozen bounds are used only while they still describe this block list.**
+    //
+    // `_blockEnd` is recorded per projection while the turn streams, against the
+    // block count at that moment. The count can then SHRINK: `onDone` re-renders
+    // with `streaming` false, which drops an unterminated `<think>` outright and
+    // folds an unterminated `<tool_call>` into one finished card. Every frozen
+    // bound is then past the end, `projOf` finds its first candidate for every
+    // block, and one bar is stretched over the whole bubble.
+    //
+    // Clamping each bound to `blocks.length` does NOT fix that, which is worth
+    // stating because it looks like it should: `projOf` only ever asks
+    // `boundary(i) > bi` for `bi < blocks.length`, so a bound at the length and a
+    // bound past it answer identically for every block. The bounds have to be
+    // abandoned, not trimmed — and all of them together, since a mix of frozen
+    // and estimated bounds is not a partition of anything.
+    const stale = spans.some((s) => s._blockEnd != null && s._blockEnd > blocks.length);
+    const boundary = (i) => (!stale && spans[i]._blockEnd != null)
+      ? spans[i]._blockEnd
+      : Math.round(boundTok(i) / maxTok * blocks.length);
     const projOf = (bi) => { for (let i = 0; i < spans.length; i++) { if (boundary(i) > bi) return i; } return -1; };
     // Points → intervals: stash each projection's governed length + throughput on
     // the span so the hover popover and panel header (which see one span at a time)
@@ -1994,6 +2120,11 @@ import { estateSwitcher } from './common/lib/estate.js';
     // whole-block bar. Needs `_charEnd` (live decode); reloaded turns lack it, so
     // they stay coarse. Incomplete (still-decoding) thinks have no range, so they
     // never split — that's what keeps the active bar from shrinking.
+    // A block that owns its bar outright: it is a unit the reader sees as one
+    // thing, so a bar shared with the prose around it reads as overflowing it.
+    const ownSegment = (el) => el.classList && (
+      el.classList.contains('think-block') || el.classList.contains('think-streaming')
+      || el.classList.contains('tool-call-card') || el.classList.contains('tool-author'));
     const clen = Math.max(1, (m.content || '').length);
     const subBars = (el) => {
       if (!(el.dataset && el.dataset.c0 != null)) return null;
@@ -2050,7 +2181,21 @@ import { estateSwitcher } from './common/lib/estate.js';
       // (top→bottom). The run stops at a splittable think so it gets its own seg.
       const a = projOf(gi);
       let gj = gi;
-      while (gj < blocks.length && projOf(gj) === a && !subBars(blocks[gj])) gj++;
+      // A run never crosses a think block or a tool card, whether or not that
+      // block can be split into sub-bars.
+      //
+      // `subBars` returns null for anything without a `data-c0/c1` range, and
+      // only a COMPLETED think block carries one — a streaming think has none,
+      // and a tool card never has one at all. So while the model was thinking,
+      // the live block was absorbed into the run of whatever projection owned
+      // the prose around it, and that run's single top-to-bottom bar visibly ran
+      // past the block at both ends. It came right on its own once the turn
+      // settled, because the finished think then split and took its own segment
+      // — which is exactly the "fine once everything finishes" in the report.
+      do { gj++; } while (
+        gj < blocks.length && projOf(gj) === a
+        && !subBars(blocks[gj]) && !ownSegment(blocks[gj]) && !ownSegment(blocks[gj - 1])
+      );
       const seg = h('div', { style: 'position:relative; padding-left:1.15rem;' });
       if (a >= 0) {
         const bar = barFor(spans[a], a);
@@ -2065,6 +2210,15 @@ import { estateSwitcher } from './common/lib/estate.js';
       gi = gj;
     }
     for (let si = 0; si < segs.length - 1; si++) segs[si].style.marginBottom = '0.6rem';
+    // In the same gutter as every segment, so the prefill card and the error
+    // notice line up with the blocks above them instead of sitting a bar's width
+    // to their left. They carry no bar of their own — no projection governs
+    // them, which is why they are out of `blocks` in the first place.
+    if (extras.length) {
+      const tail = h('div', { style: 'padding-left:1.15rem;' });
+      for (let i = 0; i < extras.length; i++) tail.appendChild(extras[i]);
+      frag.appendChild(tail);
+    }
     if (cursor) frag.appendChild(cursor);
     zmd.innerHTML = '';
     zmd.appendChild(frag);
@@ -2149,6 +2303,71 @@ import { estateSwitcher } from './common/lib/estate.js';
     return 'display:flex; align-items:center; justify-content:center; width:36px; height:32px; border-radius:8px; border:1px solid ' + (activeOn ? '#6a6258' : '#50493f') + '; background:' + (activeOn ? '#37322d' : '#2e2a26') + '; color:' + (activeOn ? '#ece8e4' : '#cfc8c0') + '; cursor:pointer; box-shadow:0 12px 30px rgba(0,0,0,0.72), 0 3px 8px rgba(0,0,0,0.5);';
   }
 
+  // ── ingest backlog bar ───────────────────────────────────────────────────
+  // The daemon's background ingestion queue (repo map + code reading, plus
+  // uploads, which share the same pool) draining while the app is up and
+  // usable — not the startup overlay, which is a separate full-page gate for
+  // a daemon that is not ready yet. `null` (skipped by `h`, so the chat takes
+  // the height straight back) whenever the daemon reports no backlog:
+  // appearing and disappearing is the node being in the tree or not, like
+  // every other show/hide in this file.
+  //
+  // `total` climbs while the queue drains — a file changed mid-pass is more
+  // work, not a miscount — so the fill can slip backwards. That is the truth
+  // of the queue and is left visible; the readout on the right is what
+  // REMAINS, which is the number that only ever means one thing.
+  const INGEST_ITEM_MAX = 56;
+  function ingestView(b) {
+    const total = b.total || 0;
+    // `processed` is clamped so a poll that catches a grown total late can
+    // never render a fill past 100% or a negative remainder.
+    const processed = Math.min(b.processed || 0, total);
+    const item = b.last_item || '';
+    return {
+      total, processed,
+      pct: total > 0 ? Math.round((processed / total) * 100) : 0,
+      left: Math.max(0, total - processed).toLocaleString() + ' left',
+      item,
+      // A path's tail (the file) identifies it; its head is repeated
+      // boilerplate — clamp from the left. The CSS ellipsis then handles
+      // whatever the row still can't fit.
+      itemTxt: item.length > INGEST_ITEM_MAX ? '…' + item.slice(-(INGEST_ITEM_MAX - 1)) : item,
+    };
+  }
+  function buildIngestBar() {
+    const b = S.ingestBacklog;
+    if (!b) return null;
+    const v = ingestView(b);
+    // Narrow: the count alone, against the fill. There is no room for a path
+    // on a phone, and the eyebrow would cost more width than it explains.
+    return h('div', { id: 'zend-ingest', class: 'z-ingest', style: 'padding:0.3rem ' + (S.narrow ? '0.85rem' : '2rem') + ' 0.35rem;' },
+      S.narrow ? null : h('span', { class: 'z-ingest-label' }, 'Indexing'),
+      h('div', { class: 'z-ingest-track', role: 'progressbar', 'aria-label': 'Workspace indexing backlog', 'aria-valuemin': '0', 'aria-valuemax': String(v.total), 'aria-valuenow': String(v.processed) },
+        h('div', { class: 'z-ingest-fill', style: 'width:' + v.pct + '%;' })),
+      S.narrow ? null : h('span', { class: 'z-ingest-item', title: v.item || null }, v.itemTxt),
+      h('span', { class: 'z-ingest-count' }, v.left));
+  }
+  // A counter tick with the bar already on screen: move the fill and the
+  // labels in place rather than rebuilding the page. A full render every
+  // second would tear the chat down under a selection the user is mid-copy
+  // — the same reason streamed tokens patch their own bubble
+  // (`liveUpdateStreaming`) — and nothing outside this strip reads the
+  // backlog. Falls back to a full render if the strip isn't in the DOM
+  // (it just appeared or disappeared), exactly as the streaming patch does.
+  function patchIngestBar() {
+    const b = S.ingestBacklog;
+    const bar = document.getElementById('zend-ingest');
+    if (!b || !bar) { render(); return; }
+    const v = ingestView(b);
+    const track = bar.querySelector('.z-ingest-track');
+    track.setAttribute('aria-valuemax', String(v.total));
+    track.setAttribute('aria-valuenow', String(v.processed));
+    bar.querySelector('.z-ingest-fill').style.width = v.pct + '%';
+    bar.querySelector('.z-ingest-count').textContent = v.left;
+    const item = bar.querySelector('.z-ingest-item');
+    if (item) { item.textContent = v.itemTxt; item.setAttribute('title', v.item); }
+  }
+
   // ── composer ─────────────────────────────────────────────────────────────
   function buildComposer() {
     const conv = activeConv();
@@ -2214,7 +2433,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', pref: 'zend.verbosity', ticksGrow: false, glyph: GLYPH_LINES },
     // `allowed` limits the menu to the levels this caller may use, and `clamp`
     // turns the level asked for into the one a turn will use (GET /v1/me).
-    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive', 'Mutable'], subs: ['no tools', 'safe tools only', 'every tool', 'every tool, edits files on disk'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true, allowed: toolsAllowed, clamp: clampTools },
+    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive'], subs: ['no tools', 'files and git reads', 'every tool'], key: 'toolsLevel', pref: 'zend.tools', ticksGrow: false, icon: HAMMER_SVG, glyph: HAMMER_SVG, zeroable: true, allowed: toolsAllowed, clamp: clampTools },
   };
   function buildDial(which) {
     const d = DIALS[which];
@@ -3217,6 +3436,16 @@ import { estateSwitcher } from './common/lib/estate.js';
       const turn = det.closest('[data-msg]');
       if (turn) { const key = S.activeId + ':' + turn.getAttribute('data-msg'); S.thinkOpen = Object.assign({}, S.thinkOpen, { [key]: det.open }); }
     }
+    // The same for a tool card, which had no such record and so lost its open
+    // state to every rebuild — including the streaming patch that runs while
+    // the reader is looking at it.
+    if (det && det.classList && det.classList.contains('tool-call-card')) {
+      const turn = det.closest('[data-msg]');
+      if (turn) {
+        const key = toolOpenKey(S.activeId, turn.getAttribute('data-msg'), det.getAttribute('data-tool') || '0');
+        S.toolOpen = Object.assign({}, S.toolOpen, { [key]: det.open });
+      }
+    }
     // No reposition needed: the bar gutter is align-self:stretch, so when a
     // think block expands/collapses the bars re-flow by CSS % automatically.
   }, true);
@@ -3330,7 +3559,17 @@ import { estateSwitcher } from './common/lib/estate.js';
   // way. `lastStartedAt` tracks the daemon's start stamp to detect restarts.
   let lastStartedAt = null;
   let reloadPolling = false;
+  // The sidebar's own refresh floor: `refreshConversationList` stays on a
+  // 5s cadence even when the status poll itself speeds up for the ingest
+  // bar below — the conversation list hasn't started changing any faster
+  // just because files are being indexed.
+  let lastListSync = 0;
   const LOADING_BOOT = (label) => ({ state: 'loading', detail: '', loading: { current: label, progress: 0, completed: [] } });
+  // Status-poll cadence: 5s at rest; 1s while a background ingestion backlog
+  // is draining, so the bar under the chat climbs continuously instead of in
+  // five-second steps — the cadence `pollStatus` already uses on this same
+  // endpoint during boot.
+  const SYNC_IDLE_MS = 5000, SYNC_BUSY_MS = 1000;
 
   // `prefetchedList`: see `initConversations`. Only the first poll has one — a
   // list fetched while the daemon was still loading would be empty.
@@ -3341,6 +3580,10 @@ import { estateSwitcher } from './common/lib/estate.js';
         reloadPolling = false;
         if (st.started_at_ms != null) lastStartedAt = st.started_at_ms;
         S.boot = null;
+        // A backlog is most likely right after startup: take it from the
+        // poll that unlocked the chat, so the bar is there on the first real
+        // paint instead of up to a cadence later.
+        S.ingestBacklog = st.ingest_backlog || null;
         initConversations(prefetchedList);
         loadToolSchemas();
       } else {
@@ -3386,7 +3629,7 @@ import { estateSwitcher } from './common/lib/estate.js';
   // and keep the sidebar in sync.
   function periodicSync() {
     if (reloadPolling) return;   // a reload poll already owns the loading screen
-    Promise.resolve(API.getStatus()).then((st) => {
+    return Promise.resolve(API.getStatus()).then((st) => {
       if (checkBuild(st)) return;   // build changed -> reloading
       if (!st || st.state !== 'ready') {
         // Daemon is mid-reload (restart / model reload). Drop back to the
@@ -3404,14 +3647,25 @@ import { estateSwitcher } from './common/lib/estate.js';
       const m = st.maintenance || null;
       const prevM = JSON.stringify(S.maintenance || null);
       if (JSON.stringify(m) !== prevM) S.maintenance = m;
+      // The background-ingestion bar under the chat, from the same poll.
+      // Presence changes the layout (the chat gives up the strip's height),
+      // so appearing or clearing needs the full rebuild; a counter tick does
+      // not.
+      const hadBacklog = !!S.ingestBacklog;
+      S.ingestBacklog = st.ingest_backlog || null;
+      const backlogToggled = hadBacklog !== !!S.ingestBacklog;
       if (lastStartedAt !== null && st.started_at_ms && st.started_at_ms !== lastStartedAt) {
         lastStartedAt = st.started_at_ms;
         S.loaded = {};
         initConversations();   // daemon restarted — reload from scratch
       } else {
         if (st.started_at_ms) lastStartedAt = st.started_at_ms;
-        refreshConversationList();
-        if (JSON.stringify(m) !== prevM) render();
+        // The sidebar keeps its own 5s cadence even when the status poll runs
+        // at 1s for the backlog bar: it is a second endpoint per tick, and
+        // the conversation list has not started changing any faster.
+        if (Date.now() - lastListSync >= SYNC_IDLE_MS) { lastListSync = Date.now(); refreshConversationList(); }
+        if (backlogToggled || JSON.stringify(m) !== prevM) render();
+        else if (S.ingestBacklog) patchIngestBar();
       }
     }).catch(() => {
       // Unreachable — daemon almost certainly restarting. Show the loading
@@ -3431,7 +3685,22 @@ import { estateSwitcher } from './common/lib/estate.js';
   // says so: one round trip to the first real paint, not two in a row.
   const firstList = Promise.resolve(API.seedConversations(now)).catch(() => null);
   pollStatus(firstList);
-  setInterval(periodicSync, 5000);
+  // One status poll in flight at a time: the next tick is scheduled when the
+  // last settles, so a slow daemon can never stack requests, and the wait is
+  // chosen fresh each time from `S.ingestBacklog` as THAT tick left it — a
+  // backlog that appears speeds the next tick up immediately rather than a
+  // cadence later. The one exception is the very first call: `pollStatus`'s
+  // own result (which is what actually sets `S.ingestBacklog` for the first
+  // time) hasn't landed yet at this synchronous point, so guessing from it
+  // here would default to the slow cadence even when a backlog already
+  // exists. Forcing the first tick to the busy cadence costs one redundant
+  // early poll at rest, and correctly picks up a real backlog within 1s
+  // instead of stalling on it for up to `SYNC_IDLE_MS`.
+  function scheduleSync(delay) {
+    const wait = delay != null ? delay : (S.ingestBacklog ? SYNC_BUSY_MS : SYNC_IDLE_MS);
+    setTimeout(() => { Promise.resolve(periodicSync()).then(scheduleSync, scheduleSync); }, wait);
+  }
+  scheduleSync(SYNC_BUSY_MS);
 })();
 </script>
 </body>

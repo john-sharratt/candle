@@ -303,7 +303,7 @@ pub struct Runtime {
     /// the authored state — which needs this runtime to answer its own routes.
     /// One of the two has to exist first, and it is this one.
     clock: RwLock<Option<WorldClock>>,
-    /// **The daemon's one handle to `data/.substrate/`**, opened by the
+    /// **The daemon's one handle to `data/substrate/`**, opened by the
     /// character registry and adopted here rather than opened a second time.
     ///
     /// Installed after construction for the same reason the clock is: the
@@ -2765,8 +2765,8 @@ fn load(
 
     // **The engine adopts the daemon's substrate; it does not open one.**
     //
-    // The character registry opened `--data/.substrate/` at startup and goes on
-    // appending character records to it. One `.substrate/` admits exactly one
+    // The character registry opened `--data/substrate/` at startup and goes on
+    // appending character records to it. One `substrate/` admits exactly one
     // writable handle per process — the log is opened read-write and unlocked,
     // so a second is a second append cursor and a second record index, and a
     // compaction carries forward only what its own handle walked. This daemon
@@ -2775,7 +2775,7 @@ fn load(
     // Naming a path here instead would also revive an older failure: unset, the
     // conversation layer falls back to the *process working directory*, so a
     // daemon launched from the repo root wrote its redo log to
-    // `candle/.substrate` while the character store sat correctly under
+    // `candle/substrate` while the character store sat correctly under
     // `--data`. `/v1/substrate/storage` reports on `--data` and showed 65 MB
     // while the real log reached **190 GB** across a morning of re-ingests. It
     // filled the disk, and surfaced as a linker error.
@@ -4798,7 +4798,7 @@ mod tests {
     /// The conversation layer's `workspace_path` falls back to the *process
     /// working directory*, so a runtime that does not carry `--data` cannot pass
     /// it on and the redo log lands wherever the daemon was launched from. That
-    /// happened: the character store sat correctly in `npcd/.substrate` at 65 MB
+    /// happened: the character store sat correctly in `npcd/substrate` at 65 MB
     /// while the real log grew to **190 GB** in the repo root, invisible to
     /// `/v1/substrate/storage`, until it filled the disk and surfaced as a
     /// linker error.

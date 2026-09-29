@@ -1,0 +1,70 @@
+name: git_merge
+questions:
+- my commit was refused, bring in what changed
+- pull in the latest from origin
+- merge main into this branch
+- someone else pushed, get their changes
+- update my branch with what is on origin
+- bring the release branch into mine
+- get the newest commits before I commit
+- my branch is behind origin, catch it up
+- merge the hotfix branch into my work
+- fold origin's changes into what I have
+- sync with the remote before committing
+- the commit says there are commits I do not have
+- merge that commit into my branch
+- catch up with main
+- incorporate the upstream changes
+- git pull
+category: Git
+description: 'Bring other commits into your files in a repository — by default, what others pushed to your branch on origin since you started, which is what a refused git_commit is waiting for. The merge happens in your own files and nowhere else: where both sides changed the same lines, both are kept between <<<<<<< and >>>>>>> markers and the file is listed in `conflicts` until you settle it by writing it as it should be. Then git_commit publishes the result; a new merge waits until every conflict is settled. `from` merges another branch or commit instead. Use for "pull in the latest", "merge main into this", "my commit was refused". Reads origin; writes only your files.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    RevArg:
+      description: 'A revision. `kind` picks the form and `name` carries its value.'
+      properties:
+        back:
+          description: For `parent` only — how many commits back. Defaults to 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        kind:
+          description: 'Which form: `head` (your own commit, needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          enum:
+          - head
+          - branch
+          - tag
+          - ref
+          - commit
+          - remote_branch
+          - upstream
+          - parent
+          type: string
+        name:
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
+          type: string
+      required:
+      - kind
+      type: object
+  properties:
+    from:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: What to merge in. Leave it out for your branch as origin holds it now — what a refused commit is waiting for.
+    repo:
+      description: The repository. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  title: MergeRequest
+  type: object
+examples:
+- my commit was refused, merge in what origin has<|im_end|>
+- pull the latest changes into candle<|im_end|>
+- merge main into my feature branch<|im_end|>
+- someone pushed to main, bring their work into mine<|im_end|>
+- catch my branch up with origin before I commit<|im_end|>
+- merge the release branch into this one<|im_end|>

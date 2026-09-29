@@ -155,11 +155,29 @@
         // empty bubble and no way to tell whether the model had nothing to say
         // or the daemon had died. The caller gets `onError` and decides;
         // `onDone` still runs after it, so the composer always unlocks.
-        // Any status but 200 means no turn started: every request that reaches
-        // the daemon's handler is answered 200 and streamed. A 408 from the edge
-        // on a slow uplink is one of these.
+        // Any status but 200 means no turn started. The daemon streams every
+        // request it accepts, and rejects the rest before submitting anything —
+        // a malformed turn (`400`, e.g. a missing `conv_id`) or a 408 from the
+        // edge on a slow uplink are both of these. A rejection carries an
+        // OpenAI-shaped `{ error: { message } }` body saying what was wrong, and
+        // that reason is worth more to the user than the bare status, so it is
+        // read before reporting. Parsing may itself fail — the edge's 408 is
+        // HTML — in which case the status stands on its own.
         if (!resp.ok) {
-          fail(handlers, 'The request failed with HTTP ' + resp.status + ' before the turn started.', false);
+          const status = 'HTTP ' + resp.status;
+          resp
+            .json()
+            .then((body) => (body && body.error && body.error.message) || '')
+            .catch(() => '')
+            .then((detail) => {
+              fail(
+                handlers,
+                detail
+                  ? status + ' before the turn started: ' + detail
+                  : 'The request failed with ' + status + ' before the turn started.',
+                false,
+              );
+            });
           return;
         }
         if (!resp.body) {

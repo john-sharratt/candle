@@ -5,9 +5,14 @@
 
 use std::sync::Arc;
 
-use super::head_gids::HeadGids;
 use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
+
+/// Everything one serialised chunk's headers dereference — the stub's form, which
+/// references nothing because the stub serialises nothing. Mirrors the real
+/// `gpu_chunks::ChunkPin` so the types a consumer holds do not change with the feature.
+#[derive(Clone, Debug)]
+pub struct ChunkPin;
 
 /// Serialised byte-size of one `TokenSlice` entry (mirrors the real implementation).
 #[allow(dead_code)]
@@ -62,7 +67,7 @@ impl GpuChunks {
     /// Empty, because the stub serialises nothing and so references no chunks.
     /// A consumer holding this across a launch is holding nothing, which is
     /// correct: without the feature there is no launch to outlive.
-    pub(crate) fn pins(&self) -> Arc<Vec<HeadGids>> {
+    pub(crate) fn pins(&self) -> Arc<Vec<ChunkPin>> {
         Arc::new(Vec::new())
     }
 

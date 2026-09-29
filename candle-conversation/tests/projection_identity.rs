@@ -224,7 +224,7 @@ fn init_tracing() {
 /// A private working directory, so the run is hermetic.
 ///
 /// `cargo test -p candle-conversation` runs with the CRATE directory as its
-/// cwd, which holds a `.substrate` left by other suites — and a substrate is
+/// cwd, which holds a `substrate` left by other suites — and a substrate is
 /// bound to the tokenizer that sealed it, so inheriting one belonging to a
 /// different model aborts the load outright. That refusal is correct (adopting
 /// another vocabulary would silently change what every recorded turn says); the

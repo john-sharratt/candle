@@ -1985,8 +1985,11 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
                     // sub-object is spliced in separately (§11), not declared
                     // here.
                     items: None,
+                    min_items: 0,
                     properties: None,
                     nullable: false,
+                    minimum: None,
+                    requires: Vec::new(),
                 })
                 .collect(),
         })

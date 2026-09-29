@@ -49,9 +49,11 @@
 //! case pays nothing for the generality and issues no scatter at all.
 
 use candle::{DType, Device, LiveTensor, Result};
+use candle_nn::kv_cache::WaveGeneration;
 
 use crate::models::latent_moe::scatter::{rows_scatter_inline, RowRun};
 use crate::models::quantized_matmul::QMatMul;
+use crate::models::wave_buffers::wave_empty;
 
 /// Project `x` through `weights` and split the result into parts of `widths`.
 ///
@@ -64,6 +66,7 @@ pub fn project_grouped<'w>(
     widths: &[usize],
     out_dtype: DType,
     what: &str,
+    wave: Option<&'w WaveGeneration>,
 ) -> Result<Vec<LiveTensor<'w>>> {
     if weights.is_empty() {
         candle::bail!("{what}: no projection weights");
@@ -72,7 +75,7 @@ pub fn project_grouped<'w>(
     for w in weights {
         outs.push(w.forward_live_as(x, out_dtype)?);
     }
-    split_group(outs, widths, what)
+    split_group(outs, widths, what, wave)
 }
 
 /// The splitting half of [`project_grouped`], for callers that produce the
@@ -82,10 +85,13 @@ pub fn project_grouped<'w>(
 /// int8 activation, so they go through `forward_dynamic` rather than
 /// `forward_live_as` and the outputs arrive already computed. The split is the
 /// same either way, and there is one definition of it so the two cannot drift.
+/// `wave` is the open layer phase, used only when the projection outputs carry
+/// no ticket of their own to inherit — see the block allocation below.
 pub fn split_group<'w>(
     outs: Vec<LiveTensor<'w>>,
     widths: &[usize],
     what: &str,
+    wave: Option<&'w WaveGeneration>,
 ) -> Result<Vec<LiveTensor<'w>>> {
     if outs.is_empty() {
         candle::bail!("{what}: no projection outputs");
@@ -158,7 +164,18 @@ pub fn split_group<'w>(
     // in the arena the projections already live in — not a pool allocation, and
     // not a memset: the scatter writes every byte of it, which is exactly the
     // condition invariant 6 requires for `alloc_uninit`.
-    let block = outs[0].empty_beside(rows * want, outs[0].dtype())?;
+    //
+    // **The operand does not always carry one.** A projection over a `Float`
+    // activation is the activation cloned — `to_dynamic` allocates nothing in
+    // that mode — so on a stack whose residual is pool-backed the whole group
+    // arrives ticketless and this block, the widest thing the projection
+    // allocates, fell to the pool with it. Rooting on the open phase instead is
+    // the same arena the ticketed path would have chosen; `wave` is `None` off
+    // CUDA and wherever no phase is open, which is the old behaviour exactly.
+    let block = match (outs[0].wave_ticket(), wave) {
+        (None, Some(_)) => wave_empty(rows * want, outs[0].dtype(), outs[0].device(), wave)?,
+        _ => outs[0].empty_beside(rows * want, outs[0].dtype())?,
+    };
 
     let mut runs = Vec::with_capacity(widths.len());
     let mut parts = Vec::with_capacity(widths.len());

@@ -36,7 +36,7 @@ use candle::{DType, Device, Result, Tensor};
 use candle_kernels::simple::qsa_score_paged::{run_qsa_score_paged, PAGE_WORDS};
 use candle_transformers::models::qwen4exp::config::IndexerConfig;
 use candle_transformers::models::qwen4exp::indexer::{
-    append_wave, AppendSpan, IndexCache, TailRoute,
+    append_wave, AppendSpan, IndexCache, TailRoute, PAGE_BLOCKS as KEY_PAGE_BLOCKS,
 };
 use candle_transformers::models::qwen4exp::paged_index::IndexPage;
 use candle_transformers::models::qwen4exp::qsa::IndexerWeights;
@@ -670,7 +670,8 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
         k_norm: Tensor::from_vec(seeded(D, 0xB0).iter().map(|v| v + 1.5).collect(), D, &dev)?,
     };
 
-    // Two pages, then a live tail of 300 appended tokens.
+    // Two pages, then a live tail long enough to reach three of the cache's key
+    // pages, so both routes read the tail across page boundaries.
     let pages = contiguous_pages(0, &[40, 23], &[RATIO, 2], 0xB1, D);
     let mut cache = IndexCache::new(D, &dev)?;
     for p in &pages {
@@ -678,14 +679,14 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
         cache.push_page(IndexPage::new(keys, p.last_cells), p.base, RATIO)?;
     }
     cache.place_pending()?;
-    let tail_tokens = 300usize;
+    let tail_tokens = (2 * KEY_PAGE_BLOCKS + 75) * RATIO;
     let raw = Tensor::from_vec(seeded(tail_tokens * D, 0xB2), (tail_tokens, D), &dev)?;
     let mut work = [AppendSpan {
         cache: &mut cache,
         start: 0,
         rows: tail_tokens,
     }];
-    append_wave(&mut work, &raw, &w, RATIO, 1e-6)?;
+    append_wave(&mut work, &raw, &w, RATIO, 1e-6, None)?;
 
     // The oracle's view: the pages, then the tail's stored rows where they sit.
     let tail_rows = cache.live_rows()?;
@@ -699,6 +700,7 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
         layout: Layout::Blocked,
     });
 
+    assert_eq!(n_tail, 2 * KEY_PAGE_BLOCKS + 75);
     let end = cache.page_token_span() + n_tail * RATIO;
     for &t in &[1usize, 8, 64, 65, 300] {
         let qpos: Vec<usize> = (0..t).map(|i| end - 1 - (i * 13) % end).collect();
@@ -719,6 +721,7 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
                 n,
                 0,
                 |_, _| route,
+                None,
             )?;
             let got = out.flatten_all()?.to_vec1::<f32>()?;
             // Columns past a row's candidates are the scorer's to leave alone on
@@ -869,7 +872,7 @@ fn bench_tail_routes() -> Result<()> {
             start: 0,
             rows: tokens,
         }];
-        append_wave(&mut work, &raw, &w, RATIO, 1e-6)?;
+        append_wave(&mut work, &raw, &w, RATIO, 1e-6, None)?;
         let n = cache.live_blocks();
         for &t in &[1usize, 8, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
             if t * n * 4 > 2 << 30 {
@@ -880,7 +883,19 @@ fn bench_tail_routes() -> Result<()> {
             let out = Tensor::zeros((t, n), DType::F32, &dev)?;
             let run = |route| {
                 cache
-                    .score_rows_routed(&q, &qpos, &cfg, RATIO, &table, 0, &out, n, 0, |_, _| route)
+                    .score_rows_routed(
+                        &q,
+                        &qpos,
+                        &cfg,
+                        RATIO,
+                        &table,
+                        0,
+                        &out,
+                        n,
+                        0,
+                        |_, _| route,
+                        None,
+                    )
                     .map(|_| ())
             };
             let (paged, _) = time_ms(&dev, 30, || run(TailRoute::Paged))?;

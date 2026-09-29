@@ -1,0 +1,104 @@
+name: git_grep
+questions:
+- search the release branch for that function definition
+- grep the repository at that tag for this pattern
+- where is this symbol defined on origin main
+- find every file that mentions this constant in that commit
+- was this string present before the refactor
+- run a case-insensitive search across the tracked files
+- look for this regex in the version on the release branch
+- which files reference that deprecated helper at head
+- search the committed content, not what is on disk
+- find the literal text in the checked-in sources at that revision
+- grep only under the kernels directory for that identifier
+- does that branch still contain the old macro name
+- search a past revision for this error message
+- find occurrences of that pattern in the tag we shipped
+- where did this variable appear in the committed tree
+- hunt for this regular expression across every tracked file
+- cap it at fifty matches per file and search for that call
+- is this todo comment still in the release branch
+- locate the definition in that commit without checking it out
+- which files matched that pattern in the previous revision
+category: Git
+description: '**Search what a COMMIT, BRANCH or TAG holds** — the committed content, not the files on disk. This is the tool for "search the committed files", "was this in the release branch", "did that tag still have it", "what did this look like before". Searches every file the revision tracks without checking it out, returning each matching file, line number and line, with a `count` of the total and `files_matched` distinct files. `pattern` is a POSIX extended regular expression, or a literal string when `fixed` is set; `ignore_case` matches without regard to case; `rev` chooses what to search and defaults to HEAD — the last commit, not the files on disk. Narrow with `paths`, and bound one file''s share with `max_per_file`. Binary files are skipped. **To search the working tree as it stands right now, uncommitted edits and untracked files included, use file_grep instead** — an untracked or since-edited file reads differently through the two. `page` is required, 40 matches a page: pass 0 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    RevArg:
+      description: 'A revision. `kind` picks the form and `name` carries its value.'
+      properties:
+        back:
+          description: For `parent` only — how many commits back. Defaults to 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        kind:
+          description: 'Which form: `head` (your own commit — the branch you are on as your files have it — needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          enum:
+          - head
+          - branch
+          - tag
+          - ref
+          - commit
+          - remote_branch
+          - upstream
+          - parent
+          type: string
+        name:
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
+          type: string
+      required:
+      - kind
+      type: object
+  properties:
+    fixed:
+      description: Treat `pattern` as a literal string rather than a regular expression. Defaults to false.
+      type: boolean
+    ignore_case:
+      description: Match without regard to case. Defaults to false.
+      type: boolean
+    max_per_file:
+      description: At most this many matches from any one file (1–100). Defaults to 20, so one generated file cannot crowd out every other hit.
+      format: uint32
+      maximum: 100.0
+      minimum: 1.0
+      type: integer
+    page:
+      description: Zero-based page of matches, 40 a page. Required — pass 0 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
+      format: uint32
+      minimum: 0.0
+      type: integer
+    paths:
+      description: Only search these repository-relative files or directories. Leave it out to search everything the revision tracks.
+      items:
+        type: string
+      type: array
+    pattern:
+      description: 'What to look for: a POSIX extended regular expression, or a literal string when `fixed` is set. Required.'
+      minLength: 1
+      type: string
+    repo:
+      description: The repository to search. Required.
+      minLength: 1
+      type: string
+    rev:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: The revision to search. Leave it out for the branch you are on — its last commit, not your uncommitted changes.
+  required:
+  - repo
+  - pattern
+  - page
+  title: GrepRequest
+  type: object
+examples:
+- search the release branch for that function definition<|im_end|>
+- grep candle at that tag for the timeout constant<|im_end|>
+- was this string still present in the previous revision<|im_end|>
+- find this regex under the kernels directory on main<|im_end|>
+- which committed files mention that deprecated helper<|im_end|>
+- do a case-insensitive search of the tracked sources for this name<|im_end|>
+- look for that literal error message in the commit we shipped<|im_end|>
+- where is this macro defined on origin main<|im_end|>

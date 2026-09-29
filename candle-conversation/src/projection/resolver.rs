@@ -2,7 +2,7 @@
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -21,17 +21,19 @@ use super::warm_pool;
 use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDivergence};
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
-use crate::persistence::manifest::{self, RecordLoc};
+use crate::persistence::manifest::{self, ConvState, RecordLoc};
 use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SnapshotPayload,
     TreeMetadataPayload,
 };
-use crate::persistence::resume::TurnChunkGrid;
+use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
+use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::{SharedSubstrate, SubstratePersistence};
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
@@ -339,6 +341,14 @@ pub struct Conversation {
     /// turn or chunk stays RAM-resident. Read once from the handle at
     /// construction; a handle's mode never changes.
     read_only: bool,
+    /// Serialises conversation-state writes, from the in-RAM change to the
+    /// enqueue of the record carrying it. A `ConvState` record holds the whole
+    /// state, so two updates enqueued in the opposite order to the one they
+    /// changed RAM in would leave the older state winning on replay — a
+    /// branch set, then lost to an archive that read the state before it.
+    /// Held only by these writes, never by the writer thread, so holding it
+    /// across an enqueue that waits on backpressure cannot deadlock.
+    conv_state_writes: Arc<Mutex<()>>,
     /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
     /// in, removed when the last clone of that conversation drops.
     ///
@@ -487,6 +497,7 @@ impl Conversation {
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
             read_only: false,
+            conv_state_writes: Arc::default(),
             // The directory goes when the last clone of this conversation does.
             // See the field's own note for what it cost not to have this.
             ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
@@ -534,6 +545,7 @@ impl Conversation {
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
             read_only,
+            conv_state_writes: Arc::default(),
         }
     }
 
@@ -1467,7 +1479,9 @@ impl Conversation {
                 match self.fold_warm_probes(taught, &probes, arena) {
                     Some(true) => warm.gpu_probes += probes.len(),
                     Some(false) => {}
-                    // A shutdown asked: the warm-up must end with its session.
+                    // It did not complete — a shutdown asked, or the GPU scan
+                    // failed and the host cannot stand in for it. Either way the
+                    // warm-up ends here with whatever it has already learned.
                     None => return warm,
                 }
             }
@@ -1488,8 +1502,10 @@ impl Conversation {
     /// whole-turn scores against `taught`'s gallery, observed under the probe's
     /// stream id, exactly as the seal-time scan observes it. `Some(true)` when
     /// the GPU arena scored them, `Some(false)` for the CPU (no arena, a
-    /// non-additive law the arena does not scan, an empty gallery, or a launch
-    /// that failed), `None` when a shutdown stopped it part-way.
+    /// non-additive law the arena does not scan, or an empty gallery — the cases
+    /// that never reach a kernel and are cheap on the host), `None` when it did
+    /// not complete: a shutdown stopped it, or the GPU scan failed on a gallery
+    /// the host cannot finish.
     fn fold_warm_probes(
         &self,
         taught: &SectionCollection,
@@ -1535,7 +1551,6 @@ impl Conversation {
                     n_cases: n,
                 }];
                 let mut raw = Vec::with_capacity(queries.len());
-                let mut scanned = true;
                 for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
                     if ingest_cancelled() {
                         return None;
@@ -1543,16 +1558,38 @@ impl Conversation {
                     match arena.scan_weighted(&segments, batch, weights) {
                         Ok(out) => raw.extend(out),
                         Err(e) => {
+                            // **A failed GPU scan does NOT fall back to the CPU.**
+                            //
+                            // The CPU path below is a per-query walk of the whole
+                            // gallery. It is the right answer for the cheap cases
+                            // that never reach a kernel (no arena, an empty gallery,
+                            // a fusion law the arena does not scan) — but a gallery
+                            // big enough to want the GPU is one the host cannot
+                            // finish. Measured: a `CUDA_ERROR_INVALID_CONTEXT` here
+                            // put eight cores at 100% with the GPU idle and boot
+                            // never completed — 900 s and still going, which is the
+                            // same half-hour stall `warm_collection_normalization`
+                            // already records above.
+                            //
+                            // Warm-up is an optimisation: skipping it leaves this
+                            // collection's levels cold for the session, which costs
+                            // ranking quality. Hanging the boot costs everything.
                             tracing::warn!(
                                 target: "candle_conversation::provenance",
-                                "GPU warm-up scan unavailable, using CPU: {e}"
+                                collection = %taught.name,
+                                windows = windows.len(),
+                                probes = probes.len(),
+                                "GPU warm-up scan FAILED: {e} — abandoning this \
+                                 collection's warm-up rather than falling back to a \
+                                 host scan that cannot finish a gallery this size. \
+                                 Its hit levels stay COLD for this session, so its \
+                                 members' scores are not comparable to each other."
                             );
-                            scanned = false;
-                            break;
+                            return None;
                         }
                     }
                 }
-                scanned.then_some(raw)
+                Some(raw)
             }
             _ => None,
         };
@@ -1615,19 +1652,27 @@ impl Conversation {
         let t_warm = Instant::now();
         let mut warmed_timelines = 0usize;
         for layer in &schema.layers {
-            // Out of retrieval ⇒ nothing to warm. A hit level is a denominator
-            // for candidates this layer might return, and a non-gathered layer
-            // returns none, so warming it would spend the probe budget learning
-            // levels that can never be read. (`score_belief_groups` declines the
-            // same layer, so `warm_normalization_from_substrate` needs no guard
-            // of its own — it warms THROUGH that call.)
-            if !layer.gathered {
-                continue;
-            }
+            // This function only ever warms an append-only ingest layer — the
+            // loop body below is unreached otherwise, so this is the real
+            // filter; a leftover `!layer.gathered` check used to sit ahead of
+            // it and is deliberately gone (see below).
             let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
             if !is_ingest {
                 continue;
             }
+            // `gathered = false` promises "no OTHER conversation draws from
+            // this layer" — it does NOT mean nothing reads it at all. An
+            // append-only layer's own conversations score self-local
+            // (`score_belief_groups` exempts a layer scoring its own target
+            // regardless of `gathered`, for the same reason this warm still
+            // has a reader to serve). A `!layer.gathered` skip here used to
+            // run ahead of the `is_ingest` check above, so it silently
+            // matched exactly the ingest layers this loop exists to warm —
+            // the moment one was taken out of cross-layer gather (`zend`'s
+            // provenance-injection exclusion for `code_reading`/`repo_map`),
+            // its own turns went cold forever: no later pass ever warmed
+            // them, so a conversation several turns into its own history
+            // could no longer retrieve its own earlier turns.
             for group in layer.groups.iter().filter(|g| is_warmable(g)) {
                 warmed_timelines += self.warm_group(layer, group);
             }
@@ -1796,7 +1841,24 @@ impl Conversation {
         // declines to score them, so they cannot be selected, which is the whole
         // of what the flag promises. Re-enabling restores them immediately; the
         // flag is a read-time filter, not a deletion.
-        if !layer.gathered {
+        //
+        // Exempt when `layer` IS the projection's own target — mirroring the
+        // assembly loop's `layer_is_target` exemption in `project.rs` ("the
+        // target layer is never skipped — that would leave the projection with
+        // nothing to emit"). `gathered = false` promises "no OTHER conversation
+        // draws from this layer"; it was never meant to promise "this layer's
+        // own conversations can't see their own history" too. An append-only
+        // ingest layer (`code_reading`, `repo_map`) scores self-local here —
+        // candidates scoped to `target.timeline` alone, never another
+        // conversation's — so honouring `!gathered` unconditionally silently
+        // zeroed every such layer's OWN turn-group candidates the moment it was
+        // taken out of cross-layer gather, with no way back in: a later turn
+        // in the very conversation that owns this layer could never again see
+        // turns from earlier in itself. Measured: a `code_reading` per-file
+        // conversation's closing turn, several `file_read` rounds deep, lost
+        // every earlier round in the same conversation and could not tell it
+        // had already read the whole file.
+        if !layer.gathered && layer.id != target.layer {
             return per_group;
         }
         // The substrate read guard is scoped to Phase A, never held across Phase
@@ -1844,10 +1906,15 @@ impl Conversation {
             // A belief group is never the projection target (the target is the
             // Sequence dialogue group, skipped above), but mirror the target mask
             // anyway so the invariant holds if that ever changes.
+            // A scoped group offers only what the target's own scope names —
+            // `Substrate::scoped_timelines_for_group` — so an out-of-scope
+            // conversation is never scanned, and never teaches the group's
+            // hit levels on this target's behalf.
             let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
             } else {
-                sub.active_timelines_for_group(group.id).collect()
+                sub.scoped_timelines_for_group(group.id, target.timeline)
+                    .collect()
             };
             // A tagged group reads only the conversations carrying its tags — the
             // same scope projection applies to its candidates, applied here so an
@@ -2320,7 +2387,13 @@ impl Conversation {
             // normalization lock and — on the seal scan only — observes into the
             // hit levels. The counts say whether a phase grew because the corpus
             // did.
-            tracing::debug!(
+            //
+            // `trace!`, because this is per group and there are ~17 of them per
+            // scan: it was 1,262 lines of a 4,315-line daemon log, and the
+            // `belief scan phase split` line above already carries the per-scan
+            // totals that answer "did a phase grow". Raise the target to trace
+            // when the question is which *group* grew.
+            tracing::trace!(
                 target: "candle_conversation::provenance",
                 layer = %layer.name,
                 group = group.id.raw(),
@@ -3260,32 +3333,100 @@ impl Conversation {
         self.read().live_timeline_ids()
     }
 
-    /// Set a conversation's `archived` lifecycle flag and persist it
-    /// as a `RecordType::ConvState` record. Idempotent: if the
-    /// substrate already holds the requested state, the record is
-    /// not written and the call returns `Ok(())` without touching the
-    /// log.
-    ///
-    /// Last-write-wins on replay — toggling archive↔unarchive each
-    /// appends one small record (~ 16 bytes payload + framing); a
-    /// subsequent compaction collapses the chain to one record per
-    /// timeline.
+    /// Set a conversation's `archived` lifecycle flag and persist its
+    /// state. Idempotent: if the substrate already holds the requested
+    /// flag, nothing is written.
     pub fn set_conversation_archived(
         &self,
         timeline: TimelineId,
         archived: bool,
     ) -> candle::Result<()> {
-        let changed = self.write().set_archived(timeline, archived);
-        if !changed {
-            return Ok(());
-        }
-        let state = crate::persistence::manifest::ConvState { archived };
-        let payload = manifest::encode_conv_state_payload(timeline.raw(), state);
-        self.writer.enqueue(WriteJob::ConvMeta {
-            record: RecordType::ConvState,
-            payload,
-        });
+        self.update_conv_state(timeline, |sub| sub.set_archived(timeline, archived));
         Ok(())
+    }
+
+    /// Set the branch `timeline` works on in each repository `branches`
+    /// names — repository name to branch — leaving any other repository's as
+    /// it is, and persist the state once. Idempotent: when nothing changes,
+    /// nothing is written.
+    pub fn set_conversation_branches(
+        &self,
+        timeline: TimelineId,
+        branches: &BTreeMap<String, String>,
+    ) {
+        self.update_conv_state(timeline, |sub| {
+            let mut changed = false;
+            for (repo, branch) in branches {
+                changed |= sub.set_branch(timeline, repo, branch);
+            }
+            changed
+        });
+    }
+
+    /// Stage `write` — a set of `timeline`'s changes to its files — as
+    /// events on the timeline, events before tombstones, for the persistence
+    /// thread's group commit to make durable. Returns the sequence numbers
+    /// the events took. A read-only substrate refuses: the
+    /// caller mirrors what was written, and nothing was.
+    pub fn write_conversation_files(
+        &self,
+        timeline: TimelineId,
+        write: &VfsWrite,
+    ) -> candle::Result<Vec<u64>> {
+        if self.read_only {
+            return Err(candle::Error::Msg(
+                "write_conversation_files: the substrate is read-only".to_string(),
+            ));
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_vfs(timeline.raw(), write)
+            .map_err(|e| candle::Error::Msg(format!("write_conversation_files: {e}")))
+    }
+
+    /// Every live event of `timeline`'s files, read back in
+    /// `(repo, key, seq)` order.
+    pub fn conversation_files(&self, timeline: TimelineId) -> candle::Result<Vec<VfsEventPayload>> {
+        let mut p = self.persistence.lock().unwrap();
+        p.vfs_events(timeline.raw())
+            .map_err(|e| candle::Error::Msg(format!("conversation_files: {e}")))
+    }
+
+    /// `timeline`'s conversation state — archived flag and branches — or
+    /// `None` for an unregistered timeline.
+    pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.read().conv_state(timeline)
+    }
+
+    /// Apply `change` to the substrate and, when it reports a change, persist
+    /// `timeline`'s whole resulting state as a `RecordType::ConvState` record.
+    ///
+    /// Every record carries the complete state, so replay is last-writer-wins
+    /// on the whole of it and a later compaction keeps one record per
+    /// timeline. The state is read in the same write-lock hold that changed
+    /// it, and `conv_state_writes` keeps the enqueue order equal to that
+    /// order — see the field.
+    fn update_conv_state(&self, timeline: TimelineId, change: impl FnOnce(&mut Substrate) -> bool) {
+        let _ordered = self
+            .conv_state_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = {
+            let mut sub = self.write();
+            if !change(&mut sub) {
+                return;
+            }
+            sub.conv_state(timeline)
+        };
+        let Some(state) = state else {
+            return;
+        };
+        if self.read_only {
+            return;
+        }
+        self.writer.enqueue(WriteJob::ConvState {
+            timeline: timeline.raw(),
+            payload: manifest::encode_conv_state_payload(timeline.raw(), &state),
+        });
     }
 
     /// Whether `timeline` is currently archived. Untouched / unknown
@@ -3310,6 +3451,56 @@ impl Conversation {
         p.write_tombstone(timeline.raw(), None)
             .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
         Ok(())
+    }
+
+    /// Tombstone a section stream — the section counterpart of
+    /// [`Self::tombstone_timeline`]. Marks it logically deleted both in-RAM
+    /// (so the ingest triage's `section_exists` / `section_stream_is_persisted`
+    /// checks stop treating it as present or restorable on the very next
+    /// request, in this same process) and on disk (via a
+    /// [`crate::persistence::record::RecordType::SectionTombstone`] record,
+    /// so a restarted daemon doesn't reload the same corruption). The
+    /// compactor drops the underlying `Chunk`/`Tokens`/`StreamDecl` records
+    /// on the next compaction pass; ordinary reads never see them once this
+    /// lands.
+    pub fn tombstone_section(
+        &self,
+        stream_id: StreamId,
+        reason: Option<&str>,
+    ) -> candle::Result<()> {
+        self.write().tombstone_section(stream_id);
+        if self.read_only {
+            return Ok(());
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_section_tombstone(stream_id.0, reason)
+            .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+        Ok(())
+    }
+
+    /// Re-read a persisted section's per-layer chunk windows off disk and
+    /// run the generic [`first_divergent_chunk`] check against them —
+    /// confirmation from what is actually persisted, not a trust of a live
+    /// seal failure alone. Returns the first divergence found, or `None`
+    /// when the stream holds no durable chunks (nothing to confirm) or its
+    /// persisted layers agree (the seal failure that prompted the caller to
+    /// ask must have another cause — see the reactive hook at
+    /// `scheduler::Scheduler::perform_seal_and_write`).
+    ///
+    /// Read-only by design: this only answers the question. A caller that
+    /// wants to act on a confirmed divergence calls [`Self::tombstone_section`]
+    /// itself, so a caller that only wants the answer (a future boot-time
+    /// pass, a diagnostic) never also accepts the side effect.
+    pub fn check_section_window_integrity(
+        &self,
+        stream_id: StreamId,
+        n_layers: usize,
+    ) -> candle::Result<Option<WindowDivergence>> {
+        let mut p = self.persistence.lock().unwrap();
+        let substrate = self.read();
+        let windows = read_persisted_section_windows(&mut p, &substrate, stream_id, n_layers)
+            .map_err(|e| candle::Error::Msg(format!("check_section_window_integrity: {e}")))?;
+        Ok(windows.and_then(|w| first_divergent_chunk(&w)))
     }
 
     /// Tombstone **one turn** of a live timeline — in-RAM and on disk — leaving
@@ -3452,6 +3643,21 @@ impl Conversation {
     /// RAM (at cold-land), leaving them cold-only. Returns the count flagged.
     pub fn mark_timeline_evict_when_cold(&self, timeline: TimelineId) -> usize {
         self.write().mark_timeline_evict_when_cold(timeline)
+    }
+
+    /// Rewrite every residence's gids through a KV compaction's map — the
+    /// substrate's half of the sweep. See
+    /// [`crate::substrate::Substrate::rewrite_for_compaction`].
+    ///
+    /// Holds the substrate write lock for the whole rewrite, which is what makes it
+    /// atomic with respect to a projection reading residences: a reader must see
+    /// either every old gid or every new one, never a mixture, because a mixture is
+    /// one turn's KV read through another turn's addresses.
+    pub fn rewrite_for_compaction(
+        &self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        self.write().rewrite_for_compaction(sweep)
     }
 
     /// Set the substrate-side resume key (`debug_id`) for `timeline`
@@ -3930,10 +4136,20 @@ impl Conversation {
     /// address has been persisted and can be cold-loaded back into
     /// hot without re-prefilling.  The check matches the ingest
     /// loop's skip-if-present gate.
+    ///
+    /// A tombstoned stream (see [`Substrate::tombstone_section`]) always
+    /// reads `false` here, even though its `Chunk` records are still on
+    /// disk until the next compaction pass physically drops them — the
+    /// whole point of the tombstone is that those chunks must never be
+    /// restored again, so the triage that reads this must see "not
+    /// persisted" and fall through to a fresh prefill instead.
     pub fn section_stream_is_persisted(&self, stream_id: StreamId) -> bool {
         drop(self.persistence.lock().unwrap());
-        self.read()
-            .stream_of(stream_id)
+        let view = self.read();
+        if view.is_section_tombstoned(stream_id) {
+            return false;
+        }
+        view.stream_of(stream_id)
             .map(|s| s.committed_through.is_some() && !s.chunks.is_empty())
             .unwrap_or(false)
     }
@@ -4299,10 +4515,40 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         // so a scope summary is grounded only in its own scope — the multi-timeline
         // scan (cross-file retrieval) belongs to dialogue, not ingest generation.
         if group == self.target.group || self.read.is_append_only_layer(self.target.layer) {
-            return turns_of(self.target.timeline).collect();
+            // "My own history" spans the fork lineage: a conversation forked
+            // from another continues it, so the ancestors' turns are its own
+            // opening, oldest first. Each key keeps its own timeline, so
+            // exchange partitioning, ordering and emission downstream are
+            // already multi-timeline and need no change — and an ancestor
+            // sitting warm or cold is elevated by the ordinary projection
+            // working-set path, which is why nothing has to be pinned hot.
+            //
+            // Fast-path reads join them: a tool call that resolved to content
+            // the corpus had already read injected that conversation instead of
+            // re-reading the file, and it belongs in the same place the read it
+            // stands in for would have gone. Oldest first for the same reason —
+            // a read the conversation did earlier reads as earlier.
+            //
+            // Ahead of the lineage, because the lineage is what the conversation
+            // was founded on and these are things it went and looked at since.
+            let mut keys: Vec<TurnKey> = self
+                .read
+                .inherited_chain(self.target.timeline)
+                .into_iter()
+                .flat_map(turns_of)
+                .collect();
+            let mut injected: Vec<TimelineId> = self
+                .read
+                .fast_path_injections(self.target.timeline)
+                .to_vec();
+            injected.reverse();
+            keys.extend(injected.into_iter().flat_map(turns_of));
+            return keys;
         }
+        // The same scope the belief scan applied: what was never scored for
+        // this target is never selected for it either.
         self.read
-            .active_timelines_for_group(group)
+            .scoped_timelines_for_group(group, self.target.timeline)
             .flat_map(turns_of)
             .collect()
     }
@@ -4431,9 +4677,12 @@ mod tests {
         warmable, Conversation, Observe,
     };
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use crate::persistence::content_hash::turn_stream_id;
+    use crate::persistence::manifest::ConvState;
+    use crate::persistence::vfs::{VfsAppend, VfsWrite};
     use crate::persistence::{dir_fingerprint, SharedSubstrate, SubstratePersistence};
     use crate::projection::{GroupId, LayerId, TimelineId};
     use crate::substrate::{Substrate, TurnPartWrite};
@@ -4443,6 +4692,91 @@ mod tests {
 
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **A forked conversation's "own history" spans its lineage.**
+    ///
+    /// This is the projection half of `Substrate::inherited_chain`: the target
+    /// group is still masked to one conversation (a slot never sees a sibling
+    /// chat), but that conversation now opens with the turns of whatever it was
+    /// forked from, oldest first. It is what lets a dialogue start already
+    /// holding the priming chain's documents without a single turn being
+    /// copied onto it — and without the ancestor being pinned resident, since
+    /// each key keeps its own timeline and is elevated from whatever tier it is
+    /// on when selected.
+    #[test]
+    fn a_forked_conversation_opens_with_its_ancestors_turns() {
+        use crate::projection::ids::{TurnIndex, TurnKey};
+        use crate::projection::project::ProjectionTarget;
+        use crate::substrate::ContentResolver;
+
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let grandparent = TimelineId::from_raw(21).expect("timeline id");
+        let parent = TimelineId::from_raw(22).expect("timeline id");
+        let child = TimelineId::from_raw(23).expect("timeline id");
+        for tl in [grandparent, parent, child] {
+            conv.register_timeline(tl, layer, group);
+        }
+        {
+            let mut w = conv.write();
+            w.append_with_blocks(grandparent, 8, 0, 1);
+            w.append_with_blocks(parent, 8, 1, 2);
+            w.append_with_blocks(child, 8, 2, 3);
+        }
+        for (c, p) in [(child, parent), (parent, grandparent)] {
+            conv.set_conversation_metadata(c, Substrate::FORKED_FROM_KEY, &p.raw().to_string())
+                .expect("record lineage");
+        }
+
+        let read = conv.read_for(ProjectionTarget {
+            layer,
+            group,
+            timeline: child,
+        });
+        assert_eq!(
+            ContentResolver::group_turns(&read, group),
+            vec![
+                TurnKey::new(grandparent, TurnIndex(0)),
+                TurnKey::new(parent, TurnIndex(0)),
+                TurnKey::new(child, TurnIndex(0)),
+            ],
+            "oldest ancestor first, the target's own turns last",
+        );
+    }
+
+    /// A conversation that never forked is unaffected — the masking that keeps
+    /// one chat out of another's projection is exactly as it was.
+    #[test]
+    fn an_unforked_conversation_still_sees_only_its_own_turns() {
+        use crate::projection::ids::{TurnIndex, TurnKey};
+        use crate::projection::project::ProjectionTarget;
+        use crate::substrate::ContentResolver;
+
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let mine = TimelineId::from_raw(31).expect("timeline id");
+        let sibling = TimelineId::from_raw(32).expect("timeline id");
+        conv.register_timeline(mine, layer, group);
+        conv.register_timeline(sibling, layer, group);
+        {
+            let mut w = conv.write();
+            w.append_with_blocks(mine, 8, 0, 1);
+            w.append_with_blocks(sibling, 8, 1, 2);
+        }
+
+        let read = conv.read_for(ProjectionTarget {
+            layer,
+            group,
+            timeline: mine,
+        });
+        assert_eq!(
+            ContentResolver::group_turns(&read, group),
+            vec![TurnKey::new(mine, TurnIndex(0))],
+            "a sibling conversation stays masked out",
+        );
     }
 
     /// **A spliced turn keeps its index page.**
@@ -4569,6 +4903,70 @@ mod tests {
             dir.is_dir(),
             "a workspace conversation deleted the directory it was opened on"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A conversation's state survives a reopen whole.** Branches set, a
+    /// file event written, an archive after them, then one branch moved: each
+    /// record carries the whole state, so the archive keeps the branches, the
+    /// move keeps the archive, and the log replays to exactly the state RAM
+    /// held — and the file event reads back beside it.
+    #[test]
+    fn conversation_state_survives_a_reopen_whole() {
+        let dir = std::env::temp_dir().join(format!(
+            "candle-conv-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let tl = TimelineId::from_raw(7).expect("timeline id");
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(r, b)| (r.to_string(), b.to_string()))
+                .collect()
+        };
+        let expected = ConvState {
+            archived: true,
+            branches: map(&[("candle", "zen/work"), ("mind", "master")]),
+        };
+        let write = VfsWrite {
+            tombstones: Vec::new(),
+            events: vec![VfsAppend {
+                repo: "candle".into(),
+                key: "src/lib.rs".into(),
+                body: serde_json::json!({ "kind": "state", "size": 3, "conflict": false }),
+            }],
+        };
+        {
+            let mut substrate = Substrate::new();
+            let p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let conv = Conversation::from_parts(substrate, p);
+            conv.register_timeline(tl, layer, group);
+            conv.set_conversation_branches(tl, &map(&[("candle", "main"), ("mind", "master")]));
+            assert_eq!(conv.write_conversation_files(tl, &write).unwrap(), vec![0]);
+            conv.set_conversation_archived(tl, true).unwrap();
+            conv.set_conversation_branches(tl, &map(&[("candle", "zen/work")]));
+            assert_eq!(conv.conversation_state(tl), Some(expected.clone()));
+            conv.flush_writer();
+            conv.commit_persistence().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let conv = Conversation::from_parts(substrate, p);
+            conv.register_timeline(tl, layer, group);
+            assert_eq!(conv.conversation_state(tl), Some(expected));
+            let files = conv.conversation_files(tl).unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].key, "src/lib.rs");
+            assert_eq!(files[0].body, write.events[0].body);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4773,8 +5171,14 @@ layers:
         assert!(warmable(b.schema(), dialogue, conversation).is_none());
     }
 
-    /// **A layer out of retrieval is not warmed**, whichever warm-up asks —
-    /// the single-group and single-timeline ones as well as the ingest one.
+    /// **A layer out of retrieval is not warmed** through `warmable()` — the
+    /// single-group and single-timeline warm-ups this gates. The BULK ingest
+    /// warm-up (`warm_ingest_normalization`) does NOT go through `warmable()`
+    /// and does not honour this flag for an append-only layer: see
+    /// `turn_belief_scan.rs`'s `warm_ingest_normalization_still_warms_an_append_only_layer_when_not_gathered`
+    /// for why — a `code_reading`/`repo_map`-shaped layer scores itself
+    /// regardless of `gathered`, since that flag promises only that no OTHER
+    /// conversation draws from it.
     #[test]
     fn a_group_in_a_layer_out_of_retrieval_is_not_warmable() {
         let mut b = Builder::from_yaml(WARM_YAML).unwrap();

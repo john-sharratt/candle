@@ -217,14 +217,14 @@ the line as the corpus it indexes.
 
 > **`--data` is what the engine wrote. `--mind` is what a human wrote.**
 
-`.substrate/` and `accounts/` are `--data`. `projection.yaml`, `layers/`,
+`substrate/` and `accounts/` are `--data`. `projection.yaml`, `layers/`,
 `responses/`, `moods/`, `personalities/`, `worlds/` are `--mind`. `npcd` resolves
 all of them beside the schema when `--mind` names one, and falls back to `--data`
 only for a daemon run without a mind at all.
 
 **`--data` defaults to the `--mind` directory.** A substrate is one mind's corpus
 ingested and answers for no other, so it lives beside the mind that produced it:
-the mind ignores `.substrate/` and `accounts/`, and they sit in its root without
+the mind ignores `substrate/` and `accounts/`, and they sit in its root without
 ever being committed. Passing `--data` still puts them anywhere else. Only a
 daemon run with neither flag falls back to the `npcd` directory in the source
 tree.

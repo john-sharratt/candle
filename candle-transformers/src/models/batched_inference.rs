@@ -26,7 +26,9 @@
 
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
+use super::expert_lre::WeightPlanning;
 use crate::models::delta_net::ExportedLayerState;
+use crate::models::delta_net::RecurrentCompaction;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::rope_schedule::rung_of;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
@@ -36,8 +38,9 @@ use candle::quantized::pinned_staging::GpuBuf;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    ChunkedKvBacking, CompressionPolicy, GpuArenaClassStats, HeadGids, KvCache, KvFormat,
-    ModelGeometry, QuantFormat, WavePlan, WAVE_FFN_BYTES,
+    fragmentation, plan_pool, ArenaKey, ArenaLocation, ChunkedKvBacking, CompressionPolicy,
+    Fragmentation, GpuArenaClassStats, GroundLost, HeadGids, KvCache, KvFormat, ModelGeometry,
+    QuantFormat, SizeClass, WavePlan, WaveWidth, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -1497,21 +1500,42 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
-    /// Reserve an in-place glue gap of `n_tokens` slots at the slot tail across
-    /// every layer, advance the session offset, and return the gap's block index
-    /// (identical across layers). The glue forward later fills the gap by
-    /// explicit `(slice, in_blk)` write target; until then its K/V is
-    /// uninitialised but never read (the kernel scatters before it streams).
+    /// Drop every layer's trailing empty (0-token) chunks from `seq_idx`, so
+    /// each layer ends flush with the last token it actually holds.
     ///
-    /// This is the interleaved-glue primitive: because the gap is a real chunk
-    /// with `usage = n_tokens` sitting at its logical position, the
-    /// cumulative-usage `rope_base` of every later chunk equals its true
-    /// sequence position — so decode and glue share one positional convention
-    /// (`slice_rope`) with no `col_actual_pos` side channel.
-    /// Reserve a full-by-construction glue gap across every layer's backing.
-    /// Returns `(gap_block_index, in_blk_base)` — the block index (identical
-    /// across layers) and the first valid slot of the gap's tail window, into
-    /// which the glue forward scatters the island's K/V.
+    /// The inverse of [`Self::reconcile_block_counts`], and the one the layers
+    /// need before anything is **appended**. Padding equalises the block count
+    /// of a slot that is about to be read as one uniform thing; it is the wrong
+    /// move before a write, because the pad then sits between the old content
+    /// and the new on exactly the layers that were short. Trimming is lossless
+    /// by the same argument that makes padding lossless — an empty chunk holds
+    /// no token, so no position moves — and it leaves every layer's next
+    /// append at the same block index by construction.
+    pub fn trim_empty_tail_chunks(&mut self, seq_idx: usize) -> Result<()> {
+        for backing in &self.backings {
+            let Some(blocks) = backing.sequence_block_count(seq_idx) else {
+                continue;
+            };
+            // `block_usage` is always exactly `max_blocks` wide, so a slot
+            // reporting more blocks than that is a real invariant violation
+            // — the sequence has outgrown the arena's own capacity — not a
+            // shape we can silently absorb by keeping everything.
+            let usage = backing.block_usage(seq_idx);
+            let Some(usage) = usage.get(..blocks) else {
+                candle::bail!(
+                    "trim_empty_tail_chunks: seq {seq_idx} reports {blocks} block(s) but its \
+                     backing's block_usage is only {} wide",
+                    usage.len()
+                );
+            };
+            let keep = usage.iter().rposition(|&u| u != 0).map_or(0, |i| i + 1);
+            if keep < blocks {
+                backing.truncate_sequence_to_blocks(seq_idx, keep)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Pad every lagging layer's block count up to the max with an empty
     /// (0-token) writer chunk, so every layer of `seq_idx` agrees on how many
     /// blocks it holds.
@@ -1533,35 +1557,6 @@ impl BatchedInferenceSession {
     /// blocks are still genuinely empty and padding is lossless. Padding
     /// (not truncating) the ahead layer is what's safe: truncating would drop
     /// a writer chunk a co-batched decode may target.
-    /// Drop every layer's trailing empty (0-token) chunks from `seq_idx`, so
-    /// each layer ends flush with the last token it actually holds.
-    ///
-    /// The inverse of [`Self::reconcile_block_counts`], and the one the layers
-    /// need before anything is **appended**. Padding equalises the block count
-    /// of a slot that is about to be read as one uniform thing; it is the wrong
-    /// move before a write, because the pad then sits between the old content
-    /// and the new on exactly the layers that were short. Trimming is lossless
-    /// by the same argument that makes padding lossless — an empty chunk holds
-    /// no token, so no position moves — and it leaves every layer's next
-    /// append at the same block index by construction.
-    pub fn trim_empty_tail_chunks(&mut self, seq_idx: usize) -> Result<()> {
-        for backing in &self.backings {
-            let Some(blocks) = backing.sequence_block_count(seq_idx) else {
-                continue;
-            };
-            // `block_usage` is `max_blocks` wide and zero-padded past the
-            // slot's own blocks, so bound it by the slot's count before
-            // looking for the last non-empty one.
-            let usage = backing.block_usage(seq_idx);
-            let usage = usage.get(..blocks).unwrap_or(&usage);
-            let keep = usage.iter().rposition(|&u| u != 0).map_or(0, |i| i + 1);
-            if keep < blocks {
-                backing.truncate_sequence_to_blocks(seq_idx, keep)?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn reconcile_block_counts(&mut self, seq_idx: usize) -> Result<()> {
         let max_blocks = (0..self.backings.len())
             .filter_map(|li| self.backings[li].sequence_block_count(seq_idx))
@@ -1581,6 +1576,19 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
+    /// Reserve a full-by-construction glue gap across every layer's backing.
+    /// Returns `(gap_block_index, in_blk_base)` — the block index (identical
+    /// across layers) and the first valid slot of the gap's tail window, into
+    /// which the glue forward scatters the island's K/V. The glue forward
+    /// later fills the gap by explicit `(slice, in_blk)` write target; until
+    /// then its K/V is uninitialised but never read (the kernel scatters
+    /// before it streams).
+    ///
+    /// This is the interleaved-glue primitive: because the gap is a real
+    /// chunk with `usage = n_tokens` sitting at its logical position, the
+    /// cumulative-usage `rope_base` of every later chunk equals its true
+    /// sequence position — so decode and glue share one positional
+    /// convention (`slice_rope`) with no `col_actual_pos` side channel.
     pub fn reserve_glue_gap(&mut self, seq_idx: usize, n_tokens: u32) -> Result<(usize, u32)> {
         // `reserve_glue_gap_chunk` MUTATES each layer (pushes a gap chunk + a writer
         // chunk). This loop must therefore be ATOMIC: if it bails mid-way — because a
@@ -1929,6 +1937,16 @@ impl BatchedInferenceSession {
                 }
             }
         }
+        // **The snapshots go before the swap loop, not after it.** Each one holds every
+        // float chunk of its sequence, and the loop below is where those chunks are
+        // meant to die: a sequence's truncate drops the block table's hold, then its
+        // fresh writer is claimed. Kept to the end of the function, the snapshots held
+        // the whole cohort's float copy through every writer claim, so the loop's peak
+        // was float + quantized + writers for every sequence at once — measured on the
+        // Llama-2 MHA gate at Q8_0 x32 on a 16 GB card as all 639 regions live, 322
+        // arenas of them F32. A layer the quantizer skipped still has its snapshot, as
+        // a clone, in `quantized_per_seq`.
+        drop(live_per_layer);
 
         for (s, &seq_idx) in seq_indices.iter().enumerate() {
             let quantized_per_layer = std::mem::take(&mut quantized_per_seq[s]);
@@ -1979,6 +1997,29 @@ impl BatchedInferenceSession {
             total_freed += backing.release_empty_arenas()?;
         }
         Ok(total_freed)
+    }
+
+    /// Pack the KV pools toward the lowest addresses so the arena frontier falls.
+    ///
+    /// Passes **every** backing, because the pool is shared but the block tables are
+    /// per-layer: a pass that rewrote one layer's view of a relocated chunk and not
+    /// the rest would be wrong attention on every other layer.
+    ///
+    /// `sweep` is where a caller with its own gid holders — a substrate residence, a
+    /// projection cache — applies the same relocation map. A caller whose only block
+    /// tables are these backings' passes a closure that does nothing.
+    ///
+    /// Only legal between forwards; refuses otherwise.
+    #[cfg(feature = "cuda")]
+    pub fn compact_kv(
+        &self,
+        budget: std::time::Duration,
+        sweep: &mut dyn FnMut(&mut candle_nn::kv_cache::Sweep<'_>) -> Result<()>,
+    ) -> std::result::Result<
+        candle_nn::kv_cache::CompactionReport,
+        candle_nn::kv_cache::CompactionRefused,
+    > {
+        candle_nn::kv_cache::compact_backings(&self.backings, budget, sweep)
     }
 
     /// Create the arenas that mid-wave refusals recorded, and answer with how
@@ -2069,6 +2110,143 @@ impl BatchedInferenceSession {
     /// one backing is the whole model). `None` when there are no backings.
     pub fn kv_gpu_class_stats(&self) -> Option<GpuArenaClassStats> {
         self.backings.first().map(|b| b.gpu_arena_class_stats())
+    }
+
+    /// How fragmented every GPU KV pool is — the arenas a perfect pack would
+    /// empty, per size class.
+    ///
+    /// Reads layer 0's backing for the same reason [`Self::kv_gpu_class_stats`]
+    /// does: arenas pool globally across same-config layers, so one backing's view
+    /// is the whole model's.
+    ///
+    /// Returns `(key, fragmentation)` for every pool holding at least one arena,
+    /// so a caller can report the ladder without a row per empty rung.
+    pub fn kv_fragmentation(&self) -> Vec<(ArenaKey, Fragmentation)> {
+        let Some(b) = self.backings.first() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for class in SizeClass::all() {
+            let key = ArenaKey::new(class, ArenaLocation::Gpu);
+            let Ok(census) = b.compaction_census(key) else {
+                continue;
+            };
+            if census.is_empty() {
+                continue;
+            }
+            let f = fragmentation(&census, key);
+            if f.arenas > 0 {
+                out.push((key, f));
+            }
+        }
+        out
+    }
+
+    /// Chunk moves a perfect pack would cost, across every GPU pool.
+    ///
+    /// The other half of the fragmentation figure: [`Self::kv_fragmentation`] says
+    /// how much ground a pack would return, this says what it would cost to return
+    /// it. Both are wanted before running one — a pass that frees four arenas for
+    /// forty thousand copies is not worth its bandwidth, and the ratio is the only
+    /// thing that says so.
+    ///
+    /// Unbounded (`max_moves = 0`): this is the *whole* cost of reaching a gapless
+    /// prefix, which is the figure to compare a per-pass budget against.
+    pub fn kv_planned_moves(&self) -> usize {
+        let Some(b) = self.backings.first() else {
+            return 0;
+        };
+        let mut moves = 0;
+        for class in SizeClass::all() {
+            let key = ArenaKey::new(class, ArenaLocation::Gpu);
+            let Ok(census) = b.compaction_census(key) else {
+                continue;
+            };
+            if let Some(plan) = plan_pool(&census, key, 0) {
+                moves += plan.moves.len();
+            }
+        }
+        moves
+    }
+
+    /// Everything fragmentation denies the weight side, in regions.
+    ///
+    /// **The highest live arena is the marker.** The wave transient tier must stand
+    /// above it and `weight_floor` is measured from there, so the weight side's
+    /// ground — and therefore expert residency, and therefore decode — is set by
+    /// where the topmost live arena sits. Neither the live arena count nor the
+    /// occupancy ratio matters except through that one number.
+    ///
+    /// Sums the per-pool packed floor across the ladder and reads the frontier from
+    /// the region pool, which is device-global: regions are shared by every pool, so
+    /// the frontier is not a per-class quantity and cannot be derived from
+    /// [`Self::kv_fragmentation`] alone.
+    /// Regions a perfect pack would free, **cheaply** — the gate that decides
+    /// whether a compaction pass is worth its census.
+    ///
+    /// Sums `(arenas_held - arenas_if_packed)` over the GPU pools from the refcount
+    /// tables' live counters, with no occupancy bitmap walked. That distinction is
+    /// the whole point: the exact figure is [`Self::kv_ground_lost`], which *is* the
+    /// census, so it cannot be what decides whether to pay for one. The cheap
+    /// counterpart to the region pool's hole count, which
+    /// [`Self::kv_region_stats`] already gives for free.
+    ///
+    /// Holes alone are not a usable gate. They are self-correcting — the region free
+    /// list is lowest-index-first, so the next claim takes the lowest hole — and a
+    /// steadily-loaded pool sits at zero holes with tens of sparse arenas underneath.
+    /// Measured: 16 passes over 110 s of churn, because the gate read holes and holes
+    /// were zero on all but three samples while 50 arenas of air sat in the pools.
+    pub fn kv_sparse_arenas(&self) -> usize {
+        let Some(b) = self.backings.first() else {
+            return 0;
+        };
+        SizeClass::all()
+            .map(|class| {
+                let (held, packed) = b.pool_sparsity(ArenaKey::new(class, ArenaLocation::Gpu));
+                held.saturating_sub(packed)
+            })
+            .sum()
+    }
+
+    /// The region pool's own counters for this session's device.
+    ///
+    /// The **cheap** half of the fragmentation picture, and the reason it is exposed
+    /// separately from [`Self::kv_ground_lost`]: this is a handful of field reads
+    /// behind one lock, whereas `kv_ground_lost` sums `packed_arenas` across the
+    /// ladder, which means walking every arena's occupancy bitmap. A caller deciding
+    /// *whether* to pay for that walk cannot use the walk to decide.
+    pub fn kv_region_stats(&self) -> Option<candle_nn::kv_cache::RegionStats> {
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() else {
+            return None;
+        };
+        candle_nn::kv_cache::region_stats(gpu_id)
+    }
+
+    pub fn kv_ground_lost(&self) -> Option<GroundLost> {
+        // This session's own device ordinal, not a hardcoded 0: a second engine on
+        // a second card would otherwise report the first card's frontier.
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() else {
+            return None;
+        };
+        let stats = candle_nn::kv_cache::region_stats(gpu_id)?;
+        let packed_arenas = self
+            .kv_fragmentation()
+            .iter()
+            .map(|(_, f)| f.packed_arenas)
+            .sum();
+        Some(GroundLost {
+            watermark: stats.live_watermark,
+            live_arenas: stats.live,
+            packed_arenas,
+            span_regions: stats.span_tenant,
+            // In-use ground that appears in no size-class row, so a consumer summing those
+            // rows would charge it as waste. See `GroundLost::record_regions`.
+            record_regions: self
+                .backings
+                .first()
+                .map(|b| b.record_arena_regions())
+                .unwrap_or(0),
+        })
     }
 
     /// Create a view sequence that borrows KV blocks from a parent.
@@ -3235,14 +3413,27 @@ impl BatchedInferenceSession {
     /// to `recorded_metas`).
     ///
     /// Returns an error if the sequence is not allocated.
+    /// The trailing empty chunk is dropped here for the same reason
+    /// [`Self::snapshot_sequence_per_layer`] drops it, and the two **must** agree:
+    /// they are two views of the same layer, and callers resolve a block range
+    /// against one and then slice the other. Without this they differed by exactly
+    /// one whenever the writer chunk was empty — `record_turn` reports it because the
+    /// slot really holds it — and `resolve_seal_range` clamped a seal to the longer
+    /// count. Measured: `seal range 40..49 is outside layer 0's 48 sealed chunk(s)`,
+    /// deterministic on every boot from a fresh substrate, which made the daemon
+    /// unable to start at all; an existing substrate hid it by leaving nothing to
+    /// ingest. Lossless, by the argument that justifies the drop downstream: an empty
+    /// chunk holds no token, so no range and no position moves.
     pub fn snapshot_sequence(&self, idx: usize) -> Result<candle_nn::kv_cache::SealedSequence> {
         let backing = self
             .backings
             .first()
             .ok_or_else(|| candle::Error::Msg("snapshot_sequence: no backings".into()))?;
-        backing
+        let mut seq = backing
             .record_turn(idx)
-            .map_err(|e| candle::Error::Msg(format!("snapshot_sequence: {e}")))
+            .map_err(|e| candle::Error::Msg(format!("snapshot_sequence: {e}")))?;
+        seq.drop_empty_tail();
+        Ok(seq)
     }
 
     /// Snapshot a sequence into per-layer `SealedSequence`s, one
@@ -3793,7 +3984,10 @@ pub trait ManagedBatchedModel {
     /// a forward that can still run.
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
         let mut cap = MAX_PREFILL_TOKENS;
-        let fits = WavePlan::new(self.wave_geometry(act_dtype)).max_rows_within(WAVE_FFN_BYTES);
+        // Priced from an empty wave: this cap is the model's own bound, asked
+        // before any wave is composed, so there is no head to widen from.
+        let fits = WavePlan::new(self.wave_geometry(act_dtype))
+            .max_rows_within(WAVE_FFN_BYTES, WaveWidth::default());
         if fits > 0 {
             cap = cap.min(fits);
         }
@@ -3801,6 +3995,27 @@ pub trait ManagedBatchedModel {
             cap = cap.min(kv_fits);
         }
         cap
+    }
+
+    /// The wave transient tier a prefill of `rows` rows across `sequences`
+    /// would need, in bytes.
+    ///
+    /// **The same function the tier is actually placed from**, not an estimate
+    /// of it: admission judges an offer on the residency it dislodges, and the
+    /// tier dislodges weights exactly as a region claim does. Pricing it any
+    /// other way lets the two figures drift, and the one that drifts is the one
+    /// the placement then refuses.
+    ///
+    /// The tier is superlinear in *spans*, not only in rows — the mixer's span
+    /// tables hold an entry per span and the prefill scan's transients turn on
+    /// with the first — so `sequences` is not decoration, and a caller that
+    /// prices N admissions as N separate one-sequence waves understates the wave
+    /// they compose.
+    fn wave_tier_bytes(&self, rows: usize, sequences: usize, act_dtype: DType) -> Option<u64> {
+        Some(
+            WavePlan::new(self.wave_geometry(act_dtype))
+                .tier_bytes(WaveWidth::prefill(rows, sequences.max(1))) as u64,
+        )
     }
 
     /// Rows the KV side has room to admit, or `None` when it cannot say.
@@ -5068,6 +5283,20 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// The weight side as the wave rate planner prices it — MoE geometry, and
+    /// the range the expert zone may move in.
+    ///
+    /// [`WeightPlanning::Dense`] by default: a stack with no expert cache has no
+    /// residency to trade a wave's rows against, so not planning is the correct
+    /// answer and the width backstop is the only bound.
+    ///
+    /// A routed model overrides this, and the distinction between "nothing to plan"
+    /// and "the gauges are broken" lives in [`WeightPlanning`] rather than in an
+    /// `Option` — see that type for what the conflation cost.
+    fn weight_plan(&self) -> WeightPlanning {
+        WeightPlanning::Dense
+    }
+
     /// Reservation bytes held by per-sequence recurrent state, for the same
     /// decomposition.
     ///
@@ -5081,6 +5310,24 @@ pub trait ManagedBatchedModel {
     /// than it is — the same class of blindness that let the dense weights hide.
     fn recurrent_reserved_bytes(&self) -> usize {
         0
+    }
+
+    /// What **one** sequence's carried state costs, from the model's geometry.
+    ///
+    /// The admission figure, and not derivable from
+    /// [`Self::recurrent_reserved_bytes`]: that total is zero before the first
+    /// store is built, and dividing it by the sequences in flight answers with
+    /// a number that climbs as conversations go idle, since the sum counts
+    /// every store held and the divisor only those in flight.
+    fn recurrent_store_bytes(&self) -> usize {
+        0
+    }
+
+    /// Compact the arenas per-sequence recurrent state lives in, moving at most
+    /// `max_moves` layer states (zero for no bound). Between forwards only — the
+    /// scheduler runs it in the same gap as the KV compaction, for the same holes.
+    fn compact_recurrent(&self, _max_moves: usize) -> Result<RecurrentCompaction> {
+        Ok(RecurrentCompaction::default())
     }
 
     /// Reset expert pipeline telemetry counters to zero.
@@ -5290,8 +5537,20 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().resident_weight_bytes()
     }
 
+    fn weight_plan(&self) -> WeightPlanning {
+        self.model().weight_plan()
+    }
+
     fn recurrent_reserved_bytes(&self) -> usize {
         self.model().recurrent_reserved_bytes()
+    }
+
+    fn recurrent_store_bytes(&self) -> usize {
+        self.model().recurrent_store_bytes()
+    }
+
+    fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        self.model().compact_recurrent(max_moves)
     }
 
     fn reset_expert_stats(&self) {
@@ -5302,6 +5561,15 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().snapshot_profiles()
     }
 }
+
+/// The phrase [`assert_sealed_layers_aligned`]'s `bail!` names this fault
+/// with — `candle-conversation`'s reactive section-corruption repair
+/// (`scheduler::Scheduler::repair_section_if_window_divergence_confirmed`)
+/// matches on it to decide whether a seal failure is THIS fault before
+/// re-reading the substrate to confirm. A shared constant, not a duplicated
+/// literal on each side, so the two can't silently drift apart if this
+/// message is ever reworded.
+pub const WINDOW_DIVERGENCE_MARKER: &str = "different token windows";
 
 /// Refuse a per-layer snapshot whose layers describe different token windows.
 ///
@@ -5384,8 +5652,8 @@ fn assert_sealed_layers_aligned(
         .collect::<Vec<_>>()
         .join("; ");
     candle::bail!(
-        "{site}: refusing to seal sequence {idx} — the layers describe different token \
-         windows, so sealing would persist the skew into the substrate where no repair \
+        "{site}: refusing to seal sequence {idx} — the layers describe {WINDOW_DIVERGENCE_MARKER}, \
+         so sealing would persist the skew into the substrate where no repair \
          can reach it. First difference at chunk {at}: {split}. The live slot is still \
          intact and repairable; a wave that died mid-sweep is the usual producer, and \
          its rollback is what should have undone this."

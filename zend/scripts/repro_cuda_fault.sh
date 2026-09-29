@@ -20,7 +20,7 @@
 #                of the out-of-bounds access (10-100× slower; the ground truth).
 #                Kernels are already built with --generate-line-info.
 #
-# NOTE: binds PORT (80) — no other zend may be running. Reads .substrate/zend.log
+# NOTE: binds PORT (80) — no other zend may be running. Reads substrate/zend.log
 # for the fault/breadcrumb dump on failure.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
@@ -32,7 +32,7 @@ BASE="http://127.0.0.1:${PORT}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800}"
 PROMPT="${PROMPT:-Give me a tour of the codebase: main crates, key files, and how everything connects.}"
 OUT="$(mktemp -t zend_harness.XXXX.log)"
-LOG="${WS}/.substrate/zend.log"
+LOG="${WS}/substrate/zend.log"
 
 launch=("$ZEND_BIN" "$WS" "$@")
 [ "${BLOCKING:-0}" = "1" ] && export CUDA_LAUNCH_BLOCKING=1
@@ -62,7 +62,7 @@ echo "[harness] ready — opening the conversation."
 # 2) One streaming conversation.
 resp=$(curl -s -N -m 180 -X POST "${BASE}/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"zen-code\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}]}" 2>&1)
+  -d "{\"model\":\"zen-code\",\"stream\":true,\"conv_id\":\"repro-cuda-fault\",\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}]}" 2>&1)
 
 # 3) Verdict.
 sleep 1

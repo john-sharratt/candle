@@ -1255,6 +1255,9 @@ impl Builder {
                 description: String::new(),
                 score_threshold: 0.0,
                 window: 32_768,
+                // A programmatic schema has no ingest layer to read from, so
+                // there is nothing for the fast path to inject.
+                fast_path_window: 0,
                 budget: Budget {
                     priority: 100.0,
                     min_percent: None,

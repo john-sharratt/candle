@@ -37,10 +37,19 @@ mod chunk_ops;
 // end — every one of its imports is already `cfg(cuda)`, and there is no CPU
 // form of it. Gated whole rather than shot through with per-item cfgs.
 #[cfg(feature = "cuda")]
+pub mod compact;
+pub mod compact_map;
+pub mod compact_plan;
+// Minting a fresh `KvHead` record for each chunk a compaction relocated. CUDA only for
+// the same reason `compact` is: there are no device records without a device.
+#[cfg(feature = "cuda")]
+mod compact_mint;
+#[cfg(feature = "cuda")]
 mod compress;
 mod compression_policy;
 pub(super) mod cpu_selection;
 pub mod fletcher_golden;
+mod fresh_arenas;
 mod gid_pool;
 #[cfg(feature = "cuda")]
 mod gpu_chunks;
@@ -58,6 +67,12 @@ pub mod guard;
 mod guest_stage_cpu;
 mod head_gids;
 mod io;
+/// Whether a slot's K/V is still the K/V it was, and whether everything that
+/// references it still legitimately does. Part of the `tensor-assert` harness — it
+/// reads resident records back over the bus and hashes the arenas on the device, so
+/// it compiles to nothing in a production build.
+#[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+pub mod kv_integrity;
 mod meta_pool;
 pub mod migrate;
 pub mod migrate_flight;
@@ -73,6 +88,10 @@ pub(crate) mod slot_state_arena;
 /// Where the tier may stand and what the KV side may reach. Pure arithmetic, and
 /// outside the `cuda` gate so it can be exercised on any machine.
 pub mod span_geometry;
+/// Fixed-stride slot arenas, dedicated per span tenant: recurrent state, rewind
+/// stashes, gallery pages, QSA index pages. The bookkeeping is host arithmetic and
+/// tested anywhere; the pool that claims regions is CUDA-only.
+pub mod tenant_arena;
 mod types;
 // Instrumentation for the bump arenas' high-water marks: its only caller is
 // `bump_arena`, so it shares that module's gating.
@@ -97,6 +116,15 @@ pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunk_ops::BlockAllocSpec;
 pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 #[cfg(feature = "cuda")]
+pub use compact::{
+    compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,
+    CompactionTally,
+};
+pub use compact_map::{rewrite_sealed, CompactionMap, Sweep};
+pub use compact_plan::{
+    fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
+};
+#[cfg(feature = "cuda")]
 pub use compress::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
@@ -107,12 +135,16 @@ pub use compression_policy::{
     PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER, PRODUCTION_V_QREL_HIGH_THRESHOLDS,
     PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN35_0_8B_KV_FACTORS, QWEN35_9B_KV_FACTORS,
     QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS, QWEN3_8B_KV_FACTORS,
-    QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS,
+    QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS, QWEN4EXP_Q2KO_KV_FACTORS,
 };
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
+pub use gpu_chunks::ChunkPin;
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
-pub use migrate_flight::{migrate_flight, migrate_in_flight, MigrateFlight};
+pub use migrate_flight::{
+    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations, try_migrate_flight,
+    LocationFreeze, MigrateFlight,
+};
 pub use size_class::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
     payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
@@ -157,7 +189,13 @@ pub use region_pool::{
 };
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;
-pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
+#[cfg(feature = "cuda")]
+pub use tenant_arena::{
+    arena_census, arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves,
+    relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
+};
+pub use tenant_arena::{slot_stride, SlotTenant, SLOT_ALIGN};
+pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 // Defined in both configurations — `None` when there is no CUDA device to
 // budget — so the export is unconditional too.

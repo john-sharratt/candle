@@ -24,7 +24,7 @@
     "high_risk": {
       "type": "boolean",
       "default": false,
-      "description": "Side-effecting or outward-facing (mutation, code execution, remote/network access, credentials). Omitted in the Restricted tools mode."
+      "description": "Side-effecting beyond the conversation or outward-facing (repository changes, code execution, remote/network access, credentials, notes shared across conversations). File tools are not: their changes stay in the conversation's overlay. Omitted in the Restricted tools mode."
     },
     "mandatory": {
       "type": "boolean",

@@ -1,0 +1,84 @@
+name: git_reset
+questions:
+- undo my last commit but keep the changes
+- throw away everything I have not committed
+- discard my changes to this repository
+- put the branch back to the previous commit
+- drop the last two commits completely
+- uncommit that so I can fix it and commit again
+- reset the branch to that commit
+- scrap my uncommitted work and start again
+- my last commit was wrong, take it back
+- rewind main to the release tag
+- forget the edits I made and go back to the branch as it is
+- undo the commit I just pushed
+- reset hard to the previous commit
+- soft reset back one commit
+- I want a clean slate on this branch
+- take back the commit but leave the files as they are
+category: Git
+description: 'Move the branch you are on to another commit — back to undo commits, or anywhere else — on origin, and decide what becomes of your work. `soft` keeps what you see: what the commits you moved past changed becomes your uncommitted changes, ready to fix and commit again. `hard` discards every uncommitted change, so you see the branch as it now stands; with no `to` it ONLY discards your changes — a merge being finished included — and moves nothing. Moving back rewrites origin''s copy of the branch for everyone, so it needs `expected_head` naming where you are — without it the reset is refused, naming every commit it would take off — and it is refused while the branch has commits you do not have (git_merge them in first), or if someone else pushes in between. A soft reset past a file that is not text is refused, since it could not be kept, and so is a soft reset while a merge is being finished — commit it or discard it with a hard reset. Use for "undo the last commit", "throw away my changes", "abandon this merge", "put the branch back to that commit". To undo a commit without rewriting history, git_commit''s `revert` is the way. Writes to origin.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    ResetMode:
+      description: 'What becomes of the work: `soft` keeps what you see, as uncommitted changes; `hard` discards every uncommitted change.'
+      enum:
+      - soft
+      - hard
+      type: string
+    RevArg:
+      description: 'A revision. `kind` picks the form and `name` carries its value.'
+      properties:
+        back:
+          description: For `parent` only — how many commits back. Defaults to 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        kind:
+          description: 'Which form: `head` (your own commit — the branch you are on as your files have it — needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          enum:
+          - head
+          - branch
+          - tag
+          - ref
+          - commit
+          - remote_branch
+          - upstream
+          - parent
+          type: string
+        name:
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
+          type: string
+      required:
+      - kind
+      type: object
+  properties:
+    expected_head:
+      description: 'The commit you must be at — git_status''s `head`. Leave it out and the reset starts from wherever that is; give it to refuse the reset if it moved since you looked. A reset that takes commits off the branch needs it.'
+      type: string
+    mode:
+      allOf:
+      - $ref: '#/definitions/ResetMode'
+      description: What becomes of the work. Required.
+    repo:
+      description: The repository. Required.
+      minLength: 1
+      type: string
+    to:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: 'Where to move your branch — `{"kind":"parent"}` for the previous commit. Leave it out to stay where it is: with `hard`, that only discards your uncommitted changes.'
+  required:
+  - repo
+  - mode
+  title: ResetRequest
+  type: object
+examples:
+- undo my last commit but keep the changes<|im_end|>
+- throw away everything I have not committed in candle<|im_end|>
+- put the branch back to the previous commit, discarding my work<|im_end|>
+- reset the branch to the release tag<|im_end|>
+- uncommit that so I can fix it<|im_end|>
+- discard my uncommitted changes<|im_end|>

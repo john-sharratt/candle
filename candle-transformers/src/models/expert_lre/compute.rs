@@ -515,10 +515,11 @@ pub fn compute_experts_grouped(
         }
         // A Float input against a KO pack: the KO twins are int8-MMA formats
         // with no float GEMM loader, so the rows are gathered as float and the
-        // stacked block quantized ONCE into the q8a128 operand the int8
-        // grouped path consumes. This is gather-then-quantize — one extra
-        // launch per layer against the byte-gather above, which is reserved
-        // for hidden widths that tile the q8a1024 row layout (2560 does not).
+        // stacked block quantized once into the q8a128 operand the int8
+        // grouped path consumes. This is a model loaded with int8 off, whose
+        // other projections read float activations; an int8 session hands the
+        // experts its once-quantized FFN input instead, and the tile gather
+        // above serves any hidden width that is a multiple of 128.
         MoeInput::Float(xs) if gate_dtype.is_ko() => {
             use candle::quantized::cuda::{
                 grouped_qmatmul, silu_mul_q8a128, to_dynamic, DynamicActs, DynamicTensor,

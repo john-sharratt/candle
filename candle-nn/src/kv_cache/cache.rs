@@ -3,7 +3,7 @@
 //! This module provides `Cache` for single-tensor caches and `KvCache` for
 //! paired key-value caches, supporting both contiguous and chunked backing.
 
-use super::chunked::{ChunkedKvBacking, CompressionPolicy, HeadGids, CHUNK_SIZE, GID_STRIDE};
+use super::chunked::{ChunkPin, ChunkedKvBacking, CompressionPolicy, CHUNK_SIZE, GID_STRIDE};
 use ahash::HashMap;
 use candle::quantized::GgmlDType;
 use candle::{DType, Result, Tensor};
@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// What a slot-state sync hands back per slot: the serialised slice array's
 /// `(slices_ptr, n_slices, write_slice)`, the pins keeping the chunks it
 /// references alive, and whether any slot was re-serialised.
-pub type SlotStateSync = (Vec<(u64, u32, u32)>, Vec<Arc<Vec<HeadGids>>>, bool);
+pub type SlotStateSync = (Vec<(u64, u32, u32)>, Vec<Arc<Vec<ChunkPin>>>, bool);
 
 /// Internal chunked cache wrapper for a single sequence slot.
 #[derive(Debug, Clone)]

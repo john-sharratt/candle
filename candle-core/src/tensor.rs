@@ -1,6 +1,8 @@
 //! Tensors are N-dimensional matrixes of elements using a single data type.
 #![allow(clippy::redundant_closure_call)]
 use crate::backend::{BackendDevice, BackendStorage};
+#[cfg(feature = "cuda")]
+use crate::cuda_backend::{CudaStorage, LeaseAnchor};
 use crate::op::{BackpropOp, BinaryOp, CmpOp, Op, ReduceOp, UnaryOp};
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims, ShapeWithOneHole};
@@ -307,13 +309,56 @@ impl<'w> LiveTensor<'w> {
         let dtype = self.dtype();
         let base = cuda.slice.device_ptr(&cuda.device().cuda_stream());
         let ptr = base + (layout.start_offset() * dtype.size_in_bytes()) as u64;
-        Tensor::from_leased_cuda_ptr(
-            ptr,
-            dtype,
-            self.shape().clone(),
-            self.device(),
-            crate::cuda_backend::wave_provenance::LeaseOrigin::Foreign,
-        )
+        // An anchored lease stays anchored: the re-lease is one more view of the
+        // same memory, and dropping the anchor here would let its owner hand the
+        // memory on while this view still reads it.
+        match &cuda.anchor {
+            Some(anchor) => Tensor::from_anchored_cuda_ptr(
+                ptr,
+                dtype,
+                self.shape().clone(),
+                self.device(),
+                anchor.clone(),
+            ),
+            None => Tensor::from_leased_cuda_ptr(
+                ptr,
+                dtype,
+                self.shape().clone(),
+                self.device(),
+                crate::cuda_backend::wave_provenance::LeaseOrigin::Foreign,
+            ),
+        }
+    }
+
+    /// [`Self::from_leased_cuda_ptr`] for memory whose owner can let it go: the
+    /// tensor's storage holds `anchor`, and every view, clone and re-lease of it
+    /// shares that storage — so the owner cannot hand the memory to anyone else while
+    /// any of them exists. See [`LeaseAnchor`].
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `shape.elem_count()` elements of `dtype`, be
+    /// correctly aligned, and stay live while `anchor` is held; nothing may write it
+    /// through another alias for as long as this tensor or any view of it exists.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn from_anchored_cuda_ptr<S: Into<Shape>>(
+        ptr: u64,
+        dtype: DType,
+        shape: S,
+        device: &Device,
+        anchor: LeaseAnchor,
+    ) -> Result<Self> {
+        let Device::Cuda(cuda) = device else {
+            bail!("from_anchored_cuda_ptr: expected a CUDA device, got {device:?}");
+        };
+        let shape = shape.into();
+        let storage =
+            CudaStorage::from_anchored_device_ptr(ptr, shape.elem_count(), dtype, cuda, anchor)?;
+        Ok(from_storage(
+            Storage::Cuda(storage),
+            shape,
+            BackpropOp::none(),
+            false,
+        ))
     }
 
     /// The wave generation this tensor's storage was carved from, if any — what
@@ -400,8 +445,18 @@ impl<'w> LiveTensor<'w> {
     /// model line that built the tensor — with no stack walk and no symbol
     /// resolution, and correct under inlining. The detector is armed only around
     /// a wave, so this is one relaxed load everywhere else.
+    /// **Device allocations only**, which is the module's stated scope: "Host
+    /// allocations are out of scope." Without the check a CPU tensor is
+    /// reported exactly like a pool allocation, and the report is read as a
+    /// work list — the warm tier's 16 MiB host slab
+    /// (`kv_cache::chunked::alloc::claim_slab`, the `ArenaLocation::Cpu` arm)
+    /// showed up as the single largest "forbidden allocation" in a live
+    /// inventory while touching no VRAM at all.
     #[track_caller]
-    fn note_ticketless(what: &'static str, bytes: usize) {
+    fn note_ticketless(what: &'static str, bytes: usize, device: &Device) {
+        if !device.is_cuda() {
+            return;
+        }
         crate::forbidden_alloc::record_at(std::panic::Location::caller(), what, bytes);
     }
 
@@ -417,7 +472,11 @@ impl<'w> LiveTensor<'w> {
     #[track_caller]
     pub fn ones<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         let shape = shape.into();
-        Self::note_ticketless("Tensor::ones", shape.elem_count() * dtype.size_in_bytes());
+        Self::note_ticketless(
+            "Tensor::ones",
+            shape.elem_count() * dtype.size_in_bytes(),
+            device,
+        );
         Self::ones_impl(shape, dtype, device, false)
     }
 
@@ -473,7 +532,11 @@ impl<'w> LiveTensor<'w> {
     #[track_caller]
     pub fn zeros<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         let shape = shape.into();
-        Self::note_ticketless("Tensor::zeros", shape.elem_count() * dtype.size_in_bytes());
+        Self::note_ticketless(
+            "Tensor::zeros",
+            shape.elem_count() * dtype.size_in_bytes(),
+            device,
+        );
         Self::zeros_impl(shape, dtype, device, false)
     }
 
@@ -656,7 +719,7 @@ impl<'w> LiveTensor<'w> {
         // element size is not knowable until the storage exists. Reporting the
         // element *count* as bytes instead was 4x under for F32 — in the very
         // report the rest of this work is justified by.
-        Self::note_ticketless("Tensor::new", n * storage.dtype().size_in_bytes());
+        Self::note_ticketless("Tensor::new", n * storage.dtype().size_in_bytes(), device);
         let none = BackpropOp::none();
         Ok(from_storage(storage, shape, none, is_variable))
     }
@@ -689,6 +752,7 @@ impl<'w> LiveTensor<'w> {
         Self::note_ticketless(
             "Tensor::full",
             shape.elem_count() * D::DTYPE.size_in_bytes(),
+            device,
         );
         let mut storage = unsafe { device.alloc_uninit(&shape, D::DTYPE)? };
         let layout = Layout::contiguous(shape.clone());
@@ -781,7 +845,7 @@ impl<'w> LiveTensor<'w> {
                 }
             }
             if let Some(storage) = device.arange_int_native(D::DTYPE, start_bits, step_bits, len)? {
-                Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes());
+                Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes(), device);
                 return Ok(from_storage(storage, len, BackpropOp::none(), false));
             }
         }
@@ -799,7 +863,7 @@ impl<'w> LiveTensor<'w> {
             }
         }
         let len = data.len();
-        Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes());
+        Self::note_ticketless("Tensor::arange", len * D::DTYPE.size_in_bytes(), device);
         Self::from_vec_impl(data, len, device, false)
     }
 
@@ -834,7 +898,11 @@ impl<'w> LiveTensor<'w> {
         shape: S,
         device: &Device,
     ) -> Result<Self> {
-        Self::note_ticketless("Tensor::from_vec", data.len() * D::DTYPE.size_in_bytes());
+        Self::note_ticketless(
+            "Tensor::from_vec",
+            data.len() * D::DTYPE.size_in_bytes(),
+            device,
+        );
         Self::from_vec_impl(data, shape, device, false)
     }
 
@@ -863,6 +931,7 @@ impl<'w> LiveTensor<'w> {
             Self::note_ticketless(
                 "from_vec_beside on an operand with no wave ticket",
                 data.len() * D::DTYPE.size_in_bytes(),
+                self.device(),
             );
         }
         let shape = shape.into_shape(data.len())?;

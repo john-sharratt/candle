@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{ConnectInfo, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
@@ -115,7 +115,7 @@ pub async fn completions(
     );
 
     let max_tokens = req.max_tokens.map(|n| n as usize);
-    let conv_id = req.conv_id.unwrap_or_else(|| "default".to_string());
+    let conv_id = req.conv_id;
     let force_hires = req.force_high_resolution;
     let assistant_prefill = req.assistant_prefill;
     let lossless_kv = req.lossless_kv;
@@ -123,7 +123,13 @@ pub async fn completions(
     // projects, and whether its file tools change the disk. Resolved against
     // the caller's role (`crate::access`): absent is the role's default, and a
     // mode above the role runs as Restricted.
-    let role = access::role(&headers, peer, session.gateways(), session.roles());
+    let role = access::role(
+        &headers,
+        peer,
+        session.gateways(),
+        session.roles(),
+        session.local_signin(),
+    );
     let tools_mode = access::effective_mode(role, req.tools.as_ref().and_then(RequestTools::mode));
     // A client that runs its own tools sends their definitions instead.
     let client_tools = match req.tools {
@@ -162,6 +168,22 @@ pub async fn completions(
             .submit_passthrough(messages, client_tools, max_tokens)
             .await
     } else {
+        // **Every conversation names itself, and there is no shared fallback.**
+        //
+        // A missing id used to mean "the `default` conversation", which is not a
+        // conversation but a bucket: unrelated dialogue from unrelated clients
+        // accumulated on one timeline, so its recurrent state and its K/V
+        // described a history no single caller had had. Absence is a caller bug,
+        // and the only honest answer to it is to refuse the turn rather than
+        // silently file it somewhere.
+        //
+        // Checked here rather than on the request type because `passthrough`
+        // above genuinely has no conversation — it runs the client's own context
+        // and never reaches the substrate — so the id is required by the path
+        // that uses it, not by the wire format.
+        let Some(conv_id) = conv_id.filter(|id| !id.trim().is_empty()) else {
+            return missing_conv_id();
+        };
         session
             .submit(
                 messages,
@@ -182,6 +204,30 @@ pub async fn completions(
     } else {
         collect_completion(token_stream, model, id, created, framing).await
     }
+}
+
+/// `400` for a turn that named no conversation.
+///
+/// A status, not an in-band `⚠` message in the reply text: the engine's failures
+/// are reported that way because a turn did start and the caller wants the
+/// stream, whereas this one is rejected before anything is submitted. The web
+/// client already reads any non-200 as "no turn started" and surfaces it through
+/// `onError`.
+fn missing_conv_id() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "message": "conv_id is required: every conversation is addressed by its own \
+                            id, and there is no shared default conversation to fall back on. \
+                            Send a stable id per conversation.",
+                "type": "invalid_request_error",
+                "param": "conv_id",
+                "code": "missing_conv_id",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// A turn's reply as the session streams it.

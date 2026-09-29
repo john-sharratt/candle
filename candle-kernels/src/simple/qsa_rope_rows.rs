@@ -7,6 +7,9 @@
 //!
 //! ```text
 //!   src, dst     device f32[n_rows, d], contiguous
+//!   src_pages    device i64[⌈n_rows / rows_per_src_page⌉] page base addresses,
+//!                or null to read `src`; row r at
+//!                src_pages[r / rows_per_src_page] + (r % rows_per_src_page)·d
 //!   pos          device u32[n_rows / rows_per_pos], or null for
 //!                pos(group) = pos_base + group · pos_step
 //!   rungs        every rung's table and m², by value
@@ -22,6 +25,8 @@ extern "C" {
     #[allow(clippy::too_many_arguments)]
     pub fn run_qsa_rope_rows(
         src: *const f32,
+        src_pages: *const i64,
+        rows_per_src_page: i32,
         dst: *mut f32,
         n_rows: i32,
         d: i32,

@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{FileError, Paging};
+use super::{stores_for, FileError, Paging, RepoPath};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Paths per page. A path is far cheaper than a `file_list` entry (no size or
@@ -20,8 +20,13 @@ pub struct SearchRequest {
     /// path. Supports `*` as a wildcard (`*.rs`, `src/*/mod.rs`). Required.
     #[validate(length(min = 1))]
     pub query: String,
-    /// Restrict the search to paths beginning with this prefix (e.g.
-    /// `candle-nn/src/`). Omit to search the whole project.
+    /// The repository to search, or `*` to search every repository in the
+    /// workspace. Required.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// Restrict the search to paths beginning with this prefix, relative to
+    /// each repository searched (e.g. `candle-nn/src/`). Omit to search whole
+    /// repositories.
     pub prefix: Option<String>,
     /// Zero-based page of results. Defaults to 0. When the response's
     /// `paging.next_page` is set, pass it here for the following page.
@@ -30,10 +35,10 @@ pub struct SearchRequest {
 
 #[derive(Serialize)]
 pub struct SearchResponse {
-    /// Matching paths, shortest first then alphabetical — the shortest path
-    /// matching a name is usually the definition rather than a vendored or
-    /// generated copy of it.
-    pub files: Vec<String>,
+    /// Matching files, shortest path first then by repository and path — the
+    /// shortest path matching a name is usually the definition rather than a
+    /// vendored or generated copy of it.
+    pub files: Vec<RepoPath>,
     pub paging: Paging,
 }
 
@@ -42,8 +47,9 @@ pub struct FileSearch;
 impl Tool for FileSearch {
     const NAME: &'static str = "file_search";
     const DESCRIPTION: &'static str =
-        "Find files by NAME or PATH anywhere in the project, without knowing which \
-         directory they are in. Give a filename (`config.rs`), a stem (`compress`), \
+        "Find files by NAME or PATH anywhere in the workspace, without knowing which \
+         directory they are in. `repo` is required: name one repository, or pass \
+         `*` to search them all. Give a filename (`config.rs`), a stem (`compress`), \
          an extension (`.toml`), a path fragment (`kv_cache/chunked`), or a glob \
          (`*_test.rs`, `src/*/mod.rs`); matching is case-insensitive over the whole \
          path. Use for: locating a file whose name you know but whose directory you \
@@ -51,9 +57,9 @@ impl Tool for FileSearch {
          discovering where a subsystem lives before reading it. Triggered by \
          \"where is\", \"find the file\", \"which file is\", \"locate\", \"is there a \
          file called\", \"what files are named\", \"show me all the .rs files\". \
-         Returns paths only, shortest first, paged. THIS IS THE TOOL FOR FINDING A \
-         FILE — do not guess directory names and call file_list repeatedly; one \
-         file_search over the whole project replaces that entirely. Use file_grep to \
+         Returns each file's repo and path, shortest path first, paged. THIS IS THE \
+         TOOL FOR FINDING A FILE — do not guess directory names and call file_list \
+         repeatedly; one file_search over the whole workspace replaces that entirely. Use file_grep to \
          search file CONTENTS for a string or symbol; use file_list to enumerate a \
          directory you already know; use file_read once you have the path.";
 
@@ -70,16 +76,29 @@ impl Tool for FileSearch {
         let prefix = req.prefix.as_deref().unwrap_or("");
         let query = req.query.to_ascii_lowercase();
 
-        let mut all: Vec<String> = ctx
-            .vfs
-            .paths(prefix)
-            .into_iter()
-            .filter(|p| matches(&p.to_ascii_lowercase(), &query))
-            .collect();
+        let mut all: Vec<RepoPath> = Vec::new();
+        for (repo, store) in stores_for(ctx, &req.repo)? {
+            all.extend(
+                store
+                    .paths(prefix)
+                    .into_iter()
+                    .filter(|p| matches(&p.to_ascii_lowercase(), &query))
+                    .map(|path| RepoPath {
+                        repo: repo.clone(),
+                        path,
+                    }),
+            );
+        }
         // Shortest first: `config.rs` at a crate root beats a deeply nested
         // vendored copy of the same name, and that is nearly always the one the
         // caller meant.
-        all.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+        all.sort_by(|a, b| {
+            a.path
+                .len()
+                .cmp(&b.path.len())
+                .then_with(|| a.repo.cmp(&b.repo))
+                .then_with(|| a.path.cmp(&b.path))
+        });
 
         let paging = Paging::of(all.len(), req.page.unwrap_or(0), SEARCH_PAGE_ENTRIES);
         let files = all

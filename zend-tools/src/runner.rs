@@ -15,6 +15,7 @@
 
 use serde_json::{json, Value};
 
+use crate::alias_pins;
 use crate::context::ToolContext;
 use crate::numfmt;
 use crate::registry;
@@ -40,8 +41,14 @@ pub fn run(tool_name: &str, tool_call_id: &str, args: &Value, ctx: &ToolContext)
         });
     };
 
+    // An alias's name fixes some arguments; a call that contradicts it is
+    // refused before it runs ([`alias_pins`]).
+    let args = match alias_pins::apply(tool_name, args) {
+        Ok(args) => args,
+        Err(refusal) => return refusal,
+    };
     tracing::debug!("dispatch start");
-    let mut result = tool.call(ctx, args);
+    let mut result = tool.call(ctx, &args);
     tracing::debug!(success = !is_error_response(&result), "dispatch complete");
     // Annotate large/tiny numeric fields with `<key>_display` renderings
     // (digit-grouped, magnitude-tagged) so the model quotes magnitudes instead

@@ -9,7 +9,10 @@ use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PresentRequest {
-    /// Paths to surface to the user (1–10 entries; project or session files). Required.
+    /// The repository the files belong to. Required.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// Paths to surface to the user, relative to the repository (1–10 entries; project or session files). Required.
     #[validate(length(min = 1, max = 10))]
     pub paths: Vec<String>,
     /// Optional short heading shown above the presented files. Defaults to none.
@@ -21,6 +24,7 @@ pub struct PresentRequest {
 
 #[derive(Serialize)]
 pub struct PresentResponse {
+    pub repo: String,
     pub presented: Vec<String>,
     pub missing: Vec<String>,
 }
@@ -44,13 +48,14 @@ impl Tool for FilePresent {
     }
 
     fn run(ctx: &ToolContext, req: PresentRequest) -> Result<PresentResponse, FileError> {
+        let store = ctx.files.repo(&req.repo)?;
         let mut presented = Vec::new();
         let mut missing = Vec::new();
         for path in &req.paths {
             // An unreadable workspace file (oversize / not UTF-8) counts as
             // missing rather than failing the whole call — the other paths in the
             // batch are still worth surfacing.
-            match ctx.vfs.read(path) {
+            match store.read(path) {
                 Ok(Some(_)) => presented.push(path.clone()),
                 Ok(None) | Err(_) => missing.push(path.clone()),
             }
@@ -58,7 +63,11 @@ impl Tool for FilePresent {
         if presented.is_empty() {
             return Err(FileError::NoFilesFound);
         }
-        Ok(PresentResponse { presented, missing })
+        Ok(PresentResponse {
+            repo: req.repo,
+            presented,
+            missing,
+        })
     }
 }
 

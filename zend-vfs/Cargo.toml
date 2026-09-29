@@ -1,0 +1,50 @@
+[package]
+name = "zend-vfs"
+version = "0.1.0"
+edition = "2021"
+description = "The Zen Code daemon's view of its workspace repositories: the typed git layer, each conversation's file changes as deltas, and the checkout tools run on."
+
+[lib]
+name = "zend_vfs"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_yaml = { workspace = true }
+base64     = { workspace = true }
+regex = "1"
+# ripgrep's git-aware file walker — backs the VFS overlay's workspace layer.
+ignore = "0.4"
+# Line diff that turns an edit into the splices the overlay records.
+similar = "2"
+# A blob's id computed from bytes a folder holds, in either object format.
+sha1 = "0.10"
+sha2 = "0.10"
+# The sandbox: a command run as a child process, its output read and its
+# timeout kept without a thread per run, one run per checkout at a time.
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+# The sandbox server: a job's output handed out as a stream, and its id drawn
+# at random.
+futures = { workspace = true }
+rand    = { workspace = true }
+# A checkout that could not be put back as its owner left it, reported when
+# nothing is left to return the error to.
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
+serde_json = { workspace = true }
+# Sandbox runs contending on real threads.
+tokio      = { version = "1", features = ["rt-multi-thread"] }

@@ -1,0 +1,171 @@
+//! What a run put on a checkout beyond its base commit, and how to tell
+//! cheaply that it is still there.
+//!
+//! [`materialize`](super::materialize) records, for every path a
+//! conversation changed, the content it wrote and the [`FileStamp`] the file
+//! had afterwards. When the tool has run, [`capture`](super::capture) asks
+//! [`Ledger::verified`] of each: when the file's stamp is the recorded one and
+//! not racy, the recorded content is what the file holds and the file is
+//! never opened — so reading back what a tool did touches only the files it
+//! actually changed.
+//!
+//! Every path the ledger does not name holds its base commit's content, or is
+//! absent when the base has none: the ledger is exactly the checkout's
+//! deviation from its base.
+
+use std::collections::BTreeMap;
+
+use super::stamp::FileStamp;
+use crate::file_delta::now_ns;
+
+/// One path the checkout holds differently from its base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The file's bytes, or `None` when the path is absent.
+    pub content: Option<Vec<u8>>,
+    /// The file's stamp when `content` was recorded, `None` for an absent
+    /// path.
+    pub stamp: Option<FileStamp>,
+}
+
+/// A checkout's deviation from its base commit, stamped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ledger {
+    /// The commit the checkout's tracked files were put at.
+    base: String,
+    entries: BTreeMap<String, Entry>,
+    /// When the stamps were last taken, nanoseconds since the Unix epoch — the
+    /// moment a stamp's times are judged racy against.
+    stamped_at_ns: i64,
+}
+
+impl Ledger {
+    /// A ledger for a checkout at `base` with nothing on it beyond the base.
+    pub fn new(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            entries: BTreeMap::new(),
+            stamped_at_ns: now_ns(),
+        }
+    }
+
+    /// The commit the checkout's tracked files are at.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub fn entry(&self, path: &str) -> Option<&Entry> {
+        self.entries.get(path)
+    }
+
+    /// Every path the checkout holds differently from its base, in order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// What `path` holds, known without reading it: the recorded content when
+    /// the file's current stamp is the recorded one and not racy. `None` when
+    /// the ledger cannot vouch — the path is not in it, the stamp differs, or
+    /// it was taken too close to a write to tell — and the file must be read.
+    pub fn verified(&self, path: &str, current: Option<FileStamp>) -> Option<Option<&[u8]>> {
+        let entry = self.entries.get(path)?;
+        match (entry.stamp, current) {
+            (None, None) => Some(None),
+            (Some(recorded), Some(now))
+                if recorded == now && !recorded.is_racy(self.stamped_at_ns) =>
+            {
+                Some(entry.content.as_deref())
+            }
+            _ => None,
+        }
+    }
+
+    /// Record `path` as holding `content` with `stamp`.
+    pub fn record(
+        &mut self,
+        path: impl Into<String>,
+        content: Option<Vec<u8>>,
+        stamp: Option<FileStamp>,
+    ) {
+        self.entries.insert(path.into(), Entry { content, stamp });
+    }
+
+    /// Mark the stamps as taken now. Called once a pass has recorded every
+    /// path it touched, so the racy window is measured from after the last
+    /// write it made.
+    pub fn seal(&mut self) {
+        self.stamped_at_ns = now_ns();
+    }
+
+    /// Shift the moment the stamps count as taken — for tests that need a
+    /// stamp old enough to be trusted without sleeping out the racy window.
+    #[cfg(test)]
+    pub(crate) fn seal_at(&mut self, ns: i64) {
+        self.stamped_at_ns = ns;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkout::stamp::RACY_WINDOW_NS;
+
+    fn stamp(t: i64) -> FileStamp {
+        FileStamp {
+            size: 3,
+            mtime_ns: t,
+        }
+    }
+
+    /// **A matching, settled stamp vouches for the content; anything else
+    /// sends the caller to read the file.**
+    #[test]
+    fn verification_needs_a_matching_settled_stamp() {
+        let mut l = Ledger::new("abc");
+        l.record("a.txt", Some(b"abc".to_vec()), Some(stamp(1_000)));
+        l.record("gone.txt", None, None);
+        l.seal_at(1_000 + RACY_WINDOW_NS * 10);
+
+        assert_eq!(
+            l.verified("a.txt", Some(stamp(1_000))),
+            Some(Some(&b"abc"[..]))
+        );
+        assert_eq!(
+            l.verified("a.txt", Some(stamp(1_001))),
+            None,
+            "a different stamp"
+        );
+        assert_eq!(l.verified("a.txt", None), None, "the file is gone");
+        assert_eq!(l.verified("gone.txt", None), Some(None), "still absent");
+        assert_eq!(l.verified("gone.txt", Some(stamp(5))), None, "it came back");
+        assert_eq!(
+            l.verified("other.txt", Some(stamp(1_000))),
+            None,
+            "not recorded"
+        );
+
+        // Taken too close to the write, the same stamp vouches for nothing.
+        l.seal_at(1_000 + RACY_WINDOW_NS / 2);
+        assert_eq!(l.verified("a.txt", Some(stamp(1_000))), None);
+    }
+
+    #[test]
+    fn entries_are_recorded_and_listed_in_order() {
+        let mut l = Ledger::new("abc");
+        assert!(l.is_empty());
+        l.record("b", Some(vec![1]), Some(stamp(1)));
+        l.record("a", None, None);
+        assert_eq!(l.paths().collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l.base(), "abc");
+        assert_eq!(l.entry("b").unwrap().content.as_deref(), Some(&[1u8][..]));
+    }
+}

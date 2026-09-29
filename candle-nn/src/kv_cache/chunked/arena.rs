@@ -39,11 +39,80 @@ use crate::kv_cache::chunked::size_class::{class_for_format, SizeClass};
 pub struct ArenaKey {
     pub class: SizeClass,
     pub location: ArenaLocation,
+    pub kind: ArenaKind,
 }
+
+/// What an arena's slots hold, and therefore what decides their stride.
+///
+/// Two kinds draw from the same region pool and sit on the same side of
+/// `weight_floor` (`docs/vram_span_partition.md` §8). They are separate kinds rather
+/// than separate size classes for two reasons:
+///
+/// - **A record's size is model geometry, not a format.** It is
+///   `n_kv_head × (head_dim / 2 + 26 × n_palette)` rounded up to a [`RECORD_STRIDES`]
+///   rung, which differs per checkpoint, so no fixed [`LADDER`](super::size_class::LADDER) rung can
+///   express it — the ladder is a map from `KvFormat` to bytes and a record is not a
+///   format.
+/// - **Holders follow them through different fields.** Both are packed by the same
+///   compaction walk, but a moved band is followed through a chunk's `gids` and a moved
+///   record through its `meta` — see §8. Every walk that enumerates the *band* pools
+///   iterates `SizeClass::all()` against a [`ArenaKind::Band`] key, so the size-class
+///   statistics and the relief decisions that read them never see a record arena; the
+///   compaction pass adds the record pool to its ranking explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArenaKind {
+    /// K/V payload. Stride and capacity come from the size class.
+    Band,
+    /// `KvHead` records, which the paged kernels dereference. Carries its own
+    /// stride because the size class cannot express it.
+    Record {
+        /// Bytes per record slot: the record size rounded up to a rung of
+        /// [`RECORD_STRIDES`], which keeps the set of record pools finite and so
+        /// preallocatable. Note the pad this costs — see §8; nothing currently decodes a
+        /// record slot from an address, so the power-of-two shape buys less than it seems.
+        stride: u32,
+        /// Slots per arena, from the stride and the region size.
+        chunks: u32,
+    },
+}
+
+/// Every slot stride a `KvHead` record arena can have, smallest first.
+///
+/// **Why a fixed list, and why it is not just the powers of two.** The property the
+/// allocator needs is that the set of record strides is *finite and known*, because that
+/// is what lets the gid pool preallocate every record pool at construction and stay eager
+/// and lock-free. Powers of two are one such set, but they are a wasteful one: a record's
+/// slot is pure padding above its size, and nothing recovers it.
+///
+/// Rounding to powers of two put the 1,344 B GQA record in a 2,048 B slot — 34% pad, one
+/// record per chunk per layer, ~144 MiB at 48 layers and 128K context, all of it inside
+/// the reservation and subtracted from `weight_floor`'s arithmetic. The stated
+/// justification, that a power of two makes slot decode a shift and a mask, is not cashed
+/// in anywhere: nothing decodes a record slot from an address, because the kernel is
+/// handed absolute destinations and `record_slot_addr` multiplies.
+///
+/// So the rungs interleave 1.5× steps between the powers of two, which bounds the pad at
+/// a third of a slot instead of a half and puts that same GQA record in 1,536 B — 12.5%.
+/// Every rung is a multiple of 8, which is what keeps each slot's base 8-aligned for the
+/// `uint64_t` band-pointer stores.
+///
+/// **The floor is not arbitrary.** `chunks_per_region` is `TARGET_ARENA_BYTES / stride`,
+/// and it must stay *below* `GID_STRIDE` or a chunk index collides with the next arena's
+/// gid namespace. At 16 MiB regions and a `1 << 16` gid stride, a 256 B slot would give
+/// exactly 65,536 chunks — the first value that breaks it — so the ladder starts at 512.
+/// [`record_strides_fit_the_gid_namespace`](tests) holds all of this.
+///
+/// The ceiling covers the widest geometry in the table (64 heads × 512 head_dim × 16
+/// bands is ~42 KiB) with room above it; an unlisted size is a loud failure at allocation
+/// rather than a silently missing pool.
+pub const RECORD_STRIDES: [usize; 20] = [
+    512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768, 49_152,
+    65_536, 98_304, 131_072, 262_144, 524_288, 1_048_576,
+];
 
 impl PartialEq for ArenaKey {
     fn eq(&self, other: &Self) -> bool {
-        self.class == other.class && self.location == other.location
+        self.class == other.class && self.location == other.location && self.kind == other.kind
     }
 }
 
@@ -53,12 +122,17 @@ impl Hash for ArenaKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.class.hash(state);
         self.location.hash(state);
+        self.kind.hash(state);
     }
 }
 
 impl ArenaKey {
     pub fn new(class: SizeClass, location: ArenaLocation) -> Self {
-        Self { class, location }
+        Self {
+            class,
+            location,
+            kind: ArenaKind::Band,
+        }
     }
 
     /// The key a chunk of `format` allocates from, given the chunk geometry.
@@ -77,7 +151,85 @@ impl ArenaKey {
                 "no size class covers {format:?} at {elems_per_chunk} elems/chunk"
             ))
         })?;
-        Ok(Self { class, location })
+        Ok(Self {
+            class,
+            location,
+            kind: ArenaKind::Band,
+        })
+    }
+
+    /// The key the `KvHead` records of one backing allocate from.
+    ///
+    /// `record_bytes` is the serialized record size; the slot stride is that rounded up
+    /// to a [`RECORD_STRIDES`] rung, which is the whole reason the pool table stays **eager**:
+    /// the stride space is a dozen discrete rungs rather than a continuum, so every one
+    /// a geometry can ask for is preallocated and no pool is ever created at runtime.
+    /// See [`RECORD_STRIDES`].
+    /// # Panics
+    ///
+    /// If no rung holds `record_bytes`. That is a geometry the pool table was not built
+    /// for, so the alternative is a lookup for a pool that does not exist — and a record
+    /// arena sized outside the ladder can put more slots in an arena than `GID_STRIDE`
+    /// admits, which decodes gids into the *next* arena and reads the wrong addresses
+    /// without faulting. Loud here, rather than wrong later.
+    pub fn for_records(location: ArenaLocation, record_bytes: usize) -> Self {
+        // The first rung that holds the record — NOT merely the next power of two, which
+        // would both waste a third more of each slot and, below the floor, give more slots
+        // per arena than the gid namespace allows: a 1 B record rounds to a 1 B stride and
+        // 16,777,216 slots against a 65,536 limit.
+        let stride = RECORD_STRIDES
+            .iter()
+            .copied()
+            .find(|&s| s >= record_bytes)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a {record_bytes} B KvHead record exceeds the largest record stride \
+                     ({} B). Add a rung to RECORD_STRIDES — and check it against \
+                     GID_STRIDE, because the slot count per arena must stay below it.",
+                    RECORD_STRIDES[RECORD_STRIDES.len() - 1],
+                )
+            });
+        Self::for_record_stride(location, stride)
+    }
+
+    /// The record key at an exact slot stride.
+    ///
+    /// The one constructor both the pool table and the allocating caller go through, so
+    /// a key built from a record size and a key built from a rung are the *same* key —
+    /// a second derivation here is how the caller would look up a pool that was never
+    /// preallocated.
+    pub fn for_record_stride(location: ArenaLocation, stride: usize) -> Self {
+        debug_assert!(
+            stride.is_multiple_of(8),
+            "a record stride must be 8-aligned so every slot base is, for the \
+             uint64_t band-pointer stores"
+        );
+        // Capacity from the same region size the band arenas are carved to, so a
+        // record arena is one region like every other and the frontier arithmetic in
+        // `region_pool` needs no special case.
+        let chunks = (super::types::TARGET_ARENA_BYTES / stride).max(1);
+        Self {
+            // Carried only so the key stays one shape; no record consults it, and the
+            // band pool at this class is a different key because the kind differs.
+            class: SizeClass::at(0),
+            location,
+            kind: ArenaKind::Record {
+                stride: stride as u32,
+                chunks: chunks as u32,
+            },
+        }
+    }
+
+    /// The same arena geometry at another tier.
+    ///
+    /// Carries the class **and the kind**, so a tier migration cannot silently change
+    /// what an arena's slots hold. Today every caller is moving band arenas — records are
+    /// GPU-only and cannot migrate, because their address is fixed for the handle's life —
+    /// so this is a guard against a future caller rather than a fix for a present bug:
+    /// rebuilding a record key as `ArenaKey::new(class, location)` returns a band key
+    /// whose stride its slots do not have. `Arena::arena_key` had exactly that defect.
+    pub fn at(&self, location: ArenaLocation) -> Self {
+        Self { location, ..*self }
     }
 
     pub fn is_gpu(&self) -> bool {
@@ -86,12 +238,18 @@ impl ArenaKey {
 
     /// Byte stride between consecutive chunk slots in an arena with this key.
     pub fn slot_stride(&self) -> usize {
-        self.class.bytes()
+        match self.kind {
+            ArenaKind::Band => self.class.bytes(),
+            ArenaKind::Record { stride, .. } => stride as usize,
+        }
     }
 
     /// How many chunk slots an arena with this key holds.
     pub fn chunks(&self) -> usize {
-        self.class.chunks_per_region()
+        match self.kind {
+            ArenaKind::Band => self.class.chunks_per_region(),
+            ArenaKind::Record { chunks, .. } => chunks as usize,
+        }
     }
 }
 
@@ -224,9 +382,12 @@ impl ChunkStatus {
 /// PCIe, which invariant 8 forbids) or go through raw pointer writes.
 #[derive(Debug)]
 pub struct Arena {
-    /// The slab: `U8`, shape `(chunks * class.bytes(),)`.
+    /// The slab: `U8`, shape `(chunks * slot_stride(),)`.
     data: Tensor,
     class: SizeClass,
+    /// What the slots hold, and so what their stride is. A record arena's stride
+    /// cannot be derived from `class` — see [`ArenaKind`].
+    kind: ArenaKind,
     location: ArenaLocation,
     /// Index of this arena in the storage map.
     index: usize,
@@ -245,18 +406,18 @@ impl Arena {
     /// Wrap a byte slab that owns its own storage — a CPU arena.
     ///
     /// A GPU arena is carved instead: [`Self::in_region`].
-    pub(super) fn new(
-        data: Tensor,
-        class: SizeClass,
-        location: ArenaLocation,
-        index: usize,
-    ) -> Self {
+    /// Takes the whole key rather than its parts: the key is what decides the slot
+    /// stride, and for a record arena that is carried on the kind rather than derived
+    /// from the class, so splitting them here is what would let an arena and the key
+    /// it was created from disagree about its own geometry.
+    pub(super) fn new(data: Tensor, key: ArenaKey, index: usize) -> Self {
         debug_assert_eq!(data.dtype(), DType::U8, "an arena slab is raw bytes");
         debug_assert_eq!(data.rank(), 1, "an arena slab is flat");
         Self {
             data,
-            class,
-            location,
+            class: key.class,
+            kind: key.kind,
+            location: key.location,
             index,
             #[cfg(feature = "cuda")]
             region: None,
@@ -282,13 +443,38 @@ impl Arena {
     /// Byte stride between consecutive chunk slots.
     #[inline]
     pub fn slot_stride(&self) -> usize {
-        self.class.bytes()
+        match self.kind {
+            ArenaKind::Band => self.class.bytes(),
+            ArenaKind::Record { stride, .. } => stride as usize,
+        }
     }
 
     /// Number of chunk slots.
     #[inline]
     pub fn chunks(&self) -> usize {
-        self.class.chunks_per_region()
+        match self.kind {
+            ArenaKind::Band => self.class.chunks_per_region(),
+            ArenaKind::Record { chunks, .. } => chunks as usize,
+        }
+    }
+
+    /// This arena's region index — its position in **physical address order**
+    /// inside the reservation, which is what a compaction packs toward.
+    ///
+    /// `None` for a CPU arena, whose slab is an ordinary host allocation and has
+    /// no region, and on a build without CUDA.
+    ///
+    /// Distinct from [`Self::index`], the gid namespace index: that is whatever
+    /// the pool handed out and is recycled when an arena is tombstoned, so the
+    /// two orders diverge as soon as anything is released. Ordering a compaction
+    /// by `index` packs into whichever end of the span the recycling happened to
+    /// favour — see `compact_plan::ArenaSlots::rank`.
+    #[inline]
+    pub(super) fn region_rank(&self) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        return self.region.as_ref().map(|r| r.index());
+        #[cfg(not(feature = "cuda"))]
+        return None;
     }
 
     /// The raw byte slab.
@@ -594,8 +780,18 @@ impl Arena {
     }
 
     /// Get the [`ArenaKey`] for this arena.
+    ///
+    /// Carries the **kind**, so the key round-trips. Rebuilding it as
+    /// `ArenaKey::new(class, location)` returned a band key for a record arena — with a
+    /// stride taken from `class` that its slots do not have — and since this is where
+    /// every key handed to [`ArenaKey::at`] comes from, it defeated that method's whole
+    /// purpose before it ran.
     pub fn arena_key(&self) -> ArenaKey {
-        ArenaKey::new(self.class, self.location)
+        ArenaKey {
+            class: self.class,
+            location: self.location,
+            kind: self.kind,
+        }
     }
 
     /// Zero the chunk at `chunk_idx`, to the **full class stride**.
@@ -631,11 +827,18 @@ impl Arena {
     /// question when reading an occupancy dump, since the KV side packs
     /// lowest-first and the high end is what a reclaim reaches for.
     pub fn format_label(&self) -> String {
+        // A record arena labels itself as one. Reporting `class0` for it made it
+        // indistinguishable from the smallest band class in every occupancy and region
+        // dump — in a change whose point is making the span's ground accountable.
+        let what = match self.kind {
+            ArenaKind::Band => format!("class{}", self.class.bytes()),
+            ArenaKind::Record { stride, .. } => format!("record{stride}"),
+        };
         #[cfg(feature = "cuda")]
         if let Some(region) = self.region.as_ref().map(RegionHandle::index) {
-            return format!("class{} r{region}", self.class.bytes());
+            return format!("{what} r{region}");
         }
-        format!("class{}", self.class.bytes())
+        what
     }
 
     /// Raw device pointer and byte stride for one slot. `None` for CPU arenas.

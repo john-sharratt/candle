@@ -112,6 +112,8 @@ use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, PushKernelArg, ValidAsZeroBits};
 use float8::F8E4M3;
 use half::{bf16, f16};
+use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 
 #[cfg(feature = "cudnn")]
@@ -2412,6 +2414,39 @@ pub struct CudaStorage {
     /// everything except the arena leases built by
     /// [`CudaStorage::from_leased_device_ptr`].
     pub backing: Backing,
+    /// The holder of the leased memory, kept alive by this storage — see
+    /// [`LeaseAnchor`]. `None` for owned storage and for a lease whose memory
+    /// outlives the process's use of it (a KV arena slot, a wave range).
+    pub anchor: Option<LeaseAnchor>,
+}
+
+/// A share in whatever owns the memory behind a lease, carried by the storage so
+/// the memory cannot be handed to anyone else while any view of it exists.
+///
+/// **Why the storage carries it and not the caller.** A lease is a raw address,
+/// and a tensor built on one can be cloned, reshaped, narrowed or re-leased
+/// (`Tensor::as_foreign_lease`) by code that never sees the owner. Every one of
+/// those shares or copies this storage's `Arc`, so a share held *here* travels with
+/// all of them and the memory stays reserved until the last view is dropped. Held
+/// anywhere else it is a promise that every such copy was found — the promise a
+/// stale `kvheads_ptr` word broke for `KvHead` records.
+#[derive(Clone)]
+pub struct LeaseAnchor(Arc<dyn Any + Send + Sync>);
+
+impl LeaseAnchor {
+    /// Anchor a lease to `owner`: the lease's storage, and every view of it, keeps a
+    /// share of it.
+    pub fn new<T: Any + Send + Sync>(owner: Arc<T>) -> Self {
+        Self(owner)
+    }
+}
+
+impl fmt::Debug for LeaseAnchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("LeaseAnchor")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
 }
 
 impl CudaStorageSlice {
@@ -2507,7 +2542,28 @@ impl CudaStorage {
             slice,
             device: device.clone(),
             backing: Backing::Lease(origin),
+            anchor: None,
         })
+    }
+
+    /// [`Self::from_leased_device_ptr`] for memory whose owner can let it go: the
+    /// storage — and every view, clone and re-lease of it — holds `anchor`, so the
+    /// owner cannot hand the memory to anyone else while any of them exists.
+    ///
+    /// # Safety
+    /// As [`Self::from_leased_device_ptr`], except that the memory's lifetime is the
+    /// anchor's to guarantee: `anchor` must keep the range live while it is held.
+    pub unsafe fn from_anchored_device_ptr(
+        ptr: u64,
+        len: usize,
+        dtype: DType,
+        device: &CudaDevice,
+        anchor: LeaseAnchor,
+    ) -> Result<Self> {
+        let mut storage =
+            Self::from_leased_device_ptr(ptr, len, dtype, device, LeaseOrigin::Foreign)?;
+        storage.anchor = Some(anchor);
+        Ok(storage)
     }
 }
 
@@ -2567,6 +2623,7 @@ macro_rules! cuda_dtype {
                     slice,
                     device,
                     backing: Backing::Owned,
+                    anchor: None,
                 }
             }
 
@@ -2581,6 +2638,7 @@ macro_rules! cuda_dtype {
                     slice: CudaStorageSlice::$dtype(slice),
                     device,
                     backing: Backing::Lease(origin),
+                    anchor: None,
                 }
             }
         }
@@ -2737,9 +2795,10 @@ impl CudaStorage {
                     );
                 }
                 let view = slice.slice(offset..offset + elem_count);
-                stream
-                    .memcpy_dtoh(&view, &mut dst[..elem_count])
-                    .map_err(crate::Error::wrap)?;
+                // `.w()`, not `Error::wrap` — see `CudaDevice::synchronize`'s
+                // comment: this is a real device round-trip and needs the same
+                // sticky/OOM-streak visibility as every other CUDA call.
+                stream.memcpy_dtoh(&view, &mut dst[..elem_count]).w()?;
                 Ok(())
             }
             _ => crate::bail!(
@@ -2982,6 +3041,7 @@ impl CudaStorage {
                 slice,
                 device,
                 backing: Backing::Owned,
+                anchor: None,
             });
         }
 
@@ -3000,6 +3060,7 @@ impl CudaStorage {
             },
             device,
             backing: Backing::Owned,
+            anchor: None,
         };
 
         // Use in-place mutation method
@@ -3246,6 +3307,9 @@ impl CudaStorage {
             Backing::Owned => drop(previous),
         }
         self.backing = fresh_backing;
+        // The fresh buffer is not the anchored memory, so this storage no longer has
+        // anything of its owner's to keep alive.
+        self.anchor = None;
 
         Ok(true)
     }
@@ -3371,6 +3435,7 @@ impl CudaStorage {
                 slice,
                 device,
                 backing: Backing::Owned,
+                anchor: None,
             });
         }
 
@@ -3389,6 +3454,7 @@ impl CudaStorage {
             },
             device,
             backing: Backing::Owned,
+            anchor: None,
         };
 
         // Use in-place mutation method
@@ -3602,10 +3668,12 @@ impl BackendStorage for CudaStorage {
     fn try_clone(&self, layout: &Layout) -> Result<Self> {
         let (slice, out_backing) = Clone.map(self, self.device(), layout)?;
         let device = self.device.clone();
+        // A copy into fresh memory: nothing of the source's lease comes with it.
         Ok(Self {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -3931,6 +3999,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -3942,6 +4011,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing,
+            anchor: None,
         })
     }
 
@@ -3954,6 +4024,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -3971,6 +4042,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -3991,6 +4063,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4001,6 +4074,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4011,6 +4085,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4026,6 +4101,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4249,6 +4325,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4269,6 +4346,7 @@ impl BackendStorage for CudaStorage {
                 slice,
                 device,
                 backing: out_backing,
+                anchor: None,
             });
         }
 
@@ -4283,6 +4361,7 @@ impl BackendStorage for CudaStorage {
             slice: col,
             device,
             backing: col_backing,
+            anchor: None,
         };
         let l_out = params.l_out();
         let b = params.b_size;
@@ -4327,6 +4406,7 @@ impl BackendStorage for CudaStorage {
                 slice,
                 device,
                 backing: out_backing,
+                anchor: None,
             });
         }
         let l_out = params.l_out();
@@ -4389,6 +4469,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -4452,6 +4533,7 @@ impl BackendStorage for CudaStorage {
             slice: slice.0,
             device,
             backing: slice.1,
+            anchor: None,
         })
     }
 
@@ -4472,6 +4554,7 @@ impl BackendStorage for CudaStorage {
                 slice,
                 device,
                 backing: out_backing,
+                anchor: None,
             });
         }
 
@@ -4487,6 +4570,7 @@ impl BackendStorage for CudaStorage {
             slice: col,
             device,
             backing: col_backing,
+            anchor: None,
         };
         let h_out = params.out_h();
         let w_out = params.out_w();
@@ -4554,6 +4638,7 @@ impl BackendStorage for CudaStorage {
                 slice,
                 device,
                 backing: out_backing,
+                anchor: None,
             });
         }
         let (out_w, out_h) = (params.out_w(), params.out_h());
@@ -4636,6 +4721,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing,
+            anchor: None,
         })
     }
 
@@ -4653,6 +4739,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4670,6 +4757,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4687,6 +4775,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4701,6 +4790,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 
@@ -4711,6 +4801,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
     fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
@@ -4720,6 +4811,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
     fn scatter_set(
@@ -4830,6 +4922,7 @@ impl BackendStorage for CudaStorage {
                 slice,
                 device: dev.clone(),
                 backing: Backing::Owned,
+                anchor: None,
             });
         }
 
@@ -4937,6 +5030,7 @@ impl BackendStorage for CudaStorage {
             slice,
             device,
             backing: out_backing,
+            anchor: None,
         })
     }
 

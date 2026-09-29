@@ -31,7 +31,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | `calculator` | `calculator.rs` | evalexpr; no eval code path |
 | `unit_convert` | `unit_convert.rs` | Static dimension table; affine temperature |
 | `random` | `random.rs` | rand crate; integer/float/choice/shuffle/dice |
-| `web_search` | `web_search.rs` | Tavily API; key from `secrets/tools.yaml` |
+| `web_search` | `web_search.rs` | Tavily API; key from `~/.zend/secrets.yaml` (or `--secrets`) |
 | `web_fetch` | `web_fetch.rs` | reqwest + readability extractor; SSRF guard |
 | `weather` | `weather.rs` | Open-Meteo geocoding + forecast APIs |
 
@@ -41,12 +41,69 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 |------|------|-------|
 | `write` | `file/write.rs` | Create or overwrite; 10 MiB VFS cap |
 | `file_read` | `file/read.rs` | Numbered excerpt of the whole file, or of a line range; only `path` required |
-| `file_edit` | `file/edit.rs` | Unified-diff patch, located by context |
+| `file_edit` | `file/edit.rs` | Replace `old_text` with `new_text`, located by content, indentation-tolerant |
 | `file_list` | `file/list.rs` | Path prefix filter; sorted |
 | `file_search` | `file/search.rs` | Find files by name/path; substring or `*` glob, whole project |
 | `file_grep` | `file/grep.rs` | Regex over file contents; path + line number per hit |
 | `file_delete` | `file/delete.rs` | Idempotent; returns `deleted` flag |
 | `file_present` | `file/present.rs` | Foreground presentation gesture |
+
+### Commands (2 tools)
+
+| Tool | File | Notes |
+|------|------|-------|
+| `run_command` | `run/command.rs` | One program, no shell, in the repository's sandbox on the conversation's branch; waits; returns exit code, changed files, output page 0. A command line in `program`, shell operators and redirects, and shell-escaped quotes are refused, each saying how to call it instead; a git command line goes to the git refusal. `Network` + `Exec` + `DiskWrite` |
+| `run_output` | `run/output.rs` | Any page of a run's log by `job`; `Exec` |
+
+The sandboxes themselves — one per git repository, logs in the workspace's
+`jobs/` — are `crate::sandboxes`, reached only through
+`ToolContext::sandboxes`, which requires `Exec`.
+
+### Git (12 tools)
+
+Typed access to the workspace's repositories through `zend-vfs`. Nothing in
+this crate spawns or parses git; each tool is a request/response shell over
+that layer. The family splits by capability, and that split is the design:
+**the readers declare nothing, the writers declare `DiskWrite` and
+`Network`**, which Restricted's grants withhold — so changing a repository
+is Comprehensive's alone. Running `git` is deliberately not `Exec`; see `git/mod.rs`
+for why.
+
+Each conversation is on one branch per repository, its file store's, at its
+own base commit — what `HEAD` means to every tool here — and its uncommitted
+work is its file store's changes over that base. Writes go to origin first and
+the local branch follows; reads stay local. A commit lands whole or is
+refused with nothing written; `git_merge` brings the branch's new commits into
+the conversation's files, conflicts marked there (`git/mod.rs`,
+`zend_vfs::origin`, `zend_vfs::work`).
+
+Tests live in `tests/git_tools/`, not beside the code: they need real
+repositories on disk, and the `exec`/`disk` guards hold every line under
+`src/tools` to the capability-checked primitives.
+
+| Tool | File | Notes |
+|------|------|-------|
+| `git_status` | `git/status.rs` | The conversation's uncommitted changes (added / modified / deleted); its branch and base, `incoming` commits, conflicts, a merge being finished, and the local branch ahead/behind origin's |
+| `git_log` | `git/log.rs` | History as subjects, 20 a page; `since` + `count` for "how far ahead"; `follow_renames`; `lines` for the commits behind a span of one file's lines (`git/line_history.rs`) |
+| `git_show` | `git/show.rs` | `what`: changes / patch / file / tree / blame; first page carries the full message |
+| `git_grep` | `git/grep.rs` | Search a revision's tracked content; long lines clipped as `file_grep` clips |
+| `git_refs` | `git/refs.rs` | `kind`: branches / tags / remotes / remote_branches (with their remotes' URLs) |
+| `git_commit` | `git/commit.rs` | `from`: all_changes / files (only those listed: `take`/`write`/`delete`) / patch / cherry_pick / revert → pushed to origin under a lease, whole or not at all; refused — nothing written — when behind, raced or in conflict; a merge is committed whole; `all_changes` with nothing of its own publishes a fast-forward merge as it is; files onto another branch that changed them need `expected_head`; a conflicting replay names the patch to read and make by hand |
+| `git_merge` | `git/merge.rs` | Origin's copy of the branch (or `from`) merged into the conversation's files; overlaps marked and listed until settled |
+| (aliases) | `alias_pins.rs` | An alias whose name says a mode fixes it: `git_cherry_pick` is `from: cherry_pick`, `git_revert` `from: revert`, `delete_tag` `kind: tag, action: delete`, … — compiled narrowed in zend's grammar, and a contradicting call refused at dispatch |
+| `git_ref` | `git/reference.rs` | Branch or tag × create / move / delete, on origin under a lease, then locally; a move that drops commits needs `expected`; the branch you are on is moved by `git_reset`; a created branch is not switched to, and the answer says so; a tag is deleted wherever it still is, refused when its two copies differ |
+| `git_switch` | `git/switch.rs` | Puts the conversation on another branch, merging its changes onto it; `create` (required) says whether to make the branch on origin |
+| `git_reset` | `git/reset.rs` | Moves the conversation's branch on origin from its base — never over commits it has not seen, and taking commits off only with `expected_head`; `soft` keeps the view as uncommitted changes, `hard` discards them and any merge |
+| `git_fetch` | `git/fetch.rs` | Tracking refs only; never moves a local branch |
+| `git_push` | `git/push.rs` | Atomic, leased; no unconditional force; a tag is never published as a same-named branch |
+
+Every reader takes a **required** `page`, sized so a page costs about what a
+`file_read` page does, and no field in the family admits `null` — an optional
+field is left out, never nulled.
+
+Shared pieces: `git/mod.rs` (error mapping, repo resolution, the flat `RevArg`
+revision, protected-path rules) and `git/wire.rs` (the response shapes — full
+object ids, ISO dates, binary reported rather than mangled).
 
 ### Notes (4 tools) — web chat only
 

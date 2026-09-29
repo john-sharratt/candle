@@ -31,7 +31,7 @@ use serde::Serialize;
 pub enum LoadStep {
     /// Fetch (if absent) and load the GGUF onto the card.
     Model,
-    /// Replay the redo log at `.substrate/` into the in-RAM substrate.
+    /// Replay the redo log at `substrate/` into the in-RAM substrate.
     Substrate,
     /// Install every act into the schema's `tools` collection, one member each,
     /// so a turn can show the ones it is able to take. See `engine::tools::install`.

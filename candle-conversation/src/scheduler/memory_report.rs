@@ -63,6 +63,17 @@ pub struct WeightSection {
     pub base_bytes: Option<u64>,
     /// Expert slots currently resident in VRAM — moves as experts page.
     pub resident_expert_bytes: Option<u64>,
+    /// The weight zone's floor: ground the weight side must keep, and therefore
+    /// ground **K/V may not plan against**. `None` off a device reservation.
+    ///
+    /// Reported because a consumer sizing a batch of new conversations has to
+    /// subtract it and had no way to see it. The `repo_map` pool sized itself
+    /// from the governor's whole capacity, so at 96 conversations its K/V grew
+    /// to 48 GB and squeezed the weight zone from 53.5 GB to 10.9 GB — 19 GB
+    /// under this floor. Admission then refused every prefill, correctly and
+    /// permanently: residency was below the floor, and refusing prefills is not
+    /// a thing that gives K/V back.
+    pub floor_bytes: Option<u64>,
 }
 
 /// The provenance gallery arena's VRAM slabs.
@@ -293,6 +304,60 @@ pub struct KvSection {
     pub classes: Vec<KvClassRow>,
     /// Per-backing per-format rows from every registered `ChunkedKvBacking`.
     pub arenas: Vec<ArenaRow>,
+    /// One past the highest live region — the arena frontier, in regions.
+    ///
+    /// **The figure that costs weights, and the denominator of every efficiency
+    /// number computed from this report.** The wave transient tier stands above the
+    /// highest live arena and `weight_floor` is measured from there, so expert
+    /// residency is set by this one index rather than by how many arenas are live
+    /// or how full they are.
+    ///
+    /// Carried here rather than left to the consumer's own `region_stats` call so
+    /// that the frontier and the class rows are ONE sample. Read apart, they are up
+    /// to a publish interval out of step, and the mismatch does not look like skew:
+    /// it appears as regions the class rows cannot account for, which reads exactly
+    /// like a second tenant holding ground. Measured — 734 phantom regions.
+    pub frontier_regions: usize,
+    /// Regions held by any tenant at that same moment — arenas and span tenants.
+    pub live_regions: usize,
+    /// Of [`Self::live_regions`], the ones a span tenant holds: a sequence's
+    /// recurrent state store, the provenance gallery. Ground in use that no
+    /// compaction can pack, so a consumer measuring fragmentation must not charge it.
+    pub span_regions: usize,
+    /// Of [`Self::live_regions`], the ones **record** arenas hold. In use, and absent from
+    /// [`Self::classes`] — which reports band pools only — so a consumer summing those rows
+    /// must add this or it charges live records as waste.
+    pub record_regions: usize,
+    /// [`Self::span_regions`] broken down by tenant, from the SAME publish.
+    ///
+    /// **Which tenant holds the ground is not answerable from the total.** A tenant
+    /// on thirty mostly-empty arenas and one on thirty full ones give the same
+    /// `span_regions`, so an optimisation cannot be aimed at a tenant or
+    /// attributed to one. Each row also carries what its holders occupy and how
+    /// many strides it spans, which is what separates ground a packing walk could
+    /// reclaim from ground only a different slot layout could.
+    ///
+    /// Published here rather than sampled by the consumer because the two figures
+    /// must be one moment: read a publish interval apart, the difference between
+    /// the total and the rows reads exactly like an uncounted tenant instead of
+    /// like sampling skew — the same trap [`Self::frontier_regions`] records.
+    pub span_tenants: Vec<SpanTenantRow>,
+}
+
+/// One span tenant's arenas at the moment of a publish.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpanTenantRow {
+    /// The tenant's name, as `SlotTenant::label` gives it.
+    pub tenant: &'static str,
+    /// Whole regions its arenas stand on.
+    pub regions: usize,
+    /// Bytes its holders actually occupy. The shortfall against `regions` is free
+    /// slots plus every arena's unused tail.
+    pub held_bytes: usize,
+    /// Distinct strides. A tenant spread over several pools pays at least one
+    /// region per pool however small its slots are, which no packing walk
+    /// recovers — only giving it fewer strides does.
+    pub pools: usize,
 }
 
 /// One size class's share of the resident GPU arenas.
@@ -303,6 +368,14 @@ pub struct KvClassRow {
     pub arenas: usize,
     pub reserved_bytes: u64,
     pub live_bytes: u64,
+    /// Arenas this class's live chunks would occupy if they were packed.
+    pub packed_arenas: usize,
+    /// Arenas a perfect pack would empty — regions that are recoverable and that
+    /// the empty-arena sweep structurally cannot recover, because an arena keeps
+    /// its region until its *last* chunk goes and nothing moves chunks between
+    /// arenas. This is the fragmentation figure; region holes are not (they are
+    /// taken by the next claim, the free list being lowest-index-first).
+    pub freeable_arenas: usize,
 }
 
 /// One `(backing, format)` arena row.
@@ -462,6 +535,12 @@ impl Scheduler {
         });
 
         // ── KV arenas ───────────────────────────────────────────────────────
+        //
+        // Carries the fragmentation figure alongside the occupancy, from the one
+        // accessor the scheduler's own log line reads (`kv_fragmentation`), so the
+        // report, the log and any harness agree by construction rather than by
+        // three implementations of the same arithmetic.
+        let frag = self.session.kv_fragmentation();
         let classes = self
             .session
             .kv_gpu_class_stats()
@@ -469,11 +548,20 @@ impl Scheduler {
                 cs.classes
                     .iter()
                     .filter(|c| c.arenas > 0)
-                    .map(|c| KvClassRow {
-                        slot_bytes: c.slot_bytes,
-                        arenas: c.arenas,
-                        reserved_bytes: c.reserved_bytes as u64,
-                        live_bytes: c.live_bytes as u64,
+                    .map(|c| {
+                        let f = frag
+                            .iter()
+                            .find(|(k, _)| k.class.bytes() == c.slot_bytes)
+                            .map(|(_, f)| *f)
+                            .unwrap_or_default();
+                        KvClassRow {
+                            slot_bytes: c.slot_bytes,
+                            arenas: c.arenas,
+                            reserved_bytes: c.reserved_bytes as u64,
+                            live_bytes: c.live_bytes as u64,
+                            packed_arenas: f.packed_arenas,
+                            freeable_arenas: f.freeable_arenas(),
+                        }
                     })
                     .collect()
             })
@@ -487,7 +575,30 @@ impl Scheduler {
                 bytes: bytes as u64,
             })
             .collect();
-        let kv = KvSection { classes, arenas };
+        // Sampled here, in the same breath as the class rows above, so a consumer
+        // dividing one by the other is dividing two halves of one snapshot.
+        let ground = self.session.kv_ground_lost().unwrap_or_default();
+        // In the same breath as `span_regions` above, for the reason on
+        // `KvSection::span_tenants`: the total and its breakdown have to be one
+        // moment or their difference reads as an uncounted tenant.
+        let span_tenants = candle_nn::kv_cache::arena_census(&self.device)
+            .into_iter()
+            .map(|t| SpanTenantRow {
+                tenant: t.tenant.label(),
+                regions: t.regions,
+                held_bytes: t.held_bytes,
+                pools: t.pools,
+            })
+            .collect();
+        let kv = KvSection {
+            classes,
+            arenas,
+            frontier_regions: ground.watermark,
+            live_regions: ground.live_arenas,
+            span_regions: ground.span_regions,
+            record_regions: ground.record_regions,
+            span_tenants,
+        };
 
         // ── Warm tier ───────────────────────────────────────────────────────
         let warm = WarmSection {
@@ -561,6 +672,7 @@ impl Scheduler {
                 .resident_weight_bytes()
                 .map(|total| (total as u64).saturating_sub(resident_expert_bytes.unwrap_or(0))),
             resident_expert_bytes,
+            floor_bytes: super::interleave::optimal_weight_bytes(),
         };
 
         // ── Gallery arena ───────────────────────────────────────────────────
@@ -701,6 +813,8 @@ mod tests {
                     arenas: 1,
                     reserved_bytes: 2,
                     live_bytes: 3,
+                    packed_arenas: 1,
+                    freeable_arenas: 0,
                 }],
                 arenas: vec![ArenaRow {
                     backing: 0,
@@ -708,6 +822,16 @@ mod tests {
                     arenas: 2,
                     bytes: 256,
                 }],
+                // One live arena at the frontier, so the fixture is a pool with
+                // nothing stranded and nothing sparse — the shape a consumer dividing
+                // `packed_arenas` by the frontier should read as fully efficient.
+                frontier_regions: 1,
+                live_regions: 1,
+                span_regions: 0,
+                record_regions: 0,
+                // No span tenant in the fixture: the breakdown sums to
+                // `span_regions`, so an empty list is the consistent pairing.
+                span_tenants: Vec::new(),
             },
             warm: WarmSection {
                 resident_count: 7,
@@ -750,6 +874,10 @@ mod tests {
                 // regression that wires both fields to the zone pass.
                 base_bytes: Some(1_100_000_000),
                 resident_expert_bytes: Some(5_100_000_000),
+                // Below the resident experts above, as a floor must be: it is
+                // the ground the zone may not fall under, not the ground it
+                // holds.
+                floor_bytes: Some(4_000_000_000),
             },
             gallery: GallerySection {
                 resident_bytes: 268_435_456,

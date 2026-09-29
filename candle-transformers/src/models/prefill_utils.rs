@@ -19,6 +19,8 @@ use {
     half::{bf16, f16},
 };
 
+#[cfg(feature = "cuda")]
+use crate::models::operand_guard::expect_dtype;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::rope_schedule::RopeRungs;
 #[cfg(feature = "cuda")]
@@ -28,7 +30,7 @@ use crate::models::slot_state::SlotTokenLayout;
 #[cfg(feature = "cuda")]
 use candle_kernels::rope::RopeRungsFfi;
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::HeadGids;
+use candle_nn::kv_cache::ChunkPin;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -66,7 +68,7 @@ struct SlotHeaderUpload {
     /// headers address with one refcount bump per slot rather than a clone per
     /// chunk — the difference between O(1) and O(depth) on every layer of every
     /// step.
-    _pinned_gids: Vec<Arc<Vec<HeadGids>>>,
+    _pinned_gids: Vec<Arc<Vec<ChunkPin>>>,
 }
 
 /// Per-forward cache of the layer-invariant uploaded `position_map`.
@@ -1362,9 +1364,17 @@ pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
         candle::bail!("paged-prefill-int8 supports head_dim 64, 128 or 256 (got {head_dim})")
     }
 
-    let q = q.to_dtype(compute_dtype)?;
-    let k_packed = k_packed.to_dtype(compute_dtype)?;
-    let v_packed = v_packed.to_dtype(compute_dtype)?;
+    // Validated, not converted (invariant 1b). `project_qkv` already emits all
+    // three at the KV arena's width (`attention_operand_dtype`), which is what
+    // this kernel is instantiated on — Q, the new K/V and the output are one
+    // template type. A reference session whose arena is F32 never arrives here:
+    // `int8_prefill_act_dtype` sends it to the float fallback. So the casts that
+    // stood here converted nothing, and would have hidden a producer emitting
+    // the wrong width behind three full-tensor passes per layer, per wave.
+    expect_dtype(q, compute_dtype, "paged-prefill-int8: q")?;
+    expect_dtype(k_packed, compute_dtype, "paged-prefill-int8: k")?;
+    expect_dtype(v_packed, compute_dtype, "paged-prefill-int8: v")?;
+    let (q, k_packed, v_packed) = (q.clone(), k_packed.clone(), v_packed.clone());
 
     let (_total_q, q_n_head, q_head_dim) = q.dims3()?;
     if q_n_head != n_head || q_head_dim != head_dim {

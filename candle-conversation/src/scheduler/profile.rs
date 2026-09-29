@@ -48,6 +48,17 @@ mod imp {
             start: Instant::now(),
         }
     }
+
+    /// File a duration something else measured under `name`.
+    ///
+    /// For work whose timing cannot be taken with a scope guard here — a pass in a crate
+    /// *below* the profiler, which measures itself and hands the numbers back. Without
+    /// this such work is invisible in the one table that is supposed to account for a
+    /// whole wave, and its absence reads as time nothing claims.
+    #[inline]
+    pub fn record(name: &'static str, elapsed: std::time::Duration) {
+        pipeline_record_duration(name, elapsed, 1);
+    }
 }
 
 #[cfg(not(feature = "profile"))]
@@ -68,6 +79,9 @@ mod imp {
     pub fn span(_name: &'static str) -> Span {
         Span
     }
+
+    #[inline(always)]
+    pub fn record(_name: &'static str, _elapsed: std::time::Duration) {}
 }
 
-pub(crate) use imp::span;
+pub(crate) use imp::{record, span};

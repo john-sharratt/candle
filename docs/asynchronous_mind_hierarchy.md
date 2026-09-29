@@ -164,7 +164,7 @@ one is, and the reason is a property of the KV subsystem rather than of the agen
 **A level costs a wake, not a residency.** A mission conversation is idle almost all of the
 time — it does nothing between one `task_complete` and the next. Its KV therefore lives in
 the warm or cold tier and is elevated on wake (`elevate_to_hot`; cold is the redo log at
-`.substrate/substrate.log` — see [`archived/kv_tier_migration.md`](archived/kv_tier_migration.md)).
+`substrate/substrate.log` — see [`archived/kv_tier_migration.md`](archived/kv_tier_migration.md)).
 The marginal cost of a level is one elevation and one prefill per event, not continuous
 decode.
 

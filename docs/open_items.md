@@ -266,7 +266,7 @@ exclude the prompt half of the ingest turn from the gallery; or fix item 5. **Do
 - **`real_cuda` tests need the card alone.** `vram::tests::real_cuda` gates on a present CUDA
   device and asserts on global headroom, so a co-resident daemon inverts it. A filter that
   matches nothing exits 0 with `0 passed; N filtered out`.
-- **Three zend tests act on the real `.substrate`.** `startup_stall_watchdog` deletes it;
+- **Three zend tests act on the real `substrate`.** `startup_stall_watchdog` deletes it;
   `reproject_control` / `reproject_wave` copy the whole segment set into `target/`. All are
   `#[ignore]` — **never pass `--ignored` to the whole zend suite.**
 - **Model gates run one cargo process per model**, daemon stopped (`deepseek4.rs:621`).

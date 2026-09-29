@@ -77,13 +77,16 @@ __device__ __forceinline__ RopeView rope_view(const RopeRungs& r, uint32_t rung)
 }
 
 /// `(sin, cos)` of pair `i < pairs` at `pos`. `pos` is clamped to the table's
-/// reach, so a position past it reads the last `HI` row rather than past the
-/// allocation.
+/// reach on both ends: a position past it reads the last `HI` row, and a
+/// negative one reads row 0, rather than either reading before the
+/// allocation. `hi` needs both clamps — `pos >> ROPE_F_LO_BITS` sign-extends
+/// for negative `pos`, so only bounding the top would leave a negative index
+/// to reach `tab + hi * pairs + i` below the table's first row.
 __device__ __forceinline__ float2 rope_f_lookup(
     const float2* __restrict__ tab, int pairs, int pos, int i)
 {
     int hi = pos >> ROPE_F_LO_BITS;
-    hi = hi < ROPE_F_HI_DIM - 1 ? hi : ROPE_F_HI_DIM - 1;
+    hi = hi < 0 ? 0 : (hi < ROPE_F_HI_DIM - 1 ? hi : ROPE_F_HI_DIM - 1);
     const int lo = pos & (ROPE_F_LO_DIM - 1);
     const float2 h = __ldg(tab + hi * pairs + i);
     const float2 l = __ldg(tab + (ROPE_F_HI_DIM + lo) * pairs + i);

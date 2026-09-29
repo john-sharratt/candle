@@ -9,7 +9,10 @@ use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct WriteRequest {
-    /// Path to create or overwrite (e.g. `src/main.rs`). The result is held in this session; a project file of the same path is shadowed, never modified on disk. Required.
+    /// The repository the file belongs to. Required.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// Path to create or overwrite, relative to the repository (e.g. `src/main.rs`). The result is held in this session; a project file of the same path is shadowed, never modified on disk. Required.
     #[validate(length(min = 1))]
     pub path: String,
     /// Full file content to write, replacing any existing content. Required.
@@ -18,6 +21,7 @@ pub struct WriteRequest {
 
 #[derive(Serialize)]
 pub struct WriteResponse {
+    pub repo: String,
     pub path: String,
     pub bytes: usize,
     pub created: bool,
@@ -33,7 +37,7 @@ impl Tool for FileWrite {
          output the model wants to reference later, creating files the user will download or \
          transfer, replacing a file's full content. Triggered by \"create a file\", \"save \
          this as\", \"write to\", \"put this in a file called\", \"make a file with\". Returns \
-         path, byte count, and whether the file was newly created vs overwritten. For partial \
+         repo, path, byte count, and whether the file was newly created vs overwritten. For partial \
          edits use file_edit; for pushing files to a real remote system use \
          remote_fs_session_put.";
 
@@ -49,8 +53,9 @@ impl Tool for FileWrite {
 
     fn run(ctx: &ToolContext, req: WriteRequest) -> Result<WriteResponse, FileError> {
         let bytes = req.content.len();
-        let created = ctx.vfs.write(&req.path, req.content)?;
+        let created = ctx.files.repo(&req.repo)?.write(&req.path, req.content)?;
         Ok(WriteResponse {
+            repo: req.repo,
             path: req.path,
             bytes,
             created,

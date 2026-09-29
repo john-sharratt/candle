@@ -375,7 +375,9 @@ pub fn draft_cohort(
                     generation: &Generation|
      -> Result<(Tensor, Tensor)> {
         let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-        let (cos, sin) = model.rotary().rope_cos_sin(&pos, theta, rope_dtype, dev)?;
+        let (cos, sin) = model
+            .rotary()
+            .rope_cos_sin(&pos, theta, rope_dtype, dev, None)?;
         let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
         let params = BatchedAttentionParams::new(
             &cos,
@@ -402,10 +404,6 @@ pub fn draft_cohort(
         committed,
         &seed_block,
         max_len,
-        // Nothing to open: this head's block runs through
-        // `forward_layer_batched_mixed`, which lays its spans out in whatever
-        // tier is already placed rather than wanting one of its own.
-        || Ok(()),
         &mut step,
     )
 }

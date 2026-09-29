@@ -14,7 +14,7 @@ use zend::log_broadcast::LogBus;
 use zend::session::{StreamItem, ZendSession};
 use zend::types::{ChatMessage, Role, ToolMode};
 
-use crate::common::needs_compaction;
+use crate::common::{needs_compaction, served, PROJECT_REPO};
 use crate::verdict::{verdict_for, Verdict};
 
 /// The script, in order. The last question is the one judged: it has the model
@@ -89,14 +89,15 @@ pub fn run_arm(arm: &Arm) {
     report(arm, &verdicts);
 }
 
-/// The arm's workspace, holding the files the script reads.
+/// The arm's workspace, holding the files the script reads in its one
+/// repository.
 fn workspace(arm: &Arm) -> PathBuf {
     let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(arm.workspace);
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("zend sits inside the repo");
     for rel in SCRIPT_FILES {
-        let dst = ws.join(rel);
+        let dst = ws.join(PROJECT_REPO).join(rel);
         std::fs::create_dir_all(dst.parent().expect("a file has a parent"))
             .expect("create the workspace");
         std::fs::copy(repo.join(rel), &dst).unwrap_or_else(|e| panic!("copy {rel}: {e}"));
@@ -110,7 +111,6 @@ async fn converse(arm: &Arm) -> Vec<(String, Verdict)> {
     let ws = workspace(arm);
     let config = DaemonConfig {
         compact_substrate: needs_compaction(&ws),
-        workspace: ws,
         port: 0,
         model: ModelChoice::Preset(Box::new(arm.model.clone())),
         disabled_layers: ["repo_map", "code_reading"]
@@ -118,7 +118,7 @@ async fn converse(arm: &Arm) -> Vec<(String, Verdict)> {
             .map(|s| s.to_string())
             .collect(),
         qsa_selection_budget: arm.qsa_selection_budget,
-        ..Default::default()
+        ..DaemonConfig::new(served(&ws))
     };
     let session = Arc::new(ZendSession::new(config, LogBus::new()));
     session.start_loading();

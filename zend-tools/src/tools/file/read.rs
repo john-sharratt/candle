@@ -8,41 +8,36 @@ use super::render::{fence_tag_for_path, numbered_excerpt};
 use super::FileError;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
-/// Most lines one `file_read` call returns, however wide a range it asks for.
+/// A page names itself. `repo`, `path` and `page` are all required — that is
+/// the order the `required` list declares them in, and so the order the
+/// constrained decoder offers them in, which is also the order a call reads
+/// in.
 ///
-/// The same size the rest of the system already treats as one excerpt, so a live
-/// read and the prefilled excerpts the model was conditioned on are the same
-/// kind of object — a scope, not a module. `zend`'s `repo_scan::anchor` bounds
-/// its anchor excerpts at 200 by the identical `start + LIMIT - 1` clamp, and
-/// the `code_reading` ingest carves scopes at 150 (`MAX_SCOPE_LINES`), so every
-/// `file_read` exchange in the corpus already fits inside this cap and none had
-/// to be re-cut for it.
-pub const MAX_READ_LINES: u32 = 200;
-
-/// Every read names a range. `path`, `start_line` and `end_line` are all
-/// required — that is the order the `required` list declares them in, and so the
-/// order the constrained decoder offers them in, which is also the order a call
-/// reads in.
-///
-/// **A range is required because an unbounded read is not a slower read, it is a
-/// different failure.** One `file_read` of a 2,499-line module put 144 KB into a
-/// live conversation; three such reads made the next turn a 53,288-token prefill,
-/// which the scheduler delivered in 8,192-token chunks while the KV pool ratcheted
-/// 6 GB against a card already at 99% — three minutes and fifty seconds of wall
-/// clock for one turn. Guidance in the tool description did not prevent it: nine
-/// of nine reads in that conversation asked for whole files. The schema does,
-/// because a call with no range cannot be decoded against this stencil at all.
+/// **A page is required because an unbounded read is not a slower read, it is
+/// a different failure.** One `file_read` of a 2,499-line module put 144 KB
+/// into a live conversation; three such reads made the next turn a
+/// 53,288-token prefill, which the scheduler delivered in 8,192-token chunks
+/// while the KV pool ratcheted 6 GB against a card already at 99% — three
+/// minutes and fifty seconds of wall clock for one turn. Guidance in the tool
+/// description did not prevent it: nine of nine reads in that conversation
+/// asked for whole files. The schema does, because a call with no page cannot
+/// be decoded against this stencil at all — and a fixed page, rather than an
+/// arbitrary caller-chosen range, means every call costs the same
+/// [`zend_vfs::vfs::PAGE_LINES`] lines regardless of what the model asks
+/// for, with no clamp-and-explain step to get there.
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {
-    /// Path of the file to read — a project file from the working directory, or one this session created (e.g. `src/main.rs`, or `/workspace/src/main.rs`). Required.
+    /// The repository the file belongs to. Required.
+    #[validate(length(min = 1))]
+    pub repo: String,
+    /// Path of the file to read, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
-    /// First line of the range to return, 1-based. Required — every read names a range. Start where the answer is: a file_grep hit's line, a line named in an error, or the line after the previous excerpt ended.
-    #[validate(range(min = 1))]
-    pub start_line: u32,
-    /// Last line of the range, 1-based and inclusive. Required. At most 200 lines come back per call; a wider range is served from start_line and the header says how much of the file is left.
-    #[validate(range(min = 1))]
-    pub end_line: u32,
+    /// Zero-based page of the file to return, 200 lines a page. Required —
+    /// pass 0 to start at the top of the file. A page past the end clamps to
+    /// the last one — read page 0 first, its header names the total, then
+    /// keep incrementing until a response's own page number stops advancing.
+    pub page: u32,
 }
 
 pub struct FileRead;
@@ -50,21 +45,19 @@ pub struct FileRead;
 impl Tool for FileRead {
     const NAME: &'static str = "file_read";
     const DESCRIPTION: &'static str =
-        "Read a range of lines from a file. Resolves against this session's edits \
-         first, then falls through to the project's working directory, so real \
-         project files can be read directly. path, start_line and end_line are ALL \
-         REQUIRED: there is no whole-file read, and at most 200 lines come back per \
-         call. Aim the range at the answer — a file_grep hit's line number, a line \
-         named in an error, the line after the previous excerpt ended — and read on \
-         if it proves too narrow. Returns the lines as numbered source in a fenced \
-         block, headed by the path and the range it covers: `(lines 1-200 of 2499)` \
-         means 200 lines came back and the file runs to 2499, so the next call \
-         starts at 201. A range wider than 200 lines is served from start_line and \
-         the header says what is left. There is no need to find a file's length \
-         first: read from line 1 and the header reports it. To find the line \
-         worth reading, use file_grep rather than paging a large file to look \
-         for it. For remote filesystems use remote_fs_session_get to download \
-         first, then file_read.";
+        "Read a file, one 200-line page at a time. Resolves against this session's \
+         edits first, then falls through to the repository on disk, so real \
+         project files can be read directly. The repo, the path within it, and \
+         the page are all required — pass page 0 to read the top of the file; it \
+         is zero-based, so page 1 is lines 201-400. Returns the page as numbered \
+         source in a fenced block, headed by the path, the repo, the page and \
+         total page count, and the line range covered — `src/lib.rs in candle \
+         (page 1 of 5, lines 201-400 of 1420)`. Keep incrementing page \
+         until the header's page number stops advancing; a short file is entirely \
+         on page 0. There is no need to find a file's length first: read page 0 \
+         and the header reports it. To find the page worth reading, use file_grep \
+         rather than paging a large file to look for it. For remote filesystems \
+         use remote_fs_session_get to download first, then file_read.";
 
     type Request = ReadRequest;
     /// A rendered excerpt, not a JSON object: the runner places a string result
@@ -83,52 +76,21 @@ impl Tool for FileRead {
         if lower.starts_with("http://") || lower.starts_with("https://") {
             return Err(FileError::IsUrl(req.path));
         }
-        let content = ctx
-            .vfs
-            .read(&req.path)?
+        let page = ctx
+            .files
+            .repo(&req.repo)?
+            .read_page(&req.path, req.page)?
             .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
-        // Split on '\n' rather than `lines()`: a trailing newline must not shift
-        // the numbering, and the renderer handles the final empty element.
-        let all: Vec<&str> = content.split('\n').collect();
-        let total = if all.last() == Some(&"") {
-            all.len().saturating_sub(1)
-        } else {
-            all.len()
-        } as u32;
-        if total == 0 {
-            return Ok(numbered_excerpt(
-                &req.path,
-                1,
-                0,
-                0,
-                fence_tag_for_path(&req.path),
-                "",
-            ));
-        }
-
-        // Both bounds clamp into the file. `start` past the end reads the last
-        // line rather than returning nothing a model would read as "empty", and
-        // `end` below `start` collapses to a one-line read rather than an error
-        // — a transposed pair costs a narrow excerpt, not a wasted round trip.
-        let start = req.start_line.clamp(1, total);
-        let end = req.end_line.clamp(start, total);
-
-        // The span cap, applied last so it bounds what the clamps produced.
-        // Served rather than refused: the model asked for a region and gets its
-        // first MAX_READ_LINES lines, and because `end` now falls short of
-        // `total` the header renders `(lines 1-200 of 2499)` — which states both
-        // that the excerpt was cut and where to resume. An `invalid_arguments`
-        // here would spend a whole turn saying the same thing.
-        let end = end.min(start.saturating_add(MAX_READ_LINES - 1));
-
-        let body = all[(start - 1) as usize..end as usize].join("\n");
         Ok(numbered_excerpt(
+            &req.repo,
             &req.path,
-            start,
-            end,
-            total,
+            page.page,
+            page.total_pages,
+            page.start_line,
+            page.end_line,
+            page.total_lines,
             fence_tag_for_path(&req.path),
-            &body,
+            &page.body,
         ))
     }
 }

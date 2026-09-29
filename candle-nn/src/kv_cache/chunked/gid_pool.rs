@@ -52,6 +52,7 @@
 //! arena and lets drops touch a single cache line.
 
 use ahash::{AHashMap, AHashSet};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::{
     collections::VecDeque,
@@ -63,7 +64,7 @@ use std::{
 };
 use strum::IntoEnumIterator;
 
-use super::arena::ArenaKey;
+use super::arena::{ArenaKey, ArenaKind, RECORD_STRIDES};
 use super::size_class::SizeClass;
 use crate::kv_cache::chunked::types::{GID_STRIDE, TARGET_ARENA_BYTES};
 use crate::kv_cache::ArenaLocation;
@@ -100,7 +101,8 @@ pub struct ArenaRefcounts {
     /// overlapped (refcount xor link) this is now the **authoritative** free/
     /// occupied discriminator (not just a scan hint): set on claim, cleared on
     /// the `1→0` last drop, `fetch_or`/`fetch_and` so different bits of a word
-    /// compose. Read by `live_gids` to enumerate live slots.
+    /// compose. Read by [`ArenaRefcounts::occupied_slots`] to enumerate live
+    /// slots for a compaction census.
     occupancy: Vec<AtomicU64>,
     /// Lock-free intrusive recycle stack of freed slots (Treiber). Links live
     /// in `counts` (a free slot's word = next-free index, or `arena_chunks` =
@@ -137,8 +139,10 @@ pub struct ArenaRefcounts {
     /// full → non-full transition so the pool's `allocate_any` can find it via
     /// find-first-set instead of scanning every arena.
     capacity: Arc<CapacityBitmap>,
-    /// Creation window guard: `true` from registration until the arena hands
-    /// out its FIRST gid. `register_arena` releases the metadata lock before
+    /// Creation window guard: `true` from registration until the arena hands out
+    /// its FIRST gid, or until its creator closes it explicitly with
+    /// `ChunkGidPool::finish_creation` — which every creator that may not claim does
+    /// (a stamp after its by-name claim, a compaction's provisioned arenas once built). `register_arena` releases the metadata lock before
     /// its caller allocates chunks or writes data, so a freshly-registered
     /// arena sits at `live == 0`, unprotected — and `try_tombstone` on another
     /// thread could free it (and recycle its INDEX to a different owner) while
@@ -239,6 +243,40 @@ impl ArenaRefcounts {
     #[inline]
     fn is_full(&self) -> bool {
         self.live.load(Ordering::Acquire) >= self.arena_chunks
+    }
+
+    /// Occupied slot indices, ascending — the census a compaction plans from.
+    ///
+    /// Walks the [`Self::occupancy`] bitmap a word at a time and peels set bits
+    /// with `trailing_zeros`, so the cost is the bitmap's words plus the live
+    /// count rather than the arena's capacity. That matters at the bottom of the
+    /// ladder, where one arena holds 52,428 slots and a per-slot loop would
+    /// dominate a pass that has only a handful of chunks to move.
+    ///
+    /// **A snapshot, not a lock.** Each word is read independently, so a claim or
+    /// a drop landing mid-walk may or may not be seen. The caller compensates
+    /// structurally rather than by locking: a compaction runs inside the arena
+    /// window with no forward in flight, and the destination claim
+    /// (`allocate_from_arena`) is what finally refuses a slot the census believed
+    /// free. A stale *source* is harmless — the move is simply not worth making.
+    pub(crate) fn occupied_slots(&self) -> Vec<u32> {
+        let live = self.live.load(Ordering::Acquire);
+        let mut out = Vec::with_capacity(live);
+        for (w, word) in self.occupancy.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let b = bits.trailing_zeros();
+                bits &= bits - 1;
+                let slot = w * 64 + b as usize;
+                // The last word is padded past `arena_chunks`; a padding bit is
+                // never set, but bounding here means a future change to the
+                // padding cannot hand a caller a slot the arena does not have.
+                if slot < self.arena_chunks {
+                    out.push(slot as u32);
+                }
+            }
+        }
+        out
     }
 
     /// Mark slot `i` occupied in the scan bitmap (set its bit).
@@ -671,11 +709,20 @@ struct ArenaPool {
 
 impl ArenaPool {
     fn new(class: SizeClass) -> Self {
+        Self::with_chunks(class.chunks_per_region())
+    }
+
+    /// A pool whose arenas hold `arena_chunks` slots.
+    ///
+    /// Split out because a record arena's capacity comes from its stride, not from its
+    /// size class — `ArenaKey::chunks()` is the authority for both kinds, and taking it
+    /// from the class for a record pool would size every refcount table wrongly.
+    fn with_chunks(arena_chunks: usize) -> Self {
         Self {
             tables: RwLock::new(BTreeMap::new()),
             total_arenas: AtomicUsize::new(0),
             total_live: Arc::new(AtomicUsize::new(0)),
-            arena_chunks: class.chunks_per_region(),
+            arena_chunks,
             alloc_gate: Mutex::new(()),
             capacity: Arc::new(CapacityBitmap::new()),
         }
@@ -918,6 +965,30 @@ impl ArenaPool {
         Some(candidate)
     }
 
+    /// Remove `arena_idx`'s table if it is past its creation window and holds no live
+    /// slot; `true` when it did.
+    ///
+    /// [`Self::try_tombstone`] for one named arena, under the same gate and for the same
+    /// reason. Protection is not consulted: the only caller is the creator that holds
+    /// the protection, releasing its own arena.
+    fn tombstone_if_empty(&self, arena_idx: usize) -> bool {
+        let _gate = self.alloc_gate.lock().unwrap();
+        let empty = self
+            .tables
+            .read()
+            .unwrap()
+            .get(&arena_idx)
+            .is_some_and(|t| !t.creation_pending() && t.live_count() == 0);
+        if !empty {
+            return false;
+        }
+        let mut tables = self.tables.write().unwrap();
+        tables.remove(&arena_idx);
+        self.total_arenas.fetch_sub(1, Ordering::Relaxed);
+        self.capacity.clear(arena_idx);
+        true
+    }
+
     /// Force-remove an arena's table regardless of whether it's empty.
     /// Used by the legacy `release_arena` path after a manual gid drain.
     fn force_release(&self, arena_idx: usize) {
@@ -982,10 +1053,52 @@ impl ArenaPool {
         arenas.saturating_sub(needed)
     }
 
+    /// Add this pool's arenas that hold no chunk to `census`, each counted once more
+    /// under the reason [`Self::try_tombstone`] would pass over it, if it has one.
+    fn count_empty(&self, protected_arenas: &AHashSet<usize>, census: &mut EmptyCensus) {
+        let tables = self.tables.read().unwrap();
+        for (idx, t) in tables.iter() {
+            if t.live_count() != 0 {
+                continue;
+            }
+            census.empty += 1;
+            if t.creation_pending() {
+                census.in_creation += 1;
+            }
+            if protected_arenas.contains(idx) {
+                census.protected += 1;
+            }
+        }
+    }
+
     #[cfg(test)]
     fn free_len(&self) -> usize {
         self.total_free()
     }
+}
+
+/// One key's arenas and how full they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyOccupancy {
+    pub key: ArenaKey,
+    /// Arenas registered for the key.
+    pub arenas: usize,
+    /// Slots holding a chunk, across those arenas.
+    pub live: usize,
+    /// Slots in one arena of the key.
+    pub arena_chunks: usize,
+}
+
+/// The arenas of a pool that hold no chunk, and why the empty sweep would keep any
+/// of them. An arena can be counted under both reasons.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmptyCensus {
+    /// Arenas with no live chunk.
+    pub empty: usize,
+    /// Of those, arenas still inside their creation window.
+    pub in_creation: usize,
+    /// Of those, arenas protected from the sweep.
+    pub protected: usize,
 }
 
 /// Internal state of the GID pool, partitioned by ArenaKey.
@@ -1020,11 +1133,28 @@ fn preallocated_pool_table() -> AHashMap<ArenaKey, ArenaPool> {
     // pools. That collapse is the whole point: every format sharing a class
     // now shares one pool and one free list, so a slot freed by any of them is
     // allocatable by all of them (`docs/archived/arena_unification.md` §3.4).
-    let mut pools = AHashMap::with_capacity(ArenaLocation::iter().count() * SizeClass::COUNT);
+    let mut pools = AHashMap::with_capacity(
+        ArenaLocation::iter().count() * SizeClass::COUNT + RECORD_STRIDES.len(),
+    );
     for location in ArenaLocation::iter() {
         for class in SizeClass::all() {
             pools.insert(ArenaKey::new(class, location), ArenaPool::new(class));
         }
+    }
+    // **The `KvHead` record pools, preallocated for the same reason — and GPU only.** A
+    // record arena's stride is one of the dozen rungs of `RECORD_STRIDES`, which is what
+    // keeps this table complete at construction and the lookup lock-free. A record pool
+    // sizes its refcount tables from the key's own capacity, not from a size class,
+    // because a record's slot count comes from its stride
+    // (`docs/vram_span_partition.md` §8).
+    //
+    // Not per location: records are allocated `Gpu` only, and a record cannot migrate
+    // tiers because its device address is fixed for the handle's life — every slice
+    // header holds it raw. A per-location loop minted twelve CPU pools that nothing
+    // could ever allocate from.
+    for stride in RECORD_STRIDES {
+        let key = ArenaKey::for_record_stride(ArenaLocation::Gpu, stride);
+        pools.insert(key, ArenaPool::with_chunks(key.chunks()));
     }
     pools
 }
@@ -1102,6 +1232,12 @@ impl ChunkGidPool {
     pub fn protect_arena(&self, arena_idx: usize) {
         let mut state = self.inner.metadata.lock().unwrap();
         state.protected_arenas.insert(arena_idx);
+    }
+
+    /// Lift [`Self::protect_arena`], so the empty sweep may reclaim the arena again.
+    pub fn unprotect_arena(&self, arena_idx: usize) {
+        let mut state = self.inner.metadata.lock().unwrap();
+        state.protected_arenas.remove(&arena_idx);
     }
 
     /// Register a new arena with the pool.
@@ -1266,6 +1402,70 @@ impl ChunkGidPool {
         })
     }
 
+    /// Per-arena occupancy for one pool — the gid-pool half of a compaction
+    /// census.
+    ///
+    /// Returns `(arena_idx, capacity, occupied slot indices ascending)` for every
+    /// registered arena of `key`, itself in ascending `arena_idx` order because
+    /// that is the `BTreeMap`'s order.
+    ///
+    /// **`arena_idx` order is not address order.** An index is whatever the pool
+    /// handed out and is recycled when an arena is tombstoned, so the caller must
+    /// join this against each arena's region index before planning anything —
+    /// packing by index instead of address is the mistake
+    /// `compact_plan::ArenaSlots::rank` exists to prevent, and it silently packs
+    /// into the wrong end of the span.
+    /// `(arena_idx, capacity, live_count)` for every registered arena of `key` —
+    /// the **cheap** form of [`Self::pool_occupancy`].
+    ///
+    /// Occupancy's cost is `occupied_slots()`, which walks an arena's whole refcount
+    /// bitmap and materialises a `Vec<u32>` of its live slots: at the 320 B rung that
+    /// is 52,428 bits and up to 52,428 `u32`s per arena. A caller that only needs to
+    /// know *how much* is live — to decide which pool is worth censusing at all —
+    /// must not pay that, or the decision costs more than the thing it is deciding
+    /// about.
+    pub fn pool_arena_load(&self, key: ArenaKey) -> Vec<(usize, usize, usize)> {
+        let Some(pool) = self.inner.pools.get(&key) else {
+            return Vec::new();
+        };
+        let tables = pool.tables.read().unwrap();
+        tables
+            .iter()
+            .map(|(&arena_idx, t)| (arena_idx, pool.arena_chunks, t.live_count()))
+            .collect()
+    }
+
+    /// Arenas one pool holds, and how many it would need packed — the **cheap**
+    /// sparsity figure.
+    ///
+    /// `Fragmentation::packed_arenas` computes the same number from a full occupancy
+    /// census, and the difference matters because this one is a gate: a pass that
+    /// censuses the ladder to decide whether to census the ladder has already paid.
+    /// Every term here is a field read — the live count is an atomic the refcount
+    /// table maintains — so an idle engine can ask this on every wave.
+    ///
+    /// `(arenas_held, arenas_if_packed)`.
+    pub fn pool_sparsity(&self, key: ArenaKey) -> (usize, usize) {
+        let load = self.pool_arena_load(key);
+        if load.is_empty() {
+            return (0, 0);
+        }
+        let capacity = load[0].1.max(1);
+        let live: usize = load.iter().map(|(_, _, live)| *live).sum();
+        (load.len(), live.div_ceil(capacity))
+    }
+
+    pub fn pool_occupancy(&self, key: ArenaKey) -> Vec<(usize, usize, Vec<u32>)> {
+        let Some(pool) = self.inner.pools.get(&key) else {
+            return Vec::new();
+        };
+        let tables = pool.tables.read().unwrap();
+        tables
+            .iter()
+            .map(|(&arena_idx, t)| (arena_idx, pool.arena_chunks, t.occupied_slots()))
+            .collect()
+    }
+
     /// Convenience: allocate a gid using a default test key.
     pub fn allocate(&self) -> ChunkGid {
         let key = ArenaKey::new(TEST_CLASS, ArenaLocation::Gpu);
@@ -1285,6 +1485,30 @@ impl ChunkGidPool {
         state.arena_registry[arena_idx] = None;
         state.free_arenas.push_back(arena_idx);
         Some(arena_idx)
+    }
+
+    /// Release one named arena if it is empty and past its creation window, returning
+    /// its index to the free list; `true` when it did.
+    ///
+    /// For a creator handing back an arena it made and did not use. The caller releases
+    /// the arena's storage afterwards, exactly as after [`Self::next_tombstone`].
+    ///
+    /// **The index leaves the protected set here, under the same lock that puts it on
+    /// the free list.** Lifted any later, the index would sit free and protected at once,
+    /// and a creator that registered and protected it in between would have its
+    /// protection erased by the belated lift.
+    pub fn tombstone_if_empty(&self, key: ArenaKey, arena_idx: usize) -> bool {
+        let mut state = self.inner.metadata.lock().unwrap();
+        let Some(pool) = self.inner.pools.get(&key) else {
+            return false;
+        };
+        if !pool.tombstone_if_empty(arena_idx) {
+            return false;
+        }
+        state.arena_registry[arena_idx] = None;
+        state.protected_arenas.remove(&arena_idx);
+        state.free_arenas.push_back(arena_idx);
+        true
     }
 
     /// Declare an arena created **ahead of demand** finished, so the empty
@@ -1317,6 +1541,37 @@ impl ChunkGidPool {
                 .store(false, Ordering::Release);
         }
         any
+    }
+
+    /// Every arena holding no chunk, across every key, and why the empty sweep would
+    /// keep any of them — what an out-of-regions report needs before it can claim the
+    /// reservation is occupied.
+    pub fn empty_census(&self) -> EmptyCensus {
+        let state = self.inner.metadata.lock().unwrap();
+        let mut census = EmptyCensus::default();
+        for pool in self.inner.pools.values() {
+            pool.count_empty(&state.protected_arenas, &mut census);
+        }
+        census
+    }
+
+    /// Every key that has an arena, with its arena count and live slots, most arenas
+    /// first — what is holding the reservation at the moment it is read.
+    pub fn occupancy(&self) -> Vec<KeyOccupancy> {
+        let mut out: Vec<KeyOccupancy> = self
+            .inner
+            .pools
+            .iter()
+            .map(|(key, pool)| KeyOccupancy {
+                key: *key,
+                arenas: pool.total_arenas.load(Ordering::Relaxed),
+                live: pool.total_live(),
+                arena_chunks: pool.arena_chunks,
+            })
+            .filter(|o| o.arenas > 0)
+            .collect();
+        out.sort_by_key(|o| Reverse(o.arenas));
+        out
     }
 
     /// True when a forced compaction could free at least one whole arena across
@@ -1433,6 +1688,17 @@ impl ChunkGidPool {
         }
         for (key, pool) in self.inner.pools.iter() {
             if key.location != ArenaLocation::Gpu {
+                continue;
+            }
+            // **Record arenas are not a size class and must not be counted as one.**
+            // This walk is over `pools.iter()`, not over band keys, so unlike the census
+            // in `compact` it does see the record pools — and a record key carries
+            // `SizeClass::at(0)` only to keep the key one shape, so all twelve record
+            // rungs would land in the smallest class's row. That row then reports arenas
+            // it does not own, reserved bytes for regions that are not its, and
+            // `live_bytes` accumulated at strides up to 1 MiB against a 320 B
+            // `slot_bytes` — and it feeds the fragmentation and relief decisions.
+            if !matches!(key.kind, ArenaKind::Band) {
                 continue;
             }
             let arenas = pool.total_arenas.load(Ordering::Relaxed);
@@ -1834,6 +2100,44 @@ mod tests {
         assert_eq!(b, 1);
         // Each arena contributes `arena_chunks` of capacity.
         assert_eq!(pool.free_list_len_for(key), test_arena_chunks() * 2);
+    }
+
+    /// **The census counts every empty arena, and names what would keep each one from
+    /// the sweep**: an open creation window, a protection, both, or nothing.
+    #[test]
+    fn the_empty_census_names_why_each_empty_arena_is_kept() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let used = pool.register_arena(key);
+        let _live = pool.allocate_from_arena(key, used).unwrap();
+        let _pending = pool.register_arena(key);
+        let released = pool.register_arena(key);
+        pool.finish_creation(key, released);
+        let guarded = pool.register_arena(key);
+        pool.finish_creation(key, guarded);
+        pool.protect_arena(guarded);
+        let both = pool.register_arena(key);
+        pool.protect_arena(both);
+
+        assert_eq!(
+            pool.empty_census(),
+            EmptyCensus {
+                empty: 4,
+                in_creation: 2,
+                protected: 2,
+            }
+        );
+        assert_eq!(pool.next_tombstone(key), Some(released));
+        assert_eq!(pool.next_tombstone(key), None, "the rest are kept");
+        assert_eq!(
+            pool.occupancy(),
+            [KeyOccupancy {
+                key,
+                arenas: 4,
+                live: 1,
+                arena_chunks: test_arena_chunks(),
+            }]
+        );
     }
 
     #[test]

@@ -32,7 +32,11 @@ pub mod draft;
 pub mod engine;
 pub mod hyper;
 #[cfg(feature = "cuda")]
+mod index_keys;
+#[cfg(feature = "cuda")]
 pub mod indexer;
+/// The KV threshold row by expert format.
+pub mod kv_row;
 pub mod loader;
 pub mod model;
 /// The NextN / MTP draft head — the block past the trunk, and the input
@@ -43,6 +47,8 @@ pub mod paged_index;
 pub mod place;
 pub mod ple;
 pub mod ple_cache;
+/// The prepared engine artifact — recipe, sources, requant, build.
+pub mod prepare;
 pub mod qsa;
 pub mod qsa_select;
 pub mod rope;

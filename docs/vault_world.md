@@ -64,7 +64,7 @@ The result lands in both files.
 
 **And the walls are already real.** `MindPath` refuses `..`, refuses `.exe`, and
 refuses anything that is not a named section (`npcd/src/mind/path.rs`). A Maker
-cannot wander into `.substrate` because it is not addressable. The building's
+cannot wander into `substrate` because it is not addressable. The building's
 walls and the path guard are the same wall.
 
 There is one vault per world. This one is Battle Cities.

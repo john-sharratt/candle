@@ -62,7 +62,14 @@ pub use chunked::slot_state_stats;
 /// worst defects were geometry, and none of them needed a GPU to find.
 pub use chunked::span_geometry;
 pub use chunked::wave_plan::{
-    BufferShape, Encoding, LayerPhase, ModelGeometry, WaveBuffer, WavePlan, BUMP_ALIGNMENT,
+    ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, HyperWidths, LayerPhase,
+    ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
+    DELTA_NET_SCAN_CHUNK,
+};
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    arena_census, arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves,
+    relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
@@ -86,6 +93,8 @@ pub use chunked::{
     initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
     weight_capacity_bytes, weight_floor_after,
 };
+/// Fixed-stride slot arenas, one set per span tenant — see `chunked::tenant_arena`.
+pub use chunked::{slot_stride, SlotTenant, SLOT_ALIGN};
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.
 pub use chunked::{
@@ -93,7 +102,7 @@ pub use chunked::{
 };
 /// The wave arena's phase spans. Measurements, so they are available whether or
 /// not the crate was built with a GPU backend.
-pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
+pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;
@@ -108,23 +117,39 @@ pub use chunked::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
     payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
+pub use chunked::{
+    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations, try_migrate_flight,
+    LocationFreeze, MigrateFlight,
+};
+/// Arena sparsity — the arenas a perfect KV pack would empty, per pool. The
+/// figure compaction is judged by; see `chunked::compact_plan`. `compaction_tally`
+/// is the other half: every pass's outcome since boot, refusals included, counted
+/// at the source because a refusal is the one outcome that cannot log.
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,
+    CompactionTally,
+};
 #[cfg(feature = "cuda")]
 pub use chunked::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
+pub use chunked::{
+    fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
+};
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
-pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
 pub use chunked::{
-    production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
+    production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta, ChunkPin,
     ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
     KvErrorThresholdFactors, LLAMA2_KV_FACTOR, LLAMA3_KV_FACTOR, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN35_0_8B_KV_FACTORS,
     QWEN35_9B_KV_FACTORS, QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS,
-    QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS,
+    QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS, QWEN4EXP_Q2KO_KV_FACTORS,
 };
+pub use chunked::{rewrite_sealed, CompactionMap, Sweep};
 pub use chunked::{ArenaKey, StoragePolicy};
 pub use chunked::{LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE};
 pub use rotating::{

@@ -117,9 +117,10 @@ fn set_mode_enum_value() {
     let v = TestVocab::new();
     let tree = tree_of(&three_tool_catalog(), &v);
     // name "set_mode"; enum value "exec" (inside the value's quote branch). The
-    // only param is required, so the close is prefilled — no further decode.
+    // enum arm carries what follows the value — here the call's close — so the
+    // model writes the value's closing quote and the close in its own tokens.
     let mut script = bytes_of("set_mode\"");
-    script.extend(bytes_of("exec\"")); // enum branch
+    script.extend(bytes_of("exec\"}}\n</tool_call>")); // enum branch
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
     let text = run.text(&v);
     let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
@@ -212,7 +213,33 @@ fn calculator_reflects_model_value_verbatim_even_when_garbage() {
 // Numbers and arrays are emitted as JSON values, lookahead-terminated and
 // pushed back to the close — exercises the session push-back path.
 #[test]
-fn integer_value_via_pushback() {
+fn number_value_via_pushback() {
+    let v = TestVocab::new();
+    let tools = parse_tools(
+        r#"[{"name":"wait","params":[{"name":"secs","type":"number","required":true}]}]"#,
+    )
+    .unwrap();
+    let tree = Arc::new(
+        compile(
+            &compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap(),
+            &v,
+        )
+        .unwrap(),
+    );
+    // Single tool ⇒ the name folds to a prefilled static; only the value is
+    // decoded. value "2.5" then the args-close '}' (lookahead delimiter).
+    let script = bytes_of(" 2.5}");
+    let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
+    let text = run.text(&v);
+    let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();
+    assert_eq!(parsed["name"], "wait");
+    assert_eq!(parsed["arguments"]["secs"], 2.5);
+}
+
+// An integer is written digit by digit under the mask, and the arm that ends
+// it carries the call's close — so the script writes the close in full.
+#[test]
+fn integer_value_is_written_digit_by_digit() {
     let v = TestVocab::new();
     let tools = parse_tools(
         r#"[{"name":"wait","params":[{"name":"secs","type":"integer","required":true}]}]"#,
@@ -225,9 +252,7 @@ fn integer_value_via_pushback() {
         )
         .unwrap(),
     );
-    // Single tool ⇒ the name folds to a prefilled static; only the value is
-    // decoded. value "30" then the args-close '}' (lookahead delimiter).
-    let script = bytes_of("30}");
+    let script = bytes_of("30}}\n</tool_call>");
     let run = simulate(tree, &v, Oracle::Scripted(script), 2000).unwrap();
     let text = run.text(&v);
     let parsed: serde_json::Value = serde_json::from_str(json_body(&text)).unwrap();

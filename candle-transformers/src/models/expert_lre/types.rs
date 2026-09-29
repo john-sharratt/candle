@@ -5,8 +5,8 @@
 
 use super::compute::QMatMul;
 use crate::models::profile::{ProfileMark, ProfileSnapshot};
-use candle::cuda_backend::wave_provenance::WaveTicket;
 use candle::quantized::GgmlDType;
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -47,8 +47,16 @@ pub struct PipelineStats {
     /// them in different places is how a warm tier sized at a third of the model
     /// went unnoticed while it sent two thirds of every miss to disk.
     pub warm_slots: usize,
+    /// **Gauge**: of `warm_slots`, those in pageable memory beyond the
+    /// page-lock ceiling — uploaded through the pinned staging ring.
+    pub warm_paged_slots: usize,
     /// Experts in the model, so `warm_slots` reads as a fraction.
     pub total_experts: usize,
+    /// **Gauge**: MoE layers in the model. Published beside `total_experts`
+    /// because the rate model needs the two apart: a decode step costs
+    /// `moe_layers` layers, and a layer's copy is capped at `total_experts /
+    /// moe_layers` experts. Their product alone cannot say either.
+    pub moe_layers: usize,
     /// Speculative prefetch loads that landed in VRAM.
     pub prefetch_loads: usize,
     /// Hint-driven speculative loads.
@@ -91,6 +99,21 @@ pub struct PipelineStats {
     /// fleet at whatever happens to be standing free. Refreshed by the pipeline
     /// thread each classify, like `resident_vram_bytes`.
     pub zone_cedeable_bytes: usize,
+    /// **Gauge**: the weight zone as it stands, and the range it may move in —
+    /// `capacity`, `min_capacity` and `limit`, each in bytes.
+    ///
+    /// Published together because they are only meaningful together: the wave
+    /// rate planner judges an admission on the residency it dislodges, which
+    /// needs where the zone is *and* how far it can go. The KV side cannot
+    /// derive them — `request_kv_ground` reports only what it was conceded after
+    /// the fact, and the zone regrows, so a figure inferred from concessions
+    /// reads the same whether or not the ground came back.
+    pub zone_bytes: usize,
+    pub zone_min_bytes: usize,
+    pub zone_max_bytes: usize,
+    /// **Gauge**: bytes one expert slot occupies — the unit every figure above
+    /// is a multiple of, and the grain the rate model prices a routed expert in.
+    pub expert_slot_bytes: usize,
     /// **Gauge**: whether the MoE dispatches on the device.
     ///
     /// `true` when the expert grid is fully VRAM-resident and
@@ -121,31 +144,35 @@ impl PipelineStats {
             .map_or_else(|_| Self::default(), |s| s.clone())
     }
 
-    /// Reset the per-interval tallies. The **gauges** —
-    /// `resident_vram_bytes`, `zone_cedeable_bytes`, `warm_slots`,
-    /// `total_experts`, `prefetch_depth` — survive it: they describe the
-    /// cache's shape rather than what it did since the last reset, and an
+    /// Reset the per-interval tallies. The **gauges** survive it: they describe
+    /// the cache's shape rather than what it did since the last reset, and an
     /// inline-mode cache (which never re-seeds them via a classify) would
     /// otherwise read 0 forever.
+    ///
+    /// **The tallies are cleared by name rather than the gauges restored around
+    /// a `default()`.** Both spellings zero the same fields today, but they fail
+    /// in opposite directions when this struct grows: restoring meant every new
+    /// gauge was silently zeroed on the next reset unless someone remembered to
+    /// add it to the list, and a gauge that reads zero is indistinguishable from
+    /// a cache that holds nothing. A new *tally* forgotten here merely
+    /// accumulates across intervals, which shows up as a number that only ever
+    /// rises — visible, rather than invisible.
     pub fn reset(shared: &Arc<Mutex<Self>>) {
         if let Ok(mut s) = shared.lock() {
-            let gauges = (
-                s.resident_vram_bytes,
-                s.zone_cedeable_bytes,
-                s.warm_slots,
-                s.total_experts,
-                s.prefetch_depth,
-                s.device_dispatch,
-            );
-            *s = Self::default();
-            (
-                s.resident_vram_bytes,
-                s.zone_cedeable_bytes,
-                s.warm_slots,
-                s.total_experts,
-                s.prefetch_depth,
-                s.device_dispatch,
-            ) = gauges;
+            s.expert_hits = 0;
+            s.expert_misses = 0;
+            s.evictions = 0;
+            s.dma_loads = 0;
+            s.warm_loads = 0;
+            s.cold_loads = 0;
+            s.prefetch_loads = 0;
+            s.hint_loads = 0;
+            s.predicted_hits = 0;
+            s.predicted_total = 0;
+            s.fence_stalls = 0;
+            s.late_loads = 0;
+            s.stream_loads = 0;
+            s.work_requests = 0;
         }
     }
 
@@ -169,6 +196,28 @@ impl PipelineStats {
         } else {
             (self.predicted_hits as f64 / self.predicted_total as f64) * 100.0
         }
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::PipelineStats;
+
+    /// A reset clears the tallies and keeps the gauges — including the warm
+    /// tier's pageable share, which a report reads after every config.
+    #[test]
+    fn a_reset_keeps_the_gauges() {
+        let shared = PipelineStats::new_shared();
+        {
+            let mut s = shared.lock().unwrap();
+            s.warm_slots = 13_508;
+            s.warm_paged_slots = 2_138;
+            s.cold_loads = 11_225;
+        }
+        PipelineStats::reset(&shared);
+        let s = PipelineStats::snapshot(&shared);
+        assert_eq!((s.warm_slots, s.warm_paged_slots), (13_508, 2_138));
+        assert_eq!(s.cold_loads, 0);
     }
 }
 
@@ -344,6 +393,19 @@ pub struct MoeWorkRequest {
     /// Flat assignment array sorted by expert ID.
     /// Each entry: `(expert_id, token_idx, flat_weight_idx)`.
     pub assignments: Vec<(u32, u32, u32)>,
+    /// Count of leading rows, in this request's token order, that are
+    /// decode-attributed (decode rows plus any single-token prefills folded
+    /// into the decode group). The rest are prefill/glue rows.
+    ///
+    /// Used only to weight cache residency scoring
+    /// (`ExpertCacheInner::record_hit` vs `record_prefill_hit` /
+    /// `record_prefill_elevate`): a decode row's reuse of a specific expert is
+    /// near-certain from one step to the next, while a prefill row's is close
+    /// to zero, so the two must not compete for residency on equal footing.
+    /// `num_tokens` (every row decode-attributed) reproduces undifferentiated
+    /// scoring exactly, which is the right value for a caller that has not
+    /// been taught its own decode/prefill split yet.
+    pub decode_tokens: usize,
     /// The wave generation the submitting layer has open, if any.
     ///
     /// A [`WaveTicket`] is a `Copy` coordinate rather than a borrow, which is
@@ -373,6 +435,19 @@ pub struct MoeWorkRequest {
 /// Hints are sent by the forward thread while the async routing DtoH is
 /// in-flight, allowing the pipeline thread to start DMA for predicted
 /// experts before the full work request arrives.
+///
+/// **`Work` is deliberately not boxed**, which `clippy::large_enum_variant`
+/// asks for because it is ~240 B against `Hint`'s ~32. The fix it proposes costs
+/// a heap allocation on the MoE dispatch path — one per layer per wave, 28,511 of
+/// them in a single flagship engine run — to save a few bytes of stack in the
+/// rarer variant, which is the wrong trade on a hot path. The message is moved
+/// straight into a bounded channel whose buffer is already sized for the large
+/// variant, so the padding is never copied anywhere else.
+///
+/// The lint only fires with `--features profile`: `MoeWorkRequest::submitted_at`
+/// is a zero-sized `ProfileMark` without it and a real timestamp with it, which
+/// is what tips the ratio.
+#[allow(clippy::large_enum_variant)]
 pub enum PipelineMessage {
     /// Full MoE dispatch: classify → DMA → compute → return.
     Work(MoeWorkRequest),

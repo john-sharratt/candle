@@ -100,11 +100,12 @@ fn resolve_prepared(
     // "the merge has not been run on this machine".
     anyhow::bail!(
         "engine artifact {filename} is not on this machine.\n\
-         It is BUILT, not downloaded — nothing publishes it under that name. Produce it with \
-         the `prepare_engine_gguf` gate in `candle-transformers/src/models/quantized_qwen38_moe.rs` \
-         (it fetches the pinned {repo} Q8_0 split and the W4A16 expert release, imports the \
-         experts to Q4_KO, folds in the MTP head and merges), then place or symlink the result \
-         at {}.",
+         It is BUILT, not downloaded — nothing publishes it under that name, and the name \
+         carries the digest of the recipe that builds it. Produce it on this card with the \
+         `test_parallel_batched_forwarding` gate in \
+         `candle-transformers/src/models/quantized_qwen38_moe.rs` (`qwen4exp::prepare`: it \
+         fetches the recipe's pinned {repo} sources, brings the routed experts to this card's \
+         rung, folds in the MTP head and merges), which writes it to {}.",
         our_path.display(),
     )
 }

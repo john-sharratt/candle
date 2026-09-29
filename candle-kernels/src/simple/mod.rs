@@ -54,6 +54,10 @@ pub mod gather_r16_kv;
 // memory — lets a tensor stay in the GGUF mmap instead of occupying VRAM
 pub mod gather_rows;
 
+/// Token-embedding lookup from a quantized table resident in VRAM: gather,
+/// dequantize and replicate across residual streams in one launch.
+pub mod embed_gather_dequant;
+
 // Provenance sign(Q) bit-pack: GPU read+sign+pack, one launch for all layers
 pub mod prov_sign_pack;
 
@@ -104,6 +108,15 @@ pub mod comp_idx;
 // launch, driven by a descriptor table — the corpus-gallery append across every
 // session of a wave
 pub mod rows_scatter;
+
+// One content hash per KV slot over the bands its block tables name, folded
+// commutatively so block scheduling cannot change the result — the integrity
+// primitive the compaction boundaries compare across
+pub mod kv_hash;
+
+// KvHead record construction on the device: one grid-strided launch per batch, band
+// addresses computed from an arena extent table rather than serialized on the host
+pub mod kv_record_fill;
 
 // NVTX3 range shim, so an nsys trace names the pipeline span that launched each
 // kernel (header-only NVTX3; nothing to link against)

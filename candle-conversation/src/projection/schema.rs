@@ -822,6 +822,15 @@ pub struct LayerSchema {
     /// Total turn-budget (in tokens) distributed across all visible layers
     /// when this layer is the projection target.
     pub window: usize,
+    /// Tokens of THIS layer's conversations a fast-path tool read may inject
+    /// into another conversation.
+    ///
+    /// A tool call whose content the corpus has already read injects that
+    /// conversation instead of re-reading the file; this bounds how much of
+    /// this layer one conversation may accumulate that way, evicted
+    /// least-recently-used. `0` keeps the layer out of the fast path, so a read
+    /// of its content always runs for real.
+    pub fast_path_window: usize,
     /// Flex weight when *some other layer* is the projection target and
     /// this layer is visible (lower than the target). Determines how much
     /// of the target's `window` this layer receives.

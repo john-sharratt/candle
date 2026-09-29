@@ -26,10 +26,25 @@ questions:
 - show me every place that constructs a ToolContext
 category: Files
 mandatory: true
-description: 'Search the CONTENTS of every file in the project for a string or regular expression, returning the matching lines with their file paths and line numbers. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing the callers of an API; locating a config key, a magic string, or a leftover TODO. Takes a regex in Rust regex syntax (`^pub fn `, `Error::\w+`, `foo|bar`) — a plain string matches itself — plus an optional path prefix to narrow the search and an optional ignore_case. Returns path, line number and the matching line, paged, along with files_searched so that an empty result is unambiguous: scanning four thousand files and finding nothing reads differently from a prefix that matched nothing to scan. Capped at twenty hits per file so one generated file cannot hide every other file that matched; `truncated` says when a cap was reached. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it before guessing directory names with file_list. The line number it returns is what file_read takes as start_line, so the two compose directly. Use file_search to find a file by its NAME rather than its contents.'
+description: 'Search the CONTENTS of every file in the workspace **as it stands on disk right now** — uncommitted edits and untracked files included — for a string or regular expression, and return the matching lines with their repo, file path and line number. **If the question is about what a COMMIT, BRANCH or TAG holds ("search the committed files", "was this in the release branch", "did that tag still have it"), stop and use git_grep instead** — an untracked or since-edited file reads differently through the two, so answering a committed-content question from the working tree is confidently wrong. `repo` is required: name one repository when you know which one holds the code, or pass `*` to search them all. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing the callers of an API; locating a config key, a magic string, or a leftover TODO. Takes a regex in Rust regex syntax (`^pub fn `, `Error::\w+`, `foo|bar`) — a plain string matches itself — plus an optional path prefix to narrow the search and an optional ignore_case. Returns repo, path, line number and the matching line, paged, along with files_searched so that an empty result is unambiguous: scanning four thousand files and finding nothing reads differently from a prefix that matched nothing to scan. Capped at twenty hits per file so one generated file cannot hide every other file that matched; `truncated` says when a cap was reached. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it before guessing directory names with file_list. The line number it returns divided by 200, rounded down, is the page to pass file_read to see it in context. Use file_search to find a file by its NAME rather than its contents, and git_grep for what a commit, branch or tag holds rather than what is on disk.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
+    pattern:
+      description: Regular expression to search for, in Rust regex syntax (`\b`, `[A-Z]`, `foo|bar`, `^fn `). A plain string works as itself. Required.
+      minLength: 1
+      type: string
+    repo:
+      description: The repository to search, or `*` to search every repository in the workspace. Required.
+      enum:
+      - '*'
+      minLength: 1
+      type: string
+    prefix:
+      description: Restrict the search to paths beginning with this prefix, relative to each repository searched (e.g. `candle-nn/src/`). Omit to search whole repositories.
+      type:
+      - string
+      - 'null'
     ignore_case:
       description: Match without regard to case. Defaults to false, which is what searching for a source identifier wants.
       type:
@@ -42,17 +57,9 @@ parameters:
       type:
       - integer
       - 'null'
-    pattern:
-      description: Regular expression to search for, in Rust regex syntax (`\b`, `[A-Z]`, `foo|bar`, `^fn `). A plain string works as itself. Required.
-      minLength: 1
-      type: string
-    prefix:
-      description: Restrict the search to paths beginning with this prefix (e.g. `candle-nn/src/`). Omit to search the whole project.
-      type:
-      - string
-      - 'null'
   required:
   - pattern
+  - repo
   title: GrepRequest
   type: object
 examples:
@@ -60,13 +67,13 @@ examples:
   where is forward_wave defined<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user is asking where a symbol is defined, which is a question about file contents rather than file names, so this is file_grep rather than file_search.
+  The user is asking where a symbol is defined, which is a question about file contents rather than file names, so this is file_grep rather than file_search. forward_wave is this candle codebase's batched forward, so I search the candle repo rather than the whole workspace.
 
   A plain<|projection|> string matches itself, so the pattern can simply be "forward_wave". That will find the definition and the call sites together; the paths and line numbers in the result will<|projection|> let me narrow to the definition, and I can file_read at the line number afterwards.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "forward_wave"}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "forward_wave", "repo": "candle"}}
   </tool_call><|projection|>
 - |-
   are there any TODO or FIXME comments left<|im_end|>
@@ -74,71 +81,71 @@ examples:
   <|projection|><think>
   Two alternatives to look for, which is what regex alternation is for: the pattern "TODO|FIXME" matches either branch in one pass rather than costing two searches.
 
-  No<|projection|> prefix, because the question is about the whole project. If the result comes back with truncated set I will know there are more than the cap and can narrow by directory.
+  Repo<|projection|> `*` and no prefix, because the question is about the whole workspace. If the result comes back with truncated set I will know there are more than the cap and can narrow by repo or directory.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "TODO|FIXME"}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "TODO|FIXME", "repo": "*"}}
   </tool_call><|projection|>
 - |-
   who calls elevate_to_hot<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Finding callers means finding the call syntax, so I will search for the name followed by an open parenthesis. The parenthesis is a regex metacharacter, so it has to be<|projection|> escaped: "elevate_to_hot\(".
+  Finding callers means finding the call syntax, so I will search for the name followed by an open parenthesis. The parenthesis is a regex metacharacter, so it has to be<|projection|> escaped: "elevate_to_hot\(". elevate_to_hot belongs to this candle codebase's KV tiering, so the repo is candle.
 
   That excludes the bare mentions in comments and doc text, leaving the actual call sites, which is what "who calls" is asking for.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "elevate_to_hot\\("}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "elevate_to_hot\\(", "repo": "candle"}}
   </tool_call><|projection|>
 - |-
   find the public functions in zend-tools<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A declaration at the start of a line is an anchored pattern: "^pub fn " with the caret pinning it to the beginning, so I get declarations rather than every mention of the<|projection|> words.
+  zend-tools is a crate in this candle codebase, so the repo is candle. A declaration at the start of a line is an anchored pattern: "^pub fn " with the caret pinning it to the beginning, so I get declarations rather than every mention of the<|projection|> words.
 
-  The user named a crate, so prefix should be "zend-tools/src/" to keep the search inside it and the result small.
+  The user named a crate, so I narrow with repo "candle" and prefix "zend-tools/src/" to keep the search inside it and the result small.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "^pub fn ", "prefix": "zend-tools/src/"}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "^pub fn ", "repo": "candle", "prefix": "zend-tools/src/"}}
   </tool_call><|projection|>
 - |-
   the log says connection refused, find where that message comes from<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  They have an error string and want its origin. Searching the contents for the literal text is the direct route, and the message may be capitalised differently in the source<|projection|> than in the log, so I will set ignore_case to true rather than guess.
+  They have an error string and want its origin, without naming a repository, so I search the whole workspace with repo `*`. Searching the contents for the literal text is the direct route, and the message may be capitalised differently in the source<|projection|> than in the log, so I will set ignore_case to true rather than guess.
 
   The pattern is the plain string "connection refused".
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "connection refused", "ignore_case": true}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "connection refused", "repo": "*", "ignore_case": true}}
   </tool_call><|projection|>
 - |-
   does anything still use the old KvFormat enum<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  This is an existence question about the codebase, and file_grep answers it cleanly: if nothing matches, the matches array is empty and files_searched reports how much was<|projection|> scanned, so "no hits across four thousand files" is a real answer rather than an ambiguous blank.
+  This is an existence question about the codebase, and file_grep answers it cleanly: if nothing matches, the matches array is empty and files_searched reports how much was<|projection|> scanned, so "no hits across four thousand files" is a real answer rather than an ambiguous blank. KvFormat is this candle codebase's KV cache format type, so the repo is candle.
 
   The pattern is the identifier "KvFormat".
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "KvFormat"}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "KvFormat", "repo": "candle"}}
   </tool_call><|projection|>
 - |-
   which file reads the tavily api key<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The distinctive token here is the key's name rather than the prose, so searching the contents for "tavily_api_key" will land on the code that reads it.
+  The distinctive token here is the key's name rather than the prose, so searching the contents for "tavily_api_key" will land on the code that reads it. No repository was named and any of them could read a key, so I search the whole workspace with repo `*`.
 
-  I will leave<|projection|> ignore_case off, since a Rust identifier is written one way, and the result gives me the path and line to read next.
+  I will leave<|projection|> ignore_case off, since a Rust identifier is written one way, and the result gives me the repo, path and line to read next.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "tavily_api_key"}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "tavily_api_key", "repo": "*"}}
   </tool_call><|projection|>
 - |-
   show me every place that constructs a ToolContext<|im_end|>
@@ -146,9 +153,9 @@ examples:
   <|projection|><think>
   Construction shows up as the type name followed by a path separator and a constructor, so "ToolContext::" is a good pattern — narrower than the bare type name, which would<|projection|> also match every signature that takes one as a parameter.
 
-  No prefix: the user asked for every place, so the search should cover the whole project.
+  ToolContext is the tool crate's type in this candle codebase, so the repo is candle, with no prefix: the user asked for every place it is built.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "ToolContext::"}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "ToolContext::", "repo": "candle"}}
   </tool_call><|projection|>

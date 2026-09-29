@@ -138,6 +138,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
         acts: DynamicActs<'w>,
         work_dtype: DType,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.layer.ffn {
@@ -147,7 +148,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
             // See the qwen3-MoE arm: the shared+routed combine writes the width
             // its experts ran in, so this path narrows on return.
             QuantFfn::Moe(m) => {
-                let mut out = m.forward_dynamic(acts, work_dtype, wave)?;
+                let mut out = m.forward_dynamic(acts, work_dtype, decode_tokens, wave)?;
                 out.to_dtype_mut(out_dtype)?;
                 Ok(out)
             }
@@ -179,6 +180,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
         &self,
         acts: &DynamicActs<'w>,
         out_dtype: DType,
+        wave: WaveRef<'w>,
     ) -> Result<QkvProjection<'w>> {
         project_qkv_gated(
             self.attn()?,
@@ -189,6 +191,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
             acts,
             out_dtype,
             self.lora,
+            wave,
         )
     }
 
@@ -249,6 +252,10 @@ pub fn project_qkv_gated<'w>(
     acts: &DynamicActs<'w>,
     out_dtype: DType,
     lora: LayerLora<'_>,
+    // The open attention phase. Used only when the projections' own outputs
+    // carry no ticket — a `Float` activation is the residual cloned, so on a
+    // stack whose residual is pool-backed there is nothing to inherit from.
+    wave: Option<&'w WaveGeneration>,
 ) -> Result<QkvProjection<'w>> {
     // The adapter reads the same post-norm activation the base projections do,
     // and adds to their raw output — before the q/k norms and before the rotary
@@ -278,6 +285,7 @@ pub fn project_qkv_gated<'w>(
         outs,
         &[w.q_rows, w.kv_rows, w.kv_rows],
         "attention q/k/v projections",
+        wave,
     )?
     .into_iter();
     let qg = parts.next().expect("three parts requested");

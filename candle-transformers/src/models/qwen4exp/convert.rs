@@ -506,7 +506,58 @@ fn rewrite_shard(
 /// Resumable the same way the converter is: written to a `.tmp` sibling and
 /// renamed on success, so an existing final name is always a complete file.
 pub fn merge_gguf_split(splits: &[PathBuf], dst: &Path) -> Result<PathBuf> {
-    merge_gguf_files(splits, dst, &[])
+    merge_gguf_files(splits, dst, &[], &Verbatim)
+}
+
+/// A per-tensor transform applied while a merge streams its data.
+///
+/// The directory is written before any data, so a rewrite first declares the
+/// dtype a tensor will be written as ([`TensorRewrite::target`]) — its length
+/// follows from the dtype's block geometry — and then produces exactly that many
+/// bytes ([`TensorRewrite::emit`]), which the merge checks.
+pub trait TensorRewrite {
+    /// The dtype `name` is written as, or `None` to copy its bytes verbatim.
+    fn target(&self, name: &str, dims: &[usize], dtype: GgmlDType) -> Option<GgmlDType>;
+
+    /// `name`'s bytes re-encoded as `target`, from its raw source bytes.
+    fn emit(
+        &self,
+        name: &str,
+        dims: &[usize],
+        dtype: GgmlDType,
+        src: &[u8],
+        target: GgmlDType,
+    ) -> Result<Vec<u8>>;
+}
+
+/// The rewrite that rewrites nothing.
+pub struct Verbatim;
+
+impl TensorRewrite for Verbatim {
+    fn target(&self, _: &str, _: &[usize], _: GgmlDType) -> Option<GgmlDType> {
+        None
+    }
+
+    fn emit(
+        &self,
+        name: &str,
+        _: &[usize],
+        _: GgmlDType,
+        _: &[u8],
+        _: GgmlDType,
+    ) -> Result<Vec<u8>> {
+        candle::bail!("Verbatim rewrite asked to emit {name}, which it never targets")
+    }
+}
+
+/// Byte length of a tensor of `elems` elements stored as `dtype`.
+fn stored_bytes(elems: usize, dtype: GgmlDType) -> usize {
+    elems / dtype.block_size() * dtype.type_size()
+}
+
+/// Whether `name` is a routed-expert projection (`blk.N.ffn_{gate,up,down}_exps.weight`).
+pub fn is_expert_tensor(name: &str) -> bool {
+    expert_proj_of(name).is_some()
 }
 
 /// [`merge_gguf_split`] over files that are not all shards of one split.
@@ -518,8 +569,8 @@ pub fn merge_gguf_split(splits: &[PathBuf], dst: &Path) -> Result<PathBuf> {
 /// covers its 512 experts by construction rather than by learning about a
 /// second file.
 ///
-/// * **Duplicate tensor names are dropped, first file wins.** A head's GGUF
-///   carries its own `token_embd` / `output` / `output_hc_*` so it can run
+/// * **Duplicate tensor names are dropped, first file wins.** A self-contained
+///   head's GGUF carries its own `token_embd` / `output` so it can run
 ///   standalone, but `mtp_use_dedicated_embeddings: false` says those *are* the
 ///   trunk's — keeping both would write ~1.35 GiB twice and leave the loader
 ///   two answers for one name.
@@ -527,10 +578,15 @@ pub fn merge_gguf_split(splits: &[PathBuf], dst: &Path) -> Result<PathBuf> {
 ///   is not the first shard's: `block_count` gains the head's block and
 ///   `nextn_predict_layers` announces it, which is what makes the shared config
 ///   parser split trunk from head (`num_layers = block_count − nextn`).
+///
+/// `rewrite` re-encodes the tensors it targets as they stream — which is how a
+/// requantized-expert artifact is written in one pass over the split, with no
+/// intermediate converted copy on disk.
 pub fn merge_gguf_files(
     splits: &[PathBuf],
     dst: &Path,
     overrides: &[(String, candle::quantized::gguf_file::Value)],
+    rewrite: &dyn TensorRewrite,
 ) -> Result<PathBuf> {
     if dst.exists() {
         return Ok(dst.to_path_buf());
@@ -540,8 +596,18 @@ pub fn merge_gguf_files(
     struct ShardDir {
         path: PathBuf,
         data_base: u64,
-        /// `(name, dims outermost-first, dtype, src_offset, bytes)`.
-        tensors: Vec<(String, Vec<usize>, GgmlDType, u64, usize)>,
+        tensors: Vec<MergedTensor>,
+    }
+    /// One tensor as read from its shard and as written to the merged file.
+    struct MergedTensor {
+        name: String,
+        /// Outermost-first.
+        dims: Vec<usize>,
+        dtype: GgmlDType,
+        src_offset: u64,
+        src_bytes: usize,
+        out_dtype: GgmlDType,
+        out_bytes: usize,
     }
     let mut shards = Vec::with_capacity(splits.len());
     let mut metadata: Option<Vec<(String, candle::quantized::gguf_file::Value)>> = None;
@@ -559,27 +625,32 @@ pub fn merge_gguf_files(
             md.sort_by(|a, b| a.0.cmp(&b.0));
             metadata = Some(md);
         }
-        let mut tensors: Vec<(String, Vec<usize>, GgmlDType, u64, usize)> = content
+        let mut tensors: Vec<MergedTensor> = content
             .tensor_infos
             .iter()
             .map(|(name, info)| {
-                let bytes = info.shape.elem_count() / info.ggml_dtype.block_size()
-                    * info.ggml_dtype.type_size();
-                (
-                    name.clone(),
-                    info.shape.dims().to_vec(),
-                    info.ggml_dtype,
-                    info.offset,
-                    bytes,
-                )
+                let dims = info.shape.dims().to_vec();
+                let elems = info.shape.elem_count();
+                let out_dtype = rewrite
+                    .target(name, &dims, info.ggml_dtype)
+                    .unwrap_or(info.ggml_dtype);
+                MergedTensor {
+                    name: name.clone(),
+                    dims,
+                    dtype: info.ggml_dtype,
+                    src_offset: info.offset,
+                    src_bytes: stored_bytes(elems, info.ggml_dtype),
+                    out_dtype,
+                    out_bytes: stored_bytes(elems, out_dtype),
+                }
             })
             .collect();
-        tensors.sort_by_key(|t| t.3);
+        tensors.sort_by_key(|t| t.src_offset);
         // First file wins on a repeated name — see the doc on
         // [`merge_gguf_files`]. Filtering here rather than at write time keeps
         // the directory and the data pass counting the same tensors, which is
         // the invariant the recomputed offsets rest on.
-        tensors.retain(|t| seen.insert(t.0.clone()));
+        tensors.retain(|t| seen.insert(t.name.clone()));
         shards.push(ShardDir {
             path: path.clone(),
             data_base: content.tensor_data_offset,
@@ -612,33 +683,45 @@ pub fn merge_gguf_files(
     // will stream.
     let mut offset = 0usize;
     for shard in &shards {
-        for (name, dims, dtype, _, bytes) in &shard.tensors {
-            write_string(&mut w, name)?;
-            w.write_u32::<LittleEndian>(dims.len() as u32)?;
-            for &d in dims.iter().rev() {
+        for t in &shard.tensors {
+            write_string(&mut w, &t.name)?;
+            w.write_u32::<LittleEndian>(t.dims.len() as u32)?;
+            for &d in t.dims.iter().rev() {
                 w.write_u64::<LittleEndian>(d as u64)?;
             }
-            w.write_u32::<LittleEndian>(dtype.to_gguf_file_code())?;
+            w.write_u32::<LittleEndian>(t.out_dtype.to_gguf_file_code())?;
             w.write_u64::<LittleEndian>(offset as u64)?;
-            offset += bytes + pad32(*bytes);
+            offset += t.out_bytes + pad32(t.out_bytes);
         }
     }
     let pos = w.stream_position()? as usize;
     w.write_all(&vec![0u8; pad32(pos)])?;
 
     // Data: one forward mmap pass per shard, 256 MiB windows so the page cache
-    // is streamed through rather than filled.
+    // is streamed through rather than filled. A rewritten tensor is emitted
+    // whole and must be exactly the length its directory entry promised.
     for shard in &shards {
         let map = unsafe { memmap2::Mmap::map(&File::open(&shard.path)?)? };
-        for (_, _, _, src_off, bytes) in &shard.tensors {
-            let start = shard.data_base as usize + *src_off as usize;
-            let mut done = 0usize;
-            while done < *bytes {
-                let take = (*bytes - done).min(256 << 20);
-                w.write_all(&map[start + done..start + done + take])?;
-                done += take;
+        for t in &shard.tensors {
+            let start = shard.data_base as usize + t.src_offset as usize;
+            let src = &map[start..start + t.src_bytes];
+            if t.out_dtype != t.dtype {
+                let out = rewrite.emit(&t.name, &t.dims, t.dtype, src, t.out_dtype)?;
+                if out.len() != t.out_bytes {
+                    candle::bail!(
+                        "merge: {} rewritten to {} bytes, directory says {}",
+                        t.name,
+                        out.len(),
+                        t.out_bytes
+                    );
+                }
+                w.write_all(&out)?;
+            } else {
+                for window in src.chunks(256 << 20) {
+                    w.write_all(window)?;
+                }
             }
-            w.write_all(&vec![0u8; pad32(*bytes)])?;
+            w.write_all(&vec![0u8; pad32(t.out_bytes)])?;
         }
     }
     w.flush()?;
@@ -667,24 +750,29 @@ pub fn merge_gguf_files(
 /// * **Narrower** frees nothing: a narrow expert simply under-fills a slot sized
 ///   for the widest. It buys PCIe bytes per draft step, not residency.
 ///
-/// So the head takes the trunk's width, and this is the one **lossy** step in
-/// the path: the trunk's `Q4_KO` is a bit-exact re-encoding of its W4A16 source
-/// (`convert_w4a16_experts`), while the head has no such source and is
-/// genuinely requantized from `Q8_0`. That cost is confined to *proposals* — a
-/// worse draft is a rejected token, never a wrong one, because the target's own
-/// logits decide — and the alternative halves trunk residency.
+/// So the head takes the trunk's width — `experts`, whatever the rung chose — and
+/// is requantized from `Q8_0` to it on the GPU
+/// ([`super::prepare::requant::requant_experts`]). That cost is confined to
+/// *proposals* — a worse draft is a rejected token, never a wrong one, because
+/// the target's own logits decide — and the alternative halves trunk residency.
 ///
 /// # What is dropped
 ///
-/// The sidecar ships `token_embd`, `output` and `output_hc_*` so it can run
+/// The self-contained head ships `token_embd` and `output` so it can run
 /// standalone, but `mtp_use_dedicated_embeddings: false` says those *are* the
 /// trunk's. Writing them again would cost ~1.35 GiB and leave the loader two
 /// answers for one tensor name; the merge would drop the second copy anyway.
+///
+/// Written to a `.tmp` sibling and renamed on success, so an existing
+/// `dst_path` is always a complete file.
 #[cfg(feature = "cuda")]
-pub fn convert_mtp_sidecar(src_path: &Path, dst_path: &Path, device: &Device) -> Result<usize> {
-    use crate::models::latent_moe::GgufModel;
-    use crate::models::quantized_matmul::QMatMul;
-    use candle::quantized::{Int8Mode, QTensor};
+pub fn convert_mtp_sidecar(
+    src_path: &Path,
+    dst_path: &Path,
+    experts: GgmlDType,
+    device: &Device,
+) -> Result<usize> {
+    use super::prepare::requant::requant_experts;
 
     if dst_path.exists() {
         return Ok(0);
@@ -692,35 +780,11 @@ pub fn convert_mtp_sidecar(src_path: &Path, dst_path: &Path, device: &Device) ->
     let mut f = File::open(src_path)?;
     let content = Content::read(&mut f)?;
 
-    // The head's block index: `block_count − nextn_predict_layers`, the same
-    // arithmetic the shared config parser does, so the prefix here and the one
-    // the loader looks under cannot drift.
-    let u32_of = |k: &str| -> Result<usize> {
-        match content.metadata.get(k) {
-            Some(candle::quantized::gguf_file::Value::U32(v)) => Ok(*v as usize),
-            other => candle::bail!("mtp sidecar: {k} is {other:?}, expected U32"),
-        }
-    };
-    let head_idx = u32_of("qwen4exp.block_count")? - u32_of("qwen4exp.nextn_predict_layers")?;
-
-    // **Only the embedding and the LM head are the trunk's.** Verified by
-    // comparing dequantized bytes against the pinned source
-    // (`the_mtp_sidecar_is_loadable`): those two are bit-identical, which is
-    // what `mtp_use_dedicated_embeddings: false` promises.
+    // **Only the embedding and the LM head are the trunk's**, which is what
+    // `mtp_use_dedicated_embeddings: false` promises; the head's own output
+    // mixer is published under its own block (`nextn.hc_head_*`), so every
+    // other tensor keeps the name it came with.
     let is_trunks = |n: &str| n == "token_embd.weight" || n == "output.weight";
-
-    // **`output_hc_*` is NOT the trunk's, despite the name.** The same
-    // comparison puts it at max|Δ| of 9.8 / 2.6 / 14.2 — it is the head's own
-    // `hyper_connection_mixer`, the mix that collapses the wide residual to
-    // `n_embd` before `eh_proj`'s concat (`hnorm` is `[hc_dim]` and `eh_proj`
-    // takes `[2·n_embd]`, so something has to do that collapse). The converter
-    // emitted it under the trunk's output-mixer name because a standalone head
-    // has only one mixer; merged, that name is taken. Renaming it into the
-    // head's own block is what keeps both.
-    let renamed = |n: &str| -> Option<String> {
-        n.strip_prefix("output_hc_")
-            .map(|tail| format!("blk.{head_idx}.hc_mixer_{tail}"))
-    };
 
     let mut names: Vec<&String> = content
         .tensor_infos
@@ -730,44 +794,28 @@ pub fn convert_mtp_sidecar(src_path: &Path, dst_path: &Path, device: &Device) ->
     names.sort_by_key(|n| content.tensor_infos[*n].offset);
 
     // Requantize the experts up front: the directory needs their output sizes
-    // before any data is written, and a Q4_KO image's length is a function of
-    // the repack rather than of arithmetic we should restate here.
+    // before any data is written. Each one is its own `[out, in]` matrix — the
+    // KO layout is per matrix, so the `[n_expert, out, in]` tensor is converted
+    // expert by expert (`requant_experts`).
+    let map = unsafe { memmap2::Mmap::map(&File::open(src_path)?)? };
+    let data_base = content.tensor_data_offset as usize;
     let mut converted: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
-    let mut gguf = GgufModel::open(&[src_path.to_path_buf()])?;
-    for name in names.iter().filter(|n| expert_proj_of(n).is_some()) {
-        let qt = gguf.qtensor(name, device)?;
-        // **Per expert, not per tensor.** An expert weight is `[n_expert, out,
-        // in]` and the KO repack is a 2-D matmul layout, so handing it the whole
-        // 3-D tensor silently returns the source unchanged — which the dtype
-        // check below caught. The trunk's own importer takes the same shape for
-        // the same reason: "the concatenated Q4_KO images".
-        let dense = qt.dequantize(device)?;
-        let dims = dense.dims().to_vec();
-        let [n_expert, rows, cols] = dims[..] else {
-            candle::bail!("{name} is {dims:?} — expected the merged [n_expert, out, in] form");
-        };
-        let mut image = Vec::new();
-        for e in 0..n_expert {
-            let slice = dense.narrow(0, e, 1)?.reshape((rows, cols))?;
-            // Q8_0 → F32 → Q4_0 → Q4_KO. The middle step is the real
-            // quantization; `Performance` maps a 4-bit source to the same-width
-            // twin, so the repack after it is a pure byte permutation. The loss
-            // is entirely in the middle one.
-            let q4 = QTensor::quantize(&slice, GgmlDType::Q4_0)?;
-            let ko = QMatMul::from_qtensor_with_mode(q4, Int8Mode::Performance)?;
-            let ko = ko.inner().qtensor().ok_or_else(|| {
-                candle::Error::Msg(format!("{name}: repack produced no quantized weight"))
-            })?;
-            if ko.dtype() != GgmlDType::Q4_KO {
-                candle::bail!(
-                    "{name} expert {e}: repack produced {:?}, expected Q4_KO — the head would \
-                     not match the trunk's slot width",
-                    ko.dtype()
-                );
-            }
-            image.extend_from_slice(&ko.data()?);
-        }
+    // An expert already at the target width is copied like any other tensor.
+    for name in names
+        .iter()
+        .filter(|n| expert_proj_of(n).is_some() && content.tensor_infos[**n].ggml_dtype != experts)
+    {
+        let info = &content.tensor_infos[*name];
+        let start = data_base + info.offset as usize;
+        let len = stored_bytes(info.shape.elem_count(), info.ggml_dtype);
+        let image = requant_experts(
+            &map[start..start + len],
+            info.shape.dims(),
+            info.ggml_dtype,
+            experts,
+            device,
+        )?;
         converted.insert((*name).clone(), image);
     }
 
@@ -776,13 +824,14 @@ pub fn convert_mtp_sidecar(src_path: &Path, dst_path: &Path, device: &Device) ->
             Some(b) => b.len(),
             None => {
                 let info = &content.tensor_infos[name];
-                info.shape.elem_count() / info.ggml_dtype.block_size() * info.ggml_dtype.type_size()
+                stored_bytes(info.shape.elem_count(), info.ggml_dtype)
             }
         }
     };
     let out_sizes: Vec<usize> = names.iter().map(|n| out_size(n)).collect();
 
-    let out = File::create(dst_path)?;
+    let tmp = dst_path.with_extension("gguf.tmp");
+    let out = File::create(&tmp)?;
     let mut w = BufWriter::with_capacity(1 << 20, out);
     w.write_u32::<LittleEndian>(0x4655_4747)?; // GGUF
     w.write_u32::<LittleEndian>(2)?;
@@ -798,17 +847,14 @@ pub fn convert_mtp_sidecar(src_path: &Path, dst_path: &Path, device: &Device) ->
     let mut offset = 0usize;
     for (name, bytes) in names.iter().zip(&out_sizes) {
         let info = &content.tensor_infos[*name];
-        // The head's mixer moves into the head's own block here — see
-        // `renamed`. Everything else keeps the name it came with.
-        let out_name = renamed(name).unwrap_or_else(|| (*name).clone());
-        write_string(&mut w, &out_name)?;
+        write_string(&mut w, name)?;
         let dims = info.shape.dims();
         w.write_u32::<LittleEndian>(dims.len() as u32)?;
         for &d in dims.iter().rev() {
             w.write_u64::<LittleEndian>(d as u64)?;
         }
         let dtype = if converted.contains_key(*name) {
-            GgmlDType::Q4_KO
+            experts
         } else {
             info.ggml_dtype
         };
@@ -819,8 +865,6 @@ pub fn convert_mtp_sidecar(src_path: &Path, dst_path: &Path, device: &Device) ->
     let pos = w.stream_position()? as usize;
     w.write_all(&vec![0u8; pad32(pos)])?;
 
-    let map = unsafe { memmap2::Mmap::map(&File::open(src_path)?)? };
-    let data_base = content.tensor_data_offset as usize;
     for (name, bytes) in names.iter().zip(&out_sizes) {
         match converted.get(*name) {
             Some(image) => w.write_all(image)?,
@@ -834,6 +878,7 @@ pub fn convert_mtp_sidecar(src_path: &Path, dst_path: &Path, device: &Device) ->
     }
     w.flush()?;
     drop(w);
+    std::fs::rename(&tmp, dst_path)?;
     Ok(converted.len())
 }
 
@@ -892,9 +937,13 @@ pub fn convert_w4a16_experts(
                 t.elapsed().as_secs_f32()
             );
         } else {
-            // Same bytes, no copy. Fall back to a copy across volumes.
-            if std::fs::hard_link(src, &dst).is_err() {
-                std::fs::copy(src, &dst)?;
+            // Same bytes, no copy. Fall back to a copy across volumes. The link
+            // is to the resolved file: a hub-cache source is itself a symlink
+            // into `blobs/`, and on Linux `link(2)` links the symlink — a
+            // relative one that dangles from any other directory.
+            let resolved = std::fs::canonicalize(src)?;
+            if std::fs::hard_link(&resolved, &dst).is_err() {
+                std::fs::copy(&resolved, &dst)?;
             }
         }
         out.push(dst);

@@ -142,7 +142,7 @@ Resolving it is one command, but it is a real decision rather than a formality:
 1,268 canon documents plus every character layer come under version control, and
 a live daemon writes into the working tree while Makers hold branches. The
 questions are whether the daemon commits as itself or as the Maker, what happens
-to a branch a Maker abandons by walking away, and whether `.substrate/` is
+to a branch a Maker abandons by walking away, and whether `substrate/` is
 ignored (it must be).
 
 **Resolving A also resolves part of H** — `bench_blame` *is* the custody chain,

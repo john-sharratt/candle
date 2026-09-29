@@ -32,6 +32,11 @@ pub enum Step {
     Run(ToolCall),
     /// A call that could not be read. Nothing runs; this is its result.
     Refuse(ToolResult),
+    /// A call already satisfied without running it — the fast path resolved it
+    /// to content this conversation now carries (see [`crate::fast_path`]).
+    /// Unlike [`Step::Refuse`] this is a success: the call is answered, it just
+    /// costs no read.
+    Served(ToolResult),
 }
 
 impl Step {
@@ -39,7 +44,7 @@ impl Step {
     pub fn name(&self) -> &str {
         match self {
             Step::Run(call) => &call.name,
-            Step::Refuse(result) => &result.call.name,
+            Step::Refuse(result) | Step::Served(result) => &result.call.name,
         }
     }
 }
@@ -96,6 +101,9 @@ pub fn run(ctx: &ToolContext, steps: Vec<Step>) -> Vec<ToolResult> {
                 );
                 result
             }
+            // Already answered by the fast path; running it would re-read a
+            // file whose content this conversation is now carrying.
+            Step::Served(result) => result,
         })
         .collect()
 }
@@ -194,6 +202,7 @@ mod tests {
         match step {
             Step::Refuse(r) => r.response["error"].as_str().unwrap(),
             Step::Run(c) => panic!("{} was planned to run", c.name),
+            Step::Served(r) => panic!("{} was served by the fast path", r.call.name),
         }
     }
 

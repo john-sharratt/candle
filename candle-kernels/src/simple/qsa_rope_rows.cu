@@ -11,6 +11,12 @@
 //     scored by cuBLAS instead — rotated into a scratch buffer that lives for
 //     one launch (`IndexCache::score_rows`), at `tail_base + j · ratio`.
 //
+// Rows come either from one dense `src` (`[n_rows, d]`), or — when `src_pages`
+// is non-null — from a PAGE TABLE: row `r` at `src_pages[r / rows_per_src_page]
+// + (r % rows_per_src_page) · d`. The live tail's keys are paged (one arena slot
+// per page), so reading them through the table is what spares the caller a
+// gather into one dense block (hot-path invariant 2b).
+//
 // Positions come either from a per-group array (`pos`, one entry per
 // `rows_per_pos` consecutive rows) or, when `pos` is null, from the affine
 // `pos_base + group · pos_step`.
@@ -38,6 +44,8 @@ namespace qsa_rope_rows {
 
 __global__ void rope_rows_kernel(
     const float* __restrict__ src,
+    const long long* __restrict__ src_pages,
+    int rows_per_src_page,
     float* __restrict__ dst,
     int n_rows,
     int d,
@@ -59,7 +67,10 @@ __global__ void rope_rows_kernel(
          i += (long long)gridDim.x * blockDim.x) {
         const int row = (int)(i / per_row);
         const int k = (int)(i - (long long)row * per_row);
-        const float* s = src + (long long)row * d;
+        const float* s = src_pages != nullptr
+            ? (const float*)(uintptr_t)__ldg(src_pages + row / rows_per_src_page)
+                  + (long long)(row % rows_per_src_page) * d
+            : src + (long long)row * d;
         float* o = dst + (long long)row * d;
         if (k < pairs) {
             const int group = row / rows_per_pos;
@@ -86,6 +97,8 @@ __global__ void rope_rows_kernel(
 
 extern "C" void run_qsa_rope_rows(
     const float* src,
+    const long long* src_pages,
+    int32_t rows_per_src_page,
     float* dst,
     int32_t n_rows,
     int32_t d,
@@ -101,11 +114,12 @@ extern "C" void run_qsa_rope_rows(
 ) {
     const int pairs = (int)rungs.pairs;
     if (n_rows <= 0 || d <= 0 || pairs <= 0 || 2 * pairs > d || rows_per_pos <= 0) return;
+    if (src_pages != nullptr && rows_per_src_page <= 0) return;
     const long long total = (long long)n_rows * (d - pairs);
     const int threads = 256;
     long long blocks = (total + threads - 1) / threads;
     if (blocks > 65535) blocks = 65535;
     qsa_rope_rows::rope_rows_kernel<<<(unsigned)blocks, threads, 0, (cudaStream_t)stream>>>(
-        src, dst, n_rows, d, rows_per_pos, pos, pos_base, pos_step,
+        src, src_pages, rows_per_src_page, dst, n_rows, d, rows_per_pos, pos, pos_base, pos_step,
         rungs, group_rung, rung, q_scale);
 }

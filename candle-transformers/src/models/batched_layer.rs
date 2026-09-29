@@ -39,6 +39,10 @@ use candle::LiveTensor;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::WaveGeneration;
 
+use candle::wave_provenance::WaveTicket;
+
+use crate::models::wave_buffers::wave_from_vec_ticketed;
+
 /// A borrow of the attention generation, threaded from the layer down to the
 /// kernels that allocate inside it.
 ///
@@ -174,7 +178,7 @@ impl BatchedPrefillMeta {
     /// lengths are equal), kept for the decode/uniform-prefill call sites.
     pub fn new(offsets: &[usize], seq_len: usize, device: &Device) -> Result<Self> {
         let q_lens = vec![seq_len; offsets.len()];
-        Self::new_ragged(offsets, &q_lens, device)
+        Self::new_ragged(offsets, &q_lens, device, None)
     }
 
     /// Build paged-prefill metadata for a **ragged** batch — each sequence has
@@ -183,7 +187,15 @@ impl BatchedPrefillMeta {
     /// packed Q layout is `[Σ q_lens, n_head, head_dim]`), `q_lens` are the
     /// per-sequence new-token counts, and `kv_lens[i] = offsets[i] + q_lens[i]`
     /// is each sequence's total context length after this prefill.
-    pub fn new_ragged(offsets: &[usize], q_lens: &[usize], device: &Device) -> Result<Self> {
+    /// `ticket`, when present, is the forward-scoped span these three tables
+    /// belong to — they are built once per wave and read by every layer, which
+    /// is exactly what that span is for. `None` uploads them the ordinary way.
+    pub fn new_ragged(
+        offsets: &[usize],
+        q_lens: &[usize],
+        device: &Device,
+        ticket: Option<WaveTicket>,
+    ) -> Result<Self> {
         if offsets.len() != q_lens.len() {
             candle::bail!(
                 "BatchedPrefillMeta::new_ragged: {} offsets vs {} q_lens",
@@ -199,13 +211,14 @@ impl BatchedPrefillMeta {
             acc += ql as u32;
             cu.push(acc);
         }
-        let cu_seqlens_q = Tensor::from_vec(cu, batch_size + 1, device)?;
-        let q_lens_t = Tensor::from_vec(
+        let cu_seqlens_q = wave_from_vec_ticketed(cu, batch_size + 1, device, ticket)?;
+        let q_lens_t = wave_from_vec_ticketed(
             q_lens.iter().map(|&l| l as u32).collect::<Vec<_>>(),
             batch_size,
             device,
+            ticket,
         )?;
-        let kv_lens = Tensor::from_vec(
+        let kv_lens = wave_from_vec_ticketed(
             offsets
                 .iter()
                 .zip(q_lens.iter())
@@ -213,6 +226,7 @@ impl BatchedPrefillMeta {
                 .collect::<Vec<_>>(),
             batch_size,
             device,
+            ticket,
         )?;
         Ok(Self {
             cu_seqlens_q,
@@ -370,11 +384,18 @@ pub trait BatchedAttentionLayer {
     /// from [`Self::ffn_norm`], which allocates, while the MoE combine target is
     /// taken from the wave. A dense MLP hands its activations to a `Module` and
     /// so could not accept a wave-scoped operand anyway.
+    /// `decode_tokens` is the count of leading rows (of this call's combined
+    /// buffer) that are decode-attributed. Only an MoE implementation reads it,
+    /// to weight expert-cache residency scoring — a decode row's reuse of a
+    /// given expert is near-certain step to step, a prefill row's is close to
+    /// zero, so the two must not bid for slots on equal footing. A dense FFN
+    /// ignores it.
     fn ffn_forward<'w>(
         &self,
         acts: DynamicActs<'w>,
         work_dtype: DType,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>>;
 
@@ -386,10 +407,16 @@ pub trait BatchedAttentionLayer {
     /// - Q shape: (batch, seq_len, n_head * head_dim)
     /// - K shape: (batch, seq_len, n_kv_head * head_dim)
     /// - V shape: (batch, seq_len, n_kv_head * head_dim)
+    ///
+    /// `wave` is the open attention phase, for the one case the operand cannot
+    /// supply: a `Float` activation is the residual cloned rather than a fresh
+    /// allocation, so on a stack whose residual is pool-backed the projection
+    /// group has no ticket to inherit and its split block fell to the pool.
     fn project_qkv<'w>(
         &self,
         acts: &DynamicActs<'w>,
         out_dtype: DType,
+        wave: WaveRef<'w>,
     ) -> Result<QkvProjection<'w>>;
 
     /// The output-projection weight (`attention_wo` / `self_attn.o_proj`). Backs the generalized
@@ -585,9 +612,25 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     // the residual add takes the result as it stands. Narrowing here instead
     // cost a full-tensor pass per layer per wave to undo the widening only the
     // SwiGLU intermediates needed.
+    // Decode rows (plus any single-token prefills folded into the decode
+    // group) sit first in the combined buffer — see `WaveAttnGroup::rows`'s
+    // accumulation above. `take_while` rather than an unconditional filter+sum
+    // so a future group order that broke that contiguity would undercount
+    // rather than silently attribute a later prefill group's rows to decode.
+    let decode_tokens: usize = groups
+        .iter()
+        .take_while(|g| g.decode_layout)
+        .map(|g| g.rows)
+        .sum();
     let h2 = {
         let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode(), ffn_wave.as_ref())?;
-        layer.ffn_forward(acts, mlp_dtype, orig_dtype, ffn_wave.as_ref())?
+        layer.ffn_forward(
+            acts,
+            mlp_dtype,
+            orig_dtype,
+            decode_tokens,
+            ffn_wave.as_ref(),
+        )?
     };
     // Same contract as the attention residual above: `ffn_forward` stores
     // `orig_dtype`, and the residual never left it, so this is an assertion.
@@ -707,7 +750,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     let kv_dtype = attention_operand_dtype(caches, x_tensor.dtype());
     let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
-        layer.project_qkv(&acts, kv_dtype)?
+        layer.project_qkv(&acts, kv_dtype, wave)?
     };
 
     // Reshape for attention: (B, seq_len, H*D) -> (B, H, seq_len, D)
@@ -889,7 +932,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     let kv_dtype = attention_operand_dtype(caches, x_tensor.dtype());
     let QkvProjection { q, k, v, gate } = {
         let acts = layer.attention_norm(x_tensor, layer.int8mode(), wave)?;
-        layer.project_qkv(&acts, kv_dtype)?
+        layer.project_qkv(&acts, kv_dtype, wave)?
     };
 
     let n_head = layer.n_head();
@@ -1769,7 +1812,7 @@ mod tests {
         // (query) lengths — the ragged case.
         let offsets = [0usize, 5, 100];
         let q_lens = [3usize, 7, 2];
-        let m = BatchedPrefillMeta::new_ragged(&offsets, &q_lens, &dev).unwrap();
+        let m = BatchedPrefillMeta::new_ragged(&offsets, &q_lens, &dev, None).unwrap();
 
         // cu_seqlens_q is the exclusive prefix sum of q_lens → packed Q has
         // 3+7+2 = 12 rows.

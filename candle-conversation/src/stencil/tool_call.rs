@@ -18,9 +18,13 @@
 //!   properties) — written by the grammar too: `[`, then per element a branch
 //!   between another element (`, {`) and `]`, unrolled to
 //!   [`MAX_ARRAY_ELEMENTS`]. An array inside such an array decodes free.
-//! - `integer`/`number`, and any array or object the above does not cover
-//!   (no schema, nullable, scalar elements) — emitted as any structurally-valid
-//!   JSON value (`Terminator::JsonValue`), lookahead-terminated at the enclosing
+//! - `integer` — digit by digit under the mask, unrolled to
+//!   [`MAX_INTEGER_DIGITS`], with `-` only where the schema's `minimum` allows
+//!   a negative; the last arm of each digit carries what follows the value. A
+//!   string, a `null` or a commit id cannot be decoded there.
+//! - `number`, and any array or object the above does not cover (no schema,
+//!   nullable, scalar elements) — emitted as any structurally-valid JSON value
+//!   (`Terminator::JsonValue`), lookahead-terminated at the enclosing
 //!   `,`/`}`/`]`. The session pushes that delimiter back to the next node when
 //!   the next node continues with it, and drops it when it does not, so the
 //!   grammar writes the structure the model got wrong. This guarantees valid
@@ -84,6 +88,10 @@ pub struct Param {
     /// free JSON value.
     #[serde(default)]
     pub items: Option<Box<Param>>,
+    /// `array`: the schema's `minItems`. A guided array offers no `]` before
+    /// this many elements, so an array that must not be empty cannot be.
+    #[serde(default)]
+    pub min_items: usize,
     /// `object`: its fields, ordered as a tool's own parameters are. `None`
     /// leaves the object a free JSON value; `Some` of an empty list is `{}`.
     /// `ParamType::Object` refined into a typed sub-object rather than left as
@@ -94,6 +102,17 @@ pub struct Param {
     /// `null` is also a value: the grammar offers it beside the typed value.
     #[serde(default)]
     pub nullable: bool,
+    /// `integer`: the schema's `minimum`. At or above zero, the grammar offers
+    /// no `-`; absent or negative, the value may be signed.
+    #[serde(default)]
+    pub minimum: Option<f64>,
+    /// A required enum field: the fields of the same object each value
+    /// requires beyond the object's own `required` list, as `(value, fields)`
+    /// — the schema's `if`/`then` ([`value_requirements`]). The grammar writes
+    /// them as required after that value, so a call cannot close without
+    /// what its choice depends on.
+    #[serde(default)]
+    pub requires: Vec<(String, Vec<String>)>,
 }
 
 /// One tool: a name and an ordered parameter list.
@@ -130,21 +149,146 @@ impl ToolSpec {
     /// then optionals in the order the properties object declares them**, and
     /// the tree emits them in that order. The workspace builds `serde_json` with
     /// `preserve_order`, so the properties iterate as the schema's author wrote
-    /// them — `file_read`'s optional range is offered `start_line` before
-    /// `end_line`, where a sorted map would put the end first and a call written
-    /// in reading order could never reach it. A nested object's fields follow
-    /// the same rule.
+    /// them — two optionals meant to be read together (a range's start before
+    /// its end) stay offered in that order, where a sorted map would put the
+    /// second one first and a call written in reading order could never reach
+    /// it. A nested object's fields follow the same rule.
     pub fn from_json_schema(name: &str, schema: &Value) -> ToolSpec {
         ToolSpec {
             name: name.to_string(),
-            params: fields_of(schema),
+            params: fields_of(schema, schema),
         }
     }
 }
 
+/// How far a `$ref` chain is followed before the schema is treated as opaque.
+/// A schema that refers to itself — a tree node whose children are the same
+/// node — is legal JSON Schema and has no finite parameter tree, so the
+/// recursion has to stop somewhere rather than hang the builder.
+const MAX_REF_DEPTH: usize = 8;
+
+/// A schema with its `$ref` and single-member `allOf` indirection followed.
+///
+/// `schemars` writes a named type as `{"$ref": "#/definitions/Name"}`, and a
+/// named type that also carries a description as
+/// `{"allOf": [{"$ref": …}], "description": …}`. Neither carries a `type`, so
+/// without resolving them every named type in the catalog — a credential kind,
+/// a revision, a push action — reaches [`parse_param_type`] as an unrecognized
+/// schema and becomes "any JSON value", losing exactly the `enum` the grammar
+/// exists to enforce.
+fn resolve<'a>(schema: &'a Value, root: &'a Value, depth: usize) -> &'a Value {
+    if depth >= MAX_REF_DEPTH {
+        return schema;
+    }
+    // `allOf` of a single member is that member; siblings are metadata. A
+    // conditional member (`if`/`then`) is a rule over the siblings, not the
+    // schema itself ([`value_requirements`]).
+    if let Some([only]) = schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .map(|a| &a[..])
+    {
+        if only.get("if").is_none() {
+            return resolve(only, root, depth + 1);
+        }
+    }
+    let Some(pointer) = schema.get("$ref").and_then(Value::as_str) else {
+        return schema;
+    };
+    // Only local pointers; a remote `$ref` is not fetched.
+    let Some(rest) = pointer.strip_prefix("#/") else {
+        return schema;
+    };
+    let mut at = root;
+    for segment in rest.split('/') {
+        // JSON Pointer escapes, in the order the spec requires.
+        let key = segment.replace("~1", "/").replace("~0", "~");
+        match at.get(&key) {
+            Some(next) => at = next,
+            None => return schema,
+        }
+    }
+    resolve(at, root, depth + 1)
+}
+
+/// Merge a discriminated `oneOf` over objects into one object schema.
+///
+/// A tagged union — `{"kind":"branch","name":…}` or `{"kind":"commit","id":…}`
+/// — has no representation in [`Param`], which carries one shape per value.
+/// Leaving it unresolved costs the whole structure: the model gets "any JSON
+/// value" and can write any key at all. Merging keeps most of it. The result
+/// offers the union of every arm's fields, requires only what every arm
+/// requires (the discriminator), and gives the discriminator the union of the
+/// arms' constant values — so the tag is constrained to the tags that exist
+/// and the keys to the keys that exist.
+///
+/// What it does not keep is the dependency between them: the grammar will let
+/// `{"kind":"head","id":…}` through, a combination no arm allows. That is
+/// caught one layer later, when the call deserializes into the tool's request
+/// type and comes back `invalid_arguments` naming the field — a far better
+/// outcome than an unconstrained object, where the model can invent key names
+/// that match nothing at all.
+fn merge_variants(arms: &[&Value], root: &Value, depth: usize) -> Option<Param> {
+    let objects: Vec<&Value> = arms.iter().map(|a| resolve(a, root, depth)).collect();
+    // Every arm must be an object schema with properties, or there is nothing
+    // structural to merge and the value stays opaque.
+    if !objects
+        .iter()
+        .all(|o| o.get("properties").is_some_and(Value::is_object))
+    {
+        return None;
+    }
+    let mut merged: Vec<Param> = Vec::new();
+    for object in &objects {
+        for field in fields_of(object, root) {
+            match merged.iter_mut().find(|m| m.name == field.name) {
+                None => merged.push(field),
+                Some(existing) => {
+                    // A field two arms share keeps the union of their allowed
+                    // values, so a discriminator ends up listing every tag.
+                    match (&mut existing.enum_values, field.enum_values) {
+                        (Some(have), Some(more)) => {
+                            for v in more {
+                                if !have.contains(&v) {
+                                    have.push(v);
+                                }
+                            }
+                        }
+                        // One arm leaves it open, so the merged field is open.
+                        (slot, _) => *slot = None,
+                    }
+                    existing.nullable |= field.nullable;
+                }
+            }
+        }
+    }
+    // Required only where every arm requires it.
+    for field in &mut merged {
+        field.required = objects.iter().all(|o| {
+            o.get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(field.name.as_str())))
+        });
+    }
+    // The discriminator first, then the rest in first-seen order.
+    merged.sort_by_key(|f| !f.required);
+    Some(Param {
+        name: String::new(),
+        ty: ParamType::Object,
+        required: false,
+        enum_values: None,
+        items: None,
+        min_items: 0,
+        properties: Some(merged),
+        nullable: false,
+        minimum: None,
+        requires: Vec::new(),
+    })
+}
+
 /// An object schema's properties as parameters, required first in the
 /// `required` list's order, then optionals in declared order.
-fn fields_of(schema: &Value) -> Vec<Param> {
+fn fields_of(schema: &Value, root: &Value) -> Vec<Param> {
     let required: Vec<&str> = schema
         .get("required")
         .and_then(|r| r.as_array())
@@ -157,7 +301,7 @@ fn fields_of(schema: &Value) -> Vec<Param> {
             params.push(Param {
                 name: pname.clone(),
                 required: required.contains(&pname.as_str()),
-                ..param_of(pschema)
+                ..param_of(pschema, root)
             });
         }
     }
@@ -168,25 +312,82 @@ fn fields_of(schema: &Value) -> Vec<Param> {
             .position(|r| *r == p.name)
             .unwrap_or(usize::MAX)
     });
+    for (field, value, fields) in value_requirements(schema) {
+        if let Some(p) = params.iter_mut().find(|p| p.name == field) {
+            p.requires.push((value, fields));
+        }
+    }
     params
 }
 
+/// What each value of a field requires, from an object schema's `allOf` of
+/// `{"if": {"properties": {F: {"const": V}}}, "then": {"required": [...]}}`
+/// — `enum` in place of `const` names several values at once — as
+/// `(F, V, fields)`.
+///
+/// A request whose fields depend on a mode — `git_commit`'s `from: files`
+/// needs `changes`, `from: patch` needs `patch` — can list none of them in
+/// `required`, since no one of them is needed by every mode. Left optional,
+/// the grammar offers the close beside each, and a model takes it: measured
+/// live, `git_commit` was sent `{"from": "files", "message": …}` and then
+/// `{"from": "files", "changes": []}` while the model's reasoning named both
+/// files it meant to `take`. Each `if` that matches neither shape is skipped.
+fn value_requirements(schema: &Value) -> Vec<(String, String, Vec<String>)> {
+    let mut out = Vec::new();
+    let Some(rules) = schema.get("allOf").and_then(Value::as_array) else {
+        return out;
+    };
+    for rule in rules {
+        let (Some(when), Some(then)) = (
+            rule.pointer("/if/properties").and_then(Value::as_object),
+            rule.pointer("/then/required").and_then(Value::as_array),
+        ) else {
+            continue;
+        };
+        // One field tested, or the rule is not about one field's value.
+        let mut tests = when.iter();
+        let (Some((field, test)), None) = (tests.next(), tests.next()) else {
+            continue;
+        };
+        let values: Vec<&str> = match (test.get("const"), test.get("enum")) {
+            (Some(one), _) => one.as_str().into_iter().collect(),
+            (None, Some(Value::Array(many))) => many.iter().filter_map(Value::as_str).collect(),
+            _ => continue,
+        };
+        let fields: Vec<String> = then
+            .iter()
+            .filter_map(|f| f.as_str().map(str::to_string))
+            .collect();
+        for value in values {
+            out.push((field.clone(), value.to_string(), fields.clone()));
+        }
+    }
+    out
+}
+
 /// One value schema as an unnamed, optional [`Param`].
-fn param_of(schema: &Value) -> Param {
+fn param_of(schema: &Value, root: &Value) -> Param {
+    let schema = resolve(schema, root, 0);
     // One schema or `null`: the schema, nullable.
     let alternatives = schema
         .get("anyOf")
         .or_else(|| schema.get("oneOf"))
         .and_then(Value::as_array);
     if let Some(alternatives) = alternatives {
-        let is_null = |s: &&Value| s.get("type").and_then(Value::as_str) == Some("null");
+        let is_null =
+            |s: &&Value| resolve(s, root, 0).get("type").and_then(Value::as_str) == Some("null");
         let others: Vec<&Value> = alternatives.iter().filter(|s| !is_null(s)).collect();
+        let nullable = others.len() < alternatives.len();
         if let [only] = others.as_slice() {
-            let inner = param_of(only);
+            let inner = param_of(only, root);
             return Param {
-                nullable: inner.nullable || others.len() < alternatives.len(),
+                nullable: inner.nullable || nullable,
                 ..inner
             };
+        }
+        // Several real alternatives: a tagged union, if they are all objects.
+        if let Some(merged) = merge_variants(&others, root, 0) {
+            return Param { nullable, ..merged };
         }
     }
     let enum_members = schema.get("enum").and_then(Value::as_array);
@@ -201,12 +402,22 @@ fn param_of(schema: &Value) -> Param {
     let nullable = type_nullable
         || enum_members.is_some_and(|a| a.iter().any(Value::is_null))
         || schema.get("nullable").and_then(Value::as_bool) == Some(true);
+    // A minimum past the unrolled bound has no level to require it at, and the
+    // grammar would write exactly the bound — a call the schema refuses. Such
+    // an array is left a free value.
+    let min_items = schema
+        .get("minItems")
+        .and_then(Value::as_u64)
+        .map_or(0, |n| n as usize);
     let items = match (ty, schema.get("items")) {
-        (ParamType::Array, Some(items @ Value::Object(_))) => Some(Box::new(param_of(items))),
+        (ParamType::Array, Some(items @ Value::Object(_))) if min_items <= MAX_ARRAY_ELEMENTS => {
+            Some(Box::new(param_of(items, root)))
+        }
         _ => None,
     };
+    let guided_min = if items.is_some() { min_items } else { 0 };
     let properties = match (ty, schema.get("properties")) {
-        (ParamType::Object, Some(Value::Object(_))) => Some(fields_of(schema)),
+        (ParamType::Object, Some(Value::Object(_))) => Some(fields_of(schema, root)),
         _ => None,
     };
     Param {
@@ -215,8 +426,11 @@ fn param_of(schema: &Value) -> Param {
         required: false,
         enum_values,
         items,
+        min_items: guided_min,
         properties,
         nullable,
+        minimum: schema.get("minimum").and_then(Value::as_f64),
+        requires: Vec::new(),
     }
 }
 
@@ -556,13 +770,13 @@ pub const TOOL_CALL_TREE_LABEL: &str = "tool_call";
 /// clock while the calls themselves ran in milliseconds. Batching what the model
 /// already knows it needs collapses those round-trips into one.
 ///
-/// Four is a starting point, not a tuned constant: it covers the common fan-out
-/// (list a directory, read the two or three files it names) without letting one
-/// turn commit to a long speculative run whose later calls are chosen before any
-/// result has come back. The ceiling is a grammar bound, not a target — a turn
-/// making one call remains perfectly ordinary, because the loop's other arm is
-/// always the turn terminator.
-pub const MAX_TOOL_CALLS_PER_TURN: usize = 4;
+/// Five covers the common fan-out — list a directory, then read the handful of
+/// files it names — without letting one turn commit to a long speculative run
+/// whose later calls are all chosen before any result has come back. The
+/// ceiling is a grammar bound, not a target: a turn making one call remains
+/// perfectly ordinary, because the loop's other arm is always the turn
+/// terminator.
+pub const MAX_TOOL_CALLS_PER_TURN: usize = 5;
 
 /// Compile a tool catalog into a [`TreeSpec`].  Errors on an empty catalog or a
 /// name/enum collision the trie rejects.
@@ -852,6 +1066,11 @@ pub fn compile_action_loop_with_body<'a>(
 /// the bound needs — so the last level offers only the close.
 pub const MAX_ARRAY_ELEMENTS: usize = 64;
 
+/// How many digits an integer value may have — enough for any `i64`
+/// (`9223372036854775807` is nineteen). Unrolled one level per digit, as an
+/// array is per element, for the same reason: the compiler rejects cycles.
+pub const MAX_INTEGER_DIGITS: usize = 19;
+
 struct ToolTreeBuilder<'a> {
     spec: TreeSpec,
     env: &'a ToolCallEnvelope,
@@ -910,21 +1129,117 @@ impl<'a> ToolTreeBuilder<'a> {
     ) -> Result<SpecId, BuildError> {
         let required: Vec<&Param> = params.iter().filter(|p| p.required).collect();
         let optional: Vec<&Param> = params.iter().filter(|p| !p.required).collect();
-        let mut memo = FieldMemo::default();
+        self.build_sequence(&required, &optional, true, close, end)
+    }
 
-        // Optional gates start with emitted_any = (a required field precedes them).
-        let mut opt_entry =
-            self.opt_gates(&optional, 0, !required.is_empty(), close, end, &mut memo)?;
-
-        // Prepend the required fields, in order, building backwards.
-        for (i, p) in required.iter().enumerate().rev() {
-            let (leadin, value) = self.build_value(p, opt_entry)?;
-            opt_entry = self.spec.push(NodeSpec::Static {
-                text: self.key(p, i == 0, &leadin),
-                next: value,
-            });
+    /// `required` in order, then the gates over `optional`, through `close` to
+    /// `end`. `first` says no field precedes them.
+    fn build_sequence(
+        &mut self,
+        required: &[&Param],
+        optional: &[&Param],
+        first: bool,
+        close: &str,
+        end: SpecId,
+    ) -> Result<SpecId, BuildError> {
+        let Some((&p, rest)) = required.split_first() else {
+            // Optional gates start with emitted_any = (a required field precedes them).
+            let mut memo = FieldMemo::default();
+            return self.opt_gates(optional, 0, !first, close, end, &mut memo);
+        };
+        if let (false, Some(values), false) = (p.requires.is_empty(), &p.enum_values, p.nullable) {
+            return self.build_discriminated(p, values, rest, optional, first, close, end);
         }
-        Ok(opt_entry)
+        let tail = self.build_sequence(rest, optional, false, close, end)?;
+        let (leadin, value) = self.build_value(p, tail)?;
+        Ok(self.spec.push(NodeSpec::Static {
+            text: self.key(p, first, &leadin),
+            next: value,
+        }))
+    }
+
+    /// A required enum field `p` whose values require fields of their own
+    /// ([`Param::requires`]): each value goes on to the rest of the object
+    /// with the fields it requires moved from `optional` to required, after
+    /// `rest`. Values that require nothing share one tail.
+    #[allow(clippy::too_many_arguments)]
+    fn build_discriminated(
+        &mut self,
+        p: &Param,
+        values: &[String],
+        rest: &[&Param],
+        optional: &[&Param],
+        first: bool,
+        close: &str,
+        end: SpecId,
+    ) -> Result<SpecId, BuildError> {
+        let mut shared: Option<SpecId> = None;
+        let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(values.len());
+        for value in values {
+            // Every rule naming the value counts.
+            let needs: Vec<&String> = p
+                .requires
+                .iter()
+                .filter(|(v, _)| v == value)
+                .flat_map(|(_, fields)| fields)
+                .collect();
+            let wanted = |o: &&Param| needs.contains(&&o.name);
+            let tail = match (optional.iter().any(wanted), shared) {
+                (false, Some(tail)) => tail,
+                (false, None) => {
+                    let tail = self.build_sequence(rest, optional, false, close, end)?;
+                    shared = Some(tail);
+                    tail
+                }
+                (true, _) => {
+                    let promoted: Vec<Param> = optional
+                        .iter()
+                        .copied()
+                        .filter(|o| wanted(o))
+                        .map(|o| Param {
+                            required: true,
+                            ..o.clone()
+                        })
+                        .collect();
+                    let mut now_required: Vec<&Param> = rest.to_vec();
+                    now_required.extend(promoted.iter());
+                    let still_optional: Vec<&Param> =
+                        optional.iter().copied().filter(|o| !wanted(o)).collect();
+                    self.build_sequence(&now_required, &still_optional, false, close, end)?
+                }
+            };
+            arms.push((value.clone(), tail));
+        }
+        let branch = match self.env.style {
+            // The end marker rides on each arm, as in [`Self::build_value`].
+            CallStyle::FunctionBlock => {
+                let marker = self.env.param_close;
+                let arms = arms
+                    .into_iter()
+                    .map(|(v, next)| (format!("{v}{marker}"), next))
+                    .collect();
+                self.spec.push(NodeSpec::Branch { arms })
+            }
+            // Quoted, each carrying the first step of its own tail — so the
+            // value and the key it requires next are one choice — and its
+            // space, the key ending at the colon.
+            CallStyle::JsonBlock | CallStyle::Lines => {
+                let quoted = arms
+                    .into_iter()
+                    .map(|(v, next)| (Value::String(v).to_string(), next))
+                    .collect();
+                let arms = self
+                    .with_continuations(quoted)
+                    .into_iter()
+                    .map(|(t, next)| (format!(" {t}"), next))
+                    .collect();
+                self.spec.push(NodeSpec::Branch { arms })
+            }
+        };
+        Ok(self.spec.push(NodeSpec::Static {
+            text: self.key(p, first, ""),
+            next: branch,
+        }))
     }
 
     /// What opens one argument, up to the point its value begins.
@@ -1082,7 +1397,14 @@ impl<'a> ToolTreeBuilder<'a> {
             });
             return Ok((String::new(), span));
         }
-        match self.value_arms(p, next)? {
+        // An enum field's arms carry the first step of what follows the field
+        // — the next key, or the close — so the value's closing quote and the
+        // separator after it are one arm's text. See [`Self::continuations`].
+        let arms = self.value_arms(p, next)?.map(|arms| match p.enum_values {
+            Some(_) => self.with_continuations(arms),
+            None => arms,
+        });
+        match arms {
             // One way to begin — an object's `{`, an array's `[`, a one-value
             // enum: it is the lead-in, folded into the key (`"filter": {`).
             Some(mut arms) if arms.len() == 1 => Ok(arms.remove(0)),
@@ -1146,18 +1468,123 @@ impl<'a> ToolTreeBuilder<'a> {
             (None, ParamType::Array) => match p.items.as_deref() {
                 Some(item) if self.array_depth == 0 && guided_element(item) => {
                     self.array_depth += 1;
-                    let built = self.build_array(item, next);
+                    let built = self.build_array(item, p.min_items, next);
                     self.array_depth -= 1;
                     vec![("[".into(), built?)]
                 }
                 _ => return Ok(None),
             },
-            (None, ParamType::Integer | ParamType::Number) => return Ok(None),
+            (None, ParamType::Integer) => match self.integer_arms(p, next) {
+                Some(arms) => arms,
+                None => return Ok(None),
+            },
+            (None, ParamType::Number) => return Ok(None),
         };
         if p.nullable {
             arms.push(("null".into(), next));
         }
         Ok(Some(arms))
+    }
+
+    /// **An integer is written digit by digit under the mask**, so nothing but
+    /// an integer can be decoded there.
+    ///
+    /// ```text
+    ///   ─┬─ "0" ──────────────── <end>
+    ///    ├─ "1".."9" ─ D₁₈ ─┬─ "0".."9" ─ D₁₇ ─ … ─ D₀ ─ <end>
+    ///    └─ "-" ─ "1".."9" ─┘  └─ <end>
+    /// ```
+    ///
+    /// `<end>` is what follows the value — the next key, the close — taken as
+    /// each arm's text ([`Self::continuations`]), so the digit the model does
+    /// not write and the separator it does are one choice. `-` is offered only
+    /// when the schema's `minimum` allows a negative, and a leading `0` ends the
+    /// number, as JSON requires.
+    ///
+    /// It was a free JSON value, which guarantees structure and not type: live,
+    /// a `git_show` call decoded `"page": "7eb876659c1b…"` — a commit id in an
+    /// integer field — and was refused a layer later. Under the mask the `"`
+    /// that opens it is never a candidate.
+    ///
+    /// `None` when what follows the value cannot be written as arm text — its
+    /// first step is free text, not a key or a close — and the value stays a
+    /// free JSON value.
+    fn integer_arms(&mut self, p: &Param, next: SpecId) -> Option<Vec<(String, SpecId)>> {
+        const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+        let ends = self.continuations(next);
+        if ends.iter().any(|(text, _)| text.is_empty()) {
+            return None;
+        }
+        let finished = self.choice(ends.clone());
+        // Built back to front: after the last admitted digit only the end
+        // remains, and each level before it offers one more digit or the end.
+        let mut more = finished;
+        for _ in 1..MAX_INTEGER_DIGITS {
+            let mut arms: Vec<(String, SpecId)> =
+                DIGITS.iter().map(|d| (d.to_string(), more)).collect();
+            arms.extend(ends.iter().cloned());
+            more = self.spec.push(NodeSpec::Branch { arms });
+        }
+        let leading: Vec<(String, SpecId)> =
+            DIGITS[1..].iter().map(|d| (d.to_string(), more)).collect();
+        let mut first = vec![("0".to_string(), finished)];
+        first.extend(leading.iter().cloned());
+        if p.minimum.is_none_or(|m| m < 0.0) {
+            let negative = self.spec.push(NodeSpec::Branch { arms: leading });
+            first.push(("-".to_string(), negative));
+        }
+        Some(first)
+    }
+
+    /// A node offering `arms`: a static when there is only one way on, which is
+    /// no choice at all.
+    fn choice(&mut self, mut arms: Vec<(String, SpecId)>) -> SpecId {
+        match arms.len() {
+            1 => {
+                let (text, next) = arms.remove(0);
+                self.spec.push(NodeSpec::Static { text, next })
+            }
+            _ => self.spec.push(NodeSpec::Branch { arms }),
+        }
+    }
+
+    /// The first step of `next`, as `(text, successor)` arms an enum value's
+    /// arm can carry on its end: a static's text, each arm of a branch, or —
+    /// for anything the grammar does not write itself — nothing.
+    ///
+    /// **Why an enum value takes its successor's first step with it.** Its
+    /// closing quote is the grammar's, and the next thing written is a
+    /// separator or a close the model chooses (`, "path":` against `}`). A
+    /// tokenizer writes those two together — Qwen's `",` and `"}` are single
+    /// tokens — so a quote committed on its own leaves the model to choose from
+    /// a boundary its encoding never produces, holding a lone `,` it is never
+    /// trained to write after `"`. Measured live: a `file_list` whose `repo` is
+    /// an enum closed its arguments after the repository three times running,
+    /// the model's reasoning each time saying it meant to pass `path`. With
+    /// the separator on the arm, the value and what follows it are one choice
+    /// the model writes in its own tokens.
+    ///
+    /// Object fields only. An array element's successor is the next element's
+    /// own separator branch, so folding there compounds across every element
+    /// of the array; a field's successor is a key or the close, one step deep.
+    fn continuations(&self, next: SpecId) -> Vec<(String, SpecId)> {
+        match self.spec.node(next) {
+            NodeSpec::Static { text, next } => vec![(text.clone(), *next)],
+            NodeSpec::Branch { arms } => arms.clone(),
+            NodeSpec::FreeText { .. } | NodeSpec::End => vec![(String::new(), next)],
+        }
+    }
+
+    /// `arms` with each one's successor's first step appended
+    /// ([`Self::continuations`]).
+    fn with_continuations(&self, arms: Vec<(String, SpecId)>) -> Vec<(String, SpecId)> {
+        arms.into_iter()
+            .flat_map(|(text, next)| {
+                self.continuations(next)
+                    .into_iter()
+                    .map(move |(tail, after)| (format!("{text}{tail}"), after))
+            })
+            .collect()
     }
 
     /// Any structurally-valid JSON value, lookahead-terminated at the enclosing
@@ -1195,10 +1622,21 @@ impl<'a> ToolTreeBuilder<'a> {
     /// `}` never written, a `]` in its place, not JSON, so no call. A free span
     /// counts one depth for `[` and `{` alike and could not see it.
     ///
+    /// **The first `min_items` levels offer no `]`**, so the schema's
+    /// `minItems` holds under the mask. Live, `git_push` — whose `pushes`
+    /// needs at least one — was decoded `"pushes": []` three turns running
+    /// while the model's reasoning named the branch it meant to push: offered
+    /// the close beside the first element, it took the close.
+    ///
     /// Unrolled to [`MAX_ARRAY_ELEMENTS`] and built back to front, as
     /// [`compile_action_loop`] builds its levels: each level's continuation
     /// points at the next, so the deepest exists first.
-    fn build_array(&mut self, item: &Param, next: SpecId) -> Result<SpecId, BuildError> {
+    fn build_array(
+        &mut self,
+        item: &Param,
+        min_items: usize,
+        next: SpecId,
+    ) -> Result<SpecId, BuildError> {
         // After the last admitted element, only the close remains.
         let mut after = self.spec.push(NodeSpec::Static {
             text: "]".to_string(),
@@ -1213,8 +1651,10 @@ impl<'a> ToolTreeBuilder<'a> {
                 .into_iter()
                 .map(|(open, element)| (format!("{sep}{open}"), element))
                 .collect();
-            arms.push(("]".to_string(), next));
-            after = self.spec.push(NodeSpec::Branch { arms });
+            if level >= min_items {
+                arms.push(("]".to_string(), next));
+            }
+            after = self.choice(arms);
         }
         Ok(after)
     }
@@ -1232,34 +1672,31 @@ mod tests {
     /// split the grammar makes.
     ///
     /// The JSON arm used to quote every value, so a numeric argument rendered
-    /// `"start_line": "1"` while `build_value`'s `Number` arm emits `1`. Only
+    /// `"page": "1"` while `build_value`'s `Number` arm emits `1`. Only
     /// prose-valued callers existed, so nothing caught it until an ingest chain
-    /// needed to prefill a line range.
+    /// needed to prefill a page number.
     #[test]
     fn render_writes_numbers_bare_and_strings_quoted() {
         let json = ToolCallEnvelope::qwen3();
-        let out = json.render("file_read", &[("path", "a/mod.rs"), ("start_line", "1")]);
+        let out = json.render("file_read", &[("path", "a/mod.rs"), ("page", "1")]);
         assert!(
             out.contains(r#""path": "a/mod.rs""#),
             "a string argument stays quoted and escaped: {out}"
         );
         assert!(
-            out.contains(r#""start_line": 1"#),
+            out.contains(r#""page": 1"#),
             "a numeric argument is bare, as `build_value` emits it: {out}"
         );
 
         // A function block's values are raw whatever their type, so neither
         // gains quotes and the scalar question does not arise.
         let fb = ToolCallEnvelope::qwen35();
-        let out = fb.render("file_read", &[("path", "a/mod.rs"), ("start_line", "1")]);
+        let out = fb.render("file_read", &[("path", "a/mod.rs"), ("page", "1")]);
         assert!(
             out.contains("<parameter=path>\na/mod.rs</parameter>"),
             "{out}"
         );
-        assert!(
-            out.contains("<parameter=start_line>\n1</parameter>"),
-            "{out}"
-        );
+        assert!(out.contains("<parameter=page>\n1</parameter>"), "{out}");
         assert!(!out.contains('"'), "raw values carry no quotes: {out}");
     }
 
@@ -1711,7 +2148,7 @@ mod tests {
     /// nullable container included, which is guided with `null` beside it.
     #[test]
     fn items_and_properties_are_kept_recursively() {
-        let schema: serde_json::Value = serde_json::from_str(
+        let schema: Value = serde_json::from_str(
             r#"{
                 "type": "object",
                 "properties": {
@@ -1771,7 +2208,7 @@ mod tests {
     /// it qualifies is kept.
     #[test]
     fn every_spelling_of_nullable_is_read() {
-        let param = |schema: serde_json::Value| param_of(&schema);
+        let param = |schema: Value| param_of(&schema, &schema);
         for (schema, ty) in [
             (json!({"type": ["boolean", "null"]}), ParamType::Boolean),
             (json!({"type": ["null", "string"]}), ParamType::String),
@@ -1811,11 +2248,246 @@ mod tests {
         assert_eq!(object.properties.map(|f| f.len()), Some(1));
     }
 
+    /// **A named type is followed to its definition.** `schemars` writes one as
+    /// a bare `$ref`, or as an `allOf` of a single `$ref` when it also carries
+    /// a description. Both must reach the definition, or the `enum` the
+    /// grammar exists to enforce is lost and the value becomes any JSON at all.
+    #[test]
+    fn a_named_type_is_resolved_to_its_definition() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {
+                "CredType": {"type": "string", "enum": ["ssh_key", "http_bearer"]}
+            },
+            "properties": {
+                "bare": {"$ref": "#/definitions/CredType"},
+                "described": {
+                    "allOf": [{"$ref": "#/definitions/CredType"}],
+                    "description": "Credential type."
+                },
+                "optional": {
+                    "anyOf": [{"$ref": "#/definitions/CredType"}, {"type": "null"}]
+                }
+            },
+            "required": ["bare", "described"]
+        });
+        let spec = ToolSpec::from_json_schema("credential_save", &schema);
+        let by_name = |n: &str| spec.params.iter().find(|p| p.name == n).unwrap();
+        for name in ["bare", "described", "optional"] {
+            let p = by_name(name);
+            assert_eq!(p.ty, ParamType::String, "{name}");
+            assert_eq!(
+                p.enum_values.as_deref(),
+                Some(&["ssh_key".to_string(), "http_bearer".to_string()][..]),
+                "{name} lost its enum",
+            );
+        }
+        assert!(by_name("optional").nullable);
+        assert!(!by_name("bare").nullable);
+    }
+
+    /// A `$ref` that leads nowhere, or in a circle, leaves the value opaque
+    /// rather than hanging the builder or panicking.
+    #[test]
+    fn an_unresolvable_or_circular_ref_is_left_opaque() {
+        let dangling = json!({
+            "type": "object",
+            "properties": {"x": {"$ref": "#/definitions/Missing"}}
+        });
+        assert_eq!(
+            ToolSpec::from_json_schema("t", &dangling).params[0].ty,
+            ParamType::Object
+        );
+
+        let circular = json!({
+            "type": "object",
+            "definitions": {"Loop": {"$ref": "#/definitions/Loop"}},
+            "properties": {"x": {"$ref": "#/definitions/Loop"}}
+        });
+        assert_eq!(
+            ToolSpec::from_json_schema("t", &circular).params[0].ty,
+            ParamType::Object
+        );
+
+        // A remote pointer is not fetched.
+        let remote = json!({
+            "type": "object",
+            "properties": {"x": {"$ref": "https://example.com/s.json#/A"}}
+        });
+        assert_eq!(
+            ToolSpec::from_json_schema("t", &remote).params[0].ty,
+            ParamType::Object
+        );
+    }
+
+    /// **A tagged union is merged into one object whose discriminator lists
+    /// every tag.** Without this a revision argument reaches the grammar as
+    /// "any JSON value" and the model may write any key at all; with it the
+    /// tag is one of the five that exist and the keys are the keys that exist.
+    ///
+    /// The merge is deliberately permissive about *combinations* — `kind` and
+    /// every arm's field are offered together — because `Param` carries one
+    /// shape per value. A combination no arm allows is refused when the call
+    /// deserializes, which names the offending field.
+    #[test]
+    fn a_tagged_union_merges_into_one_object_listing_every_tag() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {
+                "RevArg": {
+                    "oneOf": [
+                        {"type": "object", "properties": {
+                            "kind": {"type": "string", "enum": ["head"]}},
+                         "required": ["kind"]},
+                        {"type": "object", "properties": {
+                            "kind": {"type": "string", "enum": ["commit"]},
+                            "id": {"type": "string"}},
+                         "required": ["kind", "id"]},
+                        {"type": "object", "properties": {
+                            "kind": {"type": "string", "enum": ["branch"]},
+                            "name": {"type": "string"}},
+                         "required": ["kind", "name"]}
+                    ]
+                }
+            },
+            "properties": {
+                "rev": {"anyOf": [{"$ref": "#/definitions/RevArg"}, {"type": "null"}]}
+            }
+        });
+        let spec = ToolSpec::from_json_schema("git_log", &schema);
+        let rev = &spec.params[0];
+        assert_eq!(rev.ty, ParamType::Object);
+        assert!(rev.nullable, "the field itself is optional");
+        let fields = rev.properties.as_ref().expect("the union keeps its fields");
+
+        let kind = fields.iter().find(|f| f.name == "kind").unwrap();
+        assert_eq!(
+            kind.enum_values.as_deref(),
+            Some(
+                &[
+                    "head".to_string(),
+                    "commit".to_string(),
+                    "branch".to_string()
+                ][..]
+            ),
+            "the discriminator must list every arm's tag",
+        );
+        assert!(kind.required, "every arm requires the discriminator");
+
+        // The arms' own fields are offered, and none is required, because no
+        // single one is required by every arm.
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["kind", "id", "name"], "discriminator first");
+        for f in fields.iter().filter(|f| f.name != "kind") {
+            assert!(!f.required, "{} is required by only one arm", f.name);
+            assert_eq!(f.ty, ParamType::String);
+        }
+    }
+
+    /// A union whose arms are not all objects stays opaque — there is no
+    /// single shape to merge them into.
+    #[test]
+    fn a_union_of_unlike_arms_stays_opaque() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "x": {"oneOf": [
+                    {"type": "object", "properties": {"a": {"type": "string"}}},
+                    {"type": "string"}
+                ]}
+            }
+        });
+        let x = &ToolSpec::from_json_schema("t", &schema).params[0];
+        assert_eq!(x.ty, ParamType::Object);
+        assert!(x.properties.is_none(), "no single shape, so no fields");
+    }
+
+    /// A union nested inside an array's elements resolves too — `git_push`
+    /// takes an array of tagged push items.
+    #[test]
+    fn a_union_inside_an_array_resolves() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {
+                "PushItem": {
+                    "oneOf": [
+                        {"type": "object", "properties": {
+                            "action": {"type": "string", "enum": ["update_branch"]},
+                            "branch": {"type": "string"}},
+                         "required": ["action", "branch"]},
+                        {"type": "object", "properties": {
+                            "action": {"type": "string", "enum": ["delete_tag"]},
+                            "tag": {"type": "string"}},
+                         "required": ["action", "tag"]}
+                    ]
+                }
+            },
+            "properties": {
+                "pushes": {"type": "array", "items": {"$ref": "#/definitions/PushItem"}}
+            },
+            "required": ["pushes"]
+        });
+        let spec = ToolSpec::from_json_schema("git_push", &schema);
+        let element = spec.params[0]
+            .items
+            .as_ref()
+            .expect("elements keep a schema");
+        let fields = element
+            .properties
+            .as_ref()
+            .expect("the element is an object");
+        let action = fields.iter().find(|f| f.name == "action").unwrap();
+        assert_eq!(
+            action.enum_values.as_deref(),
+            Some(&["update_branch".to_string(), "delete_tag".to_string()][..])
+        );
+        assert!(fields.iter().any(|f| f.name == "branch"));
+        assert!(fields.iter().any(|f| f.name == "tag"));
+    }
+
+    /// **An enum field's arm spells the separator after it, so the model writes
+    /// the quote and the separator as its own token.** `repo` is an optional
+    /// enum ahead of the optional `path`: after the value, the arms go on to
+    /// the next key or to the close, never stopping at a lone closing quote —
+    /// the boundary that left a live model unable to write `",` and closing its
+    /// arguments instead of naming the path it meant to.
+    #[test]
+    fn an_enum_field_arm_carries_the_separator_after_it() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "enum": ["a", "b"]},
+                "path": {"type": "string"}
+            }
+        });
+        let spec = compile_tool_call_tree(
+            &[ToolSpec::from_json_schema("t", &schema)],
+            &ToolCallEnvelope::qwen3(),
+        )
+        .unwrap();
+        let all = arms(&spec);
+        for want in [
+            " \"a\", \"path\":",
+            " \"b\", \"path\":",
+            " \"a\"}}\n</tool_call>",
+            " \"b\"}}\n</tool_call>",
+        ] {
+            assert!(
+                all.iter().any(|a| a == want),
+                "{want:?} missing from {all:?}"
+            );
+        }
+        assert!(
+            !all.iter().any(|a| a == " \"a\"" || a == " \"b\""),
+            "an enum arm must not end on its bare closing quote: {all:?}"
+        );
+    }
+
     /// A closed set compiles to a choice, with `null` among the arms exactly
     /// when the schema allows it. A string is not a closed set.
     #[test]
     fn a_closed_set_compiles_to_a_choice() {
-        let arms_for = |value: serde_json::Value| {
+        let arms_for = |value: Value| {
             let schema = json!({"type": "object", "properties": {"v": value}, "required": ["v"]});
             let spec = compile_tool_call_tree(
                 &[ToolSpec::from_json_schema("t", &schema)],
@@ -1832,11 +2504,21 @@ mod tests {
             arms_for(json!({"type": ["boolean", "null"]})),
             [" false", " null", " true"]
         );
+        // An enum arm carries what follows the value — here the call's close —
+        // so the value's closing quote and the close are one arm's text.
+        let close = "}}\n</tool_call>";
         assert_eq!(
             arms_for(json!({"enum": ["x", "y", null]})),
-            [" \"x\"", " \"y\"", " null"]
+            [
+                format!(" \"x\"{close}"),
+                format!(" \"y\"{close}"),
+                format!(" null{close}")
+            ]
         );
-        assert_eq!(arms_for(json!({"enum": ["x", "y"]})), [" \"x\"", " \"y\""]);
+        assert_eq!(
+            arms_for(json!({"enum": ["x", "y"]})),
+            [format!(" \"x\"{close}"), format!(" \"y\"{close}")]
+        );
         // A nullable string is not a closed set: it is a free value, so the
         // model's own ` ""` and ` null` tokens are both reachable and no arm
         // prefills its opening quote.
@@ -1844,7 +2526,10 @@ mod tests {
         // An enum value is written as JSON, escapes and all.
         assert_eq!(
             arms_for(json!({"enum": ["say \"x\"", "b"]})),
-            [" \"b\"", " \"say \\\"x\\\"\""]
+            [
+                format!(" \"b\"{close}"),
+                format!(" \"say \\\"x\\\"\"{close}")
+            ]
         );
         // An array of booleans chooses at every element.
         let a = arms_for(json!({"type": "array", "items": {"type": "boolean"}}));
@@ -1853,12 +2538,173 @@ mod tests {
         }
     }
 
+    /// **A guided array honours `minItems`**: the levels before the minimum
+    /// offer no `]`, so `"pushes": []` cannot be decoded for a `git_push` that
+    /// needs one push. Each unrolled level offers one `]` arm otherwise, so
+    /// the count of them is the count of levels the array may close at.
+    #[test]
+    fn a_guided_array_offers_no_close_before_its_minimum() {
+        let closes = |min: Option<u64>| {
+            let mut array = json!({"type": "array", "items": {"type": "boolean"}});
+            if let Some(min) = min {
+                array["minItems"] = json!(min);
+            }
+            let schema = json!({"type": "object", "properties": {"v": array}, "required": ["v"]});
+            let tool = ToolSpec::from_json_schema("t", &schema);
+            assert_eq!(tool.params[0].min_items, min.unwrap_or(0) as usize);
+            let spec = compile_tool_call_tree(&[tool], &ToolCallEnvelope::qwen3()).unwrap();
+            arms(&spec).into_iter().filter(|a| a == "]").count()
+        };
+        assert_eq!(closes(None), MAX_ARRAY_ELEMENTS);
+        assert_eq!(closes(Some(1)), MAX_ARRAY_ELEMENTS - 1);
+        assert_eq!(closes(Some(3)), MAX_ARRAY_ELEMENTS - 3);
+        // A minimum past the unrolled bound could only be written as exactly
+        // the bound, which the schema refuses: the array is left free.
+        let schema = json!({"type": "object", "properties": {"v": {
+            "type": "array", "items": {"type": "boolean"}, "minItems": 1000}}});
+        let past = &ToolSpec::from_json_schema("t", &schema).params[0];
+        assert!(past.items.is_none(), "{past:?}");
+        assert_eq!(past.min_items, 0);
+    }
+
+    /// `git_push`'s real schema — `pushes` an array of `$ref`'d objects with
+    /// `minItems: 1` — compiles with its first element required.
+    #[test]
+    fn a_push_needs_a_push() {
+        let schema = json!({
+            "type": "object",
+            "definitions": {"PushItem": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["update_branch", "delete_branch"]},
+                "name": {"type": "string"}},
+                "required": ["action", "name"]}},
+            "properties": {
+                "remote": {"type": "string"},
+                "pushes": {"type": "array", "minItems": 1, "maxItems": 50,
+                           "items": {"$ref": "#/definitions/PushItem"}}},
+            "required": ["remote", "pushes"]
+        });
+        let tool = ToolSpec::from_json_schema("git_push", &schema);
+        let pushes = tool.params.iter().find(|p| p.name == "pushes").unwrap();
+        assert_eq!(pushes.min_items, 1);
+        let spec = compile_tool_call_tree(&[tool], &ToolCallEnvelope::qwen3()).unwrap();
+        // Every level but the first may close: the first element is written.
+        let closes = arms(&spec).into_iter().filter(|a| a == "]").count();
+        assert_eq!(
+            closes,
+            MAX_ARRAY_ELEMENTS - 1,
+            "an empty push list is offered"
+        );
+    }
+
+    /// A mode-switched request, `git_commit`'s shape: `from` decides which of
+    /// the optional fields a call needs, through `if`/`then`.
+    fn moded_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "from": {"type": "string", "enum": ["changes", "files", "patch", "revert", "noop"]},
+                "message": {"type": "string"},
+                "changes": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                "patch": {"type": "string"},
+                "commit": {"type": "string"}
+            },
+            "required": ["repo", "from"],
+            "allOf": [
+                {"if": {"properties": {"from": {"const": "files"}}},
+                 "then": {"required": ["message", "changes"]}},
+                {"if": {"properties": {"from": {"enum": ["changes", "patch"]}}},
+                 "then": {"required": ["message"]}},
+                {"if": {"properties": {"from": {"const": "patch"}}},
+                 "then": {"required": ["patch"]}},
+                {"if": {"properties": {"from": {"const": "revert"}}},
+                 "then": {"required": ["commit"]}},
+                {"if": {"properties": {"from": {"const": "files"}, "repo": {"const": "x"}}},
+                 "then": {"required": ["patch"]}}
+            ]
+        })
+    }
+
+    /// **Each `if`/`then` lands on the field it tests**, value by value — an
+    /// `enum` naming several — and a rule testing two fields is not one field's.
+    #[test]
+    fn value_requirements_are_read_onto_the_field_they_test() {
+        let tool = ToolSpec::from_json_schema("t", &moded_schema());
+        let from = tool.params.iter().find(|p| p.name == "from").unwrap();
+        let s = |v: &[&str]| v.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            from.requires,
+            vec![
+                ("files".to_string(), s(&["message", "changes"])),
+                ("changes".to_string(), s(&["message"])),
+                ("patch".to_string(), s(&["message"])),
+                ("patch".to_string(), s(&["patch"])),
+                ("revert".to_string(), s(&["commit"])),
+            ]
+        );
+        assert!(tool
+            .params
+            .iter()
+            .all(|p| p.name == "from" || p.requires.is_empty()));
+    }
+
+    /// **A value cannot close the call before the fields it requires**: each
+    /// arm of `from` goes on into its own first required key, and only a value
+    /// that requires nothing may close.
+    #[test]
+    fn a_mode_value_goes_on_into_the_fields_it_requires() {
+        let spec = compile_tool_call_tree(
+            &[ToolSpec::from_json_schema("t", &moded_schema())],
+            &ToolCallEnvelope::qwen3(),
+        )
+        .unwrap();
+        let all = arms(&spec);
+        let has = |want: &str| all.iter().any(|a| a == want);
+        for want in [
+            " \"files\", \"message\":",
+            " \"changes\", \"message\":",
+            " \"patch\", \"message\":",
+            " \"revert\", \"commit\":",
+            " \"noop\"}}\n</tool_call>",
+            " \"noop\", \"message\":",
+        ] {
+            assert!(has(want), "{want:?} missing from {all:?}");
+        }
+        for closed in ["files", "changes", "patch", "revert"] {
+            let early = format!(" \"{closed}\"}}}}\n</tool_call>");
+            assert!(!has(&early), "{closed} may close the call: {all:?}");
+        }
+        // Required after their value, the keys are the grammar's to write.
+        let fixed = statics(&spec);
+        for key in [", \"changes\": [", ", \"patch\":"] {
+            assert!(
+                fixed.iter().any(|s| s == key),
+                "{key:?} missing from {fixed:?}"
+            );
+        }
+    }
+
+    /// The function-block shape branches the same way, each value ending on
+    /// the element's own marker.
+    #[test]
+    fn a_mode_value_branches_in_the_function_block_shape_too() {
+        let env = ToolCallEnvelope::qwen35();
+        let spec =
+            compile_tool_call_tree(&[ToolSpec::from_json_schema("t", &moded_schema())], &env)
+                .unwrap();
+        let all = arms(&spec);
+        for value in ["changes", "files", "patch", "revert", "noop"] {
+            let want = format!("{value}{}", env.param_close);
+            assert!(all.contains(&want), "{want:?} missing from {all:?}");
+        }
+    }
+
     /// Which arrays and objects the grammar writes, read off the spec: a free
     /// `JsonValue` span per value the model writes whole.
     #[test]
     fn only_elements_the_grammar_can_begin_are_guided() {
         let free_spans = |schema: &str| {
-            let schema: serde_json::Value = serde_json::from_str(schema).unwrap();
+            let schema: Value = serde_json::from_str(schema).unwrap();
             let tool = ToolSpec::from_json_schema("t", &schema);
             let spec = compile_tool_call_tree(&[tool], &ToolCallEnvelope::qwen3()).unwrap();
             spec.nodes
@@ -1918,7 +2764,7 @@ mod tests {
             .with_special("[\"", 306)
             .with_special("\": [", 307)
             .with_special(" [", 308);
-        let schema: serde_json::Value = serde_json::from_str(
+        let schema: Value = serde_json::from_str(
             r#"{"type":"object","properties":{
                  "files":{"type":"array","items":{"type":"object","properties":{
                    "path":{"type":"string"},"start_line":{"type":["number","null"]}},
@@ -1938,13 +2784,13 @@ mod tests {
     /// text.
     #[test]
     fn params_follow_the_required_list_then_declared_order() {
-        let schema: serde_json::Value = serde_json::from_str(
+        let schema: Value = serde_json::from_str(
             r#"{
                 "type": "object",
                 "properties": {
-                    "start_line": {"type": "integer"},
+                    "width": {"type": "integer"},
                     "path": {"type": "string"},
-                    "end_line": {"type": "integer"},
+                    "height": {"type": "integer"},
                     "note": {"type": "string"},
                     "after": {"type": "string"}
                 },
@@ -1952,9 +2798,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let spec = ToolSpec::from_json_schema("file_read", &schema);
+        let spec = ToolSpec::from_json_schema("probe", &schema);
         let names: Vec<&str> = spec.params.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["path", "note", "start_line", "end_line", "after"]);
+        assert_eq!(names, ["path", "note", "width", "height", "after"]);
         assert!(spec.params[..2].iter().all(|p| p.required));
         assert!(spec.params[2..].iter().all(|p| !p.required));
     }

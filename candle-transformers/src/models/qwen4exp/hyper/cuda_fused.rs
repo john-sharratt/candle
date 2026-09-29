@@ -23,10 +23,14 @@
 
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::{CudaStream, DevicePtr};
-use candle::{DType, Result, Tensor};
-use candle_kernels::simple::gr_hyper::{run_gr_combine, run_gr_mix, run_gr_norm, GR_MAX_HC};
+use candle::wave_provenance::WaveTicket;
+use candle::{DType, LiveTensor, Result, Tensor};
+use candle_kernels::simple::gr_hyper::{
+    gr_hc_supported, run_gr_combine, run_gr_mix, run_gr_norm, GR_MAX_HC,
+};
 
 use crate::models::operand_guard::expect_dtype;
+use crate::models::wave_buffers::wave_empty_ticketed;
 
 /// A dense F32 operand resolved to a device pointer.
 struct Operand {
@@ -42,8 +46,11 @@ struct Operand {
 /// Contiguity is required (the kernels index `row · d + j` with no stride
 /// metadata) but a nonzero start offset is not: it is added to the pointer
 /// here and folded into `vec_ok`.
-fn with_operand<R>(t: &Tensor, what: &str, f: impl FnOnce(Operand, &CudaStream) -> R) -> Result<R> {
-    expect_dtype(t, DType::F32, what)?;
+fn with_operand<R>(
+    t: &LiveTensor<'_>,
+    what: &str,
+    f: impl FnOnce(Operand, &CudaStream) -> R,
+) -> Result<R> {
     if !t.is_contiguous() {
         candle::bail!(
             "{what}: kernel operand has layout {:?} stride {:?}, which is not dense — these \
@@ -52,6 +59,17 @@ fn with_operand<R>(t: &Tensor, what: &str, f: impl FnOnce(Operand, &CudaStream) 
             t.stride()
         );
     }
+    with_ptr(t, what, f)
+}
+
+/// Resolve `t` at its start offset with no layout check, for an operand whose
+/// kernel takes its stride as an argument. The caller validates the layout.
+fn with_ptr<R>(
+    t: &LiveTensor<'_>,
+    what: &str,
+    f: impl FnOnce(Operand, &CudaStream) -> R,
+) -> Result<R> {
+    expect_dtype(t, DType::F32, what)?;
     let (storage, layout) = t.storage_and_layout();
     let candle::Storage::Cuda(cs) = &*storage else {
         candle::bail!("{what}: expected CUDA storage");
@@ -70,7 +88,7 @@ fn with_operand<R>(t: &Tensor, what: &str, f: impl FnOnce(Operand, &CudaStream) 
 }
 
 /// `xn = grouped_rms(x) ⊙ gain`, one launch over `[n, hc, d]`.
-pub fn norm(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
+pub fn norm(x: &Tensor, gain: &Tensor, eps: f64, root: Option<WaveTicket>) -> Result<Tensor> {
     let (n, hc, d) = x.dims3()?;
     if gain.elem_count() != hc * d {
         candle::bail!(
@@ -80,7 +98,13 @@ pub fn norm(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
         );
     }
     // Fully overwritten by the kernel (hot-path invariant 6).
-    let xn = Tensor::empty((n, hc, d), DType::F32, x.device())?;
+    // **The seed of the Gated Residual's provenance.** The residual itself is
+    // pool-backed by design — it outlives every phase reset — so nothing in this
+    // chain has an operand to inherit an arena from. Rooting the norm's output
+    // on the open phase gives the rest of `hc_mix` a ticketed operand, and the
+    // eager ops after it (the low-rank GEMMs, the silu, the collapse) inherit it
+    // the ordinary way. With no phase open this is a pool allocation.
+    let xn = wave_empty_ticketed((n, hc, d), DType::F32, x.device(), root)?;
     with_operand(x, "gr norm: residual stream", |xo, stream| {
         with_operand(gain, "gr norm: gain", |go, _| {
             with_operand(&xn, "gr norm: out", |oo, _| {
@@ -106,7 +130,18 @@ pub fn norm(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// `mixed[t,j] = mean_s( xn[t,s,j] · sigmoid(gate_raw[t,s,j]) )`, one launch.
-pub fn mix(xn: &Tensor, gate_raw: &Tensor, hc: usize, d: usize) -> Result<Tensor> {
+pub fn mix(
+    xn: &Tensor,
+    gate_raw: &Tensor,
+    hc: usize,
+    d: usize,
+    root: Option<WaveTicket>,
+) -> Result<Tensor> {
+    // As for the combine: an uninstantiated stream count launches nothing and
+    // leaves `mixed` unwritten.
+    if !gr_hc_supported(hc) {
+        candle::bail!("gr mix: hc={hc} is not a power of two up to GR_MAX_HC={GR_MAX_HC}");
+    }
     let n = xn.elem_count() / (hc * d);
     if gate_raw.elem_count() != xn.elem_count() {
         candle::bail!(
@@ -115,7 +150,8 @@ pub fn mix(xn: &Tensor, gate_raw: &Tensor, hc: usize, d: usize) -> Result<Tensor
             xn.elem_count()
         );
     }
-    let mixed = Tensor::empty((n, d), DType::F32, xn.device())?;
+    // The block input, consumed inside the phase that produced it.
+    let mixed = wave_empty_ticketed((n, d), DType::F32, xn.device(), root)?;
     with_operand(xn, "gr mix: xn", |xo, stream| {
         with_operand(gate_raw, "gr mix: gate", |go, _| {
             with_operand(&mixed, "gr mix: out", |oo, _| {
@@ -139,27 +175,44 @@ pub fn mix(xn: &Tensor, gate_raw: &Tensor, hc: usize, d: usize) -> Result<Tensor
     Ok(mixed)
 }
 
-/// `out = res + block_out · 2·sigmoid(inject/hc)`, one launch.
+/// `res += block_out · 2·sigmoid(inject/hc)`, in place, one launch.
 ///
 /// One read and one write of the wide buffer, where the eager chain took four
-/// passes (sigmoid, scale, broadcast-multiply, add).
-pub fn combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tensor> {
+/// passes (sigmoid, scale, broadcast-multiply, add) and a second residual to
+/// write them into. `res` is taken `&mut` for the reason `Tensor::add_mut` is:
+/// the caller states it holds the residual it is updating, and nothing else
+/// reads it expecting the old value. A row-range view of the wave's residual is
+/// a valid `res` — its start offset is threaded to the kernel — which is how a
+/// wave's groups each combine their own rows with no concatenation between.
+///
+/// `block_out` and `inject` are borrowed at the caller's wave lifetime: they are
+/// the block's output and the pre-mix's projection, still on that phase's arena
+/// span, and this kernel only reads them.
+pub fn combine(
+    res: &mut Tensor,
+    block_out: &LiveTensor<'_>,
+    inject: &LiveTensor<'_>,
+) -> Result<()> {
     let (n, hc, d) = res.dims3()?;
-    // The kernel holds its per-stream weights in a fixed register array and
-    // returns without launching above that width. `out` below is allocated
-    // uninitialised, so an unlaunched combine would hand back garbage as the
-    // new residual and carry it through every remaining layer with nothing
-    // raised. The launcher cannot report it — refuse it here.
-    if hc > GR_MAX_HC {
-        candle::bail!("gr combine: hc={hc} exceeds GR_MAX_HC={GR_MAX_HC}");
+    // The launcher returns without launching for a stream count it has no
+    // instantiation for, which would leave the residual silently un-updated
+    // for every remaining layer. It cannot report that — refuse it here.
+    if !gr_hc_supported(hc) {
+        candle::bail!("gr combine: hc={hc} is not a power of two up to GR_MAX_HC={GR_MAX_HC}");
     }
-    if inject.elem_count() != n * hc {
+    // The inject is read through its row stride: it is the tail columns of the
+    // pre-mix's stacked down-projection, a `[n, hc]` view of a `[n, low_rank +
+    // hc]` buffer, and compacting it first would be a launch and an allocation
+    // per call for 16 bytes a row.
+    if inject.dims() != [n, hc] || inject.stride()[1] != 1 || inject.stride()[0] < hc {
         candle::bail!(
-            "gr combine: inject has {} elements for n·hc = {}",
-            inject.elem_count(),
-            n * hc
+            "gr combine: inject is {:?} stride {:?}, expected [{n}, {hc}] with unit column \
+             stride",
+            inject.dims(),
+            inject.stride()
         );
     }
+    let inject_stride = inject.stride()[0];
     if block_out.elem_count() != n * d {
         candle::bail!(
             "gr combine: block output has {} elements for n·d = {}",
@@ -167,33 +220,29 @@ pub fn combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tens
             n * d
         );
     }
-    // Fully overwritten by the kernel (hot-path invariant 6).
-    let out = Tensor::empty((n, hc, d), DType::F32, res.device())?;
     with_operand(res, "gr combine: residual", |ro, stream| {
         with_operand(block_out, "gr combine: block output", |bo, _| {
-            with_operand(inject, "gr combine: inject", |io, _| {
-                with_operand(&out, "gr combine: out", |oo, _| {
-                    // `inject` is [n, hc] and read scalar-wise, so its own
-                    // alignment does not gate the vector path; the three wide
-                    // operands do.
-                    let vec_ok = ro.vec_ok && bo.vec_ok && oo.vec_ok;
-                    candle::set_kernel_breadcrumb("run_gr_combine", file!(), line!());
-                    unsafe {
-                        run_gr_combine(
-                            ro.ptr as *const f32,
-                            bo.ptr as *const f32,
-                            io.ptr as *const f32,
-                            oo.ptr as *mut f32,
-                            n as i32,
-                            hc as i32,
-                            d as i32,
-                            i32::from(vec_ok),
-                            stream.cu_stream() as *mut std::ffi::c_void,
-                        );
-                    }
-                })
+            with_ptr(inject, "gr combine: inject", |io, _| {
+                // `inject` is [n, hc] and read scalar-wise, so its own
+                // alignment does not gate the vector path; the two wide
+                // operands do.
+                let vec_ok = ro.vec_ok && bo.vec_ok;
+                candle::set_kernel_breadcrumb("run_gr_combine", file!(), line!());
+                unsafe {
+                    run_gr_combine(
+                        ro.ptr as *mut f32,
+                        bo.ptr as *const f32,
+                        io.ptr as *const f32,
+                        n as i32,
+                        hc as i32,
+                        d as i32,
+                        inject_stride as i32,
+                        i32::from(vec_ok),
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                    );
+                }
             })
         })
-    })????;
-    Ok(out)
+    })???;
+    Ok(())
 }

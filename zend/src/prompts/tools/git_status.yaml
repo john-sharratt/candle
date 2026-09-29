@@ -1,0 +1,51 @@
+name: git_status
+questions:
+- what have I changed but not committed yet
+- is my work in that repo committed
+- which branch am I on right now
+- show me the uncommitted changes
+- what would go into my next commit
+- are there any files I added but have not committed
+- did I leave anything uncommitted before switching
+- do I have unsaved work in this repository
+- which files did I modify since the last commit
+- summarise where I am in this repository
+- what is my current branch and commit
+- anything outstanding in the repo
+- tell me whether this repo has pending edits
+- did I delete that file or is it still there
+- am I on main or a feature branch
+- check if it is safe to switch branches
+- how far ahead of origin is my branch
+- is my branch behind origin
+- how many files have I changed
+- is everything I wrote already committed
+category: Git
+description: 'Report what you have not committed in a repository: every file you added, modified or deleted since your files'' base commit, each with its `status`. Also names the branch you are on and that commit (`head`); `incoming` — how many commits the branch has that you do not, which git_merge brings in and a commit waits for; `conflicts` — files a merge left for you to settle before committing; `merging` — while a merge is being finished, the commit it brings in; and, as `upstream`, how far the local branch is `ahead` and `behind` origin''s copy; when origin has no copy yet, or the repository has no origin, `no_upstream` says so. A `counts` block comes back with every reply — `added`, `modified`, `deleted` — so "how many have I changed" is READ off those totals rather than counted from the listing, and `clean` says outright whether there is anything uncommitted at all, a merge being finished included. Use for "what have I changed", "is this committed", "what branch am I on", "am I up to date", "what is still in conflict", or to see what a commit of your changes would hold. The changed paths page, 80 a page, and `page` is required: pass 0 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only: it commits nothing and changes nothing.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    page:
+      description: Zero-based page of changed paths, 80 a page. Required — pass 0 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
+      format: uint32
+      minimum: 0.0
+      type: integer
+    repo:
+      description: The repository to inspect. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - page
+  title: StatusRequest
+  type: object
+examples:
+- what have I changed in the candle repo<|im_end|>
+- is my work committed<|im_end|>
+- which branch am I on<|im_end|>
+- show me anything uncommitted before I switch branches<|im_end|>
+- did I add any new files in mind<|im_end|>
+- what would my next commit hold<|im_end|>
+- give me a summary of where I am in the repo<|im_end|>
+- how far ahead of origin is my branch in candle<|im_end|>

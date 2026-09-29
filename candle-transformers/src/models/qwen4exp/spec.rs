@@ -528,7 +528,8 @@ pub fn rewind_row_state(
                 start: 0,
                 rows: kept,
             }];
-            append_wave(&mut one, keys, w, ratio, eps)?;
+            // Replay of a captured span, outside any open layer phase.
+            append_wave(&mut one, keys, w, ratio, eps, None)?;
         }
     }
     Ok(())

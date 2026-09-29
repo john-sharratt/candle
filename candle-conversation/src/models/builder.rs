@@ -124,7 +124,7 @@ pub struct ModelBuilder {
     /// Maximum Hot-tier turns before triggering Hot → Warm eviction.
     /// `0` = auto-compute from arena geometry in [`engine()`](Self::engine).
     max_hot_turns: usize,
-    /// Workspace root whose `.substrate/` directory backs the persistence
+    /// Workspace root whose `substrate/` directory backs the persistence
     /// redo log. `None` falls back to the process working directory.
     ///
     /// Ignored when [`Self::substrate`] handed over an already-open one.
@@ -134,7 +134,7 @@ pub struct ModelBuilder {
     /// `None` — the ordinary case — means the engine opens the directory
     /// [`Self::workspace_path`] names. A host that appends its own record
     /// classes to the same log must pass one instead, because a second writable
-    /// handle to one `.substrate/` silently drops records; see
+    /// handle to one `substrate/` silently drops records; see
     /// [`SharedSubstrate`].
     substrate: Option<SharedSubstrate>,
     /// Open the workspace's substrate read-only — forwarded to
@@ -304,7 +304,7 @@ impl ModelBuilder {
         self
     }
 
-    /// Set the workspace root whose `.substrate/` directory backs the
+    /// Set the workspace root whose `substrate/` directory backs the
     /// persistence redo log.
     ///
     /// Has no effect once [`Self::substrate`] has handed over an open one —
@@ -318,7 +318,7 @@ impl ModelBuilder {
     /// path to open its own at.
     ///
     /// Required of any host that writes its own records into the same redo log:
-    /// one `.substrate/` admits exactly one writable handle per process, and a
+    /// one `substrate/` admits exactly one writable handle per process, and a
     /// second one loses records rather than failing. See [`SharedSubstrate`].
     pub fn substrate(mut self, shared: SharedSubstrate) -> Self {
         self.substrate = Some(shared);
@@ -329,7 +329,7 @@ impl ModelBuilder {
     ///
     /// For a tool that inspects a workspace a running daemon owns: the engine
     /// resumes, prefills and decodes entirely in RAM and writes nothing under
-    /// `.substrate/` from start through shutdown. The store must already exist.
+    /// `substrate/` from start through shutdown. The store must already exist.
     ///
     /// Has no effect once [`Self::substrate`] has handed over an open one —
     /// that handle's own mode rules. See [`EngineConfig::read_only_substrate`].
@@ -999,16 +999,21 @@ impl ModelBuilder {
             ModelArch::Qwen4Exp => {
                 use candle::quantized::Int8Mode;
                 use candle_transformers::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-                // Per-layer progress not yet wired for this arch.
-                let _ = progress;
                 // KV is allocated per ATTENTION layer (12 of 48) and the window
                 // budget is config-derived, exactly as the hybrid's is.
                 let _ = max_seq;
                 // `model_path` is the merged KO artifact, not the vendor's
                 // split: the engine takes one mmap and one `Content`, and the
                 // expert pack is sized from a live span measurement at load.
-                let gpu = Qwen4ExpGpu::load(model_path, device, Int8Mode::auto(device))
-                    .map_err(ConversationError::Model)?;
+                // `progress` reports the expert repack, which is the bulk of a
+                // cold load's wall time.
+                let gpu = Qwen4ExpGpu::load_with_progress(
+                    model_path,
+                    device,
+                    Int8Mode::auto(device),
+                    progress,
+                )
+                .map_err(ConversationError::Model)?;
                 let mut model = Qwen4ExpBatched::new(gpu).map_err(ConversationError::Model)?;
                 if let Some(positions) = self.qsa_selection_budget {
                     model
@@ -1694,11 +1699,25 @@ impl ModelBuilder {
     /// reads as protection.
     #[cfg(feature = "hub")]
     fn download_or_fail(&self) -> crate::Result<(PathBuf, PathBuf)> {
-        let model_path = self.resolve_repo_file(
-            &self.spec.model_repo,
-            &self.spec.model_rev,
-            &self.spec.model_filename,
-        )?;
+        // **A prepared artifact is never downloaded, and this resolver used to try
+        // anyway.** `ModelSpec::prepared_from_source` marks a checkpoint this codebase
+        // *builds* from a repository's published files — Flash-Next's merged GGUF is the
+        // case — and its own documentation says resolution therefore skips the network and
+        // looks in the local cache. That was implemented in `zend::download` and nowhere
+        // else, so the daemon loaded such a model and everything below it got a 404 on a
+        // filename that was never published. Any harness in this crate was simply unable
+        // to open the one architecture that carries per-sequence state outside the K/V.
+        let model_path = if self.spec.prepared_from_source {
+            prepared_artifact_path(&self.spec.model_repo, &self.spec.model_filename)?
+        } else {
+            self.resolve_repo_file(
+                &self.spec.model_repo,
+                &self.spec.model_rev,
+                &self.spec.model_filename,
+            )?
+        };
+        // The tokenizer is published even when the checkpoint is not, and it comes from
+        // its own repository — so it resolves normally either way.
         let tokenizer_path = self.resolve_repo_file(
             &self.spec.tokenizer_repo,
             &self.spec.tokenizer_rev,
@@ -1847,6 +1866,44 @@ fn cached_repo_file(
         .join(rev)
         .join(filename);
     snapshot.is_file().then_some(snapshot)
+}
+
+/// The cache directory prepared and downloaded artifacts share.
+///
+/// `~/.cache/zend/models`, so a prepared artifact sits beside the published ones and one
+/// layout covers both. Defined here, in the crate every loader goes through, because the
+/// alternative is what was there before: the convention written down in `zend::download`
+/// and nowhere else, so the daemon could open a prepared checkpoint and nothing below it
+/// could.
+pub fn model_cache_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".cache").join("zend").join("models")
+}
+
+/// Locate an artifact this codebase **prepares** rather than downloads.
+///
+/// Layout is `<cache>/<repo-with-dashes>/<file>`, matching every downloaded artifact.
+/// What differs is the miss: there is no URL to fall back to, because the name was never
+/// published — so a miss is reported as the build step it actually is, rather than as a
+/// 404 on a file nobody ever uploaded.
+pub fn prepared_artifact_path(repo: &str, filename: &str) -> crate::Result<PathBuf> {
+    let path = model_cache_dir()
+        .join(repo.replace('/', "--"))
+        .join(filename);
+    if path.is_file() {
+        return Ok(path);
+    }
+    Err(ConversationError::Download(format!(
+        "{filename} is prepared from {repo}'s published files, not published under that \
+         name, and it is not in the cache at {}. Run the prepare step that builds it \
+         (for Flash-Next, `candle_transformers::models::qwen4exp::prepare`, which the \
+         `quantized_qwen38_moe` forward gate runs for this card's rung) — there is no \
+         download for this file.",
+        path.display(),
+    )))
 }
 
 /// **The gap, named, so a green run cannot be read as a covered one.**

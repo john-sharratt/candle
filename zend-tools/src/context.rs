@@ -8,14 +8,15 @@
 //!
 //! | Field | Type | Purpose |
 //! |-------|------|---------|
-//! | `vfs` | [`state::VfsStore`] | Overlay filesystem for `file_*` tools — session writes over the workspace |
+//! | `files` | [`RepoFiles`] | Overlay filesystem for `file_*` tools — one store per repository, one conversation's changes over each |
 //! | `credentials` | [`state::CredentialStore`] | Named auth material for session opens — reached only through [`ToolContext::credentials`] |
 //! | `notes` | [`state::NotesStore`] | Cross-conversation persistent key-value store |
 //! | `sessions` | [`state::SessionRegistry`] | All open protocol sessions (SSH, TCP, …) |
 //! | `hash_states` | [`state::HashStateStore`] | Running hash contexts for `hash_state_*` tools |
 //! | `http_client` | `reqwest::blocking::Client` | Shared HTTP client for `web_fetch`, `weather`, etc. — reached only through [`ToolContext::http`] |
-//! | `secrets` | [`state::ToolSecrets`] | Deployment API keys (Tavily) for the tools that call third-party services |
+//! | `secrets` | [`state::Secrets`] | The daemon's API keys and tokens (Tavily, GitHub), read once from a per-user file |
 //! | `subagent_runner` | `Option<Arc<dyn SubagentRunner>>` | Injected by daemon to run nested agent loops |
+//! | `sandboxes` | [`Sandboxes`] | The workspace's command sandboxes `run_command` runs in — reached only through [`ToolContext::sandboxes`] |
 //!
 //! # Grants
 //!
@@ -27,52 +28,56 @@
 //! # Construction
 //!
 //! In production the daemon calls [`ToolContext::with_workspace`] once at startup,
-//! passing its working directory so the `file_*` tools resolve real project files
-//! through the VFS overlay. [`ToolContext::new`] leaves the overlay upper-only,
-//! which is what most tests want; a test needing the lower layer points
-//! `with_workspace` at a temp dir.
+//! passing its [`Workspace`] so the `file_*` tools resolve real project files in
+//! each repository through the VFS overlay, and gives each conversation its own
+//! overlay with [`ToolContext::with_files`]. [`ToolContext::new`] leaves every
+//! repository's store upper-only ([`RepoFiles::detached`]), which is what most
+//! tests want; a test needing the lower layer builds a `Workspace` over a temp
+//! dir.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::grants::{Capability, Grants, NotPermitted};
-use crate::state::{
-    CredentialStore, HashStateStore, NotesStore, SessionRegistry, ToolSecrets, VfsStore,
-};
+use crate::sandboxes::Sandboxes;
+use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
+use zend_vfs::{RepoFiles, Workspace};
 
 /// Read-only handle bundle passed by the runner into each tool invocation.
 /// All stores are wrapped in `Arc` so cloning the context is cheap.
 #[derive(Clone)]
 pub struct ToolContext {
-    pub vfs: Arc<VfsStore>,
+    pub files: Arc<RepoFiles>,
     credentials: Arc<CredentialStore>,
     pub notes: Arc<NotesStore>,
     pub sessions: Arc<SessionRegistry>,
     pub hash_states: Arc<HashStateStore>,
     http_client: reqwest::blocking::Client,
-    pub secrets: Arc<ToolSecrets>,
+    pub secrets: Arc<Secrets>,
     pub subagent_runner: Option<Arc<dyn crate::SubagentRunner>>,
+    /// `None` for a context the daemon gave no workspace's sandboxes — a test,
+    /// a detached context — which has no checkout to run a command on.
+    sandboxes: Option<Arc<Sandboxes>>,
     grants: Grants,
 }
 
 impl ToolContext {
-    /// Construct a context with default-initialized stores, no workspace
-    /// layer — `file_*` tools see only what this session writes — and no
-    /// grants.
+    /// Construct a context with default-initialized stores, no workspace —
+    /// `file_*` tools see only what this session writes, in whatever
+    /// repository it names — and no grants.
     pub fn new() -> Self {
-        Self::build(VfsStore::new())
+        Self::build(RepoFiles::detached())
     }
 
-    /// Construct a context whose VFS overlays `workspace`, the daemon's working
-    /// directory: `file_*` reads fall through to real project files, writes and
-    /// edits stay in memory. Grants nothing.
-    pub fn with_workspace(workspace: impl Into<PathBuf>) -> Self {
-        Self::build(VfsStore::with_workspace(workspace))
+    /// Construct a context whose file stores overlay `workspace`'s
+    /// repositories: `file_*` reads fall through to real project files, writes
+    /// and edits stay in memory. Grants nothing.
+    pub fn with_workspace(workspace: Workspace) -> Self {
+        Self::build(RepoFiles::overlay(workspace))
     }
 
-    fn build(vfs: VfsStore) -> Self {
+    fn build(files: RepoFiles) -> Self {
         Self {
-            vfs: Arc::new(vfs),
+            files: Arc::new(files),
             credentials: Arc::new(CredentialStore::new()),
             notes: Arc::new(NotesStore::new()),
             sessions: Arc::new(SessionRegistry::new()),
@@ -84,8 +89,9 @@ impl ToolContext {
             // Unset unless the daemon supplies them: a test, and any caller that
             // is not the daemon, gets a context whose third-party tools report
             // themselves unconfigured rather than reaching the network.
-            secrets: Arc::new(ToolSecrets::empty()),
+            secrets: Arc::new(Secrets::empty()),
             subagent_runner: None,
+            sandboxes: None,
             grants: Grants::NONE,
         }
     }
@@ -113,27 +119,34 @@ impl ToolContext {
         Ok(&self.credentials)
     }
 
-    /// This context with its `file_*` tools working on the workspace on disk
-    /// ([`VfsStore::direct`]) instead of through the overlay. Every other store
-    /// is shared with `self` — sessions, notes and credentials stay one set,
-    /// whichever way a round's files are handled.
-    ///
-    /// `Ok(None)` for a context with no workspace, which has no disk to work on;
-    /// refused outright unless this context holds [`Capability::DiskWrite`].
-    pub fn with_direct_files(&self) -> Result<Option<Self>, NotPermitted> {
-        let grant = self.grants.disk_write()?;
-        let Some(root) = self.vfs.workspace().map(PathBuf::from) else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            vfs: Arc::new(VfsStore::direct(root, grant)),
-            ..self.clone()
-        }))
+    /// The workspace's command sandboxes, when the context may run programs
+    /// on this host — `None` when it was given none.
+    pub fn sandboxes(&self) -> Result<Option<&Sandboxes>, NotPermitted> {
+        self.grants.require(Capability::Exec)?;
+        Ok(self.sandboxes.as_deref())
     }
 
-    /// Attach the deployment's secrets, read once by the daemon at startup.
-    pub fn with_secrets(mut self, secrets: ToolSecrets) -> Self {
-        self.secrets = Arc::new(secrets);
+    /// This context with `sandboxes` to run commands in, shared by every
+    /// context built from it.
+    pub fn with_sandboxes(mut self, sandboxes: Arc<Sandboxes>) -> Self {
+        self.sandboxes = Some(sandboxes);
+        self
+    }
+
+    /// This context with `files` as its file stores — one conversation's own,
+    /// so the changes its tool calls make are its alone. Every other store is
+    /// shared with `self`.
+    pub fn with_files(&self, files: Arc<RepoFiles>) -> Self {
+        Self {
+            files,
+            ..self.clone()
+        }
+    }
+
+    /// Attach the daemon's secrets, read once at startup and shared by every
+    /// context it builds.
+    pub fn with_secrets(mut self, secrets: Arc<Secrets>) -> Self {
+        self.secrets = secrets;
         self
     }
 
@@ -174,23 +187,13 @@ mod tests {
             .is_ok());
     }
 
-    /// **A disk-writing store cannot be had without the grant.**
+    /// **The sandboxes are out of reach without `Exec`**, and a context given
+    /// none says so rather than inventing some.
     #[test]
-    fn direct_files_need_the_disk_write_grant() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = ToolContext::with_workspace(dir.path());
-        assert_eq!(
-            ctx.with_direct_files().err(),
-            Some(NotPermitted(Capability::DiskWrite))
-        );
-        let ctx = ctx.granting(Grants::NONE.with(Capability::DiskWrite));
-        let direct = ctx.with_direct_files().unwrap().expect("has a workspace");
-        assert!(direct.vfs.is_direct());
-        assert_eq!(direct.grants(), ctx.grants(), "grants carry over");
-        assert!(ToolContext::new()
-            .granting(Grants::ALL)
-            .with_direct_files()
-            .unwrap()
-            .is_none());
+    fn the_sandboxes_need_exec() {
+        let ctx = ToolContext::new();
+        assert_eq!(ctx.sandboxes().err(), Some(NotPermitted(Capability::Exec)));
+        let ctx = ctx.granting(Grants::NONE.with(Capability::Exec));
+        assert!(ctx.sandboxes().unwrap().is_none());
     }
 }

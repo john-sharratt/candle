@@ -114,7 +114,7 @@ the full extension. The schedule type takes any list, so adding a rung is a
 data change plus the needle gate in §10. Nothing else changes.
 
 **Why Qwen3.5-0.8B is progressive.** It is the same lineage with the same RoPE.
-Its rung 1 is the trained model exactly, so turning the schedule on changes
+Its rung 0 is the trained model exactly, so turning the schedule on changes
 nothing below 262,144. Past 262,144 the alternative is plain RoPE running
 outside anything it was trained on. The lineage's rungs are the better bet, and
 §10's needle gate measures them for the 0.8B like any other model. Its 1,010,000

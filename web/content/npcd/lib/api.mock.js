@@ -376,7 +376,7 @@ export const MockAPI = {
     const seg = (id, bytes, active) => ({ id, bytes, active: !!active });
     return {
       open: true,
-      path: '.substrate',
+      path: 'substrate',
       listed: true,
       segment_count: 4,
       segments: [seg(1, 67108864), seg(2, 67108864), seg(3, 67108864), seg(4, 21402112, true)],
