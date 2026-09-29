@@ -102,7 +102,7 @@ A probe that fails for any other reason — a network error, 429, a 5xx — back
 - **The extension allowlist** (`Language::from_extension`, plus `go.mod` / `go.sum`).
 - **The size cap**, `MAX_FILE_BYTES` (16 MiB), from the listing's size.
 - **The scope**, `--ingest-dir <layer>=<repo>/<folder>`: only paths under that folder.
-- **The depth bound**, `--max-depth N`: path components below the walk's start — the repository's root, or the scope folder — so `1` is its own files.
+- **The depth bound**, `--max-depth N`: path components below the walk's start — the repository's root, or the scope folder — so `1` is its own files. It bounds what is ingested, not what is kept (§7.2).
 
 Binary content cannot be told from a listing. It is sniffed when a file is about to be ingested (§7.3).
 
@@ -147,16 +147,16 @@ On the unit's conversation, as metadata: `content_key` (the key), plus `path`, `
 
 ### 7.1 Live, committed, queued
 
-1. **Live** — the corpus's keys (§5).
+1. **Live** — the corpus's keys (§5), in two lists: **ingest**, within the scope and the depth bound — what the layer reads — and **retain**, the same scope at full depth — what the layer keeps. Every ingest key is a retain key: a unit's key does not depend on the bound (a folder's listing and hint are the same whatever depth it is walked to), so the full-depth walk finds exactly the keys a deeper pass ingested.
 2. **Committed** — every live conversation of the layer carrying a `content_key`; for `code_reading`, only one whose chain **finished** (`candle_conversation::chain_health`). A file's key is written once its conversation stops calling tools, which is not the same as answering: a read cut off mid-deliberation, with no tool call and no summary, carries the key all the same. Such a chain is not committed, so its key is queued again; its conversation is deferred like a dead key's (§7.2) and retired once the rebuild commits. The resume snapshot and the `file_read` fast path read the same predicate.
-3. **Queued** — live keys not committed, in corpus order.
-4. **Dead** — committed keys not live.
+3. **Queued** — ingest keys not committed, in corpus order.
+4. **Dead** — committed keys not retained.
 
 ### 7.2 Tombstones
 
 A dead key is tombstoned, except while its path (or folder) has a queued key in the same layer: then it stays until that replacement commits, so a path is never missing from the layer while it is being re-read. A path deleted everywhere has no replacement and goes at once. Uploads (§9) are never swept here.
 
-"In scope" is literal: only the layers this boot ingests (not `--disable-layer`), and only within the scope and depth the pass walked. A key outside them is not found, and so is dead.
+"In scope" is literal: only the layers this boot ingests (not `--disable-layer`), and only within the scope folder the pass walked. A key outside it is not found, and so is dead. The depth bound is not part of it: a unit past the bound is retained for as long as a branch holds it — its branches and commit kept current like any other — so narrowing `--max-depth` drops nothing already ingested. Past the bound, only what no branch holds at any depth goes, and an old version of a deep file goes with nothing to wait for, since its new version is past the bound too and is never queued. Retrieval derives folder units at full depth for the same reason (§8.2): a retained folder stays retrievable.
 
 A repository whose branches could not be read this pass — a folder with a `.git` that would not open, or a tree that would not list — **sits the pass out whole**: none of its committed units is dead, since nobody looked for them, and none of its units is queued. Whether a folder is under git is read from the folder (a `.git` in it), never from a failure to open it.
 
@@ -182,7 +182,7 @@ A `file_list` of a folder's first page is served the same way from `repo_map`: t
 
 `repo_map` and `code_reading` are in the provenance gather, **scoped to each conversation's base**. The engine marks their groups as scoped (`ConversationEngine::set_group_scoped`), and a scoped group's candidates for a target are exactly the timelines the target's scope names (`set_retrieval_scope`) — none when it names none. Both the belief scan (`score_belief_groups`) and projection assembly (`TargetedRead::group_turns`) apply it, so an out-of-scope conversation is neither scored nor selected. An ingest conversation's own self-local projection is unaffected.
 
-Before each dialogue turn zend computes the target's scope (`zend/src/retrieval_scope.rs`): for each repository, the keys of every file and folder in the conversation's base tree, derived by the same filters and unit rules as the walk, looked up in an index of committed keys to timelines. A path the conversation has changed contributes no file key, and the folder holding it no folder key. Every upload is in scope.
+Before each dialogue turn zend computes the target's scope (`zend/src/retrieval_scope.rs`): for each repository, the keys of every file and folder in the conversation's base tree, derived by the same filters and unit rules as the walk — at full depth, like the retain list (§7.2) — looked up in an index of committed keys to timelines. A path the conversation has changed contributes no file key, and the folder holding it no folder key. Every upload is in scope.
 
 Working the scope out reads no file and **takes no base**. A repository the conversation has not read yet is scoped at the base its first read would take (`VfsStore::peek_base`), and is left unpinned. A tree's units are kept per (repository, tree, index generation), and listing the tree is the only git work: a tree some conversation was already scoped on under this index costs nothing. The whole scope of a conversation that has changed nothing is kept per set of base trees and **shared**: every such conversation on the same bases holds the same two sets. Both caches keep the sixteen most recently used entries.
 

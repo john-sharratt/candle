@@ -103,6 +103,7 @@ fn units_of(root: &Path) -> Vec<UnitItem> {
         &mut TreeCache::default(),
     )
     .0
+    .ingest
     .units
 }
 
@@ -403,6 +404,7 @@ fn branches_that_share_a_lineage_share_their_units() {
     assert!(failed.is_empty());
 
     let folders: Vec<(&str, Vec<&str>)> = corpus
+        .ingest
         .units
         .iter()
         .map(|u| {
@@ -423,6 +425,7 @@ fn branches_that_share_a_lineage_share_their_units() {
 
     let readings = |path: &str| -> Vec<Vec<&str>> {
         corpus
+            .ingest
             .files
             .iter()
             .filter(|f| f.file.path == path)

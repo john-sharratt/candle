@@ -30,6 +30,18 @@ impl IngestScope {
         }
     }
 
+    /// The same scope at full depth — what a layer's held units are judged
+    /// against. A unit past the depth bound is not read, but it is kept while
+    /// a branch still holds it, so narrowing the bound drops nothing already
+    /// ingested; and since a unit's key does not depend on the bound, the
+    /// units found at full depth are the ones the layer holds.
+    pub fn full_depth(&self) -> Self {
+        Self {
+            folder: self.folder.clone(),
+            max_depth: None,
+        }
+    }
+
     /// Whether the scope reaches into `repo` at all.
     pub fn reaches(&self, repo: &str) -> bool {
         self.folder.is_empty() || self.folder.split('/').next() == Some(repo)
@@ -112,6 +124,15 @@ mod tests {
         assert!(IngestScope::new("", Some(1))
             .admits("r", "src/b.rs", 1)
             .is_none());
+    }
+
+    /// Full depth drops the bound and keeps the folder.
+    #[test]
+    fn full_depth_keeps_the_folder_and_drops_the_bound() {
+        let s = IngestScope::new("alpha/src", Some(1));
+        assert_eq!(s.full_depth(), IngestScope::new("alpha/src", None));
+        assert!(s.full_depth().admits("alpha", "src/deep/x.rs", 1).is_some());
+        assert!(s.full_depth().admits("alpha", "docs/a.md", 1).is_none());
     }
 
     /// A scope folder narrows the walk to one folder of one repository, and

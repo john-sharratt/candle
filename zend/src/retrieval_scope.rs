@@ -81,7 +81,8 @@ struct AtBase {
 pub struct RetrievalScope {
     /// The `code_reading` group, when that layer is ingested.
     files_group: Option<GroupId>,
-    /// The `repo_map` group and the scope its units were walked under.
+    /// The `repo_map` group and the scope its retained units were walked
+    /// under — the ingest scope at full depth.
     folders: Option<(GroupId, IngestScope)>,
     index: RwLock<Arc<IngestIndex>>,
     /// Set when a unit commits: the index no longer holds all that is

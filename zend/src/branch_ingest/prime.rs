@@ -102,26 +102,43 @@ impl BranchIngest {
         let (repos, _unreadable) = record_branches(workspace);
         let folders = layers.iter().find(|l| l.mode == IngestMode::Folders);
         let files = layers.iter().find(|l| l.mode == IngestMode::Files);
-        let (units, file_items) = {
+        let (folder_corpus, file_corpus) = {
             let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
-            let mut corpus_of =
-                |layer: Option<&LayerPass<'_>>| layer.map(|l| walk(&repos, &l.scope, &mut trees).0);
-            let units = corpus_of(folders).map(|c| c.units).unwrap_or_default();
-            let file_items = corpus_of(files).map(|c| c.files).unwrap_or_default();
-            (units, file_items)
+            let mut corpus_of = |layer: Option<&LayerPass<'_>>| {
+                layer
+                    .map(|l| walk(&repos, &l.scope, &mut trees).0)
+                    .unwrap_or_default()
+            };
+            (corpus_of(folders), corpus_of(files))
         };
         let binary = self.binary.lock().unwrap().clone();
-        let file_items: Vec<FileItem> = file_items
+        let file_items: Vec<FileItem> = file_corpus
+            .ingest
+            .files
             .into_iter()
             .filter(|f| !binary.contains(&f.key))
             .collect();
+        let units = folder_corpus.ingest.units;
         let defaults: Vec<(String, String)> = repos
             .iter()
             .filter_map(|r| Some((r.name.clone(), r.tips.first()?.name.as_str().to_string())))
             .collect();
         let chain = links(&units, &file_items, &defaults);
-        let unit_keys: HashSet<String> = units.iter().map(|u| u.unit.key.clone()).collect();
-        let file_keys: HashSet<String> = file_items.iter().map(|f| f.key.clone()).collect();
+        // What a link's commit may retire is judged at full depth, as the
+        // pass judges it.
+        let unit_keys: HashSet<String> = folder_corpus
+            .retain
+            .units
+            .iter()
+            .map(|u| u.unit.key.clone())
+            .collect();
+        let file_keys: HashSet<String> = file_corpus
+            .retain
+            .files
+            .iter()
+            .filter(|f| !binary.contains(&f.key))
+            .map(|f| f.key.clone())
+            .collect();
 
         let total = chain.len() as u64;
         progress.set_step_progress(0, total);

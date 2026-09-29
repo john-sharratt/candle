@@ -2358,7 +2358,11 @@ impl InferenceState {
             let scope = IngestScope::new(&il.folder, max_depth);
             match il.mode {
                 IngestMode::Files => files_group = Some(group),
-                IngestMode::Folders => folders_group = Some((group, scope.clone())),
+                // Retrieval derives folders at full depth: the layer retains
+                // a folder past the bound while a branch holds it, and a held
+                // folder must stay retrievable. A key found for a folder never
+                // ingested simply matches nothing.
+                IngestMode::Folders => folders_group = Some((group, scope.full_depth())),
                 IngestMode::Raw => {}
             }
             branch_layers.push((il.clone(), scope));

@@ -3,7 +3,8 @@
 //!
 //! Each record branch's tip is listed once — a tree two tips share is listed
 //! once, and kept between passes while a tip still names it — and filtered by
-//! the layer's [`IngestScope`]. A unit found on several branches is one unit,
+//! the layer's [`IngestScope`] twice over: at full depth, the units the layer
+//! retains, and within the depth bound, the units it ingests. A unit found on several branches is one unit,
 //! found first on the repository's default branch, so the commit its bytes
 //! are read from is the default branch's wherever it can be — and it records
 //! every branch it was found on.
@@ -17,7 +18,7 @@ use zend_vfs::{GitError, Oid, RecordBranch, Repo, Rev};
 use super::filter::IngestScope;
 use super::keys::file_key;
 use super::manifest::Hints;
-use super::units::{folder_units, FolderUnit, TreeFile};
+use super::units::{dir_of, folder_units, FolderUnit, TreeFile};
 
 /// The branches a conversation starts on, most preferred first — they lead
 /// the walk, so a unit on one of them is read from it.
@@ -72,10 +73,21 @@ pub struct UnitItem {
 }
 
 /// Every distinct unit on any branch, in walk order.
-#[derive(Debug, Default)]
-pub struct Corpus {
+#[derive(Debug, Default, Clone)]
+pub struct Units {
     pub files: Vec<FileItem>,
     pub units: Vec<UnitItem>,
+}
+
+/// A layer's corpus: the units it reads, and the units it keeps.
+#[derive(Debug, Default)]
+pub struct Corpus {
+    /// The units inside the scope's depth bound — what the layer ingests.
+    pub ingest: Units,
+    /// Every unit of the scope at full depth ([`IngestScope::full_depth`]),
+    /// `ingest` among them. A conversation the layer holds is kept while its
+    /// key is here; only one whose key is not is tombstoned.
+    pub retain: Units,
 }
 
 /// The trees of the tips walked, by commit, kept between passes — and each
@@ -111,7 +123,9 @@ impl TreeCache {
     }
 }
 
-/// The corpus of `repos` under `scope`.
+/// The corpus of `repos` under `scope`: walked once at full depth — the
+/// units to retain — with the ones inside the depth bound picked out as the
+/// units to ingest.
 ///
 /// A repository with a tree that cannot be listed sits the pass out whole:
 /// none of its units are in the corpus — a corpus holding some of a
@@ -123,13 +137,14 @@ pub fn walk(
     scope: &IngestScope,
     cache: &mut TreeCache,
 ) -> (Corpus, Vec<String>) {
-    let mut corpus = Corpus::default();
+    let full = scope.full_depth();
+    let mut retain = Units::default();
     let mut failed = Vec::new();
-    for repo in repos.iter().filter(|r| scope.reaches(&r.name)) {
-        match walk_repo(repo, scope, cache) {
+    for repo in repos.iter().filter(|r| full.reaches(&r.name)) {
+        match walk_repo(repo, &full, cache) {
             Ok(of_repo) => {
-                corpus.files.extend(of_repo.files);
-                corpus.units.extend(of_repo.units);
+                retain.files.extend(of_repo.files);
+                retain.units.extend(of_repo.units);
             }
             Err(e) => {
                 tracing::warn!(
@@ -141,7 +156,35 @@ pub fn walk(
             }
         }
     }
-    (corpus, failed)
+    let ingest = within(&retain, scope);
+    (Corpus { ingest, retain }, failed)
+}
+
+/// The units of `all` — walked at full depth — that `scope` reads. A file is
+/// read when the scope admits it; a folder unit when the scope reads a file
+/// directly in it, since the files of one folder all sit at one depth.
+fn within(all: &Units, scope: &IngestScope) -> Units {
+    let files: Vec<FileItem> = all
+        .files
+        .iter()
+        .filter(|f| {
+            let inner = f
+                .file
+                .path
+                .strip_prefix(&format!("{}/", f.repo))
+                .unwrap_or(&f.file.path);
+            scope.admits(&f.repo, inner, f.file.size).is_some()
+        })
+        .cloned()
+        .collect();
+    let dirs: HashSet<String> = files.iter().map(|f| dir_of(&f.file.path)).collect();
+    let units = all
+        .units
+        .iter()
+        .filter(|u| dirs.contains(&u.unit.dir))
+        .cloned()
+        .collect();
+    Units { files, units }
 }
 
 /// One repository's units on every branch, or the error that kept one of its
@@ -150,8 +193,8 @@ fn walk_repo(
     repo: &RepoBranches,
     scope: &IngestScope,
     cache: &mut TreeCache,
-) -> Result<Corpus, GitError> {
-    let mut corpus = Corpus::default();
+) -> Result<Units, GitError> {
+    let mut corpus = Units::default();
     // Key → index into the corpus, so a unit found again on a later branch
     // adds that branch to the one it already is.
     let mut seen_files: HashMap<String, usize> = HashMap::new();
@@ -265,8 +308,8 @@ mod tests {
         RepoBranches::read("r", Repo::open(&dir).unwrap()).unwrap()
     }
 
-    fn paths(corpus: &Corpus) -> Vec<(&str, &str)> {
-        corpus
+    fn paths(units: &Units) -> Vec<(&str, &str)> {
+        units
             .files
             .iter()
             .map(|f| (f.file.path.as_str(), f.file.blob.as_str()))
@@ -294,7 +337,7 @@ mod tests {
             &mut TreeCache::default(),
         )
         .0;
-        assert!(!good.files.is_empty() && !good.units.is_empty());
+        assert!(!good.ingest.files.is_empty() && !good.ingest.units.is_empty());
 
         repo.tips[1].tip = Oid::parse("1234567890123456789012345678901234567890").unwrap();
         let (corpus, failed) = walk_one(
@@ -304,9 +347,10 @@ mod tests {
         );
         assert_eq!(failed, ["r"]);
         assert!(
-            corpus.files.is_empty() && corpus.units.is_empty(),
+            corpus.retain.files.is_empty() && corpus.retain.units.is_empty(),
             "main's units too"
         );
+        assert!(corpus.ingest.files.is_empty() && corpus.ingest.units.is_empty());
     }
 
     /// **Every branch is walked, each distinct file once**: a file the same
@@ -334,16 +378,21 @@ mod tests {
         assert!(failed.is_empty());
         let a_main = git(repo.repo.dir(), &["rev-parse", "main:a.rs"]);
         let a_topic = git(repo.repo.dir(), &["rev-parse", "topic:a.rs"]);
-        let got = paths(&corpus);
+        let got = paths(&corpus.ingest);
         assert_eq!(
             got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
             ["r/a.rs", "r/src/b.rs", "r/a.rs", "r/src/c.rs"]
         );
         assert_eq!(got[0].1, a_main.trim());
         assert_eq!(got[2].1, a_topic.trim());
-        let at: Vec<&Oid> = corpus.files.iter().map(|f| &f.at).collect();
+        let at: Vec<&Oid> = corpus.ingest.files.iter().map(|f| &f.at).collect();
         assert_eq!(at, [&main, &main, &topic, &topic]);
-        let branches: Vec<&[String]> = corpus.files.iter().map(|f| &f.branches[..]).collect();
+        let branches: Vec<&[String]> = corpus
+            .ingest
+            .files
+            .iter()
+            .map(|f| &f.branches[..])
+            .collect();
         assert_eq!(
             branches,
             [
@@ -354,7 +403,10 @@ mod tests {
             ],
             "src/b.rs is the same on both, so it is one unit that both branches hold",
         );
-        assert_eq!(corpus.files[0].key, format!("r/a.rs@{}", a_main.trim()));
+        assert_eq!(
+            corpus.ingest.files[0].key,
+            format!("r/a.rs@{}", a_main.trim())
+        );
     }
 
     /// **Folders are units once per distinct listing**, every one inside a
@@ -370,6 +422,7 @@ mod tests {
             &mut TreeCache::default(),
         );
         let dirs: Vec<(&str, &Oid)> = corpus
+            .ingest
             .units
             .iter()
             .map(|u| (u.unit.dir.as_str(), &u.at))
@@ -381,6 +434,7 @@ mod tests {
             "r/ lists the same entries on both, so it is one unit",
         );
         let branches: Vec<Vec<&str>> = corpus
+            .ingest
             .units
             .iter()
             .map(|u| u.branches.iter().map(String::as_str).collect())
@@ -391,13 +445,15 @@ mod tests {
             "each unit names every branch that lists the folder its way",
         );
         assert_eq!(
-            corpus.units[0].unit.listed,
+            corpus.ingest.units[0].unit.listed,
             ["r/LICENSE", "r/a.rs", "r/src/"],
             "the listing is what file_list shows: LICENSE is not read but is listed"
         );
     }
 
-    /// **The depth bound and the scope folder apply to every branch.**
+    /// **The depth bound and the scope folder apply to every branch** — the
+    /// bound to what is ingested only: what is retained is the scope at full
+    /// depth, the same units with the same keys.
     #[test]
     fn the_scope_applies_to_every_branch() {
         let root = tempfile::tempdir().unwrap();
@@ -408,16 +464,51 @@ mod tests {
             &mut TreeCache::default(),
         );
         assert_eq!(
-            paths(&shallow).iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            paths(&shallow.ingest)
+                .iter()
+                .map(|(p, _)| *p)
+                .collect::<Vec<_>>(),
             ["r/a.rs", "r/a.rs"]
         );
+        let ingest_dirs: Vec<&str> = shallow
+            .ingest
+            .units
+            .iter()
+            .map(|u| u.unit.dir.as_str())
+            .collect();
+        assert_eq!(ingest_dirs, ["r/"], "no folder past the bound is ingested");
+        let (full, _) = walk_one(
+            &repo,
+            &IngestScope::new("", None),
+            &mut TreeCache::default(),
+        );
+        assert_eq!(
+            paths(&shallow.retain),
+            paths(&full.ingest),
+            "the retained files are the full-depth walk"
+        );
+        let keys = |u: &Units| {
+            u.units
+                .iter()
+                .map(|u| u.unit.key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(&shallow.retain),
+            keys(&full.ingest),
+            "same folders, same keys"
+        );
+
         let (scoped, _) = walk_one(
             &repo,
             &IngestScope::new("r/src", None),
             &mut TreeCache::default(),
         );
         assert_eq!(
-            paths(&scoped).iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            paths(&scoped.ingest)
+                .iter()
+                .map(|(p, _)| *p)
+                .collect::<Vec<_>>(),
             ["r/src/b.rs", "r/src/c.rs"]
         );
         let (elsewhere, _) = walk_one(
@@ -425,7 +516,7 @@ mod tests {
             &IngestScope::new("other", None),
             &mut TreeCache::default(),
         );
-        assert!(elsewhere.files.is_empty() && elsewhere.units.is_empty());
+        assert!(elsewhere.retain.files.is_empty() && elsewhere.retain.units.is_empty());
     }
 
     /// **A tree is listed once and kept while a tip names it**, then let go.
