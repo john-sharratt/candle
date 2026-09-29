@@ -2657,43 +2657,25 @@ impl Qwen4ExpBatched {
         }
 
         // ── Residual: the fresh rows as gathered, or resume. ──
+        //
+        // **One buffer for the whole forward, updated in place.** `hc_combine`
+        // adds each block's scatter into `res` where it stands, so the wide
+        // `[rows, hc, hidden]` stream is this one allocation, not one per
+        // combine. It stays on the pool: the residual crosses every phase reset,
+        // and a windowed sweep hands it back as `WavePhase::Residual` for the
+        // next wave to resume from, past the forward span's reset.
+        //
+        // **A resumed residual is copied first.** `x_in` is the caller's tensor:
+        // the residual a previous window handed back to be persisted, which the
+        // driver passes through without a copy. Combining into it in place would
+        // rewrite the persisted state under its owner — and a wave that fails
+        // part-way would leave it advanced by the layers that did run. One copy
+        // per resumed forward is the price; the fresh path writes its gathered
+        // rows straight into a buffer it owns.
         let mut res = match x_in {
-            Some(t) => t.to_tensor().reshape((total_rows, hc, n_embd))?,
+            Some(t) => t.to_tensor().reshape((total_rows, hc, n_embd))?.copy()?,
             None => entry.expect("allocated whenever the residual is fresh"),
         };
-
-        // **The residual's two halves, reserved once for the whole forward.**
-        //
-        // `hc_combine` reads the current residual and writes the next, so the
-        // two cannot be one buffer. Allocating a fresh `[rows, hc, hidden]` F32
-        // per call meant 2 × layers of the widest buffer in the sweep, all of it
-        // from the pool — the residual crosses every phase reset, so no layer
-        // span can hold it. Both halves live on the forward-scoped span, which
-        // is reset once per forward and therefore exactly its lifetime, and
-        // `WaveBuffer::GrResidualPair` prices them there.
-        //
-        // Reserved AFTER the tier is placed and BEFORE the layer loop, which is
-        // the only window in which the span exists and nothing has carved from
-        // it yet. `res` above is the entry residual and is not one of the pair;
-        // the first combine writes half 0, the next half 1, and so on.
-        // **Only when this sweep runs the head.** A windowed sweep
-        // (`layer_end < num_layers`) hands its residual back as
-        // `WavePhase::Residual` for the next wave to resume from, so that
-        // residual outlives this forward — and the forward span is reclaimed by
-        // the next wave's `end_wave_transient`, which runs at the top of `sweep`
-        // BEFORE `x_in` is read. Carving it from the span would hand the caller
-        // ground the next wave re-carves, and it could alias `gr_flip[0]` and
-        // make `hc_combine` read and write one buffer. A windowed sweep
-        // therefore keeps the pool's residual, which is exactly its lifetime.
-        let gr_flip: Option<[Tensor; 2]> = match fwd_ticket {
-            Some(_) if layer_end == num_layers => {
-                let half =
-                    |_| wave_empty_ticketed((total_rows, hc, n_embd), DType::F32, dev, fwd_ticket);
-                Some([half(0)?, half(1)?])
-            }
-            _ => None,
-        };
-        let mut gr_next = 0usize;
 
         // Per-sequence host token ids (the PLE hash side) + row spans.
         let seq_tokens: Vec<Vec<u32>> = inputs
@@ -3078,8 +3060,7 @@ impl Qwen4ExpBatched {
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.mix.y.L", li), &y);
             let g_comb = crate::models::profile::gpu_span("q4e:gr_combine", dev);
-            res = hc_combine(&res, &y, &inject, gr_flip.as_ref().map(|p| &p[gr_next]))?;
-            gr_next ^= 1;
+            hc_combine(&mut res, &y, &inject)?;
             g_comb.end();
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.post_mix.res.L", li), &res);
@@ -3176,8 +3157,7 @@ impl Qwen4ExpBatched {
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.moe.y2.L", li), &y2);
             let g_comb2 = crate::models::profile::gpu_span("q4e:gr_combine_ffn", dev);
-            res = hc_combine(&res, &y2, &inject2, gr_flip.as_ref().map(|p| &p[gr_next]))?;
-            gr_next ^= 1;
+            hc_combine(&mut res, &y2, &inject2)?;
             g_comb2.end();
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.post_moe.res.L", li), &res);

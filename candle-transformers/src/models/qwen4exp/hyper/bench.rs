@@ -150,6 +150,11 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
         let gate_raw = lcg(&[GATE_TOKENS, hc_dim], cfg.seed ^ 0x13, dev)?;
         let out = lcg(&[GATE_TOKENS, d], cfg.seed ^ 0x14, dev)?;
         let inj = lcg(&[GATE_TOKENS, hc], cfg.seed ^ 0x15, dev)?;
+        // The combine updates its residual in place, so each side gets its own.
+        let mut fused_res = x.copy()?;
+        cuda_fused::combine(&mut fused_res, &out, &inj)?;
+        let mut eager_res = x.copy()?;
+        eager_combine(&mut eager_res, &out, &inj)?;
 
         let checks: [(&str, f32); 3] = [
             (
@@ -172,13 +177,7 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
                     )?,
                 )?,
             ),
-            (
-                "gr_combine",
-                rel_gap(
-                    &cuda_fused::combine(&x, &out, &inj, None)?,
-                    &eager_combine(&x, &out, &inj)?,
-                )?,
-            ),
+            ("gr_combine", rel_gap(&fused_res, &eager_res)?),
         ];
         for (name, gap) in checks {
             if gap > GATE {
@@ -199,6 +198,9 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
     let gate_raw = lcg(&[t, hc_dim], cfg.seed ^ 0x23, dev)?;
     let out = lcg(&[t, d], cfg.seed ^ 0x24, dev)?;
     let inj = lcg(&[t, hc], cfg.seed ^ 0x25, dev)?;
+    // The timed combine accumulates into this across iterations; the values
+    // stay finite over any iteration count a benchmark runs.
+    let mut res = x.copy()?;
 
     let ws = cfg.working_set_bytes();
     println!(
@@ -238,19 +240,20 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
         (
             "gr_combine",
             time_call(dev, &cfg, || {
-                cuda_fused::combine(&x, &out, &inj, None)?;
+                cuda_fused::combine(&mut res, &out, &inj)?;
                 Ok(())
             })?,
             2.0 * wide + narrow,
         ),
     ];
 
-    // What a call costs before its kernel runs. Every one of these launches
-    // allocates its own output, and allocation is a synchronising call — so the
-    // loop cannot overlap iteration n's allocation with iteration n−1's kernel,
-    // and this time sits in front of every launch rather than behind it. It is
-    // charged to the wide `[T, hc_dim]` shape, which is what `norm` and
-    // `combine` return; `mix` returns the narrow one and pays less.
+    // What a call costs before its kernel runs when its output comes from the
+    // pool rather than a wave: allocation is a synchronising call, so the loop
+    // cannot overlap iteration n's allocation with iteration n−1's kernel, and
+    // this time sits in front of every launch rather than behind it. It is
+    // charged to the wide `[T, hc_dim]` shape, which is what `norm` returns;
+    // `mix` returns the narrow one and pays less, and `combine` writes in place
+    // and pays nothing.
     //
     // `zeros` is timed beside `empty` because the difference is exactly one
     // memset over the wide residual — the pass hot-path invariant 6 exists to
@@ -401,7 +404,7 @@ pub fn run_gr_kernels(dev: &Device, cfg: GrBenchCfg) -> Result<()> {
         (
             "gr_combine",
             time_call(dev, &cfg, || {
-                eager_combine(&x, &out, &inj)?;
+                eager_combine(&mut res, &out, &inj)?;
                 Ok(())
             })?,
         ),
