@@ -16,6 +16,24 @@ pub struct RecordBranch {
     pub tip: Oid,
 }
 
+/// A local branch, and how much of it is on the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalBranch {
+    pub tip: Oid,
+    /// The last commit of it the record holds: `tip` itself unless the
+    /// branch holds commits origin's copy never had; then the commit those
+    /// were made on, or `None` when it shares no history with origin's copy.
+    pub on_record: Option<Oid>,
+}
+
+impl LocalBranch {
+    /// Whether it holds commits origin's copy never had — made on this
+    /// machine and never pushed.
+    pub fn unpushed(&self) -> bool {
+        self.on_record.as_ref() != Some(&self.tip)
+    }
+}
+
 impl Repo {
     /// Every branch on the record, in name order: origin's branches when the
     /// repository has an origin, its local branches when it has none. A local
@@ -55,6 +73,30 @@ impl Repo {
             }
         }
         self.ref_target(&branch.to_ref())
+    }
+
+    /// The local `branch` and how much of it the record holds; `None` when
+    /// there is no local branch. With no origin copy of it — no origin, or
+    /// a branch origin does not have — the local branch is the record, and
+    /// all of it is on it.
+    pub(crate) fn local_branch(
+        &self,
+        branch: &BranchName,
+    ) -> Result<Option<LocalBranch>, GitError> {
+        let Some(tip) = self.ref_target(&branch.to_ref())? else {
+            return Ok(None);
+        };
+        let on_origin = match self.origin()? {
+            Some(origin) => self.ref_target(&origin.tracking(branch))?,
+            None => None,
+        };
+        let (at, held) = (Rev::Oid(tip.clone()), on_origin.map(Rev::Oid));
+        let on_record = match held {
+            None => Some(tip.clone()),
+            Some(held) if self.is_ancestor(&at, &held)? => Some(tip.clone()),
+            Some(held) => self.merge_base(&at, &held)?,
+        };
+        Ok(Some(LocalBranch { tip, on_record }))
     }
 
     /// Whether `commit` is on the record's copy of `branch` — the tip or
@@ -101,6 +143,75 @@ mod tests {
         let record = repo.record_branches().unwrap();
         assert_eq!(names(&record), ["main", "zen/work"]);
         assert!(record.iter().all(|b| b.tip == first));
+    }
+
+    /// **A local branch is on the record up to its own commits**: all of it
+    /// when origin's copy holds it, level or ahead; up to where it left
+    /// origin's copy when it holds commits origin never had, diverged or
+    /// not; all of it when origin has no copy of the branch.
+    #[test]
+    fn a_local_branch_is_on_the_record_up_to_its_own_commits() {
+        let origin = TestRepo::bare();
+        let t = TestRepo::init();
+        t.write("a", b"one\n");
+        let first = t.commit_all("first");
+        t.git(&["remote", "add", "origin", &origin.url()]);
+        t.git(&["push", "-q", "origin", "main"]);
+        let repo = t.repo();
+        let main = BranchName::parse("main").unwrap();
+        let on_record = |b: &BranchName| repo.local_branch(b).unwrap().unwrap();
+
+        let level = on_record(&main);
+        assert_eq!(
+            (level.on_record.as_ref(), level.unpushed()),
+            (Some(&first), false)
+        );
+
+        t.write("a", b"two\n");
+        let second = t.commit_all("second");
+        t.git(&["push", "-q", "origin", "main"]);
+        t.git(&["reset", "-q", "--hard", first.as_str()]);
+        let behind = on_record(&main);
+        assert_eq!(
+            (behind.tip.clone(), behind.unpushed()),
+            (first.clone(), false)
+        );
+
+        t.write("mine", b"mine\n");
+        let mine = t.commit_all("mine");
+        let diverged = on_record(&main);
+        assert_eq!(diverged.tip, mine);
+        assert_eq!(
+            diverged.on_record,
+            Some(first.clone()),
+            "where it left origin's"
+        );
+        assert!(diverged.unpushed());
+
+        t.git(&["reset", "-q", "--hard", second.as_str()]);
+        t.write("mine", b"mine again\n");
+        let ahead_tip = t.commit_all("mine again");
+        let ahead = on_record(&main);
+        assert_eq!(
+            ahead,
+            LocalBranch {
+                tip: ahead_tip,
+                on_record: Some(second)
+            }
+        );
+        assert!(ahead.unpushed());
+
+        t.git(&["branch", "local-only"]);
+        let local = on_record(&BranchName::parse("local-only").unwrap());
+        assert!(
+            !local.unpushed(),
+            "origin has no copy: the local branch is the record"
+        );
+        assert_eq!(
+            repo.local_branch(&BranchName::parse("nowhere").unwrap())
+                .unwrap(),
+            None
+        );
     }
 
     /// **With no origin, the record is the local branches.**

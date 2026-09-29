@@ -548,6 +548,7 @@ fn a_move_journalled_but_never_made_leaves_the_file() {
             commit: t.oid("main").as_str().to_string(),
         },
         target: None,
+        set_aside: None,
         index: None,
         files: None,
         deleted: Vec::new(),
@@ -678,6 +679,97 @@ fn own_changes_are_carried_onto_a_branch_that_moved_on() {
     assert_eq!(t.read("b.txt"), b"b, moved on\n");
     assert_eq!(t.read("c.txt"), b"c\n");
     assert_eq!(t.read("new.txt"), b"not added yet\n");
+    assert_released(&t);
+}
+
+/// `job` with a commit of its own on top of `main`, as unpushed work sits on
+/// a branch; returns `(main, job)`.
+fn job_ahead(t: &TestRepo) -> (Oid, Oid) {
+    let base = t.oid("main");
+    t.git(&["checkout", "-q", "job"]);
+    t.write("a.txt", b"unpushed\n");
+    let ahead = t.commit_all("unpushed");
+    t.git(&["checkout", "-q", "main"]);
+    (base, ahead)
+}
+
+fn held_for_the_branch(t: &TestRepo) -> String {
+    t.git(&[
+        "for-each-ref",
+        "--format=%(objectname)",
+        "refs/zend/preserved/*/branch",
+    ])
+    .trim()
+    .to_string()
+}
+
+/// **A branch set aside for the run comes back at its own commit**, held by
+/// a ref meanwhile so nothing of it can be pruned; one that only moved on
+/// from there since keeps what it gained.
+#[test]
+fn a_branch_set_aside_comes_back_at_its_own_commit() {
+    let t = repo();
+    let (base, ahead) = job_ahead(&t);
+    let job = BranchName::parse("job").unwrap();
+
+    let mut kept = keep(&t, &[]);
+    kept.set_branch_aside(&job, &ahead, &base).unwrap();
+    assert_eq!(t.oid("job"), base, "moved for the run");
+    assert_eq!(held_for_the_branch(&t), ahead.as_str());
+    run_on(&t);
+    kept.restore().unwrap();
+    assert_eq!(t.oid("job"), ahead, "back at its own commit");
+    assert_eq!(status(&t), "## main\n");
+    assert_released(&t);
+
+    let mut kept = keep(&t, &[]);
+    kept.set_branch_aside(&job, &ahead, &base).unwrap();
+    t.git(&["checkout", "-q", "-f", "job"]);
+    t.git(&["reset", "-q", "--hard", ahead.as_str()]);
+    t.write("later.txt", b"later\n");
+    let gained = t.commit_all("later");
+    kept.restore().unwrap();
+    assert_eq!(t.oid("job"), gained, "moved on from it, so kept");
+    assert_released(&t);
+}
+
+/// **A branch that has left the commit it was looked at is not set aside**:
+/// refused, nothing moved, and nothing for the restore to put back.
+#[test]
+fn a_branch_that_moved_is_not_set_aside() {
+    let t = repo();
+    let (base, ahead) = job_ahead(&t);
+    let job = BranchName::parse("job").unwrap();
+    let mut kept = keep(&t, &[]);
+    assert!(kept.set_branch_aside(&job, &base, &ahead).is_err());
+    assert_eq!(t.oid("job"), ahead);
+    assert_eq!(held_for_the_branch(&t), "");
+    kept.restore().unwrap();
+    assert_eq!(t.oid("job"), ahead);
+    assert_released(&t);
+}
+
+/// **A branch set aside by a run that crashed comes back with the rest of
+/// the checkout** — the owner's `HEAD` on it, their edit over it.
+#[test]
+fn a_branch_set_aside_comes_back_after_a_crash() {
+    let t = repo();
+    let (base, ahead) = job_ahead(&t);
+    t.git(&["checkout", "-q", "job"]);
+    t.write("b.txt", b"my edit\n");
+    let job = BranchName::parse("job").unwrap();
+    // As a sandbox job does: the run's target is the commit the branch is
+    // set aside onto, which is where a crash leaves the owner's `HEAD`.
+    let mut kept = preserve(Arc::new(t.repo()), "a test ran", &[], Some(&base)).unwrap();
+    kept.set_branch_aside(&job, &ahead, &base).unwrap();
+    kept.crash();
+    t.git(&["checkout", "-q", "-f", "job"]);
+
+    recover(&Arc::new(t.repo())).unwrap();
+    assert_eq!(t.oid("job"), ahead);
+    assert_eq!(status(&t), "## job\n M b.txt\n");
+    assert_eq!(t.read("a.txt"), b"unpushed\n");
+    assert_eq!(t.read("b.txt"), b"my edit\n");
     assert_released(&t);
 }
 

@@ -507,12 +507,36 @@ impl BackingInner {
                     tier / (1 << 20),
                 )
             }
+            // A region under an arena that holds no chunk is occupied in name only, so
+            // say how many there are and what kept the sweep off them.
+            let empty = self.pool.empty_census();
+            let holding: Vec<String> = self
+                .pool
+                .occupancy()
+                .iter()
+                .map(|o| {
+                    format!(
+                        "{:?} class {} B: {} arenas, {} of {} slots live",
+                        o.key.kind,
+                        o.key.class.bytes(),
+                        o.arenas,
+                        o.live,
+                        o.arenas * o.arena_chunks,
+                    )
+                })
+                .collect();
             candle::bail!(
                 "{KV_DEVICE_OOM_MARKER}: no region is claimable for class {} B — every one of \
                  the KV reservation's {total} regions is occupied ({live} live), and the weight \
                  side would not sell any. It is at its floor: the fewest expert slots the cache \
-                 can serve a token with. The partition has nothing left to trade.",
+                 can serve a token with. The partition has nothing left to trade. This \
+                 backing's arenas holding no chunk: {} ({} inside their creation window, {} \
+                 protected). Held by: {}.",
                 key.class.bytes(),
+                empty.empty,
+                empty.in_creation,
+                empty.protected,
+                holding.join("; "),
             )
         };
         // A lease over the region: writes through it land in the reservation,

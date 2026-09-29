@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::ggml_file::qtensor_from_ggml;
-use candle::quantized::gguf_file::Value;
+use candle::quantized::gguf_file::{Content, TensorInfo, Value};
 use candle::quantized::ko_quant::dequant_ko;
 use candle::quantized::GgmlDType;
 use candle::{Device, Result, Tensor};
@@ -28,6 +28,7 @@ use super::ple::PleWeights;
 use super::ple_cache::{PleCacheStats, PleRowCache, PleRowFetch};
 use super::qsa::IndexerWeights;
 use crate::models::delta_net::{DeltaNetWeights, LayerKind};
+use crate::models::dense_span::peak_load_pool_bytes;
 use crate::models::latent_moe::GgufModel;
 use crate::models::qwen35::attention::{AttentionWeights, RopeTables};
 use crate::models::qwen35::moe::FfnWeights;
@@ -199,11 +200,49 @@ fn f32t(gguf: &mut GgufModel, name: &str, device: &Device) -> Result<Tensor> {
     gguf.qtensor(name, device)?.dequantize(device)
 }
 
+/// The n-gram (PLE) table's name in the artifact.
+const PLE_TABLE: &str = "per_layer_token_embd.weight";
+
+/// The token embedding's name in the artifact.
+const TOKEN_EMBD: &str = "token_embd.weight";
+
+/// A tensor's size in the file.
+fn tensor_bytes(info: &TensorInfo) -> usize {
+    info.shape.elem_count() / info.ggml_dtype.block_size() * info.ggml_dtype.type_size()
+}
+
+/// CUDA-pool room the engine's load needs — [`peak_load_pool_bytes`] over every
+/// tensor the load reads to the device, which is every one but the n-gram table,
+/// **plus the resident embedding table**.
+///
+/// The n-gram table is the checkpoint's largest 2-D tensor by two orders of
+/// magnitude (54 GB against a ~1 GB head), and it never reaches the device: its
+/// row cache reads from the file. Bounded with it, the load would concede the
+/// whole card to the pool and leave the span nothing.
+///
+/// The embedding is the one large weight that stays in the pool after load: the
+/// checkpoint's quantized table, which the per-wave gather reads in place
+/// (`DeviceEmbedding`), not a KO twin the dense block holds.
+/// `peak_load_pool_bytes` prices only a transient source tensor, so without this
+/// term the resident table would come out of the runtime cushion, and the first
+/// post-load pool allocation would have nothing left.
+pub(crate) fn load_headroom_bytes(content: &Content) -> usize {
+    let embedding = content.tensor_infos.get(TOKEN_EMBD).map_or(0, tensor_bytes);
+    peak_load_pool_bytes(
+        content
+            .tensor_infos
+            .iter()
+            .filter(|(name, _)| name.as_str() != PLE_TABLE)
+            .map(|(_, info)| info),
+    ) + embedding
+}
+
 /// One HC module's four (or three, at the head) tensors.
 fn hc_weights(
     gguf: &mut GgufModel,
     prefix: &str,
     with_inject: bool,
+    hc: usize,
     device: &Device,
 ) -> Result<HcWeights> {
     // The inject rows are stacked under the down projection, exactly as the
@@ -216,11 +255,12 @@ fn hc_weights(
     } else {
         down
     };
-    Ok(HcWeights {
-        norm: f32t(gguf, &format!("{prefix}_norm.weight"), device)?,
+    HcWeights::from_checkpoint(
+        f32t(gguf, &format!("{prefix}_norm.weight"), device)?,
         down,
-        up: f32t(gguf, &format!("{prefix}_up.weight"), device)?,
-    })
+        f32t(gguf, &format!("{prefix}_up.weight"), device)?,
+        hc,
+    )
 }
 
 /// Load the oracle model from any member path of the split GGUF. Everything
@@ -237,13 +277,14 @@ pub fn load_oracle_model(one_split: &Path, device: &Device) -> Result<Qwen4ExpMo
     }
     let cfg = Qwen4ExpConfig::from_gguf_metadata(&gguf.metadata)?;
 
-    let embed = f32t(&mut gguf, "token_embd.weight", device)?;
+    let embed = f32t(&mut gguf, TOKEN_EMBD, device)?;
     let lm_head = if gguf.info("output.weight").is_some() {
         f32t(&mut gguf, "output.weight", device)?
     } else {
         embed.clone()
     };
-    let out_hc = hc_weights(&mut gguf, "output_hc", false, device)?;
+    let hc = cfg.hc.count;
+    let out_hc = hc_weights(&mut gguf, "output_hc", false, hc, device)?;
 
     let mut layers = Vec::with_capacity(cfg.num_layers);
     let mut expert_slabs = Vec::with_capacity(cfg.num_layers);
@@ -251,8 +292,8 @@ pub fn load_oracle_model(one_split: &Path, device: &Device) -> Result<Qwen4ExpMo
     for li in 0..cfg.num_layers {
         let p = format!("blk.{li}");
         let g = &mut gguf;
-        let hc_attn = hc_weights(g, &format!("{p}.hc_attn"), true, device)?;
-        let hc_ffn = hc_weights(g, &format!("{p}.hc_ffn"), true, device)?;
+        let hc_attn = hc_weights(g, &format!("{p}.hc_attn"), true, hc, device)?;
+        let hc_ffn = hc_weights(g, &format!("{p}.hc_ffn"), true, hc, device)?;
 
         let mix = match cfg.layer_kinds[li] {
             LayerKind::DeltaNet => LayerMix::DeltaNet(DeltaNetWeights {
@@ -375,7 +416,7 @@ pub(crate) fn open_cached_ple(
     cfg: &Qwen4ExpConfig,
     device: &Device,
 ) -> Result<Box<dyn PleSource>> {
-    let ple_slab = DiskSlab::locate(&gguf, "per_layer_token_embd.weight")?;
+    let ple_slab = DiskSlab::locate(&gguf, PLE_TABLE)?;
     if ple_slab.dims[1] != cfg.ple.head_dim {
         candle::bail!(
             "qwen4exp: PLE table width {} != embedding_length_per_layer_input {}",
@@ -411,4 +452,54 @@ pub(crate) fn open_cached_ple(
             PLE_CACHE_BYTES,
         )?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::quantized::cuda::REPACK_BAND_BYTES;
+    use candle::quantized::gguf_file::VersionedMagic;
+    use std::collections::HashMap;
+
+    fn info(dtype: GgmlDType, dims: &[usize]) -> TensorInfo {
+        TensorInfo {
+            ggml_dtype: dtype,
+            shape: dims.into(),
+            offset: 0,
+        }
+    }
+
+    /// The headroom is the largest 2-D tensor the load reads to the device,
+    /// plus the repack's two bands, plus the embedding table that stays in the
+    /// pool — and nothing for the n-gram table, which is by far the largest
+    /// 2-D tensor in the file and never leaves it.
+    #[test]
+    fn the_headroom_prices_the_resident_embedding_and_skips_the_ngram_table() {
+        let tensor_infos: HashMap<String, TensorInfo> = [
+            // 8 × 64 Q8_0: 16 blocks of 34 bytes.
+            (TOKEN_EMBD, info(GgmlDType::Q8_0, &[8, 64])),
+            // 16 × 64 Q8_0: 32 blocks — the largest tensor the load reads.
+            ("output.weight", info(GgmlDType::Q8_0, &[16, 64])),
+            // Larger than both, and excluded.
+            (PLE_TABLE, info(GgmlDType::Q8_0, &[1000, 64])),
+            // 3-D, so never repacked through the pool.
+            (
+                "blk.0.ffn_up_exps.weight",
+                info(GgmlDType::Q8_0, &[4, 64, 64]),
+            ),
+        ]
+        .into_iter()
+        .map(|(n, i)| (n.to_string(), i))
+        .collect();
+        let content = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata: HashMap::new(),
+            tensor_infos,
+            tensor_data_offset: 0,
+        };
+        assert_eq!(
+            load_headroom_bytes(&content),
+            32 * 34 + 2 * REPACK_BAND_BYTES + 16 * 34
+        );
+    }
 }

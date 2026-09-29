@@ -50,7 +50,8 @@ pub struct Sandboxes {
 impl Sandboxes {
     /// A sandbox for each git repository of `workspace`, starting the
     /// programs `policy` lists, logging to the workspace folder's
-    /// [`JOBS_DIR`] — made if it does not exist. A folder with no `.git` is
+    /// [`JOBS_DIR`] — made if it does not exist — each checkout first
+    /// recovered from any job a crash cut short. A folder with no `.git` is
     /// not a repository and gets none; one with a `.git` that cannot be
     /// opened — unreadable, corrupt — is an error, not a quiet absence.
     pub fn for_workspace(workspace: &Workspace, policy: &CommandPolicy) -> io::Result<Self> {
@@ -63,6 +64,13 @@ impl Sandboxes {
             let git = Repo::open(&repo.dir)
                 .map_err(|e| io::Error::other(format!("repository {}: {e}", repo.name)))?;
             let sandbox = Sandbox::new(git, policy.clone());
+            // A job a crash cut short left its checkout set aside — the
+            // owner's branch, `HEAD` and files. It goes back now rather than
+            // at the next job; one that cannot is left, named, for its owner
+            // and refuses that next job the same way.
+            if let Err(e) = sandbox.recover() {
+                tracing::warn!("repository {}: {e}", repo.name);
+            }
             servers.insert(repo.name.clone(), SandboxServer::new(sandbox, &jobs_dir)?);
         }
         Ok(Self { servers, jobs_dir })

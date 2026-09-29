@@ -4,11 +4,16 @@
 //! The weight split mirrors the oracle's (`docs/qwen38_flash_next.md` §12.8),
 //! moved onto the card:
 //!
-//! - **F32 at load, resident**: every HC module, the PLE projections, the
-//!   GDN/attention F32 constants, the token embedding. The GR mix and the PLE
-//!   injection run as eager F32 tensor ops for this bring-up (their fusion is
-//!   recorded §0.4 work), so their weights stay the width the oracle computes
-//!   in — a load-time decision, never an in-loop conversion (invariant 1).
+//! - **F32 at load, resident**: the PLE projections, the GDN/attention F32
+//!   constants, and each HC module's norm gain. The PLE injection runs as eager
+//!   F32 tensor ops, so its weights stay the width the oracle computes in — a
+//!   load-time decision, never an in-loop conversion (invariant 1).
+//! - **HC projections KO at load** (`HcWeightsKo`): each module's `down` and
+//!   `up`, zero-padded to the int8 tiling and run on the same matmul as every
+//!   other dense projection. Their F32 form exists only during load.
+//! - **The token embedding stays Q8_0, resident** ([`DeviceEmbedding`]): one
+//!   kernel gathers a wave's rows and writes them as F32 straight into the
+//!   wide residual.
 //! - **KO at load**: every dense projection — attention q/k/v/o, the GDN
 //!   projections, routers, shared experts, the LM head — through the same
 //!   `QMatMul` repack every production model uses (Q8_0 → Q8_KO here).
@@ -24,17 +29,20 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::gguf_file::{Content, Value};
-use candle::quantized::{Int8Mode, QTensor};
+use candle::quantized::{GgmlDType, Int8Mode, QTensor};
 use candle::{Device, Result, Tensor};
 
 use super::config::Qwen4ExpConfig;
+use super::hyper::ko::HcWeightsKo;
 use super::hyper::HcWeights;
-use super::loader::open_cached_ple;
+use super::loader::{load_headroom_bytes, open_cached_ple};
 use super::model::PleSource;
 use super::mtp::{MtpDense, MtpHead};
 use super::ple::PleWeights;
 use super::qsa::IndexerWeights;
 use crate::models::delta_net::{KvLayerMap, QuantDeltaNetWeights};
+use crate::models::dense_span;
+use crate::models::device_embedding::DeviceEmbedding;
 use crate::models::expert_lre::ExpertCache;
 use crate::models::latent_moe::GgufModel;
 use crate::models::quantized_matmul::QMatMul;
@@ -68,8 +76,8 @@ pub enum GpuLayerMix {
 
 /// One production decoder layer.
 pub struct GpuLayer {
-    pub hc_attn: HcWeights,
-    pub hc_ffn: HcWeights,
+    pub hc_attn: HcWeightsKo,
+    pub hc_ffn: HcWeightsKo,
     pub mix: GpuLayerMix,
     /// `pub(crate)` because the routed half ([`Qwen35MoeBlock`]) is the
     /// engine's shared machinery, not part of any public surface.
@@ -80,17 +88,22 @@ pub struct GpuLayer {
 pub struct Qwen4ExpGpu {
     pub cfg: Qwen4ExpConfig,
     pub device: Device,
-    /// `[vocab, hidden]` F32, resident — 2.5 GiB against a card whose budget
-    /// is the expert zone; the host-served table is a later trade.
-    pub embed: Tensor,
+    /// `[vocab, hidden]` in the checkpoint's Q8_0, resident — 644 MiB for the
+    /// released 248,320-row table, where the widened BF16 copy it replaces took
+    /// 1,212 MiB from the expert zone.
+    pub embed: DeviceEmbedding,
     pub layers: Vec<GpuLayer>,
     pub ple_w: PleWeights,
     /// The final hyper-connection mix — the output norm (no inject).
-    pub out_hc: HcWeights,
+    pub out_hc: HcWeightsKo,
     pub lm_head: QMatMul,
     pub rotary: RotaryLayout,
     pub kv_map: KvLayerMap,
     pub experts: Arc<ExpertCache>,
+    /// The routed experts' stored format — the rung the artifact was prepared
+    /// at. The KV threshold row is calibrated per format (`kv_factors_for`),
+    /// because narrower experts leave the model less margin for K/V error.
+    pub expert_format: GgmlDType,
     pub ple_table: Box<dyn PleSource>,
     /// The NextN draft head, when the artifact carries one.
     ///
@@ -135,6 +148,15 @@ impl Qwen4ExpGpu {
         }
         let cfg = Qwen4ExpConfig::from_gguf_metadata(&gguf.metadata)?;
         let eps = cfg.rms_norm_eps;
+        // One `Content` and one mapping of the artifact, shared by the load
+        // bracket below and the expert cache after the dense stack.
+        let content = Content::read(&mut std::fs::File::open(merged)?)?;
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&std::fs::File::open(merged)?)? });
+        // Claim the reservation before the first tensor, so every KO weight is
+        // carved into its dense block and the span is sized from the whole card
+        // rather than from what a lazily-created span found free mid-load; the
+        // headroom it concedes to the pool is returned at `close_load` below.
+        dense_span::open_for_load_sized(device, load_headroom_bytes(&content))?;
 
         let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
@@ -167,7 +189,11 @@ impl Qwen4ExpGpu {
         // two over the same operand — see `HcWeights::down` for why that is
         // exact and what it measures. The `cat` is a load-time cost paid once
         // per module, not the hot-path copy invariant 2 is about.
-        let hc = |g: &mut GgufModel, prefix: &str, with_inject: bool| -> Result<HcWeights> {
+        //
+        // Held KO-quantized (`HcWeightsKo`): the F32 checkpoint form is 26 MB a
+        // module and 2.6 GB across the stack, resident beside a card that
+        // streams its experts. The F32 module is a load-time intermediate.
+        let hc = |g: &mut GgufModel, prefix: &str, with_inject: bool| -> Result<HcWeightsKo> {
             let down = g
                 .qtensor(&format!("{prefix}_down.weight"), device)?
                 .dequantize(device)?;
@@ -179,21 +205,22 @@ impl Qwen4ExpGpu {
             } else {
                 down
             };
-            Ok(HcWeights {
-                norm: g
-                    .qtensor(&format!("{prefix}_norm.weight"), device)?
+            let f32_module = HcWeights::from_checkpoint(
+                g.qtensor(&format!("{prefix}_norm.weight"), device)?
                     .dequantize(device)?,
                 down,
-                up: g
-                    .qtensor(&format!("{prefix}_up.weight"), device)?
+                g.qtensor(&format!("{prefix}_up.weight"), device)?
                     .dequantize(device)?,
-            })
+                cfg.hc.count,
+            )?;
+            HcWeightsKo::from_weights(&f32_module, int8mode)
         };
 
-        // Stored BF16 — a table-storage width chosen at load (halves 2.5 GiB
-        // of residency); the per-wave gather widens its few hundred rows to
-        // the Gated Residual's F32.
-        let embed = f32t(&mut gguf, "token_embd.weight")?.to_dtype(candle::DType::BF16)?;
+        // Left in the checkpoint's format. Dequantizing it here put a 2.5 GiB
+        // F32 intermediate on the device to keep a 1.2 GiB BF16 table, for a
+        // lookup that reads one row per token; the gather kernel widens only
+        // those rows, into the residual's F32.
+        let embed = DeviceEmbedding::new(gguf.qtensor("token_embd.weight", device)?)?;
         // Tied embeddings, as the oracle loader handles them: a checkpoint
         // without `output.weight` projects through the embedding table. Reading
         // it unconditionally made the engine refuse artifacts the oracle
@@ -207,7 +234,7 @@ impl Qwen4ExpGpu {
         let out_hc = hc(&mut gguf, "output_hc", false)?;
 
         use crate::models::delta_net::LayerKind;
-        let mut trunk: Vec<(HcWeights, HcWeights, GpuLayerMix)> =
+        let mut trunk: Vec<(HcWeightsKo, HcWeightsKo, GpuLayerMix)> =
             Vec::with_capacity(cfg.num_layers);
         let mut pending: Vec<(QMatMul, QuantizedMlp, QMatMul)> = Vec::with_capacity(cfg.num_layers);
         let mut ple_w: Option<PleWeights> = None;
@@ -346,7 +373,7 @@ impl Qwen4ExpGpu {
                     int8mode,
                 )?,
                 QMatMul::from_qtensor_with_mode(
-                    QTensor::quantize(&gate_vec, candle::quantized::GgmlDType::F32)?,
+                    QTensor::quantize(&gate_vec, GgmlDType::F32)?,
                     int8mode,
                 )?,
             ));
@@ -368,12 +395,12 @@ impl Qwen4ExpGpu {
         let kv_map = KvLayerMap::new(&cfg.layer_kinds);
 
         // ── Experts: measure the span the dense weights left, carve the zone,
-        // fill the cache. One Content + mmap over the merged file. ──
+        // fill the cache, over the `Content` and mapping read above. ──
         // The head's dense weights belong with the rest of the dense stack,
         // ahead of the expert-zone measurement below — see [`MtpDense`].
         let mtp_dense = match cfg.num_mtp_layers {
             0 => None,
-            1 => Some(MtpDense::load(&mut gguf, &cfg, eps, device)?),
+            1 => Some(MtpDense::load(&mut gguf, &cfg, eps, int8mode, device)?),
             n => candle::bail!(
                 "qwen4exp engine: {n} draft-head blocks declared — this engine reads the \
                  one-block NextN form (`mtp_num_hidden_layers: 1`), which is what the \
@@ -381,8 +408,6 @@ impl Qwen4ExpGpu {
             ),
         };
 
-        let mut f = std::fs::File::open(merged)?;
-        let content = Content::read(&mut f)?;
         // `SparseMoeBlock::moe_layer_idx` indexes the expert cache's COMPACTED
         // layer list: `expert_host_refs_for` skips a block carrying no expert
         // tensors, because a mixed stack is legal for the lineage at large. The
@@ -409,7 +434,13 @@ impl Qwen4ExpGpu {
                 );
             }
         }
-        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&std::fs::File::open(merged)?)? });
+        // Every block was just checked to carry its experts, and the recipe
+        // writes one format across all of them.
+        let expert_format = content.tensor_infos["blk.0.ffn_gate_exps.weight"].ggml_dtype;
+        // The dense stack is resident: lock the block's edge and return the
+        // load's pool headroom to the span, before the expert zone below is
+        // placed from the span's right edge.
+        dense_span::close_load(device)?;
         let experts = build_expert_cache_for(
             &content,
             cfg.moe.n_experts,
@@ -501,6 +532,7 @@ impl Qwen4ExpGpu {
             kv_map,
             mtp,
             experts,
+            expert_format,
             ple_table,
         })
     }

@@ -639,7 +639,9 @@ impl Qwen4ExpBatched {
                 generation,
                 &pm,
             );
-            let embeds = m.embed.index_select(ids, 0)?.to_dtype(DType::F32)?;
+            // Fully written by the lookup (invariant 6), in the head's F32.
+            let embeds = Tensor::empty((ids.elem_count(), m.embed.ncols()), DType::F32, dev)?;
+            m.embed.gather_into(ids, None, Some(&embeds))?;
             self.head_draft_step(
                 head,
                 &embeds,

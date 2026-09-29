@@ -238,18 +238,15 @@ fn yarn_gates_qwen35_0_8b() -> Result<()> {
 /// **Qwen3.8-Flash-Next**: gate 3 at 384K and 512K, with QSA selecting at its
 /// released budget under both schedules, and 128K inside the window.
 #[test]
-#[ignore = "loads the merged Flash-Next engine GGUF and prefills to 512K; \
+#[ignore = "loads this card's Flash-Next engine artifact and prefills to 512K; \
             run with --ignored --nocapture --test-threads=1, daemon stopped"]
 fn yarn_gates_qwen38_flash_next() -> Result<()> {
-    use crate::models::quantized_qwen38_moe::{TOKENIZER_REPO, TOKENIZER_REV};
+    use crate::models::quantized_qwen38_moe::{
+        prepared_engine_gguf, TOKENIZER_REPO, TOKENIZER_REV,
+    };
     use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-    use std::path::PathBuf;
 
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let tok = tokenizer(TOKENIZER_REPO, TOKENIZER_REV)?;
     let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;

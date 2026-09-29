@@ -56,6 +56,15 @@ pub(super) struct SavedHead {
     pub commit: String,
 }
 
+/// A branch the run moved off commits origin never had, and the commit it
+/// goes back to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SavedBranch {
+    pub branch: String,
+    pub commit: String,
+}
+
 /// A file git was told to leave alone in the working tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +87,11 @@ pub(super) struct Journal {
     /// not say. With `head`, what a checkout left mid-run can hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// A branch set aside for the run — moved off the commits it holds that
+    /// origin never had — which the restore puts back at its own commit,
+    /// held meanwhile by a ref of the preservation's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_aside: Option<SavedBranch>,
     /// The commit holding the index as it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<String>,
@@ -261,6 +275,10 @@ mod tests {
                 commit: "ce013625030ba8dba906f756967f9e9ca394464a".into(),
             },
             target: Some("7898192261b8b8d7ab18ee7faa5b2d26fd8b35cc".into()),
+            set_aside: Some(SavedBranch {
+                branch: "main".into(),
+                commit: "ce013625030ba8dba906f756967f9e9ca394464a".into(),
+            }),
             index: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".into()),
             files: None,
             deleted: vec!["gone.txt".into()],

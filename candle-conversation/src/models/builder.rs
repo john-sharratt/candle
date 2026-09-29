@@ -1899,8 +1899,9 @@ pub fn prepared_artifact_path(repo: &str, filename: &str) -> crate::Result<PathB
     Err(ConversationError::Download(format!(
         "{filename} is prepared from {repo}'s published files, not published under that \
          name, and it is not in the cache at {}. Run the prepare step that builds it \
-         (see `candle_transformers::models::qwen4exp::convert` for Flash-Next) — there is \
-         no download for this file.",
+         (for Flash-Next, `candle_transformers::models::qwen4exp::prepare`, which the \
+         `quantized_qwen38_moe` forward gate runs for this card's rung) — there is no \
+         download for this file.",
         path.display(),
     )))
 }

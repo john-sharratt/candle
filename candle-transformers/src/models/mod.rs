@@ -60,6 +60,8 @@ pub mod draft_walk;
 pub mod deepseek4;
 pub mod dense_span;
 pub mod depth_anything_v2;
+#[cfg(feature = "cuda")]
+pub mod device_embedding;
 pub mod dialect;
 pub mod dinov2;
 pub mod dinov2reg4;

@@ -35,8 +35,10 @@ use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
     arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype,
     plan_wave_transient, DeltaNetWidths, HyperWidths, KvCache, LayerPhase, ModelGeometry,
-    SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth, QWEN4EXP_KV_FACTORS,
+    SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth,
 };
+
+use super::kv_row::kv_factors_for;
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::coverage::coverage_disagreements;
@@ -1917,12 +1919,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         // override replaces the `ManagedBatchedModel` default that would
         // otherwise do it — the KV layer count differs from the transformer
         // depth on a hybrid, and dropping the fold would leave the per-model
-        // row silently never reaching the compression policy.
+        // row silently never reaching the compression policy. The row is the
+        // one calibrated for this artifact's expert format (`kv_factors_for`).
         let mut config = config;
-        config.k_hi_error_threshold_factor *= QWEN4EXP_KV_FACTORS.k_hi;
-        config.k_low_error_threshold_factor *= QWEN4EXP_KV_FACTORS.k_low;
-        config.v_hi_error_threshold_factor *= QWEN4EXP_KV_FACTORS.v_hi;
-        config.v_low_error_threshold_factor *= QWEN4EXP_KV_FACTORS.v_low;
+        let row = kv_factors_for(self.model.expert_format);
+        config.k_hi_error_threshold_factor *= row.k_hi;
+        config.k_low_error_threshold_factor *= row.k_low;
+        config.v_hi_error_threshold_factor *= row.v_hi;
+        config.v_low_error_threshold_factor *= row.v_low;
         // The trunk's KV layers plus the draft head's, so the head holds its
         // keys in this same paged cache and prefills, decodes and seals
         // alongside the trunk without any session-wide operation knowing it
@@ -2624,31 +2628,38 @@ impl Qwen4ExpBatched {
         // that reaches the last trunk layer then the head runs behind it and
         // needs them — so the condition is "either consumer wants them", not
         // "the residual is fresh".
-        let needs_embeds = x_in.is_none() || (layer_end == num_layers && m.mtp.is_some());
-        let row_embeds = if needs_embeds {
+        //
+        // One launch fills both: the fresh residual is the embedding repeated
+        // across the `hc` streams, written by the gather itself, and the head
+        // reads the bare rows. Both destinations are pool allocations, as the
+        // `index_select` + `broadcast_as().contiguous()` pair they replace
+        // were, and both are fully written (invariant 6).
+        let fresh = x_in.is_none();
+        let head_embeds = layer_end == num_layers && m.mtp.is_some();
+        let entry = if fresh {
+            Some(Tensor::empty((total_rows, hc, n_embd), DType::F32, dev)?)
+        } else {
+            None
+        };
+        let row_embeds = if head_embeds {
+            Some(Tensor::empty((total_rows, n_embd), DType::F32, dev)?)
+        } else {
+            None
+        };
+        if fresh || head_embeds {
             let mut flat_ids: Vec<u32> = Vec::with_capacity(total_rows);
             for t in inputs {
                 flat_ids.extend(Self::token_ids(t)?);
             }
             let ids = wave_from_vec_ticketed(flat_ids, (total_rows,), dev, fwd_ticket)?;
-            // The table is stored BF16 (a load-time storage width); the gather
-            // widens the wave's rows to the Gated Residual's F32.
-            Some(m.embed.index_select(&ids, 0)?.to_dtype(DType::F32)?)
-        } else {
-            None
-        };
+            m.embed
+                .gather_into(&ids, entry.as_ref(), row_embeds.as_ref())?;
+        }
 
-        // ── Residual: lift fresh rows into the wide stream, or resume. ──
+        // ── Residual: the fresh rows as gathered, or resume. ──
         let mut res = match x_in {
             Some(t) => t.to_tensor().reshape((total_rows, hc, n_embd))?,
-            None => {
-                let x = row_embeds
-                    .as_ref()
-                    .expect("gathered whenever the residual is fresh");
-                x.reshape((total_rows, 1, n_embd))?
-                    .broadcast_as((total_rows, hc, n_embd))?
-                    .contiguous()?
-            }
+            None => entry.expect("allocated whenever the residual is fresh"),
         };
 
         // **The residual's two halves, reserved once for the whole forward.**

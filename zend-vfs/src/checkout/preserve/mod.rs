@@ -23,7 +23,9 @@
 //!
 //! [`Preserved::restore`] undoes it all, whether the run succeeded or not:
 //! the exclude file back first, then links the run left removed without
-//! being followed, `HEAD` back where it was (the branch made again at its
+//! being followed, a branch the run set aside — moved off commits origin
+//! never had ([`Preserved::set_branch_aside`]) — back at its own commit,
+//! `HEAD` back where it was (the branch made again at its
 //! commit if the run deleted it, and put back if the run took commits off
 //! it), the run's untracked files removed — never one that was ignored when
 //! the state was set aside — the moved files back, and the snapshot written
@@ -51,7 +53,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use self::journal::{Journal, Phase, Place, SavedHead};
+use self::journal::{Journal, Phase, Place, SavedBranch, SavedHead};
 use self::lock::CheckoutLock;
 use self::snapshot::Snapshot;
 use super::error::CheckoutError;
@@ -135,6 +137,7 @@ pub fn preserve(
             commit: commit.as_str().to_string(),
         },
         target: target.map(|t| t.as_str().to_string()),
+        set_aside: None,
         index: None,
         files: None,
         deleted: Vec::new(),
@@ -385,6 +388,7 @@ impl Preserved {
                 write_exclude(&self.repo, self.journal.exclude_bytes()?.as_deref())?;
                 let kept = Ignored::kept_in(&self.repo)?;
                 self.unlink_the_run(&kept)?;
+                self.put_branch_back()?;
                 let now = self.check_out_head()?;
                 self.clear_the_run(&kept)?;
                 aside::put_back(&self.repo, &self.place, &mut self.journal, true)?;
@@ -473,6 +477,66 @@ impl Preserved {
         Ok(at)
     }
 
+    /// Move `branch` off `tip` — commits origin never had — onto `to` for the
+    /// run, and have the restore put it back at `tip`. `tip` is held by a ref
+    /// of the preservation's own and journalled before the branch moves, so a
+    /// crash at any point leaves it for the recovery to put back. Refused,
+    /// with nothing moved, should the branch have left `tip`.
+    pub fn set_branch_aside(
+        &mut self,
+        branch: &BranchName,
+        tip: &Oid,
+        to: &Oid,
+    ) -> Result<(), CheckoutError> {
+        let [_, _, held] = self.refs()?;
+        self.repo
+            .update_refs(&RefTransaction::new().push(RefOp::Create {
+                name: held.clone(),
+                new: tip.clone(),
+            }))?;
+        self.journal.set_aside = Some(SavedBranch {
+            branch: branch.as_str().to_string(),
+            commit: tip.as_str().to_string(),
+        });
+        self.place.save(&self.journal)?;
+        if let Err(e) = self.repo.force_branch_tip(branch, Some(tip), to) {
+            // The branch is not where it was looked at: nothing to put back.
+            self.journal.set_aside = None;
+            self.place.save(&self.journal)?;
+            self.repo
+                .update_refs(&RefTransaction::new().push(RefOp::Delete {
+                    name: held,
+                    old: tip.clone(),
+                }))?;
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// A branch set aside for the run back at its own commit — unless it
+    /// only moved on from there since, which keeps what it gained.
+    fn put_branch_back(&self) -> Result<(), CheckoutError> {
+        let Some(saved) = &self.journal.set_aside else {
+            return Ok(());
+        };
+        let branch = BranchName::parse(&saved.branch)?;
+        let commit = Oid::parse(&saved.commit)?;
+        let now = self.repo.ref_target(&branch.to_ref())?;
+        let kept = match &now {
+            Some(now) => {
+                now == &commit
+                    || self
+                        .repo
+                        .is_ancestor(&Rev::Oid(commit.clone()), &Rev::Oid(now.clone()))?
+            }
+            None => false,
+        };
+        if !kept {
+            self.repo.force_branch_tip(&branch, now.as_ref(), &commit)?;
+        }
+        Ok(())
+    }
+
     /// Whether the checkout was on `branch` when its state was set aside.
     pub fn is_on(&self, branch: &BranchName) -> bool {
         self.journal.head.branch.as_deref() == Some(branch.as_str())
@@ -505,17 +569,19 @@ impl Preserved {
         }))
     }
 
-    /// The refs that keep this preservation's commits from being pruned.
-    fn refs(&self) -> Result<[RefName; 2], CheckoutError> {
+    /// The refs that keep this preservation's commits from being pruned: the
+    /// index, the files, and a branch set aside.
+    fn refs(&self) -> Result<[RefName; 3], CheckoutError> {
         let id = self.place.id();
         Ok([
             RefName::parse(&format!("refs/zend/preserved/{id}/index"))?,
             RefName::parse(&format!("refs/zend/preserved/{id}/files"))?,
+            RefName::parse(&format!("refs/zend/preserved/{id}/branch"))?,
         ])
     }
 
     fn hold(&self, snapshot: &Snapshot) -> Result<(), CheckoutError> {
-        let [index, files] = self.refs()?;
+        let [index, files, _] = self.refs()?;
         let mut txn = RefTransaction::new().push(RefOp::Create {
             name: index,
             new: snapshot.index.clone(),
@@ -549,7 +615,7 @@ impl Preserved {
 impl Preserved {
     /// What a crash leaves: the journal and everything set aside on disk,
     /// the lock let go as the operating system lets go of a dead process's.
-    pub(super) fn crash(mut self) {
+    pub(crate) fn crash(mut self) {
         self.done = true;
     }
 }

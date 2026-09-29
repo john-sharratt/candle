@@ -16,8 +16,10 @@
 //!    byte under refs of the layer's own, and a journal written that a
 //!    crash can be recovered from ([`preserve`]);
 //! 3. **put the checkout on the conversation's branch**, at the commit the
-//!    conversation's files are based on — the local branch first brought up
-//!    to it where origin already holds it and the branch lags (`follow`);
+//!    conversation's files are based on — where origin already holds it, the
+//!    local branch first brought up to it when it lags, or moved onto it for
+//!    the job when it holds commits of its owner's origin never had, which
+//!    step 9 puts back (`follow`);
 //! 4. **apply** the conversation's changes onto it, writing only the files
 //!    whose bytes are wrong (steps 3 and 4 are [`materialize`]);
 //! 5. **check** the command ([`CommandPolicy`]). Every rule that reads the
@@ -49,7 +51,7 @@
 //! | Module | Concern |
 //! |---|---|
 //! | [`command`] | The program, its arguments and its timeout |
-//! | `follow` | Bringing a lagging local branch up to the conversation's base |
+//! | `follow` | Putting the local branch on the conversation's base: a lagging one brought up, unpushed commits set aside |
 //! | [`policy`] | The security check a command passes before it runs |
 //! | `git_use` | Finding git run directly — as the program, or in a shell's script |
 //! | [`process`] | Starting it, passing on its output, killing its process tree |
@@ -144,6 +146,15 @@ impl Sandbox {
         &self.policy
     }
 
+    /// Put back whatever a job that is gone — a crash, a restore that
+    /// failed — left set aside in the checkout: its owner's branch, `HEAD`
+    /// and files. Made when the sandbox is brought up, so a crash never leaves
+    /// someone's checkout set aside until the next job; the next job makes it
+    /// too. An error names what is still set aside, and where.
+    pub fn recover(&self) -> Result<(), CheckoutError> {
+        checkout::recover(&self.repo)
+    }
+
     /// Run `job`, writing what its command prints to `output`, and record
     /// what it changed in the job's store. See the module for each step.
     ///
@@ -227,12 +238,13 @@ impl Sandbox {
     /// are made on `base`: a branch that moved off it before the checkout was
     /// put in place fails the job.
     ///
-    /// A local branch behind `base` where origin already holds `base` is
-    /// brought up to it here ([`follow::follow`]) — under the checkout's
-    /// lock and after [`preserve`] recorded where the owner's `HEAD` stood, so
-    /// the owner's checkout comes back as a branch that only moved on, its
-    /// own changes carried onto it, never as uncommitted work reverting what
-    /// origin gained.
+    /// The local branch is put on `base` here where origin already holds it
+    /// ([`follow::follow`]) — under the checkout's lock and after
+    /// [`preserve`] recorded where the owner's `HEAD` stood. A branch behind
+    /// it is brought up to it, so the owner's checkout comes back as a
+    /// branch that only moved on, its own changes carried onto it, never as
+    /// uncommitted work reverting what origin gained; a branch holding
+    /// commits origin never had is set aside and comes back at them.
     ///
     /// [`preserve`]: crate::checkout::preserve()
     async fn put_on(
@@ -246,7 +258,7 @@ impl Sandbox {
         let branch = branch.clone();
         let base = base.clone();
         let (session, ()) = off_runtime(session, move |session| {
-            follow::follow(&repo, &session.preserved, &branch, &base)?;
+            follow::follow(&repo, &mut session.preserved, &branch, &base)?;
             let grant = DiskWriteGrant::issue();
             let (ledger, _) = checkout::materialize(&repo, &grant, &branch, &changes)?;
             let at_base = ledger.base() == base.as_str();
@@ -284,10 +296,15 @@ impl Sandbox {
         }
         let store = |e: String| SandboxError::Store(e);
         let base = files.base().map_err(|e| store(e.to_string()))?;
+        // Commits on the local branch that origin never had are its owner's,
+        // not on the record the conversation pinned: they are set aside for
+        // the job and put back after it (`put_on`), and the job is judged
+        // against the rest of the branch.
         let tip = self
             .repo
-            .ref_target(&branch.to_ref())
-            .map_err(|e| store(e.to_string()))?;
+            .local_branch(branch)
+            .map_err(|e| store(e.to_string()))?
+            .and_then(|local| local.on_record);
         if base.as_ref().is_some_and(|b| b.merging().is_some()) {
             return Err(SandboxError::Merging {
                 branch: branch.to_string(),
