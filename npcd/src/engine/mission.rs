@@ -211,8 +211,9 @@ impl Mission {
             out.push_str(&tasks);
         }
         out.push_str(
-            "\nCarry it out. When it is done, go back to the command table and report it with \
-             `report_done` — or `report_stuck` if it cannot be finished — and take up the next.",
+            "\nCarry it out. When it is done, go back to the command table and report it on your \
+             effector device — `invoke` its `report_done`, or `report_stuck` if it cannot be \
+             finished — and take up the next.",
         );
         out
     }
@@ -582,7 +583,10 @@ mod tests {
         assert!(text.contains("step one") && text.contains("step two"));
         // It ends by pointing back to the command table to report and take the
         // next — the loop closes there, not out in the world.
-        assert!(text.contains("go back to the command table and report it with `report_done`"));
+        assert!(
+            text.contains("go back to the command table and report it on your effector device")
+                && text.contains("`report_done`")
+        );
         // A mission carried on its ask alone still ends at the table.
         let bare = Mission::new(
             "Just be.",

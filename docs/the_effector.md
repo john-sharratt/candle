@@ -201,7 +201,40 @@ alternative floated in review, and `OPTIONS` is the decision. The schema it retu
 what the stencil is compiled from (§11), so `query`-for-schema is not just for the
 character to read.
 
-## 6. The near-you index is a route, shown in a dynamic system-prompt section
+## 5.2 Verbs are resources
+
+A thing in the world is addressed by its id — `http://local/chronicle/<id>` — and
+**each verb it affords is itself an address beneath it**:
+`http://local/chronicle/<id>/add_entry`. That verb path is a full resource: `query`
+it for *its* schema, `invoke` it to act. The parent (`.../chronicle/<id>`) answers
+what the thing is and lists the verbs beneath it; a verb answers exactly one body.
+
+This is the decision that makes typed `invoke` total rather than partial. A resource
+that afforded several verbs could not be typed by a single focus — the schema the
+character queried could not know which verb the next `invoke` would pick (the
+multi-verb limit §11 first hit). Addressing the **verb** removes the ambiguity by
+construction: every invokable address has exactly one body, so the schema a `query`
+returns is exactly the schema the following `invoke` needs. There is nothing left to
+disambiguate, and no per-branch decode-time machinery is required (§11).
+
+So the grammar of an address is:
+
+```
+http://local/<ns>/<id>            a thing — GET its state, OPTIONS lists its verbs
+http://local/<ns>/<id>/<verb>     a verb — GET/OPTIONS its one body, POST to act
+```
+
+The personal surfaces follow the same shape: `http://local/phone/message` is a verb
+resource; `http://local/self/plan` is a readable one.
+
+*As-built delta: the shipped station router mounts each verb as a `POST`-only
+sub-path of the thing and types the body by a compile-time splice, which leaves a
+multi-verb thing's body free-JSON (Step 4's honest gap). Closing it is this section:
+give each verb path its own `GET`/`OPTIONS`, and arm the focus (§11) when a character
+queries a **verb** — then every focus is single-body and every `invoke` is typed. It
+is a small, additive change to the station route and the focus, not a rewrite.*
+
+## 6. The near-you index is a route, shown as a superseding device percept
 
 The list of what is reachable from here is a route — `GET http://local/`, served by
 the same handler machinery as everything else, consistent and externally
@@ -219,16 +252,27 @@ GET http://local/
   ] }
 ```
 
-**Where this is shown to the model is the point.** It is *not* prefilled into the
-turn stream as the character walks — that would accumulate a fresh list in the
-conversation window every time the body moves, and the list is only ever true *now*.
-Instead it lives in a **dynamic section of the system prompt**, exactly like the
-mission and task sections (§9.2): a point-in-time snapshot, re-projected each turn and
-superseded, never carried as turns. The conversation stays short — one current list,
-not a history of every list the body ever saw. This is the same
-supersede-don't-accumulate discipline the percept's situation band already follows
-(`delta.rs:191`), moved into the projection, where a point-in-time truth belongs. It
-reads, in the character's register:
+**Where this is shown to the model is the point.** It is only ever true *now*, so it
+is delivered each turn as a **superseding percept** — an `EventKind::Reachable` keyed
+so the pending inbox holds exactly one current device screen, never a growing pile of
+lists as the body moves (`replaces()`, the same discipline the situation band already
+follows, `delta.rs:191`). It is rendered verbatim, at `Salience::IDLE` so it never
+preempts.
+
+*As-built correction (Appendix D territory): the design first called this "a dynamic
+section of the system prompt, like the mission and task sections." That is how it
+reads to the character, but not how it is built — npcd has no per-turn-fresh
+system-prompt-section mechanism (schema sections are cast-shared and sealed; a
+per-turn re-seal is model-dependent and would mean touching `candle-*`). And the
+mission/task content it was compared to does not live in a projected section either:
+missions reach the character as a **superseding percept** too (the `Nudge`, rendered
+verbatim in `narrator.rs`). So "like the missions and tasks" is honoured literally —
+the near-you list is the same kind of superseding percept. The one honest cost: like
+every point-in-time percept, a turn's line stays in that turn's window history — but it
+is a single top-level line, not schemas (those arrive via `query`, inline), and the
+window is bounded, so the conversation does not carry the world's whole API.*
+
+It reads, in the character's register:
 
 ```
 YOUR EFFECTOR DEVICE
@@ -238,12 +282,12 @@ Reachable from here: the lift · the command table · a world-history terminal �
 and, for the leaves the body is standing at, it carries their schema inline (§11), so
 the character can act in one turn.
 
-**The queries and interactions stay inline.** Only the *ambient list* moves to the
-system prompt. A `query` and its schema response, an `invoke` and its result or
+**The queries and interactions stay inline.** Only the *ambient list* is the
+superseding percept. A `query` and its schema response, an `invoke` and its result or
 error, are actions and their outcomes, and they belong in the turn stream as
 `<tool_call>`/`<tool_response>` exactly like any act (§5, §12). The split is the whole
-of it: *what is reachable* is a point-in-time fact in the system prompt; *what I did
-about it* is the conversation.
+of it: *what is reachable* is a superseding, point-in-time percept; *what I did about
+it* is the conversation.
 
 ## 6.1 The system prompt explains the device
 
@@ -363,11 +407,15 @@ Everything else under `local` is situated (§7.1) and supplied by the active wor
 
 ## 8. One API, two entry paths, one identity
 
-The world stands up a genuine `axum` router at host `local`, beside the three that
-already exist (`main.rs:635`, behind the `web` crate's per-site local-router map,
-`web/src/server.rs:153`). Routes register through the same wrapper the operator
-surface uses so they are self-documenting and testable (`guard.rs:91`) — though the
-device surface's auth is the token check of §8.3, not the operator roles.
+The world stands up a genuine `axum` router for host `local`, built beside the three
+that already exist and **nested into the npcd router at `/v1/local`** (`main.rs`) —
+*not* a second `web` `local_api` site. (As-built: `web` dispatches sites by the `Host`
+header, `server.rs:311`, so a `local` *host* would need its own hostname, whereas a
+`/v1/local` *path* already resolves to the npcd site — the nest is the clean
+equivalent, no `sites:` change.) The router runs behind its **own** device-auth
+middleware (§8.3), *not* `guard::Api`: that wrapper hardcodes the operator `X-Tokera`
+role check with no escape hatch (`guard.rs:91`), which is the whole reason the device
+carries its own.
 
 ### 8.1 The fast path skips TCP, never the API
 
@@ -405,17 +453,23 @@ for rather than discovered:
   (`enact.rs:535`) — and it is tested.
 - **The production Router handle.** Today the merged router is handed to `web` and no
   handle is kept; the `oneshot` path is `#[cfg(test)]` (`api.rs:448`, `main.rs:636`).
-  The fast path needs the `local` router (or its `.into_service()`) plumbed onto
-  `Runtime` — Step 1 builds it.
+  **As-built (Step 1):** `Runtime` retains the router (`set_effector_router`) and
+  drives it via `effector_query`, an `async` method — the sync/async seam above is
+  handled by making the effector call at the async layer, never `block_on`.
 
 ### 8.2 The external mount
 
 The effector routes are also reachable from outside, on the hosted domain, under a
 proper path. The in-fiction `http://local/table/command-3` is mounted externally as
-`/v1/local/table/command-3` (final prefix is **Q3**), authenticated by the NPC's
-token (§8.3) rather than by an operator role. This is what lets an external client —
+`/v1/local/table/command-3` (the same router, nested — §8), authenticated by the
+NPC's token (§8.3) rather than by an operator role. This is what lets an external client —
 a game embedder, a test, a tool — reach exactly what a character reaches, and it is
 why the id-in-URL of §7 matters: external control addresses things by id.
+
+*As-built: the near-you index — the in-fiction `http://local/` — is reached externally
+at the bare prefix `/v1/local` (no trailing slash: axum serves a nested router's `/`
+route at the prefix itself, and `/v1/local/` 404s). Sub-resources are
+`/v1/local/<ns>/<id>...` as expected.*
 
 ### 8.3 Identity, unified: one `Principal`, two shapes
 
@@ -521,10 +575,34 @@ today; and world state keys on `place` (`area/node`) plus display name, never an
 instance (`sim/mod.rs`; `within_reach` returns catalogue ids, `perceive.rs:280`).
 Because the world is not persisted (bodies re-enter deterministically,
 `runtime.rs:788`), an id must be a **pure function of the map** to stay stable across
-restart and be shareable by console and test. So the id is `(place, part-id,
-ordinal)`, which means the within-node de-dup at `load.rs:271` is removed and the
-sim's place-keyed state grows the ordinal. This is **Q2**, and it is a foundation
-task (Step 2), not a footnote.
+restart and be shareable by console and test. **As-built:** the id is
+`<part-id>~<ordinal>` (tilde is URL-unreserved and appears in no kebab-case part id, so
+the split on the last tilde is reversible; ordinal is **0-based and world-wide**,
+counting placements of that catalogue part across the whole map in a deterministic walk
+— areas by id, nodes in file order, placements in file order) —
+`npc-map/src/instance.rs`, `MapSet::{instances_at, resolve_instance}`.
+
+The id was once `<area>~<node>~<part-id>~<ordinal>`, which was self-describing but long
+(`vault-command~command-room~order-table~0`) — many tokens per arm once the url became a
+grammar-forced enum (§5.1's stencil, below). Dropping the area and node names to a
+world-wide ordinal (`order-table~0`) keeps it unique and a pure function of the map — the
+walk is deterministic and each node's starting offset is precomputed once at load
+(`MapSet::part_offset`), so `instances_at` stays O(node) — while cutting the id to a
+fraction of the length. The within-node catalogue-id de-dup is kept as `part_ids_at`
+(for `within_reach`), with the per-instance enumeration beside it; the sim keys devices
+by this instance id (`sim/seed.rs`, `Sim::station`), while record *custody* stays global
+(an era held anywhere is unavailable everywhere — correctly not per-instance).
+
+**The url is a stencil, not free text (the anti-hallucination cut).** `query`'s `url` and
+`invoke`'s `url` are grammar-forced enums, not free strings: `query.url` is bound to the
+near-you set (`Choices::QueryUrl` ← `Within::reachable`), and `invoke.url` to each
+reachable resource's verb-paths (`Choices::InvokeUrl` ← `Within::invokable`,
+`<resource-url>/<verb>` from `station::verbs_of`). So the decoder is forced through a real
+address the device actually lists — a character can never `query http://local/command-table`
+(a hallucinated guess that 404s) nor `invoke` a bare resource (a 405); it reads and acts
+on exactly what stands within reach. The near-you percept renders each route as
+`- <summary> — <url>` so the address it must name is on the screen to copy
+(`prompt::near_you_section`).
 
 Handlers reach the world through the one lock: `Hosted`, a single mutex over
 `{ world, attention, sim, rooms }` (`world/mod.rs:41`), with `with` the sole write
@@ -569,6 +647,73 @@ not a second, independently-locked world object. The embedder owns its state; it
 not own a second lock. That is the version of "attachable" that keeps the invariant,
 and it also bounds *how deep* the reach can be: as deep as `Sim`'s, no deeper.
 
+### 9.1.1 The `WorldRoutes` trait (Step 7)
+
+The device machinery is world-agnostic: the token auth (§8.3), the near-you framing
+(§6), the `query`/`invoke` verbs (§5), the focus and the schema→stencil (§11), and the
+personal roots (`/history`, `/phone`, `/self`, §7.2) are all npcd's and know nothing of
+what world sits behind them. Everything world-specific is one trait:
+
+```rust
+/// A world the effector device can address. npcd ships the vault as the default
+/// implementation; a project embedding npcd supplies another. The provider is held
+/// behind npcd's ONE world lock (for the vault that lock is `Hosted`; an embedder's
+/// state lives behind the same lock, like `Sim`), so no second lock is introduced
+/// (§9.1) — npcd acquires the lock and then calls these, never the reverse.
+pub trait WorldRoutes: Send + Sync {
+    /// The situated top-level addresses reachable from a caller's standpoint — the
+    /// world's half of the near-you index (§6). npcd adds the personal roots around
+    /// this; the provider returns only what its own world affords from here.
+    fn reachable(&self, caller: Caller) -> Vec<RouteEntry>;
+
+    /// A thing's state — `GET http://local/<ns>/<id>` — or `None` if the id names
+    /// nothing the caller can reach (→ 404). A pure read.
+    fn read(&self, caller: Caller, resource: &str) -> Option<Value>;
+
+    /// A verb's one body schema — `OPTIONS http://local/<ns>/<id>/<verb>` (§5.1,
+    /// §5.2) — the schema the `invoke` stencil is compiled from; `None` if the verb
+    /// is not afforded here. Reading a thing (no verb) lists the verbs beneath it.
+    fn schema(&self, caller: Caller, resource: &str, verb: Option<&str>) -> Option<Value>;
+
+    /// Enact a verb — `POST http://local/<ns>/<id>/<verb>` — returning the world's
+    /// verdict (`Did`/`Refused`), which npcd maps to `200`/`409` (§12). Runs under
+    /// the write lock; proximity, custody and mode are the provider's to enforce and
+    /// to phrase, exactly as the vault's act handlers do.
+    fn invoke(&self, caller: Caller, resource: &str, verb: &str, args: &Map<String, Value>)
+        -> RouteOutcome;
+}
+
+/// Who is acting, world-neutrally: the body the token resolved to and how far it
+/// reaches (§8.3). The provider maps `npc_id` to its own notion of standpoint.
+pub struct Caller { pub npc_id: u64, pub scope: Scope }
+```
+
+`RouteEntry` is `{ url, summary }` (§6); `RouteOutcome` is the `Did`/`Departed`/
+`Refused` the envelope already maps (`effector/enact_route.rs`). Interior mutability is
+not the provider's concern — npcd holds the single lock around every call, so the
+methods take `&self` and mutate the state that lock guards.
+
+**The vault is the reference implementation, not a special case.** npcd's own
+`WorldRoutes` impl is exactly the wiring built this session, read through the trait:
+`reachable` = `within_reach` + the lift landing + `instances_at` mapped through
+`namespace_of` (§C.0); `read`/`schema` = the station and lift `GET`/`OPTIONS` handlers;
+`invoke` = synthesise the `Act` and run `body::perform` (§C, D.5). Factoring it behind
+the trait is a lift-and-name of code that already exists and is green — the change is
+that the router calls `provider.reachable(...)`/`read`/`schema`/`invoke` instead of
+naming the vault's functions directly, and `Runtime` holds a `Box<dyn WorldRoutes>`
+(installed after construction, defaulting to the vault) beside the world lock.
+
+**Replace, not compose (Q4).** One active `WorldRoutes` per daemon: an embedder's
+provider *replaces* the vault's; npcd keeps only the personal roots around it. A world
+that wants both the vault and its own affordances composes them inside its own impl,
+not in npcd — which keeps npcd with exactly one answer to "what is reachable here."
+
+*Not built this session (design only): the trait itself. The vault's routes ship as
+concrete modules; Step 7 is the refactor that names the seam. It is deferred to when a
+second world (an embedder) is real, because a trait with one implementation is a shape
+guessed rather than a seam proven — the interface above is the target that refactor
+lands on.*
+
 ## 9.2 Some routes write prompt-visible state, not just world state
 
 Most effector calls change the world and are perceived over ticks (§10). A few
@@ -596,11 +741,17 @@ This is not a new mechanism — it is the existing authoring plane and projectio
 reached through the effector device instead of the operator API. `plan_*`/`orders_*`
 write the agency layer; the projection resurfaces it; the character reads its plan in
 the dynamic system prompt exactly as it does today. Appendix A must route these to
-the projected store, not the world store — flagged there. **Today this is unmet**
-(Appendix D.5/D.6): `orders_*` write `Sim.ledger` in RAM and `plan_*` has no handler
-at all; the bridge from the effector handlers to the substrate agency plane
-(`engine/authoring.rs`, `AuthoredStrategy`) is a foundation task, not existing
-behaviour. (The one hard invariant
+the projected store, not the world store — flagged there.
+
+*As-built correction (Appendix E "The bridge"): this is now **met**. The bridge is
+built — the cast is shared as `Arc<tokio::sync::RwLock<Npcs>>` and installed on
+`Runtime` (`runtime.rs::set_npcs`/`npcs`), reusing the one `Npcs`/substrate handle,
+never a second. `plan_*`/`orders_*` route through `effector/plan.rs` (mounted at
+`/plan` and `/orders`, and excluded from the generic station nest so they never reach
+`Sim.ledger`) to `Npcs::put_strategy_self` (`npcs.rs`), an owner-blind write of the
+character's own `agency` layer that projects on the next turn via the `agency`
+collection and `persona::intent`. The write target is `Npcs::put_strategy`, not
+`engine/authoring.rs` (which is only a life-document parser).* (The one hard invariant
 the authoring plane already carries, and which this must not breach: a belief-write
 is the character's own, never a tool's silent edit — `npc_mind_design.md`; the
 effector's belief routes are the character revising itself, on the record.)
@@ -705,6 +856,31 @@ So:
    (`stencil_tree.md`, as-built deltas) — armed on the `invoke` branch for the focus
    resource. This is §13's caching rule applied to the stencil: it keeps the
    near-perfect hit rate on the frame while giving `invoke` its typed body.
+
+*As-built (Step 4): the **compile-time-splice fallback**, not the decode-time swap.*
+*A true decode-time tree-swap on the `invoke` branch is not reachable without editing*
+*the turn driver (`candle-conversation/src/conversation.rs`, a reserved WIP file): a*
+*character turn is entered directly inside a single prefilled `turn_grammar` tree, not*
+*driven through the `TriggerRegistry` the assistant/think path uses, so there is no*
+*live branch to arm a swap on. So the acceptable fallback of the build order is what*
+*shipped: the focus's typed body is a `{ … }` sub-stencil compiled by front-end B*
+*(`compile_invoke_body_tree`, `ToolSpec::from_json_schema` over the OPTIONS body*
+*schema) and cached by `(resource-id, schema-fingerprint)`; a focused turn's grammar is*
+*the ordinary frame with that sub-stencil **spliced** onto the `invoke` body at compile*
+*time (`compile_action_loop_with_body`), cached in its own map keyed by the frame key*
+*plus `(resource-id, fingerprint)`. Blocker 1 holds exactly: the `(Deliberation, Within)`*
+*frame cache is never keyed by focus, so two characters with different focuses still*
+*share the frame; a no-focus turn is byte-identical to the plain frame. Only the JSON*
+*call styles get the typed body; a function-block body keeps its free span. Focus lives*
+*on `Minds` beside the frame cache (`engine/effector_focus.rs`), set by a resource*
+*`query`'s in-process `OPTIONS` in `Runtime::enact_device`, whose schema also rides back*
+*inline. A multi-verb station arms nothing (the focus arms one body and cannot know the*
+*verb), so its body stays free JSON. **Resolved by verb-as-resource (§5.2), not the*
+*decode-time swap:** once each verb is its own queryable address, every focus is one*
+*verb's single body and the compile-time splice types it — editing the reserved*
+*`conversation.rs` is not needed at all. The remaining work is the §5.2 as-built delta*
+*(each verb path gets its own `GET`/`OPTIONS`; the focus arms on a verb query), small*
+*and additive; single-body things (the lift) and single-verb things are already typed.*
 
 **How the character reaches a schema without spending a turn on it.** The naive path
 — discover, `query` for schema, then `invoke` — is three turns to do one thing, and
@@ -1134,9 +1310,11 @@ Conventions used in every table below:
   `engine/work.rs` (`work::perform`), not `station.rs` (declaration only) — so the
   `[no handler yet]` flags mark *reads and genuinely-absent verbs*, not the shipped
   writing handlers (see D.5).
-- **id pattern** — `(place, part-id, ordinal)` (§7, §9; Q2). `place` is `level/node`. Parts
-  placed with `count > 1` in a node need the **ordinal**; singletons take ordinal `1` and may
-  omit it. The `<id>` placeholder in each table is spelled out per part in the matrix.
+- **id pattern** — `<part-id>~<ordinal>` (§7). The ordinal is 0-based and world-wide (across
+  the whole map in a deterministic walk), so a singleton is `<part>~0` and same-part
+  placements take consecutive numbers without the place in the string. The `<id>` placeholder
+  in each table below is the old long `<area>~<node>~<part>~<ordinal>` form; the shipped id is
+  the short one (`order-table~0`, not `vault-command~command-room~order-table~0`).
 
 ---
 
@@ -1146,6 +1324,12 @@ From the six vault level maps and `creators-vault.yaml`. "Ordinal?" = does any n
 more than one, so a route id must carry the ordinal to be unique (§9, the removed
 `load.rs:271` de-dup). Parts marked **(war world)** carry world-acts but are placed only in
 `tower-redoubt.yaml`, never in the vault — listed because Appendix A routes their verbs.
+
+*(As-built, Step 2: the "id pattern" column below is shorthand. A route's full address
+is `http://local/<ns>/<instance-id>`, where `<instance-id>` is the concrete
+`<area>~<node>~<part-id>~<ordinal>` of §9 — e.g. a band-one character terminal is
+`http://local/character/vault-casting~band-one~character-terminal~0`. The `<node>-<n>`
+here just names which node and which ordinal.)*
 
 | Part | kind | binds | modes | Vault level → node(s) | Ordinal? | id pattern (ns/…) |
 |---|---|---|---|---|---|---|
@@ -1163,7 +1347,7 @@ more than one, so a route id must carry the ordinal to be unique (§9, the remov
 | archive | fixture | — | — | chronicle → stacks ×1 | no | `chronicle/stacks-archive` |
 | timeline-wall | fixture | — | — | chronicle → stacks ×1 | no | `chronicle/stacks-timeline` |
 | enquiry-desk | station | an open enquiry | — | command → enquiry ×1 | no | `enquiry/enquiry-1` |
-| order-table | fixture | — | — | command → command-room ×1 | no | `orders/command-room-1` |
+| order-table | fixture | — | — | command → command-room ×1 | no | `command/command-room-1` (Step 6 split it from `orders`; see §C.11) |
 | creators-chair | fixture | — | — | command → command-room ×1 | no | `creator/command-room-1` |
 | dispatch-board | fixture | — | — | command → dispatch ×1 | no | `dispatch/dispatch-1` |
 | stores | fixture | — | — | command → receiving ×1 | no | `stores/receiving-1` |
@@ -1394,16 +1578,22 @@ overlook). These mutate frozen topology (§16 "Topology mutation… Step 8"; App
 
 ## C.11 `orders` — `http://local/orders/<id>` — **PROJECTED store (§9.2)**
 
-Parts: order-table (fixture, command-room) and muster-board (fixture, tower-redoubt — the
-`set`/`hand_to` end). Per §9.2 / App A, `orders_*` write the **agency layer** and re-project
-into the system prompt, not the world.
+Part: muster-board (fixture, tower-redoubt — the `set`/`hand_to` end). Per §9.2 / App A,
+`orders_*` write the **agency layer** and re-project into the system prompt, not the world.
+
+**order-table routes under `command`, not `orders`.** The plan below to keep both parts on
+one `orders` prefix was superseded during Step 6: `report_done` at the command desk closes a
+mission against `Sim.ledger` (`ORDERS_REPORT_DONE`, `work.rs`'s `mission` dispatch), which is
+a different store and a different concern from muster-board's projected-agency `set`/`hand_to`
+— so `namespace_of` mounts order-table's acts at `command/<id>` instead
+(`npcd/src/effector/namespace.rs`). `command` is otherwise a plain generic station namespace
+like any other (§9), not a second projected-store surface.
 
 | Route | Method | Condition | Body schema | Store | From |
 |---|---|---|---|---|---|
-| `GET .../orders/command-room-1` (read) | GET | always | — | projected (agency) | order-table.yaml; audit §2.2 **[no handler yet]** |
-| `POST .../orders/command-room-1/take` | POST | always (`Claimable`) | `what` free req | projected + Sim `ledger` | audit §2.2 (→ `claim`, enact.rs:330) **[no handler yet]** |
-| `POST .../orders/command-room-1/give_back` | POST | holding it | `what` free req | projected + Sim `ledger` | audit §2.2 (→ `release`) **[no handler yet]** |
-| `POST .../orders/command-room-1/report_done` | POST | holding it | `what` free req | projected | `ORDERS_REPORT_DONE` station.rs:830 |
+| `GET .../command/command-room-1` (read) | GET | always | — | World (generic station read) | `station.rs::state` |
+| `POST .../command/command-room-1/collect_mission` | POST | at the table, no open mission | — | Sim `missions` | `MISSION_ACTS`/`mission_acts.rs`, dispatched in `work.rs::mission` |
+| `POST .../command/command-room-1/report_done` | POST | holding an order | `what` free req | Sim `ledger` | `ORDERS_REPORT_DONE` station.rs:830, `work.rs::perform` |
 | `POST .../orders/muster-1/set` | POST | always | `what` free req; `for` free opt | projected (agency) | `ORDERS_SET` station.rs:804 (audit §3.2/§6.2) |
 | `POST .../orders/muster-1/hand_to` | POST | always | `what` free req; `to` free req | projected (agency) | `ORDERS_HAND_TO` station.rs:818 (audit §6.2) |
 
@@ -1627,8 +1817,16 @@ Reachable wherever the body stands (§7); npcd owns them even when an embedder r
 | `POST .../phone/reach_out` | POST | `Contacts` non-empty | `to` enum(`Contacts`) req; `intent` free req | Sim phone / projected | `REACH_OUT` acts.rs:1061; enact.rs:97 |
 | `POST .../phone/invite` | POST | `Invitable` non-empty | `to` enum(`Invitable`) req; `who` enum(`Invitees`) req; `intent` free opt | Sim phone / projected | `INVITE` acts.rs:1230; enact.rs:94 |
 | `POST .../phone/open_group` | POST | `Contacts` non-empty | `called` free req; `with` enum(`Contacts`) req; `intent` free opt | Sim phone / projected | `OPEN_GROUP` acts.rs:1270; enact.rs:95 |
-| `POST .../phone/send_image` | POST | `Pictorial` mode + `Threads` | `to` enum(`Threads`) req | Sim phone / projected | `send_image` (body, `tools.rs`); audit §2.1 |
+| `POST .../phone/send_image` | POST | *(deferred — see below)* | `to` enum(`Threads`) req | Sim phone / projected | `send_image` (body, `tools.rs`); audit §2.1 |
 | `POST .../phone/<thread>/sign_off` | POST | `Leavable` | `intent` free req | Sim phone / projected | `SIGN_OFF` acts.rs:1027; enact.rs:96 |
+
+*As-built: `/phone/send_image` is **deferred** and is **not** mounted or advertised. `send_image` is
+not a body act — it is absent from `body::is_of_the_body` and `enact::is_mine`, so `enact::perform`
+returns `NotOfTheBody`, which `enact_response` maps to `500`. The engine performs `send_image` above
+the body layer (the image-guest / interaction path), which the `/phone` route cannot reach; wiring
+that path is a later cut. Until then `send_image` is left out of `phone.rs` `VERBS` and the `OPTIONS`
+schema rather than mounted as a route that only ever errors. The other four verbs
+(`message`/`invite`/`open_group`/`reach_out`) and `sign_off` are routed as the table shows.*
 
 ### `/history` — read-only onto what this body has done and seen
 
@@ -1647,6 +1845,13 @@ Reachable wherever the body stands (§7); npcd owns them even when an embedder r
 
 `/self` is **read-only** — the writes happen at the situated stations that own them (C.11, C.21,
 C.8) and project forward (§7.2).
+
+*As-built: the four reads are **built** (`effector/selfsurface.rs`, mounted at `/self`), served
+from the shared cast (`Runtime::npcs`). `plan` and `orders` both render the one `agency` vector on
+the record — there is no separate ledger-orders layer on `NpcPayload`. `memory` returns an empty
+projection here: `NpcPayload` carries no memory layer (a character's memory lives in the
+substrate's own records and `layers/memory/`, not on the record); the body's witnessed recent past
+is `/history`. Each read degrades to an empty layer if the cast is not installed, never a failure.*
 
 ---
 
@@ -1895,9 +2100,9 @@ reaches the mind folder, and the mechanism. Schemas/verbs are in Appendix C.
 | `chronicle_settle_boundary` (C.3) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` (`work.rs:264`) |
 | `story_draft` (C.5) | World | `Sim.record` + **mind folder** via `Sim.bench` | **Yes** (`layers/stories/*.md`) | `write_into`→`bench.append` |
 | `story_file` (C.5) | World | `Sim.record` (→Filed) | No | `set_state` (`work.rs:260`) |
-| `character_write_identity`/`wants`/`memories` (C.8) | World | **`Sim.record.body` (RAM only)** | **No** (Character kind gets no path) | `write_into`→`Record.write` (`work.rs:710`) |
+| `character_write_identity`/`wants`/`memories` (C.8) | World | **mind folder** via `Sim.bench` *(as-built: D.6 #1 done)* | **Yes** (`personalities/<who>.yaml` `anchor`/`wants`; `layers/memory/<who>/memories.md`) | `bench.write_field`/`bench.append` (the `portrait_draw` pattern) — RAM `Record.write` only when there is no mind folder |
 | `character_settle_relation` (C.8) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` (`work.rs:264`) |
-| `place_write_entry`/`write_local_history` (C.9) | World | **`Sim.record.body` (RAM only)** | **No** (Place kind gets no path) | `write_into`→`Record.write` |
+| `place_write_entry`/`write_local_history` (C.9) | World | `Sim.record` + **mind folder** via `Sim.bench` *(as-built: D.6 #1 done)* | **Yes** (`layers/world/locations/<slug>.md`; `layers/world/geography/<slug>.md`) | entry: `write_into`→`settle_path`(Place→locations)→`bench.append`; local history: `history_path`(geography)→`bench.append` |
 | `place_settle_route` (C.9) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` |
 | `portrait_draw`/`prompt_edit` (C.6) | World | **mind folder** via `Sim.bench` | **Yes** (`personalities/<who>.yaml` `portrait.prompt`) | `bench.write_field` (`work.rs:239`) |
 | `portrait_file_plate` (C.6) | World | `Sim.record` (→Filed) | No (no image store) | `set_state` |
@@ -1923,10 +2128,15 @@ authored, `station.rs:406`), `plan_*` (none), `roster_*` (none), `room_sit` (non
 `portrait_redraw` is really `portrait_prompt_edit` (`station.rs:306`). Building the C.8-belief,
 C.19, C.21 routes is writing *new* handlers, not migrating.
 
-**A subtlety:** every write verb funnels through `write_into`, but whether it reaches the mind
-folder is decided by the *record kind*, not the routing — `settle_path` mints a path only for
-`Era`/`Story`/`Gap`, so `character_write_*` and `place_write_*` always fall to the RAM branch.
-They look like document writers and are not.
+**A subtlety:** `settle_path` mints a path per record *kind*, and it now mints one for `Place`
+too (`layers/world/locations`), so `place_write_entry` reaches the mind folder through the same
+`write_into` path as an era. `character_write_*` do *not* go through `write_into` — an identity
+or a want is a field on the personality sheet (`bench.write_field`, the `portrait_draw`
+pattern), and a memory is an append to `layers/memory/<who>/`. A place's local history is a
+second document in `layers/world/geography/` (`Record::history_path`), distinct from the
+place's own entry, because a place has one entry and any number of histories and `Item.path`
+can name only one. *(As-built after D.6 #1; the earlier "always fall to the RAM branch" was the
+pre-implementation state.)*
 
 **Net correction.** Of the authoring namespaces, only **chronicle-era, story, portrait-prompt,
 craft-library, and the raw `bench_`/`file_` surface** reach the mind folder — through
@@ -1941,6 +2151,16 @@ craft-library, and the raw `bench_`/`file_` surface** reach the mind folder — 
    eras/stories but which still holds elsewhere. Fix: give Character/Place kinds a `settle_path`
    (`personalities/…`, `layers/world/locations|geography/…`) + `index_canon` adoption so they
    route through `bench`; or persist `Sim`.
+
+   *As-built: **done for character and place.** `character_write_identity`/`wants` splice the
+   `anchor`/`wants` fields of `personalities/<who>.yaml` (the `portrait_draw` pattern);
+   `character_write_memories` appends `layers/memory/<who>/memories.md`; `place_write_entry`
+   settles into `layers/world/locations/<slug>.md` through `write_into`; `place_write_local_history`
+   appends `layers/world/geography/<slug>.md`. `settle_path` gained a `Place → locations` arm,
+   `Record::history_path` names the geography document, and `index_canon` now adopts both world
+   layers as `Filed` `Place`s, so a survey survives a restart; a commit of a freshly-branched
+   document also lands it `Filed` (the new `Held → Filed` transition). The `record_*`/`orders_`/
+   `structure_` verdicts that live in `Sim.ledger` remain RAM-only.*
 2. **The projected store is never written by a station handler.** §9.2/C.11/C.21 require
    `orders_`/`plan_` to write the substrate **agency** layer (`AuthoredStrategy`) and re-project
    into the system prompt. Today `orders_*` write `Sim.ledger` and `plan_*` has no handler. **The
@@ -1948,11 +2168,21 @@ craft-library, and the raw `bench_`/`file_` surface** reach the mind folder — 
    life-document parser with no substrate side effect). A bridge from the turn loop to the shared
    `Npcs` handle must be built (Appendix E). Once it writes, the change projects automatically via
    the `agency` collection (`projection.yaml:437`) and `persona::intent` (`persona.rs:98`).
+
+   *As-built: **done.** The shared cast is installed on `Runtime` (`set_npcs`/`npcs`), and
+   `effector/plan.rs` (mounted at `/plan`, `/orders`, and kept out of the generic station nest)
+   writes the agency layer through the new owner-blind `Npcs::put_strategy_self`. `/self`
+   (`effector/selfsurface.rs`) reads the same layers back. The change projects with no extra
+   wiring, exactly as this item predicted.*
 3. **Git is a repository but not a runtime store.** The mind folder is a git repo, yet the
    daemon never runs git. `bench_commit` writes with `std::fs::rename`; `bench_blame`/`log`
-   answer from in-RAM state that resets on restart. **v1 closes this** (Appendix E): the daemon is
-   plumbed to commit as the acting body at `bench_commit` and to read `git log`/`git blame` back,
-   so custody and history survive a restart.
+   answer from in-RAM state that resets on restart. **v1 keeps this in-RAM (per-run) custody;
+   real git is a later cut** (Appendix E): custody and blame/log are correct within a run — the
+   collision check that manufactures the Settling trigger is real (§C.25) — and only their
+   *persistence across a restart* waits on git plumbing (`git add`/`commit` as the acting body at
+   `bench_commit`, `git blame`/`log` back). It is deferred because it is durability-only, adds a
+   git runtime dependency, and the world it records is itself not persisted (bodies re-enter, so a
+   run is the natural custody horizon).
 
 Also missing, lower-stakes: the **effector router/token surface itself** (all of Appendix C's
 routing is future work — the handlers are still reached through the old `Tool`/`enact`/`work`
@@ -1982,11 +2212,13 @@ build follows Part F's order; this is the decision record it is built against.*
 - **New-part placement** (map YAML edits — Step 2). **standards board** in every level's `core`
   node (reachable everywhere, audit §3.4); **planning board** in command → command-room (beside
   the order table); **trials shelf** in chronicle → sorting-room (beside the appraisal bench).
-- **Git custody is in v1, not deferred.** `bench_commit` commits the changed files as the acting
-  body; `bench_blame`/`bench_log` read real `git blame`/`git log`, so custody and history survive
-  a restart. This closes D.6 #3 within v1. (libgit2 via the `git2` crate vs shelling `git` is the
-  one engineering sub-choice left, decided at implementation for testability — no external `git`
-  binary dependency preferred.)
+- **Git custody is deferred; v1 is in-RAM (per-run).** `bench_commit` writes the files with
+  `std::fs`, and `bench_blame`/`bench_log` answer from in-RAM state — correct within a run (the
+  commit-collision Settling trigger is real), reset on a restart. Real git (`git add`/`commit` as
+  the acting body, `git blame`/`log` back) is a later cut: it is durability-only, the world it
+  records is not itself persisted (a run is the natural custody horizon), and it adds a git runtime
+  dependency best introduced deliberately. (When it lands: shelling `git` is preferred over the
+  `git2`/libgit2 native dependency, since the mind folder is already a repo.)
 
 ## Engineering (settled by investigation)
 
@@ -2000,7 +2232,20 @@ build follows Part F's order; this is the decision record it is built against.*
   writes (`plan_*`/`orders_*`) run at the **async turn-loop layer**, split out of the sync
   `&Hosted`-only `work::perform`; `npc_id` parses from `body` (`"npc-{id}"`, `runtime.rs:763`); a
   new **owner-blind self-write** method resolves `owner` from `Npcs::payload(npc_id).owner`.
-- **Token store.** A git-ignored `tokens/` `Registry` at the mind root keyed `npc_id → {token,
+
+  *As-built: **built.** `Authored.npcs` is `Arc<tokio::sync::RwLock<Npcs>>` (only its
+  construction changed; every call site reaches it through the `Arc`'s `Deref`), installed on
+  `Runtime` via `set_npcs`/`npcs` beside `set_substrate`. The self-write is
+  `Npcs::put_strategy_self(npc_id, strategy_id, body, now_ms)` — it resolves `owner` from
+  `payload(npc_id).owner_id` and calls the existing `put_strategy`. The projected verbs live in
+  `effector/plan.rs`, an async router mounted at `/plan` and `/orders` (not the sync
+  `body::perform`); the caller's `npc_id` comes straight from the device token's `DeviceCaller`,
+  so no `body`-string parse is needed on this path. `/self` reads are `effector/selfsurface.rs`.
+  `give_back` maps to `abandoned` (not "dormant"): the agency states are exactly
+  `active`/`finished`/`abandoned`.*
+- **Token store.** A git-ignored `tokens/` `Registry` under the **data directory**
+  (`data/tokens`, parallel to `accounts/` — as-built; the mind and data roots coincide
+  in the current deployment) keyed `npc_id → {token,
   scope}` (parallel to `accounts/`), a real secret never derived from `body_id`; a `token →
   npc_id → body` lookup built at startup. Scope ∈ {`as-npc` (default, proximity-gated), `direct`
   (by-id, §7/§8.3)}.
@@ -2017,3 +2262,191 @@ build follows Part F's order; this is the decision record it is built against.*
   only after the shrink.
 
 With these settled, implementation proceeds per Part F with no further design input required.
+
+---
+
+# Appendix F — Runtime topology mutation (Step 8)
+
+*Specced now, built later. This is the design for the last thing that makes the world
+"fully dynamic": adding, removing and reshaping rooms while the daemon runs. Everything
+above makes the world dynamic for what characters *do*; this makes it dynamic for what
+the map *is*. It is a real cut of its own because the map is frozen today (`MapSet`
+exposes only an immutable borrow; only actors/holds/lift/events are mutable —
+world-model survey), and unfreezing it safely is the whole of the work.*
+
+## F.1 The mutation surface
+
+`MapSet` (and `World`, which owns it) gains a small, transactional write surface — the
+mirror of the reads it already has:
+
+```rust
+impl World {
+    fn add_area(&mut self, area: Area) -> Done;          // a new level/region/room
+    fn add_node(&mut self, at: &Where, node: Node) -> Done;
+    fn add_portal(&mut self, portal: Portal) -> Done;    // a cross-area link (a lift stop, a gate)
+    fn place_part(&mut self, at: &Where, placement: Placement) -> Done;
+    fn remove_node(&mut self, at: &Where) -> Done;       // and remove_area / remove_portal / unplace_part
+    fn retitle(&mut self, at: &Where, name: String) -> Done;   // and the other in-place edits
+}
+```
+
+Each returns the same typed `Done`/`Refused` (`world.rs:351`) the movement and claim
+surface uses — a mutation that would break the map is refused, in second person, not
+half-applied.
+
+## F.2 Every mutation re-runs the derived passes, transactionally
+
+The map has derived state that is never authored — `Node::exits` and `Node::visible`
+(woven from one-ended doors and sightlines, `load.rs:302/348`), the portal graph
+`MapSet.ways`, and the lift's `shaft` (one `Core` per `Level`, ordered by `ordinal`,
+`world.rs:512`). A mutation is therefore **apply-to-a-copy, re-derive, validate, swap**:
+
+1. build the candidate map with the delta applied;
+2. re-run `weave` (doors mutual, exits filled), `ways` (portals both-way), the
+   visibility pass, and `validate::check` — the same passes `assemble` runs;
+3. if `validate` fails, discard the candidate and return `Refused` — nothing changes;
+4. re-derive `build_shaft` and rebuild/adjust the `Lift` **only when the set of `Core`
+   nodes per `Level` changed** (a new floor, a floor drowned), preserving the car's
+   position where the floor it is on survives;
+5. swap the candidate in under the one lock and log the change as a world event, so it
+   is witnessed (§10) — a room appearing or vanishing is a thing bodies notice.
+
+## F.3 The invariants a mutation may not break
+
+- **Doors stay mutual and derived.** A one-ended `off`/`sees` is authored; `exits`/
+  `visible` are always re-woven, never hand-set — so a one-way door remains impossible
+  to write (`schema.rs:24`).
+- **No stranded hold.** Removing a node or a part must first release any hold on it, as
+  `leave` does for a departing actor (`world.rs:837`) — a station that vanishes with a
+  claim on it would strand that claim forever.
+- **No body left nowhere.** Removing an occupied node relocates its bodies to the
+  area's `arrival`/a `Core` (and logs it), or the removal is refused while occupied —
+  the design's choice is *relocate and tell them*, since a Maker drowning a place should
+  not be blocked by someone standing in it, and the body feeling the ground go is good
+  fiction.
+- **The shaft stays one `Core` per `Level`, ordinal-ordered.** A level added without a
+  `Core`, or a second `Core` on a level, is a `validate` failure (refused).
+- **Instance ids shift, and that is stated.** An instance id is `(area, node, part-id,
+  ordinal)` (§7), so removing the 2nd of three terminals renumbers the 3rd. Topology
+  mutation therefore may invalidate outstanding URLs — acceptable because it is rare,
+  authored, and witnessed (a character re-reads its near-you index the next turn), but
+  it is the reason ids are re-derived, never cached across a mutation.
+
+## F.4 How it is reached, and how it persists
+
+An earlier draft named the Makers' `map_*` verbs (`map_add_place`, `map_settle_border`,
+`map_remove_place`, …) as the effector face of this surface. Building it made plain that
+those verbs are a *different map*, and this records the correction (design docs are
+authoritative; a draft the code disproves is fixed, §CLAUDE.md):
+
+- The `map_*` verbs author **cartography lore** — `sim.record` items of `Kind::Place`,
+  the fictional world-map the Makers draw as content (`work.rs:342`, `map_add_place`
+  puts a `Place` item; `map_remove_place` lets one go). They do not touch the walkable
+  `npc-map` topology at all, and they should not: a Maker drawing a coastline is
+  authoring the game's world, not adding a room to the vault it is standing in.
+- Runtime topology mutation is the **engine primitive** `MapSet::apply` /
+  `World::reshape` (`npc-map/src/mutate.rs`, `world.rs`), which reshapes the *walkable*
+  map — the rooms and ways bodies actually move through. Its trigger is not a Maker's
+  in-fiction act; it is the **operator / embedder surface** (direct scope, §8.3): an
+  embedder growing the world it attached (through the public `World::reshape`), or an
+  operator editing the running vault (over the wire).
+
+The operator wire surface is a single effector route, `POST http://local/reshape/:world`
+(`npcd/src/effector/reshape.rs`), **gated on `Scope::Direct`** — an as-npc token is
+`403`, so a Maker cannot reshape the vault it stands in by reaching for its own device.
+It is not in the near-you index (a character is never shown a way to reshape its world),
+and it is its own prefix, distinct from the Makers' `/map` cartography station (which
+authors lore). The body is a `MapEdit` in its adjacently tagged wire form
+(`{"op":"add_node","with":{…}}`); a malformed one is a prescriptive `400`, an edit the
+world refuses a `409` in its own words, and a success reports who it relocated and whether
+it is durable.
+
+Persistence is `npcd/src/world/mapstore.rs`, invoked by `Hosted::reshape` after the in-RAM
+swap: it writes the one area the edit touched back to `<mind>/map/<world>/<area-id>.yaml`
+(atomic temp-then-rename), or removes that file for a drowned area. Only the touched file
+is rewritten — every other authored file is left byte-for-byte, comments and all — and the
+derived `exits`/`visible` are `#[serde(skip)]`, so what lands on disk is the authored form
+a fresh load re-weaves. The write is off the world lock and best-effort: the swap is the
+source of truth, so a disk failure is *reported* (`durable: "failed"`) rather than
+un-happening a reshape that already took. A world with no authored directory (a generated
+or test world) is `durable: "ephemeral"` — the change holds for the run only.
+
+*As-built: implemented and tested end to end — `MapSet::apply` (the transactional
+mutation), `World::reshape` (swap, re-derive the shaft, relocate the stranded), the
+direct-scope `/reshape/:world` route, and the `mapstore` YAML writeback.*
+
+---
+
+# Appendix G — World-state acts as routes
+
+The generic station mechanism (§C, Step 6) mounts only the acts an authored `Part`
+names in its `at`. The world-state half of `WORLD_ACTS` (`acts.rs:1311`) is not
+`at`-bound — its availability is `Always`/`Nearby`/`Embodied`/`AwayFromHome`, not "at
+this part" — so those verbs need their own mounting.
+
+## G.1 One surface, name-addressed — not instance-addressed
+
+An earlier draft of this appendix split these acts by target and mounted the
+target-facing ones (`claim`, `operate`, `record_verdict`, …) on a target's *instance id*
+(`POST http://local/<ns>/<id>/claim`). Building it made plain that the shape does not fit
+the world model, so the design changed and this records the change (design docs are
+authoritative; a draft the code disproves is corrected, §CLAUDE.md):
+
+- These acts name their targets **by the name the world writes down**, resolved against
+  the live `Choices` sets — not by a map instance id. "The blast door" is a
+  `crate::sim` device keyed by *place*, not a placed map part with an id
+  (`Within::operable` ← `sim.operable(place)`); "close the longest silence" is a
+  `Claimable` subject with no placement at all. Instance-id addressing (§7) is for placed
+  parts; it cannot name a sim device or an abstract subject, which is most of what these
+  acts work on.
+- So they mount on **one personal surface, `http://local/here`** — reachable wherever the
+  body stands (like `/phone` and `/self`, §7.2), carrying no instance id. The target is a
+  *field in the body*, drawn from an enumerated set the schema advertises.
+
+The verbs `/here` owns are the non-part-bound world-state acts, less the ones another
+surface already holds and the ones this design keeps as embodied body acts: `read`,
+`scan`, `claim`, `release`, `operate`, `post_notice`, `record_verdict`, `give`, `equip`,
+`use`, `gather`, `engage`, `recall`. Speech, movement, `act`, `sleep`, `promise` and
+`remind` stay compiled body acts; the lift keeps `/lift`, the phone `/phone`, and the
+tower's `command_tower`/`produce` are `AtPart`, so the station mechanism mounts them
+where their fixtures stand.
+
+## G.2 OPTIONS is the live `Choices` set
+
+The one computation that decides, for a body standing here, which acts are reachable and
+— per enumerated argument — exactly which values it may take is
+`tools::specs_within(mode, &within)`, over the `Within` that `Runtime::within` assembles.
+`/here` renders that computation directly, so the device and the grammar can never
+disagree:
+
+- `GET http://local/here` — the world-state acts `specs_within` admits this moment, each
+  with its one-line description. An act with nothing to work on (nothing claimable, no
+  fight to `engage`) is absent rather than advertised-and-refused — the grammar's own
+  discipline.
+- `OPTIONS http://local/here` — one `POST` verb per available act, each body the JSON
+  schema of its arguments: the old `Choices` live sets (`Company`, `Reachable`,
+  `Carried`, `Equippable`, `Usable`, `DeviceModes`, `Claimable`, `Postable`, …) become
+  the `enum` on the matching property, filled from world state at the moment it is asked,
+  exactly as the lift's `floor` enum is; free arguments are plain strings.
+- `POST http://local/here/<verb>` — the act's declared params are read from the body and
+  run through the real dispatch (synthesise the `Act`, `body::perform`, map with
+  `enact_response`). The act's own gating is the route's, `409` on a refusal; and because
+  every verb here is a body act, none `500`s. Availability is not pre-checked — an act the
+  room offers nothing to work on refuses itself in the world's own words, the prescriptive
+  error a character corrects against (§12).
+
+`read` and `scan` mount as `POST` verbs here rather than as `query`/GET: both route
+through `body::perform` and `read` mutates the reader's read-cursor (which is why
+`Choices::Readable` excludes what a body has already read), so they are effectful reads,
+not the pure GETs the earlier draft assumed. `engage` is `Embodied` and joins the set
+when a fight gives it a posture to take.
+
+## G.3 It does not remove the compiled acts, and that is not a dual path
+
+The same act reaches `body::perform` two ways — as a compiled body act in a turn's
+grammar, and as a `/here` route — exactly as an `AtPart` act reaches it both as a
+compiled act and as a station route. One implementation (the world's own dispatch), two
+front doors: the no-dual-path rule (§CLAUDE.md) is kept.
+
+*As-built: mounted. `npcd/src/effector/here.rs` is the `/here` surface; the near-you
+index advertises `http://local/here`.*

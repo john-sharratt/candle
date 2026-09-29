@@ -54,6 +54,7 @@ pub mod body;
 pub mod cooldown;
 pub mod dreams;
 pub mod driver;
+pub mod effector_focus;
 pub mod enact;
 pub mod environment;
 pub mod event;
@@ -111,6 +112,7 @@ use crate::api::{err, owner_of, Authored};
 use crate::engine::interaction::Interlocutor;
 use crate::engine::mind::Minds;
 use crate::guard::Api;
+use crate::npcs;
 use crate::projection;
 
 /// The one refusal this module makes, worded once.
@@ -326,7 +328,7 @@ async fn owned(s: &Arc<Authored>, headers: &HeaderMap, nid: &str) -> Result<u64,
             "no such character",
         ))
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(nid) else {
         return Err(not_found());
     };
     if s.npcs.read().await.visible_to(npc_id, &owner).is_none() {
@@ -693,7 +695,7 @@ async fn inject(
     };
     // The session says which character; ownership is still checked, because an
     // interaction id is not a capability.
-    if let Err(r) = owned(&s, &headers, &session.npc_id.to_string()).await {
+    if let Err(r) = owned(&s, &headers, &npcs::npc_id_wire(session.npc_id)).await {
         return *r;
     }
     let line = body
@@ -1081,7 +1083,7 @@ async fn stream(
     let Some(session) = rt.interactions.get(&ix, now) else {
         return err(StatusCode::NOT_FOUND, "interaction_not_found", &ix);
     };
-    if let Err(r) = owned(&s, &headers, &session.npc_id.to_string()).await {
+    if let Err(r) = owned(&s, &headers, &npcs::npc_id_wire(session.npc_id)).await {
         return *r;
     }
 

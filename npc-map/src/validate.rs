@@ -12,7 +12,9 @@
 //!
 //! | Check | The mistake it catches |
 //! |---|---|
+//! | ids are `[a-z0-9-]+` | an id a persistence layer cannot safely turn into a file name |
 //! | ids unique | two rooms answering to one name |
+//! | placement counts are sane | a runtime edit asking for billions of instances |
 //! | the spine is passages | a room named as part of the route |
 //! | a room has a way out | a room nobody said what it opens off |
 //! | everything reachable | a wing walled off from the rest of the level |
@@ -24,6 +26,35 @@ use anyhow::{bail, Result};
 
 use crate::load::MapSet;
 use crate::schema::{Area, NodeKind};
+
+/// The most instances of one part a single node may place.
+///
+/// A runtime reshape ([`crate::mutate::MapEdit::PlacePart`]) carries its count
+/// straight off an untrusted request body with no bound of its own — nothing
+/// stops a caller asking for `count: 4_294_967_295`. The largest count any
+/// authored room actually places today is 16 ([`vault-command`]'s seating), so
+/// this is generous headroom, not a tuned ceiling: past it, the request is
+/// asking for an id space no real room needs and [`MapSet::instances_at`]
+/// would otherwise try to allocate on the very next read of that node.
+const MAX_PLACEMENT_COUNT: u32 = 256;
+
+/// Whether an id is safe to carry into a file name.
+///
+/// Every authored id in this crate is already kebab-case — letters, digits and
+/// hyphens — so this enforces the shape rather than inventing one. It matters
+/// beyond style: a reshape's `AddArea`/`AddNode` ([`crate::mutate::MapEdit`])
+/// takes its id from an untrusted request body, and the area id is later
+/// joined straight into a file path to write the change back (a persistence
+/// layer's `<area-id>.yaml`). An id holding `..`, `/` or `\` would walk that
+/// join outside the map directory; restricting every id to this charset here,
+/// where every edit is validated before it takes effect, closes that off at
+/// the source rather than trusting every writer downstream to sanitise again.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
 
 /// Check every area in the set, and the joins between them.
 pub fn check(set: &MapSet) -> Result<()> {
@@ -50,6 +81,16 @@ fn check_parts(set: &MapSet, area: &Area) -> Result<()> {
                     area.id,
                     node.id,
                     placement.part()
+                );
+            }
+            if placement.count() > MAX_PLACEMENT_COUNT {
+                bail!(
+                    "`{}`: `{}` places `{}` with a count of {}, more than the {} a node may hold",
+                    area.id,
+                    node.id,
+                    placement.part(),
+                    placement.count(),
+                    MAX_PLACEMENT_COUNT
                 );
             }
         }
@@ -93,8 +134,21 @@ fn check_announcements(area: &Area) -> Result<()> {
 }
 
 fn check_area(area: &Area) -> Result<()> {
+    if !valid_id(&area.id) {
+        bail!(
+            "`{}`: not a valid area id — letters, digits and hyphens only",
+            area.id
+        );
+    }
     let mut seen = BTreeSet::new();
     for node in &area.nodes {
+        if !valid_id(&node.id) {
+            bail!(
+                "`{}`: `{}` is not a valid node id — letters, digits and hyphens only",
+                area.id,
+                node.id
+            );
+        }
         if !seen.insert(node.id.as_str()) {
             bail!("`{}`: two nodes share the id `{}`", area.id, node.id);
         }
@@ -391,5 +445,65 @@ mod tests {
         }];
         let err = MapSet::from_areas([parent]).unwrap_err().to_string();
         assert!(err.contains("no such node"), "{err}");
+    }
+
+    /// **An area id that would escape a persistence layer's directory is
+    /// refused.** A reshape's `AddArea` takes its id straight off an untrusted
+    /// request body, and that id is later joined into a file path
+    /// (`crate::mutate`'s module doc); `..` and `/` must never reach that far.
+    #[test]
+    fn an_area_id_with_a_path_separator_is_refused() {
+        let mut a = area(vec![node("core", NodeKind::Core, &[])]);
+        a.id = "../../etc".into();
+        let err = MapSet::from_areas([a]).unwrap_err().to_string();
+        assert!(err.contains("not a valid area id"), "{err}");
+    }
+
+    /// **A node id with the same hazard is refused the same way.**
+    #[test]
+    fn a_node_id_with_a_path_separator_is_refused() {
+        let a = area(vec![node("core/../x", NodeKind::Core, &[])]);
+        let err = MapSet::from_areas([a]).unwrap_err().to_string();
+        assert!(err.contains("not a valid node id"), "{err}");
+    }
+
+    /// **An ordinary kebab-case id still validates.** The charset check must
+    /// not reject the ids every authored map already uses.
+    #[test]
+    fn an_ordinary_kebab_case_id_is_valid() {
+        assert!(valid_id("vault-casting"));
+        assert!(valid_id("character-terminal"));
+        assert!(valid_id("a1"));
+        assert!(!valid_id(""));
+        assert!(!valid_id("../x"));
+        assert!(!valid_id("a/b"));
+        assert!(!valid_id("Upper"));
+        assert!(!valid_id("under_score"));
+    }
+
+    /// **A placement asking for an unreasonable count is refused**, not
+    /// carried through to a runtime read that would try to allocate it. The
+    /// bound is far above anything an authored room needs (16 is the largest
+    /// in the shipped vault).
+    #[test]
+    fn a_placement_with_an_unreasonable_count_is_refused() {
+        use crate::part::{Part, PartKind, Placement};
+        let part = Part {
+            id: "seat".into(),
+            kind: PartKind::Seat,
+            name: "seat".into(),
+            plural: None,
+            binds: None,
+            short: None,
+            long: "a seat".into(),
+            modes: vec![],
+        };
+        let mut a = area(vec![node("hall", NodeKind::Core, &[])]);
+        a.nodes[0].parts = vec![Placement::Counted {
+            part: "seat".into(),
+            count: u32::MAX,
+        }];
+        let err = MapSet::assemble([a], [part]).unwrap_err().to_string();
+        assert!(err.contains("more than the"), "{err}");
     }
 }

@@ -411,15 +411,38 @@ fn build_slot_headers(
                     ));
                 }
             });
-            // Count invariant: the slices must cover EXACTLY the slot's recorded
-            // sealed-KV offset. A shortfall means the block table lost chunks
-            // (the host-side "computed write len N is invalid" class); the
-            // kernel would seek a token past the covered range and walk off the
-            // END of the slice array into adjacent stager memory — garbage
-            // headers, garbage kvheads_ptr, CUDA_ERROR_ILLEGAL_ADDRESS with no
-            // attribution.
+            // Count invariant: the slices must cover AT LEAST the slot's recorded
+            // sealed-KV offset. A shortfall (`cum < want`) means the block table
+            // lost chunks (the host-side "computed write len N is invalid"
+            // class); the kernel would seek a token past the covered range and
+            // walk off the END of the slice array into adjacent stager memory —
+            // garbage headers, garbage kvheads_ptr, CUDA_ERROR_ILLEGAL_ADDRESS
+            // with no attribution. That is the only fatal case.
+            //
+            // An OVERAGE (`cum > want`) is the mid-creep skew and is safe,
+            // REGARDLESS of `q_len`. A windowed advance moves some layers ahead of
+            // the others, so `reconcile_entry_offsets` clamps the slot offset to
+            // the MINIMUM coverage across layers (see `sequence_backing_tokens`) —
+            // which leaves the ahead layers covering more than that clamped `want`.
+            // The position map built below from THIS layer's chunks is then a
+            // SUPERSET of `[0, want)`: every position the varlen metadata asks for
+            // still resolves, and the extra covered tokens are simply unindexed.
+            // New tokens are appended at the writer slice the layout resolves from
+            // this layer's own chunks (`extend_for_write_region`), not blindly at
+            // `want`, so a positive `q_len` lands correctly on top of the superset.
+            // (This is the SAME event `classify_pm_divergence` above calls the
+            // benign creep: there `cum` is measured against the cached map layer 0
+            // published; here against the clamped `want`. Two baselines, one skew.)
+            //
+            // Bailing on the overage — in ANY form, including the earlier
+            // `q_len > 0` variant of this guard — deadlocks the creep: the forward
+            // fails, the lagging layers never catch up, and it fails again every
+            // tick, wedging the slot for good. That regression showed up live as
+            // "nothing came of it" across most characters. The overage genuinely
+            // occurs during normal windowed decode (`q_len == 1`), so a shortfall
+            // is the only fatal case; overage is tolerated.
             let want = offsets[slot_i];
-            if (cum as usize) != want {
+            if (cum as usize) < want {
                 candle::bail!(
                     "slot header build: batch slot {slot_i} slices cover {cum} tokens \
                      but the slot's recorded offset is {want} ({} slices) — block \

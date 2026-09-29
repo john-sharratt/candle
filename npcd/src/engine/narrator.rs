@@ -90,7 +90,12 @@ fn event_line(e: &Event) -> Option<String> {
             (!t.is_empty()).then(|| format!("word reaches everyone across the world: {t}"))
         }
         // Authored, addressed to the focal character already — pass through.
-        EventKind::Nudge { text } | EventKind::Operator { text } => {
+        // The near-you screen is likewise already finished prose
+        // (`prompt::near_you_section`), so it is handed to the character verbatim
+        // rather than re-voiced as something that happened.
+        EventKind::Nudge { text }
+        | EventKind::Operator { text }
+        | EventKind::Reachable { text } => {
             let t = text.trim();
             (!t.is_empty()).then(|| t.to_string())
         }
@@ -279,6 +284,38 @@ mod tests {
         assert_eq!(
             line,
             "Pax Veridian does it: that I am looking at the chart, at Ulysses Thorne"
+        );
+    }
+
+    /// The near-you screen is passed bare and survives the render pipeline — it
+    /// is the finished device section (effector design §6), handed to the
+    /// character verbatim rather than re-voiced, exactly as the standing task is.
+    #[test]
+    fn the_reachable_screen_is_passed_bare_and_survives_render() {
+        let screen =
+            "YOUR EFFECTOR DEVICE\nReachable from here: the lift · the command table · your phone";
+        let line = event_line(&ev(EventKind::Reachable {
+            text: screen.into(),
+        }))
+        .unwrap();
+        assert_eq!(line, screen, "the device screen is handed over verbatim");
+
+        // Through the full narrator → render pipeline the reachable list reaches
+        // the character intact: not paraphrased, not re-voiced into the third
+        // person, the middle-dot list preserved.
+        let turn = build_turn(
+            "Wren",
+            "",
+            &[],
+            &[ev(EventKind::Reachable {
+                text: screen.into(),
+            })],
+        )
+        .expect("a screen is worth narrating");
+        let prose = crate::engine::narration::render(&turn);
+        assert!(
+            prose.contains("Reachable from here: the lift · the command table · your phone"),
+            "the reachable list must survive render verbatim: {prose}"
         );
     }
 

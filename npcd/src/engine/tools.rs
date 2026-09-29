@@ -813,6 +813,100 @@ const REFLECT: Tool = Tool {
     ],
 };
 
+/// The effector device's two verbs — the fixed surface over a world that can
+/// grow without bound (effector design §5).
+///
+/// **Two tools, and they never change while the world behind them does.** A new
+/// place, machine or whole subsystem shows up as new addresses under
+/// `http://local/...`, discovered and acted on through exactly these two, with no
+/// new `Tool` static and no recompile. That is the whole escape from the tool
+/// surface that could not scale: the body keeps its hands, and gains a device
+/// whose *verbs* are fixed over a *dynamic* set of addressable things.
+///
+/// `query` reads and `invoke` acts — the GET/OPTIONS versus everything-else line
+/// the model already draws between finding out and doing. Handled on the async
+/// effector fast path (`Runtime::enact_device`, effector design §6, §8.1), not
+/// through `body::perform`: they are body/meta tools, always offered, never world
+/// acts. See [`crate::engine::body::is_device`].
+const QUERY: Tool = Tool {
+    name: "query",
+    at: &[],
+    category: "Device",
+    // Not a world act: it commits through no arbiter and takes no world-version,
+    // because looking changes nothing. Enacted in the loop, not by `body::perform`.
+    plane: Plane::Meta,
+    availability: Availability::Always,
+    description: "Read an address on your effector device — what lives beneath it, or what a \
+                  thing will accept. Looking never changes anything, so you may look as often as \
+                  you like. Addresses look like `http://local/...`; read `http://local/` for \
+                  what is reachable from where you stand.",
+    params: &[Param {
+        name: "url",
+        ty: "string",
+        required: true,
+        description: "The address to read, exactly as it appears on your device — \
+                      \"http://local/\" for what is near you, or one of the addresses it lists.",
+    }],
+    examples: &[
+        Example {
+            situation: "You have just picked the device up and want to know what is around you.",
+            call: r#"{"url":"http://local/"}"#,
+            because: "The bare host is the near-you index — everything reachable from where you \
+                      stand. It is where you look before you know what any one thing is.",
+        },
+        Example {
+            situation: "The index showed a lift within reach and you want to know whether the \
+                        car is here and where it can take you.",
+            call: r#"{"url":"http://local/lift/command-shaft"}"#,
+            because: "Reading the thing itself tells you its state and what it will accept, and \
+                      looking costs nothing — so you find out before you `invoke` it.",
+        },
+    ],
+};
+
+const INVOKE: Tool = Tool {
+    name: "invoke",
+    at: &[],
+    category: "Device",
+    // Its effect reaches the world, but through the effector router rather than
+    // the world-act arbiter — enacted on the async fast path, so it declares
+    // itself a device/meta tool, not `Plane::World`. See `Runtime::enact_device`.
+    plane: Plane::Meta,
+    availability: Availability::Always,
+    description: "Act at an address on your effector device, giving it the fields it asked for \
+                  as a JSON object. The world does the thing and answers, or tells you plainly \
+                  what was wrong so you can fix it and try again. Look with `query` first if you \
+                  are not sure what an address will take.",
+    params: &[
+        Param {
+            name: "url",
+            ty: "string",
+            required: true,
+            description: "The address to act at, exactly as it appears on your device — e.g. \
+                          \"http://local/lift/command-shaft/call\".",
+        },
+        // **The body is a JSON object written out as a string.** It is free text
+        // the handler parses and validates against the resource's own schema, and
+        // a malformed one comes back as a prescriptive `{error:"bad_json",…}`
+        // rather than a crash — see
+        // [`crate::engine::runtime::Runtime::enact_device`].
+        Param {
+            name: "body",
+            ty: "string",
+            required: false,
+            description: "The fields the address asked for, as a JSON object written out — e.g. \
+                          {\"powered\": true}. Leave it off for an address that takes none.",
+        },
+    ],
+    examples: &[Example {
+        situation: "You are standing on the lift's landing and the car is somewhere else. You \
+                    want it here.",
+        call: r#"{"url":"http://local/lift/command-shaft/call","body":"{}"}"#,
+        because: "Calling the lift takes no fields, so the body is an empty object. The world \
+                  answers that the car is on its way; you learn it arrived by looking again.",
+    }],
+};
+
 /// How a character names its own body as the target of an act.
 ///
 /// A word rather than the character's own name, for two reasons. The name is
@@ -877,6 +971,11 @@ const BODY_ACTS: &[Tool] = &[
     // Speech, attention, movement — what a body does with other bodies and
     // with rooms.
     TELL, WHISPER, SHOUT, ASK, GESTURE, MOVE_TO, FOLLOW, REFLECT, SEND_IMAGE,
+    // The effector device — the fixed two-verb surface onto the world. Always
+    // offered, like the body's own acts, and for the same reason: what it can
+    // reach is a fact about where the body stands, not about whether the tool
+    // exists. See [`QUERY`] / [`INVOKE`].
+    QUERY, INVOKE,
 ];
 
 /// The interaction modes a character can be in. Decides which tools are offered.
@@ -1019,6 +1118,31 @@ pub fn nearby(mode: Mode, company: usize) -> Vec<&'static Tool> {
 
 pub fn by_name(name: &str) -> Option<&'static Tool> {
     CATALOG.iter().find(|t| t.name == name)
+}
+
+/// Whether an act has **migrated to the effector device** — reached only through
+/// `query`/`invoke` on its resource, and therefore no longer offered in the
+/// compiled grammar (effector design Step 6, "deleting each corresponding `Tool`
+/// … as it moves").
+///
+/// **This is the seam between the compiled catalogue and the device.** The `Tool`
+/// stays in [`CATALOG`] — the device route reads its `params` to build the
+/// resource schema, and [`crate::engine::body::perform`] still dispatches it when
+/// a route invokes it — but [`specs_within`] filters it out, so a character can
+/// no longer emit it as a plain call. It has to find the resource on its
+/// effector device and act there, which is the whole point of the migration: the
+/// tool surface stays fixed (`query`/`invoke`) while the world's affordances move
+/// behind it.
+///
+/// The migration is incremental, one namespace at a time so the pulse can prove
+/// each cut before the next. The command table is first: taking up and reporting
+/// a mission is done by invoking `http://local/command/<id>/…`, not by a compiled
+/// act, so those three leave the grammar here. [`mission_acts::MISSION_ACTS`] is
+/// the one list of which three that is — read from there rather than repeated,
+/// so a future namespace's migration cannot drift out of step with its own
+/// registry the way a second hand-written name list would.
+pub fn routed(tool: &str) -> bool {
+    mission_acts::is_mine(tool)
 }
 
 /// Whether this act's outcome is *narrated* for the character to read back,
@@ -1379,6 +1503,29 @@ pub enum Choices {
     /// fixed one so the ordinary empty-set rule takes `engage` out of a library
     /// instead of a special case doing it.
     Postures,
+
+    // ---- the effector device ----
+    //
+    /// **Every address reachable from here** — what the effector `query` may
+    /// name. The near-you index as a grammar enum: the personal routes, the lift
+    /// at a landing, and every placed instance's url ([`Within::reachable`]).
+    ///
+    /// **This is the anti-hallucination fix.** With `query`'s `url` bound here,
+    /// the decoder is forced through a real address the device actually lists — a
+    /// character cannot `query http://local/command-table` (a plausible guess
+    /// that 404s) because that string is not an arm of the tree. It reads what is
+    /// on its device, and nothing else, which is the whole point of the near-you
+    /// index being live (§6, §13).
+    QueryUrl,
+
+    /// **Every verb-path an `invoke` may act on** ([`Within::invokable`]) — each
+    /// reachable resource's `<url>/<verb>` for the verbs it affords. Bound to
+    /// `invoke`'s `url`, so the decoder is forced through a whole verb-path the
+    /// world actually serves: a character cannot `invoke` a bare resource
+    /// (a `405`), nor a verb the resource does not have. The complement of
+    /// [`Choices::QueryUrl`] — query reads a resource, invoke acts on a verb of
+    /// one.
+    InvokeUrl,
 }
 
 impl Choices {
@@ -1500,6 +1647,12 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("command_tower", "action", Choices::TowerActions),
     ("produce", "what", Choices::Makeable),
     ("produce", "queue", Choices::Queues),
+    // ---- the effector device ----
+    // Both device addresses are grammar-forced sets, so the decoder can only name
+    // an address the device actually lists — `query` a real resource, `invoke` a
+    // real verb-path of one — never a hallucinated url and never a bare resource.
+    ("query", "url", Choices::QueryUrl),
+    ("invoke", "url", Choices::InvokeUrl),
 ];
 
 /// What is true where a character stands, in the grammar's own terms.
@@ -1584,6 +1737,19 @@ pub struct Within {
     pub contacts: Vec<String>,
     /// The acts the parts standing here carry, straight off the map.
     pub station: Vec<String>,
+    /// **Every address reachable from here, for the effector `query`.** The
+    /// near-you index as a live set: the personal routes, the lift when at a
+    /// landing, and every placed instance's url. Bound to `query`'s `url` so the
+    /// grammar forces it to a real address — a character can `query` only what is
+    /// actually on its device, never a hallucinated `http://local/command-table`.
+    /// See [`Choices::QueryUrl`].
+    pub reachable: Vec<String>,
+    /// **Every address an `invoke` may act on** — each reachable resource's
+    /// verb-paths (`<resource-url>/<verb>`). Bound to `invoke`'s `url` so the
+    /// grammar forces a whole verb-path a resource actually affords: a character
+    /// cannot `invoke` a bare resource (a `405`) or a verb that is not there. See
+    /// [`Choices::InvokeUrl`].
+    pub invokable: Vec<String>,
     /// Whether this body is standing somewhere that is not where it musters
     /// from — what [`Availability::AwayFromHome`] reads.
     ///
@@ -1723,6 +1889,12 @@ impl Within {
 pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
     CATALOG
         .iter()
+        // **An act that has migrated to the effector device is not in the
+        // grammar** — it is reached by `query`/`invoke` on its resource, not
+        // offered as a compiled call (effector design Step 6). The `Tool` stays
+        // in the catalogue because the device route builds its schema from it;
+        // this is the one place it leaves the *grammar*. See [`routed`].
+        .filter(|t| !routed(t.name))
         // **A body that has just done this cannot do it again yet.** Absent
         // rather than refused, for the reason every other absence here is: a
         // refusal is the most recent thing in the character's window, and a
@@ -1809,7 +1981,9 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
                             .map(|v| v.iter().map(|s| (*s).to_string()).collect()),
                     },
                     // An act's arguments are scalars; none is a container, and
-                    // none may be null.
+                    // none may be null. The effector `invoke` body's typed
+                    // sub-object is spliced in separately (§11), not declared
+                    // here.
                     items: None,
                     properties: None,
                     nullable: false,
@@ -1887,6 +2061,8 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Invitable => within.invitable.clone(),
         Choices::Invitees => within.invitees.clone(),
         Choices::Contacts => within.contacts.clone(),
+        Choices::QueryUrl => within.reachable.clone(),
+        Choices::InvokeUrl => within.invokable.clone(),
     }
 }
 
@@ -2154,6 +2330,57 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// **The effector device is the fixed two-verb surface, always offered.**
+    ///
+    /// `query` and `invoke` are body acts (in `BODY_ACTS`), `Availability::Always`
+    /// so they are reachable wherever the body stands, carry calibration examples,
+    /// and take string parameters the grammar can bound. See [`QUERY`] / [`INVOKE`].
+    #[test]
+    fn the_effector_device_offers_query_and_invoke_always() {
+        for name in ["query", "invoke"] {
+            let t = by_name(name).unwrap_or_else(|| panic!("`{name}` is not in the catalog"));
+            assert!(
+                BODY_ACTS.iter().any(|b| b.name == name),
+                "`{name}` is not a body act — it must be in BODY_ACTS"
+            );
+            assert_eq!(
+                t.availability,
+                Availability::Always,
+                "`{name}` must be offered wherever the body stands"
+            );
+            assert!(
+                !t.examples.is_empty(),
+                "`{name}` carries no calibration example"
+            );
+            for p in t.params {
+                assert_eq!(
+                    p.ty, "string",
+                    "`{name}`.{} is `{}` — the device body is a string until the stencil shapes it",
+                    p.name, p.ty
+                );
+            }
+        }
+
+        // `query` reads one address; `invoke` acts at one, with an optional body.
+        let query = by_name("query").unwrap();
+        assert_eq!(query.params.len(), 1);
+        assert_eq!(query.params[0].name, "url");
+        assert!(query.params[0].required, "an address to read is required");
+
+        let invoke = by_name("invoke").unwrap();
+        let url = invoke.params.iter().find(|p| p.name == "url").expect("url");
+        assert!(url.required, "an address to act at is required");
+        let body = invoke
+            .params
+            .iter()
+            .find(|p| p.name == "body")
+            .expect("body");
+        assert!(
+            !body.required,
+            "the body is optional — some addresses take none"
+        );
     }
 
     /// Every argument an example passes must be a parameter the tool declares.
@@ -3106,9 +3333,11 @@ mod tests {
     fn every_act_offered_is_one_that_does_something() {
         for t in for_mode(Mode::Physical) {
             assert!(
-                crate::engine::body::is_of_the_body(t.name) || t.name == "wait",
-                "`{}` is offered but reaches no world — either implement it in \
-                 `body::perform` or take it out of the catalog",
+                crate::engine::body::is_of_the_body(t.name)
+                    || crate::engine::body::is_device(t.name)
+                    || t.name == "wait",
+                "`{}` is offered but reaches no world — implement it in `body::perform`, route it \
+                 through the effector device, or take it out of the catalog",
                 t.name
             );
         }
@@ -3225,5 +3454,45 @@ mod tests {
         let tell = entry(by_name("tell").unwrap());
         assert!(tell.contains("\n  manner (optional): "), "{tell}");
         assert!(tell.contains("\n  intent: "), "{tell}");
+    }
+
+    /// **A migrated act leaves the grammar even where its station stands.**
+    /// `collect_mission` is `routed` to the effector device, so a body standing
+    /// at the command table — `within.station` naming it — is still not offered
+    /// it as a compiled call. It reaches missions through `query`/`invoke` on the
+    /// command table now, which is the whole of the Step 6 cut.
+    #[test]
+    fn a_routed_act_is_absent_from_the_grammar_at_its_station() {
+        let mut at_table = Within::nowhere();
+        // What `sim.station_tools` would report at the command table: the acts its
+        // parts carry, by name — including the migrated mission acts.
+        at_table.station = vec![
+            "collect_mission".to_string(),
+            "report_done".to_string(),
+            "report_stuck".to_string(),
+        ];
+        // `query`/`invoke` are offered only when there is an address to name —
+        // the near-you set is `query`'s enum and the verb-paths are `invoke`'s.
+        // Give both, as the device would list the command table, so the two device
+        // verbs are in the grammar to check against.
+        at_table.reachable = vec![
+            "http://local/here".to_string(),
+            "http://local/command/order-table~0".to_string(),
+        ];
+        at_table.invokable = vec!["http://local/command/order-table~0/collect_mission".to_string()];
+        let offered: Vec<String> = specs_within(Mode::Physical, &at_table)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        for migrated in ["collect_mission", "report_done", "report_stuck"] {
+            assert!(
+                !offered.iter().any(|n| n == migrated),
+                "`{migrated}` is routed to the device and must not be in the grammar: {offered:?}"
+            );
+            assert!(routed(migrated), "`{migrated}` should be marked routed");
+        }
+        // And `query`/`invoke` — the fixed device surface — are always there.
+        assert!(offered.iter().any(|n| n == "query"));
+        assert!(offered.iter().any(|n| n == "invoke"));
     }
 }

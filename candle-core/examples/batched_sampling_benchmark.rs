@@ -236,6 +236,7 @@ mod bench {
                     output_ptr as *mut u32,
                     42, // seed
                     rng_ptr as *mut u64,
+                    std::ptr::null(),
                 );
             }
             stream.synchronize().expect("sync");
@@ -441,6 +442,7 @@ mod bench {
                     op as *mut u32,
                     42,
                     rp as *mut u64,
+                    std::ptr::null(),
                 );
             }
             stream.synchronize().expect("sync");
@@ -506,6 +508,7 @@ mod bench {
                     op as *mut u32,
                     42,
                     rp as *mut u64,
+                    std::ptr::null(),
                 );
             }
             stream.synchronize().expect("sync");

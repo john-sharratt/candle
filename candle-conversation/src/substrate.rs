@@ -55,8 +55,8 @@ use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
-    DebugIdPayload, DistillMode, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
-    TurnCouplingPayload,
+    CustomObjectPayload, DebugIdPayload, DistillMode, DistillPayload, RecordType, TombstonePayload,
+    TreeMetadataPayload, TurnCouplingPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
@@ -313,6 +313,12 @@ pub struct Substrate {
     /// its turns shed to at compaction. Same replay-order-independence as
     /// tombstones.
     distilled_timelines: HashMap<TimelineId, DistillMode>,
+
+    /// Generic keyed objects ([`RecordType::CustomObject`]), keyed by the stable
+    /// hash of their string key so a re-write with the same key supersedes the
+    /// old one (last-writer-wins). Held in RAM and re-emitted on compaction, the
+    /// same survival the other resident metadata gets.
+    custom_objects: HashMap<u64, CustomObjectPayload>,
 
     /// Layers whose conversations are **append-only ingest trunks** (code_reading,
     /// repo_map) rather than interactive dialogue. A projection whose *target* is
@@ -3610,6 +3616,25 @@ impl Substrate {
         self.set_debug_id(timeline, payload.debug_id.clone());
     }
 
+    /// Apply a custom object — on replay and on the runtime write path. Keyed by
+    /// the stable hash of its `key`, so a re-write with the same key replaces the
+    /// old one (last-writer-wins).
+    pub fn apply_custom_object(&mut self, obj: CustomObjectPayload) {
+        self.custom_objects.insert(obj.stream_id(), obj);
+    }
+
+    /// The live custom object stored under `key`, if any.
+    pub fn custom_object(&self, key: &str) -> Option<&CustomObjectPayload> {
+        self.custom_objects
+            .get(&CustomObjectPayload::stream_id_for(key))
+    }
+
+    /// Every live custom object — the set the compaction pass re-emits so they
+    /// survive it.
+    pub fn live_custom_objects(&self) -> Vec<CustomObjectPayload> {
+        self.custom_objects.values().cloned().collect()
+    }
+
     /// Apply a decoded [`TombstonePayload`].  Works whether or not
     /// the timeline is currently registered — registration just
     /// observes the tombstone bit when it later drains the same set.
@@ -4198,6 +4223,11 @@ impl Substrate {
             RecordType::DebugId => {
                 if let Ok(payload) = DebugIdPayload::decode(&entry.record.payload) {
                     self.apply_debug_id_payload(&payload);
+                }
+            }
+            RecordType::CustomObject => {
+                if let Ok(payload) = CustomObjectPayload::decode(&entry.record.payload) {
+                    self.apply_custom_object(payload);
                 }
             }
             RecordType::Tombstone => {

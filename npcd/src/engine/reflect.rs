@@ -539,6 +539,10 @@ pub(crate) fn think_off(
 /// be read rather than guessed at.
 #[derive(Debug, Serialize)]
 pub struct Reflection {
+    /// Serialised as a base-36 string ([`crate::npcs::npc_id_wire`]) like
+    /// every other character id on the wire — a `u64` past 2^53 does not
+    /// survive a JavaScript client as a bare JSON number.
+    #[serde(serialize_with = "crate::npcs::npc_id_wire_serde")]
     pub npc_id: u64,
     /// Echoed back so a caller reading a stored reflection knows what it was
     /// about without holding the request.

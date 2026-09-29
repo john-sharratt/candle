@@ -1094,6 +1094,13 @@ mod tests {
             if name == "send_image" {
                 continue;
             }
+            // The effector device's two verbs reach the world through the
+            // effector router on the async fast path (`Runtime::enact_device`),
+            // not through any synchronous body/enact dispatch — so this layer
+            // deliberately does not perform them.
+            if crate::engine::body::is_device(name) {
+                continue;
+            }
             assert!(
                 crate::engine::body::is_of_the_body(name) || is_mine(name),
                 "`{name}` is in the catalog and nothing performs it"

@@ -36,6 +36,7 @@ use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{Addressed, Event, EventKind, Salience};
 use crate::engine::runtime::Runtime;
 use crate::engine::slash;
+use crate::npcs;
 
 /// How many ticks a feed request may ask for. The scheduler's own ring is the
 /// hard bound; this stops one request rendering all of it.
@@ -48,8 +49,11 @@ pub struct FeedQuery {
     limit: Option<usize>,
     /// Only this character's ticks. Absent means every character the caller may
     /// see, interlaced — which is the view's default and the reason it exists.
+    /// A base-36 string off the wire ([`npcs::npc_id_wire`]), not a number —
+    /// the console pastes an id straight out of a tick or census row, and
+    /// those are base-36.
     #[serde(default)]
-    npc_id: Option<u64>,
+    npc_id: Option<String>,
     /// Admin only: the whole cast, including characters the caller does not own.
     #[serde(default)]
     all: bool,
@@ -108,6 +112,18 @@ impl Scope {
     }
 }
 
+/// Decode the `npc_id` query filter, or say which raw value could not be read.
+///
+/// A decode failure is reported back to the caller (`Err`, the offending
+/// string) rather than silently treated as "no filter" — a mistyped id must
+/// not return the whole unfiltered feed with nothing to say why.
+fn parse_npc_id_filter(raw: Option<&str>) -> Result<Option<u64>, &str> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => npcs::npc_id_of_wire(raw).map(Some).ok_or(raw),
+    }
+}
+
 /// `GET /v1/pulse` — recent ticks across the cast.
 pub async fn feed(
     State(s): State<Arc<Authored>>,
@@ -123,6 +139,16 @@ pub async fn feed(
     };
     let scope = scope_of(&s, &id, &owner, q.all).await;
     let limit = q.limit.unwrap_or(DEFAULT_FEED).clamp(1, MAX_FEED);
+    let want = match parse_npc_id_filter(q.npc_id.as_deref()) {
+        Ok(want) => want,
+        Err(raw) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "bad_npc_id",
+                &format!("`{raw}` is not a valid base-36 npc_id"),
+            )
+        }
+    };
 
     // Filtered *before* the limit, so asking for fifty rows gives fifty rows
     // this caller can see rather than fifty from the whole cast with most of
@@ -132,7 +158,7 @@ pub async fn feed(
         .recent(MAX_FEED.max(limit))
         .into_iter()
         .filter(|t| scope.admits(t.npc_id))
-        .filter(|t| q.npc_id.is_none_or(|want| t.npc_id == want))
+        .filter(|t| want.is_none_or(|want| t.npc_id == want))
         .collect();
     let drop = ticks.len().saturating_sub(limit);
     ticks.drain(..drop);
@@ -155,21 +181,21 @@ pub async fn feed(
 
 /// `npc_id` → display name, for the ids present.
 ///
-/// Ids are stringified because a `u64` past 2^53 does not survive a JavaScript
-/// client — the same reason the character record itself serialises its id as a
-/// string, and getting it wrong here would give every large-id character the
-/// name of whichever one it collided with.
+/// Ids are stringified in base-36 because a `u64` past 2^53 does not survive a
+/// JavaScript client — the same reason the character record itself serialises
+/// its id this way, and getting it wrong here would give every large-id
+/// character the name of whichever one it collided with.
 async fn name_map(
     s: &Arc<Authored>,
     ids: impl Iterator<Item = u64>,
 ) -> serde_json::Map<String, Value> {
     let wanted: HashSet<u64> = ids.collect();
-    let npcs = s.npcs.read().await;
+    let cast = s.npcs.read().await;
     wanted
         .into_iter()
         .filter_map(|id| {
-            let n = npcs.payload(id)?;
-            Some((id.to_string(), Value::String(n.name.clone())))
+            let n = cast.payload(id)?;
+            Some((npcs::npc_id_wire(id), Value::String(n.name.clone())))
         })
         .collect()
 }
@@ -318,15 +344,16 @@ pub async fn world(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Respon
     for world_id in rt.hosted.ids() {
         for (npc_id, body) in rt.bodies.in_world(&world_id) {
             if scope.admits(npc_id) {
-                bound.insert(body, json!(npc_id.to_string()));
+                bound.insert(body, json!(npcs::npc_id_wire(npc_id)));
             }
         }
     }
 
     Json(json!({
         "worlds": worlds,
-        // `body -> npc_id`, as a string: an id past 2^53 does not survive a
-        // JavaScript client as a number, and this one is read by the console.
+        // `body -> npc_id`, as a base-36 string: an id past 2^53 does not
+        // survive a JavaScript client as a number, and this one is read by
+        // the console.
         "bound": bound,
         "moments": rt.moments().iter().map(|(id, n, paused)| json!({
             "world_id": id, "moments": n, "paused": paused,
@@ -960,6 +987,30 @@ fn no_scheduler() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No `npc_id` at all is no filter — the feed's default, interlaced view.
+    #[test]
+    fn an_absent_npc_id_filter_is_no_filter() {
+        assert_eq!(parse_npc_id_filter(None), Ok(None));
+    }
+
+    /// A real base-36 id decodes to the filter it names.
+    #[test]
+    fn a_valid_npc_id_decodes_to_its_filter() {
+        let id = 6_817_662_845_163_923_144_u64;
+        let wire = npcs::npc_id_wire(id);
+        assert_eq!(parse_npc_id_filter(Some(&wire)), Ok(Some(id)));
+    }
+
+    /// **A malformed `npc_id` is reported, not silently treated as no
+    /// filter.** Before this fix, a decode failure fell through to "show
+    /// everything" — the opposite of what a caller asking for one character's
+    /// ticks would expect from a typo.
+    #[test]
+    fn a_malformed_npc_id_is_reported_rather_than_ignored() {
+        assert_eq!(parse_npc_id_filter(Some("abc123!")), Err("abc123!"));
+        assert_eq!(parse_npc_id_filter(Some("")), Err(""));
+    }
 
     /// A body with a speaker: `serde` fills the `Option` fields we do not send.
     fn direct_body(text: &str, speaker: Option<&str>, salience: Option<f32>) -> DirectBody {

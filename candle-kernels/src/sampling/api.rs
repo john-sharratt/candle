@@ -68,6 +68,12 @@ extern "C" {
     /// - `output_tokens`: Output sampled token IDs
     /// - `seed`: RNG seed
     /// - `rng_offsets`: Per-sequence RNG offsets (nullable for argmax)
+    /// - `seq_dials`: `[batch_size]` array of `SeqDials` (see `batched_sampler`),
+    ///   or null. When non-null, EVERY scalar dial above (temperature, top-k/p,
+    ///   penalties, EOS/segment ramps) is overridden per row from
+    ///   `seq_dials[row]`, so a batched wave that mixes configs samples each row
+    ///   on its own dials instead of the first row's. Null keeps the shared-scalar
+    ///   behaviour.
     pub fn run_batched_sampling(
         logits: *const c_void,
         batch_size: i32,
@@ -114,5 +120,6 @@ extern "C" {
         output_tokens: *mut u32,
         seed: u64,
         rng_offsets: *mut u64,
+        seq_dials: *const c_void,
     );
 }

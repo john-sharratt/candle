@@ -48,6 +48,7 @@ use tokio::sync::Notify;
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::sleep::{DayAction, DayTracker};
 use crate::engine::window::Window;
+use crate::npcs;
 
 /// The slowest a wholly idle character thinks. Long, because a character with
 /// nothing happening genuinely has nothing to think about, and the cost of a
@@ -461,7 +462,8 @@ pub struct TickStart {
 /// What one tick did — the Pulse view's row.
 #[derive(Clone, Debug, Serialize)]
 pub struct TickRecord {
-    /// **Serialised as a string, and it has to be.**
+    /// **Serialised as a base-36 string ([`npcs::npc_id_wire`]), and it has to
+    /// be a string.**
     ///
     /// Character ids are minted across the whole `u64` range — a real one is
     /// `6817662845163923144`, comfortably past the 2^53 where a JavaScript
@@ -1127,7 +1129,7 @@ impl Scheduler {
 
 /// A `u64` id on the wire as a string. See [`TickRecord::npc_id`].
 fn id_as_string<S: serde::Serializer>(id: &u64, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&id.to_string())
+    s.serialize_str(&npcs::npc_id_wire(*id))
 }
 
 /// One character's loop state, for the roster and the Pulse header.
@@ -2130,20 +2132,24 @@ mod tests {
         s.deliver(big, 0, Salience::NORMAL, say("something to answer"));
         s.tick(big, 0, 0, |_, _| vec![]).expect("ticked");
 
+        let wire_id = npcs::npc_id_wire(big);
         let json = serde_json::to_string(&s.recent(1)[0]).unwrap();
         assert!(
-            json.contains(&format!("\"npc_id\":\"{big}\"")),
+            json.contains(&format!("\"npc_id\":\"{wire_id}\"")),
             "a tick's id is not a string: {json}"
         );
         let census = serde_json::to_string(&s.census()[0]).unwrap();
         assert!(
-            census.contains(&format!("\"npc_id\":\"{big}\"")),
+            census.contains(&format!("\"npc_id\":\"{wire_id}\"")),
             "a census row's id is not a string: {census}"
         );
 
         // And it round-trips: the exact value comes back, not a rounded one.
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["npc_id"].as_str().unwrap().parse::<u64>().unwrap(), big);
+        assert_eq!(
+            npcs::npc_id_of_wire(v["npc_id"].as_str().unwrap()).unwrap(),
+            big
+        );
     }
 
     /// A retired character is gone: not due, not tickable — and its own task,

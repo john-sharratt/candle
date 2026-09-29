@@ -1376,11 +1376,14 @@ impl BatchedInferenceSession {
 
     /// Append the sealed chunks of `sealed_per_layer` onto the tail of
     /// `seq_idx` as live chunk windows.  Pure metadata — no DMA.
-    /// Advances the sequence's logical token offset by the appended
-    /// token count (sum of usages, taken from layer 0).
     ///
-    /// Returns `(block_start, block_end)` from layer 0 (all layers
-    /// land at the same range because the metadata is uniform).
+    /// The source is first run through [`reconcile_sealed_prefix`], so a
+    /// per-layer creep skew is cut to the common prefix rather than injected
+    /// verbatim (which would desync the slot and wedge every later decode), and
+    /// the per-layer loop is atomic — a mid-loop failure rolls back every layer
+    /// already injected. After reconciliation the layers are uniform, so the
+    /// appended token count (which advances the sequence's logical offset) and
+    /// the returned `(block_start, block_end)` are read from layer 0.
     pub fn inject_sealed_at_tail(
         &mut self,
         seq_idx: usize,
@@ -1393,86 +1396,83 @@ impl BatchedInferenceSession {
                 self.backings.len()
             );
         }
-        // A section can be sealed once, while a windowed creep prefill left a
-        // later window's layers one empty writer chunk behind an earlier
-        // window's (`reconcile_block_counts`), and then never re-sealed again
-        // — every future injection of that persisted record would otherwise
-        // bake the same skew into a fresh live sequence on first use. Heal it
-        // here instead, the same way a live divergence is already healed
-        // (`heal_tail_divergence`'s "truncate every layer to the shortest"):
-        // truncate every layer's copy of this section to the token count its
-        // shortest layer actually holds before injecting any of it.
-        let layer_tokens: Vec<usize> = sealed_per_layer
-            .iter()
-            .map(|s| s.chunks.iter().map(|c| c.token_count as usize).sum())
-            .collect();
-        let min_tokens = layer_tokens.iter().copied().min().unwrap_or(0);
-        let truncated;
-        let sealed_per_layer: &[candle_nn::kv_cache::SealedSequence] =
-            if layer_tokens.iter().all(|&t| t == min_tokens) {
-                sealed_per_layer
-            } else {
-                tracing::error!(
-                    seq = seq_idx,
-                    layer_tokens = ?layer_tokens,
-                    min_tokens,
-                    "inject_sealed_at_tail: this section's persisted layers disagree on token \
-                     count — truncating every layer to the shortest ({min_tokens} tokens) before \
-                     injecting, instead of baking the skew into a live sequence",
-                );
-                truncated = sealed_per_layer
+        // Reconcile a per-layer creep skew before injecting. If the sealed
+        // section has one layer group a filled chunk ahead of the others,
+        // injecting it verbatim desyncs the slot per layer and wedges every
+        // later decode (`unify_decode_layout` cannot heal a mid-history,
+        // Arc-shared divergence). Cut every layer to the common prefix so only a
+        // consistent turn enters the slot — this both blocks new corruption and
+        // lets an already-skewed section (from a substrate sealed before the
+        // seal-time guard, or that slipped past it) reload and continue.
+        let reconciled = reconcile_sealed_prefix(sealed_per_layer);
+        let source: &[candle_nn::kv_cache::SealedSequence] = match reconciled.as_deref() {
+            Some(fixed) => {
+                let dropped: usize = sealed_per_layer
                     .iter()
-                    .map(|s| truncate_sealed_to_tokens(s, min_tokens))
-                    .collect::<Vec<_>>();
-                &truncated
-            };
+                    .zip(fixed.iter())
+                    .map(|(s, f)| s.chunks.len() - f.chunks.len())
+                    .max()
+                    .unwrap_or(0);
+                tracing::warn!(
+                    seq_idx,
+                    dropped_chunks = dropped,
+                    "inject_sealed_at_tail: reconciled a per-layer sealed skew by cutting to \
+                     the common prefix — the section's layers described different token \
+                     windows (a windowed-creep skew sealed into the substrate)"
+                );
+                fixed
+            }
+            None => sealed_per_layer,
+        };
+
         // **Append onto content, never onto a layer's empty writer chunk.**
-        // The token-count check above cannot see this one: the layers agree on
-        // how many tokens this record holds and still disagree on where the
-        // append lands, because a layer carrying a trailing empty chunk takes
-        // the injected content one block further along than a layer without
-        // one. That is how a silent, lossless block-count skew (padding from
-        // `reconcile_block_counts`, or a creep's phantom writer chunk — both
-        // benign while the extra block is empty) becomes an *interior* hole the
-        // instant anything is appended, and an interior hole is precisely what
+        // Reconciling the source above cannot see this one: it is the
+        // *destination*'s skew, not the incoming record's — a layer carrying a
+        // trailing empty chunk on `seq_idx` takes the injected content one
+        // block further along than a layer without one. That is how a silent,
+        // lossless block-count skew (padding from `reconcile_block_counts`, or
+        // a creep's phantom writer chunk — both benign while the extra block
+        // is empty) becomes an *interior* hole the instant anything is
+        // appended, and an interior hole is precisely what
         // `heal_tail_divergence` refuses to repair. Trimming first is lossless
         // for the same reason the padding was: an empty chunk holds no token,
         // so no position moves. The caller pushes a fresh writer chunk after an
         // inject when it needs one (`push_empty_if_sealed`).
         self.trim_empty_tail_chunks(seq_idx)?;
+
+        // Atomic per-layer inject: capture each layer's pre-inject block count
+        // and roll every injected layer back if a later one fails, so a mid-loop
+        // error can never leave a prefix of layers ahead of the rest — the exact
+        // permanent skew this whole path exists to avoid (cf. `reserve_glue_gap`,
+        // whose loop carries the same rollback for the same reason).
         let mut range = (0usize, 0usize);
-        let mut tokens_added: usize = 0;
-        for (i, (backing, sealed)) in self
-            .backings
-            .iter()
-            .zip(sealed_per_layer.iter())
-            .enumerate()
-        {
-            let r = backing
-                .inject_sealed_at_tail(seq_idx, sealed)
-                .map_err(|e| {
-                    candle::Error::Msg(format!(
-                        "inject_sealed_at_tail: layer {i} of {} refused seq {seq_idx} ({} \
-                     chunk(s), {} token(s)) after {i} earlier layer(s) already committed \
-                     theirs — the layers now disagree on this sequence's length: {e}",
-                        self.backings.len(),
-                        sealed.chunks.len(),
-                        sealed
-                            .chunks
-                            .iter()
-                            .map(|c| c.token_count as usize)
-                            .sum::<usize>(),
-                    ))
-                })?;
-            if i == 0 {
-                range = r;
-                tokens_added = sealed
-                    .chunks
-                    .iter()
-                    .map(|c| c.token_count as usize)
-                    .sum::<usize>();
+        let mut pre_counts: Vec<usize> = Vec::with_capacity(self.backings.len());
+        let rollback = |backings: &[ChunkedKvBacking], pre: &[usize]| {
+            for (li, &c) in pre.iter().enumerate() {
+                let _ = backings[li].truncate_sequence_to_blocks(seq_idx, c);
+            }
+        };
+        for (i, (backing, sealed)) in self.backings.iter().zip(source.iter()).enumerate() {
+            let pre = backing.sequence_block_count(seq_idx).unwrap_or(0);
+            pre_counts.push(pre);
+            match backing.inject_sealed_at_tail(seq_idx, sealed) {
+                Ok(r) => {
+                    if i == 0 {
+                        range = r;
+                    }
+                }
+                Err(e) => {
+                    rollback(&self.backings, &pre_counts);
+                    return Err(e);
+                }
             }
         }
+        // Every layer now holds the reconciled (identical) windows, so the token
+        // count is uniform — layer 0 speaks for all of them.
+        let tokens_added: usize = source
+            .first()
+            .map(|s| s.chunks.iter().map(|c| c.token_count as usize).sum())
+            .unwrap_or(0);
         if tokens_added > 0 {
             if let Some(Some(state)) = self.sequences.get_mut(seq_idx) {
                 state.offset += tokens_added;
@@ -1818,11 +1818,39 @@ impl BatchedInferenceSession {
                 // would be a quantized chunk with room left in it, which a later
                 // tail restore can stand where writes land (`drop_empty_tail`).
                 // The fresh writer pushed below replaces it.
+                //
+                // **This is also the cross-layer reconciliation.** A windowed
+                // creep leaves one layer with a trailing empty writer chunk the
+                // others do not yet have; dropping every layer's trailing empties
+                // brings them all back to their last real chunk, so the benign
+                // skew is gone before the alignment check below. What it cannot
+                // remove — a layer a *filled* chunk off the others — is a real
+                // divergence, which is exactly what that check must catch.
                 let mut live = backing.record_turn(seq_idx)?;
                 live.drop_empty_tail();
                 per_seq.push(live);
             }
             live_per_layer.push(per_seq);
+        }
+
+        // **Refuse to drain a per-layer skew to the warm tier.** The in-session
+        // `snapshot_sequence_per_layer` seal already refuses a sequence whose
+        // layers describe different token windows; this hot→warm drain is the
+        // other path that persists per-layer KV, and it must refuse the same
+        // thing. Without the check a wave that died mid-sweep — leaving the MTP
+        // head's layer a filled chunk off the trunk (`draft.rs` on why the head
+        // is a stream layer that must track it) — was sealed to warm, then cold,
+        // with no cross-layer record; every later projection that borrowed the
+        // turn re-injected the skew into a fresh slot per layer, which is the
+        // permanent corruption `assert_sealed_layers_aligned` exists to stop.
+        // Refused here, the slot stays hot and intact, and the next drain retries
+        // once the wave has advanced the lagging layers into line.
+        for (s, &seq_idx) in seq_indices.iter().enumerate() {
+            let per_layer: Vec<SealedSequence> = live_per_layer
+                .iter()
+                .map(|per_seq| per_seq[s].clone())
+                .collect();
+            assert_sealed_layers_aligned(&per_layer, seq_idx, "quantize_and_seal_sequences")?;
         }
 
         // `quantized_per_seq[seq][layer]`, seeded with the live snapshots so a
@@ -5300,6 +5328,13 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 /// Compares `(offset, token_count)` per chunk — the window geometry, which is
 /// what has to agree. Everything else in a `SealedChunk` (gids, palettes,
 /// scales, formats) is legitimately per-layer.
+///
+/// **Every layer is checked, the MTP head's included.** On this stack the head's
+/// KV layer is a `stream_only` layer, not a draft one — its `head_wave_pass`
+/// steps it over the same rows at the same positions in the same wave, so it is
+/// designed to stand at the same length as its siblings and turn-sealing depends
+/// on that (see `qwen35::engine::kv_layers`). A divergence on it is therefore a
+/// real skew to refuse, not an expected lag.
 fn assert_sealed_layers_aligned(
     per_layer: &[candle_nn::kv_cache::SealedSequence],
     idx: usize,
@@ -5357,38 +5392,56 @@ fn assert_sealed_layers_aligned(
     )
 }
 
-/// Truncate a sealed sequence's chunks to the leading run whose cumulative
-/// token count does not exceed `target_tokens` — a whole-chunk truncation,
-/// never a split chunk.
+/// Cut every layer's sealed chunks back to the longest prefix on which all
+/// layers agree `(offset, token_count)`, returning the reconciled per-layer
+/// sequences — or `None` when the layers already agree chunk-for-chunk.
 ///
-/// The counterpart to [`assert_sealed_layers_aligned`]'s refusal: that check
-/// stops a *new* seal from persisting a per-layer skew, but a record already
-/// on disk from before the check existed (or from a seal path that predates
-/// it) carries the skew forever otherwise. Used by
-/// [`BatchedInferenceSession::inject_sealed_at_tail`] to heal such a record
-/// on read — the same "truncate every layer to the shortest" a live
-/// divergence is already healed with, applied here so it never becomes a
-/// live divergence in the first place.
-fn truncate_sealed_to_tokens(
-    seq: &candle_nn::kv_cache::SealedSequence,
-    target_tokens: usize,
-) -> candle_nn::kv_cache::SealedSequence {
-    let mut running = 0usize;
-    let mut chunks = Vec::with_capacity(seq.chunks.len());
-    for c in &seq.chunks {
-        let next = running + c.token_count as usize;
-        if next > target_tokens {
+/// **The recovery twin of [`assert_sealed_layers_aligned`].** That guard refuses
+/// to *seal* a per-layer skew; this repairs one that is being *injected*. A
+/// windowed-resume prefill legitimately commits a filled chunk on the layers it
+/// has resumed while the rest still hold an empty one (see
+/// [`BatchedInferenceSession::reserve_glue_gap`]); if such a section is sealed
+/// and later re-injected verbatim, the skew desyncs the slot per layer, and
+/// `unify_decode_layout` cannot heal it once appended turns push it into
+/// mid-history (deep, Arc-shared) — every decode then diverges and the sequence
+/// wedges. The chunks dropped here are exactly that undelivered creep surplus,
+/// so cutting to the common prefix is the same safe truncation
+/// `heal_tail_divergence` performs, moved to the inject boundary where the skew
+/// would otherwise enter a live slot. Injecting a consistent turn also lets the
+/// wedged conversation reload and continue, losing only the divergent tail of
+/// the one skewed section rather than the whole thread.
+fn reconcile_sealed_prefix(
+    per_layer: &[candle_nn::kv_cache::SealedSequence],
+) -> Option<Vec<candle_nn::kv_cache::SealedSequence>> {
+    let first = per_layer.first()?;
+    let min_len = per_layer.iter().map(|s| s.chunks.len()).min().unwrap_or(0);
+    let window = |s: &candle_nn::kv_cache::SealedSequence, i: usize| {
+        (s.chunks[i].offset, s.chunks[i].token_count)
+    };
+    let mut common = min_len;
+    for i in 0..min_len {
+        let w = window(first, i);
+        if per_layer.iter().any(|s| window(s, i) != w) {
+            common = i;
             break;
         }
-        running = next;
-        chunks.push(c.clone());
     }
-    candle_nn::kv_cache::SealedSequence {
-        chunks,
-        token_count: running,
-        chunk_size: seq.chunk_size,
-        location: seq.location,
+    // Aligned: every layer already ends exactly at the common prefix, so there
+    // is no skew to cut and the source can be injected as-is.
+    if per_layer.iter().all(|s| s.chunks.len() == common) {
+        return None;
     }
+    Some(
+        per_layer
+            .iter()
+            .map(|s| {
+                let mut t = s.clone();
+                t.chunks.truncate(common);
+                t.token_count = t.chunks.iter().map(|c| c.token_count as usize).sum();
+                t
+            })
+            .collect(),
+    )
 }
 
 /// A uniform transformer's half of a wave: the same layer body at every index.
@@ -5420,7 +5473,7 @@ impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
 
 #[cfg(test)]
 mod seal_alignment_tests {
-    use super::assert_sealed_layers_aligned;
+    use super::{assert_sealed_layers_aligned, reconcile_sealed_prefix};
     use candle_nn::kv_cache::{ArenaLocation, HeadGids, SealedChunk, SealedSequence};
     use std::sync::Arc;
 
@@ -5507,6 +5560,112 @@ mod seal_alignment_tests {
     #[test]
     fn an_empty_snapshot_is_fine() {
         assert!(assert_sealed_layers_aligned(&[], 0, "test").is_ok());
+    }
+
+    /// Aligned layers need no reconciliation — the source injects unchanged.
+    #[test]
+    fn reconcile_leaves_aligned_layers_untouched() {
+        let uniform = layer(&[(0, 32), (0, 32), (0, 17)]);
+        let per_layer: Vec<SealedSequence> = (0..13).map(|_| uniform.clone()).collect();
+        assert!(
+            reconcile_sealed_prefix(&per_layer).is_none(),
+            "layers that already agree must not be rewritten"
+        );
+    }
+
+    /// **The recovery case.** The production skew — a contiguous prefix of layers
+    /// a filled 32-token chunk ahead of the rest — is cut back to the common
+    /// prefix, so every layer ends describing the same token windows and the
+    /// injected turn is consistent. The dropped chunk is the undelivered creep
+    /// surplus.
+    #[test]
+    fn reconcile_cuts_a_mid_sweep_filled_skew_to_common_prefix() {
+        let ahead = layer(&[(0, 32), (0, 32), (0, 32)]);
+        let behind = layer(&[(0, 32), (0, 32), (0, 0)]);
+        let per_layer: Vec<SealedSequence> = (0..13)
+            .map(|li| {
+                if li < 3 {
+                    ahead.clone()
+                } else {
+                    behind.clone()
+                }
+            })
+            .collect();
+
+        let fixed = reconcile_sealed_prefix(&per_layer).expect("a real skew must reconcile");
+        // Common prefix is chunk 2 (the first two chunks agree), so every layer
+        // is cut to two chunks.
+        assert!(
+            fixed.iter().all(|s| s.chunks.len() == 2),
+            "cut to the common prefix"
+        );
+        assert!(
+            fixed.iter().all(|s| s.token_count == 64),
+            "token count recomputed"
+        );
+        // And the reconciled layers now pass the seal guard.
+        assert!(
+            assert_sealed_layers_aligned(&fixed, 0, "test").is_ok(),
+            "reconciled layers describe identical windows"
+        );
+    }
+
+    /// A layer carrying one extra trailing chunk the others lack is a skew too,
+    /// and is trimmed to the common length rather than injected as-is.
+    #[test]
+    fn reconcile_trims_a_longer_layer() {
+        let long = layer(&[(0, 32), (0, 32), (0, 9)]);
+        let short = layer(&[(0, 32), (0, 32)]);
+        let per_layer = vec![long.clone(), short.clone(), short];
+        let fixed = reconcile_sealed_prefix(&per_layer).expect("length skew must reconcile");
+        assert!(fixed.iter().all(|s| s.chunks.len() == 2));
+        assert!(assert_sealed_layers_aligned(&fixed, 0, "test").is_ok());
+    }
+
+    /// **The drain's reconciliation: dropping trailing empties aligns a benign
+    /// creep skew.** A windowed creep leaves one layer with a trailing empty
+    /// writer chunk the others do not yet have — the skew is only in the tail,
+    /// and no token moves when it goes. `quantize_and_seal_sequences` runs
+    /// `drop_empty_tail` on every layer before it checks alignment for exactly
+    /// this reason: after the drop the layers describe the same token windows and
+    /// the drain proceeds, rather than refusing a sequence that is actually fine.
+    #[test]
+    fn drop_empty_tail_reconciles_a_benign_trailing_writer_skew() {
+        let ahead = layer(&[(0, 32), (0, 32), (0, 0)]);
+        let behind = layer(&[(0, 32), (0, 32)]);
+        let mut per_layer = vec![ahead, behind.clone(), behind];
+        // Before reconciliation the trailing empty makes them diverge.
+        assert!(
+            assert_sealed_layers_aligned(&per_layer, 7, "test").is_err(),
+            "an un-reconciled trailing empty reads as a skew"
+        );
+        for s in &mut per_layer {
+            s.drop_empty_tail();
+        }
+        assert!(
+            assert_sealed_layers_aligned(&per_layer, 7, "test").is_ok(),
+            "dropping the trailing empty aligns the layers"
+        );
+    }
+
+    /// **A real head skew survives `drop_empty_tail` and the drain refuses it.**
+    /// When the MTP head's layer is a *filled* chunk off the trunk (a wave that
+    /// died mid-sweep, not a trailing writer), the drop cannot remove it — the
+    /// chunk holds tokens — so the alignment check fires and the drain refuses to
+    /// seal the skew to the warm tier. This is the corruption that used to reach
+    /// the substrate unchecked on this path.
+    #[test]
+    fn a_real_head_skew_survives_drop_empty_tail_and_is_refused() {
+        let mut head = layer(&[(0, 32), (0, 32), (0, 32)]);
+        let mut trunk = layer(&[(0, 32), (0, 32)]);
+        head.drop_empty_tail();
+        trunk.drop_empty_tail();
+        let mut per_layer: Vec<SealedSequence> = (0..10).map(|_| trunk.clone()).collect();
+        per_layer.push(head);
+        let err = assert_sealed_layers_aligned(&per_layer, 9, "quantize_and_seal_sequences")
+            .expect_err("a filled-chunk head skew must not drain");
+        assert!(err.to_string().contains("chunk 2"), "{err}");
+        assert!(err.to_string().contains("[10]"), "{err}");
     }
 }
 

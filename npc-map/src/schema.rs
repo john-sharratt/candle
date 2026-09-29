@@ -287,7 +287,7 @@ impl Stand {
 /// A coordinate on the map rather than a fact about the world, which is why it
 /// lives here — a route is computed from the map alone, and nothing about who
 /// is standing where is needed to work one out.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Where {
     pub area: String,
     pub node: String,

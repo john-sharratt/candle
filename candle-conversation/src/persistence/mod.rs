@@ -63,8 +63,8 @@ use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
-    decode_record, encode_record, ChunkPayload, DebugIdPayload, NpcPayload, RecordHeader,
-    RecordType, TombstonePayload, TreeMetadataPayload,
+    decode_record, encode_record, ChunkPayload, CustomObjectPayload, DebugIdPayload, NpcPayload,
+    RecordHeader, RecordType, TombstonePayload, TreeMetadataPayload,
 };
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -251,6 +251,31 @@ impl SharedSubstrate {
             SubstratePersistence::open_in_with_substrate_read_only(dir, &mut substrate)?;
         Ok(Self::new(substrate, persistence))
     }
+
+    /// Store a keyed [`CustomObjectPayload`] — durably and in RAM in one call.
+    ///
+    /// A later write with the same key supersedes this one (last-writer-wins):
+    /// the header carries the key's hash as its `stream_id`, so supersession is
+    /// mechanical on replay, and the in-RAM [`Substrate`] holds only the winner
+    /// so compaction re-emits it. This is the write half of the durable host
+    /// state (e.g. npcd's command-table open flag); [`Self::custom_object`]
+    /// reads it back.
+    pub fn put_custom_object(&self, obj: CustomObjectPayload) -> Result<()> {
+        {
+            let mut p = self.persistence.lock().unwrap();
+            p.write_custom_object(&obj)?;
+            p.commit()?;
+        }
+        self.substrate.write().unwrap().apply_custom_object(obj);
+        Ok(())
+    }
+
+    /// Read the live [`CustomObjectPayload`] for `key`, or `None` if none was
+    /// ever written (or the last write for the key was tombstoned by a newer
+    /// one — the winner is whatever [`Self::put_custom_object`] stored last).
+    pub fn custom_object(&self, key: &str) -> Option<CustomObjectPayload> {
+        self.substrate.read().unwrap().custom_object(key).cloned()
+    }
 }
 
 /// The persistence layer behind a substrate — owns the active redo log, the
@@ -367,6 +392,7 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
             | RecordType::WideQSig
             | RecordType::TurnIndexPage
             | RecordType::Commit
+            | RecordType::CustomObject
     )
 }
 
@@ -1050,6 +1076,25 @@ impl SubstratePersistence {
     pub fn write_npc(&mut self, npc: &NpcPayload) -> Result<()> {
         let bytes = npc.encode();
         self.append_record(RecordType::Npc, 0, npc.npc_id, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
+    /// Append a [`RecordType::CustomObject`] record. The header's `stream_id` is
+    /// the key's stable hash, so a later write with the same key supersedes this
+    /// one on replay (last-writer-wins). Caller applies it to the in-RAM
+    /// [`Substrate`] too so it re-emits on compaction — see
+    /// [`SharedSubstrate::put_custom_object`].
+    pub fn write_custom_object(&mut self, obj: &CustomObjectPayload) -> Result<()> {
+        let bytes = obj.encode();
+        self.append_record(
+            RecordType::CustomObject,
+            0,
+            obj.stream_id(),
+            0,
+            0,
+            0,
+            &bytes,
+        )?;
         Ok(())
     }
 
@@ -2316,6 +2361,84 @@ mod tests {
             "a shared handle compacts against a view that includes every \
              character, whenever it was created"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A custom object is durable, last-writer-wins, and survives compaction.**
+    ///
+    /// The whole point of the type: `npcd` writes the command-table flag once and
+    /// it comes back after a reboot, keeps the newest value when re-written, and
+    /// is not lost when the log is rewritten (the silent-drop failure mode
+    /// `survival.rs` documents). Exercises the `SharedSubstrate` write/read pair
+    /// across an open → re-write → compact → reopen cycle.
+    #[test]
+    fn a_custom_object_is_durable_lww_and_survives_compaction() {
+        let dir = tmp_dir("custom_object");
+
+        // Write once, read it straight back from the same handle.
+        {
+            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let mut obj =
+                CustomObjectPayload::new("command-table", serde_json::json!({ "open": true }));
+            obj.metadata
+                .insert("world".to_string(), "vault".to_string());
+            shared.put_custom_object(obj).unwrap();
+
+            let back = shared.custom_object("command-table").unwrap();
+            assert_eq!(back.blob, serde_json::json!({ "open": true }));
+            assert_eq!(
+                back.metadata.get("world").map(String::as_str),
+                Some("vault")
+            );
+            assert!(
+                shared.custom_object("never-written").is_none(),
+                "an unknown key has no object"
+            );
+        }
+
+        // A fresh open replays the log — the object is durable.
+        {
+            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let back = shared.custom_object("command-table").unwrap();
+            assert_eq!(back.blob, serde_json::json!({ "open": true }));
+
+            // Re-write the same key: last-writer-wins.
+            shared
+                .put_custom_object(CustomObjectPayload::new(
+                    "command-table",
+                    serde_json::json!({ "open": false }),
+                ))
+                .unwrap();
+            assert_eq!(
+                shared.custom_object("command-table").unwrap().blob,
+                serde_json::json!({ "open": false }),
+                "the newest write wins in RAM"
+            );
+
+            // Compact against this view, then confirm the winner survived.
+            {
+                let mut p = shared.persistence.lock().unwrap();
+                let mut s = shared.substrate.write().unwrap();
+                p.compact(&mut s, None).unwrap();
+            }
+        }
+
+        // Reopen after compaction: only the last value is present, and the
+        // superseded first write did not resurrect.
+        {
+            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let back = shared.custom_object("command-table").unwrap();
+            assert_eq!(
+                back.blob,
+                serde_json::json!({ "open": false }),
+                "the last-written value survives compaction and reload"
+            );
+            assert!(
+                back.metadata.is_empty(),
+                "the second write carried no metadata, so the winner has none"
+            );
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

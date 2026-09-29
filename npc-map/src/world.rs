@@ -61,6 +61,7 @@ use std::fmt;
 
 use crate::lift::{Lift, Moment};
 use crate::load::MapSet;
+use crate::mutate::MapEdit;
 use crate::part::PartKind;
 use crate::route;
 use crate::salience::Weight;
@@ -856,6 +857,115 @@ impl World {
             what: Happening::Left,
         });
         Ok(())
+    }
+
+    /// Reshape the world's map while it runs — add or drown a room, open a gate
+    /// that was not there (effector design Appendix F).
+    ///
+    /// **Apply-to-a-copy, validate, then swap.** The edit is handed to
+    /// [`MapSet::apply`], which rebuilds and re-validates the whole set; a
+    /// mutation that would break the map returns `Err` here and **nothing
+    /// changes** — the running world keeps the map it had. Only a set that
+    /// passes the same gate a fresh load does is swapped in.
+    ///
+    /// **No body is left nowhere.** A body standing where a node used to be is
+    /// relocated to the area's way in ([`MapSet::arrival_in`], then the world's
+    /// arrival), releasing whatever station it held first — the hold's node is
+    /// gone, so nothing else ever could. The relocation is logged as a departure
+    /// from the vanished place and an arrival at the new one, so both rooms
+    /// perceive it the ordinary way. If a stranded body has nowhere at all to go
+    /// — an edit that leaves the world with no arrival — the reshape is refused
+    /// rather than stranding it.
+    ///
+    /// Returns the ids relocated, in a stable order (empty when the reshape
+    /// displaced nobody). `Err(reason)` carries the world's own words on why the
+    /// edit could not be made — this is an authoring act reached from the map
+    /// stations, not a body act, so it answers with a reason string rather than a
+    /// [`Refused`].
+    pub fn reshape(&mut self, edit: &MapEdit) -> Result<Vec<String>, String> {
+        // The candidate set. A mutation that will not validate refuses here,
+        // before anything in the live world is touched.
+        let new_map = self.map.apply(edit).map_err(|e| e.to_string())?;
+
+        // Bodies standing where a node no longer exists, and where each will go.
+        // Resolved against the *new* map, and refused outright if any has nowhere
+        // to land, so the swap below cannot strand anyone.
+        let mut moves: Vec<(String, Where, Where)> = Vec::new();
+        for actor in self.actors.values() {
+            if new_map.node_at(&actor.at).is_some() {
+                continue;
+            }
+            let to = new_map
+                .arrival_in(&actor.at.area)
+                .or_else(|| new_map.arrival())
+                .ok_or_else(|| {
+                    format!(
+                        "that would leave {} standing nowhere, and there is no way into the world \
+                         to move them to",
+                        self.name_of(&actor.id).unwrap_or(&actor.id)
+                    )
+                })?;
+            moves.push((actor.id.clone(), actor.at.clone(), to));
+        }
+
+        // Commit: the map is swapped, then the lift shaft re-derived from it.
+        self.map = new_map;
+        self.reshaft();
+
+        // Relocate the stranded, releasing a now-impossible hold first, and log
+        // the move both ways so the vanished room and the new one each see it.
+        let mut relocated = Vec::new();
+        for (id, from, to) in moves {
+            self.now += 1;
+            let at = self.now;
+            if self.actors.get(&id).and_then(|a| a.hold.as_ref()).is_some() {
+                self.release_at(&id, at).map_err(|e| e.to_string())?;
+            }
+            let Some(actor) = self.actors.get_mut(&id) else {
+                continue;
+            };
+            actor.at = to.clone();
+            actor.walk = None;
+            self.riders.remove(&id);
+            self.log.push(Event {
+                at,
+                actor: id.clone(),
+                place: from,
+                what: Happening::Left,
+            });
+            self.log.push(Event {
+                at,
+                actor: id.clone(),
+                place: to,
+                what: Happening::Arrived,
+            });
+            relocated.push(id);
+        }
+        Ok(relocated)
+    }
+
+    /// Re-derive the lift shaft after the map has changed.
+    ///
+    /// The shaft is a pure function of the map's levels and their cores
+    /// ([`World::build_shaft`]), so it is simply rebuilt. The car is only
+    /// disturbed when the shaft actually changed — a mutation that adds a room to
+    /// a level leaves the floors exactly as they were, and the lift with them.
+    /// When the floors do change, the car is set back to the building's arrival
+    /// floor (as a fresh world starts it) and anyone mid-ride is set down, since
+    /// a floor index no longer names the same landing.
+    fn reshaft(&mut self) {
+        let shaft = Self::build_shaft(&self.map);
+        if shaft == self.shaft {
+            return;
+        }
+        let start = self
+            .map
+            .arrival()
+            .and_then(|at| shaft.iter().position(|c| c.area == at.area))
+            .unwrap_or(0);
+        self.lift = (shaft.len() >= 2).then(|| Lift::new(shaft.len(), start));
+        self.shaft = shaft;
+        self.riders.clear();
     }
 
     /// Set off for somewhere, and find out later whether you got there.
@@ -1778,6 +1888,126 @@ mod tests {
             .expect("the ring joins everything");
         assert_eq!(route.first().unwrap(), &at("band-one"));
         assert_eq!(route.last().unwrap(), &at("relations"));
+    }
+
+    /// A plain room node for a reshape test — somewhere to stand that opens off
+    /// one existing room.
+    fn room(id: &str, off: &[&str]) -> Node {
+        Node {
+            id: id.into(),
+            kind: NodeKind::Social,
+            name: id.into(),
+            plural: false,
+            stand: None,
+            off: off.iter().map(|s| s.to_string()).collect(),
+            character: None,
+            parts: vec![],
+            ground: vec![],
+            habit: None,
+            sees: vec![],
+            exits: vec![],
+            visible: vec![],
+        }
+    }
+
+    /// **A reshape adds a room, and it is walkable at once.** The new node opens
+    /// off the green room; after the reshape the green room opens back onto it —
+    /// the door woven both ways, exactly as a loaded map's is — and a body can
+    /// route to it.
+    #[test]
+    fn a_reshape_adds_a_walkable_room() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", at("green-room")).unwrap();
+        let moved = w
+            .reshape(&MapEdit::AddNode {
+                area: "vault-casting".into(),
+                node: Box::new(room("annex", &["green-room"])),
+            })
+            .expect("a room off the green room is a valid reshape");
+        assert!(moved.is_empty(), "adding a room displaces nobody");
+        let green = w
+            .map()
+            .get("vault-casting")
+            .unwrap()
+            .node("green-room")
+            .unwrap();
+        assert!(
+            green.exits.contains(&"annex".to_string()),
+            "the door was not woven back: {:?}",
+            green.exits
+        );
+        // And it is genuinely reachable from where the body stands.
+        let route = w.route("m1", &at("annex")).expect("the annex is walkable");
+        assert_eq!(route.last().unwrap(), &at("annex"));
+    }
+
+    /// **A body standing where a room is drowned is relocated, not stranded.**
+    /// It is moved to the area's way in, and the move is logged both ways so the
+    /// vanished room and the new one each perceive it.
+    #[test]
+    fn a_reshape_relocates_a_body_off_a_drowned_room() {
+        let mut w = vault();
+        w.reshape(&MapEdit::AddNode {
+            area: "vault-casting".into(),
+            node: Box::new(room("annex", &["green-room"])),
+        })
+        .unwrap();
+        w.enter("m1", "Maker-01", at("annex")).unwrap();
+        assert_eq!(w.actor("m1").unwrap().at, at("annex"));
+
+        let moved = w
+            .reshape(&MapEdit::RemoveNode(at("annex")))
+            .expect("drowning an empty leaf room is valid");
+        assert_eq!(moved, vec!["m1".to_string()], "the body was not relocated");
+        // vault-casting's way in is its core, where the stranded body lands.
+        assert_eq!(w.actor("m1").unwrap().at, at("core"));
+        assert!(w
+            .map()
+            .get("vault-casting")
+            .unwrap()
+            .node("annex")
+            .is_none());
+    }
+
+    /// **An impossible reshape refuses and changes nothing.** A room opening off
+    /// a door to nowhere cannot validate, so the running world keeps the map it
+    /// had — the annex never appears.
+    #[test]
+    fn an_impossible_reshape_leaves_the_world_untouched() {
+        let mut w = vault();
+        let before = w.map().get("vault-casting").unwrap().nodes.len();
+        let err = w
+            .reshape(&MapEdit::AddNode {
+                area: "vault-casting".into(),
+                node: Box::new(room("annex", &["nowhere"])),
+            })
+            .expect_err("a door to nowhere cannot be reshaped in");
+        assert!(err.contains("not a node here"), "{err}");
+        assert_eq!(
+            w.map().get("vault-casting").unwrap().nodes.len(),
+            before,
+            "a refused reshape must not change the map"
+        );
+    }
+
+    /// **Adding a room to a level leaves the lift exactly as it was.** The shaft
+    /// is a function of the levels and their cores, and neither changed — so the
+    /// car is not disturbed and nobody mid-ride is set down.
+    #[test]
+    fn a_reshape_within_a_level_does_not_touch_the_lift() {
+        let mut w = vault();
+        let shaft_before = w.shaft().to_vec();
+        w.reshape(&MapEdit::AddNode {
+            area: "vault-casting".into(),
+            node: Box::new(room("annex", &["green-room"])),
+        })
+        .unwrap();
+        assert_eq!(
+            w.shaft(),
+            shaft_before.as_slice(),
+            "the shaft must be unchanged"
+        );
+        assert!(w.lift().is_some(), "the lift is still there");
     }
 
     /// **The vault's lift serves every level, in order.** The shaft is built

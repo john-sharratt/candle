@@ -833,6 +833,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 output_ptr as *mut u32,
                 p.seed,
                 rng_ptr as *mut u64,
+                std::ptr::null(),
             );
         }
     }
@@ -1153,6 +1154,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 output_ptr as *mut u32,
                 p.seed,
                 rng_ptr as *mut u64,
+                std::ptr::null(),
             );
         }
     }

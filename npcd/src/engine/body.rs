@@ -121,6 +121,11 @@ pub fn answers(tool: &str) -> bool {
 /// "this happens in a head" when it actually meant "nothing happens at all".
 /// Both are gone from the catalog entirely now, which is the more thorough
 /// version of the same fix.
+///
+/// **A device call is deliberately not one of these.** `query`/`invoke` reach the
+/// world through the effector router, not [`perform`] — see [`is_device`] — so
+/// this must answer `false` for them, or the synchronous dispatch would try to
+/// run an async tower service and find nothing to run.
 pub fn is_of_the_body(tool: &str) -> bool {
     matches!(
         tool,
@@ -136,6 +141,19 @@ pub fn is_of_the_body(tool: &str) -> bool {
             | "reflect"
     ) || crate::engine::enact::is_mine(tool)
         || crate::engine::work::is_mine(tool)
+}
+
+/// Whether this act is an effector-device call — `query` or `invoke`.
+///
+/// These are the two fixed verbs of the effector device (effector design §5).
+/// They are **not** [`is_of_the_body`]: a device call reaches the world through
+/// the effector router, an async tower service driven on the fast path
+/// (`Runtime::enact_device`, §6, §8.1), where [`perform`] is synchronous and has
+/// nothing to run for it. The async turn loop routes these here instead, so the
+/// two questions must never overlap — a name that answered `true` to both would
+/// be dispatched twice.
+pub fn is_device(tool: &str) -> bool {
+    matches!(tool, "query" | "invoke")
 }
 
 /// Perform one act against the world a body stands in.
@@ -933,6 +951,24 @@ mod tests {
         Act {
             tool: Box::leak(tool.to_string().into_boxed_str()),
             args: Map::new(),
+        }
+    }
+
+    /// **A device call is a device call, not a body act.** `query`/`invoke` reach
+    /// the world through the effector router on the async fast path, never through
+    /// [`perform`], so [`is_of_the_body`] must not claim them — the two questions
+    /// cannot overlap or the act is dispatched twice.
+    #[test]
+    fn a_device_call_is_not_a_body_act() {
+        for tool in ["query", "invoke"] {
+            assert!(
+                is_device(tool),
+                "`{tool}` is not recognised as a device act"
+            );
+            assert!(
+                !is_of_the_body(tool),
+                "`{tool}` is claimed as a body act — it would be run through body::perform"
+            );
         }
     }
 

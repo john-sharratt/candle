@@ -57,6 +57,11 @@ impl RecordAccounting {
             | RecordType::ProjectionEvents
             | RecordType::WideQSig
             | RecordType::TurnIndexPage
+            // `CustomObject` carries its key's hash in the header's `stream_id`
+            // (see `CustomObjectPayload::stream_id`), so a re-write for the same
+            // key supersedes the previous one here mechanically — the resident
+            // twin of `StreamDecl`, re-emitted from RAM at compaction.
+            | RecordType::CustomObject
             // `Npc` carries its `npc_id` in the header's `stream_id`, so the
             // newest record for a character supersedes every earlier one here
             // mechanically — the same trick `Snapshot` uses for its per-timeline

@@ -101,6 +101,10 @@ pub fn survival(rt: RecordType) -> Survival {
         // The exchange grouping for a tool round-trip, held in
         // `Timeline::couplings` and re-emitted from `live_couplings`.
         RecordType::TurnCoupling => Survival::Resident,
+        // Host-defined keyed state (e.g. npcd's command-table open flag), held
+        // in `Substrate::custom_objects` and re-emitted from
+        // `live_custom_objects`.
+        RecordType::CustomObject => Survival::Resident,
 
         // ── Rebuilt by the writer ───────────────────────────────────────────
         RecordType::HeaderIndex => Survival::Regenerated,
@@ -138,6 +142,7 @@ pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
     RecordType::BranchCheckpoint,
     RecordType::Npc,
     RecordType::TurnIndexPage,
+    RecordType::CustomObject,
 ];
 
 /// A per-record-type tally, for reporting what a store holds and what a rewrite
@@ -242,6 +247,7 @@ pub fn type_label(rt: RecordType) -> &'static str {
         RecordType::BranchCheckpoint => "branch_checkpoint",
         RecordType::Npc => "npc",
         RecordType::TurnIndexPage => "turn_index_page",
+        RecordType::CustomObject => "custom_object",
         RecordType::Unknown => "unknown",
     }
 }

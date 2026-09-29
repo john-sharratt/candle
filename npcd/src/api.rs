@@ -67,7 +67,15 @@ pub struct Authored {
     pub accounts: RwLock<Accounts>,
     /// The cast, in memory, backed by the substrate — see [`crate::npcs`].
     /// A write lock only for a create/edit/delete; listing takes the read lock.
-    pub npcs: RwLock<Npcs>,
+    ///
+    /// Held behind an `Arc` so the one cast — and with it the process's one
+    /// writable substrate handle ([`crate::npcs::Npcs::substrate`]) — can be
+    /// shared with the engine: [`crate::engine::runtime::Runtime::set_npcs`]
+    /// adopts this same handle, so the effector device reads a character's own
+    /// projected state and writes its agency plane through the identical `Npcs`
+    /// there is no second of. Every call site still reaches the lock through the
+    /// `Arc`'s `Deref` (`self.npcs.read().await`); only construction is wrapped.
+    pub npcs: Arc<RwLock<Npcs>>,
     /// Who is an admin, from the config. Not behind a lock: it is decided at
     /// startup and there is deliberately no way to change it while running —
     /// see [`web::auth::role`].
@@ -139,7 +147,7 @@ impl Authored {
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
             accounts: RwLock::new(accounts),
-            npcs: RwLock::new(npcs),
+            npcs: Arc::new(RwLock::new(npcs)),
             roles,
             libraries,
             images,
@@ -621,7 +629,7 @@ async fn get_npc(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         // An unparseable id is simply not a character anybody has.
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
@@ -661,7 +669,7 @@ async fn post_reflect(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     // Ownership before anything expensive: a reflection costs several decodes
@@ -772,7 +780,7 @@ async fn post_dream(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     // Ownership — unless the caller may see the whole cast (admin or creator).
@@ -924,12 +932,13 @@ async fn create_npc(
 
 /// A character id off the wire.
 ///
-/// The id is serialised as a **string**, because a `u64` past 2^53 does not
-/// survive a JavaScript client — so reading it back out of a response body is a
-/// string parse, not `as_u64`, and using the latter here silently found nothing.
+/// The id is serialised as a base-36 **string** ([`npcs::npc_id_wire`]),
+/// because a `u64` past 2^53 does not survive a JavaScript client — so
+/// reading it back out of a response body is a base-36 parse, not `as_u64`,
+/// and using the latter here silently found nothing.
 fn npc_id_of(v: &Value) -> Option<u64> {
     v.as_str()
-        .and_then(|s| s.parse().ok())
+        .and_then(npcs::npc_id_of_wire)
         .or_else(|| v.as_u64())
 }
 
@@ -1024,7 +1033,7 @@ async fn patch_npc(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.write().await.patch(npc_id, &owner, &body, now_ms()) {
@@ -1078,7 +1087,7 @@ async fn patch_one(s: Arc<Authored>, headers: HeaderMap, nid: String, patch: Val
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.write().await.patch(npc_id, &owner, &patch, now_ms()) {
@@ -1136,7 +1145,7 @@ async fn delete_belief(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s
@@ -1222,7 +1231,7 @@ async fn read_npc(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.read().await.visible_to(npc_id, &owner) {
@@ -1243,7 +1252,7 @@ where
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     let mut npcs = s.npcs.write().await;
@@ -1377,7 +1386,7 @@ async fn delete_npc(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.write().await.delete(npc_id, &owner, now_ms()) {

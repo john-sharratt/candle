@@ -50,10 +50,23 @@ pub(crate) const PROJECTION_MARKER: &str = "<|projection|>";
 /// generator recombined them; shown a random eight it found a new one.
 const SAMPLED_AXES: usize = 8;
 
+use axum::body::{to_bytes, Body};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::Request as HttpRequest;
+use axum::http::StatusCode;
+use axum::Router;
+use serde_json::{from_slice, json, to_string, to_vec, Value};
+use tower::ServiceExt;
+
+use crate::effector::auth::PinnedStandpoint;
+use crate::effector::namespace::namespace_of;
+use crate::effector::station;
+use crate::effector::token::Tokens;
 use crate::engine::act::Act;
 use crate::engine::authoring;
 use crate::engine::body::{self, Outcome};
 use crate::engine::driver::{self, Metronome};
+use crate::engine::effector_focus;
 use crate::engine::environment;
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::identity;
@@ -61,6 +74,7 @@ use crate::engine::ingest;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
 use crate::engine::mind::{frame_fingerprint, Minds, Projected};
+use crate::engine::mission_acts;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
 use crate::engine::schema;
@@ -69,7 +83,7 @@ use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::Ledger;
 use crate::mind::Mind;
 use crate::model;
-use crate::npcs::Casting;
+use crate::npcs::{Casting, Npcs};
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use npc_map::world::Where;
@@ -297,6 +311,24 @@ pub struct Runtime {
     /// runtime to answer its routes. See [`crate::npcs::Npcs::substrate`] for
     /// what the second handle cost.
     substrate: RwLock<Option<SharedSubstrate>>,
+    /// The shared cast — the very same `Arc<RwLock<Npcs>>` [`crate::api::Authored`]
+    /// holds, adopted rather than reconstructed.
+    ///
+    /// Installed after construction for the same reason the substrate is: the
+    /// registry that owns the cast lives in the authored state, which needs this
+    /// runtime to answer its routes. It is the effector device's bridge to a
+    /// character's projected state — the `/self` reads render a character's own
+    /// agency/belief layers ([`crate::effector::selfsurface`]) and the
+    /// `plan_*`/`orders_*` writes land in the agency plane
+    /// ([`crate::effector::plan`], effector design §9.2) through
+    /// [`Npcs::put_strategy_self`], which then projects on the next turn via the
+    /// `agency` collection and [`crate::engine::persona`].
+    ///
+    /// **The same handle, never a second.** Sharing the one `Arc` preserves the
+    /// one-writable-substrate-handle invariant ([`crate::npcs::Npcs::substrate`],
+    /// `npcs.rs` §"One handle to the substrate"): the effector writes through the
+    /// identical `Npcs`/`SharedSubstrate` the console API and the load walk use.
+    npcs: RwLock<Option<Arc<tokio::sync::RwLock<Npcs>>>>,
     /// Every character's live conversation. `None` until the model is loaded —
     /// there is nothing to hold a conversation on before then.
     pub minds: RwLock<Option<Arc<Minds>>>,
@@ -317,6 +349,22 @@ pub struct Runtime {
     /// Where a named register goes to be remembered. Absent until installed,
     /// and a character that names one before then simply is not recorded.
     mood_sink: RwLock<Option<MoodSink>>,
+    /// The effector device's token store — one opaque secret per character,
+    /// resolving a bearer token to a body (see [`crate::effector::token`]).
+    ///
+    /// Installed after construction like the clock, because it reads the
+    /// daemon's `tokens/` directory which is the daemon's to open once. Held as
+    /// an `Arc` so the `local` router's auth layer and the in-process fast path
+    /// resolve and mint through one handle rather than two.
+    tokens: RwLock<Option<Arc<Tokens>>>,
+    /// The `local` effector router, retained so a character's `query`/`invoke`
+    /// takes the in-process fast path (effector design §8.1) — the same service
+    /// the external mount answers on, driven through `oneshot` with no socket.
+    ///
+    /// Installed after construction because the router's own state holds a
+    /// [`Weak`] handle back to this runtime, and one of the two has to exist
+    /// first. Absent until then, and a call before then simply is not answered.
+    effector: RwLock<Option<Router>>,
     /// The worlds this daemon is running.
     ///
     /// Distinct from `Authored::worlds`, which is the registry of world
@@ -492,11 +540,13 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
 ///
 /// The standing task while the table is open, so an idle character reads it and
 /// makes its way there rather than settling into the room it is in. It names the
-/// act (`collect_mission`), because an instruction that names the branch the
-/// grammar has an arm for lands where one that only describes the wish does not —
-/// the lesson [`IN_COMPANY`] records. The loud call that reaches a character
-/// mid-conversation is the tannoy the table's opening sends; this is what keeps
-/// drawing one that has drifted, and what a character reads on its way.
+/// command table's device verb (`invoke` its `collect_mission`): the mission acts
+/// have migrated to the effector device (`tools::routed`), so taking one up is a
+/// device call on the table's address, not a compiled act. Naming the concrete
+/// verb still lands where a bare wish does not — the lesson [`IN_COMPANY`]
+/// records — it is only the *surface* that moved. The loud call that reaches a
+/// character mid-conversation is the tannoy the table's opening sends; this is
+/// what keeps drawing one that has drifted, and what a character reads on its way.
 /// Substrate key for the durable command-table open flag — see
 /// [`Runtime::set_table_open`], which writes it, and [`Runtime::host`], which
 /// reads it back as a world loads. One key for the daemon: `set_table_open`
@@ -510,9 +560,11 @@ pub const TO_THE_TABLE: &str =
      command room, on the command level: if you are on another floor, go to the \
      lift, call it with `lift_call`, ride it to the command level with \
      `lift_use`, and then `move_to` the command room — you cannot walk between \
-     floors. This comes before talk — do not answer the room, go. Once \
-     you are there, at the table, take up a mission with `collect_mission`; carry \
-     it out, and when it is done come back to the table and take up the next.";
+     floors. This comes before talk — do not answer the room, go. Once you are \
+     there, the table is on your effector device: `query` its address (your \
+     device lists it) to see what it offers, then take up a mission by `invoke` \
+     on its `collect_mission`. Carry it out, and when it is done come back and \
+     report it at the table the same way, then take up the next.";
 
 /// The summons for a character that is **already at the table** with no mission.
 ///
@@ -523,10 +575,12 @@ pub const TO_THE_TABLE: &str =
 /// stop, and take one up now.
 pub const AT_THE_TABLE: &str =
     "You are at the command table, where the work is handed out, and you are \
-     carrying nothing. Do not walk away and do not stand here talking: take up a \
-     mission now with `collect_mission`. Once it is yours, carry it out, and when \
-     it is done come back to this table and report it — `report_done`, or \
-     `report_stuck` if it will not finish — then take up the next.";
+     carrying nothing. Do not walk away and do not stand here talking. The table \
+     is on your effector device: `query` its address (your device lists it — \
+     \"the table\") to see what it offers, then take up a mission now by `invoke` \
+     on its `collect_mission`. Once it is yours, carry it out, and when it is \
+     done come back and `invoke` the table's `report_done` — or `report_stuck` if \
+     it will not finish — then take up the next.";
 
 /// How long a character must go without news before the standing task is
 /// restated to it.
@@ -626,10 +680,13 @@ impl Runtime {
             ledger: Arc::new(Ledger::open(data)),
             clock: RwLock::new(None),
             substrate: RwLock::new(None),
+            npcs: RwLock::new(None),
             minds: RwLock::new(None),
             persona: RwLock::new(None),
             place_sink: RwLock::new(None),
             mood_sink: RwLock::new(None),
+            tokens: RwLock::new(None),
+            effector: RwLock::new(None),
             hosted,
             interactions: crate::engine::interaction::Interactions::new(),
             bodies: Bindings::new(),
@@ -961,7 +1018,7 @@ impl Runtime {
         hosted.sim(|s| {
             s.station_tools(&place)
                 .iter()
-                .any(|t| t == "collect_mission")
+                .any(|t| t == mission_acts::COLLECT_MISSION.name)
         })
     }
 
@@ -1059,11 +1116,19 @@ impl Runtime {
         // read, from [`World::lift_within`], so the situation and the grammar
         // cannot disagree about it.
         let (at_lift, lift_here, floors) = hosted.read(|w| w.lift_within(&body));
+        // The addresses reachable from here, as the near-you index lists them —
+        // the live enums `query`'s and `invoke`'s `url` are bound to, so the
+        // grammar forces a real address the device actually shows and a character
+        // can never `query` a hallucinated one nor `invoke` a bare resource
+        // (effector design §6; `Choices::QueryUrl` / `Choices::InvokeUrl`).
+        let (reachable, invokable) = self.reachable_urls(&hosted, &body, at_lift);
         let base = tools::Within {
             company,
             at_lift,
             lift_here,
             floors,
+            reachable,
+            invokable,
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
             places: body::reachable(&hosted, &body),
@@ -1090,6 +1155,59 @@ impl Runtime {
         // without hostiles ends up without `engage`.
         let place = hosted.place_of(&body);
         hosted.sim(|sim| base.clone().from_sim(sim, &body, &place))
+    }
+
+    /// The addresses reachable from where `body` stands — the near-you index as
+    /// two flat lists of urls, for the grammar's `query` and `invoke` enums
+    /// ([`tools::Choices::QueryUrl`] / [`tools::Choices::InvokeUrl`]).
+    ///
+    /// The **sync twin** of the async near-you index (`GET http://local/`, see
+    /// [`crate::effector::router`]): the same personal routes, the lift at a
+    /// landing, and every placed instance's url — computed straight off the map so
+    /// the device screen a character reads and the addresses its grammar will let
+    /// it name are one set. Returns `(query, invoke)`:
+    ///
+    /// - **query** — a resource per line: the personal routes, the lift, each
+    ///   instance's url, and the bare `http://local/` so the whole index can be
+    ///   re-read.
+    /// - **invoke** — a whole verb-path per line: `<instance-url>/<verb>` for
+    ///   every verb an instance affords ([`station::verbs_of`]). A resource with
+    ///   no verbs (a seat) contributes nothing, so `invoke` can only ever name a
+    ///   verb the world will actually serve — not a bare resource, not a missing
+    ///   verb.
+    fn reachable_urls(
+        &self,
+        hosted: &Arc<Hosted>,
+        body: &str,
+        at_landing: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut query = vec![
+            "http://local/".to_string(),
+            "http://local/here".to_string(),
+            "http://local/history".to_string(),
+            "http://local/phone".to_string(),
+            "http://local/self".to_string(),
+        ];
+        let mut invoke = Vec::new();
+        if at_landing {
+            query.push("http://local/lift/command-shaft".to_string());
+        }
+        hosted.read(|w| {
+            if let Some(at) = w.actor(body).map(|a| a.at.clone()) {
+                for inst in w.map().instances_at(&at) {
+                    let url = format!(
+                        "http://local/{}/{}",
+                        namespace_of(inst.part_id()),
+                        inst.id()
+                    );
+                    for verb in station::verbs_of(inst.part_id()) {
+                        invoke.push(format!("{url}/{verb}"));
+                    }
+                    query.push(url);
+                }
+            }
+        });
+        (query, invoke)
     }
 
     /// Walk a person into the world, beside the character they came to see.
@@ -1587,6 +1705,393 @@ impl Runtime {
         *self.mood_sink.write().unwrap() = Some(sink);
     }
 
+    /// Supply the effector device's token store. Called once at startup, before
+    /// the `local` router is built from it.
+    pub fn set_tokens(&self, tokens: Arc<Tokens>) {
+        *self.tokens.write().unwrap() = Some(tokens);
+    }
+
+    /// The token store, for a caller building the `local` router's auth layer.
+    pub fn tokens(&self) -> Option<Arc<Tokens>> {
+        self.tokens.read().unwrap().clone()
+    }
+
+    /// Retain the `local` effector router so the fast path can drive it. Called
+    /// once at startup, after the router is built.
+    pub fn set_effector_router(&self, router: Router) {
+        *self.effector.write().unwrap() = Some(router);
+    }
+
+    /// Drive the effector device in-process for a character (effector design
+    /// §8.1) and return the JSON it answers.
+    ///
+    /// This is the fast path every in-fiction `query` takes: it skips the
+    /// socket, not the API. It builds a real `http::Request`, stamps the
+    /// character's bearer token — and **never** an `x-tokera-*`, or the operator
+    /// middleware would read the character as a human — and invokes the retained
+    /// `local` router through `oneshot`, the identical service the external mount
+    /// answers on. The in-fiction call always acts as the character's own body,
+    /// so it carries the as-npc scope and can never reach past its standpoint.
+    ///
+    /// **Never call this while holding the world lock.** A handler behind the
+    /// router acquires that lock itself, so re-entering here from inside a
+    /// `hosted.with(...)`/`read(...)` closure would deadlock the non-reentrant
+    /// world mutex silently (effector design §8.1). Acquire, act, release, then
+    /// query — as the lift handlers already do.
+    pub async fn effector_query(
+        &self,
+        npc_id: u64,
+        path: &str,
+        pinned: Option<&npc_map::world::Where>,
+    ) -> anyhow::Result<Value> {
+        let (status, value) = self.effector_call(npc_id, "GET", path, None, pinned).await?;
+        // A `query` is a read that is expected to answer — a non-2xx is a bug in
+        // the caller's path, not a normal outcome — so it is surfaced as an
+        // error rather than handed back. (`invoke` keeps the status, because a
+        // 409 refusal there is an ordinary answer the caller maps.)
+        anyhow::ensure!(
+            status.is_success(),
+            "effector {path} answered {status}: {value}"
+        );
+        Ok(value)
+    }
+
+    /// The near-you index, fetched for this turn and rendered as the character's
+    /// dynamic **YOUR EFFECTOR DEVICE** system-prompt section (effector design
+    /// §6).
+    ///
+    /// This is the async fetch-and-render seam: [`Self::effector_query`] is
+    /// async, so the index is fetched here, on the engine's async path, and the
+    /// rendered section is handed down to the turn's prompt assembly
+    /// ([`crate::engine::mind::Minds::think`]) — never fetched from inside the
+    /// synchronous prompt-building code. It is recomputed every turn from the
+    /// body's current standpoint, so the section supersedes rather than
+    /// accumulates.
+    ///
+    /// **It never fails the turn.** A device that is not installed (a test path
+    /// with no router or token store), a fetch that errored, or an index that is
+    /// empty or shapeless all degrade to `None` — no section this turn — rather
+    /// than an error propagated up the tick. Only the ambient list moves to the
+    /// prompt; the `query`/`invoke` calls and their `<tool_response>`s stay
+    /// inline (§6).
+    ///
+    /// **Never holds the world lock across the await.** `effector_query`
+    /// acquires and releases the non-reentrant world lock inside the router
+    /// (§8.1); this method holds nothing while it awaits.
+    ///
+    /// Driven each turn from [`character_loop`], which delivers the rendered
+    /// section as a superseding [`crate::engine::event::EventKind::Reachable`]
+    /// percept.
+    pub(crate) async fn near_you_section(&self, npc_id: u64) -> Option<String> {
+        // No pin: this is fetched at the head of the tick, before the decode, so
+        // the live standpoint already is the grammar-time one.
+        let index = self.effector_query(npc_id, "/", None).await.ok()?;
+        prompt::near_you_section(&index)
+    }
+
+    /// Act at an effector address in-process — the `invoke` fast path (effector
+    /// design §8.1), the counterpart to [`Self::effector_query`].
+    ///
+    /// Same machinery as a query — the as-npc bearer token stamped on the
+    /// request ([`Tokens::ensure`], **never** an `x-tokera-*`), the retained
+    /// `local` router driven through `oneshot`, no socket — but a `POST` carrying
+    /// a JSON body. It returns the status alongside the value rather than erroring
+    /// on a non-2xx, because a refusal (`409`, §12) is a legitimate answer to an
+    /// act: the world would not have it, and the caller reads the status and the
+    /// body the way an external client would.
+    ///
+    /// **Never call this while holding the world lock** — the handler behind the
+    /// router takes that lock itself, so re-entering from inside a
+    /// `hosted.with(...)`/`read(...)` closure deadlocks the non-reentrant world
+    /// mutex silently. Acquire, act, release, then invoke.
+    pub async fn effector_invoke(
+        &self,
+        npc_id: u64,
+        path: &str,
+        body: Value,
+        pinned: Option<&npc_map::world::Where>,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        self.effector_call(npc_id, "POST", path, Some(body), pinned)
+            .await
+    }
+
+    /// Drive the retained `local` router in-process for a character, the shared
+    /// core of [`Self::effector_query`] and [`Self::effector_invoke`].
+    ///
+    /// Stamps the character's own as-npc bearer token and no gateway header, so
+    /// the device middleware resolves it as the body and never as a human, and
+    /// returns the status and parsed JSON so each caller applies its own rule to
+    /// a non-2xx.
+    async fn effector_call(
+        &self,
+        npc_id: u64,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        pinned: Option<&npc_map::world::Where>,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let router = self
+            .effector
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the effector router is not installed"))?;
+        let tokens = self
+            .tokens()
+            .ok_or_else(|| anyhow::anyhow!("the token store is not installed"))?;
+
+        // The fast path always acts as the character's own body, so it takes the
+        // as-npc token specifically (`as_npc`, not `ensure`) — a stored `Direct`
+        // scope must never become the in-fiction identity (§8.3).
+        let token = tokens.as_npc(npc_id)?;
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header(AUTHORIZATION, format!("Bearer {token}"));
+        // Pin the reach check to where the body stood when this turn's grammar
+        // was built, if a standpoint was supplied. A typed extension only the
+        // in-process path can insert, so it never reaches — and could never be
+        // forged by — an external caller (see [`PinnedStandpoint`]).
+        if let Some(at) = pinned {
+            builder = builder.extension(PinnedStandpoint(at.clone()));
+        }
+        let request = match body {
+            Some(value) => builder
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(to_vec(&value)?))?,
+            None => builder.body(Body::empty())?,
+        };
+
+        // The router's error type is `Infallible`, so this cannot fail; the
+        // `expect` documents that rather than papering over a real error.
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the effector router is infallible");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await?;
+        let value: Value = from_slice(&bytes).unwrap_or(Value::Null);
+        Ok((status, value))
+    }
+
+    /// Enact one effector-device call — `query` or `invoke` — on the async fast
+    /// path and build the same [`Recorded`] a body act produces through
+    /// [`Self::record_act`], so the character reads a device call's outcome back
+    /// exactly as it reads any other act's (effector design §5, §6, §12).
+    ///
+    /// **The two verbs, and what comes back.** `query` reads and its `answer` is
+    /// the value the address returned — the `<tool_response>` the character reads
+    /// next turn. `invoke` acts and its `answer` is the status and value together:
+    /// the receipt the world hands back *this* turn (§10), a `200` acknowledgement
+    /// or a `409` refusal in the world's own words (§12). The lasting effect of an
+    /// `invoke` arrives later through perception, not through this return value.
+    ///
+    /// **The url becomes a router path** via [`device_path`]: a leading
+    /// `http://local` — the only host the device can reach in-fiction (§7) — is
+    /// stripped, so `http://local/lift/command-shaft/call` and the bare
+    /// `/lift/command-shaft/call` address the same route, and `http://local/`
+    /// reaches the near-you index at `/`.
+    ///
+    /// **The `invoke` body is a JSON object written out as a string** (§11): an
+    /// absent or blank one defaults to `{}`, and a string that will not parse is
+    /// answered with a prescriptive `{error:"bad_json",…}` rather than panicking,
+    /// so the character can correct it.
+    ///
+    /// A cooldown is charged only when the call landed, mirroring `record_act`.
+    ///
+    /// **Never holds the world lock across the await.** It calls
+    /// [`Self::effector_query`] / [`Self::effector_invoke`], whose handlers take
+    /// the non-reentrant world lock themselves; this method holds nothing, so the
+    /// lock is never re-entered (§8.1).
+    /// Arm a character's effector **focus** from a resource `query`, and return
+    /// the resource's `OPTIONS` schema so it can ride back inline (effector
+    /// design §11).
+    ///
+    /// A `query` is a `GET`; this is the paired `OPTIONS` that fetches the
+    /// resource's schema. It arms the focus — the schema of the effectful body,
+    /// so the next `invoke`'s body is decoded against it — and hands the schema
+    /// back to be read this turn, collapsing discover→schema→act into one turn.
+    ///
+    /// **The index and personal readables arm nothing.** `http://local/`,
+    /// `/history`, and `/self` are GET-only readables (§7.2); they have no
+    /// effectful body, so no `OPTIONS` is issued and any prior focus is left as
+    /// it was — a stale focus is harmless and re-read each focused turn (§11). A
+    /// resource whose schema advertises nothing armable clears the focus, so the
+    /// next `invoke` falls back to free JSON. `None` is returned (no schema
+    /// inline, focus unchanged) whenever the device is not installed, the
+    /// `OPTIONS` did not answer, or the engine holds no minds.
+    ///
+    /// **Never holds the world lock across the await.** It calls
+    /// [`Self::effector_call`], whose handler takes the world lock itself; this
+    /// method holds nothing (§8.1).
+    async fn arm_focus(
+        &self,
+        npc_id: u64,
+        path: &str,
+        pinned: Option<&npc_map::world::Where>,
+    ) -> Option<Value> {
+        // GET-only readables have no schema to fetch — leave any focus be.
+        if path == "/" || path.starts_with("/history") || path.starts_with("/self") {
+            return None;
+        }
+        let (status, options) = self
+            .effector_call(npc_id, "OPTIONS", path, None, pinned)
+            .await
+            .ok()?;
+        if !status.is_success() {
+            return None;
+        }
+        let minds = self.minds.read().unwrap().clone()?;
+        match effector_focus::body_schema_from_options(&options) {
+            Some(body_schema) => {
+                let resource = effector_focus::resource_id(&options, path);
+                minds.set_focus(npc_id, &resource, body_schema);
+            }
+            // A resource with nothing armable (a multi-verb station, a read-only
+            // resource) disarms rather than leaves a stale body typed.
+            None => minds.clear_focus(npc_id),
+        }
+        Some(options)
+    }
+
+    pub(crate) async fn enact_device(
+        &self,
+        npc_id: u64,
+        act: &Act,
+        pinned: Option<&npc_map::world::Where>,
+    ) -> Recorded {
+        let url = act
+            .args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let path = device_path(&url);
+
+        match act.tool {
+            "query" => match self.effector_query(npc_id, &path, pinned).await {
+                Ok(value) => {
+                    // A resource query also fetches the `OPTIONS` schema: it arms
+                    // the character's focus so the next `invoke` body is typed
+                    // (§11), and the schema rides back inline so the character can
+                    // act in one turn. The index and personal readables are
+                    // GET-only and arm nothing. The value the address returned is
+                    // still what the character reads; the feed line just names
+                    // what was looked at.
+                    let schema = self.arm_focus(npc_id, &path, pinned).await;
+                    let answer = match schema {
+                        Some(schema) => {
+                            let bundled = json!({ "state": value, "schema": schema });
+                            to_string(&bundled).unwrap_or_else(|_| bundled.to_string())
+                        }
+                        None => to_string(&value).unwrap_or_else(|_| value.to_string()),
+                    };
+                    self.cooldowns.took_act(npc_id, act);
+                    Recorded {
+                        feed: format!("query {url}"),
+                        answer,
+                        landed: true,
+                        departing: false,
+                    }
+                }
+                // A read that did not answer — no such address here, or out of
+                // reach. The character is told plainly and nothing is charged.
+                Err(why) => Recorded {
+                    feed: format!("query {url} {REFUSED} {why}"),
+                    answer: format!("The device could not read {url}: {why}"),
+                    landed: false,
+                    departing: false,
+                },
+            },
+            "invoke" => {
+                let body = match act.args.get("body") {
+                    None => json!({}),
+                    Some(Value::String(s)) if s.trim().is_empty() => json!({}),
+                    Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            // Prescriptive, not a panic: the field that was wrong,
+                            // named, so the next attempt can fix it (§8.4, §12).
+                            let err = json!({
+                                "error": "bad_json",
+                                "detail": e.to_string(),
+                                "field": "body",
+                            });
+                            let answer = to_string(&err).unwrap_or_else(|_| err.to_string());
+                            return Recorded {
+                                feed: format!("invoke {url} {REFUSED} bad_json"),
+                                answer,
+                                landed: false,
+                                departing: false,
+                            };
+                        }
+                    },
+                    // The grammar writes `body` as a string; an already-structured
+                    // value is a caller passing an object directly — taken as-is.
+                    Some(other) => other.clone(),
+                };
+                match self.effector_invoke(npc_id, &path, body, pinned).await {
+                    Ok((status, value)) => {
+                        let landed = status.is_success();
+                        // **The character reads the world's own line, not the HTTP
+                        // envelope.** The route answers `{ok, detail}` on success
+                        // and `{error, detail}` on a refusal (`enact_response`);
+                        // either way `detail` is the sentence the world would have
+                        // handed a body that acted any other way — "You take it up.
+                        // What has been asked of you: …", or "You are already
+                        // carrying a mission." So that is what rides back as the
+                        // answer. The status is on the feed line for the operator,
+                        // not wrapped around the prose the character has to read.
+                        let answer = value
+                            .get("detail")
+                            .and_then(|d| d.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                to_string(&value).unwrap_or_else(|_| value.to_string())
+                            });
+                        if landed {
+                            self.cooldowns.took_act(npc_id, act);
+                        }
+                        // **A refusal reads its reason on the feed, like a compiled
+                        // act does.** A landed act is self-evident, so its feed line
+                        // carries the status (`→ 200 OK`); a refused one carries the
+                        // world's own line — the same `detail` the character reads as
+                        // its `<tool_response>` — so an operator watching the pulse
+                        // sees *why* it was refused, not a bare `✗ 409 Conflict`.
+                        // This is the device-act counterpart of `record_act` putting
+                        // a refusal's words on the feed (see `Recorded`).
+                        let feed = match landed {
+                            true => format!("invoke {url} {LANDED} {status}"),
+                            false => format!("invoke {url} {REFUSED} {answer}"),
+                        };
+                        Recorded {
+                            feed,
+                            answer,
+                            landed,
+                            departing: false,
+                        }
+                    }
+                    Err(why) => Recorded {
+                        feed: format!("invoke {url} {REFUSED} {why}"),
+                        answer: format!("The device could not reach {url}: {why}"),
+                        landed: false,
+                        departing: false,
+                    },
+                }
+            }
+            // Only `query`/`invoke` are device acts (`body::is_device`), and the
+            // loop routes nothing else here — this arm is the honest answer if it
+            // ever does, rather than a silent success.
+            other => Recorded {
+                feed: other.to_string(),
+                answer: format!("Nothing on your device answers `{other}`."),
+                landed: false,
+                departing: false,
+            },
+        }
+    }
+
     /// Remember a register a character has just named for itself.
     ///
     /// **Only from an act the world accepted**, and only `pause` names one —
@@ -1648,6 +2153,22 @@ impl Runtime {
     /// instead of a slow leak.
     pub fn set_substrate(&self, shared: SharedSubstrate) {
         *self.substrate.write().unwrap() = Some(shared);
+    }
+
+    /// Adopt the shared cast. Called once at startup with the very handle
+    /// [`crate::api::Authored`] holds — never a second `Npcs` — so the effector
+    /// device's `/self` reads and its agency writes go through the one cast and
+    /// the one writable substrate handle behind it (effector design §9.2,
+    /// Appendix E "The bridge").
+    pub fn set_npcs(&self, npcs: Arc<tokio::sync::RwLock<Npcs>>) {
+        *self.npcs.write().unwrap() = Some(npcs);
+    }
+
+    /// The shared cast, for the effector bridge. `None` on a test path that
+    /// stood the runtime up without one — a caller degrades to an empty result
+    /// rather than failing the read.
+    pub fn npcs(&self) -> Option<Arc<tokio::sync::RwLock<Npcs>>> {
+        self.npcs.read().unwrap().clone()
     }
 
     /// Stop one character, ask it two things, and throw the conversation away.
@@ -3440,7 +3961,35 @@ impl Runtime {
 /// One character's whole life as a task: wait until due, perceive, think, act,
 /// and — when a turn reflects — await the reflection's answer before taking
 /// another turn. Returns when the character is retired or the daemon stops.
+/// Strip an effector `url` to the router path the fast path invokes (effector
+/// design §7).
+///
+/// `http://local` is the only host the device can reach in the fiction, so a
+/// leading `http://local` is removed and both `http://local/lift/x` and the bare
+/// `/lift/x` address the same route; `http://local` and `http://local/` both map
+/// to the near-you index at `/`. A path with no leading slash is given one, so a
+/// model that writes `lift/x` still reaches the route.
+fn device_path(url: &str) -> String {
+    let rest = url.trim();
+    let rest = rest.strip_prefix("http://local").unwrap_or(rest);
+    if rest.is_empty() {
+        "/".to_string()
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        format!("/{rest}")
+    }
+}
+
 async fn character_loop(rt: Arc<Runtime>, id: u64) {
+    // The last effector near-you screen delivered to this character, so the
+    // section is re-delivered only when it changes — a body that has not moved
+    // reads the same screen it was already handed. Delivering every tick would
+    // make `Scheduler::deliver`'s `due_at = 0` a tight re-tick loop (the hazard
+    // `at_table_summons` documents); on-change is the same discipline the
+    // situation band follows, one seam up. Local to this per-character task, so
+    // no lock and no shared map; a respawn re-delivers the current screen once.
+    let mut last_near_you: Option<String> = None;
     loop {
         if rt.stopping() {
             return;
@@ -3552,6 +4101,31 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 }
             }
 
+            // The effector device's near-you screen — what is reachable from
+            // where the body stands right now (effector design §6). Fetched on
+            // the async fast path (`near_you_section` never holds the world lock
+            // across its await) and delivered as a superseding percept so the
+            // character reads the current screen and never a stale list: it
+            // rides its own "reachable" band and supersedes each turn, the same
+            // point-in-time discipline as the situation band. Delivered only on
+            // change — an unmoved body would otherwise be re-woken every tick by
+            // `deliver`'s `due_at = 0`. `None` (empty index, or no device
+            // installed on this path) delivers nothing. The `query`/`invoke`
+            // calls and their outcomes stay inline in the turn stream; only this
+            // ambient list moves here.
+            let near_you = rt.near_you_section(id).await;
+            if near_you != last_near_you {
+                if let Some(text) = near_you.clone() {
+                    rt.scheduler.deliver(
+                        id,
+                        world_ms,
+                        Salience::IDLE,
+                        EventKind::Reachable { text },
+                    );
+                }
+                last_near_you = near_you;
+            }
+
             let minds = rt.minds.read().unwrap().clone();
             let persona = rt.persona_of_async(id).await;
             let day = crate::engine::sleep::day_of(world_ms);
@@ -3562,6 +4136,15 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // grammar built halfway through it would be masked to a room
             // that no longer matches the situation the character read.
             let within = rt.within(id);
+            // The standpoint the grammar above was built from, captured at the
+            // same pre-decode instant. A device act the character then chooses is
+            // reach-checked against this position rather than wherever the
+            // metronome has since walked a moving body — so `query`/`invoke` on an
+            // address the grammar just offered cannot 404 because a leg passed
+            // during the decode. See [`crate::effector::auth::PinnedStandpoint`].
+            let pinned_at = rt
+                .body_of(id)
+                .and_then(|(hosted, body)| hosted.read(|w| w.actor(&body).map(|a| a.at.clone())));
 
             // The tick's three phases, with the decode awaited between
             // the first two and the last — [`Scheduler::begin_tick`] /
@@ -3649,7 +4232,18 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             // reflection answers.
                             let mut reflecting: Option<(Owed, [String; 3])> = None;
                             for a in &t.parsed.acts {
-                                let r = rt.record_act(id, a);
+                                // A device call (`query`/`invoke`) is enacted on
+                                // the async effector fast path rather than through
+                                // the synchronous `record_act`/`body::perform`
+                                // path — the effector router is an async tower
+                                // service. Both produce a `Recorded`, so the feed,
+                                // the answer, and everything downstream are one
+                                // shape. See `Runtime::enact_device`.
+                                let r = if body::is_device(a.tool) {
+                                    rt.enact_device(id, a, pinned_at.as_ref()).await
+                                } else {
+                                    rt.record_act(id, a)
+                                };
                                 // Intent-carrying acts read back a narration of
                                 // what they did, not the bare "You tell X." the
                                 // world hands them — and the same line shows in
@@ -3814,6 +4408,320 @@ mod tests {
         // A temp path: the tests exercise scheduling, not persistence, and an
         // in-repo one would leave a ledger file behind.
         Runtime::new(Mind::new(None), &std::env::temp_dir())
+    }
+
+    // ── the effector device, enacted ────────────────────────────────────────
+
+    /// A url is stripped to a router path however the model spells it — the
+    /// in-fiction host removed, a missing leading slash added, and the bare host
+    /// mapped to the near-you index (effector design §7).
+    #[test]
+    fn a_url_becomes_a_router_path() {
+        assert_eq!(device_path("http://local/"), "/");
+        assert_eq!(device_path("http://local"), "/");
+        assert_eq!(
+            device_path("http://local/lift/command-shaft/call"),
+            "/lift/command-shaft/call"
+        );
+        // The bare path, already stripped, is left as it is.
+        assert_eq!(device_path("/lift/command-shaft"), "/lift/command-shaft");
+        // A path with no leading slash is given one.
+        assert_eq!(device_path("lift/command-shaft"), "/lift/command-shaft");
+        // Surrounding whitespace does not change the route.
+        assert_eq!(device_path("  http://local/history "), "/history");
+    }
+
+    /// One device act, from the arguments a decode would have produced.
+    fn device_act(tool: &'static str, args: serde_json::Value) -> Act {
+        Act {
+            tool,
+            args: args.as_object().expect("an object").clone(),
+        }
+    }
+
+    /// A daemon hosting the vault, held still, with the effector device installed
+    /// — the token store and the `local` router the fast path drives. The same
+    /// shape as `npcd/tests/effector.rs::daemon`, here inside the crate so the
+    /// `pub(crate)` [`Runtime::enact_device`] is reachable.
+    fn device_daemon() -> Arc<Runtime> {
+        use crate::effector::router::{router, Local};
+        use crate::effector::token::Tokens;
+
+        const ROOMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps");
+        const WORLD: &str = "creators-vault";
+
+        let rt = rt();
+        rt.host(WORLD, std::path::Path::new(ROOMS))
+            .expect("the vault loads");
+        rt.hold_world(WORLD, true);
+
+        let dir = std::env::temp_dir().join(format!(
+            "npcd-enact-device-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokens = Arc::new(Tokens::load(dir).expect("a fresh token store"));
+        rt.set_tokens(tokens.clone());
+        rt.set_effector_router(router(Local::new(tokens, &rt)));
+        rt
+    }
+
+    /// **`enact_device` really reaches the effector.** Standing on the shaft's top
+    /// landing, an `invoke` of the lift's `call` runs the world's own `lift_call`
+    /// and reads back the world's own line (the success `detail`, not the HTTP
+    /// envelope); a `query` of the bare host returns the near-you index; and a
+    /// malformed `body` is answered prescriptively rather than panicking (effector
+    /// design §5, §6, §12).
+    #[tokio::test]
+    async fn enact_device_reaches_the_effector_and_reads_and_acts() {
+        const WORLD: &str = "creators-vault";
+        let rt = device_daemon();
+
+        // A body on the top landing, with the car away, so the call sets it going.
+        let npc_id = 1;
+        let body = Runtime::body_id(npc_id);
+        let world = rt.hosted.get(WORLD).expect("hosted");
+        let landings: Vec<Where> = world.read(|w| w.shaft().to_vec());
+        let top = landings.len() - 1;
+        world.with(|w| {
+            w.enter(&body, "Maker-01".to_string(), landings[top].clone())
+                .expect("a real landing")
+        });
+        rt.bodies.bind(npc_id, WORLD, &body).expect("bound");
+
+        // invoke — reaches `effector_invoke`, the world takes it, and the
+        // character reads the world's own line back (the success `detail` from
+        // `enact_response`, not the HTTP envelope): a landed lift call comes back
+        // as the sentence a body acting any other way would have read.
+        let inv = rt
+            .enact_device(
+                npc_id,
+                &device_act(
+                    "invoke",
+                    json!({ "url": "http://local/lift/command-shaft/call" }),
+                ),
+                None,
+            )
+            .await;
+        assert!(inv.landed, "the invoke did not land: {inv:?}");
+        assert!(
+            !inv.answer.trim().is_empty(),
+            "a landed invoke read back an empty line: {inv:?}"
+        );
+        // The world's own words, not a JSON envelope — the same prose a character
+        // reads in its `<tool_response>`.
+        assert!(
+            serde_json::from_str::<Value>(&inv.answer).is_err(),
+            "the invoke answer should be the world's line, not a JSON envelope: {}",
+            inv.answer
+        );
+        // The feed line carries the status for the operator watching the pulse.
+        assert!(inv.feed.contains("200"), "the feed lost the status: {}", inv.feed);
+
+        // query — the bare host returns the near-you index.
+        let q = rt
+            .enact_device(
+                npc_id,
+                &device_act("query", json!({ "url": "http://local/" })),
+                None,
+            )
+            .await;
+        assert!(q.landed, "the query did not land: {q:?}");
+        let idx: Value = serde_json::from_str(&q.answer).expect("the query answer is JSON");
+        assert!(
+            idx["routes"].is_array(),
+            "the near-you index did not come back: {idx}"
+        );
+
+        // A malformed body — a prescriptive `bad_json` answer, and no panic.
+        let bad = rt
+            .enact_device(
+                npc_id,
+                &device_act(
+                    "invoke",
+                    json!({ "url": "http://local/lift/command-shaft/call", "body": "{not json" }),
+                ),
+                None,
+            )
+            .await;
+        assert!(
+            !bad.landed,
+            "a malformed body must not read as landed: {bad:?}"
+        );
+        let err: Value = serde_json::from_str(&bad.answer).expect("the bad-body answer is JSON");
+        assert_eq!(err["error"], json!("bad_json"), "{err}");
+        assert_eq!(err["field"], json!("body"), "{err}");
+
+        // A refusal surfaces its reason on the feed, not a bare status — the same
+        // world line the character reads. Riding the lift with no floor named is
+        // refused, and the feed carries that line so the pulse shows *why*.
+        let refused = rt
+            .enact_device(
+                npc_id,
+                &device_act("invoke", json!({ "url": "http://local/lift/command-shaft/use" })),
+                None,
+            )
+            .await;
+        assert!(!refused.landed, "the floorless ride should be refused: {refused:?}");
+        assert!(
+            !refused.answer.trim().is_empty(),
+            "a refusal read back an empty reason: {refused:?}"
+        );
+        assert!(
+            refused.feed.contains(refused.answer.trim()),
+            "the feed dropped the refusal reason (a bare status): feed={:?} answer={:?}",
+            refused.feed,
+            refused.answer
+        );
+    }
+
+    /// **The near-you index becomes the character's YOUR EFFECTOR DEVICE screen.**
+    ///
+    /// Standing at a workstation, the async fetch-and-render seam
+    /// ([`Runtime::near_you_section`]) fetches the same near-you index the device
+    /// answers and renders it into the dynamic system-prompt section the
+    /// character reads this turn (effector design §6): the heading, then every
+    /// reachable summary in the index's order, joined by the doc's middle dot.
+    /// One layer up from the raw index, on the effector daemon setup.
+    #[tokio::test]
+    async fn near_you_section_renders_a_bodys_reachable_screen() {
+        const WORLD: &str = "creators-vault";
+        let rt = device_daemon();
+
+        // Band one places character terminals beside the always-present personal
+        // routes — a screen with several distinct summaries on it.
+        let npc_id = 1;
+        let body = Runtime::body_id(npc_id);
+        let world = rt.hosted.get(WORLD).expect("hosted");
+        world.with(|w| {
+            w.enter(
+                &body,
+                "Maker-01".to_string(),
+                Where::new("vault-casting", "band-one"),
+            )
+            .expect("a real room")
+        });
+        rt.bodies.bind(npc_id, WORLD, &body).expect("bound");
+
+        // The index the section is built from, so the assertion tracks the
+        // device rather than hardcoding the vault's terminal names: every
+        // summary the device lists must reach the section.
+        let index = rt
+            .effector_query(npc_id, "/", None)
+            .await
+            .expect("the index answers");
+        let summaries: Vec<String> = index["routes"]
+            .as_array()
+            .expect("routes is an array")
+            .iter()
+            .map(|r| r["summary"].as_str().expect("a summary").to_string())
+            .collect();
+        assert!(
+            summaries.len() >= 4,
+            "band one places terminals beside the personal routes: {summaries:?}"
+        );
+
+        let section = rt
+            .near_you_section(npc_id)
+            .await
+            .expect("a body that can reach things gets a section");
+        assert!(
+            section.starts_with("YOUR EFFECTOR DEVICE\nReachable from here"),
+            "{section}"
+        );
+        for summary in &summaries {
+            assert!(
+                section.contains(summary.as_str()),
+                "the section dropped `{summary}`:\n{section}"
+            );
+        }
+        // The personal routes are always reachable and always named.
+        assert!(section.contains("your phone"), "{section}");
+        assert!(section.contains("what you have done and seen"), "{section}");
+        // A real list — one route per line, each carrying its address so the
+        // character can `query`/`invoke` it rather than guess.
+        assert!(section.contains("\n- "), "{section}");
+        assert!(section.contains("http://local/"), "{section}");
+    }
+
+    /// The section degrades to nothing — never an error up the tick — when the
+    /// device is not installed: with no router and no token store,
+    /// `effector_query` errors and the seam returns `None` rather than a stub or
+    /// a failed turn (effector design §6).
+    #[tokio::test]
+    async fn near_you_section_degrades_to_none_without_the_device() {
+        let rt = rt();
+        assert_eq!(rt.near_you_section(1).await, None);
+    }
+
+    /// **A placed body's turn carries the near-you screen, superseded to one.**
+    ///
+    /// The async seam renders the device's near-you index
+    /// ([`Runtime::near_you_section`]); delivered as an [`EventKind::Reachable`]
+    /// percept it rides its own band, so the window keeps exactly one current
+    /// screen (two deliveries leave one) and the turn the character reads carries
+    /// the reachable list (effector design §6). One seam up from the raw index,
+    /// on the effector daemon setup.
+    #[tokio::test]
+    async fn a_placed_bodys_turn_carries_the_superseding_near_you_screen() {
+        use crate::engine::event::{EventKind, Salience};
+
+        let rt = device_daemon();
+        // Band one places character terminals beside the personal routes, and
+        // `embody` enters the body, wakes its inbox and binds it — so the near-you
+        // index resolves and the scheduler has somewhere to deliver.
+        embody(&rt, 1, "m1", "band-one");
+
+        let screen = rt
+            .near_you_section(1)
+            .await
+            .expect("a placed body has a near-you screen");
+        assert!(
+            screen.starts_with("YOUR EFFECTOR DEVICE\nReachable from here"),
+            "{screen}"
+        );
+
+        // Delivered twice, as the character loop would across two turns of an
+        // unmoved body: the "reachable" band keeps exactly one current screen.
+        for _ in 0..2 {
+            rt.scheduler.deliver(
+                1,
+                0,
+                Salience::IDLE,
+                EventKind::Reachable {
+                    text: screen.clone(),
+                },
+            );
+        }
+        let start = rt
+            .scheduler
+            .begin_tick(1)
+            .expect("a tick carrying the delivered screen");
+
+        // The turn the character reads carries the reachable list.
+        let perceived: String = start
+            .events
+            .iter()
+            .map(|e| e.prose())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            perceived.contains("Reachable from here"),
+            "the turn dropped the near-you screen:\n{perceived}"
+        );
+
+        // Two deliveries leave exactly one current screen in the window — a body
+        // that has not moved never reads a stale list stacked beside the current.
+        let screens = window(&rt, 1)
+            .into_iter()
+            .filter(|t| t.contains("YOUR EFFECTOR DEVICE"))
+            .count();
+        assert_eq!(screens, 1, "the near-you band must supersede to one screen");
     }
 
     // ── the cast, supervised ────────────────────────────────────────────────
@@ -4939,8 +5847,9 @@ mod tests {
             "the steps are shown: {nudge}"
         );
         assert!(
-            nudge.contains("go back to the command table and report it with `report_done`"),
-            "the mission points back to the table: {nudge}"
+            nudge.contains("go back to the command table and report it on your effector device")
+                && nudge.contains("`report_done`"),
+            "the mission points back to the table's device: {nudge}"
         );
         assert_ne!(
             nudge, NO_MISSION,

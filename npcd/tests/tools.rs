@@ -164,10 +164,13 @@ fn refused(o: &Outcome) -> &str {
 /// **Everything offered can be performed, and everything performed is offered.**
 ///
 /// The join that neither half can check alone. `specs_within` decides what a
-/// character may call; `body::perform` decides what happens when it does. A tool
-/// present in one and absent from the other is a character either spending turns
-/// on nothing or being refused for using its own vocabulary — and both look fine
-/// from inside the half that is right.
+/// character may call; `body::perform` decides what happens when it does — except
+/// the two device acts (`query`/`invoke`), which are dispatched by the async
+/// `enact_device` to the effector router rather than the synchronous body path, so
+/// they satisfy the join through `is_device` instead. A tool present in one and
+/// absent from the other is a character either spending turns on nothing or being
+/// refused for using its own vocabulary — and both look fine from inside the half
+/// that is right.
 #[test]
 fn every_act_a_room_offers_is_an_act_that_is_performed() {
     for h in [vault(), waste()] {
@@ -178,7 +181,7 @@ fn every_act_a_room_offers_is_an_act_that_is_performed() {
         };
         for name in offered(&h, body) {
             assert!(
-                npcd::engine::body::is_of_the_body(&name),
+                npcd::engine::body::is_of_the_body(&name) || npcd::engine::body::is_device(&name),
                 "`{name}` is offered in {} and nothing performs it",
                 h.id()
             );
@@ -1383,6 +1386,14 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
         .collect();
 
     for t in tools::CATALOG.iter() {
+        // A migrated act is reached through the effector device, not a room's
+        // grammar (effector design Step 6, `tools::routed`) — it stays in the
+        // catalogue so its device route can build a schema, but it is never
+        // offered as a compiled call, so "reachable in some room's grammar" does
+        // not apply to it.
+        if tools::routed(t.name) {
+            continue;
+        }
         let reachable = seen.iter().any(|s| s == t.name) || messaging.contains(&t.name);
         assert!(
             reachable,

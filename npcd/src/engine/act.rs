@@ -1145,6 +1145,52 @@ mod tests {
         assert!(p.narration.is_empty());
     }
 
+    /// **The effector device's two verbs parse as acts.** `query` and `invoke`
+    /// are ordinary catalog tools as far as the parser is concerned — a
+    /// `<tool_call>` naming either, with its arguments, yields the matching
+    /// [`Act`] the async loop routes to the effector fast path.
+    #[test]
+    fn a_device_call_parses_as_a_query_or_invoke_act() {
+        let q = parse(
+            "<tool_call>\n{\"name\": \"query\", \"arguments\": {\"url\": \"http://local/\"}}\n\
+             </tool_call>",
+        );
+        assert_eq!(q.rejected, Vec::new(), "{:?}", q.rejected);
+        assert_eq!(q.acts.len(), 1);
+        assert_eq!(q.acts[0].tool, "query");
+        assert_eq!(q.acts[0].args["url"], "http://local/");
+
+        let i = parse(
+            "<tool_call>\n{\"name\": \"invoke\", \"arguments\": \
+             {\"url\": \"http://local/lift/command-shaft/call\", \"body\": \"{}\"}}\n</tool_call>",
+        );
+        assert_eq!(i.rejected, Vec::new(), "{:?}", i.rejected);
+        assert_eq!(i.acts.len(), 1);
+        assert_eq!(i.acts[0].tool, "invoke");
+        assert_eq!(
+            i.acts[0].args["url"],
+            "http://local/lift/command-shaft/call"
+        );
+        // The body is a JSON object written out as a string, for now.
+        assert_eq!(i.acts[0].args["body"], "{}");
+
+        // The url is required on both, so a call without it is refused, not
+        // half-performed.
+        let short = parse(r#"{"tool":"query"}"#);
+        assert!(short.acts.is_empty());
+        assert!(
+            matches!(
+                short.rejected.first(),
+                Some(Rejected::MissingParam {
+                    tool: "query",
+                    param: "url"
+                })
+            ),
+            "{:?}",
+            short.rejected
+        );
+    }
+
     /// Every tool in the catalog must round-trip through its own example — the
     /// examples are what calibration prefills, so a format the parser rejects
     /// would be taught to the model as correct.

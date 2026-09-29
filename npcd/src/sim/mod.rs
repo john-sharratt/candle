@@ -189,6 +189,22 @@ impl Sim {
         self.devices.operable_at(place)
     }
 
+    /// The station standing at an instance id, if the map placed one there.
+    ///
+    /// The id is the map's own per-instance id ([`npc_map::PartInstance::id`]),
+    /// which the seed keys every device by — so a route addressing one placed
+    /// station of several in a room reaches exactly that one, independent of its
+    /// neighbours. `None` for an id no placement mints, which is how a stale or
+    /// forged id is refused rather than resolving to something nearby.
+    pub fn station(&self, instance_id: &str) -> Option<&device::Device> {
+        self.devices.get(instance_id)
+    }
+
+    /// The mutable half of [`Self::station`], for the act that changes one.
+    pub fn station_mut(&mut self, instance_id: &str) -> Option<&mut device::Device> {
+        self.devices.get_mut(instance_id)
+    }
+
     /// `operate.mode` — the dependent one, which needs to know what was chosen.
     pub fn modes_of(&self, place: &str, what: &str) -> Vec<String> {
         self.devices.modes_of(place, what)
