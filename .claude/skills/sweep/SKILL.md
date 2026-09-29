@@ -1,6 +1,6 @@
 ---
 name: sweep
-description: Run every model's batched-forwarding gate (test_parallel_batched_forwarding*) serially, smallest model first, with zend/npcd stopped and restarted afterwards; report per-model throughput/compression/pass tables and a summary. Full sweep on >64 GB VRAM, partial otherwise. Failures are fixed forward.
+description: Run every model's batched-forwarding gate (test_parallel_batched_forwarding*) serially, smallest model first, with zend/npcd stopped and restarted afterwards; report per-model throughput/compression/pass tables and a summary. Full sweep on >64 GB VRAM, partial (DeepSeek-V4-Flash skipped) otherwise; Qwen3.8-Flash-Next runs on every machine. Failures are fixed forward.
 disable-model-invocation: true
 ---
 
@@ -21,11 +21,21 @@ nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nouni
 ```
 
 - `memory.total` **> 65536 MiB (64 GiB) → full sweep**: every gate.
-- Otherwise **→ partial sweep**: skip the gates that cannot fit — `deepseek4`
-  (DeepSeek-V4-Flash, 284B) and `quantized_qwen38_moe` (Qwen3.8-Flash-Next, ~124 GB
-  GGUF) — plus the `qwen38_flash_next_q4ko` engine probe of step 4b, and any newly found
-  gate whose checkpoint is that class of size (judge from its `#[ignore]` text and model
-  file). Name the skipped gates in the report.
+- Otherwise **→ partial sweep**: skip only `deepseek4` (DeepSeek-V4-Flash, 284B), and any
+  newly found gate whose checkpoint is that class of size (judge from its `#[ignore]` text
+  and model file). Name the skipped gates in the report.
+- **Qwen3.8-Flash-Next (`qwen38-fn`) runs on every machine, full sweep or partial** — both
+  its gate `quantized_qwen38_moe` and the `qwen38_flash_next` engine probe of step 4b
+  (which runs the preset for this card's rung — `Q2_KO` under 32 GiB, `Q4_KO` at 64+).
+  Model size is not bounded by VRAM (`CLAUDE.md`): the expert cache streams VRAM → pinned
+  RAM → mmap, and on a 16 GB card it runs from the prepared Q2_KO hybrid artifact
+  (`qwen4exp::prepare`, recipe-hashed, cached under
+  `~/.cache/zend/models/unsloth--Qwen3.8-Flash-Next-GGUF/`). The gate sizes its ladder from
+  free VRAM itself — a rung it cannot hold on this card (×16 needs ≥ 24 GiB) is the gate's
+  to skip, not the sweep's. If the artifact is not built yet, the first run builds it
+  (~11 min, ~88 GiB on disk for Q2_KO) — check free disk before starting. A failure here —
+  OOM, a fault, a missed story — is a bug to fix forward (step 9), never a reason to skip
+  the model on a smaller card.
 
 ## 2. Discover the gates — never use a remembered list
 
@@ -75,7 +85,7 @@ by its size. The 2026-09-13 order, with that run's wall-clock:
 | 8 | `quantized_qwen3_moe::…::test_parallel_batched_forwarding` | Qwen3-30B-A3B | 90 s |
 | 9 | `quantized_qwen35_moe::…::test_parallel_batched_forwarding_35b` | Qwen3.5-35B-A3B | 100 s |
 | 10 | `quantized_qwen36_moe::…::test_parallel_batched_forwarding_36_35b` | Qwen3.6-35B-A3B | 100 s |
-| 11 | `quantized_qwen38_moe::…::test_parallel_batched_forwarding` | Qwen3.8-Flash-Next | 250 s (full only) |
+| 11 | `quantized_qwen38_moe::…::test_parallel_batched_forwarding` | Qwen3.8-Flash-Next | 250 s (every machine) |
 | 12 | `deepseek4::…::test_parallel_batched_forwarding` | DeepSeek-V4-Flash | 200 s (full only) |
 
 Each gate is its own command, run in the background with its output redirected to a log in
@@ -104,14 +114,14 @@ every daemon while all twelve gates stay green.
 `candle-conversation/tests/kv_fragmentation.rs` is where those rows live. Discover them the
 way step 2 discovers gates — `Grep` the file for `#[test]` and read each one's `#[ignore]`
 text — rather than trusting this table, which is orientation only. Run them serially, after
-the gates and under the same "card to itself" rule. The 30B probe holds ~17 GB resident and
-runs anywhere; the Flash-Next probe is ~56 GB and is **full sweep only**, skipped by the same
-rule as its gate:
+the gates and under the same "card to itself" rule. Both run on **every machine**: the 30B
+probe holds ~17 GB resident, and the Flash-Next probe, ~56 GB on the big card, runs on a
+smaller one through the expert cache's streaming tiers like its gate (step 1):
 
 | # | probe | model | ~time |
 |---|---|---|---|
 | 13 | `qwen3_30b_a3b_q4` | Qwen3-30B-A3B, engine probe | 185 s |
-| 14 | `qwen38_flash_next_q4ko` | Qwen3.8-Flash-Next, engine probe | 187 s |
+| 14 | `qwen38_flash_next` | Qwen3.8-Flash-Next, engine probe | 187 s (every machine) |
 
 ```bash
 cargo test --release -p candle-conversation --features hub --test kv_fragmentation \
