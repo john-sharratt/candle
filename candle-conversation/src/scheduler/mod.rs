@@ -2382,8 +2382,8 @@ impl WaveStats {
         // `reproj` rising ⇒ continuous-reproject (provenance scan/glue) growing;
         // `unaccounted` large ⇒ blocked off-thread (persistence thread / lock).
         // Detailed per-wave breakdown — the live GUI panels carry the same numbers,
-        // so this stays at debug and the `wave {}s` heartbeat above is the info line.
-        tracing::debug!(
+        // so this stays at trace and the `wave {}s` heartbeat above is the info line.
+        tracing::trace!(
             target: "candle_conversation::scheduler::timing",
             drain_ms = self.drain_ms,
             promote_ms = self.promote_ms,

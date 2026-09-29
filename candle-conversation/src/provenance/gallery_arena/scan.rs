@@ -337,7 +337,7 @@ impl GalleryArena {
         // Index (reuse or rebuild, which pins pages resident) versus launch
         // (which synchronizes and tallies on the host). They have unrelated
         // costs, so a slow scan is attributed to one or the other.
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::provenance::gallery_arena",
             probes = probes.len(),
             segments = segments.len(),

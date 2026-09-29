@@ -42,7 +42,7 @@ use self::kept::Kept;
 use self::tree_scope::TreeScope;
 use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::manifest::Hints;
-use crate::branch_ingest::units::{dir_of, workspace_unit, TreeFile};
+use crate::branch_ingest::units::{dir_of, TreeFile};
 use crate::code_read::is_upload_path;
 
 /// The least time between two rebuilds a turn asks for.
@@ -140,6 +140,50 @@ impl RetrievalScope {
         }
     }
 
+    /// The committed `repo_map` unit for the folder `inner` of `repo` (`""`
+    /// for its root), as `files` lists it — what the fast path carries in
+    /// place of a `file_list`.
+    pub fn folder_unit(
+        &self,
+        engine: &Mutex<ConversationEngine>,
+        files: &RepoFiles,
+        repo: &str,
+        inner: &str,
+    ) -> Option<TimelineId> {
+        let index = self.current(Instant::now(), |generation| {
+            IngestIndex::read(&engine.lock().unwrap(), generation)
+        });
+        self.folder_in(&index, files, repo, inner)
+    }
+
+    /// [`Self::folder_unit`] under `index`. `None` when the folder layer is not
+    /// ingested, the repository has no base, or no unit carries the folder's
+    /// key — and whenever the conversation has changed anything at or under
+    /// the folder. That is stricter than the scope, which drops only a changed
+    /// file's own folder: a scope that keeps a stale folder offers a summary,
+    /// while this tells the model the listing is in context, and a new file in
+    /// a new subfolder changes the listing above it too.
+    fn folder_in(
+        &self,
+        index: &IngestIndex,
+        files: &RepoFiles,
+        repo: &str,
+        inner: &str,
+    ) -> Option<TimelineId> {
+        self.folders.as_ref()?;
+        let at = at_bases(files).into_iter().find(|r| r.name == repo)?;
+        let under = if inner.is_empty() {
+            String::new()
+        } else {
+            format!("{inner}/")
+        };
+        if at.changed.iter().any(|path| path.starts_with(&under)) {
+            return None;
+        }
+        let dir = format!("{repo}/{under}");
+        self.tree_scope(index, &at)?.folders.get(&dir).copied()
+    }
+
     /// The index to scope a turn by — rebuilt first when a unit has
     /// committed since the last rebuild and that one is [`REBUILD_EVERY`]
     /// old.
@@ -222,11 +266,6 @@ impl RetrievalScope {
                     .filter(|(dir, _)| !changed_dirs.contains(*dir))
                     .map(|(_, tl)| *tl),
             );
-        }
-        if self.folders.is_some() {
-            if let Some(tl) = index.get(&workspace_unit(&files.names()).key) {
-                in_folders.insert(tl);
-            }
         }
         let scope = Scope {
             files: Arc::new(in_files),
@@ -392,7 +431,6 @@ mod tests {
         {
             by_key.insert(unit.key, tl(10 + n as u64));
         }
-        by_key.insert(workspace_unit(&["r".into()]).key, tl(20));
         IngestIndex::of(by_key, vec![tl(30)], generation)
     }
 
@@ -425,7 +463,7 @@ mod tests {
         let rs = scoped(root.path());
         let scope = scope_of(&rs, &RepoFiles::overlay(ws));
         assert_eq!(*scope.files, set(&[1, 2, 30]));
-        assert_eq!(*scope.folders, set(&[10, 11, 20]));
+        assert_eq!(*scope.folders, set(&[10, 11]));
     }
 
     /// **A path the conversation changed leaves the scope**, and so does the
@@ -442,7 +480,7 @@ mod tests {
             .unwrap();
         let scope = scope_of(&rs, &files);
         assert_eq!(*scope.files, set(&[1, 30]));
-        assert_eq!(*scope.folders, set(&[10, 20]), "r/src/ left with its file");
+        assert_eq!(*scope.folders, set(&[10]), "r/src/ left with its file");
     }
 
     /// **Conversations on the same bases that changed nothing share one
@@ -463,6 +501,61 @@ mod tests {
         let changed = scope_of(&rs, &two);
         assert!(!Arc::ptr_eq(&a.files, &changed.files));
         assert!(Arc::ptr_eq(&a.files, &scope_of(&rs, &one).files));
+    }
+
+    fn folder_in(rs: &RetrievalScope, files: &RepoFiles, repo: &str, inner: &str) -> Option<u64> {
+        let index = Arc::clone(&rs.index.read().unwrap());
+        rs.folder_in(&index, files, repo, inner)
+            .map(TimelineId::raw)
+    }
+
+    /// **A folder is found by its repository and path inside it** — the root
+    /// as the empty path — at the unit its base lists; a folder with no unit,
+    /// or an unlisted repository, is found nowhere.
+    #[test]
+    fn a_folder_unit_is_the_one_its_base_lists() {
+        let (root, ws) = workspace();
+        let rs = scoped(root.path());
+        let files = RepoFiles::overlay(ws);
+        assert_eq!(folder_in(&rs, &files, "r", ""), Some(10));
+        assert_eq!(folder_in(&rs, &files, "r", "src"), Some(11));
+        assert_eq!(folder_in(&rs, &files, "r", "nope"), None);
+        assert_eq!(folder_in(&rs, &files, "other", ""), None);
+    }
+
+    /// **Anything changed at or under a folder takes it out**, the folders
+    /// above included — a new file in a new subfolder changes their listings
+    /// too — while a sibling folder stays.
+    #[test]
+    fn a_change_under_a_folder_takes_it_and_its_ancestors_out() {
+        let (root, ws) = workspace();
+        let rs = scoped(root.path());
+        let files = RepoFiles::overlay(ws);
+        files
+            .repo("r")
+            .unwrap()
+            .write("src/b.rs", "fn mine() {}\n".into())
+            .unwrap();
+        assert_eq!(folder_in(&rs, &files, "r", "src"), None);
+        assert_eq!(folder_in(&rs, &files, "r", ""), None);
+
+        let files = files.fresh();
+        files
+            .repo("r")
+            .unwrap()
+            .write("a.rs", "fn mine() {}\n".into())
+            .unwrap();
+        assert_eq!(folder_in(&rs, &files, "r", "src"), Some(11));
+        assert_eq!(folder_in(&rs, &files, "r", ""), None);
+    }
+
+    /// With no folder layer ingested, no folder is served.
+    #[test]
+    fn with_no_folder_layer_no_folder_unit_is_found() {
+        let (root, ws) = workspace();
+        let rs = RetrievalScope::new(Some(GroupId::from_raw(2).unwrap()), None);
+        *rs.index.write().unwrap() = Arc::new(index(root.path(), &IngestScope::new("", None), 1));
+        assert_eq!(folder_in(&rs, &RepoFiles::overlay(ws), "r", ""), None);
     }
 
     /// **Working a scope out takes no base**: a conversation that has not

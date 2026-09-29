@@ -2678,7 +2678,7 @@ impl PipelineState {
             };
             grow_note(GrowOutcome::Gained(gained));
             if gained > 0 {
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_transformers::expert_lre",
                     gained,
                     spare = -delta,
@@ -2817,7 +2817,7 @@ impl PipelineState {
         }
         let conceded =
             (before - self.inner.zone.capacity()) as u64 * self.inner.zone.slot_bytes() as u64;
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_transformers::expert_lre",
             wanted = delta,
             relocated = plan.relocate.len(),

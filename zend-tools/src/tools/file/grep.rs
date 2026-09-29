@@ -47,9 +47,9 @@ pub struct GrepRequest {
     pub page: Option<u32>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct GrepMatch {
-    pub repo: String,
+    /// Relative to the group's repository.
     pub path: String,
     /// 1-based line number — `(line - 1) / PAGE_LINES` is the page to pass
     /// `file_read` to see the surrounding code.
@@ -63,9 +63,20 @@ pub struct GrepMatch {
     pub modified: bool,
 }
 
+/// One repository's matching lines.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RepoMatches {
+    pub repo: String,
+    pub matches: Vec<GrepMatch>,
+}
+
 #[derive(Serialize)]
 pub struct GrepResponse {
-    pub matches: Vec<GrepMatch>,
+    /// Matching lines grouped by repository, in the workspace's order — the
+    /// repository is what a `file_read` of a hit names, and with `*` the hits
+    /// span several.
+    pub repos: Vec<RepoMatches>,
+    /// Paged across every group, in the order shown.
     pub paging: Paging,
     /// How many files were actually scanned. Distinguishes "searched 4,000
     /// files and this pattern is genuinely absent" from "the prefix matched
@@ -85,8 +96,8 @@ impl Tool for FileGrep {
     const NAME: &'static str = "file_grep";
     const DESCRIPTION: &'static str =
         "Search the CONTENTS of every file in the workspace for a string or regular \
-         expression, and return the matching lines with their repo, file path and \
-         line number. `repo` is required: name one repository, or pass `*` to \
+         expression, and return the matching lines grouped by repo, each with its \
+         file path and line number. `repo` is required: name one repository, or pass `*` to \
          search them all. Use for: finding where a function, type, constant or error \
          message is defined or used; checking whether something exists in the \
          codebase at all; tracing callers of an API; locating a config key, a magic \
@@ -94,8 +105,8 @@ impl Tool for FileGrep {
          \"find all uses of\", \"search the code for\", \"does the codebase \
          contain\", \"grep for\", \"which file has\", \"find the string\". Takes a \
          regex (`^pub fn `, `Error::\\w+`, `foo|bar`), an optional path prefix to \
-         narrow the search, and optional ignore_case. Returns repo, path, line number \
-         and the matching line, paged, with files_searched so an empty result is \
+         narrow the search, and optional ignore_case. Returns the matches grouped by \
+         repo — path, line number and the matching line — paged, with files_searched so an empty result is \
          unambiguous. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it \
          before guessing at directory names with file_list. Use file_search to find \
          a file by its NAME; use file_read with the line number this returns to see \
@@ -128,7 +139,7 @@ impl Tool for FileGrep {
         // one went unsearched — a workspace grep reported a word as absent
         // from a repository that held it 2,413 times.
         let stores = stores_for(ctx, &req.repo)?;
-        let mut hits: Vec<GrepMatch> = Vec::new();
+        let mut hits: Vec<(String, GrepMatch)> = Vec::new();
         let mut files_searched = 0usize;
         let mut truncated = false;
         for (i, (repo, store)) in stores.iter().enumerate() {
@@ -141,29 +152,45 @@ impl Tool for FileGrep {
             } = store.grep(&re, prefix, MAX_HITS_PER_FILE, share);
             files_searched += searched;
             truncated |= clipped;
-            hits.extend(found.into_iter().map(|h| GrepMatch {
-                repo: repo.clone(),
-                path: h.path,
-                line: h.line_no,
-                text: truncate(&h.line),
-                modified: h.modified,
+            hits.extend(found.into_iter().map(|h| {
+                (
+                    repo.clone(),
+                    GrepMatch {
+                        path: h.path,
+                        line: h.line_no,
+                        text: truncate(&h.line),
+                        modified: h.modified,
+                    },
+                )
             }));
         }
 
         let paging = Paging::of(hits.len(), req.page.unwrap_or(0), GREP_PAGE_HITS);
-        let matches = hits
-            .into_iter()
-            .skip(paging.skipped())
-            .take(GREP_PAGE_HITS)
-            .collect();
+        let page = hits.into_iter().skip(paging.skipped()).take(GREP_PAGE_HITS);
 
         Ok(GrepResponse {
-            matches,
+            repos: grouped(page),
             paging,
             files_searched,
             truncated,
         })
     }
+}
+
+/// `(repo, match)` pairs, already in order, as one group per run of a
+/// repository.
+fn grouped(pairs: impl IntoIterator<Item = (String, GrepMatch)>) -> Vec<RepoMatches> {
+    let mut out: Vec<RepoMatches> = Vec::new();
+    for (repo, hit) in pairs {
+        match out.last_mut() {
+            Some(group) if group.repo == repo => group.matches.push(hit),
+            _ => out.push(RepoMatches {
+                repo,
+                matches: vec![hit],
+            }),
+        }
+    }
+    out
 }
 
 /// Clip a very long line, marking that it was clipped.
@@ -182,7 +209,39 @@ pub const FILE_GREP: RegisteredTool = RegisteredTool::new::<FileGrep>();
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, MAX_LINE_CHARS};
+    use super::{grouped, truncate, GrepMatch, RepoMatches, MAX_LINE_CHARS};
+
+    fn hit(path: &str, line: u32) -> GrepMatch {
+        GrepMatch {
+            path: path.into(),
+            line,
+            text: "x".into(),
+            modified: false,
+        }
+    }
+
+    /// Consecutive hits of one repository are one group, in the order given.
+    #[test]
+    fn hits_are_grouped_by_repository_in_order() {
+        let pairs = vec![
+            ("a".to_string(), hit("x.rs", 1)),
+            ("a".to_string(), hit("x.rs", 9)),
+            ("b".to_string(), hit("y.rs", 2)),
+        ];
+        assert_eq!(
+            grouped(pairs),
+            [
+                RepoMatches {
+                    repo: "a".into(),
+                    matches: vec![hit("x.rs", 1), hit("x.rs", 9)],
+                },
+                RepoMatches {
+                    repo: "b".into(),
+                    matches: vec![hit("y.rs", 2)],
+                },
+            ]
+        );
+    }
 
     #[test]
     fn a_short_line_is_returned_intact() {

@@ -32,14 +32,13 @@
 //!
 //! A unit's directory is workspace-relative (`candle/zend/src/`); the call
 //! addresses it as its repository and the path inside it
-//! ([`crate::repo_path::split`]), the arguments the live tool takes. The
-//! workspace root (`.`) lists with `repo: "*"`, which lists the repositories.
+//! ([`crate::repo_path::split`]), the arguments the live tool takes — every
+//! folder is inside one repository, as every `file_list` is.
 
 use candle_conversation::stencil::ToolCallEnvelope;
 use candle_conversation::TurnText;
 use serde_json::{json, Map, Value};
 use zend_tools::ToolContext;
-use zend_vfs::ALL_REPOS;
 
 use super::dir_unit::DirUnit;
 use crate::repo_path::split;
@@ -84,26 +83,21 @@ const SUMMARY_ASK: &str = "in ONE complete sentence, ending with a full stop. \
      The file listing is the evidence — names and paths alone are enough; never reply \
      that there is not enough information, and do not read any file.";
 
-/// How a request names the folder. The workspace root and a repository's root
-/// are named in words; any other directory by its path in backticks, with the
-/// repository it is in. `.` is the tag and cache key, not something to show a
-/// reader — asked to summarize "the `.` folder" the model writes about "the
-/// `.()` directory".
+/// How a request names the folder: a repository's root by the repository's
+/// name, any other folder by its path in backticks with the repository it is
+/// in.
 fn folder_phrase(unit: &DirUnit) -> String {
-    match split(unit.list_path()) {
-        ("", _) => "the workspace and the repositories it holds".to_string(),
+    match split(&unit.dir) {
         (repo, "") => format!("the `{repo}` repository"),
         (repo, inner) => format!("the `{inner}/` folder in the `{repo}` repository"),
     }
 }
 
-/// The `file_list` arguments for `unit`: [`ALL_REPOS`] for the workspace root
-/// (which lists the repositories), the repository for a repository's root, the
-/// repository and path otherwise — in the order the tool's schema declares
-/// them.
+/// The `file_list` arguments for `unit`: the repository alone for its root,
+/// the repository and path otherwise — in the order the tool's schema
+/// declares them.
 fn list_args(unit: &DirUnit) -> Vec<(&'static str, &str)> {
-    match split(unit.list_path()) {
-        ("", _) => vec![("repo", ALL_REPOS)],
+    match split(&unit.dir) {
         (repo, "") => vec![("repo", repo)],
         (repo, inner) => vec![("repo", repo), ("path", inner)],
     }
@@ -195,7 +189,7 @@ pub fn chain_error(prefilled: &[(TurnText, String)], decode_user: &TurnText) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::branch_ingest::units::{test_units_reading, workspace_unit};
+    use crate::branch_ingest::units::test_units_reading;
     use crate::repo_scan::types::Language;
     use candle_conversation::models::Dialect;
     use std::path::Path;
@@ -289,33 +283,27 @@ mod tests {
         );
     }
 
-    /// The workspace root is named in words. Asked to summarize "the `.` folder"
-    /// the model writes about "the `.()` directory" — `.` is the tag and cache
-    /// key, never something to put in front of a reader. Its listing is
-    /// `repo: "*"`, which lists the repositories.
+    /// **A repository's root is listed with the repository alone** — `file_list`
+    /// lists inside one repository, never the workspace, so no call names `*`
+    /// — and its response holds that repository's own entries, repo-relative.
     #[test]
-    fn the_workspace_root_is_named_in_words_not_as_a_dot() {
+    fn a_repository_root_lists_with_the_repository_alone() {
         let d = workspace(&[("a/x.rs", "fn x() {}\n"), ("b/y.rs", "fn y() {}\n")]);
-        let root = DirUnit::of(&workspace_unit(&["a".into(), "b".into()]));
-        assert_eq!(root.dir, ".", "the tag/cache key stays `.`");
-
-        let request = render_request(&root);
+        let units = build_units(d.path(), &[("a/x.rs", Language::Rust)]);
+        let root = &units[0];
+        assert_eq!(root.dir, "a/");
         assert_eq!(
-            request,
-            format!("Summarize the workspace and the repositories it holds {SUMMARY_ASK}"),
+            render_list_call(&env(), root),
+            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"a\"}}\n</tool_call>",
         );
-        assert!(!request.contains('`'), "no backticked path for the root");
-        assert_eq!(
-            render_list_call(&env(), &root),
-            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"*\"}}\n</tool_call>",
+        let listing = render_list_response(&ctx_for(&d), root).text();
+        assert!(
+            listing.starts_with(
+                "<tool_response>{\"repo\":\"a\",\"entries\":[{\"path\":\"x.rs\",\"bytes\":10}]"
+            ),
+            "{listing}"
         );
-        let listing = render_list_response(&ctx_for(&d), &root).text();
-        assert_eq!(
-            listing,
-            "<tool_response>{\"repo\":\"*\",\"entries\":[{\"repo\":\"a\",\"dir\":true},{\"repo\":\"b\",\"dir\":true}],\
-             \"paging\":{\"page\":0,\"pages\":1,\"per_page\":50,\"total\":2,\"next_page\":null},\
-             \"total_bytes\":0}</tool_response>",
-        );
+        assert!(!listing.contains("y.rs"), "b's files are b's: {listing}");
     }
 
     /// A crate root announces itself rather than leaving the model to infer it

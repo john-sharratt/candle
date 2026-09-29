@@ -93,6 +93,9 @@
   .badge.norm{color:var(--ink-faint)}
   .badge.think{color:var(--c-think);border-color:#4a3d1f}
   .badge.peak{color:var(--accent);border-color:#1e3a4a}
+  .repo{font-family:var(--mono);font-size:11px;font-weight:500;color:var(--accent);
+    border:1px solid var(--line2);border-radius:5px;padding:1px 6px;margin-right:8px;
+    vertical-align:1px}
   .branches{display:block;font-family:var(--mono);font-size:11px;font-weight:400;
     color:var(--ink-dim);margin-top:2px;overflow-wrap:anywhere}
   .chips{display:flex;flex-wrap:wrap;gap:6px;margin:9px 0}
@@ -466,6 +469,9 @@ function versionLine(c){
 function convCard(c){
   const head=[
     h('span',{class:'title'},[
+      // An ingested unit's repository, left of the path inside it — the way
+      // the tools address it (`repo: candle, path: CLAUDE.md`).
+      c.repo ? h('span',{class:'repo',text:c.repo}) : null,
       document.createTextNode(c.label && c.label.trim() ? c.label : '(untitled)'),
       versionLine(c),
     ].filter(Boolean)),
@@ -692,12 +698,12 @@ function mockTools(){
 function mockLayer(name){
   const m={
     repo_map:[
-      {timeline:'3300220011009988776',conv_id:'',label:'candle/',archived:false,group:'structure',turns:2,tokens:14880,summary_nodes:0,branches:['main']},
-      {timeline:'3300220011009988777',conv_id:'',label:'candle/',archived:false,group:'structure',turns:2,tokens:14880,summary_nodes:0,branches:['cline-passthrough','hunt-snapshot','npc-engine','qwen38-moe','stencil-json-repair']},
+      {timeline:'3300220011009988776',conv_id:'',repo:'candle',label:'/',archived:false,group:'structure',turns:2,tokens:14880,summary_nodes:0,branches:['main']},
+      {timeline:'3300220011009988777',conv_id:'',repo:'candle',label:'/',archived:false,group:'structure',turns:2,tokens:14880,summary_nodes:0,branches:['cline-passthrough','hunt-snapshot','npc-engine','qwen38-moe','stencil-json-repair']},
     ],
     code_reading:[
-      {timeline:'2200110099887766554',conv_id:'',label:'candle-conversation/src/substrate.rs',archived:false,group:'scopes',turns:9,tokens:6120,summary_nodes:0,branches:['main','qwen38-moe'],commit:'2122c95d9b8e4f1a3c5d7e9f0a1b2c3d4e5f6a7b'},
-      {timeline:'2200110099887766555',conv_id:'',label:'zend/src/session.rs',archived:false,group:'scopes',turns:6,tokens:4310,summary_nodes:0,branches:['main'],commit:'1dda19ce4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c'},
+      {timeline:'2200110099887766554',conv_id:'',repo:'candle',label:'candle-conversation/src/substrate.rs',archived:false,group:'scopes',turns:9,tokens:6120,summary_nodes:0,branches:['main','qwen38-moe'],commit:'2122c95d9b8e4f1a3c5d7e9f0a1b2c3d4e5f6a7b'},
+      {timeline:'2200110099887766555',conv_id:'',repo:'candle',label:'zend/src/session.rs',archived:false,group:'scopes',turns:6,tokens:4310,summary_nodes:0,branches:['main'],commit:'1dda19ce4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c'},
     ],
     dialogue:[
       {timeline:'8421990033112233445',conv_id:'a1b2c3d4e5f6',label:'Trace the substrate redo log replay',archived:false,group:'primary_conversation',turns:18,tokens:24310,summary_nodes:3},

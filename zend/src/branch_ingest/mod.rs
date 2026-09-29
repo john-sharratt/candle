@@ -10,6 +10,7 @@ pub mod filter;
 pub mod keys;
 pub mod manifest;
 pub mod plan;
+pub mod prime;
 pub mod tie;
 pub mod units;
 pub mod walk;
@@ -80,7 +81,6 @@ impl BranchIngest {
         progress: &Arc<LoadProgress>,
     ) -> anyhow::Result<bool> {
         let (repos, unreadable) = record_branches(workspace);
-        let names = workspace.names();
         let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
         let mut corpora: HashMap<IngestScope, (Corpus, Vec<String>)> = HashMap::new();
         let mut changed = false;
@@ -90,7 +90,7 @@ impl BranchIngest {
             }
             let (corpus, failed) = corpora
                 .entry(layer.scope.clone())
-                .or_insert_with(|| walk(&repos, &layer.scope, &mut trees, &names, &unreadable));
+                .or_insert_with(|| walk(&repos, &layer.scope, &mut trees));
             // A repository that could not be read this pass has units nobody
             // looked for — they are not gone.
             let held_back: Vec<&str> = failed
@@ -192,13 +192,9 @@ fn units(
             subject: &u.unit.dir,
         })
         .collect();
-    // The workspace's own unit lists every repository, so while one sits a
-    // pass out the unit is not looked for either.
     let committed: Vec<Committed> = repo_scan::committed(ctx.engine)
         .into_iter()
-        .filter(|c| {
-            !in_repos(&c.subject, held_back) && !(c.subject == "." && !held_back.is_empty())
-        })
+        .filter(|c| !in_repos(&c.subject, held_back))
         .collect();
     let p = plan(&live, &committed);
     tombstone(ctx.engine, layer.name, &p.tombstone);
@@ -246,7 +242,7 @@ fn units(
 /// never from a failure to open it: a git that cannot be spawned, a lock held
 /// for a moment, an ownership refusal all fail an open, and a repository
 /// read as not under git would have every unit it ever had tombstoned.
-fn record_branches(workspace: &Workspace) -> (Vec<RepoBranches>, Vec<String>) {
+pub(crate) fn record_branches(workspace: &Workspace) -> (Vec<RepoBranches>, Vec<String>) {
     let mut repos = Vec::new();
     let mut unreadable = Vec::new();
     for spec in workspace.repos() {

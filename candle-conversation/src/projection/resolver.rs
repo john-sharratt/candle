@@ -1102,7 +1102,7 @@ impl Conversation {
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, s)| format!("{}={:.1}", coll.sections[i].name, s))
                     .unwrap_or_default();
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_conversation::belief",
                     collection = %coll.name,
                     probe_windows = probe.len(),
@@ -1191,7 +1191,7 @@ impl Conversation {
         // Phase split for the reproject `scan_ms`: which side of the scan the
         // time went to (the collection scan vs the per-layer group scans), so a
         // silent GPU→CPU fallback or a growing probe shows up attributably.
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::provenance",
             probe_windows = probe.len(),
             collections_us = coll_us,

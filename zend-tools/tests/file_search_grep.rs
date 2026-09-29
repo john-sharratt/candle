@@ -49,8 +49,8 @@ fn a_name_is_found_anywhere_in_the_tree() {
         json!({"repo": REPO, "query": "web_search"}),
         &ctx(&dir),
     ));
-    assert_eq!(r["files"][0]["repo"], REPO);
-    assert_eq!(r["files"][0]["path"], "src/tools/web_search.rs");
+    assert_eq!(r["repos"][0]["repo"], REPO);
+    assert_eq!(r["repos"][0]["files"][0], "src/tools/web_search.rs");
     assert_eq!(r["paging"]["total"], 1);
 }
 
@@ -64,7 +64,7 @@ fn the_query_is_case_insensitive() {
         json!({"repo": REPO, "query": "WEB_Search.RS"}),
         &ctx(&dir),
     ));
-    assert_eq!(r["files"][0]["path"], "src/tools/web_search.rs");
+    assert_eq!(r["repos"][0]["files"][0], "src/tools/web_search.rs");
 }
 
 /// **The shortest path wins.** A vendored copy of `mod.rs` must not outrank the
@@ -78,8 +78,8 @@ fn the_shallowest_match_sorts_first() {
         json!({"repo": REPO, "query": "mod.rs"}),
         &ctx(&dir),
     ));
-    assert_eq!(r["files"][0]["path"], "src/tools/mod.rs");
-    assert_eq!(r["files"][1]["path"], "vendor/copy/src/tools/mod.rs");
+    assert_eq!(r["repos"][0]["files"][0], "src/tools/mod.rs");
+    assert_eq!(r["repos"][0]["files"][1], "vendor/copy/src/tools/mod.rs");
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn a_glob_matches_by_extension() {
         json!({"repo": REPO, "query": "*.toml"}),
         &ctx(&dir),
     ));
-    assert_eq!(r["files"][0]["path"], "Cargo.toml");
+    assert_eq!(r["repos"][0]["files"][0], "Cargo.toml");
     assert_eq!(r["paging"]["total"], 1);
 }
 
@@ -103,7 +103,7 @@ fn a_prefix_narrows_the_search() {
         &ctx(&dir),
     ));
     assert_eq!(r["paging"]["total"], 1);
-    assert_eq!(r["files"][0]["path"], "vendor/copy/src/tools/mod.rs");
+    assert_eq!(r["repos"][0]["files"][0], "vendor/copy/src/tools/mod.rs");
 }
 
 /// An unmatched query is an empty result, not an error — a model must be able
@@ -117,7 +117,7 @@ fn an_unmatched_query_is_empty_not_an_error() {
         &ctx(&dir),
     ));
     assert_eq!(r["paging"]["total"], 0);
-    assert_eq!(r["files"].as_array().unwrap().len(), 0);
+    assert_eq!(r["repos"].as_array().unwrap().len(), 0);
 }
 
 /// A file this session wrote is findable alongside the workspace's own.
@@ -135,7 +135,7 @@ fn a_session_file_is_searchable() {
         json!({"repo": REPO, "query": "scratch"}),
         &c,
     ));
-    assert_eq!(r["files"][0]["path"], "notes/scratch.md");
+    assert_eq!(r["repos"][0]["files"][0], "notes/scratch.md");
 }
 
 // ── file_grep ────────────────────────────────────────────────────────────────
@@ -148,10 +148,13 @@ fn a_literal_is_found_with_its_line_number() {
         json!({"repo": REPO, "pattern": "TODO"}),
         &ctx(&dir),
     ));
-    assert_eq!(r["matches"][0]["repo"], REPO);
-    assert_eq!(r["matches"][0]["path"], "src/tools/web_search.rs");
-    assert_eq!(r["matches"][0]["line"], 2);
-    assert_eq!(r["matches"][0]["text"], "    // TODO: cache");
+    assert_eq!(r["repos"][0]["repo"], REPO);
+    assert_eq!(
+        r["repos"][0]["matches"][0]["path"],
+        "src/tools/web_search.rs"
+    );
+    assert_eq!(r["repos"][0]["matches"][0]["line"], 2);
+    assert_eq!(r["repos"][0]["matches"][0]["text"], "    // TODO: cache");
 }
 
 /// The line number is what `(line - 1) / PAGE_LINES` turns into the page
@@ -165,8 +168,11 @@ fn the_line_number_feeds_a_file_read_page() {
         json!({"repo": REPO, "pattern": "API_KEY"}),
         &c,
     ));
-    let path = r["matches"][0]["path"].as_str().unwrap().to_string();
-    let line = r["matches"][0]["line"].as_u64().unwrap();
+    let path = r["repos"][0]["matches"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let line = r["repos"][0]["matches"][0]["line"].as_u64().unwrap();
     assert_eq!(line, 3);
     let page = (line - 1) / u64::from(PAGE_LINES);
 
@@ -263,8 +269,8 @@ fn a_session_edit_shadows_the_workspace_copy() {
         json!({"repo": REPO, "pattern": "unique_marker"}),
         &c,
     ));
-    assert_eq!(r["matches"][0]["path"], "src/main.rs");
-    assert_eq!(r["matches"][0]["modified"], true);
+    assert_eq!(r["repos"][0]["matches"][0]["path"], "src/main.rs");
+    assert_eq!(r["repos"][0]["matches"][0]["modified"], true);
 
     // The overwritten line is gone from the search, because the session's copy
     // is what the path now resolves to.

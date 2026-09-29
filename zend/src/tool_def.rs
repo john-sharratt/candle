@@ -80,7 +80,10 @@ pub struct ToolDef {
     pub parameters: Value,
     /// ChatML selection-calibration trajectories (prompt + `<|im_end|>
     /// <|im_start|>assistant` + think→call with [`PROJECTION_MARKER`]s), or a bare
-    /// prompt for an uncalibrated tool. Prefilled by the calibration phase.
+    /// prompt for a tool whose trajectories are not recorded yet. A trajectory
+    /// is prefilled on its own ([`Self::trajectories`]); a bare prompt has no
+    /// answer to prefill, so it is calibrated as the question it is
+    /// ([`Self::calibration_questions`]).
     #[serde(default)]
     pub examples: Vec<String>,
     /// Extra ways a user might ASK for this tool — one plain question each, no
@@ -133,6 +136,41 @@ impl ToolDef {
         h.update([0u8]);
         h.update(example.as_bytes());
         format!("{}|{:x}", self.name, h.finalize())
+    }
+
+    /// The `examples` entries that carry a recorded answer: those with an
+    /// assistant half after `assistant_start`. Each is one calibration case.
+    pub fn trajectories<'a>(
+        &'a self,
+        assistant_start: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.examples
+            .iter()
+            .map(String::as_str)
+            .filter(move |e| e.contains(assistant_start))
+    }
+
+    /// The questions calibrated as this tool's one stuffed group: the authored
+    /// [`Self::questions`], then every bare-prompt `examples` entry as the
+    /// plain question it is, its trailing `user_end` dropped.
+    ///
+    /// A bare prompt has no trajectory, and routing happens on the question, so
+    /// this is the exemplar it can give. Decoding it live instead put a
+    /// single-row decode of up to 2,048 tokens on the boot path per prompt, and
+    /// a prompt the model reasonably answers without
+    /// a call ("what failed at the end of the build log?" with no job to read)
+    /// never sealed, so it was decoded again on every boot.
+    pub fn calibration_questions(&self, assistant_start: &str, user_end: &str) -> Vec<String> {
+        let end = user_end.trim();
+        let bare = self
+            .examples
+            .iter()
+            .filter(|e| !e.contains(assistant_start))
+            .map(|e| {
+                let p = e.trim();
+                p.strip_suffix(end).unwrap_or(p).trim_end().to_string()
+            });
+        self.questions.iter().cloned().chain(bare).collect()
     }
 }
 
@@ -412,6 +450,37 @@ mod tests {
         assert_ne!(
             swapped.calibration_marker(&swapped.questions.join("\u{0}")),
             baseline,
+        );
+    }
+
+    /// A recorded trajectory is its own case; a bare prompt is not one at all.
+    #[test]
+    fn only_an_example_with_an_answer_is_a_trajectory() {
+        let mut d = def("List the files.", serde_json::json!({}));
+        d.examples = vec![
+            "list src<|im_end|>\n<|im_start|>assistant\n<think>x</think>".into(),
+            "list the files<|im_end|>".into(),
+        ];
+        let t: Vec<&str> = d.trajectories("<|im_start|>assistant").collect();
+        assert_eq!(
+            t,
+            ["list src<|im_end|>\n<|im_start|>assistant\n<think>x</think>"]
+        );
+    }
+
+    /// A bare prompt joins the question group as plain text, after the
+    /// authored questions and without its ChatML terminator.
+    #[test]
+    fn a_bare_prompt_is_calibrated_as_a_question() {
+        let mut d = def("List the files.", serde_json::json!({}));
+        d.examples = vec![
+            "list src<|im_end|>\n<|im_start|>assistant\n<think>x</think>".into(),
+            "list the files<|im_end|>".into(),
+            "  what is in docs?<|im_end|>\n".into(),
+        ];
+        assert_eq!(
+            d.calibration_questions("<|im_start|>assistant", "<|im_end|>\n"),
+            ["what files are here", "list the files", "what is in docs?"]
         );
     }
 
@@ -926,6 +995,9 @@ mod tests {
     #[test]
     fn every_repository_tool_declares_repo_as_its_executor_does() {
         let one_repo = [
+            // Listing and reading are raw operations on one repository's
+            // files; only a search spans the workspace.
+            "file_list",
             "file_read",
             "write",
             "file_edit",
@@ -955,7 +1027,7 @@ mod tests {
             "run_command",
             "run_output",
         ];
-        let any_repo = ["file_list", "file_search", "file_grep"];
+        let any_repo = ["file_search", "file_grep"];
         for def in load_bundled() {
             let name = def.name.as_str();
             let param = &def.parameters["properties"][REPO_PARAM];

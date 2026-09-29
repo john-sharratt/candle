@@ -254,7 +254,13 @@ pub struct ConvView {
     /// Raw timeline id as a decimal string (see [`SubstrateOverview`] note).
     pub timeline: String,
     pub conv_id: String,
+    /// For an ingested unit, the path inside its repository (`src/lib.rs`,
+    /// `src/`, `/` for the repository's root) — the repository is
+    /// [`Self::repo`]. Otherwise the conversation's title.
     pub label: String,
+    /// For an ingested unit, the repository it is in; empty otherwise, and
+    /// for the workspace's own unit.
+    pub repo: String,
     pub archived: bool,
     pub group: String,
     /// Turn count including summary nodes.

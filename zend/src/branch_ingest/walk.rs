@@ -17,7 +17,7 @@ use zend_vfs::{GitError, Oid, RecordBranch, Repo, Rev};
 use super::filter::IngestScope;
 use super::keys::file_key;
 use super::manifest::Hints;
-use super::units::{folder_units, workspace_unit, FolderUnit, TreeFile};
+use super::units::{folder_units, FolderUnit, TreeFile};
 
 /// The branches a conversation starts on, most preferred first — they lead
 /// the walk, so a unit on one of them is read from it.
@@ -62,14 +62,12 @@ pub struct FileItem {
     pub branches: Vec<String>,
 }
 
-/// A folder unit, and the commit its listing and files are read from —
-/// `None` for the workspace's own unit, which lists repositories.
+/// A folder unit, and the commit its listing and files are read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitItem {
     pub unit: FolderUnit,
-    pub at: Option<Oid>,
-    /// Every branch whose tip lists the folder this way, in walk order; empty
-    /// for the workspace's own unit, which is on no repository's branch.
+    pub at: Oid,
+    /// Every branch whose tip lists the folder this way, in walk order.
     pub branches: Vec<String>,
 }
 
@@ -119,16 +117,11 @@ impl TreeCache {
 /// none of its units are in the corpus — a corpus holding some of a
 /// repository's branches would read the rest as gone — and its name is
 /// returned beside the corpus so the pass that plans from it holds its units
-/// back rather than reading them as deleted. The workspace's own unit lists
-/// every repository the workspace holds (`workspace_names`), so it is left
-/// out whenever any repository sits the pass out — failed here, or already
-/// `held_back` by the caller.
+/// back rather than reading them as deleted.
 pub fn walk(
     repos: &[RepoBranches],
     scope: &IngestScope,
     cache: &mut TreeCache,
-    workspace_names: &[String],
-    held_back: &[String],
 ) -> (Corpus, Vec<String>) {
     let mut corpus = Corpus::default();
     let mut failed = Vec::new();
@@ -147,17 +140,6 @@ pub fn walk(
                 failed.push(repo.name.clone());
             }
         }
-    }
-    if failed.is_empty() && held_back.is_empty() && !corpus.units.is_empty() {
-        let unit = workspace_unit(workspace_names);
-        corpus.units.insert(
-            0,
-            UnitItem {
-                unit,
-                at: None,
-                branches: Vec::new(),
-            },
-        );
     }
     (corpus, failed)
 }
@@ -202,7 +184,7 @@ fn walk_repo(
                     seen_units.insert(unit.key.clone(), corpus.units.len());
                     corpus.units.push(UnitItem {
                         unit,
-                        at: Some(tip.tip.clone()),
+                        at: tip.tip.clone(),
                         branches: vec![branch.clone()],
                     });
                 }
@@ -291,25 +273,17 @@ mod tests {
             .collect()
     }
 
-    /// Walk `repo` alone, the workspace holding only it and nothing held back.
+    /// Walk `repo` alone.
     fn walk_one(
         repo: &RepoBranches,
         scope: &IngestScope,
         cache: &mut TreeCache,
     ) -> (Corpus, Vec<String>) {
-        walk(
-            std::slice::from_ref(repo),
-            scope,
-            cache,
-            &["r".to_string()],
-            &[],
-        )
+        walk(std::slice::from_ref(repo), scope, cache)
     }
 
     /// **A repository with a tree that cannot be listed sits the pass out
-    /// whole** — none of its branches' units, not only the failing one's —
-    /// and the workspace's unit, which lists it, sits out with it; so does
-    /// the workspace's unit when the caller holds a repository back.
+    /// whole** — none of its branches' units, not only the failing one's.
     #[test]
     fn a_repository_that_fails_part_way_sits_the_pass_out_whole() {
         let root = tempfile::tempdir().unwrap();
@@ -320,21 +294,7 @@ mod tests {
             &mut TreeCache::default(),
         )
         .0;
-        assert!(!good.files.is_empty() && good.units[0].unit.dir == ".");
-
-        let (with_held, failed) = walk(
-            std::slice::from_ref(&repo),
-            &IngestScope::new("", None),
-            &mut TreeCache::default(),
-            &["r".to_string(), "other".to_string()],
-            &["other".to_string()],
-        );
-        assert!(failed.is_empty());
-        assert!(!with_held.files.is_empty(), "r's own units are still found");
-        assert!(
-            with_held.units.iter().all(|u| u.unit.dir != "."),
-            "the workspace's unit lists `other`, which was not looked at"
-        );
+        assert!(!good.files.is_empty() && !good.units.is_empty());
 
         repo.tips[1].tip = Oid::parse("1234567890123456789012345678901234567890").unwrap();
         let (corpus, failed) = walk_one(
@@ -397,8 +357,9 @@ mod tests {
         assert_eq!(corpus.files[0].key, format!("r/a.rs@{}", a_main.trim()));
     }
 
-    /// **Folders are units once per distinct listing**, the workspace's unit
-    /// first; `src/` lists differently on `topic`, so it is two units.
+    /// **Folders are units once per distinct listing**, every one inside a
+    /// repository — there is no unit for the workspace, which no `file_list`
+    /// lists; `src/` lists differently on `topic`, so it is two units.
     #[test]
     fn a_folder_is_one_unit_per_distinct_listing() {
         let root = tempfile::tempdir().unwrap();
@@ -408,20 +369,15 @@ mod tests {
             &IngestScope::new("", None),
             &mut TreeCache::default(),
         );
-        let dirs: Vec<(&str, Option<&Oid>)> = corpus
+        let dirs: Vec<(&str, &Oid)> = corpus
             .units
             .iter()
-            .map(|u| (u.unit.dir.as_str(), u.at.as_ref()))
+            .map(|u| (u.unit.dir.as_str(), &u.at))
             .collect();
         let (main, topic) = (&repo.tips[0].tip, &repo.tips[1].tip);
         assert_eq!(
             dirs,
-            [
-                (".", None),
-                ("r/", Some(main)),
-                ("r/src/", Some(main)),
-                ("r/src/", Some(topic)),
-            ],
+            [("r/", main), ("r/src/", main), ("r/src/", topic)],
             "r/ lists the same entries on both, so it is one unit",
         );
         let branches: Vec<Vec<&str>> = corpus
@@ -431,11 +387,11 @@ mod tests {
             .collect();
         assert_eq!(
             branches,
-            [vec![], vec!["main", "topic"], vec!["main"], vec!["topic"]],
+            [vec!["main", "topic"], vec!["main"], vec!["topic"]],
             "each unit names every branch that lists the folder its way",
         );
         assert_eq!(
-            corpus.units[1].unit.listed,
+            corpus.units[0].unit.listed,
             ["r/LICENSE", "r/a.rs", "r/src/"],
             "the listing is what file_list shows: LICENSE is not read but is listed"
         );

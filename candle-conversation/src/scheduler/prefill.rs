@@ -704,8 +704,9 @@ impl Scheduler {
         }
         let (free, setpoint) = self.kv_region_state(phase).unwrap_or((0, 0));
         // INFO when the pass actually shed something — that is a real event.
-        // DEBUG otherwise: this runs from several gates every scheduler loop,
-        // so an unconditional INFO floods the log under a sustained burst.
+        // TRACE otherwise: this runs from several gates every scheduler loop,
+        // so a no-op pass at any lower level floods the log under a sustained
+        // burst.
         macro_rules! emit {
             ($lvl:ident) => {
                 tracing::$lvl!(
@@ -737,7 +738,7 @@ impl Scheduler {
         if acted || compress_refused {
             emit!(info);
         } else {
-            emit!(debug);
+            emit!(trace);
         }
         // **Relief that shed something is an admission opportunity too.** Unlike
         // a completion it can happen with nothing finishing at all, and a pass

@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::Builder;
+use candle_conversation::projection::{Builder, TimelineId};
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend_tools::ToolContext;
@@ -50,4 +50,10 @@ pub struct RefreshContext<'a> {
     pub tool_ctx: Arc<ToolContext>,
     /// Told whenever a unit commits, so the next turn's scope can find it.
     pub retrieval: &'a RetrievalScope,
+    /// The conversation a unit's new conversation descends from: the priming
+    /// chain's end (`crate::branch_ingest::prime`), or — while the chain is
+    /// being built — the link before the one being read. Recorded as the
+    /// unit's parent before its reading starts, so its turns are projected
+    /// with the chain already in context. `None` when there is no chain.
+    pub chain_end: Option<TimelineId>,
 }

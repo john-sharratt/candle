@@ -749,7 +749,7 @@ impl Scheduler {
                 // reached on a card whose only distinguishing feature was being large
                 // enough to hold the checkpoint. It read as healthy throughout.
                 if let Some(rate) = self.wave_rate.as_ref() {
-                    tracing::debug!(
+                    tracing::trace!(
                         target: "candle_conversation::scheduler::throttle",
                         fixed_ms = rate.fixed_secs() * 1e3,
                         overhead_ms = rate.overhead_secs() * 1e3,
@@ -848,7 +848,7 @@ impl Scheduler {
                 let swept = self.session.release_empty_arenas().unwrap_or(0);
                 if swept > 0 {
                     relief_trace::note("sched", "arena_sweep", swept as u64, 0);
-                    tracing::debug!(
+                    tracing::trace!(
                         target: "candle_conversation::scheduler::vram_relief",
                         arenas_swept = swept,
                         "proactive empty-arena sweep (per-wave)"
@@ -884,7 +884,7 @@ impl Scheduler {
                 if let Some(g) = self.session.kv_ground_lost() {
                     if g.total() > 0 {
                         let mib = candle_nn::kv_cache::REGION_BYTES >> 20;
-                        tracing::debug!(
+                        tracing::trace!(
                             target: "candle_conversation::scheduler::vram_relief",
                             frontier = g.watermark,
                             could_be = g.packed_arenas,
@@ -917,7 +917,7 @@ impl Scheduler {
                             )
                         })
                         .collect();
-                    tracing::debug!(
+                    tracing::trace!(
                         target: "candle_conversation::scheduler::vram_relief",
                         freeable_arenas = freeable,
                         freeable_mib = freeable * (candle_nn::kv_cache::REGION_BYTES >> 20),
@@ -931,7 +931,7 @@ impl Scheduler {
                 // optimistic. A run that admits oddly is asked this first, and
                 // without the line the answer is unobtainable after the fact.
                 if let Some(r) = self.wave_rate.as_ref() {
-                    tracing::debug!(
+                    tracing::trace!(
                         target: "candle_conversation::scheduler::admission",
                         link_gbps = r.link_bytes_per_s() / 1e9,
                         effective_gbps = r.effective_bytes_per_s() / 1e9,
@@ -1041,7 +1041,7 @@ impl Scheduler {
             // What is left of the pool once KV moved out. Flat is the healthy
             // shape: growth here means something outside the reservation is
             // still allocating per-wave.
-            tracing::debug!(
+            tracing::trace!(
                 "kv-pool: used={}MiB reserved={}MiB gap={}MiB",
                 mib(used),
                 mib(reserved),
@@ -1067,7 +1067,7 @@ impl Scheduler {
                     )
                 })
                 .collect();
-            tracing::debug!("kv-pool classes: {}", rows.join(" "));
+            tracing::trace!("kv-pool classes: {}", rows.join(" "));
         }
         // The reservation's KV side. `free` is the pressure signal admission
         // reads; `peak_live` against `total` says how close the startup
@@ -1078,7 +1078,7 @@ impl Scheduler {
         // placed against the arena frontier as it stands at that moment — so a
         // claim arriving with a tier standing is an arena created inside a wave.
         if let Some(r) = candle_nn::kv_cache::region_stats(0) {
-            tracing::debug!(
+            tracing::trace!(
                 "kv-regions: live={} peak={} free={} of {} ({}MiB) | tier={}MiB \
                  (ceiling {} regions) | weights={}MiB | in-wave-arenas={} in-wave-refusals={}",
                 r.live,
@@ -1097,7 +1097,7 @@ impl Scheduler {
         // from: `S = 2*W_wave + W_persist + shelf`.
         if let Some((cursor, peak, cap)) = candle_nn::kv_cache::persistence_domain_stats(0) {
             if peak > 0 {
-                tracing::debug!(
+                tracing::trace!(
                     "kv-transient persist: cursor={}MiB peak={}MiB cap={}MiB",
                     mib(cursor),
                     mib(peak),
@@ -1110,7 +1110,7 @@ impl Scheduler {
         if let Some(halves) = candle_nn::kv_cache::wave_domain_stats(0) {
             let peak = halves.iter().map(|h| h.1).max().unwrap_or(0);
             if peak > 0 {
-                tracing::debug!(
+                tracing::trace!(
                     "kv-transient wave: peak={}MiB (a={}MiB b={}MiB) cap={}MiB each",
                     mib(peak),
                     mib(halves[0].1),
@@ -1126,7 +1126,7 @@ impl Scheduler {
         // 32-token boundary, per layer.
         let (live, slabs, bytes) = candle_nn::kv_cache::slot_state_stats();
         if slabs > 0 {
-            tracing::debug!(
+            tracing::trace!(
                 "kv-slotstate: live={live} slabs={slabs} reserved={}MiB promotions={}",
                 mib(bytes),
                 candle_nn::kv_cache::class_promotion_count(),

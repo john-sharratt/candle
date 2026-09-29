@@ -58,7 +58,7 @@ impl Scheduler {
                 100.0 * num as f64 / den as f64
             }
         };
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::scheduler::reproject",
             glue_ms,
             glue_tokens,
@@ -358,7 +358,7 @@ impl Scheduler {
         // whatever survives these filters. Reading it from the outside is guesswork: a
         // width of four could be four sequences active, or twenty with sixteen held back,
         // and those are unrelated problems. Every term that removed a row is named.
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::scheduler::throttle",
             active = self.active_decodes.len(),
             finished = self
@@ -457,7 +457,7 @@ impl Scheduler {
 
         let _t_step = super::PhaseTimer::new("decode_batch_step");
 
-        tracing::debug!(
+        tracing::trace!(
             target: "sched",
             "decode batch={} prefill_active={}",
             seq_ids.len(),
@@ -1833,7 +1833,7 @@ impl Scheduler {
         let plan_refs: Vec<&super::projection_assembler::GapFillPlan> =
             inflights.iter().map(|i| &i.plan).collect();
         let glue_total: usize = inflights.iter().map(|i| i.plan.n_glue_tokens).sum();
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::scheduler::reproject",
             n_slots = inflights.len(),
             glue_total,

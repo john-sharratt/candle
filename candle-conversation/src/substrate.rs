@@ -1981,34 +1981,71 @@ impl Substrate {
     pub fn snapshot_pending_warm(
         &self,
     ) -> Vec<(ResidenceIndex, Vec<SealedSequence>, Option<ConvCompression>)> {
-        self.hot_lru
-            .iter()
-            .filter_map(|&idx| {
-                let slot = &self.residence[idx.0];
-                if slot.warm.is_some() {
-                    return None;
-                }
-                // Skip residences pinned into the current wave's working set: a
-                // slot the in-flight decode is actively attending is about to be
-                // (or is being) elevated warm→hot on the shared copy stream and
-                // on the persistence thread this drain runs on. Backing it up
-                // hot→warm right now is redundant work that MONOPOLISES the
-                // persistence thread + stream against the very elevation
-                // the decode is blocked on — the tier-migration livelock where the
-                // same working set churns hot→warm every pass while the decode
-                // lands zero forwards. Defer its warm copy until it leaves the
-                // working set (mirrors the pinned hot-drop defer in
-                // `mark_timeline_evict_when_cold`). Durability is only deferred,
-                // not lost: the authoritative hot copy stays resident while pinned,
-                // and the next unpinned pass makes the warm copy.
-                if self.working_set_pins.contains(&idx) {
-                    return None;
-                }
-                slot.hot
-                    .as_ref()
-                    .map(|hot| (idx, hot.clone(), slot.compression))
-            })
+        self.pending_warm()
+            .map(|(idx, hot, cc)| (idx, hot.clone(), cc))
             .collect()
+    }
+
+    /// The distinct compression overrides among the residences
+    /// [`Self::snapshot_pending_warm`] would return — the persistence thread's
+    /// hot→warm groups, named without cloning a single sequence.
+    pub fn pending_warm_policies(&self) -> Vec<Option<ConvCompression>> {
+        let mut out: Vec<Option<ConvCompression>> = Vec::new();
+        for (_, _, cc) in self.pending_warm() {
+            if !out.contains(&cc) {
+                out.push(cc);
+            }
+        }
+        out
+    }
+
+    /// [`Self::snapshot_pending_warm`] restricted to one compression override:
+    /// one hot→warm group, cloned when the persistence thread is about to
+    /// migrate it and not before.
+    pub fn snapshot_pending_warm_for(
+        &self,
+        policy: Option<ConvCompression>,
+    ) -> Vec<(ResidenceIndex, Vec<SealedSequence>)> {
+        self.pending_warm()
+            .filter(|(_, _, cc)| *cc == policy)
+            .map(|(idx, hot, _)| (idx, hot.clone()))
+            .collect()
+    }
+
+    /// Every hot residence awaiting a warm copy, with its hot bytes and its
+    /// compression override — what the hot→warm phase works through.
+    fn pending_warm(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            ResidenceIndex,
+            &Vec<SealedSequence>,
+            Option<ConvCompression>,
+        ),
+    > + '_ {
+        self.hot_lru.iter().filter_map(|&idx| {
+            let slot = &self.residence[idx.0];
+            if slot.warm.is_some() {
+                return None;
+            }
+            // Skip residences pinned into the current wave's working set: a
+            // slot the in-flight decode is actively attending is about to be
+            // (or is being) elevated warm→hot on the shared copy stream and
+            // on the persistence thread this drain runs on. Backing it up
+            // hot→warm right now is redundant work that MONOPOLISES the
+            // persistence thread + stream against the very elevation
+            // the decode is blocked on — the tier-migration livelock where the
+            // same working set churns hot→warm every pass while the decode
+            // lands zero forwards. Defer its warm copy until it leaves the
+            // working set (mirrors the pinned hot-drop defer in
+            // `mark_timeline_evict_when_cold`). Durability is only deferred,
+            // not lost: the authoritative hot copy stays resident while pinned,
+            // and the next unpinned pass makes the warm copy.
+            if self.working_set_pins.contains(&idx) {
+                return None;
+            }
+            slot.hot.as_ref().map(|hot| (idx, hot, slot.compression))
+        })
     }
 
     /// Total VRAM byte footprint of hot residences that lack a warm copy — the
@@ -7031,6 +7068,45 @@ mod tests {
             chunk_size: 32,
             location: candle_nn::kv_cache::ArenaLocation::Cpu,
         }
+    }
+
+    /// **The hot→warm groups are named without cloning, and each is cloned on
+    /// its own.** The persistence thread snapshots one group under its migrate
+    /// guard, so the per-policy snapshot must return exactly that policy's
+    /// pending residences — and skip what the whole snapshot skips: a
+    /// residence already warm, and one pinned into the wave's working set.
+    #[test]
+    fn pending_warm_is_named_by_policy_and_snapshotted_per_group() {
+        let lossless = ConvCompression {
+            lossless: true,
+            level: None,
+            disable_k_override: false,
+            force_k: None,
+            force_v: None,
+        };
+        let mut sub = Substrate::new();
+        let plain = sub.alloc_residence(StreamId(1), None);
+        let exact = sub.alloc_residence(StreamId(2), Some(lossless));
+        let warm = sub.alloc_residence(StreamId(3), None);
+        let pinned = sub.alloc_residence(StreamId(4), Some(lossless));
+        for r in [plain, exact, warm, pinned] {
+            sub.install_hot(r, vec![minimal_sealed_layer()]);
+        }
+        sub.install_warm(warm, vec![minimal_sealed_layer()]);
+        sub.working_set_pins.insert(pinned);
+
+        let mut policies = sub.pending_warm_policies();
+        policies.sort_by_key(|p| p.is_some());
+        assert_eq!(policies, [None, Some(lossless)]);
+
+        let of = |p| -> Vec<usize> {
+            sub.snapshot_pending_warm_for(p)
+                .into_iter()
+                .map(|(idx, _)| idx.0)
+                .collect()
+        };
+        assert_eq!(of(None), [plain.0]);
+        assert_eq!(of(Some(lossless)), [exact.0]);
     }
 
     /// `register_timeline` is data-idempotent — calling it again on a

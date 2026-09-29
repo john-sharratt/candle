@@ -17,6 +17,7 @@
 pub mod binary_sniff;
 pub mod converse;
 pub mod dir_unit;
+mod link;
 pub mod render;
 pub mod types;
 
@@ -40,6 +41,7 @@ use crate::refresh_ctx::RefreshContext;
 
 pub use binary_sniff::is_binary_sample;
 pub use dir_unit::DirUnit;
+pub(crate) use link::ingest_link;
 pub use types::Language;
 
 /// Directories ingested concurrently. Each unit is ONE conversation running a
@@ -507,8 +509,9 @@ const MAX_DECODE_FAILURES: usize = 24;
 pub const PASS_NAME: &str = "repo_map";
 
 /// Gather-scope tags for a directory's turns: `["repo_map", <dir>]`. The second
-/// tag is the unit's directory (`"."` for the workspace root), so a tag-scoped
-/// provenance gallery can admit exactly one folder's turns.
+/// tag is the unit's workspace-relative directory (`candle/` for a
+/// repository's root), so a tag-scoped provenance gallery can admit exactly one
+/// folder's turns.
 fn dir_tags(unit: &DirUnit) -> Vec<String> {
     vec!["repo_map".to_string(), unit.dir.clone()]
 }
@@ -543,14 +546,13 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
 }
 
 /// One folder to ingest: the unit as a branch lists it, and the commit its
-/// listing and files are read from — `None` for the workspace's own unit,
-/// which lists the repositories.
+/// listing and files are read from.
 #[derive(Debug, Clone)]
 pub struct UnitJob {
     pub unit: FolderUnit,
-    pub at: Option<Oid>,
+    pub at: Oid,
     /// Every branch whose tip lists the folder this way, recorded on the
-    /// conversation ([`BRANCHES_KEY`]); empty for the workspace's own unit.
+    /// conversation ([`BRANCHES_KEY`]).
     pub branches: Vec<String>,
 }
 
@@ -946,13 +948,10 @@ fn run_dir_pool(
 
 /// The tools a unit's chain runs against: file stores reading the commit the
 /// unit was found on, so the listing and the manifest hint its turns show are the
-/// ones its key names. The workspace's own unit lists repositories, which no
-/// commit holds. `None` when the unit's repository is not read through git.
+/// ones its key names. `None` when the unit's repository is not read through
+/// git.
 fn unit_tools(tools: &ToolContext, job: &UnitJob) -> Option<ToolContext> {
-    let files = match &job.at {
-        Some(at) => tools.files.fresh_at(&job.unit.repo, at)?,
-        None => tools.files.fresh(),
-    };
+    let files = tools.files.fresh_at(&job.unit.repo, &job.at)?;
     Some(tools.with_files(Arc::new(files)))
 }
 
@@ -1038,6 +1037,26 @@ fn process_one_dir(
             .unwrap()
             .fork()
             .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
+        // The priming chain is this conversation's parent, recorded BEFORE its
+        // own listing and summary run, so its turns are projected with the
+        // chain already in context (`Substrate::inherited_chain`). Metadata
+        // only: nothing is copied, and the parent needs no residency of its own.
+        if let Some(parent) = ctx.chain_end {
+            engine
+                .lock()
+                .unwrap()
+                .set_forked_from(conv.timeline_id(), parent)
+                .map_err(|err| anyhow::anyhow!("repo_map priming-chain parent: {err}"))?;
+            // The fork seeded the recurrent slot before this pointer existed,
+            // so ask again now that the lineage is on record.
+            if let Err(err) = conv.seed_recurrent_from_lineage() {
+                tracing::warn!(
+                    target: "zend::repo_scan",
+                    dir = %unit.dir,
+                    "seeding recurrent memory from the priming chain failed: {err:#}",
+                );
+            }
+        }
         let e = engine.lock().unwrap();
         // The folder's closing turn is its own decoded summary, so the AVL
         // summariser must not compress these turns into a second summary tree.
@@ -1392,10 +1411,10 @@ mod tests {
     }
 
     #[test]
-    fn the_root_unit_tags_with_a_usable_label() {
+    fn a_repository_root_tags_with_its_repository() {
         assert_eq!(
-            dir_tags(&unit(".")),
-            vec!["repo_map".to_string(), ".".to_string()],
+            dir_tags(&unit("candle/")),
+            vec!["repo_map".to_string(), "candle/".to_string()],
         );
     }
 

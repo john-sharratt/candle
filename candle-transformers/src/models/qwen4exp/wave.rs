@@ -349,7 +349,7 @@ impl Qwen4ExpBatched {
                     .filter(|(_, r)| *r > 0)
                     .map(|(c, r)| c.indexed_tokens(r))
                     .collect();
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_conversation::scheduler::reproject",
                     parent,
                     child,

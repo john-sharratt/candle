@@ -25,6 +25,9 @@
 //! engine wave-batches together.
 
 mod lines;
+mod link;
+
+pub(crate) use link::ingest_link;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -754,10 +757,33 @@ fn process_one_file(
             .unwrap()
             .fork()
             .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?;
-        ctx.engine
-            .lock()
-            .unwrap()
-            .set_timeline_summarize(conv.timeline_id(), false);
+        // The priming chain is this conversation's parent, recorded BEFORE its
+        // own reading starts, so every turn below is projected with the chain
+        // already in context (`Substrate::inherited_chain`). Nothing is copied
+        // and the parent needs no residency of its own: an ancestor sitting
+        // warm or cold is elevated by the ordinary working-set path when it is
+        // selected.
+        {
+            let e = ctx.engine.lock().unwrap();
+            if let Some(parent) = ctx.chain_end {
+                e.set_forked_from(conv.timeline_id(), parent)
+                    .map_err(|err| anyhow::anyhow!("code_reading priming-chain parent: {err}"))?;
+            }
+            e.set_timeline_summarize(conv.timeline_id(), false);
+        }
+        // Now that the lineage is on record, take the recurrent memory of the
+        // conversation this one continues — the slot was seeded from its own
+        // (empty) timeline when the fork returned. Outside the engine lock: it
+        // waits on a scheduler round-trip that other workers' mints need.
+        if ctx.chain_end.is_some() {
+            if let Err(err) = conv.seed_recurrent_from_lineage() {
+                tracing::warn!(
+                    target: "zend::code_read::ingest",
+                    file = %file.path,
+                    "seeding recurrent memory from the priming chain failed: {err:#}",
+                );
+            }
+        }
         (conv, superseded)
     };
 
