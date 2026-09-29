@@ -23,12 +23,11 @@
 
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::{CudaStream, DevicePtr};
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, LiveTensor, Result, Tensor};
 use candle_kernels::simple::gr_hyper::{
     gr_hc_supported, run_gr_combine, run_gr_mix, run_gr_norm, GR_MAX_HC,
 };
-
-use candle_nn::kv_cache::WaveGeneration;
 
 use crate::models::operand_guard::expect_dtype;
 use crate::models::wave_buffers::wave_empty_ticketed;
@@ -89,7 +88,7 @@ fn with_ptr<R>(
 }
 
 /// `xn = grouped_rms(x) ⊙ gain`, one launch over `[n, hc, d]`.
-pub fn norm(x: &Tensor, gain: &Tensor, eps: f64, wave: Option<&WaveGeneration>) -> Result<Tensor> {
+pub fn norm(x: &Tensor, gain: &Tensor, eps: f64, root: Option<WaveTicket>) -> Result<Tensor> {
     let (n, hc, d) = x.dims3()?;
     if gain.elem_count() != hc * d {
         candle::bail!(
@@ -104,8 +103,8 @@ pub fn norm(x: &Tensor, gain: &Tensor, eps: f64, wave: Option<&WaveGeneration>) 
     // chain has an operand to inherit an arena from. Rooting the norm's output
     // on the open phase gives the rest of `hc_mix` a ticketed operand, and the
     // eager ops after it (the low-rank GEMMs, the silu, the collapse) inherit it
-    // the ordinary way. Without a wave this is `Tensor::empty` exactly as before.
-    let xn = wave_empty_ticketed((n, hc, d), DType::F32, x.device(), wave.map(|g| g.ticket()))?;
+    // the ordinary way. With no phase open this is a pool allocation.
+    let xn = wave_empty_ticketed((n, hc, d), DType::F32, x.device(), root)?;
     with_operand(x, "gr norm: residual stream", |xo, stream| {
         with_operand(gain, "gr norm: gain", |go, _| {
             with_operand(&xn, "gr norm: out", |oo, _| {
@@ -136,7 +135,7 @@ pub fn mix(
     gate_raw: &Tensor,
     hc: usize,
     d: usize,
-    wave: Option<&WaveGeneration>,
+    root: Option<WaveTicket>,
 ) -> Result<Tensor> {
     // As for the combine: an uninstantiated stream count launches nothing and
     // leaves `mixed` unwritten.
@@ -152,7 +151,7 @@ pub fn mix(
         );
     }
     // The block input, consumed inside the phase that produced it.
-    let mixed = wave_empty_ticketed((n, d), DType::F32, xn.device(), wave.map(|g| g.ticket()))?;
+    let mixed = wave_empty_ticketed((n, d), DType::F32, xn.device(), root)?;
     with_operand(xn, "gr mix: xn", |xo, stream| {
         with_operand(gate_raw, "gr mix: gate", |go, _| {
             with_operand(&mixed, "gr mix: out", |oo, _| {

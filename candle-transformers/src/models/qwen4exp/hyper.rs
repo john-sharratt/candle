@@ -12,8 +12,8 @@
 //! contiguously exactly as ggml's `[n_embd, hc, T]` does, and the `[hc_dim]`
 //! norm weights apply as a plain broadcast.
 
+use candle::wave_provenance::WaveTicket;
 use candle::{LiveTensor, Result, Tensor};
-use candle_nn::kv_cache::WaveGeneration;
 
 /// Microbench + `ncu` target for the three fused kernels, with its own
 /// correctness gate (§0.4 rule 4).
@@ -163,13 +163,13 @@ pub fn hc_grouped_norm(
     x: &Tensor,
     weight: &Tensor,
     eps: f64,
-    wave: Option<&WaveGeneration>,
+    root: Option<WaveTicket>,
 ) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if matches!(x.device(), candle::Device::Cuda(_)) {
         // One launch: the reduction and the per-(stream, column) gain in a
         // single pass.
-        return cuda_fused::norm(x, weight, eps, wave);
+        return cuda_fused::norm(x, weight, eps, root);
     }
     eager_grouped_norm(x, weight, eps)
 }
@@ -189,21 +189,23 @@ fn eager_grouped_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 /// The read half: collapse the wide residual `[T, hc, n_embd]` into the block
 /// input `[T, n_embd]`, and produce the `[T, hc]` write weights for
 /// [`hc_combine`] when the module carries an `inject`.
-/// `wave`, when present, is the open layer phase this mix's transients belong
-/// to. Everything it produces is consumed before that phase closes — the block
-/// input by the mixer or the FFN, the inject weights by [`hc_combine`] — which
-/// is what makes rooting them on the span sound. The residual `hc_combine`
-/// returns is deliberately NOT on it: that crosses every phase boundary.
+/// `root`, when present, is the ticket of the open phase this mix's transients
+/// belong to — a layer's attention or FFN phase, or the forward phase the head
+/// scores in. Everything it produces is consumed before that phase closes — the
+/// block input by the mixer, the FFN or the LM head, the inject weights by
+/// [`hc_combine`] — which is what makes rooting them on the span sound. The
+/// residual `hc_combine` updates is deliberately NOT on it: that crosses every
+/// phase boundary.
 pub fn hc_mix(
     x: &Tensor,
     w: &impl HcProject,
     eps: f64,
-    wave: Option<&WaveGeneration>,
+    root: Option<WaveTicket>,
 ) -> Result<(Tensor, Option<Tensor>)> {
     let (t, hc, n_embd) = x.dims3()?;
     let dev = x.device();
     let g = crate::models::profile::gpu_span("hc_mix:norm", dev);
-    let xn = hc_grouped_norm(x, w.norm(), eps, wave)?;
+    let xn = hc_grouped_norm(x, w.norm(), eps, root)?;
     let xn_flat = xn.reshape((t, hc * n_embd))?;
     g.end();
 
@@ -231,7 +233,7 @@ pub fn hc_mix(
             // registers. `gate` arrives RAW from the up-projection here — the
             // kernel applies the sigmoid, so the eager path's separate pass
             // over `[t, hc·n_embd]` disappears with it.
-            cuda_fused::mix(&xn, &gate_raw, hc, n_embd, wave)?
+            cuda_fused::mix(&xn, &gate_raw, hc, n_embd, root)?
         } else {
             eager_gate_mean(&xn_flat, &gate_raw, t, hc, n_embd)?
         }

@@ -2847,7 +2847,12 @@ impl Qwen4ExpBatched {
             };
             let g_pre = crate::models::profile::gpu_span("q4e:gr_pre", dev);
             #[cfg(feature = "cuda")]
-            let (h, inject) = hc_mix(&res, &layer.hc_attn, eps, mix_wave.as_ref())?;
+            let (h, inject) = hc_mix(
+                &res,
+                &layer.hc_attn,
+                eps,
+                mix_wave.as_ref().map(|g| g.ticket()),
+            )?;
             #[cfg(not(feature = "cuda"))]
             let (h, inject) = hc_mix(&res, &layer.hc_attn, eps, None)?;
             let inject = inject.expect("layer HC modules carry an inject");
@@ -3086,7 +3091,12 @@ impl Qwen4ExpBatched {
             };
             let g_pre2 = crate::models::profile::gpu_span("q4e:gr_pre_ffn", dev);
             #[cfg(feature = "cuda")]
-            let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps, ffn_wave.as_ref())?;
+            let (h2, inject2) = hc_mix(
+                &res,
+                &layer.hc_ffn,
+                eps,
+                ffn_wave.as_ref().map(|g| g.ticket()),
+            )?;
             #[cfg(not(feature = "cuda"))]
             let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps, None)?;
             let inject2 = inject2.expect("layer HC modules carry an inject");
@@ -3226,7 +3236,7 @@ impl Qwen4ExpBatched {
 
         // ── Head: the final mix IS the output norm; score decode rows + each
         // prefill's last row through the LM head in one GEMM. ──
-        let (mixed, _) = hc_mix(&res, &m.out_hc, eps, None)?;
+        //
         // Decode rows, then each prefill span's LAST row — except a verifying
         // span, where EVERY row is scored.
         //
@@ -3252,9 +3262,24 @@ impl Qwen4ExpBatched {
             }
             acc += l as u32;
         }
+        // **The rows are chosen BEFORE the mix, not after.** The mix is
+        // row-wise, so mixing only the scored rows gives the same bits, and a
+        // prefill wave scores a handful of its thousands of rows: mixing the
+        // whole residual first ran the head's norm, its two low-rank GEMMs and
+        // the collapse over every row to keep a few. A wave that scores every
+        // row (all decode) takes the residual as it stands.
+        //
+        // The mix runs on the forward span, where the plan prices it at the
+        // scored rows (`WaveBuffer::HyperHead*`). The selected residual comes
+        // off the pool, as the residual itself does.
         let r_total = sel.len();
-        let idx = wave_from_vec_ticketed(sel, r_total, dev, fwd_ticket)?;
-        let scored = mixed.index_select(&idx, 0)?.contiguous()?;
+        let scored_res = if r_total == total_rows {
+            res
+        } else {
+            let idx = Tensor::from_vec(sel, r_total, dev)?;
+            res.index_select(&idx, 0)?
+        };
+        let (scored, _) = hc_mix(&scored_res, &m.out_hc, eps, fwd_ticket)?;
         let acts = {
             let candle::Device::Cuda(cuda) = dev else {
                 candle::bail!("qwen4exp wave runs on CUDA");
