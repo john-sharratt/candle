@@ -1,7 +1,7 @@
 ---
 title: "AI: Waves, or how to lose a fight with PCIe"
 date: 2026-08-19
-feature: 1
+feature: 2
 tint: info
 tags: [moe, scheduling, cuda]
 summary: >-

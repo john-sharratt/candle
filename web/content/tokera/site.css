@@ -114,7 +114,7 @@ main.reading {
   margin: 0 auto;
   padding: 52px clamp(18px, 5vw, 24px) 120px;
 }
-main.wide { max-width: 1180px; margin: 0 auto; padding: 0 clamp(18px, 5vw, 56px) 120px; }
+main.wide { max-width: 1360px; margin: 0 auto; padding: 0 clamp(18px, 5vw, 56px) 120px; }
 
 /* ── two panes ───────────────────────────────────────────────────────────── */
 
@@ -394,8 +394,23 @@ main.split {
 
 /* ── the chart ───────────────────────────────────────────────────────────── */
 
-.work-art { min-width: 0; margin-top: 22px; }
-.curve { width: 100%; height: auto; display: block; overflow: visible; }
+/* The curve and the four measured figures side by side: the claim's shape on
+   the left, its numbers on the right. They stack once the tile is too narrow
+   for both. */
+.work-art {
+  min-width: 0;
+  margin-top: 22px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  gap: 22px;
+  align-items: center;
+}
+@media (max-width: 1100px) {
+  .work-art { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+}
+/* Capped rather than full-bleed: the engine tile is the wide one, and a curve
+   stretched across it outweighs the words it illustrates. */
+.curve { width: 100%; max-width: 380px; height: auto; display: block; margin: 0 auto; overflow: visible; }
 
 .curve .axis   { fill: none; stroke: var(--line-2); stroke-width: 1; }
 .curve .rising { stroke: var(--crit); stroke-width: 2.5; stroke-linecap: round; }
@@ -413,6 +428,7 @@ main.split {
 
 /* ── stats ───────────────────────────────────────────────────────────────── */
 
+/* Two by two beside the curve, and still two by two when stacked under it. */
 .stats {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -421,18 +437,17 @@ main.split {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   overflow: hidden;
-  margin-top: 26px;
 }
-.stat { background: var(--panel); padding: 20px 22px 18px; }
+.stat { background: var(--panel); padding: 12px 14px 11px; }
 .stat .n {
-  font-size: clamp(1.35rem, 2.6vw, 1.8rem);
-  letter-spacing: -1px;
+  font-size: clamp(1.15rem, 1.9vw, 1.45rem);
+  letter-spacing: -.8px;
   font-weight: 640;
   color: var(--ink);
   line-height: 1;
-  margin-bottom: 8px;
+  margin-bottom: 5px;
 }
-.stat .l { color: var(--ink-faint); font-size: .755rem; line-height: 1.45; }
+.stat .l { color: var(--ink-faint); font-size: .7rem; line-height: 1.35; }
 
 /* ── per-post accent ─────────────────────────────────────────────────────── */
 
@@ -529,6 +544,40 @@ main.split {
   .prose .shot.hero img { max-height: 300px; }
 }
 
+/* A row of objects photographed and cut out of their backgrounds — hardware,
+   mostly. No frame and no hairline, because the picture is the object rather
+   than a rectangle of scene; a soft drop shadow grounds it on the page instead.
+   Aligned on their bottoms so they stand on one shelf whatever their heights. */
+.prose .machines {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 22px;
+  align-items: end;
+  margin: 1.8em 0 2.2em;
+}
+.prose .machines figure { margin: 0; text-align: center; }
+.prose .machines img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 250px;
+  object-fit: contain;
+  margin: 0 auto;
+  filter: drop-shadow(0 10px 16px rgba(0, 0, 0, .35));
+}
+.prose .machines figcaption {
+  margin-top: 12px;
+  font-size: .76rem;
+  line-height: 1.45;
+  color: var(--ink-faint);
+  max-width: none;
+}
+.prose .machines figcaption b { display: block; color: var(--ink); font-size: .9rem; }
+@media (max-width: 620px) {
+  .prose .machines { grid-template-columns: 1fr; gap: 28px; }
+  .prose .machines img { max-height: 300px; }
+}
+
 .prose .fig { margin: 2.1em 0; }
 .prose .fig svg {
   display: block;
@@ -603,6 +652,32 @@ main.split {
 .prose .fig .towers rect { fill: var(--panel-3); }
 .prose .fig .cores circle { fill: var(--post, var(--accent)); }
 .prose .fig .ground { stroke: var(--line-3); stroke-width: 1.5; }
+
+/* Charts of measured results. One pairing throughout: this engine in the post's
+   own colour, published figures in amber — learned once, read everywhere. A
+   chart carries its own title and legend inside the SVG so it survives being
+   screenshotted out of the post. */
+.prose .fig .ttl { fill: var(--ink); font-family: var(--font); font-size: 15px; font-weight: 700; letter-spacing: -.2px; }
+.prose .fig .ttl-sub { fill: var(--ink-ghost); font-size: 10.5px; }
+.prose .fig .grid { stroke: var(--line); stroke-width: 1; }
+.prose .fig .grid.base { stroke: var(--line-3); }
+.prose .fig .tick { fill: var(--ink-ghost); font-size: 10.5px; }
+.prose .fig .cat { fill: var(--ink-dim); font-family: var(--font); font-size: 12.5px; font-weight: 600; }
+.prose .fig .cat-sub { fill: var(--ink-ghost); font-size: 10px; }
+.prose .fig .us { fill: var(--post, var(--accent)); }
+.prose .fig .us-soft { fill: var(--post, var(--accent)); opacity: .45; }
+.prose .fig .them { fill: var(--warn); opacity: .8; }
+.prose .fig .v-us { fill: var(--post, var(--accent)); font-family: var(--font); font-size: 13px; font-weight: 700; }
+.prose .fig .v-them { fill: var(--ink-faint); font-size: 11px; }
+.prose .fig .hero-n { fill: var(--post, var(--accent)); font-family: var(--font); font-size: 30px; font-weight: 750; letter-spacing: -1px; }
+.prose .fig .line-us { fill: none; stroke: var(--post, var(--accent)); stroke-width: 3.2; stroke-linejoin: round; stroke-linecap: round; }
+.prose .fig .line-them { fill: none; stroke: var(--warn); stroke-width: 2.6; stroke-linejoin: round; stroke-linecap: round; }
+.prose .fig .dash { stroke-dasharray: 7 5; }
+.prose .fig .area-us { fill: var(--post, var(--accent)); opacity: .14; }
+.prose .fig .dot-us { fill: var(--post, var(--accent)); stroke: var(--bg-deep); stroke-width: 2; }
+.prose .fig .dot-them { fill: var(--warn); stroke: var(--bg-deep); stroke-width: 2; }
+.prose .fig .parity { stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 4 4; }
+.prose .fig .t-them { fill: var(--warn); }
 
 /* The post's own accent, applied to the document it wraps. */
 .prose a { color: var(--post, var(--accent)); }
@@ -886,7 +961,6 @@ img, svg, video, canvas { max-width: 100%; }
   .site-nav a { padding: 6px 9px; font-size: .85rem; }
   .site-auth .who { display: none; }              /* the avatar is enough here */
   .hero h1 { letter-spacing: -1.2px; }
-  .stats { grid-template-columns: minmax(0, 1fr); }
   .doc-head h1, .work h2 { letter-spacing: -.6px; }
   .work { padding: 22px 20px; }
   .work::after { left: 20px; right: 20px; }
@@ -915,7 +989,7 @@ img, svg, video, canvas { max-width: 100%; }
   main.wide, main.reading { padding-left: 14px; padding-right: 14px; }
   .work { padding: 20px 16px; }
   .work::after { left: 16px; right: 16px; }
-  .stat { padding: 16px 16px 14px; }
+  .stat { padding: 11px 12px 10px; }
 }
 
 /* ── motion ──────────────────────────────────────────────────────────────── */
