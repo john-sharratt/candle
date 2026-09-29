@@ -32,6 +32,7 @@ use crate::persistence::record::{
     TreeMetadataPayload,
 };
 use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
+use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
@@ -313,6 +314,12 @@ pub struct Conversation {
     /// compaction can hold across its relocation I/O). Shared across clones; the
     /// last drop drains + fsyncs + joins the writer. See [`SubstrateWriter`].
     writer: Arc<SubstrateWriter>,
+    /// Reads records out of sealed segments without `persistence`'s mutex — the
+    /// read-side twin of `writer`. A compaction holds that mutex across its
+    /// relocation I/O, and the recurrent-snapshot read at every hybrid-model
+    /// admission used to queue behind it on the scheduler thread. Taken once at
+    /// construction; see [`SealedReader`].
+    sealed: SealedReader,
     /// The most recently read prompt-branch checkpoint, held decoded and keyed
     /// by the content prefix it belongs to.
     ///
@@ -483,6 +490,7 @@ impl Conversation {
         let persistence = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate)
             .expect("ephemeral SubstratePersistence");
         let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
+        let sealed = persistence.sealed_reader();
         let inner = Arc::new(RwLock::new(substrate));
         let persistence = Arc::new(Mutex::new(persistence));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
@@ -494,6 +502,7 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
+            sealed,
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
             read_only: false,
@@ -524,9 +533,9 @@ impl Conversation {
             substrate: inner,
             persistence,
         } = shared;
-        let (segments, read_only) = {
+        let (segments, read_only, sealed) = {
             let p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            (p.segment_count(), p.is_read_only())
+            (p.segment_count(), p.is_read_only(), p.sealed_reader())
         };
         let maintenance = Arc::new(Mutex::new((segments, None, false)));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
@@ -542,6 +551,7 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
+            sealed,
             branch_checkpoint: Arc::new(Mutex::new(None)),
             section_loads: Arc::default(),
             read_only,
@@ -4091,27 +4101,92 @@ impl Conversation {
         &self,
         timeline: TimelineId,
     ) -> Result<Option<SnapshotPayload>, ConversationError> {
-        let Some(loc) = self.recurrent_snapshot_loc(timeline) else {
+        let Some(mut loc) = self.recurrent_snapshot_loc(timeline) else {
             return Ok(None);
         };
-        let bytes = self
-            .persistence
-            .lock()
-            .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
-            .read_record_payload(&loc)
-            .map_err(|e| {
-                ConversationError::Channel(format!(
-                    "recurrent snapshot for timeline {} is indexed but unreadable: {e}",
-                    timeline.raw()
-                ))
-            })?;
-        let payload = SnapshotPayload::decode(&bytes).map_err(|e| {
+        // **A sealed snapshot is read without the persistence mutex.** The
+        // scheduler calls this at every admission of a hybrid-model turn, and a
+        // compaction holds that mutex across its whole relocation — measured at
+        // 16.5 s mean, 31 s worst — so the read used to stall admission, and
+        // with it every decode, for as long as the compaction ran.
+        //
+        // A stale location is the one thing to handle, on either path:
+        // compaction relocates the record, repoints the index, and only then
+        // unlinks the old segment — and a whole-store compaction deletes the
+        // segment the active one was. So after **any** failed read the location
+        // is read again, and the read is retried only if the index moved: what
+        // the error says varies by platform (a file pending deletion on Windows
+        // fails to open with `PermissionDenied`, not `NotFound`), whether the
+        // record moved does not. A record that is unreadable where the index
+        // still points is reported on its first failure. Bounded, because each
+        // retry follows a completed relocation; the bound only protects against
+        // a store that keeps compacting under the read.
+        for _ in 0..SEALED_READ_ATTEMPTS {
+            let Some(read) = self.sealed.read_record_payload(&loc) else {
+                // In the active segment, where records may still be staged in
+                // RAM: only the locked read can see them.
+                break;
+            };
+            match read {
+                Ok(bytes) => return Self::decode_snapshot(timeline, &bytes).map(Some),
+                // Unmoved — a torn or corrupt record, or one the index names in
+                // a missing file: the locked read reports it, with the same
+                // message it always gave.
+                Err(_) => match self.moved_snapshot_loc(timeline, loc) {
+                    Some(moved) => loc = moved,
+                    None => break,
+                },
+            }
+        }
+        // The locked read. The location was fetched before the mutex, and the
+        // wait for it can span a compaction, so it gets the same re-read. The
+        // index is consulted with the persistence guard already dropped: the
+        // writer takes these two locks one after the other, never nested, and
+        // so does this.
+        let mut attempt = 0;
+        loop {
+            let read = self
+                .persistence
+                .lock()
+                .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
+                .read_record_payload(&loc);
+            match read {
+                Ok(bytes) => return Self::decode_snapshot(timeline, &bytes).map(Some),
+                Err(e) => {
+                    attempt += 1;
+                    match self.moved_snapshot_loc(timeline, loc) {
+                        Some(moved) if attempt < SEALED_READ_ATTEMPTS => loc = moved,
+                        _ => {
+                            return Err(ConversationError::Channel(format!(
+                                "recurrent snapshot for timeline {} is indexed but unreadable: {e}",
+                                timeline.raw()
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The timeline's snapshot location if the index now names a different one
+    /// than `stale` — the record was relocated since `stale` was read. `None`
+    /// when it has not moved, or when no snapshot is indexed any more.
+    fn moved_snapshot_loc(&self, timeline: TimelineId, stale: RecordLoc) -> Option<RecordLoc> {
+        self.recurrent_snapshot_loc(timeline)
+            .filter(|now| *now != stale)
+    }
+
+    /// Decode a recurrent snapshot record, naming the timeline on failure.
+    fn decode_snapshot(
+        timeline: TimelineId,
+        bytes: &[u8],
+    ) -> Result<SnapshotPayload, ConversationError> {
+        SnapshotPayload::decode(bytes).map_err(|e| {
             ConversationError::Channel(format!(
                 "recurrent snapshot for timeline {} failed to decode: {e}",
                 timeline.raw()
             ))
-        })?;
-        Ok(Some(payload))
+        })
     }
 
     /// Declare a section stream — appends a `StreamDecl::PromptSection`
@@ -5348,5 +5423,150 @@ layers:
         assert_eq!(selected_in_collection(&sel, "tools"), Some("b".to_string()));
         // A different collection name matches nothing.
         assert_eq!(selected_in_collection(&sel, "memory"), None);
+    }
+}
+
+#[cfg(test)]
+mod recurrent_snapshot_read_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::Conversation;
+    use crate::persistence::content_hash::snapshot_stream_id;
+    use crate::persistence::record::SnapshotPayload;
+    use crate::persistence::segmented_log::segment_path;
+    use crate::projection::TimelineId;
+
+    /// A recognisable snapshot for `timeline`.
+    fn payload(timeline: TimelineId, turn_index: u32) -> SnapshotPayload {
+        SnapshotPayload {
+            timeline_id: timeline.raw(),
+            turn_index,
+            schedule_hash: 0xC0FF_EE00,
+            layers: Vec::new(),
+            aux: Vec::new(),
+        }
+    }
+
+    /// Store a snapshot exactly as the writer thread does — append under the
+    /// persistence lock, then register the location under the substrate lock,
+    /// never nested — and optionally seal the segment it landed in.
+    fn store(conv: &Conversation, timeline: TimelineId, turn_index: u32, seal: bool) {
+        let stream = snapshot_stream_id(timeline.raw());
+        let loc = {
+            let mut p = conv.persistence.lock().expect("persistence");
+            let loc = p
+                .write_snapshot(stream, &payload(timeline, turn_index).encode())
+                .expect("append");
+            p.commit().expect("commit");
+            if seal {
+                p.seal_active().expect("seal");
+            }
+            loc
+        };
+        conv.write().apply_snapshot_loc(stream, loc);
+    }
+
+    /// **The admission read completes while a compaction holds the persistence
+    /// mutex.** That hold is what stalled the scheduler: a mean of 16.5 s per
+    /// maintenance op, measured, with every decode waiting behind the snapshot
+    /// read at admission. The mutex is held here for the whole read, as the
+    /// relocation phase holds it, and the read runs against a deadline.
+    #[test]
+    fn a_sealed_snapshot_reads_while_persistence_is_held() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(41);
+        store(&conv, timeline, 3, true);
+
+        let held = conv.persistence.clone();
+        let _compaction = held.lock().expect("hold persistence");
+        let reader = conv.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(reader.read_recurrent_snapshot(timeline));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the snapshot read finished while persistence was held")
+            .expect("readable")
+            .expect("present");
+        worker.join().expect("worker");
+        assert_eq!(got.turn_index, 3);
+        assert_eq!(got.schedule_hash, 0xC0FF_EE00);
+        assert_eq!(got.timeline_id, timeline.raw());
+    }
+
+    /// A snapshot still in the active segment is read through the locked path,
+    /// exactly as before: its record may be staged in RAM, which only the log
+    /// holding it can see.
+    #[test]
+    fn a_snapshot_in_the_active_segment_is_still_read() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(42);
+        store(&conv, timeline, 5, false);
+        let got = conv
+            .read_recurrent_snapshot(timeline)
+            .expect("readable")
+            .expect("present");
+        assert_eq!(got.turn_index, 5);
+    }
+
+    /// **An index naming a segment that is gone is still an error.** The
+    /// lock-free read re-reads the location on a missing file, and when the
+    /// index still names that file it hands over to the locked read — which
+    /// reports it rather than answering `None`. A missing snapshot that reads as
+    /// "no snapshot" is the silent amnesia this path exists to prevent.
+    #[test]
+    fn a_snapshot_whose_segment_vanished_is_an_error_not_a_none() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(43);
+        store(&conv, timeline, 7, true);
+        let loc = conv.recurrent_snapshot_loc(timeline).expect("indexed");
+        let file = {
+            let p = conv.persistence.lock().expect("persistence");
+            segment_path(p.dir(), loc.segment)
+        };
+        std::fs::remove_file(&file).expect("remove the segment");
+        let err = conv
+            .read_recurrent_snapshot(timeline)
+            .expect_err("a vanished snapshot is not an absent one");
+        assert!(
+            err.to_string().contains("indexed but unreadable"),
+            "the locked read's own report: {err}"
+        );
+    }
+
+    /// **A read retries only a location the index has moved away from.** A
+    /// snapshot written again lands at a new location, and the one read before
+    /// it is stale; the current location is not. This is what both read paths
+    /// consult after a failure, so an unreadable record where the index still
+    /// points is reported rather than chased.
+    #[test]
+    fn only_a_relocated_snapshot_counts_as_moved() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(45);
+        store(&conv, timeline, 1, true);
+        let first = conv.recurrent_snapshot_loc(timeline).expect("indexed");
+        store(&conv, timeline, 2, true);
+        let second = conv.recurrent_snapshot_loc(timeline).expect("indexed");
+        assert_ne!(first, second, "the test's own premise");
+        assert_eq!(conv.moved_snapshot_loc(timeline, first), Some(second));
+        assert_eq!(conv.moved_snapshot_loc(timeline, second), None);
+        // And the read follows the index to the newer record.
+        let got = conv
+            .read_recurrent_snapshot(timeline)
+            .expect("readable")
+            .expect("present");
+        assert_eq!(got.turn_index, 2);
+    }
+
+    /// No snapshot is an ordinary `None`, and asks nothing of either path.
+    #[test]
+    fn no_snapshot_is_none() {
+        let conv = Conversation::ephemeral();
+        assert!(conv
+            .read_recurrent_snapshot(TimelineId::for_test(44))
+            .expect("readable")
+            .is_none());
     }
 }

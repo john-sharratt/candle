@@ -6,7 +6,7 @@ Zen Code is a persistent AI coding assistant that accumulates institutional know
 
 The system is architecturally distinct from every existing coding assistant in one respect: it never starts over. A single unbounded trunk session persists across the lifetime of the project. The trunk is built through phased parallel analysis (repo map, code reading, static analysis, dependency analysis, architectural analysis, critical analysis), extended daily with converged developer conversations and overnight dream explorations, and stored as version-controlled YAML shadow files alongside the source code. Institutional knowledge compounds over time — the longer the system runs, the deeper its understanding becomes.
 
-The inference engine is the custom Candle fork described in the companion paper, providing unbounded three-tier paged context with O(1) error at any depth, attentional provenance indexing for 3–10ms retrieval over the full knowledge base, adaptive per-block KV quantisation, and 64 concurrent session capacity on a single consumer GPU.
+The inference engine is the custom Candle fork described in the companion paper, providing unbounded three-tier paged context with O(1) error at any depth, attentional provenance indexing for ~10 ms retrieval over the full knowledge base, adaptive per-block KV quantisation up to 7.6×, and 64 concurrent sessions on a single GPU (`docs/performance.md`).
 
 ---
 

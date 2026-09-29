@@ -1,7 +1,7 @@
 ---
 title: "AI: One Card, One Stack"
 date: 2026-08-11
-feature: 4
+feature: 5
 tint: accent
 tags: [inference, architecture]
 summary: >-

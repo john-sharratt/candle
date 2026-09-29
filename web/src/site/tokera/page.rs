@@ -75,6 +75,19 @@ pub const ORIGIN: &str = "https://tokera.com";
 /// The card image for a page that has none of its own.
 const DEFAULT_CARD: &str = "/img/blog/prr.jpg";
 
+/// Cloudflare Web Analytics for tokera.com, on every page `doc_open` renders.
+///
+/// Cookieless — it stores nothing on the visitor's machine, which is why the
+/// site needs no consent banner to carry it. The token is not a secret: it
+/// names the Cloudflare analytics site the beacon reports to, and every page
+/// publishes it.
+///
+/// The beacon is loaded only when the page is being read at `tokera.com`, so a
+/// local run (`tokera.localhost`, `web --authoritative`) reports nothing. The
+/// loader inserts the beacon asynchronously, so it never blocks the render of
+/// a documents site built to work without scripts.
+const ANALYTICS_BEACON: &str = r#"<script>(function(){if(location.hostname!=="tokera.com")return;var s=document.createElement("script");s.defer=true;s.src="https://static.cloudflareinsights.com/beacon.min.js";s.setAttribute("data-cf-beacon",'{"token": "d97ee514b3144213aa52da6f83e8af05"}');document.head.appendChild(s);})();</script>"#;
+
 /// The first image in a rendered document, if it has one.
 ///
 /// Used for the social card. Deliberately a scan of the output rather than a
@@ -242,6 +255,7 @@ fn doc_open(m: &Meta) -> String {
 <link rel="stylesheet" href="/lib/estate.css">
 <link rel="stylesheet" href="/site.css">
 <script type="application/ld+json">{ld}</script>
+{analytics}
 </head>
 <body class="tokera">
 {nav}
@@ -250,6 +264,7 @@ fn doc_open(m: &Meta) -> String {
         description = esc(m.description),
         nav = nav_bar(m.nav),
         ld = json_ld(m, &canonical, &image),
+        analytics = ANALYTICS_BEACON,
     )
 }
 
@@ -557,6 +572,40 @@ mod tests {
             kind: Kind::Article,
             image: None,
             published: Some("2026-01-02"),
+        }
+    }
+
+    /// Every kind of page reports to the analytics site exactly once, inside
+    /// `<head>` — error pages included, so a broken link shows up as traffic
+    /// rather than disappearing.
+    #[test]
+    fn every_page_kind_carries_the_analytics_beacon_once() {
+        let kinds = [
+            ("site", Kind::Site),
+            ("article", Kind::Article),
+            ("paper", Kind::Paper),
+            ("error", Kind::Error),
+        ];
+        for (name, kind) in kinds {
+            let page = head(&Meta { kind, ..meta() });
+            assert_eq!(
+                page.matches("static.cloudflareinsights.com/beacon.min.js")
+                    .count(),
+                1,
+                "{name}"
+            );
+            let beacon = page.find(ANALYTICS_BEACON).expect("beacon rendered");
+            let head_end = page.find("</head>").expect("head closed");
+            assert!(beacon < head_end, "{name}: beacon outside <head>");
+            assert!(
+                page.contains(r#""token": "d97ee514b3144213aa52da6f83e8af05""#),
+                "{name}"
+            );
+            // Only the public host reports: a local run must not count itself.
+            assert!(
+                page.contains(r#"location.hostname!=="tokera.com")return;"#),
+                "{name}: beacon is not gated on the public host"
+            );
         }
     }
 
