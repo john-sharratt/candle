@@ -131,59 +131,67 @@ aggregate**, with the experts streaming VRAM → RAM → NVMe underneath it the
 whole time.
 
 <figure class="fig">
-<svg viewBox="0 0 640 370" role="img" aria-label="Qwen3.8-Flash-Next decode rate by machine. This engine on a 16 GB laptop with 32 GB RAM: 64.7 tokens per second aggregate at eight sessions and 20.0 single. Published runs: llama.cpp on an RTX 5090 with 128 GB RAM 48.0, RTX 4090 with 96 GB 30, RTX 5080 with 64 GB 29, an RTX 4090 with unstated engine and RAM 21, RTX 3090 with 128 GB 15.">
+<svg viewBox="0 0 640 446" role="img" aria-label="Qwen3.8-Flash-Next decode rate by machine. This engine on an RTX 3090 with 64 GB RAM: 147.0 tokens per second aggregate at sixteen sessions and 24.3 single. This engine on a 16 GB laptop with 32 GB RAM: 64.7 aggregate at eight sessions and 20.0 single. Published runs: llama.cpp on an RTX 5090 with 128 GB RAM 48.0, RTX 4090 with 96 GB 30, RTX 5080 with 64 GB 29, an RTX 4090 with unstated engine and RAM 21, RTX 3090 with 128 GB 15.">
   <text class="ttl" x="16" y="20">Qwen3.8-Flash-Next (180B) · decode, tokens per second</text>
   <text class="ttl-sub" x="16" y="38">one GPU each · the host RAM behind every run</text>
   <rect class="us" x="452" y="11" width="10" height="10" rx="2"/>
   <text class="cat-sub" x="467" y="20">This engine</text>
   <rect class="them" x="542" y="11" width="10" height="10" rx="2"/>
   <text class="cat-sub" x="557" y="20">Published</text>
-  <path class="grid base" d="M250 52 V320"/>
-  <path class="grid" d="M300 52 V320 M350 52 V320 M400 52 V320 M450 52 V320 M500 52 V320 M550 52 V320 M600 52 V320"/>
-  <text class="cat" x="16" y="72">This engine · 8 sessions</text>
-  <text class="cat-sub" x="16" y="86">RTX 4090 Laptop 16 GB · 32 GB RAM</text>
-  <rect class="us" x="250" y="62" width="323.5" height="22" rx="4"/>
-  <text class="v-us" x="581.5" y="78">64.7</text>
-  <text class="cat" x="16" y="110">llama.cpp · RTX 5090</text>
-  <text class="cat-sub" x="16" y="124">32 GB · 128 GB RAM</text>
-  <rect class="them" x="250" y="100" width="240.1" height="22" rx="4"/>
-  <text class="v-them" x="498.1" y="115">48.0</text>
-  <text class="cat" x="16" y="148">llama.cpp · RTX 4090</text>
-  <text class="cat-sub" x="16" y="162">24 GB · 96 GB RAM</text>
-  <rect class="them" x="250" y="138" width="150" height="22" rx="4"/>
-  <text class="v-them" x="408" y="153">30</text>
-  <text class="cat" x="16" y="186">llama.cpp · RTX 5080</text>
-  <text class="cat-sub" x="16" y="200">16 GB · 64 GB RAM · n-gram speculation</text>
-  <rect class="them" x="250" y="176" width="145" height="22" rx="4"/>
-  <text class="v-them" x="403" y="191">29</text>
-  <text class="cat" x="16" y="224">RTX 4090, engine not stated</text>
-  <text class="cat-sub" x="16" y="238">24 GB · RAM not stated · 250K context</text>
-  <rect class="them" x="250" y="214" width="105" height="22" rx="4"/>
-  <text class="v-them" x="363" y="229">21</text>
+  <path class="grid base" d="M250 52 V396"/>
+  <path class="grid" d="M295 52 V396 M340 52 V396 M385 52 V396 M430 52 V396 M475 52 V396 M520 52 V396 M565 52 V396"/>
+  <text class="cat" x="16" y="72">This engine · 16 sessions</text>
+  <text class="cat-sub" x="16" y="86">RTX 3090 24 GB · 64 GB RAM</text>
+  <rect class="us" x="250" y="62" width="330.75" height="22" rx="4"/>
+  <text class="v-us" x="588.75" y="78">147.0</text>
+  <text class="cat" x="16" y="110">This engine · 8 sessions</text>
+  <text class="cat-sub" x="16" y="124">RTX 4090 Laptop 16 GB · 32 GB RAM</text>
+  <rect class="us" x="250" y="100" width="145.6" height="22" rx="4"/>
+  <text class="v-us" x="403.6" y="116">64.7</text>
+  <text class="cat" x="16" y="148">llama.cpp · RTX 5090</text>
+  <text class="cat-sub" x="16" y="162">32 GB · 128 GB RAM</text>
+  <rect class="them" x="250" y="138" width="108" height="22" rx="4"/>
+  <text class="v-them" x="366" y="154">48.0</text>
+  <text class="cat" x="16" y="186">llama.cpp · RTX 4090</text>
+  <text class="cat-sub" x="16" y="200">24 GB · 96 GB RAM</text>
+  <rect class="them" x="250" y="176" width="67.5" height="22" rx="4"/>
+  <text class="v-them" x="325.5" y="192">30</text>
+  <text class="cat" x="16" y="224">llama.cpp · RTX 5080</text>
+  <text class="cat-sub" x="16" y="238">16 GB · 64 GB RAM · n-gram speculation</text>
+  <rect class="them" x="250" y="214" width="65.25" height="22" rx="4"/>
+  <text class="v-them" x="323.25" y="230">29</text>
   <text class="cat" x="16" y="262">This engine · 1 session</text>
-  <text class="cat-sub" x="16" y="276">RTX 4090 Laptop 16 GB · 32 GB RAM</text>
-  <rect class="us-soft" x="250" y="252" width="100" height="22" rx="4"/>
-  <text class="v-us" x="358" y="267">20.0</text>
-  <text class="cat" x="16" y="300">llama.cpp · RTX 3090</text>
-  <text class="cat-sub" x="16" y="314">24 GB · 128 GB RAM</text>
-  <rect class="them" x="250" y="290" width="75" height="22" rx="4"/>
-  <text class="v-them" x="333" y="305">15</text>
-  <text class="tick mid" x="250" y="338">0</text>
-  <text class="tick mid" x="300" y="338">10</text>
-  <text class="tick mid" x="350" y="338">20</text>
-  <text class="tick mid" x="400" y="338">30</text>
-  <text class="tick mid" x="450" y="338">40</text>
-  <text class="tick mid" x="500" y="338">50</text>
-  <text class="tick mid" x="550" y="338">60</text>
-  <text class="tick mid" x="600" y="338">70</text>
-  <text class="t-dim" x="16" y="362">this engine decodes speculatively with the model's own MTP head; the RTX 5080 run uses n-gram speculation</text>
+  <text class="cat-sub" x="16" y="276">RTX 3090 24 GB · 64 GB RAM</text>
+  <rect class="us-soft" x="250" y="252" width="54.7" height="22" rx="4"/>
+  <text class="v-us" x="312.7" y="268">24.3</text>
+  <text class="cat" x="16" y="300">RTX 4090, engine not stated</text>
+  <text class="cat-sub" x="16" y="314">24 GB · RAM not stated · 250K context</text>
+  <rect class="them" x="250" y="290" width="47.25" height="22" rx="4"/>
+  <text class="v-them" x="305.25" y="306">21</text>
+  <text class="cat" x="16" y="338">This engine · 1 session</text>
+  <text class="cat-sub" x="16" y="352">RTX 4090 Laptop 16 GB · 32 GB RAM</text>
+  <rect class="us-soft" x="250" y="328" width="45" height="22" rx="4"/>
+  <text class="v-us" x="303" y="344">20.0</text>
+  <text class="cat" x="16" y="376">llama.cpp · RTX 3090</text>
+  <text class="cat-sub" x="16" y="390">24 GB · 128 GB RAM · 130K context</text>
+  <rect class="them" x="250" y="366" width="33.75" height="22" rx="4"/>
+  <text class="v-them" x="291.75" y="382">15</text>
+  <text class="tick mid" x="250" y="414">0</text>
+  <text class="tick mid" x="295" y="414">20</text>
+  <text class="tick mid" x="340" y="414">40</text>
+  <text class="tick mid" x="385" y="414">60</text>
+  <text class="tick mid" x="430" y="414">80</text>
+  <text class="tick mid" x="475" y="414">100</text>
+  <text class="tick mid" x="520" y="414">120</text>
+  <text class="tick mid" x="565" y="414">140</text>
+  <text class="t-dim" x="16" y="438">this engine decodes speculatively with the model's own MTP head; the RTX 5080 run uses n-gram speculation</text>
 </svg>
 <figcaption>Every published single-GPU run of this model that states its host uses
-64–128 GB of RAM. The laptop has 32, and is the only one serving eight people at
-once.</figcaption>
+64–128 GB of RAM. The laptop has 32 and serves eight people at once; the RTX 3090
+has 64 and serves sixteen.</figcaption>
 </figure>
 
-Look at the two green bars, because together they tell the whole story.
+Look at the laptop's two green bars, because together they tell the whole story.
 
 The single session — 20 t/s — sits among the desktop runs, which is exactly where
 you'd expect a laptop with half the model on an NVMe drive to sit.
@@ -193,6 +201,15 @@ of RAM behind it. Every expert that crosses the bus serves every session that
 routed to it, so the eighth conversation costs a fraction of the first. That's
 the [wave](/blog/waves-and-the-pcie-bottleneck) doing its job, on a model six
 times bigger than the one it was designed on.
+
+Then there's the RTX 3090 — a six-year-old card on PCIe 3.0, with no native
+FP8, and the one card where there's a published run to put ours directly beside.
+llama.cpp on a 3090 with 128 GB of RAM decodes this model at 15 t/s. Ours has
+half that RAM, and a single session decodes at **24.3 t/s**. Give it sixteen
+conversations — a rung the laptop can't fit — and it reaches **147.0 t/s
+aggregate**, ten times the published figure, every session validated. (Their
+run was at a 130K context and a 4-bit quant; ours is a short prompt on the 2-bit
+expert artifact. The width is the part no published run has.)
 
 As far as I can find, this is the first time anyone has published this model
 running on a laptop GPU — or in 32 GB of host memory at all.

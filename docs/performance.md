@@ -20,7 +20,10 @@ references, below and in full in §6.8).
    aggregate decode at ×8, 5.44× KV compression at C10 **[I1 · I2]**. No
    laptop-GPU run of this model has been published, and the published
    single-GPU runs that state their host use 64–128 GB of RAM
-   **[E49 · E51 · E52]**.
+   **[E49 · E51 · E52]**. On a 24 GB RTX 3090 with 64 GB of RAM the same
+   artifact decodes **24.3 t/s at one session and 147.0 t/s aggregate at ×16**,
+   every session validated, where the published llama.cpp run on an RTX 3090
+   with 128 GB decodes 15 t/s single-stream **[I18 · E51]**.
 
 2. **Context length is free.** Flash-Next keeps **99% of its prefill and 111% of
    its decode from 32K to 128K** — decode is *faster* at 128K — while the other
@@ -122,6 +125,7 @@ references, below and in full in §6.8).
 | **I15** | Engine probe, Flash-Next: story 8/8, worst sustained efficiency 100%, uptake 73% (2026-09-30) and 88% (2026-09-29) | §3.9 *Engine probes* |
 | **I16** | Aggregate decode against llama.cpp's best published single-stream rate, same model and card class. RTX 3090: Qwen3-8B C8 ×10 303.4 vs 115.3; Qwen3-30B-A3B Q8_0 ×20 274.5 vs 153.6; Qwen3.5-35B C10 ×16 375.9 vs 111.2; Qwen3.6-35B C10 ×16 388.6 vs 157.66; Qwen3.8-27B C9 ×5 198.9 vs 65.28 (MTP); Llama-2-7B BF16 ×48 547.6 vs 161.89. 16 GB: Qwen3-8B C8 ×10 230.1 vs 102.7 (RTX 4080); Flash-Next BF16 ×8 64.7 vs 27.5–29 (RTX 5080); exception — Qwen3.6-35B C10 ×16 129.7 vs 183.29 / 249.33 MTP (RTX 4080, IQ3_S resident). Blackwell (our RTX PRO 5000 vs a published RTX 5090): Qwen3-8B 460.1 vs 200.4; Qwen3-30B-A3B 595.7 vs 226.1; Qwen3.5-35B 1,187.7 vs 194.0; Qwen3.6-35B 1,201.6 vs 333.55 (MTP); Llama-2-7B 917.3 vs 300.40 | §3.7–§3.9 ladders; §6.2–§6.5 |
 | **I17** | Flash-Next gate prefill 430.7 → 627.0 t/s (BF16 ×4) and 354.5 → 472.0 (BF16 ×8), builds `9be7b182c` → `a475e852c`, every row validated | commits `91ef33339`, `eef0f44ab`, `0ce74ecad`; §7.3 |
+| **I18** | Flash-Next on the RTX 3090 (i7-10700K, 64 GB RAM), Q2_KO experts: full ladder incl. ×16, every row validated; BF16 ×1 warm 524.0 / 24.3 t/s, ×4 1,033.4 prefill, ×16 147.0 aggregate decode, C10 ×2 5.46×; engine probe story 8/8, efficiency 99%, uptake 80% | §3.8 *Qwen3.8-Flash-Next*; `results/performance_rtx_3090_24gb_rows_2026-09-30.tsv` |
 
 ### External references — published results
 
@@ -170,9 +174,12 @@ references, below and in full in §6.8).
 > - **RTX 3090 24 GB** — a width/throughput gate sweep on 2026-09-14 (§3.8),
 >   the same `test_parallel_batched_forwarding*` gates as §3.7, run one model at
 >   a time. Ten of the fleet's models plus the two AntiLoop+StyleTune hybrids;
->   the 180B Flash-Next and the 284B DeepSeek were not run in that sweep. **No
->   depth curves** — the `long_context_*` and `profile_*` gates were not run on
->   this card, so the 3090 appears in the width tables only.
+>   the 180B Flash-Next and the 284B DeepSeek were not run in that sweep.
+>   **Qwen3.8-Flash-Next** was added on 2026-09-30 (build `e596fad8d`): its gate
+>   and its `kv_fragmentation` engine probe, from the same Q2_KO-expert artifact
+>   the 4090 Mobile runs (§3.8 *Qwen3.8-Flash-Next*). **No depth curves** — the
+>   `long_context_*` and `profile_*` gates were not run on this card, so the 3090
+>   appears in the width tables only.
 > - **RTX 4090 Mobile 16 GB** — a width/throughput gate sweep on 2026-09-30
 >   (§3.9), build `bf291341c`: the same `test_parallel_batched_forwarding*` gates,
 >   one model at a time, plus the two `kv_fragmentation` engine probes (§2.2). Ten
@@ -722,7 +729,9 @@ unaffected. The 3090 has not been re-swept on the fixed build.
 production 3.6-35B npcd actually serves. The 180B Flash-Next and the 284B
 DeepSeek were not run in this sweep. Size alone does not exclude them — the
 expert cache streams a MoE's experts from host, and Flash-Next runs on the
-16 GB card (§3.9) — but neither has a 3090 row. Two card-specific notes carry
+16 GB card (§3.9) — and **Flash-Next was measured separately on 2026-09-30**,
+on a current build (*Qwen3.8-Flash-Next* below, marked ‡ in the summary).
+DeepSeek still has no 3090 row. Two card-specific notes carry
 into these rows: **Llama-3.2-3B ran without flash-attn** (its build needs
 `cl.exe` on PATH, absent in the sweep shell; the model's
 `#[cfg(not(feature = "flash-attn"))]` fallback path was used instead), and
@@ -746,8 +755,11 @@ each model's ladder:
 | Qwen3.6-35B-A3B | 3,662.1 | 388.6 | 6.05× (C10) |
 | Qwen3.6-35B AntiLoop+StyleTune (auto/Precision) | 3,463.1 | 351.6 | 6.09× (C10) |
 | Qwen3.6-35B AntiLoop+StyleTune (Performance) | 3,742.3 | 399.0 | 6.10× (C10) |
+| Qwen3.8-Flash-Next (Q2_KO experts) ‡ | 1,033.4 | 147.0 | 5.46× (C10) |
 
 † ran on the no-flash-attn fallback path (above).
+‡ measured 2026-09-30 on build `e596fad8d`, which carries the refresh fix and the
+synchronised prompt timer — not comparable with the other rows' prefill (above).
 
 **Against the 72 GB card, on the models both ran.** The comparison holds only on
 the width gate, and only loosely: the 3090's ladders stop at a narrower widest
@@ -1009,6 +1021,56 @@ the `auto`/Precision row above.
 | C9 | perf | yes | 2 | ✓ | 3731.4 | 148.5 | 100.0% | 5.77x | 1358 |
 | C10 | perf | yes | 8 | ✓ | 3738.5 | 346.7 | 100.0% | 6.10x | 5316 |
 | C10 | perf | yes | 16 | ✓ | 3384.8 | 399.0 | 100.0% | 6.07x | 10618 |
+
+#### Qwen3.8-Flash-Next (Q2_KO experts)
+
+Measured on **2026-09-30**, sixteen days after the rest of this section, on build
+`e596fad8d` — with the daemon stopped and the card at its idle floor, like the
+sweep. The card runs the same **Q2_KO-expert** artifact as the 4090 Mobile (both
+sit under the ladder's 32 GiB rung, so the recipe and its digest tag
+`130076148f33` are identical); this run used a copy of the 4090 Mobile's file,
+which the gate verified against its own recipe before loading. The ×16 rung the
+16 GB card skips runs here.
+
+The 3090's host changes the expert tiers, not the format: its 64 GB of RAM pins
+**all 24,064 evictable experts** (31.0 GiB warm tier, no shortfall), so every
+miss is a host→device upload over PCIe 3.0 and the run read nothing from the
+NVMe pack. The 4090 Mobile's 31.5 GiB host cannot hold that tier.
+
+| KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
+|---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
+| BF16 | prec | yes | 1 (cold) | ✓ | 247.3 | 20.2 | - | - | 713 |
+| BF16 | prec | yes | 4 | ✓ | 1033.4 | 67.0 | - | - | 2894 |
+| BF16 | prec | yes | 8 | ✓ | 895.2 | 113.2 | - | - | 5748 |
+| BF16 | prec | yes | 16 | ✓ | 976.5 | 147.0 | - | - | 11482 |
+| BF16 | prec | yes | 1 (warm) | ✓ | 524.0 | 24.3 | - | - | 713 |
+| C0 | prec | yes | 2 | ✓ | 851.7 | 44.2 | 100.0% | 2.18x | 1466 |
+| C5 | prec | yes | 2 | ✓ | 857.7 | 43.4 | 100.0% | 4.01x | 1466 |
+| C8 | prec | yes | 2 | ✓ | 862.6 | 43.4 | 100.0% | 4.74x | 1466 |
+| C10 | prec | yes | 2 | ✓ | 863.9 | 44.0 | 100.0% | 5.46x | 1466 |
+| C10 | prec | yes | 8 | ✓ | 1010.6 | 95.6 | 100.0% | 5.44x | 5748 |
+
+**Against the 4090 Mobile (§3.9), same artifact.** Decode at ×8 is 113.2 against
+64.7 t/s (1.7×), and the 3090 adds a ×16 row at 147.0; prefill at ×4 is 1,033.4
+against 654.7. The 4090 Mobile's rows are from build `bf291341c`, before the
+hot-path prefill work of I17, so the prefill gap is the build as much as the
+card; decode is the column to read. Compression matches to the second decimal
+place (C10 ×2 5.46× against 5.44×), as it should — the ratio is the model's.
+
+**Engine probe** (`kv_fragmentation::qwen38_flash_next`, §2.2), run after the
+gate under the same card-to-itself rule:
+
+| Probe | Story | Worst sustained VRAM efficiency | Weight uptake | Result |
+|---|---:|---:|---:|---|
+| Qwen3.8-Flash-Next (`qwen38_flash_next`) | 8/8 | 99% (single sample 80%) | 80% of 3,152 MiB released | pass |
+
+Its phase B — eight sequences prefilling and decoding together on the pool
+phase A fragmented — delivered 4,024 prefill tokens in 17.90 s (224.8 t/s) and
+384 decode tokens in 18.40 s (20.9 t/s aggregate), with the two phases
+overlapping rather than summing. That is delivery under churn, at the engine's
+own context rather than the gate's 262,144 (§2.2), mid-way through a KV pack and
+a weight-zone regrowth; it is not a ceiling and is not comparable with the
+gate's ×8 row. `qwen38_flash_next_combined` measures both from one load.
 
 ### 3.9 RTX 4090 Mobile 16 GB — the width gate sweep
 
@@ -1611,6 +1673,7 @@ quantized_pct, compress, peak_tokens`, scraped from the run logs:
 | `performance_rtx_pro_5000_72gb_rows_2026-09-15_run1.tsv` | 72 GB · 2026-09-15 — width only, build `23623c6b`, run 1 | 171 |
 | `performance_rtx_pro_5000_72gb_rows_2026-09-15_run2.tsv` | 72 GB · 2026-09-15 — width only, build `23623c6b`, run 2 | 171 |
 | `performance_rtx_4090_mobile_16gb_rows.tsv` | RTX 4090 Mobile · 2026-09-30 — width gate sweep, build `bf291341c` | 187 |
+| `performance_rtx_3090_24gb_rows_2026-09-30.tsv` | RTX 3090 · 2026-09-30 — Flash-Next gate only, build `e596fad8d` | 10 |
 
 A † cell in §3.6 *Width* or §3.7 is the 72 GB 2026-09-13 file's value, a ◆ cell
 the higher of the two 2026-09-15 files' values; every other 72 GB width cell is
@@ -1619,7 +1682,8 @@ Llama-2-7B before Qwen3-8B and Qwen3.8-27B before Qwen3-30B-A3B. The 3090 and
 4090 Mobile TSVs hold the width-sweep axis only — their `depth` column is blank
 and `prompt_tokens` is `~700`, the gate's fixed prompt. The 4090 Mobile's engine
 probes (§3.9) are not rows of that file: they report story, efficiency and
-uptake rather than a ladder, and §3.9 carries them. Reproduce any row with the
+uptake rather than a ladder, and §3.9 carries them; the same holds for the
+3090's Flash-Next probe, which §3.8 carries. Reproduce any row with the
 command in its test's `#[ignore]` attribute.
 
 | Table | Test |
@@ -1629,7 +1693,7 @@ command in its test's `#[ignore]` attribute.
 | §3.6 Coherence | `quantized_qwen38_moe::tests::profile_decode_vs_depth` (72 GB) |
 | §3.6 Rewrite | `quantized_qwen38_moe::tests::profile_story_rewrite_vs_depth` (72 GB) |
 | §3.6 Width, §3.7 | `test_parallel_batched_forwarding*` (72 GB) |
-| §3.8 | `test_parallel_batched_forwarding*` (RTX 3090) |
+| §3.8 | `test_parallel_batched_forwarding*` and `kv_fragmentation::qwen38_flash_next` (RTX 3090) |
 | §3.9 | `test_parallel_batched_forwarding*` and `kv_fragmentation::{qwen3_30b_a3b_q4, qwen38_flash_next}` (RTX 4090 Mobile) |
 
 All runs, in every sweep and on all three cards, were strictly sequential — one
@@ -1840,6 +1904,7 @@ Qwen3.8-Flash-Next is 125B + 51B n-gram + 4B MTP, 6B active** (§3.1, E60).
 | *RTX 4090 24 GB* | n/s | n/s | n/s | n/s | f16 ("no kv cache quantization") | 250K | 364 | 21 (no MTP) | E50 |
 | *RTX 5090* | Ryzen 7 9700X, 128 GB DDR5 | llama.cpp PR #27742 | UD-Q2_K_XL | `-ncmoe 24` | n/s | 65,536 | 1,429 | 48.02 short; 43.28 after ~16K | E52 |
 | *RTX PRO 6000 Blackwell* | n/s | n/s (Unsloth) | n/s | n/s | n/s | n/s | — | 100; 170 **MTP** | E53 |
+| RTX 3090 **(ours, §3.8)** | i7-10700K, 64 GB | this engine, BF16 ×1 warm / ×8 / ×16 | Q2_KO experts | experts streamed VRAM→pinned RAM | BF16 | ~700-tok prompt | 524.0 / 895.2 / 976.5 | 24.3 / 113.2 / 147.0 (**MTP**) | — |
 | RTX 4090 Mobile **(ours, §3.9)** | Core Ultra 9 185H, 32 GB | this engine, BF16 ×1 warm / ×8 / C10 ×8 | Q2_KO experts | experts streamed VRAM→RAM→NVMe | BF16 / C10 | ~700-tok prompt | 244.2 / 495.4 / 497.9 | 20.0 / 64.7 / 59.5 (**MTP**) | — |
 | RTX PRO 5000 **(ours, §3.6)** | Ryzen 9 9950X3D, 189 GB | this engine, ×1 warm / ×8 | Q4_KOEXP | resident | BF16 | ~700-tok prompt | 1,705.7 / 1,880.9 | 86.9 / 393.1 (**MTP**) | — |
 
@@ -1917,7 +1982,11 @@ figures, not a controlled comparison.
   not.** On a 16 GB-class card the nearest published run (RTX 5080 16 GB, E51)
   decodes at 27.5–29 t/s with n-gram speculation, against our 20.0 at ×1 with
   MTP on the RTX 4090 Mobile — and our 64.7 aggregate at ×8, a width no source
-  reports. On the 72 GB card our 86.9 t/s at ×1 with MTP is below the
+  reports. On the RTX 3090, the one card class with a published run and ours,
+  llama.cpp decodes 15 t/s single-stream with 128 GB of host RAM (E51, UD-Q4_K_XL,
+  q8_0 KV at a 130K context) against our 24.3 at ×1 with MTP and 64 GB (Q2_KO
+  experts, a ~700-token prompt) — the context and the expert width both differ,
+  so the ×1 gap is not the engine alone — and our 147.0 aggregate at ×16. On the 72 GB card our 86.9 t/s at ×1 with MTP is below the
   RTX PRO 6000's published 100 without MTP and 170 with it (E53, on an
   unstated artifact), and our ×8 aggregate is 393.1.
 - **Quantized KV and decode depth.** llama.cpp's q8_0 KV costs Qwen3-8B 18% of
@@ -2191,11 +2260,11 @@ section beside the existing ones rather than overwriting them.
   decode-slot refresh fix and the synchronised prompt timer (§4), so its prefill
   column understates the card, and it predates every change since. Until it is
   re-run, no prefill comparison against the 3090 is architectural (§3.9).
-- **Qwen3.8-Flash-Next and DeepSeek-V4-Flash.** Neither has a 3090 row. Size does
-  not exclude them — Flash-Next runs on the 16 GB card — and Flash-Next's ×16
-  rung, which the 16 GB card skips, needs the 24 GiB the 3090 has.
+- **DeepSeek-V4-Flash.** No 3090 row. Size does not exclude it — Flash-Next
+  runs here and on the 16 GB card through the expert cache (§3.8).
 - **Depth**, as for the 4090 Mobile.
-- **Both engine probes** (`kv_fragmentation`), which have no 3090 result.
+- **The Qwen3-30B engine probe** (`kv_fragmentation::qwen3_30b_a3b_q4`), which has
+  no 3090 result; the Flash-Next probe does (§3.8).
 - **Llama-3.2-3B with flash-attn.** §3.8 ran its no-flash-attn fallback because
   the sweep shell had no `cl.exe` on PATH; a shell with it measures the real
   path.
