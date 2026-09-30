@@ -131,6 +131,12 @@ pub struct Substrate {
     /// sessions — the conversation ids themselves are random u64s and carry no
     /// time information.
     conv_order_counter: u64,
+    /// Monotonic counter stamped onto a [`TimelineEntry::active`] each time the
+    /// conversation is used ([`Self::touch_conversation`]). Unlike `order`, the
+    /// rank is persisted in the `ConvState` record, so replay restores it
+    /// exactly whatever order compaction re-emits those records in; replay
+    /// raises the counter to the highest rank it sees.
+    conv_active_counter: u64,
 
     /// Inverse index: every timeline registered against a given group.
     /// Maintained in lockstep with [`Self::timelines`].
@@ -238,6 +244,14 @@ pub struct Substrate {
     /// singletons.  The per-stream `BTreeMap` only ever sits in
     /// memory — reload rebuilds it from record headers.
     streams: HashMap<StreamId, StreamRuntime>,
+
+    /// Bumped whenever anything a collection's belief gallery is assembled from
+    /// changes — a stream declared, a signature or projection-event blob
+    /// written, a turn or timeline tombstoned, the streams cleared. The gallery
+    /// walks every stream to find its members; keyed on this, it is assembled
+    /// once per change instead of on every reprojection (see
+    /// [`Self::gallery_epoch`]).
+    gallery_epoch: u64,
 
     /// Interior-mutable per-stream memo of decoded wide-Q windows for the belief
     /// scan — filled lazily under a read lock, so a session's reprojections
@@ -1237,7 +1251,7 @@ pub struct TimelineEntry {
     pub conv_id: Option<String>,
     /// Creation-order rank, stamped from [`Substrate::conv_order_counter`] the
     /// first time `conv_id` is set. `0` until then. Higher = created later; the
-    /// daemon sidebar sorts on this so newest conversations lead the list.
+    /// daemon sidebar orders conversations with the same [`Self::active`] by it.
     pub order: u64,
     /// Free-form key/value metadata, persisted in the same
     /// `RecordType::Label` record as `label`/`conv_id` and merged
@@ -1255,6 +1269,11 @@ pub struct TimelineEntry {
     /// the repository's workspace name. Persisted with `archived` in the same
     /// `RecordType::ConvState` record — see [`ConvState`].
     pub branches: BTreeMap<String, String>,
+    /// Last-use rank, stamped from [`Substrate::conv_active_counter`] each time
+    /// the conversation is used; higher = used more recently, `0` = not used
+    /// since the rank was kept. Persisted with `archived` in the `ConvState`
+    /// record. The daemon sidebar sorts on it, most recently used first.
+    pub active: u64,
     /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
@@ -1427,6 +1446,7 @@ impl TimelineEntry {
             custom: BTreeMap::new(),
             archived: false,
             branches: BTreeMap::new(),
+            active: 0,
             turns: BTreeMap::new(),
             tree_meta: BTreeMap::new(),
             debug_id: None,
@@ -1987,34 +2007,71 @@ impl Substrate {
     pub fn snapshot_pending_warm(
         &self,
     ) -> Vec<(ResidenceIndex, Vec<SealedSequence>, Option<ConvCompression>)> {
-        self.hot_lru
-            .iter()
-            .filter_map(|&idx| {
-                let slot = &self.residence[idx.0];
-                if slot.warm.is_some() {
-                    return None;
-                }
-                // Skip residences pinned into the current wave's working set: a
-                // slot the in-flight decode is actively attending is about to be
-                // (or is being) elevated warm→hot on the shared copy stream and
-                // on the persistence thread this drain runs on. Backing it up
-                // hot→warm right now is redundant work that MONOPOLISES the
-                // persistence thread + stream against the very elevation
-                // the decode is blocked on — the tier-migration livelock where the
-                // same working set churns hot→warm every pass while the decode
-                // lands zero forwards. Defer its warm copy until it leaves the
-                // working set (mirrors the pinned hot-drop defer in
-                // `mark_timeline_evict_when_cold`). Durability is only deferred,
-                // not lost: the authoritative hot copy stays resident while pinned,
-                // and the next unpinned pass makes the warm copy.
-                if self.working_set_pins.contains(&idx) {
-                    return None;
-                }
-                slot.hot
-                    .as_ref()
-                    .map(|hot| (idx, hot.clone(), slot.compression))
-            })
+        self.pending_warm()
+            .map(|(idx, hot, cc)| (idx, hot.clone(), cc))
             .collect()
+    }
+
+    /// The distinct compression overrides among the residences
+    /// [`Self::snapshot_pending_warm`] would return — the persistence thread's
+    /// hot→warm groups, named without cloning a single sequence.
+    pub fn pending_warm_policies(&self) -> Vec<Option<ConvCompression>> {
+        let mut out: Vec<Option<ConvCompression>> = Vec::new();
+        for (_, _, cc) in self.pending_warm() {
+            if !out.contains(&cc) {
+                out.push(cc);
+            }
+        }
+        out
+    }
+
+    /// [`Self::snapshot_pending_warm`] restricted to one compression override:
+    /// one hot→warm group, cloned when the persistence thread is about to
+    /// migrate it and not before.
+    pub fn snapshot_pending_warm_for(
+        &self,
+        policy: Option<ConvCompression>,
+    ) -> Vec<(ResidenceIndex, Vec<SealedSequence>)> {
+        self.pending_warm()
+            .filter(|(_, _, cc)| *cc == policy)
+            .map(|(idx, hot, _)| (idx, hot.clone()))
+            .collect()
+    }
+
+    /// Every hot residence awaiting a warm copy, with its hot bytes and its
+    /// compression override — what the hot→warm phase works through.
+    fn pending_warm(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            ResidenceIndex,
+            &Vec<SealedSequence>,
+            Option<ConvCompression>,
+        ),
+    > + '_ {
+        self.hot_lru.iter().filter_map(|&idx| {
+            let slot = &self.residence[idx.0];
+            if slot.warm.is_some() {
+                return None;
+            }
+            // Skip residences pinned into the current wave's working set: a
+            // slot the in-flight decode is actively attending is about to be
+            // (or is being) elevated warm→hot on the shared copy stream and
+            // on the persistence thread this drain runs on. Backing it up
+            // hot→warm right now is redundant work that MONOPOLISES the
+            // persistence thread + stream against the very elevation
+            // the decode is blocked on — the tier-migration livelock where the
+            // same working set churns hot→warm every pass while the decode
+            // lands zero forwards. Defer its warm copy until it leaves the
+            // working set (mirrors the pinned hot-drop defer in
+            // `mark_timeline_evict_when_cold`). Durability is only deferred,
+            // not lost: the authoritative hot copy stays resident while pinned,
+            // and the next unpinned pass makes the warm copy.
+            if self.working_set_pins.contains(&idx) {
+                return None;
+            }
+            slot.hot.as_ref().map(|hot| (idx, hot, slot.compression))
+        })
     }
 
     /// Total VRAM byte footprint of hot residences that lack a warm copy — the
@@ -3518,6 +3575,13 @@ impl Substrate {
         self.streams.values().any(|s| !s.chunks.is_empty())
     }
 
+    /// The belief-gallery epoch: unchanged while nothing a collection's gallery
+    /// is assembled from has changed, so an assembled gallery keyed on it can be
+    /// reused. See the field.
+    pub fn gallery_epoch(&self) -> u64 {
+        self.gallery_epoch
+    }
+
     /// Decoded wide-Q window for `stream_id`, memoized across reprojections.
     ///
     /// The belief scan reads the same static gallery on every reprojection;
@@ -3643,6 +3707,7 @@ impl Substrate {
     /// per-turn KV residence slots) is preserved.
     pub fn clear_walker_state(&mut self) {
         self.streams.clear();
+        self.gallery_epoch += 1;
         self.timeline_by_debug_id.clear();
         // The two indexes compaction can *shrink* — an entry whose record was
         // dropped would otherwise survive here pointing into a segment that no
@@ -3780,6 +3845,7 @@ impl Substrate {
             }
         }
         self.streams.entry(stream_id).or_default().decl = Some(decl);
+        self.gallery_epoch += 1;
     }
 
     /// Record a chunk location for `stream_id` at chunk index `idx`.
@@ -3905,6 +3971,8 @@ impl Substrate {
         if let Some(entry) = self.timelines.get_mut(&timeline) {
             entry.archived = state.archived;
             entry.branches = state.branches;
+            entry.active = state.active;
+            self.conv_active_counter = self.conv_active_counter.max(state.active);
         }
     }
 
@@ -3984,10 +4052,12 @@ impl Substrate {
                 // replayed in.
                 if !self.tombstoned_timelines.contains(&timeline) {
                     self.tombstoned_turns.insert((timeline, turn));
+                    self.gallery_epoch += 1;
                 }
             }
             None => {
                 self.tombstoned_timelines.insert(timeline);
+                self.gallery_epoch += 1;
                 // The same subsumption the live path applies — see
                 // [`Self::tombstone_timeline`]. Replay order is arbitrary, so a
                 // turn tombstone read after its timeline's must not resurrect
@@ -4037,6 +4107,7 @@ impl Substrate {
             return;
         }
         self.tombstoned_turns.insert((timeline, turn_index));
+        self.gallery_epoch += 1;
         let (residence, retired_tokens) = match self
             .timelines
             .get_mut(&timeline)
@@ -4116,6 +4187,7 @@ impl Substrate {
     /// deletion would only take effect on the next reload.
     pub fn tombstone_timeline(&mut self, timeline: TimelineId) {
         self.tombstoned_timelines.insert(timeline);
+        self.gallery_epoch += 1;
         // **A wholesale tombstone subsumes every turn-scoped one it covers.**
         //
         // `tombstoned_turns` only ever grew, so a conversation that retired a
@@ -4657,6 +4729,7 @@ impl Substrate {
                 // Last-writer-wins per turn stream id.
                 self.streams.entry(stream_id).or_default().projection_events =
                     Some(entry.record.payload.clone());
+                self.gallery_epoch += 1;
                 // Mirror the `WideQSig` arm: drop this stream's memoized seams so a
                 // replay/apply after the seam cache warmed can't serve stale seams.
                 self.seam_cache
@@ -4669,6 +4742,7 @@ impl Substrate {
                 // per turn stream id — each (re)projection overwrites the window.
                 self.streams.entry(stream_id).or_default().wide_q_sigs =
                     Some(entry.record.payload.clone());
+                self.gallery_epoch += 1;
                 self.evict_decoded_wide_sig(stream_id);
             }
             RecordType::TurnIndexPage => {
@@ -5381,6 +5455,28 @@ impl Substrate {
             + self.section_token_total
     }
 
+    /// `timeline`'s own sealed turn tokens — [`Self::total_token_count`] without the
+    /// shared sections, which belong to no one conversation. What a per-conversation
+    /// figure that is summed across conversations must use, or every conversation
+    /// counts the whole tool catalog again. O(1).
+    pub fn timeline_token_total(&self, timeline: TimelineId) -> usize {
+        self.timeline_token_totals
+            .get(&timeline)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Tokens sealed in the whole substrate: every live timeline's turns and the shared
+    /// sections, each counted once. O(timelines).
+    pub fn corpus_token_total(&self) -> usize {
+        self.timeline_token_totals
+            .iter()
+            .filter(|(tl, _)| !self.tombstoned_timelines.contains(tl))
+            .map(|(_, tokens)| tokens)
+            .sum::<usize>()
+            + self.section_token_total
+    }
+
     pub fn turn_indices(&self, timeline: TimelineId) -> impl Iterator<Item = TurnIndex> + '_ {
         self.timelines
             .get(&timeline)
@@ -5628,7 +5724,20 @@ impl Substrate {
         self.timelines.get(&timeline).map(|e| ConvState {
             archived: e.archived,
             branches: e.branches.clone(),
+            active: e.active,
         })
+    }
+
+    /// Mark `timeline` as used now: stamp it with the next last-use rank, so
+    /// it outranks every conversation used before it. Returns `false` for an
+    /// unregistered timeline, which has no state to write.
+    pub fn touch_conversation(&mut self, timeline: TimelineId) -> bool {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            return false;
+        };
+        self.conv_active_counter += 1;
+        entry.active = self.conv_active_counter;
+        true
     }
 
     /// Set the branch `timeline` works on in `repo`. No-op when the timeline
@@ -5744,6 +5853,7 @@ impl Substrate {
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.gallery_epoch += 1;
     }
 
     /// Store a turn's projection-event record payload (opaque JSON bytes) on its
@@ -5751,6 +5861,7 @@ impl Substrate {
     /// and on redo-log replay.
     pub fn set_projection_events_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
         self.streams.entry(stream_id).or_default().projection_events = Some(payload);
+        self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded seams so a
         // single seal doesn't force a full-gallery JSON re-parse on the next scan.
         self.seam_cache
@@ -5769,6 +5880,7 @@ impl Substrate {
     /// Cache a turn's encoded wide-Q signature window, last-writer-wins.
     pub fn set_wide_q_sigs_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
         self.streams.entry(stream_id).or_default().wide_q_sigs = Some(payload);
+        self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded window so a
         // single seal doesn't force a full-gallery re-decode on the next scan.
         self.evict_decoded_wide_sig(stream_id);
@@ -6502,6 +6614,13 @@ mod tests {
     };
     use crate::token_buffer::TokenBuffer;
 
+    /// A timeline id no allocator in a test can also mint. Allocators are
+    /// microsecond clocks, so two fresh ones asked in the same microsecond
+    /// return the same id — two "different" timelines then share their turns.
+    fn unshared_timeline(n: u64) -> TimelineId {
+        TimelineId::from_raw((1 << 62) | n).expect("non-zero timeline id")
+    }
+
     fn make_timeline() -> (LayerId, GroupId, TimelineId, Substrate) {
         let layer = LayerId::for_test(1);
         let group = GroupId::for_test(1);
@@ -6703,7 +6822,7 @@ mod tests {
     fn a_read_larger_than_the_budget_is_refused_and_disturbs_nothing() {
         let (mut sub, target, reads) = fast_path_fixture(2, 100);
         assert!(sub.fast_path_admit(target, reads[0], 250));
-        let huge = TimelineAllocator::new().next();
+        let huge = unshared_timeline(1);
         sub.register_timeline(huge, LayerId::for_test(1), GroupId::for_test(1));
         sub.append_with_blocks(huge, 5_000, 0, 1);
         assert!(!sub.fast_path_admit(target, huge, 250));
@@ -6735,7 +6854,7 @@ mod tests {
     #[test]
     fn a_read_with_no_turns_is_refused() {
         let (mut sub, target, _) = fast_path_fixture(0, 0);
-        let empty = TimelineAllocator::new().next();
+        let empty = unshared_timeline(1);
         sub.register_timeline(empty, LayerId::for_test(1), GroupId::for_test(1));
         assert!(!sub.fast_path_admit(target, empty, 1000));
     }
@@ -7061,6 +7180,68 @@ mod tests {
             chunk_size: 32,
             location: candle_nn::kv_cache::ArenaLocation::Cpu,
         }
+    }
+
+    /// **The hot→warm groups are named without cloning, and each is cloned on
+    /// its own.** The persistence thread snapshots one group under its migrate
+    /// guard, so the per-policy snapshot must return exactly that policy's
+    /// pending residences — and skip what the whole snapshot skips: a
+    /// residence already warm, and one pinned into the wave's working set.
+    #[test]
+    fn pending_warm_is_named_by_policy_and_snapshotted_per_group() {
+        let lossless = ConvCompression {
+            lossless: true,
+            level: None,
+            disable_k_override: false,
+            force_k: None,
+            force_v: None,
+        };
+        let mut sub = Substrate::new();
+        let plain = sub.alloc_residence(StreamId(1), None);
+        let exact = sub.alloc_residence(StreamId(2), Some(lossless));
+        let warm = sub.alloc_residence(StreamId(3), None);
+        let pinned = sub.alloc_residence(StreamId(4), Some(lossless));
+        for r in [plain, exact, warm, pinned] {
+            sub.install_hot(r, vec![minimal_sealed_layer()]);
+        }
+        sub.install_warm(warm, vec![minimal_sealed_layer()]);
+        sub.working_set_pins.insert(pinned);
+
+        let mut policies = sub.pending_warm_policies();
+        policies.sort_by_key(|p| p.is_some());
+        assert_eq!(policies, [None, Some(lossless)]);
+
+        let of = |p| -> Vec<usize> {
+            sub.snapshot_pending_warm_for(p)
+                .into_iter()
+                .map(|(idx, _)| idx.0)
+                .collect()
+        };
+        assert_eq!(of(None), [plain.0]);
+        assert_eq!(of(Some(lossless)), [exact.0]);
+    }
+
+    /// **A conversation's own tokens exclude the shared sections, and the corpus counts
+    /// them once.** `total_token_count` adds the sections to every conversation — right
+    /// for one conversation's "materialized / N" — so a sum of it across a layer counted
+    /// the tool catalog once per conversation: 37 folder units read as 1.5 M tokens.
+    #[test]
+    fn a_conversations_tokens_exclude_the_sections_the_corpus_counts_once() {
+        let (layer, group, first, mut sub) = make_timeline();
+        let second = unshared_timeline(1);
+        let retired = unshared_timeline(2);
+        sub.register_timeline(second, layer, group);
+        sub.register_timeline(retired, layer, group);
+        sub.append_with_blocks(first, 100, 0, 4);
+        sub.append_with_blocks(second, 30, 0, 1);
+        sub.append_with_blocks(retired, 7, 0, 1);
+        sub.tombstone_timeline(retired);
+        sub.section_token_total = 40;
+
+        assert_eq!(sub.total_token_count(first), 140);
+        assert_eq!(sub.timeline_token_total(first), 100);
+        assert_eq!(sub.timeline_token_total(second), 30);
+        assert_eq!(sub.corpus_token_total(), 100 + 30 + 40);
     }
 
     /// `register_timeline` is data-idempotent — calling it again on a
@@ -9425,6 +9606,49 @@ mod tests {
         assert!(sub.decoded_wide_sig(turn_stream_id(1, 99)).is_none());
     }
 
+    /// **Every change a belief gallery is assembled from moves the epoch, and
+    /// reading does not.** A collection's gallery is cached on this epoch, so a
+    /// change that failed to move it would serve a stale gallery — a tombstoned
+    /// turn still voting, or a new exemplar missing — silently.
+    #[test]
+    fn the_gallery_epoch_moves_on_every_change_and_never_on_a_read() {
+        use crate::provenance::encode_wide_sigs;
+        let (_, _, timeline, mut sub) = make_timeline();
+        let sid = turn_stream_id(timeline.raw(), 0);
+        let sig = WideQSig {
+            n_heads: 12,
+            words: vec![0xAAAA_AAAA_AAAA_AAAA; 24],
+        };
+        let mut last = sub.gallery_epoch();
+        let mut moved = |sub: &Substrate, what: &str| {
+            let now = sub.gallery_epoch();
+            assert!(now > last, "{what} must move the gallery epoch");
+            last = now;
+        };
+
+        sub.set_wide_q_sigs_blob(sid, encode_wide_sigs(std::slice::from_ref(&sig)));
+        moved(&sub, "a signature write");
+        sub.set_projection_events_blob(sid, b"[]".to_vec());
+        moved(&sub, "a projection-events write");
+
+        // Reads leave it alone.
+        let before = sub.gallery_epoch();
+        let _ = sub.decoded_wide_sig(sid);
+        let _ = sub.all_streams().count();
+        assert_eq!(
+            sub.gallery_epoch(),
+            before,
+            "a read must not move the epoch"
+        );
+
+        sub.tombstone_timeline(timeline);
+        moved(&sub, "a timeline tombstone");
+        sub.reset();
+        moved(&sub, "a reset");
+        sub.clear_walker_state();
+        moved(&sub, "clearing the streams");
+    }
+
     /// Invalidation is per-stream: rewriting one turn's sig evicts only that
     /// turn's decoded window and leaves every other memo intact — so a single
     /// seal never churns the whole gallery (the point of incremental eviction).
@@ -9795,11 +10019,13 @@ mod tests {
                 .into_iter()
                 .map(|(r, b)| (r.to_string(), b.to_string()))
                 .collect(),
+            active: 0,
         };
         assert_eq!(sub.conv_state(a), Some(a_state.clone()));
         let b_state = super::ConvState {
             archived: true,
             branches: Default::default(),
+            active: 0,
         };
         assert_eq!(
             sub.live_conv_states(),
@@ -9810,6 +10036,42 @@ mod tests {
         sub.apply_conv_state(a.raw(), super::ConvState::default());
         assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
         assert_eq!(sub.live_conv_states().len(), 1, "a is untouched again");
+    }
+
+    /// **The last use outranks every earlier one, and survives replay.** Each
+    /// touch stamps the next rank; a replayed state restores its rank exactly,
+    /// whatever order the records arrive in, and the next touch still lands
+    /// above every rank replayed.
+    #[test]
+    fn a_touch_outranks_every_earlier_use_and_replay_restores_it() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let (a, b) = (alloc.next(), alloc.next());
+        let mut sub = Substrate::new();
+        sub.register_timeline(a, layer, group);
+        sub.register_timeline(b, layer, group);
+
+        assert!(sub.touch_conversation(a));
+        assert!(sub.touch_conversation(b));
+        assert!(sub.touch_conversation(a));
+        assert!(!sub.touch_conversation(alloc.next()), "unregistered");
+        assert_eq!(sub.conv_state(a).unwrap().active, 3);
+        assert_eq!(sub.conv_state(b).unwrap().active, 2);
+
+        // Replay into a fresh substrate, the later-used record first — the
+        // order compaction's timeline-ordered re-emit can produce.
+        let states = sub.live_conv_states();
+        let mut replayed = Substrate::new();
+        replayed.register_timeline(a, layer, group);
+        replayed.register_timeline(b, layer, group);
+        for (tl, state) in states.into_iter().rev() {
+            replayed.apply_conv_state(tl, state);
+        }
+        assert_eq!(replayed.conv_state(a).unwrap().active, 3);
+        assert_eq!(replayed.conv_state(b).unwrap().active, 2);
+        assert!(replayed.touch_conversation(b));
+        assert_eq!(replayed.conv_state(b).unwrap().active, 4);
     }
 
     #[test]

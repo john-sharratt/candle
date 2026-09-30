@@ -1361,6 +1361,7 @@ impl RegionPool {
             live: self.live,
             free_below_ceiling: self.free_count(),
             ceiling_blocked: self.ceiling_blocked(),
+            free_above_live: self.total.saturating_sub(self.live_watermark()),
             tier_bytes: self.transient_bytes,
             tier_high_water: self.transient_high_water,
         };
@@ -1374,6 +1375,7 @@ impl RegionPool {
                     Refusal::Observing => 0,
                     Refusal::Pressure => 1,
                     Refusal::Occupied => 2,
+                    Refusal::Fragmented => 6,
                 };
                 SPARE_TALLY[idx].fetch_add(1, Ordering::Relaxed);
                 0
@@ -2463,21 +2465,22 @@ static SWEEP_CALLS: AtomicU64 = AtomicU64::new(0);
 /// purchases succeed:
 ///
 /// `[observing, pressure, occupancy_bound, regions_granted, buy_conceded,
-///   buy_refused]`
+///   buy_refused, fragmented]`
 ///
-/// The first three attribute a zero to one of the three things that can produce
-/// it, which is the difference between "the mechanism is inert" and "the
-/// mechanism is working and the ground is genuinely spoken for". The last two
-/// say whether a claim that waited would ever have anything to wait for.
+/// `observing`, `pressure`, `occupancy_bound` and `fragmented` attribute a zero
+/// to one of the four things that can produce it, which is the difference
+/// between "the mechanism is inert", "the ground is genuinely spoken for" and
+/// "the ground is free but in holes the floor cannot reach". The two `buy_`
+/// slots say whether a claim that waited would ever have anything to wait for.
 ///
 /// There were four attributions while the weight side also measured against a
 /// windowed history of KV demand; that term is gone (see
 /// [`RegionPool::spare_regions`]) and its slot with it, rather than being left
 /// to report a permanent zero under a name nothing can produce.
-static SPARE_TALLY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static SPARE_TALLY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// See [`SPARE_TALLY`].
-pub fn spare_tally() -> [u64; 6] {
+pub fn spare_tally() -> [u64; 7] {
     std::array::from_fn(|i| SPARE_TALLY[i].load(Ordering::Relaxed))
 }
 

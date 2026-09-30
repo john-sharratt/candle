@@ -1,4 +1,5 @@
-//! Serving a `file_read` from content the corpus has already read.
+//! Serving a `file_read` or a `file_list` from content the corpus has already
+//! ingested.
 //!
 //! A `code_reading` conversation is a whole file, read once, sealed in the
 //! substrate and keyed by its path and blob id (`docs/zend_branch_ingest.md`
@@ -8,10 +9,16 @@
 //! and say so. The K/V is already there, so the call costs an elevation
 //! instead of a prefill and a decode.
 //!
+//! A `repo_map` conversation is the same for a folder: it holds the folder's
+//! `file_list` response and its summary, keyed by what the listing shows
+//! (§6.2). A `file_list` of the first page of a folder whose unit the
+//! conversation's base holds carries that unit instead of listing again.
+//!
 //! **The hit test is the whole file; the injection is the whole file.** A call
 //! for page 1 of a file hits on the file's hash, and what lands in context is
 //! the entire read — so the requested page is necessarily present, and no page
-//! bookkeeping is needed to know it.
+//! bookkeeping is needed to know it. A folder unit holds only its listing's
+//! first page, so only a call for that page is served.
 //!
 //! What it does NOT do is claim more than it delivers. A hit is only returned
 //! once the conversation has been admitted to the projection
@@ -26,7 +33,7 @@ use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
-use serde_json::json;
+use serde_json::{json, Value};
 use zend_vfs::{Oid, RepoFiles, Workspace};
 
 use crate::branch_ingest::keys::{file_key, CONTENT_KEY, LINES_KEY};
@@ -34,9 +41,11 @@ use crate::code_read::chain_finished;
 use crate::tool_round::{plan, Step};
 use crate::tools::ToolResult;
 
-/// The tool this serves. Only whole-file reads are content-addressed, so this
-/// is the only call whose result another conversation can stand in for.
+/// Whole-file reads are content-addressed by `code_reading`.
 const FILE_READ: &str = "file_read";
+
+/// Folder listings are content-addressed by `repo_map`.
+const FILE_LIST: &str = "file_list";
 
 /// Above this estimated size a file is read normally rather than carried.
 ///
@@ -80,12 +89,39 @@ fn served_response(repo: &str, path: &str, lines: usize) -> serde_json::Value {
     })
 }
 
+/// The answer a served `file_list` gets — as few tokens as says it, since the
+/// listing it stands in for is small and sits right beside it in context.
+/// Carries no failure marker, for the reason [`served_response`] gives.
+fn listed_response() -> Value {
+    json!({"status": "already_listed", "note": "Listing already in context."})
+}
+
 /// One call the fast path answered, for the caller to log and report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Served {
-    /// The file's workspace-relative key (`candle/src/lib.rs`).
+    /// The tool whose call was answered.
+    pub tool: &'static str,
+    /// Workspace-relative: a file (`candle/src/lib.rs`) or a folder with its
+    /// trailing `/` (`candle/src/`).
     pub path: String,
     pub timeline: TimelineId,
+}
+
+/// Finds the committed `repo_map` unit for a folder — repository and path
+/// inside it, `""` for its root — as the conversation's base lists it
+/// (`RetrievalScope::folder_unit`).
+pub type FolderOf<'a> = &'a dyn Fn(&str, &str) -> Option<TimelineId>;
+
+/// What one screening consults: the conversation, its view of every
+/// repository, and where the ingested units are.
+pub struct Screen<'a> {
+    pub engine: &'a Mutex<ConversationEngine>,
+    pub target: TimelineId,
+    pub workspace: &'a Workspace,
+    pub files: &'a RepoFiles,
+    pub folder_of: FolderOf<'a>,
+    /// Tokens the conversation's fast-path set may hold.
+    pub budget_tokens: usize,
 }
 
 /// The repository-relative form of a `path` argument.
@@ -130,81 +166,164 @@ fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, Strin
     Some((format!("{repo}/{rel}"), repo.to_string(), rel))
 }
 
-/// Replace every `file_read` in `steps` whose content the corpus has already
-/// read with an answer carrying that conversation, and admit each to `target`'s
-/// projection.
+/// The repository and the folder inside it (`""` for its root) a `file_list`
+/// call asks for — only a call for the listing's first page, the one page a
+/// folder unit holds. `None` for a repository the workspace does not list.
+fn list_key(step: &Step, workspace: &Workspace) -> Option<(String, String)> {
+    let Step::Run(call) = step else {
+        return None;
+    };
+    if call.name != FILE_LIST {
+        return None;
+    }
+    let args = &call.arguments;
+    let first_page = match args.get("page") {
+        None | Some(Value::Null) => true,
+        Some(page) => page.as_u64() == Some(0),
+    };
+    if !first_page {
+        return None;
+    }
+    let repo = args.get("repo")?.as_str()?;
+    let dir = &workspace.repo(repo)?.dir;
+    let path = match args.get("path") {
+        None | Some(Value::Null) => "",
+        Some(path) => path.as_str()?,
+    };
+    let inner = normalise(path, dir);
+    let inner = inner.trim_end_matches('/');
+    let inner = if inner == "." { "" } else { inner };
+    Some((repo.to_string(), inner.to_string()))
+}
+
+/// A call the corpus can answer: the conversation standing in for it, admitted
+/// to the target's set, and the answer to give.
+struct Hit {
+    served: Served,
+    response: Value,
+}
+
+impl Screen<'_> {
+    /// The hit for `step`, admitted to the target's fast-path set — `None`
+    /// when anything is unsure, so the call runs for real.
+    ///
+    /// Takes the engine's `Mutex` rather than a locked engine: the lookups are
+    /// git work, and holding the engine across them would stall every other
+    /// conversation and the ingest worker for the length of a round. The lock
+    /// is taken per candidate, around the lookup and admit only.
+    fn hit(&self, step: &Step) -> Option<Hit> {
+        if let Some((key, repo, rel)) = read_key(step, self.workspace) {
+            return self.read_hit(key, &repo, &rel);
+        }
+        let (repo, inner) = list_key(step, self.workspace)?;
+        self.list_hit(&repo, &inner)
+    }
+
+    /// A `file_read` of a file the conversation left alone, whose version a
+    /// finished `code_reading` chain read, within the size cap.
+    fn read_hit(&self, key: String, repo: &str, rel: &str) -> Option<Hit> {
+        let (blob, size) = committed(self.files, repo, rel)?;
+        if !fits_fast_path(size) {
+            tracing::debug!(
+                target: "zend::fast_path",
+                path = %key,
+                bytes = size,
+                "file is past the fast-path size cap — reading it for real",
+            );
+            return None;
+        }
+        let looked_up = {
+            let e = self.engine.lock().unwrap();
+            e.find_conversations_by_metadata(CONTENT_KEY, &file_key(&key, &blob))
+                .into_iter()
+                // A read whose chain never finished holds no summary: handed
+                // over as "already read", it would put an assistant that
+                // deliberates and answers nothing into this conversation.
+                .filter(|&tl| chain_finished(&e, tl))
+                .find_map(|tl| Some((tl, lines_of(&e, tl)?)))
+                // Admit BEFORE answering, under the same lock: a read the
+                // budget refuses is not in the projection, so claiming it
+                // would be a lie.
+                .filter(|(tl, _)| e.fast_path_admit(self.target, *tl, self.budget_tokens))
+        };
+        let Some((timeline, lines)) = looked_up else {
+            tracing::debug!(
+                target: "zend::fast_path",
+                path = %key,
+                "no admitted conversation carries this file — reading it for real",
+            );
+            return None;
+        };
+        Some(Hit {
+            response: served_response(repo, rel, lines),
+            served: Served {
+                tool: FILE_READ,
+                path: key,
+                timeline,
+            },
+        })
+    }
+
+    /// A `file_list` of a folder whose finished `repo_map` unit the
+    /// conversation's base lists exactly as the unit shows it.
+    fn list_hit(&self, repo: &str, inner: &str) -> Option<Hit> {
+        let dir = if inner.is_empty() {
+            format!("{repo}/")
+        } else {
+            format!("{repo}/{inner}/")
+        };
+        // Looked up before the engine is locked: the lookup takes it itself.
+        let unit = (self.folder_of)(repo, inner);
+        let admitted = unit.filter(|&tl| {
+            let e = self.engine.lock().unwrap();
+            chain_finished(&e, tl) && e.fast_path_admit(self.target, tl, self.budget_tokens)
+        });
+        let Some(timeline) = admitted else {
+            tracing::debug!(
+                target: "zend::fast_path",
+                path = %dir,
+                "no admitted conversation carries this folder — listing it for real",
+            );
+            return None;
+        };
+        Some(Hit {
+            response: listed_response(),
+            served: Served {
+                tool: FILE_LIST,
+                path: dir,
+                timeline,
+            },
+        })
+    }
+}
+
+/// Replace every `file_read` and `file_list` in `steps` whose result the
+/// corpus already holds with an answer carrying that conversation, and admit
+/// each to the target's projection.
 ///
 /// A call is left alone — and so runs for real — whenever anything is unsure:
-/// the conversation has changed the file in `files` (so its copy is not the
-/// committed one the corpus read), its base holds no such file, no
-/// conversation carries its key and its line count, or the read does not fit
-/// `budget_tokens`. Nothing is read: the key comes from the base's tree, the
-/// line count from the conversation that read the file.
-/// Takes the engine's `Mutex` rather than a locked engine: the lookups below
-/// are git work, and holding the engine across them would stall every other
-/// conversation and the ingest worker for the length of a round. The lock is
-/// taken per candidate, around the lookup and admit only.
-pub fn screen(
-    engine: &Mutex<ConversationEngine>,
-    target: TimelineId,
-    workspace: &Workspace,
-    files: &RepoFiles,
-    budget_tokens: usize,
-    steps: Vec<Step>,
-) -> (Vec<Step>, Vec<Served>) {
-    if budget_tokens == 0 {
+/// the conversation has changed what it names (its own copy is not the
+/// committed one the corpus ingested), its base holds no such file or folder,
+/// no finished conversation carries its key, or the conversation does not fit
+/// the budget. Nothing is read: the keys come from the base's tree, the line
+/// count from the conversation that read the file.
+pub fn screen(screen: &Screen<'_>, steps: Vec<Step>) -> (Vec<Step>, Vec<Served>) {
+    if screen.budget_tokens == 0 {
         return (steps, Vec::new());
     }
     let mut served = Vec::new();
     let out = steps
         .into_iter()
         .map(|step| {
-            let Some((key, repo, rel)) = read_key(&step, workspace) else {
-                return step;
-            };
-            let Some((blob, size)) = committed(files, &repo, &rel) else {
-                return step;
-            };
-            if !fits_fast_path(size) {
-                tracing::debug!(
-                    target: "zend::fast_path",
-                    path = %key,
-                    bytes = size,
-                    "file is past the fast-path size cap — reading it for real",
-                );
-                return step;
-            }
-            let looked_up = {
-                let e = engine.lock().unwrap();
-                e.find_conversations_by_metadata(CONTENT_KEY, &file_key(&key, &blob))
-                    .into_iter()
-                    // A read whose chain never finished holds no summary: handed
-                    // over as "already read", it would put an assistant that
-                    // deliberates and answers nothing into this conversation.
-                    .filter(|&tl| chain_finished(&e, tl))
-                    .find_map(|tl| Some((tl, lines_of(&e, tl)?)))
-                    // Admit BEFORE answering, under the same lock: a read the
-                    // budget refuses is not in the projection, so claiming it
-                    // would be a lie.
-                    .filter(|(tl, _)| e.fast_path_admit(target, *tl, budget_tokens))
-            };
-            let Some((timeline, lines)) = looked_up else {
-                tracing::debug!(
-                    target: "zend::fast_path",
-                    path = %key,
-                    "no admitted conversation carries this file — reading it for real",
-                );
+            let Some(hit) = screen.hit(&step) else {
                 return step;
             };
             let Step::Run(call) = step else {
-                unreachable!("read_target matched a Run step")
+                unreachable!("a hit is only found for a Run step")
             };
-            served.push(Served {
-                path: key,
-                timeline,
-            });
+            served.push(hit.served);
             Step::Served(ToolResult {
-                response: served_response(&repo, &rel, lines),
+                response: hit.response,
                 call,
             })
         })
@@ -231,7 +350,8 @@ fn lines_in(meta: &BTreeMap<String, String>) -> Option<usize> {
     meta.get(LINES_KEY)?.parse().ok()
 }
 
-/// Rebuild `target`'s fast-path set by replaying its own `file_read` calls.
+/// Rebuild the target's fast-path set by replaying its own `file_read` and
+/// `file_list` calls.
 ///
 /// The set is in-memory, so a restart loses it while the conversation it
 /// describes is still durable — and a conversation resumed without it would be
@@ -246,51 +366,26 @@ fn lines_in(meta: &BTreeMap<String, String>) -> Option<usize> {
 ///
 /// Oldest turn first, so the most recent read ends up at the front of the set
 /// exactly as it would have during the live conversation.
-pub fn rebuild(
-    engine: &Mutex<ConversationEngine>,
-    target: TimelineId,
-    workspace: &Workspace,
-    files: &RepoFiles,
-    budget_tokens: usize,
-) -> usize {
-    if budget_tokens == 0 {
+pub fn rebuild(screen: &Screen<'_>) -> usize {
+    if screen.budget_tokens == 0 {
         return 0;
     }
     let texts = {
-        let e = engine.lock().unwrap();
-        e.fast_path_clear(target);
-        e.assistant_turn_texts(target)
+        let e = screen.engine.lock().unwrap();
+        e.fast_path_clear(screen.target);
+        e.assistant_turn_texts(screen.target)
     };
-    let mut admitted = 0usize;
-    for text in texts {
-        for step in plan(&text) {
-            let Some((key, repo, rel)) = read_key(&step, workspace) else {
-                continue;
-            };
-            let Some((blob, size)) = committed(files, &repo, &rel) else {
-                continue;
-            };
-            if !fits_fast_path(size) {
-                continue;
-            }
-            let e = engine.lock().unwrap();
-            if let Some(tl) = e
-                .find_conversations_by_metadata(CONTENT_KEY, &file_key(&key, &blob))
-                .into_iter()
-                .find(|&tl| chain_finished(&e, tl))
-            {
-                if e.fast_path_admit(target, tl, budget_tokens) {
-                    admitted += 1;
-                }
-            }
-        }
-    }
+    let admitted = texts
+        .iter()
+        .flat_map(|text| plan(text))
+        .filter(|step| screen.hit(step).is_some())
+        .count();
     if admitted > 0 {
         tracing::info!(
             target: "zend::fast_path",
-            timeline = target.raw(),
+            timeline = screen.target.raw(),
             admitted,
-            "rebuilt the fast-path set from the conversation's own reads",
+            "rebuilt the fast-path set from the conversation's own reads and listings",
         );
     }
     admitted
@@ -405,6 +500,51 @@ mod tests {
         assert!(
             response["note"].as_str().unwrap().contains("18 lines"),
             "the note tells the model how much it already has: {response}",
+        );
+    }
+
+    /// **A served listing is short and a success.** The whole answer is these
+    /// bytes, so its size is pinned exactly — a note that grew back to a
+    /// paragraph would cost more than the small listing it stands in for.
+    #[test]
+    fn the_listed_response_is_short_and_carries_no_failure_marker() {
+        assert_eq!(
+            serde_json::to_string(&listed_response()).unwrap(),
+            r#"{"status":"already_listed","note":"Listing already in context."}"#
+        );
+    }
+
+    /// A listing is keyed by its repository and the folder inside it, however
+    /// the call spells the folder; the root is the empty folder.
+    #[test]
+    fn a_listing_is_keyed_by_its_repository_and_folder() {
+        let key = |args: serde_json::Value| list_key(&call(FILE_LIST, args), &workspace());
+        let src = Some(("candle".to_string(), "zend/src".to_string()));
+        assert_eq!(key(json!({"repo": "candle", "path": "zend/src"})), src);
+        assert_eq!(key(json!({"repo": "candle", "path": "./zend/src/"})), src);
+        assert_eq!(key(json!({"repo": "candle", "path": "zend\\src"})), src);
+        let root = Some(("candle".to_string(), String::new()));
+        assert_eq!(key(json!({"repo": "candle"})), root);
+        assert_eq!(key(json!({"repo": "candle", "path": ""})), root);
+        assert_eq!(key(json!({"repo": "candle", "path": "."})), root);
+        assert_eq!(
+            key(json!({"repo": "candle", "path": null, "page": 0})),
+            root
+        );
+    }
+
+    /// **Only the first page is served** — it is the one page a folder unit
+    /// holds — and an unlisted repository never is.
+    #[test]
+    fn a_later_page_or_an_unlisted_repository_is_not_a_candidate() {
+        let key = |args: serde_json::Value| list_key(&call(FILE_LIST, args), &workspace());
+        assert_eq!(key(json!({"repo": "candle", "page": 1})), None);
+        assert_eq!(key(json!({"repo": "candle", "page": "0"})), None);
+        assert_eq!(key(json!({"repo": "other"})), None);
+        assert_eq!(key(json!({"path": "zend/src"})), None);
+        assert_eq!(
+            list_key(&call(FILE_READ, json!({"repo": "candle"})), &workspace()),
+            None
         );
     }
 

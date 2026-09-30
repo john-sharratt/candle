@@ -84,7 +84,7 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --max-depth 1 -v` | 2026-09-29, from the running process — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`); its substrate is `D:\prog\substrate`, started blank on this restart. `repo_map` and `code_reading` bounded to one path component; `-v` (DEBUG) |
+| .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --max-depth 3 -v` | 2026-09-29, from the running process — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`, `battle-cities`); its substrate is `D:\prog\substrate`. `repo_map` and `code_reading` ingest to three path components below each repository's root; what was ingested deeper is retained while a branch holds it; `-v` (DEBUG) |
 | .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`) |
 
 Notes on the arguments:

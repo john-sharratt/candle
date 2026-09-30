@@ -1,6 +1,6 @@
 # Zend: Workspace, Tooling and Execution Architecture
 
-**Status:** Workspace and tools built (§3–§4). Ingest (§5) reads the repositories' branches as origin holds them, as designed in `docs/zend_branch_ingest.md`; nothing ingests from a repository's folder, which is the sandbox's. The priming chain (§6) is removed. The sandbox that runs tooling on one machine is built and wired into the daemon as `run_command` (`zend-vfs::sandbox`, §7.4); cluster execution is designed, not built (§7–§8).
+**Status:** Workspace and tools built (§3–§4). Ingest (§5) reads the repositories' branches as origin holds them, as designed in `docs/zend_branch_ingest.md`; nothing ingests from a repository's folder, which is the sandbox's. The priming chain (§6) is built from the branches. The sandbox that runs tooling on one machine is built and wired into the daemon as `run_command` (`zend-vfs::sandbox`, §7.4); cluster execution is designed, not built (§7–§8).
 **Scope:** How zend serves several repositories as one workspace; how the model reads and changes code in them; how the base conversation is seeded with every repository; and how real tooling (cargo, node, python, tests) runs, on one machine and across a cluster.
 
 ---
@@ -57,7 +57,7 @@ Rules, enforced when the workspace is built (`zend-vfs/src/workspace.rs`):
 
 ### 3.2 The uploads repository
 
-The daemon adds `uploads` after the listed repositories (`zend/src/workspace.rs`) and creates its folder. The upload endpoint writes files there; the model reads them as `repo: uploads`. A manifest that lists a repository named `uploads` is refused. The uploads repository is never walked by the ingest layers and never part of the priming chain — uploads are ingested by the endpoint itself.
+The daemon adds `uploads` after the listed repositories (`zend/src/workspace.rs`) and creates its folder. The upload endpoint writes files there; the model reads them as `repo: uploads`. A manifest that lists a repository named `uploads` is refused. The uploads repository is never walked by the ingest layers and never part of the priming chain (§6) — uploads are ingested by the endpoint itself.
 
 ### 3.3 The workspace folder
 
@@ -116,9 +116,8 @@ Every tool that touches files requires `repo`. The scope of a call is always sta
 
 | Tool | `repo` values | Notes |
 |---|---|---|
-| `file_read`, `write`, `file_edit`, `file_delete`, `file_present` | one repository | `path` is repository-relative. |
-| `file_list` | one repository, or `*` | `*` lists the repositories and takes no `path` (`invalid_arguments` otherwise). |
-| `file_search`, `file_grep` | one repository, or `*` | `*` covers every repository; each result names its repository. `prefix` applies inside each repository searched. One hit ceiling across the whole call. |
+| `file_list`, `file_read`, `write`, `file_edit`, `file_delete`, `file_present` | one repository | `path` is repository-relative. These are raw operations on one repository's files; none takes `*`. |
+| `file_search`, `file_grep` | one repository, or `*` | `*` covers every repository; results come back grouped by repository. `prefix` applies inside each repository searched. One hit ceiling across the whole call. |
 | `code_run`, `code_session_exec` | one repository | The script's `vfs` global is that repository's store. |
 | `remote_fs_session_get`, `remote_fs_session_put` | one repository | The repository the file is saved into / uploaded from. |
 
@@ -139,8 +138,8 @@ Because the enum is part of each tool's rendered definition, it is part of its c
 ### 4.4 Output
 
 - A `file_read` excerpt is headed `path in repo (page P of N, lines a-b of T):` — the same header the `code_reading` and `repo_map` ingests prefill, byte for byte.
-- `file_list` inside a repository carries a top-level `repo`; the workspace listing's entries are `{"repo": name, "dir": true}`.
-- `file_search` returns `{repo, path}` objects, shortest path first; `file_grep` matches carry `repo`.
+- `file_list` carries a top-level `repo`; its entries' paths are relative to it.
+- `file_search` and `file_grep` return `repos`: one group per repository with hits, in the manifest's order — `{repo, files: [path, …]}`, shortest path first within each, and `{repo, matches: [{path, line, text}, …]}`. Paging runs across the groups in that order.
 - `write` / `file_edit` / `file_delete` / `file_present` responses carry `repo`.
 
 ---
@@ -158,7 +157,7 @@ The `repo_map` and `code_reading` layers are ingested from every branch origin h
 
 ### 5.2 `repo_map` units
 
-One unit per directory holding walked files (`candle/`, `candle/zend/src/`, …), plus a **workspace unit** (`.`) whenever anything was walked: its evidence is the set of repositories reached, and its listing turn is `file_list` with `repo: "*"`, which lists the repositories. Each unit's prefilled calls split its directory into `repo` and `path` (`file_list {repo: candle, path: zend/src}`; the workspace unit's is `{repo: "*"}`), and the request names the folder with its repository.
+One unit per directory holding walked files (`candle/`, `candle/zend/src/`, …) — every one inside a repository, since `file_list` lists inside one repository and there is no listing of the workspace itself. Each unit's prefilled call splits its directory into `repo` and `path` (`file_list {repo: candle, path: zend/src}`; a repository's root is `{repo: candle}`), and the request names the folder with its repository.
 
 ### 5.3 `code_reading`
 
@@ -168,13 +167,27 @@ A file's hidden conversation opens with ``Read the entire contents of `zend/src/
 
 The fast path, which serves a `file_read` from a `code_reading` conversation that already read the same bytes, joins the call's `repo` and `path` into the workspace-relative key the ingest used, with the blob id the conversation's base holds for that path. A file the conversation has changed is never served: its own copy is what it must read. A `repo` the workspace does not list is never joined onto the workspace; the call runs for real and the tool refuses it.
 
+A `file_list` of a folder's first page is served from the folder's `repo_map` conversation by the same rules, the folder addressed as its repository and the path inside it (`""` for the root) — see `docs/zend_branch_ingest.md` §8.1.
+
 There is no file watcher: nothing reads a repository's folder for ingest. Origin is watched instead (`docs/zend_branch_ingest.md` §4).
 
 ---
 
 ## 6. Seeding the base conversation
 
-The base conversation every dialogue forks from is seeded with nothing from the repositories. The priming chain that read the workspace listing, each repository's root listing and its anchor documents (README, ARCHITECTURE, AGENTS, CLAUDE) walked the repositories' folders, and is removed with the rest of the folder ingest; a chain built from the branches belongs to the ingest that replaces it.
+The base conversation every dialogue forks from descends from the **priming chain** (`zend/src/branch_ingest/prime.rs`), built from the branches by the ingest itself:
+
+```
+for each repository, in the manifest's order:
+  its root listing -> README -> ARCHITECTURE -> AGENTS -> CLAUDE
+-> base_conv, and every other repo_map folder and code_reading file
+```
+
+There is no link for the workspace itself: every file operation works inside one repository, and the repositories are named to the model by every tool's `repo` enum.
+
+Each link records the one before it as its parent (`set_forked_from`) before its own reading starts, so every turn of it is projected with the chain behind it, and by the last link the conversation has genuinely read every listing and document before it, in order. The link is a durable pointer, not a copy. Every link is an ordinary unit of its layer, keyed by content (`docs/zend_branch_ingest.md` §6): a link already committed is re-pointed at the link before it, never read again, and the pass that follows finds every link committed. Each repository contributes the version its **default branch** holds — one base conversation serves every branch, and the default branch is the one a conversation starts on. An anchor a repository lacks is skipped (matched case-insensitively, at its root only), and a repository not under git contributes nothing.
+
+The chain is built once per boot, before `ready` (the `Priming` load step) and before the ingest worker's first pass, so the first question asked already has it and every unit ingested afterwards records its end as its parent. It follows the default branches as they stand at boot; a later move of one is picked up by the next boot's chain.
 
 ---
 
@@ -292,7 +305,7 @@ Agents are long-lived VMs, added or removed on queue depth and wait time, and re
 **Ingest** (CPU)
 
 - The walk visits exactly the listed repositories, keys workspace-relatively, respects scope and depth, never walks uploads.
-- The workspace unit lists the repositories and heads the pass; prefilled calls split `repo` and `path`.
+- Every folder unit is inside a repository and no prefilled call names `*`; prefilled calls split `repo` and `path`.
 - The fast path refuses a repository the workspace does not list, and never offers a file the conversation has changed.
 
 **End to end** (GPU, `#[ignore]`d): a daemon over a multi-repository workspace answers a question whose answer lives in the second repository's files.

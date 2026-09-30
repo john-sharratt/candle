@@ -52,13 +52,16 @@ use crate::api::substrate::{
     SystemPromptView, TimelineDetail, ToolView, ToolsView, TurnView,
 };
 use crate::branch_ingest::filter::IngestScope;
-use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY};
+use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
+use crate::code_read::PATH_KEY;
 use crate::coding_sampling;
 use crate::config::DaemonConfig;
 use crate::conv_branches::{self, BaseBranches};
 use crate::conv_file_store::ConvFileStore;
+use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
+use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
@@ -68,6 +71,8 @@ use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript}
 use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repeat_guard::{self, RepeatGuard, Verdict};
+use crate::repo_path::shown as shown_unit;
+use crate::repo_scan::DIR_KEY;
 use crate::resume;
 use crate::retrieval_scope::RetrievalScope;
 use crate::think_budget;
@@ -456,6 +461,11 @@ struct InferenceState {
     /// so they have no reasoning to protect and stay on their existing
     /// from-scratch construction (`raw_read::ingest_raw`).
     ingest_bases: HashMap<String, Mutex<Sequence>>,
+    /// The priming chain's final link (`BranchIngest::prime`, built once per
+    /// boot before `ready`): `base_conv`'s parent, and the parent every ingest
+    /// unit's conversation records before its reading starts. `None` when
+    /// there is no chain — no git repository, or no ingest layer.
+    chain_end: Mutex<Option<TimelineId>>,
     /// Queue feeding the dedicated titler task. The request path enqueues a
     /// [`TitleJob`] (non-blocking, dropped if the task is backed up) instead
     /// of spawning per submit, so title generation runs in the background —
@@ -1495,9 +1505,9 @@ impl InferenceState {
         );
 
         // ── Calibrating sections ──────────────────────────────────────────────
-        // Free-decode each registered tool's authored examples into the hidden
-        // `Reserved::Calibration` layer, capturing the full think→call trajectory
-        // (and its per-reprojection wide-Q windows) for each.
+        // Prefill each registered tool's authored trajectories and questions into
+        // the hidden `Reserved::Calibration` layer, capturing each think→call
+        // trajectory (and its per-reprojection wide-Q windows) and each question.
         //
         // All cases share ONE projection: the whole catalog as a name-keyed `tools`
         // collection governed by `SelectionRule::Named`. Each run pins exactly its
@@ -1516,25 +1526,6 @@ impl InferenceState {
             let calib_start = Instant::now();
             let mut timing = CalibTiming::default();
             let defs = crate::tool_def::all();
-            let total: usize = defs
-                .iter()
-                .map(|d| d.examples.len() + d.questions.len())
-                .sum();
-            let asks: usize = defs.iter().map(|d| d.questions.len()).sum();
-            // Submissions, not exemplars: every tool's question set is ONE
-            // stuffed prefill carved into one turn per question, so the number
-            // of forwards the phase costs is trajectories + tools, not the
-            // corpus size.
-            let submissions: usize = defs
-                .iter()
-                .map(|d| d.examples.len() + usize::from(!d.questions.is_empty()))
-                .sum();
-            tracing::info!(
-                exemplars = total,
-                question_only = asks,
-                submissions,
-                "calibrating sections: per-tool example prefills (named tool selection)"
-            );
             let (calib_builder, calib_layer, calib_group) =
                 crate::tools::build_calibration_projection(&conv_config.dialect)
                     .map_err(|e| anyhow::anyhow!("build calibration projection: {e}"))?;
@@ -1585,28 +1576,52 @@ impl InferenceState {
             //
             // Trajectories stay one per submission: they are ~95% think block
             // and call, long and irregular, so stuffing buys little and the
-            // per-case padding to a block boundary buys less.
+            // per-case padding to a block boundary buys less. A bare-prompt
+            // example has no trajectory and joins the question group
+            // (`ToolDef::calibration_questions`), so nothing in this phase is
+            // decoded live on the tool files' account.
+            let dialect = &conv_config.dialect;
             let cases: Vec<CalibCase<'_>> = defs
                 .iter()
                 .flat_map(|d| {
-                    let full = d.examples.iter().map(move |e| CalibCase::Trajectory {
-                        tool: d.name.as_str(),
-                        text: Cow::Borrowed(e.as_str()),
-                        marker: d.calibration_marker(e),
+                    let full = d.trajectories(dialect.assistant_start).map(move |e| {
+                        CalibCase::Trajectory {
+                            tool: d.name.as_str(),
+                            text: Cow::Borrowed(e),
+                            marker: d.calibration_marker(e),
+                        }
                     });
-                    let asked = (!d.questions.is_empty()).then(|| CalibCase::Questions {
+                    let questions =
+                        d.calibration_questions(dialect.assistant_start, dialect.user_end);
+                    let asked = (!questions.is_empty()).then(|| CalibCase::Questions {
                         tool: d.name.as_str(),
-                        questions: d.questions.clone(),
                         // One marker for the whole group: the group is
                         // regenerated as a unit, so its resume key must change
                         // when ANY of its questions does. Joined with a
                         // separator that cannot occur inside a question, so two
                         // different splits cannot hash alike.
-                        marker: d.calibration_marker(&d.questions.join("\u{0}")),
+                        marker: d.calibration_marker(&questions.join("\u{0}")),
+                        questions,
                     });
                     full.chain(asked)
                 })
                 .collect();
+            let total: usize = cases.iter().map(CalibCase::exemplars).sum();
+            let asks: usize = cases
+                .iter()
+                .filter(|c| matches!(c, CalibCase::Questions { .. }))
+                .map(CalibCase::exemplars)
+                .sum();
+            // Submissions, not exemplars: every tool's question set is ONE
+            // stuffed prefill carved into one turn per question, so the number
+            // of forwards the phase costs is trajectories + tools, not the
+            // corpus size.
+            tracing::info!(
+                exemplars = total,
+                question_only = asks,
+                submissions = cases.len(),
+                "calibrating sections: per-tool example prefills (named tool selection)"
+            );
 
             // Retire exemplars that no longer match any current case. A tool whose
             // description, parameters, or example changed keeps its old
@@ -1966,9 +1981,10 @@ impl InferenceState {
                     // only a single-turn example (exactly one assistant header):
                     // split into the body (after the header — the think→call we
                     // prefill, projection markers kept) and the user prompt (before
-                    // it, minus the trailing `user_end`). A bare prompt (no header)
-                    // or a multi-turn lead-in (more than one) is decoded live rather
-                    // than prefilling a wrong-grid body. `submit_prefilled_turn`
+                    // it, minus the trailing `user_end`). A multi-turn lead-in (more
+                    // than one header) is decoded live rather than prefilling a
+                    // wrong-grid body; a bare prompt never reaches here — it is
+                    // calibrated with the tool's questions. `submit_prefilled_turn`
                     // strips the markers for the prefilled text and records each
                     // one's token offset so the staged prefill wave fires a
                     // projection there, reproducing the decode's projection sequence.
@@ -2006,8 +2022,8 @@ impl InferenceState {
                                 // the header — the think→call we prefill,
                                 // projection markers kept) and the user prompt
                                 // (before it, minus the trailing `user_end`). A
-                                // bare prompt or a multi-turn lead-in is decoded
-                                // live rather than prefilling a wrong-grid body.
+                                // multi-turn lead-in is decoded live rather than
+                                // prefilling a wrong-grid body.
                                 if text.matches(assistant_start).count() == 1 {
                                     let (before, b) =
                                         text.split_once(assistant_start).expect("count == 1");
@@ -2150,6 +2166,11 @@ impl InferenceState {
                 // so they qualify; any not-yet-warm straggler is caught by the
                 // flushing boundary sweep below (which re-demotes the whole list).
                 // The call is fire-and-forget, so case submission never stalls.
+                // The host-RAM trough is sampled on every event, so a from-empty
+                // full recalibration records it as it happens rather than it
+                // being inferred after a crash — see
+                // `vram::sample_available_low_water`.
+                vram::sample_available_low_water();
                 if calib_timelines.len() - reclaimed_up_to >= CALIBRATION_BATCH {
                     if let Err(e) = timing.time(
                         |t| &mut t.demote,
@@ -2158,22 +2179,17 @@ impl InferenceState {
                         tracing::warn!("calibration hot→warm demote failed: {e}");
                     }
                     reclaimed_up_to = calib_timelines.len();
+                    // Logged once per window, not only at the phase's end: a raw
+                    // allocator abort kills the process with no unwind, so a line
+                    // only at completion is never written when the phase itself
+                    // is what crashes — exactly the run this exists to diagnose.
+                    tracing::info!(
+                        done,
+                        total,
+                        free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
+                        "calibrating sections: window checkpoint"
+                    );
                 }
-                // Same window cadence as the demote sweep above, so a from-empty
-                // full recalibration's host-RAM trough is recorded as it happens
-                // rather than inferred after a crash — see
-                // `vram::sample_available_low_water`. Logged here too, not only at
-                // the phase's end: a raw allocator abort kills the process with no
-                // unwind, so a log line only at completion is never written when
-                // the phase itself is what crashes — exactly the run this exists
-                // to diagnose.
-                vram::sample_available_low_water();
-                tracing::info!(
-                    done,
-                    total,
-                    free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
-                    "calibrating sections: window checkpoint"
-                );
             }
             // Boundary sweep: flush the pending hot→warm migration so the final
             // window's just-sealed cases are warm-backed, then demote every
@@ -2342,7 +2358,11 @@ impl InferenceState {
             let scope = IngestScope::new(&il.folder, max_depth);
             match il.mode {
                 IngestMode::Files => files_group = Some(group),
-                IngestMode::Folders => folders_group = Some((group, scope.clone())),
+                // Retrieval derives folders at full depth: the layer retains
+                // a folder past the bound while a branch holds it, and a held
+                // folder must stay retrievable. A key found for a folder never
+                // ingested simply matches nothing.
+                IngestMode::Folders => folders_group = Some((group, scope.full_depth())),
                 IngestMode::Raw => {}
             }
             branch_layers.push((il.clone(), scope));
@@ -2405,6 +2425,7 @@ impl InferenceState {
             tool_modes: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
             ingest_bases,
+            chain_end: Mutex::new(None),
             titler_tx,
             titler_worker: Mutex::new(None),
             titler_timeline,
@@ -2429,6 +2450,11 @@ impl InferenceState {
             think_steering,
             passthrough: PassthroughCache::new(),
         });
+        // The priming chain, read before `ready` and before the ingest worker's
+        // first pass: the first question asked must already have it, and the
+        // pass must find its links committed rather than read them unparented.
+        progress.set_step(LoadStep::Priming);
+        state.prime(&progress)?;
         let worker_state = Arc::clone(&state);
         // Spawned on the daemon's runtime — the loader thread holds an enter
         // guard for exactly this kind of arming (see `start_loading`).
@@ -2456,7 +2482,48 @@ impl InferenceState {
                 .tool_host
                 .context_for(ToolMode::Restricted, &self.tool_host.conversation_files()),
             retrieval: &self.retrieval_scope,
+            chain_end: *self.chain_end.lock().unwrap(),
         }
+    }
+
+    /// Every branch layer this boot ingests, as the branch ingest takes them.
+    fn layer_passes(&self) -> anyhow::Result<Vec<LayerPass<'_>>> {
+        self.branch_layers
+            .iter()
+            .map(|(il, scope)| {
+                Ok(LayerPass {
+                    name: &il.name,
+                    mode: il.mode,
+                    scope: scope.clone(),
+                    base: self.ingest_base(&il.name)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Build the priming chain and hang the base conversation off its end, so
+    /// every dialogue — a fork of `base_conv` inherits its lineage — starts
+    /// with the workspace listing, each repository's root listing and its
+    /// anchor documents already read. Every ingest unit read after this
+    /// records the same end as its parent (`RefreshContext::chain_end`).
+    fn prime(&self, progress: &LoadProgress) -> anyhow::Result<()> {
+        if self.branch_layers.is_empty() {
+            return Ok(());
+        }
+        let passes = self.layer_passes()?;
+        let end =
+            self.branch_ingest
+                .prime(&self.refresh_ctx(), &self.workspace, &passes, progress)?;
+        if let Some(end) = end {
+            let base = self.base_conv.lock().unwrap().timeline_id();
+            self.engine
+                .lock()
+                .unwrap()
+                .set_forked_from(base, end)
+                .map_err(|e| anyhow::anyhow!("base_conv priming-chain parent: {e}"))?;
+        }
+        *self.chain_end.lock().unwrap() = end;
+        Ok(())
     }
 
     /// The prefilled template a `Folders`/`Files` ingest layer's units fork
@@ -2491,18 +2558,7 @@ impl InferenceState {
         let progress = Arc::new(LoadProgress::silent());
         let mut any = false;
         if !self.branch_layers.is_empty() {
-            let passes = self
-                .branch_layers
-                .iter()
-                .map(|(il, scope)| {
-                    Ok(LayerPass {
-                        name: &il.name,
-                        mode: il.mode,
-                        scope: scope.clone(),
-                        base: self.ingest_base(&il.name)?,
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let passes = self.layer_passes()?;
             let ctx = self.refresh_ctx();
             any |= self
                 .branch_ingest
@@ -3098,6 +3154,8 @@ fn run_inference_stream(
             // each repository's base; one already working somewhere keeps it,
             // and then this writes nothing.
             conv_branches::seed(&engine, timeline, &state.base_branches);
+            // A turn is a use: the sidebar lists this conversation first.
+            engine.touch_conversation(timeline);
         }
 
         if let Some((files, mirror)) = minted_files {
@@ -3118,13 +3176,22 @@ fn run_inference_stream(
                     .iter()
                     .find(|l| l.name == "code_reading")
                     .map_or(0, |l| l.fast_path_window);
-                crate::fast_path::rebuild(
-                    &rebuild_state.engine,
-                    timeline,
-                    &rebuild_state.workspace,
-                    &files,
-                    budget,
-                );
+                let folder_of = |repo: &str, inner: &str| {
+                    rebuild_state.retrieval_scope.folder_unit(
+                        &rebuild_state.engine,
+                        &files,
+                        repo,
+                        inner,
+                    )
+                };
+                fast_path::rebuild(&Screen {
+                    engine: &rebuild_state.engine,
+                    target: timeline,
+                    workspace: &rebuild_state.workspace,
+                    files: &files,
+                    folder_of: &folder_of,
+                    budget_tokens: budget,
+                });
             })
             .await;
         }
@@ -3798,11 +3865,12 @@ fn run_inference_stream(
                 break;
             }
 
-            // Answer what the corpus has already read before dispatching the
+            // Answer what the corpus has already ingested before dispatching the
             // rest. A `file_read` whose bytes hash to an existing `code_reading`
-            // conversation is served by carrying that conversation into this
-            // projection — the K/V exists, so it costs an elevation rather than
-            // a prefill and a decode. Anything unsure (file unreadable, no
+            // conversation, or a `file_list` of a folder an existing `repo_map`
+            // conversation lists, is served by carrying that conversation into
+            // this projection — the K/V exists, so it costs an elevation rather
+            // than a prefill and a decode. Anything unsure (file unreadable, no
             // conversation, over budget) is left in the round and runs for real.
             // On the blocking pool, like the dispatch below: it hashes each
             // candidate file from disk, and this task's every wait is an await.
@@ -3817,12 +3885,23 @@ fn run_inference_stream(
                     .iter()
                     .find(|l| l.name == "code_reading")
                     .map_or(0, |l| l.fast_path_window);
-                crate::fast_path::screen(
-                    &screen_state.engine,
-                    timeline,
-                    &screen_state.workspace,
-                    &screen_files,
-                    budget,
+                let folder_of = |repo: &str, inner: &str| {
+                    screen_state.retrieval_scope.folder_unit(
+                        &screen_state.engine,
+                        &screen_files,
+                        repo,
+                        inner,
+                    )
+                };
+                fast_path::screen(
+                    &Screen {
+                        engine: &screen_state.engine,
+                        target: timeline,
+                        workspace: &screen_state.workspace,
+                        files: &screen_files,
+                        folder_of: &folder_of,
+                        budget_tokens: budget,
+                    },
                     round,
                 )
             })
@@ -3833,9 +3912,10 @@ fn run_inference_stream(
                         tracing::info!(
                             conv_id = %conv_id,
                             iteration,
+                            tool = hit.tool,
                             path = %hit.path,
                             timeline = hit.timeline.raw(),
-                            "file_read served from the corpus — no re-read",
+                            "tool call served from the corpus — nothing re-read",
                         );
                     }
                     screened
@@ -4594,11 +4674,10 @@ pub struct ConvEntry {
     /// sidebar hides archived entries by default; the "show archived"
     /// checkbox toggles them back in via `?include_archived=true`.
     pub archived: bool,
-    /// Creation-order rank used by the sidebar to sort newest-first. This is a
-    /// monotonic counter (`TimelineEntry::order`), NOT a millisecond clock — the
-    /// `conv_id` is a random u64 with no time information, so the substrate
-    /// stamps each conversation an increasing rank in redo-log (creation) order.
-    /// The wire name is kept for the frontend's existing sort key.
+    /// The entry's place in the listing, most recently used first — see
+    /// [`crate::conv_order`]. The top entry holds the highest value. A rank,
+    /// NOT a millisecond clock: the substrate keeps no time. The wire name is
+    /// kept for the frontend's existing sort key.
     pub updated_ms: u64,
 }
 
@@ -4835,6 +4914,7 @@ impl ZendSession {
             timelines: s.timeline_count(),
             conversations: s.conversation_count(),
             sections: s.section_count(),
+            tokens: s.corpus_token_total(),
         };
 
         // Layer metadata only — each layer carries a conversation COUNT, never
@@ -5064,7 +5144,7 @@ impl ZendSession {
             archived: s.is_archived(tl),
             layer,
             group,
-            total_tokens: s.total_token_count(tl),
+            total_tokens: s.timeline_token_total(tl),
             custom: s.custom_of(tl).cloned().unwrap_or_default(),
             inherited_chain: s
                 .inherited_chain(tl)
@@ -5336,7 +5416,8 @@ impl ZendSession {
         let passthrough_tagged = engine.conversations_with_metadata_key(passthrough::METADATA_KEY);
         let conv = engine.conversation();
         let view = conv.read();
-        let mut entries: Vec<ConvEntry> = known
+        let active_of = |tl| view.timeline_entry(tl).map_or(0, |e| e.active);
+        let mut entries: Vec<(ConvEntry, conv_order::Ranks)> = known
             .into_iter()
             .filter(|(tl, _, _, _, _)| *tl != titler_timeline)
             .filter(|(_, _, _, archived, _)| include_archived || !*archived)
@@ -5348,18 +5429,14 @@ impl ZendSession {
                 } else {
                     turn_counts.get(&tl).copied().unwrap_or(0)
                 };
-                // `order` is creation rank (see `TimelineEntry::order`) — the
-                // conv_id itself is a random u64 and carries no time. The field
-                // is named `updated_ms` for the wire, but it is a monotonic
-                // rank, not a millisecond clock; the sidebar only ever sorts on
-                // it, never displays it as a time.
-                ConvEntry {
+                let entry = ConvEntry {
                     id: conv_id,
                     label,
                     turn_count,
                     archived,
-                    updated_ms: order,
-                }
+                    updated_ms: 0,
+                };
+                (entry, (active_of(tl), order))
             })
             .collect();
         // Passthrough conversations stored before they carried a `conv_id` are
@@ -5374,17 +5451,18 @@ impl ZendSession {
                 .min()
                 .map(|i| view.user_text_of(tl, i))
                 .unwrap_or_default();
-            Some(ConvEntry {
-                id: passthrough::conv_id_of(tl),
-                label: passthrough::label_for(&first_user),
-                turn_count: view.turn_indices(tl).count() as u32,
-                archived: entry.archived,
-                updated_ms: entry.order,
-            })
+            Some((
+                ConvEntry {
+                    id: passthrough::conv_id_of(tl),
+                    label: passthrough::label_for(&first_user),
+                    turn_count: view.turn_indices(tl).count() as u32,
+                    archived: entry.archived,
+                    updated_ms: 0,
+                },
+                (entry.active, entry.order),
+            ))
         }));
-        // Newest-created first.
-        entries.sort_by_key(|e| std::cmp::Reverse(e.updated_ms));
-        entries
+        conv_order::by_last_use(entries)
     }
 
     /// Archive a conversation — one-way. Sets the archived lifecycle flag and
@@ -5575,6 +5653,7 @@ impl ZendSession {
             tracing::warn!(conv_id = %conv_id, "record_uploads: set conv_id failed: {e}");
         }
         conv_branches::seed(&engine, timeline, &state.base_branches);
+        engine.touch_conversation(timeline);
         // Give it a provisional label from the file(s) if it has none yet, so it
         // shows a sensible name in the sidebar before any chat turn — the titler
         // refines it once the user actually talks. Never overwrite an existing
@@ -6441,7 +6520,7 @@ fn layer_totals(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -> (u
         .flat_map(|g| s.timelines_for_group(g.id))
         .filter(|tl| *tl != titler && !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
         .fold((0, 0), |(n, tok), tl| {
-            (n + 1, tok + s.total_token_count(tl))
+            (n + 1, tok + s.timeline_token_total(tl))
         })
 }
 
@@ -6496,14 +6575,31 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                 .and_then(|m| m.get(COMMIT_KEY))
                 .cloned()
                 .unwrap_or_default();
+            // An ingested unit is keyed workspace-relative (`candle/CLAUDE.md`);
+            // the view shows it the way the tools address it — its repository,
+            // and the path inside it.
+            let unit_key = s.custom_of(tl).and_then(|m| {
+                m.get(PATH_KEY)
+                    .or_else(|| m.get(DIR_KEY))
+                    .filter(|_| m.contains_key(CONTENT_KEY))
+                    .cloned()
+            });
+            let (repo, label) = match &unit_key {
+                Some(key) => {
+                    let (repo, inner) = shown_unit(key);
+                    (repo.to_string(), inner)
+                }
+                None => (String::new(), label),
+            };
             conversations.push(ConvView {
                 timeline: tl.raw().to_string(),
                 conv_id: s.conv_id_of(tl).unwrap_or_default().to_string(),
                 label,
+                repo,
                 archived: s.is_archived(tl),
                 group: g.name.clone(),
                 turns: s.turn_count(tl),
-                tokens: s.total_token_count(tl),
+                tokens: s.timeline_token_total(tl),
                 summary_nodes,
                 branches,
                 commit,

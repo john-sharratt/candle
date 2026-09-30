@@ -611,7 +611,7 @@ impl Scheduler {
         // Gallery eviction — **this cannot clear the pressure below it**, and is
         // not here to.
         //
-        // `evict_lru` drops `PageRun`s, returning page slots to the gallery's
+        // `evict_to_cap` drops `PageRun`s, returning page slots to the gallery's
         // own arenas. A region goes back to the span only when the last page in
         // its arena goes, so `gallery_freed` counts pages freed, and
         // `region_stats().free` moves only by the arenas that emptied — the next
@@ -620,16 +620,16 @@ impl Scheduler {
         // Gallery growth is bounded by the arena itself — it evicts to its own
         // ceiling at admission — so this is not the only limit, and it must not
         // fire merely because KV is tight: that would shed belief-scan residency
-        // the next scan rebuilds from the substrate, every episode. It runs only
-        // when the arena is *itself* over its ceiling, which is the one case
-        // where evicting is the right answer.
+        // the next scan rebuilds from the substrate, every episode. It enforces
+        // the same ceiling by the same rule the arena does (`evict_to_cap`): only
+        // turns no scan has used recently go, so a working set above the ceiling
+        // stays. A plain LRU here shed a live dialogue's working set on every
+        // decode relief — 892 MiB a wave, `relieved=false` each time since
+        // scattered pages return no region — and its next scan re-uploaded it,
+        // a 1.6–2.0 s index rebuild per reprojection.
         if self.vram_under_pressure_for(phase) {
             if let Some(arena) = self.gallery_arena.as_ref() {
-                let cap = arena.cap_bytes();
-                let held = arena.page_bytes();
-                if held > cap {
-                    gallery_freed = arena.evict_lru((held - cap).max(want));
-                }
+                gallery_freed = arena.evict_to_cap();
             }
         }
 
@@ -704,8 +704,9 @@ impl Scheduler {
         }
         let (free, setpoint) = self.kv_region_state(phase).unwrap_or((0, 0));
         // INFO when the pass actually shed something — that is a real event.
-        // DEBUG otherwise: this runs from several gates every scheduler loop,
-        // so an unconditional INFO floods the log under a sustained burst.
+        // TRACE otherwise: this runs from several gates every scheduler loop,
+        // so a no-op pass at any lower level floods the log under a sustained
+        // burst.
         macro_rules! emit {
             ($lvl:ident) => {
                 tracing::$lvl!(
@@ -737,7 +738,7 @@ impl Scheduler {
         if acted || compress_refused {
             emit!(info);
         } else {
-            emit!(debug);
+            emit!(trace);
         }
         // **Relief that shed something is an admission opportunity too.** Unlike
         // a completion it can happen with nothing finishing at all, and a pass
@@ -871,7 +872,11 @@ impl Scheduler {
         if self.prefill_queue.is_empty() {
             return;
         }
-        let in_flight = self.active_prefills.len();
+        // Every gate below reads the priority pause; judge against the present.
+        // `in_flight` counts only prefills that can advance — see
+        // `running_prefills`.
+        self.observe_priorities();
+        let in_flight = self.running_prefills();
         if in_flight >= Self::MAX_PREFILL_WIDTH {
             return;
         }
@@ -935,7 +940,7 @@ impl Scheduler {
         // never coming, and a relief pass that actually shed.
         if !self.settled_since_admit {
             // Skipping the pass must not skip the deadlock-freedom rule.
-            if self.active_prefills.is_empty() {
+            if in_flight == 0 {
                 self.force_queue_head("admission is closed until something settles");
             }
             return;
@@ -972,7 +977,7 @@ impl Scheduler {
             // 518 — and the only way to find it was to notice that the pass which should
             // have logged never did. A path that quietly costs an order of magnitude is
             // the one path that must not be quiet.
-            if let Some(work) = self.prefill_queue.pop_front() {
+            if let Some(work) = self.pop_unpaused_head() {
                 tracing::debug!(
                     target: "candle_conversation::scheduler::throttle",
                     queued = self.prefill_queue.len(),
@@ -1012,7 +1017,7 @@ impl Scheduler {
         // FIFO, not the cheapest that fits: under a budget stuck at its floor,
         // cheapest-first starves the expensive work permanently, and the
         // expensive work is never the cheapest.
-        if filled.prefills == 0 && self.active_prefills.is_empty() {
+        if filled.prefills == 0 && self.running_prefills() == 0 {
             self.force_queue_head("admission refused every offer");
         }
         // The pass acted on the completions that opened it; the next one waits
@@ -1061,11 +1066,18 @@ impl Scheduler {
     /// cheapest-first starves the expensive work permanently, and the expensive
     /// work is never the cheapest.
     ///
-    /// Callers apply it only with `active_prefills` empty. `why` names the path
+    /// Callers apply it only with no prefill that can advance
+    /// ([`Self::running_prefills`] zero). `why` names the path
     /// that forced it, because a head admitted this way was never judged and a
     /// reader has to be able to tell that from an admission that was.
+    ///
+    /// The head is the first entry **not paused** by priority
+    /// ([`Self::priority_paused`]): a dialogue turn queued behind ingest is the
+    /// one forced in, and paused ingest is never forced past a pause the
+    /// running conversation holds. Nothing paused can deadlock the engine — the
+    /// work pausing it is running.
     fn force_queue_head(&mut self, why: &'static str) {
-        if let Some(work) = self.prefill_queue.pop_front() {
+        if let Some(work) = self.pop_unpaused_head() {
             tracing::debug!(
                 target: "candle_conversation::scheduler::throttle",
                 queued = self.prefill_queue.len() + 1,
@@ -1074,6 +1086,15 @@ impl Scheduler {
             );
             self.begin_prefill(work);
         }
+    }
+
+    /// Remove and return the first queued prefill that is not paused by
+    /// priority, in queue order.
+    fn pop_unpaused_head(&mut self) -> Option<PrefillWork> {
+        self.observe_priorities();
+        let at = (0..self.prefill_queue.len())
+            .find(|&i| !self.priority_paused(self.prefill_queue[i].sequence_id))?;
+        self.prefill_queue.remove(at)
     }
 
     /// The planner, built on first use and taken for the duration of a pass.
@@ -2067,8 +2088,14 @@ impl Scheduler {
         }
         let mut members: Vec<WaveMember> = Vec::new();
         let mut prefill_tokens = 0usize;
+        // A prefill paused behind higher-priority work sits this group out and
+        // keeps its place — see `priority_pause`.
+        self.observe_priorities();
         for p in &self.active_prefills {
             if p.error.is_some() || p.final_logits.is_some() || p.offset >= p.work.tokens.len() {
+                continue;
+            }
+            if self.priority_paused(p.work.sequence_id) {
                 continue;
             }
             let advance = (p.work.tokens.len() - p.offset).min(cap);
@@ -4027,6 +4054,134 @@ mod turn_view_release_tests {
             scheduler.session.sequence_offset(parent.0).is_some(),
             "the parent is untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod priority_admission_tests {
+    use std::sync::Arc;
+
+    use super::super::tests::make_test_scheduler;
+    use super::super::*;
+    use super::wave_chunk_tests::dialogue_prefill;
+
+    const YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: dialogue
+    window: 8000
+    decode_priority: high
+    summary:
+      turns:
+        max_tokens: 256
+        user: { system_prompt: s, user_prompt: u }
+        assistant: { system_prompt: s, user_prompt: u }
+    score_formula: max
+    budget: { priority: 40 }
+    groups:
+      - id: chat
+        selection: { kind: top_k, k: 2 }
+  - name: ingest
+    window: 8000
+    decode_priority: low
+    summary:
+      turns:
+        max_tokens: 256
+        user: { system_prompt: s, user_prompt: u }
+        assistant: { system_prompt: s, user_prompt: u }
+    score_formula: max
+    budget: { priority: 10 }
+    groups:
+      - id: files
+        selection: { kind: top_k, k: 2 }
+"#;
+
+    /// Bind `seq` to `layer`'s group on its own timeline, so its priority
+    /// resolves through the schema the way a live slot's does.
+    fn bind(sched: &mut Scheduler, builder: &Arc<Builder>, seq: SequenceId, layer: &str, tl: u64) {
+        let group = if layer == "dialogue" { "chat" } else { "files" };
+        let timeline = TimelineId::from_raw(tl).expect("timeline id");
+        sched.slot_targets.insert(
+            seq,
+            ProjectionTarget {
+                layer: builder.id_for_layer(layer).unwrap(),
+                group: builder.id_for_group(group).unwrap(),
+                timeline,
+            },
+        );
+        sched
+            .timeline_projections
+            .insert(timeline, Arc::clone(builder));
+    }
+
+    /// **A dialogue turn queued behind paused ingest is admitted.** The paused
+    /// ingest prefill moves no row, so it is not "in flight" for the
+    /// keep-one-alive rule: with admission closed until something settles, the
+    /// turn pausing it is the head that gets forced in. Counting the paused
+    /// prefill as in flight left the turn queued with nothing able to settle.
+    #[test]
+    fn a_dialogue_turn_is_admitted_past_paused_ingest() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let dialogue = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, ingest, "ingest", 1);
+        bind(&mut sched, &builder, dialogue, "dialogue", 2);
+        sched
+            .active_prefills
+            .push(dialogue_prefill(ingest, vec![1; 8]));
+        sched
+            .prefill_queue
+            .push_back(dialogue_prefill(dialogue, vec![1; 8]).work);
+        sched.settled_since_admit = false;
+
+        sched.promote_new_prefills();
+
+        assert!(
+            sched.priority_paused(ingest),
+            "the queued turn pauses ingest"
+        );
+        assert_eq!(
+            sched.running_prefills(),
+            1,
+            "only the dialogue turn can run"
+        );
+        assert!(
+            sched
+                .active_prefills
+                .iter()
+                .any(|p| p.work.sequence_id == dialogue),
+            "the dialogue turn was left queued behind paused ingest"
+        );
+    }
+
+    /// **A slot whose priority does not resolve pauses nobody.** It is gated as
+    /// `High` for itself, but it is not evidence that a conversation is running,
+    /// so ingest keeps its turn.
+    #[test]
+    fn an_unresolvable_slot_does_not_pause_ingest() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let probe = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, ingest, "ingest", 1);
+        sched
+            .active_prefills
+            .push(dialogue_prefill(ingest, vec![1; 8]));
+        sched
+            .active_prefills
+            .push(dialogue_prefill(probe, vec![1; 8]));
+
+        sched.observe_priorities();
+
+        assert!(
+            !sched.priority_paused(probe),
+            "never paused: it counts as High"
+        );
+        assert!(!sched.priority_paused(ingest), "and it pauses nothing");
     }
 }
 

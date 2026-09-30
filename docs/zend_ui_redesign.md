@@ -61,7 +61,7 @@ Router in `zend/src/api/mod.rs` serves the embedded `web/` dir (fallback) plus:
 
 | Method & route | Handler | Returns |
 |---|---|---|
-| `GET /v1/conversations?include_archived=` | `conversations::list` | `{ conversations: ConvEntry[] }` where `ConvEntry { id, label, turn_count, archived }` |
+| `GET /v1/conversations?include_archived=` | `conversations::list` | `{ conversations: ConvEntry[] }` where `ConvEntry { id, label, turn_count, archived, updated_ms }`, most recently used first |
 | `GET /v1/conversations/:id` | `conversations::get` | `{ id, messages: [{ role, content }] }` |
 | `POST /v1/conversations/:id/archive` | `conversations::archive` | `204` |
 | `POST /v1/conversations/:id/unarchive` | `conversations::unarchive` | `204` |
@@ -661,8 +661,12 @@ These were settled during planning and are now binding for the sections above:
    prompt steers the model's reasoning depth and answer length. The one
    exception is **no-thinking**, handled by a dedicated **inference-level hook**
    that switches the think channel on/off (not a prompt directive). (§2.2 / §2.3)
-4. **`updated_ms`** — *Add the field to `ConvEntry`.* Track last-activity ms on
-   the conversation and serialize it. (§2.1)
+4. **`updated_ms`** — *Add the field to `ConvEntry`.* The sidebar lists the most
+   recently used conversation first. The substrate keeps no clock, so it is a
+   rank: each submit or upload stamps the conversation's `active` from a
+   counter, persisted in its `ConvState` record so replay restores it exactly;
+   the listing sorts by `(active, creation order)` and serializes each entry's
+   position (top = highest) as `updated_ms` (`zend/src/conv_order.rs`). (§2.1)
 5. **Span region (think vs answer)** — *Parse from emitted content.* Track
    whether the decode head sits between `<think>` and `</think>` in the stream
    and tag each span's region accordingly. (§2.3)
@@ -771,7 +775,8 @@ decisions; 12 is a perf guard.
 - `ChatCompletionRequest` dial fields `effort/verbosity/think`. ✅ 2 tests.
 - **No-thinking** (decision 10): `apply_no_think` prepends `/no_think` to the last
   user turn on `effort:0`/`think:false`, in the chat path. ✅ 5 tests.
-- `ConvEntry.updated_ms` (decision 4), derived from the conv id. ✅ compiles; served.
+- `ConvEntry.updated_ms` (decision 4), the most-recently-used rank from
+  `ConvState.active`. ✅ tested (`conv_order`, substrate touch + replay).
 - **Windowed-substrate endpoint** `GET /v1/conversations/:id/substrate` (§2.4):
   real engine-backed materialization (`system_prompt` + recovered turns →
   ordered sections) via the pure `substrate_view::build`, **dummy-substrate
@@ -831,5 +836,3 @@ blind):**
 - **Windowed-substrate endpoint** (§2.4) — materializes projected context.
 - **Conversation-files layer** + upload-prefill SSE + file routes (§2.5) —
   mirrors `code_read`; new substrate record kind.
-- Substrate-backed `updated_ms` (replace the id-derived value once turn
-  timestamps are exposed).

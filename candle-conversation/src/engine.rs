@@ -1132,6 +1132,12 @@ impl ConversationEngine {
             .map_err(ConversationError::Model)
     }
 
+    /// Mark a conversation used now — the sidebar lists it first until another
+    /// is used. Persists its `ConvState`.
+    pub fn touch_conversation(&self, timeline: TimelineId) {
+        self.conversation.touch_conversation(timeline);
+    }
+
     /// Mark `timeline` as scratch: its turns never reach cold storage.
     ///
     /// Sets `no_cold_persist` on every residence the timeline holds, so a

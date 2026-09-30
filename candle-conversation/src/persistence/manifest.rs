@@ -116,6 +116,16 @@ pub struct ConvState {
     /// developer has checked out.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub branches: BTreeMap<String, String>,
+    /// When the conversation was last used, as a rank: stamped from the
+    /// substrate's activity counter on every use, so a higher value was used
+    /// more recently. `0` for a conversation not used since the rank was
+    /// kept. A rank, not a clock — the substrate has no time.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub active: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl ConvState {
@@ -412,7 +422,31 @@ mod tests {
                 .iter()
                 .map(|(r, b)| (r.to_string(), b.to_string()))
                 .collect(),
+            active: 0,
         }
+    }
+
+    /// **The last-use rank is carried in the same bytes**, after the branches,
+    /// and a record written before it existed reads as never used.
+    #[test]
+    fn conv_state_payload_carries_the_last_use_rank() {
+        let used = ConvState {
+            active: 17,
+            ..state(false, &[("candle", "main")])
+        };
+        let bytes = encode_conv_state_payload(9, &used);
+        assert_eq!(
+            bytes,
+            br#"{"timeline_id":9,"archived":false,"branches":{"candle":"main"},"active":17}"#
+        );
+        assert_eq!(decode_conv_state_payload(&bytes).unwrap(), (9, used));
+        assert_eq!(
+            decode_conv_state_payload(br#"{"timeline_id":9,"archived":false}"#)
+                .unwrap()
+                .1
+                .active,
+            0
+        );
     }
 
     /// **The `ConvState` payload is exactly these bytes**, and decodes back

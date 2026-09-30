@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{claim_arena_slots, relocate_tensor, ArenaSlot, SlotTenant};
 
@@ -136,38 +137,55 @@ impl KeyPages {
             .collect()
     }
 
-    /// The first `n_blocks` keys as one owned `[n_blocks, d]` tensor — for a seal
-    /// or a record, never for the scorer, which reads the pages in place.
-    pub(super) fn gather(&self, n_blocks: usize) -> Result<Tensor> {
+    /// The first `n_blocks` keys, `[n_blocks, d]` row-major, read back to the host
+    /// page by page — for a seal or a record, never for the scorer, which reads the
+    /// pages in place. Nothing is gathered on the device: a gather is a buffer from
+    /// the CUDA pool, outside the span, for bytes that are only on their way off
+    /// the card.
+    pub(super) fn host_rows(&self, n_blocks: usize) -> Result<Vec<f32>> {
         self.check(n_blocks)?;
-        if n_blocks == 0 {
-            return Tensor::zeros((0, self.d), DType::F32, &self.device);
+        let mut out = Vec::with_capacity(n_blocks * self.d);
+        for p in 0..n_blocks.div_ceil(PAGE_BLOCKS) {
+            let used = (n_blocks - p * PAGE_BLOCKS).min(PAGE_BLOCKS);
+            out.extend(
+                self.pages[p]
+                    .narrow(0, 0, used)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            );
         }
-        let views = (0..n_blocks.div_ceil(PAGE_BLOCKS))
-            .map(|p| {
-                let used = (n_blocks - p * PAGE_BLOCKS).min(PAGE_BLOCKS);
-                self.pages[p].narrow(0, 0, used)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Tensor::cat(&views, 0)
+        Ok(out)
     }
 
-    /// Write `rows` (`[n, d]`) as the first `n` keys, claiming pages as needed.
-    pub(super) fn write_rows(&mut self, rows: &Tensor) -> Result<()> {
-        let (n, d) = rows.dims2()?;
-        if d != self.d {
+    /// Write `rows` (`[n, d]` row-major, host) as the first `n` keys, claiming
+    /// pages as needed — straight into the pages, with no device buffer between.
+    pub(super) fn write_host_rows(&mut self, rows: &[f32]) -> Result<()> {
+        if !rows.len().is_multiple_of(self.d) {
             candle::bail!(
-                "qsa index pages: [{n}, {d}] rows into {}-wide pages",
+                "qsa index pages: {} values is not a whole number of {}-wide rows",
+                rows.len(),
                 self.d
             );
         }
+        let n = rows.len() / self.d;
         self.ensure(n)?;
         for p in 0..n.div_ceil(PAGE_BLOCKS) {
             let first = p * PAGE_BLOCKS;
             let used = (n - first).min(PAGE_BLOCKS);
-            self.pages[p].slice_set(&rows.narrow(0, first, used)?, 0, 0)?;
+            write_host(
+                &self.pages[p],
+                &rows[first * self.d..(first + used) * self.d],
+            )?;
         }
         Ok(())
+    }
+
+    /// Hand over the pages holding the first `n_blocks` keys, leaving this table
+    /// with the pages above them — how a live tail is closed into a page without
+    /// moving a key.
+    pub(super) fn detach(&mut self, n_blocks: usize) -> Result<Vec<Tensor>> {
+        self.check(n_blocks)?;
+        Ok(self.pages.drain(..n_blocks.div_ceil(PAGE_BLOCKS)).collect())
     }
 
     /// A copy of the first `n_blocks` keys in pages of their own — only the pages
@@ -209,6 +227,33 @@ impl KeyPages {
             );
         }
         Ok(())
+    }
+}
+
+/// Copy host `vals` into the front of `dst` — on CUDA one host-to-device copy into
+/// the slot `dst` views, on the stream every reader of the slot uses; on any other
+/// device a `slice_set`.
+pub(super) fn write_host(dst: &Tensor, vals: &[f32]) -> Result<()> {
+    if vals.len() > dst.elem_count() {
+        candle::bail!(
+            "qsa index: {} values into a {}-value buffer",
+            vals.len(),
+            dst.elem_count()
+        );
+    }
+    match dst.device() {
+        Device::Cuda(cuda) => {
+            // SAFETY: `dst` is a live, dense F32 buffer of at least `vals.len()`
+            // elements. From pageable memory the driver has staged the bytes
+            // before this returns, so `vals` may go.
+            unsafe { memcpy_htod_async(tensor_ptr(dst)?, vals, cuda.cuda_stream().cu_stream()) }
+                .map_err(|e| candle::Error::Msg(format!("qsa index upload: {e}")))
+        }
+        dev => {
+            let (_, d) = dst.dims2()?;
+            let rows = vals.len() / d;
+            dst.slice_set(&Tensor::from_slice(vals, (rows, d), dev)?, 0, 0)
+        }
     }
 }
 
@@ -291,9 +336,8 @@ impl Drop for SnapshotBuffer {
 mod tests {
     use super::*;
 
-    fn rows(n: usize, d: usize) -> Tensor {
-        let v: Vec<f32> = (0..n * d).map(|i| i as f32).collect();
-        Tensor::from_vec(v, (n, d), &Device::Cpu).unwrap()
+    fn rows(n: usize, d: usize) -> Vec<f32> {
+        (0..n * d).map(|i| i as f32).collect()
     }
 
     #[test]
@@ -331,20 +375,13 @@ mod tests {
         let n = PAGE_BLOCKS + 3;
         let src = rows(n, 4);
         let mut keys = KeyPages::new(4, &Device::Cpu);
-        keys.write_rows(&src).unwrap();
-        assert_eq!(
-            keys.gather(n).unwrap().to_vec2::<f32>().unwrap(),
-            src.to_vec2::<f32>().unwrap()
-        );
+        keys.write_host_rows(&src).unwrap();
+        assert_eq!(keys.host_rows(n).unwrap(), src);
         let child = keys.fork(n).unwrap();
         assert_eq!(child.capacity_blocks(), 2 * PAGE_BLOCKS);
-        assert_eq!(
-            child.gather(n).unwrap().to_vec2::<f32>().unwrap(),
-            src.to_vec2::<f32>().unwrap(),
-            "a fork carries the keys"
-        );
+        assert_eq!(child.host_rows(n).unwrap(), src, "a fork carries the keys");
         assert!(
-            keys.gather(2 * PAGE_BLOCKS + 1).is_err(),
+            keys.host_rows(2 * PAGE_BLOCKS + 1).is_err(),
             "past capacity is refused"
         );
     }
@@ -354,9 +391,30 @@ mod tests {
     fn a_fork_claims_only_the_pages_in_use() {
         let mut keys = KeyPages::new(4, &Device::Cpu);
         keys.ensure(4 * PAGE_BLOCKS).unwrap();
-        keys.write_rows(&rows(10, 4)).unwrap();
+        keys.write_host_rows(&rows(10, 4)).unwrap();
         assert_eq!(keys.fork(10).unwrap().capacity_blocks(), PAGE_BLOCKS);
         assert_eq!(keys.fork(0).unwrap().capacity_blocks(), 0);
+    }
+
+    /// **Detaching hands the written pages over as they stand and keeps the rest.**
+    /// The pages covering `n` keys leave with their rows; the table keeps its
+    /// capacity above them, empty, for the tail that follows.
+    #[test]
+    fn detaching_hands_over_the_pages_in_use_and_keeps_the_rest() {
+        let n = PAGE_BLOCKS + 3;
+        let src = rows(n, 4);
+        let mut keys = KeyPages::new(4, &Device::Cpu);
+        keys.ensure(3 * PAGE_BLOCKS).unwrap();
+        keys.write_host_rows(&src).unwrap();
+        let taken = keys.detach(n).unwrap();
+        assert_eq!(taken.len(), 2, "the two pages the keys reach");
+        assert_eq!(keys.capacity_blocks(), PAGE_BLOCKS, "the unused page stays");
+        let back: Vec<f32> = taken
+            .iter()
+            .flat_map(|t| t.flatten_all().unwrap().to_vec1::<f32>().unwrap())
+            .take(n * 4)
+            .collect();
+        assert_eq!(back, src, "the rows leave where they were written");
     }
 
     #[test]

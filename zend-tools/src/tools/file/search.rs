@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{stores_for, FileError, Paging, RepoPath};
+use super::{stores_for, FileError, Paging};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Paths per page. A path is far cheaper than a `file_list` entry (no size or
@@ -33,12 +33,23 @@ pub struct SearchRequest {
     pub page: Option<u32>,
 }
 
+/// One repository's matching files.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RepoHits {
+    pub repo: String,
+    /// Paths relative to `repo`, shortest first — the shortest path matching a
+    /// name is usually the definition rather than a vendored or generated copy
+    /// of it.
+    pub files: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub struct SearchResponse {
-    /// Matching files, shortest path first then by repository and path — the
-    /// shortest path matching a name is usually the definition rather than a
-    /// vendored or generated copy of it.
-    pub files: Vec<RepoPath>,
+    /// Matching files grouped by repository, in the workspace's order — the
+    /// repository is what a `file_read` of a hit names, and with `*` the hits
+    /// span several.
+    pub repos: Vec<RepoHits>,
+    /// Paged across every group, in the order shown.
     pub paging: Paging,
 }
 
@@ -57,7 +68,8 @@ impl Tool for FileSearch {
          discovering where a subsystem lives before reading it. Triggered by \
          \"where is\", \"find the file\", \"which file is\", \"locate\", \"is there a \
          file called\", \"what files are named\", \"show me all the .rs files\". \
-         Returns each file's repo and path, shortest path first, paged. THIS IS THE \
+         Returns the matching paths grouped by repo, shortest path first within \
+         each, paged. THIS IS THE \
          TOOL FOR FINDING A FILE — do not guess directory names and call file_list \
          repeatedly; one file_search over the whole workspace replaces that entirely. Use file_grep to \
          search file CONTENTS for a string or symbol; use file_list to enumerate a \
@@ -76,38 +88,47 @@ impl Tool for FileSearch {
         let prefix = req.prefix.as_deref().unwrap_or("");
         let query = req.query.to_ascii_lowercase();
 
-        let mut all: Vec<RepoPath> = Vec::new();
-        for (repo, store) in stores_for(ctx, &req.repo)? {
-            all.extend(
-                store
-                    .paths(prefix)
-                    .into_iter()
-                    .filter(|p| matches(&p.to_ascii_lowercase(), &query))
-                    .map(|path| RepoPath {
-                        repo: repo.clone(),
-                        path,
-                    }),
-            );
-        }
-        // Shortest first: `config.rs` at a crate root beats a deeply nested
+        // Repository by repository, in the workspace's order; within each,
+        // shortest first: `config.rs` at a crate root beats a deeply nested
         // vendored copy of the same name, and that is nearly always the one the
         // caller meant.
-        all.sort_by(|a, b| {
-            a.path
-                .len()
-                .cmp(&b.path.len())
-                .then_with(|| a.repo.cmp(&b.repo))
-                .then_with(|| a.path.cmp(&b.path))
-        });
+        let mut all: Vec<(String, String)> = Vec::new();
+        for (repo, store) in stores_for(ctx, &req.repo)? {
+            let mut paths: Vec<String> = store
+                .paths(prefix)
+                .into_iter()
+                .filter(|p| matches(&p.to_ascii_lowercase(), &query))
+                .collect();
+            paths.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+            all.extend(paths.into_iter().map(|path| (repo.clone(), path)));
+        }
 
         let paging = Paging::of(all.len(), req.page.unwrap_or(0), SEARCH_PAGE_ENTRIES);
-        let files = all
+        let page = all
             .into_iter()
             .skip(paging.skipped())
-            .take(SEARCH_PAGE_ENTRIES)
-            .collect();
-        Ok(SearchResponse { files, paging })
+            .take(SEARCH_PAGE_ENTRIES);
+        Ok(SearchResponse {
+            repos: grouped(page),
+            paging,
+        })
     }
+}
+
+/// `(repo, path)` pairs, already in order, as one group per run of a
+/// repository.
+fn grouped(pairs: impl IntoIterator<Item = (String, String)>) -> Vec<RepoHits> {
+    let mut out: Vec<RepoHits> = Vec::new();
+    for (repo, path) in pairs {
+        match out.last_mut() {
+            Some(group) if group.repo == repo => group.files.push(path),
+            _ => out.push(RepoHits {
+                repo,
+                files: vec![path],
+            }),
+        }
+    }
+    out
 }
 
 /// Whether `path` (already lowercased) matches `query` (already lowercased).
@@ -153,7 +174,27 @@ pub const FILE_SEARCH: RegisteredTool = RegisteredTool::new::<FileSearch>();
 
 #[cfg(test)]
 mod tests {
-    use super::matches;
+    use super::{grouped, matches, RepoHits};
+
+    /// Consecutive hits of one repository are one group, in the order given.
+    #[test]
+    fn hits_are_grouped_by_repository_in_order() {
+        let pairs = [("a", "x.rs"), ("a", "src/y.rs"), ("b", "z.rs")]
+            .map(|(r, p)| (r.to_string(), p.to_string()));
+        assert_eq!(
+            grouped(pairs),
+            [
+                RepoHits {
+                    repo: "a".into(),
+                    files: vec!["x.rs".into(), "src/y.rs".into()],
+                },
+                RepoHits {
+                    repo: "b".into(),
+                    files: vec!["z.rs".into()],
+                },
+            ]
+        );
+    }
 
     #[test]
     fn a_plain_query_is_a_substring_of_the_path() {

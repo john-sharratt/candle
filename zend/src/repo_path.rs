@@ -15,9 +15,36 @@ pub fn split(key: &str) -> (&str, &str) {
     key.split_once('/').unwrap_or((key, ""))
 }
 
+/// How a view shows an ingested unit's key: `(repository, path inside it)`,
+/// the way the tools address it. A folder keeps its trailing `/` and a
+/// repository's root reads `/`.
+pub fn shown(key: &str) -> (&str, String) {
+    let (repo, inner) = split(key);
+    let folder = key.ends_with('/');
+    let inner = match (inner, folder) {
+        ("", _) => "/".to_string(),
+        (inner, true) => format!("{inner}/"),
+        (inner, false) => inner.to_string(),
+    };
+    (repo, inner)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split;
+    use super::{shown, split};
+
+    #[test]
+    fn a_unit_is_shown_as_its_repository_and_the_path_inside_it() {
+        assert_eq!(
+            shown("candle/CLAUDE.md"),
+            ("candle", "CLAUDE.md".to_string())
+        );
+        assert_eq!(
+            shown("candle/zend/src/"),
+            ("candle", "zend/src/".to_string())
+        );
+        assert_eq!(shown("candle/"), ("candle", "/".to_string()));
+    }
 
     #[test]
     fn a_file_splits_at_its_first_segment() {

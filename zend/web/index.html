@@ -437,7 +437,10 @@ import { estateSwitcher } from './common/lib/estate.js';
     toolSchemaGen: 0,    // bumped when toolSchemas lands; part of the render-cache key
     activeId: null,
     loaded: {},
-    showArchived: (function () { try { return localStorage.getItem('zend.showArchived') === '1'; } catch (_) { return false; } })(),
+    // Off at every load, never remembered: left on in one browser, it kept
+    // archived conversations — and each one just archived — in that browser's
+    // list with nothing to say why.
+    showArchived: false,
     sidebarCollapsed: false,
     sidebarDrawer: false,   // narrow only: the conversation list open as an overlay drawer
     confirm: null,          // in-app confirm dialog: { title, body, confirmLabel, danger, onConfirm }
@@ -452,7 +455,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     promptValue: '',
     logsOpen: false,
     // Composer dials are a per-user browser preference (persisted in
-    // localStorage, like theme/show-archived), so a new conversation starts
+    // localStorage, like the theme), so a new conversation starts
     // with the user's last-chosen settings rather than a hardcoded default.
     effortLevel: dialPref('zend.effort', 2),
     verbosityLevel: dialPref('zend.verbosity', 2),
@@ -1177,7 +1180,12 @@ import { estateSwitcher } from './common/lib/estate.js';
     } });
   }
   function doArchiveConv(id) {
-    API.archiveConversation(id);
+    // The sync never clears the flag (archiving is one-way), so a refused
+    // archive has to put the row back itself.
+    Promise.resolve(API.archiveConversation(id)).catch(() => {
+      S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: false }) : c);
+      render();
+    });
     let conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: true }) : c);
     let activeId = S.activeId;
     if (activeId === id && !S.showArchived) {
@@ -1193,7 +1201,6 @@ import { estateSwitcher } from './common/lib/estate.js';
   }
   function toggleArchived() {
     const showArchived = !S.showArchived;
-    try { localStorage.setItem('zend.showArchived', showArchived ? '1' : '0'); } catch (_) {}
     let activeId = S.activeId;
     if (!showArchived) { const a = S.conversations.find((c) => c.id === activeId); if (a && a.archived) activeId = null; }
     writeHashConv(activeId);
@@ -1217,18 +1224,19 @@ import { estateSwitcher } from './common/lib/estate.js';
     // shouldn't drop the active one, but never hard-crash send if it did) both
     // start a fresh conversation rather than dereferencing `undefined`.
     target = activeId !== null ? conversations.find((c) => c.id === activeId) : null;
+    // updated_ms is the listing's most-recently-used rank (the daemon's
+    // conv_order), not a clock. Sending is a use, so the conversation takes
+    // the top at once; the server ranks it first too, so the next sync agrees.
+    const topRank = S.conversations.reduce((m, c) => Math.max(m, c.updated_ms || 0), 0);
     if (!target) {
       const id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'c' + Date.now();
-      // updated_ms is a creation-order rank (see the daemon's TimelineEntry::order),
-      // not a clock. Seat a brand-new conversation just above the current top so it
-      // leads the list; the server's rank (also the new max) keeps it there after hydrate.
-      const topRank = S.conversations.reduce((m, c) => Math.max(m, c.updated_ms || 0), 0);
       target = { id, title: titleOf(text), archived: false, updated_ms: topRank + 1, turn_count: 0, history: [], files: [] };
       conversations = [target].concat(conversations);
       activeId = id;
       S.loaded[id] = true;
-    } else if (target.history.length === 0) {
-      target.title = titleOf(text);
+    } else {
+      if (target.history.length === 0) target.title = titleOf(text);
+      if (target.updated_ms !== topRank) target.updated_ms = topRank + 1;
     }
     target.history = target.history.concat([
       { role: 'user', content: text },
@@ -1724,7 +1732,9 @@ import { estateSwitcher } from './common/lib/estate.js';
           iconBtn('M9 2L4 7l5 5', drawer ? 'Close' : 'Collapse sidebar', closeSidebar, 27))),
       h('div', { class: 'zscroll-blue', style: 'flex:1; min-height:0; overflow-y:auto; padding:0 0.4rem 0.5rem;' },
         convs.length ? rows : [h('div', { style: 'padding:1rem 0.9rem; font-size:0.775rem; color:#4a6278;' }, 'No conversations yet.')]),
-      h('div', { style: 'flex-shrink:0; padding:0.55rem 0.85rem 0.65rem; border-top:1px solid #2a3848; background:#19222f;' },
+      // The footer clears the phone's home indicator / gesture bar: the page is
+      // `viewport-fit=cover`, so without the inset the checkbox sits under it.
+      h('div', { class: 'z-sbfoot', style: 'flex-shrink:0; padding:0.55rem 0.85rem calc(0.65rem + env(safe-area-inset-bottom, 0px)); border-top:1px solid #2a3848; background:#19222f;' },
         h('label', { onClick: toggleArchived, style: 'display:flex; align-items:center; gap:0.45rem; font-size:0.72rem; color:#6a8098; cursor:pointer; user-select:none;' },
           h('span', { style: 'width:13px; height:13px; border-radius:3px; border:1px solid #445870; background:' + (S.showArchived ? ACCENT : 'transparent') + '; display:flex; align-items:center; justify-content:center; color:#fff; font-size:9px;' }, S.showArchived ? '✓' : ''),
           'Show archived'),
@@ -3616,8 +3626,14 @@ import { estateSwitcher } from './common/lib/estate.js';
         const ex = S.conversations.find((c) => String(c.id) === String(e.id));
         if (ex) {
           if (e.title && e.title !== ex.title) { ex.title = e.title; mutated = true; }   // titler is authoritative
-          if (!!e.archived !== !!ex.archived) { ex.archived = !!e.archived; mutated = true; }
-          if (e.updated_ms) ex.updated_ms = e.updated_ms;
+          // Archiving is one-way, so the sync only ever sets the flag. The
+          // archive POST waits on the engine, and a list served before it lands
+          // still says "not archived" — copying that back resurrected the row
+          // the user had just archived.
+          if (e.archived && !ex.archived) { ex.archived = true; mutated = true; }
+          // The rank moves whenever any conversation is used — from this tab
+          // or another device — so a change reorders the list.
+          if (e.updated_ms && e.updated_ms !== ex.updated_ms) { ex.updated_ms = e.updated_ms; mutated = true; }
         } else {
           S.conversations = S.conversations.concat([Object.assign({}, e, { history: e.history || [] })]);
           mutated = true;

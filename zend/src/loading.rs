@@ -6,7 +6,9 @@
 //! 2. **Substrate** — replay the redo log into the in-RAM substrate.
 //! 3. **Sections** — prefill the projection schema's pinned sections, then
 //!    calibrate them.
-//! 4. **Normalizing** — relearn the tool catalog's score-normalization levels.
+//! 4. **Priming** — read the priming chain the base conversation descends
+//!    from (`crate::branch_ingest::prime`).
+//! 5. **Normalizing** — relearn the tool catalog's score-normalization levels.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
 //! via [`Self::set_step`], reports intra-step progress via
@@ -26,6 +28,12 @@ pub enum LoadStep {
     Compacting,
     Sections,
     CalibratingSections,
+    /// The priming chain (`BranchIngest::prime`): the workspace listing, then
+    /// each repository's root listing and anchor documents, read in order.
+    /// Before `ready`, because the base conversation descends from it — the
+    /// first question asked must already have it. Links read on an earlier
+    /// boot are not read again, so a restart pays for what changed.
+    Priming,
     /// The tool catalog's score-normalization hit levels, relearned from its
     /// corpus. They are runtime-only, so every start pays this — last, once the
     /// corpus is complete, and before `ready`, because a query scored against
@@ -42,6 +50,7 @@ impl LoadStep {
         LoadStep::Compacting,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
+        LoadStep::Priming,
         LoadStep::Normalizing,
     ];
 
@@ -53,6 +62,7 @@ impl LoadStep {
             LoadStep::Compacting => "Compacting substrate",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
+            LoadStep::Priming => "Reading the repositories",
             LoadStep::Normalizing => "Normalizing scores",
         }
     }
@@ -74,6 +84,7 @@ impl LoadStep {
             LoadStep::Compacting => "",
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
+            LoadStep::Priming => "documents",
             LoadStep::Normalizing => "",
         }
     }

@@ -238,6 +238,13 @@ pub struct Sweep<'m> {
     /// sweep can reach is maintained by hand. A rising count is how a new holder nobody
     /// swept is discovered.
     witnessed: AHashSet<i64>,
+    /// Destination gids of chunks the sweep deliberately left on their sources, because
+    /// no fresh record could be minted for them ([`Self::remint`]).
+    ///
+    /// Kept apart from an unreached holder's destinations: those are a hole in the holder
+    /// set, these are a pass that ran out of record room and will move the chunk later.
+    #[cfg(feature = "cuda")]
+    forgone: AHashSet<i64>,
     /// Where a rewritten chunk's fresh record comes from, and the backing that claims
     /// it. `None` off a device, where there are no records at all.
     ///
@@ -285,6 +292,8 @@ impl<'m> Sweep<'m> {
             allocations_rewritten: 0,
             witnessed: AHashSet::new(),
             #[cfg(feature = "cuda")]
+            forgone: AHashSet::new(),
+            #[cfg(feature = "cuda")]
             mint: None,
             #[cfg(feature = "cuda")]
             retired: Vec::new(),
@@ -311,6 +320,7 @@ impl<'m> Sweep<'m> {
             originals: Vec::new(),
             allocations_rewritten: 0,
             witnessed: AHashSet::new(),
+            forgone: AHashSet::new(),
             mint: Some((mint, backing)),
             retired: Vec::new(),
             minted: AHashSet::new(),
@@ -343,6 +353,59 @@ impl<'m> Sweep<'m> {
             self.note_minted(record.raw());
         }
         Ok(minted)
+    }
+
+    /// Give a chunk whose gids are moving to `next` a fresh record — or say it must stay
+    /// where it is.
+    ///
+    /// `true` when the holder may install `next`: the chunk carries no record (it is
+    /// addressed from its gids), this sweep mints none, or a fresh record for `next` is now
+    /// in `meta`. `false` when the record pool had no slot left for it: the chunk then
+    /// keeps its source gids **and** its source record, which agree, and a later pass with
+    /// record room moves it.
+    ///
+    /// **Moving the gids without the record splits the chunk.** Reads go through the
+    /// record, to the source, which the record keeps alive; the new gids hold a destination
+    /// nothing reads. So the chunk held two slots, and every later pass saw the
+    /// record-pinned source as live, copied it again, and found no holder naming the copy:
+    /// 445, then 13,076 relocated slots unreached on every pass for half an hour, each run
+    /// of them starting on the pass after one that reported `records_declined`.
+    #[cfg(feature = "cuda")]
+    pub(super) fn remint(
+        &mut self,
+        next: &HeadGids,
+        meta: &mut Option<MetaGid>,
+        src: RecordInputs<'_>,
+    ) -> candle::Result<bool> {
+        if meta.is_none() || self.mint.is_none() {
+            return Ok(true);
+        }
+        match self.mint_record(next, src)? {
+            Some(record) => {
+                self.install_record(meta, record);
+                Ok(true)
+            }
+            None => {
+                let map = self.map;
+                self.forgone.extend(
+                    next.as_slice()
+                        .iter()
+                        .map(ChunkGid::raw)
+                        .filter(|&raw| map.is_destination(raw)),
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Record that a holder now names `next` — see [`Self::witnessed`]. Called where the
+    /// holder installs it, so a chunk left on its source witnesses nothing.
+    pub(super) fn witness(&mut self, next: &HeadGids) {
+        for g in next.as_slice() {
+            if self.map.is_destination(g.raw()) {
+                self.witnessed.insert(g.raw());
+            }
+        }
     }
 
     /// Record that `raw` is a slot this sweep minted into — see [`Self::minted`].
@@ -425,13 +488,14 @@ impl<'m> Sweep<'m> {
     /// Relocated slots no visited holder named — the pass's completeness gap.
     ///
     /// Empty is the only sound answer: every slot the pass moved and is about to
-    /// free must be named by a holder it rewrote.
+    /// free must be named by a holder it rewrote. A destination forgone for want of a
+    /// record ([`Self::remint`]) is not a gap and is not counted.
     ///
     /// Only the compaction pass asks, and there is no host compaction.
     #[cfg(feature = "cuda")]
     pub(super) fn unwitnessed(&self, map: &CompactionMap) -> Vec<i64> {
         map.destinations()
-            .filter(|raw| !self.witnessed.contains(raw))
+            .filter(|raw| !self.witnessed.contains(raw) && !self.forgone.contains(raw))
             .collect()
     }
 
@@ -455,14 +519,6 @@ impl<'m> Sweep<'m> {
         }
         let map = self.map;
         let next = gids.map_unique(|g| Ok(map.get(g).cloned().unwrap_or_else(|| g.clone())))?;
-        // Every destination this holder now names — it is the naming that keeps the
-        // destination's refcount honest, and the absence of a naming that leaves a
-        // source held by a holder the pass could not correct.
-        for g in next.as_slice() {
-            if map.is_destination(g.raw()) {
-                self.witnessed.insert(g.raw());
-            }
-        }
         // Hold the original alive so its address cannot be recycled under the memo key —
         // see [`Self::originals`]. Taken before the insert so the key is pinned for as long
         // as the entry exists.
@@ -538,26 +594,28 @@ pub fn rewrite_sealed(
                 // one.** Installing it retires the old record — and with it, once the
                 // sweep ends, the clone of the old gids the old record was holding —
                 // which is what lets the source be reclaimed. A chunk with no record is
-                // addressed from its gids and must not be given one.
+                // addressed from its gids and must not be given one; a chunk with one
+                // that cannot have a fresh one stays whole on its source.
                 #[cfg(feature = "cuda")]
-                if c.meta.is_some() {
-                    let minted = sweep.mint_record(
-                        &next,
-                        RecordInputs {
-                            k_pal: &c.k_pal,
-                            v_pal: &c.v_pal,
-                            k_scale: &c.k_scale,
-                            v_scale: &c.v_scale,
-                            k_fmt: &c.k_fmt,
-                            v_fmt: &c.v_fmt,
-                        },
-                    )?;
-                    if let Some(record) = minted {
-                        sweep.install_record(&mut c.meta, record);
-                    }
+                let movable = sweep.remint(
+                    &next,
+                    &mut c.meta,
+                    RecordInputs {
+                        k_pal: &c.k_pal,
+                        v_pal: &c.v_pal,
+                        k_scale: &c.k_scale,
+                        v_scale: &c.v_scale,
+                        k_fmt: &c.k_fmt,
+                        v_fmt: &c.v_fmt,
+                    },
+                )?;
+                #[cfg(not(feature = "cuda"))]
+                let movable = true;
+                if movable {
+                    sweep.witness(&next);
+                    c.gids = next;
+                    changed = true;
                 }
-                c.gids = next;
-                changed = true;
             }
             // The record itself may have been copied lower. After the band rewrite, so a
             // record just minted for new bands is never swapped for a copy of the old one.
@@ -756,6 +814,37 @@ mod tests {
         let mut sweep = Sweep::new(&map);
         assert!(rewrite_sealed(&[seq], &mut sweep).unwrap().is_none());
         assert_eq!(sweep.allocations_rewritten(), 0);
+    }
+
+    /// **A destination is witnessed where a holder installs it, not where it is
+    /// computed.** A chunk the sweep leaves on its source for want of a record computes
+    /// its replacement and installs none, and must not read as a holder of the copy — that
+    /// is how the completeness count tells an unreached holder from a declined mint.
+    #[test]
+    fn a_destination_is_witnessed_only_when_a_holder_installs_it() {
+        let mut map = CompactionMap::new();
+        map.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0x4000);
+        let mut sweep = Sweep::new(&map);
+        let gids = HeadGids::uniform(ChunkGid::detached(raw(5, 2)), 1);
+
+        sweep.rewrite_gids(&gids).unwrap().expect("moved");
+        assert!(
+            sweep.witnessed.is_empty(),
+            "computing a replacement names nothing",
+        );
+
+        let seq = SealedSequence {
+            chunks: vec![chunk_with(gids)],
+            token_count: 32,
+            chunk_size: 32,
+            location: crate::kv_cache::ArenaLocation::Gpu,
+        };
+        rewrite_sealed(&[seq], &mut sweep).unwrap().expect("moved");
+        assert_eq!(
+            sweep.witnessed.iter().copied().collect::<Vec<_>>(),
+            [raw(0, 1)],
+            "the holder that installed the replacement names its destination",
+        );
     }
 
     /// **With no minter, a rewritten chunk keeps its record — and the record keeps the

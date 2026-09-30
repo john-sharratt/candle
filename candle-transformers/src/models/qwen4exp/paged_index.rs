@@ -28,7 +28,7 @@
 //! here, on the host, where the page table already lives, and the kernel is
 //! handed the resulting `cnt` and never sees a width at all.
 
-use candle::{DType, Device, Result, Tensor};
+use candle::{Device, Result, Tensor};
 
 use super::indexer::IndexCache;
 #[cfg(feature = "cuda")]
@@ -185,8 +185,9 @@ impl PagedIndex {
     /// A window holding one live cache's rows — the degenerate single-page case,
     /// which is what a sequence that has not been reconstructed looks like.
     pub fn from_live(cache: &IndexCache, ratio: usize, device: &Device) -> Result<Self> {
-        let rows = cache.live_rows()?;
-        let last_cells = if rows.dim(0)? == 0 { 1 } else { ratio };
+        let (n, d) = (cache.live_blocks(), cache.head_dim());
+        let rows = Tensor::from_vec(cache.live_rows_host()?, (n, d), device)?;
+        let last_cells = if n == 0 { 1 } else { ratio };
         Self::new(vec![(IndexPage::new(rows, last_cells), 0)], ratio, device)
     }
 
@@ -470,19 +471,43 @@ pub fn tail_span_pages(page_widths: &[usize], tail_tokens: usize, tokens: usize)
 ///
 /// So the open rows travel too, and a resume rebuilds the cache exactly rather
 /// than approximately.
-#[derive(Debug, Clone)]
+///
+/// **Host data, and only host data.** A record is on its way to or from the log
+/// or a projection's injection, and a device tensor here was a buffer from the
+/// CUDA pool per layer per piece — outside the span, and made again on every
+/// projection. The device side of a page is a
+/// [`ResidentPage`](super::resident_page::ResidentPage), placed from these rows.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SealedIndex {
-    /// The completed rows, as a scoring page.
-    pub page: IndexPage,
-    /// `[n_open, head_dim]` F32 — the raw, un-pooled rows of the trailing
-    /// partial block. Zero rows when the turn happened to end on a boundary.
-    pub open: Tensor,
+    /// `[rows, dim]` row-major F32 — the completed, pooled, normed, un-rotated
+    /// block keys.
+    pub rows: Vec<f32>,
+    pub dim: usize,
+    /// Tokens the last row covers, in `1..=ratio`.
+    pub last_cells: usize,
+    /// `[n_open, dim]` row-major F32 — the raw, un-pooled rows of the trailing
+    /// partial block. Empty when the turn happened to end on a boundary.
+    pub open: Vec<f32>,
 }
 
 impl SealedIndex {
-    /// Tokens this record covers: the page's rows plus the open block.
-    pub fn tokens(&self, ratio: usize) -> Result<usize> {
-        Ok(self.page.tokens(ratio)? + self.open.dim(0)?)
+    /// Completed rows.
+    pub fn n_rows(&self) -> usize {
+        self.rows.len().checked_div(self.dim).unwrap_or(0)
+    }
+
+    /// Carried open rows.
+    pub fn n_open(&self) -> usize {
+        self.open.len().checked_div(self.dim).unwrap_or(0)
+    }
+
+    /// Tokens the completed rows cover: full rows at `ratio`, plus the short last
+    /// one.
+    pub fn page_tokens(&self, ratio: usize) -> usize {
+        match self.n_rows() {
+            0 => 0,
+            r => (r - 1) * ratio + self.last_cells,
+        }
     }
 }
 
@@ -513,7 +538,7 @@ pub fn encode_aux(ple: &[u8], layers: &[SealedIndex]) -> Result<Vec<u8>> {
     out.extend_from_slice(ple);
     out.extend_from_slice(&(layers.len() as u32).to_le_bytes());
     for s in layers {
-        let blob = encode_page(&s.page.keys, s.page.last_cells, &s.open)?;
+        let blob = encode_page(s)?;
         out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         out.extend_from_slice(&blob);
     }
@@ -522,7 +547,7 @@ pub fn encode_aux(ple: &[u8], layers: &[SealedIndex]) -> Result<Vec<u8>> {
 
 /// Read back what [`encode_aux`] wrote: the PLE bytes and one sealed index per
 /// attention layer.
-pub fn decode_aux(blob: &[u8], dev: &Device) -> Result<(Vec<u8>, Vec<SealedIndex>)> {
+pub fn decode_aux(blob: &[u8]) -> Result<(Vec<u8>, Vec<SealedIndex>)> {
     let u32_at = |o: usize| -> Result<u32> {
         let b = blob
             .get(o..o + 4)
@@ -548,34 +573,42 @@ pub fn decode_aux(blob: &[u8], dev: &Device) -> Result<(Vec<u8>, Vec<SealedIndex
         let section = blob
             .get(off..off + len)
             .ok_or_else(|| candle::Error::Msg(format!("aux blob: page {i} truncated")))?;
-        pages.push(decode_page(section, dev)?);
+        pages.push(decode_page(section)?);
         off += len;
     }
     Ok((ple, pages))
 }
 
 /// A layer's completed rows and its open block, as raw little-endian F32.
-pub fn encode_page(keys: &Tensor, last_cells: usize, open: &Tensor) -> Result<Vec<u8>> {
-    let (rows, dim) = keys.dims2()?;
-    let (n_open, open_dim) = open.dims2()?;
-    if n_open > 0 && open_dim != dim {
-        candle::bail!("index page: open rows are [{n_open}, {open_dim}] against a [_, {dim}] page");
+pub fn encode_page(s: &SealedIndex) -> Result<Vec<u8>> {
+    if s.dim == 0 && !(s.rows.is_empty() && s.open.is_empty()) {
+        candle::bail!("index page: rows with no width");
     }
-    let vals = keys.flatten_all()?.to_vec1::<f32>()?;
-    let open_vals = open.flatten_all()?.to_vec1::<f32>()?;
-    let mut out = Vec::with_capacity(16 + (vals.len() + open_vals.len()) * 4);
-    out.extend_from_slice(&(rows as u32).to_le_bytes());
-    out.extend_from_slice(&(dim as u32).to_le_bytes());
-    out.extend_from_slice(&(last_cells as u32).to_le_bytes());
-    out.extend_from_slice(&(n_open as u32).to_le_bytes());
-    for v in vals.iter().chain(open_vals.iter()) {
+    if s.dim > 0 && (!s.rows.len().is_multiple_of(s.dim) || !s.open.len().is_multiple_of(s.dim)) {
+        candle::bail!(
+            "index page: {} row values and {} open values against a {}-wide page",
+            s.rows.len(),
+            s.open.len(),
+            s.dim
+        );
+    }
+    let mut out = Vec::with_capacity(16 + (s.rows.len() + s.open.len()) * 4);
+    out.extend_from_slice(&(s.n_rows() as u32).to_le_bytes());
+    out.extend_from_slice(&(s.dim as u32).to_le_bytes());
+    out.extend_from_slice(&(s.last_cells as u32).to_le_bytes());
+    out.extend_from_slice(&(s.n_open() as u32).to_le_bytes());
+    for v in s.rows.iter().chain(s.open.iter()) {
         out.extend_from_slice(&v.to_le_bytes());
     }
     Ok(out)
 }
 
 /// Read back what [`encode_page`] wrote.
-pub fn decode_page(blob: &[u8], dev: &Device) -> Result<SealedIndex> {
+///
+/// The values are converted in one pass over 4-byte chunks. A page is thousands
+/// of rows, and the bounds-checked read per value this replaced was the larger
+/// part of every injection's host time.
+pub fn decode_page(blob: &[u8]) -> Result<SealedIndex> {
     let u32_at = |o: usize| -> Result<u32> {
         let b = blob
             .get(o..o + 4)
@@ -596,22 +629,17 @@ pub fn decode_page(blob: &[u8], dev: &Device) -> Result<SealedIndex> {
             blob.len()
         );
     }
-    let mut vals = Vec::with_capacity(n);
-    for i in 0..n {
-        vals.push(f32::from_bits(u32_at(16 + i * 4)?));
-    }
-    let mut open_vals = Vec::with_capacity(n_o);
-    for i in 0..n_o {
-        open_vals.push(f32::from_bits(u32_at(16 + (n + i) * 4)?));
-    }
+    let floats = |bytes: &[u8]| -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    };
     Ok(SealedIndex {
-        // A decoded page is position-free by construction: its rows are
-        // un-rotated, and the scorer rotates them at wherever it is placed.
-        page: IndexPage::new(
-            Tensor::from_vec(vals, (rows, dim), dev)?.to_dtype(DType::F32)?,
-            last_cells,
-        ),
-        open: Tensor::from_vec(open_vals, (n_open, dim), dev)?.to_dtype(DType::F32)?,
+        rows: floats(&blob[16..16 + n * 4]),
+        dim,
+        last_cells,
+        open: floats(&blob[16 + n * 4..want]),
     })
 }
 

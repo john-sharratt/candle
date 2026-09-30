@@ -14,8 +14,8 @@ use crate::branch_ingest::units::FolderUnit;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirUnit {
     /// Workspace-relative directory path with a trailing slash
-    /// (`candle/zend/src/`), or `"."` for the workspace — the gather-scope
-    /// tag and the conversation's `dir`.
+    /// (`candle/zend/src/`, `candle/` for a repository's root) — the
+    /// gather-scope tag and the conversation's `dir`.
     pub dir: String,
     /// The files its listing's first page shows, as the key saw them.
     pub listed: Vec<String>,
@@ -33,16 +33,6 @@ impl DirUnit {
             listed: unit.listed.clone(),
             module_hint: unit.module_hint.clone(),
             content_key: unit.key.clone(),
-        }
-    }
-
-    /// The directory the folder's `file_list` call uses. The workspace root
-    /// lists with an empty path, matching how the live tool addresses it.
-    pub fn list_path(&self) -> &str {
-        if self.dir == "." {
-            ""
-        } else {
-            &self.dir
         }
     }
 
@@ -70,7 +60,7 @@ mod tests {
     use super::*;
     use crate::branch_ingest::filter::IngestScope;
     use crate::branch_ingest::units::{
-        folder_units, test_tree, test_units, test_units_reading, workspace_unit, TreeFile,
+        folder_units, test_tree, test_units, test_units_reading, TreeFile,
     };
     use crate::repo_scan::types::Language;
 
@@ -118,11 +108,9 @@ mod tests {
     }
 
     #[test]
-    fn the_workspace_lists_with_an_empty_path_and_a_folder_with_its_own() {
-        let root = DirUnit::of(&workspace_unit(&["a".into()]));
-        assert_eq!(root.list_path(), "");
+    fn a_folder_is_labelled_by_its_workspace_relative_path() {
         let nested = DirUnit::of(&unit(&[("a/zend/src/x.rs", Language::Rust)]));
-        assert_eq!(nested.list_path(), "a/zend/src/");
+        assert_eq!(nested.dir, "a/zend/src/");
         assert_eq!(nested.label(), "a/zend/src/");
     }
 

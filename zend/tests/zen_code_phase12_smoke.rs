@@ -288,6 +288,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         think_triggers,
         tool_ctx,
         retrieval: &retrieval,
+        chain_end: None,
     };
     let layers = [
         LayerPass {

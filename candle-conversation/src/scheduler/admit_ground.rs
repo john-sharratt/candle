@@ -36,6 +36,8 @@
 //! reason [`admit::Ground::resident_weights`] gives: it moves under the fill's
 //! feet from places admission cannot see.
 
+use std::time::Instant;
+
 use super::admission::prefill_cost_bytes;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::interleave;
@@ -214,7 +216,16 @@ impl Ground for AdmitPass<'_> {
         // before the pass leaves it useless: one fill starting empty could take
         // as many prefills as the row budget allows, which is the case the
         // ceiling exists for.
-        if self.sched.active_prefills.len() >= Scheduler::MAX_PREFILL_WIDTH {
+        // Counted as prefills that can advance: a paused one moves no row
+        // (`Scheduler::running_prefills`).
+        if self.sched.running_prefills() >= Scheduler::MAX_PREFILL_WIDTH {
+            return None;
+        }
+        // **A band paused behind higher-priority work offers nothing** — its
+        // turns wait in the queue, in order, until the running conversation's
+        // cooldown ends (see `priority_pause`). Checked per band, so a `High`
+        // turn behind paused `Low` ones is still offered.
+        if self.sched.priority_pause.paused(prio, Instant::now()) {
             return None;
         }
         // **Walk past what this band is not being offered.** A band is asked for

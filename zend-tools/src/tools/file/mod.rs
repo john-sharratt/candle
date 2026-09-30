@@ -23,10 +23,12 @@
 //!
 //! Every call names a `repo` — one of the repositories the workspace lists —
 //! and its paths are relative to that repository's folder
-//! ([`zend_vfs::RepoFiles`]). `file_list`, `file_search` and `file_grep`
-//! also take [`ALL_REPOS`] (`"*"`) to cover every repository at once; their
-//! results then name the repository each entry came from. The scope is always
-//! stated: a call that means the whole workspace says so.
+//! ([`zend_vfs::RepoFiles`]). The searches, `file_search` and `file_grep`,
+//! also take [`ALL_REPOS`] (`"*"`) to cover every repository at once, and
+//! return their hits grouped by the repository each came from. The scope is
+//! always stated: a call that means the whole workspace says so. Every other
+//! file operation — list, read, write, edit, delete — works inside one
+//! repository and takes no `*`.
 //!
 //! Paths are normalised before use (see [`VfsStore`]), so
 //! `./src/../src/main.rs`, `/src/main.rs`, and `src/main.rs` are all one entry.

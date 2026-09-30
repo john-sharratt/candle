@@ -1,5 +1,7 @@
 //! The `repo_map` layer's units as one tree lists them: one per folder
-//! holding files the layer reads, plus the workspace's own. Derived from what
+//! holding files the layer reads — every one inside a repository, since
+//! `file_list` lists inside one repository and never the workspace itself.
+//! Derived from what
 //! the folder's listing shows and the hint its manifest gives — the one file
 //! read, once per manifest version (`manifest::Hints`) — so a unit's key is
 //! known before any conversation runs. The ingest and a conversation's
@@ -29,16 +31,15 @@ pub struct TreeFile {
 /// One folder as a tree lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderUnit {
-    /// The repository it is in; empty for the workspace's own unit.
+    /// The repository it is in.
     pub repo: String,
-    /// Workspace-relative with a trailing `/` (`candle/zend/src/`), or `.`
-    /// for the workspace.
+    /// Workspace-relative with a trailing `/`: `candle/zend/src/`, or
+    /// `candle/` for the repository's root.
     pub dir: String,
     /// How many entries its listing holds.
     pub total: usize,
     /// The entries its listing's first page shows, workspace-relative, a
-    /// folder ending in `/`, in the listing's order; for the workspace, each
-    /// repository as `name/`.
+    /// folder ending in `/`, in the listing's order.
     pub listed: Vec<String>,
     /// The hint its request carries: the first of its manifests, in path
     /// order, that gives one.
@@ -101,33 +102,6 @@ pub fn folder_units(
             }
         })
         .collect()
-}
-
-/// The workspace's own unit: its listing is every repository the workspace
-/// holds (`names`, in the workspace's order), as `file_list` over them shows
-/// it.
-pub fn workspace_unit(names: &[String]) -> FolderUnit {
-    let listed: Vec<String> = names
-        .iter()
-        .take(LIST_PAGE_ENTRIES)
-        .map(|r| format!("{r}/"))
-        .collect();
-    let key = dir_key(
-        ".",
-        &Listing {
-            total: names.len(),
-            page: &listed,
-        },
-        None,
-    );
-    FolderUnit {
-        repo: String::new(),
-        dir: ".".to_string(),
-        total: names.len(),
-        listed,
-        module_hint: None,
-        key,
-    }
 }
 
 /// A workspace-relative file's folder, with a trailing `/`.
@@ -341,16 +315,5 @@ mod tests {
                 name: "demo".into()
             })
         );
-    }
-
-    /// **The workspace's unit lists every repository, in the workspace's
-    /// order**, and a repository joining moves its key.
-    #[test]
-    fn the_workspace_unit_lists_the_repositories() {
-        let two = workspace_unit(&["mind".into(), "candle".into()]);
-        assert_eq!(two.dir, ".");
-        assert_eq!(two.listed, ["mind/", "candle/"]);
-        let one = workspace_unit(&["mind".into()]);
-        assert_ne!(one.key, two.key);
     }
 }

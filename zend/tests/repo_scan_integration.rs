@@ -101,10 +101,9 @@ fn units_of(root: &Path) -> Vec<UnitItem> {
         std::slice::from_ref(&branches),
         &IngestScope::new("", None),
         &mut TreeCache::default(),
-        &workspace_of(root).names(),
-        &[],
     )
     .0
+    .ingest
     .units
 }
 
@@ -131,10 +130,10 @@ fn record(root: &Path) -> RecordingTurnSink {
     // is what holds the other style.
     let env = ToolCallEnvelope::for_dialect(&Dialect::chat_ml());
     for item in units_of(root) {
-        let files = match &item.at {
-            Some(at) => ctx.files.fresh_at(REPO, at).expect("a git repository"),
-            None => ctx.files.fresh(),
-        };
+        let files = ctx
+            .files
+            .fresh_at(REPO, &item.at)
+            .expect("a git repository");
         let tools = ctx.with_files(Arc::new(files));
         let unit = DirUnit::of(&item.unit);
         let tags = vec!["repo_map".to_string(), unit.dir.clone()];
@@ -155,17 +154,11 @@ fn one_unit_per_directory_holding_files() {
         .into_iter()
         .map(|u| u.unit.dir)
         .collect();
-    // The workspace root (listing the repository), the repository's root
-    // (Cargo.toml, README.md) and its `src/`. `target/` is ignored, so it was
-    // never committed and contributes no unit; `.gitignore` is hidden.
-    assert_eq!(
-        dirs,
-        vec![
-            ".".to_string(),
-            "demo/".to_string(),
-            "demo/src/".to_string()
-        ]
-    );
+    // The repository's root (Cargo.toml, README.md) and its `src/` — no unit
+    // for the workspace itself, which no `file_list` lists. `target/` is
+    // ignored, so it was never committed and contributes no unit; `.gitignore`
+    // is hidden.
+    assert_eq!(dirs, vec!["demo/".to_string(), "demo/src/".to_string()]);
 }
 
 /// One chain per folder, and it is ONE pair: request → `file_list` /
@@ -228,29 +221,21 @@ fn the_manifest_hint_is_read_from_the_commit() {
     );
 }
 
-/// The workspace root's chain lists the repositories — `file_list` with repo
-/// `*` — and summarises from that listing alone.
+/// **No folder call names `*`**: `file_list` works inside one repository, so
+/// every chain — the repository's root included — names its repository.
 #[test]
-fn the_workspace_root_lists_the_repositories() {
+fn every_folder_call_names_its_repository() {
     let dir = small_workspace();
-    let sink = record(dir.path());
-    let root = sink
-        .turns
-        .iter()
-        .filter(|(_, _, tags)| tags[1] == ".")
-        .collect::<Vec<_>>();
-    assert_eq!(root.len(), 2, "request+list, then listing+summary");
-    assert!(root[0]
-        .0
-        .starts_with("Summarize the workspace and the repositories it holds"));
-    assert!(root[0]
-        .1
-        .contains("{\"name\": \"file_list\", \"arguments\": {\"repo\": \"*\"}}"));
-    assert!(
-        root[1].0.contains("{\"repo\":\"demo\",\"dir\":true}"),
-        "{}",
-        root[1].0
-    );
+    for (_, assistant, tags) in &record(dir.path()).turns {
+        if assistant.is_empty() {
+            continue;
+        }
+        assert!(
+            assistant.contains("\"repo\": \"demo\""),
+            "{tags:?}: {assistant}"
+        );
+        assert!(!assistant.contains("\"*\""), "{tags:?}: {assistant}");
+    }
 }
 
 /// The listing is produced by running the real `file_list` at the unit's
@@ -415,12 +400,11 @@ fn branches_that_share_a_lineage_share_their_units() {
         std::slice::from_ref(&branches),
         &IngestScope::new("", None),
         &mut TreeCache::default(),
-        &workspace_of(dir.path()).names(),
-        &[],
     );
     assert!(failed.is_empty());
 
     let folders: Vec<(&str, Vec<&str>)> = corpus
+        .ingest
         .units
         .iter()
         .map(|u| {
@@ -433,7 +417,6 @@ fn branches_that_share_a_lineage_share_their_units() {
     assert_eq!(
         folders,
         [
-            (".", vec![]),
             ("demo/", vec!["main", "topic"]),
             ("demo/src/", vec!["main", "topic"]),
         ],
@@ -442,6 +425,7 @@ fn branches_that_share_a_lineage_share_their_units() {
 
     let readings = |path: &str| -> Vec<Vec<&str>> {
         corpus
+            .ingest
             .files
             .iter()
             .filter(|f| f.file.path == path)

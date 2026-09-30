@@ -946,24 +946,25 @@ impl SequenceState {
             if let Some(next) = sweep.rewrite_gids(&cw.gids)? {
                 // A fresh record for the new bands, and only for a chunk that had one —
                 // prefix history, by the check above. Installing it retires the old
-                // record, which is what releases the source once the sweep ends.
-                if cw.meta.is_some() {
-                    if let Some(record) = sweep.mint_record(
-                        &next,
-                        RecordInputs {
-                            k_pal: &cw.k_pal,
-                            v_pal: &cw.v_pal,
-                            k_scale: &cw.k_scale,
-                            v_scale: &cw.v_scale,
-                            k_fmt: &cw.k_fmt,
-                            v_fmt: &cw.v_fmt,
-                        },
-                    )? {
-                        sweep.install_record(&mut cw.meta, record);
-                    }
+                // record, which is what releases the source once the sweep ends. A
+                // chunk that cannot have a fresh one stays whole on its source.
+                let movable = sweep.remint(
+                    &next,
+                    &mut cw.meta,
+                    RecordInputs {
+                        k_pal: &cw.k_pal,
+                        v_pal: &cw.v_pal,
+                        k_scale: &cw.k_scale,
+                        v_scale: &cw.v_scale,
+                        k_fmt: &cw.k_fmt,
+                        v_fmt: &cw.v_fmt,
+                    },
+                )?;
+                if movable {
+                    sweep.witness(&next);
+                    cw.gids = next;
+                    moved = true;
                 }
-                cw.gids = next;
-                moved = true;
             }
             // A relocated record moves the address this slot's cached decode buffer
             // holds as `kvheads_ptr`, so it counts as a move for the invalidation below.

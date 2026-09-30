@@ -51,6 +51,8 @@ pub mod ple_cache;
 pub mod prepare;
 pub mod qsa;
 pub mod qsa_select;
+#[cfg(feature = "cuda")]
+pub mod resident_page;
 pub mod rope;
 pub mod spec;
 #[cfg(feature = "cuda")]

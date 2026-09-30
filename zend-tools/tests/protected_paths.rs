@@ -215,15 +215,15 @@ fn ordinary_files_still_read_and_search() {
         json!({"repo": REPO, "query": "main.rs"}),
         &c,
     ));
-    assert_eq!(found["files"][0]["path"], "src/main.rs");
+    assert_eq!(found["repos"][0]["files"][0], "src/main.rs");
 
     let hit = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
         json!({"repo": REPO, "pattern": "println"}),
         &c,
     ));
-    assert_eq!(hit["matches"][0]["path"], "src/main.rs");
-    assert_eq!(hit["matches"][0]["line"], 1);
+    assert_eq!(hit["repos"][0]["matches"][0]["path"], "src/main.rs");
+    assert_eq!(hit["repos"][0]["matches"][0]["line"], 1);
 }
 
 /// A directory merely *named* like a secret elsewhere in a path is still

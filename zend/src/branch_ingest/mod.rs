@@ -3,13 +3,15 @@
 //! One pass, run by the ingest worker at startup and after every fetch that
 //! moved a branch: list every record branch's tree ([`walk`]), key every unit
 //! by what it shows ([`keys`]), plan each layer against what it already holds
-//! ([`plan`]), tombstone what no branch holds, and ingest what nothing holds
-//! yet — each unit read at the commit it was found on.
+//! ([`plan`]), tombstone what no branch holds at any depth, and ingest what
+//! nothing holds yet within the depth bound — each unit read at the commit it
+//! was found on.
 
 pub mod filter;
 pub mod keys;
 pub mod manifest;
 pub mod plan;
+pub mod prime;
 pub mod tie;
 pub mod units;
 pub mod walk;
@@ -80,7 +82,6 @@ impl BranchIngest {
         progress: &Arc<LoadProgress>,
     ) -> anyhow::Result<bool> {
         let (repos, unreadable) = record_branches(workspace);
-        let names = workspace.names();
         let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
         let mut corpora: HashMap<IngestScope, (Corpus, Vec<String>)> = HashMap::new();
         let mut changed = false;
@@ -90,7 +91,7 @@ impl BranchIngest {
             }
             let (corpus, failed) = corpora
                 .entry(layer.scope.clone())
-                .or_insert_with(|| walk(&repos, &layer.scope, &mut trees, &names, &unreadable));
+                .or_insert_with(|| walk(&repos, &layer.scope, &mut trees));
             // A repository that could not be read this pass has units nobody
             // looked for — they are not gone.
             let held_back: Vec<&str> = failed
@@ -119,11 +120,8 @@ impl BranchIngest {
         // A file found to be binary is never read, so it is not a unit: its
         // path's older versions must not wait on it as their replacement.
         let binary = self.binary.lock().unwrap().clone();
-        let files: Vec<&FileItem> = corpus
-            .files
-            .iter()
-            .filter(|f| !binary.contains(&f.key))
-            .collect();
+        let files = readable(&corpus.ingest.files, &binary);
+        let retained = readable(&corpus.retain.files, &binary);
         let live: Vec<Live<'_>> = files
             .iter()
             .map(|f| Live {
@@ -131,19 +129,22 @@ impl BranchIngest {
                 subject: &f.file.path,
             })
             .collect();
+        let retain: HashSet<&str> = retained.iter().map(|f| f.key.as_str()).collect();
         let committed: Vec<Committed> = code_read::committed(ctx.engine)
             .into_iter()
             .filter(|c| !in_repos(&c.subject, held_back))
             .collect();
-        let p = plan(&live, &committed);
+        let p = plan(&live, &retain, &committed);
         tombstone(ctx.engine, layer.name, &p.tombstone);
-        let branches: HashMap<&str, &[String]> = files
+        // A held file past the depth bound keeps its branches and its commit
+        // current as well: the full-depth walk found it.
+        let branches: HashMap<&str, &[String]> = retained
             .iter()
             .map(|f| (f.key.as_str(), &f.branches[..]))
             .collect();
         let held = still_held(&committed, &p.tombstone);
         retie(ctx.engine, layer.name, &held, &branches);
-        let found: HashMap<&str, String> = files
+        let found: HashMap<&str, String> = retained
             .iter()
             .map(|f| (f.key.as_str(), f.at.to_string()))
             .collect();
@@ -164,17 +165,23 @@ impl BranchIngest {
             target: "zend::branch_ingest",
             layer = layer.name,
             live = live.len(),
+            retained = retain.len(),
             committed = committed.len(),
             queued = jobs.len(),
             tombstoned = p.tombstone.len(),
             "planned the layer against every branch",
         );
         if !jobs.is_empty() {
-            let keys: HashSet<String> = files.iter().map(|f| f.key.clone()).collect();
+            let keys: HashSet<String> = retain.iter().map(|k| k.to_string()).collect();
             code_read::ingest_jobs(ctx, &jobs, &keys, progress, layer.base, &self.binary)?;
         }
         Ok(!jobs.is_empty() || !p.tombstone.is_empty())
     }
+}
+
+/// `items` less the files found to be binary.
+fn readable<'c>(items: &'c [FileItem], binary: &HashSet<String>) -> Vec<&'c FileItem> {
+    items.iter().filter(|f| !binary.contains(&f.key)).collect()
 }
 
 fn units(
@@ -185,6 +192,7 @@ fn units(
     progress: &Arc<LoadProgress>,
 ) -> anyhow::Result<bool> {
     let live: Vec<Live<'_>> = corpus
+        .ingest
         .units
         .iter()
         .map(|u| Live {
@@ -192,17 +200,21 @@ fn units(
             subject: &u.unit.dir,
         })
         .collect();
-    // The workspace's own unit lists every repository, so while one sits a
-    // pass out the unit is not looked for either.
+    let retain: HashSet<&str> = corpus
+        .retain
+        .units
+        .iter()
+        .map(|u| u.unit.key.as_str())
+        .collect();
     let committed: Vec<Committed> = repo_scan::committed(ctx.engine)
         .into_iter()
-        .filter(|c| {
-            !in_repos(&c.subject, held_back) && !(c.subject == "." && !held_back.is_empty())
-        })
+        .filter(|c| !in_repos(&c.subject, held_back))
         .collect();
-    let p = plan(&live, &committed);
+    let p = plan(&live, &retain, &committed);
     tombstone(ctx.engine, layer.name, &p.tombstone);
+    // A held folder past the depth bound keeps its branches current as well.
     let branches: HashMap<&str, &[String]> = corpus
+        .retain
         .units
         .iter()
         .map(|u| (u.unit.key.as_str(), &u.branches[..]))
@@ -216,23 +228,25 @@ fn units(
     let jobs: Vec<UnitJob> = p
         .queued
         .iter()
-        .map(|&i| UnitJob {
-            unit: corpus.units[i].unit.clone(),
-            at: corpus.units[i].at.clone(),
-            branches: corpus.units[i].branches.clone(),
+        .map(|&i| &corpus.ingest.units[i])
+        .map(|u| UnitJob {
+            unit: u.unit.clone(),
+            at: u.at.clone(),
+            branches: u.branches.clone(),
         })
         .collect();
     tracing::info!(
         target: "zend::branch_ingest",
         layer = layer.name,
         live = live.len(),
+        retained = retain.len(),
         committed = committed.len(),
         queued = jobs.len(),
         tombstoned = p.tombstone.len(),
         "planned the layer against every branch",
     );
     if !jobs.is_empty() {
-        let keys: HashSet<String> = corpus.units.iter().map(|u| u.unit.key.clone()).collect();
+        let keys: HashSet<String> = retain.iter().map(|k| k.to_string()).collect();
         repo_scan::ingest_units(ctx, &jobs, &keys, progress, layer.name, layer.base)?;
     }
     Ok(!jobs.is_empty() || !p.tombstone.is_empty())
@@ -246,7 +260,7 @@ fn units(
 /// never from a failure to open it: a git that cannot be spawned, a lock held
 /// for a moment, an ownership refusal all fail an open, and a repository
 /// read as not under git would have every unit it ever had tombstoned.
-fn record_branches(workspace: &Workspace) -> (Vec<RepoBranches>, Vec<String>) {
+pub(crate) fn record_branches(workspace: &Workspace) -> (Vec<RepoBranches>, Vec<String>) {
     let mut repos = Vec::new();
     let mut unreadable = Vec::new();
     for spec in workspace.repos() {

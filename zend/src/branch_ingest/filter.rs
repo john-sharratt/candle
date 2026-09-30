@@ -3,10 +3,15 @@
 
 use crate::repo_scan::types::Language;
 
-/// The largest file an ingest layer reads. Big enough for generated parsers,
-/// vendored single-file libraries and long design documents; an accidentally
-/// committed binary is typically far larger.
-pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// The largest file an ingest layer reads.
+///
+/// Above the largest hand-written source in the workspace
+/// (`candle-conversation/src/scheduler/mod.rs`, ~710 KB) and below the dumps
+/// that are text only by extension: SASS listings (2.3–2.8 MB) and a 13 MB
+/// JSON data file would each be 600K+ tokens, more than a reading chain can
+/// finish or a dialogue can carry, so reading one buys a truncated summary at
+/// the cost of hours of ingest.
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Where one ingest layer reads: a folder of the workspace (`--ingest-dir`)
 /// and a depth bound (`--max-depth`).
@@ -27,6 +32,18 @@ impl IngestScope {
         Self {
             folder: if folder == "." { "" } else { folder }.to_string(),
             max_depth,
+        }
+    }
+
+    /// The same scope at full depth — what a layer's held units are judged
+    /// against. A unit past the depth bound is not read, but it is kept while
+    /// a branch still holds it, so narrowing the bound drops nothing already
+    /// ingested; and since a unit's key does not depend on the bound, the
+    /// units found at full depth are the ones the layer holds.
+    pub fn full_depth(&self) -> Self {
+        Self {
+            folder: self.folder.clone(),
+            max_depth: None,
         }
     }
 
@@ -102,6 +119,35 @@ mod tests {
         );
     }
 
+    /// **The gate sits between the largest real source and the dumps.** Sizes
+    /// are the workspace's own: the largest hand-written file is read, a SASS
+    /// listing and a bulk JSON data file are not.
+    #[test]
+    fn the_size_gate_reads_large_source_and_skips_dumps() {
+        let s = IngestScope::new("", None);
+        assert_eq!(MAX_FILE_BYTES, 1_048_576);
+        assert_eq!(
+            s.admits(
+                "candle",
+                "candle-conversation/src/scheduler/mod.rs",
+                709_620
+            ),
+            Some(Language::Rust)
+        );
+        assert_eq!(
+            s.admits(
+                "candle",
+                "candle-flash-attn/precompiled/hdim128_sass.txt",
+                2_807_684
+            ),
+            None
+        );
+        assert_eq!(
+            s.admits("battle-cities", "crates/lore/src/lore.json", 12_961_528),
+            None
+        );
+    }
+
     /// `1` is a repository's own files; `2` adds one folder down.
     #[test]
     fn depth_counts_from_the_repository_root() {
@@ -112,6 +158,15 @@ mod tests {
         assert!(IngestScope::new("", Some(1))
             .admits("r", "src/b.rs", 1)
             .is_none());
+    }
+
+    /// Full depth drops the bound and keeps the folder.
+    #[test]
+    fn full_depth_keeps_the_folder_and_drops_the_bound() {
+        let s = IngestScope::new("alpha/src", Some(1));
+        assert_eq!(s.full_depth(), IngestScope::new("alpha/src", None));
+        assert!(s.full_depth().admits("alpha", "src/deep/x.rs", 1).is_some());
+        assert!(s.full_depth().admits("alpha", "docs/a.md", 1).is_none());
     }
 
     /// A scope folder narrows the walk to one folder of one repository, and

@@ -11,7 +11,9 @@ use crate::recorded_reply::recorded_reply;
 use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
-use crate::persistence::content_hash::{hash_tokens, section_stream_id, ContentChain, ContentHash};
+use crate::persistence::content_hash::{
+    hash_tokens, section_stream_id, turn_stream_id, ContentChain, ContentHash,
+};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
@@ -19,16 +21,17 @@ use crate::projection::{
     ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId,
     TurnIndex,
 };
-use crate::provenance::WideQSig;
+use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, CarvedTurn,
-    ProjectionInputs, ReprojectionPolicy, SchedulerRequest, TurnContent,
+    ProjectionInputs, ReprojectionPolicy, SchedulerRequest, SealedProbe, TurnContent,
 };
 use crate::sealed_turn::{SealedPages, SealedTurn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::stuffed_grid::{plan_stuffed_grid_with_indices, CaseGrid};
+use crate::substrate::ProjectionScores;
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{ConversationTree, TurnType};
@@ -3674,7 +3677,6 @@ impl Sequence {
         assistant_content_start: u32,
         seconds: f64,
     ) -> crate::Result<()> {
-        use crate::persistence::content_hash::turn_stream_id;
         use crate::persistence::streams::StreamDecl;
         use crate::projection::event::group_name_of;
         use crate::projection::{encode_events, staged_ingest_event, SelectedTurn, SystemItem};
@@ -3769,9 +3771,8 @@ impl Sequence {
     /// galleries + scorer, but the probe is the finished turn's stored signature
     /// rather than a live gather. Empty when the turn has no signature (nothing
     /// to score against).
-    fn last_turn_belief_scores(&self) -> crate::substrate::ProjectionScores {
-        use crate::provenance::decode_wide_sigs;
-        let empty = crate::substrate::ProjectionScores::new();
+    fn last_turn_belief_scores(&self) -> ProjectionScores {
+        let empty = ProjectionScores::new();
         let timeline = self.target.timeline;
         let (probe, q_span, tags, source) = {
             let read = self.substrate.read();
@@ -3803,30 +3804,42 @@ impl Sequence {
             let tags = read.turn_tags(timeline, idx);
             // The turn's own stream id keys the observation, so a later replay of
             // this turn folds nothing a second time.
-            let source = crate::persistence::content_hash::turn_stream_id(timeline.raw(), idx.0).0;
+            let source = turn_stream_id(timeline.raw(), idx.0).0;
             (probe, q_span, tags, source)
         };
-        let probe_q = q_span.and_then(|r| probe.get(r)).filter(|q| !q.is_empty());
-        let (scores, _) = self
-            .substrate
-            // The seal scan is the once-per-turn learning point for the
-            // score-normalization hit levels — and it teaches only the scopes this
-            // turn is inside, so a dialogue turn cannot rewrite a tag-scoped
-            // collection's lens. No arena here (the scheduler owns it) → the CPU
-            // per-file scan; the hot reproject path runs the paged GPU scan over
-            // the resident arena.
-            .score_beliefs(
-                self.projection.schema(),
-                self.target,
-                &probe,
+        let probe_q: Vec<WideQSig> = q_span
+            .and_then(|r| probe.get(r))
+            .map(<[WideQSig]>::to_vec)
+            .unwrap_or_default();
+        // The seal scan is the once-per-turn learning point for the
+        // score-normalization hit levels — and it teaches only the scopes this
+        // turn is inside, so a dialogue turn cannot rewrite a tag-scoped
+        // collection's lens. The scheduler runs it on its gallery arena, the
+        // only thread that may scan there.
+        let (tx, rx) = flume::bounded(1);
+        let sent = self.scheduler_tx.send(SchedulerRequest::ScoreSealedTurn {
+            substrate: self.substrate.clone(),
+            projection: Arc::clone(&self.projection),
+            target: self.target,
+            sealed: SealedProbe {
+                probe,
                 probe_q,
-                Observe::Yes {
-                    tags: &tags,
-                    source,
-                },
-                None,
-            );
-        scores
+                tags,
+                source,
+            },
+            response_tx: tx,
+        });
+        match sent.ok().and_then(|()| rx.recv().ok()) {
+            Some(scores) => scores,
+            None => {
+                tracing::warn!(
+                    timeline = timeline.raw(),
+                    "seal belief scan: the scheduler is gone; the turn's projection \
+                     event carries no belief scores"
+                );
+                empty
+            }
+        }
     }
 
     /// Recompute the materialized projection for this conversation and pair it
@@ -4812,7 +4825,7 @@ impl Sequence {
         if count == 0 {
             return Ok(());
         }
-        let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), count - 1);
+        let stream_id = turn_stream_id(timeline.raw(), count - 1);
         let payload = crate::projection::encode_events(events);
         self.substrate.persist_projection_events(stream_id, payload);
         Ok(())

@@ -472,6 +472,24 @@ test.describe('1.11 opening a conversation', () => {
     // falls back to the home page while the next one loads.
     await expect(page.locator('.z-convtitle')).not.toContainText('Trace the substrate redo log replay');
     await expect(page.getByRole('heading', { name: HOME })).toHaveCount(0);
+    // And from the drawer's list.
+    await page.getByTitle('Expand sidebar').click();
+    await expect(page.locator('.z-sb')).toBeVisible();
+    await expect(page.locator('.z-sb').getByText('Trace the substrate redo log replay')).toHaveCount(0);
+  });
+
+  test('on a phone the drawer shows “Show archived”, off by default and off again after a reload', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    const toggle = page.locator('.z-sb').getByText('Show archived');
+    await expect(toggle).toBeInViewport();
+    await expect(page.locator('.z-sb').getByText('Scratch notes on WS reconnect backoff')).toHaveCount(0);
+    await toggle.click();
+    await expect(page.locator('.z-sb').getByText('Scratch notes on WS reconnect backoff')).toBeVisible();
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await expect(page.locator('.z-sb').getByText('Scratch notes on WS reconnect backoff')).toHaveCount(0);
   });
 
   test('a tool round shows its result’s prefill progress, gone once the answer starts', async ({ page }) => {

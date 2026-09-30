@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use candle::quantized::cuda::to_dynamic;
 use candle::{DType, Device, LiveTensor, Result, Tensor};
@@ -47,10 +47,11 @@ use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hyper::{hc_combine, hc_mix};
 use super::indexer::{compact_index_caches, select_layer, IndexCache, IndexSnapshot};
 use super::paged_index;
-use super::paged_index::{IndexPage, SealedIndex};
+use super::paged_index::SealedIndex;
 use super::ple::{ple_apply, ple_row_ids, PleState};
 use super::qsa::IndexerWeights;
 use super::qsa_select::budget_fits_kernel;
+use super::resident_page::{PageRegistry, PieceKey, ResidentPage};
 use super::spec::SpecCapture;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, WaveResult,
@@ -103,14 +104,20 @@ fn pool_cushion_bytes(device: &Device) -> Option<usize> {
     None
 }
 
-/// Seal `rows` into a **position-free** page.
+/// Seal `c`'s live tail into a **position-free** record: its completed rows and
+/// its open block, read back to the host.
 ///
 /// The rows are un-rotated, so they carry no position already — the record is
 /// injectable at any offset in any conversation, the index's half of "compute
-/// once, inject anywhere". Owned, because `rows` is typically a view into a
-/// live cache that the next append overwrites.
-fn seal_page(rows: &Tensor, last_cells: usize) -> Result<IndexPage> {
-    Ok(IndexPage::new(rows.to_owned_tensor()?, last_cells))
+/// once, inject anywhere". Read straight out of the cache's key pages; nothing is
+/// gathered on the device first.
+fn seal_live(c: &IndexCache, last_cells: usize) -> Result<SealedIndex> {
+    Ok(SealedIndex {
+        rows: c.live_rows_host()?,
+        dim: c.head_dim(),
+        last_cells,
+        open: c.open_rows_host()?,
+    })
 }
 
 /// The deepest KV compression the draft head's own layer seals at, whatever
@@ -143,6 +150,9 @@ pub struct Qwen4ExpBatched {
     /// fourth carried class (§6.3's "QSA index ring"). Bracketed exactly as
     /// the other two: a failed wave leaves none of them advanced.
     pub(super) index: RwLock<HashMap<usize, Vec<IndexCache>>>,
+    /// The resident index pages of every injected piece some cache still holds,
+    /// so a piece pushed into many slots is placed once and shared.
+    pages: PageRegistry,
     /// Per-sequence carried residual for the draft head's next first row — the
     /// `h(t-1)` its input assembly needs across a wave boundary. Empty on a
     /// checkpoint with no head, and reset with the other carried state when a
@@ -351,7 +361,7 @@ impl Qwen4ExpBatched {
                     .filter(|(_, r)| *r > 0)
                     .map(|(c, r)| c.indexed_tokens(r))
                     .collect();
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_conversation::scheduler::reproject",
                     parent,
                     child,
@@ -463,20 +473,14 @@ impl Qwen4ExpBatched {
         let mut pages = Vec::with_capacity(caches.len());
         for ((c, &ratio), w) in caches.iter_mut().zip(ratios.iter()).zip(indexers.iter()) {
             if ratio == 0 {
-                pages.push(SealedIndex {
-                    page: IndexPage::new(c.live_rows()?, 1),
-                    open: c.open_rows()?,
-                });
+                pages.push(seal_live(c, 1)?);
                 continue;
             }
-            // Sealing is not a forward: no phase is open to carve from.
+            // Sealing is not a forward: no phase is open to carve from. The
+            // flush consumes the carried rows, so the page IS the whole piece
+            // and there is no open block to carry with it.
             let cells = c.flush_open_block(w, cfg.rms_norm_eps, None)?;
-            pages.push(SealedIndex {
-                page: seal_page(&c.live_rows()?, cells.unwrap_or(ratio))?,
-                // The flush consumed the carried rows, so the page IS the whole
-                // piece and there is no open block to carry with it.
-                open: c.open_rows()?,
-            });
+            pages.push(seal_live(c, cells.unwrap_or(ratio))?);
         }
         Ok(Some(paged_index::encode_aux(&[], &pages)?))
     }
@@ -544,10 +548,7 @@ impl Qwen4ExpBatched {
         let mut pages = Vec::with_capacity(caches.len());
         for ((c, &ratio), w) in caches.iter().zip(ratios.iter()).zip(indexers.iter()) {
             if ratio == 0 {
-                pages.push(SealedIndex {
-                    page: IndexPage::new(c.live_rows()?, 1),
-                    open: c.open_rows()?,
-                });
+                pages.push(seal_live(c, 1)?);
                 continue;
             }
             // **Two row spaces, and they are not the same one.**
@@ -575,8 +576,9 @@ impl Qwen4ExpBatched {
             };
             let mut fork = c.fork()?;
             let cells = fork.flush_open_block(w, cfg.rms_norm_eps, None)?;
-            let rows = fork.live_rows()?;
-            let n = rows.dim(0)?;
+            let d = fork.head_dim();
+            let rows = fork.live_rows_host()?;
+            let n = rows.len() / d;
             if first > n {
                 candle::bail!(
                     "qsa seal: seq {seq} asked for the rows from position {start_pos}, which \
@@ -585,10 +587,11 @@ impl Qwen4ExpBatched {
                      sequence that forwarded it, where it is the tail."
                 );
             }
-            let take = n - first;
             pages.push(SealedIndex {
-                page: seal_page(&rows.narrow(0, first, take)?, cells.unwrap_or(ratio))?,
-                open: fork.open_rows()?,
+                rows: rows[first * d..].to_vec(),
+                dim: d,
+                last_cells: cells.unwrap_or(ratio),
+                open: fork.open_rows_host()?,
             });
         }
         Ok(Some(paged_index::encode_aux(&[], &pages)?))
@@ -711,12 +714,13 @@ impl Qwen4ExpBatched {
                     Some(_) => {}
                 }
                 // A closed page's rows are un-rotated and immutable, so the
-                // record is the page itself.
+                // record is the page's rows as they stand. A page is already
+                // closed; only the live tail carries an open block.
                 layer_pages.push(SealedIndex {
-                    page: p.clone(),
-                    // A page is already closed; only the live tail carries an
-                    // open block.
-                    open: p.keys.narrow(0, 0, 0)?,
+                    rows: p.host_rows()?,
+                    dim: c.head_dim(),
+                    last_cells: p.last_cells(),
+                    open: Vec::new(),
                 });
             }
             blobs.push((
@@ -729,30 +733,31 @@ impl Qwen4ExpBatched {
             let mut layer_pages = Vec::with_capacity(caches.len());
             for ((c, &ratio), w) in caches.iter().zip(ratios.iter()).zip(indexers.iter()) {
                 if ratio == 0 {
-                    layer_pages.push(SealedIndex {
-                        page: IndexPage::new(c.live_rows()?, 1),
-                        open: c.open_rows()?,
-                    });
+                    layer_pages.push(seal_live(c, 1)?);
                     continue;
                 }
                 let mut fork = c.fork()?;
                 let cells = fork.flush_open_block(w, cfg.rms_norm_eps, None)?;
-                layer_pages.push(SealedIndex {
-                    page: seal_page(&fork.live_rows()?, cells.unwrap_or(ratio))?,
-                    open: fork.open_rows()?,
-                });
+                layer_pages.push(seal_live(&fork, cells.unwrap_or(ratio))?);
             }
             blobs.push((tail_tokens, paged_index::encode_aux(&[], &layer_pages)?));
         }
         Ok(blobs)
     }
 
-    /// Install a sealed page per attention layer ahead of `seq`'s live tail.
+    /// The resident pages of an injected piece, one per KV layer (`None` where
+    /// the layer indexes nothing): the ones already standing when any slot still
+    /// holds this record's pages, otherwise decoded and placed now — every
+    /// indexed layer in one launch, into slots of the index tenant.
     #[cfg(feature = "cuda")]
-    pub fn push_positional_state(&self, seq: usize, blob: &[u8]) -> Result<()> {
+    fn resident_pages(&self, blob: &[u8]) -> Result<Vec<Option<Arc<ResidentPage>>>> {
         let cfg = &self.model.cfg;
-        let (_, sealed) = paged_index::decode_aux(blob, &self.model.device)?;
         let want = cfg.kv_layers().total();
+        let key = PieceKey::of(blob);
+        if let Some(layers) = self.pages.get(&key) {
+            return Ok(layers);
+        }
+        let (_, sealed) = paged_index::decode_aux(blob)?;
         if sealed.len() != want {
             candle::bail!(
                 "qwen4exp: an injected piece carries {} index pages but this checkpoint has \
@@ -762,6 +767,30 @@ impl Qwen4ExpBatched {
             );
         }
         let ratios = self.attention_ratios();
+        let host: Vec<(&[f32], usize)> = sealed
+            .iter()
+            .zip(ratios.iter())
+            .filter(|(_, &r)| r > 0)
+            .map(|(s, _)| (s.rows.as_slice(), s.last_cells))
+            .collect();
+        let mut placed =
+            ResidentPage::place_host(&host, cfg.indexer.head_dim, &self.model.device)?.into_iter();
+        let layers: Vec<Option<Arc<ResidentPage>>> = ratios
+            .iter()
+            .map(|&r| if r > 0 { placed.next() } else { None })
+            .collect();
+        self.pages.insert(key, &layers);
+        Ok(layers)
+    }
+
+    /// Install a sealed page per attention layer ahead of `seq`'s live tail.
+    #[cfg(feature = "cuda")]
+    pub fn push_positional_state(&self, seq: usize, blob: &[u8]) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let want = cfg.kv_layers().total();
+        let ratios = self.attention_ratios();
+        // Resolved before the lock is taken: a placement is a launch.
+        let layers = self.resident_pages(blob)?;
         let mut map = self
             .index
             .write()
@@ -774,23 +803,20 @@ impl Qwen4ExpBatched {
         }
         let mut pushed = 0usize;
         let mut had_open_tail = None;
-        for ((c, s), &ratio) in caches.iter_mut().zip(sealed.iter()).zip(ratios.iter()) {
-            if ratio == 0 {
-                continue;
-            }
+        for ((c, &ratio), page) in caches.iter_mut().zip(ratios.iter()).zip(layers) {
+            let Some(page) = page else { continue };
             if had_open_tail.is_none() {
                 let (blocks, open) = c.seal_shape();
                 had_open_tail = Some(blocks * ratio + open);
             }
-            pushed = s.page.tokens(ratio)?;
+            pushed = page.tokens(ratio);
             // Abutting the last placement. The base is where the scorer rotates
             // the page's rows to, so this is the one line that decides where the
             // piece's rows actually sit — and, since it is recorded rather than
             // accumulated, a preceding piece that carried no rows moves it and
             // nothing else.
             let base = c.next_base();
-            c.push_page(s.page.clone(), base, ratio)?;
-            c.place_pending()?;
+            c.push_page(page, base, ratio)?;
         }
         // **Only the pathological case is reported.** A page installed onto an
         // empty tail is the ordinary path and happens once per injected piece —
@@ -1001,10 +1027,7 @@ impl Qwen4ExpBatched {
                         // all — a resume rebuilds them from the projection, and
                         // `indexed_tokens` is what reports the shortfall if one
                         // does not.)
-                        v.push(SealedIndex {
-                            page: seal_page(&c.live_rows()?, (*ratio).max(1))?,
-                            open: c.open_rows()?,
-                        });
+                        v.push(seal_live(c, (*ratio).max(1))?);
                     }
                     v
                 }
@@ -1024,7 +1047,7 @@ impl Qwen4ExpBatched {
     /// found nothing relevant.
     pub fn restore_aux_state(&self, seq: usize, blob: &[u8]) -> Result<()> {
         let cfg = &self.model.cfg;
-        let (ple_blob, layers) = paged_index::decode_aux(blob, &self.model.device)?;
+        let (ple_blob, layers) = paged_index::decode_aux(blob)?;
         let state = PleState::decode(
             &ple_blob,
             cfg.ple.conv_history(),
@@ -1048,9 +1071,10 @@ impl Qwen4ExpBatched {
             let mut caches = Vec::with_capacity(layers.len());
             for s in &layers {
                 caches.push(IndexCache::from_rows(
-                    &s.page.keys,
+                    &s.rows,
                     &s.open,
                     cfg.indexer.head_dim,
+                    &self.model.device,
                 )?);
             }
             self.index
@@ -1170,6 +1194,7 @@ impl Qwen4ExpBatched {
             verify: RwLock::new(None),
             ple: RwLock::new(HashMap::new()),
             index: RwLock::new(HashMap::new()),
+            pages: PageRegistry::default(),
             index_rope,
             qsa_rows: AtomicU64::new(0),
             rope,

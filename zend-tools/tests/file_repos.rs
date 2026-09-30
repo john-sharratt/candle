@@ -40,6 +40,25 @@ fn ctx(dir: &TempDir) -> ToolContext {
     ToolContext::with_workspace(ws)
 }
 
+/// A grouped search result — `{"repos": [{"repo", <items>: [...]}]}` — as its
+/// groups: each repository with its items, in order.
+fn groups<'a>(
+    resp: &'a serde_json::Value,
+    items: &str,
+) -> Vec<(&'a str, Vec<&'a serde_json::Value>)> {
+    resp["repos"]
+        .as_array()
+        .expect("results grouped by repository")
+        .iter()
+        .map(|g| {
+            (
+                g["repo"].as_str().unwrap(),
+                g[items].as_array().unwrap().iter().collect(),
+            )
+        })
+        .collect()
+}
+
 fn excerpt_source(resp: &serde_json::Value) -> String {
     let text = resp.as_str().expect("file_read returns a rendered string");
     let body = text
@@ -111,39 +130,24 @@ fn parent_traversal_cannot_reach_a_sibling_repository() {
 
 // ── file_list ────────────────────────────────────────────────────────────────
 
-/// With repo `*`, `file_list` lists the workspace's repositories themselves,
-/// in manifest order.
+/// `file_list` lists inside one repository, its paths relative to it.
 #[test]
-fn file_list_of_all_repos_lists_the_repositories() {
+fn file_list_lists_inside_one_repository() {
     let dir = two_repo_workspace();
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": "*"}),
+        json!({"repo": "b"}),
         &c,
     ));
-    assert_eq!(resp["repo"], "*");
-    let entries = resp["entries"].as_array().unwrap();
-    let repos: Vec<&str> = entries
+    assert_eq!(resp["repo"], "b");
+    let paths: Vec<&str> = resp["entries"]
+        .as_array()
+        .unwrap()
         .iter()
-        .map(|e| e["repo"].as_str().unwrap())
+        .map(|e| e["path"].as_str().unwrap())
         .collect();
-    assert_eq!(repos, vec!["a", "b"]);
-    for e in entries {
-        assert!(e["dir"].as_bool().unwrap());
-        assert!(e.get("path").is_none(), "no path on a repository entry");
-    }
-}
-
-/// A `path` with repo `*` is nonsensical — a path is relative to one
-/// repository — and is rejected rather than guessed at.
-#[test]
-fn file_list_of_all_repos_with_a_path_is_invalid() {
-    let dir = two_repo_workspace();
-    let c = ctx(&dir);
-    let resp = harness::invoke_with_ctx("file_list", json!({"repo": "*", "path": "src"}), &c);
-    let detail = harness::expect_error(&resp, "invalid_arguments");
-    assert!(detail.contains("src"), "{detail}");
+    assert_eq!(paths, ["only_b.txt", "shared.txt", "src"]);
 }
 
 /// **The scope is always stated.** Every file tool requires `repo`; a call
@@ -163,25 +167,32 @@ fn every_file_tool_refuses_a_call_without_a_repo() {
     }
 }
 
-/// `*` covers every repository, and only the tools that search or list take
-/// it: a tool that reads one repository's file is refused it.
+/// `*` covers every repository, and only the searches take it: listing and
+/// reading are raw operations on one repository's files, and are refused it
+/// as they would be any repository the workspace does not list.
 #[test]
 fn only_the_search_tools_take_all_repos() {
     let dir = two_repo_workspace();
     let c = ctx(&dir);
-    let resp = harness::invoke_with_ctx(
-        "file_read",
-        json!({"repo": "*", "path": "shared.txt", "page": 0}),
-        &c,
-    );
-    let detail = harness::expect_error(&resp, "unknown_repo");
-    assert!(detail.contains("a, b"), "{detail}");
+    for (tool, args) in [
+        (
+            "file_read",
+            json!({"repo": "*", "path": "shared.txt", "page": 0}),
+        ),
+        ("file_list", json!({"repo": "*"})),
+    ] {
+        let resp = harness::invoke_with_ctx(tool, args, &c);
+        let detail = harness::expect_error(&resp, "unknown_repo");
+        assert!(detail.contains("a, b"), "{tool}: {detail}");
+    }
 }
 
 // ── file_search / file_grep across repositories ─────────────────────────────
 
+/// **Hits across every repository come back grouped by repository**, in the
+/// workspace's order, each path relative to its group's repository.
 #[test]
-fn file_search_of_all_repos_finds_hits_in_both_tagged_by_repo() {
+fn file_search_of_all_repos_groups_the_hits_by_repo() {
     let dir = two_repo_workspace();
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
@@ -189,15 +200,11 @@ fn file_search_of_all_repos_finds_hits_in_both_tagged_by_repo() {
         json!({"query": "shared.txt", "repo": "*"}),
         &c,
     ));
-    let files = resp["files"].as_array().unwrap();
-    assert_eq!(files.len(), 2);
-    let repos: std::collections::BTreeSet<&str> =
-        files.iter().map(|f| f["repo"].as_str().unwrap()).collect();
-    assert_eq!(
-        repos,
-        std::collections::BTreeSet::from(["a", "b"]),
-        "{files:?}"
-    );
+    let got: Vec<(&str, Vec<&str>)> = groups(&resp, "files")
+        .into_iter()
+        .map(|(repo, files)| (repo, files.iter().map(|f| f.as_str().unwrap()).collect()))
+        .collect();
+    assert_eq!(got, [("a", vec!["shared.txt"]), ("b", vec!["shared.txt"])]);
 }
 
 #[test]
@@ -209,13 +216,14 @@ fn file_search_with_a_repo_finds_only_that_repos_hits() {
         json!({"repo": "b", "query": "shared.txt"}),
         &c,
     ));
-    let files = resp["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0]["repo"], "b");
+    let got = groups(&resp, "files");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, "b");
+    assert_eq!(got[0].1, [&json!("shared.txt")]);
 }
 
 #[test]
-fn file_grep_of_all_repos_finds_hits_in_both_tagged_by_repo() {
+fn file_grep_of_all_repos_groups_the_hits_by_repo() {
     let dir = two_repo_workspace();
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
@@ -223,16 +231,23 @@ fn file_grep_of_all_repos_finds_hits_in_both_tagged_by_repo() {
         json!({"pattern": "pub fn marker_", "repo": "*"}),
         &c,
     ));
-    let matches = resp["matches"].as_array().unwrap();
-    assert_eq!(matches.len(), 2);
-    let repos: std::collections::BTreeSet<&str> = matches
-        .iter()
-        .map(|m| m["repo"].as_str().unwrap())
+    let got: Vec<(&str, Vec<(&str, u64)>)> = groups(&resp, "matches")
+        .into_iter()
+        .map(|(repo, hits)| {
+            (
+                repo,
+                hits.iter()
+                    .map(|m| (m["path"].as_str().unwrap(), m["line"].as_u64().unwrap()))
+                    .collect(),
+            )
+        })
         .collect();
     assert_eq!(
-        repos,
-        std::collections::BTreeSet::from(["a", "b"]),
-        "{matches:?}"
+        got,
+        [
+            ("a", vec![("src/lib.rs", 2)]),
+            ("b", vec![("src/lib.rs", 2)])
+        ]
     );
 }
 
@@ -263,8 +278,8 @@ fn a_workspace_grep_represents_every_repository_that_matches() {
             json!({"pattern": "pub fn marker_", "repo": "*", "page": page}),
             &c,
         ));
-        for m in resp["matches"].as_array().unwrap() {
-            repos.insert(m["repo"].as_str().unwrap().to_string());
+        for (repo, _) in groups(&resp, "matches") {
+            repos.insert(repo.to_string());
         }
         match resp["paging"]["next_page"].as_u64() {
             Some(next) => page = next,
@@ -291,10 +306,11 @@ fn file_grep_with_a_repo_finds_only_that_repos_hits() {
         json!({"repo": "b", "pattern": "pub fn marker_"}),
         &c,
     ));
-    let matches = resp["matches"].as_array().unwrap();
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0]["repo"], "b");
-    assert_eq!(matches[0]["path"], "src/lib.rs");
+    let got = groups(&resp, "matches");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, "b");
+    assert_eq!(got[0].1.len(), 1);
+    assert_eq!(got[0].1[0]["path"], "src/lib.rs");
 }
 
 // ── Isolation ────────────────────────────────────────────────────────────────

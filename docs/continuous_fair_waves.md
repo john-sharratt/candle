@@ -99,6 +99,41 @@ of forward progress per wave (fractional, accumulated):
 `R` is the single knob that trades ingest throughput against decode latency, set
 per layer by how interactive that layer's conversations are.
 
+### 3.1 Priority pause
+
+The throttle shares the device; the pause yields it. While any sequence of a
+higher priority has work — queued, prefilling or decoding — every
+lower-priority sequence is **paused**: not admitted, and held out of every
+forward, decode rows and prefill cohort alike. The pause lasts until
+`COOLDOWN` (15 s) after the last higher-priority activity, so a dialogue
+running tool rounds keeps the device through the seconds each tool takes
+rather than handing it back to ingest between rounds.
+
+A paused sequence keeps its K/V, recurrent state and queue position and
+resumes where it stopped. `High` is never paused, so a pause cannot deadlock
+the engine: the work that holds it is running. For that to hold, admission's
+progress gates — the width backstop, the pressure guard and the keep-one-alive
+rule — count only prefills that can advance (`running_prefills`): a paused
+prefill moves no row, and counting it as in flight kept a dialogue turn queued
+behind the very ingest it was pausing. When everything with work is paused,
+the loop waits on its request channel (`PAUSED_POLL`, 250 ms) instead of
+cycling empty quanta. Implemented in `scheduler/priority_pause.rs`; the gates
+are admission's per-band offer, decode row selection, and prefill wave
+membership.
+
+Only a priority that resolves through a slot's projection target is evidence
+of running work. A slot with none (a summary probe, a slot reloaded without its
+projection) is gated as `High` for itself but pauses nobody.
+
+The normalization warm-up replay (`scheduler/norm_warm.rs`) runs at ingest
+priority: one replayed turn per loop iteration on the gallery arena, and none
+while a higher band is running or cooling down.
+
+Measured motivation: with sixteen ingest workers sealing turns, a dialogue's
+belief-scan index was invalidated by their uploads and its forwards widened by
+their rows; the earlier rule only capped ingest decode rows beside a dialogue
+decode, and lifted the moment that decode ended.
+
 ## 4. Glue rides with prefill
 
 Glue (boundary gap-fill, `paged-glue`) is treated as **prefill-class** by the

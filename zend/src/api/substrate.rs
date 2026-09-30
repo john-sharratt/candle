@@ -190,7 +190,8 @@ pub struct Storage {
     pub segments: Vec<SegmentView>,
     /// Sum of every segment file's size on disk.
     pub total_bytes: u64,
-    /// Live KV chunk records currently indexed in RAM.
+    /// Live KV chunk records currently indexed in RAM. A record is one 32-token
+    /// block of ONE attention layer, so this is a count of records, not of tokens.
     pub live_chunks: usize,
     /// Fraction of record bytes that are dead (superseded + tombstoned) and
     /// reclaimable by compaction. `None` when the persistence lock was
@@ -210,6 +211,10 @@ pub struct Counts {
     pub timelines: usize,
     pub conversations: usize,
     pub sections: usize,
+    /// Tokens sealed in the substrate: every live timeline's turns and the shared
+    /// sections, each counted once. The layers' `tokens` sum to this less the
+    /// sections and any timeline no layer lists.
+    pub tokens: usize,
 }
 
 /// One projection layer's schema config plus a conversation count (the list
@@ -254,12 +259,19 @@ pub struct ConvView {
     /// Raw timeline id as a decimal string (see [`SubstrateOverview`] note).
     pub timeline: String,
     pub conv_id: String,
+    /// For an ingested unit, the path inside its repository (`src/lib.rs`,
+    /// `src/`, `/` for the repository's root) — the repository is
+    /// [`Self::repo`]. Otherwise the conversation's title.
     pub label: String,
+    /// For an ingested unit, the repository it is in; empty otherwise, and
+    /// for the workspace's own unit.
+    pub repo: String,
     pub archived: bool,
     pub group: String,
     /// Turn count including summary nodes.
     pub turns: u32,
-    /// Total sealed tokens across the timeline (turns + any timeline sections).
+    /// The timeline's own sealed turn tokens — never the shared sections, which
+    /// every conversation projects and none owns.
     pub tokens: usize,
     /// Summary-forest nodes (SoT + SoS) — how much has been compressed.
     pub summary_nodes: usize,
