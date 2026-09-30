@@ -90,6 +90,10 @@ pub const SEGMENT_COMPACT_MIN_AGE_SECS: u64 = 60;
 /// shrunk neighbours (§6).
 pub const COMBINE_SEGMENT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The streams maintenance carries forward, each mapped to whether its
+/// signature records go with it. A stream absent from the map carries nothing.
+type CarriedStreams = HashMap<u64, bool>;
+
 /// One sealed segment's stats, fed to [`pick_maintenance_op`].
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentStat {
@@ -728,7 +732,7 @@ impl SubstratePersistence {
         if sealed.is_empty() {
             return Ok(None);
         }
-        let liveness = self.segment_liveness(substrate);
+        let (liveness, carried) = self.liveness_and_carry(substrate);
         let now = SystemTime::now();
         let mut stats = Vec::with_capacity(sealed.len());
         for &id in &sealed {
@@ -746,7 +750,7 @@ impl SubstratePersistence {
         // lose a unique metadata record — i.e. it targets a segment not covered by
         // the last re-emission. Skipping it for older-only targets is what breaks
         // the re-emit→looks-dead→compact churn (see `need_resident_reemit`).
-        let resident = if self.need_resident_reemit(&op.targets()) {
+        let resident = if self.need_resident_reemit(&op.targets(), &carried) {
             gather_resident_set(substrate)
         } else {
             Vec::new()
@@ -829,21 +833,27 @@ impl SubstratePersistence {
     /// with a surviving copy at `>= floor`. Dropping it loses nothing. A `None`
     /// floor (no durable snapshot yet) or any target `>= floor` (which may hold
     /// metadata written after the last re-emission) forces a re-emit.
-    fn need_resident_reemit(&self, targets: &[SegmentId]) -> bool {
+    fn need_resident_reemit(&self, targets: &[SegmentId], carried: &CarriedStreams) -> bool {
         // Exact guard for per-stream metadata (`StreamDecl` / `WideQSig` /
         // `ProjectionEvents` / `Commit`): `metadata_locs` holds ONLY the current
-        // (last-writer-wins) copy of each, so if any target segment holds one, it
-        // is the sole durable copy of a LIVE record — dropping without re-emitting
-        // would delete a live turn's decl outright (the silent-loss bug: turns
-        // vanish on reload, their KV orphaned). The floor heuristic alone
-        // mis-skipped this whenever the current copy sat below the floor (e.g. a
-        // decl sealed in the plan→execute window, which lands under the
-        // execute-time floor without a re-emitted copy). A segment holding only
-        // SUPERSEDED metadata has no `metadata_locs` entry pointing at it, so this
-        // still skips it — no re-emit→looks-dead→compact churn.
+        // (last-writer-wins) copy of each, so if any target segment holds one of
+        // a CARRIED stream, it is the sole durable copy of a live record —
+        // dropping without re-emitting would delete a live turn's decl outright
+        // (the silent-loss bug: turns vanish on reload, their KV orphaned). The
+        // floor heuristic alone mis-skipped this whenever the current copy sat
+        // below the floor (e.g. a decl sealed in the plan→execute window, which
+        // lands under the execute-time floor without a re-emitted copy).
+        //
+        // Judged by the same carry rule liveness counts by. The current copy of
+        // a stream maintenance does NOT carry — a tombstoned timeline's decl, a
+        // signature its distill mode sheds — is not something a re-emission would
+        // write anyway, so it cannot justify one. Counting it here while liveness
+        // counted it dead made every 100%-dead segment that held one force the
+        // whole resident set forward: ~33k records, the corpus's signature blobs
+        // among them, rewritten under the persistence lock per dropped segment,
+        // measured stalling the scheduler's seal writes 20–50 s at a time.
         if self
-            .metadata_locs
-            .values()
+            .carried_metadata(carried)
             .any(|loc| targets.contains(&loc.segment))
         {
             return true;
@@ -1212,7 +1222,8 @@ impl SubstratePersistence {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
-        let resident = if self.need_resident_reemit(&op.targets()) {
+        let carried = self.liveness_and_carry(substrate).1;
+        let resident = if self.need_resident_reemit(&op.targets(), &carried) {
             gather_resident_set(substrate)
         } else {
             Vec::new()
@@ -1413,6 +1424,37 @@ impl SubstratePersistence {
     /// dead weight — safe, since the trigger only over-eagerly compacts and
     /// every op preserves the resident set.
     pub fn segment_liveness(&self, substrate: &Substrate) -> HashMap<SegmentId, u64> {
+        self.liveness_and_carry(substrate).0
+    }
+
+    /// The current per-stream metadata records maintenance carries forward —
+    /// what a segment's liveness counts, and so exactly what a drop must not
+    /// lose. `carried` maps each carried stream to whether its signature
+    /// records (`ProjectionEvents` / `WideQSig` / `TurnIndexPage`) go with it;
+    /// the decl and commit always do.
+    fn carried_metadata<'a>(
+        &'a self,
+        carried: &'a CarriedStreams,
+    ) -> impl Iterator<Item = &'a RecordLoc> + 'a {
+        self.metadata_locs
+            .iter()
+            .filter_map(move |(&(rt, stream_id), loc)| {
+                let keep_sig = *carried.get(&stream_id)?;
+                let is_signature = matches!(
+                    rt,
+                    RecordType::ProjectionEvents | RecordType::WideQSig | RecordType::TurnIndexPage
+                );
+                (!is_signature || keep_sig).then_some(loc)
+            })
+    }
+
+    /// [`segment_liveness`](Self::segment_liveness), plus the carry map it was
+    /// counted by — which [`need_resident_reemit`](Self::need_resident_reemit)
+    /// must judge by too.
+    fn liveness_and_carry(
+        &self,
+        substrate: &Substrate,
+    ) -> (HashMap<SegmentId, u64>, CarriedStreams) {
         let tombstoned: HashSet<u64> = substrate
             .tombstoned_timelines()
             .iter()
@@ -1461,7 +1503,7 @@ impl SubstratePersistence {
         // never be rebuilt on reload — mirroring the `collect_live_records`
         // orphan gate — and the segments holding only its records become
         // reclaimable instead of pinned forever).
-        let mut carried: HashMap<u64, bool> = HashMap::new();
+        let mut carried: CarriedStreams = HashMap::new();
         let dead_turns = dead_turns_of(substrate);
         for (sid, entry) in substrate.all_streams() {
             let shed = classify(
@@ -1496,17 +1538,7 @@ impl SubstratePersistence {
         // copy of each is here; superseded copies are absent and correctly read
         // as dead. Counted by the carry rule above: the decl and commit always,
         // the signature records only when the stream keeps its signature.
-        for (&(rt, stream_id), loc) in &self.metadata_locs {
-            let Some(&keep_sig) = carried.get(&stream_id) else {
-                continue;
-            };
-            let is_signature = matches!(
-                rt,
-                RecordType::ProjectionEvents | RecordType::WideQSig | RecordType::TurnIndexPage
-            );
-            if is_signature && !keep_sig {
-                continue;
-            }
+        for loc in self.carried_metadata(&carried) {
             *live.entry(loc.segment).or_default() += loc.record_size;
         }
         // Recurrent-state snapshots: one live tail per conversation, tracked in
@@ -1535,7 +1567,7 @@ impl SubstratePersistence {
                 *live.entry(loc.segment).or_default() += loc.record_size;
             }
         }
-        live
+        (live, carried)
     }
 }
 
@@ -2557,40 +2589,58 @@ mod tests {
         let mut substrate = Substrate::new();
         let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
 
+        // Stream 42 is carried with its signature; stream 43 without it; stream
+        // 44 (a tombstoned timeline's) is not carried at all.
+        let carried: CarriedStreams = HashMap::from([(42, true), (43, false)]);
+
         // No durable snapshot yet → always re-emit.
-        assert!(sp.need_resident_reemit(&[SegmentId(1)]));
+        assert!(sp.need_resident_reemit(&[SegmentId(1)], &carried));
 
         // A durable snapshot at floor = seg 10 duplicated every then-existing
         // metadata record into segments >= 10.
         sp.resident_reemit_floor = Some(SegmentId(10));
         // Targets strictly older than the floor are all duplicated at >= floor → skip.
-        assert!(!sp.need_resident_reemit(&[SegmentId(5)]));
-        assert!(!sp.need_resident_reemit(&[SegmentId(9), SegmentId(1)]));
+        assert!(!sp.need_resident_reemit(&[SegmentId(5)], &carried));
+        assert!(!sp.need_resident_reemit(&[SegmentId(9), SegmentId(1)], &carried));
         // A target at/after the floor may hold post-snapshot metadata → re-emit.
-        assert!(sp.need_resident_reemit(&[SegmentId(10)]));
-        assert!(sp.need_resident_reemit(&[SegmentId(12)]));
+        assert!(sp.need_resident_reemit(&[SegmentId(10)], &carried));
+        assert!(sp.need_resident_reemit(&[SegmentId(12)], &carried));
         // Any target at/after the floor in a mixed set forces a re-emit.
-        assert!(sp.need_resident_reemit(&[SegmentId(5), SegmentId(11)]));
+        assert!(sp.need_resident_reemit(&[SegmentId(5), SegmentId(11)], &carried));
 
-        // Exact guard: a target holding the CURRENT copy of a per-stream metadata
-        // record (here a StreamDecl in seg 5, BELOW the floor) must force a
-        // re-emit — the floor heuristic alone would wrongly skip it and the drop
-        // would delete the live turn's decl (the silent-loss bug).
-        sp.metadata_locs.insert(
-            (RecordType::StreamDecl, 42),
-            RecordLoc {
-                segment: SegmentId(5),
-                offset: 0,
-                payload_len: 0,
-                record_size: 4096,
-            },
-        );
+        let at = |segment: u64| RecordLoc {
+            segment: SegmentId(segment),
+            offset: 0,
+            payload_len: 0,
+            record_size: 4096,
+        };
+        // Exact guard: a target holding the CURRENT copy of a carried stream's
+        // metadata record (here a StreamDecl in seg 5, BELOW the floor) must
+        // force a re-emit — the floor heuristic alone would wrongly skip it and
+        // the drop would delete the live turn's decl (the silent-loss bug).
+        sp.metadata_locs.insert((RecordType::StreamDecl, 42), at(5));
         assert!(
-            sp.need_resident_reemit(&[SegmentId(5)]),
+            sp.need_resident_reemit(&[SegmentId(5)], &carried),
             "a target holding a current StreamDecl must force a re-emit even below the floor",
         );
         // A below-floor target with no current metadata still skips (no churn).
-        assert!(!sp.need_resident_reemit(&[SegmentId(4)]));
+        assert!(!sp.need_resident_reemit(&[SegmentId(4)], &carried));
+
+        // A stream maintenance does not carry pins nothing: its decl is not
+        // re-emitted by a re-emission, so it cannot justify one.
+        sp.metadata_locs.insert((RecordType::StreamDecl, 44), at(6));
+        assert!(
+            !sp.need_resident_reemit(&[SegmentId(6)], &carried),
+            "a tombstoned stream's decl forced a re-emit of the whole resident set",
+        );
+        // Nor does a signature the stream's carry sheds — only its decl counts.
+        sp.metadata_locs.insert((RecordType::WideQSig, 43), at(7));
+        assert!(!sp.need_resident_reemit(&[SegmentId(7)], &carried));
+        sp.metadata_locs.insert((RecordType::StreamDecl, 43), at(7));
+        assert!(sp.need_resident_reemit(&[SegmentId(7)], &carried));
+        // A carried stream's signature does count.
+        sp.metadata_locs.insert((RecordType::WideQSig, 42), at(8));
+        assert!(sp.need_resident_reemit(&[SegmentId(8)], &carried));
 
         std::fs::remove_dir_all(&dir).ok();
     }

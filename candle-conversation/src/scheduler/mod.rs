@@ -37,14 +37,20 @@ mod interleave;
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
 mod named_tool;
+mod norm_warm;
 pub mod phase_ring;
 mod prefill;
+mod priority_pause;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
+mod projection_identity;
 pub mod relief_trace;
 mod run;
 mod sample;
+mod seal_scan;
 mod spec_chooser;
+#[cfg(test)]
+mod test_substrate;
 
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
@@ -83,7 +89,7 @@ use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
 };
-use crate::substrate::{ResidenceIndex, TurnPartWrite};
+use crate::substrate::{ProjectionScores, ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, ProbeError, SelectionDiagnostics, SummariserTrigger, TurnKind,
@@ -103,6 +109,10 @@ use candle_transformers::models::batched_inference::{
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use self::exported_state::{ExportedState, SharedState};
+use self::norm_warm::NormWarm;
+use self::priority_pause::PriorityPause;
+use self::projection_identity::{section_content_stamp, segments_identity};
+pub(crate) use self::seal_scan::SealedProbe;
 use flume::{Receiver, Sender, TryRecvError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -339,6 +349,21 @@ pub(crate) enum SchedulerRequest {
         sequence_id: SequenceId,
         adapter: Option<Arc<str>>,
         response_tx: Sender<Result<(), ConversationError>>,
+    },
+
+    /// Score a just-sealed turn's beliefs — the once-per-turn seal scan that
+    /// teaches the normalization hit levels — on the scheduler's gallery arena.
+    ///
+    /// It comes here rather than scanning on the caller's thread because the
+    /// arena has exactly one scan thread (see [`seal_scan`]). The CPU per-file
+    /// scan the caller would otherwise run cost ~1 s over a 7M-token layer,
+    /// paid after every turn before its tool calls could dispatch.
+    ScoreSealedTurn {
+        substrate: Conversation,
+        projection: Arc<Builder>,
+        target: ProjectionTarget,
+        sealed: SealedProbe,
+        response_tx: Sender<ProjectionScores>,
     },
 
     /// Ingest a substrate section: fresh slot in, sealed section out.
@@ -1229,6 +1254,10 @@ struct ReprojectInFlight {
     /// The turn's Concept F question boundary, carried from the freed view's
     /// [`ViewState`] into the re-carved one.
     question_tokens: usize,
+    /// The identity of the segment list this rebuild applies — recorded on the
+    /// re-carved view's [`ViewState::applied_identity`] when the rebuild placed
+    /// every piece.
+    identity: u64,
 }
 
 /// Per-sequence state while actively generating tokens.
@@ -1660,6 +1689,12 @@ struct ViewState {
     /// boundary (`docs/provenance_adaptive_projection.md` §8). The pinned
     /// Q-window is the turn's first `question_tokens` real tokens.
     question_tokens: usize,
+    /// The identity ([`projection_identity`]) of the segment list this turn's
+    /// last reprojection rebuilt the parent from — `None` until the turn's first
+    /// reprojection, and whenever that rebuild left a piece out. A reprojection
+    /// that arrives at the same identity would rebuild the parent it already
+    /// has, so it leaves the parent and the view as they are.
+    applied_identity: Option<u64>,
 }
 
 /// A model-decode compression node in flight — the [`Content::Decode`]
@@ -2156,6 +2191,9 @@ struct WaveStats {
     drain_prefill_tokens: u64,
     drain_elevate_ms: u64,
     drain_glue_ms: u64,
+    /// The expert pipeline's `(hits, misses, DMA loads)` at the previous flush,
+    /// so each wave line reports this window's own — `None` on a dense model.
+    experts_prev: Option<(usize, usize, usize)>,
 }
 
 impl WaveStats {
@@ -2187,6 +2225,7 @@ impl WaveStats {
             drain_prefill_tokens: 0,
             drain_elevate_ms: 0,
             drain_glue_ms: 0,
+            experts_prev: None,
         }
     }
 
@@ -2311,6 +2350,7 @@ impl WaveStats {
         fmt: Option<(u32, u64, u64, u32, u64, u64)>,
         vram_decomp: (u64, u64, u64, u64),
         slots: (u32, u32, u32, u32),
+        experts: Option<(usize, usize, usize)>,
     ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
@@ -2373,8 +2413,23 @@ impl WaveStats {
         } else {
             String::new()
         };
+        // This window's expert activations and how many were already resident —
+        // a miss is a weight DMA the forward waited on, and the one number
+        // that says whether decode is bound by the card or by the link.
+        let experts_str = match (experts, self.experts_prev) {
+            (Some((h, m, d)), Some((h0, m0, d0))) if (h + m) > (h0 + m0) => {
+                let (hits, misses) = (h.saturating_sub(h0), m.saturating_sub(m0));
+                format!(
+                    " | experts hit={:.2}% miss={misses} dma={}",
+                    100.0 * hits as f64 / (hits + misses) as f64,
+                    d.saturating_sub(d0),
+                )
+            }
+            _ => String::new(),
+        };
+        self.experts_prev = experts;
         tracing::info!(
-            "wave {:.1}s: {body}{vram}{backlog_str}",
+            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}",
             elapsed.as_secs_f64()
         );
         // Phase breakdown: where the wall-clock went on the scheduler thread.
@@ -2868,6 +2923,12 @@ pub(crate) struct Scheduler {
     /// Starts `true`: nothing has completed on a fresh engine, and one that
     /// waited for a completion before its first admission would never take one.
     pub(super) settled_since_admit: bool,
+    /// Which priority bands have had work recently — lower bands wait while a
+    /// higher one runs, and for a cooldown after (see [`priority_pause`]).
+    pub(super) priority_pause: PriorityPause,
+    /// The dialogue normalization warm-up's replayed turns, scored in the gaps
+    /// higher-priority work leaves (see [`norm_warm`]).
+    norm_warm: NormWarm,
     /// When the last KV compaction pass ran, so the cheap per-wave gate can hold a
     /// floor on the interval. `None` before the first pass.
     pub(super) last_kv_compaction: Option<std::time::Instant>,
@@ -3331,8 +3392,8 @@ impl Scheduler {
         // The arena used to register an eviction closure with the VRAM
         // governor, at a cheap relief rung, so the governor would shed resident
         // galleries before it ever evicted model KV. The rungs are gone;
-        // `relieve_vram_pressure` calls `evict_lru` directly and does it before
-        // touching KV, which is the same priority expressed as call order.
+        // `relieve_vram_pressure` calls `evict_to_cap` directly and does it
+        // before touching KV, which is the same priority expressed as call order.
         // **What this checkpoint actually brings to a decode.** Every one of
         // these is a capability the engine silently degrades around rather than
         // failing on: a model with no drafter reports `draft_budget == 0`, every
@@ -3435,6 +3496,8 @@ impl Scheduler {
             prefill_queue: VecDeque::new(),
             // See the field: the first pass has nothing to wait for.
             settled_since_admit: true,
+            priority_pause: PriorityPause::default(),
+            norm_warm: NormWarm::default(),
             last_kv_compaction: None,
             wave_forwards: 0,
             wave_overhead_us: 0,
@@ -4169,6 +4232,7 @@ impl Scheduler {
                         original_borrowed: borrowed,
                         turn_start_parent_blocks,
                         question_tokens: user_content_end as usize,
+                        applied_identity: None,
                     },
                 );
 
@@ -4323,6 +4387,18 @@ impl Scheduler {
                         .map_err(ConversationError::Model)
                 };
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::ScoreSealedTurn {
+                substrate,
+                projection,
+                target,
+                sealed,
+                response_tx,
+            } => {
+                let scores = self.score_sealed_turn(&substrate, &projection, target, &sealed);
+                let _ = response_tx.send(scores);
                 true
             }
 
@@ -10088,6 +10164,7 @@ impl Scheduler {
         //    `group_candidates` carries each turn group's freshly-scored turns for
         //    the turn-boundary challenger below.
         let t_scan = Instant::now();
+        self.queue_norm_warm(&policy.substrate, &policy.projection, policy.target);
         let schema = policy.projection.schema();
         // observe = false: a live reprojection only READS the normalization hit
         // levels; learning happens once per turn at seal (last_turn_belief_scores).
@@ -10095,9 +10172,8 @@ impl Scheduler {
         // resident gallery arena, per-file z) — one launch for the whole group,
         // numerically equivalent to the CPU per-file scan up to fast-math ULP /
         // same ranking (see `examples/gpu_belief_parity.rs`). Seal-time learning
-        // still runs CPU (`last_turn_belief_scores`, arena=None), so learned
-        // normalization levels and live GPU scores differ by ~1e-3 — negligible for
-        // the 0-1000 bands.
+        // runs the same launch here (`SchedulerRequest::ScoreSealedTurn`), so the
+        // levels are learned from the scores they later normalize.
         let (projection_scores, group_candidates) = policy.substrate.score_beliefs(
             schema,
             policy.target,
@@ -10305,6 +10381,29 @@ impl Scheduler {
             .iter()
             .filter(|s| matches!(s, ProjectionSegment::Sealed(SealedKind::Turn(..))))
             .count();
+
+        // The parent already holds this selection when its last rebuild came
+        // from a segment list with the same identity and placed all of it:
+        // rebuilding would reproduce it exactly, at ~190 ms a time.
+        let identity = {
+            let read = policy.substrate.read();
+            segments_identity(&projected_segments, |id| {
+                section_content_stamp(&read.section_tokens_of(id))
+            })
+        };
+        if view_state.applied_identity == Some(identity) {
+            self.keep_unchanged_projection(view_id, composition);
+            tracing::debug!(
+                target: "candle_conversation::scheduler::reproject",
+                view = view_id.0,
+                total_ms = t_repro.elapsed().as_millis() as u64,
+                probe_ms,
+                scan_ms,
+                project_ms,
+                "reproject: selection unchanged — the parent is kept"
+            );
+            return Ok(None);
+        }
 
         // 6. Zero-copy rebuild.
         //
@@ -10555,6 +10654,7 @@ impl Scheduler {
             project_ms,
             elevate_ms,
             question_tokens: old_view_state.map(|v| v.question_tokens).unwrap_or(0),
+            identity,
         }))
     }
 
@@ -10588,6 +10688,7 @@ impl Scheduler {
             project_ms,
             elevate_ms,
             question_tokens,
+            identity,
         } = inflight;
 
         // Carry the belief forward: the next reprojection seeds from what this one
@@ -10621,6 +10722,7 @@ impl Scheduler {
         decode_state.last_projection_end = repro_gen;
 
         let t_finish = Instant::now();
+        let applied_identity = plan.complete.then_some(identity);
         self.apply_projection_finish(parent_id, plan)?;
         // The rebuilt prefix ends here, so the turn's anchor moves here — and
         // the index closes with it. The rebuild re-supplies the turn's user half
@@ -10750,6 +10852,7 @@ impl Scheduler {
                 // include the tail.
                 turn_start_parent_blocks: new_prefix_block_count,
                 question_tokens,
+                applied_identity,
             },
         );
 
@@ -13197,6 +13300,7 @@ mod tests {
                 original_borrowed: BlockCount(0),
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
+                applied_identity: None,
             },
         );
 
@@ -13242,6 +13346,7 @@ mod tests {
                 original_borrowed: BlockCount(0),
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
+                applied_identity: None,
             },
         );
 
@@ -13286,6 +13391,7 @@ mod tests {
                 original_borrowed: BlockCount(0),
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
+                applied_identity: None,
             },
         );
         scheduler.discard_turn_view(view);
@@ -14000,6 +14106,7 @@ mod tests {
                 original_borrowed: borrowed,
                 turn_start_parent_blocks: borrowed.0,
                 question_tokens: 0,
+                applied_identity: None,
             },
         );
         view

@@ -432,6 +432,37 @@ impl Scheduler {
                     .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
             }
 
+            // 2a. One turn of the normalization warm-up replay, when ingest-
+            // priority work may run (see `norm_warm`).
+            self.step_norm_warm();
+
+            // 2b. Everything with work is lower priority and paused behind a
+            // conversation still in its cooldown: wait for a request (which ends
+            // the wait at once) or the poll interval, then look again, rather
+            // than spinning through quanta that would run nothing.
+            if self.all_work_paused() {
+                let t_idle = Instant::now();
+                match self.rx.recv_timeout(super::priority_pause::PAUSED_POLL) {
+                    Ok(req) => {
+                        self.wave_stats
+                            .add_idle(t_idle.elapsed().as_millis() as u64);
+                        let t_req = Instant::now();
+                        let keep_going = self.handle_request(req);
+                        self.wave_stats
+                            .add_requests(t_req.elapsed().as_micros() as u64);
+                        if !keep_going {
+                            break;
+                        }
+                    }
+                    Err(flume::RecvTimeoutError::Timeout) => {
+                        self.wave_stats
+                            .add_idle(t_idle.elapsed().as_millis() as u64);
+                    }
+                    Err(flume::RecvTimeoutError::Disconnected) => break,
+                }
+                continue;
+            }
+
             // 3. If idle, block waiting for work. Deferred glue counts as work: the
             // unified wave step scatters it (`take_wave_glue`), so don't block while
             // any is pending or it would never be consumed.
@@ -448,9 +479,23 @@ impl Scheduler {
                 // scheduler idle between requests, attributed to the Idle phase so it
                 // isn't mislabeled as Blocked in the GUI.
                 let t_idle = Instant::now();
-                let req = match self.rx.recv() {
-                    Ok(req) => req,
-                    Err(_) => break, // Engine dropped.
+                // A queued warm-up is work too: wait only as long as it allows,
+                // then go round to score its next replayed turn.
+                let req = if let Some(wait) = self.norm_warm_wait() {
+                    match self.rx.recv_timeout(wait) {
+                        Ok(req) => req,
+                        Err(flume::RecvTimeoutError::Timeout) => {
+                            self.wave_stats
+                                .add_idle(t_idle.elapsed().as_millis() as u64);
+                            continue;
+                        }
+                        Err(flume::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    match self.rx.recv() {
+                        Ok(req) => req,
+                        Err(_) => break, // Engine dropped.
+                    }
                 };
                 self.wave_stats
                     .add_idle(t_idle.elapsed().as_millis() as u64);
@@ -833,6 +878,9 @@ impl Scheduler {
                     fmt,
                     (reserved_mib, total_mib, free_mib, weights_mib),
                     slots,
+                    self.model
+                        .expert_stats()
+                        .map(|s| (s.expert_hits, s.expert_misses, s.dma_loads)),
                 );
                 // Same cadence: publish the full memory report (global slot for
                 // `GET /v1/memory` + one JSON debug line). See `memory_report`.

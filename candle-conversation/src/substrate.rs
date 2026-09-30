@@ -245,6 +245,14 @@ pub struct Substrate {
     /// memory — reload rebuilds it from record headers.
     streams: HashMap<StreamId, StreamRuntime>,
 
+    /// Bumped whenever anything a collection's belief gallery is assembled from
+    /// changes — a stream declared, a signature or projection-event blob
+    /// written, a turn or timeline tombstoned, the streams cleared. The gallery
+    /// walks every stream to find its members; keyed on this, it is assembled
+    /// once per change instead of on every reprojection (see
+    /// [`Self::gallery_epoch`]).
+    gallery_epoch: u64,
+
     /// Interior-mutable per-stream memo of decoded wide-Q windows for the belief
     /// scan — filled lazily under a read lock, so a session's reprojections
     /// decode the static gallery once instead of every scan, and invalidated
@@ -3561,6 +3569,13 @@ impl Substrate {
         self.streams.values().any(|s| !s.chunks.is_empty())
     }
 
+    /// The belief-gallery epoch: unchanged while nothing a collection's gallery
+    /// is assembled from has changed, so an assembled gallery keyed on it can be
+    /// reused. See the field.
+    pub fn gallery_epoch(&self) -> u64 {
+        self.gallery_epoch
+    }
+
     /// Decoded wide-Q window for `stream_id`, memoized across reprojections.
     ///
     /// The belief scan reads the same static gallery on every reprojection;
@@ -3686,6 +3701,7 @@ impl Substrate {
     /// per-turn KV residence slots) is preserved.
     pub fn clear_walker_state(&mut self) {
         self.streams.clear();
+        self.gallery_epoch += 1;
         self.timeline_by_debug_id.clear();
         // The two indexes compaction can *shrink* — an entry whose record was
         // dropped would otherwise survive here pointing into a segment that no
@@ -3823,6 +3839,7 @@ impl Substrate {
             }
         }
         self.streams.entry(stream_id).or_default().decl = Some(decl);
+        self.gallery_epoch += 1;
     }
 
     /// Record a chunk location for `stream_id` at chunk index `idx`.
@@ -4010,10 +4027,12 @@ impl Substrate {
                 // replayed in.
                 if !self.tombstoned_timelines.contains(&timeline) {
                     self.tombstoned_turns.insert((timeline, turn));
+                    self.gallery_epoch += 1;
                 }
             }
             None => {
                 self.tombstoned_timelines.insert(timeline);
+                self.gallery_epoch += 1;
                 // The same subsumption the live path applies — see
                 // [`Self::tombstone_timeline`]. Replay order is arbitrary, so a
                 // turn tombstone read after its timeline's must not resurrect
@@ -4063,6 +4082,7 @@ impl Substrate {
             return;
         }
         self.tombstoned_turns.insert((timeline, turn_index));
+        self.gallery_epoch += 1;
         let (residence, retired_tokens) = match self
             .timelines
             .get_mut(&timeline)
@@ -4142,6 +4162,7 @@ impl Substrate {
     /// deletion would only take effect on the next reload.
     pub fn tombstone_timeline(&mut self, timeline: TimelineId) {
         self.tombstoned_timelines.insert(timeline);
+        self.gallery_epoch += 1;
         // **A wholesale tombstone subsumes every turn-scoped one it covers.**
         //
         // `tombstoned_turns` only ever grew, so a conversation that retired a
@@ -4678,6 +4699,7 @@ impl Substrate {
                 // Last-writer-wins per turn stream id.
                 self.streams.entry(stream_id).or_default().projection_events =
                     Some(entry.record.payload.clone());
+                self.gallery_epoch += 1;
                 // Mirror the `WideQSig` arm: drop this stream's memoized seams so a
                 // replay/apply after the seam cache warmed can't serve stale seams.
                 self.seam_cache
@@ -4690,6 +4712,7 @@ impl Substrate {
                 // per turn stream id — each (re)projection overwrites the window.
                 self.streams.entry(stream_id).or_default().wide_q_sigs =
                     Some(entry.record.payload.clone());
+                self.gallery_epoch += 1;
                 self.evict_decoded_wide_sig(stream_id);
             }
             RecordType::TurnIndexPage => {
@@ -5800,6 +5823,7 @@ impl Substrate {
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.gallery_epoch += 1;
     }
 
     /// Store a turn's projection-event record payload (opaque JSON bytes) on its
@@ -5807,6 +5831,7 @@ impl Substrate {
     /// and on redo-log replay.
     pub fn set_projection_events_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
         self.streams.entry(stream_id).or_default().projection_events = Some(payload);
+        self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded seams so a
         // single seal doesn't force a full-gallery JSON re-parse on the next scan.
         self.seam_cache
@@ -5825,6 +5850,7 @@ impl Substrate {
     /// Cache a turn's encoded wide-Q signature window, last-writer-wins.
     pub fn set_wide_q_sigs_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
         self.streams.entry(stream_id).or_default().wide_q_sigs = Some(payload);
+        self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded window so a
         // single seal doesn't force a full-gallery re-decode on the next scan.
         self.evict_decoded_wide_sig(stream_id);
@@ -6558,6 +6584,13 @@ mod tests {
     };
     use crate::token_buffer::TokenBuffer;
 
+    /// A timeline id no allocator in a test can also mint. Allocators are
+    /// microsecond clocks, so two fresh ones asked in the same microsecond
+    /// return the same id — two "different" timelines then share their turns.
+    fn unshared_timeline(n: u64) -> TimelineId {
+        TimelineId::from_raw((1 << 62) | n).expect("non-zero timeline id")
+    }
+
     fn make_timeline() -> (LayerId, GroupId, TimelineId, Substrate) {
         let layer = LayerId::for_test(1);
         let group = GroupId::for_test(1);
@@ -6759,7 +6792,7 @@ mod tests {
     fn a_read_larger_than_the_budget_is_refused_and_disturbs_nothing() {
         let (mut sub, target, reads) = fast_path_fixture(2, 100);
         assert!(sub.fast_path_admit(target, reads[0], 250));
-        let huge = TimelineAllocator::new().next();
+        let huge = unshared_timeline(1);
         sub.register_timeline(huge, LayerId::for_test(1), GroupId::for_test(1));
         sub.append_with_blocks(huge, 5_000, 0, 1);
         assert!(!sub.fast_path_admit(target, huge, 250));
@@ -6791,7 +6824,7 @@ mod tests {
     #[test]
     fn a_read_with_no_turns_is_refused() {
         let (mut sub, target, _) = fast_path_fixture(0, 0);
-        let empty = TimelineAllocator::new().next();
+        let empty = unshared_timeline(1);
         sub.register_timeline(empty, LayerId::for_test(1), GroupId::for_test(1));
         assert!(!sub.fast_path_admit(target, empty, 1000));
     }
@@ -7165,8 +7198,8 @@ mod tests {
     #[test]
     fn a_conversations_tokens_exclude_the_sections_the_corpus_counts_once() {
         let (layer, group, first, mut sub) = make_timeline();
-        let second = TimelineAllocator::new().next();
-        let retired = TimelineAllocator::new().next();
+        let second = unshared_timeline(1);
+        let retired = unshared_timeline(2);
         sub.register_timeline(second, layer, group);
         sub.register_timeline(retired, layer, group);
         sub.append_with_blocks(first, 100, 0, 4);
@@ -9541,6 +9574,49 @@ mod tests {
 
         // An absent stream (and an empty window) resolve to None.
         assert!(sub.decoded_wide_sig(turn_stream_id(1, 99)).is_none());
+    }
+
+    /// **Every change a belief gallery is assembled from moves the epoch, and
+    /// reading does not.** A collection's gallery is cached on this epoch, so a
+    /// change that failed to move it would serve a stale gallery — a tombstoned
+    /// turn still voting, or a new exemplar missing — silently.
+    #[test]
+    fn the_gallery_epoch_moves_on_every_change_and_never_on_a_read() {
+        use crate::provenance::encode_wide_sigs;
+        let (_, _, timeline, mut sub) = make_timeline();
+        let sid = turn_stream_id(timeline.raw(), 0);
+        let sig = WideQSig {
+            n_heads: 12,
+            words: vec![0xAAAA_AAAA_AAAA_AAAA; 24],
+        };
+        let mut last = sub.gallery_epoch();
+        let mut moved = |sub: &Substrate, what: &str| {
+            let now = sub.gallery_epoch();
+            assert!(now > last, "{what} must move the gallery epoch");
+            last = now;
+        };
+
+        sub.set_wide_q_sigs_blob(sid, encode_wide_sigs(std::slice::from_ref(&sig)));
+        moved(&sub, "a signature write");
+        sub.set_projection_events_blob(sid, b"[]".to_vec());
+        moved(&sub, "a projection-events write");
+
+        // Reads leave it alone.
+        let before = sub.gallery_epoch();
+        let _ = sub.decoded_wide_sig(sid);
+        let _ = sub.all_streams().count();
+        assert_eq!(
+            sub.gallery_epoch(),
+            before,
+            "a read must not move the epoch"
+        );
+
+        sub.tombstone_timeline(timeline);
+        moved(&sub, "a timeline tombstone");
+        sub.reset();
+        moved(&sub, "a reset");
+        sub.clear_walker_state();
+        moved(&sub, "clearing the streams");
     }
 
     /// Invalidation is per-stream: rewriting one turn's sig evicts only that

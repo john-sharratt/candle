@@ -619,6 +619,12 @@ pub(super) struct GapFillPlan {
     /// [`SlotState::glue_islands`] after the wave fires (`apply_segments_finish`
     /// with `capture_islands`).
     pub islands: Vec<PlannedIsland>,
+    /// Whether the walk placed every sealed section and turn it was given. A
+    /// skipped one (not hot when the walk reached it) leaves the slot short of
+    /// what its segment list describes, so the list's identity does not name
+    /// the slot's contents and a later reprojection must not treat it as
+    /// already built.
+    pub complete: bool,
 }
 
 /// One glue island's plan entry — see [`GapFillPlan::islands`].
@@ -686,6 +692,7 @@ fn fire_only(plan: &GapFillPlan) -> GapFillPlan {
         placed_before: 0,
         n_glue_tokens: plan.n_glue_tokens,
         islands: Vec::new(),
+        complete: plan.complete,
     }
 }
 
@@ -1079,6 +1086,7 @@ pub(super) fn apply_segments_build(
         placed_before: state.placed,
         n_glue_tokens: walker.n_glue_tokens,
         islands,
+        complete: walker.skipped_turns == 0 && walker.skipped_sections == 0,
     })
 }
 
@@ -2128,6 +2136,7 @@ pub(super) fn apply_segments_finish(
         placed_before,
         n_glue_tokens,
         islands,
+        complete: _,
     } = plan;
     // The glue tokens were already logged into the slot_tokens debug view at
     // their interleaved positions during the walk (`reserve_glue_island`).

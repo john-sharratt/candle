@@ -245,7 +245,7 @@ pub use project::{
     TOOLS_ENABLED_SELECTOR, TOOL_ROUND_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
-pub use resolver::{CollectionWarm, Conversation, Observe, SectionLoads, TargetedRead};
+pub use resolver::{CollectionWarm, Conversation, Observe, SectionLoads, TargetedRead, WarmProbe};
 pub use schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection,

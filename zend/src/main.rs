@@ -21,6 +21,7 @@
 // test crates) then trips dead-code lints that cannot be honestly fixed.
 // `log_file` is the one genuinely bin-only module: the rotating on-disk log
 // is a property of the daemon process, not of the library.
+mod ctrl_c;
 mod log_file;
 mod self_heal;
 
@@ -592,6 +593,7 @@ async fn main() -> anyhow::Result<()> {
     // On Ctrl-C / SIGTERM the server stops accepting connections and drains
     // in-flight requests; then the substrate redo log is checkpointed so the
     // last turn — including a partial in-flight tail — is durable on disk.
+    ctrl_c::accept_ctrl_c();
     let shutdown_session = Arc::clone(&session);
     // With the peer's address, so `access::role` can tell the gateway from
     // anything else that reaches the port.
