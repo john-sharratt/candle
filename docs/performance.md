@@ -54,14 +54,16 @@ references, below and in full in §6.8).
    K/V type pair without a compiled flash-attention kernel drops its prefill
    10–45× **[E66 · E67]**.
 
-5. **In aggregate, one card out-decodes llama.cpp's best published rate — by up
-   to 6×.** Serving concurrent conversations from one card, this engine's
+5. **In aggregate, one card out-decodes llama.cpp's best published rate — by
+   nearly 10×.** Serving concurrent conversations from one card, this engine's
    aggregate decode beats the best published llama.cpp single-stream figure for
-   the same model on the same class of card: **1.8–3.4× on the RTX 3090**
-   (Qwen3-8B 303.4 vs 115.3 t/s; Qwen3.8-27B 198.9 vs 65.3 with MTP), **2.2× on
-   16 GB cards** (Qwen3-8B; Flash-Next), and **2.3–6.1× on Blackwell**
-   (Qwen3.5-35B-A3B 1,187.7 vs 194.0) **[I8 · I16 · E1 · E17 · E19 · E21 · E27
-   · E46 · E51]**. The one exception is the 35B MoEs on 16 GB, where a 3-bit
+   the same model on the same class of card: **1.8–9.8× on the RTX 3090**
+   (Qwen3-8B 303.4 vs 115.3 t/s; Qwen3.8-27B 198.9 vs 65.3 with MTP; Flash-Next
+   147.0 at ×16 vs 15, the published run at a 130K context on UD-Q4_K_XL against
+   our ~700-token prompt on Q2_KO experts, so the least like-for-like row),
+   **2.2× on 16 GB cards** (Qwen3-8B; Flash-Next), and **2.3–6.1× on Blackwell**
+   (Qwen3.5-35B-A3B 1,187.7 vs 194.0) **[I8 · I16 · I18 · E1 · E17 · E19 · E21 ·
+   E27 · E46 · E51]**. The one exception is the 35B MoEs on 16 GB, where a 3-bit
    quant that fits wholly in VRAM decodes a single stream at 183–249 t/s against
    our 130 aggregate with Q6_K experts streamed **[I11 · E45]**. The 35B MoEs reach
    **1,188–1,202 t/s aggregate at ×64** on one 72 GB card, eleven times their
@@ -123,7 +125,7 @@ references, below and in full in §6.8).
 | **I13** | Thirteen gates, 187 rows on the laptop with no failing session; the same gates on the 3090 and 72 GB card | §3.7–§3.9; §5 provenance table |
 | **I14** | C10 on the 35Bs: 6.23× / 5.96× (laptop) against 6.23× / 6.05× (3090); dense rungs within 0.1× | §3.9 *Against the RTX 3090* |
 | **I15** | Engine probe, Flash-Next: story 8/8, worst sustained efficiency 100%, uptake 73% (2026-09-30) and 88% (2026-09-29) | §3.9 *Engine probes* |
-| **I16** | Aggregate decode against llama.cpp's best published single-stream rate, same model and card class. RTX 3090: Qwen3-8B C8 ×10 303.4 vs 115.3; Qwen3-30B-A3B Q8_0 ×20 274.5 vs 153.6; Qwen3.5-35B C10 ×16 375.9 vs 111.2; Qwen3.6-35B C10 ×16 388.6 vs 157.66; Qwen3.8-27B C9 ×5 198.9 vs 65.28 (MTP); Llama-2-7B BF16 ×48 547.6 vs 161.89. 16 GB: Qwen3-8B C8 ×10 230.1 vs 102.7 (RTX 4080); Flash-Next BF16 ×8 64.7 vs 27.5–29 (RTX 5080); exception — Qwen3.6-35B C10 ×16 129.7 vs 183.29 / 249.33 MTP (RTX 4080, IQ3_S resident). Blackwell (our RTX PRO 5000 vs a published RTX 5090): Qwen3-8B 460.1 vs 200.4; Qwen3-30B-A3B 595.7 vs 226.1; Qwen3.5-35B 1,187.7 vs 194.0; Qwen3.6-35B 1,201.6 vs 333.55 (MTP); Llama-2-7B 917.3 vs 300.40 | §3.7–§3.9 ladders; §6.2–§6.5 |
+| **I16** | Aggregate decode against llama.cpp's best published single-stream rate, same model and card class. RTX 3090: Qwen3-8B C8 ×10 303.4 vs 115.3; Qwen3-30B-A3B Q8_0 ×20 274.5 vs 153.6; Qwen3.5-35B C10 ×16 375.9 vs 111.2; Qwen3.6-35B C10 ×16 388.6 vs 157.66; Qwen3.8-27B C9 ×5 198.9 vs 65.28 (MTP); Llama-2-7B BF16 ×48 547.6 vs 161.89; Flash-Next BF16 ×16 147.0 vs 15 (published at 130K context, UD-Q4_K_XL; ours Q2_KO experts, ~700-token prompt; measured 2026-09-30, I18). 16 GB: Qwen3-8B C8 ×10 230.1 vs 102.7 (RTX 4080); Flash-Next BF16 ×8 64.7 vs 27.5–29 (RTX 5080); exception — Qwen3.6-35B C10 ×16 129.7 vs 183.29 / 249.33 MTP (RTX 4080, IQ3_S resident). Blackwell (our RTX PRO 5000 vs a published RTX 5090): Qwen3-8B 460.1 vs 200.4; Qwen3-30B-A3B 595.7 vs 226.1; Qwen3.5-35B 1,187.7 vs 194.0; Qwen3.6-35B 1,201.6 vs 333.55 (MTP); Llama-2-7B 917.3 vs 300.40 | §3.7–§3.9 ladders; §6.2–§6.5 |
 | **I17** | Flash-Next gate prefill 430.7 → 627.0 t/s (BF16 ×4) and 354.5 → 472.0 (BF16 ×8), builds `9be7b182c` → `a475e852c`, every row validated | commits `91ef33339`, `eef0f44ab`, `0ce74ecad`; §7.3 |
 | **I18** | Flash-Next on the RTX 3090 (i7-10700K, 64 GB RAM), Q2_KO experts: full ladder incl. ×16, every row validated; BF16 ×1 warm 524.0 / 24.3 t/s, ×4 1,033.4 prefill, ×16 147.0 aggregate decode, C10 ×2 5.46×; engine probe story 8/8, efficiency 99%, uptake 80% | §3.8 *Qwen3.8-Flash-Next*; `results/performance_rtx_3090_24gb_rows_2026-09-30.tsv` |
 

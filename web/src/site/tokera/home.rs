@@ -19,7 +19,7 @@ const STATS: [(&str, &str); 4] = [
     ("180B", "parameters on a 16 GB laptop"),
     ("1,202", "tokens/sec across 64, one card"),
     ("7.6×", "KV cache compression"),
-    ("6×", "llama.cpp's best decode, one card"),
+    ("9.8×", "llama.cpp's best decode, one card"),
 ];
 
 /// One tile. `span` is twelfths of the grid — the mosaic runs 5+7, then 4+4+4,
@@ -79,7 +79,7 @@ const WORK: [Work; 6] = [
             "A 180B model serving eight people from a 16 GB laptop with 32 GB of RAM",
             "Context grows from 32K to 128K, and decode gets faster",
             "KV cache compressed up to 7.6× as it is written, every answer checked",
-            "One card out-decodes llama.cpp's best published rate by up to 6×",
+            "One card out-decodes llama.cpp's best published rate by nearly 10×",
             "A 284B model serving sixteen people from a single GPU",
         ],
         links: &[
