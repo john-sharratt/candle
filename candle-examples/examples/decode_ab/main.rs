@@ -15,16 +15,19 @@
 //!   cargo run --release --features cuda --example decode_ab -- compare \
 //!       --scenarios gqa3_ctx512_b8 --formats q4_0,q8_0,f16 --out report.md
 //!   cargo run --release --features cuda --example decode_ab -- bench --iters 200
+//!   cargo run --release --features cuda --example decode_ab -- profile \
+//!       --scenarios gqa4_ctx2048_b16 --formats rq-uni-q0_v-L0,rq-uni-q0_x-L0
 
 mod fixture;
 mod formats;
 mod metrics;
 mod report;
 mod scenarios;
+mod timing;
 
 use anyhow::{bail, Context, Result};
 use candle::quantized::pinned_staging::PinnedStager;
-use candle::Device;
+use candle::{DType, Device};
 use clap::{Parser, Subcommand};
 
 use fixture::{Fixture, Rope};
@@ -32,12 +35,15 @@ use formats::{
     all_formats, deep_formats, default_formats, quant_formats, select_formats, ArenaFmt,
 };
 use metrics::Metrics;
-use report::{render_bench, render_golden, BenchRow, GoldenOutcome, GoldenRow};
+use report::{
+    render_bench, render_golden, render_profile, BenchRow, GoldenOutcome, GoldenRow, ProfileRow,
+};
 use scenarios::{
     default_scenarios, flash_next_deep_scenarios, flash_next_holed_scenarios, flash_next_scenarios,
     perf_scenarios, select_scenarios, single_decode_scenarios, suite_deep_scenarios,
     suite_scenarios, Scenario,
 };
+use timing::median;
 
 #[derive(Parser)]
 #[command(
@@ -67,16 +73,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Check the INT8 kernel's output against an FP32 ground truth (identity
-    /// RoPE) and gate on structural correctness (cosine).
+    /// Check the INT8 decode kernel against FP32 attention (identity RoPE) over
+    /// the context AS STORED — dequantized, scaled and placed exactly as the
+    /// kernels read it — and gate on that; the cosine against the unquantized
+    /// truth is reported beside it as the format's precision.
     Compare {
-        /// Pass gate: min cosine of the int8 output vs FP32 truth. Cosine is
-        /// precision-robust — even the most aggressive compression (L7 / Q2/Q1)
-        /// keeps cosine ≥ ~0.96, while a structural K-read/palette bug craters it
-        /// to ≲ 0.6. 0.93 sits in that gap: it passes all legitimate quant loss
-        /// and fails only correctness regressions.
-        #[arg(long, default_value_t = 0.93)]
-        golden_cosine_tol: f32,
+        /// Pass gate: min cosine of the int8 output vs FP32 attention over the
+        /// stored context. With the storage format's loss taken out of the
+        /// reference, what is left is the kernel's own INT8 arithmetic, the
+        /// same few parts in 10⁴ at every format and compression level; a
+        /// structural bug — a wrong block, rank, scale, side or codebook —
+        /// falls far below it at any precision. Calibrated on the prefill
+        /// sweep over every format (RTX 4090 Mobile, 2026-10-01): the lowest
+        /// correct cell reads 0.99971 (uniform Q0_X), the host codec
+        /// mismatches the gate was built to catch read 0.98 and below.
+        #[arg(long, default_value_t = 0.999)]
+        stored_cosine_tol: f32,
+    },
+    /// Check the INT8 prefill kernel the same way: FP32 causal attention over
+    /// the stored context plus the fresh tokens, gated as `compare` gates the
+    /// decode.
+    ComparePrefill {
+        /// Pass gate: min cosine vs FP32 attention over the stored context.
+        #[arg(long, default_value_t = 0.999)]
+        stored_cosine_tol: f32,
+        /// Fresh tokens per slot in the checked prefill.
+        #[arg(long, default_value_t = 64)]
+        prefill_tokens: usize,
     },
     /// Benchmark per-call INT8 kernel time across the matrix.
     Bench {
@@ -87,15 +110,33 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         warmup: usize,
     },
+    /// Device time of every production stage that touches the stored arena:
+    /// the seal (format selection + palette conversion), a decode step, and a
+    /// batched prefill step over the stored context. Run it under `nsys
+    /// profile -t cuda` for the per-kernel breakdown inside each stage.
+    Profile {
+        /// Timed decode steps per cell.
+        #[arg(long, default_value_t = 50)]
+        iters: usize,
+        /// Timed prefill steps per cell.
+        #[arg(long, default_value_t = 8)]
+        prefill_iters: usize,
+        /// New tokens per slot in each prefill step.
+        #[arg(long, default_value_t = 64)]
+        prefill_tokens: usize,
+        /// Untimed warmup iterations of each timed stage.
+        #[arg(long, default_value_t = 5)]
+        warmup: usize,
+    },
     /// Comprehensive ground-truth regression suite: run the golden gate across
     /// the full quant × shape matrix in one pass. Defaults to a codec sweep
     /// (every codec at shallow/mid shapes) plus a depth/scale sweep (production
     /// native-INT8 formats at deep & large-batch shapes); `--scenarios` /
     /// `--formats` / `--all-formats` override either axis.
     Suite {
-        /// Pass gate: min cosine of the int8 output vs FP32 truth.
-        #[arg(long, default_value_t = 0.93)]
-        golden_cosine_tol: f32,
+        /// Pass gate: min cosine vs FP32 attention over the stored context.
+        #[arg(long, default_value_t = 0.999)]
+        stored_cosine_tol: f32,
     },
 }
 
@@ -133,9 +174,25 @@ fn main() -> Result<()> {
     let (scenarios, fmts) = resolve_matrix(&cli, is_suite)?;
 
     let markdown = match &cli.cmd {
-        Cmd::Compare { golden_cosine_tol } => {
-            run_golden(&scenarios, &fmts, *golden_cosine_tol, &device, &stager)?
-        }
+        Cmd::Compare { stored_cosine_tol } => run_golden(
+            &scenarios,
+            &fmts,
+            *stored_cosine_tol,
+            Stage::Decode,
+            &device,
+            &stager,
+        )?,
+        Cmd::ComparePrefill {
+            stored_cosine_tol,
+            prefill_tokens,
+        } => run_golden(
+            &scenarios,
+            &fmts,
+            *stored_cosine_tol,
+            Stage::Prefill(*prefill_tokens),
+            &device,
+            &stager,
+        )?,
         Cmd::Bench { iters, warmup } => {
             // Default the bench to the batch-8 perf set (fills the MMA M dim),
             // the batch-1 deep-context single-decode set (the grid-starved
@@ -153,7 +210,24 @@ fn main() -> Result<()> {
             };
             run_bench(&bench_scen, &fmts, *iters, *warmup, &device, &stager)?
         }
-        Cmd::Suite { golden_cosine_tol } => {
+        Cmd::Profile {
+            iters,
+            prefill_iters,
+            prefill_tokens,
+            warmup,
+        } => run_profile(
+            &scenarios,
+            &fmts,
+            StageIters {
+                decode: *iters,
+                prefill: *prefill_iters,
+                prefill_tokens: *prefill_tokens,
+                warmup: *warmup,
+            },
+            &device,
+            &stager,
+        )?,
+        Cmd::Suite { stored_cosine_tol } => {
             // Default suite = two sweeps:
             //   • CODEC: every quant format at the cheap shallow/mid shapes
             //     (resolve_matrix already set scenarios/fmts to
@@ -180,10 +254,17 @@ fn main() -> Result<()> {
                     ),
                 ]
             };
-            let mut golden = String::from("# Decode suite — ground truth (vs FP32)\n");
+            let mut golden = String::from("# Decode suite — vs FP32 over the stored context\n");
             for (scn, fmt, label) in &groups {
                 golden.push_str(&format!("\n## {label}\n\n"));
-                golden.push_str(&run_golden(scn, fmt, *golden_cosine_tol, &device, &stager)?);
+                golden.push_str(&run_golden(
+                    scn,
+                    fmt,
+                    *stored_cosine_tol,
+                    Stage::Decode,
+                    &device,
+                    &stager,
+                )?);
             }
             golden
         }
@@ -197,12 +278,31 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Ground-truth gate: build the int8 kernel's output for each cell, compare to
-/// the FP32 golden, and pass/FAIL on structural correctness (cosine).
+/// Which kernel a golden check runs: one decode step, or a prefill of that
+/// many fresh tokens per slot over the stored context.
+#[derive(Clone, Copy)]
+enum Stage {
+    Decode,
+    Prefill(usize),
+}
+
+impl Stage {
+    fn name(self) -> &'static str {
+        match self {
+            Stage::Decode => "decode",
+            Stage::Prefill(_) => "prefill",
+        }
+    }
+}
+
+/// The golden gate: run the int8 kernel for each cell, compare it to FP32
+/// attention over the context as stored (the gate) and over the unquantized
+/// truth (the format's precision, reported), and pass/FAIL on the first.
 fn run_golden(
     scenarios: &[Scenario],
     fmts: &[ArenaFmt],
-    cosine_tol: f32,
+    stored_cosine_tol: f32,
+    stage: Stage,
     device: &Device,
     stager: &PinnedStager,
 ) -> Result<String> {
@@ -211,20 +311,22 @@ fn run_golden(
     'outer: for sc in scenarios {
         for &fmt in fmts {
             eprint!("golden  {:<24} {:<14} ... ", sc.name, fmt.label());
-            let outcome = match golden_cell(sc, fmt, device, stager) {
-                Ok(metrics) => {
-                    // Per-format floor: the most aggressive formats (1-bit Q1_S)
-                    // have a legitimately lower structural-correctness ceiling.
-                    let floor = fmt.golden_cosine_floor(cosine_tol);
-                    let passed = metrics.cosine >= floor;
+            let outcome = match golden_cell(sc, fmt, stage, device, stager) {
+                Ok((stored, truth)) => {
+                    let passed = stored.cosine >= stored_cosine_tol;
                     any_fail |= !passed;
                     eprintln!(
-                        "{} int8_cos={:.5} int8_mae={:.2e}",
+                        "{} stored_cos={:.6} truth_cos={:.5} truth_mae={:.2e}",
                         if passed { "pass" } else { "FAIL" },
-                        metrics.cosine,
-                        metrics.mae,
+                        stored.cosine,
+                        truth.cosine,
+                        truth.mae,
                     );
-                    GoldenOutcome::Ran { metrics, passed }
+                    GoldenOutcome::Ran {
+                        stored,
+                        truth,
+                        passed,
+                    }
                 }
                 Err(e) => {
                     let msg = short_err(&e);
@@ -249,24 +351,62 @@ fn run_golden(
         }
     }
     if any_fail {
-        eprintln!("note: one or more GOLDEN cells FAILED — the kernel diverged from FP32 truth.");
+        eprintln!(
+            "note: one or more GOLDEN cells FAILED — the kernel diverged from attention over \
+             the context it was given."
+        );
     }
-    Ok(render_golden(&rows, cosine_tol))
+    Ok(render_golden(stage.name(), &rows, stored_cosine_tol))
 }
 
-/// Ground-truth check for one cell: int8 kernel output vs the FP32 golden.
+/// One cell: the int8 kernel's output against FP32 attention over the stored
+/// context, and against FP32 attention over the unquantized truth. The
+/// fixture is built fresh with identity RoPE (the references are plain
+/// attention), which guarantees pristine, deterministic input — a decode or
+/// prefill commits its tokens, so fixtures are not reused across checks. The
+/// stored context is read before the kernel runs; it is the prefilled
+/// tokens, which neither kernel rewrites.
 fn golden_cell(
     sc: &Scenario,
     fmt: ArenaFmt,
+    stage: Stage,
     device: &Device,
     stager: &PinnedStager,
-) -> candle::Result<Metrics> {
+) -> candle::Result<(Metrics, Metrics)> {
     if !sc.head_dim_supported() {
         candle::bail!("head_dim {} unsupported", sc.head_dim);
     }
-    let out = build_and_decode(sc, fmt, device, stager)?;
-    let gold = fixture::golden_decode(sc, device)?;
-    Metrics::compute(&gold, &out, sc.n_q_head, sc.head_dim)
+    if matches!(
+        (stage, fmt),
+        (Stage::Prefill(_), ArenaFmt::Float(DType::F8E4M3))
+    ) {
+        // FP8 is a post-seal storage format: a prefill's compute dtype is its
+        // cache's, F16/BF16 only, and production never prefills over a cache
+        // forced to F8E4M3 (`prefill_utils`). Its read path is the decode's.
+        candle::bail!("no FP8 prefill: FP8 is a post-seal storage format");
+    }
+    let mut fix = Fixture::build(sc, fmt, Rope::Identity, device, stager)?;
+    let stored: Vec<(Vec<f32>, Vec<f32>)> = (0..sc.num_slots)
+        .map(|s| fix.stored_context(s))
+        .collect::<candle::Result<_>>()?;
+    let stored_ctx = |s: usize| Ok(stored[s].clone());
+    let truth_ctx = |s: usize| fixture::synthetic_context(sc, s, device);
+    let (out, gold_stored, gold_truth) = match stage {
+        Stage::Decode => (
+            fix.decode(device, stager)?.0,
+            fixture::golden_decode(sc, device, stored_ctx)?,
+            fixture::golden_decode(sc, device, truth_ctx)?,
+        ),
+        Stage::Prefill(n) => (
+            fix.prefill_step(n, device, stager)?.0,
+            fixture::golden_prefill(sc, n, device, stored_ctx)?,
+            fixture::golden_prefill(sc, n, device, truth_ctx)?,
+        ),
+    };
+    Ok((
+        Metrics::compute(&gold_stored, &out, sc.n_q_head, sc.head_dim)?,
+        Metrics::compute(&gold_truth, &out, sc.n_q_head, sc.head_dim)?,
+    ))
 }
 
 fn run_bench(
@@ -327,18 +467,96 @@ fn run_bench(
     Ok(render_bench(&rows))
 }
 
-/// Build a fresh identity-RoPE fixture (the golden is plain attention) and run
-/// a single int8 decode. The fresh build guarantees pristine, deterministic
-/// input (a decode commits the write token, so fixtures must not be reused
-/// across calls).
-fn build_and_decode(
-    sc: &Scenario,
-    fmt: ArenaFmt,
+/// How much of each stage `run_profile` times.
+struct StageIters {
+    decode: usize,
+    prefill: usize,
+    prefill_tokens: usize,
+    warmup: usize,
+}
+
+/// The stage profile: per cell, build a real-RoPE fixture (the seal is timed
+/// inside the build), then time decode steps, then prefill steps — each walks
+/// the contexts forward, so the prefill reads the decoded tokens too.
+fn run_profile(
+    scenarios: &[Scenario],
+    fmts: &[ArenaFmt],
+    it: StageIters,
     device: &Device,
     stager: &PinnedStager,
-) -> candle::Result<candle::Tensor> {
-    let mut fix = Fixture::build(sc, fmt, Rope::Identity, device, stager)?;
-    Ok(fix.decode(device, stager)?.0)
+) -> Result<String> {
+    // A cold GPU clocks differently from one under load: the first cell of a
+    // run otherwise reads ~20% slow. Run it once, untimed, before the matrix.
+    if let (Some(sc), Some(&fmt)) = (
+        scenarios.iter().find(|s| s.head_dim_supported()),
+        fmts.first(),
+    ) {
+        eprintln!("profile warmup {} {}", sc.name, fmt.label());
+        let mut fix = Fixture::build(sc, fmt, Rope::Real, device, stager)?;
+        for _ in 0..it.decode.max(1) {
+            fix.decode(device, stager)?;
+        }
+        for _ in 0..it.prefill.max(1) {
+            fix.prefill_step(it.prefill_tokens, device, stager)?;
+        }
+    }
+    let mut rows = Vec::new();
+    'outer: for sc in scenarios {
+        for &fmt in fmts {
+            if !sc.head_dim_supported() {
+                continue;
+            }
+            eprint!("profile {:<24} {:<14} ... ", sc.name, fmt.label());
+            let run = || -> candle::Result<ProfileRow> {
+                let mut fix = Fixture::build(sc, fmt, Rope::Real, device, stager)?;
+                for _ in 0..it.warmup {
+                    fix.decode(device, stager)?;
+                }
+                let decode = median(
+                    (0..it.decode.max(1))
+                        .map(|_| fix.decode(device, stager).map(|(_, dt)| dt))
+                        .collect::<candle::Result<_>>()?,
+                );
+                for _ in 0..it.warmup {
+                    fix.prefill_step(it.prefill_tokens, device, stager)?;
+                }
+                let prefill = median(
+                    (0..it.prefill.max(1))
+                        .map(|_| {
+                            fix.prefill_step(it.prefill_tokens, device, stager)
+                                .map(|(_, dt)| dt)
+                        })
+                        .collect::<candle::Result<_>>()?,
+                );
+                Ok(ProfileRow {
+                    scenario: sc.name.to_string(),
+                    format: fmt.label(),
+                    seal_us: fix.seal.as_secs_f64() * 1e6,
+                    decode_us: decode.as_secs_f64() * 1e6,
+                    prefill_tokens: it.prefill_tokens,
+                    prefill_us: prefill.as_secs_f64() * 1e6,
+                })
+            };
+            match run() {
+                Ok(row) => {
+                    eprintln!(
+                        "seal={:.1}µs decode={:.1}µs prefill={:.1}µs",
+                        row.seal_us, row.decode_us, row.prefill_us
+                    );
+                    rows.push(row);
+                }
+                Err(e) => {
+                    let msg = short_err(&e);
+                    eprintln!("skip ({msg})");
+                    if is_context_fatal(&msg) {
+                        eprintln!("FATAL: CUDA context poisoned — stopping profile early.");
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    Ok(render_profile(&rows))
 }
 
 /// Whether an error string indicates a CUDA context-poisoning failure (an

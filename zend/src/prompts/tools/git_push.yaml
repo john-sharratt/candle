@@ -1,0 +1,119 @@
+name: git_push
+questions:
+- push this branch to origin
+- publish the tag we just cut
+- delete that branch on the remote
+- push my branch and the tag together in one atomic push
+- my branch is local only, put it on the remote
+- the remote rejected my push, what do I do
+- send this work upstream so the team can review it
+- remove the stale feature branch from origin
+- push without clobbering anyone else's commits
+- publish this as a new branch nobody has seen yet
+- the tag on the remote points at the wrong commit, remove it
+- push the rebased branch over the old one
+- push
+- make origin match my local branch
+- can you publish these two branches at once
+- upload my commits to the upstream repository
+- push the release tag so CI picks it up
+- is it safe to force push this branch
+- push everything I committed to origin main
+- get this branch onto the server for the pull request
+category: Git
+description: 'Publish branches or tags to a remote. Every change carries a lease — the value the remote ref must currently hold — so a push can never silently discard work someone else pushed in between; a lease that no longer matches is rejected and nothing changes. **You do not normally supply the lease.** Omit `expected` and it comes from this repository''s remote-tracking ref, which is what `--force-with-lease` does by default and is the value that actually protects a concurrent push; set `new: true` instead to require that the ref does not exist on the remote yet, which is how something is published for the first time. **Run git_fetch first** so the tracking refs reflect what the remote actually holds rather than a stale guess. `pushes` takes one to fifty items, each `update_branch` (a branch set to `source`, defaulting to the local branch of the same name), `delete_branch`, `update_tag` or `delete_tag`. They go in ONE atomic push: either every ref is accepted or none is, so a rejection of any one leaves the remote untouched. This is the one git tool whose effect leaves this machine. Reaches the network and changes the remote.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    PushAct:
+      description: 'What to do to one ref on the remote: `update_branch` sets a branch to a revision, `delete_branch` removes it, `update_tag` publishes a tag, `delete_tag` removes one.'
+      enum:
+      - update_branch
+      - delete_branch
+      - update_tag
+      - delete_tag
+      type: string
+    PushItem:
+      description: One ref to change on the remote, chosen by `action`.
+      properties:
+        action:
+          allOf:
+          - $ref: '#/definitions/PushAct'
+          description: What to do to this ref.
+        expected:
+          description: 'What the remote ref must currently hold. Optional, and omitting it is the ordinary case: the lease then comes from this repository''s remote-tracking ref, which is the value that actually protects a concurrent push. Give it only when naming a specific id read after a git_fetch.'
+          type: string
+        name:
+          description: The ref's name on the remote — a branch name or a tag name, to match `action`. Required.
+          type: string
+        new:
+          description: Require that the ref does not exist on the remote yet — publishing a branch or a tag for the first time. Takes the place of `expected`.
+          type: boolean
+        source:
+          allOf:
+          - $ref: '#/definitions/RevArg'
+          description: What to publish, for the update actions. Leave it out for the local branch or tag of the same name.
+      required:
+      - action
+      - name
+      type: object
+    RevArg:
+      description: 'A revision. `kind` picks the form and `name` carries its value.'
+      properties:
+        back:
+          description: For `parent` only — how many commits back. Defaults to 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        kind:
+          description: 'Which form: `head` (your own commit — the branch you are on as your files have it — needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          enum:
+          - head
+          - branch
+          - tag
+          - ref
+          - commit
+          - remote_branch
+          - upstream
+          - parent
+          type: string
+        name:
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
+          type: string
+      required:
+      - kind
+      type: object
+  properties:
+    pushes:
+      description: 'The refs to change, at least one and at most fifty. They go in one atomic push: either every one is accepted or none is. Leave each item''s `expected` out unless you are naming a specific id — the lease is taken from the remote-tracking ref — and run git_fetch first so that ref is current.'
+      items:
+        $ref: '#/definitions/PushItem'
+      maxItems: 50
+      minItems: 1
+      type: array
+    remote:
+      description: The remote to push to, as git_refs reports it — usually `origin`. Required.
+      minLength: 1
+      type: string
+    repo:
+      description: The repository to push from. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - remote
+  - pushes
+  title: PushRequest
+  type: object
+examples:
+- push this branch to origin<|im_end|>
+- publish the release tag we just cut<|im_end|>
+- delete the stale feature branch on the remote<|im_end|>
+- push my branch and the tag together in one atomic push<|im_end|>
+- my branch is local only, put it on origin for the first time<|im_end|>
+- push the rebased branch over the old one without clobbering anyone<|im_end|>
+- that tag on the remote is wrong, remove it<|im_end|>
+- send this work upstream so the team can see it<|im_end|>
+- push the v0.2.0 tag to origin<|im_end|>
+- get rid of the scratch tag on the remote<|im_end|>

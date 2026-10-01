@@ -1,15 +1,9 @@
+use super::named_tool::steer_to_named_tool;
 use super::spec_chooser::SpecChooser;
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use candle_transformers::models::speculative_choice::{AcceptWalk, TokenChooser};
-
-/// Max number of LOW-priority (bulk-ingest) decodes allowed to co-batch into a
-/// wave that also carries a HIGH-priority (interactive dialogue) decode. Keeps
-/// the forward small enough that a dialogue token isn't stuck behind dozens of
-/// ingest sequences, while still amortizing per-layer expert loads across a
-/// handful of ingest rows. Deferred ingest decodes run on the next wave.
-const MAX_INGEST_COBATCH_WITH_DIALOGUE: usize = 8;
 
 impl Scheduler {
     /// Emit the steering finish trace: a one-line summary of the path the
@@ -57,7 +51,7 @@ impl Scheduler {
                 100.0 * num as f64 / den as f64
             }
         };
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::scheduler::reproject",
             glue_ms,
             glue_tokens,
@@ -352,48 +346,36 @@ impl Scheduler {
             .filter(|id| !glue_pending.contains(&id.0))
             .collect();
 
-        // ── Interactive-decode priority ──────────────────────────────────────
-        // A HIGH-priority (interactive dialogue) decode must not be trapped
-        // behind a large bulk-INGEST co-batch — a single dialogue token stuck in
-        // a 40-sequence forward is what collapses interactive latency. When a
-        // high-priority decode is present this wave, move the high-priority
-        // decodes to the FRONT of the batch and cap how many LOW-priority
-        // (ingest) decodes ride along, so the forward stays small and the
-        // dialogue token lands fast. The deferred ingest decodes are still active
-        // — they simply run on the next wave — so this is pure scheduling, no
-        // correctness impact. `decode_layer_priority` returns `None` for an
-        // unresolvable slot; treat those as `High` (protective) so a real decode
-        // is never wrongly demoted into the ingest cap.
-        if seq_ids.len() > 1 {
-            let prio: std::collections::HashMap<SequenceId, crate::projection::DecodePriority> =
-                seq_ids
-                    .iter()
-                    .map(|&id| {
-                        (
-                            id,
-                            self.decode_layer_priority(id)
-                                .unwrap_or(crate::projection::DecodePriority::High),
-                        )
-                    })
-                    .collect();
-            let has_high = prio
+        // **Why this wave is as wide as it is, in the one place that decides.** A decode
+        // forward's width is the whole of decode throughput, and it is not a cap — it is
+        // whatever survives these filters. Reading it from the outside is guesswork: a
+        // width of four could be four sequences active, or twenty with sixteen held back,
+        // and those are unrelated problems. Every term that removed a row is named.
+        tracing::trace!(
+            target: "candle_conversation::scheduler::throttle",
+            active = self.active_decodes.len(),
+            finished = self
+                .active_decodes
                 .values()
-                .any(|p| *p == crate::projection::DecodePriority::High);
-            if has_high {
-                // High (ratio 64) → Normal (16) → Low (1): dialogue at the front.
-                seq_ids.sort_by_key(|id| std::cmp::Reverse(prio[id].ratio()));
-                let mut low_kept = 0usize;
-                seq_ids.retain(|id| {
-                    if prio[id] == crate::projection::DecodePriority::Low {
-                        low_kept += 1;
-                        low_kept <= MAX_INGEST_COBATCH_WITH_DIALOGUE
-                    } else {
-                        // High/Normal always ride — never capped.
-                        true
-                    }
-                });
-            }
-        }
+                .filter(|s| s.finished)
+                .count(),
+            glue_pending = glue_pending.len(),
+            selected = seq_ids.len(),
+            "decode row selection",
+        );
+
+        // ── Interactive-decode priority ──────────────────────────────────────
+        // Lower-priority decodes sit out while higher-priority work is running
+        // and for a cooldown after it (`priority_pause`), so an ingest co-batch
+        // never widens the dialogue's forward and never takes the device in the
+        // gap between its tool rounds. A paused decode stays active and resumes
+        // where it stopped — pure scheduling. Among what remains, the highest
+        // priority leads, so the adapter rule below keeps the dialogue's.
+        // `decode_priority_or_high` treats an unresolvable slot as `High`, so a
+        // real decode is never wrongly paused.
+        self.observe_priorities();
+        seq_ids.retain(|&id| !self.priority_paused(id));
+        seq_ids.sort_by_key(|&id| std::cmp::Reverse(self.decode_priority_or_high(id).ratio()));
 
         // ── One adapter per wave ─────────────────────────────────────────────
         //
@@ -418,19 +400,24 @@ impl Scheduler {
         }
 
         if seq_ids.is_empty() {
-            // Every active decode is deferred-glue-pending, so there is no decode
-            // row to run this wave — but the glue that is BLOCKING them must still
-            // fire, or the slots stay excluded forever. The glue drains only in
-            // `take_wave_glue` inside `decode_forward_cobatched` (below, past the
-            // early return); `run_prefill_until_budget`'s glue drain is gated
-            // behind `decode_width() == 0`, which these excluded-but-live slots
-            // hold `> 0`. So without this, neither path fires the glue: a hard
-            // deadlock — 0 forwards, `decode_ms` spinning, the turn never decodes.
-            // Drive a glue-only wave (no decode/prefill rows) to drain the deferred
-            // fire, materialising the gap so the slot decodes next wave.
-            if !self.deferred_glue_fires.is_empty() {
+            // Every active decode is excluded this wave — deferred-glue-pending,
+            // or paused behind higher-priority work (`priority_pause`) — so there
+            // is no decode row to run. But the work those rows would have carried
+            // must still move: `run_prefill_until_budget` is gated behind
+            // `decode_width() == 0`, which these excluded-but-live slots hold
+            // `> 0`, so the prefill cohort, section chunks and deferred glue ride
+            // ONLY the decode sweep. Without this, neither path advances them: a
+            // hard deadlock — 0 forwards, the queue standing still. Measured with
+            // the pause: ingest decodes paused, the dialogue's next-round prefill
+            // (1,856 tokens) never advanced, and the turn hung until killed.
+            // Drive a decode-less wave, exactly as `run_prefill_until_budget`
+            // would, whenever any of the three has work.
+            if !self.deferred_glue_fires.is_empty()
+                || self.prefill_width() > 0
+                || self.section_ingest_width() > 0
+            {
                 if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
-                    tracing::error!("decode: deferred-glue drain wave failed: {e}");
+                    tracing::error!("decode: decode-less wave for excluded rows failed: {e}");
                 }
             }
             return;
@@ -438,7 +425,7 @@ impl Scheduler {
 
         let _t_step = super::PhaseTimer::new("decode_batch_step");
 
-        tracing::debug!(
+        tracing::trace!(
             target: "sched",
             "decode batch={} prefill_active={}",
             seq_ids.len(),
@@ -614,6 +601,19 @@ impl Scheduler {
         // sequence, and pricing it as one row each would understate the wave.
         self.wave_stats
             .record(false, seq_ids.len(), wave_rows, kv_len, fwd_ms);
+        // What this step cost, taught to the planner. A bus-bound step says
+        // nothing about the layer time and the model discards it; a
+        // compute-bound one is the only thing that can move an estimate the
+        // decode side was seeded 26x optimistic on. The hit coefficient rides
+        // the same moment because it is read from the counters this forward just
+        // moved.
+        // Microseconds, not the truncated millisecond the stats line uses: the
+        // truncation is a floor, so it teaches the model that every forward was
+        // faster than it was — a 1.4 ms step reads as 1.0, and a sub-millisecond
+        // one as zero and is dropped entirely. That bias lands straight on
+        // `layer_secs`, which is the estimate this wiring exists to correct.
+        self.observe_decode_forward(seq_ids.len(), fwd_us);
+        self.observe_expert_hit_rate();
 
         // Reads the scored rows back and advances each sequence by what the wave
         // actually wrote — the walk below rolls the rejected tail off again.
@@ -1112,7 +1112,7 @@ impl Scheduler {
                         }
                     }
                     None => {
-                        if let Some(driver) = state.triggers.driver_for(token) {
+                        if let Some(mut driver) = state.triggers.driver_for(token) {
                             // A trigger token (e.g. `<tool_call>`) opened a grammar:
                             // steer the rest of this call to the catalog's shape.
                             // A once-trigger (the think block) is spent by firing,
@@ -1127,6 +1127,21 @@ impl Scheduler {
                                 trigger = token,
                                 "stencil steering started (trigger token decoded)",
                             );
+                            // The call writes the tool its reasoning named.
+                            if driver.tree().label() == TOOL_CALL_TREE_LABEL {
+                                if let Some(name) = steer_to_named_tool(
+                                    &self.tokenizer,
+                                    &state.generated_tokens,
+                                    &mut driver,
+                                ) {
+                                    tracing::debug!(
+                                        target: "candle_conversation::stencil",
+                                        seq_id = seq_id.0,
+                                        tool = %name,
+                                        "tool name steered to the tool the reasoning named",
+                                    );
+                                }
+                            }
                             state.stencil = Some(driver);
                         }
                     }
@@ -1200,7 +1215,8 @@ impl Scheduler {
                 .get(&seq_id)
                 .is_some_and(|s| s.free_tool_calls_from_penalties);
             let in_stencil = freed && label.is_some();
-            let in_tool_call = freed && label == Some(super::TOOL_CALL_TREE_LABEL);
+            let writing_call = label == Some(super::TOOL_CALL_TREE_LABEL);
+            let in_tool_call = freed && writing_call;
             if let Some(ss) = self.sampling_states.get_mut(&seq_id) {
                 if in_stencil && !ss.dry_suppressed {
                     ss.enter_tool_call();
@@ -1208,6 +1224,9 @@ impl Scheduler {
                     ss.exit_tool_call();
                 }
                 ss.in_tool_call = in_tool_call;
+                // Unconditional, unlike the penalty lift: the length budget is
+                // a prose answer's and never a call's, whoever the caller is.
+                ss.writing_call = writing_call;
             }
         }
 
@@ -1782,7 +1801,7 @@ impl Scheduler {
         let plan_refs: Vec<&super::projection_assembler::GapFillPlan> =
             inflights.iter().map(|i| &i.plan).collect();
         let glue_total: usize = inflights.iter().map(|i| i.plan.n_glue_tokens).sum();
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::scheduler::reproject",
             n_slots = inflights.len(),
             glue_total,
@@ -1865,7 +1884,7 @@ impl Scheduler {
     }
 
     /// Send an error to all active decodes and mark them finished.
-    fn fail_all_decodes(&mut self, seq_ids: &[SequenceId], msg: &str) {
+    pub(super) fn fail_all_decodes(&mut self, seq_ids: &[SequenceId], msg: &str) {
         for &id in seq_ids {
             if let Some(state) = self.active_decodes.get_mut(&id) {
                 let _ = state

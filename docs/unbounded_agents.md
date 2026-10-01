@@ -1,6 +1,6 @@
 # One Card, One Stack: Constraint-Driven Architecture for Asymptotically Stable Inference over Unbounded Agent Memory
 
-> **Status — v1 Technical Report.** This document describes a working prototype released to establish priority on the architecture, the theorem, and the Speculative Context Decode mechanism. Throughput and kernel benchmarks (§9.4–§9.6) are fully measured on production hardware. Quality evaluations §9.7–§9.9 (kernel accuracy, KV compression, cross-architecture transfer), and §9.10 (provenance strategy sweep, depth weight calibration, and score threshold derivation — full three-phase calibration on 1,024 scenarios / 250K tokens) are fully reported. §9.11 (concurrent session entity tracking) and §9.12 (codebase dependency analysis) are described with methodology and qualitative results; full quantitative tables will be reported in v2. The live system and full codebase are publicly released to enable independent verification in the interim. v2 will incorporate community validation results, optimizations, and critical review — contributions and collaboration are welcome — contributors will be recognized in v2 (see Appendix C)
+> **Status — v2 Technical Report, in preparation.** v1 was published on 13 May 2026 ([10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) and is archived unchanged, with an erratum, at `docs/unbounded_agents_v1.md`. v2 replaces v1's single-machine throughput section with a measured evaluation across three machines (RTX 4090 Laptop GPU 16 GB, RTX 3090 24 GB, RTX PRO 5000 Blackwell 72 GB) and twelve models from 0.5B to 284B parameters, including context-depth sweeps to 128K tokens and a comparison against every published figure for the same models on the same classes of card (§9.6). Every number in §9.6 is produced by a test in this repository and recorded, with its source row, in `docs/performance.md`. v1's headline figures of "509 t/s single-session" and "2,446 t/s across 64 sessions" were prefill rates at one and twenty contexts and are withdrawn (see the v1 erratum). Kernel benchmarks (§9.4–§9.5) and the provenance calibration (§9.10) are carried over from v1. §9.11 (concurrent session entity tracking) and §9.12 (codebase dependency analysis) are described with methodology and qualitative results; their quantitative tables are the remaining work before the v2 release. Contributions and collaboration are welcome — contributors will be recognized in v2 (see Appendix C).
 
 **Abstract**
 
@@ -8,11 +8,11 @@ Persistent agentic systems require context that grows without bound. Under stand
 
 The key theoretical result (**Theorem §11.2 — Asymptotic Numerical Stability**): under provenance-selected attention over a tiered context, total numerical error per generation step — from any source, including floating-point rounding — is bounded by a constant O(1) independent of context depth N, in contrast with the O(N) scaling of standard full-attention systems. Under practical system conditions (warm-tier blocks originating from prefill-refreshed hot-tier blocks) this constant is small, approaching the hot-tier error floor. This inverts the universal assumption of the KV quantization literature that error grows with N.
 
-The system is built on four integrated contributions: (1) an online self-learning Markov expert prediction system with DMA offload and wave-batched grouped GEMM achieving stall-free MoE inference under partial VRAM residency; (2) an adaptive per-block KV quantization family spanning FP16 to 2-bit integer with boundary-aware sub-block structure, two-phase prefill refresh eliminating autoregressive decode drift, and per-block selection across ten compression modes ranging from 1.21× (top-quality tier) to 4.67× (highest-compression tier) per-head — with asymmetric K/V error metrics matched to the softmax-amplified K and linear-bounded V error propagation paths — the production-achievable range given the attention kernel's per-head gather constraint — using asymmetric K/V thresholds grounded in the softmax error amplification asymmetry, with overall system compression ratio dependent on block-level mode distribution; (3) attentional provenance indexing via Q-vector cognitive-state fingerprints with Speculative Context Decode — a pipelined two-session generation loop that hides CPU provenance scoring (3–10ms flat scan) behind a parallel variable-window probe session terminating at newline boundaries, yielding working-set refinement at the model's natural reasoning granularity with near-zero visible overhead ; and (4) an unbounded three-tier paged context (VRAM-hot, CPU RAM-warm, disk-cold) with adaptive quantization calibrated to the asymptotic guarantee. Each contribution originated from a hard constraint that closed the standard solution and forced an architectural choice that turns out to be universally correct.
+The system is built on four integrated contributions: (1) an online self-learning Markov expert prediction system with DMA offload and wave-batched grouped GEMM achieving stall-free MoE inference under partial VRAM residency; (2) an adaptive per-block KV quantization family spanning FP16 to 2-bit integer with boundary-aware sub-block structure, two-phase prefill refresh eliminating autoregressive decode drift, and per-block selection across eleven compression levels (C0–C10) with asymmetric K/V error metrics matched to the softmax-amplified K and linear-bounded V error propagation paths — the top level compressing the KV cache 4.1×–7.6× across twelve models with every session's output validated; (3) attentional provenance indexing via Q-vector cognitive-state fingerprints with Speculative Context Decode — a pipelined two-session generation loop that hides the provenance scan (a GPU tensor-core scan over a VRAM-resident gallery, ~9.5 ms on a 16 GB laptop GPU) behind a parallel variable-window probe session terminating at newline boundaries, yielding working-set refinement at the model's natural reasoning granularity with near-zero visible overhead ; and (4) an unbounded three-tier paged context (VRAM-hot, CPU RAM-warm, disk-cold) with adaptive quantization calibrated to the asymptotic guarantee. Each contribution originated from a hard constraint that closed the standard solution and forced an architectural choice that turns out to be universally correct.
 
-Implemented in Rust on a custom Candle fork with native quantized matmul kernels that never materialise a full-precision weight copy, the system demonstrates **509 t/s single-context** — 2.6–3.4× faster than community benchmarks for this model on RTX 4090 24GB with standard single-session frameworks [hardware-corner.net, 2025; ToolHalla, 2026] — and **2,446 t/s aggregate across 64 concurrent persistent-memory sessions** on an RTX 4090 Mobile (16GB). The concurrent-session figure reflects server throughput across 64 simultaneous agents; no standard framework runs this model on 16GB at comparable concurrency.
+Implemented in Rust on a custom Candle fork with native quantized matmul kernels that never materialise a full-precision weight copy, the system runs a **180B-parameter mixture-of-experts model (Qwen3.8-Flash-Next) on a 16 GB laptop GPU with 32 GB of host RAM**, serving eight concurrent sessions at 64.7 t/s aggregate decode — above every published single-GPU run of the model, each on a machine with 64–128 GB of RAM. Its throughput is flat in context depth: from 32K to 128K tokens it keeps **99% of its prefill and 111% of its decode**, the O(1) property measured on a stopwatch. The top compression level holds the KV cache at **up to 7.6×**, written inline as each block is sealed, at nearly 4× the compression of llama.cpp's q8_0 cache while slowing decode less. Serving concurrent conversations, one card's aggregate decode exceeds the best published llama.cpp single-stream rate for the same model and card class by **1.8–6.1×**, reaching **1,201.6 t/s across 64 sessions** of Qwen3.6-35B-A3B on one 72 GB card; and a **284B model (DeepSeek-V4-Flash) serves sixteen concurrent sessions from a single GPU** at 1,120.6 t/s prefill and 73.5 t/s aggregate decode, 2.6× the best published single-GPU decode (§9.6).
 
-An evaluation methodology is described in §9.12 using the system's own 2.2M-line Rust/CUDA Candle fork as the test subject: the system is ingested into unbounded context via a ~20M-token learning-phase conversation, then queried via iterative multi-hop retrieval during decode. The one-shot ablation — same index, single pre-generation retrieval — isolates the contribution of continuous decode-time retrieval. Quantitative results are reserved for v2, which will incorporate community validation and independent optimization. The working system is publicly available for live verification and collaborative development (Appendix C).
+An evaluation methodology is described in §9.12 using the system's own 2.2M-line Rust/CUDA Candle fork as the test subject: the system is ingested into unbounded context via a ~20M-token learning-phase conversation, then queried via iterative multi-hop retrieval during decode. The one-shot ablation — same index, single pre-generation retrieval — isolates the contribution of continuous decode-time retrieval. Its quantitative results are the remaining work before this version's release. The working system is publicly available for live verification and collaborative development (Appendix C).
 
 ---
 
@@ -24,11 +24,14 @@ This paper identifies the cause and provides the fix. The cause is structural: u
 
 This system did not originate from a theoretical observation. It originated from two constraints accepted simultaneously and without compromise: a demanding application requiring the hardest possible form of persistent memory, and a hard VRAM ceiling that could not be exceeded. The demanding application is persistent agent conversations — chosen because autonomous agents represent the worst-case instantiation of the persistent-memory problem. They require verbatim factual recall across sessions that grow indefinitely, semantic coherence across arbitrary time gaps, high concurrency across many simultaneous agents, and deployment on hardware with no datacenter budget. Any system that works for this use case works for any less-demanding persistent-memory deployment. The constraints forced architectural choices that turned out to solve the problem at the level of principle: native quantized matmul kernels written because standard GEMM dequantisation OOMed — strictly faster on unconstrained hardware; provenance-selected attention implemented because VRAM is finite and full context cannot be held hot — the mechanism that produces the hardware-independent asymptotic guarantee; two-phase quantisation designed because materialising full turns at F16 across many sessions OOMs — the design that correctly separates two independent error sources prior work conflated. Section §11.5 documents this pattern in full.
 
-We present an inference system designed to implement this architectural requirement — deliberately constrained to a single 16GB consumer GPU so that every architectural choice falls out of the constraint rather than being imposed on top of it, and validated empirically on that hardware. The system:
+We present an inference system designed to implement this architectural requirement — deliberately constrained to a single 16GB consumer GPU so that every architectural choice falls out of the constraint rather than being imposed on top of it, and validated empirically on that hardware and on two larger cards. The system:
 
-- Runs Qwen3-30B-A3B on a single 16GB RTX 4090 Mobile at 509 t/s single-session (2.6–3.4× faster than community benchmarks for this model on RTX 4090 24GB with standard frameworks) and 2,446 t/s aggregate across 64 concurrent persistent-memory sessions; no standard framework runs this model on 16GB at this concurrency
-- Supports 64 concurrent persistent-memory agent sessions with unbounded conversation history on 16GB, each maintaining genuine long-term context across arbitrarily many turns
-- Achieves per-block validated KV cache compression across ten measured modes with asymmetric K/V thresholds, with the top-quality mode achieving K_SNR 58.6 dB — directly validating the ε_hot ≈ 0 claim of the Asymptotic Numerical Stability theorem
+- Runs a 180B-parameter mixture-of-experts model (Qwen3.8-Flash-Next, 6B active) on a 16GB RTX 4090 Laptop GPU with 32GB of host RAM, streaming its experts VRAM → RAM → NVMe, and serves eight concurrent sessions at 64.7 t/s aggregate decode with every session's output validated — above every published single-GPU run of the model, each on a host with 64–128GB of RAM
+- Keeps throughput flat in context depth: from 32K to 128K tokens Flash-Next retains 99% of its prefill and 111% of its decode, with speculative acceptance fixed at 4.85 tokens per step from 8K to 128K
+- Compresses the KV cache up to 7.6× inline, each 32-token block choosing its own format as it is sealed, with prefill within 5% of uncompressed at every depth; at 8K the top level costs 0–8% of decode for 3.3×–6.3×
+- Serves concurrent sessions at an aggregate decode 1.8–6.1× the best published llama.cpp single-stream rate for the same model and card class, reaching 1,201.6 t/s across 64 sessions on one 72GB card and 256 concurrent sessions on a 0.8B model
+- Runs a 284B model (DeepSeek-V4-Flash) at sixteen-way concurrency on a single GPU: 1,120.6 t/s prefill and 73.5 t/s aggregate decode, 2.6× the best published single-GPU decode
+- Achieves per-block validated KV cache compression across eleven levels with asymmetric K/V thresholds, with the top-quality level achieving K_SNR 58.6 dB — directly validating the ε_hot ≈ 0 claim of the Asymptotic Numerical Stability theorem
 - Eliminates the decode-time numerical drift that degrades generation quality beyond ~500 tokens
 - Demonstrates compositional multi-hop reasoning over its own 2.2M-line Rust/CUDA Candle fork via iterative decode-time retrieval: the one-shot ablation confirms iterative retrieval discovers transitive dependencies that pre-generation retrieval misses, with accuracy independent of dependency chain depth (§9.12; qualitative result and live demo in v1, full quantitative evaluation in v2)
 
@@ -36,9 +39,9 @@ The system is implemented entirely in Rust on a custom fork of the Candle framew
 
 **Three independent contributions.** This paper makes three distinct contributions with different communities of impact and different timescales.
 
-*For inference systems researchers:* 509 t/s single-session on a 16GB consumer GPU — 2.6–3.4× faster than community benchmarks for this model on RTX 4090 24GB with Ollama/llama.cpp — and 2,446 t/s aggregate across 64 concurrent persistent-memory sessions (a workload no standard framework supports on 16GB). The high-concurrency design is not incidental: unbounded context with provenance-selected attention requires simultaneous parallel prefill across semantic boundaries and multi-dimensional decode across concurrent sessions — the architecture only achieves its full performance and quality properties under genuine concurrency load. The codebase dependency analysis evaluation demonstrates that unbounded context enables compositional multi-hop reasoning over real structured data: the system walks transitive dependency chains through its own codebase via iterative retrieval during decode, discovering relationships that pre-generation one-shot retrieval misses. (See Appendix C for code, live demo, and collaboration details.)
+*For inference systems researchers:* a 180B model served to eight concurrent sessions from a 16GB laptop GPU; throughput that does not fall as context grows from 32K to 128K; up to 7.6× KV compression written inline; and one card's aggregate decode at 1.8–6.1× the best published llama.cpp rate for the same model and card class, up to 1,201.6 t/s across 64 sessions (§9.6). The high-concurrency design is not incidental: unbounded context with provenance-selected attention requires simultaneous parallel prefill across semantic boundaries and multi-dimensional decode across concurrent sessions — the architecture only achieves its full performance and quality properties under genuine concurrency load. The codebase dependency analysis evaluation demonstrates that unbounded context enables compositional multi-hop reasoning over real structured data: the system walks transitive dependency chains through its own codebase via iterative retrieval during decode, discovering relationships that pre-generation one-shot retrieval misses. (See Appendix C for code, live demo, and collaboration details.)
 
-*For the KV quantization and ML theory community:* the Asymptotic Numerical Stability theorem (§11.2), which reframes the foundational problem of this subfield. The current literature treats KV quantization as an optimization problem — find the best compression scheme within a regime where error grows with context depth. The theorem establishes that the regime itself is escapable through architectural means, and that provenance-selected sparse attention is both necessary and sufficient for the escape. This changes what the right research questions are, not just the answers.
+*For the KV quantization and ML theory community:* the Asymptotic Numerical Stability theorem (§11.2), which reframes the foundational problem of this subfield. The current literature treats KV quantization as an optimization problem — find the best compression scheme within a regime where error grows with context depth. The theorem establishes that the regime itself is escapable through architectural means: provenance-selected sparse attention with a working set bounded independently of depth is sufficient for the escape, and something functionally equivalent to it is necessary. This changes what the right research questions are, not just the answers.
 
 *For the broader research community:* the constraint-driven innovation methodology documented in §11.5 — a specific, reproducible pattern in which constraints that close standard solutions force replacements that are universally better. This is the contribution with the longest half-life and the most generalisable implications.
 
@@ -52,7 +55,7 @@ The combination of bounded numerical error and compositional reasoning at unboun
 
 2. **Two-Phase KV Cache Quantization with Prefill Refresh** — a turn-boundary prefill refresh strategy that eliminates autoregressive error accumulation, coupled with an adaptive per-block selection kernel that assigns independent K/V formats based on asymmetric error metrics grounded in the softmax-amplified K vs. linear-bounded V error propagation asymmetry [AsymKV, COLING 2025]. Compression ratios span three tiers from near-lossless (top-quality) to high-compression, validated end-to-end by the multi-session story rewrite test (§9.8).
 
-3. **Attentional Provenance Indexing with Speculative Context Decode** — capturing Q vectors as persistent cognitive-state fingerprints and binarising them into 128-bit BDP signatures via an 8-head XOR fold across two syntactic-band layer depths (MH_XOR_QQ_l0×l4), enabling 3–10ms CPU-side section discrimination and corpus retrieval via span-scored BDP matching (α=2.0) and six INT8 matrix multiplies over 50K+ conversation turns and 100K+ facts. During generation, Speculative Context Decode (§6.5) pipelines a variable-window probe session — up to 64 tokens, terminated at newline boundaries — in parallel with each real decode session: the probe's Q/K fingerprints drive CPU provenance scoring at each reasoning step boundary, assembling the next context window while the current one decodes. The 3–10ms CPU scan latency is fully hidden behind parallel GPU computation, yielding near-zero visible overhead. Probe tokens are discarded and never enter the KV cache. Evaluated in §9.12 on the system's own 2.2M-line Rust/CUDA Candle fork (~20M tokens of learning-phase conversation): each probe cycle during reasoning retrieves the next dependency node at the model's natural reasoning granularity, producing compositional dependency analysis across direct, transitive, and architectural categories that single pre-generation retrieval cannot replicate.
+3. **Attentional Provenance Indexing with Speculative Context Decode** — capturing Q vectors as persistent cognitive-state fingerprints and binarising them into Binary Directional Provenance signatures — packed Q sign bits folded per head — matched Q→Q by sign agreement (XNOR + popcount). The signature design was calibrated on a 128-bit 8-head XOR fold across two syntactic-band layer depths (MH_XOR_QQ_l0×l4, §9.10); the production signature is its 12-head, 192-byte-per-token successor (§6.6). The corpus is scanned on the GPU over a VRAM-resident paged gallery by tensor-core kernels — 1-bit BMMA on Ada at ~9.5 ms steady-state on a 16GB laptop GPU, INT8 IMMA on Blackwell — bit-identical to a scalar reference. During generation, Speculative Context Decode (§6.5) pipelines a variable-window probe session — up to 64 tokens, terminated at newline boundaries — in parallel with each real decode session: the probe's Q fingerprints drive provenance scoring at each reasoning step boundary, assembling the next context window while the current one decodes. The scan's result feeds the next reprojection rather than blocking the current forward, so its latency stays off the decode's critical path. Probe tokens are discarded and never enter the KV cache. Evaluated in §9.12 on the system's own 2.2M-line Rust/CUDA Candle fork (~20M tokens of learning-phase conversation): each probe cycle during reasoning retrieves the next dependency node at the model's natural reasoning granularity, producing compositional dependency analysis across direct, transitive, and architectural categories that single pre-generation retrieval cannot replicate.
 
 4. **Unbounded Three-Tier Paged Context** — a VRAM-hot / CPU RAM-warm / disk-cold paged context architecture, together with a formal proof that total numerical error per generation step — from any source, including F16 rounding — is bounded by a constant O(1) independent of context depth N under provenance-selected attention, in contrast with the O(N) scaling of full-attention systems. This result is independent of hardware: more VRAM defers the accumulation threshold but does not eliminate the structural problem, which is architectural rather than representational. The theorem establishes that bounded error accumulation at unbounded context depth requires decoupling of working set size from context depth — a property our architecture provides and standard full-attention systems cannot.
 
@@ -72,7 +75,7 @@ Our Markov predictor learns online from actual routing observations, has no cali
 
 The online, inference-time, training-free KV cache quantization field has three meaningful entries. **KIVI** [Liu et al., ICML 2024] established channel-wise outlier structure in Keys and token-wise structure in Values, motivating per-channel K and per-token V quantization at uniform 2-bit. It is the standard baseline: well-reproduced, widely cited, but a blunt instrument — identical format assigned to every block regardless of activation difficulty. Their Table 2 shows quality degradation on long-context retrieval tasks at 5× CR. **KVQuant** [Hooper et al., NeurIPS 2024] added sensitivity-aware treatment: per-vector outlier handling and special-casing of the first token, achieving sub-0.1 perplexity degradation at 3-bit. The contribution was demonstrating that careful outlier handling makes aggressive uniform quantization viable — but format assignment remains population-level, not per-block. **TurboQuant** [Zandieh et al., ICLR 2026] achieves near-optimal compression via Hadamard rotation and Lloyd-Max quantization. The rotation spreads energy uniformly before quantization, with theoretical advantage below 3-bit. In practice, community benchmarks on Qwen3 find that Q4_0 matches or exceeds PolarQuant-MSE (the residual implementation after removing QJL) at comparable 4–5× compression ratios, suggesting the rotation overhead does not pay for itself in the range where most deployments operate.
 
-**KITTY** [Xia et al., 2025] demonstrates that mixed-precision channel-wise quantization can recover most of the accuracy gap between 2-bit and 4-bit Key caches by boosting 12.5–25% of channels to 4-bit. Their selection uses an offline-computed magnitude ranking; the authors note that "more principled or adaptive strategies may yield stronger robustness accuracy recovery" as future work. This paper addresses that directly. The binary precision-boost decision is replaced with adaptive per-block format selection using per-block reconstruction error in the Q-projected metric for K and normalised-L2 error for V. The selector operates at per-(layer, head) block granularity and is recomputed per operating point. We extend adaptation to V as well as K, providing an 11-point Pareto curve (C0–C9) rather than two configurations, and operating on the harder MoE deployment target without model-specific recalibration.
+**KITTY** [Xia et al., 2025] demonstrates that mixed-precision channel-wise quantization can recover most of the accuracy gap between 2-bit and 4-bit Key caches by boosting 12.5–25% of channels to 4-bit. Their selection uses an offline-computed magnitude ranking; the authors note that "more principled or adaptive strategies may yield stronger robustness accuracy recovery" as future work. This paper addresses that directly. The binary precision-boost decision is replaced with adaptive per-block format selection using per-block reconstruction error in the Q-projected metric for K and normalised-L2 error for V. The selector operates at per-(layer, head) block granularity and is recomputed per operating point. We extend adaptation to V as well as K, providing an 11-point Pareto curve (C0–C10) rather than two configurations, operating on dense, MoE, DeltaNet-hybrid and native-sparse models up to 284B parameters without per-model calibration.
 
 Everything else in the quantization-adjacent space is either orthogonal or a different design point. Token eviction systems (H2O, TOVA, StreamingLLM) are lossy by definition — they solve a different problem. Trained compression (DMS) requires fine-tuning. SVD-based approaches (xKV, LoRC) are per-prompt and offline-flavoured. KVTC [Staniszewski & Łańcucki, ICLR 2026] achieves ~20× compression via PCA decorrelation and entropy coding but operates offline on completed caches for storage and transfer rather than during live inference — a complementary design point. None of these compete in the online inference-time setting.
 
@@ -114,8 +117,8 @@ Token Embeddings
 │               │  wave-batched parallel    │               │
 │               └──────────┬───────────────┘               │
 │                     BARRIER                               │
-│          CPU provenance scan on PROBE_{N+1}               │
-│          (3–10ms, overlaps late decode tokens)            │
+│          GPU provenance scan on PROBE_{N+1}               │
+│          (~9.5 ms, overlaps late decode tokens)           │
 │          Assemble context window for DECODE_{N+1}         │
 └──────────────────────────────────────────────────────────┘
        │
@@ -203,13 +206,17 @@ The four-part policy eliminates cascades:
 
 **Part 4 — Free-slot-only prefetch.** As described above. Mispredictions are inert.
 
-Measured improvement on RTX 4080 at 44% residency:
+**The production cache: three tiers.** The four-part policy was designed for a two-tier cache in which every expert not in VRAM sat in pinned RAM. The production cache treats the on-disk expert pack as authoritative and VRAM and pinned RAM as independent faster copies of it, so an expert can be resident in both and eviction never writes bytes back. Its eviction key keeps Parts 2–3's intent: access frequency weighted by the wrapped forward distance to the layer's next use — Bélády's ordering, computed exactly because the layer wave is a cycle — evaluated in passes by tier, so a pack-only expert, whose miss costs an NVMe read, is protected over a warm-backed one whose miss is a ~116μs copy from pinned memory. Measured on Qwen3-30B-A3B, RTX 4090 Laptop GPU (16GB), aggregate prefill t/s, the two-tier cache against the three-tier cache it was replaced by (design and full history: `docs/expert_cache_design.md` §12.5):
 
-| Config | Before (v2) | After (v3) | Δ |
+| Config | Two-tier | Three-tier | Δ |
 |---|---|---|---|
-| BF16 × 1 context | 199.9 t/s | 241.5 t/s | +20.8% |
-| BF16 × 4 contexts | 685.3 t/s | 1090.1 t/s | +59.1% |
-| Q8_0 × 8 contexts | 1220.2 t/s | 1699.9 t/s | +39.3% |
+| F16 × 1 context | 377.5 t/s | 708.1 t/s | +87% |
+| BF16 × 1 context | 509.4 t/s | 780.6 t/s | +53% |
+| BF16 × 10 contexts | 1,931.4 t/s | 2,726.1 t/s | +41% |
+| Q8_0 × 20 contexts | 2,448.1 t/s | 2,732.5 t/s | +12% |
+| C9 × 2 contexts | 951.4 t/s | 1,463.1 t/s | +54% |
+
+The same gate now measures 1,547.0 t/s at one context and 3,999.7 t/s at twenty (§9.6).
 
 ### 4.4 Wave-Batched Grouped GEMM
 
@@ -228,7 +235,7 @@ Phase 2: Submit grouped GEMM for newly-READY experts
 Join:    Submit index_add scatter for all expert outputs
 ```
 
-The CPU never blocks. All submissions are async. The GPU resolves ordering through stream dependencies. For a typical layer with 6 hot experts and 2 cold experts, the 6-expert grouped GEMM at ~200ms overlaps with the 2 cold expert DMAs at ~120ms each — the fence wait is typically zero.
+The CPU never blocks. All submissions are async. The GPU resolves ordering through stream dependencies. For a typical layer with 6 hot experts and 2 cold experts, the 6-expert grouped GEMM overlaps with the 2 cold expert DMAs at ~120μs each — the fence wait is typically zero.
 
 Cross-request coalescing is the true batch dimension for MoE inference. In a dense model, batching amortises the weight load cost across multiple output elements. In MoE, batching means multiple tokens processed through the same expert simultaneously — and that only happens when the wave kernel aggregates work across concurrent requests.
 
@@ -302,7 +309,7 @@ The substrate gets smaller as a byproduct — structural templates are a per-pro
 
 ### 6.1 Core Insight
 
-At the moment a model produces or processes any content, the Q vectors it computes are a compressed fingerprint of its cognitive state — encoding not just content semantics but the full accumulated reasoning context in which that content was produced. We call this *attentional provenance*. By capturing and storing Q vectors alongside compressed K vectors at inference time, we construct a dual fingerprint index in CPU RAM that enables fast scanning over arbitrarily large corpora before generation begins and, critically, during generation itself. This is more than retrieval-augmented generation: the provenance index functions as an attention mechanism over unbounded context, continuously focusing the KV working set on what the current decode stream actually needs at each reasoning step. RAG retrieves once and injects; this system re-selects the context window at every reasoning boundary, using the model's own Q vectors as the selection signal.
+At the moment a model produces or processes any content, the Q vectors it computes are a compressed fingerprint of its cognitive state — encoding not just content semantics but the full accumulated reasoning context in which that content was produced. We call this *attentional provenance*. By capturing and storing Q vectors alongside compressed K vectors at inference time, we construct a fingerprint index, held resident in VRAM (§6.6), that enables fast scanning over arbitrarily large corpora before generation begins and, critically, during generation itself. This is more than retrieval-augmented generation: the provenance index functions as an attention mechanism over unbounded context, continuously focusing the KV working set on what the current decode stream actually needs at each reasoning step. RAG retrieves once and injects; this system re-selects the context window at every reasoning boundary, using the model's own Q vectors as the selection signal.
 
 This is qualitatively different from K vectors, which encode content semantics. A stored Q vector from a conversation turn captures the accumulated attentional context of everything preceding it — mood, topic trajectory, relationship dynamics, reasoning state — compressed into a ~780-byte fingerprint. When a future query produces a Q vector in a similar reasoning state, the match surfaces that turn regardless of surface-level token overlap.
 
@@ -347,23 +354,23 @@ This scoring penalises isolated hits and rewards coherent multi-token focus. Com
 
 ### 6.3 Sequential Section Resolution
 
-Each turn executes a sequential dynamic section resolution loop before generation begins. Dynamic sections are any context components whose content depends on the current query state — examples include persona, response style, domain knowledge, or conversation history. Each section is backed by a candidate library with precomputed KV representations. Selection proceeds in order: each probe generates a short token window under the system prompt for that section, captures the Q fingerprint, runs the CPU flat scan, and loads the winning candidate's KV into the context. Each subsequent probe executes into the context already committed by prior probes — Q vectors reflect genuine intent conditioned on all prior commitments.
+Each turn executes a sequential dynamic section resolution loop before generation begins. Dynamic sections are any context components whose content depends on the current query state — examples include persona, response style, domain knowledge, or conversation history. Each section is backed by a candidate library with precomputed KV representations. Selection proceeds in order: each probe generates a short token window under the system prompt for that section, captures the Q fingerprint, runs the flat scan, and loads the winning candidate's KV into the context. Each subsequent probe executes into the context already committed by prior probes — Q vectors reflect genuine intent conditioned on all prior commitments.
 
 As a concrete example, an agent deployment might resolve three sections in sequence:
 
-1. **Persona probe** — model generates W_probe tokens under persona system prompt; Q fingerprint captured in *decode mode* (post-generation); CPU scan over persona library in ~3ms; selected persona KV loaded
+1. **Persona probe** — model generates W_probe tokens under persona system prompt; Q fingerprint captured in *decode mode* (post-generation); flat scan over persona library; selected persona KV loaded
 2. **Style probe** — same pattern with persona now in context
 3. **History probe** — under main system prompt with persona and style resolved; Q reflects full response intent; scan over full B-tree index; top-ranked history turns loaded within token budget
 
-This is structurally different from prior probe-reset architectures that generated throwaway tokens under all candidates in parallel and then discarded everything. Here: one pass per section, selection on CPU, no GPU waste beyond the probe tokens themselves. The sequential conditioning property — each probe Q reflecting all prior commitments — means the final history retrieval is optimised for the specific response the model is about to generate, not a generic query intent.
+This is structurally different from prior probe-reset architectures that generated throwaway tokens under all candidates in parallel and then discarded everything. Here: one pass per section, selection by a single flat scan, no forward-pass waste beyond the probe tokens themselves. The sequential conditioning property — each probe Q reflecting all prior commitments — means the final history retrieval is optimised for the specific response the model is about to generate, not a generic query intent.
 
 **Tool section selection uses prefill-mode Q.** For tool catalog sections — where the corpus stores fingerprints derived from tool definition text — the probe Q is the user's request as read during prefill, before any decode begins. This introduces a distributional mismatch: the corpus was built from decode-phase Q (rich tool-call intent), but the query is prefill-phase Q (distributed over input tokens). The `PerTokenExcess` scoring formula (§9.10) addresses this: rather than span scoring optimised for decode's long coherent runs, it accumulates per-probe-token excess agreement above the 64-bit random baseline, capturing the weak but genuine prefill signal without requiring the threshold-crossing runs that span scoring demands. Empirical result: tool selection from 86 candidate tools succeeds using prefill-mode `PerTokenExcess`, with decode-mode `Span α=2.0` reserved for history/corpus retrieval during generation. Full results in §9.10.
 
 **Dual representation for mood/template.** Fingerprints are encoded as assistant prefill under the section's probe system prompt, placing both stored fingerprints and probe Q in the same distributional space. This eliminates the Q→K OOD problem for these sections: the match is Q→Q within-distribution at both ends.
 
-### 6.4 CPU-Side Flat Scan
+### 6.4 Flat Scan
 
-The full fingerprint index for 50K turns + 100K facts fits in approximately 126MB of CPU RAM — typically in L3 cache on modern server CPUs. Six INT8 matrix multiplies over this index, parallelised across 6+ CPU threads via VNNI instructions, complete in 3–10ms regardless of corpus size. This replaces hierarchical navigation (beam walks, recursive tree descent, iterative probe-reset cycles) with a single flat scan. For section-level scoring during generation (§6.5), the flat scan is replaced by BDP matching with span scoring α=2.0 on the TokenSignature index (§6.2).
+The scan is flat: every candidate is scored in one pass, with no hierarchy to navigate. The production scan runs on the GPU over a VRAM-resident paged gallery (§6.6) in ~9.5 ms steady-state on a 16GB laptop GPU. The dot-product formulation below, and its CPU realisation — six INT8 matrix multiplies over a ~126MB index for 50K turns + 100K facts, parallelised across 6+ CPU threads via VNNI in 3–10ms — is the design this scan was calibrated on and remains the reference for its depth weights. Either way, a flat scan replaces hierarchical navigation (beam walks, recursive tree descent, iterative probe-reset cycles) with a single flat scan. For section-level scoring during generation (§6.5), the flat scan is replaced by BDP matching with span scoring α=2.0 on the TokenSignature index (§6.2).
 
 Scoring formula for any indexed item:
 
@@ -379,17 +386,17 @@ where b ∈ {syntactic, semantic, pragmatic}. Component-specific depth weights a
 
 ### 6.5 Speculative Context Decode
 
-Sections §6.3 and §6.4 describe provenance retrieval *before* generation begins — selecting mood, template, and history for the upcoming response. During generation itself, the model's Q vectors evolve with every token produced, creating a continuous signal for context refinement. Speculative Context Decode makes this retrieval structurally intrinsic to the decode loop, with CPU scoring latency fully hidden behind parallel GPU computation.
+Sections §6.3 and §6.4 describe provenance retrieval *before* generation begins — selecting mood, template, and history for the upcoming response. During generation itself, the model's Q vectors evolve with every token produced, creating a continuous signal for context refinement. Speculative Context Decode makes this retrieval structurally intrinsic to the decode loop, with scan latency kept off the decode's critical path.
 
 **Mechanism.** Generation operates as a pipelined two-session loop with variable-length probe windows.
 
-*Cold start.* PROBE₁ speculatively decodes up to 64 tokens against the initial working set, terminating early at the first newline boundary. These tokens are discarded and never enter the KV cache. Their Q/K fingerprints are captured and scored via the CPU flat scan (§6.4). The first corrected context window is assembled from the top-scoring blocks.
+*Cold start.* PROBE₁ speculatively decodes up to 64 tokens against the initial working set, terminating early at the first newline boundary. These tokens are discarded and never enter the KV cache. Their Q fingerprints are captured and scored via the flat scan (§6.4). The first corrected context window is assembled from the top-scoring blocks.
 
 *Steady state (every subsequent window).* Two sessions launch in parallel on the wave-batched kernel:
 - **DECODE_N** — autoregressively decodes real output tokens against the context window assembled from PROBE_N's fingerprints. The token count matches whatever PROBE_N produced before termination. These tokens are kept and seal into 32-token paged blocks normally.
 - **PROBE_{N+1}** — speculatively decodes up to 64 tokens (or until newline), continuing from the probe trajectory. These tokens are discarded and never enter the KV cache.  Their Q/K fingerprints are captured.
 
-*Barrier.* Both sessions join. CPU BDP scoring runs on PROBE_{N+1}'s TokenSignatures — span-scored across consecutive runs of BDP hits to each candidate section, overlapping with the final tokens of each session where possible. The highest-scoring sections' KV blocks are loaded into the context window for DECODE_{N+1}. Return to steady state.
+*Barrier.* Both sessions join. BDP scoring runs on PROBE_{N+1}'s signatures — span-scored across consecutive runs of BDP hits to each candidate section, overlapping with the final tokens of each session where possible. The highest-scoring sections' KV blocks are loaded into the context window for DECODE_{N+1}. Return to steady state.
 
 **Newline-terminated variable window.** The probe terminates at the first newline, with a 64-token cap as a safety valve. Newlines in model output — particularly within thinking blocks — mark the completion of a discrete reasoning step; the Q vectors at a newline boundary encode what the model is reaching for next, making them the optimal fingerprint capture point. The variable window adapts naturally to the model's reasoning rhythm: a query prompting rapid short inferences triggers more frequent context updates; a query requiring extended chains of logic produces longer probe windows with more developed fingerprints. No tuning parameter. The model's own structural markers determine retrieval frequency.
 
@@ -397,15 +404,23 @@ Sections §6.3 and §6.4 describe provenance retrieval *before* generation begin
 
 **Why probe divergence is acceptable.** The probe runs ahead on a slightly divergent trajectory. This divergence is acceptable because provenance operates on approximate cognitive-state fingerprints averaged across layer bands — a short stretch of reasoning divergence does not move Q vectors far enough to select wrong context blocks. The provenance system needs the approximate neighbourhood of the reasoning direction, not the exact token sequence.
 
-**Cost structure.** The probe is hidden behind the decode: both sessions run in parallel with wave-batched expert coalescing. The probe and decode sessions diverge on similar content and share similar expert routing patterns, coalescing efficiently (see §10.1). Effective GPU cost is substantially less than 2× a single session. CPU scoring (3–10ms) is amortised over the window's real tokens. Each active query consumes two session slots from the 64 available. Visible throughput approaches the raw single-context decode rate.
+**Cost structure.** The probe is hidden behind the decode: both sessions run in parallel with wave-batched expert coalescing. The probe and decode sessions diverge on similar content and share similar expert routing patterns, coalescing efficiently (see §10.1). Effective GPU cost is substantially less than 2× a single session. The scan (~9.5 ms on a 16GB laptop GPU) is amortised over the window's real tokens, and each active query occupies two session slots. Visible throughput approaches the raw single-context decode rate.
 
 **Relationship to the theorem.** The working-set selection budget B and hot-tier bound W_hot_max are enforced at each probe-barrier cycle. The Asymptotic Numerical Stability theorem (§11.2) holds unchanged: the bound is O(1) per generation step regardless of how frequently the working set is updated, because each update selects at most B tokens from the unbounded context. Speculative Context Decode increases the frequency of working-set updates without changing the bound — and increases the quality of each update by aligning working-set assembly with the model's evolving Q-state at reasoning-step granularity.
 
-**Structural segments at the barrier.** The probe-barrier cycle includes structural-segment resolution between gather and decode (§5): adjacent `Generated` segments between sealed content form prefill runs that batch into the existing prefill pipeline. The probe's Q vectors at structural positions reflect what the model is reaching for given the *current* scaffolding, not given the *original* scaffolding of some prior turn. These structural prefills overlap with the existing 3–10ms CPU provenance scan.
+**Structural segments at the barrier.** The probe-barrier cycle includes structural-segment resolution between gather and decode (§5): adjacent `Generated` segments between sealed content form prefill runs that batch into the existing prefill pipeline. The probe's Q vectors at structural positions reflect what the model is reaching for given the *current* scaffolding, not given the *original* scaffolding of some prior turn. These structural prefills overlap with the provenance scan.
 
 **Quality implication.** The scheduling description above — near-zero overhead, latency hidden, throughput preserved — characterises cost. The quality implication is distinct and worth stating separately. Because the context window is assembled fresh at each reasoning-step boundary, every line of reasoning during a thinking block is generated against a working set optimised for that specific line. The feedback loop is: better context produces more specific Q vectors, which produce more targeted retrieval, which produce better context for the next reasoning step. This is why the one-shot ablation gap exists — one-shot retrieves once before reasoning begins, then holds a fixed context window through the entire thinking block regardless of where reasoning goes. The divergence between full system and one-shot is not a retrieval accuracy difference at hop 1; it is the compound effect of context quality improving through the reasoning chain versus remaining static. Transitive dependencies that one-shot misses are not inaccessible to it — they may be in its index — but the model's Q vectors at line N of reasoning have not yet reached the part of the index that contains them. Speculative Context Decode delivers the right context at the right reasoning step.
 
 **Middle-context degradation.** A well-documented failure mode of long-context attention is that models exhibit substantially lower recall for content positioned in the middle of a long context window, with performance concentrated at the start and end [Liu et al., 2023]. This degradation is structural: uniform flat attention over a long window dilutes attention weight across positions, and intermediate positions receive neither the primacy nor recency signal that anchors recall at the boundaries. Provenance-selected attention eliminates this failure mode architecturally. The working set at each reasoning step is a small focused window — bounded by B — assembled specifically for that step. There is no "middle" in the pathological sense: every selected block is proximal in relevance to the current Q-state, not proximal in sequence position. Content from 50,000 tokens ago that is provenance-relevant receives the same attention density as content from 100 tokens ago. The degradation curve that plagues flat long-context attention does not apply to a window that is continuously re-focused on what the decode stream actually needs.
+
+### 6.6 The Production Signature and the Resident Gallery
+
+The production signature is `WideQSig`: every decode step's Q vectors are folded into the packed sign bits of Q itself — 12 heads × 128 bits, 192 bytes per token — and retrieval is a decode→decode Q·Q consensus, a query token's signature compared against every gallery token's by sign agreement (XNOR + popcount). It is the 12-head successor of the 8-head fold calibrated in §9.10: the same binary directional principle, with more heads and no K term. At turn seal a turn's full signature window is persisted on the substrate beside its K/V.
+
+Re-uploading every candidate turn's signatures on every scan was the bottleneck of the first GPU implementation, so signatures stay **resident in VRAM** between reprojections in a paged gallery arena modelled on the paged KV cache: fixed 32-token pages, a free-list pool and persistent storage slabs, with the scan kernel reading pre-resolved device pointers rather than gathering into a packed copy. The warm and cold tiers of the gallery are the substrate's own persisted signatures; the arena holds only the hot tier and rebuilds an evicted turn on demand.
+
+Three scan backends are verified **bit-identical** by an adversarial parity test: a scalar reference; a 1-bit tensor-core backend (`BMMA.88128.XOR.POPC`, sm_75–sm_89), ~9.5 ms steady-state on the RTX 4090 Laptop GPU; and an INT8 tensor-core backend (`mma.m16n8k32.s8`), the production path on Blackwell, which dropped the 1-bit instruction. The scan's result feeds the next reprojection, so selection and forward execution are decoupled by a full wave and the scan never blocks a forward pass.
 
 ---
 
@@ -480,17 +495,27 @@ No existing inference system provides the same capability set as the system pres
 
 The evaluation instead uses three complementary approaches:
 
-1. **Community benchmark comparison** for throughput — our peak single-context and bulk throughput figures are compared against the best available published consumer-hardware benchmarks for Qwen3-30B-A3B. NVIDIA TensorRT-LLM does not publish performance figures for this model on consumer 16GB GPUs; the comparison uses community-benchmarked results on RTX 4090 24GB with standard frameworks (Ollama, llama.cpp) as the closest available reference point [hardware-corner.net, 2025; ToolHalla, 2026].
+1. **Published-figure comparison** for throughput and compression — every measured row is set against the best figure published for the same model on the same class of card by llama.cpp, vLLM, KTransformers and SGLang, with each outside figure's card, quantization, context length and engine recorded beside it (§9.6). Where our figure is an aggregate across concurrent sessions and the published one is single-stream, the comparison says so: it answers how much work one card does, which is the question this architecture is built for.
 
-2. **Ablation studies** for each novel contribution — the value of each subsystem is measured by removing it and observing the delta. Ablations are the correct evaluation methodology for a vertically integrated system where no external baseline shares the design space. The codebase dependency analysis evaluation (§9.12) additionally provides the first published demonstration of iterative attention-driven dependency walking during decode — a capability no system we are aware of provides — validated against manually enumerated ground truth over the system's own codebase.
+2. **Output validation at every measured point** — every throughput row in §9.6 comes from a gate that replays a story-rewrite task across all of its sessions and checks each session's output text against its expected rewrite (§9.8). A row is reported only if it passes. Compression and throughput are therefore never measured on a configuration whose output has degraded.
+
+3. **Ablation studies** for each novel contribution — the value of each subsystem is measured by removing it and observing the delta. Ablations are the correct evaluation methodology for a vertically integrated system where no external baseline shares the design space. The codebase dependency analysis evaluation (§9.12) additionally provides the first published demonstration of iterative attention-driven dependency walking during decode — a capability no system we are aware of provides — validated against manually enumerated ground truth over the system's own codebase.
 
 ### 9.2 Hardware
 
-**Primary benchmark platform:** NVIDIA RTX 4090 Mobile, 16GB GDDR6, Ada Lovelace (sm_89). FP8 tensor core support. PCIe 4.0 × 16 to host system.
+Three machines, each measured separately. The engine sizes its VRAM partition from the card it finds, so no row is transferred between machines.
 
-**Secondary validation:** Custom water-cooled desktop, RTX 3090 24GB (Ampere, sm_86). No native FP8 tensor cores; validates the integer-only path and serves as a reference for systems without FP8 support.
+| | RTX 4090 Laptop GPU | RTX 3090 | RTX PRO 5000 Blackwell |
+|---|---|---|---|
+| VRAM | 16 GB | 24 GB | 72 GB |
+| Architecture | Ada, sm_89, native FP8 | Ampere, sm_86, **no native FP8** | Blackwell, sm_120 |
+| Host | Core Ultra 9 185H, **32 GB RAM** | i7-10700K, 64 GB RAM | Ryzen 9 9950X3D, 189 GB RAM |
+| Host link | PCIe 4.0 ×16 | **PCIe 3.0 ×16** | PCIe 5.0 ×16 |
+| Measured | width ladder, engine probe | width ladder | width ladder and depth to 128K |
 
-**Reproducing results.** The three core test suites can be run directly from the repository root. All tests require a CUDA-capable GPU; `huge-context` enables the multi-session paged context path used for §9.8 and §9.11.
+The 16GB laptop is the design constraint; the RTX 3090 validates the integer-only path on a card with half the laptop's host bandwidth; the Blackwell card, which holds every model but the 284B resident, is where the depth sweeps are run free of weight paging. All three run Windows under the WDDM driver model, whose submission overhead is the floor under single-session decode on the smallest models.
+
+**Reproducing results.** Every row in §9.6 is a test in this repository, run one model per `cargo` process with the card to itself; the full command list and the per-row source files are in `README.md` and `docs/performance.md`. `huge-context` enables the multi-session paged context path used for §9.8 and §9.11.
 
 *Qwen3-30B-A3B — parallel batched forwarding with KV compression and multi-session identity discrimination (§9.8, §9.11):*
 
@@ -510,7 +535,7 @@ cargo test --release --features cuda,verbose,huge-context --lib \
   -- --ignored --nocapture
 ```
 
-*KV compression curve — per-block format selection across C0–C9:*
+*KV compression curve — per-block format selection across the ladder:*
 
 ```
 cargo test --release -p candle-nn --features cuda,dont_check --lib \
@@ -518,9 +543,21 @@ cargo test --release -p candle-nn --features cuda,dont_check --lib \
   -- --ignored --nocapture
 ```
 
-### 9.3 Model
+### 9.3 Models
 
-**Qwen3-30B-A3B** (48 MoE layers, 128 experts per layer, top-8 routing, 3.3B active parameters, 30B total parameters, grouped-query attention with 8 KV heads). Weights at Q4_K_M quantisation throughout all experiments.
+Twelve models, spanning dense, mixture-of-experts, DeltaNet-hybrid and native-sparse latent attention, from 0.5B to 284B parameters. Each runs inside its checkpoint's own native context window, with no position scaling applied.
+
+| Model | Size | Architecture | Weights |
+|---|---|---|---|
+| DeepSeek-V4-Flash-0731 | 284B / 13B active | native-sparse latent attention, MoE | MXFP4_KO |
+| Qwen3.8-Flash-Next | 180B / 6B active | hybrid + QSA + MoE, MTP drafter | Q4_KOEXP (72 GB); Q2_KO experts (16 GB) |
+| Qwen3.5-35B-A3B, Qwen3.6-35B-A3B | 35B / 3B active | DeltaNet hybrid + MoE | Q6_K |
+| Qwen3-30B-A3B | 30B / 3B active | MoE, 48 layers × 128 experts, top-8 | Q4_K_M |
+| Qwen3.8-27B | 27B dense | hybrid | Q6_K/Q8 |
+| Qwen3.5-9B, Qwen3.5-0.8B | 9B, 0.8B dense | DeltaNet hybrid | Q6_K |
+| Qwen3-8B, Llama-2-7B, Llama-3.2-3B, Qwen2-0.5B | 0.5–8B dense | full attention | Q6_K, Q4_0, Q4_K_M, Q4_0 |
+
+§9.4–§9.5 and §9.10 were measured on Qwen3-30B-A3B at Q4_K_M, as in v1.
 
 ### 9.4 Quantized Matmul Kernel Benchmarks
 
@@ -615,48 +652,120 @@ quantised kernel and the reference accumulate rounding differently in BF16 space
 
 Against F8E4M3 accumulators, mean differences of ~0.010 reflect E4M3's 3-bit mantissa (~12.5% relative spacing per exponent step) — an inherent format property, not kernel error. Max relative error growing with batch size reflects floating-point rounding accumulation across larger reduction dimensions; this is expected behaviour. All values remain well below thresholds that would affect model output quality at each format's intended precision level.
 
-### 9.6 Throughput: Consumer Hardware Comparison
+### 9.6 Throughput, Depth and Compression Across the Fleet
 
-Single-context and bulk decode throughput on RTX 4090 Mobile (16GB), compared against published community benchmarks for Qwen3-30B-A3B on consumer hardware. NVIDIA TensorRT-LLM publishes performance figures for datacenter GPUs (H100, A100, H200) only and does not benchmark this model on 16GB consumer cards. The closest available reference is Ollama/llama.cpp on RTX 4090 24GB — a different card with more VRAM running at single-session concurrency.
+Every figure in this section is produced by a test in this repository: the width ladder (`test_parallel_batched_forwarding*`, a ~700-token prompt at several batch widths and points on the compression ladder), the depth gate (`long_context_gate`, 4K–128K tokens of KV), or the engine probe (`kv_fragmentation`, which drives the full conversation engine under load). Every row validates each session's output text (§9.8) and is reported only if it passes. Source rows, dates and builds are in `docs/performance.md`; the raw rows are in `docs/results/`. **Prefill** is prompt tokens per second; **decode** is generated tokens per second, **summed across the batch** where a row has more than one context.
 
-| Configuration | This system | Standard frameworks (RTX 4090 24GB, single session) | Notes |
+#### 9.6.1 Width: what concurrency buys on one card
+
+RTX PRO 5000 Blackwell 72 GB; one context in BF16 against each model's widest measured point. Each cell is the best of three sweeps.
+
+| Model | ×1 prefill / decode (t/s) | Widest | Prefill / aggregate decode (t/s) |
 |---|---|---|---|
-| Single context | **509 t/s** | 150–196 t/s [hardware-corner.net, 2025; ToolHalla, 2026] | 2.6–3.4× advantage; 8GB less VRAM |
-| 64 concurrent sessions (aggregate) | **2,446 t/s total** (~38 t/s/session) | Not applicable — single-session only | Standard frameworks do not support this concurrency on 16GB |
+| Qwen2-0.5B | 31,605.8 / 256.7 | ×60 | 79,653.3 / 4,924.7 |
+| Qwen3.5-0.8B | 24,626.5 / 168.8 | ×256 (C8) | 36,290.6 / 3,353.4 |
+| Llama-3.2-3B | 13,166.0 / 130.5 (C0) | ×10 (C8) | 13,977.4 / 745.1 |
+| Qwen3-30B-A3B | 8,307.4 / 80.7 | ×20 (Q8_0) | 9,950.6 / 595.7 |
+| Qwen3.5-35B-A3B | 7,231.9 / 109.4 | ×64 (C10) | 7,153.5 / 1,187.7 |
+| Qwen3.6-35B-A3B | 7,310.2 / 107.8 | ×64 (C10) | 7,219.2 / 1,201.6 |
+| Qwen3-8B | 6,008.5 / 67.3 | ×10 (C8) | 6,065.2 / 460.1 |
+| Llama-2-7B | 6,063.7 / 97.2 | ×48 | 3,679.8 / 917.3 |
+| Qwen3.5-9B | 5,534.1 / 121.0 | ×20 (C8) | 5,837.5 / 877.5 |
+| Qwen3.8-27B | 1,729.8 / 61.0 | ×40 (C10) | 1,718.7 / 458.1 |
+| Qwen3.8-Flash-Next | 1,705.7 / 86.9 | ×16 | 1,969.8 / 421.5 |
+| DeepSeek-V4-Flash | 333.3 / 15.1 | ×16 | 1,120.6 / 73.5 |
 
-The single-session figure measures decode speed for one active context and is directly comparable to published benchmarks. The 64-session aggregate (2,446 t/s total, ~38 t/s per session) is not a server throughput metric in the conventional sense — it is the architectural operating point the system requires. Unbounded context with continuous provenance-selected working-set assembly demands simultaneous parallel prefill across semantic boundaries and concurrent multi-session decode; the wave-batched grouped GEMM, Speculative Context Decode pipelining, and three-tier paging all reach their full performance and quality properties only under genuine concurrency load. A single-session deployment leaves most of the architecture idle. Standard frameworks do not support this workload on 16GB because they are designed for single-context inference; no external baseline for the concurrent-session result exists for this reason.
+Prefill saturates early — the 35B MoEs are flat from ×1 to ×64 — while aggregate decode scales nearly linearly with width. Qwen3.6-35B-A3B goes from 104.9 t/s at one session to **1,201.6 t/s across sixty-four**, 11.5× within a single run (`docs/results/performance_rtx_pro_5000_72gb_rows_2026-09-15_run1.tsv`; the table above reports the best of three sweeps per cell), with the KV cache at 6.04× compression and prefill moving 1.1%. This is the wave-batched grouped GEMM of §4.4 measured: one expert load serves every session routed to it, so additional sessions ride weight traffic that was already in flight.
 
-**Attribution of throughput gains over baseline Candle:**
+#### 9.6.2 Depth: throughput does not fall with context
 
-| Subsystem | Isolated contribution | Method |
-|---|---|---|
-*Preliminary — full subsystem-isolated ablation in v2. The §4.3 table reports the directly measured Markov prediction contribution (+20.8–59.1% across configurations); isolated contributions for the remaining subsystems require controlled ablation runs in progress.*
+The same card, one context, 32K → 128K, BF16. Share of the 32K rate kept at 128K:
 
+| Model | Prefill kept | Decode kept |
+|---|---:|---:|
+| **Qwen3.8-Flash-Next** | **99%** | **111%** |
+| Qwen3.8-27B | 28% | 58% |
+| Qwen3.5-9B | 30% | 48% |
+| Qwen3.6-35B-A3B | 26% | 49% |
+| Qwen3.5-35B-A3B | 26% | 47% |
+| Qwen3.5-0.8B | 25% | 86% |
+
+Flash-Next, whose attention selects a bounded working set rather than attending every position, is the one model whose cost per token does not depend on how much history there is. Across the full depth sweep on the rewrite task its speculative head accepts exactly **4.85 tokens a step at every depth from 8K to 128K**, and the story is reproduced correctly from behind 128,897 tokens of padding. On the coherence task its prefill runs 1,098.8 / 1,368.9 / 1,342.8 / 1,291.8 / 1,257.5 t/s and its decode 24.7 / 28.3 / 24.6 / 26.3 / 26.4 t/s at 8K / 16K / 32K / 64K / 128K. The published llama.cpp run of the same model on an RTX 4090 24GB keeps 64% of its prefill and 65% of its decode between 6K and 110K [33]. This is the O(1) property of §11.2 appearing as a throughput property: a working set bounded independently of depth costs the same at any depth.
+
+#### 9.6.3 Compression: the top level, inline, validated
+
+Each 32-token block is compressed in the forward that produced it; there is no separate compression pass. C10 against BF16 at 8K:
+
+| Model | Prefill BF16 / C10 (t/s) | Decode BF16 / C10 (t/s) | C10 compression |
+|---|---|---|---:|
+| Qwen3-8B | 3,235.1 / 3,212.7 | 42.8 / 41.8 | 6.31× |
+| Qwen3-30B-A3B | 3,444.7 / 3,367.6 | 51.2 / 47.2 | 5.94× |
+| Llama-2-7B (4K) | 3,684.7 / 3,851.1 | 47.1 / 44.1 | 4.81× |
+| Llama-3.2-3B | 6,195.9 / 5,936.8 | 69.9 / 66.1 | 4.62× |
+
+At 8K the top level costs **0–8% of decode for 3.3×–6.3×** across the models measured there. At 32K the largest hybrids pay 27–31% of decode for 6.3×–7.5×; at 128K the cache compresses 4.63×–7.63×, 100% of blocks quantized, with Flash-Next paying 19% for 6.97×. Prefill with C10 runs within 5% of BF16 at every depth measured, and at 128K it is marginally *faster* than BF16 on all six models, because there are fewer bytes to read back. For comparison, llama.cpp's q8_0 KV cache gives ~1.9× and costs 35% of decode at 32K and 45% at 64K; its q4_0 gives ~3.56× and costs 39% and 50% [37]; vLLM's FP8 cache gives 2× [38], and TurboQuant 2.4–3.4× for 20–27% of throughput [39]. At 32K the top level holds **nearly 4× the compression of q8_0 while slowing decode less**.
+
+#### 9.6.4 Against the published record
+
+For each model, our aggregate decode serving concurrent sessions against the best published llama.cpp single-stream decode for the same model on the same class of card. The Blackwell rows compare our RTX PRO 5000 with published RTX 5090 figures.
+
+| Card class | Model | Ours, aggregate (t/s) | llama.cpp best, single-stream (t/s) | Multiple |
+|---|---|---:|---:|---:|
+| RTX 3090 | Llama-2-7B, BF16 ×48 | 547.6 | 161.89 [29] | 3.38× |
+| RTX 3090 | Qwen3.5-35B-A3B, C10 ×16 | 375.9 | 111.2 [30] | 3.38× |
+| RTX 3090 | Qwen3.8-27B, C9 ×5 | 198.9 | 65.28, with MTP [32] | 3.05× |
+| RTX 3090 | Qwen3-8B, C8 ×10 | 303.4 | 115.3 [30] | 2.63× |
+| RTX 3090 | Qwen3.6-35B-A3B, C10 ×16 | 388.6 | 157.66 [35] | 2.46× |
+| RTX 3090 | Qwen3-30B-A3B, Q8_0 ×20 | 274.5 | 153.6 [30] | 1.79× |
+| 16 GB | Qwen3-8B, C8 ×10 | 230.1 | 102.7 (RTX 4080) [31] | 2.24× |
+| 16 GB | Qwen3.8-Flash-Next, BF16 ×8 | 64.7 | 27.5–29 (RTX 5080) [34] | 2.23× |
+| Blackwell | Qwen3.5-35B-A3B, C10 ×64 | 1,187.7 | 194.0 [36] | 6.12× |
+| Blackwell | Qwen3.6-35B-A3B, C10 ×64 | 1,201.6 | 333.55, with MTP [40] | 3.60× |
+| Blackwell | Llama-2-7B, ×48 | 917.3 | 300.40 [29] | 3.05× |
+| Blackwell | Qwen3-30B-A3B, Q8_0 ×20 | 595.7 | 226.1 [41] | 2.63× |
+| Blackwell | Qwen3-8B, C8 ×10 | 460.1 | 200.4 [41] | 2.30× |
+
+Every row clears the published single-stream rate, by 1.8× to 6.1×. Aggregate against single-stream is the comparison the published record allows — llama.cpp can serve parallel requests, but no aggregate for these models on these cards has been published — and it is the comparison that answers how much work one card does. The published single-card serving runs of the 35B models on a larger RTX PRO 6000 report 5–10 concurrent requests [42, 43]; this engine runs them at 64 on a 72GB card and Qwen3.5-0.8B at 256.
+
+#### 9.6.5 The 16GB laptop
+
+The RTX 4090 Laptop GPU with 32GB of host RAM is the constraint the architecture was designed under, and where its results are least expected.
+
+- **A 180B model.** Qwen3.8-Flash-Next (180B total: a 125B trunk with 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a Q2_KO-expert artifact of ~88GB, streaming its experts VRAM → pinned RAM → NVMe. Every rung of its ladder validates 8/8. One warm session prefills at 244.2 t/s and decodes at 20.0; eight prefill at 495.4 and decode at **64.7 t/s aggregate**, with C10 at 5.44×. Every published single-GPU run of the model that states its host uses 64–128GB of RAM; the fastest, an RTX 5090 with 128GB, decodes one stream at 48.02 t/s [44], and the only published 16GB-class run, an RTX 5080 with 64GB, at 27.5–29 [34].
+- **A 30B MoE, faster than a 24GB card.** Qwen3-30B-A3B at Q8_0 ×20 prefills at **3,999.7 t/s** with its experts streaming, against 3,873.0 on the RTX 3090, whose PCIe 3.0 link carries half the laptop's bandwidth.
+- **A 35B MoE serving sixteen users.** Qwen3.5-35B-A3B and Qwen3.6-35B-A3B at Q6_K — ~28GB of weights on a 16GB card — serve ×16 at 131.2 and 129.7 t/s aggregate with C10 at 6.20× and 5.94×, every session validated.
+- **A small model at workstation rate.** Qwen3.5-0.8B at C8 ×32 prefills at **21,847 t/s** and decodes at 993 t/s aggregate, against 17,632.3 and 772.4 on the RTX 3090.
+
+C10 compresses the 35B to 6.23× on both the laptop and the RTX 3090, and every dense rung agrees between the two cards to within 0.1×: the adaptive selector makes the same decisions on different silicon.
+
+#### 9.6.6 A 284B model on one GPU
+
+DeepSeek-V4-Flash (284B total, 13B active) on one RTX PRO 5000 72GB, sixteen concurrent sessions: **1,120.6 t/s prefill and 73.5 t/s aggregate decode**. The best published single-GPU prefill for the model is 748.4 t/s (RTX PRO 6000 Max-Q, all experts on the CPU, 8K) [45], and the best published single-GPU decode is 28 t/s (RTX 5090, KTransformers + SGLang, INT4 experts on the CPU) [46] — every published run holding the routed experts in host RAM, as this one does. The aggregate is 2.6× that decode.
+
+#### 9.6.7 Where published engines lead
+
+Single-stream decode on a model that fits wholly in VRAM is llama.cpp's strength: on a 16GB card, a 3-bit Qwen3.6-35B-A3B that fits resident decodes one stream at 183.29 t/s (249.33 with MTP) [40], where this engine's sixteen-session aggregate with Q6_K experts streamed is 129.7. vLLM prefills Qwen3.6-35B-A3B at 41,105 t/s on an RTX PRO 6000 [43], against ~7,200 here. Both mark directions for the next version of the kernels; neither changes the architecture's claim, which is about how much one card can serve, from how large a model, at how much context.
 
 ### 9.7 Ablation: Expert Prediction and Eviction Policy
 
-Cold-hit rate and decode throughput on RTX 4090 Mobile under partial VRAM residency (44% expert cache):
-
-| Configuration | Cold hit rate | Decode throughput |
-|---|---|---|
-*Preliminary — ablation on RTX 4090 Mobile in progress. The §4.3 table reports measured throughput gains from the four-part eviction policy on RTX 4080 at 44% residency (+20.8–59.1% across configurations); cold-hit rate and predictor-isolated contribution on the primary benchmark platform will be reported in v2.*
+The three-tier expert cache's measured effect against the two-tier cache it replaced is reported in §4.3 (+12% to +87% prefill across nine configurations, RTX 4090 Laptop GPU). The predictor-isolated contribution — cold-hit rate and throughput with prediction disabled, the cache otherwise unchanged — is the remaining ablation for this subsystem.
 
 
 ### 9.8 Quality Evaluation: Multi-Session Identity Discrimination
 
-**Test protocol.** The story rewrite test evaluates end-task quality directly rather than via perplexity. 400 concurrent sessions run simultaneously, each with a distinct character identity (name and gender assignment, cycling with period 99). The model is instructed to rewrite a narrative passage using the assigned character. A session passes if: (a) the correct name appears, (b) gender pronouns are consistent with the assignment, and (c) no other session's name appears. This test is designed to stress exactly the signal that aggressive K quantization degrades: session-discriminating features that live in the high-relevance sub-block population.
+**Test protocol.** The story rewrite test evaluates end-task quality directly rather than via perplexity. Up to 256 concurrent sessions run simultaneously in one batch, each with a distinct character identity (name and gender assignment, cycling with period 99). The model is instructed to rewrite a narrative passage using the assigned character. A session passes if: (a) the correct name appears, (b) gender pronouns are consistent with the assignment, and (c) no other session's name appears. This test is designed to stress exactly the signal that aggressive K quantization degrades: session-discriminating features that live in the high-relevance sub-block population.
 
-**Results.** The adaptive quantization system passes the story rewrite test at all ten compression levels on Qwen3-30B-A3B with no quality cliff. On Llama-3.2-3B, failures under aggressive compression map onto three qualitatively distinct regimes — clean output, soft semantic drift, then session identity collapse — matching the Asymptotic Numerical Stability theorem's tier prediction: bounded warm-tier error produces soft degradation, while cold-tier contamination produces qualitative failure. This failure mode is structurally prevented by provenance selection, which controls which cold-tier blocks enter the working set. Cross-architecture generalization is quantified in §9.9.
+**Results.** Every throughput row in §9.6 passes this test with every session correct — across the 187 rows of the laptop sweep, not one session failed. The top compression level, C10, passes on every model in the fleet at 4.1×–7.6× (§9.6.3), sitting just inside the edge where the test starts failing. On Llama-3.2-3B, failures under aggressive compression map onto three qualitatively distinct regimes — clean output, soft semantic drift, then session identity collapse — matching the Asymptotic Numerical Stability theorem's tier prediction: bounded warm-tier error produces soft degradation, while cold-tier contamination produces qualitative failure. This failure mode is structurally prevented by provenance selection, which controls which cold-tier blocks enter the working set. Cross-architecture generalization is quantified in §9.9.
 
 ### 9.9 Cross-Architecture Transfer: Held-Out Model Validation
 
 The adaptive quantization system is derived from K/V activation samples on two reference models: Qwen3-30B-A3B (MoE) and Llama-3.2-3B (dense), spanning the MoE/dense axis and a 10× model size range.
 
-**Cross-architecture transfer result.** When deployed unchanged on the held-out Qwen3-8B model — a dense model from a different size point and model family, not used in system derivation — the system achieves **7.42× compression**, exceeding the compression ratio on either reference model (7.04× on Qwen3-30B-A3B; 5.02× on Llama-3.2-3B).
+**Cross-architecture transfer result.** In v1, deployed unchanged on the held-out Qwen3-8B model — a dense model from a different size point and model family, not used in system derivation — the system achieved 7.42× compression, exceeding either reference model (7.04× on Qwen3-30B-A3B; 5.02× on Llama-3.2-3B). The ordering holds on the current production gates at 8K: **6.31× on Qwen3-8B**, above 5.94× on Qwen3-30B-A3B and 4.62× on Llama-3.2-3B (§9.6.3). Since v1 the same selector has been deployed across twelve models — dense, MoE, DeltaNet-hybrid and native-sparse latent attention, 0.5B to 284B — reaching 4.1×–7.6× at the top level on every one.
 
 This result supports a strong generalization claim: pre-RoPE K/V activation structure is sufficiently universal across transformer architectures — across MoE/dense topology, across model families, and across model sizes — that a single fixed adaptive selection system covers the structural diversity required for high-compression quantization without per-model calibration. The held-out model achieving *higher* compression than either reference model is the diagnostic: Qwen3-8B activations are more amenable to the system's format assignments than the reference models, not less. The system is not overfitting to the reference models; it is capturing a universal structural property.
 
-**Deployment implication.** The system requires no per-model calibration sweep for deployment on new transformer architectures. Thresholds and selection criteria transfer directly. This distinguishes the approach from systems whose quantization parameters are fitted to a specific model's activation statistics (GPTQ, AWQ, KVQuant sensitivity profiling) and validates the per-block adaptive architecture as the mechanism: the kernel responds to each block's actual distribution at inference time, not to a population-level prior established at calibration.
+**Deployment implication.** The system requires no per-model calibration sweep and no calibration data for deployment on new transformer architectures. The selection algorithm, candidate formats and error metrics transfer directly; a model at most carries a scale on the thresholds. This distinguishes the approach from systems whose quantization parameters are fitted to a specific model's activation statistics (GPTQ, AWQ, KVQuant sensitivity profiling) and validates the per-block adaptive architecture as the mechanism: the kernel responds to each block's actual distribution at inference time, not to a population-level prior established at calibration.
 
 ### 9.10 Attentional Provenance Indexing: Strategy Sweep and Full Calibration
 
@@ -838,20 +947,16 @@ Decode mode is unchanged: `Span α=2.0` on pragmatic depth dominates with discri
 
 ### 9.11 Concurrent Persistent-Memory Session Result
 
-**64 concurrent persistent-memory sessions on 16GB** — the integration result that demonstrates all six subsystems functioning simultaneously at full concurrency on the target hardware.
+The width ladder of §9.6 drives the batched forward from a clean slate; it never constructs the conversation engine, so it cannot exercise admission, per-turn context projection, the persistence thread, KV compaction or tier migration. The **engine probe** (`candle-conversation/tests/kv_fragmentation.rs`) does: it runs a conversational workload through the full engine on the target hardware and reports three gates — the story rewrite per session (correctness), the worst sustained share of the KV ground actually holding KV (VRAM efficiency, threshold 90%), and how much ground released by the KV frontier the expert weights take back (weight uptake).
 
-| Metric | Value |
-|---|---|
-| Concurrent sessions | 64 |
-| Model | Qwen3-30B-A3B |
-| Hardware | RTX 4090 Mobile, 16GB |
-| Bulk throughput | **2,446 t/s** |
-| Peak VRAM utilisation | ~15.8 GB |
-| Median response latency | in progress |
-| Context depth tested | in progress |
-| Per-session memory footprint | in progress |
+| | Qwen3.8-Flash-Next | Qwen3-30B-A3B |
+|---|---|---|
+| Hardware | RTX 4090 Laptop GPU, 16GB, 32GB host | RTX 4090 Laptop GPU, 16GB, 32GB host |
+| Story | **8/8** | 20/20 |
+| Worst sustained VRAM efficiency | **100%** | 43% |
+| Weight uptake | 73–88% of released ground | 75% of released ground |
 
-Each session maintains independent unbounded conversation history with adaptive KV quantisation and attentional provenance retrieval. The 2,446 t/s bulk figure is a measured result at this exact configuration. Context coherence is validated by an entity tracking evaluation adapted from Kamradt's needle-in-a-haystack methodology [Kamradt, 2023] and informed by BABILong [Kuratov et al., NeurIPS 2024].
+Flash-Next is the stronger test: it is the one model in the fleet carrying per-sequence recurrent state outside the paged K/V, so a pass that corrupts either shows as non-finite recurrent layers, and the probe returns every story correct with the ground below the KV frontier fully used. The 30B probe's efficiency gate sits below threshold; its stories are correct, and the gap is the subject of ongoing work on KV compaction. Latency, per-session footprint and context depth under the engine are the remaining measurements for this section. Context coherence is validated by an entity tracking evaluation adapted from Kamradt's needle-in-a-haystack methodology [Kamradt, 2023] and informed by BABILong [Kuratov et al., NeurIPS 2024].
 
 **Entity tracking evaluation.** The standard Kamradt test plants a single isolated fact ("The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day") and measures retrieval accuracy at varying context depths. This evaluation extends that methodology to entity tracking under quantization: a character name is systematically substituted throughout a narrative text, requiring the model to track a specific entity across sustained narrative context rather than locate a single isolated sentence. This is a harder task — the target information is distributed rather than localised — and directly tests the failure mode that quantization-induced decode drift would cause: entity reference corruption that propagates through the session.
 
@@ -915,7 +1020,7 @@ The system's author is the definitive oracle. No crowd-sourced evaluation or ext
 
 *Random retrieval* — same tier architecture, random block selection. Confirms retrieval scoring, not storage architecture, produces correct results.
 
-**Iterative retrieval mechanism validation.** The retrieval log during the query battery confirms the iterative deepening property. The mechanism is Speculative Context Decode (§6.5): at each newline boundary during reasoning — typically one line of thought, up to 64 tokens — the probe session's Q/K fingerprints drive a CPU provenance scan, assembling the context window for the next decode window. Retrieval is structurally guaranteed at every reasoning-step boundary, not triggered heuristically. The iterative deepening entries in the retrieval log correspond directly to probe-barrier cycles:
+**Iterative retrieval mechanism validation.** The retrieval log during the query battery confirms the iterative deepening property. The mechanism is Speculative Context Decode (§6.5): at each newline boundary during reasoning — typically one line of thought, up to 64 tokens — the probe session's Q fingerprints drive the provenance scan, assembling the context window for the next decode window. Retrieval is structurally guaranteed at every reasoning-step boundary, not triggered heuristically. The iterative deepening entries in the retrieval log correspond directly to probe-barrier cycles:
 
 - Mean probe-barrier cycles per query by dependency category (each cycle is one retrieval hop, one reasoning-step boundary)
 - Recall at cycle 1 vs cumulative recall at cycle N — does recall compound as reasoning develops?
@@ -1068,7 +1173,7 @@ The combination is what the application requires. None of it is achievable throu
 
 The transformer attention mechanism is a retrieval system: Q vectors query against K vectors, scores select candidates, V values are aggregated weighted by relevance. That is what softmax attention computes. That is all it has ever computed. The architecture is a learned retrieval system operating over a fixed context window.
 
-This system performs the same operation at two scales. The provenance index does approximate attention over the full unbounded context on CPU — six INT8 matmuls for corpus retrieval, BDP span scoring for section discrimination during generation — selecting which blocks enter the working set. The GPU attention kernel then performs exact attention over the selected working set. Coarse retrieval selecting for fine retrieval. The only structural difference from standard attention is granularity: standard attention performs flat retrieval over all N tokens at O(N) cost; this system performs hierarchical retrieval — approximate selection on CPU, exact attention on GPU — at O(1) cost per generation step.
+This system performs the same operation at two scales. The provenance index does approximate attention over the full unbounded context — a binary sign-agreement scan over every stored token's Q signature (§6.6) — selecting which blocks enter the working set. The attention kernel then performs exact attention over the selected working set. Coarse retrieval selecting for fine retrieval. The only structural difference from standard attention is granularity: standard attention performs flat retrieval over all N tokens at O(N) cost; this system performs hierarchical retrieval — approximate 1-bit selection, then exact attention over what it selects — at O(1) attention cost per generation step.
 
 When a reviewer characterises this as "RAG with extra steps," the correct response is: RAG replaces attention with an external retrieval system that has no attentional continuity — content retrieved by BM25 or embedding similarity is injected into a fresh context, severing the causal chain that attention depends on. This system extends the retrieval that attention already is to unbounded depth, without severing anything. The mechanism is preserved; the scaling constraint is removed. This comes with a different binding constraint that full attention does not have: retrieval quality. Full attention over N tokens attends to all N exactly. This system selects B tokens from N via approximate provenance matching — if the provenance system surfaces the wrong B tokens, the generation step lacks the correct context regardless of how precisely those B tokens are attended. The guarantee is bounded numerical error on the attended set, not guaranteed relevance of the attended set. This is a meaningful distinction: the system trades the O(N) error problem for a retrieval quality problem that the provenance mechanism is designed to bound but cannot eliminate. RAG abandons the attention mechanism entirely and substitutes something categorically weaker. The distinction between this system and RAG is not one of implementation style — it is a difference in what property is preserved; the distinction between this system and full attention is a different trade-off, not a strict dominance.
 
@@ -1084,7 +1189,7 @@ The gap is structural, not implementational. Three deficits of RAG are architect
 
 The provenance index's use of Q vectors as cognitive-state fingerprints is the specific choice that preserves attentional continuity: a stored Q fingerprint from a prior turn captures the accumulated attentional context of everything preceding it, not just the surface semantics of that turn. Matching a current Q against stored Q fingerprints selects turns that were attended from a similar cognitive state — the attentional equivalent of relevance, not keyword or embedding overlap. This is what makes the system's retrieval genuinely continuous with the attention mechanism rather than a separate system bolted alongside it.
 
-The codebase dependency analysis evaluation (§9.12) is the strongest demonstration of this principle. During the query battery, the model reasons about engineering relationships — "what breaks if I change the block size?" — and at each newline boundary during reasoning, the Speculative Context Decode probe (§6.5) captures Q/K fingerprints of the model's current reasoning state and assembles the next context window from the provenance index. The model does not know it is performing graph traversal. It is reasoning. The retrieval system — running as a pipelined CPU scan behind the parallel probe session, with near-zero visible overhead — converts that reasoning into a dependency walk at reasoning-step granularity. The probe phase is approximate attention over the full unbounded context on CPU; the decode phase is exact attention over the selected working set on GPU. Two scales of the same operation, pipelined at the model's natural reasoning boundaries. Transitive dependencies that single pre-generation retrieval misses are surfaced in mid-reasoning probe cycles as the model's Q vectors move toward the relevant dependency region — the retrieval log records exactly which cycle and which reasoning boundary supplies each node.
+The codebase dependency analysis evaluation (§9.12) is the strongest demonstration of this principle. During the query battery, the model reasons about engineering relationships — "what breaks if I change the block size?" — and at each newline boundary during reasoning, the Speculative Context Decode probe (§6.5) captures Q/K fingerprints of the model's current reasoning state and assembles the next context window from the provenance index. The model does not know it is performing graph traversal. It is reasoning. The retrieval system — a pipelined scan behind the parallel probe session, off the decode's critical path — converts that reasoning into a dependency walk at reasoning-step granularity. The probe phase is approximate attention over the full unbounded context; the decode phase is exact attention over the selected working set. Two scales of the same operation, pipelined at the model's natural reasoning boundaries. Transitive dependencies that single pre-generation retrieval misses are surfaced in mid-reasoning probe cycles as the model's Q vectors move toward the relevant dependency region — the retrieval log records exactly which cycle and which reasoning boundary supplies each node.
 
 ### 11.5 Constraint-Driven Innovation as a Methodology
 
@@ -1114,17 +1219,17 @@ The codebase dependency analysis evaluation (§9.12) exemplifies the methodology
 
 We have presented a complete inference system built from first principles as a coherent design. The four primary contributions — online Markov expert prediction with wave-batched DMA overlap, adaptive per-block KV quantisation with two-phase prefill refresh, attentional provenance indexing with Speculative Context Decode for continuous retrieval during reasoning, and an unbounded three-tier paged context — are individually grounded in the literature but have not previously been integrated.
 
-The primary empirical result — 509 t/s single-session (2.6–3.4× faster than community benchmarks for this model on RTX 4090 24GB with standard frameworks) and 2,446 t/s aggregate across 64 concurrent persistent-memory sessions on a 16GB consumer GPU — demonstrates that the coherence dividend is real and substantial. The single-session figure is a direct performance comparison; the 64-session result sits in a concurrency regime that existing consumer-hardware deployments cannot reach: the most comparable published study found standard frameworks degrade beyond 2 concurrent users on RTX 5090 32GB [Herz et al., arXiv:2512.23029].
+The empirical results demonstrate that the coherence dividend is real and substantial. A 180B mixture-of-experts model serves eight concurrent sessions from a 16GB laptop GPU with 32GB of host RAM, above every published single-GPU run of it on machines with two to four times the memory. Throughput is flat in context depth — 99% of prefill and 111% of decode kept from 32K to 128K — which is the theorem's O(1) property measured as time. The KV cache compresses up to 7.6× inline with every output validated, at nearly 4× the compression of llama.cpp's q8_0 cache while slowing decode less. One card's aggregate decode exceeds the best published llama.cpp single-stream rate for the same model and card class by 1.8–6.1×, reaching 1,201.6 t/s across 64 sessions; and a 284B model serves sixteen sessions from a single GPU at 2.6× the best published single-GPU decode (§9.6). The concurrency regime these occupy is one existing consumer deployments do not reach: the most comparable published study found standard frameworks degrade beyond 2 concurrent users on an RTX 5090 32GB [Herz et al., arXiv:2512.23029], and the published single-card serving runs of the 35B models stop at 5–10.
 
 The primary theoretical result is the Asymptotic Numerical Stability theorem (§11.2): under provenance-selected attention over unbounded context, total numerical error per generation step is bounded by O(1) — a constant independent of N — in contrast with the O(N) scaling of standard full-attention systems. Warm- and cold-tier tokens share a fixed retrieval budget and together contribute a bounded constant C_ret, small when retrieved blocks originate from prefill-refreshed hot-tier blocks and pass the per-block threshold. This inverts the universal assumption of the KV quantization literature: the accumulation problem is not an optimisation problem within an unavoidable regime — it is an architectural property of full attention that provenance-selected attention escapes structurally.
 
 The broader competitive position follows from the same distinction. The existing KV quantization literature — KIVI, KVQuant, TurboQuant — optimises the compression primitive: better quantization formulas, rotation, codebooks. This paper optimises the compression architecture: when to quantize, what quality to guarantee per block, how to separate error sources, and how error scales with depth. The architecture absorbs primitive-level failures through adaptive selection; it does not depend on having the best primitive. That is why the system maintains per-block validated quality at compression ratios where population-level systems begin to degrade — the architecture compensates where any fixed primitive falls short.
 
-The application target — 64 concurrent persistent-memory agent sessions on a single 16GB consumer card, each with unbounded conversation history — demonstrates that the problem the system was designed to solve is solvable at scale. The inference engine exists in service of that requirement, not as an end in itself.
+The application target — many concurrent persistent-memory agent sessions on a single consumer card, each with unbounded conversation history — is met at every scale measured: sixteen users of a 35B model and eight of a 180B model on a 16GB laptop, sixty-four of a 35B model on one 72GB card. The problem the system was designed to solve is solvable at scale. The inference engine exists in service of that requirement, not as an end in itself.
 
 The codebase dependency analysis evaluation (§9.12) provides the empirical counterpart to the theorem: iterative decode-time retrieval discovers transitive dependencies that single pre-generation retrieval misses, with accuracy independent of dependency chain depth — the empirical signature of O(1) error applied to compositional reasoning. The live system (Appendix C) is the primary empirical evidence — a working demo is stronger than any accuracy table, and the system is live now. Full quantitative results will be reported in v2; the community is invited to validate and contribute (Appendix C).
 
-The sliding-window baselines do not degrade gracefully — they hit a cliff and transitive dependencies beyond the window are inaccessible by construction: the 4K window cannot see code files analysed earlier in the session; the 131K window covers only a fraction of the codebase (§9.12). A larger window defers the cliff; it does not soften it. The one-shot retrieval ablation is the critical result: the same provenance index with single pre-generation retrieval misses transitive dependencies that the full system discovers through iterative decode-time retrieval — a qualitative capability difference, not a quantitative one (§9.12). The no-provenance baseline confirms the mechanism: the same tier architecture with random retrieval produces near-zero accuracy on transitive and architectural dependencies; the storage is not the contribution, the retrieval is. The KV quantization literature — KIVI, KVQuant, TurboQuant — optimises inside a regime it has not examined the boundaries of; the O(N) error scaling they assume is a property of full attention, not a law of compression, and this paper exits the regime (§11.2, §11.3). Attention is retrieval: the provenance indexing system performs approximate attention over the full unbounded context on CPU, selecting which blocks enter exact attention on GPU; standard attention is flat retrieval at O(N) cost; this system is hierarchical retrieval at O(1) cost; RAG replaces the attention mechanism and loses attentional continuity; this system preserves the mechanism and removes the scaling constraint (§6, §11.4). The structural argument is straightforward: a datacenter running full attention over a 2.2M-line codebase is in the O(N) accumulation regime the moment it evicts a token; this system is not, on a laptop GPU — and the theorem establishes that no full-attention system on any hardware can exit that regime (§11.2 Corollary 2, §9.12).
+The sliding-window baselines do not degrade gracefully — they hit a cliff and transitive dependencies beyond the window are inaccessible by construction: the 4K window cannot see code files analysed earlier in the session; the 131K window covers only a fraction of the codebase (§9.12). A larger window defers the cliff; it does not soften it. The one-shot retrieval ablation is the critical result: the same provenance index with single pre-generation retrieval misses transitive dependencies that the full system discovers through iterative decode-time retrieval — a qualitative capability difference, not a quantitative one (§9.12). The no-provenance baseline confirms the mechanism: the same tier architecture with random retrieval produces near-zero accuracy on transitive and architectural dependencies; the storage is not the contribution, the retrieval is. The KV quantization literature — KIVI, KVQuant, TurboQuant — optimises inside a regime it has not examined the boundaries of; the O(N) error scaling they assume is a property of full attention, not a law of compression, and this paper exits the regime (§11.2, §11.3). Attention is retrieval: the provenance indexing system performs approximate attention over the full unbounded context, selecting which blocks enter exact attention; standard attention is flat retrieval at O(N) cost; this system is hierarchical retrieval at O(1) cost; RAG replaces the attention mechanism and loses attentional continuity; this system preserves the mechanism and removes the scaling constraint (§6, §11.4). The structural argument is straightforward: a datacenter running full attention over a 2.2M-line codebase is in the O(N) accumulation regime the moment it evicts a token; this system is not, on a laptop GPU — and the theorem establishes that no full-attention system on any hardware can exit that regime (§11.2 Corollary 2, §9.12).
 
 The deeper lesson is methodological: constraints accepted as first-class design requirements rather than problems to be avoided force architectural decisions that are more efficient in the dimension the constraint bounds — and efficiency in that dimension tends to generalise. The 16GB ceiling produced native quantized kernels faster on any hardware. The finite hot tier produced the sparse attention that makes unbounded context theoretically tractable. The memory pressure of concurrent sessions produced the two-phase quantization that correctly separates two error mechanisms the literature conflates. Each constraint closed a standard solution and forced a better one. The benchmark numbers demonstrate this on 16GB. The theorem explains why the results hold everywhere.
 
@@ -1187,6 +1292,44 @@ The deeper lesson is methodological: constraints accepted as first-class design 
 [27] Jiang, Z., et al. (2023). **FLARE: Active Retrieval Augmented Generation.** EMNLP 2023. https://arxiv.org/abs/2305.06983
 
 [28] Asai, A., et al. (2024). **Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection.** ICLR 2024. https://arxiv.org/abs/2310.11511
+
+*Published throughput figures compared against in §9.6. Each is recorded with its card, quantization, context length and engine in `docs/performance.md` §6.*
+
+[29] llama.cpp Discussion #15013. **Performance of llama.cpp on Nvidia CUDA** (Llama-2-7B Q4_0). https://github.com/ggml-org/llama.cpp/discussions/15013
+
+[30] Hardware Corner. (2026). **RTX 3090 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-3090/
+
+[31] Hardware Corner. (2026). **RTX 4080 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-4080/
+
+[32] jonidimo. (2026). **Qwen3.8-27B on One RTX 3090: 14h Measured Benchmark.** https://jonidimo.github.io/qwen38-3090-benchmark/benchmark.html
+
+[33] ryan4yin. (2026). **Best llama.cpp config for Qwen3.8-Flash-Next (RTX 4090 24GB).** https://gist.github.com/ryan4yin/48617bbddacc7067f10799770b7cc33f
+
+[34] unsloth/Qwen3.8-Flash-Next-GGUF discussion #3. (2026). **Share your model speed here.** https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/discussions/3
+
+[35] InsiderLLM. (2026). **Best Way to Run Qwen 3.6 35B MoE Locally.** https://insiderllm.com/guides/best-way-run-qwen-3-6-35b-moe-locally/
+
+[36] llama.cpp Discussion #19890. (2026). **RTX 5090 (CUDA) vs Radeon AI PRO R9700 (Vulkan) — Qwen3.5-35B-A3B.** https://github.com/ggml-org/llama.cpp/discussions/19890
+
+[37] SOTAAZ. (2026). **llama.cpp KV Cache Quantization, Measured on One A100.** https://sotaaz.com/post/llamacpp-kv-cache-quantization-bench-en
+
+[38] vLLM Blog. (2026). **The State of FP8 KV-Cache and Attention Quantization in vLLM.** https://vllm.ai/blog/2026-04-22-fp8-kvcache
+
+[39] vLLM Blog. (2026). **A First Comprehensive Study of TurboQuant: Accuracy and Performance.** https://vllm.ai/blog/2026-05-11-turboquant
+
+[40] ByteShape. (2026). **If It Fits, It Sits: Qwen 3.6 35B.** https://byteshape.com/blogs/Qwen3.6-35B-A3B/
+
+[41] Hardware Corner. (2026). **RTX 5090 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-5090/
+
+[42] Millstone AI. (2026). **Qwen3.5-35B-A3B FP8 on 1× RTX Pro 6000.** https://www.millstoneai.com/inference-benchmark/qwen3-5-35b-a3b-fp8-1x-rtx-pro-6000-blackwell
+
+[43] Millstone AI. (2026). **Qwen3.6-35B-A3B FP8 on 1× RTX Pro 6000.** https://www.millstoneai.com/inference-benchmark/qwen3-6-35b-a3b-fp8-1x-rtx-pro-6000-blackwell
+
+[44] holy_fox. (2026). **Running Qwen3.8-Flash-Next on an RTX 5090 with 128GB RAM using llama.cpp.** https://zenn.dev/holy_fox/articles/04887ff8177b87?locale=en
+
+[45] llama.cpp PR #24162. (2026). **DeepSeek V4.** https://github.com/ggml-org/llama.cpp/pull/24162
+
+[46] RockmSockmJesus. (2026). **DeepSeek-V4-Flash (284B MoE) at ~28 tok/s on 1x RTX 5090.** https://gist.github.com/RockmSockmJesus/30a195ccd9b62e981ec2676a99a57b7e
 
 ---
 

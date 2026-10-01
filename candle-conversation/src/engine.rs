@@ -4,8 +4,10 @@ use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
+use crate::persistence::manifest::ConvState;
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
+use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
     Builder, CollectionWarm, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget,
@@ -14,8 +16,9 @@ use crate::projection::{
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
-    compile, compile_think_tree, compile_tool_call_tree, HfVocab, StencilTree, ThinkMode,
+    compile, compile_think_tree, compile_tool_call_loop, HfVocab, StencilTree, ThinkMode,
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+    MAX_TOOL_CALLS_PER_TURN,
 };
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
 // disconnected, so nothing constructs a runner. `Substrate` comes from our side.
@@ -27,6 +30,7 @@ use crate::turn_text::literal_tokenizer;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use flume::{Receiver, Sender};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -365,14 +369,14 @@ impl ConversationEngine {
         // substrate.
         //
         // Mandatory substrate persistence — the redo log under the
-        // workspace's `.substrate/` directory (or the process CWD).
+        // workspace's `substrate/` directory (or the process CWD).
         // Open persistence and drive every record straight into the
         // substrate's in-RAM state in one walker pass — no manifest
         // mirror, no `reconstruct → collected_*` second pass.
         //
         // A host that writes its own record classes into this same log opens it
         // first and hands the open pair over ([`SharedSubstrate`]) — one
-        // `.substrate/` admits exactly one writable handle per process. Everyone
+        // `substrate/` admits exactly one writable handle per process. Everyone
         // else names a directory and the engine opens it here. Resolved once,
         // into the same pair either way, so nothing downstream knows which.
         let open_start = std::time::Instant::now();
@@ -386,7 +390,7 @@ impl ConversationEngine {
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
                     }
                 };
-                // A read-only open writes nothing under `.substrate/` and
+                // A read-only open writes nothing under `substrate/` and
                 // requires the store to exist — see
                 // `EngineConfig::read_only_substrate`.
                 let opened = if config.read_only_substrate {
@@ -898,6 +902,19 @@ impl ConversationEngine {
             .map_err(ConversationError::Model)
     }
 
+    /// Merge several `(key, value)` pairs into `timeline`'s `custom` metadata in
+    /// one persisted record, so values that describe one decision — a turn's
+    /// composer dials — are never recovered half-written.
+    pub fn set_conversation_metadata_many(
+        &self,
+        timeline: TimelineId,
+        kv: &std::collections::BTreeMap<String, String>,
+    ) -> crate::Result<()> {
+        self.conversation
+            .set_conversation_metadata_many(timeline, kv)
+            .map_err(ConversationError::Model)
+    }
+
     /// `timeline`'s `custom` metadata bag, or `None` if unregistered.
     pub fn conversation_metadata(
         &self,
@@ -906,11 +923,101 @@ impl ConversationEngine {
         self.conversation.conversation_metadata(timeline)
     }
 
+    /// Record that `child` continues `parent` — the durable fork lineage a
+    /// projection walks to treat an ancestor's turns as the child's own
+    /// opening (`Substrate::inherited_chain`).
+    ///
+    /// This is metadata only. Nothing is copied and nothing has to stay
+    /// resident: the ancestor's K/V is fetched from whatever tier it is on,
+    /// by the same working-set elevation every other selected turn uses.
+    pub fn set_forked_from(&self, child: TimelineId, parent: TimelineId) -> crate::Result<()> {
+        self.set_conversation_metadata(
+            child,
+            crate::substrate::Substrate::FORKED_FROM_KEY,
+            &parent.raw().to_string(),
+        )
+    }
+
     /// Every live conversation whose `custom` metadata contains `key == value`.
     /// The content-addressed lookup utility ingests use after substrate
     /// load to skip rebuilding units already present (tombstoned excluded).
     pub fn find_conversations_by_metadata(&self, key: &str, value: &str) -> Vec<TimelineId> {
         self.conversation.find_timelines_by_metadata(key, value)
+    }
+
+    /// Inject `read` into `target`'s fast-path set — the conversation that
+    /// already read this content, standing in for reading it again.
+    ///
+    /// `budget_tokens` is the reading layer's `fast_path_window`; the set is
+    /// evicted least-recently-used down to it. `false` means the read did not
+    /// fit and the caller must do the real read.
+    pub fn fast_path_admit(
+        &self,
+        target: TimelineId,
+        read: TimelineId,
+        budget_tokens: usize,
+    ) -> bool {
+        self.conversation
+            .write()
+            .fast_path_admit(target, read, budget_tokens)
+    }
+
+    /// The conversations `target` currently carries from the fast path, most
+    /// recently admitted first.
+    pub fn fast_path_injections(&self, target: TimelineId) -> Vec<TimelineId> {
+        self.conversation
+            .read()
+            .fast_path_injections(target)
+            .to_vec()
+    }
+
+    /// Forget `target`'s fast-path set, so the next call rebuilds it from the
+    /// conversation's own history.
+    pub fn fast_path_clear(&self, target: TimelineId) {
+        self.conversation.write().fast_path_clear(target);
+    }
+
+    /// Offer `group`'s conversations to a projection only as its target's
+    /// scope names them ([`Self::set_retrieval_scope`]) — for ingested
+    /// content that is only right for a conversation whose own files hold the
+    /// same. Idempotent; in-memory, so it is marked at every setup.
+    pub fn mark_group_scoped(&self, group: GroupId) {
+        self.conversation.write().mark_group_scoped(group);
+    }
+
+    /// Name the conversations the scoped `group` may offer `target`, replacing
+    /// what it named before. Both the belief scan and selection honour it.
+    pub fn set_retrieval_scope(
+        &self,
+        target: TimelineId,
+        group: GroupId,
+        allowed: Arc<HashSet<TimelineId>>,
+    ) {
+        self.conversation
+            .write()
+            .set_retrieval_scope(target, group, allowed);
+    }
+
+    /// Forget every scope `target` was given.
+    pub fn clear_retrieval_scope(&self, target: TimelineId) {
+        self.conversation.write().clear_retrieval_scope(target);
+    }
+
+    /// Every assistant turn's text on `timeline`, oldest first.
+    ///
+    /// The durable record of what a conversation asked for: the `<tool_call>`
+    /// blocks it wrote are in here verbatim, which is what lets a resumed
+    /// conversation replay its own calls without any of them having been
+    /// recorded a second time as metadata.
+    pub fn assistant_turn_texts(&self, timeline: TimelineId) -> Vec<String> {
+        let view = self.conversation.read();
+        let mut indices: Vec<_> = view.turn_indices(timeline).collect();
+        indices.sort_by_key(|i| i.0);
+        indices
+            .into_iter()
+            .map(|idx| view.assistant_text_of(timeline, idx))
+            .filter(|t| !t.is_empty())
+            .collect()
     }
 
     /// [`Self::find_conversations_by_metadata`] plus tombstoned conversations
@@ -928,7 +1035,7 @@ impl ConversationEngine {
 
     /// One-pass snapshot of the distinct `custom[key]` values across live
     /// conversations — for O(1) resume-cache membership probing.
-    pub fn conversation_metadata_values(&self, key: &str) -> std::collections::HashSet<String> {
+    pub fn conversation_metadata_values(&self, key: &str) -> HashSet<String> {
         self.conversation.metadata_values_for_key(key)
     }
 
@@ -969,6 +1076,48 @@ impl ConversationEngine {
         self.conversation.conversations_with_conv_id_prefix(prefix)
     }
 
+    /// Set the branch a conversation works on in each repository `branches`
+    /// names (repository workspace name → branch), leaving any other
+    /// repository's as it is. Persisted with the rest of the conversation's
+    /// state as one `RecordType::ConvState` record (last-writer-wins); a call
+    /// that changes nothing writes nothing.
+    pub fn set_conversation_branches(
+        &self,
+        timeline: TimelineId,
+        branches: &BTreeMap<String, String>,
+    ) {
+        self.conversation
+            .set_conversation_branches(timeline, branches)
+    }
+
+    /// Stage a set of a conversation's changes to its files as events on its
+    /// timeline, events before tombstones, for the group commit to make
+    /// durable — see `docs/zend_vfs_events.md`. Returns the sequence numbers
+    /// the events took, in order.
+    pub fn write_conversation_files(
+        &self,
+        timeline: TimelineId,
+        write: &VfsWrite,
+    ) -> crate::Result<Vec<u64>> {
+        self.conversation
+            .write_conversation_files(timeline, write)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Every live event of a conversation's files, in `(repo, key, seq)`
+    /// order — what building the conversation again replays.
+    pub fn conversation_files(&self, timeline: TimelineId) -> crate::Result<Vec<VfsEventPayload>> {
+        self.conversation
+            .conversation_files(timeline)
+            .map_err(ConversationError::Model)
+    }
+
+    /// A conversation's state — archived flag and the branch it works on in
+    /// each repository — or `None` for an unknown timeline.
+    pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.conversation.conversation_state(timeline)
+    }
+
     /// Toggle the archived lifecycle flag for a conversation. Persists
     /// to the redo log as `RecordType::ConvState` (last-writer-wins)
     /// and updates the in-RAM substrate. Drives the daemon's
@@ -981,6 +1130,12 @@ impl ConversationEngine {
         self.conversation
             .set_conversation_archived(timeline, archived)
             .map_err(ConversationError::Model)
+    }
+
+    /// Mark a conversation used now — the sidebar lists it first until another
+    /// is used. Persists its `ConvState`.
+    pub fn touch_conversation(&self, timeline: TimelineId) {
+        self.conversation.touch_conversation(timeline);
     }
 
     /// Mark `timeline` as scratch: its turns never reach cold storage.
@@ -1351,11 +1506,19 @@ impl ConversationEngine {
         // The model emits the `<tool_call>` trigger itself, so the tree resumes
         // *after* that marker: its `open` is the envelope minus the marker.
         //
-        // The close ends with the assistant-turn EOS (`<|im_end|>`): a tool call
-        // is the entire assistant turn, so once it is emitted the turn must end.
-        // Without this the stencil releases control after `</tool_call>` and the
-        // model free-decodes a hallucinated answer past the call. The decode
-        // loop detects the EOS in the injected close run and seals the turn.
+        // **A turn may make up to [`MAX_TOOL_CALLS_PER_TURN`] calls.** After each
+        // one the loop offers exactly two continuations — the marker, which opens
+        // another call, or the assistant-turn terminator, which ends the turn — so
+        // the decoder is never free between a call and whatever follows it. That
+        // is the same guarantee the single-call tree gave by baking the EOS into
+        // its close (without which the model free-decodes a hallucinated answer
+        // past the call), now expressed as the loop's second arm rather than as an
+        // unconditional ending. The decode loop still detects the EOS in the
+        // injected close run and seals the turn.
+        //
+        // The batching is what this buys: a model that already knows it wants
+        // three files says so in one turn instead of paying a reasoning block, a
+        // prefill and a belief scan for each.
         //
         // **Taken from the dialect, not written here.** The shape of a call is
         // decided by the template the weights were trained against — Qwen3.5
@@ -1366,8 +1529,10 @@ impl ConversationEngine {
         // the close ending exactly ON that terminator — see
         // [`ToolCallEnvelope::for_assistant_turn`] for why the trailing newline
         // in `assistant_end` cannot be allowed to ride along.
-        let envelope = ToolCallEnvelope::for_assistant_turn(&self.config.dialect);
-        let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
+        let envelope = ToolCallEnvelope::for_assistant_calls(&self.config.dialect);
+        let close_turn = ToolCallEnvelope::turn_close(&self.config.dialect);
+        let spec = compile_tool_call_loop(tools, &envelope, MAX_TOOL_CALLS_PER_TURN, &close_turn)
+            .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
         let vocab = HfVocab::new(

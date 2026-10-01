@@ -20,12 +20,17 @@ use {
 };
 
 #[cfg(feature = "cuda")]
-use crate::models::prefill_capture::maybe_capture;
+use crate::models::operand_guard::expect_dtype;
 use crate::models::qsa_selection::QsaSelection;
+use crate::models::rope_schedule::RopeRungs;
+#[cfg(feature = "cuda")]
+use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 #[cfg(feature = "cuda")]
 use crate::models::slot_state::SlotTokenLayout;
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::HeadGids;
+use candle_kernels::rope::RopeRungsFfi;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::ChunkPin;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -43,7 +48,7 @@ use candle_nn::kv_cache::WaveGeneration;
 /// only after the launch.
 #[cfg(feature = "cuda")]
 struct SlotHeaderUpload {
-    /// Raw GPU address of `SlotHeader[b]` (24 bytes each).
+    /// Raw GPU address of `SlotHeader[b]`.
     headers_ptr: u64,
     /// Keeps the header upload alive for the duration of the kernel launch.
     _headers_gpu: GpuBuf,
@@ -63,7 +68,7 @@ struct SlotHeaderUpload {
     /// headers address with one refcount bump per slot rather than a clone per
     /// chunk — the difference between O(1) and O(depth) on every layer of every
     /// step.
-    _pinned_gids: Vec<Arc<Vec<HeadGids>>>,
+    _pinned_gids: Vec<Arc<Vec<ChunkPin>>>,
 }
 
 /// Per-forward cache of the layer-invariant uploaded `position_map`.
@@ -102,6 +107,67 @@ pub struct SharedPm {
     /// writer would scatter its new tokens into a chunk the map does not
     /// describe.
     per_slot_write: Vec<u32>,
+    /// Position-map buffers a later layer's rebuild superseded, held alive until
+    /// this whole cache is dropped at the end of the forward.
+    ///
+    /// A windowed-creep layer whose live layout diverges from the cached map
+    /// rebuilds and republishes it (so the layers past the creep front reuse the
+    /// new one), but the buffer it replaces cannot be freed here: earlier layers
+    /// launched their attention kernels against that device address and may
+    /// still be reading it. Freeing and reallocating mid-forward could hand the
+    /// same pool address to this layer's upload while that read is in flight — a
+    /// wild read or wrong attention with no attribution (CLAUDE.md invariant 7).
+    /// Carrying the superseded buffer here defers its free to forward end, which
+    /// is after the logits readback — i.e. after every kernel has retired.
+    #[cfg(feature = "cuda")]
+    superseded: Vec<GpuBuf>,
+}
+
+/// Classify how a later layer's live slot layout differs from the cached
+/// position map: whether the map must be rebuilt (`stale`), and whether the
+/// divergence is the benign windowed-creep skew or a real layout change worth a
+/// loud, attributed line (`anomalous`).
+///
+/// `cached` is the per-slot `(n_slices, covered_tokens)` the map was built over
+/// and `cached_write` the per-slot writer slice; `live` is this layer's
+/// `(n_slices, covered_tokens, writer_slice)` derived from the slot-state buffer
+/// and the caller's `offsets + q_lens`. A length mismatch means the wave's slot
+/// membership moved between layers — never a creep artefact, so both flags. Per
+/// slot: the creep skew pushes a trailing 0-token writer chunk ahead of the
+/// lagging layers, so the slice count moves while the covered-token count does
+/// not; a covered-token move (or the writer slipping into a chunk the map does
+/// not describe) is a genuine layout divergence. A covered-token move is the one
+/// that reads as anomalous — the rebuild keeps the forward correct either way,
+/// but only creep is expected to move the slice count on its own.
+///
+/// Pure host logic, so these rules are unit-tested directly without a GPU (this
+/// whole module is CUDA-only, but the function touches no device). See
+/// [`SharedPm`] for why a rebuilt map must not index a stale layout.
+fn classify_pm_divergence(
+    cached: &[(u32, u32)],
+    cached_write: &[u32],
+    live: &[(u32, u32, u32)],
+) -> (bool, bool) {
+    if cached.len() != live.len() {
+        return (true, true);
+    }
+    let mut stale = false;
+    let mut anomalous = false;
+    for i in 0..live.len() {
+        let (want_slices, want_covered) = cached[i];
+        let (n_slices, this_covered, buf_write) = live[i];
+        let coverage_moved = this_covered != want_covered;
+        // The writer slice moved into a chunk the cached map does not describe.
+        let writer_moved =
+            buf_write != cached_write[i] && (cached_write[i] as usize) < n_slices as usize;
+        if n_slices != want_slices || coverage_moved || writer_moved {
+            stale = true;
+        }
+        if coverage_moved {
+            anomalous = true;
+        }
+    }
+    (stale, anomalous)
 }
 
 /// Build + upload the per-slot `SlotHeader` payloads (slices, position_map,
@@ -116,8 +182,9 @@ pub struct SharedPm {
 /// remaining cost in speculative decode: at 128K a slot is thousands of chunks
 /// that are byte-identical from one verify step to the next, and re-deriving
 /// them was 291 ms of an 1806 ms decode. What genuinely differs per launch is
-/// the position map's write region and the 24-byte headers, and those are all
-/// that is built here.
+/// the position map's write region and the headers, and those are all that is
+/// built here. Each header carries its slot's RoPE rung, from the deepest
+/// position the launch writes for it.
 #[cfg(feature = "cuda")]
 fn build_slot_headers(
     caches: &[&mut KvCache],
@@ -125,6 +192,7 @@ fn build_slot_headers(
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
     offsets: &[usize],
+    rope: &RopeRungs,
 ) -> Result<SlotHeaderUpload> {
     let t_build = profile_now();
     if caches.len() != offsets.len() || caches.len() != q_lens.len() {
@@ -218,60 +286,81 @@ fn build_slot_headers(
 
     // Per-slot `write_slice` for the headers: read from the token layout on the
     // layer that builds the map, from the cache on every later layer.
+    //
+    // `pm_cached` starts from whether a map exists, but a divergence below
+    // clears it and forces a rebuild — so it is `mut`.
+    let mut pm_cached = pm_cached;
     let mut write_slices: Vec<u32> = Vec::with_capacity(caches.len());
     if pm_cached {
-        // Position-map shape guard: the cached map was built from an earlier
+        // Position-map shape check: the cached map was built from an earlier
         // layer's slice layout; the kernel resolves every k_pos through it into
-        // THIS layer's slice array. If any slot's layout changed since the build
-        // — a chunk boundary moved, a chunk appeared or vanished — the map's
-        // `(slice_idx, in_blk)` entries index the wrong slices, and a slice_idx
-        // past this layer's slice count sends the kernel through a garbage
-        // `kvheads_ptr` (CUDA_ERROR_ILLEGAL_ADDRESS with no attribution). Refuse
-        // to launch and name the slot + shape delta instead.
-        let cache = shared_pm.borrow();
-        let s = cache
-            .as_ref()
-            .expect("pm_cached implies shared_pm is populated");
-        if s.per_slot_shape.len() != caches.len() {
-            candle::bail!(
-                "slot header build: cached position_map covers {} slots but this \
-                 layer has {} — wave membership changed mid-forward",
-                s.per_slot_shape.len(),
-                caches.len()
-            );
-        }
-        for i in 0..caches.len() {
-            let (want_slices, want_covered) = s.per_slot_shape[i];
-            let (_, n_slices, buf_write) = slot_states[i];
-            let this_covered = (offsets[i] + q_lens[i]) as u32;
-            if n_slices != want_slices || this_covered != want_covered {
-                candle::bail!(
-                    "slot header build: batch slot {i} slice layout changed \
-                     mid-forward under the cached position_map: map was built \
-                     over {want_slices} slices / {want_covered} covered tokens, \
-                     this layer has {n_slices} slices / {this_covered} covered \
-                     tokens (offset {} + q_len {}) — a concurrent mutation moved \
-                     the slot's chunk boundaries between layers",
-                    offsets[i],
-                    q_lens[i]
+        // THIS layer's slice array. The map is layer-invariant only while the
+        // slot's chunk layout is the same on every layer — and during a windowed
+        // creep prefill it is not. The creep advances the layers incrementally
+        // (layer 0 first), pushing an empty (0-token) writer chunk for the next
+        // window ahead of the layers still pending resume, so between the layer
+        // that built the map and a later layer a slot's slice count differs by
+        // that one trailing empty chunk (same covered tokens). See the skew note
+        // on `BatchedInferenceSession::sequence_block_count`. Reusing the stale
+        // map would resolve k_pos through a slice index that layer does not have
+        // — a garbage `kvheads_ptr` (CUDA_ERROR_ILLEGAL_ADDRESS, no attribution).
+        //
+        // So when the cached shape no longer matches this layer's live layout,
+        // rebuild the map from the current layout and republish it for the layers
+        // past the creep front, rather than refuse the launch. Each layer's map
+        // then matches the slices its own kernel walks, which is all correctness
+        // needs — attention is per-layer. Refusing instead stranded the forward,
+        // and retried every wave it hung the engine with the GPU pegged and no
+        // conversation ever opened. The rebuild reads the same live backing the
+        // first layer's build already trusts, so it is no less safe than that
+        // build is — and the buffer it replaces is not freed here but carried in
+        // `SharedPm::superseded` until forward end (an earlier layer's kernel may
+        // still be reading it).
+        //
+        // The benign creep skew adds a trailing 0-token chunk: the slice count
+        // moves but the covered-token count does not. A covered-token move or a
+        // change in the wave's slot count is a real layout divergence — not creep
+        // — so it is worth a loud, attributed line even though the rebuild still
+        // makes it safe.
+        let (stale, anomalous) = {
+            let cache = shared_pm.borrow();
+            let s = cache
+                .as_ref()
+                .expect("pm_cached implies shared_pm is populated");
+            // This layer's live `(n_slices, covered_tokens, writer_slice)` per
+            // slot, against the `(n_slices, covered_tokens)` + writer the map was
+            // built over. Classified by `classify_pm_divergence`, which is a pure
+            // function so the stale/anomalous rules are unit-tested directly.
+            let live: Vec<(u32, u32, u32)> = (0..caches.len())
+                .map(|i| {
+                    let (_, n_slices, buf_write) = slot_states[i];
+                    (n_slices, (offsets[i] + q_lens[i]) as u32, buf_write)
+                })
+                .collect();
+            classify_pm_divergence(&s.per_slot_shape, &s.per_slot_write, &live)
+        };
+        if stale {
+            if anomalous {
+                tracing::warn!(
+                    "position map rebuilt mid-forward from a layout that is not the \
+                     benign windowed-creep skew: the covered-token count or the wave's \
+                     slot membership moved between layers. The rebuild keeps this \
+                     forward correct, but suspect a concurrent chunk-table mutation if \
+                     it recurs."
                 );
             }
-            // The buffer derives its write chunk from live host state, the map
-            // named one when it was built. They are the same rule applied twice,
-            // and a divergence would scatter this launch's new tokens into a
-            // chunk the map does not describe — silently, since both indices are
-            // in range.
-            if buf_write != s.per_slot_write[i]
-                && (s.per_slot_write[i] as usize) < n_slices as usize
-            {
-                candle::bail!(
-                    "slot header build: batch slot {i} slot-state buffer writes \
-                     slice {buf_write} but the cached position_map's write region \
-                     names slice {} — the writer moved between layers",
-                    s.per_slot_write[i]
-                );
+            // Do NOT free the cached map here — the build path takes it and carries
+            // its buffer forward in `superseded`. This just routes both branches
+            // below to the build path.
+            pm_cached = false;
+        } else {
+            let cache = shared_pm.borrow();
+            let s = cache
+                .as_ref()
+                .expect("pm_cached implies shared_pm is populated");
+            for i in 0..caches.len() {
+                write_slices.push(s.per_slot_write[i]);
             }
-            write_slices.push(s.per_slot_write[i]);
         }
     }
     pipeline_record("slot:build", t_build);
@@ -324,15 +413,38 @@ fn build_slot_headers(
                     ));
                 }
             });
-            // Count invariant: the slices must cover EXACTLY the slot's recorded
-            // sealed-KV offset. A shortfall means the block table lost chunks
-            // (the host-side "computed write len N is invalid" class); the
-            // kernel would seek a token past the covered range and walk off the
-            // END of the slice array into adjacent stager memory — garbage
-            // headers, garbage kvheads_ptr, CUDA_ERROR_ILLEGAL_ADDRESS with no
-            // attribution.
+            // Count invariant: the slices must cover AT LEAST the slot's recorded
+            // sealed-KV offset. A shortfall (`cum < want`) means the block table
+            // lost chunks (the host-side "computed write len N is invalid"
+            // class); the kernel would seek a token past the covered range and
+            // walk off the END of the slice array into adjacent stager memory —
+            // garbage headers, garbage kvheads_ptr, CUDA_ERROR_ILLEGAL_ADDRESS
+            // with no attribution. That is the only fatal case.
+            //
+            // An OVERAGE (`cum > want`) is the mid-creep skew and is safe,
+            // REGARDLESS of `q_len`. A windowed advance moves some layers ahead of
+            // the others, so `reconcile_entry_offsets` clamps the slot offset to
+            // the MINIMUM coverage across layers (see `sequence_backing_tokens`) —
+            // which leaves the ahead layers covering more than that clamped `want`.
+            // The position map built below from THIS layer's chunks is then a
+            // SUPERSET of `[0, want)`: every position the varlen metadata asks for
+            // still resolves, and the extra covered tokens are simply unindexed.
+            // New tokens are appended at the writer slice the layout resolves from
+            // this layer's own chunks (`extend_for_write_region`), not blindly at
+            // `want`, so a positive `q_len` lands correctly on top of the superset.
+            // (This is the SAME event `classify_pm_divergence` above calls the
+            // benign creep: there `cum` is measured against the cached map layer 0
+            // published; here against the clamped `want`. Two baselines, one skew.)
+            //
+            // Bailing on the overage — in ANY form, including the earlier
+            // `q_len > 0` variant of this guard — deadlocks the creep: the forward
+            // fails, the lagging layers never catch up, and it fails again every
+            // tick, wedging the slot for good. That regression showed up live as
+            // "nothing came of it" across most characters. The overage genuinely
+            // occurs during normal windowed decode (`q_len == 1`), so a shortfall
+            // is the only fatal case; overage is tolerated.
             let want = offsets[slot_i];
-            if (cum as usize) != want {
+            if (cum as usize) < want {
                 candle::bail!(
                     "slot header build: batch slot {slot_i} slices cover {cum} tokens \
                      but the slot's recorded offset is {want} ({} slices) — block \
@@ -407,12 +519,26 @@ fn build_slot_headers(
         // link a PCIe round trip on the kernel's critical path.
         let pm_gpu = generation.submit_resident(pm_pinned)?;
         let base_ptr = pm_gpu.dev_ptr();
+        // Take the map this rebuild replaces (if any) and carry its buffer, and
+        // any it had already carried, forward — freeing it now could pull the
+        // device memory an earlier layer's in-flight kernel is still reading. It
+        // is released with this whole cache at forward end, after the kernels
+        // have retired. On the first (uncached) layer there is nothing to carry.
+        let superseded = match shared_pm.borrow_mut().take() {
+            Some(prev) => {
+                let mut carried = prev.superseded;
+                carried.push(prev._gpu);
+                carried
+            }
+            None => Vec::new(),
+        };
         *shared_pm.borrow_mut() = Some(SharedPm {
             _gpu: pm_gpu,
             base_ptr,
             byte_offsets: byte_offsets.clone(),
             per_slot_shape,
             per_slot_write: write_slices.clone(),
+            superseded,
         });
         byte_offsets
     };
@@ -422,14 +548,18 @@ fn build_slot_headers(
         .expect("position_map cache populated above")
         .base_ptr;
 
-    let mut header_buf: Vec<u8> = Vec::with_capacity(caches.len() * 24);
+    let mut header_buf: Vec<u8> = Vec::with_capacity(caches.len() * SLOT_HEADER_BYTES);
     for (i, &write_slice) in write_slices.iter().enumerate() {
         let (slices_ptr, n_slices, _) = slot_states[i];
-        let position_map_ptr = pm_base_ptr + pm_byte_offsets[i] as u64;
-        header_buf.extend_from_slice(&n_slices.to_le_bytes());
-        header_buf.extend_from_slice(&write_slice.to_le_bytes());
-        header_buf.extend_from_slice(&slices_ptr.to_le_bytes());
-        header_buf.extend_from_slice(&position_map_ptr.to_le_bytes());
+        SlotHeaderHost {
+            n_slices,
+            write_slice,
+            slices_ptr,
+            position_map_ptr: pm_base_ptr + pm_byte_offsets[i] as u64,
+            // The deepest position this launch writes for the slot.
+            rope_rung: rope.rung_for(offsets[i] + q_lens[i])?,
+        }
+        .write(&mut header_buf);
     }
 
     let mut pinned = generation.alloc(header_buf.len())?;
@@ -472,8 +602,7 @@ fn paged_prefill_batched_impl<'w>(
     n_kv_head: usize,
     head_dim: usize,
     prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
-    rope_offsets: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     rope_interleaved: bool,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
@@ -688,28 +817,10 @@ fn paged_prefill_batched_impl<'w>(
         }
     };
 
-    let header_upload = build_slot_headers(caches, q_lens, generation, shared_pm, offsets)?;
+    let header_upload = build_slot_headers(caches, q_lens, generation, shared_pm, offsets, rope)?;
     let headers_ptr = header_upload.headers_ptr;
 
     g_pack.end();
-
-    // Optional kernel-replay capture: dumps this call's packed Q/K/V + cached KV
-    // chunks + geometry to a fixture. No-op unless `ZEND_PREFILL_CAPTURE` is set;
-    // fires once, on the first call past the kv_len threshold (one layer).
-    maybe_capture(
-        caches,
-        offsets,
-        &q_packed,
-        &k_packed,
-        &v_packed,
-        q_lens,
-        n_head,
-        n_kv_head,
-        head_dim,
-        rope_offsets,
-        rope_cs,
-        rope_interleaved,
-    );
 
     let g_kernel = gpu_span("prefill:kernel", q.device());
     let out_packed = paged_prefill_attn_varlen_chunks(
@@ -726,8 +837,7 @@ fn paged_prefill_batched_impl<'w>(
         n_kv_head,
         head_dim,
         softmax_scale,
-        rope_offsets,
-        rope_cs,
+        rope,
         rope_interleaved,
         max_add,
         qsa,
@@ -787,8 +897,7 @@ pub fn paged_prefill_batched<'w>(
     n_kv_head: usize,
     head_dim: usize,
     prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
-    rope_offsets: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     rope_interleaved: bool,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
@@ -807,8 +916,7 @@ pub fn paged_prefill_batched<'w>(
         n_kv_head,
         head_dim,
         prefill_meta,
-        rope_offsets,
-        rope_cs,
+        rope,
         rope_interleaved,
         generation,
         shared_pm,
@@ -834,8 +942,7 @@ pub fn paged_prefill_batched(
     n_kv_head: usize,
     head_dim: usize,
     _prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
-    _rope_offsets: &Tensor,
-    _rope_cs: &Tensor,
+    _rope: &RopeRungs,
     _rope_interleaved: bool,
     _generation: &Generation,
     _shared_pm: &std::cell::RefCell<Option<SharedPm>>,
@@ -944,7 +1051,7 @@ pub fn paged_glue_attn(
     _glue_write_slice: &Tensor,
     _glue_write_in_blk: &Tensor,
     _fwd_ahead: &Tensor,
-    _rope_cs: &Tensor,
+    _rope: &RopeRungs,
     _rope_interleaved: bool,
     _generation: &Generation,
     _shared_pm: &std::cell::RefCell<Option<SharedPm>>,
@@ -972,12 +1079,9 @@ struct PagedPrefillInt8<'k> {
     head_dim: usize,
     /// Compute dtype for K/V/Q — F16 or BF16. Pre-resolved from K and V arena formats.
     compute_dtype: DType,
-    /// RoPE position offsets per batch element, shape [batch_size], dtype U32.
-    /// Zero values = natural positions (no extra shift). Non-zero = page-clone position delta.
-    rope_offsets: Tensor,
-    /// Precomputed cos/sin table on device, shape [max_pos, head_dim], dtype F32.
-    /// Layout: rope_cs[pos * head_dim + d*2] = cos, [pos * head_dim + d*2+1] = sin.
-    rope_cs: Tensor,
+    /// The model's RoPE rungs (`rope_schedule::RopeRungs`): each sequence
+    /// rotates by the rung its `SlotHeader` names.
+    rungs: RopeRungsFfi,
     /// RoPE pairing style: false=non-interleaved half-split (Qwen/GPT2), true=interleaved adjacent-pairs (Llama).
     rope_interleaved: bool,
     /// QSA: the block-sparse selection this layer reads through, one row per
@@ -1103,31 +1207,10 @@ impl<'k> PagedPrefillInt8<'k> {
             let (cu_ptr, _guard) = cu_seqlens_q.device_ptr(&stream);
             let (q_lens_ptr, _guard) = q_lens.device_ptr(&stream);
             let (kv_lens_ptr, _guard) = kv_lens.device_ptr(&stream);
-            // Extract rope_offsets pointer. The prefill CUDA kernel applies fused RoPE to Q
-            // (in smem) and to new K tokens (k_pos >= prefix_len) before computing attention
-            // scores and writing K/V to the arena.
-            let rope_offsets_ptr = {
-                let (ro_s, ro_l) = self.rope_offsets.storage_and_layout();
-                let ro_slice = match &*ro_s {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-                    _ => candle::bail!("paged-prefill: rope_offsets must be a cuda tensor"),
-                }
-                .slice(ro_l.start_offset()..);
-                let (ro_ptr, _ro_guard) = ro_slice.device_ptr(&stream);
-                ro_ptr as *const u32
-            };
-
-            let rope_cs_ptr = {
-                let (cs_s, cs_l) = self.rope_cs.storage_and_layout();
-                let cs_slice = match &*cs_s {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                    _ => candle::bail!("paged-prefill: rope_cs must be a cuda tensor"),
-                }
-                .slice(cs_l.start_offset()..);
-                let (cs_ptr, _cs_guard) = cs_slice.device_ptr(&stream);
-                cs_ptr as *const f32
-            };
-
+            // The kernel applies fused RoPE to Q (in smem) and to new K tokens
+            // (k_pos >= prefix_len), each at its own position under its
+            // sequence's rung, before computing attention scores and writing
+            // the un-rotated K/V to the arena.
             let headers_ptr = self.headers_ptr as *const u8;
 
             let raw_stream = stream.cu_stream() as *mut core::ffi::c_void;
@@ -1153,8 +1236,7 @@ impl<'k> PagedPrefillInt8<'k> {
                         self.max_q_len as i32,
                         self.softmax_scale,
                         q_dtype_code,
-                        rope_offsets_ptr,
-                        rope_cs_ptr,
+                        self.rungs,
                         self.rope_interleaved as i32,
                         raw_stream,
                         sel_e,
@@ -1271,8 +1353,7 @@ pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
     n_kv_head: usize,
     head_dim: usize,
     softmax_scale: f32,
-    rope_offsets: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     rope_interleaved: bool,
     max_q_len: usize,
     qsa: Option<&QsaSelection>,
@@ -1283,9 +1364,17 @@ pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
         candle::bail!("paged-prefill-int8 supports head_dim 64, 128 or 256 (got {head_dim})")
     }
 
-    let q = q.to_dtype(compute_dtype)?;
-    let k_packed = k_packed.to_dtype(compute_dtype)?;
-    let v_packed = v_packed.to_dtype(compute_dtype)?;
+    // Validated, not converted (invariant 1b). `project_qkv` already emits all
+    // three at the KV arena's width (`attention_operand_dtype`), which is what
+    // this kernel is instantiated on — Q, the new K/V and the output are one
+    // template type. A reference session whose arena is F32 never arrives here:
+    // `int8_prefill_act_dtype` sends it to the float fallback. So the casts that
+    // stood here converted nothing, and would have hidden a producer emitting
+    // the wrong width behind three full-tensor passes per layer, per wave.
+    expect_dtype(q, compute_dtype, "paged-prefill-int8: q")?;
+    expect_dtype(k_packed, compute_dtype, "paged-prefill-int8: k")?;
+    expect_dtype(v_packed, compute_dtype, "paged-prefill-int8: v")?;
+    let (q, k_packed, v_packed) = (q.clone(), k_packed.clone(), v_packed.clone());
 
     let (_total_q, q_n_head, q_head_dim) = q.dims3()?;
     if q_n_head != n_head || q_head_dim != head_dim {
@@ -1323,8 +1412,7 @@ pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
         n_kv_head,
         head_dim,
         compute_dtype,
-        rope_offsets: rope_offsets.clone(),
-        rope_cs: rope_cs.clone(),
+        rungs: rope.ffi()?,
         rope_interleaved,
         // The kernel indexes the selection by packed query row, so it must
         // carry exactly one row per query in the batch — a short table would
@@ -1378,7 +1466,7 @@ type GlueFfi = unsafe extern "C" fn(
     f32,           // softmax_scale
     *const c_void, // k_new
     *const c_void, // v_new
-    *const f32,    // rope_cs
+    RopeRungsFfi,  // rungs
     i32,           // rope_interleaved
     *const u32,    // cu_seqlens_q
     *const u32,    // q_lens
@@ -1417,7 +1505,7 @@ struct PagedGlueChunks<'k> {
     n_kv_head: usize,
     head_dim: usize,
     compute_dtype: DType,
-    rope_cs: Tensor,
+    rungs: RopeRungsFfi,
     rope_interleaved: bool,
 }
 
@@ -1481,15 +1569,6 @@ impl<'k> PagedGlueChunks<'k> {
         .slice(v_l.start_offset()..);
         let (v_ptr, _vg) = v_slice.device_ptr(&stream);
 
-        // RoPE cos/sin table (F32).
-        let (cs_s, cs_l) = self.rope_cs.storage_and_layout();
-        let cs_slice = match &*cs_s {
-            candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-            _ => candle::bail!("paged-glue: rope_cs must be a cuda tensor"),
-        }
-        .slice(cs_l.start_offset()..);
-        let (cs_ptr, _csg) = cs_slice.device_ptr(&stream);
-
         let elem_count = q_l.shape().elem_count();
         let dst = KernelOutput::<T>::new(dev, elem_count, wave)?;
 
@@ -1510,7 +1589,7 @@ impl<'k> PagedGlueChunks<'k> {
                 self.softmax_scale,
                 k_ptr as *const c_void,
                 v_ptr as *const c_void,
-                cs_ptr as *const f32,
+                self.rungs,
                 self.rope_interleaved as i32,
                 cu_ptr as *const u32,
                 ql_ptr as *const u32,
@@ -1576,7 +1655,7 @@ pub fn paged_glue_attn<'w>(
     glue_write_slice: &Tensor,
     glue_write_in_blk: &Tensor,
     fwd_ahead: &Tensor,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     rope_interleaved: bool,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
@@ -1679,7 +1758,8 @@ pub fn paged_glue_attn<'w>(
     // other 47 reuse the device buffer, skipping the host build and the PCIe
     // copy that otherwise dominate this span.
     let zero_q = vec![0usize; b_sz];
-    let header_upload = build_slot_headers(caches, &zero_q, generation, shared_pm, &kv_lens_host)?;
+    let header_upload =
+        build_slot_headers(caches, &zero_q, generation, shared_pm, &kv_lens_host, rope)?;
     g_hdr.end();
 
     let g_kernel = gpu_span("glue:kernel", device);
@@ -1703,7 +1783,7 @@ pub fn paged_glue_attn<'w>(
         n_kv_head,
         head_dim,
         compute_dtype,
-        rope_cs: rope_cs.clone(),
+        rungs: rope.ffi()?,
         rope_interleaved,
     };
     let q_compute = q_packed.to_dtype(compute_dtype)?;
@@ -1742,41 +1822,15 @@ pub fn paged_glue_attn<'w>(
     Ok(out)
 }
 
-/// Precompute cos/sin table for RoPE from inv_freq, computed with f64 precision.
-///
-/// Layout: `table[pos * head_dim + d * 2] = cos(pos * inv_freq[d])`,
-///         `table[pos * head_dim + d * 2 + 1] = sin(pos * inv_freq[d])`.
-///
-/// Returns a tensor of shape `[max_blocks * 32, head_dim]`, dtype F32, on `device`.
-pub fn compute_rope_cs(
-    inv_freq: &Tensor,
-    max_blocks: usize,
-    head_dim: usize,
-    device: &Device,
-) -> Result<Tensor> {
-    let max_pos = max_blocks * 32; // CHUNK_SIZE = 32
-    let inv_freq_host = inv_freq.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let half_dim = inv_freq_host.len();
-    let mut table = vec![0f32; max_pos * head_dim];
-    for pos in 0..max_pos {
-        let base = pos * head_dim;
-        for d in 0..half_dim {
-            let angle = pos as f64 * inv_freq_host[d] as f64;
-            table[base + d * 2] = angle.cos() as f32;
-            table[base + d * 2 + 1] = angle.sin() as f32;
-        }
-    }
-    Tensor::from_vec(table, (max_pos, head_dim), device)
-}
-
 // ============================================================================
 // Decode kernel — persistent slot buffer edition
 // ============================================================================
 
 /// Paged decode attention using persistent slot buffers.
 ///
-/// Takes the slot pool `headers` tensor (16 bytes × n_active per slot) instead
-/// of the old per-step chunk_meta / head_gids / kv_lens / per_head_table.
+/// Takes the slot pool's `SlotHeader[n_active]` instead of the old per-step
+/// chunk_meta / head_gids / kv_lens / per_head_table; each header names its
+/// slot's RoPE rung in `rope`.
 /// The kernel self-increments ws.len after scatter, so no write_offsets needed.
 ///
 /// Runs the production INT8 split-KV / warp-stripe / batched-M decode kernel
@@ -1794,7 +1848,7 @@ pub fn paged_decode_attn<'w>(
     softmax_scale: f32,
     k_new: &LiveTensor<'_>,
     v_new: &LiveTensor<'_>,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     rope_interleaved: bool,
     qsa: Option<&QsaSelection>,
 ) -> Result<LiveTensor<'w>> {
@@ -1811,7 +1865,7 @@ pub fn paged_decode_attn<'w>(
         softmax_scale,
         k_new,
         v_new,
-        rope_cs: rope_cs.clone(),
+        rungs: rope.ffi()?,
         rope_interleaved,
         num_active_slots,
         emit_q8: false,
@@ -1861,7 +1915,7 @@ pub fn paged_decode_attn_q8<'w>(
     softmax_scale: f32,
     k_new: &LiveTensor<'_>,
     v_new: &LiveTensor<'_>,
-    rope_cs: &Tensor,
+    rope: &RopeRungs,
     rope_interleaved: bool,
     gate: Option<&LiveTensor<'_>>,
     qsa: Option<&QsaSelection>,
@@ -1915,7 +1969,7 @@ pub fn paged_decode_attn_q8<'w>(
         softmax_scale,
         k_new,
         v_new,
-        rope_cs: rope_cs.clone(),
+        rungs: rope.ffi()?,
         rope_interleaved,
         num_active_slots,
         emit_q8: true,
@@ -1936,7 +1990,7 @@ struct PagedDecode<'k> {
     softmax_scale: f32,
     k_new: LiveTensor<'k>,
     v_new: LiveTensor<'k>,
-    rope_cs: Tensor,
+    rungs: RopeRungsFfi,
     rope_interleaved: bool,
     num_active_slots: usize,
     /// B2: when true the combine kernel emits the attention context as q8a1024 blocks (head_dim
@@ -1985,7 +2039,7 @@ impl<'k> PagedDecode<'k> {
             f32,
             *const core::ffi::c_void,
             *const core::ffi::c_void,
-            *const f32,
+            RopeRungsFfi,
             i32,
             *mut core::ffi::c_void,
             *const u32,
@@ -2025,14 +2079,6 @@ impl<'k> PagedDecode<'k> {
             .slice(v_l.start_offset()..);
             let (v_ptr, _v_g) = v_slice.device_ptr(&stream);
 
-            let (rcs_s, rcs_l) = self.rope_cs.storage_and_layout();
-            let rcs_slice = match &*rcs_s {
-                candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                _ => candle::bail!("paged-decode-v2: rope_cs must be CUDA"),
-            }
-            .slice(rcs_l.start_offset()..);
-            let (rcs_ptr, _rcs_g) = rcs_slice.device_ptr(&stream);
-
             let (dst_ptr, _dst_g) = dst.device_ptr(&stream);
 
             // Pass the device's dedicated stream so that both the decode
@@ -2057,7 +2103,7 @@ impl<'k> PagedDecode<'k> {
                         self.softmax_scale,
                         k_ptr as *const core::ffi::c_void,
                         v_ptr as *const core::ffi::c_void,
-                        rcs_ptr as *const f32,
+                        self.rungs,
                         self.rope_interleaved as i32,
                         raw_stream,
                         sel_e,
@@ -2107,7 +2153,7 @@ impl<'k> PagedDecode<'k> {
             f32,
             *const core::ffi::c_void,
             *const core::ffi::c_void,
-            *const f32,
+            RopeRungsFfi,
             i32,
             *mut core::ffi::c_void,
             *const u32,
@@ -2146,14 +2192,6 @@ impl<'k> PagedDecode<'k> {
             }
             .slice(v_l.start_offset()..);
             let (v_ptr, _v_g) = v_slice.device_ptr(&stream);
-
-            let (rcs_s, rcs_l) = self.rope_cs.storage_and_layout();
-            let rcs_slice = match &*rcs_s {
-                candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                _ => candle::bail!("paged-decode-v2: rope_cs must be CUDA"),
-            }
-            .slice(rcs_l.start_offset()..);
-            let (rcs_ptr, _rcs_g) = rcs_slice.device_ptr(&stream);
 
             // Nullable gate: resolve the device pointer while holding the storage
             // guard across the launch, exactly like the other operands.
@@ -2197,7 +2235,7 @@ impl<'k> PagedDecode<'k> {
                         self.softmax_scale,
                         k_ptr as *const core::ffi::c_void,
                         v_ptr as *const core::ffi::c_void,
-                        rcs_ptr as *const f32,
+                        self.rungs,
                         self.rope_interleaved as i32,
                         raw_stream,
                         sel_e,
@@ -2289,6 +2327,7 @@ mod tests {
     /// its free/realloc. So does the region pool every `KvCache` here draws
     /// from, which is why the lock is crate-wide rather than module-local.
     use crate::models::gpu_test_lock::gpu_serial;
+    use crate::models::rope_schedule::{RopeRungs, RopeSchedule};
     use candle::quantized::pinned_staging::{Generation, PinnedStager};
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::KvCache;
@@ -2311,8 +2350,7 @@ mod tests {
         n_kv_head: usize,
         head_dim: usize,
         _prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
-        rope_offsets: &Tensor,
-        rope_cs: &Tensor,
+        rope: &RopeRungs,
         rope_interleaved: bool,
         generation: &Generation,
     ) -> Result<Vec<Tensor>> {
@@ -2343,8 +2381,7 @@ mod tests {
             n_kv_head,
             head_dim,
             None,
-            rope_offsets,
-            rope_cs,
+            rope,
             rope_interleaved,
             generation,
             &std::cell::RefCell::new(None),
@@ -2363,33 +2400,31 @@ mod tests {
         Ok(per_seq)
     }
 
-    /// Helper: create a standard inv_freq tensor for tests (theta = 10000.0).
-    /// Shape: (head_dim / 2,), dtype F32, on the given device.
-    fn make_test_inv_freq(head_dim: usize, device: &Device) -> Result<Tensor> {
-        let half_dim = head_dim / 2;
-        let inv_freq: Vec<f32> = (0..half_dim)
+    /// One rung of the standard θ = 10000 frequencies, for the in-kernel RoPE
+    /// tests.
+    fn make_test_rope(head_dim: usize, device: &Device) -> Result<RopeRungs> {
+        RopeRungs::new(
+            &RopeSchedule::stated(test_inv_freq(head_dim), usize::MAX)?,
+            device,
+        )
+    }
+
+    /// The frequencies [`make_test_rope`] rotates with, for a reference built
+    /// from exact angles.
+    fn test_inv_freq(head_dim: usize) -> Vec<f32> {
+        (0..head_dim / 2)
             .map(|i| 1.0f32 / 10000.0f32.powf(2.0 * i as f32 / head_dim as f32))
-            .collect();
-        Tensor::from_vec(inv_freq, (half_dim,), device)
+            .collect()
     }
 
-    /// Zero inv_freq for correctness tests: RoPE rotation becomes identity so the
-    /// paged-kernel output can be compared directly to a no-RoPE reference.
-    fn make_zero_inv_freq(head_dim: usize, device: &Device) -> Result<Tensor> {
-        Tensor::zeros((head_dim / 2,), DType::F32, device)
-    }
-
-    /// Build a rope_cs table from inv_freq for the in-kernel RoPE tests.
-    fn make_test_rope_cs(head_dim: usize, max_blocks: usize, device: &Device) -> Result<Tensor> {
-        let inv_freq = make_test_inv_freq(head_dim, device)?;
-        super::compute_rope_cs(&inv_freq, max_blocks, head_dim, device)
-    }
-
-    /// Zero rope_cs for correctness tests (identity RoPE).
-    #[allow(dead_code)]
-    fn make_zero_rope_cs(head_dim: usize, max_blocks: usize, device: &Device) -> Result<Tensor> {
-        let inv_freq = make_zero_inv_freq(head_dim, device)?;
-        super::compute_rope_cs(&inv_freq, max_blocks, head_dim, device)
+    /// Zero frequencies for correctness tests: RoPE rotation becomes identity
+    /// so the paged-kernel output can be compared directly to a no-RoPE
+    /// reference.
+    fn make_zero_rope(head_dim: usize, device: &Device) -> Result<RopeRungs> {
+        RopeRungs::new(
+            &RopeSchedule::stated(vec![0.0; head_dim / 2], usize::MAX)?,
+            device,
+        )
     }
 
     #[test]
@@ -2419,9 +2454,6 @@ mod tests {
         let offsets = [0usize];
         let mut caches: [&mut KvCache; 1] = [&mut cache0];
 
-        // Enable the trace so the test output proves which kernel ran.
-        std::env::set_var("CANDLE_TRACE_PAGED_PREFILL", "1");
-        let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
         let generation = PinnedStager::new(device.as_cuda_device()?).begin_generation();
 
         let out = paged_prefill_uniform(
@@ -2436,8 +2468,7 @@ mod tests {
             n_kv_head,
             head_dim,
             None,
-            &rope_zeros,
-            &make_test_rope_cs(head_dim, 16, &device)?,
+            &make_test_rope(head_dim, &device)?,
             false, // rope_interleaved
             &generation,
         )
@@ -2597,9 +2628,9 @@ mod tests {
         offset: usize,
         dtype: DType,
     ) -> Result<Tensor> {
-        let rope_cs = make_zero_rope_cs(head_dim, 16, q.device())?;
+        let rope = make_zero_rope(head_dim, q.device())?;
         run_paged_prefill_with_rope(
-            q, k, v, b_sz, seq_len, n_head, n_kv_head, head_dim, offset, dtype, &rope_cs, false,
+            q, k, v, b_sz, seq_len, n_head, n_kv_head, head_dim, offset, dtype, &rope, false,
         )
     }
 
@@ -2617,7 +2648,7 @@ mod tests {
         head_dim: usize,
         offset: usize,
         dtype: DType,
-        rope_cs: &Tensor,
+        rope: &RopeRungs,
         rope_interleaved: bool,
     ) -> Result<Tensor> {
         // Stand in for the scheduler and for `wave_admit`: the prefill entry
@@ -2639,7 +2670,6 @@ mod tests {
         let offsets = [offset];
         let mut caches: [&mut KvCache; 1] = [&mut cache0];
         KvCache::ensure_chunked_capacity_batch(&mut caches, &offsets, seq_len)?;
-        let rope_zeros = Tensor::zeros(b_sz, DType::U32, q.device())?;
         let generation = PinnedStager::new(q.device().as_cuda_device()?).begin_generation();
 
         let out = paged_prefill_uniform(
@@ -2654,8 +2684,7 @@ mod tests {
             n_kv_head,
             head_dim,
             None,
-            &rope_zeros,
-            rope_cs,
+            rope,
             rope_interleaved,
             &generation,
         )?;
@@ -2873,7 +2902,7 @@ mod tests {
                 .to_dtype(dtype)?
                 .contiguous()?;
 
-            let rope_cs = make_test_rope_cs(head_dim, 16, &device)?;
+            let rope = make_test_rope(head_dim, &device)?;
             let paged_out = run_paged_prefill_with_rope(
                 &q,
                 &k,
@@ -2885,14 +2914,14 @@ mod tests {
                 head_dim,
                 0,
                 dtype,
-                &rope_cs,
+                &rope,
                 interleaved,
             )?;
 
             // Host reference: same inv_freq, same positions (0..seq_len),
             // rotation applied to full-precision Q/K before plain attention.
             let half = head_dim / 2;
-            let inv_freq = make_test_inv_freq(head_dim, &device)?.to_vec1::<f32>()?;
+            let inv_freq = test_inv_freq(head_dim);
             let mut cos_v = vec![0f32; seq_len * half];
             let mut sin_v = vec![0f32; seq_len * half];
             for t in 0..seq_len {
@@ -2983,7 +3012,6 @@ mod tests {
 
             let offsets = [prefix_len];
             let mut caches: [&mut KvCache; 1] = [&mut cache0];
-            let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
             let generation = backing.begin_stager_generation_required();
 
             let out = paged_prefill_uniform(
@@ -2998,8 +3026,7 @@ mod tests {
                 n_kv_head,
                 head_dim,
                 None,
-                &rope_zeros,
-                &make_zero_rope_cs(head_dim, 16, &device)?,
+                &make_zero_rope(head_dim, &device)?,
                 false, // rope_interleaved
                 &generation,
             )?;
@@ -3080,8 +3107,7 @@ mod tests {
         cache0.force_dtype(dtype);
         cache0.set_chunked_backing(&backing, 0, None)?;
         cache0.set_current_seq_len(0)?;
-        let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
-        let rope_cs = make_zero_rope_cs(head_dim, 16, &device)?;
+        let rope = make_zero_rope(head_dim, &device)?;
 
         let mut run =
             |offset: usize, len: usize, q: &Tensor, k: &Tensor, v: &Tensor| -> Result<Tensor> {
@@ -3101,8 +3127,7 @@ mod tests {
                     n_kv_head,
                     head_dim,
                     None,
-                    &rope_zeros,
-                    &rope_cs,
+                    &rope,
                     false,
                     &generation,
                 )?;
@@ -3204,10 +3229,9 @@ mod tests {
 
             let offsets = [prefix_len];
             let mut caches: [&mut KvCache; 1] = [&mut cache0];
-            let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
             let generation = backing.begin_stager_generation_required();
 
-            let rope_cs = make_test_rope_cs(head_dim, 16, &device)?;
+            let rope = make_test_rope(head_dim, &device)?;
             let out = paged_prefill_uniform(
                 &mut caches,
                 &offsets,
@@ -3220,8 +3244,7 @@ mod tests {
                 n_kv_head,
                 head_dim,
                 None,
-                &rope_zeros,
-                &rope_cs,
+                &rope,
                 interleaved,
                 &generation,
             )?;
@@ -3231,7 +3254,7 @@ mod tests {
             // Reference: rotate prefix + new K at their absolute positions,
             // Q at prefix_len.., then plain attention over the concatenation.
             let half = head_dim / 2;
-            let inv_freq = make_test_inv_freq(head_dim, &device)?.to_vec1::<f32>()?;
+            let inv_freq = test_inv_freq(head_dim);
             let table = |lo: usize, hi: usize| -> Result<(Tensor, Tensor)> {
                 let n = hi - lo;
                 let mut cos_v = vec![0f32; n * half];
@@ -3376,7 +3399,6 @@ mod tests {
 
         let offsets = [prefix_len];
         let mut caches: [&mut KvCache; 1] = [&mut cache0];
-        let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
         let generation = backing.begin_stager_generation_required();
 
         let out = paged_prefill_uniform(
@@ -3391,8 +3413,7 @@ mod tests {
             n_kv_head,
             head_dim,
             None,
-            &rope_zeros,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
+            &make_zero_rope(head_dim, &device)?,
             false, // rope_interleaved
             &generation,
         )?;
@@ -3468,7 +3489,6 @@ mod tests {
 
             let offsets = [prefix_len];
             let mut caches: [&mut KvCache; 1] = [&mut cache0];
-            let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
             let generation = backing.begin_stager_generation_required();
 
             let out = paged_prefill_uniform(
@@ -3483,8 +3503,7 @@ mod tests {
                 n_kv_head,
                 head_dim,
                 None,
-                &rope_zeros,
-                &make_zero_rope_cs(head_dim, 16, &device)?,
+                &make_zero_rope(head_dim, &device)?,
                 false, // rope_interleaved
                 &generation,
             )?;
@@ -3634,18 +3653,12 @@ mod tests {
     }
 
     // ========================================================================
-    // RoPE offset plumbing tests
+    // In-kernel RoPE
     // ========================================================================
-    //
-    // These tests verify that the rope_offsets parameter is correctly plumbed
-    // from the public API all the way to the CUDA kernel entry point without
-    // causing panics or incorrect output.
-    //
-    // Since the kernels treat rope_offsets=nullptr as offset=0 (a no-op), and
-    // rope_offsets=Some(zeros) also means offset=0, the two must produce
-    // numerically identical results.
 
-    /// Helper: run a single-batch prefill and return the output tensor.
+    /// Helper: run a single-batch prefill with the θ = 10000 rung and return
+    /// the output tensor.
+    #[allow(clippy::too_many_arguments)]
     fn run_prefill_with_rope(
         q: &Tensor,
         k: &Tensor,
@@ -3655,7 +3668,6 @@ mod tests {
         n_kv_head: usize,
         head_dim: usize,
         dtype: DType,
-        rope: &Tensor,
     ) -> candle::Result<Tensor> {
         use candle_nn::kv_cache::ChunkedKvBacking;
         let device = q.device();
@@ -3687,127 +3699,11 @@ mod tests {
             n_kv_head,
             head_dim,
             None,
-            rope,
-            &make_test_rope_cs(head_dim, 16, device)?,
+            &make_test_rope(head_dim, device)?,
             false, // rope_interleaved
             &generation,
         )?;
         Ok(out.into_iter().next().unwrap())
-    }
-
-    #[test]
-    fn rope_offset_prefill_none_succeeds() -> candle::Result<()> {
-        let _gpu = gpu_serial();
-        let device = Device::new_cuda(0)?;
-        let dtype = DType::BF16;
-        let (n_head, n_kv_head, head_dim, seq_len) = (8, 8, 64, 16);
-
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, seq_len, head_dim), &device)?.to_dtype(dtype)?;
-        let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, seq_len, head_dim), &device)?
-            .to_dtype(dtype)?
-            .contiguous()?;
-        let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, seq_len, head_dim), &device)?
-            .to_dtype(dtype)?
-            .contiguous()?;
-
-        let rope_zeros = Tensor::zeros(1usize, DType::U32, &device)?;
-        let out = run_prefill_with_rope(
-            &q,
-            &k,
-            &v,
-            seq_len,
-            n_head,
-            n_kv_head,
-            head_dim,
-            dtype,
-            &rope_zeros,
-        )?;
-        assert_eq!(out.dims(), &[1, n_head, seq_len, head_dim]);
-        let max_abs = out
-            .to_dtype(DType::F32)?
-            .abs()?
-            .flatten_all()?
-            .max(0)?
-            .to_scalar::<f32>()?;
-        assert!(
-            max_abs.is_finite(),
-            "rope=zeros output not finite: {max_abs}"
-        );
-        println!("rope_offset_prefill_none_succeeds OK: max_abs={max_abs:.4e}");
-        Ok(())
-    }
-
-    #[test]
-    fn rope_offset_prefill_zeros_differs_from_none() -> candle::Result<()> {
-        let _gpu = gpu_serial();
-        // Now that both paths always apply RoPE, this test confirms that different rope_offsets
-        // values produce different outputs.
-        let device = Device::new_cuda(0)?;
-        let dtype = DType::BF16;
-        let (n_head, n_kv_head, head_dim, seq_len) = (8, 8, 64, 16);
-
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, seq_len, head_dim), &device)?.to_dtype(dtype)?;
-        let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, seq_len, head_dim), &device)?
-            .to_dtype(dtype)?
-            .contiguous()?;
-        let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, seq_len, head_dim), &device)?
-            .to_dtype(dtype)?
-            .contiguous()?;
-
-        // Run with rope=zeros (offset=0)
-        let rope_zeros = Tensor::zeros(1usize, DType::U32, &device)?;
-        let out_zeros = run_prefill_with_rope(
-            &q,
-            &k,
-            &v,
-            seq_len,
-            n_head,
-            n_kv_head,
-            head_dim,
-            dtype,
-            &rope_zeros,
-        )?;
-
-        // Run with rope=offset16 — different base offset produces different rotation
-        let rope_offset16 = Tensor::from_vec(vec![16u32], 1, &device)?;
-        let out_offset16 = run_prefill_with_rope(
-            &q,
-            &k,
-            &v,
-            seq_len,
-            n_head,
-            n_kv_head,
-            head_dim,
-            dtype,
-            &rope_offset16,
-        )?;
-
-        let zeros_f32 = out_zeros.to_dtype(DType::F32)?;
-        let offset16_f32 = out_offset16.to_dtype(DType::F32)?;
-
-        // Both outputs must be finite
-        let max_zeros = zeros_f32.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
-        let max_offset16 = offset16_f32
-            .abs()?
-            .flatten_all()?
-            .max(0)?
-            .to_scalar::<f32>()?;
-        assert!(max_zeros.is_finite(), "rope=zeros output not finite");
-        assert!(max_offset16.is_finite(), "rope=offset16 output not finite");
-
-        let mae = mean_abs_error(&zeros_f32, &offset16_f32)?;
-        println!("rope_offset_prefill_zeros_differs_from_none: mae={mae:.4e}");
-        // Different rope offsets must produce different outputs
-        // RoPE preserves relative positions: shifting all token positions by the same constant
-        // leaves the relative-position attention map unchanged. The two runs should be equivalent.
-        assert!(
-            mae < 1e-2,
-            "rope=zeros and rope=offset16 should produce equivalent attention outputs \
-             (same relative positions; mae={mae:.4e})"
-        );
-        Ok(())
     }
 
     // Reference RoPE rotation: apply to f32 slice of HEAD_DIM values.
@@ -3827,9 +3723,9 @@ mod tests {
     }
 
     #[test]
-    fn rope_offset_prefill_functional() -> candle::Result<()> {
+    fn in_kernel_rope_matches_the_reference() -> candle::Result<()> {
         let _gpu = gpu_serial();
-        // Verifies: reference_attention(rotated_Q, rotated_K, V) ≈ paged_kernel(unrotated_Q, unrotated_K, V, rope=zeros)
+        // Verifies: reference_attention(rotated_Q, rotated_K, V) ≈ paged_kernel(unrotated_Q, unrotated_K, V)
         // Tolerance < 0.05 for BF16.
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
@@ -3869,26 +3765,16 @@ mod tests {
         let ref_out =
             reference_attention(&q_rotated, &k_rotated, &v, n_head, n_kv_head, head_dim, 0)?;
 
-        // Branch B: un-rotated Q, K  +  rope=zeros  (kernel rotates at tok_idx + 0)
-        let rope_zeros = Tensor::zeros(1usize, DType::U32, &device)?;
-        let out_kernel_rope = run_prefill_with_rope(
-            &q,
-            &k,
-            &v,
-            seq_len,
-            n_head,
-            n_kv_head,
-            head_dim,
-            dtype,
-            &rope_zeros,
-        )?;
+        // Branch B: un-rotated Q, K — the kernel rotates each token at its own position.
+        let out_kernel_rope =
+            run_prefill_with_rope(&q, &k, &v, seq_len, n_head, n_kv_head, head_dim, dtype)?;
 
         let mae = mean_abs_error(
             &ref_out.to_dtype(DType::F32)?,
             &out_kernel_rope.to_dtype(DType::F32)?,
         )?;
         println!(
-            "rope_offset_prefill_functional: mae(reference_attention(rotated) vs kernel+rope0)={mae:.4e}"
+            "in_kernel_rope_matches_the_reference: mae(reference(rotated) vs kernel)={mae:.4e}"
         );
         // BF16 rounding: allow up to 0.05 (two roundings: manual rotation + kernel)
         assert!(
@@ -3896,5 +3782,89 @@ mod tests {
             "fused RoPE prefill functional mismatch: mae={mae}"
         );
         Ok(())
+    }
+}
+
+/// The position-map staleness rules, tested off the GPU. See
+/// [`classify_pm_divergence`] and [`SharedPm`].
+#[cfg(test)]
+mod pm_divergence_tests {
+    use super::classify_pm_divergence;
+
+    /// An unchanged layout is neither stale nor anomalous — the common case, a
+    /// later layer of a settled forward reusing the cached map.
+    #[test]
+    fn an_unchanged_layout_reuses_the_cached_map() {
+        let cached = [(4u32, 128u32), (3, 96)];
+        let write = [3u32, 2];
+        let live = [(4u32, 128u32, 3u32), (3, 96, 2)];
+        assert_eq!(
+            classify_pm_divergence(&cached, &write, &live),
+            (false, false)
+        );
+    }
+
+    /// **The benign windowed-creep skew: a trailing 0-token chunk.** The slice
+    /// count moves by one but the covered-token count does not — stale (rebuild),
+    /// but NOT anomalous (no loud line).
+    #[test]
+    fn a_trailing_empty_chunk_is_stale_but_not_anomalous() {
+        let cached = [(4u32, 128u32)];
+        let write = [3u32];
+        // One more slice, same covered tokens — the phantom writer chunk.
+        let live = [(5u32, 128u32, 3u32)];
+        assert_eq!(
+            classify_pm_divergence(&cached, &write, &live),
+            (true, false)
+        );
+    }
+
+    /// A covered-token move is a real layout divergence, not creep — stale AND
+    /// anomalous, so it is worth a loud, attributed line.
+    #[test]
+    fn a_covered_token_move_is_anomalous() {
+        let cached = [(4u32, 128u32)];
+        let write = [3u32];
+        let live = [(4u32, 160u32, 3u32)];
+        assert_eq!(classify_pm_divergence(&cached, &write, &live), (true, true));
+    }
+
+    /// A change in the wave's slot membership between layers can never be a creep
+    /// artefact — stale AND anomalous.
+    #[test]
+    fn a_membership_change_is_anomalous() {
+        let cached = [(4u32, 128u32), (3, 96)];
+        let write = [3u32, 2];
+        let live = [(4u32, 128u32, 3u32)];
+        assert_eq!(classify_pm_divergence(&cached, &write, &live), (true, true));
+    }
+
+    /// The writer slipping into a chunk the map does not describe is stale (the
+    /// map's write region names the wrong slice) but not, on its own, anomalous.
+    #[test]
+    fn a_writer_move_within_bounds_is_stale_but_not_anomalous() {
+        let cached = [(5u32, 128u32)];
+        let write = [2u32]; // cached writer 2 < live n_slices 5, and it moved
+        let live = [(5u32, 128u32, 3u32)];
+        assert_eq!(
+            classify_pm_divergence(&cached, &write, &live),
+            (true, false)
+        );
+    }
+
+    /// A cached writer index that is out of the live slice array's bounds does
+    /// not by itself force a rebuild — the guard requires the cached writer to be
+    /// a real slice the map describes.
+    #[test]
+    fn a_writer_move_the_cached_map_never_described_is_not_stale() {
+        let cached = [(4u32, 128u32)];
+        // Cached writer 4 is not < live n_slices 4, so the writer-move arm is
+        // suppressed; nothing else moved.
+        let write = [4u32];
+        let live = [(4u32, 128u32, 1u32)];
+        assert_eq!(
+            classify_pm_divergence(&cached, &write, &live),
+            (false, false)
+        );
     }
 }

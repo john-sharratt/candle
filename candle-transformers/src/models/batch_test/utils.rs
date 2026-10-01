@@ -19,12 +19,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
+use crate::models::batch_test::span_report::print_span;
+use crate::models::batch_test::story_normalize::normalize_story;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
 use crate::models::dialect::Dialect;
 use crate::models::expert_lre::PipelineStats;
 use crate::models::speculative_choice::GreedyChooser;
+use candle::vram::process_ram::ProcessRam;
 
 /// How a run decides its draft budget.
 ///
@@ -59,14 +63,13 @@ use crate::models::profile::{
 /// The story a [`TestMode::StoryRewrite`] prompt asks the model to reproduce
 /// with its character renamed.
 ///
-/// Line endings are normalised here, once. The file is checked in with CRLF on
-/// Windows, and a prompt carrying `\r\n` tokenises differently from the same
-/// text with `\n` — so a second `include_str!` of it elsewhere would be a
-/// different prompt that merely looked identical in the source.
+/// Re-exported from [`super::fixtures`], which is outside `#[cfg(test)]` so that
+/// a harness in a crate above this one measures the same bytes. Kept as a
+/// function here because the gates already call it by this path, and because the
+/// alternative — a second `include_str!` — is a different prompt that merely
+/// looks identical in the source (see the fixtures module note).
 pub fn story_prompt() -> String {
-    include_str!("story.md")
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
+    super::fixtures::story_prompt()
 }
 
 /// Determines the validation strategy for the test harness.
@@ -154,6 +157,9 @@ pub struct TestParams {
     /// you what the level did on average, never which member did it. Pinning
     /// one at a time turns that into an answerable question.
     pub override_k_quant: Option<QuantFormat>,
+    /// Rows the caller measured itself, appended below the harness's own in the
+    /// comparison table. See [`ExtraRow`] for why the table takes them.
+    pub extra_rows: Vec<ExtraRow>,
 }
 
 impl TestParams {
@@ -177,9 +183,7 @@ impl TestParams {
             majority_pass_threshold: None,
             test_mode: TestMode::StoryRewrite,
             suppress_thinking: false,
-            prompt_system: include_str!("system.md")
-                .replace("\r\n", "\n")
-                .replace("\r", "\n"),
+            prompt_system: super::fixtures::system_prompt(),
             prompt_user: story_prompt(),
             per_config_prompts: Vec::new(),
             stop_on_eos: Vec::new(),
@@ -197,10 +201,21 @@ impl TestParams {
             lora: None,
             speculative_max_draft: DraftBudget::Adaptive,
             override_k_quant: None,
+            extra_rows: Vec::new(),
         })
     }
 
     /// Pin every sealed K block to `fmt` — see [`Self::override_k_quant`].
+    /// Append rows the caller measured, below the harness's own.
+    ///
+    /// Installed before [`Self::validate_and_print`], which is what prints them — so a
+    /// caller producing engine-driven rows measures its own after
+    /// [`Self::run_loaded_collect`] and hands them over here.
+    pub fn with_extra_rows(mut self, rows: Vec<ExtraRow>) -> Self {
+        self.extra_rows = rows;
+        self
+    }
+
     pub fn with_override_k_quant(mut self, fmt: Option<QuantFormat>) -> Self {
         self.override_k_quant = fmt;
         self
@@ -408,6 +423,44 @@ pub struct PhaseResults {
     pub runs_used: usize,
 }
 
+/// A row the caller measured itself, appended to the comparison table below the
+/// harness's own.
+///
+/// **Why the table takes foreign rows at all.** The rows this harness produces drive
+/// `forward_wave` on a session it constructs, from a clean slate, with nothing else
+/// running — which is the right way to measure *how fast the forward can go*, and the
+/// reason it is useless for measuring what a daemon sees. A daemon's throughput is
+/// shaped by admission, by the projection it runs per turn, by the persistence thread
+/// moving KV between tiers, and by whatever fragmentation the pool has accumulated —
+/// none of which exists in this crate. So the engine-driven rows are measured one crate
+/// up and handed here, and the two sit in one table because the comparison is the point:
+/// the harness rows are the ceiling, the engine rows are the delivery.
+///
+/// The fragmentation columns are `None` for a harness row, and that is not a gap. Those
+/// rows *cannot* fragment: every sequence is freed and every empty arena released
+/// between configs, with a gate asserting nothing is live before the next one starts.
+#[derive(Debug, Clone)]
+pub struct ExtraRow {
+    /// What produced this row, in the `KvMode` column's place — e.g. `Q8_0/eng`.
+    pub label: String,
+    /// Concurrent sequences.
+    pub contexts: usize,
+    pub prompt_tokens_per_sec: f64,
+    pub generate_tokens_per_sec: f64,
+    /// `(passed, total)` sessions, or `None` where the row does not validate content.
+    pub valid: Option<(usize, usize)>,
+    pub compression_ratio: Option<f64>,
+    pub peak_tokens: usize,
+    /// The arena frontier, in regions — one past the highest live region. **The figure
+    /// that costs weights**: the wave transient tier stands above it and `weight_floor`
+    /// is measured from there, so this one index sets expert residency and therefore
+    /// decode.
+    pub frontier_regions: Option<usize>,
+    /// `packed_arenas / frontier` as a percentage: of the ground denied to the weight
+    /// side, the share actually holding KV.
+    pub efficiency_pct: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TestRun {
     pub output: Vec<u32>,            // Generated output text
@@ -430,6 +483,9 @@ pub struct TestResults {
     pub compression_ratio: Option<f64>, // Float-equivalent bytes / actual quantized bytes
     pub peak_tokens: usize,         // Total tokens across all sessions at peak (after generation)
     pub expert_stats: Option<PipelineStats>, // Expert cache telemetry (if model has MoE)
+    /// This process's host RAM at the end of the decode. `None` where the
+    /// platform has no address-space walk.
+    pub host_after_decode: Option<ProcessRam>,
     /// `(hits, misses, evictions)` of a disk-resident embedding tier's row
     /// cache, if the model serves one. Cumulative across the run: the cache is
     /// process-wide and deliberately not reset per config, because its hit
@@ -947,6 +1003,7 @@ pub fn account_model_load<M>(device: &Device, load: impl FnOnce() -> Result<M>) 
     let _ = candle::gpu_memory::snapshot("before_model_load", device);
     let model = load()?;
     let _ = candle::gpu_memory::snapshot("after_model_load", device);
+    print_host_ram_line("after model load");
     let free_after = device.mem_get_info().map(|(f, _)| f).unwrap_or(0);
     candle::gpu_memory::register("model weights", free_before.saturating_sub(free_after));
     Ok(model)
@@ -961,6 +1018,9 @@ impl TestParams {
     /// on these models: a 124 GB artifact takes minutes to open, so a
     /// five-budget sweep spends most of its wall clock re-reading weights that
     /// never changed.
+    // Sized, unlike the rest of the chain: this one *constructs* the model from a
+    // closure, and a closure cannot return an unsized value. A caller that already holds
+    // a boxed trait object uses `run_loaded` or `run_loaded_collect` instead.
     pub fn run<M>(self, configs: Vec<TestConfig>, load_model: impl Fn() -> Result<M>) -> Result<()>
     where
         M: ManagedBatchedModel,
@@ -976,7 +1036,17 @@ impl TestParams {
     /// not bring in.
     pub fn run_loaded<M>(mut self, configs: Vec<TestConfig>, model: &M) -> Result<()>
     where
-        M: ManagedBatchedModel,
+        M: ManagedBatchedModel + ?Sized,
+    {
+        let mut results = self.run_configs(configs, model)?;
+        self.validate_and_print_results(&mut results)
+    }
+
+    /// Measure every config, and return the rows. See [`Self::run_loaded_collect`] for
+    /// why measuring is separable from reporting.
+    fn run_configs<M>(&mut self, configs: Vec<TestConfig>, model: &M) -> Result<Vec<TestResults>>
+    where
+        M: ManagedBatchedModel + ?Sized,
     {
         // Under `verbose`, surface the engine's `tracing` events (expert-cache
         // sizing, warm-tier decisions, elastic-boundary moves) in the gate's
@@ -1192,14 +1262,43 @@ impl TestParams {
             );
         }
 
-        // Validate and print results
-        self.validate_and_print_results(&mut results)
+        Ok(results)
+    }
+
+    /// Run `configs` and hand back their results **without printing or validating**.
+    ///
+    /// The half of [`Self::run_loaded`] that measures. It exists so a caller one crate
+    /// up can put its own rows in the same table: the engine-driven rows have to be
+    /// produced *after* this model has been moved into a
+    /// `ConversationEngine`, and the table has to be printed after both — which is
+    /// impossible while running and printing are one call.
+    ///
+    /// [`Self::run_loaded`] is this followed by [`Self::validate_and_print`], so every
+    /// existing caller measures, validates and prints exactly as it did before.
+    pub fn run_loaded_collect<M>(
+        &mut self,
+        configs: Vec<TestConfig>,
+        model: &M,
+    ) -> Result<Vec<TestResults>>
+    where
+        M: ManagedBatchedModel + ?Sized,
+    {
+        self.run_configs(configs, model)
+    }
+
+    /// Validate `results` and print every table — the reporting half of
+    /// [`Self::run_loaded`].
+    ///
+    /// Public so a caller that used [`Self::run_loaded_collect`] can finish the job,
+    /// with its own [`TestParams::with_extra_rows`] already installed.
+    pub fn validate_and_print(&self, results: &mut [TestResults]) -> Result<()> {
+        self.validate_and_print_results(results)
     }
 
     /// Run a configuration in batched mode using BatchedInferenceSession
     fn run_batched_config<M>(&self, config: &TestConfig, model: &M) -> Result<TestResults>
     where
-        M: ManagedBatchedModel,
+        M: ManagedBatchedModel + ?Sized,
     {
         // Create the batch session from the model using the inference mode's KV format.
         let batch_config = BatchedConfig {
@@ -1596,6 +1695,13 @@ impl TestParams {
         self.device.synchronize()?;
         pipeline_record("bench:bulk_total", t_prompt_total);
         let prompt_duration = prompt_start.elapsed();
+        // After the clock stops: the walk visits every page of the address space
+        // — ~17M on Flash-Next's 54 GB mapping — and inside the window it would
+        // be charged to prefill.
+        print_host_ram_line(&format!(
+            "{:?}×{} after prefill",
+            config.mode, config.num_contexts
+        ));
         let prompt_tokens = user_lens.iter().sum::<usize>() * config.num_repeats.max(1);
         let prompt_tokens_per_sec = (prompt_tokens as f64) / prompt_duration.as_secs_f64();
 
@@ -1654,6 +1760,13 @@ impl TestParams {
         )?;
         self.device.synchronize()?;
         drop(detector);
+        // Every session of the row is still alive here, so KV stands at its
+        // high-water for the row and the weight zone at what decode ran against.
+        print_span(
+            &format!("{:?} x{} decode end", config.mode, sequence_indices.len()),
+            model.expert_stats().as_ref(),
+        );
+        let host_after_decode = ProcessRam::capture();
         let forbidden = forbidden_alloc::take_report();
         if !forbidden.is_clean() {
             eprintln!("[{:?}] {}", config.mode, forbidden);
@@ -1866,7 +1979,8 @@ impl TestParams {
             quantized_token_percent,
             compression_ratio,
             peak_tokens,
-            expert_stats: None,    // Filled by run() after collection
+            expert_stats: None, // Filled by run() after collection
+            host_after_decode,
             row_cache_stats: None, // Likewise
             bulk_profile,
             single_profile,
@@ -1932,7 +2046,7 @@ impl TestParams {
         max_draft: usize,
     ) -> Result<usize>
     where
-        M: ManagedBatchedModel,
+        M: ManagedBatchedModel + ?Sized,
     {
         let nl = model.num_layers();
         let max_tokens = self.generate_token_count;
@@ -2112,7 +2226,8 @@ impl TestParams {
                 //
                 //  2. **Pronoun neutralisation** — gendered pronouns like
                 //     "his"/"her", "he"/"she" are replaced with bracketed
-                //     placeholders ("[his/her]", "[he/she]", etc.).  This
+                //     placeholders ("[his/her]", "[he/she]", etc.), whole
+                //     words at any boundary (`story_normalize`).  This
                 //     lets us compare sessions that use female names against
                 //     the original male-protagonist prompt without false
                 //     mismatches when the model correctly adapts pronouns.
@@ -2178,37 +2293,10 @@ impl TestParams {
                                 let expected_trimmed = session.expected.trim();
 
                                 // Normalize for comparison (see block comment above).
-                                let normalize = |text: &str| -> String {
-                                    let collapsed: String =
-                                        text.split_whitespace().collect::<Vec<_>>().join(" ");
-                                    let padded = format!(" {} ", collapsed);
-                                    padded
-                                        .replace(" his ", " [his/her] ")
-                                        .replace("His ", "[His/Her] ")
-                                        .replace(" her ", " [his/her] ")
-                                        .replace("Her ", "[His/Her] ")
-                                        .replace(" he ", " [he/she] ")
-                                        .replace(" He ", " [He/She] ")
-                                        .replace(" she ", " [he/she] ")
-                                        .replace("She ", "[He/She] ")
-                                        .replace(" him ", " [him/her] ")
-                                        .replace("Him ", "[Him/Her] ")
-                                        .replace(" wife ", " [wife/husband] ")
-                                        .replace(" husband ", " [wife/husband] ")
-                                        // Contraction normalization: the model may
-                                        // expand or contract these equivalently.
-                                        .replace("she'd ", "she had ")
-                                        .replace("She'd ", "She had ")
-                                        .replace("he'd ", "he had ")
-                                        .replace("He'd ", "He had ")
-                                        .trim()
-                                        .to_string()
-                                };
-
                                 let output_chars: Vec<char> =
-                                    normalize(output_trimmed).chars().collect();
+                                    normalize_story(output_trimmed).chars().collect();
                                 let expected_chars: Vec<char> =
-                                    normalize(expected_trimmed).chars().collect();
+                                    normalize_story(expected_trimmed).chars().collect();
 
                                 let common_prefix_len = output_chars
                                     .iter()
@@ -2478,9 +2566,9 @@ impl TestParams {
         }
 
         println!("\n\n=== Performance Comparison ===");
-        println!("┌──────────┬──────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┐");
-        println!("│ KvMode   │ int8 │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│");
-        println!("├──────────┼──────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┤");
+        println!("┌──────────┬──────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┬──────────┬───────┐");
+        println!("│ KvMode   │ int8 │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│ Frontier │ Eff%  │");
+        println!("├──────────┼──────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┼──────────┼───────┤");
 
         // Baseline is the first config
         let baseline = &results[0];
@@ -2538,7 +2626,7 @@ impl TestParams {
             };
 
             println!(
-                "│ {:>8} │ {:>4} │ {} │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │ {} │ {:>8} │ {:>10} │",
+                "│ {:>8} │ {:>4} │ {} │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │ {} │ {:>8} │ {:>10} │ {:>8} │ {:>5} │",
                 mode_str,
                 int8_str,
                 batched_str,
@@ -2550,11 +2638,90 @@ impl TestParams {
                 generate_perf,
                 quant_str,
                 compress_str,
-                result.peak_tokens
+                result.peak_tokens,
+                // A harness row cannot fragment — every sequence is freed and every
+                // empty arena released between configs, with a gate asserting nothing
+                // is live before the next one starts. So these are not missing numbers,
+                // they are numbers the row's own construction rules out.
+                "-",
+                "-",
             );
         }
 
-        println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┘");
+        // **The caller's rows, below the harness's, in the same table.** Measured one
+        // crate up through the real engine, so they carry admission, per-turn
+        // projection, the persistence thread and whatever fragmentation the pool has
+        // accumulated — everything the rows above exclude by design. Same baseline for
+        // the `perf` columns, because comparing the delivered rate against the ceiling
+        // is the whole reason they share a table.
+        for row in &self.extra_rows {
+            let valid_str = match row.valid {
+                None => "  -  ".to_string(),
+                Some((pass, total)) if pass == total => "  ✓  ".to_string(),
+                Some(_) => "  ✗  ".to_string(),
+            };
+            let prompt_perf = format!(
+                "{:+.1}%",
+                (row.prompt_tokens_per_sec / baseline_prompt_tps - 1.0) * 100.0
+            );
+            let generate_perf = format!(
+                "{:+.1}%",
+                (row.generate_tokens_per_sec / baseline_generate_tps - 1.0) * 100.0
+            );
+            let compress_str = match row.compression_ratio {
+                Some(ratio) => format!("{:>6.2}x", ratio),
+                None => "    -  ".to_string(),
+            };
+            let frontier_str = match row.frontier_regions {
+                Some(f) => f.to_string(),
+                None => "-".to_string(),
+            };
+            let eff_str = match row.efficiency_pct {
+                Some(e) => format!("{e}%"),
+                None => "-".to_string(),
+            };
+            // `%Quantized` has no meaning for an engine row: the workload chose its own
+            // formats per turn rather than running one mode, so there is no single figure
+            // to report and a number here would invite a comparison that is not available.
+            println!(
+                "│ {:>8} │  eng │  engine │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │      -    │ {:>8} │ {:>10} │ {:>8} │ {:>5} │",
+                row.label,
+                row.contexts,
+                valid_str,
+                row.prompt_tokens_per_sec,
+                row.generate_tokens_per_sec,
+                prompt_perf,
+                generate_perf,
+                compress_str,
+                row.peak_tokens,
+                frontier_str,
+                eff_str,
+            );
+        }
+
+        println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┴──────────┴───────┘");
+        if !self.extra_rows.is_empty() {
+            println!(
+                "  Rows marked `engine` run through the real ConversationEngine — admission, \
+                 per-turn projection,\n  the persistence thread, KV compaction — so they show \
+                 what a daemon delivers. The rows above\n  them drive `forward_wave` from a \
+                 clean slate and show how fast the forward itself can go.\n  Frontier is the \
+                 arena watermark in 16 MiB regions, Eff% the share of it holding KV."
+            );
+        }
+        // Where this process's host RAM stood as each config's decode ended —
+        // what the warm expert tier is sized against, beside what it holds.
+        let host: Vec<(String, Option<ProcessRam>)> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                (
+                    format!("#{} {:?}×{}", i + 1, r.config.mode, r.config.num_contexts),
+                    r.host_after_decode.clone(),
+                )
+            })
+            .collect();
+        print_host_ram(&host);
         // **Here, not after the expert table.** The pinned-RAM report carries the
         // boundary's `Spare calc:` attribution — which of the four gates refused
         // the weight side ground — and it used to hang off
@@ -2631,6 +2798,10 @@ impl TestParams {
                         )
                     }
                 }),
+            ),
+            (
+                "  of which pageable",
+                Box::new(|s: &PipelineStats| format!("{}", s.warm_paged_slots)),
             ),
             // Which path the MoE dispatched on. `device` means the grid is
             // fully resident and routing never leaves the card; `host (readback)`
@@ -2883,64 +3054,13 @@ impl TestParams {
              SLOTS GAINED {}",
             g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
         );
-        // The span's own accounting, so the whole-card decomposition is read off
-        // the reservation rather than reconstructed from slot and region counts —
-        // the two round in different units, and 80 boundary moves of rounding is
-        // exactly the sort of gap that gets inferred away.
-        if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
-            println!("\n=== Span (device 0) ===");
-            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-            if let Ok((free, total)) = candle::Device::new_cuda(0).and_then(|d| d.mem_get_info()) {
-                println!(
-                    "  CARD                {:>9.1} MiB total | {:>7.1} free | {:>7.1} in use",
-                    mib(total),
-                    mib(free),
-                    mib(total - free),
-                );
-            }
-            println!("  reserved            {:>9.1} MiB", mib(rs.reserved_bytes));
-            println!(
-                "    weight zone       {:>9.1} MiB   (the expert side of the boundary)",
-                mib(rs.weight_bytes)
-            );
-            let region = candle_nn::kv_cache::REGION_BYTES;
-            let kv = rs.total * region;
-            println!(
-                "    KV regions        {:>9.1} MiB   ({} x {:.0} MiB: live {}, free {}, blocked {})",
-                mib(kv),
-                rs.total,
-                mib(region),
-                rs.live,
-                rs.free,
-                rs.blocked,
-            );
-            println!(
-                "    unusable slack    {:>9.1} MiB   (span tail the region count rounds off)",
-                mib(rs.slack_bytes)
-            );
-            // Whatever the reservation holds that is neither side of the moving
-            // boundary: the dense weights, loaded before the boundary existed.
-            println!(
-                "    dense block       {:>9.1} MiB   (loaded before the boundary, immovable)",
-                mib(rs
-                    .reserved_bytes
-                    .saturating_sub(rs.weight_bytes)
-                    .saturating_sub(kv)
-                    .saturating_sub(rs.slack_bytes)),
-            );
-            println!(
-                "  peak KV live        {:>9.1} MiB   ({} regions)   granule {:.0} MiB",
-                mib(rs.peak_live * region),
-                rs.peak_live,
-                mib(rs.granularity),
-            );
-        }
+        print_span("end of run", None);
 
         let s = candle_nn::kv_cache::spare_tally();
         println!(
-            "  Spare calc: observing {} | pressure {} | occupancy-bound {} \
+            "  Spare calc: observing {} | pressure {} | occupancy-bound {} | fragmented {} \
              | granted {} regions || KV purchases: conceded {} / refused {}",
-            s[0], s[1], s[2], s[3], s[4], s[5],
+            s[0], s[1], s[2], s[6], s[3], s[4], s[5],
         );
         // The other half of the same question. `Spare calc` says what the pool
         // offered; this says what the layer zone did with it, and a collapse

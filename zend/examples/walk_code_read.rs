@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use candle_conversation::persistence::resume::decode_token_ids;
 use candle_conversation::persistence::streams::{StreamDecl, StreamId};
-use candle_conversation::persistence::SubstratePersistence;
+use candle_conversation::persistence::{SubstratePersistence, SUBSTRATE_DIR};
 use candle_conversation::substrate::Substrate;
 use tokenizers::Tokenizer;
 
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     let mut substrate = Substrate::new();
     let mut persistence = SubstratePersistence::open_in_with_substrate(&workspace, &mut substrate)
         .map_err(|e| anyhow::anyhow!("open substrate at {}: {e}", workspace.display()))?;
-    let tok = Tokenizer::from_file(workspace.join(".substrate").join("tokenizer.json"))
+    let tok = Tokenizer::from_file(workspace.join(SUBSTRATE_DIR).join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
 
     println!("token id 0 => {:?}", tok.id_to_token(0));

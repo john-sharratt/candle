@@ -312,7 +312,7 @@ fn a_level_memory_gives_the_shape_of_the_route_in_one_sentence() {
     assert!(
         text.contains(
             "Seven rooms open off the ring, which runs right round the level, \
-             and the lift and the stair open onto it."
+             and the lift opens onto it."
         ),
         "{text}"
     );
@@ -427,7 +427,7 @@ fn a_level_memory_says_what_the_level_has_not_got() {
     let set = vault();
     let text = flat(&describe::level(&set, "vault-story"));
     assert!(
-        text.contains("There is no way off this level except the lift and the stair."),
+        text.contains("There is no way off this level except the lift."),
         "{text}"
     );
 }

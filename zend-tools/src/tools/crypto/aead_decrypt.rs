@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{normalize_algorithm, CryptoError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct AeadDecryptRequest {
@@ -50,6 +50,11 @@ impl Tool for AeadDecrypt {
     type Request = AeadDecryptRequest;
     type Response = AeadDecryptResponse;
     type Error = CryptoError;
+
+    /// Pure cryptography over its arguments — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(
         _ctx: &ToolContext,

@@ -201,10 +201,9 @@ pub async fn dream(
     selection.select(STANCE_SELECTOR, Stance::Dreaming.id());
     // **A dream is prose, and the act sampling ruins it.**
     //
-    // `base_config.sampling` is tuned by `for_character_dialogue` to break the
-    // character's *act*-selection loop: a DRY penalty that punishes any repeated
-    // pair of tokens (base 1.75, allowed length 2), plus presence and cross-turn
-    // penalties. Over a seven-hundred-token dream those forbid the natural word
+    // `base_config.sampling` carries the checkpoint's repetition penalties — a
+    // DRY penalty (base 1.75), plus presence and any cross-turn penalty. Over a
+    // seven-hundred-token dream those forbid the natural word
     // the moment it would repeat — parallel phrasing, a refrain, the same object
     // named twice — so the vocabulary is pushed ever further from what the
     // sentence wanted, and the dream that opens cleanly reaches for stranger and

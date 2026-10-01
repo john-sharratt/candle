@@ -19,9 +19,10 @@
 //!   carries `S` and a conv tail across a sequence's tokens, so the state is
 //!   lifted out of the model's map for the sweep and every wave that begins
 //!   must commit or roll back — "did not commit" is not "did not happen".
-//! * **The rotary table is partial.** Only `rope_dim` of `head_dim` dims
-//!   rotate, so `rope_cs` comes from [`RotaryLayout`] rather than the uniform
-//!   `compute_rope_cs`, which would rotate the whole head.
+//! * **The rotary width is partial.** Only `rope_dim` of `head_dim` dims
+//!   rotate: [`RotaryLayout`] permutes them into the kernels' leading
+//!   frequencies, and the lineage's rungs cover exactly those, so every later
+//!   frequency is a pass-through.
 //! * **Glue is refused.** The gap-fill kernel is compiled for `head_dim 128`
 //!   and this family attends at 256, so a wave carrying glue rows fails at the
 //!   top rather than silently running them as ordinary prefill against the
@@ -34,7 +35,7 @@ use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
     begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, WavePlan,
-    REGION_BYTES, WAVE_FORWARD_BYTES,
+    WaveWidth,
 };
 
 use super::batched::HybridBatched;
@@ -48,7 +49,7 @@ use super::wave::delta_net_mix_wave;
 
 use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::LayerKind;
-use crate::models::delta_net::{RecurrentStateStore, StashSlot};
+use crate::models::delta_net::{RecurrentCompaction, RecurrentStateStore, StashSlot};
 use crate::models::profile::pipeline_record_duration;
 use crate::models::verify_wave::VerifyPlan;
 use candle_nn::kv_cache::ModelGeometry;
@@ -61,7 +62,7 @@ use crate::models::batched_layer::{
     WaveAttnGroup,
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
-use crate::models::expert_lre::{PipelineStats, ProfileSnapshot};
+use crate::models::expert_lre::{PipelineStats, ProfileSnapshot, WeightPlan, WeightPlanning};
 use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
@@ -143,6 +144,10 @@ impl ManagedBatchedModel for HybridBatched {
         HybridBatched::create_batched_session(self, config)
     }
 
+    fn rope_ceilings(&self) -> Vec<usize> {
+        self.rope().ceilings().to_vec()
+    }
+
     fn forward_wave(
         &self,
         session: &mut BatchedInferenceSession,
@@ -156,6 +161,7 @@ impl ManagedBatchedModel for HybridBatched {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
+        session.expect_rope_ceilings(self.rope().ceilings())?;
         drive_wave(
             self,
             session,
@@ -619,6 +625,15 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    fn weight_plan(&self) -> WeightPlanning {
+        // A dense checkpoint of this lineage has no expert cache, which is `Dense` and
+        // not a broken gauge set — see `WeightPlanning`.
+        match self.expert_stats() {
+            Some(s) => WeightPlan::from_stats(&s),
+            None => WeightPlanning::Dense,
+        }
+    }
+
     fn layer_stream_stats(&self) -> Option<[usize; 7]> {
         #[cfg(feature = "cuda")]
         {
@@ -679,6 +694,14 @@ impl ManagedBatchedModel for HybridBatched {
 
     fn recurrent_reserved_bytes(&self) -> usize {
         HybridBatched::recurrent_reserved_bytes(self)
+    }
+
+    fn recurrent_store_bytes(&self) -> usize {
+        HybridBatched::recurrent_store_bytes(self)
+    }
+
+    fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        HybridBatched::compact_recurrent(self, max_moves)
     }
 
     fn reset_expert_stats(&self) {
@@ -879,6 +902,9 @@ fn sweep_layers(
         pre_off,
         pre_q,
         model.device(),
+        // This path builds its headers before the forward's span opens; the
+        // qwen4exp sweep moved the construction down so it could use one.
+        None,
     )?);
     g_meta.end();
 
@@ -914,11 +940,64 @@ fn sweep_layers(
     if total_rows > 0 {
         if let Device::Cuda(d) = dev {
             let plan = WavePlan::new(model.wave_geometry(embed_dtype));
-            let pad = |b: usize| b + REGION_BYTES;
+            // **Scored rows are not all rows.** The head runs every decode row
+            // and the LAST row of each prefill span — a verifying span excepted,
+            // where each row is a prediction to compare a proposal against.
+            // Pricing `HeadLogits` at `total_rows × vocab` buys ~1 GB of tier
+            // for a 248 KB logits block on a 2,048-row prefill, taken from the
+            // weight side every wave.
+            //
+            // A wave that stops short of the last layer returns its residual and
+            // runs no head, so it scores no rows at all.
+            let verify_seqs = model.verify_row_seqs()?;
+            // Armed before the forward opened (`begin_verify_stash`), so it is
+            // readable here and describes exactly what a rewind would stage.
+            let staged = model.verify_stash_width()?;
+            let scored_prefill: usize = pre_q
+                .iter()
+                .enumerate()
+                .map(|(k, &l)| {
+                    if verify_seqs.contains(&seq_ids[n_decode + k]) {
+                        l
+                    } else {
+                        1
+                    }
+                })
+                .sum();
+            let width = WaveWidth {
+                prefill_rows: pre_rows,
+                decode_rows: n_decode,
+                scored_rows: if layer_end == num_layers {
+                    n_decode + scored_prefill
+                } else {
+                    0
+                },
+                // A one-row prefill group takes the decode kernels, so it carves
+                // no span-table entry and, alone, no scan transient.
+                prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
+                // **The rewind this wave may owe.** A verify wave's accept can
+                // reject proposals, and the replay that rewinds the recurrence
+                // then carves the cohort stash's four operands per recurrent
+                // layer off THIS span (`replay_accepted_prefixes`). These two
+                // units are what price that chain; left at zero it prices to
+                // nothing, and the span this forward reserves has no room for a
+                // replay that arrives behind it.
+                //
+                // Measured on the 35B-A3B gate at 16 contexts: `ReplayQkv`
+                // asking 1,572,864 B of a 240,384 B span — this wave's own
+                // attention price, *smaller* than the one-context case, because
+                // `staged_rows` was 0. Reserved by the forward rather than
+                // re-planned at accept time: the tier is one three-phase
+                // reservation replaced wholesale, so re-planning it for the
+                // replay alone zeroes the Ffn and Forward spans the next wave
+                // needs (measured: `wave-ffn … exceeds the 0 B budget`).
+                staged_rows: staged.map_or(0, |(rows, _)| rows),
+                staged_spans: staged.map_or(0, |(_, spans)| spans),
+            };
             let per_phase = [
-                pad(plan.phase_bytes(LayerPhase::Attention, total_rows)),
-                pad(plan.phase_bytes(LayerPhase::Ffn, total_rows)),
-                WAVE_FORWARD_BYTES,
+                plan.phase_bytes(LayerPhase::Attention, width),
+                plan.phase_bytes(LayerPhase::Ffn, width),
+                plan.phase_bytes(LayerPhase::Forward, width),
             ];
             plan_wave_transient(&d.cuda_stream(), per_phase)?;
         }
@@ -948,21 +1027,8 @@ fn sweep_layers(
     };
     g_embed.end();
 
-    // The interleaved `(cos, sin)` table the paged kernels index by position.
-    // Partial rotary, so it is the model's own table — `compute_rope_cs` would
-    // rotate all 256 dims where only 64 turn.
-    let max_blocks = contexts
-        .first()
-        .and_then(|c| {
-            c.kv_caches
-                .caches
-                .first()
-                .map(|k| k.k_cache().chunked_max_blocks())
-        })
-        .unwrap_or(0);
-    let rope_cs = model.rope_cs(max_blocks)?;
-
-    // Per-group split cos/sin over this wave's own positions.
+    // Per-group split cos/sin over this wave's own positions, for the
+    // non-paged paths; the paged kernels rotate from `model.rope()`.
     let theta = q.cfg.rope_theta;
     let rot = model.rotary();
     let dec_pos: Vec<u32> = dec_off.iter().map(|&o| o as u32).collect();
@@ -977,8 +1043,8 @@ fn sweep_layers(
     } else {
         embed_dtype
     };
-    let dec_rope = rot.rope_cos_sin(&dec_pos, theta, rope_dtype, dev)?;
-    let (pre_cos, pre_sin) = rot.rope_cos_sin(&pre_pos, theta, rope_dtype, dev)?;
+    let dec_rope = rot.rope_cos_sin(&dec_pos, theta, rope_dtype, dev, None)?;
+    let (pre_cos, pre_sin) = rot.rope_cos_sin(&pre_pos, theta, rope_dtype, dev, None)?;
     // Prefill's activation is the flat batch-of-one `[1, total, …]`, so its
     // tables carry the same leading axis.
     let half = q.cfg.attn_head_dim / 2;
@@ -992,13 +1058,11 @@ fn sweep_layers(
     // NeoX half-split within the rotary width — the layout `RotaryLayout`
     // permutes the head dims into, never the interleaved GPT-J form.
     let interleaved = false;
-    let inv_freq = model.inv_freq_device();
     let dec_params = BatchedAttentionParams::new(
         &dec_rope.0,
         &dec_rope.1,
         interleaved,
-        inv_freq,
-        &rope_cs,
+        model.rope(),
         decode_headers,
         dec_q,
         generation,
@@ -1008,8 +1072,7 @@ fn sweep_layers(
         &pre_rope.0,
         &pre_rope.1,
         interleaved,
-        inv_freq,
-        &rope_cs,
+        model.rope(),
         prefill_headers,
         pre_q,
         generation,
@@ -1285,7 +1348,7 @@ fn sweep_layers(
                     &[],
                     capture_dev,
                 )?;
-                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig, layer_lora)?;
+                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig, layer_lora, n_decode)?;
             }
         }
         // The layer's result. Reaching this on a bad value means the mixer's

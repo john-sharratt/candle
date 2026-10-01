@@ -1,0 +1,53 @@
+name: git_fetch
+questions:
+- fetch origin and tell me what moved
+- check whether there is new work upstream
+- is my remote-tracking information stale
+- update the tracking refs from origin
+- has anyone pushed to that branch since I last looked
+- grab the latest refs from the remote without merging
+- what is new on origin that I do not have
+- did the upstream branch move
+- refresh what I know about origin before I push
+- fetch only the main branch from upstream
+- prune the tracking refs for branches deleted on the remote
+- am I behind origin
+- see if there are new commits on the remote
+- sync my view of the remote without touching my files
+- how far behind is main before I start rebasing
+- fetch from the remote named upstream
+- check the server for changes but do not merge anything
+- has that pull request branch been updated remotely
+- bring my remote-tracking branches up to date
+- find out whether there is anything to pull
+category: Git
+description: 'Contact a remote and update this repository''s remote-tracking refs, reporting which ones moved and how — `new`, `fast_forward`, `forced`, or `pruned` because the branch was deleted upstream — with the old and new ids for each. Name the remote as git_remotes reports it, usually `origin`. Give `branch` to fetch just that one; omit it to fetch every branch and prune the tracking refs for branches that no longer exist on the remote. This only refreshes what is known *about* the remote: it moves no local branch, merges nothing, rebases nothing and changes no file on disk, so it is the safe first step before deciding anything. Follow it with git_refs to see how far ahead or behind each branch now is, and **run it before git_push**: the tracking refs it updates are exactly where git_push takes its default lease from, so a stale one is what gets a push rejected. Use for "check for new commits", "fetch origin", "is there anything upstream", "am I behind". Reaches the network and writes to the repository.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    branch:
+      description: Fetch only this branch. Leave it out to fetch every branch and prune the tracking refs for branches deleted on the remote.
+      type: string
+    remote:
+      description: The remote to fetch from, as git_remotes names it — usually `origin`. Required.
+      minLength: 1
+      type: string
+    repo:
+      description: The repository to fetch into. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - remote
+  title: FetchRequest
+  type: object
+examples:
+- fetch origin in candle and tell me what moved<|im_end|>
+- is there any new work upstream<|im_end|>
+- update my remote-tracking refs before I push<|im_end|>
+- fetch only the main branch from upstream<|im_end|>
+- has anyone pushed to that branch since yesterday<|im_end|>
+- am I behind origin<|im_end|>
+- prune the tracking refs for branches deleted on the remote<|im_end|>
+- check the remote for changes but do not merge anything<|im_end|>

@@ -54,6 +54,18 @@ axum       = { version = "0.7", features = ["macros", "ws"] }
 # the provider chose. Not a security boundary — the subject inside the file is
 # authoritative — but it has to be total over every possible input.
 sha2       = "0.10"
+# The OS entropy source behind an effector device token — a real secret, never
+# derived from the guessable `body_id` (see `effector::token`). The same crate,
+# and the same `OsRng`/`TryRngCore` path, that `web` mints its OAuth secrets
+# with, so there is one answer in the workspace to "where does a secret come
+# from".
+rand       = { workspace = true }
+# Driving the `local` effector router in-process: the fast path builds an
+# `http::Request` and invokes the router through `ServiceExt::oneshot`, the same
+# service the external mount answers on, minus the socket (effector design §8.1).
+# A regular dependency and not only a dev one, because the production fast path
+# needs it, not just the tests.
+tower      = { version = "0.5" }
 # Watching the mind directory, so an edited world file takes effect without a
 # restart. Same version zend watches its workspace with — filesystem event
 # semantics differ enough between major versions that two of them in one
@@ -125,7 +137,6 @@ ureq = { version = "2.12", default-features = false }
 # every 2s, so proving it runs unattended would otherwise mean a test that
 # genuinely sleeps for eight seconds.
 tokio = { version = "1", features = ["full", "test-util"] }
-# Driving the router directly in the integration tests: the auth wiring is the
-# part worth proving over HTTP rather than over function calls, and `oneshot`
-# does it without binding a port.
-tower = { version = "0.5" }
+# `tower` (for `ServiceExt::oneshot`, used to drive routers in tests without a
+# port) is a regular dependency now, because the effector fast path needs it in
+# production too — see the `[dependencies]` entry.

@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 serde      = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
 schemars   = { workspace = true }
@@ -24,8 +25,6 @@ rand = { workspace = true }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
-# ripgrep's git-aware file walker — backs the VFS overlay's workspace layer.
-ignore = "0.4"
 sha2 = "0.10"
 sha1 = { version = "0.10", features = ["oid"] }
 md-5 = "0.10"
@@ -52,6 +51,22 @@ base64 = { workspace = true }
 scraper = "0.21"
 byteorder = { workspace = true }
 boa_engine = "0.21.1"
+# The workspace repositories: the typed git layer (nothing else in this crate
+# spawns or parses git), the file stores the file tools work through, the
+# replace engine behind file_edit, and the sandbox `run_command` runs jobs in.
+zend-vfs = { path = "../zend-vfs" }
+# A sandbox job is async; a tool call drives it on a runtime of its own.
+tokio = { version = "1", features = ["rt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [dev-dependencies]
 tokio     = { version = "1", features = ["macros", "rt"] }

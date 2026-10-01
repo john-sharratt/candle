@@ -33,9 +33,13 @@ use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::RecurrentStateStore;
+use crate::models::delta_net::{compact_stores, RecurrentCompaction};
 use crate::models::draft_ladder::DraftLadder;
 use crate::models::lora::Adapter;
+use crate::models::rope_schedule::{RopeRungs, RopeSchedule};
 use crate::models::rotary_layout::RotaryLayout;
+
+use super::rope::lineage_schedule;
 
 /// A loaded hybrid model of this lineage, ready to be driven by the scheduler.
 ///
@@ -69,20 +73,11 @@ pub struct HybridBatched {
     draft: DraftLadder,
     kv_map: KvLayerMap,
     rotary: RotaryLayout,
-    /// Inverse frequencies over the **rotary** width, not the head width.
-    ///
-    /// Carried because the attention parameters take one; the CUDA paged path
-    /// reads the interleaved table instead and never touches it, but a table
-    /// sized for the whole head would be a standing invitation to rotate 256
-    /// dims where only 64 turn.
-    inv_freq: Tensor,
-    /// The interleaved `[pos, head_dim]` `(cos, sin)` table the paged kernels
-    /// index, keyed by the arena's block count.
-    ///
-    /// Built once per geometry rather than per wave: it spans the whole
-    /// addressable context, so rebuilding it every forward would cost more
-    /// than the attention it feeds.
-    rope_cs: Mutex<Option<(usize, Tensor)>>,
+    /// The lineage's RoPE rungs (`super::rope`) over the **rotary** width: the
+    /// kernels read frequency `f < rope_dim / 2` from a slot's rung and treat
+    /// every later one as pass-through, which is where [`RotaryLayout`] puts
+    /// the head's non-rotary dims.
+    rope: RopeRungs,
     /// Provenance capture depths, snapped onto layers that actually attend.
     provenance: ProvenanceLayerIndices,
     /// Per-sequence recurrent state, keyed by the scheduler's sequence id.
@@ -148,12 +143,7 @@ impl HybridBatched {
             );
         }
         let rotary = RotaryLayout::new(model.cfg.attn_head_dim, model.cfg.rope_dim, &model.device)?;
-        let theta = model.cfg.rope_theta;
-        let rope_dim = model.cfg.rope_dim;
-        let inv: Vec<f32> = (0..rope_dim / 2)
-            .map(|j| 1f32 / theta.powf(2.0 * j as f32 / rope_dim as f32))
-            .collect();
-        let inv_freq = Tensor::from_vec(inv, (rope_dim / 2,), &model.device)?;
+        let rope = RopeRungs::new(&lineage_schedule(&model.cfg)?, &model.device)?;
         let provenance = provenance_layer_indices(&model.cfg, &kv_map).ok_or_else(|| {
             candle::Error::Msg(
                 "qwen35: no attention layers, so no provenance can be captured".into(),
@@ -166,8 +156,7 @@ impl HybridBatched {
             draft,
             kv_map,
             rotary,
-            inv_freq,
-            rope_cs: Mutex::new(None),
+            rope,
             provenance,
             recurrent: Mutex::new(HashMap::new()),
             verify_rows: Mutex::new(Vec::new()),
@@ -303,6 +292,31 @@ impl HybridBatched {
         slot.as_mut().expect("just ensured").begin(blocks)
     }
 
+    /// What a rewind of the armed cohort will **stage** — `(rows, spans)` — or
+    /// `None` when no cohort is armed.
+    ///
+    /// The forward prices this into its Attention span, because the forward is
+    /// what creates the obligation: `replay_accepted_prefixes` carves four
+    /// operands per recurrent layer off that span at accept time, and
+    /// `WaveWidth::replay` is what prices them. A width built with
+    /// `staged_rows: 0` prices that chain at exactly zero — correct for a wave
+    /// that stages nothing, and short by the whole stash for one that does.
+    ///
+    /// **Rows are the stash's CAPACITY, not this cohort's total.** The buffers
+    /// only ever grow, and `stage_on_wave` stages each operand's full shape — so
+    /// a cohort narrower than the high-water mark still carves the high-water
+    /// mark, and pricing the cohort would under-reserve by the difference.
+    pub fn verify_stash_width(&self) -> Result<Option<(usize, usize)>> {
+        let slot = self
+            .verify_stash
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: verify_stash lock poisoned".into()))?;
+        match slot.as_ref() {
+            Some(s) => Ok(Some((s.capacity()?, s.spans.len()))),
+            None => Ok(None),
+        }
+    }
+
     /// Take the cohort stash for the sweep or the replay. Taking rather than
     /// borrowing: a stash span is good for exactly one rewind, and a second use
     /// would replay from a state two waves old — the taker removes the spans it
@@ -350,31 +364,25 @@ impl HybridBatched {
         }
     }
 
-    /// Inverse frequencies over the rotary width.
-    pub fn inv_freq_device(&self) -> &Tensor {
-        &self.inv_freq
+    /// The lineage's RoPE rungs, which every paged kernel rotates from.
+    pub fn rope(&self) -> &RopeRungs {
+        &self.rope
     }
 
-    /// The interleaved `(cos, sin)` table covering `max_blocks × CHUNK_SIZE`
-    /// positions, built once and reused while the geometry holds.
-    pub fn rope_cs(&self, max_blocks: usize) -> Result<Tensor> {
-        let mut slot = self
-            .rope_cs
-            .lock()
-            .map_err(|_| candle::Error::Msg("qwen35: rope_cs lock poisoned".into()))?;
-        if let Some((blocks, table)) = slot.as_ref() {
-            if *blocks == max_blocks {
-                return Ok(table.clone());
-            }
+    /// Run `schedule` in place of the lineage's — the control a long-context
+    /// gate measures the lineage's rungs against (`docs/progressive_yarn.md`
+    /// §10). Nothing stored depends on a rung (I1), so a session opened after
+    /// this simply reads the new tables. The rotary width must be the model's.
+    pub fn set_rope_schedule(&mut self, schedule: &RopeSchedule) -> Result<()> {
+        if schedule.pairs() != self.rope.pairs() {
+            candle::bail!(
+                "qwen35: a {}-pair schedule on a {}-pair rotary width",
+                schedule.pairs(),
+                self.rope.pairs()
+            );
         }
-        let table = self.rotary.rope_table(
-            max_blocks * candle_nn::CHUNK_SIZE,
-            self.model.cfg.rope_theta,
-            DType::F32,
-            &self.model.device,
-        )?;
-        *slot = Some((max_blocks, table.clone()));
-        Ok(table)
+        self.rope = RopeRungs::new(schedule, &self.model.device)?;
+        Ok(())
     }
 
     /// Let the elastic boundary grow into ground the weight side is no longer
@@ -491,18 +499,51 @@ impl HybridBatched {
 
     /// Give `child` a copy of `parent`'s recurrent state.
     ///
-    /// Reservation bytes every live sequence's recurrent state holds together.
+    /// Reservation bytes recurrent state holds on this model's device — every state
+    /// arena's regions, whatever is in them.
     ///
-    /// Summed over the map rather than derived from a per-sequence constant:
-    /// a store's region count depends on how its buffers packed, and a forked
-    /// child's need not match its parent's. A poisoned lock reports zero rather
-    /// than failing — this is a report, and a wrong number in it is preferable
-    /// to a scheduler that cannot answer how much memory it is using.
+    /// The arenas and not a sum over the stores: the stores share arenas, so their
+    /// sum leaves out every arena's free slots and unused tail, and any slot a
+    /// handle kept after its store was dropped. See
+    /// [`RecurrentStateStore::arena_reserved_bytes`].
     pub fn recurrent_reserved_bytes(&self) -> usize {
-        self.recurrent
+        RecurrentStateStore::arena_reserved_bytes(&self.model.device)
+    }
+
+    /// Compact the state arenas every sequence's recurrent state lives in — see
+    /// [`compact_stores`]. Between forwards; holds the map for the pass, which is
+    /// what keeps a wave from opening on a store mid-move.
+    pub fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
+        let mut map = self
+            .recurrent
             .lock()
-            .map(|m| m.values().map(|s| s.reserved_bytes()).sum())
-            .unwrap_or(0)
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        compact_stores(
+            map.values_mut(),
+            &self.model.cfg.delta_net,
+            &self.model.device,
+            max_moves,
+        )
+    }
+
+    /// What one sequence's state costs, whether or not one is standing.
+    ///
+    /// **Priced from the geometry, never from residency.** Every store this
+    /// model builds has the same shape, so the config answers for all of them —
+    /// and it answers at the one moment residency cannot, which is the moment
+    /// admission actually asks. See
+    /// [`RecurrentStateStore::reserved_bytes_for`] for why a mean over the live
+    /// stores is not a substitute: it divides a sum over every store the
+    /// process holds by a count of what is merely in flight, so it climbs with
+    /// the number of *idle* conversations.
+    ///
+    /// This takes no lock, which is the other half of its value here —
+    /// admission asks on the scheduler thread while forwards hold the map.
+    pub fn recurrent_store_bytes(&self) -> usize {
+        RecurrentStateStore::reserved_bytes_for(
+            &self.model.cfg.layer_kinds,
+            &self.model.cfg.delta_net,
+        )
     }
 
     /// The turn loop carves a child slot per turn and decodes on it, borrowing
@@ -1152,7 +1193,10 @@ impl HybridBatched {
     }
 
     pub fn wave_geometry(&self, act_dtype: DType) -> ModelGeometry {
-        wave_geometry(&self.model.cfg, act_dtype)
+        // The session's int8 mode, not the config's: the KO twins are chosen at
+        // load and decide what each norm's fused epilogue emits, which is a real
+        // difference in what the span holds.
+        wave_geometry(&self.model.cfg, act_dtype, self.int8mode())
     }
 
     /// Re-materialise every norm weight in the session's activation dtype.
@@ -1267,7 +1311,8 @@ impl HybridBatched {
         // per-model property added to that struct lands there and is silently
         // dropped here — a new field looks wired, builds clean, and simply never
         // reaches this model. Extend both when adding one.
-        let session = create_session(&self.model.cfg, &self.model.device, config)?;
+        let mut session = create_session(&self.model.cfg, &self.model.device, config)?;
+        session.set_rope_ceilings(self.rope.ceilings().to_vec())?;
         self.maybe_change_dtype(session.activation_dtype(), session.kv_live_dtype())?;
         Ok(session)
     }

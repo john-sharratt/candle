@@ -349,3 +349,92 @@ fn to_dtype_mut_transfers_ownership_off_the_lease() -> Result<()> {
     );
     Ok(())
 }
+
+/// **An anchored lease keeps its owner alive through every view of it.** Clones,
+/// reshapes, narrows and re-leases all hold a share of the owner, and the owner is
+/// released only when the last of them goes — which is what lets the owner hand the
+/// memory to someone else without a stale view still reading it.
+#[test]
+fn an_anchor_travels_with_every_view_and_is_released_with_the_last() -> Result<()> {
+    use candle_core::LeaseAnchor;
+    use std::sync::Arc;
+
+    let dev = Device::new_cuda(0)?;
+    let backing = Tensor::from_vec((0..12).map(|i| i as f32).collect::<Vec<_>>(), (12,), &dev)?;
+    let owner = Arc::new(());
+    let anchored = unsafe {
+        Tensor::from_anchored_cuda_ptr(
+            f32_ptr(&backing),
+            DType::F32,
+            (3, 4),
+            &dev,
+            LeaseAnchor::new(owner.clone()),
+        )?
+    };
+    // One share for the local, one for the storage.
+    assert_eq!(Arc::strong_count(&owner), 2);
+
+    let clone = anchored.clone();
+    let row = anchored.narrow(0, 1, 1)?;
+    let flat = anchored.reshape((12,))?;
+    let relet = unsafe { anchored.as_foreign_lease()? };
+    assert_eq!(
+        Arc::strong_count(&owner),
+        3,
+        "views share the storage; the re-lease is a second storage holding its own share"
+    );
+    assert_eq!(relet.to_vec2::<f32>()?[2], vec![8.0, 9.0, 10.0, 11.0]);
+
+    drop(anchored);
+    drop(clone);
+    drop(row);
+    assert_eq!(
+        Arc::strong_count(&owner),
+        3,
+        "`flat` still views the storage"
+    );
+    drop(flat);
+    assert_eq!(
+        Arc::strong_count(&owner),
+        2,
+        "the re-lease still holds its share"
+    );
+    drop(relet);
+    assert_eq!(
+        Arc::strong_count(&owner),
+        1,
+        "the last view let the owner go"
+    );
+    Ok(())
+}
+
+/// A copy is fresh memory, so it holds nothing of the source's owner — neither a
+/// `copy()` nor a cast that moves the storage onto a new buffer.
+#[test]
+fn a_copy_or_a_moved_cast_holds_no_anchor() -> Result<()> {
+    use candle_core::LeaseAnchor;
+    use std::sync::Arc;
+
+    let dev = Device::new_cuda(0)?;
+    let backing = Tensor::from_vec(vec![1.0f32; 64], (64,), &dev)?;
+    let owner = Arc::new(());
+    let mut anchored = unsafe {
+        Tensor::from_anchored_cuda_ptr(
+            f32_ptr(&backing),
+            DType::F32,
+            (64,),
+            &dev,
+            LeaseAnchor::new(owner.clone()),
+        )?
+    };
+    let copy = anchored.copy()?;
+    assert_eq!(Arc::strong_count(&owner), 2, "the copy holds no share");
+    anchored.to_dtype_mut(DType::BF16)?;
+    assert_eq!(
+        Arc::strong_count(&owner),
+        1,
+        "a cast that moved the storage onto a new buffer let the owner go"
+    );
+    drop(copy);
+    Ok(())
+}

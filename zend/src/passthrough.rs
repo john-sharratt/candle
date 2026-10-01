@@ -489,7 +489,7 @@ mod tests {
         let id = conv_id_of(tl);
         assert_eq!(id, "passthrough-1789300485193544");
         assert_eq!(timeline_of(&id), Some(tl));
-        assert_eq!(timeline_of("default"), None);
+        assert_eq!(timeline_of("a-client-supplied-id"), None);
         assert_eq!(timeline_of("passthrough-abc"), None);
         assert_eq!(timeline_of("passthrough-0"), None);
     }

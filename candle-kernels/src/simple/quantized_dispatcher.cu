@@ -26,6 +26,9 @@
 // Include adaptive per-block format selection kernel
 #include "../quantize/select_kv_format.cuh"
 
+// The INT8 decode/prefill element helpers, for the Q0_V decode oracle below.
+#include "../convert/int8_elem.cuh"
+
 // q8a128 activation-block quantize/dequant kernel templates (definitions must be
 // visible here for the run_quantize_q8a128 / run_dequantize_q8a128 instantiations
 // and the unified run_*_block dispatch cases below).
@@ -874,35 +877,158 @@ extern "C" void run_mul_mat(
 }
 
 // =============================================================================
-// Q0_V DEQUANTIZE TEST ENTRYPOINT
+// Q0_V DECODE ORACLE  (K-side and V-side)
 // =============================================================================
-// Wraps the production GPU decoder (BlockConverter<block_q0_v, T>::load) in a
-// standalone kernel so Rust unit tests can exercise the exact same decode path
-// used by attention/prefill kernels. One warp per block; lane t emits dst[t].
-
-extern "C" __global__ void dequantize_block_q0_v_f32_kernel(
+// Decodes every element of `num_blocks` Q0_V blocks through each production
+// read path that reaches a Q0_V block, under side `is_k`'s codebook, at
+// palette scale `scale`:
+//   via_dispatch — `dequant_element_inline`, the ArenaAccessor's element path
+//   via_i8_elem  — `int8_elem::i8_dequant_elem`, the INT8 prefill kernel's path
+//   via_quad     — `int8_elem::I8BlockQuad<block_q0_v>::load4`, the INT8 tile
+//                  decode kernel's four-token path, handed `1 / scale` as its
+//                  callers compute it
+//   via_header   — `q0_v_header` + `q0_v_header_elem`, the hoisted header the
+//                  decode kernels hold per block
+// The Rust decode-oracle test compares all four, bit for bit, against the
+// reference `k_quants::q0_v_elem_scaled` over every 16-bit code. One thread
+// per four-token quad: `num_blocks * 8` threads.
+template <bool IS_K>
+__global__ void q0_v_decode_oracle_kernel(
     const block_q0_v* __restrict__ src,
-    float* __restrict__ dst,
+    float* __restrict__ via_dispatch,
+    float* __restrict__ via_i8_elem,
+    float* __restrict__ via_quad,
+    float* __restrict__ via_header,
     int num_blocks,
     float scale)
 {
-    const int warps_per_grid_block = blockDim.x / WARP_SIZE;
-    const int warp_in_block = threadIdx.x / WARP_SIZE;
-    const int blk = blockIdx.x * warps_per_grid_block + warp_in_block;
-    const int lane = threadIdx.x & (WARP_SIZE - 1);
-    if (blk >= num_blocks) return;
-    BlockConverter<block_q0_v, float>::load(
-        dst + blk * QK_Q0_V, src + blk, lane, scale);
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= num_blocks * 8) return;
+    const int blk = q >> 3;
+    const int t = (q & 7) * 4;
+    const block_q0_v* b = src + blk;
+    const float r = 1.f / scale;
+    float o[4];
+    int8_elem::I8BlockQuad<block_q0_v, IS_K>::load4(b, t, r, o);
+    const Q0VHeader h = q0_v_header<IS_K>(b, r);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int e = t + j;
+        const size_t i = (size_t)blk * QK_Q0_V + e;
+        via_quad[i] = o[j];
+        via_header[i] = q0_v_header_elem(h, e);
+        via_dispatch[i] = dequant_element_inline<float, IS_K>(b, e, ArenaFormat::Q0_V, scale);
+        via_i8_elem[i] = int8_elem::i8_dequant_elem<IS_K>(
+            ArenaFormat::Q0_V, reinterpret_cast<const char*>(b), e, scale);
+    }
 }
 
-extern "C" void run_dequantize_block_q0_v_f32(
-    const void* src, void* dst, int num_blocks, float scale)
+extern "C" void run_q0_v_decode_oracle(
+    const void* src, void* via_dispatch, void* via_i8_elem, void* via_quad, void* via_header,
+    int num_blocks, int is_k, float scale)
 {
     if (num_blocks <= 0) return;
-    const int threads = 32;  // one warp per block
-    const int blocks = num_blocks;
-    dequantize_block_q0_v_f32_kernel<<<blocks, threads>>>(
-        (const block_q0_v*)src, (float*)dst, num_blocks, scale);
+    const int threads = 256;
+    const int blocks = (num_blocks * 8 + threads - 1) / threads;
+    if (is_k) {
+        q0_v_decode_oracle_kernel<true><<<blocks, threads>>>(
+            (const block_q0_v*)src, (float*)via_dispatch, (float*)via_i8_elem,
+            (float*)via_quad, (float*)via_header, num_blocks, scale);
+    } else {
+        q0_v_decode_oracle_kernel<false><<<blocks, threads>>>(
+            (const block_q0_v*)src, (float*)via_dispatch, (float*)via_i8_elem,
+            (float*)via_quad, (float*)via_header, num_blocks, scale);
+    }
+}
+
+// =============================================================================
+// Q0_V ENCODE ORACLE  (K-side and V-side)
+// =============================================================================
+// Encodes `num_blocks` 32-element blocks of `src` (f32, already outer-scaled)
+// with the production per-block encoder `quantize_blocks_q0_v<IS_K>`, one warp
+// per block. The Rust encode-oracle test compares the bytes with the
+// reference encoder `k_quants::encode_block_q0_v`.
+template <bool IS_K>
+__global__ void q0_v_encode_oracle_kernel(
+    const float* __restrict__ src, block_q0_v* __restrict__ dst, int num_blocks)
+{
+    quantize_blocks_q0_v<IS_K, 1>(src, dst, num_blocks);
+}
+
+extern "C" void run_q0_v_encode_oracle(const void* src, void* dst, int num_blocks, int is_k)
+{
+    if (num_blocks <= 0) return;
+    const int threads = 256;
+    const int blocks = (num_blocks + threads / 32 - 1) / (threads / 32);
+    if (is_k) {
+        q0_v_encode_oracle_kernel<true><<<blocks, threads>>>(
+            (const float*)src, (block_q0_v*)dst, num_blocks);
+    } else {
+        q0_v_encode_oracle_kernel<false><<<blocks, threads>>>(
+            (const float*)src, (block_q0_v*)dst, num_blocks);
+    }
+}
+
+// =============================================================================
+// KV BLOCK DECODE / ENCODE ORACLES  (every arena block format)
+// =============================================================================
+// The decode oracle reads every element of `num_blocks` blocks of arena format
+// `fmt` (`block_bytes` apart) through `dequant_element_inline` — the element
+// path every paged attention kernel's ArenaAccessor takes — at unit palette
+// scale, under side `is_k`. The encode oracle encodes `num_blocks` 32-element
+// f32 blocks with `p4c_encode_quant_block`, the encoder the palette seal writes
+// every sealed band with, one warp per block. The Rust oracle tests compare
+// both with the host block codecs, bit for bit and byte for byte.
+template <bool IS_K>
+__global__ void kv_decode_oracle_kernel(
+    const char* __restrict__ src, float* __restrict__ dst,
+    int num_blocks, int block_bytes, int fmt)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_blocks * 32) return;
+    const int blk = i >> 5;
+    dst[i] = dequant_element_inline<float, IS_K>(
+        src + (size_t)blk * block_bytes, i & 31, fmt, 1.0f);
+}
+
+extern "C" void run_kv_decode_oracle(
+    const void* src, void* dst, int num_blocks, int block_bytes, int fmt, int is_k)
+{
+    if (num_blocks <= 0) return;
+    const int threads = 256;
+    const int blocks = (num_blocks * 32 + threads - 1) / threads;
+    if (is_k) {
+        kv_decode_oracle_kernel<true><<<blocks, threads>>>(
+            (const char*)src, (float*)dst, num_blocks, block_bytes, fmt);
+    } else {
+        kv_decode_oracle_kernel<false><<<blocks, threads>>>(
+            (const char*)src, (float*)dst, num_blocks, block_bytes, fmt);
+    }
+}
+
+template <bool IS_K>
+__global__ void kv_encode_oracle_kernel(
+    const float* __restrict__ src, char* __restrict__ dst,
+    int num_blocks, int block_bytes, int fmt)
+{
+    const int blk = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (blk >= num_blocks) return;
+    p4c_encode_quant_block<IS_K>(src + (size_t)blk * 32, dst + (size_t)blk * block_bytes, fmt);
+}
+
+extern "C" void run_kv_encode_oracle(
+    const void* src, void* dst, int num_blocks, int block_bytes, int fmt, int is_k)
+{
+    if (num_blocks <= 0) return;
+    const int threads = 256;
+    const int blocks = (num_blocks + threads / 32 - 1) / (threads / 32);
+    if (is_k) {
+        kv_encode_oracle_kernel<true><<<blocks, threads>>>(
+            (const float*)src, (char*)dst, num_blocks, block_bytes, fmt);
+    } else {
+        kv_encode_oracle_kernel<false><<<blocks, threads>>>(
+            (const float*)src, (char*)dst, num_blocks, block_bytes, fmt);
+    }
 }
 
 // =============================================================================

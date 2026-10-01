@@ -6,8 +6,27 @@ whenever what is actually running differs from what is written here. If this fil
 running process disagree, the process is the fact and this file is corrected.
 
 Secrets are not in this file and never go in it: the gateway's sign-in config is
-`web/secrets/auth.yaml` (gitignored, on the gateway only) and the DNS updater's Cloudflare
-token is `D:\prog\cf-ddns\.env`.
+`web/secrets/auth.yaml` (gitignored, on the gateway only), zend's API keys and tokens are
+`~/.zend/secrets.yaml` for the user running it (the Tavily key for `web_search` and a
+GitHub token; `zend --secrets <path>` names another file), and the DNS updater's
+Cloudflare token is `D:\prog\cf-ddns\.env`.
+
+The `git_*` tools do **not** read that GitHub token. `git_fetch` and `git_push` run the
+`git` program, which authenticates the way it always does for that remote — the
+workspace's repositories use SSH remotes (`git@github.com:…`), so the key in `~/.ssh`
+is what authorises a push, and nothing puts a credential on a command line or into a
+URL. The token in the secrets file is there for a future GitHub API consumer; a
+repository configured with an HTTPS remote and no credential helper would fail to push
+rather than fall back to it, because the git layer sets `GIT_TERMINAL_PROMPT=0` and
+never prompts.
+
+zend's file sits outside every workspace, so no repository the `file_*` tools mount can
+reach it — they follow symlinks and junctions and refuse any path that leads outside its
+repository — and zend refuses to load it unless it is private to zend's user. Inside a
+repository, a `secrets` path segment is load-bearing rather than tidy:
+zend's `file_*` tools resolve a path straight to disk and never consult `.gitignore`, so
+`VfsStore` refuses any path containing that segment. A secret kept anywhere else in a
+repository is readable by the model.
 
 ## Topology
 
@@ -41,7 +60,7 @@ not identities.
 | Address | Hostname | Runs | Repo |
 |---|---|---|---|
 | `192.168.0.5` | BlackWorld | web, zend, cf-ddns | `D:\prog\candle` |
-| `192.168.0.6` | — | npcd | the checkout `/up` is run from; its mind is `C:\Users\johna\prog\mind` |
+| `192.168.0.6` | — | npcd | the checkout `/up` is run from; its mind is `D:\prog\mind` |
 
 ## Services
 
@@ -65,15 +84,20 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | zend | `target\release\zend.exe D:\prog\candle --host 192.168.0.5 --port 8081 --max-depth 1 --disable-layer code_reading` | 2026-09-15, from the running process — `repo_map` bounded to one path component; `code_reading` removed from retrieval at the user's request while that layer is broken |
-| .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind C:/Users/johna/prog/mind --forget-conversations` | 2026-09-13, from the user (not yet confirmed by a `/down`) |
+| .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --max-depth 3 -v` | 2026-09-29, from the running process — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`, `battle-cities`); its substrate is `D:\prog\substrate`. `repo_map` and `code_reading` ingest to three path components below each repository's root; what was ingested deeper is retained while a branch holds it; `-v` (DEBUG) |
+| .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`) |
 
 Notes on the arguments:
 
-- **`--skip-layer`** (zend) keeps a layer in service but stops re-reading it from disk at
-  boot — "the corpus is built". It is not `--disable-layer`, which removes the layer from
-  retrieval. npcd has no such flag; pass `--skip-layer` only to a binary whose `--help`
-  lists it.
+- **The workspace** (zend's positional argument) is a folder holding `workspace.yaml`, which
+  lists the repositories — each a folder directly inside it (`docs/zend_workspace_execution.md`
+  §3). A repository's own folder is not a workspace: zend refuses to start without the
+  manifest, before the model loads.
+
+- **`--disable-layer`** (zend) removes a layer from retrieval. zend reads no layer from the
+  repositories' folders at boot — they belong to the sandbox's jobs — so there is no flag
+  for "stop re-reading the disk"; a recorded line carrying `--skip-layer` must drop it, as
+  zend no longer accepts it.
 - **`--mind`** (npcd) names the mind directory: a directory holding `projection.yaml`
   beside its content libraries (`personalities/`, `worlds/`, `responses/`, `moods/`).
   npcd refuses to start on a directory without `projection.yaml`, and without `--mind` it
@@ -85,9 +109,7 @@ Notes on the arguments:
   state. `/up` replays one only when the recorded line has it (the last run wiped) or the
   user asks for a wipe in that run, and says so before launching. It never adds one on its
   own.
-- **Every flag must exist in the binary.** `--forget-conversations` is not in this repo's
-  `npcd` at `14eacff5` (2026-09-13) — it is either newer than that on `.6` or has since been
-  removed. `/up` checks each recorded flag against `<exe> --help` and asks rather than
+- **Every flag must exist in the binary.** `/up` checks each recorded flag against `<exe> --help` and asks rather than
   dropping one silently, because clap refuses to start on an unknown flag.
 
 ### cf-ddns
@@ -117,6 +139,45 @@ All three daemons handle Ctrl-C: web and npcd stop serving, and zend drains in-f
 and then **flushes the substrate** (demotes every hot turn to disk and fsyncs the redo log)
 before exiting. So a stop is Ctrl-C first, delivered to the detached process's console, and
 a forced kill only if it does not exit in time. A forced kill of zend skips the flush.
+
+## Self-healing (zend only)
+
+None of these daemons runs under a service manager or a restart-on-exit wrapper — see
+"Services" above — with the single exception of cf-ddns's scheduled-task supervisor. That
+was a real gap for zend: a device stuck in an out-of-memory retry storm (KV migration
+failing forever) served nothing for 40+ minutes before anyone noticed, because nothing was
+watching, and the old GPU-poison watchdog only exited cleanly "for a supervisor to relaunch"
+— a supervisor that does not exist here.
+
+zend now relaunches itself instead. `candle::gpu_poison` flags the CUDA context poisoned on
+a sticky fault (illegal address, launch failure, device assert, ECC) **or** on an
+out-of-memory streak that has run for 60 s straight with no successful device operation in
+between (`candle_core::gpu_poison::OOM_STICKY_AFTER`) — a single large-request OOM is not
+sticky on its own and is left to admission control. On either, `zend/src/self_heal.rs`:
+
+1. logs the root fault (plus the recent-kernel-launch breadcrumb);
+2. drops a marker next to `substrate/zend.log` so the relaunch **appends** instead of the
+   ordinary fresh-boot truncate — the whole point is to keep the evidence readable across the
+   restart, in one file;
+3. spawns an identical process — same executable, same argv (captured from its own launch,
+   not reconstructed from parsed flags), same working directory;
+4. exits with code 75 (distinct from clean shutdown 0 and Ctrl-C 130).
+
+The new process's own bind retries for ~5 s if the port is still held by the one it is
+replacing, and its log-file init logs an explicit `=== resumed after a self-heal restart ===`
+line so the boundary is visible when reading the file. The substrate redo log is crash-safe,
+so the abrupt exit loses nothing durable.
+
+**Relaunching is capped at 5 consecutive fast poisonings** (one within 5 minutes of the
+relaunched process's own start) — `zend/src/self_heal.rs`'s `relaunch_decision`, count
+persisted in `substrate/.self_heal_attempts`. Past the cap it stays down and exits 76
+instead of relaunching again: a genuinely broken card or driver poisons every fresh process
+within moments, and an uncapped watchdog would crash-loop on that forever rather than
+surfacing "a human needs to look at this machine." A poisoning after a healthy multi-minute
+uptime resets the count — it's a fresh occurrence, not a continuation of the same fault.
+
+**npcd has no equivalent yet** — it does not link `self_heal`, so the same class of stuck
+device would still need a human to notice and restart it by hand.
 
 ## Health checks
 

@@ -1,6 +1,6 @@
 # zend-tools
 
-Rust crate providing the 93-tool server-side execution engine for the **Zen Code** daemon (`zend`). Every tool in the system — from `web_search` and `datetime` through SSH sessions, cryptographic primitives, and sandboxed code execution — is implemented here as a statically-registered, JSON-in / JSON-out Rust function.
+Rust crate providing the 95-tool server-side execution engine for the **Zen Code** daemon (`zend`). Every tool in the system — from `web_search` and `datetime` through SSH sessions, cryptographic primitives, and sandboxed code execution — is implemented here as a statically-registered, JSON-in / JSON-out Rust function.
 
 See [`docs/tool-system.md`](../docs/tool-system.md) for the full specification.
 
@@ -41,9 +41,9 @@ src/
 │   ├── credentials.rs   CredentialStore
 │   ├── hash_state.rs    HashStateStore
 │   ├── notes.rs         NotesStore
-│   ├── sessions.rs      SessionRegistry (all protocol entries)
-│   └── vfs.rs           VfsStore (in-memory virtual filesystem)
-└── tools/           — 93 tool implementations
+│   ├── secrets.rs       Secrets (API keys and tokens, read from ~/.zend/secrets.yaml)
+│   └── sessions.rs      SessionRegistry (all protocol entries)
+└── tools/           — 95 tool implementations
     ├── bytes/       — bytes_transcode, bytes_pack, bytes_unpack, bytes_xor
     ├── calculator.rs
     ├── code/        — code_run, code_session_{open,exec,list,close}
@@ -51,7 +51,7 @@ src/
     ├── crypto/      — aead_{encrypt,decrypt}, hmac_compute, signature_{sign,verify},
     │                  kdf_derive, hkdf_{extract,expand_label}
     ├── datetime.rs
-    ├── file/        — file_{write,read,edit,list,delete,present}
+    ├── file/        — file_{write,read,edit,list,search,grep,delete,present}
     ├── hash/        — hash_compute, hash_scan
     ├── hash_state/  — hash_state_{init,update,finalize}
     ├── http_session/— http_session_{open,request,list,close}

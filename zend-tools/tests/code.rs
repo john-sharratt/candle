@@ -1,10 +1,13 @@
 mod harness;
 
 use serde_json::json;
+use zend_tools::tools::code::session_exec::MAX_SESSION_SNIPPETS;
 use zend_tools::ToolContext;
 
+use harness::REPO;
+
 fn ctx() -> ToolContext {
-    ToolContext::new()
+    harness::granted()
 }
 
 // ── code_run (one-shot) ─────────────────────────────────────────────────────────
@@ -13,7 +16,7 @@ fn ctx() -> ToolContext {
 fn code_run_console_log() {
     let r = harness::expect_success(harness::invoke(
         "code_run",
-        json!({"language": "javascript", "code": "console.log('hello from js')"}),
+        json!({"repo": REPO, "language": "javascript", "code": "console.log('hello from js')"}),
     ));
     assert!(r["stdout"].as_str().unwrap().contains("hello from js"));
     assert_eq!(r["exit_code"], 0);
@@ -23,7 +26,7 @@ fn code_run_console_log() {
 fn code_run_returns_final_value() {
     let r = harness::expect_success(harness::invoke(
         "code_run",
-        json!({"language": "js", "code": "2 + 40"}),
+        json!({"repo": REPO, "language": "js", "code": "2 + 40"}),
     ));
     assert_eq!(r["result"], "42");
     assert_eq!(r["exit_code"], 0);
@@ -33,7 +36,7 @@ fn code_run_returns_final_value() {
 fn code_run_logs_objects_as_json() {
     let r = harness::expect_success(harness::invoke(
         "code_run",
-        json!({"language": "javascript", "code": "console.log({a: 1, b: [2, 3]})"}),
+        json!({"repo": REPO, "language": "javascript", "code": "console.log({a: 1, b: [2, 3]})"}),
     ));
     assert!(
         r["stdout"]
@@ -49,7 +52,7 @@ fn code_run_logs_objects_as_json() {
 fn code_run_throw_sets_exit_code_and_stderr() {
     let r = harness::expect_success(harness::invoke(
         "code_run",
-        json!({"language": "javascript", "code": "throw new Error('boom')"}),
+        json!({"repo": REPO, "language": "javascript", "code": "throw new Error('boom')"}),
     ));
     assert_eq!(r["exit_code"], 1);
     assert!(
@@ -63,7 +66,7 @@ fn code_run_throw_sets_exit_code_and_stderr() {
 fn code_run_console_error_to_stderr() {
     let r = harness::expect_success(harness::invoke(
         "code_run",
-        json!({"language": "javascript", "code": "console.error('bad thing'); 1"}),
+        json!({"repo": REPO, "language": "javascript", "code": "console.error('bad thing'); 1"}),
     ));
     assert!(r["stderr"].as_str().unwrap().contains("bad thing"));
     assert_eq!(r["exit_code"], 0); // console.error is not a throw
@@ -73,7 +76,7 @@ fn code_run_console_error_to_stderr() {
 fn code_run_exposes_stdin_global() {
     let r = harness::expect_success(harness::invoke(
         "code_run",
-        json!({"language": "javascript", "stdin": "payload", "code": "console.log(stdin)"}),
+        json!({"repo": REPO, "language": "javascript", "stdin": "payload", "code": "console.log(stdin)"}),
     ));
     assert!(r["stdout"].as_str().unwrap().contains("payload"));
 }
@@ -83,6 +86,7 @@ fn code_run_exposes_env_global() {
     let r = harness::expect_success(harness::invoke(
         "code_run",
         json!({
+            "repo": REPO,
             "language": "javascript",
             "env": {"FOO": "bar"},
             "code": "console.log(env.FOO)"
@@ -94,7 +98,10 @@ fn code_run_exposes_env_global() {
 #[test]
 fn code_run_rejects_non_javascript() {
     for lang in ["python", "python3", "bash", "sh", "cobol"] {
-        let resp = harness::invoke("code_run", json!({"language": lang, "code": "print(1)"}));
+        let resp = harness::invoke(
+            "code_run",
+            json!({"repo": REPO, "language": lang, "code": "print(1)"}),
+        );
         harness::expect_error(&resp, "interpreter_not_found");
     }
 }
@@ -134,14 +141,14 @@ fn code_session_state_persists_across_execs() {
     // Define a variable and a function in one call...
     harness::expect_success(harness::invoke_with_ctx(
         "code_session_exec",
-        json!({"session_id": sid, "code": "let counter = 41; function inc() { counter += 1; return counter; }"}),
+        json!({"repo": REPO, "session_id": sid, "code": "let counter = 41; function inc() { counter += 1; return counter; }"}),
         &ctx,
     ));
 
     // ...and use them in the next.
     let exec = harness::expect_success(harness::invoke_with_ctx(
         "code_session_exec",
-        json!({"session_id": sid, "code": "console.log(inc())"}),
+        json!({"repo": REPO, "session_id": sid, "code": "console.log(inc())"}),
         &ctx,
     ));
     assert_eq!(exec["ok"], true);
@@ -152,6 +159,64 @@ fn code_session_state_persists_across_execs() {
     );
 
     harness::invoke_with_ctx("code_session_close", json!({"session_id": sid}), &ctx);
+}
+
+/// State passes through *replayed* snippets, not only from the last one into
+/// the new code: each earlier snippet replays as its own script, in order.
+#[test]
+fn code_session_state_chains_through_replayed_snippets() {
+    let ctx = ctx();
+    let sid = harness::expect_success(harness::invoke_with_ctx(
+        "code_session_open",
+        json!({"language": "javascript"}),
+        &ctx,
+    ))["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for code in ["let a = 1;", "const b = a + 1;"] {
+        harness::expect_success(harness::invoke_with_ctx(
+            "code_session_exec",
+            json!({"repo": REPO, "session_id": sid, "code": code}),
+            &ctx,
+        ));
+    }
+    let exec = harness::expect_success(harness::invoke_with_ctx(
+        "code_session_exec",
+        json!({"repo": REPO, "session_id": sid, "code": "b * 10"}),
+        &ctx,
+    ));
+    assert_eq!(exec["ok"], true);
+    assert_eq!(exec["result"], "20");
+}
+
+/// A session holds at most `MAX_SESSION_SNIPPETS`; the next exec is refused
+/// with a code that says to open a new session.
+#[test]
+fn a_full_session_is_refused() {
+    let ctx = ctx();
+    let sid = harness::expect_success(harness::invoke_with_ctx(
+        "code_session_open",
+        json!({"language": "javascript"}),
+        &ctx,
+    ))["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for i in 0..MAX_SESSION_SNIPPETS {
+        harness::expect_success(harness::invoke_with_ctx(
+            "code_session_exec",
+            json!({"repo": REPO, "session_id": sid, "code": format!("globalThis.n = {i};")}),
+            &ctx,
+        ));
+    }
+    let full = harness::invoke_with_ctx(
+        "code_session_exec",
+        json!({"repo": REPO, "session_id": sid, "code": "n"}),
+        &ctx,
+    );
+    let detail = harness::expect_error(&full, "session_full");
+    assert!(detail.contains("code_session_open"), "{detail}");
 }
 
 #[test]
@@ -168,7 +233,7 @@ fn code_session_throwing_exec_does_not_poison_state() {
 
     harness::expect_success(harness::invoke_with_ctx(
         "code_session_exec",
-        json!({"session_id": sid, "code": "const kept = 7;"}),
+        json!({"repo": REPO, "session_id": sid, "code": "const kept = 7;"}),
         &ctx,
     ));
 
@@ -178,7 +243,7 @@ fn code_session_throwing_exec_does_not_poison_state() {
     // `expect_success` (which keys on the `error` field).
     let bad = harness::invoke_with_ctx(
         "code_session_exec",
-        json!({"session_id": sid, "code": "throw new Error('nope')"}),
+        json!({"repo": REPO, "session_id": sid, "code": "throw new Error('nope')"}),
         &ctx,
     );
     assert_eq!(bad["ok"], false);
@@ -187,7 +252,7 @@ fn code_session_throwing_exec_does_not_poison_state() {
     // Prior state survives; the bad snippet left no trace.
     let good = harness::expect_success(harness::invoke_with_ctx(
         "code_session_exec",
-        json!({"session_id": sid, "code": "console.log(kept)"}),
+        json!({"repo": REPO, "session_id": sid, "code": "console.log(kept)"}),
         &ctx,
     ));
     assert_eq!(good["ok"], true);
@@ -232,7 +297,7 @@ fn code_session_exec_not_found() {
     let ctx = ctx();
     let resp = harness::invoke_with_ctx(
         "code_session_exec",
-        json!({"session_id": "sess_nonexistent", "code": "1 + 1"}),
+        json!({"repo": REPO, "session_id": "sess_nonexistent", "code": "1 + 1"}),
         &ctx,
     );
     harness::expect_error(&resp, "session_not_found");

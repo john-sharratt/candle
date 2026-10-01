@@ -39,6 +39,37 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// A thing's name as the disk spells its document: lowercased, every run of
+/// characters that is not a letter or a digit collapsed to a single dash, and no
+/// dash at either end.
+///
+/// The one slug the whole crate mints paths through — [`Record`]'s own eras,
+/// stories and place entries here, and [`crate::engine::work`]'s library and
+/// memory documents, which import it — so the file a write creates and the name
+/// [`Record::index_canon`] gives it back on the next start are the same string:
+/// a place surveyed as `the eastern flats` is `the-eastern-flats.md`, and reads
+/// back as `the eastern flats`. A run of several separators collapses to one
+/// dash, so `the  eastern — flats` slugs to `the-eastern-flats`, never
+/// `the--eastern---flats`.
+pub(crate) fn slug_of(name: &str) -> String {
+    let mut slug = String::new();
+    let mut pending = false;
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            // A separator run only ever becomes one dash, and never a leading
+            // one — the dash is emitted just before the next kept character.
+            if pending && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(c);
+            pending = false;
+        } else {
+            pending = true;
+        }
+    }
+    slug
+}
+
 /// What a document calls itself: its first `# ` heading.
 ///
 /// Read a line at a time and stopped at the first one that answers, so
@@ -343,21 +374,32 @@ impl Record {
         let dir = match i.kind {
             Kind::Era => "layers/eras",
             Kind::Story | Kind::Gap => "layers/stories",
+            // A place's own entry — what it is like to stand in when nothing is
+            // happening — lives beside the rest of the surveyed world. Its local
+            // history is a *second* document (see [`Record::history_path`]) and
+            // deliberately does not become the item's `path`: a place has one
+            // entry and any number of histories, and a single `path` field can
+            // name only one of them.
+            Kind::Place => "layers/world/locations",
             _ => return None,
         };
-        let slug: String = i
-            .name
-            .to_lowercase()
-            .chars()
-            .map(|c| match c.is_ascii_alphanumeric() {
-                true => c,
-                false => '-',
-            })
-            .collect();
-        let slug = slug.trim_matches('-').replace("--", "-");
-        let path = format!("{dir}/{slug}.md");
+        let path = format!("{dir}/{}.md", slug_of(&i.name));
         i.path = Some(path.clone());
         Some(path)
+    }
+
+    /// Where a place's local history lives — a second document, in the surveyed
+    /// world's geography, distinct from the place's own entry ([`settle_path`]).
+    ///
+    /// Read-only and never cached on the item, because [`settle_path`] owns
+    /// `Item.path` and that names the entry. History is derived from the name
+    /// each time instead, so writing one never displaces where the entry lives.
+    /// Only a place has a local history to write; everything else has none.
+    ///
+    /// [`settle_path`]: Record::settle_path
+    pub fn history_path(&self, name: &str) -> Option<String> {
+        let i = self.by_name(name)?;
+        (i.kind == Kind::Place).then(|| format!("layers/world/geography/{}.md", slug_of(&i.name)))
     }
 
     /// Read the canon off the disk and put it in the record.
@@ -377,7 +419,23 @@ impl Record {
     /// document already indexed keeps the state and custody it has, because
     /// re-indexing must not release work somebody is holding.
     pub fn index_canon(&mut self, root: &Path) {
-        for (dir, kind) in [("layers/eras", Kind::Era), ("layers/stories", Kind::Story)] {
+        // `owns_path` is the whole of the geography fix: a directory that owns
+        // `Item.path` names the ENTRY a place (or era, or story) is edited as;
+        // geography names *histories*, found from the name by [`history_path`]
+        // and never stored as anybody's `path`. So the geography pass only makes
+        // an otherwise-unknown place known — it never points an item's entry
+        // path at a history file, and never re-points a place that already
+        // carries its locations entry. Pointing `Item.path` at geography let a
+        // later `place_write_entry` append entry prose into the history file.
+        for (dir, kind, owns_path) in [
+            ("layers/eras", Kind::Era, true),
+            ("layers/stories", Kind::Story, true),
+            // A place's entry — its own document, edited where you stand.
+            ("layers/world/locations", Kind::Place, true),
+            // A place's local history — a second document, held name-derived by
+            // `history_path`, deliberately not the item's `path`.
+            ("layers/world/geography", Kind::Place, false),
+        ] {
             let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
                 continue;
             };
@@ -394,10 +452,14 @@ impl Record {
                     continue;
                 };
                 let path = format!("{dir}/{stem}.md");
-                if self
-                    .items
-                    .values()
-                    .any(|i| i.path.as_deref() == Some(&path))
+                // Already indexed under this exact entry document — skip. Only a
+                // path-owning dir is deduplicated this way; a history file is
+                // never anybody's `path`, so it is deduplicated by name below.
+                if owns_path
+                    && self
+                        .items
+                        .values()
+                        .any(|i| i.path.as_deref() == Some(&path))
                 {
                     continue;
                 }
@@ -406,9 +468,13 @@ impl Record {
                 // rather than gaining a twin beside it. Two items called the
                 // same thing — one real and one not — is exactly the trap this
                 // join exists to close: a Maker would reach for whichever the
-                // lookup happened to find first.
+                // lookup happened to find first. A history dir stops here: the
+                // place is known, and its history is `history_path`'s to derive,
+                // so it must NOT overwrite the entry path the place already has.
                 if let Some(existing) = self.by_name_mut(&name) {
-                    existing.path = Some(path);
+                    if owns_path {
+                        existing.path = Some(path);
+                    }
                     continue;
                 }
                 // **Namespaced by the document's own location.** An id built
@@ -418,10 +484,15 @@ impl Record {
                 // silently *replaced* the thing everybody names with one named
                 // after a filename. The failure looked like the era had never
                 // existed.
+                //
+                // A history dir makes the place known without an entry path: its
+                // entry is still unwritten, and `settle_path` mints it at the
+                // first entry write.
                 let id = format!("doc_{}_{stem}", dir.replace('/', "_"));
-                let item = Item::new(id, name, kind)
-                    .in_state(State::Filed)
-                    .at_path(path);
+                let mut item = Item::new(id, name, kind).in_state(State::Filed);
+                if owns_path {
+                    item = item.at_path(path);
+                }
                 self.put(item);
             }
         }
@@ -558,6 +629,14 @@ impl Record {
                 | (State::Draft, State::Filed)
                 | (State::Filed, State::Retired)
                 | (State::Held, State::Draft)
+                // A document taken up and committed in one move — branch it,
+                // write the first entry into it, commit — goes straight to
+                // filed. Before documents were real nothing was ever *held* at
+                // the moment it was filed, so this pairing never came up; a new
+                // era, place or story committed from a held working set needs
+                // it, and without it the commit wrote the file and then refused
+                // to record that it had.
+                | (State::Held, State::Filed)
         );
         if !ok {
             return Err(format!(
@@ -683,6 +762,87 @@ mod tests {
         assert_eq!(r.by_name("the third era").unwrap().kind, Kind::Era);
         // What is indexed is part of the record, not somebody's draft.
         assert_eq!(r.by_name("the third era").unwrap().state, State::Filed);
+    }
+
+    /// **A place with BOTH an entry and a local history takes the entry as its
+    /// `Item.path`, never the history.** `Item.path` names the ENTRY (owned by
+    /// `settle_path`); the history is a second document found name-derived by
+    /// `history_path`. Indexing both documents must leave the place pointing at
+    /// its locations entry — re-pointing it at geography is what let a later
+    /// `place_write_entry` append entry prose into the history file.
+    #[test]
+    fn a_place_with_both_documents_takes_its_entry_not_its_history() {
+        let root = canon("place-both");
+        std::fs::create_dir_all(root.join("layers/world/locations")).unwrap();
+        std::fs::create_dir_all(root.join("layers/world/geography")).unwrap();
+        std::fs::write(
+            root.join("layers/world/locations/the-eastern-flats.md"),
+            "# the eastern flats\n\nGround fused smooth, and a wind that does not stop.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("layers/world/geography/the-eastern-flats.md"),
+            "# the eastern flats\n\nWhy the road stops here.\n",
+        )
+        .unwrap();
+
+        let mut r = Record::new();
+        r.index_canon(&root);
+
+        // One item, not a twin, and its entry path is the LOCATIONS document.
+        let named: Vec<&Item> = r.iter().filter(|i| i.name == "the eastern flats").collect();
+        assert_eq!(named.len(), 1, "indexing the two documents made a twin");
+        assert_eq!(named[0].kind, Kind::Place);
+        assert_eq!(
+            r.path_of("the eastern flats").as_deref(),
+            Some("layers/world/locations/the-eastern-flats.md"),
+            "the entry path was overwritten by the geography history"
+        );
+        // The history is still reachable — derived from the name, not the path.
+        assert_eq!(
+            r.history_path("the eastern flats").as_deref(),
+            Some("layers/world/geography/the-eastern-flats.md")
+        );
+    }
+
+    /// A place known ONLY by its local history is made known without an entry
+    /// path — its entry is unwritten, so `settle_path` will mint it at the first
+    /// entry write, and geography never masquerades as the entry.
+    #[test]
+    fn a_place_known_only_by_its_history_gets_no_entry_path() {
+        let root = canon("history-only");
+        std::fs::create_dir_all(root.join("layers/world/geography")).unwrap();
+        std::fs::write(
+            root.join("layers/world/geography/the-eastern-flats.md"),
+            "# the eastern flats\n\nWhy the road stops here.\n",
+        )
+        .unwrap();
+
+        let mut r = Record::new();
+        r.index_canon(&root);
+
+        assert_eq!(r.by_name("the eastern flats").unwrap().kind, Kind::Place);
+        assert!(
+            r.path_of("the eastern flats").is_none(),
+            "a place's history became its entry path"
+        );
+        assert_eq!(
+            r.history_path("the eastern flats").as_deref(),
+            Some("layers/world/geography/the-eastern-flats.md")
+        );
+    }
+
+    /// A run of separators — spaces, punctuation, several at once — collapses to
+    /// a single dash, and there is no dash at either end.
+    #[test]
+    fn a_slug_collapses_any_run_of_separators() {
+        assert_eq!(slug_of("the eastern flats"), "the-eastern-flats");
+        assert_eq!(slug_of("the  eastern — flats"), "the-eastern-flats");
+        assert_eq!(
+            slug_of("  --A Night At The Gate!!--  "),
+            "a-night-at-the-gate"
+        );
+        assert_eq!(slug_of("a___b"), "a-b");
     }
 
     /// A document names itself by its heading, so the thing a Maker asks for is

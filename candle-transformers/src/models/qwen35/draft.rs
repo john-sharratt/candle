@@ -47,7 +47,7 @@
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::{DType, Device, Result, Tensor};
 
-use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
+use crate::models::draft_walk::{draft_reserve, draft_walk};
 use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
 
 use std::cell::RefCell;
@@ -331,16 +331,9 @@ pub fn draft_cohort(
     let act_dtype = session.activation_dtype();
     // Allocate every drafted position's write chunk before the walk begins —
     // `draft_walk`'s module docs carry why that is load-bearing rather than
-    // tidy, and the walk does it itself. It is forced here because `max_blocks`
-    // below must be read after it.
+    // tidy, and the walk does it itself.
     draft_reserve(session, seqs, kv_layer, max_len)?;
 
-    // The rope table spans the arena's whole addressable context, so it is read
-    // from the head's own layer rather than assumed — and only after the
-    // reserve above, which can grow it.
-    let max_blocks = draft_rope_depth(session, seqs, kv_layer)?;
-    let rope_cs = model.rope_cs(max_blocks)?;
-    let inv_freq = model.inv_freq_device().clone();
     let theta = q.cfg.rope_theta;
     let rope_dtype = if act_dtype == DType::F8E4M3 {
         DType::BF16
@@ -382,14 +375,15 @@ pub fn draft_cohort(
                     generation: &Generation|
      -> Result<(Tensor, Tensor)> {
         let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-        let (cos, sin) = model.rotary().rope_cos_sin(&pos, theta, rope_dtype, dev)?;
+        let (cos, sin) = model
+            .rotary()
+            .rope_cos_sin(&pos, theta, rope_dtype, dev, None)?;
         let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
         let params = BatchedAttentionParams::new(
             &cos,
             &sin,
             false,
-            &inv_freq,
-            &rope_cs,
+            model.rope(),
             DecodeHeaders::Decode {
                 buf: Some(headers.0.clone()),
                 stride: headers.1,
@@ -410,10 +404,6 @@ pub fn draft_cohort(
         committed,
         &seed_block,
         max_len,
-        // Nothing to open: this head's block runs through
-        // `forward_layer_batched_mixed`, which lays its spans out in whatever
-        // tier is already placed rather than wanting one of its own.
-        || Ok(()),
         &mut step,
     )
 }

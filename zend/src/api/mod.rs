@@ -29,6 +29,7 @@ mod chat_frames;
 mod compressed;
 pub mod conversations;
 pub mod files;
+pub mod me;
 mod memory;
 pub mod models;
 pub mod profile;
@@ -86,6 +87,7 @@ pub fn router(session: Arc<ZendSession>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat::completions))
         .route("/v1/models", get(models::list))
+        .route("/v1/me", get(me::me))
         .route("/v1/status", get(status::status))
         .route("/v1/memory", get(memory::dump))
         .route("/v1/repo_map", get(repo_map::completeness))
@@ -105,6 +107,10 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route(
             "/v1/substrate/timeline/:tl",
             get(substrate::timeline).delete(substrate::delete_timeline),
+        )
+        .route(
+            "/v1/substrate/timeline/:tl/selection",
+            get(substrate::selection),
         )
         .route("/v1/substrate/project", post(substrate::project))
         .route("/v1/debug/maintenance", post(status::force_maintenance))

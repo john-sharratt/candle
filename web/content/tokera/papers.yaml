@@ -55,13 +55,13 @@ papers:
     zenodo: "https://zenodo.org/records/20156060"
     pdf: "https://zenodo.org/records/20156060/files/one-card-one-stack.pdf?download=1"
     status: "v1 technical report"
-    source: unbounded_agents.md
+    source: unbounded_agents_v1.md
     summary: >-
       Under standard full attention, numerical error per generated token grows
       with context depth on any hardware and under any compression scheme.
       This proves the problem is architectural rather than representational,
       and presents a system whose per-step error is O(1) at unbounded depth:
       provenance-selected attention over a three-tier paged context, adaptive
-      per-block KV quantization, and Markov expert prediction — measured at
-      509 tok/s single-session and 2,446 tok/s across 64 concurrent sessions
-      on a 16 GB card.
+      per-block KV quantization, and Markov expert prediction. Current measured
+      figures, which supersede v1's throughput section, are in the repository's
+      performance document.

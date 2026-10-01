@@ -254,6 +254,7 @@ mod tests {
         let seen = listed_slugs(&html);
 
         let expected = [
+            "what-one-gpu-can-do",
             "waves-and-the-pcie-bottleneck",
             "palquant-per-block",
             "battle-cities-coming-soon",
@@ -391,11 +392,16 @@ mod tests {
             // page down — not so a paper's central definition can quietly
             // render as raw LaTeX, which is what `\mathcal` and `\big[` each
             // did until they were handled.
-            let fell_back = html.matches("math-raw").count();
-            assert_eq!(
-                fell_back, 0,
-                "{}: {fell_back} expressions rendered as literal LaTeX",
-                paper.slug
+            let fell_back: Vec<&str> = html
+                .split("math-raw\">")
+                .skip(1)
+                .filter_map(|tail| tail.split("</code>").next())
+                .collect();
+            assert!(
+                fell_back.is_empty(),
+                "{}: {} expressions rendered as literal LaTeX: {fell_back:?}",
+                paper.slug,
+                fell_back.len()
             );
         }
     }

@@ -54,6 +54,7 @@ pub mod body;
 pub mod cooldown;
 pub mod dreams;
 pub mod driver;
+pub mod effector_focus;
 pub mod enact;
 pub mod environment;
 pub mod event;
@@ -65,6 +66,10 @@ pub mod life;
 pub mod loading;
 pub mod loopguard;
 pub mod mind;
+pub mod mission;
+pub mod mission_acts;
+pub mod mission_api;
+pub mod narration;
 pub mod narrator;
 pub mod perceived;
 pub mod persona;
@@ -107,6 +112,7 @@ use crate::api::{err, owner_of, Authored};
 use crate::engine::interaction::Interlocutor;
 use crate::engine::mind::Minds;
 use crate::guard::Api;
+use crate::npcs;
 use crate::projection;
 
 /// The one refusal this module makes, worded once.
@@ -179,6 +185,22 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::User,
             get(get_messages).post(post_message),
         )
+        // ── missions ────────────────────────────────────────────────────────
+        //
+        // Lodge a mission for a character, and read how one turned out. `User`
+        // plus the ownership check inside, like everything else that writes to
+        // one owned character — a mission is a thing asked of somebody's cast.
+        .route(
+            "/v1/npc/:nid/mission",
+            Role::User,
+            get(mission_api::status).post(mission_api::lodge),
+        )
+        // Call off one owned character's mission.
+        .route(
+            "/v1/npc/:nid/mission/cancel",
+            Role::User,
+            post(mission_api::cancel),
+        )
         // ── the world's open channel ────────────────────────────────────────
         //
         // The standing group every character joins on arrival — see
@@ -213,10 +235,33 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // author wrote, not the simulation running from them.
         .route("/v1/pulse/world", Role::User, get(pulse::world))
         .route("/v1/npc/:nid/pulse", Role::User, post(pulse::inject))
+        // A line spoken straight into a character's world, from any in-world
+        // voice at a chosen loudness — the influence primitive under the
+        // console's `/` notation. `User` plus the ownership check inside, like
+        // `pulse`: it reaches only a character the caller owns.
+        .route("/v1/npc/:nid/direct", Role::User, post(pulse::direct))
         .route("/v1/npc/:nid/window", Role::User, get(pulse::window))
         // Admin: it reaches characters the caller does not own, which every
         // other route on this daemon refuses to do.
         .route("/v1/pulse/broadcast", Role::Admin, post(pulse::broadcast))
+        // A plain announcement to the whole world at URGENT — the announcement-
+        // shaped sibling of `broadcast`. Admin for the same reason: it reaches
+        // every character, including ones the caller does not own.
+        .route("/v1/pulse/announce", Role::Admin, post(pulse::announce))
+        // The command table: open it to call the cast to take up missions, shut
+        // it to stand them down. Admin — it reaches the whole cast, and drives
+        // every character, including ones the caller does not own.
+        .route(
+            "/v1/pulse/command-table",
+            Role::Admin,
+            post(mission_api::command_table),
+        )
+        // Clear the whole board's missions at once.
+        .route(
+            "/v1/pulse/missions/cancel",
+            Role::Admin,
+            post(mission_api::cancel_all),
+        )
         // ── generation ──────────────────────────────────────────────────────
         .route(
             "/v1/generate/description",
@@ -283,7 +328,7 @@ async fn owned(s: &Arc<Authored>, headers: &HeaderMap, nid: &str) -> Result<u64,
             "no such character",
         ))
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(nid) else {
         return Err(not_found());
     };
     if s.npcs.read().await.visible_to(npc_id, &owner).is_none() {
@@ -650,7 +695,7 @@ async fn inject(
     };
     // The session says which character; ownership is still checked, because an
     // interaction id is not a capability.
-    if let Err(r) = owned(&s, &headers, &session.npc_id.to_string()).await {
+    if let Err(r) = owned(&s, &headers, &npcs::npc_id_wire(session.npc_id)).await {
         return *r;
     }
     let line = body
@@ -1038,7 +1083,7 @@ async fn stream(
     let Some(session) = rt.interactions.get(&ix, now) else {
         return err(StatusCode::NOT_FOUND, "interaction_not_found", &ix);
     };
-    if let Err(r) = owned(&s, &headers, &session.npc_id.to_string()).await {
+    if let Err(r) = owned(&s, &headers, &npcs::npc_id_wire(session.npc_id)).await {
         return *r;
     }
 

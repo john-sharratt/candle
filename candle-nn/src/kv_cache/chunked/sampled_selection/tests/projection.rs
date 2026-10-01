@@ -892,7 +892,7 @@ fn select_best_passing_format(
         let dist = if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
             0.0
         } else {
-            let recon = fmt.apply_quant(block);
+            let recon = fmt.apply_quant(block, is_key);
             if is_key {
                 let recon_adj = apply_error_margin_block(block, &recon, ERROR_MARGIN_ABS);
                 magnitude_weighted_distance(block, &recon_adj)
@@ -987,7 +987,7 @@ fn select_format(block: &[f32; SELECT_BLOCK], threshold: f32) -> BlockFormat {
 fn select_format_with_error(block: &[f32; SELECT_BLOCK], threshold: f32) -> (BlockFormat, f32) {
     let candidates = candidate_formats();
     for &fmt in &candidates {
-        let recon = fmt.apply_quant(block);
+        let recon = fmt.apply_quant(block, false);
         let dist = normalized_l2_distance(block, &recon);
         if dist <= threshold {
             return (fmt, dist);
@@ -1237,7 +1237,7 @@ fn process_blocks(blocks: &[[f32; SELECT_BLOCK]], threshold: f32) -> ComponentSt
         let fmt = select_format(blk, threshold);
         s.fmt_counts[fmt.table_index()] += 1;
         s.bpe_sum += fmt.bits_per_elem() as f64;
-        let recon = fmt.apply_quant(blk);
+        let recon = fmt.apply_quant(blk, false);
         let cd = cosine_distance(blk, &recon);
         s.cos_sum += cd as f64;
         s.cos_dists.push(cd);
@@ -1583,7 +1583,7 @@ impl CurveStat {
     fn push(&mut self, block: &[f32; SELECT_BLOCK], fmt: BlockFormat) {
         self.counts[fmt.table_index()] += 1;
         self.bpe_sum += fmt.bits_per_elem() as f64;
-        let recon = fmt.apply_quant(block);
+        let recon = fmt.apply_quant(block, false);
         let cd = cosine_distance(block, &recon);
         self.cos_sum += cd as f64;
         self.cos_dists.push(cd);
@@ -2250,7 +2250,7 @@ fn test_cuda_selection_matches_cpu() {
                             if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
                                 return 0.0;
                             }
-                            let recon = fmt.apply_quant(&k_block);
+                            let recon = fmt.apply_quant(&k_block, true);
                             magnitude_weighted_distance(&k_block, &recon)
                         };
                         let cpu_err = err_of(cpu_k_fmts[b]);
@@ -2305,7 +2305,7 @@ fn test_cuda_selection_matches_cpu() {
                             if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
                                 return 0.0;
                             }
-                            let recon = fmt.apply_quant(&v_block);
+                            let recon = fmt.apply_quant(&v_block, false);
                             cosine_distance(&v_block, &recon)
                         };
                         let cpu_cos = cos_of(cpu_v_fmts[b]);
@@ -3063,7 +3063,7 @@ fn cpu_select_k_qproj(
         if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
             continue;
         }
-        let recon = fmt.apply_quant(k_block);
+        let recon = fmt.apply_quant(k_block, true);
         let recon_adj = apply_error_margin_block(k_block, &recon, ERROR_MARGIN_ABS);
         let err = cpu_q_attn_weighted_loss(k_block, &recon_adj, q_block);
         if err <= threshold {
@@ -3431,7 +3431,7 @@ fn test_cuda_r16_qproj_matches_cpu() {
                             if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
                                 return 0.0;
                             }
-                            let recon = fmt.apply_quant(&k_block);
+                            let recon = fmt.apply_quant(&k_block, true);
                             cpu_q_attn_weighted_loss(&k_block, &recon, &q_block)
                         };
                         let cpu_err = err_of(cpu_k_fmts[b]);
@@ -3566,13 +3566,13 @@ fn attention_output(
     let sqrt_d = (head_dim as f32).sqrt();
 
     // Quantize K and V per 32-element block
-    let quantize_flat = |data: &[f32], fmt: BlockFormat| -> Vec<f32> {
+    let quantize_flat = |data: &[f32], fmt: BlockFormat, is_k: bool| -> Vec<f32> {
         let mut out = vec![0.0f32; data.len()];
         for b in (0..data.len()).step_by(SELECT_BLOCK) {
             let end = (b + SELECT_BLOCK).min(data.len());
             if end - b == SELECT_BLOCK {
                 let blk: [f32; SELECT_BLOCK] = data[b..end].try_into().unwrap();
-                let recon = fmt.apply_quant(&blk);
+                let recon = fmt.apply_quant(&blk, is_k);
                 out[b..end].copy_from_slice(&recon);
             } else {
                 out[b..end].copy_from_slice(&data[b..end]);
@@ -3613,8 +3613,8 @@ fn attention_output(
 
     let ref_output = compute(k_flat, v_flat);
 
-    let k_q = quantize_flat(k_flat, k_fmt);
-    let v_q = quantize_flat(v_flat, v_fmt);
+    let k_q = quantize_flat(k_flat, k_fmt, true);
+    let v_q = quantize_flat(v_flat, v_fmt, false);
     let quant_output = compute(&k_q, &v_q);
 
     (ref_output, quant_output)
@@ -3882,7 +3882,7 @@ fn test_asymmetric_kv_attention_error() {
                     let end = (b + SELECT_BLOCK).min(k_head.len());
                     if end - b == SELECT_BLOCK {
                         let blk: [f32; SELECT_BLOCK] = k_head[b..end].try_into().unwrap();
-                        let recon = BlockFormat::Q8_0.apply_quant(&blk);
+                        let recon = BlockFormat::Q8_0.apply_quant(&blk, true);
                         k_q[b..end].copy_from_slice(&recon);
                     } else {
                         k_q[b..end].copy_from_slice(&k_head[b..end]);
@@ -3897,7 +3897,7 @@ fn test_asymmetric_kv_attention_error() {
                     if end - b == SELECT_BLOCK {
                         let blk: [f32; SELECT_BLOCK] = v_head[b..end].try_into().unwrap();
                         let v_fmt = select_format(&blk, eff_thr);
-                        let recon = v_fmt.apply_quant(&blk);
+                        let recon = v_fmt.apply_quant(&blk, false);
                         v_q[b..end].copy_from_slice(&recon);
                         v_bpe_sum += v_fmt.bits_per_elem() as f64;
                         v_blocks += 1;
@@ -6406,7 +6406,7 @@ fn compute_quality_metrics(
             if elems_per_chunk <= data.len() && blk_idx < effective_fmts.len() {
                 let blk = dim_major_block_from_token_major(data, b, n_kv_head, blocks_per_chunk);
                 let fmt = effective_fmts[blk_idx];
-                let recon = fmt.apply_quant(&blk);
+                let recon = fmt.apply_quant(&blk, is_key);
                 let cd = cosine_distance(&blk, &recon);
                 cos_dists.push(cd);
                 for (&x, &xh) in blk.iter().zip(recon.iter()) {
@@ -6478,7 +6478,7 @@ fn compute_quality_w1_p4(
 
                 // If both reductions give the same format, compute quant once
                 if w1_fmt == p4_fmt {
-                    let recon = w1_fmt.apply_quant(&blk);
+                    let recon = w1_fmt.apply_quant(&blk, is_key);
                     let cd = cosine_distance(&blk, &recon);
                     w1_cos.push(cd);
                     p4_cos.push(cd);
@@ -6490,13 +6490,13 @@ fn compute_quality_w1_p4(
                     p4_noise += n;
                 } else {
                     // Different formats — compute both
-                    let w1_recon = w1_fmt.apply_quant(&blk);
+                    let w1_recon = w1_fmt.apply_quant(&blk, is_key);
                     let w1_cd = cosine_distance(&blk, &w1_recon);
                     w1_cos.push(w1_cd);
                     for (&x, &xh) in blk.iter().zip(w1_recon.iter()) {
                         w1_noise += ((x - xh) as f64) * ((x - xh) as f64);
                     }
-                    let p4_recon = p4_fmt.apply_quant(&blk);
+                    let p4_recon = p4_fmt.apply_quant(&blk, is_key);
                     let p4_cd = cosine_distance(&blk, &p4_recon);
                     p4_cos.push(p4_cd);
                     for (&x, &xh) in blk.iter().zip(p4_recon.iter()) {
@@ -7638,7 +7638,7 @@ fn select_formats_k_qproj_with_errors(
             if fmt == BlockFormat::BF16 {
                 continue;
             }
-            let recon = fmt.apply_quant(&blk);
+            let recon = fmt.apply_quant(&blk, true);
             let err = q_projected_block_error(q_hat, subspace_k, head_dim, &blk, &recon, start);
             let better_least_error = err < least_error
                 || (err == least_error
@@ -7811,7 +7811,7 @@ fn test_qproj_k_format_selection() {
                         k_full[start..start + SELECT_BLOCK].try_into().unwrap();
 
                     for (fi, &fmt) in profile_fmts.iter().enumerate() {
-                        let recon = fmt.apply_quant(&blk);
+                        let recon = fmt.apply_quant(&blk, true);
                         let err = q_projected_block_error(
                             q_hat, subspace_k, head_dim, &blk, &recon, start,
                         );

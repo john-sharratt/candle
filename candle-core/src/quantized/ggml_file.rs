@@ -1,6 +1,10 @@
 //! Support for the GGML file format.
 
-use super::{k_quants, GgmlDType, QStorage};
+use super::{
+    k_quants, BlockP2, BlockQ0, BlockQ0M2, BlockQ0M4, BlockQ0V, BlockQ0X, BlockQ1A, BlockQ1S,
+    BlockQ2A, BlockQ2S, BlockQ2_0, BlockQ2_1, BlockQ3_0, BlockQ3_1, BlockQ4_KS, BlockQ8_1,
+    BlockQ8_K, BlockQ8_KS, BlockQAWQ, BlockQAWQ_G64, BlockR16, GgmlDType, QStorage,
+};
 use crate::{Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
@@ -187,6 +191,31 @@ pub fn qtensor_from_ggml(
         GgmlDType::MXFP4 => {
             from_raw_data::<k_quants::BlockMXFP4>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::Q8_1 => from_raw_data::<BlockQ8_1>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q8_K => from_raw_data::<BlockQ8_K>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::QAWQ => from_raw_data::<BlockQAWQ>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::QAWQ_G64 => {
+            from_raw_data::<BlockQAWQ_G64>(raw_data, size_in_bytes, dims, device)
+        }
+        // The KV-cache block formats: each has a host block codec, so its bytes
+        // load on any device exactly like the classic GGML blocks above.
+        GgmlDType::Q4_KS => from_raw_data::<BlockQ4_KS>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q8_KS => from_raw_data::<BlockQ8_KS>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q2_0 => from_raw_data::<BlockQ2_0>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q3_0 => from_raw_data::<BlockQ3_0>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::R16 => from_raw_data::<BlockR16>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0 => from_raw_data::<BlockQ0>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q1_S => from_raw_data::<BlockQ1S>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q2_S => from_raw_data::<BlockQ2S>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q2_A => from_raw_data::<BlockQ2A>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q2_1 => from_raw_data::<BlockQ2_1>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q3_1 => from_raw_data::<BlockQ3_1>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::P2 => from_raw_data::<BlockP2>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0_V => from_raw_data::<BlockQ0V>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q1_A => from_raw_data::<BlockQ1A>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0_X => from_raw_data::<BlockQ0X>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0_M2 => from_raw_data::<BlockQ0M2>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0_M4 => from_raw_data::<BlockQ0M4>(raw_data, size_in_bytes, dims, device),
         // KO twins are GPU-only lane-major chunks with no CPU block struct — their on-disk bytes
         // are already in the exact layout the int8 KO matmul reads (identical to
         // `QCudaStorage::repack_ko` output). Copy them straight to VRAM with no reinterpret and no

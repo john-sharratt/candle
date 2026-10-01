@@ -28,13 +28,15 @@
 //! ```
 #![cfg(feature = "cuda")]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle::{Device, IndexOp, Result, Tensor};
 use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
 };
-use candle_transformers::models::quantized_qwen38_moe::{TOKENIZER_REPO, TOKENIZER_REV};
+use candle_transformers::models::quantized_qwen38_moe::{
+    prepared_engine_gguf, TOKENIZER_REPO, TOKENIZER_REV,
+};
 use candle_transformers::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -365,11 +367,7 @@ fn flat_run(
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn no_forced_opener_control() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     gpu.mtp = None;
@@ -447,11 +445,7 @@ fn no_forced_opener_control() -> Result<()> {
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn think_open_only_prefill() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     gpu.mtp = None;
@@ -536,11 +530,7 @@ fn think_open_only_prefill() -> Result<()> {
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn forced_okay_named_failures() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     gpu.mtp = None;
@@ -663,11 +653,7 @@ fn classify_think(gen_think: &str) -> &'static str {
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn reproduce_run4_greeting_collapse() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     gpu.mtp = None;
@@ -809,11 +795,7 @@ fn reproduce_run4_greeting_collapse() -> Result<()> {
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn forced_okay_temperature_sweep() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     gpu.mtp = None;
@@ -886,11 +868,7 @@ fn forced_okay_temperature_sweep() -> Result<()> {
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn flat_prefill_of_a_refused_prompt() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
 
@@ -1464,11 +1442,7 @@ fn flat_prefill_of_a_refused_prompt() -> Result<()> {
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn what_the_injection_hole_costs_at_the_daemons_own_split() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     gpu.mtp = None;
@@ -1660,11 +1634,7 @@ fn what_the_injection_hole_costs_at_the_daemons_own_split() -> Result<()> {
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn which_layer_a_chunk_boundary_crossing_first_changes() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     gpu.mtp = None;
@@ -1841,11 +1811,7 @@ fn which_layer_a_chunk_boundary_crossing_first_changes() -> Result<()> {
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn a_chunk_boundary_crossing_during_decode_against_a_fresh_prefill() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     gpu.mtp = None;
@@ -2048,11 +2014,7 @@ fn argmax_continue(
 #[test]
 #[ignore = "needs the merged engine GGUF and a CUDA device"]
 fn borrowed_kv_against_the_same_seam_computed_in_place() -> Result<()> {
-    let merged =
-        PathBuf::from(r"D:\models\qwen38-flash-next\Qwen3.8-Flash-Next-Q4KOEXP-merged.gguf");
-    if !merged.exists() {
-        candle::bail!("merged engine GGUF absent — run prepare_engine_gguf first");
-    }
+    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
     let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
     // Same reason as the first probe: the MTP head is a real KV layer written on

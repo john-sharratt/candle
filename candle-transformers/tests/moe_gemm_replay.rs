@@ -63,16 +63,22 @@ fn parse_out_dtype(s: &str) -> Result<DType> {
 fn stats(bytes: &[u8], dt: DType) -> (usize, usize, f32, f32) {
     let vals: Vec<f32> = match dt {
         DType::F32 => bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
         DType::BF16 => bytes
-            .chunks_exact(2)
-            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
             .collect(),
         DType::F16 => bytes
-            .chunks_exact(2)
-            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::f16::from_bits(u16::from_le_bytes(*c)).to_f32())
             .collect(),
         _ => Vec::new(),
     };
@@ -130,9 +136,10 @@ fn analyse_rows(
     let mut covered_rows = 0usize;
     for t in 0..launch_tiles.min(starts.len()).min(cnts.len()) {
         let (s, c) = (starts[t].max(0) as usize, cnts[t].max(0) as usize);
-        for row in s..(s + c).min(nrows) {
-            if !covered[row] {
-                covered[row] = true;
+        let end = (s + c).min(nrows);
+        for seen in covered.iter_mut().take(end).skip(s) {
+            if !*seen {
+                *seen = true;
                 covered_rows += 1;
             }
         }
@@ -141,11 +148,11 @@ fn analyse_rows(
     let mut bad_covered = 0usize;
     let mut bad_uncovered = 0usize;
     let mut first_bad_covered: Option<usize> = None;
-    for row in 0..nrows {
+    for (row, &is_covered) in covered.iter().enumerate().take(nrows) {
         if !row_bad(row) {
             continue;
         }
-        if covered[row] {
+        if is_covered {
             bad_covered += 1;
             first_bad_covered.get_or_insert(row);
         } else {

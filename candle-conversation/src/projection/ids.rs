@@ -60,9 +60,10 @@ pub enum Reserved {
     /// like any plain prompt's (see [`super::PlainPromptFrames`]).
     Titler,
     /// The cached tool-catalog summary section for "Comprehensive" tools mode —
-    /// an overview of the full catalog. Sealed at runtime (its content is
-    /// model-generated, not in the schema) and pinned under this reserved
-    /// [`SectionId`] so it can be injected just before the `tools` collection.
+    /// an overview of the full catalog. Sealed at runtime (its
+    /// content is built by the daemon, not in the schema) and pinned under this
+    /// reserved [`SectionId`] so it can be injected just before the `tools`
+    /// collection.
     ToolSummary,
     /// The cached tool-catalog summary section for "Restricted" tools mode — an
     /// overview built from the safe (non-high-risk) tool subset only. The

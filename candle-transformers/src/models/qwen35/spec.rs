@@ -40,10 +40,15 @@
 //! projections, attention, and a 512-expert MoE. On the measured hybrid that is
 //! a few percent of the wave it lets us skip.
 
-use candle::{Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
-use crate::models::delta_net::state_store::RegionBump;
+use candle::DType;
+use candle::{Device, Result, Tensor};
+
 use crate::models::delta_net::{
     delta_net_advance_spans, DeltaNetConstants, DeltaNetDims, DeltaNetOut, DeltaNetProjections,
     DeltaNetSeq, DeltaNetState, LayerKind, RecurrentStateStore, SpanOperands,
@@ -51,7 +56,10 @@ use crate::models::delta_net::{
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_empty;
 #[cfg(feature = "cuda")]
-use candle_nn::kv_cache::{begin_wave, LayerPhase, WaveGeneration};
+use candle_nn::kv_cache::{
+    begin_wave, claim_arena_slots, plan_slot_moves, slot_stride, ArenaSlot, LayerPhase, SlotTenant,
+    WaveGeneration,
+};
 
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
 /// one set of shared buffers, so the replay that consumes them advances every
@@ -76,28 +84,6 @@ pub struct VerifyStash {
     /// half-written stash advances some layers and not others, silently. This
     /// is the record that makes the difference checkable.
     pub filled: Vec<bool>,
-    /// The reservation regions `layers` is carved from.
-    ///
-    /// **The regions, not the allocator that claimed them.** Keeping the
-    /// `RegionBump` would keep its `SpanClaims` alive, and that is an open arena
-    /// window — every later wave blocks in `wave_gate` waiting for it to close.
-    /// Measured as a 58-minute hang with the process alive and not one line of
-    /// output. `RegionBump::into_regions` is the handover.
-    ///
-    /// **Declared last, and that is load-bearing.** Struct fields drop in
-    /// declaration order, so `layers` — whose tensors are `Foreign` leases
-    /// pointing into these regions — must be gone before the regions return to
-    /// the free list. Moving this field up would leave every buffer above it
-    /// naming ground another claimant may already hold.
-    ///
-    /// Empty on a device with no reservation to carve from: a CPU device, or a
-    /// unit test. Those fall back to driver memory, which is what the whole
-    /// stash used to do.
-    ///
-    /// Never read: it is an RAII holder and dropping it is the whole of its job.
-    #[cfg(feature = "cuda")]
-    #[allow(dead_code)]
-    regions: Vec<candle_nn::kv_cache::SpanRegion>,
 }
 
 /// One sequence's rows within the cohort stash.
@@ -111,6 +97,109 @@ pub struct StashSpan {
     pub start: usize,
     /// Rows the sweep captured for this sequence.
     pub len: usize,
+}
+
+/// Pack the rewind stash's arenas — the two-cursor pass, per stride.
+///
+/// **A stash outlives forwards but not the cap it was built for.** Its slot stride
+/// is `cap × width × 4`, so every cohort width that has ever been verified opened
+/// its own pools; the arenas of the caps that came before do not disappear when a
+/// wider stash replaces them, they empty, and whatever is still live in them sits
+/// where the earlier cohorts left it. Over a long run that is exactly the scatter
+/// this packs.
+///
+/// **Outstanding spans do not block it, and gating on them made it dead code.** A
+/// stash with no spans never exists to be packed: `SpecCapture::new` lays the
+/// cohort out with `begin` before anything else can reach it, and `rewind_cohort`
+/// disarms by taking the whole capture rather than by clearing spans — so a gate
+/// of `is_unused()` is false for the stash's entire life and true only when there
+/// is no stash. What actually makes a move safe is *when* this runs: captures are
+/// written during a forward, replays resolve their addresses through
+/// `SpanOperands::rows` at the moment they run, and both they and this pass are on
+/// the scheduler's own thread between forwards. There is no window in which a
+/// buffer both moves and is read.
+///
+/// The widths are deduplicated: `beta_lin` and `alpha_lin` are both `n_v_heads`
+/// wide, so they share a pool, and planning the same stride twice would have the
+/// second walk treat the first's claimed destinations as occupied ground.
+#[cfg(feature = "cuda")]
+pub fn compact_verify_stash(
+    stash: &mut VerifyStash,
+    dims: &DeltaNetDims,
+    device: &Device,
+    max_moves: usize,
+) -> Result<(usize, usize)> {
+    if !matches!(device, Device::Cuda(_)) {
+        return Ok((0, 0));
+    }
+    let cap = stash.capacity()?;
+    if cap == 0 {
+        return Ok((0, 0));
+    }
+    let f32_bytes = DType::F32.size_in_bytes();
+    // Deduplicated on the STRIDE the arena will actually use, not on the byte
+    // count: two widths that differ but round up to the same 256-aligned stride
+    // share one pool, and planning that pool twice would have the second walk read
+    // the first's claimed destinations as occupied ground.
+    let mut strides: Vec<usize> = SpanOperands::widths(dims)
+        .into_iter()
+        .map(|cols| slot_stride(cap * cols * f32_bytes))
+        .collect();
+    strides.sort_unstable();
+    strides.dedup();
+    let mut planned = 0usize;
+    let mut moved = 0usize;
+    for bytes in strides {
+        let moves = plan_slot_moves(device, SlotTenant::RewindStash, bytes, max_moves)?;
+        planned += moves.len();
+        let mut by_src: HashMap<u64, ArenaSlot> =
+            moves.into_iter().map(|m| (m.src, m.dst)).collect();
+        moved += stash.relocate(&mut by_src)?;
+        // Destinations whose source this stash does not hold go back.
+        drop(by_src);
+    }
+    Ok((planned, moved))
+}
+
+/// `n` layers of driver-memory operands — for a device with no reservation to carve
+/// from (a CPU device, or a unit test), and for an empty cohort, which needs no
+/// memory at all.
+fn zeroed_layers(
+    dims: &DeltaNetDims,
+    cap: usize,
+    dev: &Device,
+    n: usize,
+) -> Result<Vec<SpanOperands>> {
+    (0..n)
+        .map(|_| SpanOperands::zeros(dims, cap, dev))
+        .collect()
+}
+
+/// `n` layers of operands in rewind-stash arena slots: one claim per operand width
+/// covering every layer, so the arena window opens at most four times for the whole
+/// stash rather than once per buffer.
+#[cfg(feature = "cuda")]
+fn stash_in_slots(
+    dims: &DeltaNetDims,
+    cap: usize,
+    dev: &Device,
+    n: usize,
+) -> Result<Vec<SpanOperands>> {
+    let f32_bytes = DType::F32.size_in_bytes();
+    let mut per_width = SpanOperands::widths(dims)
+        .into_iter()
+        .map(|cols| {
+            claim_arena_slots(dev, SlotTenant::RewindStash, cap * cols * f32_bytes, n)
+                .map(|slots| slots.into_iter().map(Arc::new))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    (0..n)
+        .map(|_| {
+            let slots =
+                [0, 1, 2, 3].map(|w| per_width[w].next().expect("n slots claimed per width"));
+            SpanOperands::in_slots(dims, cap, dev, slots)
+        })
+        .collect()
 }
 
 impl VerifyStash {
@@ -136,29 +225,19 @@ impl VerifyStash {
         // From the reservation where there is one, so the stash trades against
         // KV and weights like every other long-lived buffer instead of
         // competing invisibly for the card outside the span. See
-        // [`SpanOperands::in_regions`] for the measurement that made this
+        // [`SpanOperands::in_slots`] for the measurement that made this
         // necessary.
         #[cfg(feature = "cuda")]
-        let mut regions = RegionBump::for_device(dev)?;
-        let mut layers = Vec::with_capacity(n);
-        for _ in 0..n {
-            #[cfg(feature = "cuda")]
-            let ops = match regions.as_mut() {
-                Some(bump) => SpanOperands::in_regions(dims, cap, dev, bump)?,
-                None => SpanOperands::zeros(dims, cap, dev)?,
-            };
-            #[cfg(not(feature = "cuda"))]
-            let ops = SpanOperands::zeros(dims, cap, dev)?;
-            layers.push(ops);
-        }
+        let layers = match dev {
+            Device::Cuda(_) if cap > 0 && n > 0 => stash_in_slots(dims, cap, dev, n)?,
+            _ => zeroed_layers(dims, cap, dev, n)?,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let layers = zeroed_layers(dims, cap, dev, n)?;
         Ok(Self {
             layers,
             spans: Vec::new(),
             filled: vec![false; n],
-            // Takes the regions and drops the bump, closing the arena window
-            // before this returns — see the field's own note.
-            #[cfg(feature = "cuda")]
-            regions: regions.map_or_else(Vec::new, RegionBump::into_regions),
         })
     }
 
@@ -210,14 +289,37 @@ impl VerifyStash {
         self.spans.retain(|s| s.seq != seq);
     }
 
+    /// Move every operand buffer whose slot is the source of a planned move onto
+    /// that move's destination; answers how many moved.
+    ///
+    /// **Between steps, and only with no span outstanding.** A replay resolves the
+    /// buffers' addresses when it runs, so moving them between steps is invisible —
+    /// but a stash that still names spans is one a rewind may consume at any
+    /// moment, and a caller must not hand it to a pass. [`Self::is_unused`] is that
+    /// check.
+    ///
+    /// The stash's strides follow the verify cap rather than the model's geometry,
+    /// so a cohort of a new width opens new pools. That is why this exists at all:
+    /// the arenas of the caps that came before do not vanish, they empty, and their
+    /// live remnants sit wherever the previous cohorts left them.
+    #[cfg(feature = "cuda")]
+    pub fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
+        let mut moved = 0usize;
+        for ops in &mut self.layers {
+            moved += ops.relocate(moves)?;
+        }
+        Ok(moved)
+    }
+
     /// Whether any sequence still names a span in this stash.
     ///
     /// **The buffers outlive a span deliberately and must not outlive every
     /// span.** Keeping them across steps is the point — they are reallocated
     /// only when a wider cohort arrives — but once no sequence names one, the
-    /// stash is holding reservation regions on behalf of nobody, and it holds
-    /// them for the life of the process. It is not KV, so no arena sweep sees
-    /// it and every KV-side diagnostic reports the pool as healthy.
+    /// stash is holding rewind-stash arena slots on behalf of nobody, and it holds
+    /// them for the life of the process. It is not KV, so every KV-side
+    /// diagnostic reports the pool as healthy; only the tenant's own arena count
+    /// shows the ground it keeps.
     pub fn is_unused(&self) -> bool {
         self.spans.is_empty()
     }
@@ -480,6 +582,64 @@ mod tests {
             .unwrap()
             .to_dtype(DType::F32)
             .unwrap()
+    }
+
+    /// **The four operand buffers must not alias each other.** Each is its own
+    /// slot, so a wrong stride or a shared base would have one capture silently
+    /// overwrite another's rows — and the failure is invisible: every shape still
+    /// checks out, the replay just mixes two operands together and the rewound
+    /// state comes back subtly wrong. Written into each in turn, the other three
+    /// must be bit-unchanged.
+    ///
+    /// Also pins that the buffers arrive **zeroed**: a replay hands the mixer the
+    /// whole `cap`-row buffer while only the captured span was filled, so the rows
+    /// above the span are read before they are written.
+    #[test]
+    fn the_four_operand_buffers_are_distinct_and_zeroed() {
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        let dims = DeltaNetDims {
+            head_dim: 4,
+            n_k_heads: 2,
+            n_v_heads: 4,
+            conv_kernel: 3,
+        };
+        let cap = 6usize;
+        let stash = VerifyStash::new(&[LayerKind::DeltaNet], &dims, cap, &device).unwrap();
+        let ops = &stash.layers[0];
+        let widths = SpanOperands::widths(&dims);
+
+        let read = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (i, t) in [&ops.qkv, &ops.z, &ops.beta_lin, &ops.alpha_lin]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(t.dims2().unwrap(), (cap, widths[i]), "operand {i} shape");
+            assert!(read(t).iter().all(|&v| v == 0.0), "operand {i} not zeroed");
+        }
+
+        // Stamp each buffer with a distinct value and check the others are intact.
+        let all = [&ops.qkv, &ops.z, &ops.beta_lin, &ops.alpha_lin];
+        for (i, target) in all.iter().enumerate() {
+            let mark = (i + 1) as f32 * 11.0;
+            let stamp = Tensor::full(mark, target.dims2().unwrap(), &device)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap();
+            target.slice_set(&stamp, 0, 0).unwrap();
+            device.synchronize().unwrap();
+            for (j, other) in all.iter().enumerate() {
+                if j == i {
+                    assert!(read(other).iter().all(|&v| v == mark), "operand {i} write");
+                } else if j > i {
+                    assert!(
+                        read(other).iter().all(|&v| v == 0.0),
+                        "writing operand {i} touched operand {j} — the slots alias",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

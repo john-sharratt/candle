@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use web::auth::session::Identity;
 
+use candle_conversation::persistence::record::NpcPayload;
 use web::auth::{Role, Roles};
 
 use crate::accounts::{self, Accounts, NameError, PatchError};
@@ -66,7 +67,15 @@ pub struct Authored {
     pub accounts: RwLock<Accounts>,
     /// The cast, in memory, backed by the substrate — see [`crate::npcs`].
     /// A write lock only for a create/edit/delete; listing takes the read lock.
-    pub npcs: RwLock<Npcs>,
+    ///
+    /// Held behind an `Arc` so the one cast — and with it the process's one
+    /// writable substrate handle ([`crate::npcs::Npcs::substrate`]) — can be
+    /// shared with the engine: [`crate::engine::runtime::Runtime::set_npcs`]
+    /// adopts this same handle, so the effector device reads a character's own
+    /// projected state and writes its agency plane through the identical `Npcs`
+    /// there is no second of. Every call site still reaches the lock through the
+    /// `Arc`'s `Deref` (`self.npcs.read().await`); only construction is wrapped.
+    pub npcs: Arc<RwLock<Npcs>>,
     /// Who is an admin, from the config. Not behind a lock: it is decided at
     /// startup and there is deliberately no way to change it while running —
     /// see [`web::auth::role`].
@@ -138,7 +147,7 @@ impl Authored {
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
             accounts: RwLock::new(accounts),
-            npcs: RwLock::new(npcs),
+            npcs: Arc::new(RwLock::new(npcs)),
             roles,
             libraries,
             images,
@@ -348,6 +357,11 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // bar; *ownership* is the rest of the answer and is checked per-record
         // in the handler, because a role cannot express "yours" (§8.2).
         .route("/v1/npc", Role::User, get(list_npcs).post(create_npc))
+        // Backup and restore the whole cast, for a substrate wipe-and-rebuild.
+        // Admin-only: export carries every character's record regardless of
+        // owner, and import writes them verbatim into a fresh substrate.
+        .route("/v1/npcs/export", Role::Admin, get(export_npcs))
+        .route("/v1/npcs/import", Role::Admin, post(import_npcs))
         .route(
             "/v1/npc/:nid",
             Role::User,
@@ -520,6 +534,39 @@ pub(crate) fn npc_err(e: NpcError) -> Response {
 }
 
 /// The caller's characters. No total is returned — see §8.3.
+/// `GET /v1/npcs/export` — the whole cast as records, for a backup.
+///
+/// Every character, live and tombstoned, so a restore into a fresh substrate
+/// brings the cast back with its ids intact. Admin-only and owner-blind: this
+/// is an operator backup of the entire deployment, not a per-account listing.
+async fn export_npcs(State(s): State<Arc<Authored>>) -> Response {
+    let npcs = s.npcs.read().await.export_all();
+    Json(json!({ "count": npcs.len(), "npcs": npcs })).into_response()
+}
+
+/// `POST /v1/npcs/import` — restore backed-up character records.
+///
+/// Body is `{"npcs": [<record>, …]}` from [`export_npcs`]. Each record is
+/// written verbatim (id, owner, revision, last place preserved). The characters
+/// come back on the next daemon start, which loads them from the log and spawns
+/// their loops — the ordinary boot path, so nothing here needs to embody them.
+async fn import_npcs(State(s): State<Arc<Authored>>, Json(body): Json<Value>) -> Response {
+    let payloads: Vec<NpcPayload> =
+        match serde_json::from_value(body.get("npcs").cloned().unwrap_or(Value::Null)) {
+            Ok(v) => v,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("bad npcs payload: {e}")).into_response()
+            }
+        };
+    match s.npcs.write().await.import(payloads) {
+        Ok(n) => Json(json!({ "imported": n })).into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "npc import failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "import failed").into_response()
+        }
+    }
+}
+
 async fn list_npcs(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
@@ -582,7 +629,7 @@ async fn get_npc(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         // An unparseable id is simply not a character anybody has.
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
@@ -622,7 +669,7 @@ async fn post_reflect(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     // Ownership before anything expensive: a reflection costs several decodes
@@ -733,7 +780,7 @@ async fn post_dream(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     // Ownership — unless the caller may see the whole cast (admin or creator).
@@ -885,12 +932,13 @@ async fn create_npc(
 
 /// A character id off the wire.
 ///
-/// The id is serialised as a **string**, because a `u64` past 2^53 does not
-/// survive a JavaScript client — so reading it back out of a response body is a
-/// string parse, not `as_u64`, and using the latter here silently found nothing.
+/// The id is serialised as a base-36 **string** ([`npcs::npc_id_wire`]),
+/// because a `u64` past 2^53 does not survive a JavaScript client — so
+/// reading it back out of a response body is a base-36 parse, not `as_u64`,
+/// and using the latter here silently found nothing.
 fn npc_id_of(v: &Value) -> Option<u64> {
     v.as_str()
-        .and_then(|s| s.parse().ok())
+        .and_then(npcs::npc_id_of_wire)
         .or_else(|| v.as_u64())
 }
 
@@ -985,7 +1033,7 @@ async fn patch_npc(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.write().await.patch(npc_id, &owner, &body, now_ms()) {
@@ -1039,7 +1087,7 @@ async fn patch_one(s: Arc<Authored>, headers: HeaderMap, nid: String, patch: Val
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.write().await.patch(npc_id, &owner, &patch, now_ms()) {
@@ -1097,7 +1145,7 @@ async fn delete_belief(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s
@@ -1183,7 +1231,7 @@ async fn read_npc(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.read().await.visible_to(npc_id, &owner) {
@@ -1204,7 +1252,7 @@ where
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     let mut npcs = s.npcs.write().await;
@@ -1338,7 +1386,7 @@ async fn delete_npc(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
     match s.npcs.write().await.delete(npc_id, &owner, now_ms()) {
@@ -3162,6 +3210,10 @@ mod tests {
                 ("/v1/schema/layers", "user"),
                 // The cast: signed in, then ownership per record.
                 ("/v1/npc", "user"),
+                // The whole cast in and out as records, for backup/restore —
+                // `admin`, a full-estate read and a bulk write.
+                ("/v1/npcs/export", "admin"),
+                ("/v1/npcs/import", "admin"),
                 ("/v1/npc/:nid", "user"),
                 ("/v1/npc/:nid/tags", "user"),
                 ("/v1/npc/:nid/hidden", "user"),
@@ -3195,6 +3247,97 @@ mod tests {
                 ("/v1/me/profile/history/:rev", "user"),
                 ("/v1/me/profile/restore/:rev", "user"),
                 ("/v1/me/unique-name", "user"),
+            ]
+        );
+    }
+
+    /// The same whole-table assertion, for the engine's routes.
+    ///
+    /// **These are merged into the router separately** (`main.rs` builds
+    /// `engine::api(..)` and `.merge`s it), so the table above — which is built
+    /// from this crate's `api(..)` alone — never saw them, and the three routes
+    /// that reach a character somebody else owns (`/simulate`, `/pulse/broadcast`,
+    /// `/tools/calibrate`, all `admin`) had no guard test at all. This closes
+    /// that: read the `user` rows against their ownership checks, and the two
+    /// `creator` rows (the world channel's write side and a world posting)
+    /// against the fact that they reach a whole world at once, which ownership
+    /// cannot express.
+    #[test]
+    fn the_engine_route_table_is_what_we_think_it_is() {
+        let api = crate::engine::api(state(tmp("engine_table")));
+        let got: Vec<(&str, &str)> = api
+            .declared()
+            .iter()
+            .map(|r| (r.path, r.min.as_str()))
+            .collect();
+
+        assert_eq!(
+            got,
+            [
+                // The substrate as it actually is, and the character's memory —
+                // reads of one owned character.
+                ("/v1/npc/:nid/substrate", "user"),
+                ("/v1/npc/:nid/substrate/layer/:layer", "user"),
+                ("/v1/npc/:nid/substrate/turn/:layer/:turn", "user"),
+                ("/v1/npc/:nid/memory", "user"),
+                // The scenario harness: admin, because it spends the card's time
+                // and reports the daemon's own prompt.
+                ("/v1/simulate", "admin"),
+                // Instruments over one owned character.
+                ("/v1/npc/:nid/projection", "user"),
+                ("/v1/npc/:nid/projection/:tick", "user"),
+                ("/v1/npc/:nid/monitor", "user"),
+                ("/v1/npc/:nid/project", "user"),
+                ("/v1/npc/:nid/perceive", "user"),
+                // Interactions with one owned character.
+                ("/v1/npc/:nid/interaction", "user"),
+                ("/v1/interaction/:ix", "user"),
+                ("/v1/interaction/:ix/inject", "user"),
+                ("/v1/interaction/:ix/stream", "user"),
+                // Messaging a character on its handset.
+                ("/v1/npc/:nid/message", "user"),
+                // Lodging a mission for a character and reading how it went, and
+                // calling one off.
+                ("/v1/npc/:nid/mission", "user"),
+                ("/v1/npc/:nid/mission/cancel", "user"),
+                // The world's open channel: reading is a user's, speaking on it
+                // is a creator's, because it reaches every character in a world.
+                ("/v1/world/:wid/channel", "user"),
+                ("/v1/world/:wid/channel", "creator"),
+                ("/v1/world/:wid/posting", "creator"),
+                // The act vocabulary. Reading the catalog and the command list
+                // is a user's; calibrating an act spends the engine, so admin.
+                ("/v1/tools", "user"),
+                ("/v1/tools/calibrate", "admin"),
+                ("/v1/commands", "user"),
+                // Pulse: the cast's loop as an instrument, and reaching into it.
+                ("/v1/pulse", "user"),
+                ("/v1/pulse/census", "user"),
+                ("/v1/pulse/world", "user"),
+                ("/v1/npc/:nid/pulse", "user"),
+                // The influence primitive: a line into one owned character's
+                // world. `user` plus the ownership check, exactly like `pulse`.
+                ("/v1/npc/:nid/direct", "user"),
+                ("/v1/npc/:nid/window", "user"),
+                // Broadcast and announce reach characters the caller does not
+                // own — the two pulse routes that are admin for exactly that
+                // reason.
+                ("/v1/pulse/broadcast", "admin"),
+                ("/v1/pulse/announce", "admin"),
+                // The command table and clearing the board — admin, they drive
+                // the whole cast.
+                ("/v1/pulse/command-table", "admin"),
+                ("/v1/pulse/missions/cancel", "admin"),
+                // Generation on the resident model, over the caller's own cast.
+                ("/v1/generate/description", "user"),
+                ("/v1/generate/description/stream", "user"),
+                ("/v1/generate/name", "user"),
+                ("/v1/generate/attributes", "user"),
+                ("/v1/image/generate", "user"),
+                ("/v1/image/models", "user"),
+                ("/v1/image/queue", "user"),
+                // The push stream.
+                ("/ws/events", "user"),
             ]
         );
     }

@@ -47,7 +47,10 @@
 //! - `crc32*` — the CRC primitives, also used by [`super::log_file`]
 //!   for the superblock checksum.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::content_hash::ContentHash;
 use super::{PersistenceError, Result};
@@ -236,6 +239,47 @@ pub enum RecordType {
     /// it is fatal, and it is fatal only for conversations long enough to
     /// matter.
     TurnIndexPage = 23,
+    /// A content-addressed section stream flagged logically deleted — the
+    /// section counterpart of the whole-timeline [`Self::Tombstone`]. JSON
+    /// payload [`SectionTombstonePayload`], keyed by the section's `StreamId`
+    /// in the **header's** `stream_id` field (not re-encoded in the payload,
+    /// the same convention [`Self::WideQSig`] and [`Self::TurnIndexPage`]
+    /// use). Replay marks the stream dead; the section-ingest triage then
+    /// reads it as neither present nor persisted, so the next request
+    /// re-prefills the section instead of restoring the tombstoned chunks.
+    ///
+    /// Written when the reactive per-layer window-divergence repair confirms
+    /// a section's own persisted chunks disagree across layers — a corrupted
+    /// cold-tier section is never legitimately re-read, so nothing needs the
+    /// old records once this lands. The compactor drops them on the next
+    /// compaction pass; this marker survives it (it is what makes the drop
+    /// permanent across reloads).
+    SectionTombstone = 24,
+    /// One change a conversation made to a repository's files — a child of
+    /// the conversation's timeline. JSON payload
+    /// [`super::vfs::VfsEventPayload`], whose `body` is its owner's and never
+    /// read here. Keyed in the **header**: the timeline in `stream_id`, the
+    /// event's sequence number in `chunk_index`, so the log opens without
+    /// reading a single body.
+    ///
+    /// Dies two ways: explicitly, by a [`Self::VfsTombstone`] naming its
+    /// sequence number, or implicitly, with its timeline — a tombstoned
+    /// conversation's events are orphans that no rewrite carries. Relocated
+    /// verbatim by location ([`super::vfs::VfsIndex`]). See
+    /// `docs/zend_vfs_events.md`.
+    VfsEvent = 25,
+    /// Kills a set of a timeline's [`Self::VfsEvent`]s — every event of one
+    /// path, up to the last. JSON payload [`super::vfs::VfsTombstonePayload`],
+    /// keyed in the header like the events, by timeline and its own sequence
+    /// number. Relocated while its timeline lives, so it stays after every
+    /// copy of the events it killed.
+    VfsTombstone = 26,
+    /// A generic keyed object: a string `key`, a metadata bag, and a JSON blob.
+    /// Last-writer-wins by `key` (a later record with the same key supersedes the
+    /// older), keyed on the header's `stream_id` = a stable hash of the key. The
+    /// substrate holds the live set in RAM and re-emits it on compaction, so it
+    /// survives like the other resident metadata. See [`CustomObjectPayload`].
+    CustomObject = 27,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -277,6 +321,10 @@ impl RecordType {
             21 => RecordType::BranchCheckpoint,
             22 => RecordType::Npc,
             23 => RecordType::TurnIndexPage,
+            24 => RecordType::SectionTombstone,
+            25 => RecordType::VfsEvent,
+            26 => RecordType::VfsTombstone,
+            27 => RecordType::CustomObject,
             _ => RecordType::Unknown,
         }
     }
@@ -904,6 +952,76 @@ impl DebugIdPayload {
     }
 }
 
+/// JSON payload for a [`RecordType::CustomObject`] record — a generic keyed
+/// object anything may persist: a `key`, a metadata bag, and a JSON `blob`.
+///
+/// Last-writer-wins by `key`: the header's `stream_id` is [`Self::stream_id`], a
+/// stable hash of the key, so a later record with the same key supersedes the
+/// older one exactly the way a re-written [`NpcPayload`] supersedes its previous
+/// record. The substrate keeps the live set in RAM and re-emits it on
+/// compaction, so it outlives a compaction pass.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CustomObjectPayload {
+    /// The identity of the object. Same key → same record stream → LWW.
+    pub key: String,
+    /// A free-form string bag for small attributes that do not belong in the
+    /// blob (a kind, a schema version, a world id). Omitted on the wire when
+    /// empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    /// The object itself, as arbitrary JSON.
+    pub blob: serde_json::Value,
+}
+
+impl CustomObjectPayload {
+    /// A new object with no metadata.
+    pub fn new(key: impl Into<String>, blob: serde_json::Value) -> Self {
+        Self {
+            key: key.into(),
+            metadata: BTreeMap::new(),
+            blob,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("CustomObjectPayload serialise infallible")
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        serde_json::from_slice(buf)
+            .map_err(|e| PersistenceError::Corrupt(format!("CustomObject JSON parse: {e}")))
+    }
+
+    /// The header `stream_id` this object is keyed on — a stable hash of `key`.
+    pub fn stream_id(&self) -> u64 {
+        Self::stream_id_for(&self.key)
+    }
+
+    /// The `stream_id` a given key hashes to. Stable across builds (SHA-256), so
+    /// a key written by one run is found by the next.
+    ///
+    /// Two distinct keys that collide on the low 8 bytes of their SHA-256 share
+    /// a stream, so the later write LWW-shadows the earlier — the objects are
+    /// silently merged into one. At 64 bits the birthday bound is ~4 billion
+    /// live keys for a 50% chance of one collision; the command table holds tens
+    /// of keys, so this is not a practical risk here, but a caller that mints
+    /// keys from unbounded external input should carry its own namespace.
+    pub fn stream_id_for(key: &str) -> u64 {
+        let d = Sha256::digest(key.as_bytes());
+        let v = u64::from_le_bytes(
+            d[..8]
+                .try_into()
+                .expect("32-byte digest is at least 8 bytes"),
+        );
+        // Never zero: zero is the header's "no stream" sentinel.
+        if v == 0 {
+            1
+        } else {
+            v
+        }
+    }
+}
+
 /// JSON payload for a [`RecordType::Npc`] record — one character, as it
 /// durably is. One entry per `npc_id`, last-writer-wins on replay.
 ///
@@ -1269,6 +1387,75 @@ mod tombstone_payload_tests {
                 .to_vec()
         );
         assert_eq!(TombstonePayload::decode(&q.encode()).unwrap(), q);
+    }
+}
+
+/// JSON payload for a [`RecordType::SectionTombstone`] record. The section's
+/// `StreamId` lives in the record header (`stream_id`), not here — the same
+/// convention [`RecordType::WideQSig`] and [`RecordType::TurnIndexPage`] use,
+/// so the walker never has to decode this payload to know which stream it
+/// names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SectionTombstonePayload {
+    /// Why the section was tombstoned, when known — e.g. the chunk index and
+    /// layer split a confirmed per-layer window divergence reported.
+    /// Diagnostic only: replay treats any record of this type as dead
+    /// regardless. `None` skips the field so a reason-less tombstone stays
+    /// minimal on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl SectionTombstonePayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("SectionTombstonePayload serialise infallible")
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        serde_json::from_slice(buf)
+            .map_err(|e| PersistenceError::Corrupt(format!("SectionTombstone JSON parse: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod section_tombstone_payload_tests {
+    use super::SectionTombstonePayload;
+
+    #[test]
+    fn reasonless_payload_is_byte_identical_minimal_form() {
+        let p = SectionTombstonePayload { reason: None };
+        assert_eq!(p.encode(), br#"{}"#.to_vec());
+    }
+
+    #[test]
+    fn reason_is_serialised_when_present() {
+        let p = SectionTombstonePayload {
+            reason: Some(
+                "chunk 2: (offset 0, 32 tokens) on layers [0,1]; (offset 0, 0 tokens) \
+                          on layers [2..47]"
+                    .to_string(),
+            ),
+        };
+        assert_eq!(
+            p.encode(),
+            br#"{"reason":"chunk 2: (offset 0, 32 tokens) on layers [0,1]; (offset 0, 0 tokens) on layers [2..47]"}"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn round_trips() {
+        let p = SectionTombstonePayload {
+            reason: Some("window divergence".to_string()),
+        };
+        assert_eq!(SectionTombstonePayload::decode(&p.encode()).unwrap(), p);
+        let q = SectionTombstonePayload { reason: None };
+        assert_eq!(SectionTombstonePayload::decode(&q.encode()).unwrap(), q);
+    }
+
+    #[test]
+    fn old_record_without_reason_decodes_to_none() {
+        let decoded = SectionTombstonePayload::decode(b"{}").unwrap();
+        assert_eq!(decoded.reason, None);
     }
 }
 
@@ -2493,7 +2680,7 @@ mod tests {
     /// on-disk `HeaderIndex` format.
     #[test]
     fn record_type_tags_round_trip_with_pinned_values() {
-        let pinned: [(RecordType, u8); 16] = [
+        let pinned: [(RecordType, u8); 18] = [
             (RecordType::ModelSpec, 1),
             (RecordType::Template, 2),
             (RecordType::StreamDecl, 3),
@@ -2510,6 +2697,8 @@ mod tests {
             (RecordType::Distilled, 16),
             (RecordType::WideQSig, 17),
             (RecordType::HeaderIndex, 18),
+            (RecordType::SectionTombstone, 24),
+            (RecordType::CustomObject, 27),
         ];
         for (rt, tag) in pinned {
             assert_eq!(rt.tag(), tag, "{rt:?} wire tag");

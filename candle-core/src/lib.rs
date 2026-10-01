@@ -188,6 +188,8 @@ pub use cuda_backend as cuda;
 pub use cuda_backend::last_cuda_kernel_launch;
 #[cfg(feature = "cuda")]
 pub use cuda_backend::set_kernel_breadcrumb;
+#[cfg(feature = "cuda")]
+pub use cuda_backend::LeaseAnchor;
 
 #[cfg(not(feature = "cuda"))]
 pub use dummy_cuda_backend as cuda;

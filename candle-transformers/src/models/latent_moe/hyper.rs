@@ -347,6 +347,7 @@ impl candle::CustomOp1 for SinkhornOp {
             slice: CudaStorageSlice::F32(out),
             device: dev,
             backing: Backing::Owned,
+            anchor: None,
         };
         Ok((dst, shape))
     }

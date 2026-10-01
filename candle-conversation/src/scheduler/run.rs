@@ -110,8 +110,11 @@ impl Scheduler {
         // under pressure — the governor's cheapest-first ladder sheds cold turns,
         // and the reprojection drain below handles working-set turnover. One check
         // per quantum (not per step) keeps it cheap.
-        if self.vram_under_pressure_for(VramPhase::Decode) {
-            self.relieve_vram_pressure("decode", VramPhase::Decode);
+        {
+            let _g = profile::span("loop:decode:relief_check");
+            if self.vram_under_pressure_for(VramPhase::Decode) {
+                self.relieve_vram_pressure("decode", VramPhase::Decode);
+            }
         }
         // Fire any reprojection queued by the just-completed prefill quantum
         // BEFORE the first decode step of this quantum. The turn's first
@@ -124,7 +127,10 @@ impl Scheduler {
         // token be sampled against the query-blind opening projection first,
         // which is exactly where a wrong-tool / hallucinated answer anchors.
         let t_reproj0 = Instant::now();
-        self.drain_pending_reprojections();
+        {
+            let _g = profile::span("loop:decode:reproject_first");
+            self.drain_pending_reprojections();
+        }
         self.wave_stats
             .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
         let deadline = Instant::now() + WAVE_SLICE;
@@ -134,24 +140,42 @@ impl Scheduler {
                 // No live decode work, but there may be sequences inserted as
                 // finished during the prefill phase (EOS on first token) that
                 // the decode loop never had a chance to clean up.
+                //
+                // Spanned like the in-loop call: this is the exit taken on the
+                // quanta where nothing decodes, which is exactly where a seal is
+                // most likely to be the whole cost, so leaving it unattributed
+                // under-reports the span precisely when it matters.
+                let _g = profile::span("loop:decode:cleanup");
                 self.cleanup_finished();
                 return;
             }
             // Inject any pending tool-call static runs (Layer 3) before the
             // decode forward, so a `Static` run costs one prefill rather than N
             // decode steps.  No-op when no sequence has an active stencil.
-            self.inject_stencil_prefills();
-            self.batch_decode_step();
+            {
+                let _g = profile::span("loop:decode:stencil");
+                self.inject_stencil_prefills();
+            }
+            {
+                let _g = profile::span("loop:decode:step");
+                self.batch_decode_step();
+            }
             // Drain any continuous-re-projection swaps queued during the
             // batch.  Must run BEFORE cleanup_finished so a swap that
             // re-keys an active_decodes entry doesn't race with finalize.
             // Timed separately (a sub-slice of the decode quantum) because the
             // provenance scan + glue gap-fill here is a prime "grows over time" suspect.
             let t_reproj = Instant::now();
-            self.drain_pending_reprojections();
+            {
+                let _g = profile::span("loop:decode:reproject");
+                self.drain_pending_reprojections();
+            }
             self.wave_stats
                 .add_phase(WavePhase::Reproject, t_reproj.elapsed().as_millis() as u64);
-            self.cleanup_finished();
+            {
+                let _g = profile::span("loop:decode:cleanup");
+                self.cleanup_finished();
+            }
             steps += 1;
 
             // Take on conversations that queued WHILE this wave was executing,
@@ -160,7 +184,11 @@ impl Scheduler {
             // creep cohort the moment this quantum clips to the top and
             // `form_wave_group` re-forms — so admission latency is bounded by
             // WAVE_SLICE, not by the whole in-flight generation finishing.
-            if !self.mid_wave_admission() {
+            let admitted = {
+                let _g = profile::span("loop:decode:mid_wave_admit");
+                self.mid_wave_admission()
+            };
+            if !admitted {
                 self.shutdown_requested = true;
                 return;
             }
@@ -268,6 +296,23 @@ impl Scheduler {
     /// wait a whole decode slice when there's no decode work yet.
     pub fn run(&mut self) {
         tracing::info!("scheduler started");
+        // **A seed, deliberately not the measurement.**
+        //
+        // The figure is exact only with nothing in flight, and the idle branch
+        // below is where that is true — every region live there is permanent
+        // (the system prompt, the tool catalog, the resident corpus) and none of
+        // it is the wave's to give back. Here at entry none of that has been
+        // prefilled yet, so this reads a near-empty card and over-states what the
+        // zone can reach; the hold taken from it then defends a residency the
+        // catalog makes unreachable, and every offer refuses on the floor.
+        //
+        // It is still taken, because the alternative is worse: nothing else
+        // writes the static, so an engine that never reaches the idle branch —
+        // a sustained ingest, which never empties all five queues at once —
+        // would read `achievable_weight_now() == None`, a hold of zero, and
+        // admission defending nothing at all. A first pass that is too tight
+        // self-corrects at the first idle; one that defends nothing does not.
+        super::interleave::reseed_achievable_weight();
         // One-time snapshot of the governor's budget partition (capacity C, KV
         // floor, ladder thresholds, per-class reserved, live headroom) so a run's
         // starting VRAM state is visible in the log before any waves.
@@ -302,8 +347,12 @@ impl Scheduler {
             // `decode_forward_cobatched`.
             self.batch_drain_gap_fills = false;
             IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
+            let drain_elapsed = t_drain.elapsed();
             self.wave_stats
-                .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);
+                .add_phase(WavePhase::Drain, drain_elapsed.as_millis() as u64);
+            // Non-forward wall clock, and therefore per-forward overhead the planner has
+            // to know about — the drain runs once per wave whatever the wave carries.
+            self.wave_overhead_us += drain_elapsed.as_micros() as u64;
             _g_drain.end();
             if !cont {
                 break; // Shutdown requested or channel closed.
@@ -383,6 +432,37 @@ impl Scheduler {
                     .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
             }
 
+            // 2a. One turn of the normalization warm-up replay, when ingest-
+            // priority work may run (see `norm_warm`).
+            self.step_norm_warm();
+
+            // 2b. Everything with work is lower priority and paused behind a
+            // conversation still in its cooldown: wait for a request (which ends
+            // the wait at once) or the poll interval, then look again, rather
+            // than spinning through quanta that would run nothing.
+            if self.all_work_paused() {
+                let t_idle = Instant::now();
+                match self.rx.recv_timeout(super::priority_pause::PAUSED_POLL) {
+                    Ok(req) => {
+                        self.wave_stats
+                            .add_idle(t_idle.elapsed().as_millis() as u64);
+                        let t_req = Instant::now();
+                        let keep_going = self.handle_request(req);
+                        self.wave_stats
+                            .add_requests(t_req.elapsed().as_micros() as u64);
+                        if !keep_going {
+                            break;
+                        }
+                    }
+                    Err(flume::RecvTimeoutError::Timeout) => {
+                        self.wave_stats
+                            .add_idle(t_idle.elapsed().as_millis() as u64);
+                    }
+                    Err(flume::RecvTimeoutError::Disconnected) => break,
+                }
+                continue;
+            }
+
             // 3. If idle, block waiting for work. Deferred glue counts as work: the
             // unified wave step scatters it (`take_wave_glue`), so don't block while
             // any is pending or it would never be consumed.
@@ -392,13 +472,30 @@ impl Scheduler {
                 && self.active_section_ingests.is_empty()
                 && self.deferred_glue_fires.is_empty()
             {
+                // Nothing is in flight, so everything resident is permanent:
+                // the one moment the achievable weight residency is exact.
+                super::interleave::reseed_achievable_weight();
                 // Time ONLY the recv block (not the request handling) — this is the
                 // scheduler idle between requests, attributed to the Idle phase so it
                 // isn't mislabeled as Blocked in the GUI.
                 let t_idle = Instant::now();
-                let req = match self.rx.recv() {
-                    Ok(req) => req,
-                    Err(_) => break, // Engine dropped.
+                // A queued warm-up is work too: wait only as long as it allows,
+                // then go round to score its next replayed turn.
+                let req = if let Some(wait) = self.norm_warm_wait() {
+                    match self.rx.recv_timeout(wait) {
+                        Ok(req) => req,
+                        Err(flume::RecvTimeoutError::Timeout) => {
+                            self.wave_stats
+                                .add_idle(t_idle.elapsed().as_millis() as u64);
+                            continue;
+                        }
+                        Err(flume::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    match self.rx.recv() {
+                        Ok(req) => req,
+                        Err(_) => break, // Engine dropped.
+                    }
                 };
                 self.wave_stats
                     .add_idle(t_idle.elapsed().as_millis() as u64);
@@ -461,6 +558,10 @@ impl Scheduler {
             // timed, so all of it fell into the unattributed remainder and drew
             // as "blocked" — which is what made that band large and unexplained.
             let t_house = Instant::now();
+            // The whole between-quanta block as one span, so the profile table can say
+            // what share of a wave is not the forward at all. Its parts are spanned
+            // individually below; this is the total they have to add up to.
+            let house_span = super::profile::span("loop:housekeeping");
             let (no_ticket, arena_full) = declines.bytes_since();
             publish_wave_declines(no_ticket, arena_full);
             #[cfg(feature = "forbidden_allocations")]
@@ -591,8 +692,85 @@ impl Scheduler {
             // Closed BEFORE the flush block: the flush is the window boundary
             // itself, and its own cost is already accounted (eviction/sync carve
             // out of the remainder), so folding it in here would double-count.
-            self.wave_stats
-                .add_housekeeping(t_house.elapsed().as_micros() as u64);
+            let house_us = t_house.elapsed().as_micros() as u64;
+            self.wave_stats.add_housekeeping(house_us);
+            self.wave_overhead_us += house_us;
+
+            // **Tell the rate planner what this wave cost outside its forwards.**
+            //
+            // The planner prices width by what width amortises, and it could only see the
+            // forward's own duration — so the loop's overhead, which is per forward and
+            // does not scale with rows, was worth nothing to it. On a resident card that
+            // left *nothing* for width to amortise and the wave stopped widening at 4 rows
+            // where the engine wanted 20. See `RateModel::overhead_secs`.
+            //
+            // Divided by the forwards this wave actually ran, and skipped when it ran
+            // none: a wave with no forwards has no per-forward cost, and reporting its
+            // whole housekeeping as one forward's overhead would teach the model that a
+            // forward costs an idle loop iteration.
+            if self.wave_forwards > 0 {
+                let per_forward = self.wave_overhead_us as f64 / 1e6 / self.wave_forwards as f64;
+                if let Some(rate) = self.wave_rate.as_mut() {
+                    rate.observe_overhead(per_forward);
+                }
+            }
+            self.wave_forwards = 0;
+            self.wave_overhead_us = 0;
+
+            // **Create what a refused forward asked for — every gap, not every
+            // telemetry window.**
+            //
+            // A forward that needs an arena it could not have pre-claimed is
+            // refused outright: it runs on the thread that owns the partition,
+            // so there is no "come back later" it can act on. The refusal
+            // records the size class, and this is the only thing that acts on
+            // that record. The format a seal picks comes from the data it just
+            // wrote, so `admit_wave_kv` cannot claim it ahead of time and the
+            // demand is not rare.
+            //
+            // It used to sit inside the 2 s summary block below, which made
+            // recovery a side effect of logging: a wave refused an arena, and
+            // the turns of the next two seconds were refused the same arena for
+            // the same reason before the window came round. Nothing about the
+            // creation wants that cadence — it is cheap when there is no demand
+            // (one lock, an empty `Vec`), and the wave loop is the gap on every
+            // iteration, not one in every few hundred.
+            // **Pack the pools, then let the weight side take what packing released.**
+            // Both halves, here, in this order, because either alone buys nothing: a
+            // frontier that falls with nobody claiming the ground is invisible in
+            // every metric except decode, and a weight side asked to grow over a
+            // frontier nothing lowered has nothing to take.
+            //
+            // **Every wave, not once per telemetry window.** It sat inside the 2 s
+            // summary block, which made compaction a side effect of logging: the
+            // pools fragmented for two seconds between passes, and with the pass
+            // itself time-budgeted it never caught up — measured at 48–60% efficiency
+            // with every pass clipped. The gate in `compact_kv_if_fragmented` is a
+            // cheap counter read and a minimum interval, so being considered here
+            // costs the loop nothing on the iterations it declines.
+            //
+            // Legal here for the same reason `create_deferred_arenas` below is: the
+            // quanta are done, every forward's guards are dropped, and no wave
+            // generation is live — which is the condition `set_weight_floor` itself
+            // checks. `compact_kv` refuses rather than corrupts if that ever stops
+            // being true.
+            {
+                // The whole pass, including the gate that usually declines it — so the
+                // table shows what being *considered* every wave costs, not only what a
+                // pass costs when it runs. The phase breakdown is filed inside.
+                let _g = super::profile::span("loop:compact_kv");
+                self.compact_kv_if_fragmented();
+            }
+
+            match self.session.create_deferred_arenas() {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    arenas_created = n,
+                    "created arenas a refused pass asked for"
+                ),
+                Err(e) => tracing::warn!("deferred arena creation failed: {e}"),
+            }
 
             // Flush the wave summary + phase breakdown if its 2 s window
             // elapsed — even when no forward ran this iteration, so stalls still
@@ -601,6 +779,31 @@ impl Scheduler {
             // path out — dma_loads stays 0; the prefill cost is the attention
             // kernel, seen in the per-forward `code-read prefill` breakdown.)
             if self.wave_stats.due() {
+                // The 2 s telemetry window: the memory report, the class census, the
+                // fragmentation log. Cheap per wave only because it is rare, which is
+                // exactly the claim a span is needed to check.
+                let _g = super::profile::span("loop:telemetry");
+
+                // **What the rate planner currently believes a forward costs.**
+                //
+                // Published because every one of these was invisible while being wrong.
+                // The planner decides how wide a wave is, which is the whole of decode
+                // throughput, and it does so from four learned numbers — none of which
+                // appeared in any log. A zero `fixed`+`overhead` makes the projected rate
+                // flat in width and narrows every wave to one row, and that state was
+                // reached on a card whose only distinguishing feature was being large
+                // enough to hold the checkpoint. It read as healthy throughout.
+                if let Some(rate) = self.wave_rate.as_ref() {
+                    tracing::trace!(
+                        target: "candle_conversation::scheduler::throttle",
+                        fixed_ms = rate.fixed_secs() * 1e3,
+                        overhead_ms = rate.overhead_secs() * 1e3,
+                        compute_us_per_token = rate.compute_secs_per_token() * 1e6,
+                        link_gbps = rate.effective_bytes_per_s() / 1e9,
+                        samples = rate.samples(),
+                        "wave rate model",
+                    );
+                }
                 // Our eviction gate's own view of VRAM: the pool budget we
                 // defend (vram_budget_available) and pool_used — queried only
                 // on the wave we emit, not every iteration.
@@ -675,6 +878,9 @@ impl Scheduler {
                     fmt,
                     (reserved_mib, total_mib, free_mib, weights_mib),
                     slots,
+                    self.model
+                        .expert_stats()
+                        .map(|s| (s.expert_hits, s.expert_misses, s.dma_loads)),
                 );
                 // Same cadence: publish the full memory report (global slot for
                 // `GET /v1/memory` + one JSON debug line). See `memory_report`.
@@ -690,41 +896,108 @@ impl Scheduler {
                 let swept = self.session.release_empty_arenas().unwrap_or(0);
                 if swept > 0 {
                     relief_trace::note("sched", "arena_sweep", swept as u64, 0);
-                    tracing::debug!(
+                    tracing::trace!(
                         target: "candle_conversation::scheduler::vram_relief",
                         arenas_swept = swept,
                         "proactive empty-arena sweep (per-wave)"
                     );
                 }
                 self.log_kv_memory();
-                // **Create what the sealing thread was refused — here, because
-                // this is the gap.**
+                // **How fragmented the KV pools are — measured where a compaction
+                // would run, at the cadence it would run at.**
                 //
-                // A pass refused mid-wave records the size class it wanted, and
-                // the first version had the persistence thread act on that
-                // record at the top of its own next pass. That never fired: the
-                // sealing thread has to *find* a gap, and the gap between one
-                // wave and the next is narrower than a sealing pass. Measured —
-                // the `1088 B` class frozen at 49 arenas with 75 regions
-                // claimable, the hot→warm drain stuck at 634 MiB, and
-                // `alloc_chunk_run_for_key` reporting "unsatisfied after 4 fresh
-                // arenas … VRAM exhaustion" every few hundred milliseconds while
-                // the reservation was a fifth empty.
+                // Deliberately beside `release_empty_arenas` above, because the two
+                // are the same job at different granularities and the contrast is
+                // the point: the sweep returns an arena whose LAST chunk has gone,
+                // and nothing moves a chunk between arenas, so an arena holding a
+                // handful of live chunks keeps its whole 16 MiB region indefinitely.
+                // `freeable` is the regions that are recoverable and that the sweep
+                // structurally cannot recover.
                 //
-                // The wave loop does not have to find the gap; it *is* the gap.
-                // This runs on the thread that owns the forward, between two of
-                // them, so no wave generation is live and the creation cannot be
-                // refused for the reason the sealing thread's was.
-                match self.session.create_deferred_arenas() {
-                    Ok(0) => {}
-                    Ok(n) => tracing::debug!(
-                        target: "candle_conversation::scheduler::vram_relief",
-                        arenas_created = n,
-                        "created arenas a wave-deferred sealing pass asked for"
-                    ),
-                    Err(e) => tracing::warn!("deferred arena creation failed: {e}"),
+                // This is the figure that is NOT region holes. A region freed below
+                // the arena frontier is taken by the next claim — the free list is
+                // lowest-index-first — so holes are self-correcting and measured to
+                // peak in the tens and settle at one. Sparsity does not
+                // self-correct, which is why it is what gets logged and what a
+                // compaction is judged by.
+                // **The frontier first, because the frontier is what costs
+                // weights.** The tier stands above the highest live arena and
+                // `weight_floor` is measured from there, so expert residency is
+                // set by that one index — not by how many arenas are live and not
+                // by how full they are. `could_be` is where the frontier would sit
+                // with everything packed, and the gap between them is the ground a
+                // perfect compaction hands back, split into its two causes: the
+                // holes that hold the frontier up, and the sparsity that fills it
+                // with air.
+                if let Some(g) = self.session.kv_ground_lost() {
+                    if g.total() > 0 {
+                        let mib = candle_nn::kv_cache::REGION_BYTES >> 20;
+                        tracing::trace!(
+                            target: "candle_conversation::scheduler::vram_relief",
+                            frontier = g.watermark,
+                            could_be = g.packed_arenas,
+                            live_arenas = g.live_arenas,
+                            arena_holes = g.arena_holes(),
+                            sparsity = g.sparsity(),
+                            denied_mib = g.total() * mib,
+                            // What reclaiming it would cost. Logged beside the
+                            // gain because the ratio is the only thing that says
+                            // whether a pass is worth its bandwidth: four arenas
+                            // for forty thousand copies is not.
+                            planned_moves = self.session.kv_planned_moves(),
+                            "kv ground denied to the weight side by fragmentation",
+                        );
+                    }
                 }
-                // And wake the sealing pass now that its ground exists, rather
+                let frag = self.session.kv_fragmentation();
+                let freeable: usize = frag.iter().map(|(_, f)| f.freeable_arenas()).sum();
+                if freeable > 0 {
+                    let rows: Vec<String> = frag
+                        .iter()
+                        .filter(|(_, f)| f.freeable_arenas() > 0)
+                        .map(|(k, f)| {
+                            format!(
+                                "{}B={}a/{}pack({}%)",
+                                k.class.bytes(),
+                                f.arenas,
+                                f.packed_arenas,
+                                f.occupancy_pct(),
+                            )
+                        })
+                        .collect();
+                    tracing::trace!(
+                        target: "candle_conversation::scheduler::vram_relief",
+                        freeable_arenas = freeable,
+                        freeable_mib = freeable * (candle_nn::kv_cache::REGION_BYTES >> 20),
+                        "kv fragmentation (a perfect pack would return this): {}",
+                        rows.join(" "),
+                    );
+                }
+                // **Is the planner still running on its seeds?** Every figure
+                // it decides with is learned, and the seeds are a measurement of
+                // one card with one checkpoint — the decode one was found 26x
+                // optimistic. A run that admits oddly is asked this first, and
+                // without the line the answer is unobtainable after the fact.
+                if let Some(r) = self.wave_rate.as_ref() {
+                    tracing::trace!(
+                        target: "candle_conversation::scheduler::admission",
+                        link_gbps = r.link_bytes_per_s() / 1e9,
+                        effective_gbps = r.effective_bytes_per_s() / 1e9,
+                        link_fraction = r.link_fraction(),
+                        compute_us_per_row = r.compute_secs_per_token() * 1e6,
+                        layer_us = r.layer_secs() * 1e6,
+                        hit_coefficient = r.hit_rate(),
+                        // The two-cost fit only answers once the observations
+                        // have enough spread to separate the copy from the
+                        // compute; until then both are seeds.
+                        fit_converged = r.cost_fit_converged(),
+                        prefill_samples = r.samples(),
+                        decode_samples = r.decode_samples(),
+                        hit_samples = r.hit_samples(),
+                        "wave rate planner",
+                    );
+                }
+                // Wake the sealing pass now that its ground exists, rather
                 // than leaving it to the 5 s tick. Guarded on there being work —
                 // an atomic load — so an idle engine is not woken once per wave
                 // to find nothing. The trigger coalesces on a one-slot channel,
@@ -732,13 +1005,11 @@ impl Scheduler {
                 if self.persist_trigger.pending_warm_bytes() > 0 {
                     self.persist_trigger.fire();
                 }
-                // Last resort under heavy backlog: block the wave loop on a
-                // device sync so ingest stops outrunning the drain and the
-                // primary stream empties — letting the (short, batched) hot→warm
-                // pass run uncontended. Fires only well above the throttle
-                // target; no-op otherwise.
-                self.sync_if_backlog_critical();
             }
+            // Closes here, not at end of scope: the livelock guard below can sleep, and a
+            // span that swallowed that sleep would report the wave's idle wait as
+            // housekeeping cost.
+            house_span.end();
 
             // Livelock guard. If this wave had NO runnable forward work of any class,
             // yet the idle `recv` above did not block (some queue is non-empty), then
@@ -818,7 +1089,7 @@ impl Scheduler {
             // What is left of the pool once KV moved out. Flat is the healthy
             // shape: growth here means something outside the reservation is
             // still allocating per-wave.
-            tracing::debug!(
+            tracing::trace!(
                 "kv-pool: used={}MiB reserved={}MiB gap={}MiB",
                 mib(used),
                 mib(reserved),
@@ -844,7 +1115,7 @@ impl Scheduler {
                     )
                 })
                 .collect();
-            tracing::debug!("kv-pool classes: {}", rows.join(" "));
+            tracing::trace!("kv-pool classes: {}", rows.join(" "));
         }
         // The reservation's KV side. `free` is the pressure signal admission
         // reads; `peak_live` against `total` says how close the startup
@@ -855,7 +1126,7 @@ impl Scheduler {
         // placed against the arena frontier as it stands at that moment — so a
         // claim arriving with a tier standing is an arena created inside a wave.
         if let Some(r) = candle_nn::kv_cache::region_stats(0) {
-            tracing::debug!(
+            tracing::trace!(
                 "kv-regions: live={} peak={} free={} of {} ({}MiB) | tier={}MiB \
                  (ceiling {} regions) | weights={}MiB | in-wave-arenas={} in-wave-refusals={}",
                 r.live,
@@ -874,7 +1145,7 @@ impl Scheduler {
         // from: `S = 2*W_wave + W_persist + shelf`.
         if let Some((cursor, peak, cap)) = candle_nn::kv_cache::persistence_domain_stats(0) {
             if peak > 0 {
-                tracing::debug!(
+                tracing::trace!(
                     "kv-transient persist: cursor={}MiB peak={}MiB cap={}MiB",
                     mib(cursor),
                     mib(peak),
@@ -887,7 +1158,7 @@ impl Scheduler {
         if let Some(halves) = candle_nn::kv_cache::wave_domain_stats(0) {
             let peak = halves.iter().map(|h| h.1).max().unwrap_or(0);
             if peak > 0 {
-                tracing::debug!(
+                tracing::trace!(
                     "kv-transient wave: peak={}MiB (a={}MiB b={}MiB) cap={}MiB each",
                     mib(peak),
                     mib(halves[0].1),
@@ -903,7 +1174,7 @@ impl Scheduler {
         // 32-token boundary, per layer.
         let (live, slabs, bytes) = candle_nn::kv_cache::slot_state_stats();
         if slabs > 0 {
-            tracing::debug!(
+            tracing::trace!(
                 "kv-slotstate: live={live} slabs={slabs} reserved={}MiB promotions={}",
                 mib(bytes),
                 candle_nn::kv_cache::class_promotion_count(),

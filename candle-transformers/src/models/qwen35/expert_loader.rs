@@ -158,6 +158,12 @@ pub fn build_expert_cache(
         mmap,
         int8mode,
         expert_pack_dir,
+        // The qwen35 quantized loader carries no progress hook of its own, so
+        // there is nothing to report the repack against here.
+        None,
+        // Its embedding is a host-mapped gather that reads the mapping at run
+        // time, so none of the non-expert mapping is offloaded.
+        0,
     )
 }
 
@@ -165,6 +171,10 @@ pub fn build_expert_cache(
 /// [`expert_host_refs_for`] for why the scan is model-agnostic. Everything
 /// below the tensor names (the span measurement, the elastic boundary, the
 /// zone floor, the ground broker) was already the engine's.
+///
+/// `offloaded_bytes` is [`ExpertCacheSetup::offloaded_bytes`]: mapped bytes a
+/// bounded cache of the model's own serves, or the device holds, instead of the
+/// page cache.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_expert_cache_for(
@@ -176,6 +186,8 @@ pub fn build_expert_cache_for(
     mmap: Arc<memmap2::Mmap>,
     int8mode: candle::quantized::Int8Mode,
     expert_pack_dir: Option<&std::path::Path>,
+    progress: Option<&dyn Fn(usize, usize)>,
+    offloaded_bytes: u64,
 ) -> Result<Option<Arc<ExpertCache>>> {
     use crate::models::expert_lre::{layer_geometries, slot_bytes_for};
     use candle_nn::kv_cache::{
@@ -268,8 +280,9 @@ pub fn build_expert_cache_for(
         experts_per_layer: n_expert,
         gguf_path,
         expert_pack_dir,
-        progress: None,
+        progress,
         int8mode,
+        offloaded_bytes,
     })?;
     let cache = Arc::new(cache);
     // Open the shop: a KV arena claim that runs out of ground can now buy

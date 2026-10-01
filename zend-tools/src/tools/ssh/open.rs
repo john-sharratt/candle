@@ -1,7 +1,5 @@
 //! ssh_open tool.
 
-use std::net::TcpStream;
-
 use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -9,6 +7,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{exec_simple, SshError};
+use crate::net;
 use crate::state::sessions::{SessionMeta, SshConn, SshEntry};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
@@ -66,7 +65,7 @@ impl Tool for SshSessionOpen {
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, SshError> {
         let cred = ctx
-            .credentials
+            .credentials()?
             .get_by_name(&req.credential_name)
             .ok_or_else(|| SshError::CredentialNotFound(req.credential_name.clone()))?;
 
@@ -79,7 +78,7 @@ impl Tool for SshSessionOpen {
         let port = req.port.or(cred.default_port).unwrap_or(22);
 
         let addr = format!("{host}:{port}");
-        let stream = TcpStream::connect(&addr)
+        let stream = net::tcp_connect_to(ctx.grants(), &addr, None)
             .map_err(|e| SshError::ConnectionFailed(format!("{addr}: {e}")))?;
 
         let mut session =

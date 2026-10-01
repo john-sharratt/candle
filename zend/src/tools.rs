@@ -25,7 +25,8 @@
 //! final natural-language answer.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::io;
+use std::iter;
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::models::Dialect;
@@ -38,14 +39,20 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
-use zend_tools::{registry, ToolContext};
+use zend_tools::sandboxes::Sandboxes;
+use zend_tools::state::Secrets;
+use zend_tools::{alias_pins, registry, replay, Replay, ToolContext};
+use zend_vfs::{RepoFiles, Workspace};
 
-/// The names of every tool that is **not** high-risk — the subset projected in
-/// "Restricted" tools mode. Derived from the registry's `.risky()` policy (see
-/// [`zend_tools::registry`]); "None" mode projects no tools, "Comprehensive"
-/// projects all of them.
-pub fn safe_tool_names() -> HashSet<String> {
-    crate::tool_def::safe_names()
+use crate::access;
+use crate::sandbox_programs;
+use crate::tool_guidance;
+use crate::types::ToolMode;
+
+/// The names of the tools projected in `mode` — see
+/// [`crate::tool_def::names_for`].
+pub fn offered_tool_names(mode: ToolMode) -> HashSet<String> {
+    crate::tool_def::names_for(mode)
 }
 
 /// One Hermes tool-call block parsed from a model response.
@@ -56,12 +63,11 @@ pub struct ToolCall {
 }
 
 /// One executed tool's result, ready to be wrapped in `<tool_response>`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolResult {
-    /// The original call this result corresponds to.  Carried for
-    /// diagnostic / test purposes — the orchestrator only ever
-    /// serialises `response` into the `<tool_response>` body.
-    #[allow(dead_code)]
+    /// The call this result answers. Its `name` is what labels the result's
+    /// `<tool_response>` block when a turn made several calls — the text-side
+    /// equivalent of OpenAI's `tool_call_id`. See [`format_tool_responses`].
     pub call: ToolCall,
     /// The JSON value produced by [`zend_tools::runner::run`].  On
     /// success this is the tool's typed `Response`; on failure it's a
@@ -118,8 +124,8 @@ pub fn install_tool_catalog(
         out.push((def.name.clone(), id, json_line));
     }
     // This function only lays down the per-tool sections. The tool-catalog
-    // *overview* is sealed separately into the `ToolSummary` /
-    // `ToolSummaryRestricted` reserved sections at session startup and associated
+    // *overview* is sealed separately into the `ToolSummaryRestricted` /
+    // `ToolSummary` reserved sections at session startup and associated
     // with this collection per mode in `build_mode_builder` (via
     // `set_collection_summary_section`), so projection emits the full name listing
     // ahead of the provenance-selected subset.
@@ -294,19 +300,45 @@ fn balanced_object_spans(text: &str) -> Vec<(usize, usize)> {
 ///
 /// [`CallStyle`]: candle_conversation::stencil::CallStyle
 pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
+    calls_in_answer(&answer_text(response_text))
+        .into_iter()
+        .map(|(_, call)| call)
+        .collect()
+}
+
+/// The part of a response that can make calls, in the one syntax the call
+/// scanners read: `<think>…</think>` blocks blanked out, and function blocks
+/// translated to JSON.
+///
+/// A `<tool_call>` emitted *inside* a reasoning block is the model thinking out
+/// loud, not an invocation to dispatch, so the reasoning is stripped first — the
+/// JSON still streams to the client inline, it is simply never executed.
+///
+/// **Translated after the strip**, so a call written mid-thought is already
+/// gone — translating first would spend the work rewriting text about to be
+/// discarded, and would put a dispatchable shape into deliberation.
+///
+/// Every scanner of a round's calls reads this same text, so the byte offsets
+/// they report are comparable — see [`crate::tool_round`].
+pub(crate) fn answer_text(response_text: &str) -> String {
+    let stripped = strip_think_blocks_keep_layout(response_text);
+    match function_blocks_to_json(&stripped, tool_catalog()) {
+        Some(translated) => translated,
+        None => stripped,
+    }
+}
+
+/// Every call in `answer` (see [`answer_text`]), each with the byte offset it
+/// starts at, in the order they appear.
+///
+/// Text order, not pass order: the results of a round are paired with the
+/// calls that asked for them by position — the GUI puts the n-th result on the
+/// n-th call card — so a call recovered by a later, looser pass must still take
+/// its place among the rest.
+pub(crate) fn calls_in_answer(answer: &str) -> Vec<(usize, ToolCall)> {
     use regex::Regex;
     use std::sync::OnceLock;
-    // A `<tool_call>` emitted *inside* a `<think>…</think>` reasoning block is the
-    // model thinking out loud, not an invocation to dispatch. Strip the reasoning
-    // blocks first so only calls in the post-think answer are extracted — the JSON
-    // still streams to the client inline, it is simply never executed.
-    let response_text = strip_think_blocks_keep_layout(response_text);
-    // **Translated before anything looks for a `{`.** After the think-strip
-    // rather than before it, so a call written mid-thought is already gone —
-    // translating first would spend the work rewriting text about to be
-    // discarded, and would put a dispatchable shape into deliberation.
-    let translated = function_blocks_to_json(&response_text, tool_catalog());
-    let response_text = translated.as_deref().unwrap_or(response_text.as_str());
+    let response_text = answer;
     // Strict, well-formed match: <tool_call>...{...}...</tool_call>
     static STRICT_RE: OnceLock<Regex> = OnceLock::new();
     let strict_re = STRICT_RE.get_or_init(|| {
@@ -330,7 +362,7 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
 
     // Pass 1: strict <tool_call>...</tool_call> matches.
     for cap in strict_re.captures_iter(response_text) {
-        let full_end = cap.get(0).map(|m| m.end()).unwrap_or(0);
+        let (full_start, full_end) = cap.get(0).map_or((0, 0), |m| (m.start(), m.end()));
         let json = match cap.get(1) {
             Some(m) => m,
             None => continue,
@@ -338,10 +370,13 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         if let Ok(raw) = serde_json::from_str::<RawCall>(json.as_str()) {
             if !raw.name.is_empty() {
                 let arguments = raw.args();
-                out.push(ToolCall {
-                    name: raw.name,
-                    arguments,
-                });
+                out.push((
+                    full_start,
+                    ToolCall {
+                        name: raw.name,
+                        arguments,
+                    },
+                ));
             }
         }
         consumed_ends.push(full_end);
@@ -370,10 +405,13 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         if let Ok(raw) = serde_json::from_str::<RawCall>(json.as_str()) {
             if !raw.name.is_empty() {
                 let arguments = raw.args();
-                out.push(ToolCall {
-                    name: raw.name,
-                    arguments,
-                });
+                out.push((
+                    json.start(),
+                    ToolCall {
+                        name: raw.name,
+                        arguments,
+                    },
+                ));
             }
         }
         consumed_spans.push((json.start(), json.end()));
@@ -400,13 +438,18 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
                 && registry::find(&raw.name).is_some()
             {
                 let arguments = raw.args();
-                out.push(ToolCall {
-                    name: raw.name,
-                    arguments,
-                });
+                out.push((
+                    start,
+                    ToolCall {
+                        name: raw.name,
+                        arguments,
+                    },
+                ));
             }
         }
     }
+    // Stable, so two calls reported at one offset keep their pass order.
+    out.sort_by_key(|&(at, _)| at);
     out
 }
 
@@ -422,14 +465,54 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
 /// [`crate::tool_def::all`] is itself `OnceLock`-resolved and fixed for the
 /// process once `init` has run, so caching the derived specs here costs one
 /// schema walk per daemon rather than one per decoded turn.
-fn tool_catalog() -> &'static [ToolSpec] {
+///
+/// **Every alias a tool answers to is a spec too**, with the tool's own
+/// parameters. The grammar admits only the names it was compiled from, so a
+/// model that writes a natural alias — `file_write` for `write` — had its name
+/// healed into the nearest compiled one instead: `file_` then `list`, not
+/// `write`. A turn that meant to create a file listed the directory forty
+/// times, its reasoning saying "write the file now" before every call.
+/// Dispatch already resolves aliases ([`registry::find`]); compiling them
+/// lets the call reach it as the model wrote it.
+///
+/// **An alias whose name fixes an argument is compiled with it fixed**
+/// ([`alias_pins`]): the field is narrowed to that one value, which the grammar
+/// then writes itself. `git_cherry_pick` cannot decode `from: revert`.
+pub fn tool_catalog() -> &'static [ToolSpec] {
     static SPECS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
     SPECS.get_or_init(|| {
         crate::tool_def::all()
             .iter()
-            .map(|d| ToolSpec::from_json_schema(&d.name, &d.parameters))
+            .flat_map(|d| {
+                iter::once(d.name.as_str())
+                    .chain(registry::aliases(&d.name).iter().copied())
+                    .map(|name| ToolSpec::from_json_schema(name, &pinned(name, &d.parameters)))
+            })
             .collect()
     })
+}
+
+/// `parameters` with each field `name` fixes narrowed to its one value.
+fn pinned(name: &str, parameters: &Value) -> Value {
+    let mut narrowed = parameters.clone();
+    for (field, value) in alias_pins::pins(name) {
+        let property = &mut narrowed["properties"][*field];
+        let description = property.get("description").cloned();
+        *property = serde_json::json!({"type": "string", "enum": [value]});
+        if let Some(description) = description {
+            property["description"] = description;
+        }
+    }
+    narrowed
+}
+
+/// Parse one call object's JSON. `Ok(None)` when it parses but names no tool.
+pub(crate) fn parse_call(json: &str) -> Result<Option<ToolCall>, serde_json::Error> {
+    let raw = serde_json::from_str::<RawCall>(json)?;
+    Ok((!raw.name.is_empty()).then(|| ToolCall {
+        arguments: raw.args(),
+        name: raw.name,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -481,16 +564,46 @@ impl RawCall {
 
 /// Run one parsed tool call against the registry.  Always returns a
 /// JSON value the model can consume — successful tools return their
-/// typed response, missing tools return
-/// `{"error":"unknown_tool","detail":"..."}`.
+/// typed response; a refused call carries what the model needs to correct
+/// it ([`crate::tool_guidance`]).
 pub fn run_tool(ctx: &ToolContext, call: &ToolCall) -> Value {
     match registry::find(&call.name) {
-        Some(t) => (t.run)(ctx, &call.arguments),
-        None => serde_json::json!({
-            "error": "unknown_tool",
-            "detail": format!("no tool named {:?}", call.name),
-        }),
+        // An alias's name fixes some arguments; a call that contradicts it is
+        // refused before it runs ([`alias_pins`]).
+        Some(t) => match alias_pins::apply(&call.name, &call.arguments) {
+            Ok(args) => tool_guidance::with_guidance(t.name, t.call(ctx, &args)),
+            Err(refusal) => tool_guidance::with_guidance(t.name, refusal),
+        },
+        None => tool_guidance::unknown_tool(&call.name, ctx.grants()),
     }
+}
+
+/// Why a round of tool calls is being dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// The turn is running now, and every call it asks for is run.
+    Live,
+    /// The turn is being resumed after a restart lost the results of the calls
+    /// its assistant half asked for. A call that cannot be re-issued
+    /// ([`zend_tools::Tool::replay`]) is answered with an error instead of
+    /// being run a second time.
+    Resumed,
+}
+
+/// The answer a resumed turn gets for a call that must not run twice.
+///
+/// Shaped like every other tool failure — an `{"error", "detail"}` object — so
+/// the model reads it the way it reads the rest, and can ask for the call
+/// again itself if it still wants it.
+fn not_replayed(name: &str) -> Value {
+    serde_json::json!({
+        "error": "not_replayed_after_restart",
+        "detail": format!(
+            "zend restarted between this {name} call and its result. Running it again \
+             could repeat an effect that already happened, so it was not run. Ask for \
+             it again if you still need it."
+        ),
+    })
 }
 
 /// Dispatch every parsed tool call sequentially and pair each call with
@@ -501,11 +614,27 @@ pub fn run_tool(ctx: &ToolContext, call: &ToolCall) -> Value {
 /// (which are `Arc<RwLock<...>>` internally, but ordering across
 /// distinct tools matters for stateful flows like
 /// `ssh_session_open` → `ssh_session_exec`).
-pub fn run_tool_calls(ctx: &ToolContext, calls: Vec<ToolCall>) -> Vec<ToolResult> {
+///
+/// On [`Dispatch::Resumed`] each call is put to its tool first: the ones that
+/// leave what they left the first time are run, and the rest are answered with
+/// [`not_replayed`]. The turn continues either way — a refusal is a result the
+/// model can read, not a hole in the round.
+pub fn run_tool_calls(
+    ctx: &ToolContext,
+    calls: Vec<ToolCall>,
+    dispatch: Dispatch,
+) -> Vec<ToolResult> {
     calls
         .into_iter()
         .map(|c| {
-            let resp = run_tool(ctx, &c);
+            let refused =
+                dispatch == Dispatch::Resumed && replay(&c.name, &c.arguments) == Replay::Unsafe;
+            let resp = if refused {
+                tracing::info!(tool = %c.name, "resumed turn: call not re-issued");
+                not_replayed(&c.name)
+            } else {
+                run_tool(ctx, &c)
+            };
             ToolResult {
                 call: c,
                 response: resp,
@@ -522,23 +651,47 @@ pub fn run_tool_calls(ctx: &ToolContext, calls: Vec<ToolCall>) -> Vec<ToolResult
 /// reads each block and continues its prior reasoning.
 pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
     let mut out = TurnText::default();
-    for r in results {
+    // A turn may make several calls, and the results come back as a run of
+    // sibling blocks — so each one has to say which call it answers. This is
+    // what OpenAI's `tool_call_id` is for; here the pairing rides in the text
+    // the model is already reading, like the read header's line range and for
+    // the same reason: a structured field beside a rendered string has to be
+    // correlated with it, whereas a first line is read in passing.
+    //
+    // **Only when there is more than one.** A single-call round is the common
+    // case for both a live turn and `code_reading`'s hidden per-file
+    // conversation (which now runs this same function for its own real
+    // `file_read` calls, not a synthetic prefill) — so the header appears
+    // precisely when order alone stops being unambiguous, and it must, because
+    // a failed call returns an error envelope rather than the shape its position
+    // would imply.
+    let label =
+        |i: usize, r: &ToolResult| format!("[{}/{} {}]\n", i + 1, results.len(), r.call.name);
+    for (i, r) in results.iter().enumerate() {
         let body = match &r.response {
             // A string result is already rendered for the model — placed in the
             // block verbatim rather than JSON-encoded. `file_read` returns a
-            // numbered, fenced excerpt this way, so a live response is
-            // byte-identical to the `code_reading` ingest's prefilled ones;
-            // encoding it would collapse the source to one line of `\n` escapes.
+            // numbered, fenced excerpt this way; encoding it would collapse the
+            // source to one line of `\n` escapes.
             Value::String(rendered) => rendered.clone(),
             other => serde_json::to_string(other)
                 .unwrap_or_else(|_| "{\"error\":\"internal_error\"}".to_string()),
         };
         // The wrapper is markup; what the tool returned is literal, so a file
         // that quotes a chat tag reaches the model as its text.
-        out = out
-            .then_markup("<tool_response>")
-            .then_literal(body)
-            .then_markup("</tool_response>\n");
+        //
+        // The label is LITERAL, though it is this layer's framing rather than
+        // the tool's output. [`tool_round_text`] rebuilds a stored round for
+        // replay by taking everything between the tags as literal — it cannot
+        // tell a label from a body — so a markup label would replay as a
+        // different piece sequence from the one submitted. Literal costs nothing
+        // here: `[n/total name]` holds a registry name and digits, never a
+        // special-token string, so the two tokenize identically.
+        out = out.then_markup("<tool_response>");
+        if results.len() > 1 {
+            out = out.then_literal(label(i, r));
+        }
+        out = out.then_literal(body).then_markup("</tool_response>\n");
     }
     out
 }
@@ -589,21 +742,55 @@ pub fn tool_round_text(text: &str) -> TurnText {
 /// — subagent loops aren't wired yet).  Cloned cheaply (Arc-shared
 /// stores).
 ///
-/// One host serves the whole daemon, so the `file_*` overlay's session layer is
-/// shared across conversations: a file written in one chat is visible in the
-/// next. The lower layer is the daemon's working directory, read-only.
+/// One host serves the whole daemon, but the `file_*` overlay does not: each
+/// conversation has its own file stores ([`Self::conversation_files`]), and a
+/// round runs in a context bound to them ([`Self::context_for`]), so what one
+/// conversation writes, edits or deletes is never what another one reads. The
+/// lower layer is each of the workspace's repositories, read-only.
+///
+/// It holds one context per tools mode. They share every other store and differ
+/// only in their [`Grants`](zend_tools::Grants) ([`access::grants`]) — so what
+/// a round may do is fixed by the context it is handed, not by which tools its
+/// prompt offered. The workspace's command sandboxes are shared by all of
+/// them; only a context granted `Exec` can reach them.
 #[derive(Clone)]
 pub struct ToolHost {
-    pub ctx: Arc<ToolContext>,
+    /// Indexed by [`ToolMode::level`]. Each mode's own file stores are never
+    /// handed to a round — a round gets its conversation's.
+    contexts: [Arc<ToolContext>; ToolMode::ALL.len()],
 }
 
 impl ToolHost {
-    /// Build a host whose file tools overlay `workspace` — the daemon's working
-    /// directory, which reads fall through to when the session layer has no entry.
-    pub fn new(workspace: impl Into<PathBuf>) -> Self {
-        Self {
-            ctx: Arc::new(ToolContext::with_workspace(workspace)),
-        }
+    /// Build a host whose file tools overlay `workspace`'s repositories, which
+    /// reads fall through to when the session layer has no entry, whose every
+    /// context carries `secrets` — read once by the daemon at launch
+    /// ([`crate::secrets::load`]) — and whose commands run in a sandbox per git
+    /// repository, starting the programs [`sandbox_programs`] lists. Fails
+    /// only when the workspace's jobs folder cannot be made.
+    pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> io::Result<Self> {
+        let sandboxes = Sandboxes::for_workspace(workspace, &sandbox_programs::policy())?;
+        let base = ToolContext::with_workspace(workspace.clone())
+            .with_secrets(secrets)
+            .with_sandboxes(Arc::new(sandboxes));
+        let contexts =
+            ToolMode::ALL.map(|mode| Arc::new(base.clone().granting(access::grants(mode))));
+        Ok(Self { contexts })
+    }
+
+    /// A new conversation's own file stores: an overlay over each repository
+    /// with no changes yet.
+    pub fn conversation_files(&self) -> Arc<RepoFiles> {
+        Arc::new(
+            self.contexts[ToolMode::Restricted.level() as usize]
+                .files
+                .fresh(),
+        )
+    }
+
+    /// The context a round of tools in `mode` runs in, for the conversation
+    /// whose file stores are `files`.
+    pub fn context_for(&self, mode: ToolMode, files: &Arc<RepoFiles>) -> Arc<ToolContext> {
+        Arc::new(self.contexts[mode.level() as usize].with_files(Arc::clone(files)))
     }
 }
 
@@ -612,6 +799,288 @@ impl ToolHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use zend_vfs::RepoSpec;
+
+    /// `dir` as a workspace holding one repository, `r`.
+    fn workspace_in(dir: &tempfile::TempDir) -> Workspace {
+        std::fs::create_dir_all(dir.path().join("r")).unwrap();
+        Workspace::new(dir.path(), vec![RepoSpec::named("r")]).unwrap()
+    }
+
+    /// No secrets: what every test host that is not about secrets gets.
+    fn no_secrets() -> Arc<Secrets> {
+        Arc::new(Secrets::empty())
+    }
+
+    // ── Aliases that fix an argument ────────────────────────────────────────
+
+    /// **An alias that fixes an argument is compiled with only that value**,
+    /// while the canonical tool keeps every one: `git_cherry_pick` cannot
+    /// decode `from: revert`, and `git_commit` still can.
+    #[test]
+    fn an_alias_is_compiled_with_its_fixed_argument() {
+        let values = |tool: &str, field: &str| {
+            tool_catalog()
+                .iter()
+                .find(|s| s.name == tool)
+                .unwrap_or_else(|| panic!("{tool} compiled"))
+                .params
+                .iter()
+                .find(|p| p.name == field)
+                .unwrap_or_else(|| panic!("{tool}.{field}"))
+                .enum_values
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(values("git_cherry_pick", "from"), vec!["cherry_pick"]);
+        assert_eq!(values("git_revert", "from"), vec!["revert"]);
+        assert_eq!(values("delete_tag", "kind"), vec!["tag"]);
+        assert_eq!(values("delete_tag", "action"), vec!["delete"]);
+        assert!(values("git_commit", "from").len() > 1);
+    }
+
+    /// **Dispatch holds an alias to its name** for a call that did not come
+    /// through the grammar: a contradicting value is refused before the tool
+    /// runs.
+    #[test]
+    fn dispatch_refuses_an_alias_its_arguments_contradict() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        let ctx = host.context_for(ToolMode::Comprehensive, &host.conversation_files());
+        let out = run_tool(
+            &ctx,
+            &ToolCall {
+                name: "git_cherry_pick".to_string(),
+                arguments: serde_json::json!({"repo": "r", "from": "revert", "commit": "c"}),
+            },
+        );
+        assert_eq!(out["error"], "invalid_arguments", "{out}");
+        assert!(
+            out["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("`git_cherry_pick` means `from: cherry_pick`"),
+            "{out}"
+        );
+        // Shaped like every other `invalid_arguments` refusal — `with_guidance`
+        // must enrich this one too, not just the ones `t.call` itself returns.
+        assert_eq!(
+            out["hint"],
+            "call again with arguments that match `parameters`"
+        );
+        assert!(out["parameters"].is_object(), "{out}");
+    }
+
+    // ── The daemon's secrets ────────────────────────────────────────────────
+
+    /// **`ToolHost::new` hands the daemon's secrets to every mode's context.**
+    ///
+    /// The document's parsing is covered in `zend-tools` and the choice of file
+    /// in `crate::secrets`; what is asserted here is the wiring, which nothing
+    /// else would catch. Dropping the `.with_secrets(..)` call leaves every
+    /// crate compiling and every other test passing, and shows up only as
+    /// `web_search` reporting itself unconfigured on a machine whose key is
+    /// sitting right there in the file.
+    #[test]
+    fn the_tool_host_carries_the_daemons_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        std::fs::write(&path, "tavily_api_key: tvly-wired-through\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let secrets = Arc::new(Secrets::load(&path).unwrap());
+
+        let host = ToolHost::new(&workspace_in(&dir), secrets).unwrap();
+        let files = host.conversation_files();
+        for mode in ToolMode::ALL {
+            assert_eq!(
+                host.context_for(mode, &files).secrets.tavily_api_key(),
+                Some("tvly-wired-through"),
+                "{} lost the daemon's secrets",
+                mode.id()
+            );
+        }
+    }
+
+    /// **Each mode's context carries that mode's grants, over the
+    /// conversation's own files.** A Restricted round handed a gated call —
+    /// the network, code, a database, a git writer, a program on this host —
+    /// refuses it at dispatch, whatever the prompt offered.
+    #[test]
+    fn each_modes_context_carries_its_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        let files = host.conversation_files();
+        for mode in ToolMode::ALL {
+            let ctx = host.context_for(mode, &files);
+            assert_eq!(ctx.grants(), access::grants(mode), "{}", mode.id());
+            assert!(Arc::ptr_eq(&ctx.files, &files), "{}", mode.id());
+        }
+        let restricted = host.context_for(ToolMode::Restricted, &files);
+        for (name, arguments) in [
+            (
+                "web_fetch",
+                serde_json::json!({ "url": "https://example.com" }),
+            ),
+            (
+                "code_run",
+                serde_json::json!({ "repo": "r", "language": "js", "code": "1" }),
+            ),
+            ("sql_session_open", serde_json::json!({})),
+            (
+                "git_commit",
+                serde_json::json!({ "repo": "r", "message": "m" }),
+            ),
+            ("ping_icmp", serde_json::json!({ "host": "127.0.0.1" })),
+            (
+                "run_command",
+                serde_json::json!({ "repo": "r", "program": "npm", "args": ["test"] }),
+            ),
+        ] {
+            let call = ToolCall {
+                name: name.to_string(),
+                arguments,
+            };
+            assert_eq!(
+                run_tool(&restricted, &call)["error"],
+                "not_permitted",
+                "{name} ran in Restricted"
+            );
+        }
+        // Comprehensive reaches the sandboxes — here to be told the folder is
+        // not a git repository, so there is none for it.
+        let comprehensive = host.context_for(ToolMode::Comprehensive, &files);
+        let call = ToolCall {
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({ "repo": "r", "program": "npm", "args": ["test"] }),
+        };
+        assert_eq!(run_tool(&comprehensive, &call)["error"], "no_sandbox");
+    }
+
+    /// A workspace with no document leaves every secret unset and the daemon
+    /// still starts: not configuring web search is an ordinary way to run it.
+    #[test]
+    fn a_workspace_without_secrets_still_builds_a_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        assert_eq!(
+            host.context_for(ToolMode::Restricted, &host.conversation_files())
+                .secrets
+                .tavily_api_key(),
+            None
+        );
+    }
+
+    /// **A file one conversation writes is never what another reads.** Two
+    /// conversations' rounds run in contexts bound to their own file stores,
+    /// and neither ever changes the file on disk.
+    #[test]
+    fn each_conversation_has_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("r")).unwrap();
+        std::fs::write(dir.path().join("r/shared.txt"), "disk\n").unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        let (a, b) = (host.conversation_files(), host.conversation_files());
+        let in_a = host.context_for(ToolMode::Comprehensive, &a);
+        let in_b = host.context_for(ToolMode::Comprehensive, &b);
+
+        in_a.files
+            .repo("r")
+            .unwrap()
+            .write("shared.txt", "conversation a\n".into())
+            .unwrap();
+        in_a.files
+            .repo("r")
+            .unwrap()
+            .write("only_a.txt", "a\n".into())
+            .unwrap();
+        let b_store = in_b.files.repo("r").unwrap();
+        assert_eq!(
+            b_store.read("shared.txt").unwrap().as_deref(),
+            Some("disk\n")
+        );
+        assert_eq!(b_store.read("only_a.txt").unwrap(), None);
+        // A later round of the same conversation sees its own change.
+        let again = host.context_for(ToolMode::Comprehensive, &a);
+        assert_eq!(
+            again
+                .files
+                .repo("r")
+                .unwrap()
+                .read("shared.txt")
+                .unwrap()
+                .as_deref(),
+            Some("conversation a\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("r/shared.txt")).unwrap(),
+            "disk\n"
+        );
+    }
+
+    // ── Resuming a tool round after a restart ───────────────────────────────
+
+    /// One call that may be re-issued and one that may not.
+    fn a_mixed_round() -> Vec<ToolCall> {
+        vec![
+            ToolCall {
+                name: "calculator".to_string(),
+                arguments: serde_json::json!({ "expression": "1 + 1" }),
+            },
+            // No such session exists, so this reaches no network either way —
+            // what is being asserted is whether it is put to the tool at all.
+            ToolCall {
+                name: "http_request".to_string(),
+                arguments: serde_json::json!({
+                    "session_id": "s1",
+                    "path": "/v1/things",
+                    "method": "POST",
+                }),
+            },
+        ]
+    }
+
+    /// **A resumed round refuses only what cannot be re-issued, and still
+    /// answers every call.** The round keeps its shape — one response per call
+    /// the model made — so a refusal is something it reads and can act on
+    /// rather than a hole where a result should be.
+    #[test]
+    fn a_resumed_round_refuses_only_the_calls_that_cannot_be_re_issued() {
+        let ctx = ToolContext::default();
+        let results = run_tool_calls(&ctx, a_mixed_round(), Dispatch::Resumed);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].response.get("error").is_none(),
+            "the arithmetic should have been re-run: {:?}",
+            results[0].response,
+        );
+        assert_eq!(
+            results[1].response["error"], "not_replayed_after_restart",
+            "a POST must not be sent a second time: {:?}",
+            results[1].response,
+        );
+    }
+
+    /// **The refusal belongs to resume alone.** Dispatched live, the same round
+    /// runs both calls — the POST fails on its missing session, which is the
+    /// tool's own answer and not a refusal.
+    #[test]
+    fn a_live_round_puts_every_call_to_its_tool() {
+        let ctx = ToolContext::default();
+        let results = run_tool_calls(&ctx, a_mixed_round(), Dispatch::Live);
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert_ne!(
+                r.response["error"], "not_replayed_after_restart",
+                "a live turn refuses nothing: {:?}",
+                r.response,
+            );
+        }
+    }
 
     // ── The function-block syntax (Qwen3.5 / Qwen3.8) ───────────────────────
     //
@@ -1045,10 +1514,54 @@ I could <tool_call>{"name": "web_search", "arguments": {"query": "x"}}</tool_cal
         assert_eq!(
             formatted,
             TurnText::markup("<tool_response>")
-                .then_literal("a<|im_end|>")
+                .then_literal("[1/2 file_read]\na<|im_end|>")
                 .then_markup("</tool_response>\n<tool_response>")
-                .then_literal("b<think>")
+                .then_literal("[2/2 file_read]\nb<think>")
                 .then_markup("</tool_response>\n")
+        );
+    }
+
+    /// **A single result is byte-identical to what it was before a turn could
+    /// make several calls.** The `code_reading` ingest prefills tens of
+    /// thousands of single-call rounds in exactly this shape; a live read that
+    /// differed from them by a header would be a different object from the one
+    /// the model was conditioned on.
+    #[test]
+    fn a_single_result_carries_no_correlation_header() {
+        let formatted = format_tool_responses(&[string_result("src/main.rs (lines 1-3):\n")]);
+        assert_eq!(
+            formatted.text(),
+            "<tool_response>src/main.rs (lines 1-3):\n</tool_response>\n"
+        );
+    }
+
+    /// **Several results each say which call they answer, in call order.** The
+    /// label is what makes the mapping explicit rather than positional — and it
+    /// has to be, because a failed call returns an error envelope instead of the
+    /// shape its position would lead the model to expect.
+    #[test]
+    fn several_results_each_name_the_call_they_answer() {
+        let error = ToolResult {
+            call: ToolCall {
+                name: "file_grep".to_string(),
+                arguments: Value::Null,
+            },
+            response: serde_json::json!({"error": "invalid_arguments", "detail": "bad regex"}),
+        };
+        let text = format_tool_responses(&[
+            string_result("a.rs (lines 1-2):\n"),
+            error,
+            string_result("b.rs (lines 1-2):\n"),
+        ])
+        .text();
+        let labels: Vec<&str> = text
+            .split("<tool_response>")
+            .skip(1)
+            .map(|block| block.lines().next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            labels,
+            ["[1/3 file_read]", "[2/3 file_grep]", "[3/3 file_read]"]
         );
     }
 

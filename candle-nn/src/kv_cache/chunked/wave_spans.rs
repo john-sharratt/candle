@@ -50,3 +50,16 @@ pub const WAVE_FFN_BYTES: usize = 512 * 1024 * 1024;
 /// this is ~5000x headroom, and none of it is wasted: a span that cannot be
 /// subdivided cannot be spent on anything else.
 pub const WAVE_FORWARD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ground one wave's transient tier is guaranteed: the three spans together.
+///
+/// **The floor of a wave's tier budget, not the budget.** `MIN_ELASTIC_RESERVE`
+/// is built from these same three terms and the weight floor may never cross
+/// it, so a tier that fits here can always be placed — whatever the KV side and
+/// the weight side have done to each other in the meantime. A wave is priced
+/// against the measured gap between the arena frontier and the weight floor
+/// (`transient_headroom_bytes`), which is what the placement itself measures
+/// against, and never against less than this: on the 35B geometry this figure
+/// alone prices to ~1,000 tokens, an order of magnitude under what the gap
+/// carries.
+pub const WAVE_SPAN_BYTES: usize = WAVE_ATTN_BYTES + WAVE_FFN_BYTES + WAVE_FORWARD_BYTES;

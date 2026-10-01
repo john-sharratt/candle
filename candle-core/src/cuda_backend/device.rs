@@ -422,6 +422,7 @@ impl CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 }
@@ -848,6 +849,27 @@ impl CudaDevice {
             .unwrap_or(false)
     }
 
+    /// Make this device's CUDA context current on the calling thread.
+    ///
+    /// A CUDA context is per-thread state. Every method here that issues driver
+    /// calls binds first, so code that goes through `CudaDevice` never has to
+    /// think about it — but code that takes a raw `CUstream` or device address
+    /// and calls the driver itself must, and a thread that never bound gets
+    /// `CUDA_ERROR_INVALID_CONTEXT` rather than anything that reads as a
+    /// threading mistake.
+    ///
+    /// That is not hypothetical: the provenance gallery's page upload is a raw
+    /// `memcpy_htod_async`, and moving the normalization warm-ups onto their own
+    /// rayon pool gave them worker threads that had never bound this context.
+    /// The upload failed, the scan fell back to a host walk of the whole
+    /// gallery, and boot never finished.
+    ///
+    /// Idempotent and cheap — a `cuCtxSetCurrent` on a thread that already has
+    /// it costs nothing worth measuring.
+    pub fn bind_to_thread(&self) -> Result<()> {
+        self.context.bind_to_thread().w()
+    }
+
     /// Returns (free, total) GPU memory in bytes.
     ///
     /// Binds this device's CUDA context to the current thread and queries
@@ -1099,6 +1121,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1139,6 +1162,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1180,6 +1204,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1223,6 +1248,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1265,6 +1291,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1307,6 +1334,7 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
@@ -1349,11 +1377,20 @@ impl BackendDevice for CudaDevice {
             slice,
             device: self.clone(),
             backing: Backing::Owned,
+            anchor: None,
         })
     }
 
     fn synchronize(&self) -> Result<()> {
-        self.stream.synchronize().map_err(crate::Error::wrap)?;
+        // `.w()` (not `Error::wrap`) so a sticky fault or a sustained
+        // out-of-memory streak on THIS call is visible to `gpu_poison` —
+        // `Error::wrap`'s generic `Display` wrapping bypasses that detection
+        // entirely. This call is the daemon's most frequent, unconditional
+        // device round-trip (the persistence thread's hot→warm sync runs on a
+        // fixed cadence regardless of load), which is exactly why a poisoned
+        // context showed up here as an endless identical retry with nothing
+        // ever noticing.
+        self.stream.synchronize().w()?;
         Ok(())
     }
 }
@@ -1390,6 +1427,7 @@ impl CudaDevice {
             slice,
             device: self.clone(),
             backing,
+            anchor: None,
         })
     }
 
@@ -1437,6 +1475,7 @@ impl CudaDevice {
             slice,
             device: self.clone(),
             backing,
+            anchor: None,
         })
     }
 }

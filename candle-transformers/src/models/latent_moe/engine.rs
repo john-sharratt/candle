@@ -31,11 +31,13 @@ use candle_nn::kv_cache::WeightZone;
 use super::arch::{Arch, Ffn, Global, Hyper as HyperSite, Weight};
 use super::config::Config;
 use super::hyper::{HyperConnection, HyperParams};
+use super::kernel_attention::KernelAttnLayer;
 use super::linear::QLinear;
 use super::loader::{self, GgufModel};
 use super::moe::{Expert, Gate, ScoreFunc};
 use super::paged;
 use super::rope::RotaryCache;
+use super::rope_tables::LatentRopeTables;
 
 /// One transformer layer's resident (non-routed-expert) weights. The routed experts for this
 /// layer live in the shared [`ExpertCache`], indexed by `moe_layer_idx`.
@@ -428,6 +430,7 @@ impl Engine {
             expert_pack_dir: merged_path.parent(),
             progress: None,
             int8mode,
+            offloaded_bytes: 0,
         })?);
         #[cfg(feature = "cuda")]
         {
@@ -561,6 +564,14 @@ impl Engine {
             DType::F32,
             &weights_flat,
             assignments,
+            // `nt`: every row counts as decode-attributed, reproducing this
+            // family's scoring exactly as it stood before the decode/prefill
+            // split existed. DeepSeek-V4-Flash doesn't yet thread its own
+            // wave's decode-row count through to this call site — its wave
+            // engine (`latent_moe/wave.rs`) is a separate path from the
+            // `batched_layer.rs` one that derives it for the Qwen3-family
+            // models this change was measured against.
+            nt,
             None,
         )?; // [nt, dim] F32
         s_submit.end();
@@ -671,15 +682,20 @@ impl Engine {
 
         let mut layers = Vec::with_capacity(self.cfg.n_layers);
         let ws = std::sync::Arc::new(super::paged::LatentWorkspace::build(&self.device)?);
+        let mut tables = LatentRopeTables::default();
         for (l, layer) in self.layers.iter().enumerate() {
             let (theta, orig) = self.cfg.rope_params(l);
-            layers.push(super::kernel_attention::KernelAttnLayer::new(
-                &layer.attn,
+            let rope_tab = tables.for_layer(
                 theta,
                 orig,
                 self.cfg.rope_factor,
                 self.cfg.beta_fast,
                 self.cfg.beta_slow,
+                &self.device,
+            )?;
+            layers.push(KernelAttnLayer::new(
+                &layer.attn,
+                rope_tab,
                 self.cfg.index_head_dim,
                 ws.clone(),
                 &self.device,
@@ -723,7 +739,7 @@ pub struct KernelSession<'a> {
     /// commit (`set_len`) runs on each before the slot headers serialize.
     backings: Vec<candle_nn::kv_cache::ChunkedKvBacking>,
     seq: usize,
-    layers: Vec<super::kernel_attention::KernelAttnLayer>,
+    layers: Vec<KernelAttnLayer>,
     pos: usize,
 }
 
@@ -758,7 +774,7 @@ impl KernelSession<'_> {
         }
         let resident = self.pos - evicted as usize;
 
-        // Per-step slot metadata for ALL layers (24-byte SlotHeader each,
+        // Per-step slot metadata for ALL layers (one SlotHeader each,
         // one pinned upload). Kept alive through the layer loop. The CPU-side
         // chunk usage must mirror the RESIDENT tokens the GPU commits have
         // written (absolute `self.pos` minus the evicted front) — `set_len`

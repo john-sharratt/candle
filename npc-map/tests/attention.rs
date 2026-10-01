@@ -419,12 +419,13 @@ fn being_spoken_to_is_what_preempts_and_it_is_rare() {
             continue;
         }
         preempted += 1;
-        // Every preempt is either something aimed at this body or the outcome
-        // of something it set in motion. Nothing else may interrupt.
+        // Every preempt is something aimed at this body, the outcome of
+        // something it set in motion, or somebody running into it as they both
+        // crossed. Nothing else may interrupt.
         assert!(
-            d.events
-                .iter()
-                .any(|e| e.addressed() || (e.mine() && e.what.is_outcome())),
+            d.events.iter().any(|e| e.addressed()
+                || (e.mine() && e.what.is_outcome())
+                || matches!(&e.what, Happening::Bumped { into } if *into == e.reader)),
             "{} was interrupted by nothing that concerned it: {:?}",
             d.who,
             d.events.iter().map(|e| &e.what).collect::<Vec<_>>()

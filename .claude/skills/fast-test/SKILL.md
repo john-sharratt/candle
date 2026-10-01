@@ -179,7 +179,7 @@ tree — a defect, fixed forward like a failure.** A test's workspace is a `temp
 or a fixed directory under `env!("CARGO_TARGET_TMPDIR")` when it must persist across runs
 (a tool-catalog calibration, a substrate copy — `zend/tests/common/mod.rs`'s
 `production_workspace()`). It is never `std::env::current_dir()` or `CARGO_MANIFEST_DIR` —
-under `cargo test` both are the crate directory, which is how a 3.2 GB `zend/.substrate` came
+under `cargo test` both are the crate directory, which is how a 3.2 GB `zend/substrate` came
 to sit in the tree — and never the repo root, whose substrate is the user's live one. A named
 directory in `std::env::temp_dir()` that is never removed accumulates just the same; use a
 `TempDir`.

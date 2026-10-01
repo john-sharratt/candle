@@ -37,6 +37,7 @@ pub mod device;
 pub mod field;
 pub mod item;
 pub mod ledger;
+pub mod missions;
 pub mod phone;
 pub mod posting;
 pub mod record;
@@ -52,6 +53,7 @@ use device::Devices;
 use field::{Field, Resource};
 use item::Pack;
 use ledger::Ledger;
+use missions::Missions;
 use tower::Tower;
 
 /// Everything about a world that is not its map.
@@ -63,6 +65,21 @@ pub struct Sim {
     pub devices: Devices,
     pub field: Field,
     pub ledger: Ledger,
+    /// Which character is carrying which mission — see [`missions`].
+    ///
+    /// `serde(default)` because saved worlds predate the mission system, and a
+    /// world that loads with no missions is one where nobody has been given a
+    /// task yet — the correct reading of an absent field, not a migration.
+    #[serde(default)]
+    pub missions: Missions,
+    /// Whether the command table is open — handing out missions and calling
+    /// characters with none to come and take one. The runtime default is set as
+    /// a world is hosted, not here: a fresh world comes up **open** so its cast
+    /// has work, and only an operator's explicit shut (durable, `TABLE_OPEN_KEY`)
+    /// keeps it closed across a reboot — see [`crate::engine::runtime`]'s host
+    /// path. `serde(default)` covers a saved world from before the field existed.
+    #[serde(default)]
+    pub table_open: bool,
     /// What the world is made of, as the Makers hold it — see [`record`].
     pub record: record::Record,
     /// Every conversation carried on a handset — see [`phone`].
@@ -170,6 +187,22 @@ impl Sim {
     /// `operate.what`.
     pub fn operable(&self, place: &str) -> Vec<String> {
         self.devices.operable_at(place)
+    }
+
+    /// The station standing at an instance id, if the map placed one there.
+    ///
+    /// The id is the map's own per-instance id ([`npc_map::PartInstance::id`]),
+    /// which the seed keys every device by — so a route addressing one placed
+    /// station of several in a room reaches exactly that one, independent of its
+    /// neighbours. `None` for an id no placement mints, which is how a stale or
+    /// forged id is refused rather than resolving to something nearby.
+    pub fn station(&self, instance_id: &str) -> Option<&device::Device> {
+        self.devices.get(instance_id)
+    }
+
+    /// The mutable half of [`Self::station`], for the act that changes one.
+    pub fn station_mut(&mut self, instance_id: &str) -> Option<&mut device::Device> {
+        self.devices.get_mut(instance_id)
     }
 
     /// `operate.mode` — the dependent one, which needs to know what was chosen.
@@ -482,6 +515,22 @@ impl Sim {
     /// Who is on the roster now.
     pub fn contacts_roster(&self) -> Vec<String> {
         self.roster.clone()
+    }
+
+    /// The material a random routine is built around, for a body named `me`: the
+    /// other makers to visit and the records to consult. `me` is left out of the
+    /// makers so a routine never sends a character to visit itself. Shared by the
+    /// desk's `collect_mission` and the engine's idle auto-assignment so the two
+    /// draw from the same world.
+    pub fn mission_material(&self, me: &str) -> (Vec<String>, Vec<String>) {
+        let makers = self
+            .contacts_roster()
+            .into_iter()
+            .filter(|name| name != me)
+            .collect();
+        let mut records = self.record.names_of(record::Kind::Era);
+        records.extend(self.record.names_of(record::Kind::Story));
+        (makers, records)
     }
 
     /// How many messages are waiting for somebody across every thread.

@@ -11,7 +11,7 @@ character: >
   Eras overlap, so two Makers working next to each other are usually working
   on the same argument from different ends.
 lacks:
-  - way off this level except the lift and the stair
+  - way off this level except the lift
 spine:
   name: the ring
   loop: true
@@ -26,8 +26,8 @@ nodes:
 
   - id: core
     kind: core
-    name: the lift and the stair
-    plural: true
+    name: the lift
+    plural: false
     off: [ring-north]
 
   - id: early-range

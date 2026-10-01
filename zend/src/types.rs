@@ -100,8 +100,11 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[allow(dead_code)]
     pub top_p: Option<f32>,
-    /// Stable identifier for the conversation tab.
-    /// When absent, all requests share a single default conversation.
+    /// Stable identifier for the conversation tab — **required** for every
+    /// model but `passthrough`, which carries the client's own context and
+    /// never reaches the substrate. A request that omits it (or sends it blank)
+    /// is refused with `400 missing_conv_id`; there is no default conversation
+    /// for unaddressed turns to accumulate on.
     #[serde(default)]
     pub conv_id: Option<String>,
     /// Capture aid (zend-only): name of a section collection (e.g. `"tools"`)
@@ -162,19 +165,58 @@ pub struct StreamOptions {
 }
 
 /// Which slice of the tool catalog a conversation projects. Maps to the GUI
-/// "tools" dial. Drives both projection (which tool sections materialise) and
-/// which tool summary is injected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+/// "tools" dial. Drives projection (which tool sections materialise) and which
+/// tool summary is injected. In every mode the file tools work on the
+/// conversation's own overlay, never on the workspace on disk.
+///
+/// Declared in dial order: the GUI's level for a mode is its position in
+/// [`ToolMode::ALL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolMode {
     /// No tools: every tool section and the tool summary are omitted.
     None,
-    /// Safe tools only: high-risk tool sections are omitted; the restricted
-    /// summary is injected.
+    /// Safe tools only: the file tools, reads and writes alike, and the git
+    /// readers; nothing high-risk and nothing that needs a grant — no network,
+    /// no code, no program on this host. The restricted summary is injected.
     Restricted,
-    /// Every tool; the comprehensive summary is injected.
-    #[default]
+    /// Every tool: the network, stored credentials, the JS sandbox, the git
+    /// writers and programs on this host. The comprehensive summary is
+    /// injected.
     Comprehensive,
+}
+
+impl ToolMode {
+    /// Every mode, in dial order.
+    pub const ALL: [ToolMode; 3] = [
+        ToolMode::None,
+        ToolMode::Restricted,
+        ToolMode::Comprehensive,
+    ];
+
+    /// The wire and stored spelling — what the request's `tools` field and the
+    /// conversation's recorded dial carry.
+    pub fn id(self) -> &'static str {
+        match self {
+            ToolMode::None => "none",
+            ToolMode::Restricted => "restricted",
+            ToolMode::Comprehensive => "comprehensive",
+        }
+    }
+
+    /// The GUI dial level for this mode.
+    pub fn level(self) -> u8 {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0) as u8
+    }
+
+    /// The mode at a GUI dial level. An out-of-range level is the least
+    /// capable mode, never the most.
+    pub fn from_level(level: u8) -> ToolMode {
+        Self::ALL
+            .get(level as usize)
+            .copied()
+            .unwrap_or(ToolMode::None)
+    }
 }
 
 /// The request's `tools` field, in either shape it arrives in.
@@ -184,8 +226,9 @@ pub enum RequestTools {
     /// The composer "tools" dial. Selects which tool sections the projection
     /// materialises for this conversation: `None` omits every tool section,
     /// `Restricted` omits the high-risk tools (and uses the restricted tool
-    /// summary), `Comprehensive` keeps the full catalog. Absent → server
-    /// default (`Comprehensive`).
+    /// summary), and `Comprehensive` keeps the full catalog. Absent → the
+    /// caller's role default, and a mode above the role runs as `Restricted`
+    /// (see `crate::access`).
     Mode(ToolMode),
     /// OpenAI function definitions, each `{"type": "function", "function": {…}}`
     /// — a client that runs its own tools. The passthrough offers them to the
@@ -215,6 +258,17 @@ mod request_tests {
         assert_eq!(req.verbosity, None);
         assert_eq!(req.think, None);
         assert_eq!(req.conv_id.as_deref(), Some("abc"));
+    }
+
+    /// An absent `conv_id` parses as absent rather than as any stand-in id.
+    ///
+    /// The wire format still accepts the omission — `passthrough` has no
+    /// conversation to name — and the refusal happens in the handler, on the
+    /// branch that actually reaches the substrate.
+    #[test]
+    fn an_omitted_conv_id_stays_absent() {
+        let req: ChatCompletionRequest = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        assert_eq!(req.conv_id, None);
     }
 
     #[test]

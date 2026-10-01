@@ -5,9 +5,6 @@
 //
 //   cargo run --bin kernel_tool -- status
 //   cargo run --bin kernel_tool -- hash
-//   cargo run --bin kernel_tool -- rebuild-archive-hashes
-//   cargo run --bin kernel_tool -- rebuild-staging --build-dir target/debug/build/candle-kernels-.../out
-//   cargo run --bin kernel_tool -- rebuild-staging-hashes
 //   cargo run --bin kernel_tool -- check-for-changes
 //   cargo run --bin kernel_tool -- rebuild-archives
 //   cargo run --bin kernel_tool -- compile --group simple
@@ -44,23 +41,6 @@ enum Commands {
         #[arg(long)]
         group: Vec<String>,
     },
-
-    /// Recompute .sha256 hash files for archives that have valid .a.gz files.
-    /// Stamps existing .a.gz files as matching current source.
-    RebuildArchiveHashes,
-
-    /// Copy .o files from a build directory into staged/ cache.
-    /// Use after a successful build to populate the staged cache.
-    RebuildStaging {
-        /// Directory containing compiled .o files (e.g. target/debug/build/candle-kernels-.../out).
-        /// If omitted, auto-detects the most recent cargo build output.
-        #[arg(long)]
-        build_dir: Option<String>,
-    },
-
-    /// Recompute .o.sha256 hash files for .o files currently in staged/.
-    /// Stamps existing staged .o files as matching current source.
-    RebuildStagingHashes,
 
     /// Dry-run: report exactly which archives and kernels would be rebuilt.
     CheckForChanges,
@@ -142,15 +122,6 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Status => cmd_status(&archive_groups, &precompiled_dir, &staged_dir, &base_dir),
         Commands::Hash { group } => cmd_hash(&archive_groups, &base_dir, &group),
-        Commands::RebuildArchiveHashes => {
-            cmd_rebuild_archive_hashes(&archive_groups, &precompiled_dir, &base_dir)
-        }
-        Commands::RebuildStaging { build_dir } => {
-            cmd_rebuild_staging(&archive_groups, &staged_dir, build_dir.as_deref())
-        }
-        Commands::RebuildStagingHashes => {
-            cmd_rebuild_staging_hashes(&archive_groups, &staged_dir, &base_dir)
-        }
         Commands::CheckForChanges => {
             cmd_check_for_changes(&archive_groups, &precompiled_dir, &staged_dir, &base_dir)
         }
@@ -211,7 +182,7 @@ fn cmd_status(
     }
     enum StagingProblemKind {
         MissingO,  // .o file not in staged/
-        StaleHash, // .o exists but .sha256 is wrong or missing
+        StaleHash, // .o exists but .sha256 is wrong or missing, or the .o predates its sources
     }
 
     let mut problems: Vec<StagingProblem> = Vec::new();
@@ -219,7 +190,12 @@ fn cmd_status(
     for group in groups {
         let (kernel_hashes, aggregate_hash) =
             compute_group_hashes(group, base_dir, &mut dep_cache)?;
-        let is_cached = is_archive_cache_valid(&group.name, precompiled_dir, &aggregate_hash);
+        let is_cached = is_archive_cache_valid(
+            &group.name,
+            precompiled_dir,
+            &aggregate_hash,
+            &group_sources(group, base_dir)?,
+        ) && staged_objects_are_fresh(group, &kernel_hashes, staged_dir, base_dir)?;
 
         // Check each kernel's staged status
         let mut group_staged = 0usize;
@@ -232,7 +208,6 @@ fn cmd_status(
                 .unwrap_or("");
 
             let staged_o = staged_dir.join(format!("{}.o", name));
-            let staged_hash_file = staged_dir.join(format!("{}.o.sha256", name));
 
             if !staged_o.exists() {
                 problems.push(StagingProblem {
@@ -242,11 +217,8 @@ fn cmd_status(
                     kind: StagingProblemKind::MissingO,
                 });
             } else {
-                let hash_ok = staged_hash_file.exists()
-                    && fs::read_to_string(&staged_hash_file)
-                        .map(|h| h.trim() == expected_hash)
-                        .unwrap_or(false);
-                if hash_ok {
+                let sources = kernel_sources(kernel_path, base_dir, &group.include_dirs)?;
+                if is_staged_kernel_valid(staged_dir, &name, expected_hash, &sources) {
                     group_staged += 1;
                 } else {
                     problems.push(StagingProblem {
@@ -310,9 +282,7 @@ fn cmd_status(
             for p in &missing {
                 println!("  [{}] {} ({})", p.group_name, p.kernel_name, p.kernel_path);
             }
-            println!("\n  To copy from last build output:");
-            println!("    cargo run --bin kernel_tool -- rebuild-staging");
-            println!("\n  Or compile just the affected group(s):");
+            println!("\n  Compile just the affected group(s):");
             let mut affected_groups: Vec<&str> =
                 missing.iter().map(|p| p.group_name.as_str()).collect();
             affected_groups.sort();
@@ -325,23 +295,25 @@ fn cmd_status(
 
         if !stale.is_empty() {
             println!(
-                "Stale/missing .sha256 for staged .o files ({}):",
+                "Stale staged .o files ({}) — hash mismatch, or older than a source they \
+                 were compiled from:",
                 stale.len()
             );
             for p in &stale {
                 println!("  [{}] {} ({})", p.group_name, p.kernel_name, p.kernel_path);
             }
-            println!("\n  To repair all staging hashes:");
-            println!("    cargo run --bin kernel_tool -- rebuild-staging-hashes");
+            println!("\n  A stale object has to be recompiled. Re-stamping its hash does not");
+            println!("  repair it: the label changes, the kernel does not, and the freshness");
+            println!("  check still rejects it.");
+            println!("\n  Recompile just the affected group(s):");
+            let mut affected_groups: Vec<&str> =
+                stale.iter().map(|p| p.group_name.as_str()).collect();
+            affected_groups.sort();
+            affected_groups.dedup();
+            for g in &affected_groups {
+                println!("    cargo run --bin kernel_tool -- compile --group {}", g);
+            }
             println!();
-        }
-
-        // If everything is in staged/ (just needs hash repair), suggest the fast path
-        if missing.is_empty() && !stale.is_empty() {
-            println!("All .o files present — just the hashes need repair.");
-            println!("After repairing, rebuild archives with:");
-            println!("  cargo run --bin kernel_tool -- rebuild-staging-hashes");
-            println!("  cargo run --bin kernel_tool -- rebuild-archives");
         }
     }
 
@@ -373,219 +345,6 @@ fn cmd_hash(groups: &[ArchiveGroup], base_dir: &Path, filter_group: &[String]) -
     Ok(())
 }
 
-fn cmd_rebuild_archive_hashes(
-    groups: &[ArchiveGroup],
-    precompiled_dir: &Path,
-    base_dir: &Path,
-) -> Result<()> {
-    let mut dep_cache: HashMap<String, String> = HashMap::new();
-    let mut repaired = 0;
-
-    println!("Rebuilding archive hash files (.sha256) for existing .a.gz archives...");
-    for group in groups {
-        let gz_file = precompiled_dir.join(format!("lib{}.a.gz", group.name));
-        if !gz_file.exists() {
-            println!("  SKIP {} — no .a.gz file", group.name);
-            continue;
-        }
-
-        let (_, aggregate_hash) = compute_group_hashes(group, base_dir, &mut dep_cache)?;
-        save_archive_hash(&group.name, &aggregate_hash, precompiled_dir)?;
-        println!("  OK   {} → {}", group.name, &aggregate_hash[..16]);
-        repaired += 1;
-    }
-
-    println!("\nRepaired {} archive hash files", repaired);
-    Ok(())
-}
-
-/// Find all cargo build output directories for candle-kernels.
-/// Returns them sorted most-recent first (by directory mtime).
-fn find_all_build_dirs() -> Result<Vec<PathBuf>> {
-    let target_dir = PathBuf::from("target");
-    let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-
-    for profile in &["debug", "release"] {
-        let build_dir = target_dir.join(profile).join("build");
-        if !build_dir.exists() {
-            continue;
-        }
-        for entry in fs::read_dir(&build_dir)?.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("candle-kernels-") {
-                let out_dir = entry.path().join("out");
-                if out_dir.is_dir() {
-                    let has_objects = fs::read_dir(&out_dir)
-                        .map(|entries| {
-                            entries.flatten().any(|e| {
-                                e.path().extension().map(|ext| ext == "o").unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false);
-                    if has_objects {
-                        let mtime = entry
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        candidates.push((out_dir, mtime));
-                    }
-                }
-            }
-        }
-    }
-
-    if candidates.is_empty() {
-        anyhow::bail!(
-            "No candle-kernels build output found in target/. \
-             Pass --build-dir explicitly."
-        );
-    }
-
-    candidates.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
-    Ok(candidates.into_iter().map(|(path, _)| path).collect())
-}
-
-/// For a given kernel name, find the newest .o file across all candidate build dirs.
-/// Returns the path to the newest .o, or None if not found in any.
-fn find_newest_object(kernel_name: &str, build_dirs: &[PathBuf]) -> Option<PathBuf> {
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-
-    for dir in build_dirs {
-        let obj = dir.join(format!("{}.o", kernel_name));
-        if obj.exists() {
-            let mtime = fs::metadata(&obj)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            match &best {
-                Some((_, best_mtime)) if mtime > *best_mtime => {
-                    best = Some((obj, mtime));
-                }
-                None => {
-                    best = Some((obj, mtime));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    best.map(|(path, _)| path)
-}
-
-fn cmd_rebuild_staging(
-    groups: &[ArchiveGroup],
-    staged_dir: &Path,
-    build_dir_override: Option<&str>,
-) -> Result<()> {
-    let build_dirs: Vec<PathBuf> = match build_dir_override {
-        Some(dir) => {
-            let p = PathBuf::from(dir);
-            if !p.is_dir() {
-                anyhow::bail!("Build directory does not exist: {}", p.display());
-            }
-            vec![p]
-        }
-        None => {
-            let dirs = find_all_build_dirs()?;
-            println!(
-                "Found {} candle-kernels build dir(s), will pick newest .o per kernel:",
-                dirs.len()
-            );
-            for d in &dirs {
-                println!("  {}", d.display());
-            }
-            dirs
-        }
-    };
-
-    fs::create_dir_all(staged_dir)?;
-
-    let mut copied = 0usize;
-    let mut skipped = 0usize;
-
-    // Collect all kernel names across all groups
-    let all_kernels: Vec<String> = groups
-        .iter()
-        .flat_map(|g| g.kernels.iter())
-        .map(|k| kernel_stem(k))
-        .collect();
-
-    // Deduplicate (shouldn't be needed but just in case)
-    let mut seen = HashSet::new();
-    for name in &all_kernels {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-
-        if let Some(src) = find_newest_object(name, &build_dirs) {
-            let dest = staged_dir.join(format!("{}.o", name));
-            fs::copy(&src, &dest)
-                .with_context(|| format!("Failed to copy {}.o to staged/", name))?;
-            // Remove any stale hash — staging hashes must be rebuilt separately
-            let hash_file = staged_dir.join(format!("{}.o.sha256", name));
-            let _ = fs::remove_file(&hash_file);
-            copied += 1;
-        } else {
-            skipped += 1;
-        }
-    }
-
-    println!(
-        "Copied {} .o files to staged/ ({} not found in any build dir)",
-        copied, skipped
-    );
-    if copied > 0 {
-        println!("Run 'rebuild-staging-hashes' to stamp all staged .o files as current.");
-    }
-    Ok(())
-}
-
-fn cmd_rebuild_staging_hashes(
-    groups: &[ArchiveGroup],
-    staged_dir: &Path,
-    base_dir: &Path,
-) -> Result<()> {
-    let mut dep_cache: HashMap<String, String> = HashMap::new();
-    let mut stamped = 0usize;
-    let mut missing = 0usize;
-
-    println!("Rebuilding staged .o.sha256 hash files...");
-
-    for group in groups {
-        let canonical_args = canonical_args_for_hash(&group.compile_args);
-
-        for kernel_path in &group.kernels {
-            let name = kernel_stem(kernel_path);
-            let staged_o = staged_dir.join(format!("{}.o", name));
-
-            if !staged_o.exists() {
-                missing += 1;
-                continue;
-            }
-
-            // Compute the current hash for this kernel
-            let hash = compute_kernel_hash(
-                kernel_path,
-                &canonical_args,
-                base_dir,
-                &group.include_dirs,
-                &mut dep_cache,
-            )?;
-
-            // Write the hash file
-            let hash_file = staged_dir.join(format!("{}.o.sha256", name));
-            fs::write(&hash_file, &hash)
-                .with_context(|| format!("Failed to write {}", hash_file.display()))?;
-            stamped += 1;
-        }
-    }
-
-    println!(
-        "Stamped {} staged .o files ({} .o files not found in staged/)",
-        stamped, missing
-    );
-    Ok(())
-}
-
 fn cmd_check_for_changes(
     groups: &[ArchiveGroup],
     precompiled_dir: &Path,
@@ -601,7 +360,13 @@ fn cmd_check_for_changes(
         let (kernel_hashes, aggregate_hash) =
             compute_group_hashes(group, base_dir, &mut dep_cache)?;
 
-        if is_archive_cache_valid(&group.name, precompiled_dir, &aggregate_hash) {
+        if is_archive_cache_valid(
+            &group.name,
+            precompiled_dir,
+            &aggregate_hash,
+            &group_sources(group, base_dir)?,
+        ) && staged_objects_are_fresh(group, &kernel_hashes, staged_dir, base_dir)?
+        {
             continue; // Archive is up-to-date
         }
 
@@ -623,7 +388,8 @@ fn cmd_check_for_changes(
                 .map(|(_, h)| h.as_str())
                 .unwrap_or("");
 
-            if is_staged_kernel_valid(staged_dir, &name, current_hash) {
+            let sources = kernel_sources(kernel_path, base_dir, &group.include_dirs)?;
+            if is_staged_kernel_valid(staged_dir, &name, current_hash, &sources) {
                 staged_hits += 1;
             } else {
                 to_compile.push(kernel_path.clone());
@@ -771,7 +537,8 @@ fn cmd_compile(
             )?;
             kernel_hash_map.insert(kernel_path.clone(), hash.clone());
 
-            if is_staged_kernel_valid(staged_dir, &name, &hash) {
+            let sources = kernel_sources(kernel_path, base_dir, &group.include_dirs)?;
+            if is_staged_kernel_valid(staged_dir, &name, &hash, &sources) {
                 total_skipped += 1;
             } else {
                 to_compile.push(kernel_path);
@@ -802,7 +569,8 @@ fn cmd_compile(
         for kernel_path in &to_compile {
             let name = kernel_stem(kernel_path);
             if let Some(hash) = kernel_hash_map.get(*kernel_path) {
-                save_to_staged_cache(&compile_dir, staged_dir, &name, hash)?;
+                let sources = kernel_sources(kernel_path, base_dir, &group.include_dirs)?;
+                save_to_staged_cache(&compile_dir, staged_dir, &name, hash, &sources)?;
             }
         }
 
@@ -862,7 +630,8 @@ fn cmd_recompile(
                 &group.include_dirs,
                 &mut dep_cache,
             )?;
-            save_to_staged_cache(&compile_dir, staged_dir, &name, &hash)?;
+            let sources = kernel_sources(kernel_path, base_dir, &group.include_dirs)?;
+            save_to_staged_cache(&compile_dir, staged_dir, &name, &hash, &sources)?;
         }
 
         println!("  Done in {:.1}s", start.elapsed().as_secs_f64());

@@ -223,11 +223,35 @@ fn plain_letters(body: &str) -> bool {
     true
 }
 
+/// `\bmod` — the binary modulo operator — rewritten to an upright `mod` set off
+/// by medium spaces, which is how it typesets: `\bmod` is not a command
+/// `latex2mathml` knows, so the whole expression around it fell back to LaTeX.
+/// A trailing letter (`\bmodulo`) is a different command and is left alone.
+fn expand_bmod(latex: &str) -> String {
+    const CMD: &str = "\\bmod";
+    let mut out = String::with_capacity(latex.len());
+    let mut rest = latex;
+    while let Some(at) = rest.find(CMD) {
+        let after = &rest[at + CMD.len()..];
+        out.push_str(&rest[..at]);
+        if after.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+            out.push_str(CMD);
+        } else {
+            out.push_str("\\:\\mathrm{mod}\\:");
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Rewrites that make a command mean to the converter what it means on the
 /// page. Each one is documented where it is defined; none of them guesses, and
 /// each leaves untouched every expression that already converts.
 fn preprocess(latex: &str) -> String {
-    upright_text(&strip_delimiter_sizing(&expand_script_letters(latex)))
+    upright_text(&strip_delimiter_sizing(&expand_script_letters(&expand_bmod(
+        latex,
+    ))))
 }
 
 fn convert(latex: &str, style: DisplayStyle, class: &str) -> String {
@@ -308,6 +332,22 @@ mod tests {
             html.contains('\u{1D4B2}'),
             "\\mathcal{{W}} did not become script W"
         );
+    }
+
+    #[test]
+    fn bmod_is_rewritten_to_an_upright_spaced_mod() {
+        assert_eq!(expand_bmod(r"a \bmod 4"), r"a \:\mathrm{mod}\: 4");
+        assert_eq!(expand_bmod(r"\bmodulo"), r"\bmodulo");
+        assert_eq!(expand_bmod("no operator"), "no operator");
+    }
+
+    #[test]
+    fn the_palquant_curve_definition_converts() {
+        // Verbatim from the PalQuant paper: `\bmod`, `\pm` and a thin space in
+        // one expression, which fell back to LaTeX while `\bmod` was unknown.
+        let src = r"\text{curve}[16b + p][i] = \pm\,\text{base}[b \bmod 4][(i + 2p) \bmod 32]";
+        let html = inline(src);
+        assert!(!html.contains("math-raw"), "{html}");
     }
 
     #[test]

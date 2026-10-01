@@ -30,7 +30,7 @@
 //!
 //! // 2. Wrap with BatchedInference
 //! let model = MyModel::from_gguf(...)?;
-//! let batched = BatchedInference::new(model, 10000.0, 4096, &device)?;
+//! let batched = BatchedInference::new_with_schedule(model, &schedule, 4096, &device)?;
 //!
 //! // 3. Use batched inference
 //! let logits = batched.forward_batch(&mut contexts)?;
@@ -43,7 +43,7 @@ use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
     begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, ModelGeometry,
-    WavePlan, REGION_BYTES, WAVE_FORWARD_BYTES,
+    WavePlan, WaveWidth,
 };
 use candle_nn::Module;
 
@@ -54,15 +54,19 @@ use super::batched_layer::{
     forward_layer_batched_mixed, BatchedAttentionLayer, BatchedAttentionParams, BatchedPrefillMeta,
     DecodeHeaders, WaveAttnGroup,
 };
+use super::delta_net::RecurrentCompaction;
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
+use super::expert_lre::{WeightPlan, WeightPlanning};
 use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
+use super::rope_schedule::{RopeRungs, RopeSchedule};
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
 use super::wave_admit::admit_wave_kv;
 use super::wave_driver::{assemble_wave_contexts, WaveGroups};
 #[cfg(feature = "cuda")]
+use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
 use candle_nn::Embedding;
@@ -162,6 +166,15 @@ pub struct WaveShapes {
     /// Experts each token routes to. `1` for a dense model, which collapses the
     /// MoE terms to the dense FFN shapes rather than needing a second branch.
     pub experts_per_tok: usize,
+    /// Tokens the LM head scores over. Sizes the forward phase, which holds the
+    /// head's logits — one row per scored row, `vocab` wide.
+    pub vocab: usize,
+    /// Whether this stack applies a per-head RMSNorm to Q and K. Qwen3 and
+    /// later do; Llama and Qwen2 have no such weight, and pricing one charged
+    /// them for six buffers they never allocate.
+    pub head_qk_norm: bool,
+    /// Whether Q/K/V carry a bias. Qwen2 does; Llama and Qwen3 do not.
+    pub qkv_bias: bool,
     /// Experts the router scores over — the width of the per-token logits the
     /// FFN phase carries. `1` on a dense model, which has no router.
     pub n_experts: usize,
@@ -232,13 +245,42 @@ pub trait BatchedModelCore {
             // three largest buffers a MoE layer allocates — was priced at half
             // its size.
             accum_dtype: DType::F32,
-            // The census this plan was read off (Qwen3-30B-A3B) shows the
-            // projections consuming the norm's packed output and emitting
-            // `act_dtype` directly — no upcast, no cast back. See
-            // `ModelGeometry::projection_accum_roundtrip`.
-            projection_accum_roundtrip: false,
+            vocab: shapes.vocab,
+            // Every layer of these stacks attends, so the attention chain sizes
+            // the phase on its own — there is no second mixer to compare it to.
+            delta_net: None,
+            // No always-active shared expert on this path's checkpoints.
+            shared_expert: None,
+            // An int8 session's RMSNorm fuses its quantize into the epilogue, so
+            // the norms emit q8a128 and the projections consume it directly.
+            // Read from layer 0 because the mode is fixed at load and every
+            // layer shares it.
+            packed_norm: self.layer(0).int8mode().is_int8(),
+            // **The head's own weight decides the head's encoding.** A head that
+            // could not be KO-repacked stays on the dequant path while every
+            // layer around it runs int8 — Qwen2's case, measured.
+            packed_head: self.output_proj().int8mode().is_int8(),
             gated_qkv: false,
+            // `project_qkv` forks on the operand it is handed: an `Int8` one
+            // takes `qkv_segmented` — one launch over the three KO weights, then
+            // three narrows that copy — and a `Float` one takes three separate
+            // calls whose outputs are already contiguous. So the splits exist
+            // exactly when the norm is packed.
+            fused_qkv: self.layer(0).int8mode().is_int8(),
+            qkv_bias: shapes.qkv_bias,
+            head_qk_norm: shapes.head_qk_norm,
+            // The wave is carried as `[batch, seq, heads · dim]`, so where there
+            // IS a per-head norm it copies in and transposes back.
+            head_norm_reshapes: true,
+            // `want_q8` in the decode path, asked of the same predicate: an int8
+            // layer at a head dim the fused q8 combine serves. Qwen2's 64 is not
+            // one, and its context was priced on a span it never lands on.
+            decode_q8_context: self.layer(0).int8mode().is_int8()
+                && paged_decode_q8_head_dim(self.head_dim()),
             partial_rotary: false,
+            // One residual stream: hyper-connections are the Flash-Next
+            // lineage's, and no model on this path carries them.
+            hyper: None,
         }
     }
 
@@ -311,6 +353,39 @@ pub trait BatchedModelCore {
         None
     }
 
+    /// The wave transient tier a prefill of `rows` rows across `sequences`
+    /// would need, in bytes.
+    ///
+    /// **The same function the tier is actually placed from**, not an estimate
+    /// of it: admission judges an offer on the residency it dislodges, and the
+    /// tier dislodges weights exactly as a region claim does. Pricing it any
+    /// other way lets the two figures drift, and the one that drifts is the one
+    /// the placement then refuses.
+    ///
+    /// `None` for a model that cannot price a wave — the caller then charges no
+    /// tier, which is what it did before this existed.
+    fn wave_tier_bytes(&self, _rows: usize, _sequences: usize, _act_dtype: DType) -> Option<u64> {
+        None
+    }
+
+    /// The weight side as the wave rate planner prices it — MoE geometry, and
+    /// the range the expert zone may move in.
+    ///
+    /// Derived from [`Self::expert_stats`] rather than plumbed separately, so a
+    /// model that reports its cache reports this too and the two can never
+    /// describe different moments. `None` for a dense model, for a cache that
+    /// has not yet run a classify, and off CUDA — see
+    /// [`WeightPlan::from_stats`], which refuses a partial gauge set outright
+    /// because every missing field makes a routed expert look free.
+    fn weight_plan(&self) -> WeightPlanning {
+        // No expert cache at all is `Dense`, not a defect — the `?` would have made it
+        // indistinguishable from a cache whose gauges are zero.
+        match self.expert_stats() {
+            Some(s) => WeightPlan::from_stats(&s),
+            None => WeightPlanning::Dense,
+        }
+    }
+
     /// Snapshot the layer-streaming counters, if this model's weights are slot
     /// tenants.
     ///
@@ -377,6 +452,29 @@ pub trait BatchedModelCore {
         0
     }
 
+    /// What **one** sequence's recurrent state costs, priced from the model's
+    /// geometry rather than from what is resident.
+    ///
+    /// This is the admission figure. [`Self::recurrent_reserved_bytes`] is a
+    /// total for the whole-card decomposition and cannot stand in for it: it
+    /// answers zero before the first store exists — pricing a claim that is
+    /// about to arrive as free — and dividing it by the sequences in flight
+    /// gives a number that grows with the idle ones, because the sum and the
+    /// divisor range over different populations.
+    ///
+    /// Zero on a stack with no recurrent layers, which is the true cost there.
+    fn recurrent_store_bytes(&self) -> usize {
+        0
+    }
+
+    /// Compact the arenas per-sequence recurrent state lives in, moving at most
+    /// `max_moves` layer states (zero for no bound). Between forwards only.
+    ///
+    /// Nothing to do on a stack with no recurrent layers, which is the default.
+    fn compact_recurrent(&self, _max_moves: usize) -> Result<RecurrentCompaction> {
+        Ok(RecurrentCompaction::default())
+    }
+
     /// Reset expert pipeline telemetry counters to zero.
     fn reset_expert_stats(&self) {}
 
@@ -410,8 +508,6 @@ pub trait BatchedModelCore {
 // Batched Inference Wrapper
 // ============================================================================
 
-/// Default initial RoPE table size.
-const DEFAULT_ROPE_SEQ_LEN: usize = 4096;
 /// Chunk size for extending RoPE tables.
 const ROPE_EXTEND_CHUNK: usize = 1024;
 
@@ -439,14 +535,12 @@ const KV_FREE_SLACK_REGIONS: usize = 32;
 /// - Easy to add shared state (attention mask cache, etc.) in the future
 pub struct BatchedInference<M: BatchedModelCore> {
     model: M,
+    /// Rung 0's cos/sin by position, for the non-paged paths only; they refuse
+    /// a row past rung 0 (`batched_layer::refuse_rung_past_zero`).
     rope_cache: RwLock<CisPrecomputations>,
-    /// Per-dimension inverse frequencies for the CUDA paged-attention kernels.
-    /// Shape: [head_dim/2], dtype F32, stored on the model device.
-    inv_freq_device: Tensor,
-    /// Cached precomputed cos/sin table for decode RoPE.
-    /// Computed lazily on first decode call, keyed by max_blocks.
-    /// Shape: [max_pos, head_dim], dtype F32, on device.
-    rope_cs_cache: std::sync::Mutex<Option<(usize, Tensor)>>,
+    /// Every rung of the model's RoPE schedule, which the paged kernels rotate
+    /// from — built once at load, never rebuilt for a longer sequence.
+    rope: RopeRungs,
     /// When true, `forward_batch` projects ALL token positions through the LM head
     /// instead of only the last token. Used for perplexity evaluation.
     /// Default: false (near-zero cost when off).
@@ -454,54 +548,24 @@ pub struct BatchedInference<M: BatchedModelCore> {
 }
 
 impl<M: BatchedModelCore> BatchedInference<M> {
-    /// Create a new batched inference wrapper.
+    /// Wrap `model` with its RoPE `schedule`.
     ///
-    /// # Arguments
-    /// * `model` - The model to wrap
-    /// * `rope_theta` - RoPE base frequency (e.g., 10000.0 for LLaMA, 1000000.0 for Qwen3)
-    /// * `max_seq_len` - Initial RoPE table size (will auto-extend if needed)
-    /// * `device` - Device for RoPE tables
-    pub fn new(model: M, rope_theta: f32, max_seq_len: usize, device: &Device) -> Result<Self> {
-        let head_dim = model.head_dim();
-        let rope_cache = RwLock::new(CisPrecomputations::new_growable(
-            head_dim,
-            rope_theta,
-            max_seq_len,
-            ROPE_EXTEND_CHUNK,
-            device,
-        )?);
-        let half_dim = head_dim / 2;
-        let inv_freq_data: Vec<f32> = (0..half_dim)
-            .map(|i| 1.0f32 / rope_theta.powf(2.0 * i as f32 / head_dim as f32))
-            .collect();
-        let inv_freq_device = Tensor::from_vec(inv_freq_data, (half_dim,), device)?;
-        Ok(Self {
-            model,
-            rope_cache,
-            inv_freq_device,
-            rope_cs_cache: std::sync::Mutex::new(None),
-            all_logits: false,
-        })
-    }
-
-    /// Create with default RoPE table size.
-    pub fn new_default(model: M, rope_theta: f32, device: &Device) -> Result<Self> {
-        Self::new(model, rope_theta, DEFAULT_ROPE_SEQ_LEN, device)
-    }
-
-    /// Create with a custom inv_freq tensor for non-standard RoPE scaling.
-    ///
-    /// Use this for models with custom RoPE configurations (e.g., scaled RoPE).
-    pub fn new_with_inv_freq(
+    /// `max_seq_len` is the non-paged cos/sin table's initial size (it grows on
+    /// demand); the paged kernels' rungs cover the schedule's whole reach from
+    /// load.
+    pub fn new_with_schedule(
         model: M,
-        inv_freq: Vec<f32>,
+        schedule: &RopeSchedule,
         max_seq_len: usize,
         device: &Device,
     ) -> Result<Self> {
-        let half_dim = inv_freq.len();
-        let inv_freq_device = Tensor::from_vec(inv_freq.clone(), (half_dim,), device)?;
+        let rung0 = schedule
+            .rungs()
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle::Error::Msg("rope schedule: no rungs".into()))?;
         let rope_cache = RwLock::new(CisPrecomputations::new_growable_with_inv_freq(
-            inv_freq,
+            rung0.inv_freq,
             max_seq_len,
             ROPE_EXTEND_CHUNK,
             device,
@@ -509,10 +573,14 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         Ok(Self {
             model,
             rope_cache,
-            inv_freq_device,
-            rope_cs_cache: std::sync::Mutex::new(None),
+            rope: RopeRungs::new(schedule, device)?,
             all_logits: false,
         })
+    }
+
+    /// The model's RoPE rungs.
+    pub fn rope(&self) -> &RopeRungs {
+        &self.rope
     }
 
     /// When true, `forward_batch` returns logits for ALL positions, not just last.
@@ -660,9 +728,9 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         };
         let dev = self.model.device();
         let prefill_headers =
-            DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(pre_off, pre_q, dev)?);
+            DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(pre_off, pre_q, dev, None)?);
         #[allow(unused_mut)]
-        let mut glue_meta = BatchedPrefillMeta::new_ragged(glue_off, glue_q, dev)?;
+        let mut glue_meta = BatchedPrefillMeta::new_ragged(glue_off, glue_q, dev, None)?;
         #[cfg(feature = "cuda")]
         if let Some(pending) = pending_glue {
             glue_meta.glue = build_glue_meta(pending, glue_q, dev)?;
@@ -774,19 +842,14 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             if rows > 0 {
                 if let Device::Cuda(d) = self.model.device() {
                     let plan = WavePlan::new(self.model.wave_geometry(embed_dtype));
-                    // One region of slack per layer phase. The plan enumerates
-                    // every declared buffer, but a phase pays one alignment per
-                    // range and the count is not in the plan, so this covers the
-                    // rounding rather than an unknown.
-                    let pad = |b: usize| b + REGION_BYTES;
+                    // The plan now prices all three phases from the wave's
+                    // composition, the forward one included — it knows what the
+                    // head's logits cost because the geometry carries `vocab`.
+                    let width = WaveWidth::prefill(rows, 1);
                     let per_phase = [
-                        pad(plan.phase_bytes(LayerPhase::Attention, rows)),
-                        pad(plan.phase_bytes(LayerPhase::Ffn, rows)),
-                        // The forward phase carries per-*sequence* metadata —
-                        // ragged offsets, RoPE tables — which the plan prices as
-                        // zero because it sizes what scales with width. One
-                        // region is the floor the tier is carved in anyway.
-                        WAVE_FORWARD_BYTES,
+                        plan.phase_bytes(LayerPhase::Attention, width),
+                        plan.phase_bytes(LayerPhase::Ffn, width),
+                        plan.phase_bytes(LayerPhase::Forward, width),
                     ];
                     // The tier packs directly against the arena frontier, with no
                     // room reserved above it. Nothing claims a region after this
@@ -885,36 +948,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             Some(resume) => resume,
         };
 
-        // Shared decode rope_cs table (position-indexed lookup used by all groups).
-        let rope_cs = {
-            let max_blocks = contexts
-                .first()
-                .and_then(|c| {
-                    c.kv_caches
-                        .caches
-                        .first()
-                        .map(|k| k.k_cache().chunked_max_blocks())
-                })
-                .unwrap_or(0);
-            let mut cache = self
-                .rope_cs_cache
-                .lock()
-                .map_err(|_| candle::Error::Msg("poisoned rope_cs lock".into()))?;
-            match *cache {
-                Some((mb, ref t)) if mb == max_blocks => t.clone(),
-                _ => {
-                    let t = crate::models::prefill_utils::compute_rope_cs(
-                        &self.inv_freq_device,
-                        max_blocks,
-                        self.model.head_dim(),
-                        self.model.device(),
-                    )?;
-                    *cache = Some((max_blocks, t.clone()));
-                    t
-                }
-            }
-        };
-
         // Per-group RoPE (cos/sin) + prefill position-map caches, all alive for the
         // whole layer loop.
         let dec_rope = self.compute_rope_for_batch(dec_off, dec_q, embed_dtype)?;
@@ -928,8 +961,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &dec_rope.0,
             &dec_rope.1,
             interleaved,
-            &self.inv_freq_device,
-            &rope_cs,
+            &self.rope,
             decode_headers,
             dec_q,
             generation,
@@ -939,8 +971,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &pre_rope.0,
             &pre_rope.1,
             interleaved,
-            &self.inv_freq_device,
-            &rope_cs,
+            &self.rope,
             prefill_headers,
             pre_q,
             generation,
@@ -950,8 +981,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &glue_rope.0,
             &glue_rope.1,
             interleaved,
-            &self.inv_freq_device,
-            &rope_cs,
+            &self.rope,
             glue_headers,
             glue_q,
             generation,

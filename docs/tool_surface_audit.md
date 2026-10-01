@@ -264,12 +264,15 @@ convenient:
 
 **Revision** and **Making** need a draft edited repeatedly before it is filed,
 which is ordinary file editing. `zend-tools` already implements it —
-`file_read`, `file_edit`, `file_write`, `file_list`, `file_delete` over a session
-overlay that copies a workspace file up on first edit and records a whiteout on
-delete. Its own documentation states the alignment that matters here: `file_edit`
-replaces `old_str` only where it appears exactly once, which *"matches Claude
-Code's `str_replace` semantics and forces the model to provide enough context to
-identify a single edit site."*
+`file_read`, `file_edit`, `file_write`, `file_list`, `file_delete` over a
+per-conversation overlay that records each change as a delta — an edit as only
+the lines it changed, a delete as a marker — over the workspace's file. Its own
+documentation states the alignment that matters here: `file_edit`
+replaces an `old_text` quoted from the file with a `new_text`, located by its
+content and never by line number, so text matching in several places is refused
+as ambiguous rather than guessed at, and an edit whose result is already in the
+file is counted as already applied — which forces the model to quote enough to
+identify a single edit site, and makes re-sending an edit safe.
 
 It is a workspace member with no candle dependency, so `npcd` can depend on it
 directly. Reusing it costs one dependency and buys names the model already has a

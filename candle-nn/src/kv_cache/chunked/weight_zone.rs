@@ -403,14 +403,18 @@ impl WeightZone {
     /// Shrink to `new_capacity` slots: relocate the hottest doomed occupants
     /// into free slots below the new frontier, evict the rest.
     ///
-    /// `score` is the caller's temperature for a slot — higher is more valuable.
-    /// It is the *only* thing this module knows about worth, and it never
-    /// decides which of two resident experts survives in general; it decides
-    /// only which of the doomed ones is worth a memcpy.
+    /// `score` is the caller's worth for a slot — any ordered key, higher is
+    /// more valuable. It is the *only* thing this module knows about worth, and
+    /// it never decides which of two resident experts survives in general; it
+    /// decides only which of the doomed ones is worth a memcpy.
     ///
     /// The bookkeeping is applied here. The returned [`RetractPlan`] is what the
     /// caller must do to the bytes to make them agree.
-    pub fn retract_to(&mut self, new_capacity: usize, score: impl Fn(usize) -> f32) -> RetractPlan {
+    pub fn retract_to<K: PartialOrd>(
+        &mut self,
+        new_capacity: usize,
+        score: impl Fn(usize) -> K,
+    ) -> RetractPlan {
         // **The weight side has a floor of its own, and it had none.**
         // `MIN_ELASTIC_RESERVE` bounds how far the weight side may *grow* — it
         // protects the KV side's minimum. Nothing bounded the other direction,

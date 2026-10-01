@@ -1,4 +1,4 @@
-//! All 93 tool implementations, organised into one module per logical group.
+//! All 95 tool implementations, organised into one module per logical group.
 //!
 //! Each tool module follows the same pattern:
 //! - a `Request` struct (`Deserialize + JsonSchema + Validate`)
@@ -15,11 +15,11 @@
 //! |--------|-------|-------|
 //! | `bytes` | `bytes_{transcode,pack,unpack,xor}` | struct.pack/unpack semantics |
 //! | `calculator` | `calculator` | evalexpr; no eval code path |
-//! | `code` | `code_run`, `code_session_*` | Python/Node REPL via subprocess |
+//! | `code` | `code_run`, `code_session_*` | JavaScript on the embedded boa VM; files via the store |
 //! | `credentials` | `credential_{save,list,delete}` | In-memory typed credential store |
 //! | `crypto` | `aead_*`, `hmac_compute`, `signature_*`, `kdf_derive`, `hkdf_*` | RustCrypto |
 //! | `datetime` | `datetime` | chrono + chrono-tz; stateless |
-//! | `file` | `file_{write,read,edit,list,delete,present}` | VFS tools |
+//! | `file` | `file_{write,read,edit,list,search,grep,delete,present}` | VFS tools; `search`/`grep` find by name and by content |
 //! | `hash` | `hash_compute`, `hash_scan` | SHA2/SHA3/BLAKE3/MD5 |
 //! | `hash_state` | `hash_state_{init,update,finalize}` | Streaming hash for large data |
 //! | `http_session` | `http_session_{open,request,list,close}` | reqwest; cookie jar |
@@ -27,6 +27,7 @@
 //! | `notes` | `notes_{write,read,search,list}` | In-memory KV with FTS |
 //! | `random` | `random` | rand crate; real OS entropy |
 //! | `remote_fs` | `remote_fs_session_*` (10 tools) | SFTP via ssh2 |
+//! | `run` | `run_command`, `run_output` | A program in the repository's sandbox, on the conversation's branch |
 //! | `sql_session` | `sql_session_{open,query,list,close}` | rusqlite |
 //! | `ssh` | `ssh_session_{open,exec,exec_async,poll,list,close}` | ssh2 |
 //! | `subagent` | `sub_run` | Calls `SubagentRunner` trait impl injected by daemon |
@@ -47,6 +48,7 @@ pub mod credentials;
 pub mod crypto;
 pub mod datetime;
 pub mod file;
+pub mod git;
 pub mod hash;
 pub mod hash_state;
 pub mod http_session;
@@ -54,6 +56,7 @@ pub mod network_diag;
 pub mod notes;
 pub mod random;
 pub mod remote_fs;
+pub mod run;
 pub mod sql_session;
 pub mod ssh;
 pub mod subagent;

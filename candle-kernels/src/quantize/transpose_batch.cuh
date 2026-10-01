@@ -117,7 +117,9 @@ __global__ void transpose_quant_batch_typed(
     else if constexpr (QTYPE == 26) quantize_block_q2_a(sdata, out);
     else if constexpr (QTYPE == 27) quantize_block_q1_s(sdata, out);
     else if constexpr (QTYPE == 33) quantize_block_q0(sdata, out);
-    else if constexpr (QTYPE == 28) quantize_block_q0_v(sdata, out);
+    // A side-less QTensor encode: the V-side codebook, as the Rust
+    // `GgmlType for BlockQ0V` codec uses.
+    else if constexpr (QTYPE == 28) quantize_block_q0_v<false>(sdata, out);
     else if constexpr (QTYPE == 29) quantize_block_q1_a(sdata, out);
     else if constexpr (QTYPE == 30) quantize_block_q0_x(sdata, out);
     else if constexpr (QTYPE == 31) quantize_block_q0_m2(sdata, out);
@@ -174,7 +176,7 @@ __global__ void transpose_quant_batch(
     else if constexpr (QTYPE == 26) quantize_block_q2_a(sdata, out);
     else if constexpr (QTYPE == 27) quantize_block_q1_s(sdata, out);
     else if constexpr (QTYPE == 33) quantize_block_q0(sdata, out);
-    else if constexpr (QTYPE == 28) quantize_block_q0_v(sdata, out);
+    else if constexpr (QTYPE == 28) quantize_block_q0_v<false>(sdata, out);
     else if constexpr (QTYPE == 29) quantize_block_q1_a(sdata, out);
     else if constexpr (QTYPE == 30) quantize_block_q0_x(sdata, out);
     else if constexpr (QTYPE == 31) quantize_block_q0_m2(sdata, out);

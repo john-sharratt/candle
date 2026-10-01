@@ -148,6 +148,26 @@ test.describe('1.3 streaming', () => {
   });
 });
 
+test.describe('1.3a a long write shows as it is written', () => {
+  test('the writing box shows the file and its text mid-call, then gives way to the card', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('write up the redo log as a doc');
+    await ta.press('Enter');
+    const last = page.locator('[data-msg]').last();
+    // Mid-call: the box names the file and carries the content decoded so far.
+    const box = last.locator('.tool-author');
+    await expect(box).toBeVisible({ timeout: 10000 });
+    await expect(box.locator('.tool-author-file')).toHaveText('docs/redo_log.md');
+    await expect(box.locator('.tool-author-body')).toContainText('The redo log');
+    // Once the call closes, the finished tool card replaces the box.
+    await expect(last.locator('.tool-call-card .tool-call-name')).toHaveText('write', { timeout: 15000 });
+    await expect(last.locator('.tool-author')).toHaveCount(0);
+  });
+});
+
 test.describe('1.3b a failed send', () => {
   async function sendFailing(page, failure) {
     await boot(page);
@@ -177,6 +197,59 @@ test.describe('1.3b a failed send', () => {
     await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
     await page.getByRole('button', { name: 'Reload conversation' }).click();
     await expect(page.locator('.zerr')).toHaveCount(0);
+  });
+});
+
+test.describe('1.5b dials follow the conversation', () => {
+  // The dials are asserted through the composer buttons, which carry the level
+  // name — the state object is deliberately not exposed to the page, and a hook
+  // added only for a test would be a production seam nothing else needs.
+  const dialNames = (page) => page.evaluate(() => {
+    const names = ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive']
+      .concat(['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'])
+      .concat(['None', 'Restricted']);
+    return [...document.querySelectorAll('button')]
+      .map((b) => b.textContent.trim())
+      .filter((t) => names.includes(t));
+  });
+
+  test('opening a conversation adopts the dials it last ran at', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    await expect(page.locator('.zmd').first()).toBeVisible();
+    // The mock reports effort 3 / verbosity 1 / tools 1 for every conversation.
+    await expect.poll(() => dialNames(page)).toEqual(['Deep', 'Concise', 'Restricted']);
+  });
+
+  test('a new conversation returns to the composer defaults', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('Why is decode latency spiking under load?').click();
+    await expect.poll(() => dialNames(page)).toEqual(['Deep', 'Concise', 'Restricted']);
+    await page.getByTitle('New conversation').first().click();
+    await expect.poll(() => dialNames(page)).toEqual(['Balanced', 'Standard', 'Comprehensive']);
+  });
+});
+
+test.describe('1.5c the tools dial follows the caller role', () => {
+  const toolsMenu = async (page) => {
+    await page.getByTitle('Tools').click();
+    return page.evaluate(() => [...document.querySelectorAll('button span')]
+      .map((s) => s.textContent.trim())
+      .filter((t) => ['None', 'Restricted', 'Comprehensive'].includes(t)));
+  };
+
+  test('an admin is offered every mode, Comprehensive included', async ({ page }) => {
+    await boot(page);
+    await expect.poll(() => toolsMenu(page)).toEqual(['None', 'Restricted', 'Comprehensive']);
+  });
+
+  test('a non-admin is offered None and Restricted, and starts at Restricted', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_ROLE__ = 'user'; });
+    await boot(page);
+    await expect(page.getByTitle('Tools')).toContainText('Restricted');
+    await expect.poll(() => toolsMenu(page)).toEqual(['None', 'Restricted']);
   });
 });
 
@@ -399,6 +472,24 @@ test.describe('1.11 opening a conversation', () => {
     // falls back to the home page while the next one loads.
     await expect(page.locator('.z-convtitle')).not.toContainText('Trace the substrate redo log replay');
     await expect(page.getByRole('heading', { name: HOME })).toHaveCount(0);
+    // And from the drawer's list.
+    await page.getByTitle('Expand sidebar').click();
+    await expect(page.locator('.z-sb')).toBeVisible();
+    await expect(page.locator('.z-sb').getByText('Trace the substrate redo log replay')).toHaveCount(0);
+  });
+
+  test('on a phone the drawer shows “Show archived”, off by default and off again after a reload', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    const toggle = page.locator('.z-sb').getByText('Show archived');
+    await expect(toggle).toBeInViewport();
+    await expect(page.locator('.z-sb').getByText('Scratch notes on WS reconnect backoff')).toHaveCount(0);
+    await toggle.click();
+    await expect(page.locator('.z-sb').getByText('Scratch notes on WS reconnect backoff')).toBeVisible();
+    await boot(page);
+    await page.getByTitle('Expand sidebar').click();
+    await expect(page.locator('.z-sb').getByText('Scratch notes on WS reconnect backoff')).toHaveCount(0);
   });
 
   test('a tool round shows its result’s prefill progress, gone once the answer starts', async ({ page }) => {
@@ -473,6 +564,48 @@ test.describe('1.13 phone chrome', () => {
     await page.waitForFunction(() => window.__ZEND_READY__ === true);
     await expect(page.getByText('Starting up')).toHaveCount(0);
   });
+
+  // iOS keeps the layout viewport at full height when the keyboard opens and
+  // pans the visible area; only `visualViewport` reports it. A stand-in for it
+  // is installed before the page loads, then moved the way iOS moves it.
+  async function fakeVisualViewport(page) {
+    await page.addInitScript(() => {
+      const vv = new EventTarget();
+      Object.assign(vv, { width: 390, height: 844, offsetLeft: 0, offsetTop: 0, scale: 1 });
+      Object.defineProperty(window, 'visualViewport', { configurable: true, get: () => vv });
+      window.__fakeVV = vv;
+    });
+  }
+  const railBox = (page) => page.evaluate(() => {
+    const r = document.querySelector('.z-rail').getBoundingClientRect();
+    return { top: Math.round(r.top), height: Math.round(r.height) };
+  });
+
+  test('the rail stays in the visible area when the keyboard opens', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await fakeVisualViewport(page);
+    await boot(page);
+    expect(await railBox(page)).toEqual({ top: 0, height: 844 });
+    // The keyboard takes the bottom 336px and iOS pans the visible area down by as much.
+    await page.evaluate(() => {
+      const vv = window.__fakeVV;
+      vv.height = 508; vv.offsetTop = 336;
+      vv.dispatchEvent(new Event('resize'));
+    });
+    expect(await railBox(page)).toEqual({ top: 336, height: 508 });
+  });
+
+  test('a pinch-zoom leaves the shell at full size', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await fakeVisualViewport(page);
+    await boot(page);
+    await page.evaluate(() => {
+      const vv = window.__fakeVV;
+      vv.scale = 2; vv.height = 422; vv.offsetTop = 200;
+      vv.dispatchEvent(new Event('resize'));
+    });
+    expect(await railBox(page)).toEqual({ top: 0, height: 844 });
+  });
 });
 
 test.describe('1.10 cross-cutting', () => {
@@ -498,5 +631,53 @@ test.describe('1.10 cross-cutting', () => {
     await page.locator('#zend-prompt').click();
     await page.locator('.z-chatscroll').click({ position: { x: 200, y: 50 } }).catch(() => {});
     expect(await page.evaluate(() => document.activeElement && document.activeElement.id)).toBe('zend-prompt');
+  });
+});
+
+test.describe('1.14 background ingest bar', () => {
+  // window.__ZEND_MOCK_INGEST_BACKLOG__ (zend-api.mock.js) simulates a
+  // draining backlog: total 5, bumps to 7 on the 3rd status poll (a file
+  // changed mid-drain — more work, not a bug), then clears to null once
+  // processed catches up — mirroring the real daemon's `IngestBacklog`,
+  // which resets to zero at that exact instant rather than reporting a
+  // `processed === total` frame.
+  test('appears under the chat, grows past a mid-drain bump, then disappears', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_INGEST_BACKLOG__ = true; });
+    await boot(page, { conv: '1' });
+
+    const bar = page.locator('#zend-ingest');
+    await expect(bar).toBeVisible();
+    const track = bar.locator('.z-ingest-track');
+    const fill = bar.locator('.z-ingest-fill');
+
+    const fillPct = async () => parseInt(await fill.evaluate((el) => el.style.width), 10);
+    const firstPct = await fillPct();
+
+    // Wait past the 3rd poll's total bump (5 -> 7): the fill must not simply
+    // climb monotonically to 100% — it should read a lower percentage once
+    // the total grows, proving `total` is re-read every poll, not cached.
+    await expect.poll(() => track.getAttribute('aria-valuemax'), { timeout: 8000 }).toBe('7');
+    const afterBumpPct = await fillPct();
+    expect(afterBumpPct).toBeLessThan(100);
+
+    // It keeps draining and eventually disappears once processed catches total.
+    await expect(bar).toHaveCount(0, { timeout: 15000 });
+    expect(firstPct).toBeGreaterThanOrEqual(0); // sanity: the first read wasn't NaN
+  });
+
+  test('mobile shows the count without the last-file label; desktop shows both', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_INGEST_BACKLOG__ = true; });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await boot(page, { conv: '1' });
+    const bar = page.locator('#zend-ingest');
+    await expect(bar).toBeVisible();
+    await expect(bar.locator('.z-ingest-item')).toHaveCount(0);
+    await expect(bar.locator('.z-ingest-label')).toHaveCount(0);
+    await expect(bar.locator('.z-ingest-count')).toBeVisible();
+
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.waitForFunction(() => window.innerWidth >= 1100);
+    await expect(bar.locator('.z-ingest-item')).toBeVisible();
+    await expect(bar.locator('.z-ingest-label')).toBeVisible();
   });
 });

@@ -12,7 +12,8 @@
 //! contiguously exactly as ggml's `[n_embd, hc, T]` does, and the `[hc_dim]`
 //! norm weights apply as a plain broadcast.
 
-use candle::{Result, Tensor};
+use candle::wave_provenance::WaveTicket;
+use candle::{LiveTensor, Result, Tensor};
 
 /// Microbench + `ncu` target for the three fused kernels, with its own
 /// correctness gate (§0.4 rule 4).
@@ -20,6 +21,8 @@ use candle::{Result, Tensor};
 pub mod bench;
 #[cfg(feature = "cuda")]
 mod cuda_fused;
+#[cfg(feature = "cuda")]
+pub mod ko;
 
 /// One hyper-connection module's weights (two per layer: pre-mixer, pre-FFN;
 /// one at the head with no `inject`).
@@ -46,6 +49,13 @@ pub struct HcWeights {
     /// the same last-ulp class as any tile-shape change. Both operands were
     /// already dense F32 (`dequantize` at load), so no quantization scale is
     /// shared between the two halves and there is nothing to re-derive.
+    ///
+    /// **The gate rows carry the read gate's `1/hc`**, folded in by
+    /// [`Self::from_checkpoint`]. The algebra scales the gate projection by
+    /// `1/hc` before its SiLU; with `hc` a power of two that scale is exact in
+    /// floating point, so applying it to the weight once gives the same bits as
+    /// applying it to every output row — and removes a full pass over
+    /// `[rows, low_rank]` per call, 96 times a forward.
     pub down: Tensor,
     /// `[hc_dim, low_rank]`. Its second dimension is what says where
     /// [`Self::down`] splits — see [`HcWeights::low_rank`].
@@ -53,6 +63,32 @@ pub struct HcWeights {
 }
 
 impl HcWeights {
+    /// A module from its checkpoint tensors: the norm gain, the `down`
+    /// projection (gate rows, then — on a module that injects — the inject rows
+    /// stacked beneath), and the `up` projection. The read gate's `1/hc` is
+    /// folded into the gate rows here, once; see [`Self::down`].
+    ///
+    /// Every loader builds a module through this, so the fold cannot be applied
+    /// by one and forgotten by another.
+    pub fn from_checkpoint(norm: Tensor, down: Tensor, up: Tensor, hc: usize) -> Result<Self> {
+        if !hc.is_power_of_two() {
+            candle::bail!(
+                "hc={hc} is not a power of two: folding the gate's 1/hc into its weight would \
+                 round, so the folded and unfolded forms would no longer agree bit for bit"
+            );
+        }
+        let low_rank = up.dim(1)?;
+        let rows = down.dim(0)?;
+        let scale = 1.0 / hc as f64;
+        let gate = (down.narrow(0, 0, low_rank)? * scale)?;
+        let down = if rows > low_rank {
+            Tensor::cat(&[&gate, &down.narrow(0, low_rank, rows - low_rank)?], 0)?
+        } else {
+            gate
+        };
+        Ok(Self { norm, down, up })
+    }
+
     /// The read gate's bottleneck, and the row at which [`Self::down`] splits
     /// into the gate projection and the inject projection.
     ///
@@ -69,6 +105,51 @@ impl HcWeights {
     }
 }
 
+/// A hyper-connection module's weights, as the read half computes with them.
+///
+/// Two forms, the same split every projection in this stack has: [`HcWeights`]
+/// holds the F32 checkpoint and is the definition the CPU oracle runs;
+/// [`ko::HcWeightsKo`] holds the two projections KO-quantized for the engine's
+/// int8 matmul. The mix is written once against this and cannot tell them
+/// apart.
+pub trait HcProject {
+    /// The `[hc_dim]` grouped-norm gain.
+    fn norm(&self) -> &Tensor;
+    /// `xn_flat · downᵀ`: the gate columns, then the inject columns beneath
+    /// them on a module that injects.
+    fn down<'w>(&self, xn_flat: &LiveTensor<'w>) -> Result<LiveTensor<'w>>;
+    /// `lo · upᵀ`: the raw gate, `[t, hc_dim]`.
+    fn up<'w>(&self, lo: &LiveTensor<'w>) -> Result<LiveTensor<'w>>;
+    /// The leading columns of [`Self::down`]'s output the SiLU takes — the
+    /// gate rank, or a padding of it whose extra columns are exactly zero.
+    fn gate_cols(&self) -> usize;
+    /// Where the inject columns start in [`Self::down`]'s output, on a module
+    /// that injects.
+    fn inject_col(&self) -> Option<usize>;
+}
+
+impl HcProject for HcWeights {
+    fn norm(&self) -> &Tensor {
+        &self.norm
+    }
+
+    fn down<'w>(&self, xn_flat: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
+        xn_flat.matmul(&self.down.t()?)
+    }
+
+    fn up<'w>(&self, lo: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
+        lo.matmul(&self.up.t()?)
+    }
+
+    fn gate_cols(&self) -> usize {
+        self.up.dims()[1]
+    }
+
+    fn inject_col(&self) -> Option<usize> {
+        (self.down.dims()[0] > self.gate_cols()).then(|| self.gate_cols())
+    }
+}
+
 /// Grouped RMSNorm over the wide residual: the reduction runs per stream
 /// (over `n_embd`), the `[hc_dim]` weight scales the flattened layout.
 ///
@@ -78,12 +159,17 @@ impl HcWeights {
 /// the hot half of the eager Gated-Residual cost. The `[hc_dim]` gain cannot
 /// ride the kernel's alpha (that is per-`n_embd`), so it applies as one flat
 /// broadcast after.
-pub fn hc_grouped_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+pub fn hc_grouped_norm(
+    x: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+    root: Option<WaveTicket>,
+) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if matches!(x.device(), candle::Device::Cuda(_)) {
         // One launch: the reduction and the per-(stream, column) gain in a
         // single pass.
-        return cuda_fused::norm(x, weight, eps);
+        return cuda_fused::norm(x, weight, eps, root);
     }
     eager_grouped_norm(x, weight, eps)
 }
@@ -103,42 +189,39 @@ fn eager_grouped_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 /// The read half: collapse the wide residual `[T, hc, n_embd]` into the block
 /// input `[T, n_embd]`, and produce the `[T, hc]` write weights for
 /// [`hc_combine`] when the module carries an `inject`.
-pub fn hc_mix(x: &Tensor, w: &HcWeights, eps: f64) -> Result<(Tensor, Option<Tensor>)> {
+/// `root`, when present, is the ticket of the open phase this mix's transients
+/// belong to — a layer's attention or FFN phase, or the forward phase the head
+/// scores in. Everything it produces is consumed before that phase closes — the
+/// block input by the mixer, the FFN or the LM head, the inject weights by
+/// [`hc_combine`] — which is what makes rooting them on the span sound. The
+/// residual `hc_combine` updates is deliberately NOT on it: that crosses every
+/// phase boundary.
+pub fn hc_mix(
+    x: &Tensor,
+    w: &impl HcProject,
+    eps: f64,
+    root: Option<WaveTicket>,
+) -> Result<(Tensor, Option<Tensor>)> {
     let (t, hc, n_embd) = x.dims3()?;
     let dev = x.device();
     let g = crate::models::profile::gpu_span("hc_mix:norm", dev);
-    let xn = hc_grouped_norm(x, &w.norm, eps)?;
+    let xn = hc_grouped_norm(x, w.norm(), eps, root)?;
     let xn_flat = xn.reshape((t, hc * n_embd))?;
     g.end();
 
     // Low-rank read gate: silu(down(xn)/hc) → up(·), with the inject projection
-    // riding the SAME down GEMM (see [`HcWeights::down`]). The projections stay
-    // in cuBLAS — they are real GEMMs, and `ncu` puts them at ~50% SM and only
-    // 10–14% DRAM, so they are compute-limited on the SIMT F32 pipe rather than
-    // starved of bandwidth. That is why stacking wins: it is not a read that
+    // riding the SAME down GEMM (see [`HcWeights::down`]) and the `1/hc` already
+    // folded into its gate rows. Stacking wins because it is not a read that
     // disappears, it is a whole GEMM's worth of work.
     let g = crate::models::profile::gpu_span("hc_mix:lowrank", dev);
-    let low_rank = w.low_rank()?;
-    let proj = xn_flat.matmul(&w.down.t()?)?;
-    let injects = w.injects()?;
-    // **The one copy this costs, stated rather than hidden.** Splitting the
-    // stacked output leaves both halves with a row stride of `low_rank + hc`,
-    // and candle's matmul refuses a strided operand outright rather than
-    // copying behind the caller's back. So the gate half is compacted here —
-    // an allocate-plus-copy, which invariant 2 forbids as a rule and which is
-    // taken deliberately: `[t, low_rank]` measured 9 µs at 2,048 tokens against
-    // the 215 µs the stacking saves. The alternatives were both worse in the
-    // way the invariant actually cares about — padding `up` with zero columns
-    // so the stride is swallowed, or teaching `gr_combine` a stride argument —
-    // because each bends a shared component to fit one model's weight layout.
-    let lo = if injects {
-        proj.narrow(1, 0, low_rank)?.contiguous()?
-    } else {
-        proj.clone()
-    };
-    let lo = (lo * (1.0 / hc as f64))?;
-    let lo = lo.broadcast_mul(&candle_nn::ops::sigmoid(&lo)?)?; // silu
-    let gate_raw = lo.matmul(&w.up.t()?)?;
+    let proj = w.down(&xn_flat)?;
+    // **One pass for the whole prelude.** The SiLU reads the gate half as a
+    // strided view of the stacked output and writes a dense `[t, gate_cols]` —
+    // which is also the compaction the up-projection needs, since neither
+    // matmul takes a strided operand. One launch where there were three
+    // (compact, sigmoid, multiply) and a scale the weight now carries.
+    let lo = proj.narrow(1, 0, w.gate_cols())?.silu()?;
+    let gate_raw = w.up(&lo)?;
     g.end();
 
     let g = crate::models::profile::gpu_span("hc_mix:gate_mean", dev);
@@ -150,7 +233,7 @@ pub fn hc_mix(x: &Tensor, w: &HcWeights, eps: f64) -> Result<(Tensor, Option<Ten
             // registers. `gate` arrives RAW from the up-projection here — the
             // kernel applies the sigmoid, so the eager path's separate pass
             // over `[t, hc·n_embd]` disappears with it.
-            cuda_fused::mix(&xn, &gate_raw, hc, n_embd)?
+            cuda_fused::mix(&xn, &gate_raw, hc, n_embd, root)?
         } else {
             eager_gate_mean(&xn_flat, &gate_raw, t, hc, n_embd)?
         }
@@ -160,17 +243,13 @@ pub fn hc_mix(x: &Tensor, w: &HcWeights, eps: f64) -> Result<(Tensor, Option<Ten
     g.end();
 
     // What used to be a second full-width GEMM over `xn_flat` is now the tail
-    // rows of the one above, so this span holds only the compaction of a
-    // `[t, hc]` slice — `hc` is 4, so it is 32 KiB at prefill width. The span
-    // is kept rather than deleted because its collapse against the profile's
-    // previous run is the visible half of the change.
-    let g = crate::models::profile::gpu_span("hc_mix:inject", dev);
-    let inject = if injects {
-        Some(proj.narrow(1, low_rank, hc)?.contiguous()?)
-    } else {
-        None
+    // columns of the one above, handed on as a strided `[t, hc]` view of it:
+    // `gr_combine` reads the inject through its row stride, so there is nothing
+    // to compact.
+    let inject = match w.inject_col() {
+        Some(col) => Some(proj.narrow(1, col, hc)?),
+        None => None,
     };
-    g.end();
     Ok((mixed, inject))
 }
 
@@ -197,25 +276,34 @@ fn eager_gate_mean(
     acc.squeeze(1)? * (1.0 / hc as f64)
 }
 
-/// The write half: scatter the block output back across the streams.
-/// `2·sigmoid(inject/hc)` centres the weights on 1, so a zero injection is a
-/// plain residual add on every stream.
-pub fn hc_combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tensor> {
+/// The write half: scatter the block output back across the streams, into the
+/// residual **in place**. `2·sigmoid(inject/hc)` centres the weights on 1, so a
+/// zero injection is a plain residual add on every stream.
+///
+/// `res` is the caller's own residual — the wave's buffer, which only this
+/// forward reads — held `&mut` as `Tensor::add_mut` holds it, so the wide stream
+/// is one buffer for the whole forward rather than one per combine. A row-range
+/// view of it is a valid `res`, which is how each of a wave's groups combines
+/// its own rows without a concatenation between. `block_out` and `inject` are
+/// only read, so they may be wave-scoped: this is where a phase's result is
+/// consumed.
+pub fn hc_combine(res: &mut Tensor, block_out: &LiveTensor<'_>, inject: &Tensor) -> Result<()> {
     #[cfg(feature = "cuda")]
     if matches!(res.device(), candle::Device::Cuda(_)) {
         // One launch, one read and one write of the wide buffer, against the
-        // eager chain's four passes below.
+        // eager chain's four passes below and the scatter term it allocates.
         return cuda_fused::combine(res, block_out, inject);
     }
     eager_combine(res, block_out, inject)
 }
 
-/// The scatter as eager ops — the reference [`cuda_fused::combine`] reproduces.
-fn eager_combine(res: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tensor> {
+/// The scatter as eager ops, in place — the reference [`cuda_fused::combine`]
+/// reproduces.
+fn eager_combine(res: &mut Tensor, block_out: &LiveTensor<'_>, inject: &Tensor) -> Result<()> {
     let (t, hc, _n_embd) = res.dims3()?;
     let w = (candle_nn::ops::sigmoid(&(inject * (1.0 / hc as f64))?)? * 2.0)?;
     let w = w.reshape((t, hc, 1))?;
-    res.add(&block_out.unsqueeze(1)?.broadcast_mul(&w)?)
+    res.add_mut(&block_out.unsqueeze(1)?.broadcast_mul(&w)?)
 }
 
 #[cfg(test)]
@@ -248,12 +336,72 @@ mod tests {
     fn tiny(hc: usize, n_embd: usize, lr: usize, with_inject: bool, dev: &Device) -> HcWeights {
         let hc_dim = hc * n_embd;
         let rows = lr + if with_inject { hc } else { 0 };
-        HcWeights {
-            norm: lcg_tensor(&[hc_dim], 11, dev).affine(0.2, 1.0).unwrap(),
-            down: lcg_tensor(&[rows, hc_dim], 12, dev)
+        HcWeights::from_checkpoint(
+            lcg_tensor(&[hc_dim], 11, dev).affine(0.2, 1.0).unwrap(),
+            lcg_tensor(&[rows, hc_dim], 12, dev)
                 .affine(0.3, 0.)
                 .unwrap(),
-            up: lcg_tensor(&[hc_dim, lr], 13, dev).affine(0.3, 0.).unwrap(),
+            lcg_tensor(&[hc_dim, lr], 13, dev).affine(0.3, 0.).unwrap(),
+            hc,
+        )
+        .unwrap()
+    }
+
+    /// The fold scales exactly the gate rows by exactly `1/hc` — raw values, not
+    /// a tolerance: with `hc` a power of two the scale is exact — and leaves the
+    /// inject rows stacked beneath them untouched.
+    #[test]
+    fn the_checkpoint_fold_scales_only_the_gate_rows() {
+        let dev = dev();
+        let down = Tensor::new(&[[4.0f32, -8.0], [1.0, 2.0], [3.0, 5.0]], &dev).unwrap();
+        let up = Tensor::new(&[[1.0f32, 1.0], [1.0, 1.0]], &dev).unwrap();
+        let norm = Tensor::new(&[1.0f32, 1.0], &dev).unwrap();
+        let w = HcWeights::from_checkpoint(norm, down, up, 4).unwrap();
+        assert_eq!(
+            w.down.to_vec2::<f32>().unwrap(),
+            [[1.0, -2.0], [0.25, 0.5], [3.0, 5.0]],
+            "gate rows × 1/4, inject row unchanged"
+        );
+        assert_eq!(w.low_rank().unwrap(), 2);
+        assert!(w.injects().unwrap());
+        assert_eq!(w.gate_cols(), 2);
+        assert_eq!(w.inject_col(), Some(2));
+    }
+
+    /// A non-power-of-two `hc` would make the fold round, so it is refused.
+    #[test]
+    fn a_fold_that_would_round_is_refused() {
+        let dev = dev();
+        let t = |r: usize, c: usize| Tensor::ones((r, c), DType::F32, &dev).unwrap();
+        let err = HcWeights::from_checkpoint(t(1, 6).flatten_all().unwrap(), t(2, 6), t(6, 2), 3)
+            .expect_err("hc = 3 must be refused")
+            .to_string();
+        assert!(err.contains("not a power of two"), "{err}");
+    }
+
+    /// Combining into a row range of the residual updates those rows and no
+    /// others — how a wave's groups each write their own rows in place.
+    #[test]
+    fn a_row_range_combine_touches_only_its_rows() {
+        let dev = dev();
+        let (t, hc, n_embd) = (4usize, 2usize, 3usize);
+        let res = lcg_tensor(&[t, hc, n_embd], 91, &dev);
+        let before = res.copy().unwrap();
+        let out = lcg_tensor(&[2, n_embd], 92, &dev);
+        let zero = Tensor::zeros((2, hc), DType::F32, &dev).unwrap();
+        let mut rows = res.narrow(0, 1, 2).unwrap();
+        hc_combine(&mut rows, &out, &zero).unwrap();
+        let after = res.to_vec3::<f32>().unwrap();
+        let was = before.to_vec3::<f32>().unwrap();
+        assert_eq!(after[0], was[0], "row 0 is outside the range");
+        assert_eq!(after[3], was[3], "row 3 is outside the range");
+        let o = out.to_vec2::<f32>().unwrap();
+        for (r, orow) in [(1usize, 0usize), (2, 1)] {
+            for s in 0..hc {
+                for j in 0..n_embd {
+                    assert_eq!(after[r][s][j], was[r][s][j] + o[orow][j], "row {r}");
+                }
+            }
         }
     }
 
@@ -265,7 +413,8 @@ mod tests {
         let res = lcg_tensor(&[t, hc, n_embd], 21, &dev);
         let out = lcg_tensor(&[t, n_embd], 22, &dev);
         let zero_inject = Tensor::zeros((t, hc), DType::F32, &dev).unwrap();
-        let got = hc_combine(&res, &out, &zero_inject).unwrap();
+        let mut got = res.copy().unwrap();
+        hc_combine(&mut got, &out, &zero_inject).unwrap();
         let want = res
             .broadcast_add(&out.reshape((t, 1, n_embd)).unwrap())
             .unwrap();
@@ -297,7 +446,7 @@ mod tests {
             .unwrap()
             .contiguous()
             .unwrap();
-        let (mixed, inject) = hc_mix(&wide, &w, 1e-6).unwrap();
+        let (mixed, inject) = hc_mix(&wide, &w, 1e-6, None).unwrap();
         assert_eq!(mixed.dims(), &[t, n_embd]);
         assert_eq!(inject.unwrap().dims(), &[t, hc]);
         // The four streams were identical but the [hc_dim] norm gamma is not,
@@ -342,7 +491,7 @@ mod tests {
         let inj = lcg_tensor(&[hc, hc_dim], 65, &dev).affine(0.3, 0.).unwrap();
 
         // The two-projection form this change replaces, written out in full.
-        let xn = hc_grouped_norm(&x, &norm, eps).unwrap();
+        let xn = hc_grouped_norm(&x, &norm, eps, None).unwrap();
         let xn_flat = xn.reshape((t, hc_dim)).unwrap();
         let lo = (xn_flat.matmul(&down.t().unwrap()).unwrap() * (1.0 / hc as f64)).unwrap();
         let lo = lo
@@ -352,21 +501,17 @@ mod tests {
         let want_mixed = eager_gate_mean(&xn_flat, &gate_raw, t, hc, n_embd).unwrap();
         let want_inject = xn_flat.matmul(&inj.t().unwrap()).unwrap();
 
-        // The stacked form, through the production entry point.
-        let w = HcWeights {
-            norm,
-            down: Tensor::cat(&[&down, &inj], 0)
-                .unwrap()
-                .contiguous()
-                .unwrap(),
-            up,
-        };
+        // The stacked form, through the production entry point — which also
+        // folds the gate's `1/hc` into the weight the longhand form applies to
+        // the output.
+        let w = HcWeights::from_checkpoint(norm, Tensor::cat(&[&down, &inj], 0).unwrap(), up, hc)
+            .unwrap();
         assert!(
             w.injects().unwrap(),
             "the stacked weight must report inject"
         );
         assert_eq!(w.low_rank().unwrap(), lr);
-        let (got_mixed, got_inject) = hc_mix(&x, &w, eps).unwrap();
+        let (got_mixed, got_inject) = hc_mix(&x, &w, eps, None).unwrap();
         let got_inject = got_inject.expect("a stacked module injects");
 
         let gap = |a: &Tensor, b: &Tensor| -> f32 {
@@ -390,7 +535,7 @@ mod tests {
         let dev = dev();
         let w = tiny(4, 6, 3, false, &dev);
         let x = lcg_tensor(&[2, 4, 6], 41, &dev);
-        let (_, inject) = hc_mix(&x, &w, 1e-6).unwrap();
+        let (_, inject) = hc_mix(&x, &w, 1e-6, None).unwrap();
         assert!(inject.is_none());
     }
 
@@ -466,7 +611,7 @@ mod tests {
             let x = lcg_tensor(&[t, hc, d], 71, &gpu);
             let w = lcg_tensor(&[hc * d], 72, &gpu).affine(0.2, 1.0).unwrap();
             let want = eager_grouped_norm(&x, &w, 1e-6).unwrap();
-            let got = cuda_fused::norm(&x, &w, 1e-6).unwrap();
+            let got = cuda_fused::norm(&x, &w, 1e-6, None).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "norm parity {t}x{hc}x{d}: rel gap {gap}");
         }
@@ -485,7 +630,7 @@ mod tests {
                 .unwrap();
             let want =
                 eager_gate_mean(&xn.reshape((t, hc * d)).unwrap(), &gate_raw, t, hc, d).unwrap();
-            let got = cuda_fused::mix(&xn, &gate_raw, hc, d).unwrap();
+            let got = cuda_fused::mix(&xn, &gate_raw, hc, d, None).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "mix parity {t}x{hc}x{d}: rel gap {gap}");
         }
@@ -499,11 +644,95 @@ mod tests {
             let res = lcg_tensor(&[t, hc, d], 75, &gpu);
             let out = lcg_tensor(&[t, d], 76, &gpu);
             let inj = lcg_tensor(&[t, hc], 77, &gpu);
-            let want = eager_combine(&res, &out, &inj).unwrap();
-            let got = cuda_fused::combine(&res, &out, &inj).unwrap();
+            let mut want = res.copy().unwrap();
+            eager_combine(&mut want, &out, &inj).unwrap();
+            let mut got = res.copy().unwrap();
+            cuda_fused::combine(&mut got, &out, &inj).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "combine parity {t}x{hc}x{d}: rel gap {gap}");
         }
+    }
+
+    /// The inject as the model hands it over: the tail columns of the pre-mix's
+    /// stacked `[t, low_rank + hc]` projection, read through its row stride.
+    /// Must equal the same values as a dense `[t, hc]` tensor, bit for bit —
+    /// the stride changes which address is read, never the arithmetic.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn fused_combine_reads_a_row_strided_inject() {
+        let Some(gpu) = cuda() else { return };
+        let (t, hc, d, low_rank) = (5usize, 4usize, 258usize, 6usize);
+        let res = lcg_tensor(&[t, hc, d], 91, &gpu);
+        let out = lcg_tensor(&[t, d], 92, &gpu);
+        let proj = lcg_tensor(&[t, low_rank + hc], 93, &gpu);
+        let strided = proj.narrow(1, low_rank, hc).unwrap();
+        assert_eq!(
+            strided.stride(),
+            &[low_rank + hc, 1],
+            "the test's own premise"
+        );
+        let dense =
+            Tensor::from_vec(strided.to_vec2::<f32>().unwrap().concat(), (t, hc), &gpu).unwrap();
+        let mut want = res.copy().unwrap();
+        cuda_fused::combine(&mut want, &out, &dense).unwrap();
+        let mut got = res.copy().unwrap();
+        cuda_fused::combine(&mut got, &out, &strided).unwrap();
+        assert_eq!(
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            want.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    /// A row-range view of a device residual is updated where it stands — the
+    /// kernel's start offset — and the rows around it are untouched.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn fused_combine_updates_a_row_range_in_place() {
+        let Some(gpu) = cuda() else { return };
+        let (t, hc, d) = (4usize, 4usize, 2560usize);
+        let res = lcg_tensor(&[t, hc, d], 101, &gpu);
+        let before = res.copy().unwrap();
+        let out = lcg_tensor(&[2, d], 102, &gpu);
+        let inj = lcg_tensor(&[2, hc], 103, &gpu);
+        let mut rows = res.narrow(0, 1, 2).unwrap();
+        cuda_fused::combine(&mut rows, &out, &inj).unwrap();
+
+        let mut want = before.narrow(0, 1, 2).unwrap().copy().unwrap();
+        eager_combine(&mut want, &out, &inj).unwrap();
+        let gap = rel_gap(&res.narrow(0, 1, 2).unwrap(), &want);
+        assert!(gap < GAP, "row-range combine: rel gap {gap}");
+        let row = |t: &Tensor, r: usize| {
+            t.narrow(0, r, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        for r in [0usize, 3] {
+            assert_eq!(
+                row(&res, r),
+                row(&before, r),
+                "row {r} is outside the range"
+            );
+        }
+    }
+
+    /// The launchers are instantiated only for powers of two up to
+    /// `GR_MAX_HC`; any other count would launch nothing and leave the output
+    /// unwritten, so the host must refuse it rather than return garbage.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn fused_kernels_refuse_an_uninstantiated_stream_count() {
+        let Some(gpu) = cuda() else { return };
+        let (t, hc, d) = (2usize, 3usize, 64usize);
+        let xn = lcg_tensor(&[t, hc, d], 95, &gpu);
+        let gate_raw = lcg_tensor(&[t, hc * d], 96, &gpu);
+        assert!(cuda_fused::mix(&xn, &gate_raw, hc, d, None).is_err());
+        let mut res = lcg_tensor(&[t, hc, d], 97, &gpu);
+        let out = lcg_tensor(&[t, d], 98, &gpu);
+        let inj = lcg_tensor(&[t, hc], 99, &gpu);
+        assert!(cuda_fused::combine(&mut res, &out, &inj).is_err());
     }
 
     #[test]
@@ -516,7 +745,8 @@ mod tests {
         let res = lcg_tensor(&[t, hc, d], 77, &gpu);
         let out = lcg_tensor(&[t, d], 78, &gpu);
         let zero = Tensor::zeros((t, hc), DType::F32, &gpu).unwrap();
-        let got = hc_combine(&res, &out, &zero).unwrap();
+        let mut got = res.copy().unwrap();
+        hc_combine(&mut got, &out, &zero).unwrap();
         let want = res.broadcast_add(&out.reshape((t, 1, d)).unwrap()).unwrap();
         let gap = rel_gap(&got, &want);
         assert!(gap < 1e-6, "zero-inject identity broken on device: {gap}");
@@ -570,7 +800,7 @@ mod tests {
             let dense = Tensor::from_vec(host[skip..].to_vec(), (t, hc, d), &gpu).unwrap();
             let w = lcg_tensor(&[hc * d], 82, &gpu).affine(0.2, 1.0).unwrap();
             let want = eager_grouped_norm(&dense, &w, 1e-6).unwrap();
-            let got = cuda_fused::norm(&view, &w, 1e-6).unwrap();
+            let got = cuda_fused::norm(&view, &w, 1e-6, None).unwrap();
             let gap = rel_gap(&got, &want);
             assert!(gap < GAP, "offset-{skip} norm parity: rel gap {gap}");
         }
@@ -585,8 +815,8 @@ mod tests {
         let (t, hc, d, lr) = (4usize, 4usize, 2560usize, 8usize);
         let w = tiny(hc, d, lr, true, &gpu);
         let x = lcg_tensor(&[t, hc, d], 79, &gpu);
-        let a = hc_mix(&x, &w, 1e-6).unwrap().0.flatten_all().unwrap();
-        let b = hc_mix(&x, &w, 1e-6).unwrap().0.flatten_all().unwrap();
+        let a = hc_mix(&x, &w, 1e-6, None).unwrap().0.flatten_all().unwrap();
+        let b = hc_mix(&x, &w, 1e-6, None).unwrap().0.flatten_all().unwrap();
         assert_eq!(
             a.to_vec1::<f32>().unwrap(),
             b.to_vec1::<f32>().unwrap(),
@@ -601,12 +831,12 @@ mod tests {
         let (t, hc, n_embd) = (1usize, 2usize, 8usize);
         let w = Tensor::ones(hc * n_embd, DType::F32, &dev).unwrap();
         let x = lcg_tensor(&[t, hc, n_embd], 51, &dev);
-        let base = hc_grouped_norm(&x, &w, 1e-6).unwrap();
+        let base = hc_grouped_norm(&x, &w, 1e-6, None).unwrap();
         // Double stream 0, keep stream 1.
         let s0 = x.narrow(1, 0, 1).unwrap().affine(2.0, 0.).unwrap();
         let s1 = x.narrow(1, 1, 1).unwrap();
         let x2 = Tensor::cat(&[s0, s1], 1).unwrap();
-        let bumped = hc_grouped_norm(&x2, &w, 1e-6).unwrap();
+        let bumped = hc_grouped_norm(&x2, &w, 1e-6, None).unwrap();
         let d = base
             .narrow(1, 1, 1)
             .unwrap()

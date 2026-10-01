@@ -822,6 +822,15 @@ pub struct LayerSchema {
     /// Total turn-budget (in tokens) distributed across all visible layers
     /// when this layer is the projection target.
     pub window: usize,
+    /// Tokens of THIS layer's conversations a fast-path tool read may inject
+    /// into another conversation.
+    ///
+    /// A tool call whose content the corpus has already read injects that
+    /// conversation instead of re-reading the file; this bounds how much of
+    /// this layer one conversation may accumulate that way, evicted
+    /// least-recently-used. `0` keeps the layer out of the fast path, so a read
+    /// of its content always runs for real.
+    pub fast_path_window: usize,
     /// Flex weight when *some other layer* is the projection target and
     /// this layer is visible (lower than the target). Determines how much
     /// of the target's `window` this layer receives.
@@ -879,6 +888,20 @@ pub struct LayerSchema {
     /// "N / M <unit>" while the layer ingests. `None` falls back to a mode-derived
     /// default in [`crate`]'s ingest driver; non-ingest layers ignore it.
     pub ingest_unit: Option<String>,
+    /// Whether this layer's turns are projected into a **tool round** — a turn
+    /// whose user message is the results of calls the turn before made, marked
+    /// by [`super::TOOL_ROUND_SELECTOR`] (`in_tool_rounds:` in YAML, default
+    /// `true`).
+    ///
+    /// A tool round's last user turn is a tool response, so the model looks back
+    /// through the context for the question it is answering. An ingest layer's
+    /// turns are requests too — "Summarize the root folder of this project in
+    /// one or two complete sentences" — and a round that found one nearer than
+    /// the user's answered it instead: a chat asked to list a crate's modules
+    /// fetched the page and then described the workspace. `false` keeps such a
+    /// layer out of every tool round; the turn that opened the round, where the
+    /// question is the user's own last message, still sees it.
+    pub in_tool_rounds: bool,
     /// Where this layer sits in the stack a projection sees down through
     /// (`rank:` in YAML): a projection targeting a layer sees every layer of
     /// **lower** rank, and none of equal or higher rank but its own.

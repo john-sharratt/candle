@@ -61,12 +61,12 @@ Router in `zend/src/api/mod.rs` serves the embedded `web/` dir (fallback) plus:
 
 | Method & route | Handler | Returns |
 |---|---|---|
-| `GET /v1/conversations?include_archived=` | `conversations::list` | `{ conversations: ConvEntry[] }` where `ConvEntry { id, label, turn_count, archived }` |
+| `GET /v1/conversations?include_archived=` | `conversations::list` | `{ conversations: ConvEntry[] }` where `ConvEntry { id, label, turn_count, archived, updated_ms }`, most recently used first |
 | `GET /v1/conversations/:id` | `conversations::get` | `{ id, messages: [{ role, content }] }` |
 | `POST /v1/conversations/:id/archive` | `conversations::archive` | `204` |
 | `POST /v1/conversations/:id/unarchive` | `conversations::unarchive` | `204` |
 | `GET /v1/models` | `models::list` | model list |
-| `GET /v1/status` | `status::status` | `{ state: "loading"\|"ready", started_at_ms, detail, loading? }` |
+| `GET /v1/status` | `status::status` | `{ state: "loading"\|"ready", started_at_ms, detail, loading?, maintenance?, ingest_backlog? }` — `ingest_backlog: { processed, total, last_item } \| null` is the background repo_map/code_reading (+ upload) ingest queue, `null` when nothing is pending |
 | `POST /v1/chat/completions` | `chat::completions` | SSE (`status` events + OpenAI chunk deltas + stop chunk + `[DONE]`) or one JSON body |
 | `GET /ws/logs` | `ws_logs::handler` | WebSocket: replays `session.log.recent()` backlog, then live lines |
 
@@ -172,7 +172,9 @@ getProjectionDetail(convId, turn, event) -> Promise<{span, glue, sectionContent,
                                                     // one recorded point in full + the panel context (live: GET :id/projections/:turn/:event)
 getProjectionContext(convId, turns) -> Promise<{glue, sectionContent, turnContent, targetLayer}>
                                                     // the panel context for a point streamed live (live: POST :id/projection-context)
-getStatus() -> Promise<{state:"loading"|"ready", started_at_ms, detail, loading?, build}>  // GET /v1/status; gates the startup overlay; `build` (assets hash) drives the hot-reload check
+getStatus() -> Promise<{state:"loading"|"ready", started_at_ms, detail, loading?, maintenance?, ingest_backlog?, build}>
+                                                    // GET /v1/status; gates the startup overlay; `build` (assets hash) drives the hot-reload check;
+                                                    // `ingest_backlog: {processed,total,last_item}|null` drives the under-chat background-ingest bar
 getToolSchemas() -> Promise<{[tool]: JSONSchema|null}>  // GET /v1/substrate/tools; tool-call cards list every parameter from it, defaults included
 archiveConversation(id) / unarchiveConversation(id) -> Promise<void>
 streamChatCompletion(conv, text, opts, handlers) -> { cancel() }
@@ -659,8 +661,12 @@ These were settled during planning and are now binding for the sections above:
    prompt steers the model's reasoning depth and answer length. The one
    exception is **no-thinking**, handled by a dedicated **inference-level hook**
    that switches the think channel on/off (not a prompt directive). (§2.2 / §2.3)
-4. **`updated_ms`** — *Add the field to `ConvEntry`.* Track last-activity ms on
-   the conversation and serialize it. (§2.1)
+4. **`updated_ms`** — *Add the field to `ConvEntry`.* The sidebar lists the most
+   recently used conversation first. The substrate keeps no clock, so it is a
+   rank: each submit or upload stamps the conversation's `active` from a
+   counter, persisted in its `ConvState` record so replay restores it exactly;
+   the listing sorts by `(active, creation order)` and serializes each entry's
+   position (top = highest) as `updated_ms` (`zend/src/conv_order.rs`). (§2.1)
 5. **Span region (think vs answer)** — *Parse from emitted content.* Track
    whether the decode head sits between `<think>` and `</think>` in the stream
    and tag each span's region accordingly. (§2.3)
@@ -769,7 +775,8 @@ decisions; 12 is a perf guard.
 - `ChatCompletionRequest` dial fields `effort/verbosity/think`. ✅ 2 tests.
 - **No-thinking** (decision 10): `apply_no_think` prepends `/no_think` to the last
   user turn on `effort:0`/`think:false`, in the chat path. ✅ 5 tests.
-- `ConvEntry.updated_ms` (decision 4), derived from the conv id. ✅ compiles; served.
+- `ConvEntry.updated_ms` (decision 4), the most-recently-used rank from
+  `ConvState.active`. ✅ tested (`conv_order`, substrate touch + replay).
 - **Windowed-substrate endpoint** `GET /v1/conversations/:id/substrate` (§2.4):
   real engine-backed materialization (`system_prompt` + recovered turns →
   ordered sections) via the pure `substrate_view::build`, **dummy-substrate
@@ -783,7 +790,7 @@ decisions; 12 is a perf guard.
 
 - **Conversation files (§2.5) — complete.** `conv_files` storage core
   (binary→hex→tokenizable→reconstruct, byte-exact, 6 tests) + a persistent
-  `ConvFileStore` under `.substrate/conv-files/` (model-independent, 4 tests) +
+  `ConvFileStore` under `substrate/conv-files/` (model-independent, 4 tests) +
   routes `POST/GET/GET content/DELETE` with **multipart upload → SSE per-part
   progress** + GUI live adapter (`uploadFiles`/`getFileContent`/`deleteFile`).
   **Full lifecycle harness-tested over real HTTP, no model** (upload → progress →
@@ -829,5 +836,3 @@ blind):**
 - **Windowed-substrate endpoint** (§2.4) — materializes projected context.
 - **Conversation-files layer** + upload-prefill SSE + file routes (§2.5) —
   mirrors `code_read`; new substrate record kind.
-- Substrate-backed `updated_ms` (replace the id-derived value once turn
-  timestamps are exposed).

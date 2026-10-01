@@ -6,7 +6,9 @@
 //!
 //! State (token counts, recent history) is owned by the caller (DecodeState).
 
+use crate::banned_rows::banned_buffer;
 use crate::config::SamplingConfig;
+use crate::line_ends::ends_a_line;
 use crate::stencil::ban;
 use crate::token_buffer::TokenBuffer;
 use candle::cuda_backend::CudaStorageSlice;
@@ -23,6 +25,112 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 /// enough that a broken forward is caught in a few steps instead of running to
 /// the length cap.
 pub const DEGENERATE_TOKEN_RUN: u32 = 8;
+
+/// Per-sequence sampling dials, uploaded as a `[batch_size]` array and read by
+/// the kernel at `seq_dials[row]` so every row samples on its own config.
+///
+/// **The C twin is `batched_sampling::SeqDials` in `batched_sampling.cuh`.** The
+/// kernel reads these bytes back as that struct, so the field order and types
+/// here must match it exactly — every field is 4 bytes (`f32`/`i32`), packed
+/// with no padding, and `#[repr(C)]` keeps the layout. The token ids and vocab
+/// size are not here (they are the same across the wave and stay scalar).
+///
+/// Before this existed the kernel took these dials as scalars from the first
+/// row's config and applied them to the whole launch, so a wave that mixed
+/// configs — a deliberating turn beside an impulsive one, a narrator beside a
+/// reflection — sampled every row at whichever config sorted first, and one
+/// row's EOS ramp could cut another's turn off after a single token.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeqDials {
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    repeat_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    dry_multiplier: f32,
+    dry_base: f32,
+    dry_allowed_length: i32,
+    dry_range: i32,
+    eos_boost: f32,
+    eos_ramp_start: i32,
+    eos_ramp_len: i32,
+    eos_boost_max_multiplier: f32,
+    cross_turn_penalty: f32,
+    segment_close_boost: f32,
+    segment_close_token_id: i32,
+    segment_close_ramp_start: i32,
+    segment_close_ramp_len: i32,
+    segment_close_max_multiplier: f32,
+    segment_temp_boost: f32,
+}
+
+// The kernel reads this struct as a flat run of 4-byte words (all fields are
+// f32/i32), one per row of the batch, and casts back to the identically-laid-out
+// CUDA `SeqDials`. If the size or field count drifts from the CUDA side the
+// kernel reads a row at the wrong stride, so pin it: 21 fields × 4 bytes.
+const _: () = assert!(std::mem::size_of::<SeqDials>() == 84);
+
+impl SeqDials {
+    /// Read one row's dials from its config, resolving the same Option/gate logic
+    /// the scalar path applies (DRY defaults, the dynamic-EOS gate, the
+    /// segment-close-active gate) so a per-row wave behaves identically to a
+    /// uniform one row-for-row.
+    fn from_config(c: &SamplingConfig) -> Self {
+        let (dry_multiplier, dry_base, dry_allowed_length, dry_range) = match &c.dry {
+            Some(d) => (d.multiplier, d.base, d.allowed_length, d.range),
+            None => (0.0, 1.75, 2, 0),
+        };
+        let (eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier) = if c.dynamic_eos_boost {
+            (c.eos_ramp_start, c.eos_ramp_len, c.eos_boost_max_multiplier)
+        } else {
+            (0, 0, 0.0)
+        };
+        let (
+            segment_close_boost,
+            segment_close_token_id,
+            segment_close_ramp_start,
+            segment_close_ramp_len,
+            segment_close_max_multiplier,
+        ) = if c.segment_close_boost != 0.0 && c.segment_close_token_id >= 0 {
+            (
+                c.segment_close_boost,
+                c.segment_close_token_id,
+                c.segment_close_ramp_start,
+                c.segment_close_ramp_len,
+                c.segment_close_max_multiplier,
+            )
+        } else {
+            // Disabled for this row: -1 token id keeps the kernel's per-row
+            // segment-close path off even when a co-batched row has it on.
+            (0.0, -1, 0, 0, 0.0)
+        };
+        SeqDials {
+            temperature: c.temperature,
+            top_k: c.top_k,
+            top_p: c.top_p,
+            repeat_penalty: c.repeat_penalty,
+            frequency_penalty: c.frequency_penalty,
+            presence_penalty: c.presence_penalty,
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length,
+            dry_range,
+            eos_boost: c.eos_boost,
+            eos_ramp_start,
+            eos_ramp_len,
+            eos_boost_max_multiplier,
+            cross_turn_penalty: c.cross_turn_penalty,
+            segment_close_boost,
+            segment_close_token_id,
+            segment_close_ramp_start,
+            segment_close_ramp_len,
+            segment_close_max_multiplier,
+            segment_temp_boost: c.segment_temp_boost,
+        }
+    }
+}
 
 /// This struct persists across turns (owned by the Scheduler) so that
 /// DRY penalty can see a rolling window of recent tokens spanning
@@ -79,6 +187,19 @@ pub struct SequenceSamplingState {
     /// retains full repetition control.
     pub in_tool_call: bool,
 
+    /// True while the tool-call stencil is steering this sequence — it is
+    /// writing a call — whatever `in_tool_call`'s penalty policy says. Synced
+    /// from the stencil each decode step.
+    ///
+    /// **The turn's length budget does not apply while it is set**: the EOS
+    /// boost ramp sees a length of 0 and the graceful and forced EOS failsafes
+    /// stand down. Those budgets size a prose answer, and inside a call an EOS
+    /// is not an ending — the stencil intercepts it and closes the value where
+    /// it stands. A `write` whose content outran the answer budget came out as
+    /// a file cut mid-sentence. The call is bounded by its own grammar instead
+    /// (each value's `forced_after`), and the turn by `max_tokens`.
+    pub writing_call: bool,
+
     /// Next index into [`crate::SamplingConfig::segment_close_script`] while the
     /// hard-cap closer script is playing; `None` when no script is in flight.
     /// The script overrides sampling until every phrase token has played, then
@@ -117,6 +238,7 @@ impl SequenceSamplingState {
             dry_span_len: 0,
             dry_suppressed: false,
             in_tool_call: false,
+            writing_call: false,
             close_script_pos: None,
             close_would_continue: false,
             degenerate_run: 0,
@@ -191,6 +313,7 @@ impl SequenceSamplingState {
         self.dry_span_len = 0;
         self.dry_suppressed = false;
         self.in_tool_call = false;
+        self.writing_call = false;
         self.close_script_pos = None;
         self.close_would_continue = false;
         self.rng_offset = 0;
@@ -242,6 +365,7 @@ impl SequenceSamplingState {
         // segment, or in-flight closer script from the prior turn is cleared.
         self.dry_span_len = 0;
         self.dry_suppressed = false;
+        self.writing_call = false;
         self.in_segment = false;
         self.segment_len = 0;
         self.close_script_pos = None;
@@ -310,14 +434,22 @@ impl SequenceSamplingState {
         }
     }
 
-    /// True when the most recent token ends a sentence (`.`, `!`, `?`, `\n`).
-    /// Used by the graceful segment close and the graceful EOS failsafe to let
-    /// the current sentence complete before terminating.
+    /// True when the most recent token ends a sentence (`.`, `!`, `?`) or a
+    /// line. The graceful EOS waits for this, so an answer is not cut
+    /// mid-sentence.
     fn at_sentence_end(&self, config: &SamplingConfig) -> bool {
+        self.recent_tokens.last().is_some_and(|&t| {
+            config.sentence_end_token_ids.contains(&t) || ends_a_line(&config.line_end_token_ids, t)
+        })
+    }
+
+    /// True when the most recent token ends a line. The segment closes wait
+    /// for this — see [`SamplingConfig::line_end_token_ids`] for why a line
+    /// rather than a sentence.
+    fn at_line_end(&self, config: &SamplingConfig) -> bool {
         self.recent_tokens
             .last()
-            .map(|&t| config.sentence_end_token_ids.contains(&t))
-            .unwrap_or(false)
+            .is_some_and(|&t| ends_a_line(&config.line_end_token_ids, t))
     }
 }
 
@@ -329,7 +461,7 @@ impl SequenceSamplingState {
 ///   phrase to its end, then emits the segment-close token itself (the close
 ///   is appended by this function, not stored in the script, so a played
 ///   script can never fail to close the segment);
-/// - the GRACEFUL cap closes with the bare token at a completed sentence — no
+/// - the GRACEFUL cap closes with the bare token at the end of a line — no
 ///   rescue needed;
 /// - the HARD cap starts the configured closer script (a canned
 ///   self-interruption that turns the mid-sentence amputation into sensible
@@ -399,20 +531,17 @@ fn segment_close_override(
             config.segment_close_token_id as u32
         });
     }
-    let at_sentence_end = state.at_sentence_end(config);
+    let at_line_end = state.at_line_end(config);
     if config.graceful_segment_close_after > 0
         && state.segment_len >= config.graceful_segment_close_after
-        && at_sentence_end
+        && at_line_end
     {
         return Some(config.segment_close_token_id as u32);
     }
     if config.force_segment_close_after > 0 && state.segment_len >= config.force_segment_close_after
     {
         return Some(
-            if config.segment_close_script.is_empty()
-                || at_sentence_end
-                || state.close_would_continue
-            {
+            if config.segment_close_script.is_empty() || at_line_end || state.close_would_continue {
                 config.segment_close_token_id as u32
             } else {
                 state.close_script_pos = Some(1);
@@ -549,28 +678,24 @@ impl BatchedSampler {
             }
         }
 
-        // **The kernel's scalar parameters are shared across the launch.**
-        // Temperature, top-k/top-p, the repetition and DRY penalties, the EOS ramp
-        // and the banned-token list are passed once per launch and applied to
-        // every row; `sample_batch_cuda` reads them from `configs[0]`. A wave that
-        // mixes dials — a `ThinkMode::Off` ingest summary at
-        // `SamplingConfig::compression()` beside a dialogue turn — therefore
-        // samples every row at whichever config sorts first.
+        // **Each row samples on its OWN dials.** Temperature, top-k/top-p, the
+        // repetition and DRY penalties, the EOS ramp and the segment-close ramp
+        // are packed per row into the `SeqDials` array (`SeqDials::from_config`
+        // below) and the kernel reads `seq_dials[row]`, so a wave that mixes
+        // dials — a `ThinkMode::Off` ingest summary at
+        // `SamplingConfig::compression()` beside a dialogue turn, or a narrator
+        // beside a deliberating reflection — samples each row correctly instead
+        // of collapsing the whole launch onto row 0's config. This is the
+        // per-sequence-array shape `banned_tokens_per_seq` already uses, not
+        // host-side regrouping (splitting into one launch per distinct config
+        // would be ~one launch per sequence, since `zend` randomises `seed` per
+        // turn — the batching the engine exists to do, thrown away).
         //
-        // That is a real limitation, and it is deliberately NOT worked around by
-        // splitting the wave into one launch per distinct config. `seed` is part
-        // of the config and `zend` randomises it per turn, so "distinct config"
-        // is very nearly "distinct sequence": a 64-session wave would fall back to
-        // ~64 sampler launches plus 64 `index_select` gathers per decode step,
-        // trading a small sampling-fidelity gain for the batching the engine
-        // exists to do. Fixing it properly means per-sequence scalar arrays in the
-        // kernel (the shape `banned_tokens_per_seq` and `segment_suppress_penalty`
-        // already use), not host-side regrouping.
-        //
-        // What must NOT ride on this is anything resolved per row on the host —
-        // the segment-close budget and the EOS failsafes read `configs[i]` in the
-        // post-kernel loop, precisely because that loop visits every row and has
-        // no reason to inherit row 0's limits.
+        // The remaining scalars — `eos_token_id`, `vocab_size`, the shared
+        // banned/suppress token *lists* — are genuinely model-wide and stay
+        // scalar. And anything resolved per row on the HOST still reads
+        // `configs[i]` directly (the segment-close budget and EOS failsafes in
+        // the post-kernel loop), never row 0.
         if !kernel_idx.is_empty() {
             // Gather just the kernel rows — unless they ARE the whole batch, in
             // which case skip the copy and run the kernel over every row.
@@ -752,6 +877,12 @@ impl BatchedSampler {
             return eos_token_id;
         }
 
+        // A call being written is bounded by its grammar, not by the answer's
+        // length budget — see `SequenceSamplingState::writing_call`.
+        if state.writing_call {
+            return sampled;
+        }
+
         if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
             // Hard stop: unconditionally force EOS regardless of sentence position.
             tracing::debug!(
@@ -765,7 +896,7 @@ impl BatchedSampler {
         }
 
         if config.graceful_eos_after > 0 && state.current_len >= config.graceful_eos_after {
-            if config.sentence_end_token_ids.is_empty() {
+            if config.sentence_end_token_ids.is_empty() && config.line_end_token_ids.is_empty() {
                 // No sentence-end tokens resolved (e.g. model loaded without
                 // tokenizer resolution): fall back to hard stop at the graceful
                 // threshold.
@@ -778,8 +909,8 @@ impl BatchedSampler {
                 );
                 return eos_token_id;
             }
-            // Graceful stop: emit EOS only when the last token was a
-            // sentence-ending token (`.`, `!`, `?`, `\n`).  This lets the current
+            // Graceful stop: emit EOS only when the last token ended a sentence
+            // (`.`, `!`, `?`) or a line.  This lets the current
             // sentence complete before termination, preventing mid-sentence
             // truncation.  `forced_eos_after` is the hard backstop if no boundary
             // is ever seen.
@@ -937,8 +1068,10 @@ impl BatchedSampler {
 
         // This path only ever receives unconstrained (full-vocab) rows —
         // stencil-constrained rows are resolved by `sample_batch` before the
-        // kernel and never reach here.  Scalar params still come from the first
-        // config for the whole sub-batch (the kernel's shared-config behavior).
+        // kernel and never reach here. `config` (the first row's) supplies the
+        // scalar FFI arguments below, but those are only the null-fallback
+        // defaults: the kernel reads its real per-row dials from the `seq_dials`
+        // array built further down, so no row inherits row 0's dials.
         let config = configs[0];
 
         // Get DRY params
@@ -961,39 +1094,21 @@ impl BatchedSampler {
         // Get EOS token
         let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
 
-        // Build banned tokens buffer.
-        //
-        // Per-sequence when any row carries the structural think-close ban
+        // Build banned tokens buffer — each row's OWN deny-list, plus the
+        // structural think-close ban for rows outside a block
         // (`think_close_ban_active` — a `</think>` outside a think block is
-        // never valid output): each row gets the shared deny-list plus, for
-        // rows outside a block, the close id; `-1` is the kernel's "empty
-        // slot" sentinel. The kernel has carried this per-seq mode from the
-        // start (`banned_tokens_per_seq > 0`); this is its first caller.
-        // With no row needing the ban, the shared list goes down the legacy
-        // global path untouched.
-        let think_ban_rows = states
+        // never valid output). Unlike the scalar dials above, a ban is
+        // row-specific: the answer that closes a stuck tool loop bans
+        // `<tool_call>` for itself alone. See `banned_rows`.
+        let rows: Vec<(&[i32], Option<i32>)> = states
             .iter()
             .zip(configs.iter())
-            .any(|(s, c)| think_close_ban_active(c, s));
-        let (banned_tokens, num_banned, banned_per_seq) = if think_ban_rows {
-            let stride = config.banned_tokens.len() + 1;
-            let mut flat: Vec<i32> = Vec::with_capacity(states.len() * stride);
-            for (s, c) in states.iter().zip(configs.iter()) {
-                flat.extend_from_slice(&config.banned_tokens);
-                flat.push(if think_close_ban_active(c, s) {
-                    c.segment_close_token_id
-                } else {
-                    -1
-                });
-            }
-            (flat, 0, stride as i32)
-        } else {
-            (
-                config.banned_tokens.clone(),
-                config.banned_tokens.len() as i32,
-                0,
-            )
-        };
+            .map(|(s, c)| {
+                let close = think_close_ban_active(c, s).then_some(c.segment_close_token_id);
+                (c.banned_tokens.as_slice(), close)
+            })
+            .collect();
+        let (banned_tokens, num_banned, banned_per_seq) = banned_buffer(&rows);
         let banned_tokens = &banned_tokens;
 
         // No stencil here — constrained rows were resolved before the kernel.
@@ -1061,6 +1176,14 @@ impl BatchedSampler {
             (0.0, -1, 0, 0, 0.0)
         };
 
+        // **Per-sequence dials — every row samples on its own config.** Built
+        // from each row's config (not `configs[0]`), so the kernel's scalar
+        // arguments below are only the null-fallback defaults; the kernel reads
+        // its dials from this array instead. This is what stops one row's EOS
+        // ramp (or temperature, or penalties) bleeding into another in a wave
+        // that mixes configs.
+        let seq_dials: Vec<SeqDials> = configs.iter().map(|c| SeqDials::from_config(c)).collect();
+
         // Invoke the CUDA kernel
         self.invoke_cuda_kernel(
             &logits_flat,
@@ -1107,6 +1230,7 @@ impl BatchedSampler {
             &mut output_tokens,
             config.seed,
             &mut rng_offsets,
+            &seq_dials,
         )?;
 
         // Update states with sampled tokens and new RNG offsets.
@@ -1239,8 +1363,13 @@ impl BatchedSampler {
             recent_tokens.extend(std::iter::repeat_n(0, self.max_recent_len - window));
         }
 
-        // Current generated lengths (for dynamic EOS ramp)
-        let current_lens: Vec<i32> = states.iter().map(|s| s.current_len).collect();
+        // Current generated lengths (for dynamic EOS ramp). A sequence writing
+        // a tool call reports 0, which holds its ramp at zero boost — see
+        // `SequenceSamplingState::writing_call`.
+        let current_lens: Vec<i32> = states
+            .iter()
+            .map(|s| if s.writing_call { 0 } else { s.current_len })
+            .collect();
 
         Ok((
             token_counts,
@@ -1357,6 +1486,7 @@ impl BatchedSampler {
         output_tokens: &mut [u32],
         seed: u64,
         rng_offsets: &mut [u64],
+        seq_dials: &[SeqDials],
     ) -> candle::Result<()> {
         // Get the CUDA device and stream
         let cuda_device = match &self.device {
@@ -1454,6 +1584,33 @@ impl BatchedSampler {
             .memcpy_stod(rng_offsets)
             .map_err(|e| candle::Error::Msg(format!("failed to upload rng_offsets: {}", e)))?;
 
+        // Per-sequence dials. Uploaded as raw 4-byte words — `SeqDials` is 20
+        // packed `f32`/`i32` fields (its C twin `batched_sampling::SeqDials` has
+        // the identical layout), so the byte image is what the kernel reads back.
+        // Empty only on a zero-row launch, which never reaches this kernel path;
+        // guard anyway so the copy is never zero-length (cudarc rejects that).
+        const SEQ_DIALS_WORDS: usize = std::mem::size_of::<SeqDials>() / 4;
+        let seq_dials_words: &[i32] = if seq_dials.is_empty() {
+            &[]
+        } else {
+            // SAFETY: `SeqDials` is `#[repr(C)]` with only 4-byte `f32`/`i32`
+            // fields and no padding, so a contiguous slice of them is a valid
+            // `[i32]` of `len * SEQ_DIALS_WORDS` words.
+            unsafe {
+                std::slice::from_raw_parts(
+                    seq_dials.as_ptr() as *const i32,
+                    seq_dials.len() * SEQ_DIALS_WORDS,
+                )
+            }
+        };
+        let seq_dials_gpu: cudarc::driver::CudaSlice<i32> = stream
+            .memcpy_stod(if seq_dials_words.is_empty() {
+                &[0i32][..]
+            } else {
+                seq_dials_words
+            })
+            .map_err(|e| candle::Error::Msg(format!("failed to upload seq_dials: {}", e)))?;
+
         // Get device pointers and call kernel in a scoped block
         // so guards are dropped before download
         {
@@ -1470,6 +1627,7 @@ impl BatchedSampler {
             let (stencil_ptr, _g7) = stencil_gpu.device_ptr(&stream);
             let (output_ptr, _g8) = output_gpu.device_ptr_mut(&stream);
             let (rng_ptr, _g9) = rng_gpu.device_ptr_mut(&stream);
+            let (seq_dials_ptr, _g10) = seq_dials_gpu.device_ptr(&stream);
 
             // Helper closure to call kernel with logits pointer
             let call_kernel = |logits_ptr: *const std::ffi::c_void| unsafe {
@@ -1539,6 +1697,12 @@ impl BatchedSampler {
                     output_ptr as *mut u32,
                     seed,
                     rng_ptr as *mut u64,
+                    // Null on an empty (guard) upload, else the per-row dials.
+                    if seq_dials.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        seq_dials_ptr as *const std::ffi::c_void
+                    },
                 );
             };
 
@@ -1735,12 +1899,70 @@ mod tests {
     // even though it is constant-valued at any given commit.
     #![allow(clippy::assertions_on_constants)]
 
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::SamplingConfig;
 
     const VOCAB_SIZE: usize = 100;
     const MAX_RECENT: usize = 32;
     const EOS_TOKEN: u32 = 2;
+
+    /// The per-row dials the kernel reads must carry each config's OWN
+    /// segment-close token, not row 0's. A wave that co-batches a deliberating
+    /// row (closes `</think>` = 90) with a narrator row (no segment) must give
+    /// the deliberating row token 90 and the narrator row -1 — the exact bleed
+    /// `SeqDials` exists to remove, and the one a scalar `configs[0]` reintroduced.
+    #[test]
+    fn seq_dials_carry_each_rows_own_segment_close_token() {
+        let mut deliberating = SamplingConfig::argmax();
+        deliberating.temperature = 0.7;
+        deliberating.segment_close_boost = 3.0;
+        deliberating.segment_close_token_id = 90;
+        deliberating.segment_close_ramp_start = 2;
+        deliberating.segment_close_ramp_len = 16;
+        deliberating.segment_close_max_multiplier = 4.0;
+
+        // A narrator: no segment close at all.
+        let mut narrator = SamplingConfig::argmax();
+        narrator.temperature = 0.9;
+        narrator.segment_close_boost = 0.0;
+        narrator.segment_close_token_id = -1;
+
+        let d = SeqDials::from_config(&deliberating);
+        let n = SeqDials::from_config(&narrator);
+
+        assert_eq!(
+            d.segment_close_token_id, 90,
+            "deliberating row keeps its close token"
+        );
+        assert_eq!(d.segment_close_boost, 3.0);
+        assert_eq!(d.segment_close_ramp_len, 16);
+        assert_eq!(d.temperature, 0.7);
+
+        assert_eq!(
+            n.segment_close_token_id, -1,
+            "narrator row's close path stays off"
+        );
+        assert_eq!(n.segment_close_boost, 0.0);
+        assert_eq!(n.temperature, 0.9);
+    }
+
+    /// A config with the boost dialled up but NO token id is not "half on": the
+    /// whole segment-close path is gated off (token id -1), so a co-batched row
+    /// with it genuinely on is unaffected.
+    #[test]
+    fn seq_dials_gate_segment_close_off_when_token_missing() {
+        let mut c = SamplingConfig::argmax();
+        c.segment_close_boost = 5.0;
+        c.segment_close_token_id = -1; // boost set, but no token to boost
+        let d = SeqDials::from_config(&c);
+        assert_eq!(d.segment_close_token_id, -1);
+        assert_eq!(
+            d.segment_close_boost, 0.0,
+            "boost neutralised without a token"
+        );
+    }
 
     /// A run of token 0 is counted, and any other token clears it — the guard
     /// must fire on a *consecutive* run, not on token 0 being frequent.
@@ -1897,6 +2119,48 @@ mod tests {
         assert_eq!(sampler.resolve_final_token(0, 7, &mut state, &config), 7);
     }
 
+    /// **A call being written is not cut by the answer's length budget.** Past
+    /// both EOS thresholds a prose turn is ended; the same length inside a tool
+    /// call keeps the model's own token, and the EOS ramp sees a length of 0.
+    /// The call's own grammar and the turn's `max_tokens` bound it instead.
+    #[test]
+    fn writing_a_call_stands_the_length_budget_down() {
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.graceful_eos_after = 10;
+        config.forced_eos_after = 20;
+        let mut state = make_state();
+        for _ in 0..25 {
+            state.record_token(42, MAX_RECENT);
+        }
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            EOS_TOKEN,
+            "a prose turn past its budget is ended"
+        );
+
+        state.writing_call = true;
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            7,
+            "a call past the same budget keeps its token"
+        );
+        let (_, _, _, _, current_lens) = sampler
+            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0)
+            .unwrap();
+        assert_eq!(current_lens, vec![0], "the EOS ramp sees no length");
+
+        // The degenerate-decode guard is a fault check, not a budget: it still
+        // fires inside a call.
+        for _ in 0..DEGENERATE_TOKEN_RUN {
+            state.record_token(0, MAX_RECENT);
+        }
+        assert_eq!(
+            sampler.resolve_final_token(0, 7, &mut state, &config),
+            EOS_TOKEN
+        );
+    }
+
     fn make_sampler() -> BatchedSampler {
         BatchedSampler::new(
             candle::Device::Cpu,
@@ -1913,16 +2177,18 @@ mod tests {
 
     // ── Hard-cap closer script (segment_close_override tiers) ──────────
 
-    /// Config with segment tracking on: close=90, graceful after 4 at sentence
-    /// end (token 7), hard cap at 8, closer phrase "A B C" (the sampler
-    /// appends the close token 90 itself).
+    /// Config with segment tracking on: close=90, graceful after 4 at a line
+    /// end (token 7), a sentence end that is not a line end (token 8, `.`),
+    /// hard cap at 8, closer phrase "A B C" (the sampler appends the close
+    /// token 90 itself).
     fn closer_config() -> SamplingConfig {
         let mut c = SamplingConfig::argmax();
         c.segment_close_token_id = 90;
         c.segment_open_token_id = 89;
         c.graceful_segment_close_after = 4;
         c.force_segment_close_after = 8;
-        c.sentence_end_token_ids = vec![7];
+        c.sentence_end_token_ids = vec![8];
+        c.line_end_token_ids = Arc::from([7]);
         c.segment_close_script = vec![100, 101, 102];
         c
     }
@@ -1956,16 +2222,41 @@ mod tests {
     }
 
     #[test]
-    fn graceful_close_at_sentence_end_skips_the_script() {
+    fn graceful_close_at_line_end_skips_the_script() {
         let config = closer_config();
-        // Past graceful (not force), last token IS a sentence end.
+        // Past graceful (not force), last token IS a line end.
         let mut state = in_segment_state(5, 7);
         assert_eq!(
             segment_close_override(&config, &mut state),
             Some(90),
-            "soft cut closes bare — a completed sentence needs no rescue"
+            "soft cut closes bare — a completed line needs no rescue"
         );
         assert_eq!(state.close_script_pos, None);
+    }
+
+    /// **A `.` is not where a thought ends.** Past the graceful cap, a period
+    /// that is not a line end — the one in `169.254` — leaves the block open;
+    /// the close waits for the line to end.
+    #[test]
+    fn graceful_close_does_not_fire_at_a_period_mid_line() {
+        let config = closer_config();
+        let mut state = in_segment_state(5, 8);
+        assert_eq!(segment_close_override(&config, &mut state), None);
+    }
+
+    /// The graceful EOS still accepts a sentence end: an answer that is one
+    /// paragraph must not wait for a newline it will never write.
+    #[test]
+    fn the_answer_ends_at_a_sentence_or_a_line() {
+        let config = closer_config();
+        for last in [7, 8] {
+            let mut state = make_state();
+            state.record_token(last, MAX_RECENT);
+            assert!(state.at_sentence_end(&config), "token {last}");
+        }
+        let mut mid = make_state();
+        mid.record_token(42, MAX_RECENT);
+        assert!(!mid.at_sentence_end(&config));
     }
 
     #[test]
@@ -2336,6 +2627,45 @@ mod tests {
         assert_eq!(tokens[0], 60, "banned best token → next best");
     }
 
+    /// **A row's ban is its own inside a shared launch.** One row bans nothing;
+    /// the other — the answer closing a stuck tool loop — bans 50. Both logit
+    /// rows peak at 50: the free row takes it, the banning row its next best.
+    /// Both orderings, because the kernel read the ban from `configs[0]`: with
+    /// the banning row second its ban vanished, with it first the free row lost
+    /// its token. On CUDA when a card is present — the path that had the defect
+    /// — and on the CPU path always.
+    #[test]
+    fn a_row_s_ban_stays_in_its_row_in_a_shared_launch() {
+        let mut devices = vec![Device::Cpu];
+        devices.extend(Device::new_cuda(0).ok());
+        let free = SamplingConfig::argmax();
+        let mut closing = SamplingConfig::argmax();
+        closing.banned_tokens = vec![50];
+        for device in devices {
+            let sampler = BatchedSampler::new(
+                device.clone(),
+                VOCAB_SIZE,
+                MAX_RECENT,
+                vec![EOS_TOKEN].into(),
+                None,
+            );
+            for (configs, expected) in [
+                ([&free, &closing], vec![50, 60]),
+                ([&closing, &free], vec![60, 50]),
+            ] {
+                let (mut a, mut b) = (make_state(), make_state());
+                let logits =
+                    logits_from_rows(&[&[(50, 100.0), (60, 50.0)], &[(50, 100.0), (60, 50.0)]])
+                        .to_device(&device)
+                        .expect("logits");
+                let tokens = sampler
+                    .sample_batch(&logits, &mut [&mut a, &mut b], &configs)
+                    .expect("sample");
+                assert_eq!(tokens, expected, "{device:?}");
+            }
+        }
+    }
+
     // ── Structural think-close ban ─────────────────────────────────────
 
     /// **A `</think>` outside a think block is never sampleable.** The stencil
@@ -2367,11 +2697,11 @@ mod tests {
 
     /// **A row's own segment-close budget applies inside a shared launch.**
     ///
-    /// The kernel's scalar params come from `configs[0]` for the whole launch,
-    /// which is its contract; the host-side post-kernel loop is not bound by it
-    /// and must read `configs[i]`. Both rows here go through ONE launch: row 0 is
-    /// greedy over a decisive logit row, row 1 is mid-block with a hard cap of 1
-    /// and must still be forced closed on its own config, not row 0's.
+    /// The host-side post-kernel loop resolves the segment-close budget (and the
+    /// EOS failsafes) per row from `configs[i]`, never row 0. Both rows here go
+    /// through ONE launch: row 0 is greedy over a decisive logit row, row 1 is
+    /// mid-block with a hard cap of 1 and must still be forced closed on its own
+    /// config, not row 0's.
     #[test]
     fn a_row_obeys_its_own_close_budget_in_a_shared_launch() {
         let sampler = make_sampler();

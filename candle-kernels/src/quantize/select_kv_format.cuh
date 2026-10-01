@@ -1679,7 +1679,7 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
         if (ArenaFormat::is_quantized(v_fmt)) {
             const int   v_blk_bytes = quant_block_bytes(v_fmt);
             const char* v_blk_ptr   = v_chunk_data + (int64_t)bib * v_blk_bytes;
-            v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
+            v_val = dequant_element_inline<float, false>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
         } else {
             v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
         }
@@ -1782,7 +1782,7 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
             if (ArenaFormat::is_quantized(v_fmt)) {
                 const int   v_blk_bytes = quant_block_bytes(v_fmt);
                 const char* v_blk_ptr   = v_chunk_data + (int64_t)bib * v_blk_bytes;
-                v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
+                v_val = dequant_element_inline<float, false>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
             } else {
                 v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
             }
@@ -2338,7 +2338,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
         }
         if (ArenaFormat::is_quantized(v_src_fmt)) {
             const char* v_blk = v_chunk_data + (int64_t)bib * quant_block_bytes(v_src_fmt);
-            v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt, s_band_outer[1][p]);
+            v_val = dequant_element_inline<float, false>(v_blk, lane, v_src_fmt, s_band_outer[1][p]);
         } else {
             v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt));
         }
@@ -2913,7 +2913,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             float v_val;
             if (ArenaFormat::is_quantized(v_src_fmt_r)) {
                 const char* v_blk = v_chunk_data_r + (int64_t)bib * quant_block_bytes(v_src_fmt_r);
-                v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt_r, s_band_outer[1][p]);
+                v_val = dequant_element_inline<float, false>(v_blk, lane, v_src_fmt_r, s_band_outer[1][p]);
             } else {
                 v_val = load_as_float(v_chunk_data_r, bib * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt_r));
             }
@@ -3349,7 +3349,7 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
         if (ArenaFormat::is_quantized(v_src_fmt)) {
             const int blk_bytes = quant_block_bytes(v_src_fmt);
             const char* blk_ptr = v_chunk_data + (int64_t)dim_in_band * blk_bytes;
-            v_val = dequant_element_inline<float>(blk_ptr, lane, v_src_fmt, 1.0f);
+            v_val = dequant_element_inline<float, false>(blk_ptr, lane, v_src_fmt, 1.0f);
         } else {
             const int elem_in_chunk = dim_in_band * 32 + lane;
             v_val = load_as_float(v_chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(v_src_fmt));
@@ -3363,7 +3363,7 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
             __syncwarp();
             quantize_to_smem(warp_f32, warp_quant, fmt, /*is_k=*/false);
             __syncwarp();
-            v_rt = dequant_element_inline<float>((const char*)warp_quant, lane, select_fmt_to_arena_fmt(fmt), 1.0f);
+            v_rt = dequant_element_inline<float, false>((const char*)warp_quant, lane, select_fmt_to_arena_fmt(fmt), 1.0f);
         }
         const float v_err = max_abs_error_warp(v_val, v_rt);
 

@@ -1,7 +1,16 @@
 # QSA index placement — giving the index the KV cache's positional contract
 
-**Status:** built. §5–§7 describe the shipped design; §9 records where it
-departed from the plan, and why.
+**Status:** superseded. §1–§4 (the invariant and the three-frame problem) and
+§5.1–§5.2 (absolute frame, live tail) still hold. §5.3–§5.6, §7's gates and §8's
+"where it stands" describe the placement-time signed-rotation design
+(`PlacedPage.roped_base`, `qsa_page_place`'s per-placement rotate) that shipped
+first and was measured here — but that design has since been replaced by
+rotate-on-load: pages are stored fully un-rotated and the scorer rotates each
+key at its own absolute position when it loads it, so a placement carries no
+rotation and no `roped_base` state at all. See `docs/progressive_yarn.md` §7 for
+the current design and its gates (`tests/qsa_score_rot_harness.rs`). §9's
+"where the build departed from the plan" is history, kept for why the signed
+rotation existed before it was removed again.
 
 The QSA index is the only positional structure in the engine that cannot be
 moved. Its rows carry a rotation baked at the position they were *created* at,

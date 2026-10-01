@@ -2,7 +2,7 @@
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -17,20 +17,24 @@ use super::schema::{
     CorruptTurnPolicy, GroupSchema, LayerSchema, Schema, SectionCollection, SystemPromptItem,
     SystemPromptSchema,
 };
+use super::warm_pool;
 use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDivergence};
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
-use crate::persistence::manifest::{self, RecordLoc};
+use crate::persistence::manifest::{self, ConvState, RecordLoc};
 use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SnapshotPayload,
     TreeMetadataPayload,
 };
-use crate::persistence::resume::TurnChunkGrid;
+use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
+use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
+use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::{SharedSubstrate, SubstratePersistence};
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
@@ -53,14 +57,14 @@ use crate::turn_layout::TurnLayout;
 use candle_nn::kv_cache::SealedSequence;
 
 /// Upper bound on how many recent dialogue turns the normalization warm-up
-/// replays on load (`ensure_normalization_warm`). The asymmetric-EWMA hit levels
+/// replays on load (`take_warm_replay`). The asymmetric-EWMA hit levels
 /// converge in a few dozen steps, so this caps the one-time cost without changing
 /// the warmed levels materially.
 const WARM_REPLAY_MAX_TURNS: usize = 512;
 
 /// Self-probes per ingested timeline (file / cluster) when warming the append-only
 /// belief groups' hit levels from their own turns (see
-/// [`Conversation::warm_normalization_from_substrate`]). The asymmetric EWMA is
+/// [`Conversation::warm_ingest_normalization`]). The asymmetric EWMA is
 /// ~94% converged after 8 observes and each probe already scores against the whole
 /// timeline, so this bounds the one-time warm cost over a large corpus.
 const WARM_INGEST_PROBES_PER_TIMELINE: usize = 8;
@@ -79,6 +83,15 @@ const WARM_COLLECTION_PROBES_PER_MEMBER: usize = 8;
 /// probe upload is `probe tokens × words per token` and grows with the corpus, so
 /// the batch bounds it; each launch reuses the segment's cached index.
 const WARM_GPU_PROBE_BATCH: usize = 128;
+
+/// One sealed dialogue turn the normalization warm-up replays — see
+/// [`Conversation::take_warm_replay`].
+pub struct WarmProbe {
+    /// The turn's stream id: the observation's source, so a scope folds it once.
+    pub source: u64,
+    /// The turn's stored wide-Q signature.
+    pub probe: Vec<WideQSig>,
+}
 
 /// What a collection warm-up did — see
 /// [`Conversation::warm_collection_normalization`].
@@ -255,6 +268,17 @@ fn selected_in_collection(sel: &ProjectionSelection, collection: &str) -> Option
     })
 }
 
+/// A collection's belief gallery: each member's wide-Q window, the slot it
+/// votes for, and its stream id (the window's arena residency key).
+pub type BeliefGallery = (Vec<Arc<Vec<WideQSig>>>, Vec<usize>, Vec<StreamId>);
+
+/// Which gallery an assembly is for: the collection's name, its scope tags, and
+/// its members in slot order. The members are part of the key because the
+/// slots are: builders for different tool modes or identities carry different
+/// members under the same collection name, and a gallery assembled for one
+/// names slots that do not exist, or mean another member, in the other.
+type GalleryKey = (String, Vec<String>, Vec<String>);
+
 // ── Conversation ──────────────────────────────────────────────────────────────
 
 /// Workspace-shared, lock-protected handle to the per-turn record store.
@@ -287,12 +311,9 @@ pub struct Conversation {
     /// evolved as new turns seal. Shared across clones of this handle so learning
     /// pools over all sessions. See `docs/provenance_score_normalization.md`.
     normalization: Arc<Mutex<NormalizationCache>>,
-    /// Spawns the warm-from-substrate replay exactly once, on the first belief
-    /// scan, onto a detached background thread (so it never blocks the first live
-    /// reprojection on the decode hot path). Early reprojections may read a
-    /// still-warming cache — best-effort by construction, since the levels are
-    /// runtime-derived and seal-observe keeps warming them. See
-    /// [`Self::ensure_normalization_warm`].
+    /// Whether the dialogue warm-up replay has been handed out since it was last
+    /// armed — once per process, and again after each
+    /// [`Self::reset_normalization_warm`]. See [`Self::take_warm_replay`].
     normalization_warm: Arc<AtomicBool>,
     /// Cached `(segment_count, last_op)` for the `/v1/status` maintenance
     /// indicator — refreshed by the persistence thread after each maintenance
@@ -310,6 +331,12 @@ pub struct Conversation {
     /// compaction can hold across its relocation I/O). Shared across clones; the
     /// last drop drains + fsyncs + joins the writer. See [`SubstrateWriter`].
     writer: Arc<SubstrateWriter>,
+    /// Reads records out of sealed segments without `persistence`'s mutex — the
+    /// read-side twin of `writer`. A compaction holds that mutex across its
+    /// relocation I/O, and the recurrent-snapshot read at every hybrid-model
+    /// admission used to queue behind it on the scheduler thread. Taken once at
+    /// construction; see [`SealedReader`].
+    sealed: SealedReader,
     /// The most recently read prompt-branch checkpoint, held decoded and keyed
     /// by the content prefix it belongs to.
     ///
@@ -325,6 +352,15 @@ pub struct Conversation {
     /// change misses and refills exactly once, and the phases that open many
     /// conversations all open them on a single shared prompt branch.
     branch_checkpoint: Arc<Mutex<Option<(ContentHash, Arc<BranchCheckpointPayload>)>>>,
+    /// Each collection's assembled belief gallery, with the substrate's
+    /// [`Substrate::gallery_epoch`] it was assembled at.
+    ///
+    /// Assembling walks every stream in the substrate to find the collection's
+    /// members, and it ran on every reprojection: measured at ~194 ms for the
+    /// tool catalog on a 10M-token substrate, against a 4 ms scan. Keyed on the
+    /// epoch, it reruns only when a stream, blob or tombstone actually changed —
+    /// about once per sealed turn.
+    gallery_cache: Arc<Mutex<HashMap<GalleryKey, (u64, BeliefGallery)>>>,
     /// How this workspace's prompt sections came to be resident since it was
     /// opened: restored from the redo log, or prefilled. A restart on an
     /// unchanged prompt restores every one; a prefill there is a section the
@@ -338,6 +374,14 @@ pub struct Conversation {
     /// turn or chunk stays RAM-resident. Read once from the handle at
     /// construction; a handle's mode never changes.
     read_only: bool,
+    /// Serialises conversation-state writes, from the in-RAM change to the
+    /// enqueue of the record carrying it. A `ConvState` record holds the whole
+    /// state, so two updates enqueued in the opposite order to the one they
+    /// changed RAM in would leave the older state winning on replay — a
+    /// branch set, then lost to an archive that read the state before it.
+    /// Held only by these writes, never by the writer thread, so holding it
+    /// across an enqueue that waits on backpressure cannot deadlock.
+    conv_state_writes: Arc<Mutex<()>>,
     /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
     /// in, removed when the last clone of that conversation drops.
     ///
@@ -472,6 +516,7 @@ impl Conversation {
         let persistence = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate)
             .expect("ephemeral SubstratePersistence");
         let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
+        let sealed = persistence.sealed_reader();
         let inner = Arc::new(RwLock::new(substrate));
         let persistence = Arc::new(Mutex::new(persistence));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
@@ -483,9 +528,12 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
+            sealed,
             branch_checkpoint: Arc::new(Mutex::new(None)),
+            gallery_cache: Arc::new(Mutex::new(HashMap::new())),
             section_loads: Arc::default(),
             read_only: false,
+            conv_state_writes: Arc::default(),
             // The directory goes when the last clone of this conversation does.
             // See the field's own note for what it cost not to have this.
             ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
@@ -512,9 +560,9 @@ impl Conversation {
             substrate: inner,
             persistence,
         } = shared;
-        let (segments, read_only) = {
+        let (segments, read_only, sealed) = {
             let p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            (p.segment_count(), p.is_read_only())
+            (p.segment_count(), p.is_read_only(), p.sealed_reader())
         };
         let maintenance = Arc::new(Mutex::new((segments, None, false)));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
@@ -530,9 +578,12 @@ impl Conversation {
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
+            sealed,
             branch_checkpoint: Arc::new(Mutex::new(None)),
+            gallery_cache: Arc::new(Mutex::new(HashMap::new())),
             section_loads: Arc::default(),
             read_only,
+            conv_state_writes: Arc::default(),
         }
     }
 
@@ -742,13 +793,26 @@ impl Conversation {
     /// `(windows, slot_per_window, stream_per_window)` — the windows and slots
     /// feed [`crate::provenance::score_slots`]; the stream ids key the windows'
     /// residency in the GPU gallery arena.
+    ///
+    /// Reused while [`Substrate::gallery_epoch`] is unchanged — see
+    /// `gallery_cache`. The epoch is read under the same read lock the
+    /// assembly runs under, so a cached gallery is always the one this state
+    /// would assemble.
     pub fn belief_gallery(
         &self,
         collection: &str,
         tags: &[String],
-        slot_of: impl Fn(&str) -> Option<usize>,
-    ) -> (Vec<Arc<Vec<WideQSig>>>, Vec<usize>, Vec<StreamId>) {
+        members: &[String],
+    ) -> BeliefGallery {
+        let slot_of = |name: &str| members.iter().position(|m| m == name);
         let sub = self.inner.read().unwrap();
+        let epoch = sub.gallery_epoch();
+        let key: GalleryKey = (collection.to_string(), tags.to_vec(), members.to_vec());
+        if let Some((at, gallery)) = self.gallery_cache.lock().unwrap().get(&key) {
+            if *at == epoch {
+                return gallery.clone();
+            }
+        }
         let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
         let mut sids: Vec<StreamId> = Vec::new();
@@ -798,7 +862,12 @@ impl Conversation {
             slots.push(slot);
             sids.push(sid);
         }
-        (windows, slots, sids)
+        let gallery = (windows, slots, sids);
+        self.gallery_cache
+            .lock()
+            .unwrap()
+            .insert(key, (epoch, gallery.clone()));
+        gallery
     }
 
     /// Score every belief-driven collection in the shared system prompt against
@@ -849,7 +918,7 @@ impl Conversation {
             }
             // **A warm-up pass skips the collections it cannot teach.**
             //
-            // The dialogue replay (`warm_normalization_from_substrate`) hands the
+            // The dialogue replay (`score_warm_probe`) hands the
             // WHOLE system prompt to this loop, so every collection is scanned —
             // and `teaches` then discards the observation for any collection the
             // probe's tags are not inside. The caller drops the returned scores
@@ -863,9 +932,11 @@ impl Conversation {
             if matches!(observe, Observe::Yes { .. }) && !observe.teaches(&coll.policy.tags) {
                 continue;
             }
-            let slot_of = |name: &str| coll.sections.iter().position(|s| s.name == name);
+            let members: Vec<String> = coll.sections.iter().map(|s| s.name.clone()).collect();
+            let t_gallery = Instant::now();
             let (windows, slots, sids) =
-                self.belief_gallery(&coll.name, &coll.policy.tags, slot_of);
+                self.belief_gallery(&coll.name, &coll.policy.tags, &members);
+            let gallery_us = t_gallery.elapsed().as_micros() as u64;
             if windows.is_empty() {
                 // The belief loop has nothing to score against, so selection falls
                 // back to declaration order (the first tool in the catalog) and
@@ -940,8 +1011,8 @@ impl Conversation {
                         match arena.scan_weighted(&[make_segment()], &[p], w) {
                             Ok(mut out) => Some(out.pop().unwrap_or_default()),
                             Err(e) => {
-                                tracing::debug!(
-                                    target: "provenance",
+                                tracing::warn!(
+                                    target: "candle_conversation::provenance",
                                     "GPU collection scan unavailable, using CPU: {e}"
                                 );
                                 None
@@ -1025,6 +1096,7 @@ impl Conversation {
                 })
             };
 
+            let t_scan = Instant::now();
             let (fresh, mass_base) = scan_probe(probe);
             // Concept F: the pinned question window is a second, independent
             // scan — max-fused with the tail AFTER normalization below.
@@ -1032,6 +1104,8 @@ impl Conversation {
                 Some(q) if coll.policy.scan.question_pin && !q.is_empty() => Some(scan_probe(q).0),
                 _ => None,
             };
+            let scan_us = t_scan.elapsed().as_micros() as u64;
+            let t_normalize = Instant::now();
             // Concept A: normalize on the collection's 0–1000 hit-level band,
             // learned from the TAIL scan's raw scores (the stored whole-turn
             // signature, matching the turn-group learn path). `observe` runs at
@@ -1068,6 +1142,20 @@ impl Conversation {
                 }
                 (normed, normed_q)
             };
+            // Where one collection's scan time went — assembling its gallery
+            // (host, walks the substrate's streams), scoring it (the arena
+            // launches), and normalizing — the collection-side counterpart of
+            // the per-group `belief group scan` line.
+            tracing::trace!(
+                target: "candle_conversation::provenance",
+                collection = %coll.name,
+                windows = windows.len(),
+                seal = observe.source().is_some(),
+                gallery_us,
+                scan_us,
+                normalize_us = t_normalize.elapsed().as_micros() as u64,
+                "belief collection scan"
+            );
             // Fuse, don't filter: every lens is on the same 0–1000 band, so the
             // strongest evidence for a section wins and no lens can veto another.
             let finals: Vec<f32> = (0..n)
@@ -1089,7 +1177,7 @@ impl Conversation {
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, s)| format!("{}={:.1}", coll.sections[i].name, s))
                     .unwrap_or_default();
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_conversation::belief",
                     collection = %coll.name,
                     probe_windows = probe.len(),
@@ -1156,14 +1244,13 @@ impl Conversation {
         if probe.is_empty() {
             return (scores, candidates);
         }
-        self.ensure_normalization_warm(schema, target);
         // Collections (the tool catalog) live in the shared system prompt.
-        let t_coll = std::time::Instant::now();
+        let t_coll = Instant::now();
         scores =
             self.score_belief_collections(&schema.system_prompt, probe, probe_q, observe, arena);
         let coll_us = t_coll.elapsed().as_micros() as u64;
         // Belief-driven turn groups live across every layer.
-        let t_groups = std::time::Instant::now();
+        let t_groups = Instant::now();
         for layer in &schema.layers {
             candidates.extend(self.score_belief_groups(
                 layer,
@@ -1178,7 +1265,7 @@ impl Conversation {
         // Phase split for the reproject `scan_ms`: which side of the scan the
         // time went to (the collection scan vs the per-layer group scans), so a
         // silent GPU→CPU fallback or a growing probe shows up attributably.
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::provenance",
             probe_windows = probe.len(),
             collections_us = coll_us,
@@ -1188,72 +1275,47 @@ impl Conversation {
         (scores, candidates)
     }
 
-    /// Kick the normalization warm-up — building the hit levels from the
-    /// substrate's existing **sealed dialogue turns** so a freshly-loaded process
-    /// starts WARM (the cache is runtime-only, so without this a restart would be
-    /// cold until new traffic accrued). See `docs/provenance_score_normalization.md`
-    /// §4.4.
+    /// The dialogue replay that warms the normalization hit levels — the
+    /// substrate's existing **sealed dialogue turns**, so a freshly-loaded
+    /// process starts WARM (the cache is runtime-only, so without this a restart
+    /// would be cold until new traffic accrued). See
+    /// `docs/provenance_score_normalization.md` §4.4.
     ///
-    /// The replay is spawned **once** (via [`Once`]) onto a detached background
-    /// thread, so its O(replayed turns × gallery) scan never blocks the FIRST live
-    /// reprojection on the decode hot path (it previously ran inline under this
-    /// call — a multi-second first-token stall on a large substrate). Early
-    /// reprojections may read a still-warming cache: that is best-effort by
-    /// construction — the levels are runtime-derived and the once-per-turn
-    /// seal-observe keeps warming them — so correctness is unaffected; only how
-    /// quickly generic candidates get discounted. The handle is all-`Arc`, so the
-    /// clone moved into the thread shares the same substrate + normalization cache.
-    fn ensure_normalization_warm(&self, schema: &Schema, target: ProjectionTarget) {
-        // Never trigger the warm-up from an ingest-time (append-only target) scoring
-        // pass. During corpus load the per-scope ingest reprojections score against an
-        // append-only target; firing the heavy self-match warm-up there launches its
-        // substrate read-lock storm alongside the ingest writer, and on an unfair
-        // reader/writer lock that STARVES the writer — the scheduler stops draining its
-        // backlog and load stalls. A real query projects against a non-append-only
-        // (dialogue) target, by which point the corpus is stable; warm then.
+    /// Returns the probes when the replay is armed and disarms it; `None`
+    /// otherwise. The caller scores each with [`Self::score_warm_probe`] — the
+    /// scheduler, on its gallery arena, in the gaps higher-priority work leaves.
+    /// Early reprojections may read a still-warming cache: that is best-effort
+    /// by construction — the levels are runtime-derived and the once-per-turn
+    /// seal-observe keeps warming them — so only how quickly generic candidates
+    /// get discounted depends on it.
+    ///
+    /// The last [`WARM_REPLAY_MAX_TURNS`] dialogue turns, ordered by
+    /// `(timeline, turn index)` so the warmed levels don't depend on `HashMap`
+    /// iteration order, and bounded to the recent window (the asymmetric EWMA
+    /// converges in a few dozen steps, so older turns barely move it). Only
+    /// dialogue turns (empty-tagged — gallery turns are tagged) are probes; the
+    /// still-decoding current turn has no sealed signature yet.
+    pub fn take_warm_replay(&self, target: ProjectionTarget) -> Option<Vec<WarmProbe>> {
+        // Never armed from an ingest-time (append-only target) scoring pass:
+        // during corpus load the corpus is still moving, and a replay then warms
+        // levels the next file retires. A real query projects against a
+        // non-append-only (dialogue) target, by which point it is stable.
         if self
             .inner
             .read()
             .unwrap()
             .is_append_only_layer(target.layer)
         {
-            return;
+            return None;
         }
         // Fire once, but RE-ARMABLE: `reset_normalization_warm` clears the flag after
         // an ingest reconcile so the next projection re-learns the newly-ingested
-        // files' hit levels. A plain `Once` would warm only the corpus present at the
-        // first query — files the background reconcile adds afterwards would stay cold
-        // and dominate every query at an un-normalized score.
+        // files' hit levels. Firing only once would warm only the corpus present at
+        // the first query — files the background reconcile adds afterwards would
+        // stay cold and dominate every query at an un-normalized score.
         if self.normalization_warm.swap(true, AtomicOrdering::SeqCst) {
-            return;
+            return None;
         }
-        let this = self.clone();
-        let schema = schema.clone();
-        std::thread::spawn(move || {
-            this.warm_normalization_from_substrate(&schema, target);
-        });
-    }
-
-    /// Re-arm the normalization warm-up (see [`Self::ensure_normalization_warm`]) so
-    /// the next projection re-learns per-file hit levels. Called after an ingest
-    /// reconcile mints fresh file timelines the prior warm never scanned.
-    pub fn reset_normalization_warm(&self) {
-        self.normalization_warm.store(false, AtomicOrdering::SeqCst);
-    }
-
-    /// The warm-replay body (see [`Self::ensure_normalization_warm`]). Scores the
-    /// last [`WARM_REPLAY_MAX_TURNS`] dialogue turns as seal-style observes against
-    /// every belief group, folding the hit levels. Turns are ordered by
-    /// `(timeline, turn index)` so the warmed levels don't depend on `HashMap`
-    /// iteration order, and bounded to the recent window (the asymmetric EWMA
-    /// converges in a few dozen steps, so older turns barely move it — this caps
-    /// the one-time cost on a huge substrate). It reuses the live turn-group scan
-    /// with `observe = true`; the normalized scores it also computes are discarded.
-    /// Only dialogue turns (empty-tagged — gallery turns are tagged) are probes; the
-    /// still-decoding current turn is excluded (no sealed signature yet). Runs off
-    /// the hot path, reading the substrate under a shared lock and briefly locking
-    /// the normalization cache per group, so it coexists with live reprojections.
-    fn warm_normalization_from_substrate(&self, schema: &Schema, target: ProjectionTarget) {
         let mut probes: Vec<(u64, u32, Vec<WideQSig>)> = {
             let sub = self.inner.read().unwrap();
             sub.all_streams()
@@ -1274,35 +1336,59 @@ impl Conversation {
         };
         probes.sort_by_key(|(tl, idx, _)| (*tl, *idx));
         let start = probes.len().saturating_sub(WARM_REPLAY_MAX_TURNS);
-        for (tl, idx, probe) in &probes[start..] {
-            let mut throwaway = ProjectionScores::new();
-            // These probes are the UNTAGGED dialogue turns, so they teach the
-            // unscoped turn groups and — by the routing in `Observe::teaches` —
-            // no tag-scoped collection. Both calls are made; the lens rule
-            // decides which scopes actually learn, rather than the call site
-            // guessing. That is what keeps dialogue from degrading the tool lens
-            // while leaving both free to learn from their own traffic.
-            // Keyed on the turn itself, so a replay of an already-folded turn —
-            // which is what this pass is on every boot after the first — costs
-            // one lookup and changes nothing.
-            let observe = Observe::Yes {
-                tags: &[],
-                source: turn_stream_id(*tl, *idx).0,
-            };
-            let _ =
-                self.score_belief_collections(&schema.system_prompt, probe, None, observe, None);
-            for layer in &schema.layers {
-                // Background warm-up runs off the hot path → CPU (no device).
-                let _ = self.score_belief_groups(
-                    layer,
-                    target,
+        Some(
+            probes
+                .drain(start..)
+                .map(|(tl, idx, probe)| WarmProbe {
+                    source: turn_stream_id(tl, idx).0,
                     probe,
-                    None,
-                    &mut throwaway,
-                    observe,
-                    None,
-                );
-            }
+                })
+                .collect(),
+        )
+    }
+
+    /// Re-arm the normalization warm-up (see [`Self::take_warm_replay`]) so the
+    /// next projection re-learns per-file hit levels. Called after an ingest
+    /// reconcile mints fresh file timelines the prior warm never scanned.
+    pub fn reset_normalization_warm(&self) {
+        self.normalization_warm.store(false, AtomicOrdering::SeqCst);
+    }
+
+    /// Fold one replayed dialogue turn into the hit levels — a seal-style
+    /// observe against every belief node, whose normalized scores are
+    /// discarded.
+    ///
+    /// These probes are the UNTAGGED dialogue turns, so they teach the unscoped
+    /// turn groups and — by the routing in `Observe::teaches` — no tag-scoped
+    /// collection. Both scans are asked for; the lens rule decides which scopes
+    /// actually learn, rather than the call site guessing. That is what keeps
+    /// dialogue from degrading the tool lens while leaving both free to learn
+    /// from their own traffic. Keyed on the turn itself, so a turn a scope has
+    /// already folded changes nothing there.
+    pub fn score_warm_probe(
+        &self,
+        schema: &Schema,
+        target: ProjectionTarget,
+        warm: &WarmProbe,
+        arena: Option<&GalleryArena>,
+    ) {
+        let observe = Observe::Yes {
+            tags: &[],
+            source: warm.source,
+        };
+        let _ =
+            self.score_belief_collections(&schema.system_prompt, &warm.probe, None, observe, arena);
+        let mut throwaway = ProjectionScores::new();
+        for layer in &schema.layers {
+            let _ = self.score_belief_groups(
+                layer,
+                target,
+                &warm.probe,
+                None,
+                &mut throwaway,
+                observe,
+                arena,
+            );
         }
     }
 
@@ -1310,7 +1396,7 @@ impl Conversation {
     /// tag-scoped corpus (self-match), the collection analogue of
     /// [`Self::warm_ingest_normalization`].
     ///
-    /// [`Self::warm_normalization_from_substrate`] already re-observes collections,
+    /// The dialogue replay ([`Self::take_warm_replay`]) already re-observes collections,
     /// but only through **dialogue** probes (`tags.is_empty()`) — and a collection's
     /// own corpus is tagged by construction (that tag is what scopes its gallery).
     /// So the turns that actually teach a member's level are exactly the ones that
@@ -1349,6 +1435,27 @@ impl Conversation {
         schema: &Schema,
         arena: Option<&GalleryArena>,
     ) -> CollectionWarm {
+        // How long the job waited for the warm pool, logged as it starts: one
+        // post-recalibration boot sat in this step for over half an hour with
+        // every pool thread busy and the GPU idle, and the line says whether a
+        // recurrence is the queue or the work.
+        let queued_at = Instant::now();
+        warm_pool::run(|| {
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                queued_ms = queued_at.elapsed().as_millis() as u64,
+                "normalization warm-up: started on the warm pool",
+            );
+            self.warm_collection_normalization_on_pool(schema, arena)
+        })
+    }
+
+    /// [`Self::warm_collection_normalization`]'s body, run on the warm pool.
+    fn warm_collection_normalization_on_pool(
+        &self,
+        schema: &Schema,
+        arena: Option<&GalleryArena>,
+    ) -> CollectionWarm {
         let mut warm = CollectionWarm::default();
         let sp = &schema.system_prompt;
         for item in &sp.items {
@@ -1367,6 +1474,7 @@ impl Conversation {
             // the same derivation the gallery itself uses to map turn → slot.
             let member_names: HashSet<&str> =
                 coll.sections.iter().map(|s| s.name.as_str()).collect();
+            let planned_at = Instant::now();
             // Plan first (cheap, from declarations only), then fetch signatures for
             // exactly the turns the plan keeps — the cap does not pay to decode
             // signatures it discards.
@@ -1402,6 +1510,14 @@ impl Conversation {
                     .filter(|(_, sig)| !sig.is_empty())
                     .collect()
             };
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                collection = %coll.name,
+                members = plan.len(),
+                probes = probes.len(),
+                plan_and_fetch_ms = planned_at.elapsed().as_millis() as u64,
+                "normalization warm-up: probes planned and fetched",
+            );
             if probes.is_empty() {
                 continue;
             }
@@ -1423,7 +1539,9 @@ impl Conversation {
                 match self.fold_warm_probes(taught, &probes, arena) {
                     Some(true) => warm.gpu_probes += probes.len(),
                     Some(false) => {}
-                    // A shutdown asked: the warm-up must end with its session.
+                    // It did not complete — a shutdown asked, or the GPU scan
+                    // failed and the host cannot stand in for it. Either way the
+                    // warm-up ends here with whatever it has already learned.
                     None => return warm,
                 }
             }
@@ -1444,8 +1562,10 @@ impl Conversation {
     /// whole-turn scores against `taught`'s gallery, observed under the probe's
     /// stream id, exactly as the seal-time scan observes it. `Some(true)` when
     /// the GPU arena scored them, `Some(false)` for the CPU (no arena, a
-    /// non-additive law the arena does not scan, an empty gallery, or a launch
-    /// that failed), `None` when a shutdown stopped it part-way.
+    /// non-additive law the arena does not scan, or an empty gallery — the cases
+    /// that never reach a kernel and are cheap on the host), `None` when it did
+    /// not complete: a shutdown stopped it, or the GPU scan failed on a gallery
+    /// the host cannot finish.
     fn fold_warm_probes(
         &self,
         taught: &SectionCollection,
@@ -1453,9 +1573,19 @@ impl Conversation {
         arena: Option<&GalleryArena>,
     ) -> Option<bool> {
         let n = taught.sections.len();
-        let slot_of = |name: &str| taught.sections.iter().position(|s| s.name == name);
+        let members: Vec<String> = taught.sections.iter().map(|s| s.name.clone()).collect();
+        let gallery_started = Instant::now();
         let (windows, slots, sids) =
-            self.belief_gallery(&taught.name, &taught.policy.tags, slot_of);
+            self.belief_gallery(&taught.name, &taught.policy.tags, &members);
+        tracing::info!(
+            target: "candle_conversation::provenance",
+            collection = %taught.name,
+            windows = windows.len(),
+            probes = probes.len(),
+            gallery_ms = gallery_started.elapsed().as_millis() as u64,
+            gpu = arena.is_some() && taught.policy.scan.fusion == FusionMode::Additive,
+            "normalization warm-up: gallery assembled, scoring probes",
+        );
         if windows.is_empty() {
             return Some(false);
         }
@@ -1481,7 +1611,6 @@ impl Conversation {
                     n_cases: n,
                 }];
                 let mut raw = Vec::with_capacity(queries.len());
-                let mut scanned = true;
                 for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
                     if ingest_cancelled() {
                         return None;
@@ -1489,16 +1618,38 @@ impl Conversation {
                     match arena.scan_weighted(&segments, batch, weights) {
                         Ok(out) => raw.extend(out),
                         Err(e) => {
-                            tracing::debug!(
-                                target: "provenance",
-                                "GPU warm-up scan unavailable, using CPU: {e}"
+                            // **A failed GPU scan does NOT fall back to the CPU.**
+                            //
+                            // The CPU path below is a per-query walk of the whole
+                            // gallery. It is the right answer for the cheap cases
+                            // that never reach a kernel (no arena, an empty gallery,
+                            // a fusion law the arena does not scan) — but a gallery
+                            // big enough to want the GPU is one the host cannot
+                            // finish. Measured: a `CUDA_ERROR_INVALID_CONTEXT` here
+                            // put eight cores at 100% with the GPU idle and boot
+                            // never completed — 900 s and still going, which is the
+                            // same half-hour stall `warm_collection_normalization`
+                            // already records above.
+                            //
+                            // Warm-up is an optimisation: skipping it leaves this
+                            // collection's levels cold for the session, which costs
+                            // ranking quality. Hanging the boot costs everything.
+                            tracing::warn!(
+                                target: "candle_conversation::provenance",
+                                collection = %taught.name,
+                                windows = windows.len(),
+                                probes = probes.len(),
+                                "GPU warm-up scan FAILED: {e} — abandoning this \
+                                 collection's warm-up rather than falling back to a \
+                                 host scan that cannot finish a gallery this size. \
+                                 Its hit levels stay COLD for this session, so its \
+                                 members' scores are not comparable to each other."
                             );
-                            scanned = false;
-                            break;
+                            return None;
                         }
                     }
                 }
-                scanned.then_some(raw)
+                Some(raw)
             }
             _ => None,
         };
@@ -1551,27 +1702,44 @@ impl Conversation {
     /// a promiscuous low-entropy file (a class/language list whose repetitive tokens
     /// agree with almost any probe) tops every query.
     pub fn warm_ingest_normalization(&self, schema: &Schema) {
+        warm_pool::run(|| self.warm_ingest_normalization_on_pool(schema))
+    }
+
+    /// [`Self::warm_ingest_normalization`]'s body, run on the warm pool. It runs
+    /// after `ready`, in the reconcile thread, while conversations are being
+    /// served — the case the warm pool exists for.
+    fn warm_ingest_normalization_on_pool(&self, schema: &Schema) {
+        let t_warm = Instant::now();
         let mut warmed_timelines = 0usize;
         for layer in &schema.layers {
-            // Out of retrieval ⇒ nothing to warm. A hit level is a denominator
-            // for candidates this layer might return, and a non-gathered layer
-            // returns none, so warming it would spend the probe budget learning
-            // levels that can never be read. (`score_belief_groups` declines the
-            // same layer, so `warm_normalization_from_substrate` needs no guard
-            // of its own — it warms THROUGH that call.)
-            if !layer.gathered {
-                continue;
-            }
+            // This function only ever warms an append-only ingest layer — the
+            // loop body below is unreached otherwise, so this is the real
+            // filter; a leftover `!layer.gathered` check used to sit ahead of
+            // it and is deliberately gone (see below).
             let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
             if !is_ingest {
                 continue;
             }
+            // `gathered = false` promises "no OTHER conversation draws from
+            // this layer" — it does NOT mean nothing reads it at all. An
+            // append-only layer's own conversations score self-local
+            // (`score_belief_groups` exempts a layer scoring its own target
+            // regardless of `gathered`, for the same reason this warm still
+            // has a reader to serve). A `!layer.gathered` skip here used to
+            // run ahead of the `is_ingest` check above, so it silently
+            // matched exactly the ingest layers this loop exists to warm —
+            // the moment one was taken out of cross-layer gather (`zend`'s
+            // provenance-injection exclusion for `code_reading`/`repo_map`),
+            // its own turns went cold forever: no later pass ever warmed
+            // them, so a conversation several turns into its own history
+            // could no longer retrieve its own earlier turns.
             for group in layer.groups.iter().filter(|g| is_warmable(g)) {
                 warmed_timelines += self.warm_group(layer, group);
             }
         }
         tracing::info!(
             timelines = warmed_timelines,
+            elapsed_ms = t_warm.elapsed().as_millis() as u64,
             "normalization warm-up: learned per-file hit levels for ingest-layer timelines \
              (0 ⇒ no append-only ingest layer marked — belief levels stay cold)"
         );
@@ -1589,6 +1757,11 @@ impl Conversation {
     /// Returns how many timelines were warmed; `0` when the group is not in
     /// the schema or not [`is_warmable`].
     pub fn warm_group_normalization(&self, schema: &Schema, group: GroupId) -> usize {
+        warm_pool::run(|| self.warm_group_normalization_on_pool(schema, group))
+    }
+
+    /// [`Self::warm_group_normalization`]'s body, run on the warm pool.
+    fn warm_group_normalization_on_pool(&self, schema: &Schema, group: GroupId) -> usize {
         let Some(layer) = schema
             .layers
             .iter()
@@ -1607,6 +1780,11 @@ impl Conversation {
     /// the one member scored on a different scale from the rest. `false` when
     /// the timeline is unknown or its group is not [`is_warmable`].
     pub fn warm_timeline_normalization(&self, schema: &Schema, timeline: TimelineId) -> bool {
+        warm_pool::run(|| self.warm_timeline_normalization_on_pool(schema, timeline))
+    }
+
+    /// [`Self::warm_timeline_normalization`]'s body, run on the warm pool.
+    fn warm_timeline_normalization_on_pool(&self, schema: &Schema, timeline: TimelineId) -> bool {
         let Some((layer, group)) = self.timeline_target(timeline) else {
             return false;
         };
@@ -1723,7 +1901,24 @@ impl Conversation {
         // declines to score them, so they cannot be selected, which is the whole
         // of what the flag promises. Re-enabling restores them immediately; the
         // flag is a read-time filter, not a deletion.
-        if !layer.gathered {
+        //
+        // Exempt when `layer` IS the projection's own target — mirroring the
+        // assembly loop's `layer_is_target` exemption in `project.rs` ("the
+        // target layer is never skipped — that would leave the projection with
+        // nothing to emit"). `gathered = false` promises "no OTHER conversation
+        // draws from this layer"; it was never meant to promise "this layer's
+        // own conversations can't see their own history" too. An append-only
+        // ingest layer (`code_reading`, `repo_map`) scores self-local here —
+        // candidates scoped to `target.timeline` alone, never another
+        // conversation's — so honouring `!gathered` unconditionally silently
+        // zeroed every such layer's OWN turn-group candidates the moment it was
+        // taken out of cross-layer gather, with no way back in: a later turn
+        // in the very conversation that owns this layer could never again see
+        // turns from earlier in itself. Measured: a `code_reading` per-file
+        // conversation's closing turn, several `file_read` rounds deep, lost
+        // every earlier round in the same conversation and could not tell it
+        // had already read the whole file.
+        if !layer.gathered && layer.id != target.layer {
             return per_group;
         }
         // The substrate read guard is scoped to Phase A, never held across Phase
@@ -1754,6 +1949,15 @@ impl Conversation {
             if !group.is_belief_driven() {
                 continue;
             }
+            // Per-group phase split. `groups_us` in the caller covers a whole
+            // layer's worth of this loop, which is one level too coarse to
+            // attribute a slow scan: assembling the candidate set (host, walks
+            // every turn of every timeline in the group) and scoring it (one
+            // batched GPU launch) are different costs with different fixes, and
+            // a scan that has grown to tens of seconds looks identical from
+            // outside whichever one it is. Timed per group so the group that
+            // grew is named, not just the layer.
+            let t_select = Instant::now();
             let sub = self.inner.read().unwrap();
             // Score EVERY conversation in the group, not just the first. A belief
             // group like `code_reading` declares one timeline per file; scoring
@@ -1762,10 +1966,15 @@ impl Conversation {
             // A belief group is never the projection target (the target is the
             // Sequence dialogue group, skipped above), but mirror the target mask
             // anyway so the invariant holds if that ever changes.
+            // A scoped group offers only what the target's own scope names —
+            // `Substrate::scoped_timelines_for_group` — so an out-of-scope
+            // conversation is never scanned, and never teaches the group's
+            // hit levels on this target's behalf.
             let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
             } else {
-                sub.active_timelines_for_group(group.id).collect()
+                sub.scoped_timelines_for_group(group.id, target.timeline)
+                    .collect()
             };
             // A tagged group reads only the conversations carrying its tags — the
             // same scope projection applies to its candidates, applied here so an
@@ -1802,6 +2011,10 @@ impl Conversation {
                 // Real sig tokens per exchange slot — the Concept A.4 size input.
                 ex_tokens: Vec<usize>,
             }
+            let select_us = t_select.elapsed().as_micros() as u64;
+            let n_timelines = timelines.len();
+            let t_assemble = Instant::now();
+            let mut turns_walked = 0usize;
             let mut files: Vec<FileScan> = Vec::new();
             for timeline in timelines {
                 // Enumerate the group's turns exactly as selection does — the whole
@@ -1809,6 +2022,7 @@ impl Conversation {
                 // of scanning `all_streams()` per group (which is O(all timelines'
                 // streams) on the reproject hot path).
                 let count = sub.turn_count(timeline);
+                turns_walked += count as usize;
                 // Per candidate turn: its full sig plus the self-referencing sub-window
                 // seams recorded on it. A turn with no seams scores as one whole-turn
                 // window (the prior behaviour); a turn with N seams scores as N+1
@@ -1930,9 +2144,12 @@ impl Conversation {
             // `FileScan` owns its data (`arcs_kept` holds `Arc`s), so nothing
             // below borrows the guard.
             drop(sub);
+            let assemble_us = t_assemble.elapsed().as_micros() as u64;
+            let n_windows: usize = files.iter().map(|f| f.windows.len()).sum();
             if files.is_empty() {
                 continue;
             }
+            let t_scan = Instant::now();
 
             // ── Phase B: score every file. GPU = ONE paged segmented launch over the
             // resident gallery arena (per-file z / margin / needle gate, numerically
@@ -1941,10 +2158,44 @@ impl Conversation {
             // group vote weights come from the group's `policy.layer_weights` (empty ⇒
             // uniform — repo_map peaks on L46 (§83), configured in the schema YAML). ──
             let weights = &group.policy.layer_weights;
-            // Returns per-file `(fused, mass_base)`: the policy-fused
-            // per-exchange scores and the UNGATED additive sum for Concept B.
-            let scan_files = |p: &[WideQSig]| -> Vec<(Vec<f32>, Vec<f32>)> {
-                let gpu_scores: Option<Vec<(Vec<f32>, Vec<f32>)>> = arena.and_then(|arena| {
+            // The CPU per-file scan of one probe — the path a host without the
+            // arena takes.
+            let scan_files_cpu = |p: &[WideQSig]| -> Vec<(Vec<f32>, Vec<f32>)> {
+                files
+                    .iter()
+                    .map(|f| {
+                        let wref: Vec<&[WideQSig]> = f
+                            .windows
+                            .iter()
+                            .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
+                            .collect();
+                        let wslot: Vec<usize> =
+                            f.windows.iter().map(|&(_, _, _, slot)| slot).collect();
+                        match group.policy.scan.fusion {
+                            FusionMode::Additive => {
+                                let v = score_slots_weighted(p, &wref, &wslot, f.n_slots, weights);
+                                (v.clone(), v)
+                            }
+                            mode => {
+                                let grouped =
+                                    score_slots_grouped(p, &wref, &wslot, f.n_slots, weights);
+                                if grouped.is_empty() {
+                                    (vec![0.0; f.n_slots], vec![0.0; f.n_slots])
+                                } else {
+                                    (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
+                                }
+                            }
+                        }
+                    })
+                    .collect()
+            };
+            // Returns, per probe, per-file `(fused, mass_base)`: the policy-fused
+            // per-exchange scores and the UNGATED additive sum for Concept B. Every
+            // probe rides the same launch — one pass over the gallery and one sync
+            // for the tail and question windows together, each voting exactly as
+            // it would alone.
+            let scan_files = |probes: &[&[WideQSig]]| -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
+                let gpu_scores: Option<Vec<Vec<(Vec<f32>, Vec<f32>)>>> = arena.and_then(|arena| {
                 // Per-turn residency fingerprint: the decoded-sig `Arc` identity + a
                 // content sample (first/last words). The memo serves a STABLE `Arc`
                 // that changes identity only when a turn's blob is rewritten (and keeps
@@ -1971,30 +2222,52 @@ impl Conversation {
                         n_cases: f.n_slots,
                     })
                     .collect();
-                let arena_scan = |w: &[f32]| -> Option<Vec<Vec<f32>>> {
-                    match arena.scan_weighted(&segments, &[p], w) {
-                        Ok(mut out) => {
-                            // One probe in ⇒ one per-GLOBAL-case vote vector out, in
-                            // segment (file) order. Split it back per file by
-                            // cumulative `n_slots`.
-                            let votes = out.pop().unwrap_or_default();
-                            let mut cum = 0usize;
+                // `[probe][file][slot]`.
+                let arena_scan = |w: &[f32]| -> Option<Vec<Vec<Vec<f32>>>> {
+                    match arena.scan_weighted(&segments, probes, w) {
+                        Ok(out) => {
+                            // One per-GLOBAL-case vote vector per probe, in segment
+                            // (file) order. Split each back per file by cumulative
+                            // `n_slots`.
                             Some(
-                                files
-                                    .iter()
-                                    .map(|f| {
-                                        let end = (cum + f.n_slots).min(votes.len());
-                                        let mut v = votes.get(cum..end).unwrap_or(&[]).to_vec();
-                                        v.resize(f.n_slots, 0.0);
-                                        cum += f.n_slots;
-                                        v
+                                out.into_iter()
+                                    .map(|votes| {
+                                        let mut cum = 0usize;
+                                        files
+                                            .iter()
+                                            .map(|f| {
+                                                let end = (cum + f.n_slots).min(votes.len());
+                                                let mut v =
+                                                    votes.get(cum..end).unwrap_or(&[]).to_vec();
+                                                v.resize(f.n_slots, 0.0);
+                                                cum += f.n_slots;
+                                                v
+                                            })
+                                            .collect()
                                     })
                                     .collect(),
                             )
                         }
+                        // WARN, and on the crate-qualified target — both
+                        // deliberate.
+                        //
+                        // The target must fall under one of the host's
+                        // `EnvFilter` directives (`zend=`, `candle_conversation=`,
+                        // `candle_transformers=`, `candle_nn=`); a bare
+                        // `provenance` matches none, so the fallback could never
+                        // be printed and its absence from a log would read as
+                        // proof it had not happened.
+                        //
+                        // And on a CUDA host a declined GPU scan is not a debug
+                        // detail: the CPU per-file path is orders of magnitude
+                        // slower over a large corpus, so the symptom is a daemon
+                        // that has quietly become slow rather than one that
+                        // reports a fault. The CPU path stays — a host without
+                        // CUDA has no other way to score beliefs — but taking it
+                        // on a machine that has a GPU is worth saying out loud.
                         Err(e) => {
-                            tracing::debug!(
-                                target: "provenance",
+                            tracing::warn!(
+                                target: "candle_conversation::provenance",
                                 "paged GPU belief scan unavailable, using CPU per-file scan: {e}"
                             );
                             None
@@ -2007,91 +2280,77 @@ impl Conversation {
                 // `score_slots_fused`. The ungated group sum rides along as
                 // the mass base.
                 match group.policy.scan.fusion {
-                    FusionMode::Additive => {
-                        arena_scan(weights).map(|per_file| {
-                            per_file.into_iter().map(|v| (v.clone(), v)).collect()
-                        })
-                    }
+                    FusionMode::Additive => arena_scan(weights).map(|per_probe| {
+                        per_probe
+                            .into_iter()
+                            .map(|per_file| per_file.into_iter().map(|v| (v.clone(), v)).collect())
+                            .collect()
+                    }),
                     mode => {
                         // Derived, not the locked constant — see the turn-group
                         // scan above.
-                        let n_groups = p.first().map(|s| {
+                        let n_groups = probes.first().and_then(|p| p.first()).map(|s| {
                             let n = s.n_heads as usize;
                             match heads_per_group(n) {
                                 0 => 1,
                                 per => (n / per).max(1),
                             }
                         })?;
-                        // grouped_files[g][file][slot]
-                        let mut grouped_files: Vec<Vec<Vec<f32>>> =
-                            Vec::with_capacity(n_groups);
+                        // grouped[g][probe][file][slot]
+                        let mut grouped: Vec<Vec<Vec<Vec<f32>>>> = Vec::with_capacity(n_groups);
                         for g in 0..n_groups {
                             let mut one_hot = vec![0.0f32; n_groups];
                             one_hot[g] = weights.get(g).copied().unwrap_or(1.0);
-                            grouped_files.push(arena_scan(&one_hot)?);
+                            grouped.push(arena_scan(&one_hot)?);
                         }
                         Some(
-                            (0..files.len())
-                                .map(|fi| {
-                                    let per_group: Vec<Vec<f32>> = grouped_files
-                                        .iter()
-                                        .map(|gf| gf[fi].clone())
-                                        .collect();
-                                    (
-                                        mode.fuse(&per_group),
-                                        FusionMode::Additive.fuse(&per_group),
-                                    )
+                            (0..probes.len())
+                                .map(|pi| {
+                                    (0..files.len())
+                                        .map(|fi| {
+                                            let per_group: Vec<Vec<f32>> = grouped
+                                                .iter()
+                                                .map(|gp| gp[pi][fi].clone())
+                                                .collect();
+                                            (
+                                                mode.fuse(&per_group),
+                                                FusionMode::Additive.fuse(&per_group),
+                                            )
+                                        })
+                                        .collect()
                                 })
                                 .collect(),
                         )
                     }
                 }
             });
-                gpu_scores.unwrap_or_else(|| {
-                    files
-                        .iter()
-                        .map(|f| {
-                            let wref: Vec<&[WideQSig]> = f
-                                .windows
-                                .iter()
-                                .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
-                                .collect();
-                            let wslot: Vec<usize> =
-                                f.windows.iter().map(|&(_, _, _, slot)| slot).collect();
-                            match group.policy.scan.fusion {
-                                FusionMode::Additive => {
-                                    let v =
-                                        score_slots_weighted(p, &wref, &wslot, f.n_slots, weights);
-                                    (v.clone(), v)
-                                }
-                                mode => {
-                                    let grouped =
-                                        score_slots_grouped(p, &wref, &wslot, f.n_slots, weights);
-                                    if grouped.is_empty() {
-                                        (vec![0.0; f.n_slots], vec![0.0; f.n_slots])
-                                    } else {
-                                        (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
-                                    }
-                                }
-                            }
-                        })
-                        .collect()
-                })
+                gpu_scores.unwrap_or_else(|| probes.iter().map(|p| scan_files_cpu(p)).collect())
             };
-            let scanned: Vec<(Vec<f32>, Vec<f32>)> = scan_files(probe);
-            let fresh_per_file: Vec<Vec<f32>> =
-                scanned.iter().map(|(fused, _)| fused.clone()).collect();
-            let mass_base_per_file: Vec<Vec<f32>> =
-                scanned.into_iter().map(|(_, base)| base).collect();
             // Concept F: the pinned question window scans as a second probe,
             // max-fused with the tail per exchange AFTER normalization.
-            let fresh_q_per_file: Option<Vec<Vec<f32>>> = match probe_q {
-                Some(q) if group.policy.scan.question_pin && !q.is_empty() => {
-                    Some(scan_files(q).into_iter().map(|(fused, _)| fused).collect())
-                }
+            let question = match probe_q {
+                Some(q) if group.policy.scan.question_pin && !q.is_empty() => Some(q),
                 _ => None,
             };
+            let mut scanned = match question {
+                Some(q) => scan_files(&[probe, q]),
+                None => scan_files(&[probe]),
+            };
+            let fresh_q_per_file: Option<Vec<Vec<f32>>> = question
+                .and_then(|_| scanned.pop())
+                .map(|per_file| per_file.into_iter().map(|(fused, _)| fused).collect());
+            let tail_scan = scanned.pop().unwrap_or_default();
+            let fresh_per_file: Vec<Vec<f32>> =
+                tail_scan.iter().map(|(fused, _)| fused.clone()).collect();
+            let mass_base_per_file: Vec<Vec<f32>> =
+                tail_scan.into_iter().map(|(_, base)| base).collect();
 
+            // Phase B ends here. Split from Phase C because the boundary scan is
+            // the only one that also observes into the normalization levels
+            // under a shared lock, so scoring time and lock time are reported
+            // apart.
+            let score_us = t_scan.elapsed().as_micros() as u64;
+            let t_normalize = Instant::now();
             // ── Phase C: per-file normalize → Q-fuse → locality → stamp ──────────
             // Normalize the raw scores against each EXCHANGE's learned hit level so
             // selection compares candidates on a common 0-1000 band, not a shared
@@ -2200,9 +2459,45 @@ impl Conversation {
                     group.policy.scan.mass_rho,
                 ),
             );
+            // Where this group's scan time went, and what it walked to spend it.
+            // `assemble_us` is host work proportional to the group's turns;
+            // `score_us` is the batched launch (plus the CPU fallback when the
+            // arena declines); `normalize_us` is Phase C, which takes the
+            // normalization lock and — on the seal scan only — observes into the
+            // hit levels. The counts say whether a phase grew because the corpus
+            // did.
+            //
+            // `trace!`, because this is per group and there are ~17 of them per
+            // scan: it was 1,262 lines of a 4,315-line daemon log, and the
+            // `belief scan phase split` line above already carries the per-scan
+            // totals that answer "did a phase grow". Raise the target to trace
+            // when the question is which *group* grew.
+            tracing::trace!(
+                target: "candle_conversation::provenance",
+                layer = %layer.name,
+                group = group.id.raw(),
+                timelines = n_timelines,
+                turns = turns_walked,
+                windows = n_windows,
+                seal = observe.source().is_some(),
+                select_us,
+                assemble_us,
+                score_us,
+                normalize_us = t_normalize.elapsed().as_micros() as u64,
+                "belief group scan"
+            );
             per_group.push((group.id, cands));
         }
         per_group
+    }
+
+    /// A turn's role as its `TurnDecl` carries it.
+    fn decl_role(role: Role) -> u8 {
+        match role {
+            Role::System => 0,
+            Role::User => 1,
+            Role::Assistant => 2,
+        }
     }
 
     /// Atomically append a turn to the substrate.
@@ -2245,11 +2540,7 @@ impl Conversation {
             turn_index: idx.0,
             turn_id_day: 0,
             turn_id_seq: idx.0 + 1,
-            role: match role {
-                Role::System => 0,
-                Role::User => 1,
-                Role::Assistant => 2,
-            },
+            role: Self::decl_role(role),
             block_start,
             block_end,
             layer_id,
@@ -3121,32 +3412,106 @@ impl Conversation {
         self.read().live_timeline_ids()
     }
 
-    /// Set a conversation's `archived` lifecycle flag and persist it
-    /// as a `RecordType::ConvState` record. Idempotent: if the
-    /// substrate already holds the requested state, the record is
-    /// not written and the call returns `Ok(())` without touching the
-    /// log.
-    ///
-    /// Last-write-wins on replay — toggling archive↔unarchive each
-    /// appends one small record (~ 16 bytes payload + framing); a
-    /// subsequent compaction collapses the chain to one record per
-    /// timeline.
+    /// Set a conversation's `archived` lifecycle flag and persist its
+    /// state. Idempotent: if the substrate already holds the requested
+    /// flag, nothing is written.
     pub fn set_conversation_archived(
         &self,
         timeline: TimelineId,
         archived: bool,
     ) -> candle::Result<()> {
-        let changed = self.write().set_archived(timeline, archived);
-        if !changed {
-            return Ok(());
-        }
-        let state = crate::persistence::manifest::ConvState { archived };
-        let payload = manifest::encode_conv_state_payload(timeline.raw(), state);
-        self.writer.enqueue(WriteJob::ConvMeta {
-            record: RecordType::ConvState,
-            payload,
-        });
+        self.update_conv_state(timeline, |sub| sub.set_archived(timeline, archived));
         Ok(())
+    }
+
+    /// Mark a conversation used now and persist its state, so the sidebar
+    /// ranks it above every conversation used before it.
+    pub fn touch_conversation(&self, timeline: TimelineId) {
+        self.update_conv_state(timeline, |sub| sub.touch_conversation(timeline));
+    }
+
+    /// Set the branch `timeline` works on in each repository `branches`
+    /// names — repository name to branch — leaving any other repository's as
+    /// it is, and persist the state once. Idempotent: when nothing changes,
+    /// nothing is written.
+    pub fn set_conversation_branches(
+        &self,
+        timeline: TimelineId,
+        branches: &BTreeMap<String, String>,
+    ) {
+        self.update_conv_state(timeline, |sub| {
+            let mut changed = false;
+            for (repo, branch) in branches {
+                changed |= sub.set_branch(timeline, repo, branch);
+            }
+            changed
+        });
+    }
+
+    /// Stage `write` — a set of `timeline`'s changes to its files — as
+    /// events on the timeline, events before tombstones, for the persistence
+    /// thread's group commit to make durable. Returns the sequence numbers
+    /// the events took. A read-only substrate refuses: the
+    /// caller mirrors what was written, and nothing was.
+    pub fn write_conversation_files(
+        &self,
+        timeline: TimelineId,
+        write: &VfsWrite,
+    ) -> candle::Result<Vec<u64>> {
+        if self.read_only {
+            return Err(candle::Error::Msg(
+                "write_conversation_files: the substrate is read-only".to_string(),
+            ));
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_vfs(timeline.raw(), write)
+            .map_err(|e| candle::Error::Msg(format!("write_conversation_files: {e}")))
+    }
+
+    /// Every live event of `timeline`'s files, read back in
+    /// `(repo, key, seq)` order.
+    pub fn conversation_files(&self, timeline: TimelineId) -> candle::Result<Vec<VfsEventPayload>> {
+        let mut p = self.persistence.lock().unwrap();
+        p.vfs_events(timeline.raw())
+            .map_err(|e| candle::Error::Msg(format!("conversation_files: {e}")))
+    }
+
+    /// `timeline`'s conversation state — archived flag and branches — or
+    /// `None` for an unregistered timeline.
+    pub fn conversation_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.read().conv_state(timeline)
+    }
+
+    /// Apply `change` to the substrate and, when it reports a change, persist
+    /// `timeline`'s whole resulting state as a `RecordType::ConvState` record.
+    ///
+    /// Every record carries the complete state, so replay is last-writer-wins
+    /// on the whole of it and a later compaction keeps one record per
+    /// timeline. The state is read in the same write-lock hold that changed
+    /// it, and `conv_state_writes` keeps the enqueue order equal to that
+    /// order — see the field.
+    fn update_conv_state(&self, timeline: TimelineId, change: impl FnOnce(&mut Substrate) -> bool) {
+        let _ordered = self
+            .conv_state_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = {
+            let mut sub = self.write();
+            if !change(&mut sub) {
+                return;
+            }
+            sub.conv_state(timeline)
+        };
+        let Some(state) = state else {
+            return;
+        };
+        if self.read_only {
+            return;
+        }
+        self.writer.enqueue(WriteJob::ConvState {
+            timeline: timeline.raw(),
+            payload: manifest::encode_conv_state_payload(timeline.raw(), &state),
+        });
     }
 
     /// Whether `timeline` is currently archived. Untouched / unknown
@@ -3171,6 +3536,56 @@ impl Conversation {
         p.write_tombstone(timeline.raw(), None)
             .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
         Ok(())
+    }
+
+    /// Tombstone a section stream — the section counterpart of
+    /// [`Self::tombstone_timeline`]. Marks it logically deleted both in-RAM
+    /// (so the ingest triage's `section_exists` / `section_stream_is_persisted`
+    /// checks stop treating it as present or restorable on the very next
+    /// request, in this same process) and on disk (via a
+    /// [`crate::persistence::record::RecordType::SectionTombstone`] record,
+    /// so a restarted daemon doesn't reload the same corruption). The
+    /// compactor drops the underlying `Chunk`/`Tokens`/`StreamDecl` records
+    /// on the next compaction pass; ordinary reads never see them once this
+    /// lands.
+    pub fn tombstone_section(
+        &self,
+        stream_id: StreamId,
+        reason: Option<&str>,
+    ) -> candle::Result<()> {
+        self.write().tombstone_section(stream_id);
+        if self.read_only {
+            return Ok(());
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_section_tombstone(stream_id.0, reason)
+            .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+        Ok(())
+    }
+
+    /// Re-read a persisted section's per-layer chunk windows off disk and
+    /// run the generic [`first_divergent_chunk`] check against them —
+    /// confirmation from what is actually persisted, not a trust of a live
+    /// seal failure alone. Returns the first divergence found, or `None`
+    /// when the stream holds no durable chunks (nothing to confirm) or its
+    /// persisted layers agree (the seal failure that prompted the caller to
+    /// ask must have another cause — see the reactive hook at
+    /// `scheduler::Scheduler::perform_seal_and_write`).
+    ///
+    /// Read-only by design: this only answers the question. A caller that
+    /// wants to act on a confirmed divergence calls [`Self::tombstone_section`]
+    /// itself, so a caller that only wants the answer (a future boot-time
+    /// pass, a diagnostic) never also accepts the side effect.
+    pub fn check_section_window_integrity(
+        &self,
+        stream_id: StreamId,
+        n_layers: usize,
+    ) -> candle::Result<Option<WindowDivergence>> {
+        let mut p = self.persistence.lock().unwrap();
+        let substrate = self.read();
+        let windows = read_persisted_section_windows(&mut p, &substrate, stream_id, n_layers)
+            .map_err(|e| candle::Error::Msg(format!("check_section_window_integrity: {e}")))?;
+        Ok(windows.and_then(|w| first_divergent_chunk(&w)))
     }
 
     /// Tombstone **one turn** of a live timeline — in-RAM and on disk — leaving
@@ -3313,6 +3728,21 @@ impl Conversation {
     /// RAM (at cold-land), leaving them cold-only. Returns the count flagged.
     pub fn mark_timeline_evict_when_cold(&self, timeline: TimelineId) -> usize {
         self.write().mark_timeline_evict_when_cold(timeline)
+    }
+
+    /// Rewrite every residence's gids through a KV compaction's map — the
+    /// substrate's half of the sweep. See
+    /// [`crate::substrate::Substrate::rewrite_for_compaction`].
+    ///
+    /// Holds the substrate write lock for the whole rewrite, which is what makes it
+    /// atomic with respect to a projection reading residences: a reader must see
+    /// either every old gid or every new one, never a mixture, because a mixture is
+    /// one turn's KV read through another turn's addresses.
+    pub fn rewrite_for_compaction(
+        &self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        self.write().rewrite_for_compaction(sweep)
     }
 
     /// Set the substrate-side resume key (`debug_id`) for `timeline`
@@ -3746,27 +4176,92 @@ impl Conversation {
         &self,
         timeline: TimelineId,
     ) -> Result<Option<SnapshotPayload>, ConversationError> {
-        let Some(loc) = self.recurrent_snapshot_loc(timeline) else {
+        let Some(mut loc) = self.recurrent_snapshot_loc(timeline) else {
             return Ok(None);
         };
-        let bytes = self
-            .persistence
-            .lock()
-            .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
-            .read_record_payload(&loc)
-            .map_err(|e| {
-                ConversationError::Channel(format!(
-                    "recurrent snapshot for timeline {} is indexed but unreadable: {e}",
-                    timeline.raw()
-                ))
-            })?;
-        let payload = SnapshotPayload::decode(&bytes).map_err(|e| {
+        // **A sealed snapshot is read without the persistence mutex.** The
+        // scheduler calls this at every admission of a hybrid-model turn, and a
+        // compaction holds that mutex across its whole relocation — measured at
+        // 16.5 s mean, 31 s worst — so the read used to stall admission, and
+        // with it every decode, for as long as the compaction ran.
+        //
+        // A stale location is the one thing to handle, on either path:
+        // compaction relocates the record, repoints the index, and only then
+        // unlinks the old segment — and a whole-store compaction deletes the
+        // segment the active one was. So after **any** failed read the location
+        // is read again, and the read is retried only if the index moved: what
+        // the error says varies by platform (a file pending deletion on Windows
+        // fails to open with `PermissionDenied`, not `NotFound`), whether the
+        // record moved does not. A record that is unreadable where the index
+        // still points is reported on its first failure. Bounded, because each
+        // retry follows a completed relocation; the bound only protects against
+        // a store that keeps compacting under the read.
+        for _ in 0..SEALED_READ_ATTEMPTS {
+            let Some(read) = self.sealed.read_record_payload(&loc) else {
+                // In the active segment, where records may still be staged in
+                // RAM: only the locked read can see them.
+                break;
+            };
+            match read {
+                Ok(bytes) => return Self::decode_snapshot(timeline, &bytes).map(Some),
+                // Unmoved — a torn or corrupt record, or one the index names in
+                // a missing file: the locked read reports it, with the same
+                // message it always gave.
+                Err(_) => match self.moved_snapshot_loc(timeline, loc) {
+                    Some(moved) => loc = moved,
+                    None => break,
+                },
+            }
+        }
+        // The locked read. The location was fetched before the mutex, and the
+        // wait for it can span a compaction, so it gets the same re-read. The
+        // index is consulted with the persistence guard already dropped: the
+        // writer takes these two locks one after the other, never nested, and
+        // so does this.
+        let mut attempt = 0;
+        loop {
+            let read = self
+                .persistence
+                .lock()
+                .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
+                .read_record_payload(&loc);
+            match read {
+                Ok(bytes) => return Self::decode_snapshot(timeline, &bytes).map(Some),
+                Err(e) => {
+                    attempt += 1;
+                    match self.moved_snapshot_loc(timeline, loc) {
+                        Some(moved) if attempt < SEALED_READ_ATTEMPTS => loc = moved,
+                        _ => {
+                            return Err(ConversationError::Channel(format!(
+                                "recurrent snapshot for timeline {} is indexed but unreadable: {e}",
+                                timeline.raw()
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The timeline's snapshot location if the index now names a different one
+    /// than `stale` — the record was relocated since `stale` was read. `None`
+    /// when it has not moved, or when no snapshot is indexed any more.
+    fn moved_snapshot_loc(&self, timeline: TimelineId, stale: RecordLoc) -> Option<RecordLoc> {
+        self.recurrent_snapshot_loc(timeline)
+            .filter(|now| *now != stale)
+    }
+
+    /// Decode a recurrent snapshot record, naming the timeline on failure.
+    fn decode_snapshot(
+        timeline: TimelineId,
+        bytes: &[u8],
+    ) -> Result<SnapshotPayload, ConversationError> {
+        SnapshotPayload::decode(bytes).map_err(|e| {
             ConversationError::Channel(format!(
                 "recurrent snapshot for timeline {} failed to decode: {e}",
                 timeline.raw()
             ))
-        })?;
-        Ok(Some(payload))
+        })
     }
 
     /// Declare a section stream — appends a `StreamDecl::PromptSection`
@@ -3791,10 +4286,20 @@ impl Conversation {
     /// address has been persisted and can be cold-loaded back into
     /// hot without re-prefilling.  The check matches the ingest
     /// loop's skip-if-present gate.
+    ///
+    /// A tombstoned stream (see [`Substrate::tombstone_section`]) always
+    /// reads `false` here, even though its `Chunk` records are still on
+    /// disk until the next compaction pass physically drops them — the
+    /// whole point of the tombstone is that those chunks must never be
+    /// restored again, so the triage that reads this must see "not
+    /// persisted" and fall through to a fresh prefill instead.
     pub fn section_stream_is_persisted(&self, stream_id: StreamId) -> bool {
         drop(self.persistence.lock().unwrap());
-        self.read()
-            .stream_of(stream_id)
+        let view = self.read();
+        if view.is_section_tombstoned(stream_id) {
+            return false;
+        }
+        view.stream_of(stream_id)
             .map(|s| s.committed_through.is_some() && !s.chunks.is_empty())
             .unwrap_or(false)
     }
@@ -3978,7 +4483,7 @@ impl Conversation {
                 //    the scheduler's Sync bucket so a multi-second compaction shows
                 //    as Sync (a persistence wait) rather than unattributed Blocked,
                 //    and log it so the op's cost is visible on its own line.
-                let t_exec = std::time::Instant::now();
+                let t_exec = Instant::now();
                 let result = {
                     let mut p = self.persistence.lock().unwrap();
                     p.execute_maintenance(&plan).map_err(|e| {
@@ -4160,10 +4665,40 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         // so a scope summary is grounded only in its own scope — the multi-timeline
         // scan (cross-file retrieval) belongs to dialogue, not ingest generation.
         if group == self.target.group || self.read.is_append_only_layer(self.target.layer) {
-            return turns_of(self.target.timeline).collect();
+            // "My own history" spans the fork lineage: a conversation forked
+            // from another continues it, so the ancestors' turns are its own
+            // opening, oldest first. Each key keeps its own timeline, so
+            // exchange partitioning, ordering and emission downstream are
+            // already multi-timeline and need no change — and an ancestor
+            // sitting warm or cold is elevated by the ordinary projection
+            // working-set path, which is why nothing has to be pinned hot.
+            //
+            // Fast-path reads join them: a tool call that resolved to content
+            // the corpus had already read injected that conversation instead of
+            // re-reading the file, and it belongs in the same place the read it
+            // stands in for would have gone. Oldest first for the same reason —
+            // a read the conversation did earlier reads as earlier.
+            //
+            // Ahead of the lineage, because the lineage is what the conversation
+            // was founded on and these are things it went and looked at since.
+            let mut keys: Vec<TurnKey> = self
+                .read
+                .inherited_chain(self.target.timeline)
+                .into_iter()
+                .flat_map(turns_of)
+                .collect();
+            let mut injected: Vec<TimelineId> = self
+                .read
+                .fast_path_injections(self.target.timeline)
+                .to_vec();
+            injected.reverse();
+            keys.extend(injected.into_iter().flat_map(turns_of));
+            return keys;
         }
+        // The same scope the belief scan applied: what was never scored for
+        // this target is never selected for it either.
         self.read
-            .active_timelines_for_group(group)
+            .scoped_timelines_for_group(group, self.target.timeline)
             .flat_map(turns_of)
             .collect()
     }
@@ -4292,9 +4827,12 @@ mod tests {
         warmable, Conversation, Observe,
     };
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use crate::persistence::content_hash::turn_stream_id;
+    use crate::persistence::manifest::ConvState;
+    use crate::persistence::vfs::{VfsAppend, VfsWrite};
     use crate::persistence::{dir_fingerprint, SharedSubstrate, SubstratePersistence};
     use crate::projection::{GroupId, LayerId, TimelineId};
     use crate::substrate::{Substrate, TurnPartWrite};
@@ -4304,6 +4842,91 @@ mod tests {
 
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **A forked conversation's "own history" spans its lineage.**
+    ///
+    /// This is the projection half of `Substrate::inherited_chain`: the target
+    /// group is still masked to one conversation (a slot never sees a sibling
+    /// chat), but that conversation now opens with the turns of whatever it was
+    /// forked from, oldest first. It is what lets a dialogue start already
+    /// holding the priming chain's documents without a single turn being
+    /// copied onto it — and without the ancestor being pinned resident, since
+    /// each key keeps its own timeline and is elevated from whatever tier it is
+    /// on when selected.
+    #[test]
+    fn a_forked_conversation_opens_with_its_ancestors_turns() {
+        use crate::projection::ids::{TurnIndex, TurnKey};
+        use crate::projection::project::ProjectionTarget;
+        use crate::substrate::ContentResolver;
+
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let grandparent = TimelineId::from_raw(21).expect("timeline id");
+        let parent = TimelineId::from_raw(22).expect("timeline id");
+        let child = TimelineId::from_raw(23).expect("timeline id");
+        for tl in [grandparent, parent, child] {
+            conv.register_timeline(tl, layer, group);
+        }
+        {
+            let mut w = conv.write();
+            w.append_with_blocks(grandparent, 8, 0, 1);
+            w.append_with_blocks(parent, 8, 1, 2);
+            w.append_with_blocks(child, 8, 2, 3);
+        }
+        for (c, p) in [(child, parent), (parent, grandparent)] {
+            conv.set_conversation_metadata(c, Substrate::FORKED_FROM_KEY, &p.raw().to_string())
+                .expect("record lineage");
+        }
+
+        let read = conv.read_for(ProjectionTarget {
+            layer,
+            group,
+            timeline: child,
+        });
+        assert_eq!(
+            ContentResolver::group_turns(&read, group),
+            vec![
+                TurnKey::new(grandparent, TurnIndex(0)),
+                TurnKey::new(parent, TurnIndex(0)),
+                TurnKey::new(child, TurnIndex(0)),
+            ],
+            "oldest ancestor first, the target's own turns last",
+        );
+    }
+
+    /// A conversation that never forked is unaffected — the masking that keeps
+    /// one chat out of another's projection is exactly as it was.
+    #[test]
+    fn an_unforked_conversation_still_sees_only_its_own_turns() {
+        use crate::projection::ids::{TurnIndex, TurnKey};
+        use crate::projection::project::ProjectionTarget;
+        use crate::substrate::ContentResolver;
+
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let mine = TimelineId::from_raw(31).expect("timeline id");
+        let sibling = TimelineId::from_raw(32).expect("timeline id");
+        conv.register_timeline(mine, layer, group);
+        conv.register_timeline(sibling, layer, group);
+        {
+            let mut w = conv.write();
+            w.append_with_blocks(mine, 8, 0, 1);
+            w.append_with_blocks(sibling, 8, 1, 2);
+        }
+
+        let read = conv.read_for(ProjectionTarget {
+            layer,
+            group,
+            timeline: mine,
+        });
+        assert_eq!(
+            ContentResolver::group_turns(&read, group),
+            vec![TurnKey::new(mine, TurnIndex(0))],
+            "a sibling conversation stays masked out",
+        );
     }
 
     /// **A spliced turn keeps its index page.**
@@ -4430,6 +5053,71 @@ mod tests {
             dir.is_dir(),
             "a workspace conversation deleted the directory it was opened on"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A conversation's state survives a reopen whole.** Branches set, a
+    /// file event written, an archive after them, then one branch moved: each
+    /// record carries the whole state, so the archive keeps the branches, the
+    /// move keeps the archive, and the log replays to exactly the state RAM
+    /// held — and the file event reads back beside it.
+    #[test]
+    fn conversation_state_survives_a_reopen_whole() {
+        let dir = std::env::temp_dir().join(format!(
+            "candle-conv-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let tl = TimelineId::from_raw(7).expect("timeline id");
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(r, b)| (r.to_string(), b.to_string()))
+                .collect()
+        };
+        let expected = ConvState {
+            archived: true,
+            branches: map(&[("candle", "zen/work"), ("mind", "master")]),
+            active: 0,
+        };
+        let write = VfsWrite {
+            tombstones: Vec::new(),
+            events: vec![VfsAppend {
+                repo: "candle".into(),
+                key: "src/lib.rs".into(),
+                body: serde_json::json!({ "kind": "state", "size": 3, "conflict": false }),
+            }],
+        };
+        {
+            let mut substrate = Substrate::new();
+            let p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let conv = Conversation::from_parts(substrate, p);
+            conv.register_timeline(tl, layer, group);
+            conv.set_conversation_branches(tl, &map(&[("candle", "main"), ("mind", "master")]));
+            assert_eq!(conv.write_conversation_files(tl, &write).unwrap(), vec![0]);
+            conv.set_conversation_archived(tl, true).unwrap();
+            conv.set_conversation_branches(tl, &map(&[("candle", "zen/work")]));
+            assert_eq!(conv.conversation_state(tl), Some(expected.clone()));
+            conv.flush_writer();
+            conv.commit_persistence().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let conv = Conversation::from_parts(substrate, p);
+            conv.register_timeline(tl, layer, group);
+            assert_eq!(conv.conversation_state(tl), Some(expected));
+            let files = conv.conversation_files(tl).unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].key, "src/lib.rs");
+            assert_eq!(files[0].body, write.events[0].body);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4634,8 +5322,14 @@ layers:
         assert!(warmable(b.schema(), dialogue, conversation).is_none());
     }
 
-    /// **A layer out of retrieval is not warmed**, whichever warm-up asks —
-    /// the single-group and single-timeline ones as well as the ingest one.
+    /// **A layer out of retrieval is not warmed** through `warmable()` — the
+    /// single-group and single-timeline warm-ups this gates. The BULK ingest
+    /// warm-up (`warm_ingest_normalization`) does NOT go through `warmable()`
+    /// and does not honour this flag for an append-only layer: see
+    /// `turn_belief_scan.rs`'s `warm_ingest_normalization_still_warms_an_append_only_layer_when_not_gathered`
+    /// for why — a `code_reading`/`repo_map`-shaped layer scores itself
+    /// regardless of `gathered`, since that flag promises only that no OTHER
+    /// conversation draws from it.
     #[test]
     fn a_group_in_a_layer_out_of_retrieval_is_not_warmable() {
         let mut b = Builder::from_yaml(WARM_YAML).unwrap();
@@ -4805,5 +5499,150 @@ layers:
         assert_eq!(selected_in_collection(&sel, "tools"), Some("b".to_string()));
         // A different collection name matches nothing.
         assert_eq!(selected_in_collection(&sel, "memory"), None);
+    }
+}
+
+#[cfg(test)]
+mod recurrent_snapshot_read_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::Conversation;
+    use crate::persistence::content_hash::snapshot_stream_id;
+    use crate::persistence::record::SnapshotPayload;
+    use crate::persistence::segmented_log::segment_path;
+    use crate::projection::TimelineId;
+
+    /// A recognisable snapshot for `timeline`.
+    fn payload(timeline: TimelineId, turn_index: u32) -> SnapshotPayload {
+        SnapshotPayload {
+            timeline_id: timeline.raw(),
+            turn_index,
+            schedule_hash: 0xC0FF_EE00,
+            layers: Vec::new(),
+            aux: Vec::new(),
+        }
+    }
+
+    /// Store a snapshot exactly as the writer thread does — append under the
+    /// persistence lock, then register the location under the substrate lock,
+    /// never nested — and optionally seal the segment it landed in.
+    fn store(conv: &Conversation, timeline: TimelineId, turn_index: u32, seal: bool) {
+        let stream = snapshot_stream_id(timeline.raw());
+        let loc = {
+            let mut p = conv.persistence.lock().expect("persistence");
+            let loc = p
+                .write_snapshot(stream, &payload(timeline, turn_index).encode())
+                .expect("append");
+            p.commit().expect("commit");
+            if seal {
+                p.seal_active().expect("seal");
+            }
+            loc
+        };
+        conv.write().apply_snapshot_loc(stream, loc);
+    }
+
+    /// **The admission read completes while a compaction holds the persistence
+    /// mutex.** That hold is what stalled the scheduler: a mean of 16.5 s per
+    /// maintenance op, measured, with every decode waiting behind the snapshot
+    /// read at admission. The mutex is held here for the whole read, as the
+    /// relocation phase holds it, and the read runs against a deadline.
+    #[test]
+    fn a_sealed_snapshot_reads_while_persistence_is_held() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(41);
+        store(&conv, timeline, 3, true);
+
+        let held = conv.persistence.clone();
+        let _compaction = held.lock().expect("hold persistence");
+        let reader = conv.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(reader.read_recurrent_snapshot(timeline));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the snapshot read finished while persistence was held")
+            .expect("readable")
+            .expect("present");
+        worker.join().expect("worker");
+        assert_eq!(got.turn_index, 3);
+        assert_eq!(got.schedule_hash, 0xC0FF_EE00);
+        assert_eq!(got.timeline_id, timeline.raw());
+    }
+
+    /// A snapshot still in the active segment is read through the locked path,
+    /// exactly as before: its record may be staged in RAM, which only the log
+    /// holding it can see.
+    #[test]
+    fn a_snapshot_in_the_active_segment_is_still_read() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(42);
+        store(&conv, timeline, 5, false);
+        let got = conv
+            .read_recurrent_snapshot(timeline)
+            .expect("readable")
+            .expect("present");
+        assert_eq!(got.turn_index, 5);
+    }
+
+    /// **An index naming a segment that is gone is still an error.** The
+    /// lock-free read re-reads the location on a missing file, and when the
+    /// index still names that file it hands over to the locked read — which
+    /// reports it rather than answering `None`. A missing snapshot that reads as
+    /// "no snapshot" is the silent amnesia this path exists to prevent.
+    #[test]
+    fn a_snapshot_whose_segment_vanished_is_an_error_not_a_none() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(43);
+        store(&conv, timeline, 7, true);
+        let loc = conv.recurrent_snapshot_loc(timeline).expect("indexed");
+        let file = {
+            let p = conv.persistence.lock().expect("persistence");
+            segment_path(p.dir(), loc.segment)
+        };
+        std::fs::remove_file(&file).expect("remove the segment");
+        let err = conv
+            .read_recurrent_snapshot(timeline)
+            .expect_err("a vanished snapshot is not an absent one");
+        assert!(
+            err.to_string().contains("indexed but unreadable"),
+            "the locked read's own report: {err}"
+        );
+    }
+
+    /// **A read retries only a location the index has moved away from.** A
+    /// snapshot written again lands at a new location, and the one read before
+    /// it is stale; the current location is not. This is what both read paths
+    /// consult after a failure, so an unreadable record where the index still
+    /// points is reported rather than chased.
+    #[test]
+    fn only_a_relocated_snapshot_counts_as_moved() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(45);
+        store(&conv, timeline, 1, true);
+        let first = conv.recurrent_snapshot_loc(timeline).expect("indexed");
+        store(&conv, timeline, 2, true);
+        let second = conv.recurrent_snapshot_loc(timeline).expect("indexed");
+        assert_ne!(first, second, "the test's own premise");
+        assert_eq!(conv.moved_snapshot_loc(timeline, first), Some(second));
+        assert_eq!(conv.moved_snapshot_loc(timeline, second), None);
+        // And the read follows the index to the newer record.
+        let got = conv
+            .read_recurrent_snapshot(timeline)
+            .expect("readable")
+            .expect("present");
+        assert_eq!(got.turn_index, 2);
+    }
+
+    /// No snapshot is an ordinary `None`, and asks nothing of either path.
+    #[test]
+    fn no_snapshot_is_none() {
+        let conv = Conversation::ephemeral();
+        assert!(conv
+            .read_recurrent_snapshot(TimelineId::for_test(44))
+            .expect("readable")
+            .is_none());
     }
 }

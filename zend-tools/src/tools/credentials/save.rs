@@ -151,7 +151,7 @@ impl Tool for CredentialSave {
             default_database: req.default_database,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        ctx.credentials
+        ctx.credentials()?
             .save(cred)
             .map_err(CredError::DuplicateName)?;
 

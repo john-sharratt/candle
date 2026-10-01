@@ -19,8 +19,8 @@ which is what most unit tests use.
 |------|------|-------------|
 | `write.rs` | `write` | Create or overwrite a file; enforces 10 MiB cap |
 | `read.rs` | `file_read` | Return a file, or a line range of it, as a numbered, fenced excerpt; only `path` is required |
-| `edit.rs` | `file_edit` | Unique-substring replacement |
-| `list.rs` | `file_list` | Paged union listing of project + session files, optionally filtered by path prefix |
+| `edit.rs` | `file_edit` | Replaces `old_text` with `new_text`; the engine is `zend-vfs/src/replace/` |
+| `list.rs` | `file_list` | Paged, one-level union listing of a directory's project + session files |
 | `delete.rs` | `file_delete` | Drop a session file or whiteout a project one; returns `deleted` flag |
 | `present.rs` | `file_present` | Foreground presentation gesture |
 | `mod.rs` | — | `FileError` enum |
@@ -49,24 +49,37 @@ example depends on.
 Project files above 4 MiB, or whose bytes are not valid UTF-8, list with their
 true size but fail to read with `unreadable`.
 
-## `file_read` line range
+## `file_read` paging
 
-`start_line` (1-based) and `end_line` (inclusive) are both optional, and a
-missing bound is the file's own edge: no range returns the whole file,
-`start_line` alone reads to the end, `end_line` alone reads from the top.
-`start_line` is clamped into the file and `end_line` into `[start_line, total]`.
-The header reads `(lines a-b of N)` when the excerpt stops before the end of the
-file, which is the signal to continue from `b + 1`, and `(lines a-b)` otherwise.
+`path` and `page` are both required — there is no whole-file read. `page` is
+0-based and every page is [`PAGE_LINES`](../../../../zend-vfs/src/vfs.rs) lines
+(currently 200); a page past the end clamps to the last one rather than
+failing. The header reads `(page P of N, lines a-b of total)`, which names
+both the page just returned and the total page count, so the model reads it
+straight to know whether to keep going.
 
-## `file_edit` uniqueness requirement
+## `file_edit` replacements
 
-`old_str` must appear exactly once in the file:
-- 0 occurrences → `not_found`
-- 1 occurrence → replacement applied
-- 2+ occurrences → `ambiguous` error with count
+`file_edit` takes `old_text` — the text to change, quoted from the file as it
+stands — and `new_text`, what takes its place. `zend-vfs/src/replace/` is the
+engine, and its module docs are the reference.
 
-This matches Claude Code's `str_replace` semantics and prevents accidental
-multi-site edits from an insufficiently specific search string.
+- `old_text` found exactly once → replaced (`"matched": "exact"`); an indented
+  `old_text` must start a line
+- found more than once (overlapping counted apart) → `ambiguous`, unless
+  `replace_all` is set
+- not found exactly, but found as whole lines with their indentation ignored →
+  replaced, the new text re-indented to the file's (`"matched": "indentation"`)
+- absent, with `new_text` standing in the file as whole lines that are not
+  only punctuation → **already applied**, nothing written
+- neither → `not_found`, saying where the first line of `old_text` is, if it is
+- empty `old_text`, or `new_text` the same → `invalid_arguments`
+
+Already-applied detection is what makes the tool idempotent: sending the same
+edit twice succeeds both times and the second call writes nothing. An
+occurrence of `old_text` inside an occurrence of `new_text` is the edit's own
+result and is not counted, which is why `retries = 3` → `retries = 30` cannot
+produce `retries = 300`.
 
 ## `file_present` vs Files panel
 
@@ -86,9 +99,9 @@ retained — only a write or a successful edit consumes budget.
 
 | Code | When |
 |------|------|
-| `not_found` | Path resolves in neither layer (`read`, `edit`, `delete`) |
+| `not_found` | Path resolves in neither layer (`read`, `edit`, `delete`), or an `edit`'s `old_text` is not in the file |
 | `vfs_full` | Write would exceed 10 MiB cap |
-| `ambiguous` | `old_str` appears more than once (`edit`) |
+| `ambiguous` | An `edit`'s `old_text` occurs more than once and `replace_all` is not set |
 | `no_files_found` | All requested paths missing (`present`) |
 | `unreadable` | Project file above the read limit or not UTF-8 text |
-| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `path` |
+| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `path` — or an `edit` whose `old_text` is empty or the same as its `new_text` |

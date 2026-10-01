@@ -37,6 +37,10 @@
         {
           id: '1', title: 'Trace the substrate redo log replay', archived: false,
           updated_ms: now - 60000, turn_count: 2,
+          // The dials this conversation was last run at. The seeded conversation
+          // is the one that arrives already hydrated, so it is also the one whose
+          // dials have to come with it: there is no later fetch to carry them.
+          dials: { effort: 3, verbosity: 1, think: true, tools: 1 },
           history: [
             { role: 'user', content: 'Trace how the substrate redo log gets replayed on daemon boot.' },
             { role: 'assistant', content: J([
@@ -81,10 +85,16 @@
     async getConversation(id) {
       await delay(350);
       const seed = (this._convs || []).find((c) => c.id === String(id));
-      if (seed && seed.history && seed.history.length) return Object.assign({}, seed);
+      // The dials the daemon holds for a conversation — the levels its last
+      // turn ran at. Deliberately not the composer's defaults, so adopting them
+      // on open is visible.
+      const dials = { effort: 3, verbosity: 1, think: true, tools: 1 };
+      if (seed && seed.history && seed.history.length) {
+        return Object.assign({}, seed, { dials });
+      }
       const title = seed ? seed.title : 'Conversation';
       return {
-        id: String(id), title,
+        id: String(id), title, dials,
         archived: seed ? seed.archived : false,
         updated_ms: seed ? seed.updated_ms : Date.now(),
         turn_count: seed ? seed.turn_count : 2,
@@ -118,9 +128,38 @@
       return this._panelData();
     },
 
-    // GET /v1/status — the mock daemon is always ready (no model to load).
+    // GET /v1/status — the mock daemon is always ready (no model to load). A
+    // test sets `window.__ZEND_MOCK_INGEST_BACKLOG__ = true` before boot to
+    // exercise the background-ingestion bar: `total` grows once mid-drain (a
+    // file changing while the backlog drains is more work, not a bug) and the
+    // field goes back to `null` once `processed` catches `total`, matching
+    // the real daemon's counters (which reset to zero at that exact instant,
+    // so a client never observes a `processed === total` frame).
+    _ingestBacklogCalls: 0,
     getStatus() {
-      return Promise.resolve({ state: 'ready', started_at_ms: 0, detail: '', loading: null, build: 'mock' });
+      let ingest_backlog = null;
+      if (window.__ZEND_MOCK_INGEST_BACKLOG__) {
+        const n = ++this._ingestBacklogCalls;
+        const files = ['src/main.rs', 'src/session.rs', 'src/api/status.rs', 'src/ingest_backlog.rs'];
+        const total = n < 3 ? 5 : 7; // bumps from 5 to 7 on the 3rd poll
+        if (n < total) {
+          ingest_backlog = { processed: n, total, last_item: files[(n - 1) % files.length] };
+        }
+      }
+      return Promise.resolve({
+        state: 'ready', started_at_ms: 0, detail: '', loading: null, maintenance: null,
+        ingest_backlog, build: 'mock',
+      });
+    },
+
+    // GET /v1/me — the mock is an admin, so every tools mode is on the dial. A
+    // test sets `window.__ZEND_MOCK_ROLE__ = 'user'` before boot to see the page
+    // as a non-admin does.
+    getMe() {
+      const admin = window.__ZEND_MOCK_ROLE__ !== 'user';
+      return Promise.resolve(admin
+        ? { role: 'creator', tool_modes: ['none', 'restricted', 'comprehensive'], default_tools: 'comprehensive' }
+        : { role: 'user', tool_modes: ['none', 'restricted'], default_tools: 'restricted' });
     },
 
     // GET /v1/substrate/tools — argument schemas for the tools the seeded
@@ -479,9 +518,35 @@
           });
         });
       };
+      // A message asking to write a file streams a `write` whose content runs
+      // long — the case the live writing box exists for — then its result.
+      const writeRound = () => {
+        const path = 'docs/redo_log.md';
+        const body = ['# The redo log', '',
+          'Every substrate mutation is appended to one log before it is applied, so a crash',
+          'loses at most the record being written and never a record already acknowledged.', '',
+          '## Records', '',
+          'A record is a type byte, a length, the payload and a Fletcher-32 checksum. The',
+          'reader stops at the first record whose checksum fails and treats it as the tail.', '',
+          '## Segments', '',
+          'The log rolls to a new segment at 64 MiB. Compaction rewrites a closed segment',
+          'without its tombstoned records and swaps it in atomically.', '',
+          '## Recovery', '',
+          'On open the reader replays every segment in order, rebuilding the substrate from',
+          'the records it can verify. A torn tail is truncated, not repaired.'].join('\n');
+        const call = JSON.stringify({ name: 'write', arguments: { path, content: body } });
+        streamText('<tool_call>' + call + '</tool_call>\n\n', () => {
+          if (handlers.onTool) handlers.onTool({ phase: 'running', tools: ['write'] });
+          later(250, () => {
+            if (handlers.onTool) handlers.onTool({ phase: 'done', tools: ['write'], results: [{ path, bytes: body.length }], tokens: [24] });
+            answer();
+          });
+        });
+      };
       later(34, () => {
         handlers.onStatus('');
         if (/\bread\b[\s\S]*\bfile\b/i.test(text || '')) toolRound();
+        else if (/\bwrite\b/i.test(text || '')) writeRound();
         else answer();
       });
       return { cancel: () => { cancelled = true; timers.forEach((t) => { clearInterval(t); clearTimeout(t); }); } };

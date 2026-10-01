@@ -227,7 +227,9 @@ export async function render(params) {
         } else {
           const newest = ticks[0].tick;
           mount(stream, ...ticks.map((t) => {
-            const c = { blocked: 'quiet', pending: 'batch', preempted: 'preempt' }[t.cause] || t.cause;
+            // The serialized readiness name is the label; map only the legacy
+            // `blocked`/`pending`/`preempted` that an old record might still carry.
+            const c = { blocked: 'quiet', pending: 'waiting', preempted: 'interrupted' }[t.cause] || t.cause;
             return h('article', {
               class: 'tick is-' + t.cause + (t.tick > seen ? ' is-new' : ''),
               style: '--hue:' + (npc.hue != null ? npc.hue : 32),

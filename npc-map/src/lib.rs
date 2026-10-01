@@ -36,7 +36,10 @@
 
 pub mod delta;
 pub mod describe;
+pub mod instance;
+pub mod lift;
 pub mod load;
+pub mod mutate;
 pub mod part;
 pub mod perceive;
 pub mod route;
@@ -50,7 +53,9 @@ pub mod world;
 
 pub use delta::{Attention, Delta};
 pub use describe::Known;
+pub use instance::PartInstance;
 pub use load::MapSet;
+pub use mutate::MapEdit;
 pub use part::{Part, PartKind, Placement};
 pub use salience::Weight;
 pub use schema::{Area, AreaKind, Node, NodeKind, Portal, Spine, Stand, Where};

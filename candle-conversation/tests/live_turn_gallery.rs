@@ -93,18 +93,27 @@ fn live_recorded_turn_feeds_tag_scoped_gallery_without_reload() {
     }
 
     // And the tag-scoped gallery admits it immediately.
-    let slot_of = |name: &str| {
-        if name == "calculator" {
-            Some(7)
-        } else {
-            None
-        }
-    };
-    let (windows, slots, _sids) = conv.belief_gallery("tools", &["tool".to_string()], slot_of);
+    // Seven members ahead of it, so the calculator is slot 7.
+    let mut members: Vec<String> = (0..7).map(|i| format!("other_{i}")).collect();
+    members.push("calculator".to_string());
+    let (windows, slots, _sids) = conv.belief_gallery("tools", &["tool".to_string()], &members);
     assert_eq!(
         windows.len(),
         1,
         "the live-sealed turn must enter the gallery without a restart"
     );
     assert_eq!(slots, vec![7], "slot resolves from the tool-name tag");
+
+    // The same collection under another member list — a builder for a
+    // different tool mode — numbers its slots its own way, even with the
+    // first list's gallery cached at the same epoch.
+    let restricted = vec!["calculator".to_string()];
+    let (_, slots, _) = conv.belief_gallery("tools", &["tool".to_string()], &restricted);
+    assert_eq!(
+        slots,
+        vec![0],
+        "a cached gallery answered for other members"
+    );
+    let (_, slots, _) = conv.belief_gallery("tools", &["tool".to_string()], &members);
+    assert_eq!(slots, vec![7]);
 }

@@ -28,6 +28,7 @@ pub mod collections;
 pub mod compliance;
 pub mod console;
 pub mod describe;
+pub mod effector;
 pub mod engine;
 pub mod guard;
 pub mod guest_routes;

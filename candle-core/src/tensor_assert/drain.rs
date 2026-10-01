@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn bad_sites_sort_before_clean_ones_and_by_ticket() {
-        let mut v = vec![
+        let mut v = [
             Finding {
                 name: "clean".into(),
                 seq: None,

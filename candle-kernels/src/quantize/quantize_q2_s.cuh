@@ -22,7 +22,7 @@ __device__ __forceinline__ void quantize_block_q2_s_vec(
     float amax = local_max;
     #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1)
-        amax = fmaxf(amax, __shfl_xor_sync(0xff, amax, offset, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
     amax = __shfl_sync(0xffffffff, amax, 0, 32);
 
     // Encode d as INT8 then decode for round-trip consistency.
@@ -96,7 +96,7 @@ __device__ __forceinline__ void quantize_blocks_q2_s(
         float amax = local_max;
         #pragma unroll
         for (int offset = 4; offset > 0; offset >>= 1)
-            amax = fmaxf(amax, __shfl_xor_sync(0xff, amax, offset, 8));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
         amax = __shfl_sync(0xffffffff, amax, 0, 32);
 
         const int8_t scale = (int8_t)__float2int_rn(fminf(127.0f, (amax * (1.0f / 1.5f)) * 127.0f));

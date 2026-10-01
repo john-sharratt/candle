@@ -1216,7 +1216,19 @@ impl Drop for ArenaWindow {
 /// "hundreds of fresh regions per forward, because the compressor creates
 /// size-class arenas as it chooses formats" — was read as proof the tier could
 /// not sit at the arena frontier. It was proof of this.
-pub fn enter_arena_window(stream: &Arc<CudaStream>) -> Result<ArenaWindow> {
+///
+/// # `tenant`
+///
+/// Who wants the ground, named in both refusals. The span has four tenants and
+/// the refusals are about *placement*, so the first question either one raises
+/// is which tenant asked — and the message could not answer it. A recurrent
+/// store built inside the forward reported itself as "creating a KV arena",
+/// which is the one tenant it was not: the hunt for it went through two wrong
+/// subsystems before a stack capture named `RecurrentStateStore::new`.
+///
+/// `&'static str`, so no call site can pay for a `format!` on the success path
+/// that every wave takes.
+pub fn enter_arena_window(stream: &Arc<CudaStream>, tenant: &'static str) -> Result<ArenaWindow> {
     let (ordinal, had_tier) = {
         let mut map = lock_domains();
         let (ordinal, domain) = domain_entry(&mut map, stream);
@@ -1228,15 +1240,17 @@ pub fn enter_arena_window(stream: &Arc<CudaStream>) -> Result<ArenaWindow> {
         // engine outright.
         if domain.forward_open && domain.forward_thread == Some(current().id()) {
             candle::bail!(
-                "creating a KV arena from inside the forward that owns the partition: this \
-                 thread opened the wave, so nothing it does can end it. The wave's storage \
-                 is claimed by `admit_wave_kv` before the forward opens — an arena wanted \
-                 after that point is one the transient tier has already been placed against."
+                "{tenant} wants reservation ground from inside the forward that owns the \
+                 partition: this thread opened the wave, so nothing it does can end it. Every \
+                 tenant's ground is claimed before the forward opens — K/V by `admit_wave_kv`, \
+                 the rest beside it — and ground wanted after that point is ground the \
+                 transient tier has already been placed against. Move {tenant}'s claim above \
+                 `begin_forward`, and above `plan_wave_transient` with it."
             )
         }
         if domain.forward_open || domain.live_generations > 0 {
             candle::bail!(
-                "{KV_ARENA_MID_WAVE}: a forward owns the partition, and the transient tier \
+                "{KV_ARENA_MID_WAVE} ({tenant}): a forward owns the partition, and the transient tier \
                  was placed against the arena frontier as it stood when that forward began. \
                  Creating an arena now moves the frontier under it. Retry once the wave has \
                  ended — the wave's own storage is claimed by `admit_wave_kv` before it \
@@ -2157,7 +2171,11 @@ mod wave_tests {
         let (tx, rx) = mpsc::channel();
         let s2 = s.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(enter_arena_window(&s2).err().map(|e| e.to_string()));
+            let _ = tx.send(
+                enter_arena_window(&s2, "a test tenant")
+                    .err()
+                    .map(|e| e.to_string()),
+            );
         })
         .join()
         .expect("prober panicked");
@@ -2173,7 +2191,7 @@ mod wave_tests {
 
         // Once the wave is over the same request succeeds.
         drop(guard);
-        drop(enter_arena_window(&s)?);
+        drop(enter_arena_window(&s, "a test tenant")?);
         Ok(())
     }
 
@@ -2190,7 +2208,7 @@ mod wave_tests {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let open = begin_forward(&s);
-        let err = enter_arena_window(&s)
+        let err = enter_arena_window(&s, "a test tenant")
             .err()
             .expect("the forward's own thread must be refused")
             .to_string();
@@ -2198,13 +2216,19 @@ mod wave_tests {
             err.contains("admit_wave_kv"),
             "the error must say where the allocation belonged instead: {err}"
         );
+        // The tenant, because "which tenant asked" is the first question this
+        // refusal raises and the message used to answer it with the wrong one.
+        assert!(
+            err.contains("a test tenant"),
+            "the error must name the tenant that asked: {err}"
+        );
         assert!(
             !err.contains(super::KV_ARENA_MID_WAVE),
             "a placement bug must not be marked retryable, or the caller spins: {err}"
         );
         drop(open);
         // And once the forward is over, the same thread is an ordinary caller.
-        drop(enter_arena_window(&s)?);
+        drop(enter_arena_window(&s, "a test tenant")?);
         Ok(())
     }
 
@@ -2233,7 +2257,7 @@ mod wave_tests {
         assert!(placed > 0, "the forward should have left a tier standing");
 
         // The window opens anyway, and the ground comes back with it.
-        let window = enter_arena_window(&s)?;
+        let window = enter_arena_window(&s, "a test tenant")?;
         assert_eq!(
             super::super::region_pool::region_stats(ordinal)
                 .map(|r| r.transient_bytes)

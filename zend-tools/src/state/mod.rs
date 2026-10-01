@@ -7,20 +7,28 @@
 //!
 //! | Module | Store | Used by |
 //! |--------|-------|---------|
-//! | [`vfs`] | [`VfsStore`] | `file_*` tools — in-memory virtual filesystem |
 //! | [`credentials`] | [`CredentialStore`] | `credential_*` tools, session opens |
 //! | [`notes`] | [`NotesStore`] | `notes_*` tools — cross-conversation KV store |
 //! | [`sessions`] | [`SessionRegistry`] | All session tool groups |
 //! | [`hash_state`] | [`HashStateStore`] | `hash_state_*` streaming hash tools |
+//! | [`secrets`] | [`Secrets`] | `web_search`, git — the daemon's API keys and tokens |
+//!
+//! The workspace's repositories and the per-conversation file overlays the
+//! `file_*` tools work through live in `zend_vfs`.
+//!
+//! [`Secrets`] is the one store that is not in-memory-only and not
+//! conversation-scoped: it is read once from a per-user file on disk, outside
+//! the workspace, and is the same for every conversation the daemon serves.
 
 pub mod credentials;
 pub mod hash_state;
 pub mod notes;
+pub mod secrets;
+mod secrets_exposure;
 pub mod sessions;
-pub mod vfs;
 
 pub use credentials::CredentialStore;
 pub use hash_state::HashStateStore;
 pub use notes::NotesStore;
+pub use secrets::{Secrets, SecretsError};
 pub use sessions::SessionRegistry;
-pub use vfs::VfsStore;

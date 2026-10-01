@@ -13,6 +13,7 @@
  *   - streamChatCompletion (token + status + think + prefill)  POST /v1/chat/completions (SSE)
  *   - subscribeLogs / seedLogs               WS /ws/logs (structured JSON frames)
  *   - getToolSchemas                         GET /v1/substrate/tools
+ *   - getMe                                  GET /v1/me
  *
  * A conversation's history carries its projection points light (the fields
  * the timeline draws, plus each point's `turn`/`event` address). The projection
@@ -62,6 +63,9 @@
         // keeps one per think block, in order.
         history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, thinking: m.thinking ? [m.thinking] : [], tool_tokens: m.tool_tokens || [], spans: m.spans || [], files: m.files || [] })),
         uploads: body.uploads || [],
+        // The composer dials this conversation last ran at, as levels. Absent
+        // for one that has never taken a turn — the composer keeps its own.
+        dials: body.dials || null,
       };
     },
     archiveConversation(id) { return postVoid('/v1/conversations/' + enc(id) + '/archive'); },
@@ -92,6 +96,17 @@
         started_at_ms: 0,
         detail: 'connecting to daemon…',
         loading: { current: 'Connecting', progress: 0, completed: [] },
+      }));
+    },
+
+    // GET /v1/me — the caller's role, the tools modes it may choose, and the one
+    // it starts at. The gateway's sign-in decides the role; a caller the
+    // daemon cannot place gets the least.
+    getMe() {
+      return getJSON('/v1/me').catch(() => ({
+        role: 'unauthenticated',
+        tool_modes: ['none', 'restricted'],
+        default_tools: 'restricted',
       }));
     },
 
@@ -140,11 +155,29 @@
         // empty bubble and no way to tell whether the model had nothing to say
         // or the daemon had died. The caller gets `onError` and decides;
         // `onDone` still runs after it, so the composer always unlocks.
-        // Any status but 200 means no turn started: every request that reaches
-        // the daemon's handler is answered 200 and streamed. A 408 from the edge
-        // on a slow uplink is one of these.
+        // Any status but 200 means no turn started. The daemon streams every
+        // request it accepts, and rejects the rest before submitting anything —
+        // a malformed turn (`400`, e.g. a missing `conv_id`) or a 408 from the
+        // edge on a slow uplink are both of these. A rejection carries an
+        // OpenAI-shaped `{ error: { message } }` body saying what was wrong, and
+        // that reason is worth more to the user than the bare status, so it is
+        // read before reporting. Parsing may itself fail — the edge's 408 is
+        // HTML — in which case the status stands on its own.
         if (!resp.ok) {
-          fail(handlers, 'The request failed with HTTP ' + resp.status + ' before the turn started.', false);
+          const status = 'HTTP ' + resp.status;
+          resp
+            .json()
+            .then((body) => (body && body.error && body.error.message) || '')
+            .catch(() => '')
+            .then((detail) => {
+              fail(
+                handlers,
+                detail
+                  ? status + ' before the turn started: ' + detail
+                  : 'The request failed with ' + status + ' before the turn started.',
+                false,
+              );
+            });
           return;
         }
         if (!resp.body) {

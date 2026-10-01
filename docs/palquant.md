@@ -305,11 +305,11 @@ Block layouts and reconstruction formulas for the 16 codebook formats. All forma
 | Q1_A | 1.50 | INT8 $s_+$ (1 B), INT8 $s_-$ (1 B), 32× sign bit (4 B); **6 B** | $x_i = s_+$ if $\text{sgn}(i){=}{+}$, else $-s_-$ — asymmetric sign-encoded |
 | Q1_S | 1.25 | INT8 scale (1 B), 32× sign bit (4 B); **5 B** | $x_i = s \cdot \text{sgn}(i)$, $\text{sgn}(i) \in \{-1,+1\}$ |
 | Q0_M2 | 0.75 | 2× INT8 centroids (2 B), 8× 1-bit quartet selector (1 B); **3 B** | $x_i = c_{m_{\lfloor i/4 \rfloor}}$ — 2-centroid quartet-mask |
-| Q0_V | 0.50 | 8 b curve idx $u$, 5 b scale idx $v$, 3 b centroid idx $w$; **2 B** | $x_i = c[v][w] + s[v] \cdot \text{curve}[u][i]$ from constant tables |
+| Q0_V | 0.50 | 7 b curve idx $u$, 5 b scale idx $v$, 4 b centroid idx $w$; **2 B** | $x_i = c[v][w] + s[v] \cdot \text{curve}[u][i]$ from calibrated tables |
 | Q0_X | 0.50 | INT8 anchor $a$ (1 B), 5 b outlier position $p$, 3 b signed delta $d$; **2 B** | $x_i = a$ for $i \neq p$; $x_p = a + d \cdot s_{\text{step}}(a)$ |
 | Q0 | 0.25 | INT8 centroid $c$ (1 B); **1 B** | $x_i = c$ for all $i$ — constant block |
 
-Q0_V's tables (256 curves × 32 scales × 8 centroids per arena, 8.5 KB constant-memory per K or V arena) are calibrated once from population statistics of pre-RoPE K/V activations and shipped as constants — the only model-derived component anywhere in the codebook. F16 and BF16 (16 BPE, 64 B per block) are used as quality fallback when no codebook format passes the per-block error threshold; they are not part of the 16-format codebook itself.
+Q0_V's tables (128 curves × 32 scales × 16 centroids per side) are calibrated once. The 128 curves are the 16 even rotations of four base curves and their negations, $\text{curve}[16b + p][i] = \pm\,\text{base}[b \bmod 4][(i + 2p) \bmod 32]$, so a side's whole curve codebook is 256 B, and the encoder scores all 128 exactly as 64 circular correlations — the squared error of a curve is $E_b - 2R$ up to a term every curve shares. The tables are derived from population statistics of pre-RoPE K/V activations and shipped as constants — the only model-derived component anywhere in the codebook. F16 and BF16 (16 BPE, 64 B per block) are used as quality fallback when no codebook format passes the per-block error threshold; they are not part of the 16-format codebook itself.
 
 ### B. Per-Level Candidate Format Lists
 

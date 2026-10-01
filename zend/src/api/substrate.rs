@@ -8,12 +8,17 @@
 //! - `GET /v1/substrate/tools`               — the live tool catalog.
 //! - `GET /v1/substrate/layer/{name}`        — the conversations in one layer.
 //! - `GET /v1/substrate/timeline/{tl}`       — one conversation's summary forest.
+//! - `GET /v1/substrate/timeline/{tl}/selection` — its most recent score-density
+//!   selection: which nodes made the slot, why, and the pending/token/budget
+//!   counters around it. Unlike the other routes this is NOT a substrate read —
+//!   it is in-memory, last-write-wins per timeline, and empties on restart.
 //!
 //! All read the daemon's live `Substrate` through a cloned `Conversation` handle
 //! (engine lock released immediately, only the substrate read guard held for the
 //! walk), never a rebuild from the multi-GB redo log, and return `503` until the
 //! model is loaded. They never mutate.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -24,6 +29,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use candle_conversation::summary_tree::SelectionOrigin;
 use candle_conversation::turn_layout::TurnLayout;
 
 use crate::session::ZendSession;
@@ -111,6 +117,20 @@ pub async fn timeline(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// `GET /v1/substrate/timeline/{tl}/selection` — see the module doc.
+pub async fn selection(
+    State(session): State<Arc<ZendSession>>,
+    Path(tl): Path<String>,
+) -> Result<Json<SelectionView>, StatusCode> {
+    let raw: u64 = tl.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    session
+        .substrate_selection(raw)
+        // Model not loaded, unknown timeline, or no projection has run for it
+        // yet (or it used the rule-based path, which records no diagnostic).
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 /// `DELETE /v1/substrate/timeline/{tl}` — tombstone one timeline by its RAW id.
 ///
 /// The conversation-scoped `DELETE /v1/conversations/{id}` cannot reach these.
@@ -170,7 +190,8 @@ pub struct Storage {
     pub segments: Vec<SegmentView>,
     /// Sum of every segment file's size on disk.
     pub total_bytes: u64,
-    /// Live KV chunk records currently indexed in RAM.
+    /// Live KV chunk records currently indexed in RAM. A record is one 32-token
+    /// block of ONE attention layer, so this is a count of records, not of tokens.
     pub live_chunks: usize,
     /// Fraction of record bytes that are dead (superseded + tombstoned) and
     /// reclaimable by compaction. `None` when the persistence lock was
@@ -190,6 +211,10 @@ pub struct Counts {
     pub timelines: usize,
     pub conversations: usize,
     pub sections: usize,
+    /// Tokens sealed in the substrate: every live timeline's turns and the shared
+    /// sections, each counted once. The layers' `tokens` sum to this less the
+    /// sections and any timeline no layer lists.
+    pub tokens: usize,
 }
 
 /// One projection layer's schema config plus a conversation count (the list
@@ -234,15 +259,31 @@ pub struct ConvView {
     /// Raw timeline id as a decimal string (see [`SubstrateOverview`] note).
     pub timeline: String,
     pub conv_id: String,
+    /// For an ingested unit, the path inside its repository (`src/lib.rs`,
+    /// `src/`, `/` for the repository's root) — the repository is
+    /// [`Self::repo`]. Otherwise the conversation's title.
     pub label: String,
+    /// For an ingested unit, the repository it is in; empty otherwise, and
+    /// for the workspace's own unit.
+    pub repo: String,
     pub archived: bool,
     pub group: String,
     /// Turn count including summary nodes.
     pub turns: u32,
-    /// Total sealed tokens across the timeline (turns + any timeline sections).
+    /// The timeline's own sealed turn tokens — never the shared sections, which
+    /// every conversation projects and none owns.
     pub tokens: usize,
     /// Summary-forest nodes (SoT + SoS) — how much has been compressed.
     pub summary_nodes: usize,
+    /// For an ingested unit, every branch whose tip holds the version this
+    /// conversation read, default branch first — what tells one `candle/`
+    /// row from another. Empty for a dialogue, an upload, and the workspace's
+    /// own unit.
+    pub branches: Vec<String>,
+    /// For a file reading, the commit it read the file at — the version it
+    /// holds, which every branch sharing that version shares, so the view shows
+    /// this rather than [`Self::branches`]. Empty for anything else.
+    pub commit: String,
 }
 
 /// `GET /v1/substrate/system-prompt` — the single shared system prompt. Fetched
@@ -300,6 +341,14 @@ pub struct TimelineDetail {
     pub layer: String,
     pub group: String,
     pub total_tokens: usize,
+    /// The conversation's persisted `custom` metadata — content hashes, source
+    /// path, and the `forked_from` lineage pointer.
+    pub custom: BTreeMap<String, String>,
+    /// The lineage this conversation actually projects with, oldest ancestor
+    /// first, ending in itself — what `Substrate::inherited_chain` resolves
+    /// `forked_from` to after dropping retired ancestors and applying the
+    /// token cap. A single entry means it inherits nothing.
+    pub inherited_chain: Vec<String>,
     /// Forest peaks — the orphan summary nodes that are the window entry points.
     pub peaks: Vec<u32>,
     /// Turn indices that open a coupled exchange (a tool-call turn joined with
@@ -333,6 +382,31 @@ pub struct TurnView {
     /// present for normal turns, letting the viewer colorize the exact segments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<TurnLayout>,
+}
+
+/// `GET /v1/substrate/timeline/{tl}/selection` body — the most recent
+/// score-density selection recorded for this timeline.
+#[derive(Serialize)]
+pub struct SelectionView {
+    /// In selection order — oldest first, most recent last.
+    pub selected: Vec<SelectedNodeView>,
+    /// Pending turns at the moment of selection (bigger pending ⇒ smaller
+    /// selection region).
+    pub pending_count: usize,
+    /// Total token cost of the selected set (excludes pending).
+    pub selected_tokens: u32,
+    /// Layer window budget used, for scale.
+    pub budget: u32,
+}
+
+/// One selected node: which turn/summary, why it was chosen, and the score
+/// that won it the slot (`None` for a node selection never scored, such as a
+/// `Pending` or `HardAnchor` origin).
+#[derive(Serialize)]
+pub struct SelectedNodeView {
+    pub node_id: u32,
+    pub origin: SelectionOrigin,
+    pub effective_score: Option<f32>,
 }
 
 /// `POST /v1/substrate/project` request — the typed query to project.

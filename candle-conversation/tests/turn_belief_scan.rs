@@ -124,6 +124,173 @@ fn score_belief_groups_self_matches_the_probed_turn() {
     );
 }
 
+/// Regression: `code_reading`/`repo_map` are marked `gathered = false` so no
+/// OTHER conversation draws from them (`zend`'s provenance-injection
+/// exclusion) — but their OWN conversations still need to score their OWN
+/// earlier turns via self-local belief scoring. Before the fix,
+/// `score_belief_groups` declined this layer's candidates unconditionally on
+/// `!layer.gathered`, with no exemption for the layer scoring itself as its
+/// own projection target — so a turn several rounds into its own conversation
+/// could not see any of its own earlier turns, and (with `warm_ingest_normalization`
+/// also skipping a non-gathered layer even when it is append-only) never would,
+/// on any later pass either. Same fixture and probe as
+/// `score_belief_groups_self_matches_the_probed_turn`, with `gathered` turned off.
+#[test]
+fn score_belief_groups_still_scores_its_own_target_layer_when_not_gathered() {
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+
+    let mut builder = Builder::from_yaml(SCAN_YAML).unwrap();
+    let layer = builder.id_for_layer("mem").unwrap();
+    let group = builder.id_for_group("clusters").unwrap();
+    assert!(builder.set_layer_gathered("mem", false));
+
+    let timeline = candle_conversation::projection::TimelineId::from_raw(7).expect("timeline id");
+    conv.register_timeline(timeline, layer, group);
+
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64, // turn 0
+        0x5555_5555_5555_5555u64, // turn 1
+        0xFFFF_FFFF_FFFF_FFFFu64, // turn 2
+    ];
+    for fill in fills {
+        let idx = conv
+            .record_turn(
+                timeline,
+                Role::User,
+                TurnPartWrite {
+                    token_count: 4,
+                    tags: vec!["repo_map".to_string()],
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record_turn");
+        let stream_id = turn_stream_id(timeline.raw(), idx.0);
+        conv.persist_wide_q_sigs(stream_id, &encode_wide_sigs(&[sig(fill)]))
+            .expect("persist sigs");
+    }
+
+    let probe = vec![sig(fills[1])];
+    let mut scores = ProjectionScores::new();
+    let target = ProjectionTarget {
+        layer,
+        group,
+        timeline,
+    };
+    let candidates = conv.score_belief_groups(
+        &builder.schema().layers[0],
+        target,
+        &probe,
+        None,
+        &mut scores,
+        Observe::No,
+        None,
+    );
+
+    assert_eq!(
+        candidates.len(),
+        1,
+        "the layer being scored IS the projection's own target, so it must \
+         still be scored despite gathered = false"
+    );
+    assert_eq!(
+        candidates[0].1.len(),
+        3,
+        "all three of its own turns are candidates"
+    );
+
+    use candle_conversation::projection::TurnIndex;
+    let s0 = scores.turn(timeline, TurnIndex(0));
+    let s1 = scores.turn(timeline, TurnIndex(1));
+    let s2 = scores.turn(timeline, TurnIndex(2));
+    assert!(
+        s1 > s0 && s1 > s2,
+        "self-match still ranks the probed turn highest when not gathered: \
+         s0={s0}, s1={s1}, s2={s2}"
+    );
+}
+
+/// Regression, the other half of the same fix: `warm_ingest_normalization`
+/// used to skip any layer with `gathered = false` before it ever checked
+/// whether the layer was an append-only ingest layer — so `code_reading` /
+/// `repo_map`, the ONLY layers this warm-up ever actually warms, matched that
+/// skip unconditionally the moment they were taken out of cross-layer gather.
+/// Their own turns went cold forever: no later pass ever warmed them, because
+/// the flag that was supposed to mean "no one else reads this" was read as
+/// "no one reads this." Proven by effect, not by structure: the SAME probe
+/// against the SAME turn must score differently once warming has taught the
+/// layer's hit level, which only happens if the warm-up actually ran.
+#[test]
+fn warm_ingest_normalization_still_warms_an_append_only_layer_when_not_gathered() {
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+
+    let mut builder = Builder::from_yaml(SCAN_YAML).unwrap();
+    let layer = builder.id_for_layer("mem").unwrap();
+    let group = builder.id_for_group("clusters").unwrap();
+    conv.mark_layer_append_only(layer);
+    assert!(builder.set_layer_gathered("mem", false));
+
+    let timeline = candle_conversation::projection::TimelineId::from_raw(7).expect("timeline id");
+    conv.register_timeline(timeline, layer, group);
+
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64, // turn 0
+        0x5555_5555_5555_5555u64, // turn 1
+        0xFFFF_FFFF_FFFF_FFFFu64, // turn 2
+    ];
+    for fill in fills {
+        let idx = conv
+            .record_turn(
+                timeline,
+                Role::User,
+                TurnPartWrite {
+                    token_count: 4,
+                    tags: vec!["repo_map".to_string()],
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record_turn");
+        let stream_id = turn_stream_id(timeline.raw(), idx.0);
+        conv.persist_wide_q_sigs(stream_id, &encode_wide_sigs(&[sig(fill)]))
+            .expect("persist sigs");
+    }
+
+    let probe = vec![sig(fills[1])];
+    let target = ProjectionTarget {
+        layer,
+        group,
+        timeline,
+    };
+    let score_of = |conv: &Conversation| {
+        let mut scores = ProjectionScores::new();
+        conv.score_belief_groups(
+            &builder.schema().layers[0],
+            target,
+            &probe,
+            None,
+            &mut scores,
+            Observe::No,
+            None,
+        );
+        use candle_conversation::projection::TurnIndex;
+        scores.turn(timeline, TurnIndex(1))
+    };
+
+    let cold = score_of(&conv);
+    conv.warm_ingest_normalization(builder.schema());
+    let warmed = score_of(&conv);
+
+    assert_ne!(
+        cold, warmed,
+        "warm_ingest_normalization must have taught this layer's hit level \
+         despite gathered = false, changing the same probe's normalized score \
+         (cold={cold}, warmed={warmed})"
+    );
+}
+
 /// A coupled tool round-trip (a code-read scope) must be scored as ONE exchange:
 /// the call turn and its response turn share a single normalized score, so
 /// provenance selecting either half brings in the whole pair. Turn 0 is coupled

@@ -43,14 +43,9 @@
 //!   exactly equivalent on those formats, and faithful on Q4_KS/Q8_KS and
 //!   the INT8-scale / Q0-family formats where `outer` does not cancel.
 
-use candle::quantized::k_quants::{
-    BlockQ0, BlockQ0M2, BlockQ0M4, BlockQ0V, BlockQ0X, BlockQ1A, BlockQ1S, BlockQ2A, BlockQ2S,
-    BlockQ2_0, BlockQ2_1, BlockQ3_0, BlockQ3_1, BlockQ4_0, BlockQ4_1, BlockQ4_KS, BlockQ5_0,
-    BlockQ5_1, BlockQ8_0, BlockQ8_KS, BlockR16, GgmlType,
-};
-use candle::quantized::GgmlDType;
 use half::f16;
 
+use super::block_round_trip::block_round_trip;
 use crate::kv_cache::QuantFormat;
 use std::cmp::Ordering;
 
@@ -573,80 +568,21 @@ pub fn slot_stats(amax: &[f32; HEAD_DIM], idx_compact: &[u16]) -> SlotStats {
     }
 }
 
-/// Map QuantFormat to a `GgmlDType` we can dispatch round-trip through.
-///
-/// Unsupported formats and why:
-///
-/// * `R16` — K-source carrier format that stores Q activations alongside
-///   K values. It is never a *quant target* in the candidate ladders, so
-///   its round-trip semantics differ from every other format (the `q[]`
-///   field would round-trip as zero on V data).
-/// * `Q8_1` — `BlockQ8_1::to_float` is `unimplemented!()` in
-///   `candle-core` (Q8_1 is a vec-dot intermediate, not a storage
-///   format). Q8_1 appears in production candidate ladders for K-side
-///   C1–C7 but its kernel-side round-trip uses a CUDA-only dequant path
-///   that has no Rust analogue. Returning `None` here lets the search
-///   skip it cleanly.
-fn ggml_supported(fmt: QuantFormat) -> Option<GgmlDType> {
-    match fmt {
-        QuantFormat::R16 | QuantFormat::Q8_1 => None,
-        _ => Some(fmt.to_ggml_dtype()),
-    }
-}
-
-/// Round-trip 32 floats through `fmt` after pre-scaling by `outer`. Returns
-/// the dequantized vector pre-divided by `outer` (so the caller compares
-/// against the original directly). Returns `None` for formats not mirrored
-/// (currently `R16` only — see [`ggml_supported`]).
+/// Round-trip 32 floats through `fmt` on side `is_k` after pre-scaling by
+/// `outer` (`block_round_trip`). Returns the dequantized vector pre-divided
+/// by `outer` (so the caller compares against the original directly), or
+/// `None` for a format that is never a quant target (R16, the active K
+/// carrier: its Q-capture half has no round trip).
 pub fn roundtrip_block(
     fmt: QuantFormat,
     src: &[f32; CHUNK_SIZE],
     outer: f32,
+    is_k: bool,
 ) -> Option<[f32; CHUNK_SIZE]> {
-    let dtype = ggml_supported(fmt)?;
-    let mut scaled = [0.0f32; CHUNK_SIZE];
-    for i in 0..CHUNK_SIZE {
-        scaled[i] = src[i] * outer;
-    }
-    let mut recon = [0.0f32; CHUNK_SIZE];
-    match dtype {
-        GgmlDType::Q4_0 => roundtrip_via::<BlockQ4_0>(&scaled, &mut recon),
-        GgmlDType::Q4_1 => roundtrip_via::<BlockQ4_1>(&scaled, &mut recon),
-        GgmlDType::Q5_0 => roundtrip_via::<BlockQ5_0>(&scaled, &mut recon),
-        GgmlDType::Q5_1 => roundtrip_via::<BlockQ5_1>(&scaled, &mut recon),
-        GgmlDType::Q8_0 => roundtrip_via::<BlockQ8_0>(&scaled, &mut recon),
-        // Q8_1 filtered by ggml_supported — to_float is unimplemented.
-        GgmlDType::Q8_1 => return None,
-        GgmlDType::Q4_KS => roundtrip_via::<BlockQ4_KS>(&scaled, &mut recon),
-        GgmlDType::Q8_KS => roundtrip_via::<BlockQ8_KS>(&scaled, &mut recon),
-        GgmlDType::Q2_0 => roundtrip_via::<BlockQ2_0>(&scaled, &mut recon),
-        GgmlDType::Q3_0 => roundtrip_via::<BlockQ3_0>(&scaled, &mut recon),
-        GgmlDType::Q2_1 => roundtrip_via::<BlockQ2_1>(&scaled, &mut recon),
-        GgmlDType::Q3_1 => roundtrip_via::<BlockQ3_1>(&scaled, &mut recon),
-        GgmlDType::Q0 => roundtrip_via::<BlockQ0>(&scaled, &mut recon),
-        GgmlDType::Q1_S => roundtrip_via::<BlockQ1S>(&scaled, &mut recon),
-        GgmlDType::Q2_S => roundtrip_via::<BlockQ2S>(&scaled, &mut recon),
-        GgmlDType::Q2_A => roundtrip_via::<BlockQ2A>(&scaled, &mut recon),
-        GgmlDType::Q0_V => roundtrip_via::<BlockQ0V>(&scaled, &mut recon),
-        GgmlDType::Q1_A => roundtrip_via::<BlockQ1A>(&scaled, &mut recon),
-        GgmlDType::Q0_X => roundtrip_via::<BlockQ0X>(&scaled, &mut recon),
-        GgmlDType::Q0_M2 => roundtrip_via::<BlockQ0M2>(&scaled, &mut recon),
-        GgmlDType::Q0_M4 => roundtrip_via::<BlockQ0M4>(&scaled, &mut recon),
-        GgmlDType::R16 => roundtrip_via::<BlockR16>(&scaled, &mut recon),
-        _ => return None,
-    }
+    let scaled: [f32; CHUNK_SIZE] = std::array::from_fn(|i| src[i] * outer);
+    let recon = block_round_trip(fmt.to_ggml_dtype(), &scaled, is_k)?;
     let inv_outer = if outer != 0.0 { 1.0 / outer } else { 0.0 };
-    let mut out = [0.0f32; CHUNK_SIZE];
-    for i in 0..CHUNK_SIZE {
-        out[i] = recon[i] * inv_outer;
-    }
-    Some(out)
-}
-
-fn roundtrip_via<B: GgmlType>(scaled: &[f32; CHUNK_SIZE], recon: &mut [f32; CHUNK_SIZE]) {
-    let mut blk = [B::zeros()];
-    B::from_float(scaled, &mut blk);
-    B::to_float(&blk, recon);
+    Some(recon.map(|r| r * inv_outer))
 }
 
 /// Mean of the four largest absolute errors across the 32 lanes.
@@ -731,7 +667,7 @@ pub fn search_scales_for_fmt(
     inv_head_amax_sq: f32,
     v_thr_sq: f32,
 ) -> Option<PerFmtSearch> {
-    ggml_supported(fmt)?;
+    block_round_trip(fmt.to_ggml_dtype(), &[0.0; CHUNK_SIZE], is_k)?;
     let mut best: Option<ScaleResult> = None;
     let mut fallback: Option<ScaleResult> = None;
     for si in 0..NUM_SCALE_CANDIDATES {
@@ -750,7 +686,7 @@ pub fn search_scales_for_fmt(
             let bu = b as usize;
             let mut orig = [0.0f32; CHUNK_SIZE];
             orig.copy_from_slice(&data[bu * CHUNK_SIZE..(bu + 1) * CHUNK_SIZE]);
-            let recon = roundtrip_block(fmt, &orig, outer)?;
+            let recon = roundtrip_block(fmt, &orig, outer, is_k)?;
             let (pass_metric, thr) = if is_k {
                 let e = mean_top4_abs_error(&orig, &recon);
                 (e * inv_head_amax, kthresh[bu])
@@ -1162,7 +1098,7 @@ mod tests {
         for i in 0..CHUNK_SIZE {
             src[i] = (i as f32 - 16.0) * 0.1;
         }
-        let out = roundtrip_block(QuantFormat::Q4_0, &src, 1.0).unwrap();
+        let out = roundtrip_block(QuantFormat::Q4_0, &src, 1.0, false).unwrap();
         for i in 0..CHUNK_SIZE {
             let e = (src[i] - out[i]).abs();
             assert!(e < 0.25, "Q4_0 element {i} error {e} too large");
@@ -1175,7 +1111,7 @@ mod tests {
         for i in 0..CHUNK_SIZE {
             src[i] = (i as f32 - 16.0) * 0.1;
         }
-        let out = roundtrip_block(QuantFormat::Q8_0, &src, 1.0).unwrap();
+        let out = roundtrip_block(QuantFormat::Q8_0, &src, 1.0, false).unwrap();
         for i in 0..CHUNK_SIZE {
             let e = (src[i] - out[i]).abs();
             assert!(e < 0.02, "Q8_0 element {i} error {e} too large");
@@ -1211,7 +1147,7 @@ mod tests {
 
     fn run_roundtrip(fmt: QuantFormat) {
         let src = ramp_src();
-        let out = roundtrip_block(fmt, &src, 1.0)
+        let out = roundtrip_block(fmt, &src, 1.0, true)
             .unwrap_or_else(|| panic!("{:?} dispatch returned None", fmt));
         let bound = fmt_error_bound(fmt);
         let mut max_err = 0.0f32;
@@ -1304,13 +1240,16 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_q8_1() {
+        run_roundtrip(QuantFormat::Q8_1);
+    }
+
+    #[test]
     fn roundtrip_unsupported_format_returns_none() {
         let src = ramp_src();
         // R16 carries Q activations in the `q[]` field; round-tripping
         // would lose them.
-        assert!(roundtrip_block(QuantFormat::R16, &src, 1.0).is_none());
-        // Q8_1::to_float is unimplemented in candle-core.
-        assert!(roundtrip_block(QuantFormat::Q8_1, &src, 1.0).is_none());
+        assert!(roundtrip_block(QuantFormat::R16, &src, 1.0, true).is_none());
     }
 
     #[test]
@@ -1676,10 +1615,14 @@ mod tests {
     #[test]
     fn production_c5_candidates_all_round_trip() {
         let (k_cands, v_cands) = production_adaptive_candidates(5);
-        for kv in k_cands.iter().chain(v_cands.iter()) {
+        let sides = k_cands
+            .iter()
+            .map(|kv| (kv, true))
+            .chain(v_cands.iter().map(|kv| (kv, false)));
+        for (kv, is_k) in sides {
             let q = quant_from_kv(*kv);
             let src = ramp_src();
-            let out = roundtrip_block(q, &src, 1.0)
+            let out = roundtrip_block(q, &src, 1.0, is_k)
                 .unwrap_or_else(|| panic!("C5 candidate {:?} round-trip None", q));
             let mut max_err = 0.0f32;
             for i in 0..CHUNK_SIZE {

@@ -266,6 +266,10 @@ __device__ __forceinline__ int p4c_quant_block_bytes(int fmt) {
 // budget set by __launch_bounds__(128,8).  The __noinline__ boundary lets the
 // register allocator treat this as a true call frame — the callee's registers
 // are freed on return and never overlap the caller's r_buf[16] + loop vars.
+//
+// IS_K names the side: Q0_V's codebook is calibrated per side, and a block
+// must be encoded under the codebook every decoder of that side reads it with.
+template <bool IS_K>
 __device__ __noinline__ void p4c_encode_quant_block(
     const float* src32, void* dst_block, int fmt
 ) {
@@ -287,7 +291,7 @@ __device__ __noinline__ void p4c_encode_quant_block(
         case ArenaFormat::Q2_A:    quantize_block_q2_a_vec(src32, (block_q2_a*)dst_block); break;
         case ArenaFormat::Q2_1:    quantize_block_q2_1(src32, (block_q2_1*)dst_block); break;
         case ArenaFormat::Q3_1:    quantize_block_q3_1(src32, (block_q3_1*)dst_block); break;
-        case ArenaFormat::Q0_V:    quantize_block_q0_v(src32, (block_q0_v*)dst_block); break;
+        case ArenaFormat::Q0_V:    quantize_block_q0_v<IS_K>(src32, (block_q0_v*)dst_block); break;
         case ArenaFormat::Q1_A:    quantize_block_q1_a(src32, (block_q1_a*)dst_block); break;
         case ArenaFormat::Q0_X:    quantize_block_q0_x(src32, (block_q0_x*)dst_block); break;
         case ArenaFormat::Q0_M2:   quantize_block_q0_m2(src32, (block_q0_m2*)dst_block); break;
@@ -645,7 +649,7 @@ palette4_convert_kernel(
             } else {
                 for (int t = 0; t < P4C_CHUNK_SIZE; t++)
                     smem_f16_buf[t][d] = __float2half(
-                        dequant_element_inline<float>(blk_base, t, fmt, src_outer));
+                        dequant_element_inline<float, IS_K>(blk_base, t, fmt, src_outer));
             }
         }
     };
@@ -836,7 +840,7 @@ palette4_convert_kernel(
                     // Dst quant layout: block(ld, c) = dst_base + (ld * num_chunks + c) * bb
                     const int ld = warp_pd0 + wl;
                     char* blk_addr = dst_base + (int64_t)(ld * num_chunks + c) * bb;
-                    p4c_encode_quant_block(scratch, blk_addr, dst_fmt);
+                    p4c_encode_quant_block<IS_K>(scratch, blk_addr, dst_fmt);
                     __syncwarp();  // encode complete before scratch is reused for wl+1
                 }
             }

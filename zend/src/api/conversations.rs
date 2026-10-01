@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use super::compressed;
 use crate::chatml::split_turn;
 use crate::projection_event::ProjectionSpanOut;
-use crate::session::{ConvEntry, UploadInfo, UploadStats, ZendSession};
+use crate::session::{ConvEntry, ConversationDials, UploadInfo, UploadStats, ZendSession};
 use crate::types::Role;
 
 #[derive(Debug, Default, Deserialize)]
@@ -189,12 +189,16 @@ pub async fn get(
     }
 
     let title = session.conversation_label(&id);
+    let branches = session.conversation_branches(&id);
+    let dials = session.conversation_dials(&id);
     Ok(compressed::json(
         &HistoryBody {
             id,
             title,
+            branches,
             messages,
             uploads,
+            dials,
         },
         &headers,
     ))
@@ -229,10 +233,22 @@ pub struct HistoryBody {
     /// label the sidebar lists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The branch this conversation works on in each repository, by
+    /// repository name. Absent when it has none — a workspace with no git
+    /// repository, or a conversation the model has not loaded.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub branches: BTreeMap<String, String>,
     pub messages: Vec<HistoryMessage>,
     /// Every file uploaded to this conversation (recovered from the
     /// substrate), newest-last — hydrates the files pane on resume.
     pub uploads: Vec<UploadOut>,
+    /// The composer dials this conversation last ran under. The GUI sets its
+    /// dials from these when the conversation is opened, so a conversation
+    /// continues at the settings it was held at rather than at whatever the
+    /// composer happened to be showing. Absent for one that has never taken a
+    /// turn — the client keeps its own defaults there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dials: Option<ConversationDials>,
 }
 
 #[derive(Serialize)]

@@ -16,15 +16,20 @@
 
 use std::ffi::c_void;
 
-/// The widest hyper-connection count [`run_gr_combine`] is built for, mirroring
-/// `GR_MAX_HC` in `simple/gr_hyper.cu`, where the per-stream weights are held in
-/// a fixed-size register array.
+/// The widest hyper-connection count [`run_gr_mix`] and [`run_gr_combine`] are
+/// built for, mirroring `GR_MAX_HC` in `simple/gr_hyper.cu`. Both kernels are
+/// instantiated per stream count — every power of two up to this — so the
+/// stream loop unrolls and the per-stream weights stay in registers.
 ///
-/// The kernel's own bound check can only `return` — the launcher is
-/// `extern "C" void` — and its destination is allocated uninitialised, so a
-/// caller that ignores this constant propagates an uninitialised residual with
-/// no error. Refuse it host-side, as `MHC_MAX_HC` is refused.
+/// A launcher handed any other count can only `return` — it is
+/// `extern "C" void` — leaving its destination unwritten with no error. Refuse
+/// it host-side with [`gr_hc_supported`].
 pub const GR_MAX_HC: usize = 16;
+
+/// Whether the mix and combine launchers are instantiated for `hc` streams.
+pub const fn gr_hc_supported(hc: usize) -> bool {
+    hc.is_power_of_two() && hc <= GR_MAX_HC
+}
 
 extern "C" {
     /// Grouped RMS norm over the wide residual, with the `[hc·d]` gain folded
@@ -57,18 +62,19 @@ extern "C" {
         stream: *mut c_void,
     );
 
-    /// The write scatter, into a fresh residual:
-    /// `out[t,s,j] = res[t,s,j] + block_out[t,j] · 2·sigmoid(inject[t,s] / hc)`.
+    /// The write scatter, in place on the residual:
+    /// `res[t,s,j] += block_out[t,j] · 2·sigmoid(inject[t,s] / hc)`.
     ///
-    ///   res/out `[n, hc, d]`, block_out `[n, d]`, inject `[n, hc]` (`hc ≤ 16`)
+    ///   res `[n, hc, d]`, block_out `[n, d]`, inject `[n, hc]` (`hc ≤ 16`) with
+    ///   its rows `inject_stride ≥ hc` elements apart
     pub fn run_gr_combine(
-        res: *const f32,
+        res: *mut f32,
         block_out: *const f32,
         inject: *const f32,
-        out: *mut f32,
         n: i32,
         hc: i32,
         d: i32,
+        inject_stride: i32,
         vec_ok: i32,
         stream: *mut c_void,
     );

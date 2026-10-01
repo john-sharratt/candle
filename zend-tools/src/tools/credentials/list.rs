@@ -52,7 +52,7 @@ impl Tool for CredentialList {
     type Error = CredError;
 
     fn run(ctx: &ToolContext, req: ListRequest) -> Result<ListResponse, CredError> {
-        let creds = ctx.credentials.list(req.cred_type.as_deref());
+        let creds = ctx.credentials()?.list(req.cred_type.as_deref());
         let credentials = creds
             .into_iter()
             .map(|c| CredEntry {

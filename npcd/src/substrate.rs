@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
+use candle_conversation::persistence::SUBSTRATE_DIR;
 use serde::Serialize;
 
 /// Segment files are named `seg-<id>.log`; the highest id is the one being
@@ -68,7 +69,7 @@ pub struct SubstrateDir(PathBuf);
 
 impl SubstrateDir {
     pub fn new(data_dir: &Path) -> Self {
-        Self(data_dir.join(".substrate"))
+        Self(data_dir.join(SUBSTRATE_DIR))
     }
 
     /// Read the segment files.
@@ -181,13 +182,13 @@ mod tests {
         assert_eq!(s.segment_count, 0);
         // The path is reported anyway, so "looked in the wrong place" is
         // distinguishable from "nothing written yet".
-        assert!(s.path.ends_with(".substrate"));
+        assert!(s.path.ends_with(SUBSTRATE_DIR));
     }
 
     #[test]
     fn segments_are_ordered_and_the_newest_is_the_active_one() {
         let root = tmp();
-        let sub = root.join(".substrate");
+        let sub = root.join(SUBSTRATE_DIR);
         fs::create_dir_all(&sub).unwrap();
         seg(&sub, "seg-000002.log", 200);
         seg(&sub, "seg-000010.log", 50);
@@ -210,7 +211,7 @@ mod tests {
     #[test]
     fn the_in_memory_figures_stay_absent() {
         let root = tmp();
-        fs::create_dir_all(root.join(".substrate")).unwrap();
+        fs::create_dir_all(root.join(SUBSTRATE_DIR)).unwrap();
         let s = SubstrateDir::new(&root).read();
         assert!(s.live_chunks.is_none());
         assert!(s.dead_ratio.is_none());
@@ -222,7 +223,7 @@ mod tests {
     #[test]
     fn files_that_are_not_segments_are_ignored() {
         let root = tmp();
-        let sub = root.join(".substrate");
+        let sub = root.join(SUBSTRATE_DIR);
         fs::create_dir_all(&sub).unwrap();
         seg(&sub, "seg-000001.log", 10);
         seg(&sub, "substrate.log", 999);
@@ -246,7 +247,7 @@ mod tests {
     #[test]
     fn a_huge_substrate_truncates_the_list_but_not_the_totals() {
         let root = tmp();
-        let sub = root.join(".substrate");
+        let sub = root.join(SUBSTRATE_DIR);
         fs::create_dir_all(&sub).unwrap();
         let n = MAX_LISTED + 7;
         for i in 0..n {

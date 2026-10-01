@@ -62,12 +62,15 @@ candle-kernels/build_tool/
 # Raw R16 KV tensor dumps (large; signatures.prov and MANIFEST.json are tracked)
 **/raw_kvq.prov
 
-# Substrate persistence redo log — created at runtime under any workspace root.
-# The glob covers renamed copies too: a substrate set aside before a model
-# change (`.substrate.qwen3-30b-a3b/`) is hundreds of gigabytes and is exactly
-# as unwelcome in a commit as the live one.
-.substrate/
-.substrate.*/
+# Substrate persistence redo log — created at runtime under any workspace root
+# (the repo root itself, or a subtree like zend/ or npcd/ when run with that
+# subtree as its own workspace). The glob covers renamed copies too: a
+# substrate set aside before a model change (`substrate.qwen3-30b-a3b/`) is
+# hundreds of gigabytes and is exactly as unwelcome in a commit as the live
+# one. No source directory in this tree is named `substrate`, so the pattern
+# is left unanchored on purpose — if one is ever added, anchor this instead.
+substrate/
+substrate.*/
 
 # Per-folder substrate metadata — the daemon writes a `.substrate.yaml` (summary,
 # distinctive terms, retrieval questions) into every folder it maps.
@@ -77,8 +80,8 @@ candle-kernels/build_tool/
 # files here at runtime; they are workspace content, never repo content.
 uploads/
 
-# Stray full prefill-capture dumps: ZEND_PREFILL_CAPTURE writes the untrimmed
-# capture here by default. The committed test fixture is the trimmed copy under
+# Stray full prefill-capture dumps (`trim_prefill_fixture`'s default input).
+# The committed test fixture is the trimmed copy under
 # candle-transformers/tests/fixtures/ (LFS-tracked via .gitattributes).
 /prefill_fixture.bin
 
@@ -101,6 +104,19 @@ zend/examples/provenance_queries.json
 # absent, so a clone without one builds and behaves exactly as the presets say.
 # See `candle-conversation/src/models/overrides.rs`.
 /models.override.yaml
+
+# A secrets folder at the repository root. zend reads its keys from
+# `~/.zend/secrets.yaml` (or `--secrets <path>`), outside every repository, so
+# nothing here is read by the daemon — but a machine set up before that change
+# may still hold `secrets/tools.yaml` with a live key, and this keeps it out of
+# a `git add -A`. Mirrors `web/secrets/` and `npcd/secrets/`, which are ignored
+# by their own crates' .gitignore files.
+#
+# The ignore entry keeps such a file out of commits and does nothing about the
+# model, because the `file_*` tools resolve a path straight to disk and never
+# consult the ignore rules. `VfsStore::PROTECTED_SEGMENT` is what stops
+# `file_read` serving it.
+/secrets/
 
 # Daemon output, redirected by hand when running npcd from the workspace root.
 # Six of these had accumulated untracked and a `git add -A` would have taken

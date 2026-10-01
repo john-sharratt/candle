@@ -25,7 +25,7 @@ fn a_comma_after_the_last_field_is_dropped() {
         &[
             T("read_files\""),
             T("{"),
-            T("a\""),
+            T(" \"a\""),
             T(", \"start_line\":"),
             T(" 1"),
             T(","),
@@ -53,7 +53,7 @@ fn a_merged_run_of_closers_after_a_value_is_dropped() {
             &[
                 T("read_files\""),
                 T("{"),
-                T("a\""),
+                T(" \"a\""),
                 T(", \"end_line\":"),
                 T(" 2"),
                 closers,
@@ -78,7 +78,7 @@ fn digits_merged_with_a_closer_keep_the_digits() {
             &[
                 T("read_files\""),
                 T("{"),
-                T("a\""),
+                T(" \"a\""),
                 T(", \"end_line\":"),
                 T(" "),
                 K(merged),
@@ -124,12 +124,12 @@ fn after_a_dropped_delimiter_the_array_can_continue() {
         &[
             T("read_files\""),
             T("{"),
-            T("a\""),
+            T(" \"a\""),
             T(", \"end_line\":"),
             T(" 2"),
             T(","),
             T(", {"),
-            T("b\""),
+            T(" \"b\""),
             T("}"),
             T("]"),
         ],
@@ -161,7 +161,7 @@ fn eos_inside_an_element_string_closes_the_string() {
         &[
             T("read_files\""),
             T("{"),
-            T("src/ma"),
+            T(" \"src/ma"),
             K(EOS),
             T("}"),
             T("]"),
@@ -180,7 +180,7 @@ fn eos_in_an_element_number_writes_a_value() {
         &[
             T("read_files\""),
             T("{"),
-            T("a\""),
+            T(" \"a\""),
             T(", \"end_line\":"),
             K(EOS),
             T("]"),
@@ -193,7 +193,7 @@ fn eos_in_an_element_number_writes_a_value() {
         &[
             T("read_files\""),
             T("{"),
-            T("a\""),
+            T(" \"a\""),
             T(", \"end_line\":"),
             T(" 34"),
             K(EOS),
@@ -213,7 +213,7 @@ fn a_structure_where_a_number_belongs_is_still_one_value() {
         &[
             T("read_files\""),
             T("{"),
-            T("a\""),
+            T(" \"a\""),
             T(", \"start_line\":"),
             T(" [1, {\"x\": \"]\"}]"),
             T("}"),

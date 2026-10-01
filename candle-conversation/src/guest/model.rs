@@ -107,8 +107,9 @@ pub trait GuestModel: Send {
     ///
     /// Decode is bandwidth-bound on the weights: every token streams the whole
     /// checkpoint, so B sequences stepping together stream those same bytes once
-    /// instead of B times. That is the difference between this engine's 509 t/s
-    /// on one session and 2,446 t/s across sixty-four, and a guest that answers
+    /// instead of B times. That is the difference between this engine's 97.2
+    /// t/s decode on one Llama-2-7B session and 917.3 t/s across forty-eight
+    /// (`docs/performance.md` §3.7), and a guest that answers
     /// its backlog one job at a time is paying the single-session rate for work
     /// that has no ordering constraint in it at all.
     ///

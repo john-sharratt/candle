@@ -87,12 +87,14 @@ using fused_attn::load_b_frag_n8k32_ldmatrix;
 using fused_attn::mma_int8_m16n8k32;
 
 // Per-element staging/decoding helpers shared with the INT8 tile decode kernel.
-using int8_elem::i8_rope_cs;
 using int8_elem::i8_apply_rope;
+using int8_elem::i8_apply_rope_pair;
 using int8_elem::qt_to_f32;
 using int8_elem::qt_from_f32;
 using int8_elem::i8_quant;
 using int8_elem::i8_arena_elem;
+using int8_elem::i8_pal_rank_load4;
+using int8_elem::i8_with_format;
 
 constexpr int I8_WARPS = 8;
 constexpr int I8_THREADS = I8_WARPS * 32;
@@ -175,8 +177,7 @@ paged_prefill_int8_kernel(
     int n_head,
     int n_kv_head,
     float softmax_scale,
-    const uint32_t* __restrict__ rope_offsets,
-    const float* __restrict__ rope_cs,
+    const RopeRungs rungs,
     int rope_interleaved,               // 0 = half-split pairing, 1 = interleaved (LLaMA)
     // Split-KV: grid.z = batch_size × num_splits. Shard s of a sequence
     // processes tiles (sealed AND fresh — one shared ordinal space) with
@@ -218,6 +219,9 @@ paged_prefill_int8_kernel(
     if (batch_idx >= batch_size || kv_head_idx >= n_kv_head) return;
 
     const SlotHeader& slot_hdr = get_slot_header(headers_ptr, batch_idx);
+    // The sequence's own rung: a block never spans two sequences, so nothing
+    // rung-dependent here is shared with another sequence's rows.
+    const RopeView rope = rope_view(rungs, slot_hdr.rope_rung);
 
     const int q_start = (int)cu_seqlens_q[batch_idx];
     const int q_len = (int)q_lens[batch_idx];
@@ -232,7 +236,6 @@ paged_prefill_int8_kernel(
     const int rows_used = block_m_tok * hpg; // ≤ I8_M_ROWS; rows beyond are idle
     const int t0 = (int)blockIdx.x * block_m_tok;
     if (t0 >= q_len) return;
-    const uint32_t rope_base = rope_offsets[batch_idx];
     const int first_q_head = kv_head_idx * hpg;
 
     // ------------------------------------------------------------------
@@ -362,8 +365,8 @@ paged_prefill_int8_kernel(
             const QT* qrow = q + ((int64_t)(q_start + tok) * n_head + head) * HEAD_DIM;
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) x[w] = qt_to_f32<QT>(qrow[lane + 32 * w]);
-            int pos = prefix_len + tok + (int)rope_base;
-            i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope_cs);
+            int pos = prefix_len + tok;
+            i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope.for_q());
         } else {
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) x[w] = 0.f;
@@ -560,8 +563,91 @@ paged_prefill_int8_kernel(
         // from the packed inputs; a column past the tile's blocks (or past
         // kv_len inside a partial last block) is zero and masked with
         // P == 0 in the compute phase.
+        //
+        //
+        // A K window of one column into the int8 slab: the window's absmax
+        // over the warp sets its scale.
+        const auto stage_k_window = [&](int j, int w, float x) {
+            float a = fabsf(x);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+            const float scale = a / 127.f;
+            const float inv = (scale > 0.f) ? 1.f / scale : 0.f;
+            s_k8[j][lane + 32 * w] = i8_quant(x, inv);
+            if (lane == 0) s_k_scale[j][w] = __float2half(scale);
+        };
+        //
+        // The quad path. A warp's four columns are four consecutive positions;
+        // when all four are sealed and sit consecutively in one slice, each
+        // dim's four tokens are a run of the same block (quant) or four strided
+        // elements (dtype), decoded together by `i8_pal_rank_load4`: the block
+        // header once instead of four times, and when each side's palettes
+        // share one format — nearly every slice — one format dispatch per
+        // window pair instead of one per element. K is finished one RoPE pair
+        // of windows at a time (RoPE rotates window w against w + N_WIN/2 and
+        // each window has its own scale), so only that pair's four tokens are
+        // live at once: holding every window's quad across the token loop
+        // tripled the kernel's register spill.
+        static_assert(I8_COLS_PER_WARP == 4, "a warp's columns are one token quad");
+        bool quad = false;
+        if (my_q != QSA_WALK_END) {
+            const int pos0 = my_q + my_to;
+            if (pos0 + 3 < prefix_len && pos0 + 3 < kv_len) {
+                int sl0, ib0, sl3, ib3;
+                resolve_pos(slot_hdr, pos0, sl0, ib0);
+                resolve_pos(slot_hdr, pos0 + 3, sl3, ib3);
+                if (sl0 == sl3 && ib3 == ib0 + 3) {
+                    if (sl0 != bound_slice) bind_slice(sl0); // warp-uniform
+                    const int fk = s_wext_fmt[warp][0][0];
+                    const int fv = s_wext_fmt[warp][1][0];
+                    bool uniform = true;
+                    #pragma unroll
+                    for (int p = 1; p < N_PALETTE; ++p)
+                        uniform = uniform && s_wext_fmt[warp][0][p] == fk && s_wext_fmt[warp][1][p] == fv;
+                    if (uniform) {
+                        quad = true;
+                        const int j0 = warp * I8_COLS_PER_WARP;
+                        // Window w's four tokens of rank table `side` at quad `ib0`.
+                        const auto load_window = [&](auto tag, auto is_k_const, int w, float (&o)[4]) {
+                            constexpr bool IS_K = decltype(is_k_const)::value;
+                            constexpr int side = IS_K ? 0 : 1;
+                            const int t = s_wrank[warp][side][lane + 32 * w];
+                            const int p = (t >> 6) & (N_PALETTE - 1);
+                            i8_pal_rank_load4<IS_K>(tag, s_wext_base[warp][side][p], t & 63, SUB,
+                                                    __frcp_rn(s_wext_scl[warp][side][p]), ib0, o);
+                        };
+                        using KSide = std::integral_constant<bool, true>;
+                        using VSide = std::integral_constant<bool, false>;
+                        #pragma unroll 1
+                        for (int w = 0; w < N_WIN / 2; ++w) {
+                            float lo[4], hi[4];
+                            i8_with_format(fk, [&](auto tag) {
+                                load_window(tag, KSide{}, w, lo);
+                                load_window(tag, KSide{}, w + N_WIN / 2, hi);
+                            });
+                            #pragma unroll
+                            for (int tt = 0; tt < 4; ++tt) {
+                                i8_apply_rope_pair<N_WIN>(lo[tt], hi[tt], w, pos0 + tt, lane,
+                                                          rope_interleaved, rope);
+                                stage_k_window(j0 + tt, w, lo[tt]);
+                                stage_k_window(j0 + tt, w + N_WIN / 2, hi[tt]);
+                            }
+                        }
+                        #pragma unroll 1
+                        for (int w = 0; w < N_WIN; ++w) {
+                            float vq[4];
+                            i8_with_format(fv, [&](auto tag) { load_window(tag, VSide{}, w, vq); });
+                            #pragma unroll
+                            for (int tt = 0; tt < 4; ++tt)
+                                s_fresh[j0 + tt][lane + 32 * w] = __float2half(vq[tt]);
+                        }
+                    }
+                }
+            }
+        }
         #pragma unroll 1
-        for (int tt = 0; tt < I8_COLS_PER_WARP; ++tt) {
+        for (int tt = 0; tt < I8_COLS_PER_WARP && !quad; ++tt) {
             const int j = warp * I8_COLS_PER_WARP + tt;
             const int pos = (my_q == QSA_WALK_END) ? kv_len : my_q + my_to + tt;
             // K stays in registers for RoPE (pairs (w, w + N_WIN/2) are
@@ -591,30 +677,21 @@ paged_prefill_int8_kernel(
                     const int d = lane + 32 * w;
                     const int tk = s_wrank[warp][0][d];
                     const int pk = (tk >> 6) & (N_PALETTE - 1);
-                    x[w] = i8_arena_elem(s_wext_fmt[warp][0][pk], s_wext_bb[warp][0][pk],
+                    x[w] = i8_arena_elem<true>(s_wext_fmt[warp][0][pk], s_wext_bb[warp][0][pk],
                                          s_wext_base[warp][0][pk], tk & 63, in_blk,
                                          s_wext_scl[warp][0][pk], SUB);
                     const int tv = s_wrank[warp][1][d];
                     const int pv = (tv >> 6) & (N_PALETTE - 1);
-                    const float v = i8_arena_elem(s_wext_fmt[warp][1][pv], s_wext_bb[warp][1][pv],
+                    const float v = i8_arena_elem<false>(s_wext_fmt[warp][1][pv], s_wext_bb[warp][1][pv],
                                                   s_wext_base[warp][1][pv], tv & 63, in_blk,
                                                   s_wext_scl[warp][1][pv], SUB);
                     s_fresh[j][lane + 32 * w] = __float2half(v);
                 }
             }
             if (pos < kv_len)
-                i8_apply_rope<HEAD_DIM, N_WIN>(x, pos + (int)rope_base, lane, rope_interleaved, rope_cs);
+                i8_apply_rope<HEAD_DIM, N_WIN>(x, pos, lane, rope_interleaved, rope);
             #pragma unroll
-            for (int w = 0; w < N_WIN; ++w) {
-                float a = fabsf(x[w]);
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1)
-                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-                float scale = a / 127.f;
-                float inv = (scale > 0.f) ? 1.f / scale : 0.f;
-                s_k8[j][lane + 32 * w] = i8_quant(x[w], inv);
-                if (lane == 0) s_k_scale[j][w] = __float2half(scale);
-            }
+            for (int w = 0; w < N_WIN; ++w) stage_k_window(j, w, x[w]);
         }
         if (lane == 0) s_qpos[warp] = (my_q == QSA_WALK_END) ? DEAD_QPOS : my_q + my_to;
         __syncthreads();
@@ -919,8 +996,7 @@ inline void launch_paged_prefill_int8(
     int32_t n_kv_head,
     int32_t max_q_len,
     float softmax_scale,
-    const uint32_t* rope_offsets,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int32_t rope_interleaved,
     cudaStream_t stream,
     QsaSel sel = {nullptr, nullptr, nullptr, nullptr, 0, 1}
@@ -1006,7 +1082,7 @@ inline void launch_paged_prefill_int8(
         (const QT*)q_ptr, (const QT*)k_ptr, (const QT*)v_ptr,
         headers_ptr, cu_seqlens_q, q_lens, kv_lens,
         (QT*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head,
-        softmax_scale, rope_offsets, rope_cs, (int)rope_interleaved,
+        softmax_scale, rungs, (int)rope_interleaved,
         num_splits, partials, sel);
 
     if (num_splits > 1) {

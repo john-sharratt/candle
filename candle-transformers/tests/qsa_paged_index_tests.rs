@@ -12,20 +12,21 @@
 //! # What the oracle is, and why it is not the dense kernel
 //!
 //! [`PagedIndex::score_reference`] is the naive expression evaluated eagerly on
-//! the host — one dot product at a time, in row order. Comparing against the
-//! dense GPU path instead would only prove the two agree, which is exactly the
-//! thing a shared bug would also produce. The tolerance is not laxity: the
-//! kernel accumulates in a different order (a `float4` body, heads folded after
-//! a per-head ReLU), so bit-equality is not available and asking for it would
-//! pin an implementation rather than a result.
+//! the host in f64 — every stored key rotated at its own position from the
+//! exact angle, then one dot product at a time, in row order. Comparing against
+//! the dense GPU path instead would only prove the two agree, which is exactly
+//! the thing a shared bug would also produce. The tolerance is not laxity: the
+//! kernel rotates from an f32 table and accumulates in a different order (a
+//! `float4` body, heads folded after a per-head ReLU), so bit-equality is not
+//! available and asking for it would pin an implementation rather than a result.
 
 #![cfg(feature = "cuda")]
 
 use candle::{DType, Device, Result, Tensor};
-use candle_transformers::models::qwen35::attention::RopeTables;
 use candle_transformers::models::qwen4exp::paged_index::{
-    decode_page, encode_page, IndexPage, PagedIndex, SealedIndex,
+    decode_aux, decode_page, encode_aux, encode_page, IndexPage, PagedIndex, SealedIndex,
 };
+use candle_transformers::models::rope_schedule::{plain_inv_freq, FactoredRope};
 
 /// The released checkpoint's indexer geometry.
 const HEAD_DIM: usize = 128;
@@ -80,10 +81,14 @@ fn window(rows_per_page: &[usize], last_cells: usize, seed: u64) -> Result<Paged
     PagedIndex::new(pages, RATIO, &d)
 }
 
-/// The rotation tables the placement uses. Deep enough for every base these
-/// tests place a page at.
-fn rope() -> Result<RopeTables> {
-    RopeTables::new(ROPE_DIM, ROPE_THETA, 1 << 16, &dev()?)
+/// The frequencies the scorer's table is built from, and the oracle's.
+fn inv_freq() -> Vec<f32> {
+    plain_inv_freq(ROPE_DIM, ROPE_THETA)
+}
+
+/// The factored table the scorer rotates every key from.
+fn rope() -> Result<FactoredRope> {
+    FactoredRope::new(&inv_freq(), &dev()?)
 }
 
 fn queries(t: usize, seed: u64) -> Result<Tensor> {
@@ -99,14 +104,14 @@ fn compare(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize]) -> Result<f32> {
     let n = idx.total_rows();
     let t = qpos.len();
     let out = Tensor::zeros((t, n.max(1)), DType::F32, &d)?;
-    idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n.max(1), 0, &rope()?)?;
+    idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n.max(1), 0, &rope()?, 0)?;
     let got = out.flatten_all()?.to_vec1::<f32>()?;
-    let want = idx.score_reference(q, qpos, N_HEADS, HEAD_DIM, &rope()?)?;
+    let want = idx.score_reference(q, qpos, N_HEADS, HEAD_DIM, &inv_freq())?;
 
     let mut worst = 0f32;
     for r in 0..t {
         for g in 0..n {
-            let (a, b) = (got[r * n + g], want[r * n + g]);
+            let (a, b) = (got[r * n + g], want[r * n + g] as f32);
             let masked_a = a <= -1e29;
             let masked_b = b <= -1e29;
             assert_eq!(
@@ -242,23 +247,25 @@ fn a_gap_between_pages_is_allowed_and_an_overlap_is_not() -> Result<()> {
 /// produce a plausible index on resume.
 #[test]
 fn a_page_round_trips_through_its_record_bytes() -> Result<()> {
-    let _g = gpu().lock().unwrap();
-    let d = dev()?;
     let mut rng = Lcg(91);
     let rows = 11usize;
     let vals = rng.vec(rows * HEAD_DIM);
-    let keys = Tensor::from_vec(vals.clone(), (rows, HEAD_DIM), &d)?;
     let open_vals = rng.vec(2 * HEAD_DIM);
-    let open = Tensor::from_vec(open_vals.clone(), (2, HEAD_DIM), &d)?;
-    let blob = encode_page(&keys, 3, &open)?;
-    let back = decode_page(&blob, &d)?;
-    assert_eq!(back.page.rows()?, rows);
-    assert_eq!(back.page.last_cells, 3);
-    let got = back.page.keys.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(got, vals, "the page's keys did not survive the round trip");
+    let sealed = SealedIndex {
+        rows: vals.clone(),
+        dim: HEAD_DIM,
+        last_cells: 3,
+        open: open_vals.clone(),
+    };
+    let back = decode_page(&encode_page(&sealed)?)?;
+    assert_eq!(back.n_rows(), rows);
+    assert_eq!(back.last_cells, 3);
     assert_eq!(
-        back.open.flatten_all()?.to_vec1::<f32>()?,
-        open_vals,
+        back.rows, vals,
+        "the page's keys did not survive the round trip"
+    );
+    assert_eq!(
+        back.open, open_vals,
         "the open block did not survive — a resume would stand behind its own K/V"
     );
     Ok(())
@@ -272,24 +279,26 @@ fn a_page_round_trips_through_its_record_bytes() -> Result<()> {
 /// while proving nothing about the other three.
 #[test]
 fn an_open_block_of_every_width_round_trips() -> Result<()> {
-    let _g = gpu().lock().unwrap();
-    let d = dev()?;
     let mut rng = Lcg(93);
     for n_open in 0..=RATIO {
-        let keys = Tensor::from_vec(rng.vec(5 * HEAD_DIM), (5, HEAD_DIM), &d)?;
         let open_vals = rng.vec(n_open * HEAD_DIM);
-        let open = Tensor::from_vec(open_vals.clone(), (n_open, HEAD_DIM), &d)?;
-        let back = decode_page(&encode_page(&keys, RATIO, &open)?, &d)?;
+        let sealed = SealedIndex {
+            rows: rng.vec(5 * HEAD_DIM),
+            dim: HEAD_DIM,
+            last_cells: RATIO,
+            open: open_vals.clone(),
+        };
+        let back = decode_page(&encode_page(&sealed)?)?;
         assert_eq!(
-            back.open.dim(0)?,
+            back.n_open(),
             n_open,
             "an open block of {n_open} rows came back as {} — the cache's \
              `n_blocks · ratio + n_open == tokens` no longer holds",
-            back.open.dim(0)?
+            back.n_open()
         );
-        assert_eq!(back.open.flatten_all()?.to_vec1::<f32>()?, open_vals);
+        assert_eq!(back.open, open_vals);
         assert_eq!(
-            back.tokens(RATIO)?,
+            back.page_tokens(RATIO) + back.n_open(),
             5 * RATIO + n_open,
             "the record describes the wrong token count"
         );
@@ -300,17 +309,19 @@ fn an_open_block_of_every_width_round_trips() -> Result<()> {
 /// A truncated blob is refused rather than reshaped into a plausible index.
 #[test]
 fn a_truncated_page_blob_is_refused() -> Result<()> {
-    let _g = gpu().lock().unwrap();
-    let d = dev()?;
     let mut rng = Lcg(92);
-    let keys = Tensor::from_vec(rng.vec(8 * HEAD_DIM), (8, HEAD_DIM), &d)?;
-    let open = Tensor::from_vec(rng.vec(3 * HEAD_DIM), (3, HEAD_DIM), &d)?;
-    let blob = encode_page(&keys, RATIO, &open)?;
-    assert!(decode_page(&blob[..blob.len() / 2], &d).is_err());
+    let sealed = SealedIndex {
+        rows: rng.vec(8 * HEAD_DIM),
+        dim: HEAD_DIM,
+        last_cells: RATIO,
+        open: rng.vec(3 * HEAD_DIM),
+    };
+    let blob = encode_page(&sealed)?;
+    assert!(decode_page(&blob[..blob.len() / 2]).is_err());
     // Losing only the open block is the interesting truncation: the completed
     // rows still decode, so a reader that did not check the declared open count
     // would hand back a page that looks whole and stands short.
-    assert!(decode_page(&blob[..blob.len() - HEAD_DIM * 4], &d).is_err());
+    assert!(decode_page(&blob[..blob.len() - HEAD_DIM * 4]).is_err());
     Ok(())
 }
 
@@ -379,8 +390,6 @@ fn per_turn_pages_expose_the_same_candidate_prefix_as_one_page() -> Result<()> {
 /// plausible-looking index.
 #[test]
 fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
-    let _g = gpu().lock().unwrap();
-    let d = dev()?;
     let mut rng = Lcg(555);
     let ple: Vec<u8> = (0..37u8).collect();
     let layers = 12usize;
@@ -399,29 +408,25 @@ fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
         let open_vals = rng.vec(n_open * HEAD_DIM);
         expect_open.push(open_vals.clone());
         sealed.push(SealedIndex {
-            page: IndexPage::new(
-                Tensor::from_vec(vals, (rows, HEAD_DIM), &d)?,
-                1 + (i % RATIO),
-            ),
-            open: Tensor::from_vec(open_vals, (n_open, HEAD_DIM), &d)?,
+            rows: vals,
+            dim: HEAD_DIM,
+            last_cells: 1 + (i % RATIO),
+            open: open_vals,
         });
     }
-    let blob = candle_transformers::models::qwen4exp::paged_index::encode_aux(&ple, &sealed)?;
-    let (ple_back, back) =
-        candle_transformers::models::qwen4exp::paged_index::decode_aux(&blob, &d)?;
+    let blob = encode_aux(&ple, &sealed)?;
+    let (ple_back, back) = decode_aux(&blob)?;
     assert_eq!(ple_back, ple, "the PLE section did not survive");
     assert_eq!(back.len(), layers, "page count changed");
     for (i, s) in back.iter().enumerate() {
-        assert_eq!(s.page.rows()?, 3 + i, "page {i} row count");
-        assert_eq!(s.page.last_cells, 1 + (i % RATIO), "page {i} last_cells");
+        assert_eq!(s.n_rows(), 3 + i, "page {i} row count");
+        assert_eq!(s.last_cells, 1 + (i % RATIO), "page {i} last_cells");
         assert_eq!(
-            s.page.keys.flatten_all()?.to_vec1::<f32>()?,
-            expect[i],
+            s.rows, expect[i],
             "page {i} keys did not survive the round trip"
         );
         assert_eq!(
-            s.open.flatten_all()?.to_vec1::<f32>()?,
-            expect_open[i],
+            s.open, expect_open[i],
             "layer {i}'s open block did not survive the round trip"
         );
     }
@@ -432,21 +437,17 @@ fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
 /// list — a missing page is an attention layer with no candidates at all.
 #[test]
 fn a_truncated_aux_container_is_refused() -> Result<()> {
-    let _g = gpu().lock().unwrap();
-    let d = dev()?;
     let mut rng = Lcg(556);
     let sealed = vec![SealedIndex {
-        page: IndexPage::new(
-            Tensor::from_vec(rng.vec(4 * HEAD_DIM), (4, HEAD_DIM), &d)?,
-            RATIO,
-        ),
-        open: Tensor::from_vec(rng.vec(2 * HEAD_DIM), (2, HEAD_DIM), &d)?,
+        rows: rng.vec(4 * HEAD_DIM),
+        dim: HEAD_DIM,
+        last_cells: RATIO,
+        open: rng.vec(2 * HEAD_DIM),
     }];
-    let blob = candle_transformers::models::qwen4exp::paged_index::encode_aux(&[1, 2, 3], &sealed)?;
+    let blob = encode_aux(&[1, 2, 3], &sealed)?;
     for cut in [4usize, 16, blob.len() / 2, blob.len() - 1] {
         assert!(
-            candle_transformers::models::qwen4exp::paged_index::decode_aux(&blob[..cut], &d)
-                .is_err(),
+            decode_aux(&blob[..cut]).is_err(),
             "a container truncated at {cut} bytes decoded without error"
         );
     }
@@ -469,9 +470,10 @@ fn bench_once(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize], iters: usize) ->
         candle::bail!("bench runs on CUDA")
     };
     let stream = cuda.cuda_stream();
+    let rope = rope()?;
     // Warm: first launch pays module load and the descriptor upload.
     for _ in 0..5 {
-        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope()?)?;
+        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope, 0)?;
     }
     d.synchronize()?;
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
@@ -479,7 +481,7 @@ fn bench_once(idx: &mut PagedIndex, q: &Tensor, qpos: &[usize], iters: usize) ->
         let start = stream
             .record_event(Some(CU_EVENT_DEFAULT))
             .map_err(|e| candle::Error::Msg(format!("event: {e}")))?;
-        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope()?)?;
+        idx.score_rows(q, qpos, N_HEADS, HEAD_DIM, &out, n, 0, &rope, 0)?;
         let stop = stream
             .record_event(Some(CU_EVENT_DEFAULT))
             .map_err(|e| candle::Error::Msg(format!("event: {e}")))?;

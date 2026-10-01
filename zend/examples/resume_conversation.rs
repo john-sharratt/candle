@@ -26,12 +26,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
+use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::SealedPages;
 use clap::{Parser, ValueEnum};
 use regex::Regex;
 use tracing_subscriber::EnvFilter;
 use zend::api::chat::{apply_tools_dial, dial_selection};
-use zend::config::{layer_flag_sets, DaemonConfig};
+use zend::config::DaemonConfig;
 use zend::log_broadcast::LogBus;
 use zend::session::{
     Demonstration, ReplayOutcome, ReplaySampling, ReplaySpec, TurnComparison, ZendSession,
@@ -41,7 +42,7 @@ use zend::types::ToolMode;
 #[derive(Parser)]
 #[command(about = "Replay a recorded conversation to a turn and decode that turn live, read-only")]
 struct Args {
-    /// The workspace whose `.substrate/` holds the conversation. Opened
+    /// The workspace whose `substrate/` holds the conversation. Opened
     /// read-only; nothing is written.
     #[arg(long)]
     workspace: PathBuf,
@@ -77,9 +78,6 @@ struct Args {
     /// Layers out of service, as the daemon's `--disable-layer`.
     #[arg(long = "disable-layer", default_value = "code_reading")]
     disable_layer: Vec<String>,
-    /// Layers in service but not read, as the daemon's `--skip-layer`.
-    #[arg(long = "skip-layer", default_value = "repo_map")]
-    skip_layer: Vec<String>,
     /// A run whose output matches any of these patterns counts as a failure.
     #[arg(long = "fail-if")]
     fail_if: Vec<String>,
@@ -211,8 +209,8 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .map(|p| Regex::new(p).with_context(|| format!("--fail-if {p:?} is not a regex")))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    if !args.workspace.join(".substrate").is_dir() {
-        bail!("{} holds no .substrate directory", args.workspace.display());
+    if !args.workspace.join(SUBSTRATE_DIR).is_dir() {
+        bail!("{} holds no substrate directory", args.workspace.display());
     }
     let tools_mode = match args.tools {
         Tools::None => ToolMode::None,
@@ -224,14 +222,11 @@ async fn main() -> anyhow::Result<()> {
         DemonstrationArg::FirstStep => Demonstration::FirstStepOnly,
     };
 
-    let (disabled_layers, skipped_layers) = layer_flag_sets(&args.disable_layer, &args.skip_layer);
     let config = DaemonConfig {
-        workspace: args.workspace.clone(),
-        disabled_layers,
-        skipped_layers,
+        disabled_layers: args.disable_layer.iter().cloned().collect(),
         read_only_substrate: true,
         qsa_selection_budget: args.qsa_selection_budget,
-        ..Default::default()
+        ..DaemonConfig::new(zend::workspace::open(&args.workspace)?)
     };
     let session = Arc::new(ZendSession::new(config, LogBus::new()));
     session.start_loading();

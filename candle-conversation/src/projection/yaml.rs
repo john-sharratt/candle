@@ -529,6 +529,11 @@ struct YamlLayer {
     description: String,
     /// Total turn-budget when this layer is the projection target.
     window: usize,
+    /// Tokens of THIS layer's conversations a fast-path tool read may inject
+    /// into another conversation. `0` (the default) keeps the layer out of the
+    /// fast path entirely, so a tool read of its content always runs for real.
+    #[serde(default)]
+    fast_path_window: usize,
     #[serde(default)]
     score_threshold: f32,
     #[serde(default)]
@@ -569,6 +574,10 @@ struct YamlLayer {
     /// default in the ingest driver; non-ingest layers ignore it.
     #[serde(default)]
     ingest_unit: Option<String>,
+    /// Whether the layer's turns project into tool rounds — see
+    /// [`LayerSchema::in_tool_rounds`]. Omitted → `true`.
+    #[serde(default)]
+    in_tool_rounds: Option<bool>,
     /// The layer's place in the visibility stack — see [`LayerSchema::rank`].
     /// Omitted → its declaration index.
     #[serde(default)]
@@ -1053,6 +1062,7 @@ fn build(
             description: yl.description.clone(),
             score_threshold: yl.score_threshold,
             window: yl.window,
+            fast_path_window: yl.fast_path_window,
             budget: layer_budget,
             dials,
             summary: layer_summary,
@@ -1065,6 +1075,7 @@ fn build(
             decode_priority: yl.decode_priority.into(),
             on_corrupt_turn: yl.on_corrupt_turn.into(),
             ingest_unit: yl.ingest_unit.clone(),
+            in_tool_rounds: yl.in_tool_rounds.unwrap_or(true),
             // Its declaration index unless it says otherwise — the stack every
             // schema had before a layer could declare its place in it.
             rank: yl.rank.unwrap_or(layers.len() as i32),

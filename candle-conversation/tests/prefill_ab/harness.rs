@@ -16,7 +16,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     quantize_sealed_in_place, ChunkedKvBacking, CompressionPolicy, KvCache, CHUNK_SIZE,
 };
-use candle_transformers::models::prefill_utils::{compute_rope_cs, paged_prefill_batched};
+use candle_transformers::models::prefill_utils::paged_prefill_batched;
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
 use std::sync::{Mutex, MutexGuard};
 
 // Production attention shape (Qwen3-MoE): GQA 32/4, HEAD_DIM 128. The GQA
@@ -189,9 +190,9 @@ pub struct BuiltCase {
     pub new_q: Vec<Vec<f32>>,
     pub new_k: Vec<Vec<f32>>,
     pub new_v: Vec<Vec<f32>>,
-    pub rope_cs_host: Vec<f32>,
-    pub rope_cs: Tensor,
-    pub rope_offsets: Tensor,
+    /// The single-rung RoPE set the kernel rotates from; the golden reads
+    /// the same factored table through `RopeRungs::cos_sin`.
+    pub rope: RopeRungs,
     /// Pinned staging pool, built once per case — `PinnedStager::new` is a
     /// pinned host allocation and must stay out of the per-run timing.
     pub stager: PinnedStager,
@@ -306,13 +307,7 @@ pub fn build_case(spec: &Scenario, device: &Device) -> Result<BuiltCase> {
             }
         })
         .collect();
-    let inv_freq = Tensor::from_vec(inv_freq, HEAD_DIM / 2, device)?;
-    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
-    let rope_cs_host = rope_cs
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    let rope_offsets = Tensor::zeros(n_seqs, DType::U32, device)?;
+    let rope = RopeRungs::new(&RopeSchedule::stated(inv_freq, usize::MAX)?, device)?;
 
     // Binding a cache to a slot is what allocates it — the scratch slot
     // needs one too before `seal_segment` can truncate/write it.
@@ -420,9 +415,7 @@ pub fn build_case(spec: &Scenario, device: &Device) -> Result<BuiltCase> {
         new_q,
         new_k,
         new_v,
-        rope_cs_host,
-        rope_cs,
-        rope_offsets,
+        rope,
         q_dev,
         k_dev,
         v_dev,
@@ -505,8 +498,7 @@ pub fn run_prefill(case: &mut BuiltCase) -> Result<Tensor> {
         N_KV_HEAD,
         HEAD_DIM,
         Some((&case.cu_seqlens_q, &case.q_lens_dev, &case.kv_lens_dev)),
-        &case.rope_offsets,
-        &case.rope_cs,
+        &case.rope,
         false,
         &generation,
         &std::cell::RefCell::new(None),

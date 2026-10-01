@@ -5,8 +5,8 @@
 //! The reference mirrors the kernel's exact conventions:
 //! - K is stored unrotated (position-independent); rotation is applied at
 //!   attention time at each token's absolute position, reading cos/sin from
-//!   the same `rope_cs` table the kernel uses
-//!   (`rope_cs[pos*HEAD_DIM + 2i] = cos`, `…+ 2i + 1] = sin`, pair `(i, i+H/2)`).
+//!   the same factored rung-0 table the kernel uses (`RopeRungs::cos_sin`,
+//!   pair `(i, i+H/2)`).
 //! - Q rows rotate at `prefix_len + t`.
 //! - Causal horizon: q row `t` attends columns `0 ..= prefix_len + t`.
 //! - GQA: q head `h` reads kv head `h / (N_HEAD / N_KV_HEAD)`.
@@ -19,14 +19,14 @@
 //! is what validates the golden itself (RoPE convention included).
 
 use crate::harness::{BuiltCase, HEAD_DIM, N_HEAD, N_KV_HEAD};
+use candle_transformers::models::rope_schedule::RopeRungs;
 
-/// Rotate one head vector in place at `pos` (non-interleaved half-split).
-fn rope_rotate(v: &mut [f32], pos: usize, rope_cs: &[f32]) {
+/// Rotate one head vector in place at `pos` (non-interleaved half-split), on
+/// rung 0 — the harness schedules have exactly one rung.
+fn rope_rotate(v: &mut [f32], pos: usize, rope: &RopeRungs) {
     let half = HEAD_DIM / 2;
-    let base = pos * HEAD_DIM;
     for i in 0..half {
-        let cos = rope_cs[base + 2 * i];
-        let sin = rope_cs[base + 2 * i + 1];
+        let (cos, sin) = rope.cos_sin(0, pos, i);
         let x = v[i];
         let y = v[i + half];
         v[i] = x * cos - y * sin;
@@ -59,7 +59,7 @@ pub fn golden(case: &BuiltCase) -> Vec<f32> {
                 };
                 let s = (src_t * N_KV_HEAD + h) * HEAD_DIM;
                 k_rot[dst..dst + HEAD_DIM].copy_from_slice(&src[s..s + HEAD_DIM]);
-                rope_rotate(&mut k_rot[dst..dst + HEAD_DIM], t, &case.rope_cs_host);
+                rope_rotate(&mut k_rot[dst..dst + HEAD_DIM], t, &case.rope);
 
                 let (srcv, srcv_t) = if t < prefix {
                     (&case.prefix_v[si], t)
@@ -79,7 +79,7 @@ pub fn golden(case: &BuiltCase) -> Vec<f32> {
                 let mut q_row = [0f32; HEAD_DIM];
                 let qs = (t * N_HEAD + h) * HEAD_DIM;
                 q_row.copy_from_slice(&case.new_q[si][qs..qs + HEAD_DIM]);
-                rope_rotate(&mut q_row, prefix + t, &case.rope_cs_host);
+                rope_rotate(&mut q_row, prefix + t, &case.rope);
 
                 // Scores + online-stable softmax in f64.
                 let mut scores = vec![0f64; horizon];

@@ -42,7 +42,7 @@ mod coherence {
     use candle_conversation::SamplingConfig;
     use futures::StreamExt;
 
-    use crate::common::{needs_compaction, production_workspace, run_conv_id};
+    use crate::common::{needs_compaction, production_workspace, run_conv_id, served};
     use zend::config::DaemonConfig;
     use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
@@ -108,9 +108,8 @@ mod coherence {
         let workspace = production_workspace();
         let config = DaemonConfig {
             compact_substrate: needs_compaction(&workspace),
-            workspace,
             port: 0,
-            ..Default::default()
+            ..DaemonConfig::new(served(&workspace))
         };
         let conv_id = run_conv_id(conv_id);
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));

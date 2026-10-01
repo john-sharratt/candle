@@ -1,9 +1,8 @@
-//! Numerical comparison metrics for the A/B check.
+//! Numerical comparison metrics for the golden check.
 //!
-//! Both kernels emit `(num_slots, n_q_head, head_dim)` outputs. The reference
-//! is the V2 paged-decode kernel; the candidate is fused-attn-v1. We report
-//! aggregate parity plus a per-(q_head) breakdown so a divergence localizes to
-//! the head whose read path differs.
+//! The kernel and its FP32 reference emit `(rows, n_q_head, head_dim)`
+//! outputs. We report aggregate parity plus a per-(q_head) breakdown so a
+//! divergence localizes to the head whose read path differs.
 
 use candle::{DType, Result, Tensor};
 
@@ -22,7 +21,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// `a` = reference (V2), `b` = candidate (fused). Tensors are converted to
+    /// `a` = reference, `b` = kernel output. Tensors are converted to
     /// F32 on the host for an exact, dtype-independent comparison.
     pub fn compute(a: &Tensor, b: &Tensor, n_q_head: usize, head_dim: usize) -> Result<Metrics> {
         let dims = a.dims().to_vec();

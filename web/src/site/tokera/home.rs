@@ -14,21 +14,25 @@ use axum::response::{Html, IntoResponse, Response};
 
 use super::page::{self, Kind, Meta, Nav, Width};
 
-/// Measured, from `docs/unbounded_agents.md` §9 and `docs/palquant.md` §4.
+/// Measured, from the headline results of `docs/performance.md` (claims 1, 3, 5).
 const STATS: [(&str, &str); 4] = [
-    ("509", "tokens/sec, one session"),
-    ("2,446", "tokens/sec across 64"),
-    ("7.4×", "KV cache compression"),
-    ("16 GB", "of consumer GPU"),
+    ("180B", "parameters on a 16 GB laptop"),
+    ("1,202", "tokens/sec across 64, one card"),
+    ("7.6×", "KV cache compression"),
+    ("9.8×", "llama.cpp's best decode, one card"),
 ];
 
-/// One tile. `span` is twelfths of the grid — the mosaic runs 7+5, then 4+4+4,
+/// One tile. `span` is twelfths of the grid — the mosaic runs 5+7, then 4+4+4,
 /// then one full-width band, which is what stops the page reading as a column
 /// of equal things.
 ///
 /// `tint` is the same closed set the blog uses, so every project carries a
 /// colour and the page is not six grey boxes. Where a project also has a post,
 /// the two agree.
+///
+/// `art` marks the one tile that carries the error-curve diagram and the
+/// measured stats. It is its own field rather than read off the span, so
+/// re-proportioning the mosaic cannot move the diagram onto another project.
 struct Work {
     kicker: &'static str,
     name: &'static str,
@@ -39,6 +43,7 @@ struct Work {
     status: &'static str,
     span: u8,
     tint: &'static str,
+    art: bool,
 }
 
 const WORK: [Work; 6] = [
@@ -59,8 +64,9 @@ const WORK: [Work; 6] = [
         ],
         links: &[("https://battlecities.net/", "battlecities.net")],
         status: "In development · Rust, Bevy",
-        span: 7,
+        span: 5,
         tint: "tint-crit",
+        art: false,
     },
     Work {
         kicker: "The engine",
@@ -69,11 +75,21 @@ const WORK: [Work; 6] = [
         body: "Ten thousand turns in, the arithmetic is as clean as it was at turn ten. \
                Attention goes only to what the model itself reaches for, so the working set \
                never grows — and neither does the error.",
-        points: &[],
-        links: &[("/papers/one-card", "Read the paper")],
-        status: "Working · RTX 4090 Mobile, 16 GB",
-        span: 5,
+        points: &[
+            "A 180B model serving eight people from a 16 GB laptop with 32 GB of RAM",
+            "Context grows from 32K to 128K, and decode gets faster",
+            "KV cache compressed up to 7.6× as it is written, every answer checked",
+            "One card out-decodes llama.cpp's best published rate by nearly 10×",
+            "A 284B model serving sixteen people from a single GPU",
+        ],
+        links: &[
+            ("/blog/what-one-gpu-can-do", "See the numbers"),
+            ("/papers/one-card", "Read the paper"),
+        ],
+        status: "Working · 16 GB laptop to 72 GB workstation",
+        span: 7,
         tint: "tint-accent",
+        art: true,
     },
     Work {
         kicker: "The characters",
@@ -89,6 +105,7 @@ const WORK: [Work; 6] = [
         status: "In development",
         span: 4,
         tint: "tint-ok",
+        art: false,
     },
     Work {
         kicker: "The assistant",
@@ -105,14 +122,14 @@ const WORK: [Work; 6] = [
         status: "In development",
         span: 4,
         tint: "tint-info",
+        art: false,
     },
     Work {
         kicker: "The writing",
         name: "Papers",
         tagline: "The proof, in full and in the open",
-        body: "Rendered live from the working documents rather than frozen into a PDF, so the \
-               published version improves as the work does. Maths typeset, tables intact, \
-               nothing behind a login.",
+        body: "Read here as web pages rather than locked in a PDF, each beside its DOI and \
+               the PDF of record. Maths typeset, tables intact, nothing behind a login.",
         points: &[],
         links: &[
             ("/papers/one-card", "One Card, One Stack"),
@@ -121,6 +138,7 @@ const WORK: [Work; 6] = [
         status: "Published here",
         span: 4,
         tint: "tint-violet",
+        art: false,
     },
     Work {
         kicker: "Earlier",
@@ -139,6 +157,7 @@ const WORK: [Work; 6] = [
         // things still being built.
         span: 12,
         tint: "tint-warn",
+        art: false,
     },
 ];
 
@@ -292,7 +311,7 @@ fn tile(w: &Work) -> String {
 
     // Only the engine carries art, because only the engine's claim is a shape —
     // and the measurements ride along with it.
-    let art = if w.span == 5 {
+    let art = if w.art {
         format!(
             "<div class=\"work-art\">{}{}</div>",
             diagram(),
@@ -395,14 +414,21 @@ mod tests {
 
     #[test]
     fn the_mosaic_rows_are_whole() {
-        // 7+5, then 4+4+4, then a full-width band. A span that does not
+        // 5+7, then 4+4+4, then a full-width band. A span that does not
         // complete its row leaves a gap and the layout silently reads as a
-        // list again.
+        // list again. The engine takes the wide half of the first row because
+        // it carries the diagram, the stats and the most copy.
         let spans: Vec<u8> = WORK.iter().map(|w| w.span).collect();
-        assert_eq!(spans, [7, 5, 4, 4, 4, 12]);
+        assert_eq!(spans, [5, 7, 4, 4, 4, 12]);
         assert_eq!(spans[0] + spans[1], 12);
         assert_eq!(spans[2] + spans[3] + spans[4], 12);
         assert_eq!(spans[5], 12);
+    }
+
+    #[test]
+    fn the_art_flag_names_the_engine_tile() {
+        let with_art: Vec<&str> = WORK.iter().filter(|w| w.art).map(|w| w.name).collect();
+        assert_eq!(with_art, ["Unbounded context"]);
     }
 
     #[test]

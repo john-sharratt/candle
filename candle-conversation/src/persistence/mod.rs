@@ -18,12 +18,16 @@
 //! - [`recovery`] — chain-first recovery with a forward-walk fallback.
 //! - [`accounting`] — O(1) live/dead byte accounting for compaction.
 //! - [`survival`] — how each record type outlives a rewrite (exhaustive).
+//! - [`chunk_window_integrity`] — the generic per-layer chunk window-geometry
+//!   comparison, shared by every caller that needs to ask "do these layers
+//!   describe the same K/V windows".
 //! - [`inherit`] — multi-log inheritance and the shared cache.
 //!
 //! [`SubstratePersistence`] is the public API tying them together.
 
 pub mod accounting;
 pub mod chunk_plan;
+pub mod chunk_window_integrity;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
@@ -38,12 +42,15 @@ pub mod pipeline;
 pub mod record;
 pub mod recovery;
 pub mod resume;
+pub mod sealed_reader;
 pub mod segment;
 pub mod segmented_log;
 pub mod streams;
+mod stripes;
 pub mod survival;
 pub mod thread;
 pub mod transfer;
+pub mod vfs;
 pub mod walker;
 pub mod writer;
 
@@ -63,13 +70,15 @@ use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
-    decode_record, encode_record, ChunkPayload, DebugIdPayload, NpcPayload, RecordHeader,
-    RecordType, TombstonePayload, TreeMetadataPayload,
+    decode_record, encode_record, ChunkPayload, CustomObjectPayload, DebugIdPayload, NpcPayload,
+    RecordHeader, RecordType, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
 };
+use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
+use vfs::VfsIndex;
 use walker::WalkEntry;
 
 /// Errors raised by the persistence layer.
@@ -107,8 +116,10 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 
 /// The name of the per-working-directory persistence subdirectory. Holds the
 /// segmented redo log (`seg-*.log` sealed, one `seg-*.active`) — see
-/// [`segmented_log`].
-pub const SUBSTRATE_DIR: &str = ".substrate";
+/// [`segmented_log`]. It is visible, not a dot-directory: it sits in a
+/// workspace folder beside the repositories it serves, not inside one of them.
+/// Every path to it is built from this constant, never from a literal.
+pub const SUBSTRATE_DIR: &str = "substrate";
 
 /// A plain character record, for the tests in this module and in
 /// [`maintenance`] that need one to survive something.
@@ -173,7 +184,7 @@ pub(crate) fn dir_fingerprint(dir: &Path) -> Vec<(String, u64, [u8; 32])> {
 /// A substrate the host process opened, for the engine to adopt rather than
 /// open a second time.
 ///
-/// **One process, one writable handle per `.substrate/`.** [`log_file::LogFile::open`]
+/// **One process, one writable handle per `substrate/`.** [`log_file::LogFile::open`]
 /// takes the file read-write and takes no lock, so a second
 /// [`SubstratePersistence`] over the same directory is a second append cursor
 /// *and* a second [`SubstratePersistence::npc_locs`] view. The two writers
@@ -241,7 +252,7 @@ impl SharedSubstrate {
     ///
     /// For a tool that reads a workspace another process — the daemon — may be
     /// writing to at the same time. The store must already exist, and nothing
-    /// under `dir/.substrate/` is created, renamed, deleted, truncated, grown or
+    /// under `dir/substrate/` is created, renamed, deleted, truncated, grown or
     /// written for as long as the pair lives. Everything in RAM behaves as it
     /// does on a writable substrate; only the durable side is absent — see
     /// [`SubstratePersistence::open_in_with_substrate_read_only`].
@@ -251,6 +262,31 @@ impl SharedSubstrate {
             SubstratePersistence::open_in_with_substrate_read_only(dir, &mut substrate)?;
         Ok(Self::new(substrate, persistence))
     }
+
+    /// Store a keyed [`CustomObjectPayload`] — durably and in RAM in one call.
+    ///
+    /// A later write with the same key supersedes this one (last-writer-wins):
+    /// the header carries the key's hash as its `stream_id`, so supersession is
+    /// mechanical on replay, and the in-RAM [`Substrate`] holds only the winner
+    /// so compaction re-emits it. This is the write half of the durable host
+    /// state (e.g. npcd's command-table open flag); [`Self::custom_object`]
+    /// reads it back.
+    pub fn put_custom_object(&self, obj: CustomObjectPayload) -> Result<()> {
+        {
+            let mut p = self.persistence.lock().unwrap();
+            p.write_custom_object(&obj)?;
+            p.commit()?;
+        }
+        self.substrate.write().unwrap().apply_custom_object(obj);
+        Ok(())
+    }
+
+    /// Read the live [`CustomObjectPayload`] for `key`, or `None` if none was
+    /// ever written (or the last write for the key was tombstoned by a newer
+    /// one — the winner is whatever [`Self::put_custom_object`] stored last).
+    pub fn custom_object(&self, key: &str) -> Option<CustomObjectPayload> {
+        self.substrate.read().unwrap().custom_object(key).cloned()
+    }
 }
 
 /// The persistence layer behind a substrate — owns the active redo log, the
@@ -258,12 +294,12 @@ impl SharedSubstrate {
 ///
 /// Persistence is mandatory: a substrate cannot exist without one.
 ///
-/// **Exactly one of these may exist per `.substrate/` directory in a process.**
+/// **Exactly one of these may exist per `substrate/` directory in a process.**
 /// See [`SharedSubstrate`] for what a second one costs and how a host that
 /// needs its own writes avoids opening it.
 pub struct SubstratePersistence {
     /// The segmented redo log — the active append segment plus the sealed
-    /// segment set under `.substrate/`. Replaces the single monolithic log:
+    /// segment set under `substrate/`. Replaces the single monolithic log:
     /// reads route to the segment holding each record by `(segment, offset)`.
     segments: SegmentedLog,
     manifest: Manifest,
@@ -342,6 +378,12 @@ pub struct SubstratePersistence {
     /// every NPC and the first compaction would delete the entire cast.
     npc_locs: HashMap<u64, RecordLoc>,
 
+    /// Where every conversation's live file events and tombstones are —
+    /// `docs/zend_vfs_events.md`. Their bodies belong to the daemon above and
+    /// are never in RAM here, so like `npc_locs` this map is what keeps them:
+    /// compaction and maintenance carry what it names, and a resume reads it.
+    vfs_index: VfsIndex,
+
     /// Per-type record counts as the store stood when it opened — the baseline
     /// a rewrite's carry-forward tally is reported against, so a class that
     /// stops being carried is named at the moment it happens rather than
@@ -367,6 +409,7 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
             | RecordType::WideQSig
             | RecordType::TurnIndexPage
             | RecordType::Commit
+            | RecordType::CustomObject
     )
 }
 
@@ -503,8 +546,17 @@ pub const COMPACTION_DEAD_RATIO_THRESHOLD: f32 = 0.5;
 /// reclaims nothing worth the pause, regardless of its dead ratio.
 pub const COMPACTION_MIN_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Staged bytes at which an append writes the group-commit buffer through to
+/// the active segment. Writing through is not a commit — nothing is synced
+/// until the next [`SubstratePersistence::commit`] — it only stops the buffer
+/// from holding everything between commits. Commits are paced by
+/// [`INDEX_FLUSH_ENTRIES`] records, and maintenance relocates chunk records of
+/// ~165 KB each, so an unbounded buffer reached 2.1 GB inside one compaction
+/// and aborted the daemon on the allocation.
+pub const STAGE_FLUSH_BYTES: usize = 64 * 1024 * 1024;
+
 impl SubstratePersistence {
-    /// Open the persistence layer at `<cwd>/.substrate/substrate.log`,
+    /// Open the persistence layer at `<cwd>/substrate/substrate.log`,
     /// creating the directory and file if absent and recovering the
     /// manifest if present.
     pub fn open() -> Result<SubstratePersistence> {
@@ -512,7 +564,7 @@ impl SubstratePersistence {
         SubstratePersistence::open_in(&cwd)
     }
 
-    /// Open the persistence layer at `<dir>/.substrate/` (the segment set).
+    /// Open the persistence layer at `<dir>/substrate/` (the segment set).
     pub fn open_in(dir: &Path) -> Result<SubstratePersistence> {
         Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, |_| {})
     }
@@ -540,7 +592,7 @@ impl SubstratePersistence {
 
     /// As [`Self::open_in_with_substrate`], but **read-only**: the segment set
     /// is opened with [`SegmentedLog::open_read_only_with_sink`], so nothing
-    /// under `<dir>/.substrate/` is ever created, renamed, deleted, truncated,
+    /// under `<dir>/substrate/` is ever created, renamed, deleted, truncated,
     /// grown or written through this handle, and the store must already exist.
     ///
     /// Every durable operation keeps its signature and answers without
@@ -585,7 +637,7 @@ impl SubstratePersistence {
     }
 
     /// Open over an ordered list of paths. The last entry is the active,
-    /// writable **segment directory** (`.substrate/`); every earlier entry is
+    /// writable **segment directory** (`substrate/`); every earlier entry is
     /// an inherited read-only single-file log, loaded through the shared
     /// cache (§13.5).
     pub fn open_concat(logs: &[PathBuf]) -> Result<SubstratePersistence> {
@@ -595,7 +647,7 @@ impl SubstratePersistence {
         Self::from_dir_with_sink(active_dir, inherited, false, |_| {})
     }
 
-    /// Open the segment set in `dir` (the `.substrate/` directory) with the
+    /// Open the segment set in `dir` (the `substrate/` directory) with the
     /// listed inherited single-file logs, driving every recovered record
     /// through `sink` in the same pass that builds the manifest and the
     /// dead-weight accounting. `read_only` opens the segment set with
@@ -622,6 +674,7 @@ impl SubstratePersistence {
         let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
         let mut snapshot_locs: HashMap<u64, RecordLoc> = HashMap::new();
         let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        let mut vfs_index = VfsIndex::new();
         // What the store actually holds, by type. One array increment per record
         // in a walk that already visits every record — see `RecordCensus`.
         let mut census = RecordCensus::new();
@@ -631,6 +684,7 @@ impl SubstratePersistence {
             record_metadata_loc(&mut metadata_locs, entry);
             record_snapshot_loc(&mut snapshot_locs, entry);
             record_npc_loc(&mut npc_locs, entry);
+            vfs::record_vfs_loc(&mut vfs_index, &mut accounting, entry);
             sink(entry);
         };
         let opened = if read_only {
@@ -695,6 +749,7 @@ impl SubstratePersistence {
             metadata_locs,
             snapshot_locs,
             npc_locs,
+            vfs_index,
             open_census: census,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
@@ -721,7 +776,8 @@ impl SubstratePersistence {
         &self.inherited
     }
 
-    /// The durable logical end of the active segment.
+    /// The logical end of what is written to the active segment — synced only
+    /// once committed.
     pub fn write_offset(&self) -> u64 {
         self.segments.write_offset()
     }
@@ -846,6 +902,9 @@ impl SubstratePersistence {
             }
             self.rotate_if_over_target()?;
         }
+        // Last, once the record is accounted and indexed: a write that fails
+        // leaves it staged and known, for the next commit to carry.
+        self.write_through_if_over_stage()?;
         Ok((segment, offset, size))
     }
 
@@ -887,6 +946,8 @@ impl SubstratePersistence {
             }
             self.rotate_if_over_target()?;
         }
+        // Last, as in `append_record`.
+        self.write_through_if_over_stage()?;
         Ok((segment, offset, size))
     }
 
@@ -1053,9 +1114,28 @@ impl SubstratePersistence {
         Ok(())
     }
 
+    /// Append a [`RecordType::CustomObject`] record. The header's `stream_id` is
+    /// the key's stable hash, so a later write with the same key supersedes this
+    /// one on replay (last-writer-wins). Caller applies it to the in-RAM
+    /// [`Substrate`] too so it re-emits on compaction — see
+    /// [`SharedSubstrate::put_custom_object`].
+    pub fn write_custom_object(&mut self, obj: &CustomObjectPayload) -> Result<()> {
+        let bytes = obj.encode();
+        self.append_record(
+            RecordType::CustomObject,
+            0,
+            obj.stream_id(),
+            0,
+            0,
+            0,
+            &bytes,
+        )?;
+        Ok(())
+    }
+
     /// Every character's current record location, keyed by `npc_id`.
     ///
-    /// The `.substrate/` directory this store's segments live in.
+    /// The `substrate/` directory this store's segments live in.
     pub fn dir(&self) -> &Path {
         self.segments.dir()
     }
@@ -1200,6 +1280,9 @@ impl SubstratePersistence {
         // and the same one `record_snapshot_loc` replays on reload.
         self.snapshot_locs
             .remove(&snapshot_stream_id(timeline_id).0);
+        // Its file events are orphans now: out of the index, so no rewrite
+        // carries them, and their bytes dead.
+        vfs::retire_timeline(&mut self.vfs_index, &mut self.accounting, timeline_id);
         Ok(())
     }
 
@@ -1220,6 +1303,23 @@ impl SubstratePersistence {
         };
         let bytes = payload.encode();
         self.append_record(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
+    /// Append a [`RecordType::SectionTombstone`] record marking the
+    /// content-addressed section stream `stream_id` as logically deleted.
+    /// Walker replay applies it via [`Substrate::apply_section_tombstone`],
+    /// which reads as "not persisted" on the next ingest triage, so the
+    /// section re-prefills fresh instead of restoring the tombstoned chunks.
+    /// Idempotent — duplicate tombstones for the same stream replay into the
+    /// same set. `reason` is a diagnostic note (the confirmed divergence
+    /// detail); pass `None` when there is nothing more to say than "gone".
+    pub fn write_section_tombstone(&mut self, stream_id: u64, reason: Option<&str>) -> Result<()> {
+        let payload = SectionTombstonePayload {
+            reason: reason.map(str::to_string),
+        };
+        let bytes = payload.encode();
+        self.append_record(RecordType::SectionTombstone, 0, stream_id, 0, 0, 0, &bytes)?;
         Ok(())
     }
 
@@ -1282,8 +1382,9 @@ impl SubstratePersistence {
     }
 
     /// Read one chunk's payload — from the active log, else any inherited
-    /// log (§13.5). The chunk must be durable (committed); it is read from
-    /// the file, not the un-flushed staging buffer.
+    /// log (§13.5). The chunk must be written to the file — committed, or
+    /// written through by a long append; it is read from the file, not the
+    /// staging buffer.
     pub fn read_chunk(
         &mut self,
         substrate: &Substrate,
@@ -1572,6 +1673,13 @@ impl SubstratePersistence {
         Ok(None)
     }
 
+    /// A reader for this store's sealed segments that needs no lock on it —
+    /// taken once, beside the handle, so a read that finds its record sealed
+    /// never waits on this persistence's mutex. See [`sealed_reader`].
+    pub fn sealed_reader(&self) -> SealedReader {
+        self.segments.sealed_reader()
+    }
+
     /// Read one record's payload back by location — the snapshot-restore
     /// read (the caller got `loc` from the substrate's snapshot index).
     pub fn read_record_payload(&mut self, loc: &RecordLoc) -> Result<Vec<u8>> {
@@ -1593,17 +1701,27 @@ impl SubstratePersistence {
     }
 
     /// Bytes staged but not yet flushed to the active segment. Returns 0 when
-    /// there is nothing to write. The periodic flush task uses this to
-    /// avoid pointless `fsync` calls on an idle workspace.
+    /// there is nothing staged — which, once a large append has flushed part
+    /// way, is not the same as nothing to commit ([`Self::commit_if_pending`]).
     pub fn pending_bytes(&self) -> usize {
         self.segments.pending_len()
     }
 
-    /// Group-commit if (and only if) there are staged records. Returns
-    /// `Ok(true)` when a flush+fsync actually happened, `Ok(false)` for the
-    /// no-op idle path. Cheap to call on a tight timer.
+    /// Write the staged records through to the active segment once they reach
+    /// [`STAGE_FLUSH_BYTES`], leaving the sync to the next commit.
+    fn write_through_if_over_stage(&mut self) -> Result<()> {
+        if self.segments.pending_len() >= STAGE_FLUSH_BYTES {
+            self.segments.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Group-commit if (and only if) there is something to make durable —
+    /// records staged, or written through by a large append and not yet
+    /// synced. Returns `Ok(true)` when a flush+fsync actually happened,
+    /// `Ok(false)` for the no-op idle path. Cheap to call on a tight timer.
     pub fn commit_if_pending(&mut self) -> Result<bool> {
-        if self.segments.pending_len() == 0 {
+        if !self.segments.needs_commit() {
             return Ok(false);
         }
         self.segments.commit()?;
@@ -1658,6 +1776,11 @@ impl SubstratePersistence {
             return Ok(());
         }
         self.flush_header_index()?;
+        // A write-through may have left bytes on the segment that no commit
+        // has synced yet; a sealed segment's handle is dropped, so sync now.
+        if self.segments.needs_commit() {
+            self.segments.commit()?;
+        }
         self.segments.seal_and_rotate()?;
         // The fresh active starts its own `HeaderIndex` chain — the sealed
         // segment keeps the chain the flush above completed.
@@ -1867,7 +1990,12 @@ impl SubstratePersistence {
         let dir = self.segments.dir().to_path_buf();
         // Planning only — no disk reads; each read-back record carries its
         // source location, read back coalesced + staged verbatim in step 3.
-        let live = compaction::collect_live_records(&self.manifest, substrate, &self.npc_locs);
+        let live = compaction::collect_live_records(
+            &self.manifest,
+            substrate,
+            &self.npc_locs,
+            &self.vfs_index,
+        );
         // What this compaction is carrying forward, by type, against what the
         // store held when it opened. A class present at open and absent here is
         // being deleted — the failure this whole module exists to make visible,
@@ -1984,15 +2112,18 @@ impl SubstratePersistence {
         self.metadata_locs.clear();
         self.snapshot_locs.clear();
         self.npc_locs.clear();
+        self.vfs_index.clear();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
         let snapshot_locs = &mut self.snapshot_locs;
         let npc_locs = &mut self.npc_locs;
+        let vfs_index = &mut self.vfs_index;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(metadata_locs, entry);
             record_snapshot_loc(snapshot_locs, entry);
             record_npc_loc(npc_locs, entry);
+            vfs::record_vfs_loc(vfs_index, accounting, entry);
             substrate.apply_walker_entry(entry);
         })?;
         // The compacted segment carries a fresh index chain; chain the next
@@ -2035,6 +2166,75 @@ mod tests {
             },
             debug_name: name.to_string(),
         })
+    }
+
+    /// **The staging buffer never holds more than the write-through bound plus
+    /// one record**, and bytes written through still owe a commit: 70 one-MiB
+    /// appends with no commit between them leave under 65 MiB staged, the rest
+    /// on the segment, and `commit_if_pending` syncs once and then idles.
+    #[test]
+    fn a_long_append_run_writes_through_and_still_owes_a_commit() {
+        let dir = tmp_dir("write_through");
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        sp.commit().unwrap();
+        let start = sp.write_offset();
+        let payload = vec![7u8; 1024 * 1024];
+        let mut record = 0;
+        for chunk in 0..70u64 {
+            let (_, _, size) = sp
+                .append_record(RecordType::Tokens, 0, 9, chunk, 0, 0, &payload)
+                .unwrap();
+            record = size as usize;
+            assert!(sp.pending_bytes() < STAGE_FLUSH_BYTES + record);
+        }
+        assert!(sp.write_offset() > start);
+        assert!(sp.pending_bytes() < STAGE_FLUSH_BYTES);
+        assert!(sp.commit_if_pending().unwrap());
+        assert_eq!(sp.pending_bytes(), 0);
+        assert_eq!(sp.write_offset(), start + 70 * record as u64);
+        assert!(!sp.commit_if_pending().unwrap());
+        drop(sp);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Records written through and never committed reopen cleanly**: a
+    /// handle dropped mid-run — a crash, as far as the log can tell — leaves
+    /// the written-through records on the segment and loses only the staged
+    /// tail, and the log opens on a record boundary with a whole record count.
+    #[test]
+    fn records_written_through_but_not_committed_reopen_cleanly() {
+        let dir = tmp_dir("write_through_reopen");
+        let (start, record) = {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.commit().unwrap();
+            let start = sp.write_offset();
+            let payload = vec![7u8; 1024 * 1024];
+            let mut record = 0;
+            for chunk in 0..70u64 {
+                let (_, _, size) = sp
+                    .append_record(RecordType::Tokens, 0, 9, chunk, 0, 0, &payload)
+                    .unwrap();
+                record = size;
+            }
+            assert!(
+                sp.write_offset() > start,
+                "part of the run was written through"
+            );
+            (start, record)
+        };
+        let mut substrate = Substrate::new();
+        let reopened = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let kept = reopened.write_offset() - start;
+        assert_eq!(kept % record, 0, "the log ends on a record boundary");
+        assert!(
+            kept >= STAGE_FLUSH_BYTES as u64 && kept < 70 * record,
+            "kept {kept} bytes"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **A read-only handle refuses every write and changes no byte.** Built
@@ -2316,6 +2516,84 @@ mod tests {
             "a shared handle compacts against a view that includes every \
              character, whenever it was created"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A custom object is durable, last-writer-wins, and survives compaction.**
+    ///
+    /// The whole point of the type: `npcd` writes the command-table flag once and
+    /// it comes back after a reboot, keeps the newest value when re-written, and
+    /// is not lost when the log is rewritten (the silent-drop failure mode
+    /// `survival.rs` documents). Exercises the `SharedSubstrate` write/read pair
+    /// across an open → re-write → compact → reopen cycle.
+    #[test]
+    fn a_custom_object_is_durable_lww_and_survives_compaction() {
+        let dir = tmp_dir("custom_object");
+
+        // Write once, read it straight back from the same handle.
+        {
+            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let mut obj =
+                CustomObjectPayload::new("command-table", serde_json::json!({ "open": true }));
+            obj.metadata
+                .insert("world".to_string(), "vault".to_string());
+            shared.put_custom_object(obj).unwrap();
+
+            let back = shared.custom_object("command-table").unwrap();
+            assert_eq!(back.blob, serde_json::json!({ "open": true }));
+            assert_eq!(
+                back.metadata.get("world").map(String::as_str),
+                Some("vault")
+            );
+            assert!(
+                shared.custom_object("never-written").is_none(),
+                "an unknown key has no object"
+            );
+        }
+
+        // A fresh open replays the log — the object is durable.
+        {
+            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let back = shared.custom_object("command-table").unwrap();
+            assert_eq!(back.blob, serde_json::json!({ "open": true }));
+
+            // Re-write the same key: last-writer-wins.
+            shared
+                .put_custom_object(CustomObjectPayload::new(
+                    "command-table",
+                    serde_json::json!({ "open": false }),
+                ))
+                .unwrap();
+            assert_eq!(
+                shared.custom_object("command-table").unwrap().blob,
+                serde_json::json!({ "open": false }),
+                "the newest write wins in RAM"
+            );
+
+            // Compact against this view, then confirm the winner survived.
+            {
+                let mut p = shared.persistence.lock().unwrap();
+                let mut s = shared.substrate.write().unwrap();
+                p.compact(&mut s, None).unwrap();
+            }
+        }
+
+        // Reopen after compaction: only the last value is present, and the
+        // superseded first write did not resurrect.
+        {
+            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let back = shared.custom_object("command-table").unwrap();
+            assert_eq!(
+                back.blob,
+                serde_json::json!({ "open": false }),
+                "the last-written value survives compaction and reload"
+            );
+            assert!(
+                back.metadata.is_empty(),
+                "the second write carried no metadata, so the winner has none"
+            );
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2829,6 +3107,79 @@ mod tests {
                 chunk_payload((n - 1) as u32)
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Full compaction carries a live run longer than one read stripe
+    /// whole**: seventy one-MiB chunks back to back, read back byte for byte
+    /// after the rewrite and after a reload.
+    #[test]
+    fn compact_carries_a_live_run_past_one_stripe() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+        let dir = tmp_dir("compact_stripes");
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 56,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
+        let big = |index: u64| ChunkPayload {
+            kv_bytes: (0..1024 * 1024u64)
+                .map(|i| ((i + index * 17) % 251) as u8)
+                .collect(),
+            ..chunk_payload(index as u32)
+        };
+        const LIVE: u64 = 70;
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            sp.write_chunk(sid, LIVE, 32, 4, None, &chunk_payload(1))
+                .unwrap(); // superseded below
+            for i in 0..LIVE {
+                sp.write_chunk(sid, i, 32, 4, None, &big(i)).unwrap();
+            }
+            sp.write_chunk(sid, LIVE, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.compact(&mut substrate, None).unwrap();
+            for i in 0..LIVE {
+                assert_eq!(
+                    sp.read_chunk(&substrate, sid, i).unwrap(),
+                    big(i),
+                    "chunk {i}"
+                );
+            }
+        }
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        for i in 0..LIVE {
+            assert_eq!(
+                sp.read_chunk(&substrate, sid, i).unwrap(),
+                big(i),
+                "chunk {i}"
+            );
+        }
+        assert_eq!(
+            sp.read_chunk(&substrate, sid, LIVE).unwrap(),
+            chunk_payload(2)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

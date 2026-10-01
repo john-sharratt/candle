@@ -55,7 +55,7 @@ announcements:
   - Makers do not sleep. Makers may, however, stop. The difference matters and it is in none of the manuals.
   - Whoever left a half-cast face on the portraits level, it is looking at me, and you can come and collect it.
   - If two Makers disagree about what a place looks like, the place looks like both of them until somebody writes it down.
-  - The lift between the chronicle and the story levels is working. It has always been working. Please stop taking the stair to prove a point.
+  - The lift between the chronicle and the story levels is working. It has always been working. Please stop calling it broken to prove a point.
   - Nothing in this building is ever dark, which means nothing in this building has an excuse.
   - Battle Cities is at war and the vault is not. Try to remember which of them you are standing in.
   - Makers are asked not to name new characters after other Makers. It has caused two incidents and one very long afternoon.
@@ -91,7 +91,7 @@ announcements:
   - Do not stack crates higher than the shortest Maker on the level.
   - The wall turret is on the roster for testing and not for demonstrating.
   - Anybody who has opened a panel is responsible for closing it, and there is a list.
-  - The stairwell is to be kept clear, which means clear of everything and not clear of most things.
+  - The lift landing is to be kept clear, which means clear of everything and not clear of most things.
   - A tool taken from the magnetic strip is to go back on the magnetic strip.
   - Makers are asked to walk on the left in the corridors. Nobody has ever done this.
   - If you find a cable across a walkway, do not step over it, and do not step on it either.
@@ -204,7 +204,7 @@ announcements:
   - The archive has lost a shelf. The shelf is somewhere in the archive.
   - Two Makers have independently written the same character. Both of them are keeping it.
   - Whoever left the easel facing the wall has made a point that has been taken.
-  - The record for the fastest descent of the stairwell stands and will not be beaten safely.
+  - The record for the fastest descent by lift stands and will not be beaten safely.
   - Somebody has drawn the Creator on the structure board. It is a fair likeness.
   - A Maker has requested a second Creator's chair. The request is denied and admired.
   - The vault's official position on the thing in the walls is that there is no thing in the walls.
@@ -264,12 +264,12 @@ announcements:
   - There is nobody out there who is not somebody's work.
 portals:
   - between: [vault-command/core, vault-chronicle/core]
-    kind: a lift and a stair
+    kind: a lift
   - between: [vault-chronicle/core, vault-story/core]
-    kind: a lift and a stair
+    kind: a lift
   - between: [vault-story/core, vault-cartography/core]
-    kind: a lift and a stair
+    kind: a lift
   - between: [vault-cartography/core, vault-casting/core]
-    kind: a lift and a stair
+    kind: a lift
   - between: [vault-casting/core, vault-portraits/core]
-    kind: a lift and a stair
+    kind: a lift

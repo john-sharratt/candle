@@ -55,8 +55,8 @@ use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
-    DebugIdPayload, DistillMode, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
-    TurnCouplingPayload,
+    CustomObjectPayload, DebugIdPayload, DistillMode, DistillPayload, RecordType,
+    SectionTombstonePayload, TombstonePayload, TreeMetadataPayload, TurnCouplingPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
@@ -131,6 +131,12 @@ pub struct Substrate {
     /// sessions — the conversation ids themselves are random u64s and carry no
     /// time information.
     conv_order_counter: u64,
+    /// Monotonic counter stamped onto a [`TimelineEntry::active`] each time the
+    /// conversation is used ([`Self::touch_conversation`]). Unlike `order`, the
+    /// rank is persisted in the `ConvState` record, so replay restores it
+    /// exactly whatever order compaction re-emits those records in; replay
+    /// raises the counter to the highest rank it sees.
+    conv_active_counter: u64,
 
     /// Inverse index: every timeline registered against a given group.
     /// Maintained in lockstep with [`Self::timelines`].
@@ -155,6 +161,29 @@ pub struct Substrate {
     /// Running global sum of ingested section token counts (the shared
     /// workspace corpus). Maintained on section install (overwrite-aware).
     section_token_total: usize,
+
+    /// Per-conversation fast-path injections, most recently admitted first.
+    ///
+    /// A tool call that resolves to content the corpus has already read injects
+    /// that ingest conversation here instead of re-reading the file, and the
+    /// projection then carries it as if this conversation had read it
+    /// ([`Self::fast_path_injections`]). In-memory only and derived: it is
+    /// rebuilt by replaying the conversation's own tool calls, so losing it
+    /// costs a re-read, never correctness.
+    fast_path: HashMap<TimelineId, Vec<TimelineId>>,
+
+    /// Groups whose conversations are offered to a projection only as its
+    /// target's scope names them ([`Self::set_retrieval_scope`]). Ingested
+    /// content keyed by what it shows — a file as one branch holds it — is
+    /// only right for a conversation whose own files hold the same, so such a
+    /// group offers nothing a target was not given. In-memory only, marked
+    /// once at engine setup.
+    scoped_groups: HashSet<GroupId>,
+
+    /// Per target, per scoped group, the conversations that group may offer
+    /// it ([`Self::scoped_timelines_for_group`]). In-memory only and derived:
+    /// the embedder sets it before each turn from the target's own files.
+    retrieval_scopes: HashMap<TimelineId, HashMap<GroupId, Arc<HashSet<TimelineId>>>>,
 
     /// Hot-tier LRU list, most-recently-used at the front.
     /// `front()` = MRU, `back()` = next eviction victim. Membership
@@ -215,6 +244,14 @@ pub struct Substrate {
     /// singletons.  The per-stream `BTreeMap` only ever sits in
     /// memory — reload rebuilds it from record headers.
     streams: HashMap<StreamId, StreamRuntime>,
+
+    /// Bumped whenever anything a collection's belief gallery is assembled from
+    /// changes — a stream declared, a signature or projection-event blob
+    /// written, a turn or timeline tombstoned, the streams cleared. The gallery
+    /// walks every stream to find its members; keyed on this, it is assembled
+    /// once per change instead of on every reprojection (see
+    /// [`Self::gallery_epoch`]).
+    gallery_epoch: u64,
 
     /// Interior-mutable per-stream memo of decoded wide-Q windows for the belief
     /// scan — filled lazily under a read lock, so a session's reprojections
@@ -296,6 +333,18 @@ pub struct Substrate {
     /// tokens, and [`Self::retire_section`] removes them outright. See
     /// [`Self::mark_section_transient`]. In-memory only.
     transient_sections: HashSet<SectionId>,
+    /// Section streams flagged by [`RecordType::SectionTombstone`] as
+    /// logically deleted — the section counterpart of
+    /// [`Self::tombstoned_timelines`]. Set by the reactive repair that
+    /// confirms a section's persisted per-layer chunks disagree across
+    /// layers (`candle-conversation/src/scheduler/mod.rs`'s
+    /// `snapshot_sequence_per_layer` failure hook). [`Self::section_exists`]
+    /// and `Conversation::section_stream_is_persisted` both read this so a
+    /// tombstoned section is neither "already present" nor "restorable" on
+    /// the next ingest triage — the request falls through to a fresh
+    /// prefill instead of reloading the corrupted chunks, in this same
+    /// process as well as after a restart.
+    tombstoned_sections: HashSet<StreamId>,
     /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
     /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
@@ -313,6 +362,12 @@ pub struct Substrate {
     /// its turns shed to at compaction. Same replay-order-independence as
     /// tombstones.
     distilled_timelines: HashMap<TimelineId, DistillMode>,
+
+    /// Generic keyed objects ([`RecordType::CustomObject`]), keyed by the stable
+    /// hash of their string key so a re-write with the same key supersedes the
+    /// old one (last-writer-wins). Held in RAM and re-emitted on compaction, the
+    /// same survival the other resident metadata gets.
+    custom_objects: HashMap<u64, CustomObjectPayload>,
 
     /// Layers whose conversations are **append-only ingest trunks** (code_reading,
     /// repo_map) rather than interactive dialogue. A projection whose *target* is
@@ -1196,7 +1251,7 @@ pub struct TimelineEntry {
     pub conv_id: Option<String>,
     /// Creation-order rank, stamped from [`Substrate::conv_order_counter`] the
     /// first time `conv_id` is set. `0` until then. Higher = created later; the
-    /// daemon sidebar sorts on this so newest conversations lead the list.
+    /// daemon sidebar orders conversations with the same [`Self::active`] by it.
     pub order: u64,
     /// Free-form key/value metadata, persisted in the same
     /// `RecordType::Label` record as `label`/`conv_id` and merged
@@ -1210,6 +1265,15 @@ pub struct TimelineEntry {
     /// them back in. Persisted as `RecordType::ConvState`,
     /// last-write-wins.
     pub archived: bool,
+    /// The branch this conversation works on in each repository, keyed by
+    /// the repository's workspace name. Persisted with `archived` in the same
+    /// `RecordType::ConvState` record — see [`ConvState`].
+    pub branches: BTreeMap<String, String>,
+    /// Last-use rank, stamped from [`Substrate::conv_active_counter`] each time
+    /// the conversation is used; higher = used more recently, `0` = not used
+    /// since the rank was kept. Persisted with `archived` in the `ConvState`
+    /// record. The daemon sidebar sorts on it, most recently used first.
+    pub active: u64,
     /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
@@ -1381,6 +1445,8 @@ impl TimelineEntry {
             order: 0,
             custom: BTreeMap::new(),
             archived: false,
+            branches: BTreeMap::new(),
+            active: 0,
             turns: BTreeMap::new(),
             tree_meta: BTreeMap::new(),
             debug_id: None,
@@ -1845,6 +1911,46 @@ impl Substrate {
     /// migrate, for residences flagged beforehand) never ran for them — nothing
     /// else drops their hot until the async, possibly-lagging cold write lands.
     /// Without this, completed files' hot KV piles up and fills the card mid-ingest.
+    /// Rewrite every resident sequence's gids through a KV compaction's map.
+    ///
+    /// The substrate's half of a compaction sweep. A chunk's gid *is* its physical
+    /// location, so a pass that relocates one must rewrite every holder of that
+    /// identity inside the same window — and the residences are the largest holder
+    /// outside the backing itself, invisible to any walk of the block tables.
+    ///
+    /// Both tiers are visited. `warm` gids are in the same `arena_idx` namespace as
+    /// hot ones (the pool is one index space; `ArenaKey` only selects which pool the
+    /// refcount table lives in), so leaving them out would be leaving real holders
+    /// stale — and the map's own two-level lookup rejects anything from an untouched
+    /// arena, so a host chunk simply misses.
+    ///
+    /// Returns how many sequences were rewritten, for the pass's log line.
+    pub fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
+    ) -> candle::Result<usize> {
+        let mut rewritten = 0usize;
+        for res in self.residence.iter_mut() {
+            let mut any = false;
+            if let Some(hot) = res.hot.as_ref() {
+                if let Some(next) = candle_nn::kv_cache::rewrite_sealed(hot, sweep)? {
+                    res.hot = Some(next);
+                    any = true;
+                }
+            }
+            if let Some(warm) = res.warm.as_ref() {
+                if let Some(next) = candle_nn::kv_cache::rewrite_sealed(warm, sweep)? {
+                    res.warm = Some(next);
+                    any = true;
+                }
+            }
+            if any {
+                rewritten += 1;
+            }
+        }
+        Ok(rewritten)
+    }
+
     pub fn mark_timeline_evict_when_cold(&mut self, timeline: TimelineId) -> usize {
         let Some(entry) = self.timelines.get(&timeline) else {
             return 0;
@@ -1901,34 +2007,71 @@ impl Substrate {
     pub fn snapshot_pending_warm(
         &self,
     ) -> Vec<(ResidenceIndex, Vec<SealedSequence>, Option<ConvCompression>)> {
-        self.hot_lru
-            .iter()
-            .filter_map(|&idx| {
-                let slot = &self.residence[idx.0];
-                if slot.warm.is_some() {
-                    return None;
-                }
-                // Skip residences pinned into the current wave's working set: a
-                // slot the in-flight decode is actively attending is about to be
-                // (or is being) elevated warm→hot on the shared copy stream and
-                // on the persistence thread this drain runs on. Backing it up
-                // hot→warm right now is redundant work that MONOPOLISES the
-                // persistence thread + stream against the very elevation
-                // the decode is blocked on — the tier-migration livelock where the
-                // same working set churns hot→warm every pass while the decode
-                // lands zero forwards. Defer its warm copy until it leaves the
-                // working set (mirrors the pinned hot-drop defer in
-                // `mark_timeline_evict_when_cold`). Durability is only deferred,
-                // not lost: the authoritative hot copy stays resident while pinned,
-                // and the next unpinned pass makes the warm copy.
-                if self.working_set_pins.contains(&idx) {
-                    return None;
-                }
-                slot.hot
-                    .as_ref()
-                    .map(|hot| (idx, hot.clone(), slot.compression))
-            })
+        self.pending_warm()
+            .map(|(idx, hot, cc)| (idx, hot.clone(), cc))
             .collect()
+    }
+
+    /// The distinct compression overrides among the residences
+    /// [`Self::snapshot_pending_warm`] would return — the persistence thread's
+    /// hot→warm groups, named without cloning a single sequence.
+    pub fn pending_warm_policies(&self) -> Vec<Option<ConvCompression>> {
+        let mut out: Vec<Option<ConvCompression>> = Vec::new();
+        for (_, _, cc) in self.pending_warm() {
+            if !out.contains(&cc) {
+                out.push(cc);
+            }
+        }
+        out
+    }
+
+    /// [`Self::snapshot_pending_warm`] restricted to one compression override:
+    /// one hot→warm group, cloned when the persistence thread is about to
+    /// migrate it and not before.
+    pub fn snapshot_pending_warm_for(
+        &self,
+        policy: Option<ConvCompression>,
+    ) -> Vec<(ResidenceIndex, Vec<SealedSequence>)> {
+        self.pending_warm()
+            .filter(|(_, _, cc)| *cc == policy)
+            .map(|(idx, hot, _)| (idx, hot.clone()))
+            .collect()
+    }
+
+    /// Every hot residence awaiting a warm copy, with its hot bytes and its
+    /// compression override — what the hot→warm phase works through.
+    fn pending_warm(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            ResidenceIndex,
+            &Vec<SealedSequence>,
+            Option<ConvCompression>,
+        ),
+    > + '_ {
+        self.hot_lru.iter().filter_map(|&idx| {
+            let slot = &self.residence[idx.0];
+            if slot.warm.is_some() {
+                return None;
+            }
+            // Skip residences pinned into the current wave's working set: a
+            // slot the in-flight decode is actively attending is about to be
+            // (or is being) elevated warm→hot on the shared copy stream and
+            // on the persistence thread this drain runs on. Backing it up
+            // hot→warm right now is redundant work that MONOPOLISES the
+            // persistence thread + stream against the very elevation
+            // the decode is blocked on — the tier-migration livelock where the
+            // same working set churns hot→warm every pass while the decode
+            // lands zero forwards. Defer its warm copy until it leaves the
+            // working set (mirrors the pinned hot-drop defer in
+            // `mark_timeline_evict_when_cold`). Durability is only deferred,
+            // not lost: the authoritative hot copy stays resident while pinned,
+            // and the next unpinned pass makes the warm copy.
+            if self.working_set_pins.contains(&idx) {
+                return None;
+            }
+            slot.hot.as_ref().map(|hot| (idx, hot, slot.compression))
+        })
     }
 
     /// Total VRAM byte footprint of hot residences that lack a warm copy — the
@@ -2741,7 +2884,7 @@ impl Substrate {
             }
         }
         if let Some(state) = self.pending_conv_state.remove(&timeline.raw()) {
-            let _ = self.set_archived(timeline, state.archived);
+            self.replace_conv_state(timeline, state);
         }
     }
 
@@ -2838,6 +2981,246 @@ impl Substrate {
                 }
                 self.timelines.get(tl).map(|e| !e.archived).unwrap_or(true)
             })
+    }
+
+    // ── fork lineage ────────────────────────────────────────────────────────
+
+    /// Metadata key under which a fork records the timeline it came from.
+    ///
+    /// A plain `custom` entry rather than a record type of its own: the Label
+    /// record carrying `custom` is already durable, already re-emitted by both
+    /// the full-compaction and incremental-maintenance live sets, and already
+    /// replayed into [`TimelineEntry`] on reload. A parent pointer kept here
+    /// therefore needs no new wire format and cannot be silently dropped by a
+    /// rewrite that has never heard of it — which is exactly how the in-memory
+    /// `splice_source_timelines` pin failed.
+    pub const FORKED_FROM_KEY: &'static str = "forked_from";
+
+    /// Ceiling on the tokens an inherited chain may contribute *above* the
+    /// target's own turns.
+    ///
+    /// The chain is walked child-upward and stops once the next ancestor would
+    /// cross this, so what gets dropped is the FRONT — the oldest, most
+    /// general documents — while the nearest, most specific ancestors survive.
+    pub const INHERITED_CHAIN_TOKEN_CAP: usize = 100_000;
+
+    /// The timeline `tl` was forked from, if it recorded one and that parent
+    /// is still usable.
+    ///
+    /// A tombstoned or archived parent reads as absent rather than as an
+    /// error: a chain link can be retired by its own layer's reconciliation
+    /// long after a child recorded it, and a dangling pointer must degrade to
+    /// "no inheritance" instead of failing the child.
+    pub fn parent_timeline(&self, tl: TimelineId) -> Option<TimelineId> {
+        let raw: u64 = self
+            .timelines
+            .get(&tl)?
+            .custom
+            .get(Self::FORKED_FROM_KEY)?
+            .parse()
+            .ok()?;
+        let parent = TimelineId::from_raw(raw)?;
+        if self.tombstoned_timelines.contains(&parent) {
+            return None;
+        }
+        if !self
+            .timelines
+            .get(&parent)
+            .map(|e| !e.archived)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        Some(parent)
+    }
+
+    // ── fast-path tool reads ────────────────────────────────────────────────
+
+    /// Admit `injected` to `target`'s fast-path set and evict from the tail
+    /// until the set fits `budget_tokens`.
+    ///
+    /// Most-recently-admitted first, so eviction drops what the conversation
+    /// touched longest ago. Re-admitting something already present moves it to
+    /// the front rather than duplicating it — the same file resolved twice is
+    /// one injection, which is what makes the content hash a dedupe key.
+    ///
+    /// `target` itself always stays out of its own set; a conversation does not
+    /// inject itself.
+    ///
+    /// Returns whether `injected` is in the set afterwards. `false` means it
+    /// alone exceeds the budget, and the caller must fall back to a real read —
+    /// admitting it would evict everything and still not fit.
+    pub fn fast_path_admit(
+        &mut self,
+        target: TimelineId,
+        injected: TimelineId,
+        budget_tokens: usize,
+    ) -> bool {
+        if injected == target {
+            return false;
+        }
+        // Refuse anything that cannot actually deliver its content. The caller
+        // tells the model the file is already in context on the strength of
+        // this answer, so a tombstoned, archived or empty conversation must
+        // read as a miss and send it to a real read — being told it has a file
+        // it does not have is worse than reading the file twice.
+        if self.tombstoned_timelines.contains(&injected) {
+            return false;
+        }
+        if !self
+            .timelines
+            .get(&injected)
+            .map(|e| !e.archived)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if Substrate::turn_count(self, injected) == 0 {
+            return false;
+        }
+        let cost = |tl: &TimelineId| self.timeline_token_totals.get(tl).copied().unwrap_or(0);
+        if cost(&injected) > budget_tokens {
+            return false;
+        }
+        let entry = self.fast_path.entry(target).or_default();
+        entry.retain(|tl| *tl != injected);
+        entry.insert(0, injected);
+
+        let mut spent = 0usize;
+        let mut keep = 0usize;
+        for tl in entry.iter() {
+            let c = self.timeline_token_totals.get(tl).copied().unwrap_or(0);
+            if spent + c > budget_tokens {
+                break;
+            }
+            spent += c;
+            keep += 1;
+        }
+        self.fast_path
+            .get_mut(&target)
+            .expect("just inserted")
+            .truncate(keep);
+        true
+    }
+
+    /// The conversations `target` has fast-path injected, most recent first.
+    pub fn fast_path_injections(&self, target: TimelineId) -> &[TimelineId] {
+        self.fast_path
+            .get(&target)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Drop `target`'s fast-path set — the conversation is going away, or its
+    /// set is about to be rebuilt from its own history.
+    pub fn fast_path_clear(&mut self, target: TimelineId) {
+        self.fast_path.remove(&target);
+    }
+
+    // ── retrieval scope ─────────────────────────────────────────────────────
+
+    /// Offer `group`'s conversations to a projection only as its target's
+    /// scope names them. Idempotent.
+    pub fn mark_group_scoped(&mut self, group: GroupId) {
+        self.scoped_groups.insert(group);
+    }
+
+    /// Whether `group` offers only what a target's scope names.
+    pub fn is_group_scoped(&self, group: GroupId) -> bool {
+        self.scoped_groups.contains(&group)
+    }
+
+    /// Name the conversations the scoped `group` may offer `target`,
+    /// replacing whatever it named before.
+    pub fn set_retrieval_scope(
+        &mut self,
+        target: TimelineId,
+        group: GroupId,
+        allowed: Arc<HashSet<TimelineId>>,
+    ) {
+        self.retrieval_scopes
+            .entry(target)
+            .or_default()
+            .insert(group, allowed);
+    }
+
+    /// Forget every scope `target` was given — it is going away.
+    pub fn clear_retrieval_scope(&mut self, target: TimelineId) {
+        self.retrieval_scopes.remove(&target);
+    }
+
+    /// [`Self::active_timelines_for_group`] as `target` may see it: all of
+    /// them for a group that is not scoped, only those `target`'s scope names
+    /// for one that is — and none when it names none.
+    pub fn scoped_timelines_for_group(
+        &self,
+        group: GroupId,
+        target: TimelineId,
+    ) -> impl Iterator<Item = TimelineId> + '_ {
+        let scope: Option<Option<&Arc<HashSet<TimelineId>>>> =
+            self.scoped_groups.contains(&group).then(|| {
+                self.retrieval_scopes
+                    .get(&target)
+                    .and_then(|by_group| by_group.get(&group))
+            });
+        self.active_timelines_for_group(group)
+            .filter(move |tl| match scope {
+                None => true,
+                Some(None) => false,
+                Some(Some(allowed)) => allowed.contains(tl),
+            })
+    }
+
+    /// `tl` together with the ancestors it inherits, **oldest first**.
+    ///
+    /// This is what "my own history" means once conversations fork from one
+    /// another: the turns of every ancestor, in the order they were read, then
+    /// the target's own. Oldest-first is what makes the concatenation
+    /// chronological — and it is also `TurnKey`'s own ordering, since an
+    /// ancestor is always minted before the child that forks from it.
+    ///
+    /// The target itself is always present, even when it alone exceeds the
+    /// budget: a conversation never loses its own turns to an inherited one.
+    pub fn inherited_chain(&self, tl: TimelineId) -> Vec<TimelineId> {
+        let mut chain = vec![tl];
+        let mut seen: HashSet<TimelineId> = HashSet::from([tl]);
+        let mut budget = Self::INHERITED_CHAIN_TOKEN_CAP;
+        let mut cursor = tl;
+        while let Some(parent) = self.parent_timeline(cursor) {
+            // A cycle is not reachable by construction (a fork's parent always
+            // predates it), but the pointer is durable, user-visible metadata
+            // and a walk that trusted it could hang the projection.
+            if !seen.insert(parent) {
+                tracing::warn!(
+                    timeline = tl.raw(),
+                    repeated = parent.raw(),
+                    "inherited chain revisits a timeline — cycle in `forked_from`, truncating",
+                );
+                break;
+            }
+            let cost = self
+                .timeline_token_totals
+                .get(&parent)
+                .copied()
+                .unwrap_or(0);
+            if cost > budget {
+                tracing::warn!(
+                    timeline = tl.raw(),
+                    dropped_at = parent.raw(),
+                    inherited = chain.len() - 1,
+                    cost,
+                    budget,
+                    cap = Self::INHERITED_CHAIN_TOKEN_CAP,
+                    "inherited chain hit its token cap — older ancestors dropped from the front",
+                );
+                break;
+            }
+            budget -= cost;
+            chain.push(parent);
+            cursor = parent;
+        }
+        chain.reverse();
+        chain
     }
 
     // ── tool-round-trip couplings ───────────────────────────────────────────
@@ -3192,6 +3575,13 @@ impl Substrate {
         self.streams.values().any(|s| !s.chunks.is_empty())
     }
 
+    /// The belief-gallery epoch: unchanged while nothing a collection's gallery
+    /// is assembled from has changed, so an assembled gallery keyed on it can be
+    /// reused. See the field.
+    pub fn gallery_epoch(&self) -> u64 {
+        self.gallery_epoch
+    }
+
     /// Decoded wide-Q window for `stream_id`, memoized across reprojections.
     ///
     /// The belief scan reads the same static gallery on every reprojection;
@@ -3317,6 +3707,7 @@ impl Substrate {
     /// per-turn KV residence slots) is preserved.
     pub fn clear_walker_state(&mut self) {
         self.streams.clear();
+        self.gallery_epoch += 1;
         self.timeline_by_debug_id.clear();
         // The two indexes compaction can *shrink* — an entry whose record was
         // dropped would otherwise survive here pointing into a segment that no
@@ -3338,6 +3729,7 @@ impl Substrate {
             tl.label = None;
             tl.conv_id = None;
             tl.archived = false;
+            tl.branches.clear();
             tl.debug_id = None;
             tl.tree_meta.clear();
             tl.pending_summary_queue.clear();
@@ -3345,10 +3737,10 @@ impl Substrate {
         }
     }
 
-    /// Emit `(timeline_id, conv_id, label, archived, custom)` tuples for
-    /// every timeline that holds non-default values.  Used by compaction
-    /// to re-emit live `Label` / `ConvState` records.
-    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, bool, BTreeMap<String, String>)> {
+    /// Emit `(timeline_id, conv_id, label, custom)` tuples for every timeline
+    /// that holds non-default values.  Used by compaction to re-emit live
+    /// `Label` records; the `ConvState` side is [`Self::live_conv_states`].
+    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, BTreeMap<String, String>)> {
         // Emit in creation `order`, not `timelines` (HashMap) iteration order:
         // the compactor writes these as `Label` records, and reload re-derives
         // each timeline's `order` from the order its `conv_id` Label replays
@@ -3356,31 +3748,22 @@ impl Substrate {
         // sidebar's creation-order sort on every compaction. `order` is 0 for
         // timelines that never got a conv_id (label/custom only); they sort
         // first and their relative order is immaterial.
-        let mut out: Vec<(u64, u64, String, String, bool, BTreeMap<String, String>)> = self
+        let mut out: Vec<(u64, u64, String, String, BTreeMap<String, String>)> = self
             .timelines
             .iter()
             .filter_map(|(tid, tl)| {
                 let conv_id = tl.conv_id.clone().unwrap_or_default();
                 let label = tl.label.clone().unwrap_or_default();
-                if conv_id.is_empty() && label.is_empty() && !tl.archived && tl.custom.is_empty() {
+                if conv_id.is_empty() && label.is_empty() && tl.custom.is_empty() {
                     None
                 } else {
-                    Some((
-                        tl.order,
-                        tid.raw(),
-                        conv_id,
-                        label,
-                        tl.archived,
-                        tl.custom.clone(),
-                    ))
+                    Some((tl.order, tid.raw(), conv_id, label, tl.custom.clone()))
                 }
             })
             .collect();
         out.sort_by_key(|(order, tid, ..)| (*order, *tid));
         out.into_iter()
-            .map(|(_, tid, conv_id, label, archived, custom)| {
-                (tid, conv_id, label, archived, custom)
-            })
+            .map(|(_, tid, conv_id, label, custom)| (tid, conv_id, label, custom))
             .collect()
     }
 
@@ -3462,6 +3845,7 @@ impl Substrate {
             }
         }
         self.streams.entry(stream_id).or_default().decl = Some(decl);
+        self.gallery_epoch += 1;
     }
 
     /// Record a chunk location for `stream_id` at chunk index `idx`.
@@ -3567,17 +3951,28 @@ impl Substrate {
         }
     }
 
-    /// Apply a decoded `ConvState` payload.  Same stash-and-drain
-    /// pattern as [`Self::apply_conv_meta`] for unregistered
-    /// timelines.
+    /// Apply a decoded `ConvState` payload — the whole state, replacing
+    /// whatever an earlier record set. Same stash-and-drain pattern as
+    /// [`Self::apply_conv_meta`] for unregistered timelines, except that a
+    /// later stashed state replaces an earlier one rather than merging.
     pub fn apply_conv_state(&mut self, timeline_raw: u64, state: ConvState) {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
         if self.timelines.contains_key(&timeline) {
-            let _ = self.set_archived(timeline, state.archived);
+            self.replace_conv_state(timeline, state);
         } else {
             self.pending_conv_state.insert(timeline_raw, state);
+        }
+    }
+
+    /// Install `state` as `timeline`'s whole conversation state.
+    fn replace_conv_state(&mut self, timeline: TimelineId, state: ConvState) {
+        if let Some(entry) = self.timelines.get_mut(&timeline) {
+            entry.archived = state.archived;
+            entry.branches = state.branches;
+            entry.active = state.active;
+            self.conv_active_counter = self.conv_active_counter.max(state.active);
         }
     }
 
@@ -3610,6 +4005,25 @@ impl Substrate {
         self.set_debug_id(timeline, payload.debug_id.clone());
     }
 
+    /// Apply a custom object — on replay and on the runtime write path. Keyed by
+    /// the stable hash of its `key`, so a re-write with the same key replaces the
+    /// old one (last-writer-wins).
+    pub fn apply_custom_object(&mut self, obj: CustomObjectPayload) {
+        self.custom_objects.insert(obj.stream_id(), obj);
+    }
+
+    /// The live custom object stored under `key`, if any.
+    pub fn custom_object(&self, key: &str) -> Option<&CustomObjectPayload> {
+        self.custom_objects
+            .get(&CustomObjectPayload::stream_id_for(key))
+    }
+
+    /// Every live custom object — the set the compaction pass re-emits so they
+    /// survive it.
+    pub fn live_custom_objects(&self) -> Vec<CustomObjectPayload> {
+        self.custom_objects.values().cloned().collect()
+    }
+
     /// Apply a decoded [`TombstonePayload`].  Works whether or not
     /// the timeline is currently registered — registration just
     /// observes the tombstone bit when it later drains the same set.
@@ -3638,10 +4052,12 @@ impl Substrate {
                 // replayed in.
                 if !self.tombstoned_timelines.contains(&timeline) {
                     self.tombstoned_turns.insert((timeline, turn));
+                    self.gallery_epoch += 1;
                 }
             }
             None => {
                 self.tombstoned_timelines.insert(timeline);
+                self.gallery_epoch += 1;
                 // The same subsumption the live path applies — see
                 // [`Self::tombstone_timeline`]. Replay order is arbitrary, so a
                 // turn tombstone read after its timeline's must not resurrect
@@ -3691,6 +4107,7 @@ impl Substrate {
             return;
         }
         self.tombstoned_turns.insert((timeline, turn_index));
+        self.gallery_epoch += 1;
         let (residence, retired_tokens) = match self
             .timelines
             .get_mut(&timeline)
@@ -3770,6 +4187,7 @@ impl Substrate {
     /// deletion would only take effect on the next reload.
     pub fn tombstone_timeline(&mut self, timeline: TimelineId) {
         self.tombstoned_timelines.insert(timeline);
+        self.gallery_epoch += 1;
         // **A wholesale tombstone subsumes every turn-scoped one it covers.**
         //
         // `tombstoned_turns` only ever grew, so a conversation that retired a
@@ -3783,6 +4201,8 @@ impl Substrate {
         // know which of its turns were retired first.
         self.tombstoned_turns.retain(|(tl, _)| *tl != timeline);
         self.splice_source_timelines.remove(&timeline);
+        // A tombstoned conversation is never a projection's target again.
+        self.retrieval_scopes.remove(&timeline);
         // A tombstoned timeline's KV is dead — release its resident VRAM now.
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
             Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
@@ -3791,6 +4211,64 @@ impl Substrate {
         for r in residences {
             self.release_dead_residence(r);
         }
+    }
+
+    /// Mark the section stream `stream_id` as tombstoned in-RAM — the
+    /// section counterpart of [`Self::tombstone_timeline`]. Callers writing
+    /// the matching [`RecordType::SectionTombstone`] record to the redo log
+    /// invoke this to keep the live ingest triage in sync — without it the
+    /// section would only read as gone on the next reload, and a request in
+    /// this same process would restore the corrupted chunks again.
+    ///
+    /// Releases any hot/warm VRAM a currently-registered section pointing at
+    /// this stream holds. A tombstoned section is never legitimately read
+    /// again, so there is nothing later that depends on keeping its resident
+    /// bytes around — unlike an ordinary LRU eviction, this is not something
+    /// a future projection will need back.
+    pub fn tombstone_section(&mut self, stream_id: StreamId) {
+        self.tombstoned_sections.insert(stream_id);
+        let residences: Vec<ResidenceIndex> = self
+            .sections
+            .values()
+            .map(|e| e.residence)
+            .filter(|&r| self.residence[r.0].stream_id == stream_id)
+            .collect();
+        for r in residences {
+            self.release_dead_residence(r);
+        }
+    }
+
+    /// Whether the section stream `stream_id` has been tombstoned.
+    pub fn is_section_tombstoned(&self, stream_id: StreamId) -> bool {
+        self.tombstoned_sections.contains(&stream_id)
+    }
+
+    /// Direct read of the tombstoned-section-stream set. Used by the
+    /// compactor to re-emit one [`RecordType::SectionTombstone`] marker per
+    /// entry (the same role [`Self::tombstoned_timelines`] plays for
+    /// timeline tombstones) and by a future boot-time integrity pass that
+    /// wants the same set the reactive repair maintains.
+    pub fn tombstoned_sections(&self) -> &HashSet<StreamId> {
+        &self.tombstoned_sections
+    }
+
+    /// Apply a decoded [`SectionTombstonePayload`] read back from the redo
+    /// log. Sets the in-RAM flag only — replay runs before anything is
+    /// restored, so there is no VRAM to release the way the live
+    /// [`Self::tombstone_section`] does mid-process.
+    pub fn apply_section_tombstone(
+        &mut self,
+        stream_id: StreamId,
+        payload: &SectionTombstonePayload,
+    ) {
+        if let Some(reason) = &payload.reason {
+            tracing::debug!(
+                stream_id = stream_id.0,
+                reason = %reason,
+                "replaying section tombstone with recorded reason",
+            );
+        }
+        self.tombstoned_sections.insert(stream_id);
     }
 
     /// Mark `timeline`'s durable state as **ephemeral**: nothing will ever read
@@ -3981,8 +4459,27 @@ impl Substrate {
     /// flat, so the garbage was moved into host RAM rather than released. That
     /// 7.2 GiB is what pushed the box to 0.9 GiB free and 1,302 pages/sec.
     ///
-    /// The cold copy is left alone: the compactor sheds it with the record, and
-    /// a transient timeline never had one.
+    /// **The cold REFERENCE goes with them, because the compactor sheds the
+    /// record it names.** `keep_chunks` is `distill.is_none()`, so every chunk
+    /// this residence points at is dropped from the log on the next pass — and
+    /// nothing else ever removes the reference. Maintenance repoints relocated
+    /// records and has no notion of a dropped one; the in-RAM stream index is
+    /// insert-only. So a cold ref left standing here does not become stale
+    /// later, it becomes a pointer into a segment that gets unlinked, and it
+    /// still reads as a cold copy to everything that asks.
+    ///
+    /// That is not theoretical. An archived conversation is marked `TextOnly`,
+    /// which keeps its tokens and sheds its chunks — so its turns kept a
+    /// non-zero `token_count` and a cold tier that no longer existed. Selection
+    /// chose them on the strength of both, `elevate_to_hot` answered
+    /// `cold-load found no chunks`, `apply_projection` dropped them, and the
+    /// whole thing repeated on the next turn and every turn after, because
+    /// nothing had changed. Clearing it here makes the turn tier-less, which is
+    /// what it is: the projection then skips it on the branch that already
+    /// exists for K/V-less turns instead of failing a load to discover it.
+    ///
+    /// `released` still counts only hot and warm — it reports memory handed
+    /// back, and a cold ref is not memory.
     fn release_distilled_kv(&mut self, timeline: TimelineId) -> usize {
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
             Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
@@ -4008,6 +4505,7 @@ impl Substrate {
             if self.residence[r.0].warm.take().is_some() {
                 Self::remove_from_lru(&mut self.warm_lru, r);
             }
+            self.residence[r.0].cold = None;
         }
         released
     }
@@ -4028,14 +4526,17 @@ impl Substrate {
         &self.distilled_timelines
     }
 
-    /// On-disk bytes held by streams of tombstoned timelines — dead
-    /// weight the header-keyed accounting can't see (a tombstone names
-    /// its timeline in the payload, and the doomed records were live
-    /// appends at write time).  Summed from the in-RAM stream index, no
-    /// disk I/O; the compaction trigger adds this to the incremental
-    /// dead-byte counter.
+    /// On-disk bytes held by streams of tombstoned timelines and tombstoned
+    /// section streams — dead weight the header-keyed accounting can't see
+    /// (a tombstone names its target in the payload, not the header, and the
+    /// doomed records were live appends at write time). Summed from the
+    /// in-RAM stream index, no disk I/O; the compaction trigger adds this to
+    /// the incremental dead-byte counter.
     pub fn tombstoned_stream_bytes(&self) -> u64 {
-        if self.tombstoned_timelines.is_empty() && self.tombstoned_turns.is_empty() {
+        if self.tombstoned_timelines.is_empty()
+            && self.tombstoned_turns.is_empty()
+            && self.tombstoned_sections.is_empty()
+        {
             return 0;
         }
         self.streams
@@ -4047,7 +4548,10 @@ impl Substrate {
                             || self.tombstoned_turns.contains(&(tl, t.turn_index))
                     })
                 }
-                _ => false,
+                Some(decl @ StreamDecl::PromptSection(_)) => {
+                    self.tombstoned_sections.contains(&decl.stream_id())
+                }
+                None => false,
             })
             .map(|s| {
                 s.chunks.values().map(|c| c.record_size).sum::<u64>()
@@ -4200,9 +4704,19 @@ impl Substrate {
                     self.apply_debug_id_payload(&payload);
                 }
             }
+            RecordType::CustomObject => {
+                if let Ok(payload) = CustomObjectPayload::decode(&entry.record.payload) {
+                    self.apply_custom_object(payload);
+                }
+            }
             RecordType::Tombstone => {
                 if let Ok(payload) = TombstonePayload::decode(&entry.record.payload) {
                     self.apply_tombstone(&payload);
+                }
+            }
+            RecordType::SectionTombstone => {
+                if let Ok(payload) = SectionTombstonePayload::decode(&entry.record.payload) {
+                    self.apply_section_tombstone(stream_id, &payload);
                 }
             }
             RecordType::Distilled => {
@@ -4215,6 +4729,7 @@ impl Substrate {
                 // Last-writer-wins per turn stream id.
                 self.streams.entry(stream_id).or_default().projection_events =
                     Some(entry.record.payload.clone());
+                self.gallery_epoch += 1;
                 // Mirror the `WideQSig` arm: drop this stream's memoized seams so a
                 // replay/apply after the seam cache warmed can't serve stale seams.
                 self.seam_cache
@@ -4227,6 +4742,7 @@ impl Substrate {
                 // per turn stream id — each (re)projection overwrites the window.
                 self.streams.entry(stream_id).or_default().wide_q_sigs =
                     Some(entry.record.payload.clone());
+                self.gallery_epoch += 1;
                 self.evict_decoded_wide_sig(stream_id);
             }
             RecordType::TurnIndexPage => {
@@ -4247,6 +4763,11 @@ impl Substrate {
             // the same walk through its own sink. The substrate holds no
             // opinion about a character.
             | RecordType::Npc
+            // A conversation's file events belong to the daemon above; the
+            // persistence layer locates them (`VfsIndex`) and the substrate
+            // holds no opinion about them either.
+            | RecordType::VfsEvent
+            | RecordType::VfsTombstone
             | RecordType::Unknown => {}
         }
     }
@@ -4934,6 +5455,28 @@ impl Substrate {
             + self.section_token_total
     }
 
+    /// `timeline`'s own sealed turn tokens — [`Self::total_token_count`] without the
+    /// shared sections, which belong to no one conversation. What a per-conversation
+    /// figure that is summed across conversations must use, or every conversation
+    /// counts the whole tool catalog again. O(1).
+    pub fn timeline_token_total(&self, timeline: TimelineId) -> usize {
+        self.timeline_token_totals
+            .get(&timeline)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Tokens sealed in the whole substrate: every live timeline's turns and the shared
+    /// sections, each counted once. O(timelines).
+    pub fn corpus_token_total(&self) -> usize {
+        self.timeline_token_totals
+            .iter()
+            .filter(|(tl, _)| !self.tombstoned_timelines.contains(tl))
+            .map(|(_, tokens)| tokens)
+            .sum::<usize>()
+            + self.section_token_total
+    }
+
     pub fn turn_indices(&self, timeline: TimelineId) -> impl Iterator<Item = TurnIndex> + '_ {
         self.timelines
             .get(&timeline)
@@ -5065,15 +5608,74 @@ impl Substrate {
     }
 
     /// The set of distinct `custom[key]` values across all **live**
-    /// (non-tombstoned) timelines. A one-pass snapshot so callers can
-    /// probe membership in O(1) instead of an O(timelines) scan per probe
-    /// (e.g. the code_read resume cache over thousands of files).
+    /// (non-tombstoned) timelines whose own K/V is intact. A one-pass snapshot
+    /// so callers can probe membership in O(1) instead of an O(timelines) scan
+    /// per probe (e.g. the code_read resume cache over thousands of files).
+    ///
+    /// **Intactness is part of the answer, because this set is a resume cache.**
+    /// Its whole purpose is "has this content already been ingested, so the work
+    /// can be skipped" — and a conversation that lost its K/V has not been
+    /// usefully ingested, however complete its metadata looks. Keyed on the
+    /// source hash alone, such a unit matched, was skipped, and was therefore
+    /// never repaired: the hash describes the *input*, so it keeps matching
+    /// forever while the stored answer stays a hole. Nothing else noticed
+    /// either — `validate` only checks the chunk grid of turns that *have* one,
+    /// and the crashed-partial sweep looks for a missing hash, which this unit
+    /// has. Measured: `ARCHITECTURE.md`, a priming-chain anchor in every
+    /// conversation's ancestry, sat with 104 blocks of a turn's K/V absent for
+    /// days across many boots.
+    ///
+    /// A hash survives here if *any* intact timeline carries it, so this only
+    /// drops a value when every conversation holding it is damaged — which is
+    /// exactly when the unit needs re-ingesting.
     pub fn metadata_values_for_key(&self, key: &str) -> std::collections::HashSet<String> {
         self.timelines
             .iter()
             .filter(|(tid, _)| !self.tombstoned_timelines.contains(tid))
+            .filter(|(tid, _)| self.timeline_kv_intact(**tid))
             .filter_map(|(_, tl)| tl.custom.get(key).cloned())
             .collect()
+    }
+
+    /// Whether every turn **this timeline owns** still holds its K/V in some
+    /// tier (hot, warm or cold).
+    ///
+    /// **Own turns only — never the inherited chain.** A fork's ancestors are
+    /// resolved live at projection time ([`Self::inherited_chain`]), so a hole
+    /// in an ancestor is that ancestor's to repair and is fixed for every
+    /// descendant at once when it is. Walking the chain here would instead mark
+    /// every descendant damaged: each `code_read` file hangs off the priming
+    /// chain's end, so one damaged anchor would condemn the entire corpus and
+    /// re-ingest the whole workspace.
+    ///
+    /// **K/V that was deliberately reclaimed is not damage**, so an ARCHIVED or
+    /// DISTILLED timeline always reads as intact. A tool-calibration exemplar
+    /// ends archived + distilled(`ProvenanceOnly`): [`Self::release_distilled_kv`]
+    /// drops its chunks on purpose, because its `WideQSig`s are all the belief
+    /// scan still needs from it. Counting that as damage would be wrong twice
+    /// over — it describes 876 of this store's 1,467 conversations, and a
+    /// re-ingest is not the repair for content nobody ingests. Tombstoned
+    /// timelines never reach here; [`Self::metadata_values_for_key`] drops them
+    /// first.
+    ///
+    /// A turn spanning no blocks holds no K/V by construction and is skipped —
+    /// it is not damage either. An unknown timeline reads as NOT intact, which
+    /// fails toward doing the work rather than trusting a conversation that is
+    /// not there.
+    pub fn timeline_kv_intact(&self, timeline: TimelineId) -> bool {
+        let Some(entry) = self.timelines.get(&timeline) else {
+            return false;
+        };
+        if entry.archived || self.is_distilled(timeline) {
+            return true;
+        }
+        entry.turns.values().all(|turn| {
+            if turn.block_range.1 <= turn.block_range.0 {
+                return true;
+            }
+            let slot = &self.residence[turn.content.residence.0];
+            slot.hot.is_some() || slot.warm.is_some() || slot.cold.is_some()
+        })
     }
 
     /// All **live** (non-tombstoned) timelines that carry `key` in their
@@ -5108,17 +5710,85 @@ impl Substrate {
             return false;
         }
         entry.archived = archived;
+        // An archived conversation takes no more turns: no scope of its is
+        // read again.
+        if archived {
+            self.retrieval_scopes.remove(&timeline);
+        }
         true
     }
 
-    /// Every recovered timeline that has a `conv_id` recorded, paired
+    /// `timeline`'s whole conversation state — what its `ConvState` record
+    /// carries — or `None` for an unregistered timeline.
+    pub fn conv_state(&self, timeline: TimelineId) -> Option<ConvState> {
+        self.timelines.get(&timeline).map(|e| ConvState {
+            archived: e.archived,
+            branches: e.branches.clone(),
+            active: e.active,
+        })
+    }
+
+    /// Mark `timeline` as used now: stamp it with the next last-use rank, so
+    /// it outranks every conversation used before it. Returns `false` for an
+    /// unregistered timeline, which has no state to write.
+    pub fn touch_conversation(&mut self, timeline: TimelineId) -> bool {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            return false;
+        };
+        self.conv_active_counter += 1;
+        entry.active = self.conv_active_counter;
+        true
+    }
+
+    /// Set the branch `timeline` works on in `repo`. No-op when the timeline
+    /// isn't registered. Returns `true` when the branch actually changed, so
+    /// the caller can skip the persistence write when nothing did.
+    pub fn set_branch(&mut self, timeline: TimelineId, repo: &str, branch: &str) -> bool {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            return false;
+        };
+        if entry.branches.get(repo).map(String::as_str) == Some(branch) {
+            return false;
+        }
+        entry.branches.insert(repo.to_string(), branch.to_string());
+        true
+    }
+
+    /// Every live timeline's conversation state that differs from an
+    /// untouched one, as `(timeline_id, state)` in timeline order — what
+    /// compaction and maintenance re-emit as `ConvState` records.
+    pub fn live_conv_states(&self) -> Vec<(u64, ConvState)> {
+        let mut out: Vec<(u64, ConvState)> = self
+            .timelines
+            .keys()
+            .filter_map(|tl| {
+                let state = self.conv_state(*tl)?;
+                (!state.is_default()).then_some((tl.raw(), state))
+            })
+            .collect();
+        out.sort_by_key(|(tl, _)| *tl);
+        out
+    }
+
+    /// Every **live** timeline that has a `conv_id` recorded, paired
     /// with `(conv_id, label, archived)`. Drives the daemon's sidebar:
     /// `label` is empty during the brief window between first-submit
     /// and titler-completion, `archived` is the lifecycle filter the
     /// sidebar applies before rendering.
+    ///
+    /// **Tombstoned timelines are excluded**, like every other listing here
+    /// ([`Self::live_timeline_ids`], [`Self::conversations_with_conv_id_prefix`]).
+    /// This used to return them, on the reasoning that excluding them was each
+    /// caller's job — which made `DELETE /v1/conversations/{id}` a no-op from
+    /// the only place a user can see: the row came back on the next sidebar
+    /// hydrate, for the life of the log, because a tombstone marks a timeline
+    /// for reclamation rather than removing its registry entry. Archived is the
+    /// flag a caller filters on; deleted is not a flag, and nothing outside
+    /// maintenance has any use for a deleted conversation.
     pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool, u64)> {
         self.timelines
             .iter()
+            .filter(|(tl, _)| !self.tombstoned_timelines.contains(tl))
             .filter_map(|(tl, entry)| {
                 let conv_id = entry.conv_id.clone()?;
                 let label = entry.label.clone().unwrap_or_default();
@@ -5131,15 +5801,12 @@ impl Substrate {
     /// `(timeline, conv_id)`.
     ///
     /// [`Self::known_conversations`] answers the same question by materialising
-    /// every conversation the workspace has *ever* held — tombstoned ones
-    /// included, since the sidebar lists them — and cloning two strings for
+    /// every live conversation the workspace holds and cloning two strings for
     /// each. A caller that wants one character's handful out of that pays for
-    /// the whole history of the log, and that history only grows: retirement
-    /// bounds the live set, not the registry.
+    /// the whole registry, and the registry only grows: retirement bounds the
+    /// live set, not the entries.
     ///
-    /// Filtering inside the read lock allocates for the matches alone, and
-    /// dropping tombstoned entries here means the caller is not handed
-    /// conversations whose only remaining use is to be skipped.
+    /// Filtering inside the read lock allocates for the matches alone.
     pub fn conversations_with_conv_id_prefix(&self, prefix: &str) -> Vec<(TimelineId, String)> {
         self.timelines
             .iter()
@@ -5186,6 +5853,7 @@ impl Substrate {
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.gallery_epoch += 1;
     }
 
     /// Store a turn's projection-event record payload (opaque JSON bytes) on its
@@ -5193,6 +5861,7 @@ impl Substrate {
     /// and on redo-log replay.
     pub fn set_projection_events_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
         self.streams.entry(stream_id).or_default().projection_events = Some(payload);
+        self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded seams so a
         // single seal doesn't force a full-gallery JSON re-parse on the next scan.
         self.seam_cache
@@ -5211,6 +5880,7 @@ impl Substrate {
     /// Cache a turn's encoded wide-Q signature window, last-writer-wins.
     pub fn set_wide_q_sigs_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
         self.streams.entry(stream_id).or_default().wide_q_sigs = Some(payload);
+        self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded window so a
         // single seal doesn't force a full-gallery re-decode on the next scan.
         self.evict_decoded_wide_sig(stream_id);
@@ -5398,8 +6068,20 @@ impl Substrate {
     /// it to hot.  Used by the ingest loop to skip re-issuing a
     /// `RestoreSection` for a section the substrate already knows
     /// about (preventing duplicate residence allocations).
+    ///
+    /// A tombstoned section (see [`Self::tombstone_section`]) reads as
+    /// absent here even though its entry is still in [`Self::sections`] —
+    /// mirroring how a tombstoned timeline stays in [`Self::timelines`] and
+    /// is filtered at every read site instead of being purged. The next
+    /// triage that asks for this section id falls through to the ingest
+    /// path, which re-prefills fresh and overwrites the tombstoned entry.
     pub fn section_exists(&self, section: SectionId) -> bool {
-        self.sections.contains_key(&section)
+        match self.sections.get(&section) {
+            Some(entry) => !self
+                .tombstoned_sections
+                .contains(&self.residence[entry.residence.0].stream_id),
+            None => false,
+        }
     }
 
     /// Per-layer chunk count for the section's hot residence, or
@@ -5932,6 +6614,13 @@ mod tests {
     };
     use crate::token_buffer::TokenBuffer;
 
+    /// A timeline id no allocator in a test can also mint. Allocators are
+    /// microsecond clocks, so two fresh ones asked in the same microsecond
+    /// return the same id — two "different" timelines then share their turns.
+    fn unshared_timeline(n: u64) -> TimelineId {
+        TimelineId::from_raw((1 << 62) | n).expect("non-zero timeline id")
+    }
+
     fn make_timeline() -> (LayerId, GroupId, TimelineId, Substrate) {
         let layer = LayerId::for_test(1);
         let group = GroupId::for_test(1);
@@ -5945,6 +6634,333 @@ mod tests {
         // riding a default that no longer exists.
         sub.set_timeline_summarize(timeline, true);
         (layer, group, timeline, sub)
+    }
+
+    // ── fork lineage (`inherited_chain`) ────────────────────────────────────
+
+    /// Build `n` timelines in one group, each forked from the one before, every
+    /// turn costing `tokens_each`. Returns them oldest-first.
+    fn forked_line(n: usize, tokens_each: usize) -> (Substrate, Vec<TimelineId>) {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+        let mut tls = Vec::new();
+        for _ in 0..n {
+            let tl = alloc.next();
+            sub.register_timeline(tl, layer, group);
+            sub.append_with_blocks(tl, tokens_each, 0, 1);
+            if let Some(parent) = tls.last().copied() {
+                set_parent(&mut sub, tl, parent);
+            }
+            tls.push(tl);
+        }
+        (sub, tls)
+    }
+
+    fn set_parent(sub: &mut Substrate, child: TimelineId, parent: TimelineId) {
+        let mut kv = BTreeMap::new();
+        kv.insert(
+            Substrate::FORKED_FROM_KEY.to_string(),
+            parent.raw().to_string(),
+        );
+        sub.merge_custom(child, &kv);
+    }
+
+    // ── retrieval scope ─────────────────────────────────────────────────────
+
+    /// Two targets and three ingest conversations in one group.
+    fn scope_fixture() -> (Substrate, GroupId, [TimelineId; 2], [TimelineId; 3]) {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+        let targets = [alloc.next(), alloc.next()];
+        let ingested = [alloc.next(), alloc.next(), alloc.next()];
+        for tl in ingested {
+            sub.register_timeline(tl, layer, group);
+        }
+        (sub, group, targets, ingested)
+    }
+
+    fn scoped(sub: &Substrate, group: GroupId, target: TimelineId) -> Vec<TimelineId> {
+        sub.scoped_timelines_for_group(group, target).collect()
+    }
+
+    /// **A group that is not scoped offers every live conversation**, to
+    /// every target — a scope given to it changes nothing.
+    #[test]
+    fn an_unscoped_group_offers_everything() {
+        let (mut sub, group, [a, _], ingested) = scope_fixture();
+        sub.set_retrieval_scope(a, group, Arc::new(HashSet::from([ingested[0]])));
+        assert!(!sub.is_group_scoped(group));
+        assert_eq!(scoped(&sub, group, a), ingested.to_vec());
+    }
+
+    /// **A scoped group offers each target exactly what its scope names**,
+    /// nothing to a target with no scope, and never a tombstoned conversation
+    /// even when named.
+    #[test]
+    fn a_scoped_group_offers_each_target_its_own_scope() {
+        let (mut sub, group, [a, b], ingested) = scope_fixture();
+        sub.mark_group_scoped(group);
+        assert!(sub.is_group_scoped(group));
+        assert!(
+            scoped(&sub, group, a).is_empty(),
+            "no scope, nothing offered"
+        );
+
+        sub.set_retrieval_scope(
+            a,
+            group,
+            Arc::new(HashSet::from([ingested[0], ingested[2]])),
+        );
+        sub.set_retrieval_scope(b, group, Arc::new(HashSet::from([ingested[1]])));
+        assert_eq!(scoped(&sub, group, a), vec![ingested[0], ingested[2]]);
+        assert_eq!(scoped(&sub, group, b), vec![ingested[1]]);
+
+        sub.tombstoned_timelines.insert(ingested[2]);
+        assert_eq!(scoped(&sub, group, a), vec![ingested[0]]);
+
+        sub.set_retrieval_scope(a, group, Arc::new(HashSet::from([ingested[1]])));
+        assert_eq!(
+            scoped(&sub, group, a),
+            vec![ingested[1]],
+            "replaced, not merged"
+        );
+
+        sub.clear_retrieval_scope(a);
+        assert!(scoped(&sub, group, a).is_empty());
+        assert_eq!(scoped(&sub, group, b), vec![ingested[1]], "b's is its own");
+    }
+
+    /// **A target that can take no more turns keeps no scope**: archiving it
+    /// or tombstoning it lets every scope it was given go.
+    #[test]
+    fn an_archived_or_tombstoned_target_lets_its_scope_go() {
+        let (mut sub, group, [a, b], ingested) = scope_fixture();
+        sub.mark_group_scoped(group);
+        let dialogue = GroupId::for_test(2);
+        for target in [a, b] {
+            sub.register_timeline(target, LayerId::for_test(2), dialogue);
+            sub.set_retrieval_scope(target, group, Arc::new(HashSet::from([ingested[0]])));
+        }
+        assert!(sub.set_archived(a, true));
+        assert!(scoped(&sub, group, a).is_empty());
+        assert_eq!(scoped(&sub, group, b), vec![ingested[0]]);
+        sub.tombstone_timeline(b);
+        assert!(sub.retrieval_scopes.is_empty());
+    }
+
+    // ── fast-path tool reads ────────────────────────────────────────────────
+
+    /// A conversation plus `n` ingest conversations of `tokens_each`, none of
+    /// them related — the fast path joins conversations that never forked from
+    /// one another.
+    fn fast_path_fixture(n: usize, tokens_each: usize) -> (Substrate, TimelineId, Vec<TimelineId>) {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+        let target = alloc.next();
+        sub.register_timeline(target, layer, group);
+        let mut reads = Vec::new();
+        for _ in 0..n {
+            let tl = alloc.next();
+            sub.register_timeline(tl, layer, group);
+            sub.append_with_blocks(tl, tokens_each, 0, 1);
+            reads.push(tl);
+        }
+        (sub, target, reads)
+    }
+
+    #[test]
+    fn an_admitted_read_is_injected_most_recent_first() {
+        let (mut sub, target, reads) = fast_path_fixture(3, 10);
+        for r in &reads {
+            assert!(sub.fast_path_admit(target, *r, 1000));
+        }
+        assert_eq!(
+            sub.fast_path_injections(target),
+            vec![reads[2], reads[1], reads[0]],
+        );
+    }
+
+    /// The same file resolved twice is one injection — what makes the content
+    /// hash a dedupe key rather than an append log.
+    #[test]
+    fn re_admitting_the_same_read_moves_it_to_the_front_without_duplicating() {
+        let (mut sub, target, reads) = fast_path_fixture(3, 10);
+        for r in &reads {
+            sub.fast_path_admit(target, *r, 1000);
+        }
+        sub.fast_path_admit(target, reads[0], 1000);
+        assert_eq!(
+            sub.fast_path_injections(target),
+            vec![reads[0], reads[2], reads[1]],
+            "re-admitted entry leads, and appears exactly once",
+        );
+    }
+
+    #[test]
+    fn the_budget_evicts_from_the_tail() {
+        let (mut sub, target, reads) = fast_path_fixture(4, 100);
+        for r in &reads {
+            sub.fast_path_admit(target, *r, 250);
+        }
+        assert_eq!(
+            sub.fast_path_injections(target),
+            vec![reads[3], reads[2]],
+            "two 100-token reads fit a 250 budget; the older two are dropped",
+        );
+    }
+
+    /// A read too big for the budget is refused rather than admitted — it would
+    /// evict every other entry and still not fit, and the caller needs to know
+    /// so it can do a real read instead.
+    #[test]
+    fn a_read_larger_than_the_budget_is_refused_and_disturbs_nothing() {
+        let (mut sub, target, reads) = fast_path_fixture(2, 100);
+        assert!(sub.fast_path_admit(target, reads[0], 250));
+        let huge = unshared_timeline(1);
+        sub.register_timeline(huge, LayerId::for_test(1), GroupId::for_test(1));
+        sub.append_with_blocks(huge, 5_000, 0, 1);
+        assert!(!sub.fast_path_admit(target, huge, 250));
+        assert_eq!(
+            sub.fast_path_injections(target),
+            vec![reads[0]],
+            "the refused read left the existing set intact",
+        );
+    }
+
+    /// A retired conversation reads as a miss. Its turns are gone, so serving
+    /// it would tell the model it has a file that nothing will deliver.
+    #[test]
+    fn a_tombstoned_read_is_refused() {
+        let (mut sub, target, reads) = fast_path_fixture(1, 10);
+        sub.tombstone_timeline(reads[0]);
+        assert!(!sub.fast_path_admit(target, reads[0], 1000));
+        assert!(sub.fast_path_injections(target).is_empty());
+    }
+
+    #[test]
+    fn an_archived_read_is_refused() {
+        let (mut sub, target, reads) = fast_path_fixture(1, 10);
+        sub.set_archived(reads[0], true);
+        assert!(!sub.fast_path_admit(target, reads[0], 1000));
+    }
+
+    /// A registered conversation that never sealed a turn carries nothing.
+    #[test]
+    fn a_read_with_no_turns_is_refused() {
+        let (mut sub, target, _) = fast_path_fixture(0, 0);
+        let empty = unshared_timeline(1);
+        sub.register_timeline(empty, LayerId::for_test(1), GroupId::for_test(1));
+        assert!(!sub.fast_path_admit(target, empty, 1000));
+    }
+
+    #[test]
+    fn a_conversation_never_injects_itself() {
+        let (mut sub, target, _) = fast_path_fixture(1, 10);
+        assert!(!sub.fast_path_admit(target, target, 1000));
+        assert!(sub.fast_path_injections(target).is_empty());
+    }
+
+    #[test]
+    fn clearing_drops_the_set_for_a_rebuild() {
+        let (mut sub, target, reads) = fast_path_fixture(2, 10);
+        for r in &reads {
+            sub.fast_path_admit(target, *r, 1000);
+        }
+        sub.fast_path_clear(target);
+        assert!(sub.fast_path_injections(target).is_empty());
+    }
+
+    #[test]
+    fn a_timeline_that_never_forked_inherits_only_itself() {
+        let (_layer, _group, tl, sub) = make_timeline();
+        assert_eq!(sub.inherited_chain(tl), vec![tl]);
+        assert_eq!(sub.parent_timeline(tl), None);
+    }
+
+    /// The whole point: the chain reads oldest-first, so concatenating each
+    /// timeline's turns yields the documents in the order they were read.
+    #[test]
+    fn an_inherited_chain_runs_oldest_ancestor_first_and_ends_at_the_target() {
+        let (sub, tls) = forked_line(4, 10);
+        let target = *tls.last().unwrap();
+        assert_eq!(sub.inherited_chain(target), tls);
+    }
+
+    #[test]
+    fn a_tombstoned_ancestor_ends_the_chain_instead_of_failing() {
+        let (mut sub, tls) = forked_line(3, 10);
+        sub.tombstone_timeline(tls[0]);
+        // tls[2] -> tls[1] still resolves; tls[1] -> tls[0] is now dangling.
+        assert_eq!(sub.inherited_chain(tls[2]), vec![tls[1], tls[2]]);
+    }
+
+    /// An ancestor a layer's own reconciliation has archived drops out the same
+    /// way — the child keeps working, it just inherits less.
+    #[test]
+    fn an_archived_ancestor_ends_the_chain() {
+        let (mut sub, tls) = forked_line(3, 10);
+        sub.set_archived(tls[0], true);
+        assert_eq!(sub.inherited_chain(tls[2]), vec![tls[1], tls[2]]);
+    }
+
+    /// The cap drops the FRONT — the oldest, most general ancestors — and keeps
+    /// the nearest ones, which are the most specific to the target.
+    #[test]
+    fn the_token_cap_drops_the_front_of_the_chain_and_keeps_the_nearest() {
+        // Four ancestors at 40k each: the target plus two ancestors fit inside
+        // the 100k ceiling (80k), a third would reach 120k.
+        let (sub, tls) = forked_line(5, 40_000);
+        let target = *tls.last().unwrap();
+        let chain = sub.inherited_chain(target);
+        assert_eq!(chain, vec![tls[2], tls[3], target]);
+    }
+
+    /// A conversation never loses its OWN turns to the inherited budget, however
+    /// large they are — the cap governs what it inherits, not what it is.
+    #[test]
+    fn the_target_survives_a_cap_its_own_turns_already_exceed() {
+        let (sub, tls) = forked_line(2, Substrate::INHERITED_CHAIN_TOKEN_CAP * 2);
+        let target = *tls.last().unwrap();
+        assert_eq!(sub.inherited_chain(target), vec![target]);
+    }
+
+    /// `forked_from` is durable, user-visible metadata, so the walk must not
+    /// trust it to be acyclic — a cycle would otherwise hang every projection.
+    #[test]
+    fn a_cycle_in_the_lineage_truncates_rather_than_hanging() {
+        let (mut sub, tls) = forked_line(3, 10);
+        set_parent(&mut sub, tls[0], tls[2]);
+        let chain = sub.inherited_chain(tls[2]);
+        assert_eq!(chain.len(), 3, "each timeline appears exactly once");
+        assert_eq!(*chain.last().unwrap(), tls[2]);
+    }
+
+    #[test]
+    fn a_parent_pointer_naming_an_unknown_timeline_is_ignored() {
+        let (_layer, _group, tl, mut sub) = make_timeline();
+        let mut kv = BTreeMap::new();
+        kv.insert(Substrate::FORKED_FROM_KEY.to_string(), "999999".to_string());
+        sub.merge_custom(tl, &kv);
+        assert_eq!(sub.parent_timeline(tl), None);
+        assert_eq!(sub.inherited_chain(tl), vec![tl]);
+    }
+
+    #[test]
+    fn an_unparseable_parent_pointer_is_ignored() {
+        let (_layer, _group, tl, mut sub) = make_timeline();
+        let mut kv = BTreeMap::new();
+        kv.insert(
+            Substrate::FORKED_FROM_KEY.to_string(),
+            "not-a-timeline".to_string(),
+        );
+        sub.merge_custom(tl, &kv);
+        assert_eq!(sub.parent_timeline(tl), None);
     }
 
     /// Regression: two conversations (timelines) in the SAME group is the case
@@ -6164,6 +7180,68 @@ mod tests {
             chunk_size: 32,
             location: candle_nn::kv_cache::ArenaLocation::Cpu,
         }
+    }
+
+    /// **The hot→warm groups are named without cloning, and each is cloned on
+    /// its own.** The persistence thread snapshots one group under its migrate
+    /// guard, so the per-policy snapshot must return exactly that policy's
+    /// pending residences — and skip what the whole snapshot skips: a
+    /// residence already warm, and one pinned into the wave's working set.
+    #[test]
+    fn pending_warm_is_named_by_policy_and_snapshotted_per_group() {
+        let lossless = ConvCompression {
+            lossless: true,
+            level: None,
+            disable_k_override: false,
+            force_k: None,
+            force_v: None,
+        };
+        let mut sub = Substrate::new();
+        let plain = sub.alloc_residence(StreamId(1), None);
+        let exact = sub.alloc_residence(StreamId(2), Some(lossless));
+        let warm = sub.alloc_residence(StreamId(3), None);
+        let pinned = sub.alloc_residence(StreamId(4), Some(lossless));
+        for r in [plain, exact, warm, pinned] {
+            sub.install_hot(r, vec![minimal_sealed_layer()]);
+        }
+        sub.install_warm(warm, vec![minimal_sealed_layer()]);
+        sub.working_set_pins.insert(pinned);
+
+        let mut policies = sub.pending_warm_policies();
+        policies.sort_by_key(|p| p.is_some());
+        assert_eq!(policies, [None, Some(lossless)]);
+
+        let of = |p| -> Vec<usize> {
+            sub.snapshot_pending_warm_for(p)
+                .into_iter()
+                .map(|(idx, _)| idx.0)
+                .collect()
+        };
+        assert_eq!(of(None), [plain.0]);
+        assert_eq!(of(Some(lossless)), [exact.0]);
+    }
+
+    /// **A conversation's own tokens exclude the shared sections, and the corpus counts
+    /// them once.** `total_token_count` adds the sections to every conversation — right
+    /// for one conversation's "materialized / N" — so a sum of it across a layer counted
+    /// the tool catalog once per conversation: 37 folder units read as 1.5 M tokens.
+    #[test]
+    fn a_conversations_tokens_exclude_the_sections_the_corpus_counts_once() {
+        let (layer, group, first, mut sub) = make_timeline();
+        let second = unshared_timeline(1);
+        let retired = unshared_timeline(2);
+        sub.register_timeline(second, layer, group);
+        sub.register_timeline(retired, layer, group);
+        sub.append_with_blocks(first, 100, 0, 4);
+        sub.append_with_blocks(second, 30, 0, 1);
+        sub.append_with_blocks(retired, 7, 0, 1);
+        sub.tombstone_timeline(retired);
+        sub.section_token_total = 40;
+
+        assert_eq!(sub.total_token_count(first), 140);
+        assert_eq!(sub.timeline_token_total(first), 100);
+        assert_eq!(sub.timeline_token_total(second), 30);
+        assert_eq!(sub.corpus_token_total(), 100 + 30 + 40);
     }
 
     /// `register_timeline` is data-idempotent — calling it again on a
@@ -7762,6 +8840,206 @@ mod tests {
         );
     }
 
+    /// A sealed turn spanning REAL blocks, hot + warm installed — the shape a
+    /// live ingest unit has once its seal lands. Unlike `install_hot_and_warm`
+    /// this sets `block_end`, which is what makes the turn one that *should*
+    /// hold K/V: a zero-block turn holds none by construction and intactness
+    /// rightly ignores it.
+    fn install_blocked_turn(
+        sub: &mut Substrate,
+        timeline: TimelineId,
+        blocks: u64,
+    ) -> ResidenceIndex {
+        let idx = sub
+            .append_complete(
+                timeline,
+                TurnPartWrite {
+                    sealed_gpu: Some(Arc::new(vec![minimal_sealed_layer()])),
+                    block_end: blocks,
+                    token_count: 32,
+                    ..Default::default()
+                },
+                identity_migrate,
+            )
+            .unwrap();
+        let residence = sub.turn_residence(timeline, idx).unwrap();
+        sub.install_warm(residence, vec![minimal_sealed_layer()]);
+        residence
+    }
+
+    /// Drop every tier's copy — the pin-wedge end state, and also what
+    /// `release_distilled_kv` leaves behind: a turn with token_ids and a block
+    /// range and no chunks anywhere.
+    fn reclaim_all_tiers(sub: &mut Substrate, residence: ResidenceIndex) {
+        sub.residence[residence.0].hot = None;
+        sub.residence[residence.0].warm = None;
+        sub.residence[residence.0].cold = None;
+    }
+
+    /// The resume cache is a claim about a stored ANSWER, not just about the
+    /// input hash: a live conversation that lost a turn's K/V must stop matching
+    /// so the unit re-ingests, or its hash keeps matching forever and the hole
+    /// is never repaired.
+    #[test]
+    fn a_damaged_conversation_leaves_the_resume_cache() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let intact = alloc.next();
+        let damaged = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(intact, layer, group);
+        sub.register_timeline(damaged, layer, group);
+        install_blocked_turn(&mut sub, intact, 3);
+        let broken = install_blocked_turn(&mut sub, damaged, 3);
+        let hash_meta = |v: &str| BTreeMap::from([("content_sha256".to_string(), v.to_string())]);
+        sub.merge_custom(intact, &hash_meta("aaa"));
+        sub.merge_custom(damaged, &hash_meta("bbb"));
+
+        assert!(sub.timeline_kv_intact(intact));
+        assert!(sub.timeline_kv_intact(damaged));
+        assert_eq!(
+            sub.metadata_values_for_key("content_sha256"),
+            ["aaa".to_string(), "bbb".to_string()].into(),
+        );
+
+        reclaim_all_tiers(&mut sub, broken);
+        assert!(
+            !sub.timeline_kv_intact(damaged),
+            "a chunkless live turn is damage"
+        );
+        assert_eq!(
+            sub.metadata_values_for_key("content_sha256"),
+            ["aaa".to_string()].into(),
+            "the damaged unit's hash must stop matching so it re-ingests",
+        );
+    }
+
+    /// **Deliberately reclaimed K/V is not damage.** A tool-calibration exemplar
+    /// ends archived + distilled(`ProvenanceOnly`) with its chunks dropped on
+    /// purpose, and must keep matching the resume cache — re-ingesting the
+    /// calibration corpus because its K/V is legitimately gone would be a far
+    /// worse bug than the one this predicate exists to catch.
+    #[test]
+    fn deliberately_reclaimed_kv_still_counts_as_intact() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        for (archived, distilled) in [(true, false), (false, true), (true, true)] {
+            let tl = alloc.next();
+            let mut sub = Substrate::new();
+            sub.register_timeline(tl, layer, group);
+            let r = install_blocked_turn(&mut sub, tl, 3);
+            // Content reclaimed, exactly as `release_distilled_kv` leaves it.
+            reclaim_all_tiers(&mut sub, r);
+            assert!(
+                !sub.timeline_kv_intact(tl),
+                "guard precondition: this turn IS chunkless, so the archived / \
+                 distilled exemption below is what has to carry it",
+            );
+            if archived {
+                assert!(sub.set_archived(tl, true));
+            }
+            if distilled {
+                sub.distill_timeline(tl, DistillMode::ProvenanceOnly);
+            }
+            assert!(
+                sub.timeline_kv_intact(tl),
+                "archived={archived} distilled={distilled}: reclaimed content is not damage",
+            );
+        }
+    }
+
+    /// Intactness is scoped to a timeline's OWN turns. A fork whose ancestor is
+    /// damaged is itself fine: ancestors resolve live through
+    /// `inherited_chain`, so the hole is repaired once, in the ancestor, for
+    /// every descendant. Walking the chain here would condemn the whole corpus
+    /// — every `code_read` file hangs off the priming chain's end.
+    #[test]
+    fn a_damaged_ancestor_does_not_dirty_its_descendants() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let ancestor = alloc.next();
+        let child = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(ancestor, layer, group);
+        sub.register_timeline(child, layer, group);
+        let broken = install_blocked_turn(&mut sub, ancestor, 3);
+        install_blocked_turn(&mut sub, child, 3);
+        sub.merge_custom(
+            child,
+            &BTreeMap::from([(
+                Substrate::FORKED_FROM_KEY.to_string(),
+                ancestor.raw().to_string(),
+            )]),
+        );
+        assert_eq!(
+            sub.parent_timeline(child),
+            Some(ancestor),
+            "the fork pointer is what a descendant resolves through",
+        );
+
+        reclaim_all_tiers(&mut sub, broken);
+
+        assert!(!sub.timeline_kv_intact(ancestor), "the ancestor is damaged");
+        assert!(
+            sub.timeline_kv_intact(child),
+            "the child owns intact turns — an ancestor's hole is not its own",
+        );
+    }
+
+    /// A pinned warm residence is withheld from the warm→cold work list, and
+    /// returns to it as soon as the keep-set is republished without it.
+    ///
+    /// The durability half of [`set_working_set_pins_replaces_wholesale`],
+    /// which covers only eviction. `snapshot_pending_cold`'s pin skip defers a
+    /// *redo-log append*, so a pin that outlives the slot which published it
+    /// does not merely delay reclaiming VRAM — the turn stays hot+warm and is
+    /// never written, and `pending_cold_count` reports nothing pending because
+    /// it mirrors the same filter. That is how a `repo_map` unit's first turn
+    /// came to persist with token_ids, a block range and zero `Chunk` records.
+    #[test]
+    fn a_pinned_warm_turn_is_withheld_from_cold_until_unpinned() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (pinned_idx, pinned) = install_hot_and_warm(&mut sub, timeline, 10);
+        let (_, other) = install_hot_and_warm(&mut sub, timeline, 10);
+
+        let queued = |sub: &Substrate| -> Vec<ResidenceIndex> {
+            sub.snapshot_pending_cold()
+                .into_iter()
+                .map(|(idx, _, _)| idx)
+                .collect()
+        };
+
+        sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
+        let pending = queued(&sub);
+        assert!(
+            !pending.contains(&pinned),
+            "a pinned turn is not gathered warm→cold"
+        );
+        assert!(
+            pending.contains(&other),
+            "an unpinned warm turn still is — the skip is per-residence"
+        );
+        assert_eq!(
+            sub.pending_cold_count(),
+            1,
+            "the count mirrors the filter, so the withheld turn reports as \
+             nothing pending — this is why the wedge was silent"
+        );
+
+        // The slot that published the pin goes away; the scheduler republishes
+        // the union of what is still live (`retire_slot_projection_state`).
+        sub.set_working_set_pins(&[], &[]);
+        let pending = queued(&sub);
+        assert!(
+            pending.contains(&pinned),
+            "unpinned → the turn is gathered for its redo-log append"
+        );
+        assert_eq!(sub.pending_cold_count(), 2);
+    }
+
     /// A zero target evicts nothing — there's no incoming load to make room
     /// for, so the working set is left fully hot.
     #[test]
@@ -7989,6 +9267,54 @@ mod tests {
         );
     }
 
+    /// Distillation sheds the cold REFERENCE, not just the resident copies.
+    ///
+    /// The compactor drops the chunk records a distilled timeline's turns point
+    /// at (`keep_chunks = distill.is_none()`), and nothing removes the in-RAM
+    /// reference to them: maintenance repoints relocated records and the stream
+    /// index is insert-only. A ref left behind therefore names a segment that
+    /// gets unlinked while still reading as a cold copy — which is how an
+    /// archived conversation (`TextOnly`: tokens kept, chunks shed) kept being
+    /// selected, failing `cold-load found no chunks`, and repeating every turn.
+    #[test]
+    fn distillation_clears_the_cold_reference_it_makes_dangling() {
+        for mode in [DistillMode::TextOnly, DistillMode::ProvenanceOnly] {
+            let (_, _, timeline, mut sub) = make_timeline();
+            let cold = vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 4096,
+                    record_len: 4096,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }];
+            let idx = sub.restore_turn(
+                timeline,
+                TurnLayout::default(),
+                TokenBuffer::default(),
+                32,
+                Some(cold),
+                0,
+                1,
+            );
+            assert_eq!(
+                sub.turn_tier_state(timeline, idx).map(|t| t.cold),
+                Some(true),
+                "{mode:?}: the turn starts with a cold copy"
+            );
+
+            sub.distill_timeline(timeline, mode);
+
+            assert_eq!(
+                sub.turn_tier_state(timeline, idx).map(|t| t.cold),
+                Some(false),
+                "{mode:?}: a distilled turn must not advertise a cold copy the \
+                 compactor is about to shed — selection chases it, the load \
+                 fails, and nothing ever clears it"
+            );
+        }
+    }
+
     /// A timeline in an append-only ingest layer (repo_map, code_reading)
     /// never enqueues turns for the summariser, regardless of its own
     /// `summarize` flag — enforced in `push_pending_summary` itself so no
@@ -8134,6 +9460,62 @@ mod tests {
         );
     }
 
+    /// The section counterpart of [`tombstoned_stream_bytes_sums_dead_timelines`]
+    /// — a tombstoned section's on-disk bytes must count as dead weight too,
+    /// or the compaction trigger never sees the corrupted chunks a reactive
+    /// repair leaves behind.
+    #[test]
+    fn tombstoned_stream_bytes_sums_dead_sections() {
+        use crate::persistence::content_hash::ContentHash;
+        use crate::persistence::streams::{ContentAddress, SectionDecl};
+
+        let mut sub = Substrate::new();
+        let decl_for = |lo: u64| {
+            StreamDecl::PromptSection(SectionDecl {
+                address: ContentAddress {
+                    prefix_hash: ContentHash { lo: 1, hi: 0 },
+                    section_hash: ContentHash { lo, hi: 0 },
+                },
+                debug_name: "tool_catalog".to_string(),
+            })
+        };
+        let dead_decl = decl_for(7);
+        let live_decl = decl_for(8);
+        let dead_sid = dead_decl.stream_id();
+        let live_sid = live_decl.stream_id();
+        for (sid, decl) in [(dead_sid, dead_decl), (live_sid, live_decl)] {
+            sub.apply_stream_decl(sid, decl);
+            sub.apply_chunk_loc(
+                sid,
+                0,
+                ChunkLoc {
+                    segment: FIRST_SEGMENT,
+                    offset: 4096,
+                    payload_len: 100,
+                    record_size: 8192,
+                    token_count: 32,
+                    format: 4,
+                },
+            );
+            sub.apply_tokens_loc(
+                sid,
+                RecordLoc {
+                    segment: FIRST_SEGMENT,
+                    offset: 20_480,
+                    payload_len: 64,
+                    record_size: 4096,
+                },
+            );
+        }
+        assert_eq!(sub.tombstoned_stream_bytes(), 0, "nothing tombstoned yet");
+        sub.tombstone_section(dead_sid);
+        assert_eq!(
+            sub.tombstoned_stream_bytes(),
+            8192 + 4096,
+            "only the tombstoned section's chunk + tokens bytes count"
+        );
+    }
+
     /// Gather-scope tag semantics, pinned.
     ///
     /// `SelectionPolicy.tags` documents an empty list as "all projections in
@@ -8224,6 +9606,49 @@ mod tests {
         assert!(sub.decoded_wide_sig(turn_stream_id(1, 99)).is_none());
     }
 
+    /// **Every change a belief gallery is assembled from moves the epoch, and
+    /// reading does not.** A collection's gallery is cached on this epoch, so a
+    /// change that failed to move it would serve a stale gallery — a tombstoned
+    /// turn still voting, or a new exemplar missing — silently.
+    #[test]
+    fn the_gallery_epoch_moves_on_every_change_and_never_on_a_read() {
+        use crate::provenance::encode_wide_sigs;
+        let (_, _, timeline, mut sub) = make_timeline();
+        let sid = turn_stream_id(timeline.raw(), 0);
+        let sig = WideQSig {
+            n_heads: 12,
+            words: vec![0xAAAA_AAAA_AAAA_AAAA; 24],
+        };
+        let mut last = sub.gallery_epoch();
+        let mut moved = |sub: &Substrate, what: &str| {
+            let now = sub.gallery_epoch();
+            assert!(now > last, "{what} must move the gallery epoch");
+            last = now;
+        };
+
+        sub.set_wide_q_sigs_blob(sid, encode_wide_sigs(std::slice::from_ref(&sig)));
+        moved(&sub, "a signature write");
+        sub.set_projection_events_blob(sid, b"[]".to_vec());
+        moved(&sub, "a projection-events write");
+
+        // Reads leave it alone.
+        let before = sub.gallery_epoch();
+        let _ = sub.decoded_wide_sig(sid);
+        let _ = sub.all_streams().count();
+        assert_eq!(
+            sub.gallery_epoch(),
+            before,
+            "a read must not move the epoch"
+        );
+
+        sub.tombstone_timeline(timeline);
+        moved(&sub, "a timeline tombstone");
+        sub.reset();
+        moved(&sub, "a reset");
+        sub.clear_walker_state();
+        moved(&sub, "clearing the streams");
+    }
+
     /// Invalidation is per-stream: rewriting one turn's sig evicts only that
     /// turn's decoded window and leaves every other memo intact — so a single
     /// seal never churns the whole gallery (the point of incremental eviction).
@@ -8306,14 +9731,39 @@ mod tests {
         assert!(*archived);
     }
 
+    /// A tombstoned conversation leaves the listing, so deleting one actually
+    /// removes it from the sidebar.
+    ///
+    /// The regression this pins: a tombstone marks a timeline for reclamation
+    /// but leaves its registry entry in place, so a lister that filtered only
+    /// on `archived` kept serving the deleted row on every hydrate — `DELETE`
+    /// answered 204 and the conversation never went away.
+    #[test]
+    fn a_tombstoned_conversation_is_not_listed() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        sub.set_conv_id(timeline, "abc");
+        sub.set_label(timeline, "tour");
+        assert_eq!(sub.known_conversations().len(), 1);
+
+        sub.tombstone_timeline(timeline);
+        assert!(
+            sub.known_conversations().is_empty(),
+            "a deleted conversation must not survive in the listing"
+        );
+        // Archived is a lifecycle flag the caller filters on; deleted is not,
+        // so it is gone even when the caller asked to see archived rows.
+        sub.set_archived(timeline, true);
+        assert!(sub.known_conversations().is_empty());
+    }
+
     /// **A prefix lookup answers "which are this scheme's?" without the
     /// registry.**
     ///
-    /// `known_conversations` materialises every conversation the workspace has
-    /// ever held, tombstoned ones included, because it feeds a sidebar.
-    /// Retirement bounds the live set and not the registry, so a caller that
-    /// wants one naming scheme's members — npcd's `npc-<id>-day-*` — would pay
-    /// for the whole history of the log on every open, forever.
+    /// `known_conversations` materialises every live conversation the workspace
+    /// holds, because it feeds a sidebar. Retirement bounds the live set and not
+    /// the registry, so a caller that wants one naming scheme's members —
+    /// npcd's `npc-<id>-day-*` — would pay for the whole registry on every
+    /// open, forever.
     ///
     /// Two properties, and the second is the one with teeth: a tombstoned
     /// conversation is not returned, which is what lets the caller treat
@@ -8397,7 +9847,7 @@ mod tests {
             custom: Default::default(),
         };
         sub.apply_conv_meta(timeline.raw(), &meta);
-        sub.apply_conv_state(timeline.raw(), super::ConvState { archived: false });
+        sub.apply_conv_state(timeline.raw(), super::ConvState::default());
         assert!(
             sub.known_conversations().is_empty(),
             "pre-registration: meta stashed, not visible yet"
@@ -8533,7 +9983,95 @@ mod tests {
             .iter()
             .find(|e| e.0 == tl.raw())
             .expect("timeline in live meta");
-        assert_eq!(entry.4.get("path").map(String::as_str), Some("src/lib.rs"));
+        assert_eq!(entry.3.get("path").map(String::as_str), Some("src/lib.rs"));
+    }
+
+    // ── Conversation state (archived + branches) ────────────────────────
+
+    /// **A branch is set per repository, and only a change counts.** The
+    /// state carries it beside `archived`, and `live_conv_states` — what
+    /// compaction and maintenance re-emit — carries every non-default state
+    /// whole, so a branch survives a rewrite of the log.
+    #[test]
+    fn branches_are_set_per_repository_and_re_emitted_whole() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let (a, b) = (alloc.next(), alloc.next());
+        let mut sub = Substrate::new();
+        sub.register_timeline(a, layer, group);
+        sub.register_timeline(b, layer, group);
+
+        assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
+        assert!(sub.set_branch(a, "candle", "main"));
+        assert!(!sub.set_branch(a, "candle", "main"), "no change, no write");
+        assert!(sub.set_branch(a, "mind", "master"));
+        assert!(sub.set_branch(a, "candle", "zen/work"));
+        assert!(sub.set_archived(b, true));
+        assert!(
+            !sub.set_branch(alloc.next(), "candle", "main"),
+            "unregistered"
+        );
+
+        let a_state = super::ConvState {
+            archived: false,
+            branches: [("candle", "zen/work"), ("mind", "master")]
+                .into_iter()
+                .map(|(r, b)| (r.to_string(), b.to_string()))
+                .collect(),
+            active: 0,
+        };
+        assert_eq!(sub.conv_state(a), Some(a_state.clone()));
+        let b_state = super::ConvState {
+            archived: true,
+            branches: Default::default(),
+            active: 0,
+        };
+        assert_eq!(
+            sub.live_conv_states(),
+            vec![(a.raw(), a_state), (b.raw(), b_state)]
+        );
+
+        // A replayed record replaces the state whole.
+        sub.apply_conv_state(a.raw(), super::ConvState::default());
+        assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
+        assert_eq!(sub.live_conv_states().len(), 1, "a is untouched again");
+    }
+
+    /// **The last use outranks every earlier one, and survives replay.** Each
+    /// touch stamps the next rank; a replayed state restores its rank exactly,
+    /// whatever order the records arrive in, and the next touch still lands
+    /// above every rank replayed.
+    #[test]
+    fn a_touch_outranks_every_earlier_use_and_replay_restores_it() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let (a, b) = (alloc.next(), alloc.next());
+        let mut sub = Substrate::new();
+        sub.register_timeline(a, layer, group);
+        sub.register_timeline(b, layer, group);
+
+        assert!(sub.touch_conversation(a));
+        assert!(sub.touch_conversation(b));
+        assert!(sub.touch_conversation(a));
+        assert!(!sub.touch_conversation(alloc.next()), "unregistered");
+        assert_eq!(sub.conv_state(a).unwrap().active, 3);
+        assert_eq!(sub.conv_state(b).unwrap().active, 2);
+
+        // Replay into a fresh substrate, the later-used record first — the
+        // order compaction's timeline-ordered re-emit can produce.
+        let states = sub.live_conv_states();
+        let mut replayed = Substrate::new();
+        replayed.register_timeline(a, layer, group);
+        replayed.register_timeline(b, layer, group);
+        for (tl, state) in states.into_iter().rev() {
+            replayed.apply_conv_state(tl, state);
+        }
+        assert_eq!(replayed.conv_state(a).unwrap().active, 3);
+        assert_eq!(replayed.conv_state(b).unwrap().active, 2);
+        assert!(replayed.touch_conversation(b));
+        assert_eq!(replayed.conv_state(b).unwrap().active, 4);
     }
 
     #[test]

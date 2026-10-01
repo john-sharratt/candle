@@ -8,7 +8,7 @@
 //!   own, rather than a folder and a mysterious file beside it.
 //! - **Extensions are gone**, because they were never the reader's business.
 //! - **Only the nine sections exist.** A folder that is not one cannot be
-//!   named, so `node_modules` and the daemon's `.substrate` are not filtered
+//!   named, so `node_modules` and the daemon's `substrate` are not filtered
 //!   out of the listing — they are not in the vocabulary.
 //! - **Sizes are what the thing is.** A collection has a count of what is in
 //!   it; an entry has a length. Not one column meaning two things.
@@ -403,7 +403,7 @@ mod tests {
             "worlds",
             // Not part of the corpus, and not addressable.
             "node_modules/x",
-            ".substrate",
+            "substrate",
             "scratchpad",
         ] {
             fs::create_dir_all(root.join(dir)).unwrap();

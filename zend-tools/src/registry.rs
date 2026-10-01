@@ -1,4 +1,4 @@
-//! Static registry of all 93 tool implementations.
+//! Static registry of all 106 tool implementations.
 //!
 //! # How a tool is registered
 //!
@@ -32,7 +32,8 @@ use serde_json::{json, Value};
 use validator::Validate;
 
 use crate::context::ToolContext;
-use crate::tool::{ConfirmationDetails, Tool, ToolError};
+use crate::grants::{Capability, NotPermitted};
+use crate::tool::{ConfirmationDetails, Replay, Tool, ToolError};
 
 /// A type-erased **execution** registration for the static tool table. Tool
 /// *definitions* — name (shared here as the execution binding), description, the
@@ -45,13 +46,31 @@ pub struct RegisteredTool {
     /// bind to this executor by.
     pub name: &'static str,
     /// Dispatch entry — parses, validates, runs the tool, encodes result.
-    /// The returned `Value` is what the orchestrator places inside the
-    /// `<tool_response>` block (success payload OR an `{"error": ...}` shape).
-    pub run: fn(&ToolContext, &Value) -> Value,
+    /// Private: [`RegisteredTool::call`] is the only way to reach it, and it
+    /// checks [`Self::requires`] first.
+    run: fn(&ToolContext, &Value) -> Value,
+    /// The capabilities a call needs — see [`crate::grants`]. Checked against
+    /// the context's grants before the tool's code runs.
+    pub requires: &'static [Capability],
     /// Returns confirmation details if this tool wants a user prompt.
     /// Returns `None` if either no confirmation is needed *or* the args
     /// could not be parsed (in which case `run` will surface the error).
     pub confirmation: fn(&Value) -> Option<ConfirmationDetails>,
+    /// Whether this call may be re-issued when a turn resumes after a restart
+    /// ([`Tool::replay`]). Consulted only on the resume path; a live turn runs
+    /// every call it asks for.
+    pub replay: fn(&Value) -> Replay,
+    /// The JSON Schema `schemars` derives from this tool's `Request` type.
+    ///
+    /// The schema a model is *shown* is the hand-written one in the tool's
+    /// bundled definition (`zend::tool_def`), not this — the two are separate
+    /// on purpose, because the definition carries trigger-rich prose the
+    /// derive could never produce. This exists so the two can be compared: a
+    /// definition that names a field the request does not have is a parameter
+    /// the model is told to send and the tool silently ignores, and one that
+    /// omits a required field is a call the grammar can never complete.
+    /// Neither shows up until a call fails at run time.
+    pub schema: fn() -> Value,
 }
 
 impl RegisteredTool {
@@ -60,8 +79,39 @@ impl RegisteredTool {
         Self {
             name: T::NAME,
             run: tool_run::<T>,
+            requires: &[],
             confirmation: tool_confirmation::<T>,
+            replay: tool_replay::<T>,
+            schema: tool_schema::<T>,
         }
+    }
+
+    /// This registration, needing `caps` — see [`register_all`].
+    pub const fn requires(mut self, caps: &'static [Capability]) -> Self {
+        self.requires = caps;
+        self
+    }
+
+    /// Run a call. The returned `Value` is what the orchestrator places inside
+    /// the `<tool_response>` block (success payload OR an `{"error": ...}`
+    /// shape).
+    ///
+    /// **Refused without running when the context lacks a capability this tool
+    /// requires** — before its arguments are parsed, so nothing the call
+    /// carries is acted on.
+    pub fn call(&self, ctx: &ToolContext, args: &Value) -> Value {
+        if let Err(denied) = ctx.grants().require_all(self.requires) {
+            tracing::warn!(
+                tool = self.name,
+                capability = %denied.0,
+                "tool call refused: the context lacks a capability this tool requires",
+            );
+            return json!({
+                "error": NotPermitted::CODE,
+                "detail": denied.to_string(),
+            });
+        }
+        (self.run)(ctx, args)
     }
 }
 
@@ -97,6 +147,25 @@ fn tool_confirmation<T: Tool>(args: &Value) -> Option<ConfirmationDetails> {
         return None;
     }
     T::confirmation(&req)
+}
+
+/// The schema `schemars` derives from `T::Request`.
+fn tool_schema<T: Tool>() -> Value {
+    let root = schemars::gen::SchemaGenerator::default().into_root_schema_for::<T::Request>();
+    serde_json::to_value(root).unwrap_or(Value::Null)
+}
+
+fn tool_replay<T: Tool>(args: &Value) -> Replay {
+    // Arguments that do not parse or validate never reach `run`, so re-issuing
+    // the call has no effect beyond the `invalid_arguments` it already returns
+    // — and answering it with that is more use to the model than a refusal.
+    let Ok(req) = serde_json::from_value::<T::Request>(args.clone()) else {
+        return Replay::Safe;
+    };
+    if req.validate().is_err() {
+        return Replay::Safe;
+    }
+    T::replay(&req)
 }
 
 // ── Error formatters ──────────────────────────────────────────────────────────
@@ -146,6 +215,15 @@ pub fn find(name: &str) -> Option<&'static RegisteredTool> {
         .find(|(_, aliases)| aliases.contains(&name))?
         .0;
     all_tools().iter().find(|t| t.name == canon)
+}
+
+/// The alternate names `canonical` answers to — empty for a tool with none,
+/// or a name that is not a registered tool.
+pub fn aliases(canonical: &str) -> &'static [&'static str] {
+    ALIAS_GROUPS
+        .iter()
+        .find(|(c, _)| *c == canonical)
+        .map_or(&[], |(_, aliases)| *aliases)
 }
 
 /// Alternate names the model may emit for a tool, beyond its canonical
@@ -285,12 +363,175 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "file_search",
+        &[
+            "find_file",
+            "find_files",
+            "locate_file",
+            "search_filenames",
+            "search_files",
+            "find_by_name",
+            "which_file",
+            "glob",
+            "fd",
+            "where_is",
+        ],
+    ),
+    (
+        "file_grep",
+        &[
+            "grep",
+            "rg",
+            "ripgrep",
+            "search_code",
+            "code_search",
+            "find_in_files",
+            "search_contents",
+            "find_text",
+            "find_usages",
+            "find_references",
+            "search_source",
+        ],
+    ),
+    (
         "file_delete",
         &["delete_file", "rm", "remove_file", "fs_delete", "unlink"],
     ),
     (
         "file_present",
         &["show_file", "present_file", "display_file"],
+    ),
+    (
+        "git_status",
+        &["git_state", "repo_status", "working_tree_status", "git_st"],
+    ),
+    (
+        "git_log",
+        &[
+            "git_history",
+            "commit_log",
+            "commit_history",
+            "list_commits",
+        ],
+    ),
+    // `git_diff`, `git_blame` and the like are what a model reaches for by
+    // habit, and each is one of git_show's modes: the name lands on the tool
+    // that does the job, and the mode is picked from `what` inside it.
+    (
+        "git_show",
+        &[
+            "git_diff",
+            "git_file",
+            "git_blame",
+            "git_patch",
+            "show_commit",
+            "commit_patch",
+            "commit_diff",
+            "git_changes",
+            "changed_files",
+            "blame",
+            "annotate",
+            "line_history",
+            "git_cat_file",
+            "file_at_revision",
+            "show_file_at",
+            "git_show_file",
+            "git_ls_tree",
+        ],
+    ),
+    (
+        "git_grep",
+        &["grep_revision", "search_history", "grep_at_revision"],
+    ),
+    // Remote lookups land here rather than on git_fetch. `git_remote_update`
+    // is a fetch in git itself, but measured live the model reached for it to
+    // learn where a repository pushes — was refused for want of `disk_write`,
+    // and burned a round. A name about a remote is, for the model, a question
+    // about the remote, so it resolves to the tool that answers one.
+    (
+        "git_refs",
+        &[
+            "git_branches",
+            "git_tags",
+            "git_remotes",
+            "list_branches",
+            "branches",
+            "show_branches",
+            "list_tags",
+            "tags",
+            "show_tags",
+            "list_remotes",
+            "remotes",
+            "show_remotes",
+            "git_remote",
+            "git_remote_show",
+            "git_remote_update",
+            "git_remote_get_url",
+            "remote_url",
+            "get_remote_url",
+        ],
+    ),
+    (
+        "git_commit",
+        &[
+            "commit",
+            "make_commit",
+            "record_commit",
+            "git_ci",
+            "git_apply",
+            "apply_patch",
+            "land_patch",
+            "apply_diff",
+            "git_pick",
+            "cherry_pick",
+            "git_cherry_pick",
+            "git_revert",
+            "revert_commit",
+            "backport",
+        ],
+    ),
+    (
+        "git_ref",
+        &[
+            "git_branch",
+            "git_tag",
+            "create_branch",
+            "delete_branch",
+            "move_branch",
+            "new_branch",
+            "create_tag",
+            "delete_tag",
+            "make_tag",
+        ],
+    ),
+    (
+        "git_switch",
+        &[
+            "git_checkout",
+            "checkout",
+            "switch_branch",
+            "checkout_branch",
+            "git_checkout_branch",
+        ],
+    ),
+    (
+        "git_merge",
+        &["merge", "git_pull", "pull", "merge_branch", "pull_latest"],
+    ),
+    (
+        "git_reset",
+        &[
+            "reset",
+            "undo_commit",
+            "discard_changes",
+            "git_restore",
+            "reset_branch",
+        ],
+    ),
+    ("git_fetch", &["fetch_remote", "fetch_origin"]),
+    (
+        "git_push",
+        &["push", "publish_branch", "push_branch", "git_publish"],
     ),
     (
         "notes_write",
@@ -705,6 +946,23 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
         &["code_close", "close_code", "close_repl", "end_code_session"],
     ),
     (
+        "run_command",
+        &[
+            "execute_command",
+            "run_shell_command",
+            "shell",
+            "bash",
+            "terminal",
+            "run_tests",
+            "exec_command",
+            "run_terminal_cmd",
+        ],
+    ),
+    (
+        "run_output",
+        &["command_output", "job_output", "read_output", "run_log"],
+    ),
+    (
         "sub_run",
         &[
             "subagent",
@@ -727,7 +985,14 @@ use crate::tools::{
         SIGNATURE_SIGN, SIGNATURE_VERIFY,
     },
     datetime::REGISTRATION as DATETIME,
-    file::{FILE_DELETE, FILE_EDIT, FILE_LIST, FILE_PRESENT, FILE_READ, FILE_WRITE},
+    file::{
+        FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_LIST, FILE_PRESENT, FILE_READ, FILE_SEARCH,
+        FILE_WRITE,
+    },
+    git::{
+        GIT_COMMIT, GIT_FETCH, GIT_GREP, GIT_LOG, GIT_MERGE, GIT_PUSH, GIT_REF, GIT_REFS,
+        GIT_RESET, GIT_SHOW, GIT_STATUS, GIT_SWITCH,
+    },
     hash::{HASH_COMPUTE, HASH_SCAN},
     hash_state::{HASH_STATE_FINALIZE, HASH_STATE_INIT, HASH_STATE_UPDATE},
     http_session::{
@@ -742,6 +1007,7 @@ use crate::tools::{
         REMOTE_FS_SESSION_OPEN, REMOTE_FS_SESSION_PUT, REMOTE_FS_SESSION_RENAME,
         REMOTE_FS_SESSION_STAT,
     },
+    run::{RUN_COMMAND, RUN_OUTPUT},
     sql_session::{SQL_SESSION_CLOSE, SQL_SESSION_LIST, SQL_SESSION_OPEN, SQL_SESSION_QUERY},
     ssh::{
         SSH_SESSION_CLOSE, SSH_SESSION_EXEC, SSH_SESSION_EXEC_ASYNC, SSH_SESSION_LIST,
@@ -766,103 +1032,160 @@ use crate::tools::{
 };
 
 fn register_all() -> &'static [RegisteredTool] {
-    // High-risk (`.risky()`) = side effects or reaches outside the host:
-    // mutation, code execution, remote/network access, credentials, scanning.
-    // These are the tools omitted in "Restricted" mode. Safe tools (local
-    // read-only + pure compute) carry no marker.
+    use Capability::{DiskWrite, Exec, Network, Sandbox, Secrets};
+    // What each family needs from the context — see `crate::grants`. A tool
+    // with no entry needs nothing: it computes, or works on the in-memory
+    // stores. The file tools need nothing here because the store never writes
+    // the disk: their changes stay in the conversation's overlay.
+    const NET: &[Capability] = &[Network];
+    const NET_EXEC: &[Capability] = &[Network, Exec];
+    const NET_SECRETS: &[Capability] = &[Network, Secrets];
+    const EXEC: &[Capability] = &[Exec];
+    const SANDBOX: &[Capability] = &[Sandbox];
+    const SECRETS: &[Capability] = &[Secrets];
+    // SQLite opens any path it is given, and `ATTACH` or `VACUUM INTO` create
+    // files from any session, `:memory:` included — so the whole family is a
+    // disk writer.
+    const DISK: &[Capability] = &[DiskWrite];
+    // A git fetch or push both reaches a remote and writes refs locally.
+    const NET_DISK: &[Capability] = &[Network, DiskWrite];
+    // A command starts a program on a checkout of the repository's folder, and
+    // the programs a sandbox lists reach the network themselves (`npm
+    // install`, `cargo fetch`) — nothing stands between them and it.
+    const NET_EXEC_DISK: &[Capability] = &[Network, Exec, DiskWrite];
+
+    // Which tools Restricted mode offers is decided in `zend` from each
+    // definition's `high_risk` flag and these declarations together; the
+    // family comments below note why a family needs what it declares.
     static TOOLS: &[RegisteredTool] = &[
-        // Shared tools (7) — all safe (compute + web read)
+        // Shared tools (7) — compute, and web reads that need the network
         DATETIME,
         CALC,
         UNIT_CONVERT,
         RANDOM,
-        WEB_SEARCH,
-        WEB_FETCH,
-        WEATHER,
-        // File tools (6) — reads safe, mutations high-risk
+        WEB_SEARCH.requires(NET),
+        WEB_FETCH.requires(NET),
+        WEATHER.requires(NET),
+        // File tools (8) — all safe: every change is held in the overlay
         FILE_WRITE,
         FILE_READ,
         FILE_EDIT,
         FILE_LIST,
+        FILE_SEARCH,
+        FILE_GREP,
         FILE_DELETE,
         FILE_PRESENT,
+        // Git tools (9) — the split that decides the whole family.
+        //
+        // The readers declare nothing and are not high-risk, so every mode
+        // offers them: they answer questions about the repository's history
+        // and change none of it. Running the `git` program is deliberately
+        // not `Exec` — see the family's module docs — because every argument
+        // is built by the layer from values validated at their type boundary,
+        // never a command the model composed.
+        //
+        // Four tools rather than a dozen readers: `git_show`'s `what` and
+        // `git_refs`' `kind` carry distinctions that used to be separate
+        // tools, where the choice between them was made in the projection's
+        // top-k and went wrong. Inside a call, the grammar decides them.
+        GIT_STATUS,
+        GIT_LOG,
+        GIT_SHOW,
+        GIT_GREP,
+        GIT_REFS,
+        // The writers declare DiskWrite, which Restricted's grants withhold —
+        // so changing a repository is Comprehensive's alone, and a call that
+        // arrives anyway is refused before its arguments are parsed.
+        // Every one of them also reaches origin: a branch write is kept only
+        // once origin has it.
+        GIT_COMMIT.requires(NET_DISK),
+        GIT_MERGE.requires(NET_DISK),
+        GIT_REF.requires(NET_DISK),
+        GIT_SWITCH.requires(NET_DISK),
+        GIT_RESET.requires(NET_DISK),
+        GIT_FETCH.requires(NET_DISK),
+        GIT_PUSH.requires(NET_DISK),
         // Notes tools (4) — reads safe, write high-risk
         NOTES_WRITE,
         NOTES_READ,
         NOTES_SEARCH,
         NOTES_LIST,
         // Credential tools (3) — all high-risk (secrets)
-        CREDENTIAL_SAVE,
-        CREDENTIAL_LIST,
-        CREDENTIAL_DELETE,
-        // SSH tools (6) — all high-risk (remote exec)
-        SSH_SESSION_OPEN,
-        SSH_SESSION_EXEC,
-        SSH_SESSION_EXEC_ASYNC,
-        SSH_SESSION_POLL,
-        SSH_SESSION_LIST,
-        SSH_SESSION_CLOSE,
-        // Telnet tools (4) — all high-risk (remote access)
-        TELNET_SESSION_OPEN,
-        TELNET_SESSION_SEND,
-        TELNET_SESSION_LIST,
-        TELNET_SESSION_CLOSE,
+        CREDENTIAL_SAVE.requires(SECRETS),
+        CREDENTIAL_LIST.requires(SECRETS),
+        CREDENTIAL_DELETE.requires(SECRETS),
+        // SSH tools (6) — all high-risk. Commands run on the remote host, not
+        // this one, so a session is network (and its credential), not `Exec`.
+        SSH_SESSION_OPEN.requires(NET_SECRETS),
+        SSH_SESSION_EXEC.requires(NET),
+        SSH_SESSION_EXEC_ASYNC.requires(NET),
+        SSH_SESSION_POLL.requires(NET),
+        SSH_SESSION_LIST.requires(NET),
+        SSH_SESSION_CLOSE.requires(NET),
+        // Telnet tools (4) — all high-risk (a remote shell, as SSH)
+        TELNET_SESSION_OPEN.requires(NET_SECRETS),
+        TELNET_SESSION_SEND.requires(NET),
+        TELNET_SESSION_LIST.requires(NET),
+        TELNET_SESSION_CLOSE.requires(NET),
         // HTTP session tools (4) — all high-risk (network)
-        HTTP_SESSION_OPEN,
-        HTTP_SESSION_REQUEST,
-        HTTP_SESSION_LIST,
-        HTTP_SESSION_CLOSE,
+        HTTP_SESSION_OPEN.requires(NET_SECRETS),
+        HTTP_SESSION_REQUEST.requires(NET),
+        HTTP_SESSION_LIST.requires(NET),
+        HTTP_SESSION_CLOSE.requires(NET),
         // TCP tools (5) — all high-risk (raw sockets)
-        TCP_SESSION_OPEN,
-        TCP_SESSION_SEND,
-        TCP_SESSION_RECV,
-        TCP_SESSION_LIST,
-        TCP_SESSION_CLOSE,
+        TCP_SESSION_OPEN.requires(NET),
+        TCP_SESSION_SEND.requires(NET),
+        TCP_SESSION_RECV.requires(NET),
+        TCP_SESSION_LIST.requires(NET),
+        TCP_SESSION_CLOSE.requires(NET),
         // UDP tools (5) — all high-risk (raw sockets)
-        UDP_SESSION_OPEN,
-        UDP_SESSION_SEND,
-        UDP_SESSION_RECV,
-        UDP_SESSION_LIST,
-        UDP_SESSION_CLOSE,
+        UDP_SESSION_OPEN.requires(NET),
+        UDP_SESSION_SEND.requires(NET),
+        UDP_SESSION_RECV.requires(NET),
+        UDP_SESSION_LIST.requires(NET),
+        UDP_SESSION_CLOSE.requires(NET),
         // TLS tools (5) — all high-risk (raw sockets)
-        TLS_SESSION_OPEN,
-        TLS_SESSION_SEND,
-        TLS_SESSION_RECV,
-        TLS_SESSION_LIST,
-        TLS_SESSION_CLOSE,
-        // SQL tools (4) — all high-risk (database access)
-        SQL_SESSION_OPEN,
-        SQL_SESSION_QUERY,
-        SQL_SESSION_LIST,
-        SQL_SESSION_CLOSE,
+        TLS_SESSION_OPEN.requires(NET),
+        TLS_SESSION_SEND.requires(NET),
+        TLS_SESSION_RECV.requires(NET),
+        TLS_SESSION_LIST.requires(NET),
+        TLS_SESSION_CLOSE.requires(NET),
+        // SQL tools (4) — all high-risk (SQLite files on the host's disk)
+        SQL_SESSION_OPEN.requires(DISK),
+        SQL_SESSION_QUERY.requires(DISK),
+        SQL_SESSION_LIST.requires(DISK),
+        SQL_SESSION_CLOSE.requires(DISK),
         // Remote FS tools (10) — all high-risk (remote files)
-        REMOTE_FS_SESSION_OPEN,
-        REMOTE_FS_SESSION_LIST_DIR,
-        REMOTE_FS_SESSION_STAT,
-        REMOTE_FS_SESSION_GET,
-        REMOTE_FS_SESSION_PUT,
-        REMOTE_FS_SESSION_DELETE,
-        REMOTE_FS_SESSION_MKDIR,
-        REMOTE_FS_SESSION_RENAME,
-        REMOTE_FS_SESSION_LIST,
-        REMOTE_FS_SESSION_CLOSE,
-        // Network diagnostics (6) — lookups safe, scanning high-risk
-        DNS_LOOKUP,
-        PING_ICMP,
-        TRACE_ROUTE,
-        PORT_SCAN,
-        IP_SCAN,
-        HOST_INFO,
-        // Security utilities (3) — all safe (compute)
+        REMOTE_FS_SESSION_OPEN.requires(NET_SECRETS),
+        REMOTE_FS_SESSION_LIST_DIR.requires(NET),
+        REMOTE_FS_SESSION_STAT.requires(NET),
+        REMOTE_FS_SESSION_GET.requires(NET),
+        REMOTE_FS_SESSION_PUT.requires(NET),
+        REMOTE_FS_SESSION_DELETE.requires(NET),
+        REMOTE_FS_SESSION_MKDIR.requires(NET),
+        REMOTE_FS_SESSION_RENAME.requires(NET),
+        REMOTE_FS_SESSION_LIST.requires(NET),
+        REMOTE_FS_SESSION_CLOSE.requires(NET),
+        // Network diagnostics (6) — every one reaches the network; ping and
+        // trace_route also start a local program
+        DNS_LOOKUP.requires(NET),
+        PING_ICMP.requires(NET_EXEC),
+        TRACE_ROUTE.requires(NET_EXEC),
+        PORT_SCAN.requires(NET),
+        IP_SCAN.requires(NET),
+        HOST_INFO.requires(NET),
+        // Security utilities (3) — compute; TOTP reads its seed from the
+        // credential store
         HASH_SCAN,
         HASH_COMPUTE,
-        TOTP,
-        // Crypto primitives (8) — all safe (pure compute, no external effect)
+        TOTP.requires(SECRETS),
+        // Crypto primitives (8) — pure compute over the arguments, except
+        // signing, which reads its private key from the credential store
         AEAD_ENCRYPT,
         AEAD_DECRYPT,
         HMAC_COMPUTE,
         SIGNATURE_VERIFY,
-        SIGNATURE_SIGN,
+        SIGNATURE_SIGN.requires(SECRETS),
         KDF_DERIVE,
         HKDF_EXTRACT,
         HKDF_EXPAND_LABEL,
@@ -875,16 +1198,209 @@ fn register_all() -> &'static [RegisteredTool] {
         BYTES_PACK,
         BYTES_UNPACK,
         BYTES_XOR,
-        // Code execution (5) — JavaScript on the embedded sandboxed engine
-        CODE_RUN,
-        CODE_SESSION_OPEN,
-        CODE_SESSION_EXEC,
-        CODE_SESSION_LIST,
-        CODE_SESSION_CLOSE,
+        // Code execution (5) — JavaScript on the embedded sandboxed engine,
+        // whose only filesystem is the context's file store
+        CODE_RUN.requires(SANDBOX),
+        CODE_SESSION_OPEN.requires(SANDBOX),
+        CODE_SESSION_EXEC.requires(SANDBOX),
+        CODE_SESSION_LIST.requires(SANDBOX),
+        CODE_SESSION_CLOSE.requires(SANDBOX),
         // Subagent (1) — high-risk (delegated agency)
-        SUBAGENT,
+        SUBAGENT.requires(EXEC),
+        // Commands (2) — a program run on this host, in a repository's
+        // sandbox: `Exec` to start it, `DiskWrite` for the checkout it runs
+        // on, `Network` for what the listed toolchains fetch. Reading a run's
+        // log needs `Exec` too — only a context that may run programs has
+        // runs to read.
+        RUN_COMMAND.requires(NET_EXEC_DISK),
+        RUN_OUTPUT.requires(EXEC),
     ];
     TOOLS
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::grants::Grants;
+
+    /// **With no grants, every tool that needs one is refused before it runs.**
+    /// Each is called with arguments that would otherwise do something real
+    /// (or at least reach its code); the answer must be the refusal naming the
+    /// capability, whatever the arguments.
+    #[test]
+    fn every_capability_bearing_tool_refuses_a_context_without_it() {
+        let ctx = ToolContext::new();
+        let gated: Vec<&RegisteredTool> = all_tools()
+            .iter()
+            .filter(|t| !t.requires.is_empty())
+            .collect();
+        assert!(
+            gated.len() > 50,
+            "only {} tools declare a capability",
+            gated.len()
+        );
+        for tool in gated {
+            let out = tool.call(
+                &ctx,
+                &json!({"host": "127.0.0.1", "code": "1", "url": "http://127.0.0.1/"}),
+            );
+            assert_eq!(out["error"], NotPermitted::CODE, "{} ran: {out}", tool.name);
+        }
+    }
+
+    /// Granting one capability does not open tools that need another.
+    #[test]
+    fn a_partial_grant_opens_only_what_it_covers() {
+        let ctx = ToolContext::new().granting(Grants::NONE.with(Capability::Network));
+        let exec = find("code_run").unwrap();
+        assert_eq!(
+            exec.call(&ctx, &json!({"code": "1"}))["error"],
+            NotPermitted::CODE
+        );
+        let ping = find("ping_icmp").unwrap();
+        assert_eq!(
+            ping.call(&ctx, &json!({"host": "127.0.0.1"}))["error"],
+            NotPermitted::CODE,
+            "network alone does not start a local program"
+        );
+    }
+
+    /// The families that act outside the conversation all declare it: the
+    /// names are the policy, spelled out, so a change to it is a visible diff.
+    #[test]
+    fn the_high_risk_families_declare_their_capabilities() {
+        let needs = |name: &str| find(name).unwrap_or_else(|| panic!("{name}")).requires;
+        for name in [
+            "web_fetch",
+            "web_search",
+            "weather",
+            "http_request",
+            "tcp_session_open",
+            "dns_lookup",
+            "port_scan",
+        ] {
+            assert!(needs(name).contains(&Capability::Network), "{name}");
+        }
+        // Exec is a program running on this host.
+        for name in ["ping_icmp", "trace_route", "sub_run", "run_output"] {
+            assert!(needs(name).contains(&Capability::Exec), "{name}");
+        }
+        // A command runs on a checkout of the repository's folder, and what
+        // it runs reaches the network.
+        assert_eq!(
+            needs("run_command"),
+            [Capability::Network, Capability::Exec, Capability::DiskWrite]
+        );
+        // Model-written code runs in the sandbox, not as a host program.
+        for name in ["code_run", "code_session_exec", "code_session_open"] {
+            assert_eq!(needs(name), [Capability::Sandbox], "{name}");
+        }
+        // A remote shell runs on the remote host.
+        for name in ["ssh_session_exec", "telnet_send"] {
+            assert!(!needs(name).contains(&Capability::Exec), "{name}");
+        }
+        for name in ["credential_delete", "credential_save", "ssh_open"] {
+            assert!(needs(name).contains(&Capability::Secrets), "{name}");
+        }
+        for name in ["sql_session_open", "sql_session_query"] {
+            assert!(needs(name).contains(&Capability::DiskWrite), "{name}");
+        }
+        for name in ["file_read", "file_write", "calculator", "notes_read"] {
+            assert!(needs(name).is_empty(), "{name}");
+        }
+    }
+
+    /// **The git family's whole safety story, as one assertion.**
+    ///
+    /// Reading a repository is available wherever tools are; changing one is
+    /// not. The mechanism is `DiskWrite`, which `zend::access::grants`
+    /// withholds from Restricted and gives to Comprehensive — so declaring it
+    /// here is what confines a writer to Comprehensive, both in what is
+    /// offered and in what would run.
+    ///
+    /// A new git tool must land in one of these two lists, and the final
+    /// assertion makes forgetting a compile-time-visible test failure rather
+    /// than a tool that quietly escapes the split.
+    #[test]
+    fn git_reads_are_open_and_every_git_write_needs_disk_write() {
+        let needs = |name: &str| find(name).unwrap_or_else(|| panic!("{name}")).requires;
+
+        const READERS: [&str; 5] = ["git_status", "git_log", "git_show", "git_grep", "git_refs"];
+        const WRITERS: [&str; 7] = [
+            "git_commit",
+            "git_merge",
+            "git_ref",
+            "git_switch",
+            "git_reset",
+            "git_fetch",
+            "git_push",
+        ];
+
+        for name in READERS {
+            assert!(
+                needs(name).is_empty(),
+                "{name} is a read and must need no capability",
+            );
+        }
+        for name in WRITERS {
+            assert!(
+                needs(name).contains(&Capability::DiskWrite),
+                "{name} changes a repository and must declare DiskWrite",
+            );
+        }
+        // Reaching origin is declared on top of the disk write: every write
+        // is kept only once origin has it.
+        for name in WRITERS {
+            assert!(needs(name).contains(&Capability::Network), "{name}");
+        }
+        // Nothing here is `Exec`: the layer runs `git` with arguments it
+        // built itself, never a command the model composed.
+        for name in READERS.iter().chain(WRITERS.iter()) {
+            assert!(
+                !needs(name).contains(&Capability::Exec),
+                "{name} must not declare Exec",
+            );
+        }
+
+        let registered: Vec<&str> = all_tools()
+            .iter()
+            .map(|t| t.name)
+            .filter(|n| n.starts_with("git_"))
+            .collect();
+        assert_eq!(
+            registered.len(),
+            READERS.len() + WRITERS.len(),
+            "a git tool was registered without being placed on the read/write \
+             split: {registered:?}",
+        );
+    }
+
+    /// **A writer is refused before its arguments are parsed.** The context
+    /// here holds every capability but `DiskWrite` and still cannot commit, so
+    /// the refusal is the capability and not a missing workspace.
+    #[test]
+    fn a_grant_set_without_disk_write_refuses_every_git_writer() {
+        let all_but_disk = Grants::NONE
+            .with(Capability::Network)
+            .with(Capability::Exec)
+            .with(Capability::Sandbox)
+            .with(Capability::Secrets);
+        let ctx = ToolContext::new().granting(all_but_disk);
+        for name in [
+            "git_commit",
+            "git_merge",
+            "git_ref",
+            "git_switch",
+            "git_reset",
+            "git_fetch",
+            "git_push",
+        ] {
+            let out = find(name).unwrap().call(&ctx, &json!({"repo": "app"}));
+            assert_eq!(out["error"], NotPermitted::CODE, "{name} ran: {out}");
+        }
+    }
 }
 
 #[cfg(test)]

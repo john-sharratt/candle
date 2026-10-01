@@ -70,10 +70,45 @@ pub fn percept(world: &World, id: &str) -> String {
     }
 
     let mut paragraphs: Vec<String> = vec![standing(world, actor)];
+    // The lift's whereabouts, when standing at its shaft. Dynamic — the car
+    // moves — so it lives in the percept and is re-sent as it changes, unlike
+    // the room's fixed description.
+    if let Some(line) = lift_status(world, id, &actor.at) {
+        paragraphs.push(line);
+    }
     if let Some(p) = around(world, actor) {
         paragraphs.push(p);
     }
     paragraphs.join("\n\n") + "\n"
+}
+
+/// Whether the lift's car is at this landing, for a body standing on it — the
+/// one dynamic thing about a shaft. `None` when the place is not a landing (so
+/// most rooms say nothing) or the building has no lift.
+fn lift_status(world: &World, id: &str, at: &Where) -> Option<String> {
+    let floor = world.shaft().iter().position(|c| c == at)?;
+    let lift = world.lift()?;
+    // Already aboard for a floor: the choice is made, so the line is the wait, not
+    // an invitation to call a car you are riding.
+    if let Some(dest) = world.riding(id) {
+        return Some(match world.floor_name(dest) {
+            Some(name) => {
+                format!("You have boarded the lift, bound for {name}. Wait for it to arrive.")
+            }
+            None => "You have boarded the lift. Wait for it to arrive.".to_string(),
+        });
+    }
+    Some(if lift.boardable_at(floor) {
+        "The lift is here, its doors open. You can step in and ride it to another level."
+            .to_string()
+    } else {
+        match world.floor_name(lift.floor()) {
+            Some(name) => {
+                format!("The lift is not here — it is at {name}. Call it to bring it to you.")
+            }
+            None => "The lift is not here. Call it to bring it to you.".to_string(),
+        }
+    })
 }
 
 /// What a place is, in the words whoever built it wrote down.
@@ -82,8 +117,8 @@ pub fn percept(world: &World, id: &str) -> String {
 /// body arriving somewhere new is told only its name and who is in it, which is
 /// the same thing it was told about the last four rooms — so every room in the
 /// vault reads alike and there is nothing to have an opinion about. The lift
-/// being a car and a stairwell sharing one shaft is the difference between a
-/// place and a label.
+/// being one car that serves every level from a single corner is the difference
+/// between a place and a label.
 ///
 /// **Said on arrival and not in the percept**, which is where it started. A
 /// percept is what is true *now*, and it is re-sent whenever any of it changes

@@ -36,6 +36,17 @@ pub struct MapSet {
     /// portals of whichever area declares them — both ways, since a lift that
     /// only went up would be a lift nobody could come back down.
     ways: BTreeMap<Where, Vec<Where>>,
+    /// The global ordinal the **first** instance of a part in a node gets, so an
+    /// instance id can be `<part>~<global-ordinal>` — short, and free of the area
+    /// and node names that made the old `<area>~<node>~<part>~<ordinal>` id so
+    /// long. Precomputed once at [`assemble`](MapSet::assemble) in the same
+    /// deterministic order [`instances`](MapSet::instances_at) walks (areas by id,
+    /// nodes in file order, placements in file order), so `offset + <node-local
+    /// ordinal>` is the world-wide index of that placement among all placements of
+    /// the same part — a pure function of the map on a fresh load, and **carried
+    /// forward** across a runtime edit ([`MapSet::apply`]) so an id already handed
+    /// out never moves. See [`crate::instance`] and [`part_offsets`].
+    offsets: BTreeMap<(Where, String), u32>,
 }
 
 impl MapSet {
@@ -70,9 +81,24 @@ impl MapSet {
     }
 
     /// Build a set from areas and a part catalogue.
+    ///
+    /// A fresh build with no instance ordinal to preserve — a load, or a test
+    /// building a set from scratch. [`MapSet::apply`] calls
+    /// [`Self::assemble_from`] instead, carrying its own set's offsets forward
+    /// so a runtime edit cannot renumber an id already handed out.
     pub fn assemble(
         areas: impl IntoIterator<Item = Area>,
         parts: impl IntoIterator<Item = Part>,
+    ) -> Result<MapSet> {
+        MapSet::assemble_from(areas, parts, &BTreeMap::new())
+    }
+
+    /// Build a set from areas and a part catalogue, preserving any instance
+    /// ordinal already present in `previous` (see [`part_offsets`]).
+    pub(crate) fn assemble_from(
+        areas: impl IntoIterator<Item = Area>,
+        parts: impl IntoIterator<Item = Part>,
+        previous: &BTreeMap<(Where, String), u32>,
     ) -> Result<MapSet> {
         let mut set = MapSet::default();
         for part in parts {
@@ -103,8 +129,44 @@ impl MapSet {
         // a node, where the weave for one file would have to reach into
         // another.
         set.ways = ways(&set.areas);
+        set.offsets = part_offsets(&set.areas, &set.parts, previous);
         validate::check(&set)?;
         Ok(set)
+    }
+
+    /// The global ordinal the first instance of `part_id` in `at` starts from —
+    /// what an instance id adds its node-local ordinal to (see [`Self::offsets`]
+    /// and [`crate::instance`]). `0` for a `(node, part)` that places nothing,
+    /// which is the honest answer: the first (and only) instance of a singleton is
+    /// index `0` unless earlier nodes placed the same part.
+    pub(crate) fn part_offset(&self, at: &Where, part_id: &str) -> u32 {
+        self.offsets
+            .get(&(at.clone(), part_id.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every instance offset this set has handed out, for [`MapSet::apply`] to
+    /// carry forward into the edited set ([`part_offsets`]).
+    pub(crate) fn offsets(&self) -> &BTreeMap<(Where, String), u32> {
+        &self.offsets
+    }
+
+    /// The authored areas and parts, cloned — the source a mutation rebuilds
+    /// from ([`crate::mutate`]).
+    ///
+    /// **The derived fields ride along and are harmless.** A stored `Area`
+    /// carries the `exits`/`visible` [`weave`] filled in, but those are a pure
+    /// function of the authored `off`/`sees`/`spine`, and [`MapSet::assemble`]
+    /// re-weaves them on the way back in — so a round-trip through this accessor
+    /// and `assemble` reproduces the same set, and a mutation to the authored
+    /// half is all that survives. Areas come back in id order (the set's own),
+    /// which `assemble` does not depend on.
+    pub fn authored(&self) -> (Vec<Area>, Vec<Part>) {
+        (
+            self.areas.values().cloned().collect(),
+            self.parts.values().cloned().collect(),
+        )
     }
 
     /// Where a node leads outside its own area — one step, both ways.
@@ -151,7 +213,7 @@ impl MapSet {
     ///
     /// 1. **What the area says**, if it names an arrival. Nothing beats being
     ///    told.
-    /// 2. **A core, in this area or under it** — the lift and the stair, which
+    /// 2. **A core, in this area or under it** — the lift, which
     ///    is what a core *is*: the way in. Validation already walks from a core
     ///    to prove a level is reachable, so a body starting anywhere else could
     ///    begin somewhere the map has never checked leads anywhere.
@@ -428,6 +490,88 @@ fn is_map_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| !n.starts_with('.'))
+}
+
+/// The global offset each `(node, part)` starts its instance ordinals at.
+///
+/// On a **fresh load** (`previous` empty) this is exactly the walk
+/// [`MapSet::instances_at`] enumerates — areas by id (the `BTreeMap`'s order),
+/// nodes in file order — so that `offset + <node-local ordinal>` is the
+/// world-wide index of a placement among all placements of the same part, and
+/// the same walk yields the same numbers on every load.
+///
+/// A **runtime edit** ([`MapSet::apply`]) is not a fresh load: an id already
+/// handed out has to go on meaning the same thing even when an earlier-sorting
+/// area or node gains a placement of the same part in between, which a plain
+/// re-walk would renumber (see [`crate::instance`], "a URL a character followed
+/// yesterday still resolves today"). So every `(node, part)` pair already in
+/// `previous` keeps that exact offset, unmoved by anything else in the walk; a
+/// pair with no prior offset — a genuinely new placement — is appended after
+/// the highest ordinal any surviving placement of that part already reaches.
+/// An offset, once handed out, is therefore never reused even after the
+/// placement holding it is removed — ids are spent, not recycled.
+///
+/// A placement of a part the catalogue does not hold is skipped, exactly as
+/// [`MapSet::instances_at`] skips it, so the two never disagree on the count.
+fn part_offsets(
+    areas: &BTreeMap<String, Area>,
+    parts: &BTreeMap<String, Part>,
+    previous: &BTreeMap<(Where, String), u32>,
+) -> BTreeMap<(Where, String), u32> {
+    // Every `(node, part)` this map currently places, and its total count —
+    // placements of the same part in one node share a single offset, so they
+    // are combined here once, walked in canonical order (areas by id, nodes
+    // in file order) so a fresh load with no history assigns exactly the
+    // numbers it always has.
+    let mut placed: Vec<(Where, String, u32)> = Vec::new();
+    for area in areas.values() {
+        for node in &area.nodes {
+            let at = Where::new(area.id.clone(), node.id.clone());
+            let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+            for placement in &node.parts {
+                let part_id = placement.part();
+                if !parts.contains_key(part_id) {
+                    continue;
+                }
+                *counts.entry(part_id).or_default() += placement.count();
+            }
+            for (part_id, count) in counts {
+                placed.push((at.clone(), part_id.to_string(), count));
+            }
+        }
+    }
+
+    // Seed each part's next-free ordinal from every surviving placement that
+    // already has an offset in `previous` — its whole reach is off limits to
+    // a fresh placement, regardless of where in the walk it falls. Without
+    // this pass, a part preserved at a later-walked node would not yet have
+    // staked its range when an earlier-walked *new* placement of the same
+    // part is assigned, and the two could collide on the same ordinal.
+    let mut next_free: BTreeMap<String, u32> = BTreeMap::new();
+    for (at, part_id, count) in &placed {
+        if let Some(&offset) = previous.get(&(at.clone(), part_id.clone())) {
+            let free = next_free.entry(part_id.clone()).or_default();
+            *free = (*free).max(offset + count);
+        }
+    }
+
+    // Assign: a preserved key keeps its exact offset, unmoved; a new one is
+    // appended after its part's current next-free ordinal, advancing it.
+    let mut offsets = BTreeMap::new();
+    for (at, part_id, count) in placed {
+        let key = (at, part_id);
+        let offset = match previous.get(&key) {
+            Some(&kept) => kept,
+            None => {
+                let free = next_free.entry(key.1.clone()).or_default();
+                let assigned = *free;
+                *free += count;
+                assigned
+            }
+        };
+        offsets.insert(key, offset);
+    }
+    offsets
 }
 
 /// Every map `.yaml` directly in a directory, parsed. Subdirectories are left

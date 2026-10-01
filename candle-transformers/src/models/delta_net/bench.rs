@@ -183,6 +183,7 @@ fn correctness_gate(dev: &Device, dims: &DeltaNetDims, seed: u64, eps: f64) -> R
             eps,
             None,
             ZGate::Sigmoid,
+            None,
         )?
         .to_owned_tensor()?
     };
@@ -260,7 +261,16 @@ pub fn run_delta_net_kernels(dev: &Device, cfg: DeltaNetBenchCfg) -> Result<()> 
                 stash: None,
             })
             .collect();
-        let _ = delta_net_mix_spans(&p.view(), &c, &dims, &mut seqs, eps, None, ZGate::Sigmoid)?;
+        let _ = delta_net_mix_spans(
+            &p.view(),
+            &c,
+            &dims,
+            &mut seqs,
+            eps,
+            None,
+            ZGate::Sigmoid,
+            None,
+        )?;
         Ok(())
     };
 

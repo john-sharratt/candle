@@ -15,16 +15,23 @@ use candle::quantized::pinned_staging::{Generation, PinnedStager};
 // `DType`, or the crate's own `Result` anywhere in this file.)
 use candle::{DType, Device, Result};
 
+#[cfg(feature = "cuda")]
+use super::compact_map::Replaced;
+use super::compact_plan::ArenaSlots;
+use super::fresh_arenas::FreshArenas;
 use super::head_gids::ChunkBands;
 use super::{
-    Arena, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta, CompressionPolicy,
-    GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
+    Arena, ArenaKey, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta,
+    CompressionPolicy, GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
 };
 // Only the CUDA-gated compress-eligibility helper needs the sealed-sequence type.
 use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
 #[cfg(feature = "cuda")]
 use super::SealedSequence;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, PerHeadEntry};
+use std::collections::HashSet;
+
+use super::gid_pool::ChunkGid;
 // `N_PALETTE` is referenced by the intra-doc links throughout this file and by
 // the CUDA table builders; without `cuda` only the doc links are left, and they
 // still need it in scope to resolve.
@@ -225,7 +232,8 @@ impl BackingInner {
     /// Per-head band count for the arena/record layout: [`LATENT_N_BANDS`] on
     /// the single-latent path, [`N_PALETTE`] for GQA. Every band-count use in
     /// allocation, arena sub-band sizing, and record serialization goes through
-    /// this so the single-latent path can carry 8 bands while GQA stays at 4.
+    /// this so the single-latent path can carry [`LATENT_N_BANDS`] bands while GQA
+    /// stays at [`N_PALETTE`].
     pub(crate) fn n_palette(&self) -> usize {
         if self
             .single_latent
@@ -330,6 +338,20 @@ impl BackingInner {
         }
         Ok(freed)
     }
+
+    /// Release one arena the caller created, if nothing is in it; `true` when it did.
+    ///
+    /// The targeted form of [`Self::release_empty_arenas`], for a creator handing back
+    /// what it made and did not use without also releasing everything else that happens
+    /// to be empty. The pool entry and the storage go together, as in the sweep.
+    pub(super) fn release_arena_if_empty(&self, key: ArenaKey, arena_idx: usize) -> Result<bool> {
+        if !self.pool.tombstone_if_empty(key, arena_idx) {
+            return Ok(false);
+        }
+        self.storage.release_arena(arena_idx)?;
+        self.pool.resync_counters();
+        Ok(true)
+    }
 }
 
 /// Shared backing storage for a chunked (paged) KV cache.
@@ -345,6 +367,28 @@ pub struct ChunkedKvBacking {
     pub(crate) layer_idx: usize,
     /// Per-layer block table state (sequences, max_blocks).
     pub(crate) state: Arc<RwLock<BlockTableState>>,
+}
+
+/// Where a compaction's mints may land — see [`ChunkedKvBacking::try_alloc_record_slot`].
+#[derive(Default)]
+pub(super) struct RecordPlacement {
+    /// Record arenas to fill first, lowest in the span first.
+    pub order: Vec<usize>,
+    /// `(arena, slot)` the pass has planned to read as record sources.
+    pub avoid: HashSet<(usize, u32)>,
+}
+
+/// Where one backing's `KvHead` records live and how big they are — see
+/// [`ChunkedKvBacking::record_layout`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RecordLayout {
+    /// The record arena pool for this geometry.
+    pub key: ArenaKey,
+    /// Serialized bytes of one chunk's whole `KvHead[n_kv_head]` record.
+    pub record_bytes: usize,
+    pub n_kv_head: usize,
+    pub head_dim: usize,
+    pub n_palette: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -492,16 +536,12 @@ impl ChunkedKvBacking {
         self.inner
             .single_latent
             .store(on, std::sync::atomic::Ordering::Relaxed);
-        // Resize the resident-record stride to match the new band count
-        // (single-latent = 8 bands, GQA = 4). Must run before any chunk is
-        // allocated — the meta-pool slabs are still empty here — otherwise
-        // serialize_kv_heads would overrun the 4-band slots. Idempotent.
-        let rb = super::meta_pool::chunk_record_bytes(
-            self.inner.n_kv_head,
-            self.inner.head_dim,
-            self.inner.n_palette(),
-        );
-        self.inner.meta_pool.set_record_bytes(rb);
+        // **No record stride to resize here any more.** It used to be cached on the meta
+        // pool and had to be widened to match the new band count (single-latent = 8
+        // bands, GQA = 4) before any chunk allocated, or a record would overrun its slot.
+        // `build_meta_records` now derives the record size from the live `n_palette()` on
+        // every call and picks the arena key from that, so flipping the flag above is by
+        // itself enough and there is no second copy to keep in step.
         // The constructor's `warm_protected_arenas` ran while single_latent was
         // still false, so it minted the writer/candidate arenas at the GQA band
         // width (`head_dim / N_PALETTE` = 128). The single latent needs them at
@@ -658,16 +698,7 @@ impl ChunkedKvBacking {
                 ])
             },
             pinned_stager,
-            meta_pool: super::meta_pool::MetaPool::new(
-                // GQA record stride (4-band); single-latent backings resize this
-                // to 8-band via `set_single_latent`, before any chunk allocates.
-                super::meta_pool::chunk_record_bytes(
-                    n_kv_head,
-                    head_dim,
-                    crate::kv_cache::arena_table::N_PALETTE,
-                ),
-                device.clone(),
-            ),
+            meta_pool: super::meta_pool::MetaPool::new(device.clone()),
             #[cfg(feature = "cuda")]
             prov_sign_scratch: Mutex::new(None),
             single_latent: std::sync::atomic::AtomicBool::new(false),
@@ -731,12 +762,343 @@ impl ChunkedKvBacking {
         meta.device_addr()
     }
 
+    /// Throw away every cached decode buffer in this backing that was serialised from
+    /// ground a compaction's sweep replaced, and answer which slots those were.
+    ///
+    /// **A buffer caches addresses it does not own the meaning of.** Each slice header
+    /// carries a `kvheads_ptr` — its chunk's record address — and band addresses behind
+    /// it, and the buffer is reused whenever the chunk *count* agrees, which a compaction
+    /// never changes. `SequenceState::rewrite_for_compaction` clears the buffer of a slot
+    /// whose own chunks it rewrote; this catches a buffer that names replaced ground
+    /// through anything else.
+    ///
+    /// **Decided from the buffer's own pins, not by clearing everything.** Every buffer
+    /// holds a [`ChunkPin`](super::gpu_chunks::ChunkPin) per serialised chunk, so it can
+    /// say exactly which bands and records its headers name. A buffer naming none of what
+    /// the sweep replaced is still exact and is kept: clearing it would cost its slot a
+    /// host re-serialisation, and would make the count below mean nothing.
+    ///
+    /// A non-empty answer is therefore a real finding: a buffer whose slot the sweep did
+    /// not rewrite, naming ground it moved other holders off. Not a correctness fault on
+    /// its own, since the pins keep that ground alive for as long as the buffer is held,
+    /// but it is a holder the sweep does not reach and ground the pass cannot reclaim.
+    #[cfg(feature = "cuda")]
+    pub(super) fn invalidate_decode_buffers_naming(
+        &self,
+        replaced: &Replaced,
+    ) -> Result<Vec<usize>> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let mut cleared = Vec::new();
+        for (slot, entry) in state.sequences.iter_mut().enumerate() {
+            let Some(seq) = entry.as_mut() else { continue };
+            if seq.has_decode_gpu_chunks() && replaced.names_any(&seq.gpu_chunk_pins()) {
+                seq.invalidate_gpu_chunks();
+                cleared.push(slot);
+            }
+        }
+        Ok(cleared)
+    }
+
+    /// Whether this backing's records live in device memory, and so whether there is
+    /// anything to build or mint at all.
+    #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
+    pub(super) fn records_are_resident(&self) -> bool {
+        self.inner.meta_pool.is_device_resident()
+    }
+
+    /// Claim one record slot **from an arena that already exists**, or `None`.
+    ///
+    /// Host-only and, crucially, **non-creating**: a free-list pop and nothing else.
+    ///
+    /// # Why a compaction may not use the promoting claim
+    ///
+    /// [`Self::alloc_chunk_for_key`] widens to `claim_slot_promoting`, which on a miss
+    /// calls `release_empty_arenas()` and stamps a fresh region. Both are safe at a seal
+    /// boundary and **not** safe inside a compaction's holder sweep: releasing an arena
+    /// frees its `arena_idx`, and the next registration re-tenants that index for a
+    /// different key — `ChunkGidPool::register_arena` calls it out as the
+    /// index-re-tenancy signature. Half-way through a sweep, gids naming the old arena at
+    /// that index are still installed in holders the pass has not reached, so they resolve
+    /// against whatever now sits there. When that is a *record* arena the stride is wrong,
+    /// which surfaces as `arena slot: 2176 B requested from a 1152 B slot` out of the
+    /// hot→warm migrate — 198 of them on the run that answered 1/8, and none on the runs
+    /// that answered 8/8.
+    ///
+    /// So the pass provisions the pool up front ([`Self::reserve_record_slots`]) and takes
+    /// only what already exists while it is sweeping.
+    ///
+    /// # Where the slot comes from
+    ///
+    /// `placement.order` is tried first, arena by arena — the pool's arenas lowest in the
+    /// span first — so a mint lands as low as the pool allows rather than wherever the
+    /// lowest arena *index* is, which is unrelated to address. A mint left to index order
+    /// can land in the very arena the same pass is draining, and keep it alive.
+    ///
+    /// No slot in `placement.avoid` is ever returned: those are this pass's planned record
+    /// sources. One is on the free list only if its record died after the census, and a
+    /// mint written there would land in ground the pass has declared it is reading.
+    #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
+    pub(super) fn try_alloc_record_slot(
+        &self,
+        key: ArenaKey,
+        placement: &RecordPlacement,
+    ) -> Option<ChunkGid> {
+        // **Held, not dropped, until a materialised one is found.** The pool can hold a
+        // registration whose storage was never materialised, and a record in one has no
+        // address — but dropping such a gid returns the slot to the head of the same free
+        // list, so the next call pops it again and declines again. One unmaterialised
+        // registration would turn *every* remaining mint in the pass into a decline while
+        // the reservation reported success, because `reserve_record_slots` counts that
+        // arena's capacity as available.
+        //
+        // Holding the rejects keeps them out of the way for this claim and releases them
+        // on return, which is the right lifetime: the pass is inside the arena window, so
+        // nothing else is claiming, and a registration that is unmaterialised now will
+        // still be unmaterialised on the next mint.
+        //
+        // A planned source is held the same way, for the same reason: dropped, it would be
+        // popped again by the next claim.
+        let usable = |gid: &ChunkGid| {
+            !placement
+                .avoid
+                .contains(&(gid.arena_idx(), gid.chunk_idx() as u32))
+                && self
+                    .inner
+                    .storage
+                    .read(|s| s.has_arena(gid.arena_idx()))
+                    .unwrap_or(false)
+        };
+        let mut rejected: Vec<ChunkGid> = Vec::new();
+        for &arena in &placement.order {
+            while let Some(gid) = self.inner.pool.allocate_from_arena(key, arena) {
+                if usable(&gid) {
+                    return Some(gid);
+                }
+                rejected.push(gid);
+            }
+        }
+        // Arenas the order does not know of: any the pool registered after it was taken.
+        let found = loop {
+            let Some(gid) = self.inner.pool.allocate_for(key) else {
+                break None;
+            };
+            if usable(&gid) {
+                break Some(gid);
+            }
+            rejected.push(gid);
+        };
+        drop(rejected);
+        found
+    }
+
+    /// The pool's arena indices, lowest in the span first — the order a mint fills them
+    /// in. Arenas with no region (host arenas) have no position and are left out.
+    #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
+    pub(super) fn arenas_by_rank(&self, key: ArenaKey) -> Vec<usize> {
+        let load = self.inner.pool.pool_arena_load(key);
+        let mut ranked: Vec<(usize, usize)> = self
+            .inner
+            .storage
+            .read(|s| {
+                let arenas = s.arenas();
+                load.iter()
+                    .filter_map(|(idx, _, _)| {
+                        arenas
+                            .get(idx)
+                            .and_then(|a| a.region_rank())
+                            .map(|r| (r, *idx))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ranked.sort_unstable();
+        ranked.into_iter().map(|(_, idx)| idx).collect()
+    }
+
+    /// Make sure the record pool for `key` can satisfy `want` claims without creating an
+    /// arena, and answer how many arenas that took.
+    ///
+    /// **Called before the sweep, which is the only safe place to create one.** See
+    /// [`Self::try_alloc_record_slot`] for what goes wrong if an arena is created or
+    /// released while holders are half-rewritten.
+    ///
+    /// Every arena it creates is noted in `fresh`, which keeps the empty sweep off it
+    /// until the pass ends and then releases any the mints never reached. See
+    /// [`FreshArenas`].
+    #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
+    pub(super) fn reserve_record_slots(
+        &self,
+        key: ArenaKey,
+        want: usize,
+        fresh: &mut FreshArenas<'_>,
+    ) -> Result<usize> {
+        let free = |b: &Self| -> usize {
+            b.inner
+                .pool
+                .pool_arena_load(key)
+                .iter()
+                .map(|&(_, capacity, live)| capacity.saturating_sub(live))
+                .sum()
+        };
+        let mut created = 0usize;
+        // Each turn either adds an arena's worth of free slots or gives up, so this
+        // terminates on the free count alone. A refused region is not an error: it says
+        // the KV side is full, and the caller then mints fewer records — recorded as
+        // `records_declined` — rather than failing a pass that has published nothing.
+        //
+        // **And a claim is only taken while a hole exists below the frontier.** The region
+        // free list is lowest-index-first, so with holes a fresh arena lands *under* the
+        // frontier and costs nothing; with none it lands above and raises the very number
+        // the pass exists to lower. `provision_low_arenas` stops for the same reason,
+        // and this is the same trade: declining a mint costs one chunk's reclaim, raising
+        // the frontier costs the weight side a region.
+        while free(self) < want && self.has_region_hole() {
+            if fresh.claim(&self.inner, key).is_err() {
+                break;
+            }
+            created += 1;
+        }
+        Ok(created)
+    }
+
+    /// Write a batch of already-claimed records' bytes with one launch.
+    ///
+    /// The seal path reaches the same kernel through [`Self::build_meta_records`], which
+    /// claims the slots itself; a compaction has already claimed them during its holder
+    /// sweep and only needs the fill.
+    #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
+    pub(super) fn fill_record_batch(
+        &self,
+        handles: &[super::meta_pool::MetaGid],
+        srcs: &[super::meta_pool::ChunkRecordSrc<'_>],
+        arena_info: &[ResolvedArenaInfo],
+        layout: RecordLayout,
+    ) -> Result<()> {
+        self.fill_records_on_device(
+            handles,
+            srcs,
+            arena_info,
+            layout.n_kv_head,
+            layout.head_dim,
+            layout.n_palette,
+        )
+    }
+
+    /// Read every freshly filled record back and compare it against what
+    /// [`serialize_kv_heads`](super::meta_pool::serialize_kv_heads) would have written.
+    ///
+    /// The fill kernel is held against that serializer byte-for-byte by unit test over six
+    /// geometries; this asserts the same thing for a compaction's batch, against the live
+    /// arena table and real relocated chunks. It exists to tell a **wrong record** apart
+    /// from a **wrong reader of a right record**, which no other check here can do.
+    ///
+    /// One synchronous readback per record, so it is behind the harness and never in a
+    /// production pass.
+    #[cfg(all(feature = "cuda", feature = "tensor-assert"))]
+    pub(super) fn verify_minted_records(
+        &self,
+        handles: &[super::meta_pool::MetaGid],
+        srcs: &[super::meta_pool::ChunkRecordSrc<'_>],
+        arena_info: &[ResolvedArenaInfo],
+        layout: RecordLayout,
+    ) -> Result<()> {
+        let mut want = vec![0u8; layout.record_bytes];
+        for (i, (h, src)) in handles.iter().zip(srcs).enumerate() {
+            if h.device_addr() == 0 {
+                continue;
+            }
+            want.fill(0);
+            super::meta_pool::serialize_kv_heads(
+                &mut want,
+                src,
+                layout.n_kv_head,
+                layout.head_dim,
+                layout.n_palette,
+                arena_info,
+            );
+            let Some(got) = self.read_record(h.device_addr(), layout.record_bytes) else {
+                continue;
+            };
+            if got != want {
+                let at = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(0);
+                candle::bail!(
+                    "compaction minted record {i} of {} at {:#x} and the device bytes \
+                     differ from the serializer's at byte {at} (device {:#04x}, expected \
+                     {:#04x}). Every kernel reaches this chunk's K/V through these words, \
+                     so a wrong one reads another chunk's bands — finite, plausibly shaped \
+                     and wrong, with nothing to fault.",
+                    handles.len(),
+                    h.device_addr(),
+                    got[at],
+                    want[at],
+                )
+            }
+        }
+        Ok(())
+    }
+
+    /// The record arena key and geometry this backing's records are built at, with the
+    /// two guards that must hold before a slot is claimed.
+    ///
+    /// **Derived per call, not held.** The record size follows the backing's *live*
+    /// `n_palette()` — the single latent carries four times GQA's bands — so there is
+    /// nothing cached to go stale against the geometry. See `docs/vram_span_partition.md`
+    /// §8.
+    ///
+    /// Both checks run **before** anything allocates. They used to sit inside
+    /// `fill_records_on_device`, after the claims, so a non-conforming geometry allocated
+    /// and then freed N record slots on every seal for the life of the process. The size
+    /// check is here rather than inside `ArenaKey::for_records` because that function
+    /// *panics*, and this runs on the seal and persistence threads — a panic there poisons
+    /// the locks the rest of this module `expect`s on, turning one bad geometry into
+    /// unrelated failures everywhere.
+    ///
+    /// One function because both the seal path ([`Self::build_meta_records`]) and a
+    /// compaction's mint ([`super::compact_mint::RecordMint`]) ask the same question, and
+    /// two copies of these guards would be two opinions about what a record is.
+    pub(super) fn record_layout(&self) -> Result<RecordLayout> {
+        let n_kv_head = self.inner.n_kv_head;
+        let head_dim = self.inner.head_dim;
+        let n_palette = self.inner.n_palette();
+        let record_bytes = super::meta_pool::chunk_record_bytes(n_kv_head, head_dim, n_palette);
+        if record_bytes > super::arena::RECORD_STRIDES[super::arena::RECORD_STRIDES.len() - 1] {
+            candle::bail!(
+                "a {record_bytes} B KvHead record ({n_kv_head} heads x head_dim \
+                 {head_dim} x {n_palette} bands) exceeds the largest record stride. Add a \
+                 rung to RECORD_STRIDES, checking it against GID_STRIDE."
+            );
+        }
+        // The fill kernel stores band pointers as `uint64_t` at `head_dim / 2 + p * 8`
+        // within heads `head_sz` apart, so both must be 8-aligned or the store faults.
+        // `head_dim % 16 == 0` gives the first, `n_palette % 4 == 0` the second. The host
+        // serializer never had to care — unaligned writes are legal there — which is why
+        // this was invisible until the fill moved to the device.
+        let head_sz = head_dim / 2 + n_palette * 26;
+        if !head_dim.is_multiple_of(16) || !head_sz.is_multiple_of(8) {
+            candle::bail!(
+                "KvHead record geometry is not 8-byte aligned: head_dim {head_dim} \
+                 (needs % 16 == 0) and per-head size {head_sz} (needs % 8 == 0) at \
+                 n_palette {n_palette}. The fill kernel stores band pointers as uint64_t, \
+                 which faults on an unaligned address."
+            );
+        }
+        Ok(RecordLayout {
+            key: ArenaKey::for_records(ArenaLocation::Gpu, record_bytes),
+            record_bytes,
+            n_kv_head,
+            head_dim,
+            n_palette,
+        })
+    }
+
     /// Build device-resident KV-head metadata records for a batch of chunks and
     /// return one handle per input. Serializes each `KvHead[n_kv_head]` record
-    /// (pal/scale/fmt + the 8 per-palette pointers resolved against `arena_info`
-    /// at the chunk's current placement) and uploads them in **one coalesced
-    /// transfer** (a single `memcpy_htod` per contiguous slab run) rather than a
-    /// tiny copy per chunk. Called at the finalization sites — quantize,
+    /// (pal/scale/fmt + the per-palette pointers resolved against `arena_info` at the
+    /// chunk's current placement) and writes them all with **one device launch** rather
+    /// than a tiny copy per chunk. Called at the finalization sites — quantize,
     /// cold-load, and warm→hot elevate — so a resident record always matches the
     /// bytes it describes.
     ///
@@ -746,7 +1108,12 @@ impl ChunkedKvBacking {
     /// This preserves the invariant `meta.is_some() ⇒ device_addr != 0` that the
     /// prefill/glue serializer relies on (it builds no scratch heads for resident
     /// chunks). Each handle is stored on the `SealedChunk`/`ChunkWindow` and
-    /// shared by every slot that references the chunk.
+    /// shared by every slot that references the chunk, and each holds a clone of the
+    /// gids its pointer words name — see [`MetaGid`](super::meta_pool::MetaGid).
+    ///
+    /// A compaction does not come through here: it mints a record for an *existing*
+    /// chunk whose slots it has already claimed, which is
+    /// [`super::compact_mint::RecordMint`].
     #[allow(dead_code)] // callers are cuda-gated; a pure-CPU build sees none
     pub(crate) fn build_meta_records(
         &self,
@@ -756,21 +1123,371 @@ impl ChunkedKvBacking {
         if !self.inner.meta_pool.is_device_resident() {
             return Ok(vec![None; chunks.len()]);
         }
-        let n_kv_head = self.inner.n_kv_head;
-        let head_dim = self.inner.head_dim;
-        let n_palette = self.inner.n_palette();
-        let rb = super::meta_pool::chunk_record_bytes(n_kv_head, head_dim, n_palette);
-        let mut items: Vec<(super::meta_pool::MetaGid, Vec<u8>)> = Vec::with_capacity(chunks.len());
-        for src in chunks {
-            let handle = self.inner.meta_pool.allocate()?;
-            let mut bytes = vec![0u8; rb];
-            super::meta_pool::serialize_kv_heads(
-                &mut bytes, src, n_kv_head, head_dim, n_palette, arena_info,
-            );
-            items.push((handle, bytes));
+        let RecordLayout {
+            key: record_key,
+            record_bytes: rb,
+            n_kv_head,
+            head_dim,
+            n_palette,
+        } = self.record_layout()?;
+        // Claim every slot first, then resolve all their addresses in **one** pass.
+        // Resolving per record cost a `HashSet`, a `storage.read()` lock and a dense
+        // `Vec<ResolvedArenaInfo>` each time, so a 4,096-record cold load paid 4,096 lock
+        // round-trips and rebuilt the whole arena table 4,096 times to read one entry.
+        let mut gids: Vec<ChunkGid> = Vec::with_capacity(chunks.len());
+        for _ in chunks {
+            // One arena slot per record, through the same allocator the bands use, so
+            // the slot's refcount is what keeps the record alive and a clone of the
+            // handle shares it.
+            gids.push(self.alloc_chunk_for_key(record_key)?);
         }
-        self.inner.meta_pool.write_records_batched(&items)?;
-        Ok(items.into_iter().map(|(h, _)| Some(h)).collect())
+        // Re-resolved rather than reusing the caller's `arena_info`: these slots did not
+        // exist when that snapshot was taken, and the claims above can create an arena.
+        let needed: HashSet<usize> = gids.iter().map(|g| g.arena_idx()).collect();
+        let slot_info = self.resolve_arena_info_for(&needed)?;
+        let mut handles: Vec<super::meta_pool::MetaGid> = Vec::with_capacity(chunks.len());
+        // **Each handle takes a clone of the very gids its pointer words are about to be
+        // filled from**, so the record cannot outlive the bands it names: the allocator
+        // will not reissue a band slot while a record still holds a refcount on it. One
+        // `Arc` bump per record and nothing per band — see [`MetaGid`].
+        for (gid, src) in gids.into_iter().zip(chunks) {
+            let addr = self.record_slot_addr(&gid, &slot_info, rb)?;
+            handles.push(super::meta_pool::MetaGid::from_slot(
+                gid,
+                src.gids.clone(),
+                addr,
+            ));
+        }
+        // The records are written **on the device**, from a descriptor table — no host
+        // serialization and no record bytes over the bus. See §8 of
+        // `docs/vram_span_partition.md` and `fill_records_on_device`.
+        self.fill_records_on_device(&handles, chunks, arena_info, n_kv_head, head_dim, n_palette)?;
+        // **A filled record is write-once, and that is enforced by nothing having a
+        // reason to write one** — not by `readonly_regions`, which was tried here and
+        // does not fit. Its only release is `release_below(base)`, a whole-span clear at
+        // the weight boundary; a record slot frees and is reissued constantly, so a
+        // per-record declaration would go stale on the first free and then name the
+        // slot's next legitimate tenant as a violator. That is the harness's own second
+        // danger — a stale declaration blames an innocent allocation — and a guard that
+        // cries wolf is worse here than no guard, because this is the instrument the
+        // compaction work is validated with. What stands in its place is that the only
+        // code that ever rewrote a record has been deleted, and the design note on
+        // `compact_backings` says why nothing should write one again.
+        Ok(handles.into_iter().map(Some).collect())
+    }
+
+    /// Write every record's bytes with one kernel launch.
+    ///
+    /// **Nothing is serialized on the host and no record byte crosses the bus.** The
+    /// host ships a descriptor table plus the arrays it already holds; the kernel
+    /// computes each band's absolute address from the arena extent table, derives the
+    /// identity palette map arithmetically, and defaults an absent scale to unity — so
+    /// the upload is strictly smaller than the records it produces, and for the common
+    /// float chunk (identity map, unity scales) dramatically so.
+    ///
+    /// Asynchronous throughout: the uploads and the launch all go on the backing's
+    /// stream and nothing is read back, so a batch of records costs no synchronisation.
+    ///
+    /// Held byte-for-byte against [`serialize_kv_heads`](super::meta_pool::serialize_kv_heads)
+    /// by test — the layout is encoded in four places already
+    /// (`docs/vram_span_partition.md` §8) and this must not become a fifth opinion.
+    #[allow(unused_variables)]
+    fn fill_records_on_device(
+        &self,
+        handles: &[super::meta_pool::MetaGid],
+        chunks: &[super::meta_pool::ChunkRecordSrc<'_>],
+        arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
+        n_kv_head: usize,
+        head_dim: usize,
+        n_palette: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            use candle::cuda_backend::cudarc::driver::DevicePtr;
+            use candle::cuda_backend::kernels::simple::kv_record_fill as krf;
+
+            /// A derived-only input still needs one byte of device memory so its pointer is
+            /// valid; the kernel never reads it, because every descriptor's offset is -1.
+            fn pad1_u8(mut v: Vec<u8>) -> Vec<u8> {
+                if v.is_empty() {
+                    v.push(0);
+                }
+                v
+            }
+            fn pad1_f32(mut v: Vec<f32>) -> Vec<f32> {
+                if v.is_empty() {
+                    v.push(0.0);
+                }
+                v
+            }
+            fn pad1_i64(mut v: Vec<i64>) -> Vec<i64> {
+                if v.is_empty() {
+                    v.push(0);
+                }
+                v
+            }
+
+            if handles.is_empty() {
+                return Ok(());
+            }
+            // **Not a silent `Ok`.** A record slot may be recycled, and unlike
+            // `alloc_chunk_with_arenas` the promoting claim does not zero what it hands
+            // back — so skipping the fill leaves the *previous* tenant's record standing:
+            // well-formed pointers into bands that have since been freed and reissued.
+            // The caller only reaches here having found the pool device-resident, so a
+            // non-CUDA device at this point is a broken assumption, not a configuration.
+            let Device::Cuda(cuda) = &self.inner.device else {
+                candle::bail!(
+                    "fill_records_on_device: {} records were allocated on a non-CUDA \
+                     device. Leaving them unwritten would publish the previous tenant's \
+                     band pointers, which the attention kernels dereference unchecked.",
+                    handles.len(),
+                );
+            };
+            let pal_bytes = head_dim / 4;
+            let bands = n_kv_head * n_palette * 2;
+            let tags = n_kv_head * n_palette;
+
+            // The record geometry's 8-byte alignment is checked by `build_meta_records`
+            // before it claims a slot, and again inside `run_kv_record_fill` for the
+            // callers that launch directly.
+
+            // The descriptor and the packed inputs. Appending a chunk's existing slice is
+            // a bulk copy, not a walk over bands — the per-band work is the kernel's.
+            // Flat `i64` words rather than a slice of `KvRecordDesc`: `DeviceRepr` is
+            // not implemented for it, every field is eight bytes, and
+            // `krf::DESC_WORDS`' assertions hold the two forms bit-identical.
+            let mut descs: Vec<i64> = Vec::with_capacity(handles.len() * krf::DESC_WORDS);
+            let mut gids: Vec<i64> = Vec::with_capacity(handles.len() * bands);
+            let (mut k_pal, mut v_pal) = (Vec::<u8>::new(), Vec::<u8>::new());
+            let (mut k_fmt, mut v_fmt) = (Vec::<u8>::new(), Vec::<u8>::new());
+            let (mut k_scale, mut v_scale) = (Vec::<f32>::new(), Vec::<f32>::new());
+            for (h, src) in handles.iter().zip(chunks) {
+                let gid_off = gids.len() as i64;
+                gids.extend(src.gids.as_slice().iter().map(|g| g.raw()));
+                // **Empty means "derive it"; SHORT is refused.**
+                //
+                // The descriptor carries one offset per record, so its fallback is
+                // all-or-nothing, while `serialize_kv_heads` falls back per head and per
+                // band independently (`k_pal.get(h * pal_bytes ..)`,
+                // `k_fmt.get(tag_base + p)`, `k_scale.get(..).unwrap_or(1.0)`). For an
+                // empty slice the two agree exactly — everything defaults. For a *short*
+                // one they do not: the reference honours the populated prefix and defaults
+                // the remainder, where an offset of -1 defaults the lot.
+                //
+                // The sharpest case is the format tags, and it is reachable: `compress`
+                // sizes its fmt vectors `n_kv_head * N_PALETTE` (4), so against a backing
+                // whose `n_palette()` is `LATENT_N_BANDS` (16) every tag would silently
+                // become `Invalid` — a band with no known layout — where the reference
+                // writes four real tags per head. Refused rather than reinterpreted,
+                // because a wrong format tag decodes quantized bytes as floats.
+                let short = |have: usize, need: usize| have != 0 && have < need;
+                let pal_need = n_kv_head * pal_bytes;
+                if short(src.k_pal.len(), pal_need) || short(src.v_pal.len(), pal_need) {
+                    candle::bail!(
+                        "palette maps are short: k {} v {} against {pal_need} needed for \
+                         {n_kv_head} heads at head_dim {head_dim}. The device fill cannot \
+                         express a per-head fallback, so this would default every head's \
+                         map instead of only the absent ones.",
+                        src.k_pal.len(),
+                        src.v_pal.len(),
+                    );
+                }
+                if short(src.k_fmt.len(), tags) || short(src.v_fmt.len(), tags) {
+                    candle::bail!(
+                        "band format tags are short: k {} v {} against {tags} needed for \
+                         {n_kv_head} heads x {n_palette} bands. Defaulting the remainder \
+                         would set every band to Invalid, so the record is refused.",
+                        src.k_fmt.len(),
+                        src.v_fmt.len(),
+                    );
+                }
+                if short(src.k_scale.len(), tags) || short(src.v_scale.len(), tags) {
+                    candle::bail!(
+                        "outer scales are short: k {} v {} against {tags} needed. \
+                         Defaulting the remainder would set every band's scale to unity.",
+                        src.k_scale.len(),
+                        src.v_scale.len(),
+                    );
+                }
+                let pal_off = if src.k_pal.is_empty() || src.v_pal.is_empty() {
+                    -1
+                } else {
+                    let off = k_pal.len() as i64;
+                    k_pal.extend_from_slice(&src.k_pal[..pal_need]);
+                    v_pal.extend_from_slice(&src.v_pal[..pal_need]);
+                    off
+                };
+                let fmt_off = if src.k_fmt.is_empty() || src.v_fmt.is_empty() {
+                    -1
+                } else {
+                    let off = k_fmt.len() as i64;
+                    k_fmt.extend_from_slice(&src.k_fmt[..tags]);
+                    v_fmt.extend_from_slice(&src.v_fmt[..tags]);
+                    off
+                };
+                let scale_off = if src.k_scale.is_empty() || src.v_scale.is_empty() {
+                    -1
+                } else {
+                    let off = k_scale.len() as i64;
+                    k_scale.extend_from_slice(&src.k_scale[..tags]);
+                    v_scale.extend_from_slice(&src.v_scale[..tags]);
+                    off
+                };
+                // Through the struct, so the field order is the compiler's business and
+                // the size assertions on both sides of the FFI cover these bytes.
+                descs.extend_from_slice(
+                    &krf::KvRecordDesc {
+                        dst: h.device_addr(),
+                        gid_off,
+                        pal_off,
+                        fmt_off,
+                        scale_off,
+                    }
+                    .to_words(),
+                );
+            }
+
+            // Extents indexed by arena index, so the kernel resolves a band the same way
+            // the reference does: `base_ptr + chunk_idx * chunk_byte_stride`.
+            let n_extents = arena_info.len();
+            let mut extents: Vec<i64> = Vec::with_capacity(n_extents * krf::EXTENT_WORDS);
+            for r in arena_info {
+                extents.extend_from_slice(
+                    &krf::KvArenaExtent {
+                        base: r.base_ptr,
+                        stride: r.chunk_byte_stride,
+                    }
+                    .to_words(),
+                );
+            }
+
+            // `memcpy_stod` on an empty slice is not meaningful, so a derived-only input
+            // still needs one byte of device memory for its pointer to be valid; the kernel
+            // never reads it, because every descriptor's offset is -1.
+            let d_descs = cuda.memcpy_stod(&descs)?;
+            let d_gids = cuda.memcpy_stod(&gids)?;
+            let d_kpal = cuda.memcpy_stod(&pad1_u8(k_pal))?;
+            let d_vpal = cuda.memcpy_stod(&pad1_u8(v_pal))?;
+            let d_kfmt = cuda.memcpy_stod(&pad1_u8(k_fmt))?;
+            let d_vfmt = cuda.memcpy_stod(&pad1_u8(v_fmt))?;
+            let d_kscale = cuda.memcpy_stod(&pad1_f32(k_scale))?;
+            let d_vscale = cuda.memcpy_stod(&pad1_f32(v_scale))?;
+            // Padded like the rest: `arena_info` is legitimately empty when no arena is
+            // resolved, and the kernel bounds every extent lookup against `n_extents`, so
+            // the padding byte is never read — but the pointer still has to be valid.
+            let d_ext = cuda.memcpy_stod(&pad1_i64(extents))?;
+            let stream = cuda.cuda_stream();
+            {
+                let (p_desc, _g0) = d_descs.device_ptr(&stream);
+                let (p_gid, _g1) = d_gids.device_ptr(&stream);
+                let (p_kp, _g2) = d_kpal.device_ptr(&stream);
+                let (p_vp, _g3) = d_vpal.device_ptr(&stream);
+                let (p_kf, _g4) = d_kfmt.device_ptr(&stream);
+                let (p_vf, _g5) = d_vfmt.device_ptr(&stream);
+                let (p_ks, _g6) = d_kscale.device_ptr(&stream);
+                let (p_vs, _g7) = d_vscale.device_ptr(&stream);
+                let (p_ex, _g8) = d_ext.device_ptr(&stream);
+                candle::set_kernel_breadcrumb("run_kv_record_fill", file!(), line!());
+                // SAFETY: every array is device-resident and at least as long as the
+                // offsets the descriptors name; each `dst` is a record slot this call just
+                // allocated, of exactly `chunk_record_bytes` bytes.
+                //
+                // **The buffers are dropped right after this async launch, and that is
+                // sound because of how `CudaSlice::drop` frees.** It waits on the slice's
+                // recorded events and then either calls `free_async` on the slice's own
+                // stream — the same stream this launches on, so the free is ordered behind
+                // the kernel — or, on a context without async allocation, synchronises the
+                // stream before a synchronous free. Either way the bytes outlive the read.
+                // Worth knowing that the second branch means this call site synchronises
+                // once per buffer on such a context, which is the one place the "no GPU
+                // syncs" property here depends on the driver rather than on this code.
+                unsafe {
+                    krf::run_kv_record_fill(
+                        p_desc as *const std::ffi::c_void,
+                        p_gid as *const i64,
+                        p_kp as *const u8,
+                        p_vp as *const u8,
+                        p_kf as *const u8,
+                        p_vf as *const u8,
+                        p_ks as *const f32,
+                        p_vs as *const f32,
+                        p_ex as *const std::ffi::c_void,
+                        n_extents as i32,
+                        handles.len() as i32,
+                        n_kv_head as i32,
+                        head_dim as i32,
+                        n_palette as i32,
+                        super::size_class::GID_STRIDE as i32,
+                        ArenaFormatTag::Invalid.as_u8() as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Absolute device address of the record slot `gid` names.
+    ///
+    /// **Stable for the handle's life**, which every paged kernel depends on: this
+    /// value is written raw into each slice header's `kvheads_ptr` word and
+    /// dereferenced by `reinterpret_cast` with no indirection. Resolved once, at
+    /// allocation, and cached on the handle — nothing may relocate a held record.
+    /// **The stride comes from the arena the slot is actually in, never from the key the
+    /// caller asked for.** `alloc_chunk_for_key` may promote: when no region can be
+    /// claimed, `stamp_region_promoting` walks the size-class ladder building *band*
+    /// keys and allocates from one of those, returning the gid without saying which key
+    /// it came from. Computing `base + chunk_idx * record_stride` against a band arena's
+    /// base then lands far outside it — a 2 KiB record stride against a 320 B class's
+    /// 52,428 slots reaches ~100 MiB past a 16 MiB arena, into another tenant's ground,
+    /// mapped and silent. That is invariant 7 exactly, and the fill would write a record
+    /// there for thirteen kernels to dereference.
+    ///
+    /// So the slot is bounds-checked against the arena's own capacity and addressed with
+    /// the arena's own stride, and a slot whose stride cannot hold a record is refused
+    /// rather than written. `Arena::slot_ptr` makes the same check for band slots and
+    /// its doc gives the same reason.
+    fn record_slot_addr(
+        &self,
+        gid: &ChunkGid,
+        info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
+        record_bytes: usize,
+    ) -> Result<u64> {
+        let arena_idx = gid.arena_idx();
+        let r = info.get(arena_idx).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "record arena {arena_idx} vanished between claim and address resolution"
+            ))
+        })?;
+        let slot = gid.chunk_idx();
+        if r.base_ptr == 0 || r.chunk_byte_stride <= 0 {
+            candle::bail!(
+                "record slot {slot} landed in arena {arena_idx}, which is not device \
+                 resident (base {:#x}, stride {}). A record's address is written raw into \
+                 every slice header and dereferenced unchecked, so there is no safe \
+                 address to return here.",
+                r.base_ptr,
+                r.chunk_byte_stride,
+            );
+        }
+        if slot >= r.chunk_capacity as usize {
+            candle::bail!(
+                "record slot {slot} is past arena {arena_idx}'s capacity {} — addressing \
+                 it would write into the next arena's bytes",
+                r.chunk_capacity,
+            );
+        }
+        if (r.chunk_byte_stride as usize) < record_bytes {
+            candle::bail!(
+                "record slot {slot} is in arena {arena_idx} whose stride is {} B, too \
+                 small for a {record_bytes} B record. The allocator promoted this claim \
+                 into a band arena (see `stamp_region_promoting`), and writing a record \
+                 into a slot that cannot hold it overruns into the next slot.",
+                r.chunk_byte_stride,
+            );
+        }
+        Ok(r.base_ptr + (slot * r.chunk_byte_stride as usize) as u64)
     }
 
     /// Release any fully-empty arenas back to the pool **without** the
@@ -1118,7 +1835,7 @@ impl ChunkedKvBacking {
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
     ) -> candle::Result<(
         Vec<(u64, u32, u32)>,
-        Vec<Arc<Vec<HeadGids>>>,
+        Vec<Arc<Vec<super::gpu_chunks::ChunkPin>>>,
         DecodeGpuChunkSyncStats,
     )> {
         let n_kv_head = self.inner.n_kv_head;
@@ -1346,6 +2063,27 @@ impl ChunkedKvBacking {
     pub fn is_quantized(&self) -> bool {
         self.inner.storage.is_quantized()
     }
+}
+
+/// One band a live slot names, as the refcount tables are keyed.
+///
+/// Carries the `(arena, slot)` pair rather than an address because that is the form
+/// the occupancy tables answer in, and the address is derivable from it while the
+/// reverse needs the arena extents. `record` is the chunk's coresident record, so a
+/// caller can check what *it* names as well as what the gid names — the two are
+/// independent recordings of one location and either can be the stale one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveBand {
+    pub arena: usize,
+    pub slot_in_arena: usize,
+    pub record: Option<u64>,
+    /// Position in the chunk's `HeadGids` grid, which is the index the record's
+    /// pointer words are laid out by — `h * n_palette * 2 + p * 2 + is_value`.
+    ///
+    /// Carried because holes are skipped: a caller counting the bands it was handed
+    /// would attribute each one to the wrong record word as soon as any gid in the
+    /// grid is absent, and then report every band after the hole as disagreeing.
+    pub band: usize,
 }
 
 impl BackingInner {
@@ -1608,6 +2346,251 @@ impl ChunkedKvBacking {
     /// Get the number of arenas in backing storage.
     pub fn arena_count(&self) -> Result<usize> {
         self.inner.storage.arena_count()
+    }
+
+    /// Occupied slots per arena for one pool, from the refcount tables.
+    ///
+    /// The authority on whether a slot is free, exposed because the integrity checks
+    /// must not reconstruct that from holders — every attempt to do so has missed one
+    /// (arenas pool globally across same-config layers, and sealed sequences hold
+    /// slots too), and an incomplete reference set reports faults that are not there.
+    pub fn pool_occupancy(&self, key: ArenaKey) -> Vec<(usize, usize, Vec<u32>)> {
+        self.inner.pool.pool_occupancy(key)
+    }
+
+    /// Whether any region below the arena frontier is free — so whether a fresh arena
+    /// would land *under* the frontier rather than raise it.
+    ///
+    /// The region free list is lowest-index-first, so a claim takes the lowest hole when
+    /// one exists. Gates every arena a compaction creates ahead of demand — the per-pool
+    /// low arenas and the record reservation.
+    #[cfg(feature = "cuda")]
+    pub(super) fn has_region_hole(&self) -> bool {
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device().location() else {
+            return false;
+        };
+        super::region_pool::region_stats(gpu_id).is_some_and(|s| s.live_watermark > s.live)
+    }
+
+    /// Without a device there is no region pool and so no hole to find.
+    #[cfg(not(feature = "cuda"))]
+    pub(super) fn has_region_hole(&self) -> bool {
+        false
+    }
+
+    /// Regions held by this device's **record** arenas.
+    ///
+    /// In-use ground that no size-class row accounts for: `gpu_class_stats` reports only
+    /// `ArenaKind::Band` pools, deliberately, so a record arena pollutes neither the
+    /// fragmentation figure nor the relief decisions that read it. That leaves it invisible
+    /// to a consumer summing the class rows — which then charges it as waste. Measured on
+    /// the 30B: 11 regions of 62 "lost" were record arenas holding live records.
+    ///
+    /// Counted from the pool's registrations rather than from live slots, because an arena
+    /// holds its region until it is *released*, not until its last record goes.
+    pub fn record_arena_regions(&self) -> usize {
+        super::arena::RECORD_STRIDES
+            .iter()
+            .map(|&stride| {
+                let key = ArenaKey::for_record_stride(ArenaLocation::Gpu, stride);
+                self.inner.pool.pool_arena_load(key).len()
+            })
+            .sum()
+    }
+
+    /// `(arena index, capacity, live slots)` per arena of one pool.
+    ///
+    /// The cheap form of [`Self::pool_occupancy`] — a count instead of the list — for
+    /// a caller that only needs to know which arenas a pool has registered. The
+    /// compaction's record walk asks it of every record-stride pool, where the list of
+    /// occupied slots would be a per-slot upload the walk exists to avoid.
+    pub fn pool_arena_load(&self, key: ArenaKey) -> Vec<(usize, usize, usize)> {
+        self.inner.pool.pool_arena_load(key)
+    }
+
+    /// Every band every live slot names, for the integrity checks.
+    ///
+    /// Host-only and complete: it walks the block tables rather than sampling them, so
+    /// a gid naming ground nothing holds cannot hide in the part that was not looked
+    /// at. Returns the band's `(arena, slot)` — which is what the refcount tables are
+    /// keyed by — together with the chunk's record address, so a caller that wants to
+    /// check the record's pointer as well knows where to read it.
+    ///
+    /// `record` is `None` for a chunk with no coresident record: a freshly-allocated
+    /// float writer window, or one whose record was dropped when its gids were
+    /// replaced. Both are ordinary and neither needs checking.
+    pub fn live_bands(&self) -> Result<Vec<(usize, Vec<LiveBand>)>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let mut out = Vec::new();
+        for (slot, entry) in state.sequences.iter().enumerate() {
+            let Some(seq) = entry.as_ref() else { continue };
+            let mut bands = Vec::new();
+            for cw in seq.chunks_slice().iter() {
+                let record = cw
+                    .meta
+                    .as_ref()
+                    .map(|m| m.device_addr())
+                    .filter(|a| *a != 0);
+                for (band, g) in cw.gids.as_slice().iter().enumerate() {
+                    if g.raw() < 0 {
+                        continue;
+                    }
+                    bands.push(LiveBand {
+                        arena: g.arena_idx(),
+                        slot_in_arena: g.chunk_idx(),
+                        record,
+                        band,
+                    });
+                }
+            }
+            if !bands.is_empty() {
+                out.push((slot, bands));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Each GPU arena's base address, slot stride and capacity.
+    ///
+    /// What a caller needs to turn a raw device address back into the `(arena, slot)`
+    /// the refcount tables are keyed by — the inverse of `slot_addr`, which is the
+    /// direction an orphaned *record pointer* has to be checked in.
+    pub fn arena_extents(&self) -> Result<Vec<(usize, u64, i64, u32)>> {
+        let mut needed = std::collections::HashSet::new();
+        for class in SizeClass::all() {
+            let key = ArenaKey::new(class, ArenaLocation::Gpu);
+            for (arena, _, _) in self.inner.pool.pool_arena_load(key) {
+                needed.insert(arena);
+            }
+        }
+        let info = self.resolve_arena_info_for(&needed)?;
+        Ok(needed
+            .into_iter()
+            .filter_map(|a| {
+                let r = info.get(a)?;
+                (r.base_ptr != 0 && r.chunk_byte_stride > 0).then_some((
+                    a,
+                    r.base_ptr,
+                    r.chunk_byte_stride,
+                    r.chunk_capacity,
+                ))
+            })
+            .collect())
+    }
+
+    /// `(arenas_held, arenas_if_packed)` for one pool, from the refcount tables' live
+    /// counters — see [`ChunkGidPool::pool_sparsity`].
+    pub fn pool_sparsity(&self, key: ArenaKey) -> (usize, usize) {
+        self.inner.pool.pool_sparsity(key)
+    }
+
+    /// The highest region rank a live arena of `key` holds, and how many slots that
+    /// arena is holding — the cheap question "is this pool what is holding the
+    /// frontier up?".
+    ///
+    /// **Cheap on purpose.** A compaction pass is time-budgeted, and its budget is
+    /// spent on the occupancy census; a pass that censuses the ladder in class order
+    /// spends that budget on whichever rungs happen to come first and can run out
+    /// before reaching the pool that owns the topmost arena — which is the only pool
+    /// whose position costs the weight side anything. So the ordering decision has to
+    /// be answerable without the census, which is what
+    /// [`ChunkGidPool::pool_arena_load`] is for.
+    pub fn pool_top_rank(&self, key: ArenaKey) -> Option<(usize, usize)> {
+        let load = self.inner.pool.pool_arena_load(key);
+        if load.is_empty() {
+            return None;
+        }
+        self.inner
+            .storage
+            .read(|s| {
+                let arenas = s.arenas();
+                load.iter()
+                    .filter(|(_, _, live)| *live > 0)
+                    .filter_map(|(idx, _, live)| {
+                        arenas
+                            .get(idx)
+                            .and_then(|a| a.region_rank())
+                            .map(|r| (r, *live))
+                    })
+                    .max_by_key(|(rank, _)| *rank)
+            })
+            // A poisoned storage lock is not a ranking question; the pass falls back
+            // to ladder order, which is where it started.
+            .ok()
+            .flatten()
+    }
+
+    /// The census one pool's compaction plans from — occupancy joined to physical
+    /// address order.
+    ///
+    /// Two halves, from two owners: the gid pool knows which slots are occupied
+    /// ([`ChunkGidPool::pool_occupancy`]) and the arena storage knows where each
+    /// arena physically sits ([`Arena::region_rank`]). Only the join is
+    /// plannable — occupancy alone cannot say which way is "down".
+    ///
+    /// **An arena with no region is skipped.** That is every CPU arena, whose
+    /// slab is an ordinary host allocation with no position in the reservation
+    /// and so nothing to pack toward. A pass over a host pool is therefore a
+    /// no-op rather than a plan over meaningless ranks, and the empty result says
+    /// so. (`plan_pool` filters by `ArenaKey`, so a host pool is never mixed into
+    /// a device one; this is the second, independent guard.)
+    ///
+    /// Taken under one `storage.read`, but the occupancy bitmaps are sampled
+    /// word by word — see [`ArenaRefcounts::occupied_slots`] for why a torn read
+    /// is tolerable and what finally refuses a slot the census got wrong.
+    pub fn compaction_census(&self, key: ArenaKey) -> Result<Vec<ArenaSlots>> {
+        let occupancy = self.inner.pool.pool_occupancy(key);
+        if occupancy.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inner.storage.read(|s| {
+            let arenas = s.arenas();
+            let mut out = Vec::with_capacity(occupancy.len());
+            for (arena_idx, capacity, occupied) in &occupancy {
+                let Some(arena) = arenas.get(arena_idx) else {
+                    // Registered in the pool but gone from storage: a release
+                    // that has not finished propagating. Nothing to move.
+                    continue;
+                };
+                let Some(rank) = arena.region_rank() else {
+                    continue;
+                };
+                out.push(ArenaSlots {
+                    arena_idx: *arena_idx,
+                    key,
+                    rank,
+                    capacity: *capacity,
+                    occupied: occupied.clone(),
+                });
+            }
+            out
+        })
+    }
+
+    /// The census entry for an arena this pass has just created and nothing occupies:
+    /// its physical rank and capacity, with no occupied slots.
+    ///
+    /// What [`Self::compaction_census`] would report for it, without re-walking the rest
+    /// of the pool's bitmaps to find out. `None` when the arena has no region (a host
+    /// arena) or is not in storage.
+    #[allow(dead_code)] // the only caller is `compact`, which is cuda-gated
+    pub(super) fn fresh_arena_slots(&self, key: ArenaKey, arena_idx: usize) -> Option<ArenaSlots> {
+        let rank = self
+            .inner
+            .storage
+            .read(|s| s.arenas().get(&arena_idx).and_then(|a| a.region_rank()))
+            .ok()
+            .flatten()?;
+        Some(ArenaSlots {
+            arena_idx,
+            key,
+            rank,
+            capacity: key.chunks(),
+            occupied: Vec::new(),
+        })
     }
 
     /// GPU arena occupancy split float vs quant across the pool this backing

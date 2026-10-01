@@ -17,6 +17,7 @@
 //! changes, and the host never waits for the GPU to reach an upload.
 
 use super::head_gids::HeadGids;
+use super::meta_pool::MetaGid;
 use super::slot_state_arena::{self, SlotStateSlot};
 use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
@@ -25,8 +26,52 @@ use crate::kv_cache::arena_table::N_PALETTE;
 use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
 use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream};
 use candle::cuda_backend::WrapErr;
-use candle::quantized::pinned_staging::PinnedBuf;
+use candle::quantized::pinned_staging::{give_recycled_wc, take_recycled_wc, PinnedBuf};
 use std::sync::Arc;
+
+/// Everything one serialised chunk's headers dereference, held alive for the life of
+/// any launch that reads them.
+///
+/// Both halves are addresses in a slice header: the record's own (`kvheads_ptr`) and,
+/// through it, each band's. So both handles have to be held — see [`GpuChunks::pins`],
+/// where holding only the first cost a night.
+#[derive(Clone, Debug)]
+pub struct ChunkPin {
+    /// The chunk's bands.
+    gids: HeadGids,
+    /// The chunk's resident record, when it has one. `None` for a live writer window,
+    /// whose heads are serialised inline and name no record slot.
+    meta: Option<MetaGid>,
+}
+
+impl ChunkPin {
+    fn of(chunk: &ChunkWindow) -> Self {
+        Self {
+            gids: chunk.gids.clone(),
+            meta: chunk.meta.clone(),
+        }
+    }
+
+    /// `HeadGids::alloc_id` of the bands this pin holds. Stable for as long as the pin
+    /// lives, because the pin is what keeps the allocation alive.
+    pub(crate) fn bands_alloc_id(&self) -> usize {
+        self.gids.alloc_id()
+    }
+
+    /// Raw id of the record slot this pin holds, if the chunk has a record. Unique for
+    /// as long as the pin lives, for the same reason.
+    pub(crate) fn record_raw(&self) -> Option<i64> {
+        self.meta.as_ref().map(MetaGid::raw)
+    }
+
+    /// Whether this pin already holds exactly what `chunk`'s header will name — its band
+    /// allocation and its record slot — the cheap check `update_chunk` uses before
+    /// replacing a pin.
+    fn describes(&self, chunk: &ChunkWindow) -> bool {
+        self.gids.is_same_alloc(&chunk.gids)
+            && self.record_raw() == chunk.meta.as_ref().map(MetaGid::raw)
+    }
+}
 
 /// Cached host + device-side serialised slot-state for one sequence.
 pub(crate) struct GpuChunks {
@@ -69,11 +114,18 @@ pub(crate) struct GpuChunks {
     /// re-tenanted under an in-flight kernel. So the serialisation carries its
     /// own pins, taken in the same pass that wrote the bytes.
     ///
+    /// **The record handles are pinned for the same reason and it is not optional.**
+    /// A header's `kvheads_ptr` is a *record's* address, and a record slot is an
+    /// ordinary arena slot: a compaction mints a fresh record per relocated chunk —
+    /// 800–1,400 a pass — which frees the old one and reissues its slot inside the
+    /// same sweep. A launch holding only the band gids would keep the bands alive
+    /// while the record its headers point at was handed to another chunk.
+    ///
     /// Shared, so a launch holds the set it actually read with ONE refcount
     /// bump rather than a clone per chunk: `clear` installs a fresh vector and
     /// a launch still holding the old one keeps exactly the arenas its headers
     /// point at, for as long as it needs them.
-    pins: Arc<Vec<HeadGids>>,
+    pins: Arc<Vec<ChunkPin>>,
     /// The pinned buffers an upload is copied through — two, so one can carry
     /// a copy still waiting in the stream while the next upload fills the
     /// other. See [`choose_staging`] for which one an upload takes.
@@ -99,10 +151,24 @@ struct Staging {
 impl Staging {
     fn empty() -> Self {
         Self {
-            // alloc_owned(0) returns a zero-len Bump variant — no CUDA call.
-            buf: PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail"),
+            buf: Self::no_buf(),
             done: None,
         }
+    }
+
+    /// The zero-length placeholder a `Staging` holds before its first upload.
+    /// `alloc_owned(0)` returns a zero-len `Bump` variant — no CUDA call.
+    fn no_buf() -> PinnedBuf {
+        PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail")
+    }
+
+    /// Take the pinned buffer out, leaving the placeholder.
+    ///
+    /// The caller must have fenced this staging's copies first: the recycler hands
+    /// the same pages to the next taker, so a copy still reading them would read
+    /// another owner's bytes.
+    fn take_buf(&mut self) -> PinnedBuf {
+        std::mem::replace(&mut self.buf, Self::no_buf())
     }
 
     /// Whether a copy out of this buffer may still be waiting in the stream.
@@ -172,7 +238,7 @@ impl GpuChunks {
 
     /// The chunks this serialisation references, for a consumer to hold across
     /// its launch. One refcount bump — see [`Self::pins`].
-    pub(crate) fn pins(&self) -> Arc<Vec<HeadGids>> {
+    pub(crate) fn pins(&self) -> Arc<Vec<ChunkPin>> {
         Arc::clone(&self.pins)
     }
 
@@ -587,8 +653,13 @@ impl GpuChunksGuard<'_> {
                 self.inner.pins.len()
             );
         }
-        if !self.inner.pins[chunk_idx].is_same_alloc(&chunk.gids) {
-            Arc::make_mut(&mut self.inner.pins)[chunk_idx] = chunk.gids.clone();
+        // Replaced whole when EITHER handle differs, not only the band allocation: the
+        // record beside it can change while the gids do not — a compaction that copies a
+        // record lower moves the chunk onto the copy and leaves its gids alone — and a pin
+        // naming the old record then holds the wrong slot alive while the header just
+        // written names the new one, which nothing in this buffer holds.
+        if !self.inner.pins[chunk_idx].describes(chunk) {
+            Arc::make_mut(&mut self.inner.pins)[chunk_idx] = ChunkPin::of(chunk);
         }
         self.dirty_chunks.push(chunk_idx);
         Ok(())
@@ -623,7 +694,7 @@ impl GpuChunksGuard<'_> {
         // Pin what this pass is about to reference. A fresh vector, never a
         // mutation of the old one: a launch reading the previous serialisation
         // still holds that one and must keep ITS arenas, not these.
-        self.inner.pins = Arc::new(chunks.iter().map(|c| c.gids.clone()).collect());
+        self.inner.pins = Arc::new(chunks.iter().map(ChunkPin::of).collect());
         // All chunks in a backing share one band count; derive it from the first.
         let n_palette = chunk_n_palette(&chunks[0], n_kv_head);
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);
@@ -775,8 +846,19 @@ impl Drop for GpuChunksGuard<'_> {
         if staging.buf.len() < total {
             // No copy reads this buffer any more — it was free, or waited on
             // above — so replacing it frees nothing a copy still needs.
-            match slot_state_arena::class_bytes_for(total).and_then(PinnedBuf::alloc_owned) {
-                Ok(buf) => staging.buf = buf,
+            // **Through the recycler, because `cuMemHostAlloc` is ~1 ms.** Every
+            // `(layer, slot)` owns two of these and a prefill rebuilds each about
+            // once, so this branch was a first touch nearly every time it ran:
+            // measured on the Flash-Next gate at 16 slots, 416 allocations and
+            // 417 ms — 97.6% of the slot-state rebuild. Recycling takes it to 1.6 ms.
+            // The sizes come from `class_bytes_for`, so the recycler's exact-length
+            // keys are a short ladder that hits.
+            match slot_state_arena::class_bytes_for(total).and_then(take_recycled_wc) {
+                Ok(buf) => {
+                    // The buffer it replaces is idle by the same argument as above,
+                    // so it goes back for the next taker rather than to the driver.
+                    give_recycled_wc(std::mem::replace(&mut staging.buf, buf));
+                }
                 Err(e) => {
                     // No pinned memory to stage through. Upload straight from
                     // the host copy and drain the stream before returning, so
@@ -873,6 +955,13 @@ impl Drop for GpuChunks {
         // claims from immediately). Stream ordering covers the copies enqueued
         // before the handover, not one already in flight toward the slot.
         self.fence_uploads();
+        // The fence retired every copy out of these buffers, so their pages are
+        // idle and the next `(layer, slot)` needing this size can have them
+        // instead of paying `cuMemHostAlloc` again. Returned here and not in
+        // `clear`, which keeps the buffers on purpose for the next fill.
+        for s in self.staging.iter_mut() {
+            give_recycled_wc(s.take_buf());
+        }
         self.release_slot();
     }
 }
@@ -1139,5 +1228,54 @@ mod staging_tests {
         // two, and the upload waits for it.
         assert_eq!(choose_staging([true, true], Some(0)), (1, true));
         assert_eq!(choose_staging([true, true], Some(1)), (0, true));
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::kv_cache::chunked::gid_pool::ChunkGid;
+
+    fn window(gids: HeadGids, meta: Option<MetaGid>) -> ChunkWindow {
+        ChunkWindow {
+            gids,
+            usage: 32,
+            offset: 0,
+            k_pal: Arc::new(Vec::new()),
+            v_pal: Arc::new(Vec::new()),
+            k_scale: Arc::new(Vec::new()),
+            v_scale: Arc::new(Vec::new()),
+            k_fmt: Arc::new(Vec::new()),
+            v_fmt: Arc::new(Vec::new()),
+            meta,
+        }
+    }
+
+    /// **A pin no longer describes a chunk whose record changed under unchanged gids.**
+    ///
+    /// That is what a compaction's record move produces: the chunk is moved onto a copy of
+    /// its record and its bands stay put. A pin compared on bands alone would stay on the
+    /// OLD record while `update_chunk` writes a header naming the new one, leaving the
+    /// record the header dereferences held by nothing in the buffer.
+    #[test]
+    fn a_pin_is_stale_when_only_the_record_changed() {
+        let bands = HeadGids::uniform(ChunkGid::detached(7), 1);
+        let old = MetaGid::from_slot(ChunkGid::detached(100), bands.clone(), 0xA000);
+        let new = MetaGid::from_slot(ChunkGid::detached(200), bands.clone(), 0xB000);
+
+        let pin = ChunkPin::of(&window(bands.clone(), Some(old.clone())));
+        assert!(pin.describes(&window(bands.clone(), Some(old))));
+        assert!(
+            !pin.describes(&window(bands.clone(), Some(new))),
+            "same bands, different record: the pin must be replaced",
+        );
+        assert!(
+            !pin.describes(&window(bands, None)),
+            "a record dropped is a change too",
+        );
+        assert!(
+            !pin.describes(&window(HeadGids::uniform(ChunkGid::detached(8), 1), None)),
+            "and so is a band change",
+        );
     }
 }

@@ -42,7 +42,30 @@
 //! permutation exists only because those kernels hard-code the pairing at
 //! `head_dim/2`.
 
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, LiveTensor, Result, Tensor};
+
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::wave_from_vec_ticketed;
+#[cfg(not(feature = "cuda"))]
+use candle::{Shape, WithDType};
+
+/// The upload with no wave arena to put it on — an ordinary transfer.
+///
+/// The CUDA build's [`wave_from_vec_ticketed`] already falls back to exactly
+/// this whenever the device is not CUDA or the ticket's generation has closed.
+/// Off CUDA that is the only case there is, and the arena machinery the real one
+/// is built from does not compile, so this is the same answer reached directly
+/// rather than a second policy.
+#[cfg(not(feature = "cuda"))]
+fn wave_from_vec_ticketed<D: WithDType, S: Into<Shape>>(
+    data: Vec<D>,
+    shape: S,
+    device: &Device,
+    _ticket: Option<WaveTicket>,
+) -> Result<Tensor> {
+    Tensor::from_vec(data, shape, device)
+}
 
 /// The head-dim permutation and matching RoPE table for one geometry.
 #[derive(Debug, Clone)]
@@ -166,51 +189,25 @@ impl RotaryLayout {
         x.index_select(idx, last)
     }
 
-    /// The `[max_pos, head_dim]` interleaved `(cos, sin)` table the kernels
-    /// read, with identity entries on every pass-through pair.
-    pub fn rope_table(
-        &self,
-        max_pos: usize,
-        theta: f32,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<Tensor> {
-        let half = self.head_dim / 2;
-        let r_half = self.rope_dim / 2;
-        let mut vals = Vec::with_capacity(max_pos * self.head_dim);
-        for pos in 0..max_pos {
-            for j in 0..half {
-                if j < r_half {
-                    // ggml's `rope_neox` frequency over the ROTARY width.
-                    let inv = 1f32 / theta.powf(2.0 * j as f32 / self.rope_dim as f32);
-                    let ang = pos as f32 * inv;
-                    vals.push(ang.cos());
-                    vals.push(ang.sin());
-                } else {
-                    // Pass-through pair: rotation by zero.
-                    vals.push(1.0);
-                    vals.push(0.0);
-                }
-            }
-        }
-        Tensor::from_vec(vals, (max_pos, self.head_dim), dev)?.to_dtype(dtype)
-    }
-
     /// Split `(cos, sin)` at the given absolute positions, `[n, head_dim/2]`
-    /// each, with identity entries on every pass-through pair.
+    /// each, with identity entries on every pass-through pair — rung 0's
+    /// frequencies, for the non-paged paths.
     ///
-    /// The same angles [`Self::rope_table`] interleaves, de-interleaved. The
-    /// paged kernels read the interleaved table and never touch these, but the
-    /// attention parameters carry both and a caller that reached for the split
-    /// form would otherwise get another model's frequencies. Built per wave
-    /// over the wave's own positions, which is a few hundred rows — not the
-    /// whole context, which is what the interleaved table has to cover.
+    /// The paged kernels rotate from the model's rung set and never touch
+    /// these, but the attention parameters carry both and a caller that
+    /// reached for the split form would otherwise get another model's
+    /// frequencies. Built per wave over the wave's own positions, which is a
+    /// few hundred rows.
     pub fn rope_cos_sin(
         &self,
         positions: &[u32],
         theta: f32,
         dtype: DType,
         dev: &Device,
+        // The forward-scoped span these tables belong to: built once per wave,
+        // read by every layer, which is exactly what that span is described as
+        // holding. `None` uploads them the ordinary way.
+        ticket: Option<WaveTicket>,
     ) -> Result<(Tensor, Tensor)> {
         let half = self.head_dim / 2;
         let r_half = self.rope_dim / 2;
@@ -231,8 +228,8 @@ impl RotaryLayout {
         }
         let shape = (positions.len(), half);
         Ok((
-            Tensor::from_vec(cos, shape, dev)?.to_dtype(dtype)?,
-            Tensor::from_vec(sin, shape, dev)?.to_dtype(dtype)?,
+            wave_from_vec_ticketed(cos, shape, dev, ticket)?.to_dtype(dtype)?,
+            wave_from_vec_ticketed(sin, shape, dev, ticket)?.to_dtype(dtype)?,
         ))
     }
 }
@@ -243,9 +240,28 @@ impl RotaryLayout {
 mod tests {
     use super::*;
     use crate::models::qwen35::attention::RopeTables;
+    use crate::models::rope_schedule::{plain_inv_freq, RopeRungs, RopeSchedule};
 
     fn dev() -> Device {
         Device::Cpu
+    }
+
+    /// The interleaved `(cos, sin)` row the kernels read at `pos` — frequency
+    /// `j` from the rung set, identity past its rotary pairs — over the whole
+    /// head.
+    fn kernel_row(rope: &RopeRungs, pos: usize, head_dim: usize) -> Vec<f32> {
+        (0..head_dim / 2)
+            .flat_map(|j| {
+                let (c, s) = rope.cos_sin(0, pos, j);
+                [c, s]
+            })
+            .collect()
+    }
+
+    /// The rung set over a lineage's rotary width.
+    fn rotary_rope(rope_dim: usize, theta: f32) -> RopeRungs {
+        let s = RopeSchedule::stated(plain_inv_freq(rope_dim, theta), 1 << 20).unwrap();
+        RopeRungs::new(&s, &dev()).unwrap()
     }
 
     /// What the paged kernel does: pair `d` with `d + head_dim/2`, taking
@@ -304,11 +320,7 @@ mod tests {
     fn kernel_rope_over_permuted_dims_equals_partial_rotary() {
         let (head_dim, rope_dim, theta) = (256usize, 64usize, 1e7f32);
         let l = RotaryLayout::new(head_dim, rope_dim, &dev()).unwrap();
-        let table = l
-            .rope_table(8, theta, DType::F32, &dev())
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
+        let rope = rotary_rope(rope_dim, theta);
         // The validated reference: partial rotary over the model's dims.
         let reference = RopeTables::new(rope_dim, theta, 8, &dev()).unwrap();
 
@@ -329,7 +341,7 @@ mod tests {
 
             // Kernel path: permute, then full-width rotate with our table.
             let permuted: Vec<f32> = l.permutation().iter().map(|&d| x[d]).collect();
-            let rotated = kernel_rope(&permuted, &table[pos], head_dim);
+            let rotated = kernel_rope(&permuted, &kernel_row(&rope, pos, head_dim), head_dim);
             // Undo the permutation to compare in model order.
             let mut got = vec![0f32; head_dim];
             for (slot, &d) in l.permutation().iter().enumerate() {
@@ -354,15 +366,11 @@ mod tests {
     fn pass_through_dims_are_invariant_to_position() {
         let (head_dim, rope_dim) = (256usize, 64usize);
         let l = RotaryLayout::new(head_dim, rope_dim, &dev()).unwrap();
-        let table = l
-            .rope_table(16, 1e7, DType::F32, &dev())
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
+        let rope = rotary_rope(rope_dim, 1e7);
         let x: Vec<f32> = (0..head_dim).map(|i| (i as f32) * 0.5 - 3.0).collect();
         let permuted: Vec<f32> = l.permutation().iter().map(|&d| x[d]).collect();
-        for pos in [0usize, 3, 15] {
-            let rotated = kernel_rope(&permuted, &table[pos], head_dim);
+        for pos in [0usize, 3, 15, 300_000] {
+            let rotated = kernel_rope(&permuted, &kernel_row(&rope, pos, head_dim), head_dim);
             for (slot, &d) in l.permutation().iter().enumerate() {
                 if d >= rope_dim {
                     assert!(

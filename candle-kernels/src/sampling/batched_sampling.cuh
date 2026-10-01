@@ -109,6 +109,57 @@ __device__ __forceinline__ float load_as_float<__nv_fp8_e4m3>(const __nv_fp8_e4m
 }
 
 // ============================================================================
+// Per-sequence sampling dials
+// ============================================================================
+//
+// The scalar dials — temperature, top-k/top-p, the penalties, the EOS and
+// segment-close ramps — were passed once per launch and applied to every row,
+// so a wave that mixes configs (a deliberating turn beside an impulsive one, a
+// narrator beside a reflection) sampled every row at whichever config sorted
+// first. That let one row's EOS ramp cut another row's turn off after a single
+// token. This struct carries the dials PER ROW instead: when the kernel is
+// handed a `[batch_size]` array of these, each block reads its own from
+// `seq_dials[blockIdx.x]` and the scalar arguments are ignored. A null pointer
+// keeps the legacy shared-scalar behaviour.
+//
+// **Layout is load-bearing.** The Rust host uploads a `#[repr(C)]` twin of this
+// struct (`batched_sampler::SeqDials`) as raw bytes; the field order and types
+// here must match it exactly. Every field is 4 bytes (f32/i32) so the struct is
+// naturally packed with no padding — keep it that way.
+//
+// `eos_token_id` and `vocab_size` are NOT here: they are a property of the
+// model/tokenizer, identical across the wave, so they stay scalar.
+//
+// `segment_close_token_id` IS here, per-row: a wave mixes rows that close on
+// different tokens (a deliberating row closes its `</think>` span; a narrator
+// row has no segment, token id -1), and a scalar taken from row 0 would gate
+// the whole wave on one row's token — the exact cross-row bleed this struct
+// exists to remove. -1 keeps a row's segment-close path off.
+struct SeqDials {
+    float temperature;
+    int32_t top_k;
+    float top_p;
+    float repeat_penalty;
+    float frequency_penalty;
+    float presence_penalty;
+    float dry_multiplier;
+    float dry_base;
+    int32_t dry_allowed_length;
+    int32_t dry_range;
+    float eos_boost;
+    int32_t eos_ramp_start;
+    int32_t eos_ramp_len;
+    float eos_boost_max_multiplier;
+    float cross_turn_penalty;
+    float segment_close_boost;
+    int32_t segment_close_token_id;
+    int32_t segment_close_ramp_start;
+    int32_t segment_close_ramp_len;
+    float segment_close_max_multiplier;
+    float segment_temp_boost;
+};
+
+// ============================================================================
 // Penalty Configuration (per-batch or global)
 // ============================================================================
 
@@ -2647,13 +2698,19 @@ batched_penalty_sampling_kernel(
     float temperature,
     int top_k,
     float top_p,
-    
+
     // Output
     uint32_t* __restrict__ output_tokens,    // [batch_size]
-    
+
     // RNG
     uint64_t seed,
-    uint64_t* __restrict__ rng_offsets       // [batch_size], updated in-place
+    uint64_t* __restrict__ rng_offsets,      // [batch_size], updated in-place
+
+    // Per-sequence dials — [batch_size] or null. When non-null, EVERY dial above
+    // (temperature, top-k/p, penalties, EOS/segment ramps) is overridden per row
+    // from `seq_dials[blockIdx.x]`; the scalar arguments become defaults for the
+    // null case only. See `SeqDials`.
+    const SeqDials* __restrict__ seq_dials
 ) {
     // Shared memory with conditional allocation based on feature flags
     // USE_PENALTIES controls tile_buffer (4KB), USE_DRY controls dry_cache (4KB)
@@ -2664,7 +2721,7 @@ batched_penalty_sampling_kernel(
     
     const int batch_idx = blockIdx.x;
     const int tid = threadIdx.x;
-    
+
     // Safety: validate required pointers
     // Note: rng_offsets can be null for argmax (temperature <= 0) since RNG isn't used
     if (output_tokens == nullptr || logits == nullptr) {
@@ -2672,6 +2729,39 @@ batched_penalty_sampling_kernel(
             output_tokens[batch_idx] = 0;  // Fallback to token 0
         }
         return;
+    }
+
+    // **Per-sequence dials.** The scalar dial arguments are mutable value params,
+    // so overriding them here — before any of them is read to build the penalty
+    // params or drive sampling — makes every downstream use per-row with no other
+    // change to this kernel. A null `seq_dials` leaves the scalars untouched
+    // (legacy shared-config behaviour). This is the whole of the per-sequence
+    // sampling fix; `eos_token_id` and vocab size stay scalar because they do
+    // not vary across the wave, but `segment_close_token_id` does (a narrator
+    // row carries -1 beside a deliberating row's `</think>`), so it is per-row.
+    if (seq_dials != nullptr) {
+        const SeqDials d = seq_dials[batch_idx];
+        temperature = d.temperature;
+        top_k = d.top_k;
+        top_p = d.top_p;
+        repeat_penalty = d.repeat_penalty;
+        frequency_penalty = d.frequency_penalty;
+        presence_penalty = d.presence_penalty;
+        dry_multiplier = d.dry_multiplier;
+        dry_base = d.dry_base;
+        dry_allowed_length = d.dry_allowed_length;
+        dry_range = d.dry_range;
+        eos_boost = d.eos_boost;
+        eos_ramp_start = d.eos_ramp_start;
+        eos_ramp_len = d.eos_ramp_len;
+        eos_boost_max_multiplier = d.eos_boost_max_multiplier;
+        cross_turn_penalty = d.cross_turn_penalty;
+        segment_close_boost = d.segment_close_boost;
+        segment_close_token_id = d.segment_close_token_id;
+        segment_close_ramp_start = d.segment_close_ramp_start;
+        segment_close_ramp_len = d.segment_close_ramp_len;
+        segment_close_max_multiplier = d.segment_close_max_multiplier;
+        segment_temp_boost = d.segment_temp_boost;
     }
     
     const T* my_logits = logits + batch_idx * vocab_size;
@@ -3141,23 +3231,30 @@ inline void dispatch_batched_sampling(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
+    // Per-sequence dials ([batch_size] or null) — see SeqDials.
+    const SeqDials* seq_dials,
     // Dispatch flags
     bool use_penalties,
     bool use_top_p,
     // CUDA stream (0 = default stream)
     cudaStream_t stream = 0
 ) {
-    
+
     dim3 grid(batch_size);
     dim3 block(THREADS_PER_BLOCK);
-    
+
     // Dynamic shared memory for bitset: ceil(vocab_size / 32) words * 4 bytes
     const size_t bitset_bytes = ((vocab_size + 31) / 32) * sizeof(uint32_t);
-    
+
     // 4-way dispatch based on penalties and top_p
     // USE_DRY is set to true when penalties are enabled AND dry_multiplier != 0
-    // This allows eliminating 4KB shared memory when DRY is not used
-    const bool use_dry = use_penalties && (dry_multiplier != 0.0f);
+    // This allows eliminating 4KB shared memory when DRY is not used.
+    // With per-sequence dials the scalar `dry_multiplier` says nothing about what
+    // individual rows want, so the DRY template is forced on — the kernel still
+    // gates DRY per row on that row's own `dry_multiplier`/`dry_lens`, so a row
+    // that wants none simply skips the precompute.
+    const bool use_dry =
+        (seq_dials != nullptr) || (use_penalties && (dry_multiplier != 0.0f));
 
     // A large vocabulary's recent-token bitset does not fit under the default
     // 48 KiB block ceiling alongside this kernel's static block; opt into the
@@ -3180,7 +3277,8 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
     } else if (use_penalties && use_dry && !use_top_p) {
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, true, false>
@@ -3197,7 +3295,8 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
     } else if (use_penalties && !use_dry && use_top_p) {
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, false, true>
@@ -3214,7 +3313,8 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
     } else if (use_penalties && !use_dry && !use_top_p) {
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, false, false>
@@ -3231,7 +3331,8 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
     } else if (!use_penalties && use_top_p) {
         // No penalties implies no DRY either
@@ -3249,7 +3350,8 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
     } else {
         // No penalties, no DRY, no top_p - fastest path
@@ -3267,7 +3369,8 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
     }
 }
@@ -3326,6 +3429,8 @@ inline void launch_batched_sampling_typed(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
+    // Per-sequence dials ([batch_size] or null) — see SeqDials.
+    const SeqDials* seq_dials,
     // CUDA stream (0 = default stream)
     cudaStream_t stream = 0
 ) {
@@ -3343,7 +3448,15 @@ inline void launch_batched_sampling_typed(
                          (suppress_tokens != nullptr && suppress_count > 0 &&
                           suppress_penalties != nullptr);
     bool use_top_p = (top_p < 1.0f);
-    
+    // With per-sequence dials the scalar detection above says nothing about what
+    // individual rows want, so force the full-featured kernel variant on: its
+    // penalty and top-p paths are no-ops for a row whose own dials are neutral,
+    // and every row then samples on exactly its own config.
+    if (seq_dials != nullptr) {
+        use_penalties = true;
+        use_top_p = true;
+    }
+
     // Use optimized stencil kernel when stencil is provided and reasonably small
     // For stencils up to MAX_STENCIL_SIZE (1024), direct iteration is faster
     // Note: Stencil kernel doesn't support DRY penalty yet - fall through if DRY enabled
@@ -3375,6 +3488,7 @@ inline void launch_batched_sampling_typed(
             recent_tokens, recent_lens, max_recent_len,
             temperature, top_k, top_p,
             output_tokens, seed, rng_offsets,
+            seq_dials,
             use_penalties, use_top_p,
             stream
         );

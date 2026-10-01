@@ -11,7 +11,9 @@ use crate::recorded_reply::recorded_reply;
 use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
-use crate::persistence::content_hash::{hash_tokens, section_stream_id, ContentChain, ContentHash};
+use crate::persistence::content_hash::{
+    hash_tokens, section_stream_id, turn_stream_id, ContentChain, ContentHash,
+};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
@@ -19,16 +21,17 @@ use crate::projection::{
     ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId,
     TurnIndex,
 };
-use crate::provenance::WideQSig;
+use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, CarvedTurn,
-    ProjectionInputs, ReprojectionPolicy, SchedulerRequest, TurnContent,
+    ProjectionInputs, ReprojectionPolicy, SchedulerRequest, SealedProbe, TurnContent,
 };
 use crate::sealed_turn::{SealedPages, SealedTurn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::stuffed_grid::{plan_stuffed_grid_with_indices, CaseGrid};
+use crate::substrate::ProjectionScores;
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{ConversationTree, TurnType};
@@ -49,21 +52,52 @@ pub(crate) fn slice_per_layer_sealed(
     full: &[SealedSequence],
     from: usize,
     to: usize,
-) -> Vec<SealedSequence> {
+) -> crate::Result<Vec<SealedSequence>> {
     full.iter()
-        .map(|seq| {
-            let chunks: Vec<_> = seq
-                .chunks
-                .get(from..to.min(seq.chunks.len()))
-                .unwrap_or(&[])
-                .to_vec();
+        .enumerate()
+        .map(|(layer, seq)| {
+            // **A range this layer cannot satisfy is a fault, and the seal
+            // stops.** There is no correct smaller answer: the caller has
+            // already resolved `[from, to)` against the slot's block count and
+            // is about to write it as one indivisible turn, so a layer that
+            // cannot produce it means the two disagree about what the slot
+            // holds. Sealing the remainder would persist a turn whose K/V is
+            // silently short of its tokens, which reads back as a coherent turn
+            // and attends over the wrong span.
+            //
+            // It used to be `get(from..to.min(len)).unwrap_or(&[])`: `to` was
+            // clamped and `from` never was, so a `from` past the layer's end
+            // inverted the range and the fallback turned that into an empty
+            // seal. Measured: a `repo_map` folder's FIRST turn sealed blocks
+            // 77..80 against per-layer lists holding only the view's three new
+            // chunks, so every layer produced nothing. The turn persisted with
+            // its tokens and `chunks=0(3blk×0L)`, and nothing said so — the
+            // substrate validator cannot see it either, since it checks
+            // `layers × chunks_per_layer` only on turns that HAVE chunks.
+            // `from > to` is checked too, and not as a formality: an INVERTED
+            // range is the exact shape the old clamp produced, and both bounds
+            // tested against `len` alone would let `5..3` through to
+            // `chunks[5..3]` — a panic, from the one function that was made
+            // fallible so a bad range could be reported instead. With
+            // `from <= to <= len`, `from <= len` follows.
+            if from > to || to > seq.chunks.len() {
+                return Err(crate::ConversationError::Model(candle::Error::Msg(
+                    format!(
+                        "seal range {from}..{to} is outside layer {layer}'s {} sealed chunk(s) — \
+                     the slot's block count and this layer's K/V disagree, and sealing any \
+                     part of it would persist a turn whose K/V is short of its tokens",
+                        seq.chunks.len(),
+                    ),
+                )));
+            }
+            let chunks: Vec<_> = seq.chunks[from..to].to_vec();
             let token_count = chunks.iter().map(|c| c.token_count as usize).sum();
-            SealedSequence {
+            Ok(SealedSequence {
                 chunks,
                 token_count,
                 chunk_size: seq.chunk_size,
                 location: seq.location,
-            }
+            })
         })
         .collect()
 }
@@ -207,6 +241,35 @@ fn fork_inherits_history(parent: TimelineId, fork: TimelineId) -> InheritsHistor
     } else {
         InheritsHistory::No
     }
+}
+
+/// Whether [`Sequence::fork_onto`] should seed the fork's recurrent state from
+/// its system-prompt branch checkpoint (§4.6), as a free function for the same
+/// reason [`fork_inherits_history`] is one: asserted directly, because the
+/// end-to-end oracle costs a model load and nothing else can see the defect —
+/// a conversation given the wrong memory holds the right K/V, answers from it
+/// fluently, and passes every recall probe.
+///
+/// **Three conditions, all required:**
+/// - `inherits == No` — an `Yes` fork continues the parent's own live history,
+///   which `fork_recurrent` already carries across; a branch checkpoint is
+///   only for a fork that gets nothing from that path.
+/// - `carries_recurrent_state` — a plain transformer never computed a
+///   checkpoint in the first place (`build_branch_checkpoint`'s own gate at
+///   construction), so the lookup would only ever miss.
+/// - `timeline_turn_count == 0` — the timeline has never sealed a turn. A
+///   `No` fork can also mean resuming some OTHER conversation's timeline,
+///   which `create_sequence_seeded` already restores from that timeline's own
+///   recurrent snapshot; installing base's prompt-only checkpoint over that
+///   would silently discard a real conversation's accumulated memory. A
+///   timeline with turns already sealed is exactly the case that restore does
+///   NOT leave untouched, so it must be excluded here.
+fn fork_wants_branch_checkpoint(
+    inherits: InheritsHistory,
+    carries_recurrent_state: bool,
+    timeline_turn_count: u32,
+) -> bool {
+    matches!(inherits, InheritsHistory::No) && carries_recurrent_state && timeline_turn_count == 0
 }
 
 /// Keeps a drop-cancelled [`Sequence::send_turn_with_options_async`] from
@@ -362,6 +425,25 @@ pub struct Sequence {
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
 /// glue the projection assembler wraps around the system prompt and each turn.
+/// One decoded round of [`Sequence::ingest_roundtrip_chain`].
+///
+/// An ingest that gathers its own evidence needs all three of these: the `text`
+/// to decide whether the model answered or issued a `<tool_call>`, the
+/// `turn_index` to couple that call to the response the caller feeds back, and
+/// the `tokens` to accumulate across the loop into the unit's ingest stat.
+#[derive(Debug, Clone)]
+pub struct ChainRound {
+    /// The decoded assistant text — the unit's summary, or the `<tool_call>` the
+    /// model issued in place of one.
+    pub text: String,
+    /// Sealed index of the decoded turn. Deliberately NOT "the last turn": the
+    /// async summariser can append a turn between the seal and the caller's
+    /// [`Sequence::couple_turn`].
+    pub turn_index: u32,
+    /// Tokens prefilled plus decoded in this round.
+    pub tokens: usize,
+}
+
 /// Returned by [`Sequence::glue_markers`] so the projection panel can render the
 /// framing verbatim.
 #[derive(Debug, Clone)]
@@ -1617,9 +1699,15 @@ impl Sequence {
         }
 
         // Every section still in `to_ingest` — a refused restore included —
-        // costs a prefill from here on.
+        // costs a prefill from here on. `out_skip` (pass 1, above) is counted
+        // into `restored` too: a section that `section_exists` already found
+        // resident — a cold-marker reconstructed when the substrate was
+        // opened — needed no fresh prefill just as surely as one this call
+        // explicitly restored, so excluding it from `SectionLoads` undercounts
+        // a restart that mostly restores through substrate-open reconstruction
+        // rather than this triage's own `RestoreSection` round trip.
         self.substrate
-            .record_section_loads(restore_out.len(), to_ingest.len());
+            .record_section_loads(restore_out.len() + out_skip.len(), to_ingest.len());
 
         // Bulk-allocate-then-fire: allocate one scratch slot per
         // section first (cheap, no timeline minting), then fire every
@@ -2917,7 +3005,19 @@ impl Sequence {
 
     /// [`Self::ingest_roundtrip_chain_indices`] for a caller that owns the
     /// timeline itself (the serial path): couples the chain here rather than
-    /// leaving it to a splice. Returns tokens ingested.
+    /// leaving it to a splice.
+    ///
+    /// **One round, not a whole ingest.** The decoded text comes back so the
+    /// caller can see whether the model answered or issued a `<tool_call>`, run
+    /// the tool, and submit the response as the next round's `decode_user` with
+    /// an EMPTY `prefilled` — which is how `repo_map` drives a real agentic loop
+    /// over a folder (`zend::repo_scan::converse`). The last turn is left
+    /// uncoupled for exactly that reason: a round that turns out to be a call
+    /// gets coupled to the response the caller then feeds back.
+    ///
+    /// `closing` bans the tool-call opener for this round, forcing an answer in
+    /// prose on whatever the conversation has already gathered — the caller's
+    /// round cap reaching its end.
     pub fn ingest_roundtrip_chain(
         &mut self,
         prefilled: &[(TurnText, String)],
@@ -2926,22 +3026,34 @@ impl Sequence {
         max_summary_tokens: usize,
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
-    ) -> crate::Result<usize> {
-        let (indices, tokens) = self.ingest_roundtrip_chain_indices(
+        closing: bool,
+    ) -> crate::Result<ChainRound> {
+        let (indices, prefill_tokens, handle) = self.ingest_chain_submit(
             prefilled,
             decode_user,
             tags,
             max_summary_tokens,
             force_tools,
             triggers,
+            closing,
         )?;
+        let response = handle.wait_cancellable();
+        let (indices, tokens, text) =
+            self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
         // Couple every turn except the last: each prefilled turn belongs with the
         // one that answers it, so the summariser sees the whole exchange rather
         // than a call with no response.
         for idx in indices.iter().take(indices.len().saturating_sub(1)) {
             self.couple_turn(*idx)?;
         }
-        Ok(tokens)
+        let turn_index = *indices.last().ok_or_else(|| {
+            ConversationError::Channel("round-trip chain: no turns were sealed".into())
+        })?;
+        Ok(ChainRound {
+            text,
+            turn_index,
+            tokens,
+        })
     }
 
     /// Ingest an N-turn tool round-trip whose LAST assistant turn is decoded.
@@ -2978,6 +3090,7 @@ impl Sequence {
             max_summary_tokens,
             force_tools,
             triggers,
+            false,
         )?;
         // Interruptible wait: a graceful shutdown mid-ingest latches the cancel
         // flag, and this returns `IngestCancelled` instead of waiting out the
@@ -2985,7 +3098,9 @@ impl Sequence {
         // the scheduler's decode at its next step. The ingest caller unwinds this
         // as "cancelled", not a decode failure.
         let response = handle.wait_cancellable();
-        self.ingest_chain_settle(indices, prefill_tokens, handle, response)
+        let (indices, tokens, _) =
+            self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
+        Ok((indices, tokens))
     }
 
     /// [`Self::ingest_roundtrip_chain_indices`] awaited instead of blocked on —
@@ -3008,6 +3123,7 @@ impl Sequence {
             max_summary_tokens,
             force_tools,
             triggers,
+            false,
         )?;
         // Armed across the await like every async turn wait: dropping this
         // future drops the handle (the decode winds down scheduler-side) and
@@ -3015,21 +3131,24 @@ impl Sequence {
         // rejects every later turn with `TurnInFlight`.
         let armed = CancelClearsInFlight::arm(self);
         let response = handle.wait_cancellable_async().await;
-        armed
-            .disarm()
-            .ingest_chain_settle(indices, prefill_tokens, handle, response)
+        let (indices, tokens, _) =
+            armed
+                .disarm()
+                .ingest_chain_settle(indices, prefill_tokens, handle, response)?;
+        Ok((indices, tokens))
     }
 
     /// The tail both chain waits share: propagate the wait's verdict, read the
     /// sealed index off the response, and record the decoded turn with its
-    /// staged provenance events.
+    /// staged provenance events. Returns the sealed indices, the tokens, and the
+    /// decoded text.
     fn ingest_chain_settle(
         &mut self,
         mut indices: Vec<u32>,
         prefill_tokens: usize,
         handle: TurnHandle,
         response: crate::Result<TurnResponse>,
-    ) -> crate::Result<(Vec<u32>, usize)> {
+    ) -> crate::Result<(Vec<u32>, usize, String)> {
         let response = response?;
         let resp_tokens = response.token_ids.len();
         let resp_idx = response
@@ -3044,7 +3163,7 @@ impl Sequence {
         // Records the decoded turn + its staged provenance events.
         self.finish_turn_staged(handle, &response)?;
         indices.push(resp_idx);
-        Ok((indices, prefill_tokens + resp_tokens))
+        Ok((indices, prefill_tokens + resp_tokens, response.text))
     }
 
     /// The head both chain waits share: selection framing, the prefilled turns,
@@ -3058,6 +3177,7 @@ impl Sequence {
         max_summary_tokens: usize,
         force_tools: &[String],
         triggers: Arc<TriggerRegistry>,
+        closing: bool,
     ) -> crate::Result<(Vec<u32>, usize, TurnHandle)> {
         // A scope round-trip frames on the dialogue prompt itself — the persona is
         // deliberately left alone. The turns it seals are later borrowed into
@@ -3150,7 +3270,24 @@ impl Sequence {
         // than the summary, so by the time the closing period is sampled the
         // window holds the model's own prose rather than a directory listing.
         summary_sampling.repeat_last_n = 64;
+        // The line ends are a whole-vocabulary scan the engine's config already
+        // carries; a fresh `compression()` config would repeat it per summary.
+        summary_sampling.line_end_token_ids = Arc::clone(&self.config.sampling.line_end_token_ids);
         summary_sampling.apply_think_mode(ThinkMode::Off, &self.tokenizer, max_summary_tokens);
+        // The CLOSING round of an agentic ingest loop: ban the tool-call opener
+        // so a model still trying to gather evidence cannot open another call and
+        // has to answer on what it already has. Structural, for the same reason
+        // the `<think>` suppression above is: the request's prose asking for an
+        // answer is text the model may ignore, and a round that seals as a
+        // `<tool_call>` with nowhere to send it is the unit's whole budget spent
+        // on no summary at all. Mirrors the live dialogue loop's repeat-guard
+        // closing round.
+        if closing {
+            let open = self.config.sampling.tool_call_open_token_id;
+            if open >= 0 {
+                summary_sampling.banned_tokens.push(open);
+            }
+        }
         let mut opts = TurnOptions {
             max_tokens: Some(max_summary_tokens),
             sampling: Some(summary_sampling),
@@ -3200,7 +3337,19 @@ impl Sequence {
         // A scope fork is a fresh timeline: it ingests its own scope against the
         // system prompt and holds none of the file conversation's dialogue, so
         // it must not inherit the file conversation's memory either.
-        self.fork_onto(fork_timeline)
+        //
+        // `seed_recurrent_from_branch: false` — NOT because a scope fork
+        // wouldn't benefit from it (it processes the same system prompt as any
+        // fresh conversation), but because `install_branch_states`'s own doc
+        // measures the round-trip at 157ms of 175ms, and `fork_scope`'s only
+        // caller (`zend`'s `ingest_scopes`) mints up to `SCOPE_PARALLELISM`
+        // forks in a sequential loop before running them concurrently. Seeding
+        // each one would serialise ~700ms into that loop, ahead of the
+        // parallel section it exists to feed — exactly the per-fork queue
+        // wait that function was built to batch away. A background
+        // summarisation pass over a couple of turns is a much smaller loss
+        // from starting at zero recurrent state than a user-facing reply is.
+        self.fork_onto(fork_timeline, false)
     }
 
     /// Splice a per-scope fork's two coupled turns onto THIS (file) timeline in
@@ -3528,7 +3677,6 @@ impl Sequence {
         assistant_content_start: u32,
         seconds: f64,
     ) -> crate::Result<()> {
-        use crate::persistence::content_hash::turn_stream_id;
         use crate::persistence::streams::StreamDecl;
         use crate::projection::event::group_name_of;
         use crate::projection::{encode_events, staged_ingest_event, SelectedTurn, SystemItem};
@@ -3623,9 +3771,8 @@ impl Sequence {
     /// galleries + scorer, but the probe is the finished turn's stored signature
     /// rather than a live gather. Empty when the turn has no signature (nothing
     /// to score against).
-    fn last_turn_belief_scores(&self) -> crate::substrate::ProjectionScores {
-        use crate::provenance::decode_wide_sigs;
-        let empty = crate::substrate::ProjectionScores::new();
+    fn last_turn_belief_scores(&self) -> ProjectionScores {
+        let empty = ProjectionScores::new();
         let timeline = self.target.timeline;
         let (probe, q_span, tags, source) = {
             let read = self.substrate.read();
@@ -3657,30 +3804,42 @@ impl Sequence {
             let tags = read.turn_tags(timeline, idx);
             // The turn's own stream id keys the observation, so a later replay of
             // this turn folds nothing a second time.
-            let source = crate::persistence::content_hash::turn_stream_id(timeline.raw(), idx.0).0;
+            let source = turn_stream_id(timeline.raw(), idx.0).0;
             (probe, q_span, tags, source)
         };
-        let probe_q = q_span.and_then(|r| probe.get(r)).filter(|q| !q.is_empty());
-        let (scores, _) = self
-            .substrate
-            // The seal scan is the once-per-turn learning point for the
-            // score-normalization hit levels — and it teaches only the scopes this
-            // turn is inside, so a dialogue turn cannot rewrite a tag-scoped
-            // collection's lens. No arena here (the scheduler owns it) → the CPU
-            // per-file scan; the hot reproject path runs the paged GPU scan over
-            // the resident arena.
-            .score_beliefs(
-                self.projection.schema(),
-                self.target,
-                &probe,
+        let probe_q: Vec<WideQSig> = q_span
+            .and_then(|r| probe.get(r))
+            .map(<[WideQSig]>::to_vec)
+            .unwrap_or_default();
+        // The seal scan is the once-per-turn learning point for the
+        // score-normalization hit levels — and it teaches only the scopes this
+        // turn is inside, so a dialogue turn cannot rewrite a tag-scoped
+        // collection's lens. The scheduler runs it on its gallery arena, the
+        // only thread that may scan there.
+        let (tx, rx) = flume::bounded(1);
+        let sent = self.scheduler_tx.send(SchedulerRequest::ScoreSealedTurn {
+            substrate: self.substrate.clone(),
+            projection: Arc::clone(&self.projection),
+            target: self.target,
+            sealed: SealedProbe {
+                probe,
                 probe_q,
-                Observe::Yes {
-                    tags: &tags,
-                    source,
-                },
-                None,
-            );
-        scores
+                tags,
+                source,
+            },
+            response_tx: tx,
+        });
+        match sent.ok().and_then(|()| rx.recv().ok()) {
+            Some(scores) => scores,
+            None => {
+                tracing::warn!(
+                    timeline = timeline.raw(),
+                    "seal belief scan: the scheduler is gone; the turn's projection \
+                     event carries no belief scores"
+                );
+                empty
+            }
+        }
     }
 
     /// Recompute the materialized projection for this conversation and pair it
@@ -3920,7 +4079,7 @@ impl Sequence {
         let fork_timeline = self
             .substrate
             .mint_timeline(self.target.layer, self.target.group);
-        self.fork_onto(fork_timeline)
+        self.fork_onto(fork_timeline, true)
     }
 
     /// Fork onto a **specific** timeline rather than a freshly minted one —
@@ -3940,7 +4099,7 @@ impl Sequence {
         // forking its *base* conversation onto that client's timeline, and the
         // base holds a memory of turns the client never had. `fork_onto` takes
         // the parent's live state only when `timeline` is this sequence's own.
-        self.fork_onto(timeline)
+        self.fork_onto(timeline, true)
     }
 
     /// This conversation's **live** recurrent memory, right now, without sealing
@@ -4089,7 +4248,11 @@ impl Sequence {
     /// the parent's memory. A freshly minted one gives it nothing, so the
     /// parent's memory would be a recollection of turns the child's attention
     /// layers have never seen.
-    fn fork_onto(&self, fork_timeline: TimelineId) -> crate::Result<Sequence> {
+    fn fork_onto(
+        &self,
+        fork_timeline: TimelineId,
+        seed_recurrent_from_branch: bool,
+    ) -> crate::Result<Sequence> {
         // The parent's live memory describes the parent's own history. It is
         // therefore the child's memory exactly when the child continues that
         // history — when the fork lands back on the timeline the parent is
@@ -4173,6 +4336,43 @@ impl Sequence {
             // Forks start with a fresh scanner state — scoring will refresh
             // on the next provenance scan.  No need to clone the parent's scores.
         };
+
+        // Give a fork onto a genuinely fresh timeline the same recurrent head
+        // start a schema-built conversation gets: the branch checkpoint
+        // computed once for this exact system-prompt content (§4.6), copied
+        // device-to-device into the fork's own recurrent state. Never a share
+        // of the parent's live memory — `state_is_prompt_only: false` above
+        // already says this fork's state is real and starts diverging from
+        // the first token it decodes. See [`fork_wants_branch_checkpoint`]
+        // for why the timeline/recurrence conditions are required, and
+        // `fork_scope`'s call site for why `seed_recurrent_from_branch` exists.
+        //
+        // The two cheap checks gate the substrate lock + timeline lookup
+        // below, rather than the other way round: every fork of every plain
+        // transformer, and every same-timeline fork, would otherwise pay that
+        // read for a predicate that was always going to be `false` anyway.
+        if seed_recurrent_from_branch
+            && matches!(inherits, InheritsHistory::No)
+            && fork_conv.model_core.carries_recurrent_state
+        {
+            let turn_count = fork_conv.substrate.read().turn_count(fork_timeline);
+            if fork_wants_branch_checkpoint(
+                inherits,
+                fork_conv.model_core.carries_recurrent_state,
+                turn_count,
+            ) {
+                let (prefix, _tokens) =
+                    fork_conv.prompt_branch(&fork_conv.primed_prefix, &fork_conv.branch_spans);
+                if let Err(e) = fork_conv.restore_branch_checkpoint(prefix, None) {
+                    tracing::warn!(
+                        "fork onto a fresh timeline: branch checkpoint install failed ({e}) — \
+                         the fork starts with zero recurrent state, exactly as it did before \
+                         this existed"
+                    );
+                }
+            }
+        }
+
         Ok(fork_conv)
     }
 
@@ -4212,6 +4412,43 @@ impl Sequence {
         self.current_blocks = BlockCount(0);
 
         // Clear turn history (keeps system prompt, config, beliefs).
+        self.tree.clear_turns();
+
+        Ok(())
+    }
+
+    /// [`Self::reset`]'s async counterpart — awaits the scheduler's
+    /// acknowledgement with `recv_async` instead of parking the thread in a
+    /// blocking `recv`, exactly as [`crate::TurnHandle::wait_async`] mirrors
+    /// [`crate::TurnHandle::wait`]. Identical effect; which one a caller uses is
+    /// a property of the caller.
+    ///
+    /// This is the one to use on an async hot path: the per-narration narrator
+    /// reset runs on the tokio worker pool under a per-character lock, and a
+    /// blocking round-trip there parks the worker so no other character's turn
+    /// can be polled or submitted — the batched engine then forms one-session
+    /// waves and the GPU sits idle between them.
+    pub async fn reset_async(&mut self) -> crate::Result<()> {
+        if self.turn_in_flight {
+            return Err(ConversationError::TurnInFlight {
+                sequence_id: self.id,
+            });
+        }
+
+        let (response_tx, response_rx) = flume::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::ResetSequence {
+                sequence_id: self.id,
+                response_tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        response_rx
+            .recv_async()
+            .await
+            .map_err(|_| ConversationError::SchedulerGone)??;
+
+        self.pending_user = None;
+        self.current_blocks = BlockCount(0);
         self.tree.clear_turns();
 
         Ok(())
@@ -4588,7 +4825,7 @@ impl Sequence {
         if count == 0 {
             return Ok(());
         }
-        let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), count - 1);
+        let stream_id = turn_stream_id(timeline.raw(), count - 1);
         let payload = crate::projection::encode_events(events);
         self.substrate.persist_projection_events(stream_id, payload);
         Ok(())
@@ -4641,6 +4878,30 @@ impl Sequence {
     /// This sequence's timeline id.
     pub fn timeline_id(&self) -> TimelineId {
         self.target.timeline
+    }
+
+    /// Seed this sequence's recurrent memory from the nearest ancestor that has
+    /// a snapshot — the conversation it continues.
+    ///
+    /// Call it after recording the fork's lineage
+    /// (`ConversationEngine::set_forked_from`) and before its first turn. The
+    /// slot was seeded at creation from its own timeline, which a fresh fork
+    /// has no snapshot for; the pointer that says whose memory it inherits only
+    /// exists once the fork has returned, so the seed is asked for again here
+    /// rather than the fork being reordered around it.
+    ///
+    /// `Ok(false)` when the model carries no recurrent state, or no ancestor
+    /// has a snapshot yet — both ordinary, and both leave the sequence starting
+    /// from the sequence-start state.
+    pub fn seed_recurrent_from_lineage(&self) -> crate::Result<bool> {
+        let (tx, rx) = flume::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::SeedRecurrentFromLineage {
+                sequence_id: self.id,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        rx.recv().map_err(|_| ConversationError::SchedulerGone)?
     }
 
     /// Set this conversation's sidebar label, persisting it to the redo
@@ -5120,6 +5381,72 @@ mod windowed_ingest_tests {
     }
 }
 
+/// The seal-range guard on [`slice_per_layer_sealed`]. It exists because a range
+/// the layers cannot satisfy used to be clamped into an EMPTY seal, persisting a
+/// turn with its tokens and no K/V; so every rejection path has to return the
+/// error, never panic and never silently narrow.
+/// A `SealedChunk` carries RAII per-head `ChunkGid`s, so these cases use
+/// EMPTY layers: the guard reads `chunks.len()` and nothing else, which is
+/// exactly what both rejection paths turn on. The multi-chunk success path is
+/// what every production seal exercises.
+#[cfg(test)]
+mod slice_per_layer_sealed_tests {
+    use super::slice_per_layer_sealed;
+    use candle_nn::kv_cache::{ArenaLocation, SealedSequence};
+
+    fn empty_layer() -> SealedSequence {
+        SealedSequence {
+            chunks: Vec::new(),
+            token_count: 0,
+            chunk_size: 32,
+            location: ArenaLocation::Cpu,
+        }
+    }
+
+    /// An empty range over an empty layer is legitimate — a section pin that
+    /// sealed nothing — and must slice cleanly rather than be rejected.
+    #[test]
+    fn an_empty_range_is_not_an_error() {
+        let out = slice_per_layer_sealed(&[empty_layer()], 0, 0).expect("empty range");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].chunks.is_empty());
+        assert_eq!(out[0].token_count, 0);
+    }
+
+    /// The `chunks=0(3blk×0L)` shape that started this: a range the layer cannot
+    /// satisfy must report, not narrow.
+    #[test]
+    fn a_range_past_a_layers_end_is_an_error() {
+        let err = slice_per_layer_sealed(&[empty_layer()], 77, 80)
+            .expect_err("an empty layer cannot satisfy 77..80");
+        let msg = err.to_string();
+        assert!(msg.contains("seal range 77..80"), "{msg}");
+        assert!(
+            msg.contains("layer 0"),
+            "names the layer that disagrees: {msg}"
+        );
+    }
+
+    /// **An inverted range is an error, not a panic.** Both bounds tested against
+    /// `len` alone would admit `5..3` and then panic in the slice — from the one
+    /// function made fallible so a bad range could be reported instead.
+    #[test]
+    fn an_inverted_range_is_an_error_not_a_panic() {
+        let err = slice_per_layer_sealed(&[empty_layer()], 5, 3).expect_err("5..3 is inverted");
+        assert!(err.to_string().contains("seal range 5..3"), "{err}");
+    }
+
+    /// Zero layers yields zero sequences and NO error — which is exactly why this
+    /// guard could not have caught the missing-K/V seal on its own: with no
+    /// layers the closure never runs, so the caller must treat an empty result as
+    /// a failed seal rather than trusting `Ok`.
+    #[test]
+    fn no_layers_yields_no_sequences_and_no_error() {
+        let out = slice_per_layer_sealed(&[], 77, 80).expect("no layers to check");
+        assert!(out.is_empty());
+    }
+}
+
 /// **A1 — a fork inherits the parent's memory only on the parent's own
 /// timeline.**
 ///
@@ -5165,6 +5492,45 @@ mod fork_inherits_history_tests {
             fork_inherits_history(parent, TimelineId::for_test(1)),
             InheritsHistory::No
         );
+    }
+}
+
+/// See [`fork_wants_branch_checkpoint`]'s doc for why each of the three
+/// conditions is asserted independently: the failure mode a wrong one produces
+/// is either wasted compute (recomputing what `fork_recurrent` already carried)
+/// or silent corruption (discarding a real conversation's memory) — neither of
+/// which any end-to-end recall probe distinguishes from correct behaviour.
+#[cfg(test)]
+mod fork_wants_branch_checkpoint_tests {
+    use super::{fork_wants_branch_checkpoint, InheritsHistory};
+
+    #[test]
+    fn only_a_fresh_timeline_on_a_recurrent_model_with_no_turns_wants_it() {
+        assert!(fork_wants_branch_checkpoint(InheritsHistory::No, true, 0));
+    }
+
+    #[test]
+    fn a_fork_that_continues_the_parents_own_history_does_not() {
+        // `fork_recurrent` already carries the live parent's state across for
+        // this case — installing the checkpoint on top would just redo it.
+        assert!(!fork_wants_branch_checkpoint(InheritsHistory::Yes, true, 0));
+    }
+
+    #[test]
+    fn a_plain_transformer_never_wants_it() {
+        // No checkpoint was ever computed for this model, at any turn count —
+        // the lookup would only ever miss.
+        assert!(!fork_wants_branch_checkpoint(InheritsHistory::No, false, 0));
+    }
+
+    #[test]
+    fn resuming_a_timeline_that_already_has_turns_does_not() {
+        // This is the daemon's client-resume case: `InheritsHistory::No` (a
+        // fork onto some OTHER conversation's timeline) with real history
+        // already sealed there. `create_sequence_seeded` already restored
+        // that timeline's own recurrent snapshot; installing the prompt-only
+        // checkpoint on top would silently discard it.
+        assert!(!fork_wants_branch_checkpoint(InheritsHistory::No, true, 3));
     }
 }
 

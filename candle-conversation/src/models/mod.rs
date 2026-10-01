@@ -47,8 +47,11 @@
 
 mod builder;
 mod dialect;
+mod gguf_rope;
 mod hermes3;
 pub mod overrides;
+#[cfg(test)]
+mod preset_rope_tests;
 mod qwen2;
 mod qwen3;
 mod qwen35_dense;
@@ -61,7 +64,9 @@ pub use dialect::*;
 
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
+use candle::quantized::GgmlDType;
 use candle::DType;
+pub use candle_transformers::models::rope_schedule::RopePreset;
 use std::path::Path;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -158,6 +163,20 @@ impl ModelArch {
             Self::Qwen3 | Self::Qwen3Moe | Self::Qwen2 | Self::Llama | Self::DeepSeekV4 => None,
         }
     }
+
+    /// The RoPE preset a checkpoint of this arch runs when no preset names one — a
+    /// GGUF handed over from a local directory.
+    ///
+    /// The architectures whose loaders carry their schedule get it; a GQA file gets
+    /// what it states, since nothing outside the file says which release it is.
+    pub fn file_rope(self) -> RopePreset {
+        match self {
+            Self::Qwen35Hybrid | Self::Qwen35Dense | Self::Qwen4Exp | Self::DeepSeekV4 => {
+                RopePreset::Lineage
+            }
+            Self::Qwen3 | Self::Qwen3Moe | Self::Qwen2 | Self::Llama => RopePreset::FileStated,
+        }
+    }
 }
 
 /// Pre-configured model presets.
@@ -235,6 +254,14 @@ pub enum Model {
     /// [`qwen38_flash_next`] and [`ModelSpec::prepared_from_source`].
     Qwen38_FlashNext_Q4KO,
 
+    /// Qwen3.8-Flash-Next with `Q3_KO` experts — the same model on the 32–63 GiB
+    /// rung of `quant_ladder`, from its own prepared artifact.
+    Qwen38_FlashNext_Q3KO,
+
+    /// Qwen3.8-Flash-Next with `Q2_KO` experts — the same model on the rung under
+    /// 32 GiB, the 16 GB laptop among them, from its own prepared artifact.
+    Qwen38_FlashNext_Q2KO,
+
     /// Qwen3.5-9B Q6_K — the lineage's **dense** member (~7.5 GB), same hybrid
     /// attention/DeltaNet stack with the mixture taken out.
     ///
@@ -282,6 +309,7 @@ pub enum Model {
     ///     eos_token: "<|im_end|>".into(),
     ///     default_system_prompt: "You are a helpful assistant.".into(),
     ///     max_seq_len: 8192,
+    ///     rope: RopePreset::FileStated,
     ///     default_sampling: SamplingConfig::top_p(0.9, 0.7),
     /// };
     /// let engine = Model::custom(spec)
@@ -440,6 +468,13 @@ pub struct ModelSpec {
     pub default_system_prompt: String,
     /// Maximum sequence length for KV cache allocation.
     pub max_seq_len: usize,
+    /// Where the checkpoint's RoPE schedule comes from (`docs/progressive_yarn.md` §2).
+    ///
+    /// The published GGUFs carry no YaRN keys, so a schedule the vendor publishes beside
+    /// the weights — Qwen3's 64K/128K factors over its 32K window — is named here, with
+    /// the checkpoint. [`RopePreset::FileStated`] runs what the file states;
+    /// [`RopePreset::Lineage`] marks an architecture whose loader carries its own.
+    pub rope: RopePreset,
     /// Recommended default sampling strategy for this model family.
     pub default_sampling: SamplingConfig,
     /// Whether this model supports thinking/reasoning mode (`<think>` blocks).
@@ -518,12 +553,27 @@ impl Model {
         Model::Qwen3_30B_A3B_Q6,
         Model::Qwen36_35B_A3B_Q4,
         Model::Qwen38_FlashNext_Q4KO,
+        Model::Qwen38_FlashNext_Q3KO,
+        Model::Qwen38_FlashNext_Q2KO,
         Model::Qwen35_9B_Q6,
         Model::Qwen35_0_8B_Q8,
         Model::Qwen2_0_5B,
         Model::Hermes3_3B_Q6,
         Model::Hermes3_70B_Q4,
     ];
+
+    /// The Flash-Next preset for a card whose rung puts the routed experts at
+    /// `experts` (`quant_ladder::expert_format`), or `None` when no preset carries
+    /// that width — the rung above every KO format, where the split's own `Q8_0`
+    /// stands, has no preset.
+    pub fn qwen38_flash_next_for(experts: Option<GgmlDType>) -> Option<Model> {
+        match experts? {
+            GgmlDType::Q4_KO => Some(Model::Qwen38_FlashNext_Q4KO),
+            GgmlDType::Q3_KO => Some(Model::Qwen38_FlashNext_Q3KO),
+            GgmlDType::Q2_KO => Some(Model::Qwen38_FlashNext_Q2KO),
+            _ => None,
+        }
+    }
 
     /// The preset whose [`Self::override_key`] is `key` — the variant's own
     /// identifier, the same name `models.override.yaml` addresses it by.
@@ -550,6 +600,8 @@ impl Model {
                 qwen36_moe::qwen36_35b_a3b_antiloop_styletune()
             }
             Model::Qwen38_FlashNext_Q4KO => qwen38_flash_next::qwen38_flash_next_q4ko(),
+            Model::Qwen38_FlashNext_Q3KO => qwen38_flash_next::qwen38_flash_next_q3ko(),
+            Model::Qwen38_FlashNext_Q2KO => qwen38_flash_next::qwen38_flash_next_q2ko(),
             Model::Qwen35_9B_Q6 => qwen35_dense::qwen35_9b_q6(),
             Model::Qwen35_0_8B_Q8 => qwen35_dense::qwen35_0_8b_q8(),
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),

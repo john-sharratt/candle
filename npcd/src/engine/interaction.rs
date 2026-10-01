@@ -42,6 +42,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::engine::tools::Mode;
+use crate::npcs;
 
 /// How long a session survives with nothing said on it.
 ///
@@ -126,11 +127,11 @@ impl Interaction {
     pub fn wire(&self, now_ms: u64) -> Value {
         json!({
             "interaction_id": self.id,
-            // A string, for the reason `TickRecord::npc_id` is one: a real
-            // character id is past the 2^53 where a JavaScript number stops
-            // being exact, and an id that arrives rounded matches nothing else
-            // on the page.
-            "npc_id": self.npc_id.to_string(),
+            // A base-36 string, for the reason `TickRecord::npc_id` is one: a
+            // real character id is past the 2^53 where a JavaScript number
+            // stops being exact, and an id that arrives rounded matches
+            // nothing else on the page.
+            "npc_id": npcs::npc_id_wire(self.npc_id),
             "mode": self.mode.as_wire(),
             "interlocutor": self.interlocutor,
             "state": if self.is_live(now_ms) { "live" } else { "ended" },
@@ -432,8 +433,8 @@ mod tests {
         assert!(!ix.touched(&one.id, T0), "an ended session took a line");
     }
 
-    /// The console reads ids as strings, because a real character id is past
-    /// the 2^53 where a JavaScript number stops being exact.
+    /// The console reads ids as base-36 strings, because a real character id
+    /// is past the 2^53 where a JavaScript number stops being exact.
     #[test]
     fn the_wire_shape_carries_the_character_id_as_a_string() {
         let ix = Interactions::new();
@@ -446,7 +447,7 @@ mod tests {
             WORLD_T0,
         );
         let w = one.wire(T0);
-        assert_eq!(w["npc_id"], "6817662845163923144");
+        assert_eq!(w["npc_id"], npcs::npc_id_wire(6_817_662_845_163_923_144));
         assert_eq!(w["mode"], "instant_message");
         assert_eq!(w["state"], "live");
         assert_eq!(w["idle_timeout_secs"], 86_400);

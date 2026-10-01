@@ -23,12 +23,12 @@ nodes:
 
   - id: core
     kind: core
-    name: the lift and the stair
-    plural: true
+    name: the lift
+    plural: false
     off: [ring-north]
     character: >
-      The car and the stairwell share one shaft at the corner, so two Makers
-      arriving at once do not wait on each other.
+      The one car serves every level from this corner, so a Maker with
+      somewhere to be waits on it here before anything else.
 
   - id: command-room
     kind: work

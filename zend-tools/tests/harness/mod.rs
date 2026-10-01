@@ -15,13 +15,43 @@
 
 #![allow(dead_code)] // Helpers are pulled into per-tool test binaries selectively.
 
-use serde_json::{json, Value};
-use zend_tools::ToolContext;
+use std::path::{Path, PathBuf};
 
-/// Invoke a tool by name with default `ToolContext`.
+use serde_json::{json, Value};
+use zend_tools::{Grants, ToolContext};
+use zend_vfs::{RepoSpec, Workspace};
+
+/// A fresh context granted every capability — these tests exercise what a
+/// tool does, not whether it may; the refusals are tested beside the grants.
+pub fn granted() -> ToolContext {
+    ToolContext::new().granting(Grants::ALL)
+}
+
+/// The repository name every file-tool test addresses as `repo`. Used both
+/// for a detached context (an upper-only store is created under this name on
+/// first use) and for a real on-disk workspace, where it also names the
+/// repository's folder.
+pub const REPO: &str = "proj";
+
+/// Where a fixture should write a workspace's files: `root`'s single
+/// repository, [`REPO`] — `root.join(REPO)`. `root` is the workspace folder
+/// (a `TempDir`'s path, typically), not the repository folder itself.
+pub fn repo_root(root: &Path) -> PathBuf {
+    root.join(REPO)
+}
+
+/// A `ToolContext` overlaying one repository, [`REPO`], rooted at
+/// `root.join(REPO)` — the folder a fixture built with [`repo_root`] wrote
+/// into.
+pub fn workspace_ctx(root: &Path) -> ToolContext {
+    let ws =
+        Workspace::new(root, vec![RepoSpec::named(REPO)]).expect("valid single-repo workspace");
+    ToolContext::with_workspace(ws)
+}
+
+/// Invoke a tool by name with a fresh [`granted`] context.
 pub fn invoke(tool: &str, args: Value) -> Value {
-    let ctx = ToolContext::new();
-    invoke_with_ctx(tool, args, &ctx)
+    invoke_with_ctx(tool, args, &granted())
 }
 
 /// Invoke a tool by name, threading a caller-supplied context.
@@ -33,6 +63,12 @@ pub fn invoke_with_ctx(tool: &str, args: Value, ctx: &ToolContext) -> Value {
 /// Confirmation details (if any) for a tool call. Mirrors the runtime call.
 pub fn confirmation(tool: &str, args: Value) -> Option<zend_tools::ConfirmationDetails> {
     zend_tools::confirmation(tool, &args)
+}
+
+/// Whether a call may be re-issued when a turn resumes after a restart.
+/// Mirrors the runtime call.
+pub fn replay(tool: &str, args: Value) -> zend_tools::Replay {
+    zend_tools::replay(tool, &args)
 }
 
 // ── Assertions ────────────────────────────────────────────────────────────────

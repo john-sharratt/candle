@@ -114,9 +114,9 @@ pub(crate) enum WriteJob {
         payload: Vec<u8>,
     },
     /// A pre-encoded conversation-metadata record — `Label` (the full ConvMeta:
-    /// conv_id + label + custom bag) or `ConvState` (the archived flag). Both
-    /// are small, last-writer-wins on replay, and need no index registration
-    /// after the append, so one job kind carries either.
+    /// conv_id + label + custom bag) or `Distilled`. Both are small,
+    /// last-writer-wins on replay, and need no index registration after the
+    /// append, so one job kind carries either.
     ///
     /// The payload is encoded by the enqueuer, which is the point: these used to
     /// be written by taking the persistence mutex on the calling thread and
@@ -127,6 +127,10 @@ pub(crate) enum WriteJob {
         record: RecordType,
         payload: Vec<u8>,
     },
+    /// A conversation's whole state (`ConvState` record), keyed in the header
+    /// by its timeline so the newest supersedes the last. Encoded by the
+    /// enqueuer, like [`WriteJob::ConvMeta`].
+    ConvState { timeline: u64, payload: Vec<u8> },
     /// Drain everything queued, fsync, ack, and stop the thread.
     Shutdown(Sender<()>),
 }
@@ -140,6 +144,7 @@ impl WriteJob {
             WriteJob::TurnIndexPage { payload, .. } => payload.len() as u64,
             WriteJob::ProjectionEvents { payload, .. } => payload.len() as u64,
             WriteJob::ConvMeta { payload, .. } => payload.len() as u64,
+            WriteJob::ConvState { payload, .. } => payload.len() as u64,
             WriteJob::Snapshot { payload, .. } => payload.len() as u64,
             WriteJob::BranchCheckpoint { payload, .. } => payload.len() as u64,
             WriteJob::KvCold { grid, .. } => grid.bytes() as u64,
@@ -412,6 +417,16 @@ fn process_one(
                     target: "candle_conversation::persistence::writer",
                     ?record,
                     "conversation metadata append failed: {e}"
+                );
+            }
+        }
+        WriteJob::ConvState { timeline, payload } => {
+            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = p.append_record(RecordType::ConvState, 0, timeline, 0, 0, 0, &payload) {
+                tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    timeline,
+                    "conversation state append failed: {e}"
                 );
             }
         }

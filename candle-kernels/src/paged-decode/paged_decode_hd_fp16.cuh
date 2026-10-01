@@ -35,7 +35,7 @@ extern "C" int32_t DECODE_CAT(run_paged_decode_fp16_hd, DECODE_HD)(
     float softmax_scale,
     const void* k_new,
     const void* v_new,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int32_t rope_interleaved,
     void* stream_ptr,
     void* q8_out,
@@ -50,7 +50,7 @@ extern "C" int32_t DECODE_CAT(run_paged_decode_fp16_hd, DECODE_HD)(
 ) {
     return fused_attn::launch_int8_decode_attn<__half, __half, __half, DECODE_HD>(
         (const __half*)q_ptr, headers_ptr, (__half*)o_ptr, num_active_slots, n_q_head,
-        n_kv_head, softmax_scale, (const __half*)k_new, (const __half*)v_new, rope_cs,
+        n_kv_head, softmax_scale, (const __half*)k_new, (const __half*)v_new, rungs,
         rope_interleaved, (cudaStream_t)stream_ptr, (uint8_t*)q8_out, (const __half*)gate,
         gate_slot_stride,
         QsaSel{sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio});

@@ -30,13 +30,20 @@ use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::{gpu_span, profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::quantized_mlp::QuantizedMlp;
+use super::rope_schedule::DeclaredScaling;
 use super::rope_tables::CisPrecomputations;
+// `batch_test` is itself gated on `cuda` plus `test`-or-`ruler-bench`, so the ladder
+// expressed in its types carries the same gate. `candle-conversation` depends on this
+// crate with `ruler-bench` on, which is how it reaches the ladder.
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+use crate::models::batch_test::utils::{TestConfig, TestMode};
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+use crate::models::batched_inference::InferenceMode;
 use crate::models::batched_layer::WaveRef;
 use crate::models::routing_capture;
 use crate::models::wave_buffers::wave_empty;
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
-use candle::cuda_backend::wave_provenance::WaveTicket;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{
     fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
@@ -46,6 +53,7 @@ use candle::quantized::cuda::{
 #[cfg(feature = "cuda")]
 use candle::quantized::get_vram_info;
 use candle::quantized::{gguf_file, Int8Mode, QTensor, SumScale};
+use candle::wave_provenance::WaveTicket;
 use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -67,14 +75,6 @@ pub const MAX_ROPE_SEQ_LEN: usize = 0;
 pub const ROPE_EXTEND_CHUNK: usize = 1024;
 
 type SharedCis = Arc<RwLock<CisPrecomputations>>;
-
-fn qwen_inv_freq(head_dim: usize, rope_theta: f32, rope_scaling_factor: Option<f32>) -> Vec<f32> {
-    let factor = rope_scaling_factor.unwrap_or(1.0);
-    (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / (factor * rope_theta.powf(i as f32 / head_dim as f32)))
-        .collect()
-}
 
 // ============================================================================
 // GGUF Reader Helper
@@ -120,15 +120,17 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
+    /// The file's own RoPE: only a scaling it declares
+    /// (`docs/progressive_yarn.md` §2).
     fn new(
         _dtype: DType,
         head_dim: usize,
         _max_position_embeddings: usize,
         rope_theta: f64,
-        rope_scaling_factor: Option<f32>,
+        declared: DeclaredScaling,
         dev: &Device,
     ) -> Result<Self> {
-        let inv_freq = qwen_inv_freq(head_dim, rope_theta as f32, rope_scaling_factor);
+        let inv_freq = declared.inv_freq(head_dim, rope_theta as f32)?;
         Ok(Self {
             cis: Arc::new(RwLock::new(CisPrecomputations::new_growable_with_inv_freq(
                 inv_freq,
@@ -236,6 +238,7 @@ impl SparseMoeBlock {
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         let (b_size, seq_len, hidden_dim) = match &acts {
@@ -334,6 +337,7 @@ impl SparseMoeBlock {
             k,
             num_experts,
             t,
+            decode_tokens,
             wave.map(|g| g.ticket()),
         )
     }
@@ -796,6 +800,7 @@ impl SparseMoeBlock {
         k: usize,
         num_experts: usize,
         _routing_start: ProfileMark,
+        decode_tokens: usize,
         wave: Option<WaveTicket>,
     ) -> Result<Tensor> {
         // ── 2. Group assignments by expert — the shared grouped-GEMM dispatch
@@ -842,6 +847,7 @@ impl SparseMoeBlock {
             out_dtype,
             &weights_flat,
             assignments,
+            decode_tokens,
             wave,
         )?;
 
@@ -978,6 +984,8 @@ impl BatchedAttentionLayer for LayerWeights {
         &self,
         acts: &DynamicActs<'w>,
         out_dtype: DType,
+        // As llama: separate q/k/v weights, no stacked group to split.
+        _wave: WaveRef<'w>,
     ) -> Result<QkvProjection<'w>> {
         let (b_sz, seq_len) = match acts {
             DynamicActs::Float(t) => {
@@ -1049,6 +1057,7 @@ impl BatchedAttentionLayer for LayerWeights {
         acts: DynamicActs<'w>,
         work_dtype: DType,
         out_dtype: DType,
+        decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match &self.ffn {
@@ -1062,7 +1071,7 @@ impl BatchedAttentionLayer for LayerWeights {
                 // router logits and the device dispatch share that one dtype —
                 // so this path narrows on return. Giving the combine its own
                 // store width is the same change one level down.
-                let mut out = m.forward_dynamic(acts, work_dtype, wave)?;
+                let mut out = m.forward_dynamic(acts, work_dtype, decode_tokens, wave)?;
                 out.to_dtype_mut(out_dtype)?;
                 Ok(out)
             }
@@ -1456,8 +1465,7 @@ impl ModelWeights {
         let rope_freq_base =
             md_opt_f32(&format!("{p}.rope.freq_base")).unwrap_or(1_000_000f32) as f64;
 
-        let rope_scaling_factor =
-            md_opt_f32(&format!("{p}.rope.scaling.factor")).filter(|f| *f > 0.0 && *f != 1.0);
+        let declared = DeclaredScaling::from_gguf(gg.metadata(), &p)?;
 
         let n_expert = md_opt_u32(&format!("{p}.expert_count")).unwrap_or(1) as usize;
         let n_expert_used = md_opt_u32(&format!("{p}.expert_used_count")).unwrap_or(1) as usize;
@@ -1481,7 +1489,7 @@ impl ModelWeights {
             head_dim,
             max_position_embeddings,
             rope_freq_base,
-            rope_scaling_factor,
+            declared,
             device,
         )?);
 
@@ -1608,6 +1616,9 @@ impl ModelWeights {
             Err(_) => gg.tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
+        // Read before the struct takes ownership: the forward phase holds the
+        // head's logits, one row per scored row and `vocab` wide.
+        let vocab = lm_head.weight_dims().first().copied().unwrap_or(0);
 
         Ok(Self {
             embeddings: Some(embeddings),
@@ -1627,6 +1638,9 @@ impl ModelWeights {
                 intermediate: expert_ffn_size,
                 experts_per_tok: n_expert_used,
                 n_experts: n_expert,
+                vocab,
+                head_qk_norm: true,
+                qkv_bias: false,
             },
             device: device.clone(),
             // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
@@ -1759,8 +1773,7 @@ impl ModelWeights {
             .or(hf_cfg.rope_theta)
             .unwrap_or(1_000_000.0);
 
-        let rope_scaling_factor =
-            md_opt_f32(&format!("{p}.rope.scaling.factor")).filter(|f| *f > 0.0 && *f != 1.0);
+        let declared = DeclaredScaling::from_gguf(&ct.metadata, &p)?;
 
         let n_expert = md_opt_u32(&format!("{p}.expert_count")).unwrap_or(1) as usize;
         let n_expert_used = md_opt_u32(&format!("{p}.expert_used_count")).unwrap_or(1) as usize;
@@ -1927,7 +1940,7 @@ impl ModelWeights {
             head_dim,
             max_position_embeddings,
             rope_freq_base,
-            rope_scaling_factor,
+            declared,
             device,
         )?);
 
@@ -2184,6 +2197,8 @@ impl ModelWeights {
             Err(_) => load_tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights_with_mode(lm_head_tensor.into(), int8mode)?;
+        // Read before the struct takes ownership — see the reader path above.
+        let vocab = lm_head.weight_dims().first().copied().unwrap_or(0);
 
         // ── Reserve the span, then build the expert cache into it ──
         //
@@ -2307,6 +2322,7 @@ impl ModelWeights {
                 expert_pack_dir: expert_pack_dir.as_deref(),
                 progress: cache_progress,
                 int8mode,
+                offloaded_bytes: 0,
             })?;
             // Record the resident expert footprint with the governor. Reporting
             // only — nothing sizes itself from this any more.
@@ -2405,6 +2421,9 @@ impl ModelWeights {
                 intermediate: expert_ffn_size,
                 experts_per_tok: n_expert_used,
                 n_experts: n_expert,
+                vocab,
+                head_qk_norm: true,
+                qkv_bias: false,
             },
             device: device.clone(),
             int8mode,
@@ -2433,6 +2452,207 @@ impl ModelWeights {
     }
 }
 
+/// The batched forward gate's configuration ladder for this model.
+///
+/// **Public, and outside the test module, so the same ladder can be driven from above.**
+/// `candle-conversation` runs these rows to establish the *ceiling* — what the forward
+/// itself can do from a clean slate — and then appends rows measured through the real
+/// engine, so the two sit in one table. Duplicating the ladder there instead would let
+/// the two drift, and a ceiling measured against a different ladder is not a ceiling.
+///
+/// The rows are ordered deliberately: F16 first (it is the table's baseline), the warm
+/// BF16 and Q4_0 repeats last, so a reader can see what warming was worth.
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+pub fn batched_forward_configs() -> Vec<TestConfig> {
+    vec![
+        // F16 single context
+        TestConfig {
+            mode: InferenceMode::F16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // BF16 single context
+        TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // BF16 multi-context
+        TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 10,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // Q8
+        TestConfig {
+            mode: InferenceMode::Q8_0,
+            use_batched: true,
+            num_contexts: 20,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        #[cfg(feature = "huge-context")]
+        TestConfig {
+            mode: InferenceMode::Q8_0,
+            use_batched: true,
+            num_contexts: 32,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // Q4
+        TestConfig {
+            mode: InferenceMode::Q4_0,
+            use_batched: true,
+            num_contexts: 4,
+            num_repeats: 1,
+            test_mode: Some(TestMode::Skip),
+        },
+        #[cfg(feature = "huge-context")]
+        TestConfig {
+            mode: InferenceMode::Q4_0,
+            use_batched: true,
+            num_contexts: 48,
+            num_repeats: 1,
+            test_mode: Some(TestMode::Skip),
+        },
+        TestConfig {
+            mode: InferenceMode::C0,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C1,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C2,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C3,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C4,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C5,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C6,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C7,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 48,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // C8 sits between two rungs that pass and was simply absent from this
+        // ladder — the one model in the sweep whose top rungs were never
+        // exercised contiguously, which is where a selection defect hides.
+        TestConfig {
+            mode: InferenceMode::C8,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C9,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C10,
+            use_batched: true,
+            #[cfg(feature = "huge-context")]
+            num_contexts: 10,
+            #[cfg(not(feature = "huge-context"))]
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // BF16 single context (after everything is warm)
+        TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // Q4_0 wide (after everything is warm)
+        TestConfig {
+            mode: InferenceMode::Q4_0,
+            use_batched: true,
+            num_contexts: 20,
+            num_repeats: 1,
+            test_mode: Some(TestMode::Skip),
+        },
+    ]
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2444,7 +2664,37 @@ mod tests {
     use super::*;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
+    #[cfg(feature = "cuda")]
+    use crate::models::batched_model::BatchedInference;
     use crate::models::dialect::Dialect;
+    #[cfg(feature = "cuda")]
+    use crate::models::rope_schedule::RopeSchedule;
+
+    /// The 2507 refresh's declared window, native to its θ = 10⁷.
+    #[cfg(feature = "cuda")]
+    const INSTRUCT_2507_CONTEXT: usize = 262_144;
+
+    /// A 30B-A3B checkpoint wrapped for batched inference on the frequencies
+    /// its file states, to `context_length`. The tests here stay inside the
+    /// trained window of whichever release they load, where every schedule is
+    /// the file's own RoPE.
+    #[cfg(feature = "cuda")]
+    fn batched(
+        model: ModelWeights,
+        context_length: usize,
+        max_seq_len: usize,
+        device: &Device,
+    ) -> Result<BatchedInference<ModelWeights>> {
+        let inv = model
+            .rope_inv_freq()
+            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+        BatchedInference::new_with_schedule(
+            model,
+            &RopeSchedule::stated(inv, context_length)?,
+            max_seq_len,
+            device,
+        )
+    }
 
     /// **Does Qwen3-MoE decode reproduce itself, run to run?**
     ///
@@ -2464,7 +2714,6 @@ mod tests {
     fn qwen3_moe_decode_is_reproducible() -> Result<()> {
         use crate::models::batch_test::test_helpers::hf_get;
         use crate::models::batch_test::utils::decode_reproducibility;
-        use crate::models::batched_model::BatchedInference;
 
         let Ok(device) = Device::new_cuda(0) else {
             eprintln!("[skip] no CUDA device");
@@ -2494,10 +2743,7 @@ mod tests {
                 expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
             },
         )?;
-        let inv_freq = weights
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 4096, &device)?;
+        let model = batched(weights, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
         // Fixed pseudo-token ids: the text is irrelevant, only that every pass
         // sees the identical input, so no tokenizer download is needed.
@@ -2528,7 +2774,6 @@ mod tests {
     fn qwen3_moe_decode_replay_is_bitwise_repeatable() -> Result<()> {
         use crate::models::batch_test::test_helpers::hf_get;
         use crate::models::batch_test::utils::{decode_replay_probe, prefill_replay_probe};
-        use crate::models::batched_model::BatchedInference;
 
         let Ok(device) = Device::new_cuda(0) else {
             eprintln!("[skip] no CUDA device");
@@ -2555,10 +2800,7 @@ mod tests {
                 expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
             },
         )?;
-        let inv_freq = weights
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 4096, &device)?;
+        let model = batched(weights, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
         let ids: Vec<u32> = (0..24u32).map(|i| (i * 37 + 11) % 2000 + 5).collect();
         let dirty_prefill = prefill_replay_probe(&model, &device, &ids, 6, "qwen3-moe")?;
@@ -2638,182 +2880,9 @@ mod tests {
         })?;
         println!("Using device: {:?}\n", device);
 
-        let configs = vec![
-            // F16 single context
-            TestConfig {
-                mode: InferenceMode::F16,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // BF16 single context
-            TestConfig {
-                mode: InferenceMode::BF16,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // BF16 multi-context
-            TestConfig {
-                mode: InferenceMode::BF16,
-                use_batched: true,
-                num_contexts: 10,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // Q8
-            TestConfig {
-                mode: InferenceMode::Q8_0,
-                use_batched: true,
-                num_contexts: 20,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            #[cfg(feature = "huge-context")]
-            TestConfig {
-                mode: InferenceMode::Q8_0,
-                use_batched: true,
-                num_contexts: 32,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // Q4
-            TestConfig {
-                mode: InferenceMode::Q4_0,
-                use_batched: true,
-                num_contexts: 4,
-                num_repeats: 1,
-                test_mode: Some(TestMode::Skip),
-            },
-            #[cfg(feature = "huge-context")]
-            TestConfig {
-                mode: InferenceMode::Q4_0,
-                use_batched: true,
-                num_contexts: 48,
-                num_repeats: 1,
-                test_mode: Some(TestMode::Skip),
-            },
-            TestConfig {
-                mode: InferenceMode::C0,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C1,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C2,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C3,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C4,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C5,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C6,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C7,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 48,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C9,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 10,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            /*
-            // C10 does not work on this model, the compression is just too much
-            TestConfig {
-                mode: InferenceMode::C10,
-                use_batched: true,
-                num_contexts: 5,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            */
-            // BF16 single context (after everything is warm)
-            TestConfig {
-                mode: InferenceMode::BF16,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // Q8 (after everything is warm)
-            TestConfig {
-                mode: InferenceMode::Q4_0,
-                use_batched: true,
-                num_contexts: 20,
-                num_repeats: 1,
-                test_mode: Some(TestMode::Skip),
-            },
-        ];
-
-        use crate::models::batched_model::BatchedInference;
+        // One ladder, shared with the engine-driven table one crate up — see
+        // `batched_forward_configs`.
+        let configs = super::batched_forward_configs();
 
         // Inference numeric mode for the whole model — dense projections AND MoE experts (KO
         // twins) — selected by the INT8MODE env var so a run picks a mode without recompiling.
@@ -2842,10 +2911,7 @@ mod tests {
                 },
             )?;
             println!("✓ Model loaded\n");
-            let inv_freq = model
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
         };
 
         params.with_int8mode(int8mode).run(configs, load_model)?;
@@ -2866,7 +2932,6 @@ mod tests {
     fn long_context_30b_a3b() -> Result<()> {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
         use crate::models::batch_test::test_helpers::hf_get;
-        use crate::models::batched_model::BatchedInference;
 
         let tokenizer_path = hf_get(
             "Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -2893,7 +2958,7 @@ mod tests {
             Dialect::chat_ml(),
             // `qwen3moe.context_length` in the GGUF — the 2507 release is native
             // 262K, unlike the 32K original.
-            262_144,
+            INSTRUCT_2507_CONTEXT,
             // One shallow rung even though the window is wide: this is the
             // Qwen3-generation MoE, kept as the architectural comparison for
             // the Qwen3.5+ MoEs rather than as a depth subject of its own.
@@ -2915,10 +2980,7 @@ mod tests {
                         expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
                     },
                 )?;
-                let inv_freq = model
-                    .rope_inv_freq()
-                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+                batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
             },
         )
     }
@@ -2947,7 +3009,6 @@ mod tests {
             use crate::models::batched_inference::{
                 BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult,
             };
-            use crate::models::batched_model::BatchedInference;
 
             let device = match Device::new_cuda(0) {
                 Ok(d) => d,
@@ -2964,10 +3025,7 @@ mod tests {
             )
             .map_err(|e| candle::Error::Msg(format!("model download: {e}")))?;
             let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-            let inv_freq = raw
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let n = model.num_layers();
 
@@ -3435,7 +3493,6 @@ mod tests {
         {
             use crate::models::batch_test::test_helpers::hf_get;
             use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
-            use crate::models::batched_model::BatchedInference;
 
             let device = match Device::new_cuda(0) {
                 Ok(d) => d,
@@ -3452,10 +3509,7 @@ mod tests {
             )
             .map_err(|e| candle::Error::Msg(format!("model download: {e}")))?;
             let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-            let inv_freq = raw
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let mk = |t: &[u32]| -> Result<Tensor> { Tensor::new(t, &device)?.unsqueeze(0) };
 
@@ -3666,14 +3720,9 @@ mod tests {
                 })
                 .collect();
 
-            use crate::models::batched_model::BatchedInference;
-
             let load_model = || {
                 let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-                let inv_freq = model
-                    .rope_inv_freq()
-                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+                batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
             };
 
             // Capture every config (each is a distinct prompt, tagged by index).
@@ -3729,7 +3778,6 @@ mod tests {
     mod kv_dump {
         use super::*;
         use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
-        use crate::models::batched_model::BatchedInference;
         use std::io::Write;
 
         /// Dump real KV cache data (K, V, Q) from Qwen3-30B-A3B MoE.
@@ -3794,10 +3842,7 @@ mod tests {
             println!("Model path: {:?}", model_path);
 
             let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-            let inv_freq = raw
-                .rope_inv_freq()
-                .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
-            let model = BatchedInference::new_with_inv_freq(raw, inv_freq, 4096, &device)?;
+            let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
             let n_kv_head = model.n_kv_head();
             let head_dim = model.head_dim();
@@ -3975,8 +4020,6 @@ mod tests {
             run_ruler_benchmark, RulerBenchConfig, RulerDataSource, RulerTask, QWEN3_EOS_IDS,
         };
         use crate::models::batch_test::test_helpers::{download_hf_gguf, load_hf_tokenizer};
-        use crate::models::batched_inference::InferenceMode;
-        use crate::models::batched_model::BatchedInference;
 
         let tokenizer = load_hf_tokenizer("Qwen/Qwen3-30B-A3B-Instruct-2507")?;
         let device =
@@ -3988,10 +4031,7 @@ mod tests {
         )?;
         println!("Model path: {model_path:?}");
         let weights = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
-        let inv_freq = weights
-            .rope_inv_freq()
-            .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
-        let model = BatchedInference::new_with_inv_freq(weights, inv_freq, 32_768, &device)?;
+        let model = batched(weights, INSTRUCT_2507_CONTEXT, 32_768, &device)?;
         println!("✓ Model loaded");
 
         let cfg = RulerBenchConfig {

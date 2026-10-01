@@ -14,17 +14,20 @@
 
 use std::time::Duration;
 
+use rayon::prelude::*;
+
 use candle::quantized::pinned_staging::{PinnedBuf, PinnedStager};
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     quantize_sealed_in_place, ChunkedKvBacking, CompressionPolicy, KvCache, KvFormat, CHUNK_SIZE,
 };
-use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_prefill_batched,
-};
+use candle_transformers::models::prefill_utils::{paged_decode_attn, paged_prefill_batched};
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
+use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 
 use crate::formats::ArenaFmt;
 use crate::scenarios::Scenario;
+use crate::timing::gpu_timed;
 
 /// Resolve the (qkv, arena_dtype, force_dtype) triple for a (scenario, format).
 ///
@@ -65,9 +68,14 @@ pub struct Fixture {
     q_dec: Tensor,
     k_new: Tensor,
     v_new: Tensor,
-    rope_cs: Tensor,
+    rope_rungs: RopeRungs,
+    /// The Q/K/V and kernel-output dtype.
+    qkv_dt: DType,
     arena_dtype: DType,
     softmax_scale: f32,
+    /// Device time the real-quant seal took (format selection + palette
+    /// conversion) summed over the slots; zero for a directly-typed arena.
+    pub seal: Duration,
 }
 
 impl Fixture {
@@ -142,32 +150,22 @@ impl Fixture {
             }
         };
 
-        let inv_freq = make_inv_freq(sc.head_dim, rope, device)?;
-        let rope_cs = compute_rope_cs(&inv_freq, max_blocks, sc.head_dim, device)?;
-        let rope_offsets = Tensor::zeros(1, DType::U32, device)?;
+        let inv_freq = make_inv_freq(sc.head_dim, rope);
+        let rope_rungs = RopeRungs::new(&RopeSchedule::stated(inv_freq, usize::MAX)?, device)?;
 
         let mut caches = Vec::with_capacity(sc.num_slots);
+        let mut seal = Duration::ZERO;
         for slot in 0..sc.num_slots {
             let mut cache = KvCache::new(2, max_seq);
             cache.force_dtype(force_dt);
             cache.set_chunked_backing(&backing, slot, None)?;
             let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
-            let (q, k, v) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?;
+            let (q, k, v) = make_prefill_qkv(sc, sc.ctx_len, seed, qkv_dt, device)?;
             if sc.segments.is_empty() {
                 // The prefill writes into the slot's write region, which the
                 // scheduler allocates before the pass; the harness does the same.
                 backing.ensure_for_batch_entries(&[(slot, 0)], sc.ctx_len)?;
-                run_prefill(
-                    &mut cache,
-                    &q,
-                    &k,
-                    &v,
-                    sc.ctx_len,
-                    sc,
-                    &rope_cs,
-                    &rope_offsets,
-                    stager,
-                )?;
+                run_prefill(&mut cache, &q, &k, &v, sc.ctx_len, sc, &rope_rungs, stager)?;
             } else {
                 // Segment by segment through the scratch slot: prefill it
                 // fresh, drop the empty writer chunk the prefill's decode
@@ -196,8 +194,7 @@ impl Fixture {
                         &vs,
                         len,
                         sc,
-                        &rope_cs,
-                        &rope_offsets,
+                        &rope_rungs,
                         stager,
                     )?;
                     backing.truncate_sequence_to_blocks(scratch, len.div_ceil(CHUNK_SIZE))?;
@@ -230,14 +227,17 @@ impl Fixture {
                     _ => candle::bail!("real-quant requires a CUDA device"),
                 };
                 let mut scratch: Option<PinnedBuf> = None;
-                let warm = quantize_sealed_in_place(
-                    &backing,
-                    &[&r16],
-                    pol,
-                    device,
-                    &copy_stream,
-                    &mut scratch,
-                )?;
+                let (warm, dt) = gpu_timed(device, || {
+                    quantize_sealed_in_place(
+                        &backing,
+                        &[&r16],
+                        pol,
+                        device,
+                        &copy_stream,
+                        &mut scratch,
+                    )
+                })?;
+                seal += dt;
                 backing.truncate_sequence_to_blocks(slot, 0)?;
                 backing.inject_sealed_at_tail(slot, &warm[0])?;
                 cache.set_current_seq_len(sc.ctx_len)?;
@@ -261,10 +261,103 @@ impl Fixture {
             q_dec,
             k_new,
             v_new,
-            rope_cs,
+            rope_rungs,
+            qkv_dt,
             arena_dtype,
             softmax_scale: 1.0f32 / (sc.head_dim as f32).sqrt(),
+            seal,
         })
+    }
+
+    /// Slot `slot`'s stored context — its `ctx_len` prefilled tokens — as the
+    /// kernels read it: dequantized, divided by each palette's outer scale,
+    /// dims placed by the chunk's palette map (`read_contiguous`). Token-major
+    /// `(ctx_len, n_kv_head, head_dim)`, flattened.
+    pub fn stored_context(&self, slot: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (k, v) = self
+            .backing
+            .read_contiguous(slot, 0, self.scenario.ctx_len)?;
+        let token_major = |t: Tensor| -> Result<Vec<f32>> {
+            // (1, n_kv_head, ctx, head_dim) → (ctx, n_kv_head, head_dim)
+            t.squeeze(0)?
+                .transpose(0, 1)?
+                .to_dtype(DType::F32)?
+                .contiguous()?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        };
+        Ok((token_major(k)?, token_major(v)?))
+    }
+
+    /// Prefill `n_tokens` fresh tokens onto every slot at once — one batched
+    /// launch whose prior context is the fixture's stored (possibly
+    /// quantized) arena, the way a later turn's prefill reads sealed chunks —
+    /// and advance every slot past them. Returns the attention output,
+    /// `(num_slots · n_tokens, n_q_head, head_dim)` slot-major, and the device
+    /// time. Repeated calls walk each context forward, as [`Fixture::decode`]
+    /// does.
+    pub fn prefill_step(
+        &mut self,
+        n_tokens: usize,
+        device: &Device,
+        stager: &PinnedStager,
+    ) -> Result<(Tensor, Duration)> {
+        let sc = &self.scenario;
+        let qkv_dt = self.qkv_dt;
+        let offsets: Vec<usize> = self.caches.iter().map(|c| c.current_seq_len()).collect();
+        let entries: Vec<(usize, usize)> = offsets.iter().copied().enumerate().collect();
+        self.backing.ensure_for_batch_entries(&entries, n_tokens)?;
+
+        // One (n_tokens, head, dim) block per slot, stacked token-major into
+        // the ragged (total_q, head, dim) layout the batched prefill reads.
+        let mut qs = Vec::with_capacity(sc.num_slots);
+        let mut ks = Vec::with_capacity(sc.num_slots);
+        let mut vs = Vec::with_capacity(sc.num_slots);
+        for (slot, &off) in offsets.iter().enumerate() {
+            let (q, k, v) = make_prefill_qkv(sc, n_tokens, fresh_seed(slot, off), qkv_dt, device)?;
+            qs.push(q);
+            ks.push(k);
+            vs.push(v);
+        }
+        // Built outside the timed region: assembling the harness's input.
+        let q = Tensor::cat(&qs, 0)?;
+        let k = Tensor::cat(&ks, 0)?;
+        let v = Tensor::cat(&vs, 0)?;
+        let q_lens = vec![n_tokens; sc.num_slots];
+
+        let generation = stager.begin_generation();
+        let mut caches: Vec<&mut KvCache> = self.caches.iter_mut().collect();
+        let (out, dt) = gpu_timed(device, || {
+            paged_prefill_batched(
+                None,
+                &mut caches[..],
+                &offsets,
+                &q,
+                &k,
+                &v,
+                sc.num_slots,
+                &q_lens,
+                sc.n_q_head,
+                sc.n_kv_head,
+                sc.head_dim,
+                None,
+                &self.rope_rungs,
+                sc.rope_interleaved,
+                &generation,
+                &std::cell::RefCell::new(None),
+                None,
+            )
+        })?;
+        for (cache, &off) in caches.iter_mut().zip(&offsets) {
+            cache.set_current_seq_len(off + n_tokens)?;
+        }
+        let advanced: Vec<(usize, usize)> = offsets
+            .iter()
+            .enumerate()
+            .map(|(s, &o)| (s, o + n_tokens))
+            .collect();
+        self.backing.mark_decode_writer_stale(&advanced)?;
+        Ok((out, dt))
     }
 
     /// Run one INT8 decode step at every slot's current position, then advance
@@ -310,13 +403,18 @@ impl Fixture {
         )?;
 
         // Decode headers carry no position map (the field is zero — the
-        // kernel derives positions from the slice walk).
-        let mut hdr_all: Vec<u8> = Vec::with_capacity(24 * sc.num_slots);
-        for &(ptr, n_slices, write_slice) in &seq_ptrs {
-            hdr_all.extend_from_slice(&n_slices.to_le_bytes());
-            hdr_all.extend_from_slice(&write_slice.to_le_bytes());
-            hdr_all.extend_from_slice(&ptr.to_le_bytes());
-            hdr_all.extend_from_slice(&0u64.to_le_bytes());
+        // kernel derives positions from the slice walk). Each slot's rung is
+        // the one its reach after this token falls on.
+        let mut hdr_all: Vec<u8> = Vec::with_capacity(SLOT_HEADER_BYTES * sc.num_slots);
+        for (&(slices_ptr, n_slices, write_slice), &(_, len)) in seq_ptrs.iter().zip(&entries) {
+            SlotHeaderHost {
+                n_slices,
+                write_slice,
+                slices_ptr,
+                position_map_ptr: 0,
+                rope_rung: self.rope_rungs.rung_for(len + 1)?,
+            }
+            .write(&mut hdr_all);
         }
 
         // Device-resident, as `build_decode_metadata_at` submits them: every
@@ -326,44 +424,29 @@ impl Fixture {
         let headers_gpu = generation.submit_resident(pinned)?;
         let headers_ptr = headers_gpu.dev_ptr();
 
-        // Time the kernel with CUDA events on the device's (persistent) stream
-        // — pure GPU kernel time, excluding the host-side launch/sync overhead
-        // that `Instant` + `synchronize` would add equally to both backends and
-        // thereby compress the speedup ratio. The kernel launches on this same
-        // stream (candle's `cuda_stream()` returns the stored stream).
-        use candle::cuda_backend::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
-        let cstream = match device {
-            Device::Cuda(d) => d.cuda_stream(),
-            _ => candle::bail!("decode timing requires a CUDA device"),
-        };
-        let ev_err = |e| candle::Error::Msg(format!("cuda event: {e:?}"));
-        device.synchronize()?;
-        let start = cstream
-            .record_event(Some(CU_EVENT_DEFAULT))
-            .map_err(ev_err)?;
-        let out = paged_decode_attn(
-            // This is a kernel A/B harness, not the wave path: it times one
-            // decode in isolation, so there is no generation to carve from and
-            // the output is an ordinary pool allocation.
-            None,
-            &self.q_dec,
-            headers_ptr,
-            self.arena_dtype,
-            sc.n_q_head,
-            sc.n_kv_head,
-            sc.head_dim,
-            self.softmax_scale,
-            &self.k_new,
-            &self.v_new,
-            &self.rope_cs,
-            sc.rope_interleaved,
-            None,
-        )?;
-        let stop = cstream
-            .record_event(Some(CU_EVENT_DEFAULT))
-            .map_err(ev_err)?;
-        let ms = start.elapsed_ms(&stop).map_err(ev_err)?;
-        let elapsed = Duration::from_secs_f64(ms as f64 / 1000.0);
+        // Pure GPU kernel time (see `timing`): the host-side launch/sync
+        // overhead would otherwise be added to every format alike and
+        // compress the ratios between them.
+        let (out, elapsed) = gpu_timed(device, || {
+            paged_decode_attn(
+                // This is a kernel A/B harness, not the wave path: it times one
+                // decode in isolation, so there is no generation to carve from and
+                // the output is an ordinary pool allocation.
+                None,
+                &self.q_dec,
+                headers_ptr,
+                self.arena_dtype,
+                sc.n_q_head,
+                sc.n_kv_head,
+                sc.head_dim,
+                self.softmax_scale,
+                &self.k_new,
+                &self.v_new,
+                &self.rope_rungs,
+                sc.rope_interleaved,
+                None,
+            )
+        })?;
         drop(headers_gpu);
 
         // The kernel scattered this token's K/V into each slot's write chunk
@@ -377,29 +460,50 @@ impl Fixture {
     }
 }
 
-/// RoPE inverse-frequency table for `head_dim` (theta = 10000), F32, shape
-/// `(head_dim/2,)`. [`Rope::Identity`] is all-zeros, so the rotation is the
-/// identity and the FP32 golden can be plain attention with no RoPE to
-/// replicate; the kernels still run their rotary path (cos=1, sin=0).
-fn make_inv_freq(head_dim: usize, rope: Rope, device: &Device) -> Result<Tensor> {
+/// RoPE inverse frequencies for `head_dim` (theta = 10000), `head_dim/2` of
+/// them. [`Rope::Identity`] is all-zeros, so the rotation is the identity and
+/// the FP32 golden can be plain attention with no RoPE to replicate; the
+/// kernels still run their rotary path (cos=1, sin=0).
+fn make_inv_freq(head_dim: usize, rope: Rope) -> Vec<f32> {
     let half = head_dim / 2;
     if rope == Rope::Identity {
-        return Tensor::zeros(half, DType::F32, device);
+        return vec![0.0; half];
     }
-    let mut v = Vec::with_capacity(half);
-    for i in 0..half {
-        let exp = (2 * i) as f32 / head_dim as f32;
-        v.push(1.0f32 / 10000f32.powf(exp));
-    }
-    Tensor::from_vec(v, half, device)
+    (0..half)
+        .map(|i| 1.0f32 / 10000f32.powf((2 * i) as f32 / head_dim as f32))
+        .collect()
 }
 
-/// FP32 ground-truth decode attention over the *same* synthetic K/V the fixture
-/// prefilled, assuming identity RoPE (so only valid against a [`Rope::Identity`] fixture).
-/// K/V are F16-rounded to match the arena storage precision; for real-quant
-/// arenas a kernel that reads K correctly lands within quant precision of this,
-/// while a structural (e.g. palette) K-read bug diverges far more.
-pub fn golden_decode(sc: &Scenario, device: &Device) -> Result<Tensor> {
+/// The synthetic context slot `slot` was prefilled with, F16-rounded as the
+/// arena stores it: token-major `(ctx_len, n_kv_head, head_dim)`, flattened.
+/// The unquantized truth a quantized arena approximates.
+pub fn synthetic_context(
+    sc: &Scenario,
+    slot: usize,
+    device: &Device,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
+    let (_, kp, vp) = make_prefill_qkv(sc, sc.ctx_len, seed, DType::F32, device)?;
+    let f16_rounded = |t: &Tensor| -> Result<Vec<f32>> {
+        t.to_dtype(DType::F16)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    };
+    Ok((f16_rounded(&kp)?, f16_rounded(&vp)?))
+}
+
+/// FP32 decode attention over a context, assuming identity RoPE (so only valid
+/// against a [`Rope::Identity`] fixture). `context(slot)` supplies each slot's
+/// context K/V: [`synthetic_context`] for the unquantized truth, or
+/// [`Fixture::stored_context`] for exactly what the arena holds — the
+/// reference a correct kernel matches to its own INT8 arithmetic whatever the
+/// storage format, so a divergence from it is structural.
+pub fn golden_decode(
+    sc: &Scenario,
+    device: &Device,
+    context: impl Fn(usize) -> Result<(Vec<f32>, Vec<f32>)>,
+) -> Result<Tensor> {
     let (nq, nkv, hd) = (sc.n_q_head, sc.n_kv_head, sc.head_dim);
     let group = nq / nkv;
     let scale = 1.0f32 / (hd as f32).sqrt();
@@ -418,10 +522,7 @@ pub fn golden_decode(sc: &Scenario, device: &Device) -> Result<Tensor> {
 
     let mut out = vec![0f32; sc.num_slots * nq * hd];
     for slot in 0..sc.num_slots {
-        let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
-        let (_qp, kp, vp) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?; // (ctx, nkv, hd)
-        let kpv = to_f16_vec(&kp)?;
-        let vpv = to_f16_vec(&vp)?;
+        let (kpv, vpv) = context(slot)?; // (ctx, nkv, hd)
         let ctx = sc.ctx_len;
         for h in 0..nq {
             let g = h / group;
@@ -466,6 +567,90 @@ pub fn golden_decode(sc: &Scenario, device: &Device) -> Result<Tensor> {
     Tensor::from_vec(out, (sc.num_slots, nq, hd), device)
 }
 
+/// Seed of the fresh tokens [`Fixture::prefill_step`] prefills onto `slot` at
+/// offset `off`.
+fn fresh_seed(slot: usize, off: usize) -> u64 {
+    0xF111_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9) ^ off as u64
+}
+
+/// FP32 reference for the first [`Fixture::prefill_step`] after a build:
+/// causal attention of `n_tokens` fresh tokens per slot over the slot's
+/// context (`context(slot)`, as for [`golden_decode`]) and the fresh tokens up
+/// to and including their own. Identity RoPE (only valid against a
+/// [`Rope::Identity`] fixture); the fresh Q/K/V F16-rounded, as the kernel's
+/// inputs are. Shape `(num_slots · n_tokens, n_q_head, head_dim)`, slot-major.
+pub fn golden_prefill(
+    sc: &Scenario,
+    n_tokens: usize,
+    device: &Device,
+    context: impl Fn(usize) -> Result<(Vec<f32>, Vec<f32>)>,
+) -> Result<Tensor> {
+    let (nq, nkv, hd) = (sc.n_q_head, sc.n_kv_head, sc.head_dim);
+    let group = nq / nkv;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let to_f16_vec = |t: &Tensor| -> Result<Vec<f32>> {
+        t.to_dtype(DType::F16)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    };
+    let ctx = sc.ctx_len;
+    let mut out = vec![0f32; sc.num_slots * n_tokens * nq * hd];
+    for slot in 0..sc.num_slots {
+        let (kpv, vpv) = context(slot)?;
+        let (qf, kf, vf) =
+            make_prefill_qkv(sc, n_tokens, fresh_seed(slot, ctx), DType::F32, device)?;
+        let (qfv, kfv, vfv) = (to_f16_vec(&qf)?, to_f16_vec(&kf)?, to_f16_vec(&vf)?);
+        // Key/value row `t` of the causal sequence: the stored context, then
+        // the fresh tokens. Token-major (tokens, nkv, hd).
+        let k_row = |t: usize, g: usize| -> &[f32] {
+            if t < ctx {
+                &kpv[(t * nkv + g) * hd..][..hd]
+            } else {
+                &kfv[((t - ctx) * nkv + g) * hd..][..hd]
+            }
+        };
+        let v_row = |t: usize, g: usize| -> &[f32] {
+            if t < ctx {
+                &vpv[(t * nkv + g) * hd..][..hd]
+            } else {
+                &vfv[((t - ctx) * nkv + g) * hd..][..hd]
+            }
+        };
+        // One output row per (fresh token, query head), each independent: the
+        // rows are computed in parallel, every row's arithmetic in order.
+        let slot_out = &mut out[slot * n_tokens * nq * hd..(slot + 1) * n_tokens * nq * hd];
+        slot_out
+            .par_chunks_mut(hd)
+            .enumerate()
+            .for_each(|(row, o)| {
+                let (i, h) = (row / nq, row % nq);
+                let n_keys = ctx + i + 1;
+                let g = h / group;
+                let q = &qfv[(i * nq + h) * hd..][..hd];
+                let mut logits: Vec<f32> = (0..n_keys)
+                    .map(|t| q.iter().zip(k_row(t, g)).map(|(a, b)| a * b).sum::<f32>() * scale)
+                    .collect();
+                let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0f32;
+                for lg in logits.iter_mut() {
+                    *lg = (*lg - m).exp();
+                    sum += *lg;
+                }
+                let inv = 1.0f32 / sum;
+                for (t, &w) in logits.iter().enumerate() {
+                    for (o, &v) in o.iter_mut().zip(v_row(t, g)) {
+                        *o += w * v;
+                    }
+                }
+                for o in o.iter_mut() {
+                    *o *= inv;
+                }
+            });
+    }
+    Tensor::from_vec(out, (sc.num_slots * n_tokens, nq, hd), device)
+}
+
 /// Deterministic pseudo-random value in roughly [-0.5, 0.5].
 fn pseudo(i: usize, j: usize, k: usize, seed: u64) -> f32 {
     let mut x = (i as u64)
@@ -482,13 +667,15 @@ fn pseudo(i: usize, j: usize, k: usize, seed: u64) -> f32 {
     v * 0.5
 }
 
-/// Synthetic prefill Q/K/V, shape `(1, n_head, n_tokens, head_dim)` in F32 (the
-/// cache converts to its `force_dtype` on write). Q uses `n_q_head`, K/V use
-/// `n_kv_head`.
+/// Synthetic prefill Q/K/V, shape `(n_tokens, n_head, head_dim)` in `dtype`.
+/// The fixture asks for the compute dtype, which is what the prefill kernel
+/// validates its operands against; the FP32 golden asks for F32 and rounds
+/// itself. Q uses `n_q_head`, K/V use `n_kv_head`.
 fn make_prefill_qkv(
     sc: &Scenario,
     n_tokens: usize,
     seed: u64,
+    dtype: DType,
     device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let mut q = Vec::with_capacity(n_tokens * sc.n_q_head * sc.head_dim);
@@ -510,9 +697,11 @@ fn make_prefill_qkv(
     // Flat / ragged prefill layout: token-major (total_q, n_head, head_dim).
     // The vec was filled token-major (t, h, d), so it maps directly with no
     // transpose. `paged_prefill_batched` takes total_q = sum(q_lens) rows.
-    let q = Tensor::from_vec(q, (n_tokens, sc.n_q_head, sc.head_dim), device)?;
-    let k = Tensor::from_vec(k, (n_tokens, sc.n_kv_head, sc.head_dim), device)?;
-    let v = Tensor::from_vec(v, (n_tokens, sc.n_kv_head, sc.head_dim), device)?;
+    // Built once per fixture, outside anything timed: the conversion is the
+    // harness choosing its input type, not a cast on the kernel's path.
+    let q = Tensor::from_vec(q, (n_tokens, sc.n_q_head, sc.head_dim), device)?.to_dtype(dtype)?;
+    let k = Tensor::from_vec(k, (n_tokens, sc.n_kv_head, sc.head_dim), device)?.to_dtype(dtype)?;
+    let v = Tensor::from_vec(v, (n_tokens, sc.n_kv_head, sc.head_dim), device)?.to_dtype(dtype)?;
     Ok((q, k, v))
 }
 
@@ -563,8 +752,7 @@ fn run_prefill(
     v: &Tensor,
     n_tokens: usize,
     sc: &Scenario,
-    rope_cs: &Tensor,
-    rope_offsets: &Tensor,
+    rope: &RopeRungs,
     stager: &PinnedStager,
 ) -> Result<()> {
     let offset = cache.current_seq_len();
@@ -583,8 +771,7 @@ fn run_prefill(
         sc.n_kv_head,
         sc.head_dim,
         None,
-        rope_offsets,
-        rope_cs,
+        rope,
         sc.rope_interleaved,
         &generation,
         // No shared position-map cache in this one-shot fixture prefill.

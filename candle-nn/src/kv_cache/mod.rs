@@ -62,7 +62,14 @@ pub use chunked::slot_state_stats;
 /// worst defects were geometry, and none of them needed a GPU to find.
 pub use chunked::span_geometry;
 pub use chunked::wave_plan::{
-    BufferShape, Encoding, LayerPhase, ModelGeometry, WaveBuffer, WavePlan, BUMP_ALIGNMENT,
+    ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, HyperWidths, LayerPhase,
+    ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
+    DELTA_NET_SCAN_CHUNK,
+};
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    arena_census, arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves,
+    relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
@@ -86,6 +93,8 @@ pub use chunked::{
     initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
     weight_capacity_bytes, weight_floor_after,
 };
+/// Fixed-stride slot arenas, one set per span tenant — see `chunked::tenant_arena`.
+pub use chunked::{slot_stride, SlotTenant, SLOT_ALIGN};
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.
 pub use chunked::{
@@ -93,7 +102,7 @@ pub use chunked::{
 };
 /// The wave arena's phase spans. Measurements, so they are available whether or
 /// not the crate was built with a GPU backend.
-pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
+pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::HostSealedChunk;
@@ -108,23 +117,39 @@ pub use chunked::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
     payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
+pub use chunked::{
+    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations, try_migrate_flight,
+    LocationFreeze, MigrateFlight,
+};
+/// Arena sparsity — the arenas a perfect KV pack would empty, per pool. The
+/// figure compaction is judged by; see `chunked::compact_plan`. `compaction_tally`
+/// is the other half: every pass's outcome since boot, refusals included, counted
+/// at the source because a refusal is the one outcome that cannot log.
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,
+    CompactionTally,
+};
 #[cfg(feature = "cuda")]
 pub use chunked::{
     convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
+pub use chunked::{
+    fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
+};
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
-pub use chunked::{migrate_flight, migrate_in_flight, MigrateFlight};
 pub use chunked::{
-    production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
+    production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta, ChunkPin,
     ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,
     KvErrorThresholdFactors, LLAMA2_KV_FACTOR, LLAMA3_KV_FACTOR, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN35_0_8B_KV_FACTORS,
     QWEN35_9B_KV_FACTORS, QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS,
-    QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS,
+    QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS, QWEN4EXP_Q2KO_KV_FACTORS,
 };
+pub use chunked::{rewrite_sealed, CompactionMap, Sweep};
 pub use chunked::{ArenaKey, StoragePolicy};
 pub use chunked::{LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE};
 pub use rotating::{
@@ -275,17 +300,17 @@ impl QuantFormat {
             // constant; the cheapest legitimate quant at 1 byte / 32 lanes
             // (0.25 BPE), useful for near-flat blocks.
             Self::Q0 => size_of::<BlockQ0>(),
-            // scale: 1 byte FP8(E4M3) + qs[4] sign bits (1 bit × 32 elems).
+            // scale:i8 (mean |x| · 127) + qs[4] sign bits (1 bit × 32 elems).
             Self::Q1_S => size_of::<BlockQ1S>(),
-            // scale: 1 byte FP8(E4M3) + qs[8] 2-bit symmetric quants.
+            // scale:i8 + qs[8] 2-bit symmetric quants.
             Self::Q2_S => size_of::<BlockQ2S>(),
-            // scale + bias: 2 bytes FP8(E4M3) + qs[8] 2-bit asymmetric.
+            // scale:i8 + bias:i8 + qs[8] 2-bit asymmetric.
             Self::Q2_A => size_of::<BlockQ2A>(),
             // dm: u32 packed (f16 scale | f16 min) + qs[8] 2-bit asymmetric.
             Self::Q2_1 => size_of::<BlockQ2_1>(),
             // dm: u32 packed (f16 scale | f16 min) + qh[4] + qs[8] 3-bit asym.
             Self::Q3_1 => size_of::<BlockQ3_1>(),
-            // lo: u8 curve_idx (0..255) | hi: 5-bit scale_idx + 3-bit
+            // One 16-bit code: 7-bit curve_idx, 5-bit scale_idx, 4-bit
             // centroid_idx — parametric-curve quantization, 0.5 BPE.
             Self::Q0_V => size_of::<BlockQ0V>(),
             // scale_pos:i8 + scale_neg:i8 amplitudes + qs[4] sign bits.
@@ -293,10 +318,10 @@ impl QuantFormat {
             // bulk_anchor:i8 + outlier_packed:u8 (5-bit lane | 3-bit signed
             // delta) — flat block + one outlier escape, 0.5 BPE.
             Self::Q0_X => size_of::<BlockQ0X>(),
-            // val_fp8[2] + qmask:u8 — 2 FP8(E4M3) centroids + per-quartet
+            // centroid:[i8; 2] + qmask:u8 — 2 INT8 centroids + per-quartet
             // mask choosing which centroid each lane uses.
             Self::Q0_M2 => size_of::<BlockQ0M2>(),
-            // val_fp8[4] + qmask:u32 — 4 FP8(E4M3) centroids + 2-bit-per-pair
+            // centroid:[i8; 4] + qmask:u32 — 4 INT8 centroids + 2-bit-per-pair
             // selector mask choosing one centroid per pair of lanes.
             Self::Q0_M4 => size_of::<BlockQ0M4>(),
         }

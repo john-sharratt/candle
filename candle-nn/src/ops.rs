@@ -175,6 +175,7 @@ impl candle::CustomOp1 for Sigmoid {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, layout.shape().clone()))
     }
@@ -481,6 +482,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, layout.shape().clone()))
     }
@@ -724,6 +726,7 @@ impl candle::CustomOp2 for RmsNorm {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -993,6 +996,7 @@ impl candle::CustomOp2 for SiluMul {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, l1.shape().clone()))
     }
@@ -1218,6 +1222,7 @@ impl candle::CustomOp3 for LayerNorm {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, l1.shape().clone()))
     }

@@ -94,7 +94,7 @@ for n in 1 2; do
 done
 
 # Decode-speed snapshot for the step (raw forward avg from the wave log).
-grep -aoE "kv/fwd avg=[0-9]+ fwd avg=[0-9]+ms" "$STEP_DIR/mind/.substrate/zend.log" 2>/dev/null | tail -5 >"$STEP_DIR/decode_ms.txt"
+grep -aoE "kv/fwd avg=[0-9]+ fwd avg=[0-9]+ms" "$STEP_DIR/mind/substrate/zend.log" 2>/dev/null | tail -5 >"$STEP_DIR/decode_ms.txt"
 
 # Teardown is scoped to the daemon THIS harness spawned — never other zends.
 taskkill //F //PID "$DAEMON_PID" >/dev/null 2>&1

@@ -1,0 +1,114 @@
+name: git_ref
+questions:
+- make a branch called feature/login off main
+- tag this commit as v1.4.0
+- delete the merged feature branch
+- create an annotated tag carrying a release message
+- point the branch at a different commit
+- remove that bad tag from the repository
+- I need a branch for this work
+- can you move main to the commit I just recorded
+- cut a tag for the release
+- start a branch from the release tag
+- branch off the previous commit
+- delete the tag we published by mistake
+- set up a branch named hotfix without checking it out
+- drop the old branch now that it is merged
+- make an annotated tag recording who tagged it and when
+- why can I not move that tag to a new commit
+- give me a branch at the commit I am on
+- create the branch but do not switch to it
+- remove the branch named experiment
+- repoint the release branch onto this commit
+category: Git
+description: 'Create, move or delete a branch or a tag, on origin. `kind` picks which and `action` picks the operation. `create` takes `at`, the revision the ref starts from, defaulting to your own commit; a tag created with a `message` is annotated, recording who tagged it and when, while a tag without one is a bare pointer. `move` repoints an existing branch other than the one you are on — git_reset moves that one — and a tag is NOT moved, so to retarget one, delete it and create it again. A move that would take commits off the branch is refused unless `expected` names the tip it takes them from. `delete` removes either kind, but never the branch you are on: git_switch away from it first. `expected` is optional throughout: omit it and the ref''s current value is read — a branch''s from origin, a tag''s from this repository — and swapped atomically, or give it to refuse the change if the ref moved since you looked. This moves a pointer and does NOT switch your branch — git_switch does that. Use for "make a branch for this", "tag this as v2.0", "delete the merged branch", "remove that bad tag", "point the branch at this commit". Writes to origin.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    RefAction:
+      description: 'What to do: `create` a ref that does not exist yet, `move` an existing branch to a new target (branches only), `delete` the ref.'
+      enum:
+      - create
+      - move
+      - delete
+      type: string
+    RefTarget:
+      description: 'Which kind of ref: a `branch` (moves as work lands on it) or a `tag` (a fixed marker, annotated when a `message` is given).'
+      enum:
+      - branch
+      - tag
+      type: string
+    RevArg:
+      description: 'A revision. `kind` picks the form and `name` carries its value.'
+      properties:
+        back:
+          description: For `parent` only — how many commits back. Defaults to 1.
+          format: uint32
+          minimum: 0.0
+          type: integer
+        kind:
+          description: 'Which form: `head` (your own commit — the branch you are on as your files have it — needs no name), `branch`, `tag`, `ref` (a full refs/… name), `commit` (a full object id), `remote_branch` (a remote-tracking branch written the way it is spoken of — `origin/main`), `upstream` (what `name` tracks, or what the branch you are on tracks when `name` is omitted — the form for "how far ahead of my upstream am I"), or `parent` (an ancestor of `name`, which is how to say "the previous commit" without holding its id).'
+          enum:
+          - head
+          - branch
+          - tag
+          - ref
+          - commit
+          - remote_branch
+          - upstream
+          - parent
+          type: string
+        name:
+          description: The branch or tag's short name, a full `refs/…` name, a commit id, or a remote branch as `origin/main` — whichever `kind` calls for. For `parent`, the revision to count back from, and for `upstream`, the branch whose upstream is meant; both default to your own commit. Omit for `head`.
+          type: string
+      required:
+      - kind
+      type: object
+  properties:
+    action:
+      allOf:
+      - $ref: '#/definitions/RefAction'
+      description: What to do to the ref. Required.
+    at:
+      allOf:
+      - $ref: '#/definitions/RevArg'
+      description: 'Where the ref points, for `create` and `move`. Leave it out for the branch you are on.'
+    expected:
+      description: 'What the ref must currently hold, for `move` and `delete`. Leave it out and the current value is read — a branch''s from origin, a tag''s from this repository — still swapped atomically; give it to refuse the change if the ref moved since you looked.'
+      type: string
+    kind:
+      allOf:
+      - $ref: '#/definitions/RefTarget'
+      description: Whether this is a branch or a tag. Required.
+    message:
+      description: A tag message. Giving one makes an annotated tag, which records who tagged it and when; without one the tag is a bare pointer. Ignored for a branch.
+      type: string
+    name:
+      description: The ref's short name — `feature/login`, `v1.4.0` — without `refs/heads/` or `refs/tags/`. Required.
+      minLength: 1
+      type: string
+    repo:
+      description: The repository to change. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - kind
+  - action
+  - name
+  title: RefRequest
+  type: object
+examples:
+- make a branch called feature/login off main<|im_end|>
+- tag this commit as v1.4.0<|im_end|>
+- delete the feature branch now that it is merged<|im_end|>
+- create an annotated tag for the release<|im_end|>
+- point the release branch at the commit I just recorded<|im_end|>
+- remove that bad tag from the repo<|im_end|>
+- start a branch from the previous commit<|im_end|>
+- I need a branch for this work, but do not switch to it<|im_end|>
+- tag the current main as v0.2.0 and put the tag on origin<|im_end|>
+- delete the scratch tag here and on origin<|im_end|>
+- make a nightly tag on main, then remove it again<|im_end|>
+- mark today's build with a lightweight tag<|im_end|>

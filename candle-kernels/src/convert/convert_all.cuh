@@ -21,7 +21,7 @@
 //   
 //   // In kernel - use ArenaAccessor for clean index-based access:
 //   ArenaAccessor accessor(arena_base, format, chunk_stride, head_stride, blocks_per_dim);
-//   accessor.load_head_scaled<T, HEAD_DIM, USE_TC>(dst, chunk_idx, head_idx, within_idx, lane, scale);
+//   accessor.load_head_scaled<T, HEAD_DIM, USE_TC, IS_K>(dst, chunk_idx, head_idx, within_idx, lane, scale);
 // =============================================================================
 
 // Common header with base template, scalar converters, block definitions
@@ -64,11 +64,11 @@
 // All others go through a __noinline__ slow path to reduce I-cache pressure.
 // =============================================================================
 
-// IS_K is threaded as a default-false template parameter so existing callers
-// compile unchanged (they get V-side Q0_V tables). K-side decode call sites
-// (e.g. paged-decode K, attention K-pass) explicitly pass IS_K=true so the
-// Q0_V case uses the K-side calibrated tables.
-template <typename DstType, int BLOCK_SIZE, bool IS_K = false>
+// IS_K names the side the block belongs to. Only Q0_V's decode depends on it —
+// its codebook is calibrated per side — and it has no default: a caller that
+// does not know its side cannot decode a Q0_V block correctly, so it must not
+// compile.
+template <typename DstType, int BLOCK_SIZE, bool IS_K>
 __device__ __noinline__ void load_block_convert_slow(
     DstType* dst,
     const void* src,
@@ -149,7 +149,7 @@ __device__ __noinline__ void load_block_convert_slow(
     }
 }
 
-template <typename DstType, int BLOCK_SIZE, bool IS_K = false>
+template <typename DstType, int BLOCK_SIZE, bool IS_K>
 __device__ __forceinline__ void load_block_convert(
     DstType* dst,
     const void* src,
@@ -204,7 +204,7 @@ __device__ __forceinline__ void store_block_convert(
     }
 }
 
-template <typename DstType, int BLOCK_SIZE, bool IS_K = false>
+template <typename DstType, int BLOCK_SIZE, bool IS_K>
 __device__ __forceinline__ void load_block_convert_all(
     DstType* dst,
     const void* src,
@@ -227,8 +227,8 @@ __device__ __forceinline__ void load_block_convert_all(
 // path even though it carries float values.
 
 // dequant_element_slow: all 22 formats, __noinline__ for compact code.
-// IS_K threaded as default-false for back-compat; Q0_V dispatches by IS_K.
-template <typename T, bool IS_K = false>
+// IS_K names the side; Q0_V dispatches by it.
+template <typename T, bool IS_K>
 __device__ __noinline__ T dequant_element_slow(const void* block_ptr, int idx, int format, float scale) {
     switch (format) {
         case ArenaFormat::R16:
@@ -307,7 +307,7 @@ __device__ __noinline__ T dequant_element_slow(const void* block_ptr, int idx, i
 // inlined + __noinline__ slow path for all others. Preferred for prefill.
 // IS_K threaded through to the slow-path delegation so Q0_V picks the
 // correct K/V calibrated tables.
-template <typename T, bool IS_K = false>
+template <typename T, bool IS_K>
 __device__ __forceinline__ T dequant_element_hybrid(const void* block_ptr, int idx, int format, float scale) {
     // Fast path: most common formats inlined
     switch (format) {
@@ -334,8 +334,8 @@ __device__ __forceinline__ T dequant_element_hybrid(const void* block_ptr, int i
 
 // dequant_element_inline: all 22 formats fully inlined at the call site.
 // Use for aggressive latency requirements (e.g., select_kv_format). IS_K
-// threaded as default-false; Q0_V dispatches by IS_K.
-template <typename T, bool IS_K = false>
+// names the side; Q0_V dispatches by it.
+template <typename T, bool IS_K>
 __device__ __forceinline__ T dequant_element_inline(const void* block_ptr, int idx, int format, float scale) {
     switch (format) {
         case ArenaFormat::R16:
@@ -508,7 +508,8 @@ struct ArenaAccessor {
         }
     }
     
-    template <typename T, int HEAD_DIM, bool USE_TC>
+    // IS_K names the side the head belongs to, which Q0_V's codebook depends on.
+    template <typename T, int HEAD_DIM, bool USE_TC, bool IS_K>
     __device__ __forceinline__ void load_head_scaled(
         T* dst,
         int chunk_idx,
@@ -523,7 +524,7 @@ struct ArenaAccessor {
         int elem_size = ArenaFormat::float_elem_size(format);
         if (elem_size <= 0) {
             // Quant format: use token-oriented loading
-            load_head_quant_token_oriented<T, HEAD_DIM>(dst, chunk_idx, head_idx, within_chunk, lane, scale);
+            load_head_quant_token_oriented<T, HEAD_DIM, IS_K>(dst, chunk_idx, head_idx, within_chunk, lane, scale);
             return;
         }
 
@@ -536,7 +537,7 @@ struct ArenaAccessor {
             return;
         }
 
-        load_head_convert_dtype<T, HEAD_DIM, USE_TC>(dst, elem_off, lane, scale);
+        load_head_convert_dtype<T, HEAD_DIM, USE_TC, IS_K>(dst, elem_off, lane, scale);
     }
     
 private:
@@ -579,7 +580,7 @@ private:
     // =========================================================================
     // DTYPE CONVERT PATH - Convert between float formats (F32/F16/BF16/FP8)
     // =========================================================================
-    template <typename T, int HEAD_DIM, bool USE_TC>
+    template <typename T, int HEAD_DIM, bool USE_TC, bool IS_K>
     __device__ __forceinline__ void load_head_convert_dtype(
         T* dst,
         int64_t elem_off,
@@ -601,7 +602,7 @@ private:
         if (lane < BLOCK_SIZE) {
             #pragma unroll
             for (int b = 0; b < NUM_BLOCKS; ++b) {
-                load_block_convert_all<T, BLOCK_SIZE>(
+                load_block_convert_all<T, BLOCK_SIZE, IS_K>(
                     dst + b * BLOCK_SIZE,
                     src + b * BLOCK_SIZE * elem_size,
                     format,
@@ -625,8 +626,22 @@ private:
     // Where h=head, d=dim, b=block_within_dim, H=HEAD_DIM, B=blocks_per_dim
     //
     // For HEAD_DIM=128, we need to read from 128 different blocks.
-    // Each warp lane handles HEAD_DIM/32 dimensions.
-    template <typename BlockT, typename T, int HEAD_DIM>
+    // Lane l handles dims l, l + 32, … below HEAD_DIM — so a palette narrower
+    // than the warp (16 dims at head_dim 64, 24 at 96) is covered by its first
+    // HEAD_DIM lanes rather than by HEAD_DIM / 32 == 0 dims per lane.
+    // One element of a typed block. Q0_V has no side-less BlockConverter — its
+    // codebook depends on the side — so it reads through its own IS_K loader,
+    // given the reciprocal scale `r` the caller computed once for the head.
+    template <typename BlockT, typename T, bool IS_K>
+    static __device__ __forceinline__ T load_block_element(const BlockT* block_ptr, int e, float scale, float r) {
+        if constexpr (std::is_same_v<BlockT, block_q0_v>) {
+            return q0_v_load_element_rcp<T, IS_K>(block_ptr, e, r);
+        } else {
+            return BlockConverter<BlockT, T>::load_element(block_ptr, e, scale);
+        }
+    }
+
+    template <typename BlockT, typename T, int HEAD_DIM, bool IS_K>
     __device__ __forceinline__ void load_head_quant_token_oriented_typed(
         T* dst,
         int chunk_idx,
@@ -635,7 +650,6 @@ private:
         int lane,
         float scale
     ) const {
-        constexpr int DIMS_PER_LANE = HEAD_DIM / 32;
         constexpr int BLOCK_BYTES = sizeof(BlockT);
 
         const int elem_in_block = within_chunk & 31;
@@ -648,16 +662,16 @@ private:
             : (base + ((int64_t)chunk_idx * ((chunk_stride / head_stride) * block_head_stride)
                       + (int64_t)head_idx * block_head_stride) * BLOCK_BYTES);
 
+        const float r = std::is_same_v<BlockT, block_q0_v> ? __frcp_rn(scale) : 0.f;
         #pragma unroll
-        for (int i = 0; i < DIMS_PER_LANE; ++i) {
-            const int dim = lane + i * 32;
+        for (int dim = lane; dim < HEAD_DIM; dim += 32) {
             const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
             const BlockT* block_ptr = reinterpret_cast<const BlockT*>(head_base + block_idx * BLOCK_BYTES);
-            dst[dim] = BlockConverter<BlockT, T>::load_element(block_ptr, elem_in_block, scale);
+            dst[dim] = load_block_element<BlockT, T, IS_K>(block_ptr, elem_in_block, scale, r);
         }
     }
 
-    template <typename T, int HEAD_DIM>
+    template <typename T, int HEAD_DIM, bool IS_K>
     __device__ __forceinline__ void load_head_quant_token_oriented(
         T* dst,
         int chunk_idx,
@@ -668,33 +682,28 @@ private:
     ) const {
         // Switch once on format, then run the full palette-span load.
         // This amortizes format dispatch across all dimensions in the run.
+        // The 2-byte formats are here too: their decode is a handful of
+        // instructions, so the fallback's per-element format switch would
+        // cost more than the decode itself.
         switch (format) {
-            case ArenaFormat::R16:
-                load_head_quant_token_oriented_typed<block_r16, T, HEAD_DIM>(
-                    dst, chunk_idx, head_idx, within_chunk, lane, scale);
-                return;
-            case ArenaFormat::Q4_0:
-                load_head_quant_token_oriented_typed<block_q4_0, T, HEAD_DIM>(
-                    dst, chunk_idx, head_idx, within_chunk, lane, scale);
-                return;
-            case ArenaFormat::Q8_0:
-                load_head_quant_token_oriented_typed<block_q8_0, T, HEAD_DIM>(
-                    dst, chunk_idx, head_idx, within_chunk, lane, scale);
-                return;
-            case ArenaFormat::Q4_KS:
-                load_head_quant_token_oriented_typed<block_q4_ks, T, HEAD_DIM>(
-                    dst, chunk_idx, head_idx, within_chunk, lane, scale);
-                return;
-            case ArenaFormat::Q8_KS:
-                load_head_quant_token_oriented_typed<block_q8_ks, T, HEAD_DIM>(
-                    dst, chunk_idx, head_idx, within_chunk, lane, scale);
-                return;
+#define ACC_TYPED(FMT, B)                                                          \
+            case ArenaFormat::FMT:                                                 \
+                load_head_quant_token_oriented_typed<B, T, HEAD_DIM, IS_K>(        \
+                    dst, chunk_idx, head_idx, within_chunk, lane, scale);          \
+                return
+            ACC_TYPED(R16,   block_r16);
+            ACC_TYPED(Q4_0,  block_q4_0);
+            ACC_TYPED(Q8_0,  block_q8_0);
+            ACC_TYPED(Q4_KS, block_q4_ks);
+            ACC_TYPED(Q8_KS, block_q8_ks);
+            ACC_TYPED(Q0_V,  block_q0_v);
+            ACC_TYPED(Q0_X,  block_q0_x);
+#undef ACC_TYPED
             default:
                 break;
         }
 
         // Fallback for less-common formats keeps the generic element path.
-        constexpr int DIMS_PER_LANE = HEAD_DIM / 32;
         const int block_bytes = get_quant_block_bytes(format);
         const int elem_in_block = within_chunk & 31;
         const int block_within_dim = within_chunk >> 5;
@@ -707,11 +716,10 @@ private:
                       + (int64_t)head_idx * block_head_stride) * block_bytes);
 
         #pragma unroll
-        for (int i = 0; i < DIMS_PER_LANE; ++i) {
-            const int dim = lane + i * 32;
+        for (int dim = lane; dim < HEAD_DIM; dim += 32) {
             const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
             const char* block_ptr = head_base + block_idx * block_bytes;
-            dst[dim] = dequant_element_inline<T>(block_ptr, elem_in_block, format, scale);
+            dst[dim] = dequant_element_inline<T, IS_K>(block_ptr, elem_in_block, format, scale);
         }
     }
 
@@ -765,7 +773,6 @@ public:
         int lane,
         float in_scale
     ) const {
-        constexpr int DIMS_PER_LANE = HEAD_DIM / 32;
         constexpr int BLOCK_BYTES = sizeof(BlockT);
         const int elem_in_block = within_chunk & 31;
         const int block_within_dim = within_chunk >> 5;
@@ -779,8 +786,7 @@ public:
                       + (int64_t)head_idx * block_head_stride) * BLOCK_BYTES);
 
         #pragma unroll
-        for (int i = 0; i < DIMS_PER_LANE; ++i) {
-            const int dim = lane + i * 32;
+        for (int dim = lane; dim < HEAD_DIM; dim += 32) {
             const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
             const BlockT* blk = reinterpret_cast<const BlockT*>(head_base + block_idx * BLOCK_BYTES);
             const Int8Sample smp = BlockInt8<BlockT>::load(blk, elem_in_block);

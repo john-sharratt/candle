@@ -14,18 +14,17 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 
 use candle_conversation::projection::{self, TimelineId};
-use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnText};
 
+use crate::branch_ingest::filter::MAX_FILE_BYTES;
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_scan::walk::MAX_FILE_BYTES;
 use crate::repo_scan::{shared_system_prompt, utility_config};
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 use crate::types::Role;
@@ -229,17 +228,16 @@ pub fn ingest_raw(
             .map_err(|e| anyhow::anyhow!("{layer_name} conv create: {e}"))?
     };
 
-    // Empty: a raw layer only ever PREFILLS its records — it decodes nothing, so
-    // there is no think block to steer.
-    let mut sink = SequenceTurnSink::new(&mut sequence, Arc::new(TriggerRegistry::new()));
+    // A raw layer only ever PREFILLS its records — it decodes nothing.
+    let mut sink = SequenceTurnSink::new(&mut sequence);
     let state = ingest_raw_into_sink(&mut sink, root, progress)?;
     Ok((sequence, state))
 }
 
-/// Atomic refresh of a raw layer when any record file's content hash changed.
-/// Mirrors [`crate::repo_scan::refresh_repo_map`]: re-read the folder, and on a
-/// hash change mint a fresh timeline, re-prefill every record, then tombstone the
-/// old timeline. Stale-better-than-missing holds throughout.
+/// Atomic refresh of a raw layer when any record file's content hash changed:
+/// re-read the folder, and on a hash change mint a fresh timeline, re-prefill
+/// every record, then tombstone the old timeline. Stale-better-than-missing
+/// holds throughout.
 pub fn refresh_raw(
     ctx: &RefreshContext<'_>,
     root: &Path,
@@ -288,7 +286,7 @@ pub fn refresh_raw(
     };
 
     {
-        let mut sink = SequenceTurnSink::new(&mut new_sequence, Arc::new(TriggerRegistry::new()));
+        let mut sink = SequenceTurnSink::new(&mut new_sequence);
         let total = files.len();
         for (i, (rel, content)) in files.iter().enumerate() {
             let turns = records_to_turns(parse_chatml_records(content));

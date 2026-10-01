@@ -218,14 +218,20 @@ impl Guard {
 
     /// Fold this decode's chosen acts in and set up the next turn. Returns
     /// whether the breaker fired, so the caller can deliver the [`NUDGE`].
-    fn record(&mut self, acts: &[(String, String)]) -> bool {
+    fn record(&mut self, acts: &[(String, String)], fighting: bool) -> bool {
         let turn = self.turn;
         self.force_reflect = false;
         let mut fired = false;
 
         for (act, intent) in acts {
             let act = act.as_str();
-            if GUARD_EXEMPT.contains(&act) {
+            // The exemption is for a FIGHT — that is the only place repetition of
+            // the same act is the play, and there the real-time fight rate paces
+            // it. Off the field it is a tic: three Makers stood in a room shaking
+            // one another with `act` for a hundred turns, uncooled, because `act`
+            // was exempt whether or not anything was hostile. Guard it like any
+            // other act unless something here is actually being fought.
+            if fighting && GUARD_EXEMPT.contains(&act) {
                 continue;
             }
 
@@ -314,7 +320,7 @@ impl LoopGuards {
     /// act from one decode, each paired with its [`salient`] intent, in call
     /// order. Returns whether the breaker fired — the caller then delivers the
     /// [`NUDGE`] so the forced reflect next turn is explained.
-    pub fn record(&self, npc_id: u64, acts: &[(String, String)]) -> bool {
+    pub fn record(&self, npc_id: u64, acts: &[(String, String)], fighting: bool) -> bool {
         if acts.is_empty() {
             return false;
         }
@@ -323,7 +329,7 @@ impl LoopGuards {
             .expect("loop-guard lock")
             .entry(npc_id)
             .or_default()
-            .record(acts)
+            .record(acts, fighting)
     }
 
     /// Forget a character's history — for one being retired, or one whose body
@@ -346,7 +352,13 @@ mod tests {
     }
 
     fn took(g: &LoopGuards, npc: u64, tool: &'static str, intent: &str) -> bool {
-        g.record(npc, &[(tool.to_string(), intent.to_string())])
+        g.record(npc, &[(tool.to_string(), intent.to_string())], false)
+    }
+
+    /// As [`took`], but with something hostile in the room, so a combat act keeps
+    /// its guard exemption.
+    fn took_fighting(g: &LoopGuards, npc: u64, tool: &'static str, intent: &str) -> bool {
+        g.record(npc, &[(tool.to_string(), intent.to_string())], true)
     }
 
     /// The salient text is the act's content argument, whichever one carries it.
@@ -481,18 +493,41 @@ mod tests {
     }
 
     /// A combat act opts out of the whole guard — a fight is repetition by
-    /// nature, and it is paced by the real-time fight rate instead.
+    /// nature, and it is paced by the real-time fight rate instead. Only while
+    /// something is actually being fought: see
+    /// [`a_social_act_off_the_field_is_guarded_like_any_other`].
     #[test]
     fn a_combat_act_is_never_struck() {
         let g = LoopGuards::new();
         for _ in 0..5 {
-            let fired = took(&g, 1, "act", "strike him again");
+            let fired = took_fighting(&g, 1, "act", "strike him again");
             assert!(!fired, "combat must not trip the breaker");
             assert!(
                 !g.cooling(1).contains(&"act".to_string()),
                 "combat must never be struck"
             );
         }
+    }
+
+    /// The same `act`, repeated with nothing hostile in the room, is a tic and is
+    /// cooled like any other act — three Makers shaking one another with `act`
+    /// forever is exactly the loop the guard exists to break.
+    #[test]
+    fn a_social_act_off_the_field_is_guarded_like_any_other() {
+        let g = LoopGuards::new();
+        // Same act, same intent, no fight: the closeness breaker fires and the
+        // act is struck, so the character cannot keep emitting it.
+        took(&g, 1, "act", "shake Pax to make them see the pattern");
+        took(&g, 1, "act", "shake Pax to make them see the pattern");
+        let fired = took(&g, 1, "act", "shake Pax to make them see the pattern");
+        assert!(
+            fired,
+            "a social act looping off the field must trip the breaker"
+        );
+        assert!(
+            g.cooling(1).contains(&"act".to_string()),
+            "a social act repeated off the field must be struck"
+        );
     }
 
     /// Distinct acts, or distinct intents, are not a loop and cool nothing beyond

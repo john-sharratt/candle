@@ -469,8 +469,8 @@ plugs into. The load + run seam is three lines (`quantized_qwen3_moe.rs:2340`):
 
 ```rust
 let model = ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, None, int8mode)?;
-let inv_freq = model.rope_inv_freq()...;
-BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)   // engine wraps the model
+let schedule = RopeSchedule::stated(model.rope_inv_freq()..., context_length)?;
+BatchedInference::new_with_schedule(model, &schedule, 4096, &device)   // engine wraps the model
 ```
 
 ### 5.1 The engine already streams a MoE larger than VRAM

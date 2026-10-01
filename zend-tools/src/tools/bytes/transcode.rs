@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{decode_bytes, encode_bytes, BytesError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct TranscodeRequest {
@@ -42,6 +42,11 @@ impl Tool for BytesTranscode {
     type Request = TranscodeRequest;
     type Response = TranscodeResponse;
     type Error = BytesError;
+
+    /// Pure byte manipulation — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: TranscodeRequest) -> Result<TranscodeResponse, BytesError> {
         let bytes = decode_bytes(&req.data, &req.from)?;

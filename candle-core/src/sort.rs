@@ -182,6 +182,7 @@ impl crate::CustomOp1 for ArgSort {
             slice,
             device: dev.clone(),
             backing: out_backing,
+            anchor: None,
         };
         Ok((dst, layout.shape().clone()))
     }

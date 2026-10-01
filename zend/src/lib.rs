@@ -5,41 +5,59 @@
 //! Grouped by concern: HTTP surface (`api`, `chatml`, `session`,
 //! `log_broadcast`, `log_line`, `projection_event`); model bring-up
 //! (`loading`, `model_choice`, `download`, `config`); workspace ingestion
-//! (`ingest`, `repo_scan`, `code_read`, `raw_read`, `refresh_ctx`, `watcher`,
-//! `turn_sink`); tool orchestration (`tools`, `tool_def`, `tool_summary`);
-//! conversation-attached files (`conv_files`, `conv_file_store`); and shared
-//! wire types (`types`, `response_section`).
+//! (`ingest`, `ingest_backlog`, `ingest_report`, `ingest_worker`, `repo_scan`,
+//! `code_read`, `raw_read`, `refresh_ctx`, `turn_sink`); tool
+//! orchestration (`tools`, `tool_def`, `tool_summary`); conversation-attached
+//! files (`conv_files`, `conv_file_store`); and shared wire types (`types`,
+//! `response_section`).
+pub mod access;
 pub mod api;
+pub mod branch_ingest;
 pub mod chatml;
 pub mod code_read;
 pub mod coding_sampling;
 pub mod config;
+pub mod conv_branches;
 pub mod conv_file_store;
 pub mod conv_files;
+pub mod conv_order;
+pub mod conv_overlay;
 pub mod download;
+pub mod fast_path;
 pub mod ingest;
+pub mod ingest_backlog;
 pub mod ingest_report;
+pub mod ingest_worker;
 pub mod lenient_json;
 pub mod loading;
 pub mod log_broadcast;
 pub mod log_line;
 pub mod model_choice;
 pub mod openai_tools;
+pub mod origin_watch;
 pub mod passthrough;
 pub mod projection_event;
 pub mod raw_read;
 pub mod reasoning_split;
 pub mod refresh_ctx;
+pub mod repeat_guard;
+pub mod repo_path;
 pub mod repo_scan;
 pub mod response_section;
+pub mod resume;
+pub mod retrieval_scope;
+pub mod sandbox_programs;
+pub mod secrets;
 pub mod session;
 pub mod think_budget;
 pub mod think_gate;
 pub mod think_progress;
 pub mod tool_call_split;
 pub mod tool_def;
+pub mod tool_guidance;
+pub mod tool_round;
 pub mod tool_summary;
 pub mod tools;
 pub mod turn_sink;
 pub mod types;
-pub mod watcher;
+pub mod workspace;

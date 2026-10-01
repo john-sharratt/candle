@@ -32,7 +32,13 @@ pub const FILE_MAGIC: u32 = 0x474f_4c53;
 /// content halves out of the in-memory `TurnEntryData`.  Old (v1) logs
 /// are rejected on open, forcing a clean rebuild rather than silently
 /// loading pre-split records into the new substrate shape.
-pub const FILE_FORMAT_VERSION: u32 = 2;
+///
+/// Bumped to `3` when Q0_V K blocks moved to the K codebook. Earlier logs
+/// sealed every Q0_V block, K included, with the V codebook, and their
+/// records carry no codebook tag. Decoding those K bytes with the K codebook
+/// gives plausible but wrong keys with no error, so v2 logs are rejected on
+/// open.
+pub const FILE_FORMAT_VERSION: u32 = 3;
 
 /// The file is grown ahead in extents of this size so appends write into
 /// already-allocated space — one `set_len` per extent instead of per record.
@@ -158,6 +164,10 @@ pub struct LogFile {
     allocated: u64,
     /// Group-commit staging buffer — appended records not yet flushed.
     pending: Vec<u8>,
+    /// Bytes flushed to the file since the last `fsync`: a flush bounds the
+    /// staging buffer without being a commit, and the next commit must still
+    /// sync them even though nothing is staged.
+    unsynced: bool,
     /// When true this handle was opened read-only ([`LogFile::open_read_only`]):
     /// the OS file has no write access and the superblock is never healed on
     /// open, so it is safe to point at a segment another process holds open for
@@ -187,6 +197,7 @@ impl LogFile {
             write_offset: SUPERBLOCK_SIZE,
             allocated: 0,
             pending: Vec::new(),
+            unsynced: false,
             read_only: false,
         };
         log.grow_to(SUPERBLOCK_SIZE)?;
@@ -220,6 +231,7 @@ impl LogFile {
             write_offset: SUPERBLOCK_SIZE,
             allocated,
             pending: Vec::new(),
+            unsynced: false,
             read_only: false,
         };
         let head = log.read_at(0, SUPERBLOCK_SIZE as usize)?;
@@ -263,6 +275,7 @@ impl LogFile {
             write_offset: SUPERBLOCK_SIZE,
             allocated,
             pending: Vec::new(),
+            unsynced: false,
             read_only: true,
         };
         let head = log.read_at(0, SUPERBLOCK_SIZE as usize)?;
@@ -296,7 +309,9 @@ impl LogFile {
         self.superblock
     }
 
-    /// The durable logical end of the log — offset of the next append.
+    /// The logical end of what is written to the file — the offset the next
+    /// staged record follows. Durable only once a commit has synced it: a
+    /// flush writes without syncing ([`Self::needs_commit`]).
     pub fn write_offset(&self) -> u64 {
         self.write_offset
     }
@@ -370,7 +385,14 @@ impl LogFile {
         self.file.write_all(&self.pending)?;
         self.write_offset = end;
         self.pending.clear();
+        self.unsynced = true;
         Ok(())
+    }
+
+    /// Whether a commit has anything to do: records staged, or flushed and not
+    /// yet synced.
+    pub fn needs_commit(&self) -> bool {
+        !self.pending.is_empty() || self.unsynced
     }
 
     /// Flush and `fsync` — the group-commit durability boundary.
@@ -384,6 +406,7 @@ impl LogFile {
             return Ok(());
         }
         self.file.sync_data()?;
+        self.unsynced = false;
         Ok(())
     }
 
@@ -638,6 +661,24 @@ mod tests {
             let log = LogFile::open(&path).unwrap();
             assert_eq!(log.superblock().format_version, FILE_FORMAT_VERSION);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **A flush is not a commit**: what it wrote is still owed an `fsync`, so
+    /// the log still needs a commit with nothing staged — the next group
+    /// commit must not skip it — and only the commit settles it.
+    #[test]
+    fn a_flush_leaves_a_commit_owed() {
+        let path = tmp_path("flush_owed");
+        let mut log = LogFile::create(&path).unwrap();
+        assert!(!log.needs_commit(), "a fresh log owes nothing");
+        log.stage(&rec(1, 0, b"x"));
+        assert!(log.needs_commit());
+        log.flush().unwrap();
+        assert_eq!(log.pending_len(), 0);
+        assert!(log.needs_commit(), "flushed, not synced");
+        log.commit().unwrap();
+        assert!(!log.needs_commit());
         std::fs::remove_file(&path).ok();
     }
 

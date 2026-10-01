@@ -4,7 +4,7 @@ use serde_json::json;
 use zend_tools::ToolContext;
 
 fn ctx() -> ToolContext {
-    ToolContext::new()
+    harness::granted()
 }
 
 #[test]

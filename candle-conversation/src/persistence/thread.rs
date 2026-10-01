@@ -47,7 +47,6 @@ use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
 use crate::scheduler::relief_trace;
 use crate::substrate::{ConvCompression, ResidenceIndex, StoredSequence};
-use std::collections::HashMap;
 use sysinfo::System;
 
 /// How often the loop wakes up on its own when no triggers arrive.
@@ -595,7 +594,54 @@ fn signal_vram_starvation(device: &Device, err: &candle::Error) {
 /// `None`) and DtoH-copy the result to a format-preserving CPU warm copy.
 /// Successful residences (every layer migrated) are appended to `installs`
 /// as `(idx, new_hot, new_warm)`. Queues all work on the primary stream;
-/// the caller syncs once after every group.
+/// the caller fences the group before [`install_hot_to_warm`].
+/// Install one fenced group's `(idx, new_hot, new_warm)` triples under a single
+/// substrate write lock. Returns the warm bytes and the residence count.
+fn install_hot_to_warm(
+    conversation: &Conversation,
+    installs: Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)>,
+) -> (u64, usize) {
+    if installs.is_empty() {
+        return (0, 0);
+    }
+    let mut total_bytes = 0u64;
+    let count = installs.len();
+    let mut view = conversation.write();
+    for (idx, hot, warm) in installs {
+        let bytes: u64 = warm
+            .iter()
+            .flat_map(|s| s.chunks.iter())
+            .map(|c| c.byte_size)
+            .sum();
+        tracing::trace!(
+            target: "candle_conversation::persistence::tier",
+            residence = idx.0,
+            bytes,
+            "cached hot → warm (with hot Q-format replace)"
+        );
+        total_bytes = total_bytes.saturating_add(bytes);
+        if view.residence_evict_when_cold(idx) {
+            // Completed-ingest / collection-member residence flagged for full
+            // eviction: don't keep the fresh GPU Q copy resident — install
+            // warm-only and drop hot now, so the VRAM returns immediately.
+            // The warm→cold write (reading the CPU warm copy) then frees warm
+            // too via `install_cold`, leaving it cold-only. The just-produced
+            // `hot` Q sequences drop here → arena chunks return to the pool.
+            view.install_warm_and_evict_hot(idx, warm);
+        } else {
+            // Atomic dual install: replace residence.hot with the new GPU
+            // Q-format sequences (drops the old R16/F16 Arcs from
+            // record_turn), and install warm with the CPU copy. The next
+            // turn's apply_projection injects residence.hot directly — no
+            // warm→hot promotion needed, no kv_migrate scatter into
+            // freshly-allocated arenas. Decode reads exactly the bytes the
+            // convert kernel wrote.
+            view.install_warm_and_hot(idx, hot, warm);
+        }
+    }
+    (total_bytes, count)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn migrate_group_hot_to_warm(
     backings: &[ChunkedKvBacking],
@@ -896,44 +942,22 @@ fn run_pass(
 
     // ── Phase 1: hot → warm ─────────────────────────────────────────────
     //
-    // Snapshot the work list under a brief read lock, then run the
-    // fully-batched VRAM→RAM migration per layer on the primary CUDA
-    // stream with no substrate lock held.
+    // One group per compression override, so a single batched per-layer
+    // quantize call covers each policy. Most residences share `None` (the
+    // engine-wide turn policy); utility layers such as `code_reading` form
+    // their own group at a higher level with the K override dropped (see
+    // `ConvCompression`). Only the overrides are read here: each group's
+    // sequences are cloned under its own migrate guard below.
     //
-    // For each layer we:
+    // Per group we:
     //  - run `quantize_sealed_in_place` (selection + convert kernels,
     //    primary stream),
     //  - run `migrate_sealed_to_cpu_batch_async` (kv_migrate gather +
     //    DtoH into pinned host scratch, primary stream),
-    //  - collect (hot, warm) pairs per residence.
-    //
-    // All work queues FIFO on the primary stream, so each step sees
-    // the previous step's writes without explicit fences. After all
-    // layers are migrated we take **one** substrate write lock and
-    // install every warm copy at once.
-    let pending_warm: Vec<_> = conversation.read().snapshot_pending_warm();
+    //  - fence, and install the group's (hot, warm) pairs under one
+    //    substrate write lock.
+    let policies = conversation.read().pending_warm_policies();
     let n_layers = backings.len();
-    for (idx, hot, _) in &pending_warm {
-        if hot.len() != n_layers {
-            tracing::warn!("persist: hot→warm layer-count mismatch for {idx:?} — skipping");
-        }
-    }
-
-    // Group residences by their per-conversation compression override so a
-    // single batched per-layer quantize call covers each policy. Most
-    // residences share `None` (the engine-wide turn policy); utility layers
-    // such as `code_reading` form their own group at a higher level with the
-    // K override dropped (see `ConvCompression`). Every group's kernels
-    // queue FIFO on the primary stream, so the one sync after this loop
-    // covers all of them.
-    let mut groups: HashMap<Option<ConvCompression>, Vec<(ResidenceIndex, Vec<SealedSequence>)>> =
-        HashMap::new();
-    for (idx, hot, cc) in pending_warm {
-        if hot.len() != n_layers {
-            continue;
-        }
-        groups.entry(cc).or_default().push((idx, hot));
-    }
 
     // Cross-thread write→read barrier. This persist pass runs on the background
     // persistence thread and reads each freshly-sealed turn's K/V for the
@@ -978,7 +1002,6 @@ fn run_pass(
     let sync_pre_ms = t_sync.elapsed().as_millis() as u64;
     let t_migrate = std::time::Instant::now();
 
-    let mut installs: Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)> = Vec::new();
     let mut quantize_ms = 0u64;
     let mut copy_ms = 0u64;
     let mut select_ms = 0u64;
@@ -1050,13 +1073,75 @@ fn run_pass(
         }
     }
 
-    let migrate_guard = candle_nn::kv_cache::migrate_flight();
-    for (cc, group) in groups {
+    // **Defer rather than race a compaction.** This marker is also the hold that
+    // keeps a KV compaction from relocating the chunks whose addresses the migrate
+    // below is about to capture; a pass in flight means those locations are moving
+    // under us, and the copy would put another sequence's KV in the warm tier. Never
+    // waits — see `migrate_flight` — so the pass ahead of us finishes and the next
+    // persistence round picks this work up unchanged.
+    // **Per group, not per pass, and each group's GPU work is fenced before the
+    // guard goes back.**
+    //
+    // The guard is what keeps a KV compaction from relocating the chunks whose
+    // addresses this migrate has captured — a pin keeps the arena alive and says
+    // nothing about which slot of it the chunk is in, so a relocation underneath
+    // makes the copy put another sequence's KV in the warm tier. Held across the
+    // whole batch it starves compaction exactly when compaction is most needed: a
+    // mass eviction is what produces both the fragmentation and the hot→warm work
+    // that has to precede it. Measured: 50 of 65 passes refused, and the pools at
+    // 72% through the burst.
+    //
+    // Releasing per group is only sound because the fence comes with it. The guard
+    // protects captured *addresses*, and a group's addresses stay live until its
+    // kernels retire, so handing the guard back while its copies are still queued
+    // would hand a compaction ground it is still reading. The batch-wide sync below
+    // stays as well — it is what `install_warm_and_hot` and the next projection
+    // depend on, for reasons that have nothing to do with this guard.
+    //
+    // A group that cannot get the guard is skipped, not abandoned: it is still hot,
+    // still flagged, and the next pass migrates it. Everything after this loop — the
+    // cold writes, the maintenance sweep — reads the substrate rather than raw chunk
+    // addresses, so it is unaffected by a relocation either way.
+    //
+    // **Nothing a group captured outlives its guard.** Its sequences are cloned
+    // after the guard is taken, and its results are installed — and every clone
+    // dropped — before it goes back. A compaction sweeps the holders it can reach,
+    // and this thread's locals are not among them: a batch snapshotted up front and
+    // held across the groups was a holder of every pending residence the sweep
+    // never visited. It kept the relocated slots' sources alive, so their copies were
+    // claimed and never used — 28,869 of 43,647 relocated slots in one pass, measured
+    // when a section quantize swapped a section's hot form for its quantized one and
+    // left the snapshot the only holder of the native chunks. And the install then
+    // wrote gids captured before the relocation back into the substrate. Snapshotted
+    // under the guard, a group names exactly what the substrate names at that
+    // moment, and no compaction can run until it is installed.
+    let mut deferred_groups = 0usize;
+    let mut hot_to_warm_bytes: u64 = 0;
+    let mut hot_to_warm_count: usize = 0;
+    let mut install_ms = 0u64;
+    for cc in policies {
+        let Some(group_guard) = candle_nn::kv_cache::try_migrate_flight() else {
+            deferred_groups += 1;
+            continue;
+        };
+        let group: Vec<(ResidenceIndex, Vec<SealedSequence>)> = conversation
+            .read()
+            .snapshot_pending_warm_for(cc)
+            .into_iter()
+            .filter(|(idx, hot)| {
+                let whole = hot.len() == n_layers;
+                if !whole {
+                    tracing::warn!("persist: hot→warm layer-count mismatch for {idx:?} — skipping");
+                }
+                whole
+            })
+            .collect();
         let effective = if single_latent {
             None
         } else {
             effective_turn_policy(compression_policy, cc)
         };
+        let mut installs = Vec::new();
         migrate_group_hot_to_warm(
             backings,
             device,
@@ -1072,80 +1157,59 @@ fn run_pass(
             &mut alloc_ms,
             &mut convert_ms,
         );
+        // The fence that makes the install and the release safe: the group's
+        // Q-format arenas are written and its captured addresses retired.
+        //
+        // Device-wide (not just primary-stream): the reproject on the scheduler
+        // thread reads these freshly-installed Q-arenas for the NEXT turn's
+        // context, and if any of the convert's V work retires on a stream the
+        // primary-stream sync doesn't cover, the reproject captures incomplete V
+        // (K, whose convert retires earlier, is fine) — the V-only multi-turn
+        // duplication corruption.
+        if let Err(e) = device.synchronize() {
+            tracing::warn!(
+                "cache: device sync after a hot→warm group failed: {e:?} (last CUDA \
+                 kernel on this thread: {})",
+                candle::last_cuda_kernel_launch()
+            );
+            // This group's GPU work is suspect — install none of it, and queue
+            // nothing more behind a device that is not answering.
+            drop(installs);
+            drop(group);
+            drop(group_guard);
+            break;
+        }
+        let t_install = std::time::Instant::now();
+        let (bytes, count) = install_hot_to_warm(conversation, installs);
+        install_ms += t_install.elapsed().as_millis() as u64;
+        hot_to_warm_bytes = hot_to_warm_bytes.saturating_add(bytes);
+        hot_to_warm_count += count;
+        drop(group);
+        drop(group_guard);
+    }
+    if deferred_groups > 0 {
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            deferred_groups,
+            "hot→warm groups deferred: a KV compaction is relocating chunks",
+        );
     }
     let migrate_ms = t_migrate.elapsed().as_millis() as u64;
     let t_sync_post = std::time::Instant::now();
-    // Primary-stream sync after ALL groups/layers complete.
-    //
-    // `quantize_sealed_in_place` and the format-preserving DtoH leave
-    // work in flight on the primary stream — selection kernel, convert
-    // kernel, dst arena allocations, head-gid staging copies, kv_migrate
-    // gather, the final DtoH itself. We need one explicit sync before
-    // the substrate write — otherwise `install_warm_and_hot` (CPU
-    // bookkeeping) can return and the next turn's `apply_projection`
-    // can start before the GPU has finished writing the new Q-format
-    // arenas the slot now references.
-    //
-    // Device-wide (not just primary-stream) sync: the reproject on the scheduler
-    // thread reads these freshly-installed Q-arenas for the NEXT turn's context,
-    // and if any of the convert's V work retires on a stream the primary-stream
-    // sync doesn't cover, the reproject captures incomplete V (K, whose convert
-    // retires earlier, is fine) — the V-only multi-turn duplication corruption.
-    // `device.synchronize()` waits for every stream, closing that window.
-    if let Err(e) = device.synchronize() {
-        tracing::warn!(
-            "cache: device sync after hot→warm batch failed: {e:?} (last CUDA kernel on this thread: {})",
+    // Every group fenced itself before installing; this sync runs on a fixed
+    // cadence regardless of load (see the pass-timing log below, which fires
+    // even with nothing to migrate), so it is the daemon's most reliable "the
+    // device is still alive" heartbeat — closing any out-of-memory streak
+    // `gpu_poison` is tracking before a resolved episode gets mistaken for a
+    // still-open one much later.
+    match device.synchronize() {
+        Ok(()) => candle::gpu_poison::note_device_ok(),
+        Err(e) => tracing::warn!(
+            "cache: device sync after hot→warm pass failed: {e:?} (last CUDA kernel on this thread: {})",
             candle::last_cuda_kernel_launch()
-        );
-        // The whole batch's GPU work is suspect — don't install any of it.
-        installs.clear();
+        ),
     }
     let sync_post_ms = t_sync_post.elapsed().as_millis() as u64;
-    // Migrate GPU work has retired (the sync above) — release the guard so the
-    // scheduler's VRAM relief resumes. The install below only drops old hot Arcs
-    // (its own arena frees), which no in-flight kernel is reading.
-    drop(migrate_guard);
-    let t_install = std::time::Instant::now();
-    let mut hot_to_warm_bytes: u64 = 0;
-    let mut hot_to_warm_count: usize = 0;
-    if !installs.is_empty() {
-        let mut view = conversation.write();
-        for (idx, hot, warm) in installs {
-            let bytes: u64 = warm
-                .iter()
-                .flat_map(|s| s.chunks.iter())
-                .map(|c| c.byte_size)
-                .sum();
-            tracing::trace!(
-                target: "candle_conversation::persistence::tier",
-                residence = idx.0,
-                bytes,
-                "cached hot → warm (with hot Q-format replace)"
-            );
-            hot_to_warm_bytes = hot_to_warm_bytes.saturating_add(bytes);
-            hot_to_warm_count += 1;
-            if view.residence_evict_when_cold(idx) {
-                // Completed-ingest / collection-member residence flagged for full
-                // eviction: don't keep the fresh GPU Q copy resident — install
-                // warm-only and drop hot now, so the VRAM returns immediately.
-                // The warm→cold write below (reading the CPU warm copy) then
-                // frees warm too via `install_cold`, leaving it cold-only. The
-                // just-produced `hot` Q sequences drop here → arena chunks return
-                // to the pool.
-                view.install_warm_and_evict_hot(idx, warm);
-            } else {
-                // Atomic dual install: replace residence.hot with the new
-                // GPU Q-format sequences (drops the old R16/F16 Arcs from
-                // record_turn), and install warm with the CPU copy. The
-                // next turn's apply_projection injects residence.hot
-                // directly — no warm→hot promotion needed, no kv_migrate
-                // scatter into freshly-allocated arenas. Decode reads
-                // exactly the bytes the convert kernel wrote.
-                view.install_warm_and_hot(idx, hot, warm);
-            }
-        }
-    }
-    let install_ms = t_install.elapsed().as_millis() as u64;
     // Log the breakdown when the pass did real work OR was slow even with nothing
     // to install (isolates a dominant `device.synchronize()` cost). This is the
     // number that tells us whether the drain is sync-bound, the serial 48-layer

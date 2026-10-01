@@ -67,7 +67,8 @@ extern "C" void run_batched_sampling_f32(
     // Output
     uint32_t* output_tokens,
     uint64_t seed,
-    uint64_t* rng_offsets
+    uint64_t* rng_offsets,
+    const void* seq_dials
 );
 
 extern "C" void run_batched_sampling_f16(
@@ -121,7 +122,8 @@ extern "C" void run_batched_sampling_f16(
     // Output
     uint32_t* output_tokens,
     uint64_t seed,
-    uint64_t* rng_offsets
+    uint64_t* rng_offsets,
+    const void* seq_dials
 );
 
 extern "C" void run_batched_sampling_fp8_e4m3(
@@ -175,7 +177,8 @@ extern "C" void run_batched_sampling_fp8_e4m3(
     // Output
     uint32_t* output_tokens,
     uint64_t seed,
-    uint64_t* rng_offsets
+    uint64_t* rng_offsets,
+    const void* seq_dials
 );
 
 extern "C" void run_batched_sampling_bf16(
@@ -229,7 +232,8 @@ extern "C" void run_batched_sampling_bf16(
     // Output
     uint32_t* output_tokens,
     uint64_t seed,
-    uint64_t* rng_offsets
+    uint64_t* rng_offsets,
+    const void* seq_dials
 );
 
 // ============================================================================
@@ -292,7 +296,9 @@ extern "C" void run_batched_sampling(
     // Output
     uint32_t* output_tokens,
     uint64_t seed,
-    uint64_t* rng_offsets
+    uint64_t* rng_offsets,
+    // Per-sequence dials ([batch_size] of SeqDials) or null — see SeqDials.
+    const void* seq_dials
 ) {
     switch (dtype) {
         case 0: // f32
@@ -311,7 +317,8 @@ extern "C" void run_batched_sampling(
                 recent_tokens, recent_lens, max_recent_len,
                 stencil, stencil_size,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
             break;
         case 1: // f16
@@ -330,7 +337,8 @@ extern "C" void run_batched_sampling(
                 recent_tokens, recent_lens, max_recent_len,
                 stencil, stencil_size,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
             break;
         case 2: // bf16
@@ -349,7 +357,8 @@ extern "C" void run_batched_sampling(
                 recent_tokens, recent_lens, max_recent_len,
                 stencil, stencil_size,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
             break;
         case 3: // fp8_e4m3
@@ -368,7 +377,8 @@ extern "C" void run_batched_sampling(
                 recent_tokens, recent_lens, max_recent_len,
                 stencil, stencil_size,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, seed, rng_offsets,
+                seq_dials
             );
             break;
     }

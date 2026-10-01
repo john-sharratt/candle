@@ -48,17 +48,25 @@
 //! - Fork supported from day 1 (CoW pages via `fork_sequence`)
 //! - Append-only cold store for persistence
 
+mod banned_rows;
 mod batched_sampler;
 mod cancel;
+/// Whether a turn chain finished what it started — the ingest-recovery signal.
+pub mod chain_health;
 mod config;
 mod conversation;
 pub mod conversation_log;
 mod decode_health;
 mod engine;
 mod error;
+/// The KV-fragmentation probe: the specification for the compaction pass, and the gate
+/// that keeps it honest. Reachable from both the integration tests and the
+/// `kv_fragmentation` example, which is why it is here rather than under `tests/`.
+pub mod fragmentation_probe;
 pub mod guest;
 mod handle;
 pub mod index_pages;
+mod line_ends;
 pub mod models;
 pub mod narrator;
 pub mod normalization;
@@ -80,6 +88,9 @@ pub mod provenance;
 mod recorded_reply;
 mod recovered_message;
 pub(crate) mod scheduler;
+/// A throwaway substrate directory that removes itself on drop and sweeps the
+/// corpses of crashed runs — so a harness never attaches to the live store.
+pub mod scratch_substrate;
 mod sealed_turn;
 mod sequence_handle;
 mod stats;
@@ -102,12 +113,13 @@ pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, ModeSampling, SamplingConfig,
     SchedulerConfig, SequenceConfig,
 };
-pub use conversation::{GlueMarkers, Sequence};
+pub use conversation::{ChainRound, GlueMarkers, Sequence};
 pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use projection::{
-    BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState, NO_THINK_SELECTOR,
+    BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState,
+    NO_THINK_SELECTOR, TOOL_ROUND_SELECTOR,
 };
 pub use recovered_message::RecoveredMessage;
 pub use scheduler::branch_checkpoint_counts;

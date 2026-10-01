@@ -6,7 +6,7 @@
 //! selection-calibration `examples`, and the plain-question `questions` seeds.
 //! These drive everything the prompt and calibration need — the tool catalog
 //! surfaced into the `tools` collection, the constrained-decode stencil, the
-//! safe-subset for Restricted mode, and the per-tool trajectories.
+//! subset each tools mode offers ([`names_for`]), and the per-tool trajectories.
 //!
 //! This is the definition half of the tool system, and the only half the model
 //! ever sees: the `description` and `parameters` here are what get rendered into
@@ -23,6 +23,11 @@ use std::sync::OnceLock;
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json::Value;
+use zend_tools::registry;
+use zend_vfs::Workspace;
+
+use crate::access;
+use crate::types::ToolMode;
 
 /// The tool definitions, embedded at compile time. The `tools` collection in
 /// `prompts/projection.yaml` is filled from here.
@@ -46,14 +51,39 @@ pub struct ToolDef {
     /// Projected on every turn, outside the `tools` collection's top-k:
     /// provenance still selects its usual number of tools, and a mandatory one
     /// is added on top rather than taking a slot. For the tools a coding turn
-    /// needs whatever the question — reading and listing files.
+    /// needs whatever the question — finding a file, finding code inside one,
+    /// reading and listing, and creating one.
+    ///
+    /// `write` is in the set because the edit tool cannot create a file: a
+    /// "create scratch/x.py" turn that was projected `file_edit` but not `write`
+    /// spent ten calls patching a file that did not exist, then printed the code
+    /// and gave up.
+    ///
+    /// `web_search` and `web_fetch` are in it because a tool shown only by name
+    /// in the catalog listing is, to the model, not really there: asked to
+    /// "search the web and cite your source", a turn projected without
+    /// `web_search` reasoned that the tool was "only in the descriptions, not my
+    /// actual tool list" and answered that it could not search. Looking something
+    /// up is as ordinary a coding-assistant step as reading a file. A mode that
+    /// does not grant the network drops them with the rest of its exclusions.
+    ///
+    /// The find tools are there with reading and listing, not left out. A turn
+    /// that can only enumerate and read answers "where is this" by guessing a
+    /// directory at `file_list` and reading whole files to check, which is what
+    /// `file_search` and `file_grep` were added to stop; leaving them to win a
+    /// belief slot meant the turns that most needed them — the ones with no
+    /// path in the question to score against — were exactly the turns that did
+    /// not get them.
     #[serde(default)]
     pub mandatory: bool,
     /// JSON Schema for the call arguments (the tool's Request type).
     pub parameters: Value,
     /// ChatML selection-calibration trajectories (prompt + `<|im_end|>
     /// <|im_start|>assistant` + think→call with [`PROJECTION_MARKER`]s), or a bare
-    /// prompt for an uncalibrated tool. Prefilled by the calibration phase.
+    /// prompt for a tool whose trajectories are not recorded yet. A trajectory
+    /// is prefilled on its own ([`Self::trajectories`]); a bare prompt has no
+    /// answer to prefill, so it is calibrated as the question it is
+    /// ([`Self::calibration_questions`]).
     #[serde(default)]
     pub examples: Vec<String>,
     /// Extra ways a user might ASK for this tool — one plain question each, no
@@ -107,6 +137,41 @@ impl ToolDef {
         h.update(example.as_bytes());
         format!("{}|{:x}", self.name, h.finalize())
     }
+
+    /// The `examples` entries that carry a recorded answer: those with an
+    /// assistant half after `assistant_start`. Each is one calibration case.
+    pub fn trajectories<'a>(
+        &'a self,
+        assistant_start: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.examples
+            .iter()
+            .map(String::as_str)
+            .filter(move |e| e.contains(assistant_start))
+    }
+
+    /// The questions calibrated as this tool's one stuffed group: the authored
+    /// [`Self::questions`], then every bare-prompt `examples` entry as the
+    /// plain question it is, its trailing `user_end` dropped.
+    ///
+    /// A bare prompt has no trajectory, and routing happens on the question, so
+    /// this is the exemplar it can give. Decoding it live instead put a
+    /// single-row decode of up to 2,048 tokens on the boot path per prompt, and
+    /// a prompt the model reasonably answers without
+    /// a call ("what failed at the end of the build log?" with no job to read)
+    /// never sealed, so it was decoded again on every boot.
+    pub fn calibration_questions(&self, assistant_start: &str, user_end: &str) -> Vec<String> {
+        let end = user_end.trim();
+        let bare = self
+            .examples
+            .iter()
+            .filter(|e| !e.contains(assistant_start))
+            .map(|e| {
+                let p = e.trim();
+                p.strip_suffix(end).unwrap_or(p).trim_end().to_string()
+            });
+        self.questions.iter().cloned().chain(bare).collect()
+    }
 }
 
 /// The effective tool catalog, resolved once per daemon.
@@ -117,8 +182,13 @@ static DEFS: OnceLock<Vec<ToolDef>> = OnceLock::new();
 /// game's own tools, which fully override the built-ins — an empty folder yields
 /// a deliberately tool-free mind), else the bundled built-in catalog (the coding
 /// assistant). First call wins; later calls are ignored.
-pub fn init(workspace: &Path) {
-    if DEFS.set(load_effective(workspace)).is_err() {
+///
+/// Every `repo` parameter is then constrained to `workspace`'s repositories
+/// ([`constrain_repos`]).
+pub fn init(workspace: &Workspace) {
+    let mut defs = load_effective(workspace.root());
+    constrain_repos(&mut defs, &workspace.names());
+    if DEFS.set(defs).is_err() {
         // A prior `all()` already resolved (and locked in) the fallback catalog,
         // so this override is lost. That means a consumer ran before `init` — an
         // ordering bug worth shouting about rather than silently mis-tooling.
@@ -126,6 +196,51 @@ pub fn init(workspace: &Path) {
             "tool_def::init called after the catalog was already resolved — \
              workspace tool override ignored (a consumer ran before init)"
         );
+    }
+}
+
+/// The name of the parameter that selects a repository, on every tool that
+/// takes one.
+pub const REPO_PARAM: &str = "repo";
+
+/// Put `repos` at the head of the `enum` of every tool's [`REPO_PARAM`]
+/// parameter.
+///
+/// The repositories are fixed for the daemon's life, so a `repo` value is one
+/// of a known list — exactly what an `enum` states. The names belong to the
+/// deployment, so the tool YAML does not carry them and this writes them in.
+/// What the YAML *does* declare stays after them: the tools that can cover
+/// the whole workspace declare `enum: ["*"]`
+/// ([`ALL_REPOS`](zend_vfs::ALL_REPOS)), so their choice
+/// is a repository or `*`, and every other tool's is a repository alone.
+///
+/// One schema feeds both readers: [`ToolDef::json_line`] renders it into the
+/// prompt, and `tools::tool_catalog` compiles it into the constrained decoder,
+/// where a string `enum` is a choice between the listed values
+/// (`candle_conversation::stencil::ToolSpec::from_json_schema`). So the model
+/// is shown the values it may use and cannot decode any other.
+fn constrain_repos(defs: &mut [ToolDef], repos: &[String]) {
+    for def in defs {
+        let Some(param) = def
+            .parameters
+            .get_mut("properties")
+            .and_then(|p| p.get_mut(REPO_PARAM))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let declared: Vec<Value> = param
+            .get("enum")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let values = repos
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .chain(declared)
+            .collect();
+        param.insert("enum".to_string(), Value::Array(values));
     }
 }
 
@@ -213,12 +328,15 @@ pub fn find(name: &str) -> Option<&'static ToolDef> {
     all().iter().find(|d| d.name == name)
 }
 
-/// The names of every non-high-risk tool — the subset projected in "Restricted"
-/// tools mode.
-pub fn safe_names() -> HashSet<String> {
+/// The names of the tools projected in `mode` — those [`access::offers`]
+/// admits. A mode never offers a tool its grants would refuse: offering it
+/// would spend a projection slot on a `not_permitted`.
+pub fn names_for(mode: ToolMode) -> HashSet<String> {
     all()
         .iter()
-        .filter(|d| !d.high_risk)
+        .filter(|d| {
+            registry::find(&d.name).is_some_and(|t| access::offers(mode, t.requires, d.high_risk))
+        })
         .map(|d| d.name.clone())
         .collect()
 }
@@ -232,6 +350,9 @@ pub fn category_for(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_conversation::stencil::{Param, ToolSpec};
+
+    use zend_vfs::ALL_REPOS;
 
     /// The folder-metadata pass leaves a `.substrate.yaml` in the tools folder
     /// itself, and the compile-time embed carries it along; read as a tool it
@@ -332,6 +453,37 @@ mod tests {
         );
     }
 
+    /// A recorded trajectory is its own case; a bare prompt is not one at all.
+    #[test]
+    fn only_an_example_with_an_answer_is_a_trajectory() {
+        let mut d = def("List the files.", serde_json::json!({}));
+        d.examples = vec![
+            "list src<|im_end|>\n<|im_start|>assistant\n<think>x</think>".into(),
+            "list the files<|im_end|>".into(),
+        ];
+        let t: Vec<&str> = d.trajectories("<|im_start|>assistant").collect();
+        assert_eq!(
+            t,
+            ["list src<|im_end|>\n<|im_start|>assistant\n<think>x</think>"]
+        );
+    }
+
+    /// A bare prompt joins the question group as plain text, after the
+    /// authored questions and without its ChatML terminator.
+    #[test]
+    fn a_bare_prompt_is_calibrated_as_a_question() {
+        let mut d = def("List the files.", serde_json::json!({}));
+        d.examples = vec![
+            "list src<|im_end|>\n<|im_start|>assistant\n<think>x</think>".into(),
+            "list the files<|im_end|>".into(),
+            "  what is in docs?<|im_end|>\n".into(),
+        ];
+        assert_eq!(
+            d.calibration_questions("<|im_start|>assistant", "<|im_end|>\n"),
+            ["what files are here", "list the files", "what is in docs?"]
+        );
+    }
+
     /// The calibration marker must move whenever anything the model reads about
     /// the tool moves. Hashing only the example (the earlier behaviour) let a
     /// reworded description resume its old exemplars, so the belief gallery kept
@@ -365,6 +517,543 @@ mod tests {
 
         // The marker stays name-prefixed so it is greppable per tool.
         assert!(baseline.starts_with("file_list|"));
+    }
+
+    /// **Every `repo` parameter becomes a choice between the workspace's
+    /// repositories** — in the schema the prompt renders and in the spec the
+    /// constrained decoder compiles, which are one and the same — and a tool
+    /// without one is left exactly as it was.
+    #[test]
+    fn repo_parameters_are_constrained_to_the_workspace() {
+        let repos = vec!["candle".to_string(), "mind".to_string()];
+        let mut with_repo = def(
+            "List the files.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "The repository."},
+                    "path": {"type": "string"}
+                }
+            }),
+        );
+        with_repo.name = "file_list".into();
+        let plain_params = serde_json::json!({
+            "type": "object",
+            "properties": {"expression": {"type": "string"}}
+        });
+        let mut plain = def("Calculate.", plain_params.clone());
+        plain.name = "calculator".into();
+        let mut defs = vec![with_repo, plain];
+
+        constrain_repos(&mut defs, &repos);
+
+        assert_eq!(
+            defs[0].parameters["properties"]["repo"],
+            serde_json::json!({
+                "type": "string",
+                "description": "The repository.",
+                "enum": ["candle", "mind"]
+            })
+        );
+        assert_eq!(
+            defs[1].parameters, plain_params,
+            "no repo parameter, no change"
+        );
+
+        let spec = ToolSpec::from_json_schema(&defs[0].name, &defs[0].parameters);
+        let repo = spec.params.iter().find(|p| p.name == REPO_PARAM).unwrap();
+        assert_eq!(repo.enum_values, Some(repos));
+    }
+
+    /// **A value rule names what exists.** Each `if`/`then` a definition
+    /// carries — the fields one value of a field requires, which the grammar
+    /// writes as required after that value — tests a field the definition
+    /// has, for values that field allows, and requires fields it has. A
+    /// misspelt name would leave the requirement silently off, and the call
+    /// free to close without what its mode needs.
+    #[test]
+    fn every_value_rule_names_real_fields_and_values() {
+        let mut ruled = Vec::new();
+        for def in load_bundled().iter() {
+            let params = &def.parameters;
+            let Some(rules) = params.get("allOf").and_then(Value::as_array) else {
+                continue;
+            };
+            ruled.push(def.name.clone());
+            let props = params["properties"].as_object().unwrap();
+            // A field's allowed values, through the `allOf`/`$ref` a named
+            // enum is written with.
+            let allowed = |field: &str| -> Vec<String> {
+                let schema = &props[field];
+                let named = schema["allOf"][0]["$ref"]
+                    .as_str()
+                    .or_else(|| schema["$ref"].as_str())
+                    .and_then(|r| r.strip_prefix("#/definitions/"));
+                let schema = match named {
+                    Some(name) => &params["definitions"][name],
+                    None => schema,
+                };
+                schema["enum"]
+                    .as_array()
+                    .map(|e| {
+                        e.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            // Parsed once per definition, not once per rule: every rule below
+            // reads the same schema, and re-parsing it per rule was pure
+            // repeated work for a definition with more than one `allOf` rule.
+            let spec = ToolSpec::from_json_schema(&def.name, params);
+            for rule in rules {
+                let tested = rule["if"]["properties"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{}: a rule without `if.properties`", def.name));
+                // A rule's `if` tests exactly one field, or the grammar drops
+                // it — checked up front so the per-value work below can
+                // assume a single `(field, values)` pair.
+                assert_eq!(
+                    tested.len(),
+                    1,
+                    "{}: a rule's `if` tests one field, or the grammar drops it",
+                    def.name
+                );
+                let (field, test) = tested.iter().next().unwrap();
+                assert!(
+                    props.contains_key(field),
+                    "{}: tests no field {field}",
+                    def.name
+                );
+                let values: Vec<&str> = match (&test["const"], &test["enum"]) {
+                    (Value::String(one), _) => vec![one.as_str()],
+                    (_, Value::Array(many)) => many.iter().filter_map(Value::as_str).collect(),
+                    _ => panic!("{}: {field} is tested by neither const nor enum", def.name),
+                };
+                let allows = allowed(field);
+                for value in &values {
+                    assert!(
+                        allows.iter().any(|a| a == value),
+                        "{}: {field} has no value {value} (it allows {allows:?})",
+                        def.name
+                    );
+                }
+                // The grammar acts on a rule only over a required, non-null
+                // enum — anywhere else it would be dropped without a word.
+                let param = spec.params.iter().find(|p| &p.name == field).unwrap();
+                assert!(
+                    param.required && !param.nullable && param.enum_values.is_some(),
+                    "{}: the grammar does not act on the rule over {field}",
+                    def.name
+                );
+                // And only when THIS rule's specific tested value carries its
+                // own required fields — checking the field's aggregate
+                // `requires` (every value any rule on it ever named) would
+                // pass even if a bug dropped or mis-recorded the requirement
+                // for exactly this value, as long as some other rule on the
+                // same field left it non-empty.
+                for value in &values {
+                    assert!(
+                        param
+                            .requires
+                            .iter()
+                            .any(|(v, reqs)| v == value && !reqs.is_empty()),
+                        "{}: {field}={value} carries no requirement the grammar acts on",
+                        def.name
+                    );
+                }
+                let required = rule["then"]["required"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{}: a rule without `then.required`", def.name));
+                for field in required.iter().filter_map(Value::as_str) {
+                    assert!(
+                        props.contains_key(field),
+                        "{}: requires no field {field}",
+                        def.name
+                    );
+                }
+            }
+        }
+        assert!(ruled.iter().any(|n| n == "git_commit"), "{ruled:?}");
+    }
+
+    /// **Every definition names exactly the fields its executor reads.**
+    ///
+    /// The YAML and the Rust request type are deliberately separate — the
+    /// definition carries trigger-rich prose no derive could produce — but
+    /// they have to agree on the *shape*, and nothing made them. A field the
+    /// YAML declares and the request lacks is a parameter the model is told to
+    /// send and the tool ignores; one the request requires and the YAML omits
+    /// is a call the grammar can never complete. Both surface only as a failed
+    /// call at run time, in a family where a failed call may be a refused
+    /// commit.
+    ///
+    /// Every definition in the catalog, not one family: a new tool is held to
+    /// it from the day it is written.
+    #[test]
+    fn every_definition_matches_its_executors_request_type() {
+        let names = |schema: &Value| -> HashSet<String> {
+            schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|p| p.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let required = |schema: &Value| -> HashSet<String> {
+            schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|r| {
+                    r.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // Every object the call is made of: the request itself, and each
+        // object in its definitions block (a revision, a pushed ref, a file
+        // change), since those are decoded by the same grammar.
+        let objects = |schema: &Value| -> Vec<(String, Value)> {
+            let mut out = vec![("the request".to_string(), schema.clone())];
+            if let Some(defs) = schema.get("definitions").and_then(Value::as_object) {
+                out.extend(
+                    defs.iter()
+                        .filter(|(_, d)| d.get("properties").is_some())
+                        .map(|(n, d)| (n.clone(), d.clone())),
+                );
+            }
+            out
+        };
+
+        for def in load_bundled().iter() {
+            let tool = zend_tools::registry::find(&def.name)
+                .unwrap_or_else(|| panic!("{} has no executor", def.name));
+            let generated = (tool.schema)();
+
+            for (object, want) in objects(&generated) {
+                let have = if object == "the request" {
+                    def.parameters.clone()
+                } else {
+                    def.parameters["definitions"][&object].clone()
+                };
+                assert_eq!(
+                    names(&have),
+                    names(&want),
+                    "{}: {object}'s fields differ from the request type's",
+                    def.name,
+                );
+                assert_eq!(
+                    required(&have),
+                    required(&want),
+                    "{}: {object} and the request type disagree on what is required",
+                    def.name,
+                );
+                // The type is what the stencil compiles, so it must be the
+                // request type's — a field whose YAML type still admits `null`
+                // hands the decoder a one-token way to satisfy the grammar
+                // and say nothing.
+                for field in names(&want) {
+                    let ty = |schema: &Value| schema["properties"][&field].get("type").cloned();
+                    if let Some(expected) = ty(&want) {
+                        assert_eq!(
+                            ty(&have),
+                            Some(expected),
+                            "{}: `{field}` of {object} has a different type in the \
+                             definition than in its request type",
+                            def.name,
+                        );
+                    }
+                }
+            }
+
+            // **No field of the family admits `null`.** Optional fields are
+            // left out, never nulled: measured live, `{"rev": null, "since":
+            // null}` was the call the model made three times where it meant
+            // `origin/main`, because `null` was the cheapest value the grammar
+            // offered. Checked on the decoder's own reading of the definition,
+            // so any spelling of nullability — a `null` type, an `anyOf` with
+            // `{"type":"null"}` — is caught.
+            // The git family's rule: its `null` was the cheapest wrong value.
+            // Elsewhere an `Option` field may be nullable (`file_list`'s
+            // `prefix`), and the stencil offers `null` beside the value.
+            let spec = ToolSpec::from_json_schema(&def.name, &def.parameters);
+            let mut stack: Vec<(String, &Param)> = if def.name.starts_with("git_") {
+                spec.params.iter().map(|p| (p.name.clone(), p)).collect()
+            } else {
+                Vec::new()
+            };
+            while let Some((path, p)) = stack.pop() {
+                assert!(
+                    !p.nullable,
+                    "{}: `{path}` admits null — leave an optional field out instead",
+                    def.name,
+                );
+                for child in p.properties.iter().flatten() {
+                    stack.push((format!("{path}.{}", child.name), child));
+                }
+                if let Some(items) = &p.items {
+                    stack.push((format!("{path}[]"), items));
+                }
+            }
+
+            // A `$ref` that resolves to nothing is silently "any JSON value"
+            // in the decoder, which is exactly the constraint these unions
+            // exist to provide.
+            let text = def.parameters.to_string();
+            let defined: HashSet<String> = def
+                .parameters
+                .get("definitions")
+                .and_then(Value::as_object)
+                .map(|d| d.keys().cloned().collect())
+                .unwrap_or_default();
+            for (_, rest) in text.split("#/definitions/").skip(1).map(|s| ("", s)) {
+                let referenced: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                assert!(
+                    defined.contains(&referenced),
+                    "{}: $ref to {referenced:?}, which its definitions block does not define",
+                    def.name,
+                );
+            }
+        }
+    }
+
+    /// **The git tools' tagged unions reach the decoder as constrained
+    /// choices, not as free JSON.**
+    ///
+    /// Every mode, kind and action in the family is a `$ref` to a named enum
+    /// in the definitions block. Until the stencil learned to follow a `$ref`
+    /// (`candle_conversation::stencil::ToolSpec::from_json_schema`), each one
+    /// compiled to "any JSON value" — the model could write anything and the
+    /// schema in the prompt was the only thing suggesting otherwise.
+    ///
+    /// This matters more now than it did: the family was collapsed from
+    /// seventeen tools to nine precisely so that distinctions the model was
+    /// getting wrong in the projection's top-k — where nothing enforces them —
+    /// became enum fields inside a call, where the grammar does. That trade is
+    /// only sound if the enums really do reach the decoder, which is what this
+    /// asserts, from the bundled YAML through to the compiled spec.
+    #[test]
+    fn the_git_tools_modes_compile_to_constrained_choices() {
+        let spec = |name: &str| {
+            let def = find(name).unwrap_or_else(|| panic!("{name} is defined"));
+            ToolSpec::from_json_schema(&def.name, &def.parameters)
+        };
+        let field = |params: &[Param], name: &str| {
+            params
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("no {name} parameter"))
+                .clone()
+        };
+
+        let sorted = |p: &Param, what: &str| {
+            let mut v = p
+                .enum_values
+                .clone()
+                .unwrap_or_else(|| panic!("{what} is not constrained"));
+            v.sort();
+            v
+        };
+
+        // A revision: six forms, including the `parent` that exists so "the
+        // previous commit" never needs an object id.
+        let log = spec("git_log");
+        let rev_fields = field(&log.params, "rev")
+            .properties
+            .expect("rev keeps its fields");
+        let kind = field(&rev_fields, "kind");
+        assert_eq!(
+            sorted(&kind, "the revision kind"),
+            [
+                "branch",
+                "commit",
+                "head",
+                "parent",
+                "ref",
+                "remote_branch",
+                "tag",
+                "upstream"
+            ]
+        );
+        assert!(kind.required, "a revision always names its kind");
+        for name in ["name", "back"] {
+            assert!(
+                rev_fields.iter().any(|f| f.name == name),
+                "the revision's {name} field must be offered",
+            );
+        }
+
+        // git_show's five modes — the distinction that used to be a tool
+        // choice, and was measured going wrong there.
+        let show = spec("git_show");
+        assert_eq!(
+            sorted(&field(&show.params, "what"), "git_show's what"),
+            ["blame", "changes", "file", "patch", "tree"]
+        );
+
+        // git_refs' kinds — three former tools.
+        let refs = spec("git_refs");
+        assert_eq!(
+            sorted(&field(&refs.params, "kind"), "git_refs' kind"),
+            ["branches", "remote_branches", "remotes", "tags"]
+        );
+
+        // A commit's source, and the per-file action that carries `take`.
+        let commit = spec("git_commit");
+        assert_eq!(
+            sorted(&field(&commit.params, "from"), "git_commit's from"),
+            ["all_changes", "cherry_pick", "files", "patch", "revert"]
+        );
+        let change_fields = field(&commit.params, "changes")
+            .items
+            .expect("changes constrains its elements")
+            .properties
+            .expect("the element is an object");
+        assert_eq!(
+            sorted(&field(&change_fields, "action"), "the change action"),
+            ["delete", "take", "write"]
+        );
+        assert!(
+            change_fields.iter().any(|f| f.name == "content"),
+            "a write's content must be offered",
+        );
+
+        // git_ref's two axes.
+        let git_ref = spec("git_ref");
+        assert_eq!(
+            sorted(&field(&git_ref.params, "kind"), "git_ref's kind"),
+            ["branch", "tag"]
+        );
+        assert_eq!(
+            sorted(&field(&git_ref.params, "action"), "git_ref's action"),
+            ["create", "delete", "move"]
+        );
+
+        // What a reset does to the work, and where a new branch starts.
+        assert_eq!(
+            sorted(
+                &field(&spec("git_reset").params, "mode"),
+                "git_reset's mode"
+            ),
+            ["hard", "soft"]
+        );
+        let switch = spec("git_switch");
+        assert!(
+            field(&switch.params, "from").properties.is_some(),
+            "a new branch's start is a revision"
+        );
+
+        // A push item's action, inside the array.
+        let item_fields = field(&spec("git_push").params, "pushes")
+            .items
+            .expect("pushes constrains its elements")
+            .properties
+            .expect("the item is an object");
+        assert_eq!(
+            sorted(&field(&item_fields, "action"), "the push action"),
+            ["delete_branch", "delete_tag", "update_branch", "update_tag"]
+        );
+        for name in ["name", "source", "expected", "new"] {
+            assert!(
+                item_fields.iter().any(|f| f.name == name),
+                "a push item's {name} field must be offered",
+            );
+        }
+    }
+
+    /// **A tool that can cover the whole workspace keeps its `*`** — the
+    /// repositories go ahead of what the YAML declares, never in place of it.
+    #[test]
+    fn a_declared_all_repos_value_stays_after_the_repositories() {
+        let mut grep = def(
+            "Grep.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"repo": {"type": "string", "enum": [ALL_REPOS]}},
+                "required": ["repo"]
+            }),
+        );
+        grep.name = "file_grep".into();
+        let mut defs = vec![grep];
+        constrain_repos(&mut defs, &["candle".to_string(), "mind".to_string()]);
+        assert_eq!(
+            defs[0].parameters["properties"]["repo"]["enum"],
+            serde_json::json!(["candle", "mind", "*"])
+        );
+    }
+
+    /// **Every bundled file tool requires a `repo`, and exactly the tools whose
+    /// executor takes `*` declare it.** Nothing else ties a tool's YAML to its
+    /// Rust request type, so a `repo` added to one and not the other would be a
+    /// parameter the model is shown but the tool never reads, or one it needs
+    /// but is never told about — and a `*` the YAML offered that the executor
+    /// refused would be a call the grammar let through only to fail.
+    #[test]
+    fn every_repository_tool_declares_repo_as_its_executor_does() {
+        let one_repo = [
+            // Listing and reading are raw operations on one repository's
+            // files; only a search spans the workspace.
+            "file_list",
+            "file_read",
+            "write",
+            "file_edit",
+            "file_delete",
+            "file_present",
+            "code_run",
+            "code_session_exec",
+            "remote_fs_session_get",
+            "remote_fs_session_put",
+            // Every git tool works in exactly one repository. None takes `*`:
+            // a revision, a branch and a remote only mean anything relative to
+            // the repository they belong to, so a call spanning all of them
+            // could not be executed even if the grammar let it through.
+            "git_status",
+            "git_log",
+            "git_show",
+            "git_grep",
+            "git_refs",
+            "git_commit",
+            "git_merge",
+            "git_ref",
+            "git_switch",
+            "git_reset",
+            "git_fetch",
+            "git_push",
+            // A command runs in one repository's sandbox.
+            "run_command",
+            "run_output",
+        ];
+        let any_repo = ["file_search", "file_grep"];
+        for def in load_bundled() {
+            let name = def.name.as_str();
+            let param = &def.parameters["properties"][REPO_PARAM];
+            let is_required = def.parameters["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|v| v == REPO_PARAM));
+            if one_repo.contains(&name) {
+                assert!(is_required, "{name} must require `repo`");
+                assert!(
+                    param.get("enum").is_none(),
+                    "{name} takes one repository, not `*`"
+                );
+            } else if any_repo.contains(&name) {
+                assert!(is_required, "{name} must require `repo`");
+                assert_eq!(
+                    param["enum"],
+                    serde_json::json!([ALL_REPOS]),
+                    "{name} must offer `*`"
+                );
+            } else {
+                assert!(
+                    param.is_null(),
+                    "{name} declares `repo` but its executor has none"
+                );
+            }
+        }
     }
 
     /// Two tools sharing a description and example must not collide.
@@ -443,25 +1132,114 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Reading and listing files project on every turn; nothing else does. A
-    /// mandatory tool rides on top of the belief top-k, so adding one here
-    /// widens every prompt — the set is pinned so that is a deliberate change.
+    /// The file tools a coding turn needs whatever the question, and the two web
+    /// tools, project on every turn; nothing else does. A mandatory tool rides on top of the
+    /// belief top-k, so adding one here widens every prompt — the set is pinned
+    /// so that is a deliberate change.
     #[test]
-    fn only_file_read_and_file_list_are_mandatory() {
+    fn the_file_tools_a_coding_turn_needs_are_mandatory() {
         let mut mandatory: Vec<&str> = all()
             .iter()
             .filter(|d| d.mandatory)
             .map(|d| d.name.as_str())
             .collect();
         mandatory.sort();
-        assert_eq!(mandatory, ["file_list", "file_read"]);
+        assert_eq!(
+            mandatory,
+            [
+                "file_grep",
+                "file_list",
+                "file_read",
+                "file_search",
+                "web_fetch",
+                "web_search",
+                "write"
+            ]
+        );
     }
 
+    /// **Restricted is the file tools and the git readers, and no command
+    /// line.** Its file changes stay in the overlay, so writing is safe; the
+    /// git writers, code, the network and programs on this host are not.
     #[test]
-    fn safe_names_excludes_high_risk() {
-        let safe = safe_names();
-        assert!(safe.contains("datetime"), "datetime is safe");
-        assert!(!safe.contains("code_run"), "code_run is high-risk");
+    fn restricted_writes_files_and_reads_git_but_runs_nothing() {
+        let safe = names_for(ToolMode::Restricted);
+        for name in [
+            "datetime",
+            "write",
+            "file_edit",
+            "file_delete",
+            "file_read",
+            "git_status",
+            "git_log",
+            "git_show",
+            "git_grep",
+            "git_refs",
+        ] {
+            assert!(safe.contains(name), "{name} missing from restricted");
+        }
+        for name in [
+            "git_commit",
+            "git_merge",
+            "git_ref",
+            "git_switch",
+            "git_reset",
+            "git_fetch",
+            "git_push",
+            "code_run",
+            "code_session_exec",
+            "ssh_session_exec",
+            "telnet_send",
+            "ping_icmp",
+            "trace_route",
+            "sub_run",
+            "sql_session_query",
+            "run_command",
+            "run_output",
+        ] {
+            assert!(!safe.contains(name), "{name} offered in restricted");
+        }
+    }
+
+    /// **No mode offers what it would refuse.** Every tool a mode projects
+    /// runs under that mode's grants, and the file tools a coding turn needs
+    /// are in every mode that has tools.
+    #[test]
+    fn every_mode_offers_only_what_its_grants_cover() {
+        for mode in ToolMode::ALL {
+            let names = names_for(mode);
+            for name in &names {
+                let tool = registry::find(name).expect("defined tools execute");
+                assert!(
+                    access::grants(mode).require_all(tool.requires).is_ok(),
+                    "{name} is offered in {} but needs {:?}",
+                    mode.id(),
+                    tool.requires
+                );
+            }
+            if mode != ToolMode::None {
+                for name in ["file_read", "file_list", "file_grep", "calculator"] {
+                    assert!(names.contains(name), "{name} missing from {}", mode.id());
+                }
+            }
+        }
+        assert!(names_for(ToolMode::None).is_empty());
+        let restricted = names_for(ToolMode::Restricted);
+        for name in ["web_search", "web_fetch", "dns_lookup", "sql_session_open"] {
+            assert!(!restricted.contains(name), "{name} needs a capability");
+        }
+    }
+
+    /// **Comprehensive offers every tool** — programs on the host, the JS
+    /// sandbox, the network, remote shells and the git writers included.
+    #[test]
+    fn comprehensive_offers_every_tool() {
+        let comprehensive = names_for(ToolMode::Comprehensive);
+        assert_eq!(
+            comprehensive.len(),
+            all().len(),
+            "comprehensive offers every tool"
+        );
     }
 
     /// Every definition carries a real category (never the `"Other"` fallback the

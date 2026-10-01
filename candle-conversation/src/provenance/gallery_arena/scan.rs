@@ -12,8 +12,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Instant;
 
-use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DriverError};
 use candle::{Device, Result};
 use candle_kernels::provenance::{
     bdp_bmma_supported, bdp_imma_supported, bdp_take_pending_error, run_batched_bdp_scan,
@@ -46,26 +47,59 @@ pub struct PagedSegment<'a> {
     pub n_cases: usize,
 }
 
-/// The assembled per-scan index — all small arrays, built from the resident
-/// arena. `page_ptr` holds absolute device addresses; the records never move.
+/// The index's arrays on the device — uploaded once, when the index is built,
+/// and read in place by every launch that reuses it.
+///
+/// They used to be uploaded per launch, from pageable host memory, even when the
+/// index itself was reused: `pos_map` and `case` are one `u32` per scanned
+/// token, so a 7.4M-token `code_reading` scan moved ~60 MB host-to-device on
+/// every launch — twice per reprojection (tail and question probes).
+struct DeviceIndex {
+    page_ptr: CudaSlice<u64>,
+    pos_map: CudaSlice<u32>,
+    case: CudaSlice<u32>,
+    seg_tok: CudaSlice<i32>,
+    seg_case: CudaSlice<i32>,
+}
+
+/// The assembled per-scan index, built from the resident arena. `page_ptr`
+/// holds absolute device addresses, valid while every referenced turn keeps
+/// the run it was built against (see `run_ids`).
 pub(super) struct PagedIndex {
-    page_ptr: Vec<u64>,
-    pos_map: Vec<u32>,
-    case: Vec<u32>,
-    seg_tok: Vec<i32>,
+    /// `None` when the scan covers no token — nothing to launch.
+    device: Option<DeviceIndex>,
+    /// Scanned tokens (the length of `pos_map`).
+    pub(super) n_tokens: usize,
+    /// Host copy of the per-segment case prefixes, which the tally reads.
     seg_case: Vec<i32>,
     n_cases: usize,
     n_segments: usize,
     max_seg_cases: usize,
     /// Turns referenced by this scan; pinned for its duration then unpinned.
     pub(super) pinned_sids: Vec<StreamId>,
+    /// Each referenced turn's run id when its addresses were taken, parallel to
+    /// `pinned_sids` — what a later reuse checks the arena against.
+    pub(super) run_ids: Vec<u64>,
+}
+
+impl PagedIndex {
+    /// Device bytes the index's arrays hold — what caching it costs the card,
+    /// outside the span and the arena's own ceiling.
+    pub(super) fn device_bytes(&self) -> u64 {
+        self.device.as_ref().map_or(0, |d| {
+            (d.page_ptr.len() * 8
+                + (d.pos_map.len() + d.case.len()) * 4
+                + (d.seg_tok.len() + d.seg_case.len()) * 4) as u64
+        })
+    }
 }
 
 /// A [`PagedIndex`] cached for reuse (keyed by segment fingerprint in the arena's
-/// map), valid while `gen` matches the arena's residency generation.
+/// map), valid while every turn it references still holds the run it recorded.
 pub(super) struct CachedIndex {
-    pub(super) gen: u64,
     pub(super) idx: Arc<PagedIndex>,
+    /// When a scan last stored or reused it — the cache evicts the oldest first.
+    pub(super) used: u64,
 }
 
 /// One scan backend. The auto ladder resolves per DEVICE, fastest first: b1
@@ -106,9 +140,10 @@ fn launch_failure(rc: i32) -> (&'static str, i32) {
 /// each file's case count, and every window's `(sid, fingerprint, turn length,
 /// start, end, case)`. Cheap (per-window, not per-token).
 ///
-/// **Trust boundary:** two guarantees back reuse. (1) The residency *generation*
-/// covers physical page moves — an evict/re-seal that relocates a turn's pages
-/// bumps it, so the cache can't serve stale device addresses. (2) This 64-bit
+/// **Trust boundary:** two guarantees back reuse. (1) Each turn's *run id*
+/// covers physical page moves — an evict/re-seal/compaction that relocates a
+/// turn's pages gives it a new one, so the cache can't serve stale device
+/// addresses. (2) This 64-bit
 /// SipHash covers logical changes to the scan; a caller MUST vary `w.fingerprint`
 /// whenever the turn's content changes (the resolver's `fp_of` folds in the
 /// decoded-sig `Arc` len + a content sample), and `turn.len()` is hashed directly
@@ -151,6 +186,7 @@ impl GalleryArena {
 
         // Turns pinned so far — released on error so a failed build never leaks pins.
         let mut pinned_sids: Vec<StreamId> = Vec::new();
+        let mut run_ids: Vec<u64> = Vec::new();
         for seg in segments {
             // Emit each segment's windows in CASE order, so gallery case ids are
             // non-decreasing over the scan order. The scan math is order-independent
@@ -170,7 +206,7 @@ impl GalleryArena {
                     None => {
                         // Pin the turn atomically with residency so the governor
                         // can't free its pages before the launch reads them.
-                        let addrs = match self.scan_ensure(w.sid, w.turn, w.fingerprint) {
+                        let (addrs, run_id) = match self.scan_ensure(w.sid, w.turn, w.fingerprint) {
                             Ok(a) => a,
                             Err(e) => {
                                 for &s in &pinned_sids {
@@ -180,6 +216,7 @@ impl GalleryArena {
                             }
                         };
                         pinned_sids.push(w.sid);
+                        run_ids.push(run_id);
                         let b = page_ptr.len();
                         page_ptr.extend_from_slice(&addrs);
                         turn_base.insert(w.sid, b);
@@ -203,16 +240,59 @@ impl GalleryArena {
             max_seg_cases = max_seg_cases.max(seg.n_cases);
         }
 
+        let n_tokens = pos_map.len();
+        let device = if n_tokens == 0 {
+            None
+        } else {
+            match self.upload_index(&page_ptr, &pos_map, &case, &seg_tok, &seg_case) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    for &s in &pinned_sids {
+                        self.unpin(s);
+                    }
+                    return Err(e);
+                }
+            }
+        };
         Ok(PagedIndex {
-            page_ptr,
-            pos_map,
-            case,
-            seg_tok,
+            device,
+            n_tokens,
             seg_case,
             n_cases: case_off,
             n_segments: segments.len(),
             max_seg_cases,
             pinned_sids,
+            run_ids,
+        })
+    }
+
+    /// Upload a built index's arrays once, onto the arena device's stream, for
+    /// every launch that reuses the index to read in place.
+    fn upload_index(
+        &self,
+        page_ptr: &[u64],
+        pos_map: &[u32],
+        case: &[u32],
+        seg_tok: &[i32],
+        seg_case: &[i32],
+    ) -> Result<DeviceIndex> {
+        let Device::Cuda(dev) = &self.device else {
+            return Err(candle::Error::Msg("paged scan requires CUDA".into()));
+        };
+        let stream = dev.cuda_stream();
+        let up = |what: &str, e: DriverError| {
+            candle::Error::Msg(format!("paged scan: HtoD {what}: {e}"))
+        };
+        Ok(DeviceIndex {
+            page_ptr: stream
+                .memcpy_stod(page_ptr)
+                .map_err(|e| up("page_ptr", e))?,
+            pos_map: stream.memcpy_stod(pos_map).map_err(|e| up("pos_map", e))?,
+            case: stream.memcpy_stod(case).map_err(|e| up("case", e))?,
+            seg_tok: stream.memcpy_stod(seg_tok).map_err(|e| up("seg_tok", e))?,
+            seg_case: stream
+                .memcpy_stod(seg_case)
+                .map_err(|e| up("seg_case", e))?,
         })
     }
 
@@ -289,25 +369,67 @@ impl GalleryArena {
         group_weights: &[f32],
         force: Option<PagedBackend>,
     ) -> Result<Vec<Vec<f32>>> {
-        // Reuse the cached index if the same segment set is rescanned under an
-        // unchanged residency generation (the common within-turn case) — this
-        // pins the turns. Otherwise rebuild (which also pins) and cache it.
+        // **Every scan path binds this arena's context first.**
+        //
+        // Below here are raw driver calls and FFI that read the *calling
+        // thread's* current device — `tensor_caps` says so explicitly. That
+        // used to be free, because scans only ever ran on threads that already
+        // held the context. The normalization warm-ups moved onto their own
+        // rayon pool, whose workers never bound it, and the whole path failed
+        // with `CUDA_ERROR_INVALID_CONTEXT` — an error that reads like a
+        // hardware fault and is really a thread that was never introduced to
+        // the device. Binding here makes the assumption true for any caller
+        // instead of documenting it and hoping.
+        if let Device::Cuda(dev) = &self.device {
+            dev.bind_to_thread()?;
+        }
+        // Reuse the cached index if the same segment set is rescanned and its
+        // turns still hold the runs it recorded (the common case, whatever other
+        // conversations upload meanwhile) — this pins the turns. Otherwise
+        // rebuild (which also pins) and cache it. Each turn's run id is taken
+        // with its addresses under the residency lock, so a turn moved after
+        // that point carries a new id and the next reuse rejects the entry.
+        let t_index = Instant::now();
+        let gen_before = self.residency_gen();
         let fp = fingerprint_segments(segments);
-        let idx = match self.reuse_index(fp) {
-            Some(idx) => idx,
+        let (idx, reused) = match self.reuse_index(fp) {
+            Some(idx) => (idx, true),
             None => {
                 let built = Arc::new(self.build_index(segments)?);
-                let gen = self.residency_gen();
-                self.store_index(fp, gen, built.clone());
-                built
+                self.store_index(fp, built.clone());
+                (built, false)
             }
         };
+        let index_us = t_index.elapsed().as_micros() as u64;
+        // Residency mutations (uploads, evictions, moves) on the whole device
+        // while this index was found or built — this scan's and any concurrent
+        // conversation's. With `reused` it separates "my working set churned"
+        // from "someone else's did".
+        let mutations = self.residency_gen().saturating_sub(gen_before);
+        let t_launch = Instant::now();
         let result = self.launch_paged(&idx, probes, group_weights, force);
+        let launch_us = t_launch.elapsed().as_micros() as u64;
         // Release the scan's pins whether or not the launch succeeded — the pages
         // are no longer being read once the launch has synchronized (or failed).
         for &sid in &idx.pinned_sids {
             self.unpin(sid);
         }
+        // Index (reuse or rebuild, which pins pages resident) versus launch
+        // (which synchronizes and tallies on the host). They have unrelated
+        // costs, so a slow scan is attributed to one or the other.
+        tracing::trace!(
+            target: "candle_conversation::provenance::gallery_arena",
+            probes = probes.len(),
+            segments = segments.len(),
+            turns = idx.pinned_sids.len(),
+            tokens = idx.n_tokens,
+            reused,
+            mutations,
+            held_mib = self.page_bytes() >> 20,
+            index_us,
+            launch_us,
+            "arena scan"
+        );
         result
     }
 
@@ -331,7 +453,10 @@ impl GalleryArena {
         if probes.is_empty() {
             return Ok(Vec::new());
         }
-        if idx.pos_map.is_empty() || n_segments == 0 || n_cases == 0 {
+        let Some(d_idx) = idx.device.as_ref() else {
+            return Ok(vec![vec![0.0; n_cases]; probes.len()]);
+        };
+        if n_segments == 0 || n_cases == 0 {
             return Ok(vec![vec![0.0; n_cases]; probes.len()]);
         }
 
@@ -376,22 +501,9 @@ impl GalleryArena {
 
         let stream = dev.cuda_stream();
 
-        // Upload the tiny index arrays + probe (the records stay resident).
-        let d_page_ptr = stream
-            .memcpy_stod(&idx.page_ptr)
-            .map_err(|e| candle::Error::Msg(format!("paged scan: HtoD page_ptr: {e}")))?;
-        let d_pos_map = stream
-            .memcpy_stod(&idx.pos_map)
-            .map_err(|e| candle::Error::Msg(format!("paged scan: HtoD pos_map: {e}")))?;
-        let d_case = stream
-            .memcpy_stod(&idx.case)
-            .map_err(|e| candle::Error::Msg(format!("paged scan: HtoD case: {e}")))?;
-        let d_seg_tok = stream
-            .memcpy_stod(&idx.seg_tok)
-            .map_err(|e| candle::Error::Msg(format!("paged scan: HtoD seg_tok: {e}")))?;
-        let d_seg_case = stream
-            .memcpy_stod(&idx.seg_case)
-            .map_err(|e| candle::Error::Msg(format!("paged scan: HtoD seg_case: {e}")))?;
+        // Only the probe is uploaded per launch: the index arrays are already
+        // on the device (`DeviceIndex`), and the records stay resident.
+        let t_upload = Instant::now();
         let d_probe = stream
             .memcpy_stod(&probe_words)
             .map_err(|e| candle::Error::Msg(format!("paged scan: HtoD probes: {e}")))?;
@@ -417,13 +529,15 @@ impl GalleryArena {
         let mut d_out_vote = unsafe { stream.alloc::<f32>(n_out) }
             .map_err(|e| candle::Error::Msg(format!("paged scan: alloc out_vote: {e}")))?;
 
+        let upload_us = t_upload.elapsed().as_micros() as u64;
+        let t_kernel = Instant::now();
         {
-            let (p_case, _g1) = d_case.device_ptr(&stream);
+            let (p_case, _g1) = d_idx.case.device_ptr(&stream);
             let (p_probe, _g2) = d_probe.device_ptr(&stream);
-            let (p_seg_tok, _g3) = d_seg_tok.device_ptr(&stream);
-            let (p_seg_case, _g4) = d_seg_case.device_ptr(&stream);
-            let (p_page_ptr, _g5) = d_page_ptr.device_ptr(&stream);
-            let (p_pos_map, _g6) = d_pos_map.device_ptr(&stream);
+            let (p_seg_tok, _g3) = d_idx.seg_tok.device_ptr(&stream);
+            let (p_seg_case, _g4) = d_idx.seg_case.device_ptr(&stream);
+            let (p_page_ptr, _g5) = d_idx.page_ptr.device_ptr(&stream);
+            let (p_pos_map, _g6) = d_idx.pos_map.device_ptr(&stream);
             let (p_out_case, _g7) = d_out_case.device_ptr_mut(&stream);
             let (p_out_vote, _g8) = d_out_vote.device_ptr_mut(&stream);
             let mut launched = false;
@@ -444,7 +558,7 @@ impl GalleryArena {
                                 p_seg_case as *const i32,
                                 p_page_ptr as *const u64,
                                 p_pos_map as *const u32,
-                                idx.pos_map.len() as i32,
+                                idx.n_tokens as i32,
                                 n_probe_tokens as i32,
                                 n_groups as i32,
                                 n_segments as i32,
@@ -485,7 +599,7 @@ impl GalleryArena {
                             rc,
                             stage = stage_name,
                             cuda_err,
-                            n_tokens = idx.pos_map.len(),
+                            n_tokens = idx.n_tokens,
                             n_probe_tokens,
                             n_groups,
                             n_segments,
@@ -539,15 +653,19 @@ impl GalleryArena {
                 .synchronize()
                 .map_err(|e| candle::Error::Msg(format!("paged scan: synchronize: {e}")))?;
         }
+        let kernel_us = t_kernel.elapsed().as_micros() as u64;
 
+        let t_readback = Instant::now();
         let out_case = stream
             .memcpy_dtov(&d_out_case)
             .map_err(|e| candle::Error::Msg(format!("paged scan: DtoH out_case: {e}")))?;
         let out_vote = stream
             .memcpy_dtov(&d_out_vote)
             .map_err(|e| candle::Error::Msg(format!("paged scan: DtoH out_vote: {e}")))?;
+        let readback_us = t_readback.elapsed().as_micros() as u64;
 
-        Ok(needle_tally_segments(
+        let t_tally = Instant::now();
+        let votes = needle_tally_segments(
             &out_case,
             &out_vote,
             &per_req_tokens,
@@ -556,7 +674,21 @@ impl GalleryArena {
             n_segments,
             n_cases,
             group_weights,
-        ))
+        );
+        // Where a launch's time goes: the probe upload, the kernel (to its
+        // synchronize), the vote readback, and the host tally.
+        tracing::trace!(
+            target: "candle_conversation::provenance::gallery_arena",
+            tokens = idx.n_tokens,
+            probe_tokens = n_probe_tokens,
+            segments = n_segments,
+            upload_us,
+            kernel_us,
+            readback_us,
+            tally_us = t_tally.elapsed().as_micros() as u64,
+            "arena launch"
+        );
+        Ok(votes)
     }
 }
 
@@ -584,6 +716,90 @@ mod tests {
                 .map(|w| fill.wrapping_mul(0x9E37).wrapping_add(w))
                 .collect(),
         }
+    }
+
+    /// **Probes scanned in one launch vote exactly as they do scanned alone.**
+    /// The kernel writes one result per probe token and the tally splits them
+    /// back by each request's token count, so batching a turn's tail and
+    /// question windows into one launch — one gallery pass, one sync — must not
+    /// move a single bit of either probe's votes.
+    #[test]
+    fn probes_batched_into_one_launch_vote_as_they_do_alone() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let a: Vec<WideQSig> = (0..40).map(|t| sig(0x5000 + t)).collect();
+        let b: Vec<WideQSig> = (0..9).map(|t| sig(0x6000 + t)).collect();
+        let segs = vec![
+            PagedSegment {
+                windows: vec![
+                    PagedWindow {
+                        sid: turn_stream_id(7, 0),
+                        fingerprint: 70,
+                        turn: &a,
+                        start: 0,
+                        end: 40,
+                        case: 0,
+                    },
+                    PagedWindow {
+                        sid: turn_stream_id(7, 1),
+                        fingerprint: 71,
+                        turn: &b,
+                        start: 0,
+                        end: 9,
+                        case: 1,
+                    },
+                ],
+                n_cases: 2,
+            },
+            PagedSegment {
+                windows: vec![PagedWindow {
+                    sid: turn_stream_id(8, 0),
+                    fingerprint: 80,
+                    turn: &a,
+                    start: 5,
+                    end: 30,
+                    case: 0,
+                }],
+                n_cases: 1,
+            },
+        ];
+        let tail = vec![
+            sig(0x5000 + 3),
+            sig(0xBEEF),
+            sig(0x6000 + 2),
+            sig(0x5000 + 31),
+        ];
+        let question = vec![sig(0x6000 + 7), sig(0xF00D)];
+        let weights = [0.5f32, 1.0, 2.0];
+
+        let alone_tail = arena
+            .scan_weighted(&segs, &[tail.as_slice()], &weights)
+            .unwrap();
+        let alone_q = arena
+            .scan_weighted(&segs, &[question.as_slice()], &weights)
+            .unwrap();
+        let both = arena
+            .scan_weighted(&segs, &[tail.as_slice(), question.as_slice()], &weights)
+            .unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        assert_eq!(both.len(), 2);
+        assert_eq!(
+            bits(&both[0]),
+            bits(&alone_tail[0]),
+            "the tail's votes moved"
+        );
+        assert_eq!(
+            bits(&both[1]),
+            bits(&alone_q[0]),
+            "the question's votes moved"
+        );
+        assert!(
+            both[0].iter().any(|&v| v != 0.0),
+            "the tail scored nothing — the comparison proves nothing"
+        );
     }
 
     /// The paged scan must be **bit-identical** to the contiguous
@@ -876,6 +1092,124 @@ mod tests {
             assert_eq!(b1, b2, "group B cached result must be stable");
         }
         assert_eq!(arena.resident_turns(), 2, "both turns resident, no churn");
+    }
+
+    /// **Another conversation's upload leaves this index valid; a change to
+    /// one of its own turns does not.** The index cache used to be validated by
+    /// a device-wide generation, so ingest sealing unrelated turns rebuilt a
+    /// dialogue's whole index every reprojection. Skips without CUDA.
+    #[test]
+    fn an_unrelated_upload_keeps_the_index_and_a_reseal_drops_it() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let a: Vec<WideQSig> = (0..20).map(|t| sig(0xA00 + t)).collect();
+        let seg_a = vec![PagedSegment {
+            windows: vec![PagedWindow {
+                sid: turn_stream_id(7, 0),
+                fingerprint: 1,
+                turn: &a,
+                start: 0,
+                end: 20,
+                case: 0,
+            }],
+            n_cases: 1,
+        }];
+        let probe = vec![sig(0xA00 + 3)];
+        let fp = fingerprint_segments(&seg_a);
+        arena
+            .scan_weighted(&seg_a, &[probe.as_slice()], &[])
+            .unwrap();
+
+        // Another conversation's turn uploads: the device churns, this index
+        // does not.
+        let other: Vec<WideQSig> = (0..10).map(|t| sig(0xC00 + t)).collect();
+        let gen = arena.residency_gen();
+        arena
+            .ensure_resident(turn_stream_id(9, 0), &other, 3)
+            .unwrap();
+        assert!(arena.residency_gen() > gen, "the upload is counted");
+        let kept = arena
+            .reuse_index(fp)
+            .expect("an unrelated upload keeps the index");
+        for &sid in &kept.pinned_sids {
+            arena.unpin(sid);
+        }
+
+        // This index's own turn is re-sealed under a new fingerprint: its pages
+        // are replaced, so the cached addresses are gone with them.
+        arena.ensure_resident(turn_stream_id(7, 0), &a, 2).unwrap();
+        assert!(
+            arena.reuse_index(fp).is_none(),
+            "a re-sealed turn invalidates every index over it"
+        );
+    }
+
+    /// **A compaction must be invisible to the scan.** Score the same segments
+    /// before and after packing the pages and require the vectors to be
+    /// bit-identical.
+    ///
+    /// This is the test that matters for the pass, because it exercises the real
+    /// consumer — the kernel dereferencing the page addresses in `PagedIndex` —
+    /// rather than the bookkeeping that produced them. The two ways a move goes
+    /// wrong both land here and nowhere else: a page copied to the wrong place
+    /// changes the scores, and a page moved without bumping `residency_gen` leaves
+    /// the cached index pointing at the vacated address, which the next scan reads
+    /// as whatever the arena has since put there. Neither is a fault; both are
+    /// quietly wrong retrieval.
+    #[test]
+    fn a_compaction_leaves_every_score_identical() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        // Several turns of differing length, so the runs are ragged.
+        let turns: Vec<Vec<WideQSig>> = (0..5u64)
+            .map(|t| (0..(14 + t * 9)).map(|k| sig((t << 32) + k)).collect())
+            .collect();
+        let windows: Vec<PagedWindow<'_>> = turns
+            .iter()
+            .enumerate()
+            .map(|(i, turn)| PagedWindow {
+                sid: turn_stream_id(40 + i as u64, 0),
+                fingerprint: 100 + i as u64,
+                turn,
+                start: 0,
+                end: turn.len(),
+                case: i,
+            })
+            .collect();
+        let segments = vec![PagedSegment {
+            windows,
+            n_cases: turns.len(),
+        }];
+        let probe = vec![sig(1 << 32), sig((3u64 << 32) + 5), sig(0xFEED)];
+
+        let before = arena
+            .scan_weighted(&segments, &[probe.as_slice()], &[])
+            .unwrap();
+
+        // Scatter: drop two turns from the middle of the corpus, leaving holes
+        // under live pages, then pack. `scan_weighted` unpinned on its way out, so
+        // every survivor is movable.
+        arena.drop_turn(turn_stream_id(41, 0));
+        arena.drop_turn(turn_stream_id(43, 0));
+        let report = arena.compact(0).unwrap();
+        assert!(report.moved > 0, "nothing moved, so nothing is proven");
+
+        // The dropped turns rebuild on demand; the survivors are read at their new
+        // addresses. Either way every score must reproduce exactly.
+        let after = arena
+            .scan_weighted(&segments, &[probe.as_slice()], &[])
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "compaction changed the scan's answer — a page moved to the wrong \
+             place, or a cached index outlived the move",
+        );
     }
 
     fn xorshift(state: &mut u64) -> u64 {

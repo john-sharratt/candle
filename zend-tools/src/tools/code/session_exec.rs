@@ -8,11 +8,19 @@ use super::engine::run_js;
 use super::{now, CodeError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
+/// Most successful snippets one session holds. Every exec replays all of them,
+/// each within its own file-call budget, so this bounds the work one exec can
+/// replay — 64 snippets is a long interactive session.
+pub const MAX_SESSION_SNIPPETS: usize = 64;
+
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SessionExecReq {
     /// The session id returned by the code_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// The repository whose files the snippet's `vfs` reads and writes.
+    #[validate(length(min = 1))]
+    pub repo: String,
     /// JavaScript to execute in the session. Definitions persist across calls.
     #[validate(length(min = 1))]
     pub code: String,
@@ -46,23 +54,29 @@ impl Tool for CodeSessionExec {
     type Error = CodeError;
 
     fn run(ctx: &ToolContext, req: SessionExecReq) -> Result<SessionExecResp, CodeError> {
+        let store = ctx.files.repo(&req.repo)?;
         let entry = ctx
             .sessions
             .get_code(&req.session_id)
             .ok_or_else(|| CodeError::SessionNotFound(req.session_id.clone()))?;
         let mut guard = entry.lock().unwrap();
         guard.meta.last_activity = now();
+        if guard.history.len() >= MAX_SESSION_SNIPPETS {
+            return Err(CodeError::SessionFull(
+                req.session_id.clone(),
+                MAX_SESSION_SNIPPETS,
+            ));
+        }
 
         // Replay accumulated history (silently) to rebuild state, then run the
         // new snippet.
-        let outcome = run_js(&guard.history, &req.code);
+        let outcome = run_js(ctx.grants(), &store, &guard.history, &req.code)?;
         let ok = outcome.error.is_none();
 
         // Only successful snippets join the history — a throwing snippet must not
         // poison every future replay.
         if ok {
-            guard.history.push_str(&req.code);
-            guard.history.push('\n');
+            guard.history.push(req.code);
         }
 
         Ok(SessionExecResp {

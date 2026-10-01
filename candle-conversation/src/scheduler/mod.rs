@@ -16,20 +16,41 @@
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
+/// Rate-based wave budgeting — **compiled and tested, not yet wired.**
+///
+/// Admission: [`admit::fill`] is the path, and [`admit_ground::AdmitPass`] is
+/// the engine's answer to its `Ground` trait. An offer joins the wave while the
+/// wave goes *faster* carrying it — [`admit::rate`] models what a wave will
+/// actually achieve and the rest prices and orders candidates against that
+/// model rather than against free bytes.
+///
+/// What remains in [`admission`] is the arithmetic that survived the change: the
+/// per-block and per-prefill costing the new path still prices with, and the
+/// AIMD setpoint the *ingest* regulator moves.
+mod admit;
+mod admit_ground;
 mod decode;
 pub mod exported_state;
 mod guest_room;
+mod interleave;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
+mod named_tool;
+mod norm_warm;
 pub mod phase_ring;
 mod prefill;
+mod priority_pause;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
+mod projection_identity;
 pub mod relief_trace;
 mod run;
 mod sample;
+mod seal_scan;
 mod spec_chooser;
+#[cfg(test)]
+mod test_substrate;
 
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
@@ -68,7 +89,7 @@ use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
 };
-use crate::substrate::{ResidenceIndex, TurnPartWrite};
+use crate::substrate::{ProjectionScores, ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, ProbeError, SelectionDiagnostics, SummariserTrigger, TurnKind,
@@ -83,11 +104,15 @@ use candle::{Device, Tensor};
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked,
+    BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked, WINDOW_DIVERGENCE_MARKER,
 };
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use self::exported_state::{ExportedState, SharedState};
+use self::norm_warm::NormWarm;
+use self::priority_pause::PriorityPause;
+use self::projection_identity::{section_content_stamp, segments_identity};
+pub(crate) use self::seal_scan::SealedProbe;
 use flume::{Receiver, Sender, TryRecvError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -326,6 +351,21 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
+    /// Score a just-sealed turn's beliefs — the once-per-turn seal scan that
+    /// teaches the normalization hit levels — on the scheduler's gallery arena.
+    ///
+    /// It comes here rather than scanning on the caller's thread because the
+    /// arena has exactly one scan thread (see [`seal_scan`]). The CPU per-file
+    /// scan the caller would otherwise run cost ~1 s over a 7M-token layer,
+    /// paid after every turn before its tool calls could dispatch.
+    ScoreSealedTurn {
+        substrate: Conversation,
+        projection: Arc<Builder>,
+        target: ProjectionTarget,
+        sealed: SealedProbe,
+        response_tx: Sender<ProjectionScores>,
+    },
+
     /// Ingest a substrate section: fresh slot in, sealed section out.
     ///
     /// Synchronously prefills `tokens` into `sequence_id` (which must
@@ -397,6 +437,25 @@ pub(crate) enum SchedulerRequest {
     InstallRecurrentState {
         sequence_ids: Vec<SequenceId>,
         state: SharedState,
+        response_tx: Sender<Result<bool, ConversationError>>,
+    },
+
+    /// Re-run a slot's create-time recurrent seeding, now that its lineage is
+    /// known — see [`Substrate::FORKED_FROM_KEY`].
+    ///
+    /// `create_sequence` seeds from the timeline's own snapshot, and a fork is
+    /// minted on a FRESH timeline that has none. Its memory is its parent's,
+    /// but the `forked_from` pointer is recorded by the caller *after* the fork
+    /// returns — by which time the slot has already been seeded from nothing.
+    /// Rather than reorder the fork (the child's timeline does not exist until
+    /// it returns), the caller records the pointer and then asks for the seed
+    /// again. Like [`Self::InstallRecurrentState`], this lands on a slot that
+    /// exists and has not yet run a turn.
+    ///
+    /// Replies `Ok(false)` when the model carries no recurrent state, or no
+    /// ancestor has a snapshot to seed from.
+    SeedRecurrentFromLineage {
+        sequence_id: SequenceId,
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 
@@ -881,16 +940,11 @@ pub(super) fn drain_add_us(atom: &std::sync::atomic::AtomicU64, us: u64) {
     }
 }
 
-/// `device.synchronize()`, timed into [`WAIT_US`]. Use at every deliberate GPU
-/// drain on the scheduler thread so the wait surfaces as the Sync phase.
-fn timed_synchronize(device: &Device) {
-    let t = Instant::now();
-    let _ = device.synchronize();
-    WAIT_US.fetch_add(
-        t.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
+// `timed_synchronize` stood here — `device.synchronize()` timed into `WAIT_US`, so
+// a deliberate drain on the scheduler thread surfaced as the Sync phase. Its only
+// caller was the heavy-backlog stall, and with that released there is no deliberate
+// drain left on this thread to time. Re-add it with the next one rather than
+// keeping a timer for a wait nothing performs.
 
 /// Record a persistence-side stall into [`MAINT_US`] from another module (the
 /// segment-compaction I/O in `projection::resolver` holds the persistence lock
@@ -1200,6 +1254,10 @@ struct ReprojectInFlight {
     /// The turn's Concept F question boundary, carried from the freed view's
     /// [`ViewState`] into the re-carved one.
     question_tokens: usize,
+    /// The identity of the segment list this rebuild applies — recorded on the
+    /// re-carved view's [`ViewState::applied_identity`] when the rebuild placed
+    /// every piece.
+    identity: u64,
 }
 
 /// Per-sequence state while actively generating tokens.
@@ -1631,6 +1689,12 @@ struct ViewState {
     /// boundary (`docs/provenance_adaptive_projection.md` §8). The pinned
     /// Q-window is the turn's first `question_tokens` real tokens.
     question_tokens: usize,
+    /// The identity ([`projection_identity`]) of the segment list this turn's
+    /// last reprojection rebuilt the parent from — `None` until the turn's first
+    /// reprojection, and whenever that rebuild left a piece out. A reprojection
+    /// that arrives at the same identity would rebuild the parent it already
+    /// has, so it leaves the parent and the view as they are.
+    applied_identity: Option<u64>,
 }
 
 /// A model-decode compression node in flight — the [`Content::Decode`]
@@ -2127,6 +2191,9 @@ struct WaveStats {
     drain_prefill_tokens: u64,
     drain_elevate_ms: u64,
     drain_glue_ms: u64,
+    /// The expert pipeline's `(hits, misses, DMA loads)` at the previous flush,
+    /// so each wave line reports this window's own — `None` on a dense model.
+    experts_prev: Option<(usize, usize, usize)>,
 }
 
 impl WaveStats {
@@ -2158,6 +2225,7 @@ impl WaveStats {
             drain_prefill_tokens: 0,
             drain_elevate_ms: 0,
             drain_glue_ms: 0,
+            experts_prev: None,
         }
     }
 
@@ -2282,6 +2350,7 @@ impl WaveStats {
         fmt: Option<(u32, u64, u64, u32, u64, u64)>,
         vram_decomp: (u64, u64, u64, u64),
         slots: (u32, u32, u32, u32),
+        experts: Option<(usize, usize, usize)>,
     ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
@@ -2344,8 +2413,23 @@ impl WaveStats {
         } else {
             String::new()
         };
+        // This window's expert activations and how many were already resident —
+        // a miss is a weight DMA the forward waited on, and the one number
+        // that says whether decode is bound by the card or by the link.
+        let experts_str = match (experts, self.experts_prev) {
+            (Some((h, m, d)), Some((h0, m0, d0))) if (h + m) > (h0 + m0) => {
+                let (hits, misses) = (h.saturating_sub(h0), m.saturating_sub(m0));
+                format!(
+                    " | experts hit={:.2}% miss={misses} dma={}",
+                    100.0 * hits as f64 / (hits + misses) as f64,
+                    d.saturating_sub(d0),
+                )
+            }
+            _ => String::new(),
+        };
+        self.experts_prev = experts;
         tracing::info!(
-            "wave {:.1}s: {body}{vram}{backlog_str}",
+            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}",
             elapsed.as_secs_f64()
         );
         // Phase breakdown: where the wall-clock went on the scheduler thread.
@@ -2353,8 +2437,8 @@ impl WaveStats {
         // `reproj` rising ⇒ continuous-reproject (provenance scan/glue) growing;
         // `unaccounted` large ⇒ blocked off-thread (persistence thread / lock).
         // Detailed per-wave breakdown — the live GUI panels carry the same numbers,
-        // so this stays at debug and the `wave {}s` heartbeat above is the info line.
-        tracing::debug!(
+        // so this stays at trace and the `wave {}s` heartbeat above is the info line.
+        tracing::trace!(
             target: "candle_conversation::scheduler::timing",
             drain_ms = self.drain_ms,
             promote_ms = self.promote_ms,
@@ -2827,6 +2911,57 @@ pub(crate) struct Scheduler {
     sampling_states: HashMap<SequenceId, SequenceSamplingState>,
     /// Prefill queue (FIFO) — newly submitted, not yet started.
     prefill_queue: VecDeque<PrefillWork>,
+    /// Whether a slot has released its ground since the last admission pass.
+    ///
+    /// **Admission opportunities are created only by completions.** Nothing new
+    /// can fit that did not fit before unless something freed ground, so a pass
+    /// over an engine where nothing finished re-prices every queued item to
+    /// reach the answer it reached last time. Set where a slot's ground goes
+    /// back — a decode cleaned up, a section sealed, a turn freed, an eviction
+    /// that shed something — and cleared by the pass that acts on it.
+    ///
+    /// Starts `true`: nothing has completed on a fresh engine, and one that
+    /// waited for a completion before its first admission would never take one.
+    pub(super) settled_since_admit: bool,
+    /// Which priority bands have had work recently — lower bands wait while a
+    /// higher one runs, and for a cooldown after (see [`priority_pause`]).
+    pub(super) priority_pause: PriorityPause,
+    /// The dialogue normalization warm-up's replayed turns, scored in the gaps
+    /// higher-priority work leaves (see [`norm_warm`]).
+    norm_warm: NormWarm,
+    /// When the last KV compaction pass ran, so the cheap per-wave gate can hold a
+    /// floor on the interval. `None` before the first pass.
+    pub(super) last_kv_compaction: Option<std::time::Instant>,
+    /// Forwards this wave iteration has run, of either kind.
+    ///
+    /// The divisor for the loop's per-forward overhead: a wave's non-forward wall clock
+    /// is amortised across the forwards it carried, and that quotient is what the rate
+    /// planner needs to price width correctly. See `WaveRate::observe_overhead`.
+    pub(super) wave_forwards: usize,
+    /// Microseconds this wave iteration spent **outside** its forwards.
+    ///
+    /// Every non-forward phase, not just the one that was easiest to reach. Feeding only
+    /// the housekeeping left the submission drain out — 7% of the run on its own — and the
+    /// planner then under-priced width in proportion to what was missing, which is the
+    /// same error as omitting the term altogether, only smaller.
+    pub(super) wave_overhead_us: u64,
+    /// The engine's one wave throughput planner, carried across admission
+    /// passes because what it learns — the effective copy rate, the decode
+    /// layer time, the hit coefficient — is a property of the machine rather
+    /// than of any one wave.
+    ///
+    /// `None` until the model can describe its weight side
+    /// ([`ManagedBatchedModel::weight_plan`]), which on a streaming MoE stack is
+    /// after the first classify. A dense model never reports one and never
+    /// plans: admission then falls through to the width backstop alone.
+    pub(super) wave_rate: Option<admit::WaveRate>,
+    /// The expert cache's hit and miss counters as of the last observation.
+    ///
+    /// They are cumulative for the life of the process — nothing in the daemon
+    /// resets them — so the planner is taught the *delta* over each interval.
+    /// See `Scheduler::observe_expert_hit_rate`.
+    pub(super) expert_hits_seen: usize,
+    pub(super) expert_misses_seen: usize,
     /// In-flight prefills (partially advanced across loop iterations).
     /// Promoted from `prefill_queue` by `promote_new_prefills` and drained
     /// by `promote_finished_prefills_to_decodes` once their offset reaches
@@ -3106,13 +3241,6 @@ pub(crate) struct Scheduler {
     /// [`Self::cut_admit_budget_leveled`]. `None` until the first level cut.
     last_level_cut: Option<std::time::Instant>,
 
-    /// When the admission pass last traced a starved outcome (queued work the
-    /// budget would not take). Rate-limits that trace to one line per
-    /// `ADMIT_STARVED_LOG_INTERVAL` — the condition persists across every loop
-    /// iteration until the budget or the queue moves, so it would otherwise flood
-    /// the log at the loop rate. `None` until the first starved pass.
-    last_admit_starved_log: Option<std::time::Instant>,
-
     /// [`PREFILL_OK_TOKENS`] as of the last promote-side pressure episode —
     /// the "forwards are still completing" evidence that distinguishes chronic
     /// nominal pressure (hold the width) from a genuine stall (halve it). See
@@ -3264,8 +3392,8 @@ impl Scheduler {
         // The arena used to register an eviction closure with the VRAM
         // governor, at a cheap relief rung, so the governor would shed resident
         // galleries before it ever evicted model KV. The rungs are gone;
-        // `relieve_vram_pressure` calls `evict_lru` directly and does it before
-        // touching KV, which is the same priority expressed as call order.
+        // `relieve_vram_pressure` calls `evict_to_cap` directly and does it
+        // before touching KV, which is the same priority expressed as call order.
         // **What this checkpoint actually brings to a decode.** Every one of
         // these is a capability the engine silently degrades around rather than
         // failing on: a model with no drafter reports `draft_budget == 0`, every
@@ -3366,6 +3494,16 @@ impl Scheduler {
             active_decodes: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
+            // See the field: the first pass has nothing to wait for.
+            settled_since_admit: true,
+            priority_pause: PriorityPause::default(),
+            norm_warm: NormWarm::default(),
+            last_kv_compaction: None,
+            wave_forwards: 0,
+            wave_overhead_us: 0,
+            wave_rate: None,
+            expert_hits_seen: 0,
+            expert_misses_seen: 0,
             active_prefills: Vec::new(),
             active_section_ingests: Vec::new(),
             section_positional: HashMap::new(),
@@ -3405,7 +3543,6 @@ impl Scheduler {
             admit_grow_streak: 0,
             admit_ok_tokens_seen: 0,
             last_level_cut: None,
-            last_admit_starved_log: None,
             promote_ok_tokens_seen: 0,
             promote_last_progress: None,
             ingest_timelines: HashSet::new(),
@@ -3596,6 +3733,13 @@ impl Scheduler {
                 free_tool_calls_from_penalties,
                 recorded_reply,
             } => {
+                // **The whole SubmitTurn handler, because it is the one that runs real
+                // work on the loop thread.** Its siblings are bookkeeping; this one
+                // projects the turn, elevates warm KV, carves a view and gap-fills. The
+                // drain it sits inside measured 23 ms per call against a decode kernel of
+                // a fraction of that, so the question "is that this handler or the
+                // channel" needs its own answer.
+                let _g = profile::span("drain:submit_turn");
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
                 let parent_id = sequence_id;
@@ -3778,6 +3922,10 @@ impl Scheduler {
                         .cloned()
                         .unwrap_or_default();
                     carried_belief.decay_scores(CARRIED_BELIEF_TURN_DECAY);
+                    // Choosing the context: the provenance scan and the section-tree walk
+                    // that decide which turns this reply attends over. Pure selection —
+                    // no K/V has moved yet.
+                    let _g_project = profile::span("drain:project");
                     let projection = inputs.projection.project_with_mode_and_sink(
                         target,
                         &view,
@@ -3964,6 +4112,10 @@ impl Scheduler {
                     // residences NOT in the incoming projection), then batch
                     // select-promote the projected sections/turns into hot before
                     // `apply_projection` injects them.
+                    // Warm → hot for everything the projection selected that is not
+                    // already resident. A tier crossing, so it is bounded by PCIe rather
+                    // than by compute, and it runs before any forward can start.
+                    let _g = profile::span("drain:elevate");
                     self.elevate_projection_working_set(
                         &conversation,
                         &projected_sections,
@@ -3978,6 +4130,11 @@ impl Scheduler {
                 // reset it to empty, so it must be skipped here (not just fed
                 // empty segments, which is the RULER/summarisation reset path).
                 if !skip_projection {
+                    // Injecting the projected context into the parent slot: the K/V
+                    // scatter and the block-table writes for every selected segment. The
+                    // heaviest single step in the handler, and the one that scales with
+                    // how much context the projection chose.
+                    let _g = profile::span("drain:apply_projection");
                     if let Err(e) =
                         self.apply_projection(parent_id, BlockCount(0), &projected_segments)
                     {
@@ -4075,11 +4232,21 @@ impl Scheduler {
                         original_borrowed: borrowed,
                         turn_start_parent_blocks,
                         question_tokens: user_content_end as usize,
+                        applied_identity: None,
                     },
                 );
 
                 // Step 6: queue prefill on the view sequence, carrying the
                 // reprojection policy through to DecodeState.
+                //
+                // **An arrival is an admission opportunity too.** The pass is
+                // otherwise gated on completions — nothing new can fit that did
+                // not fit before unless something freed ground — but that is
+                // only true of work already queued. A turn arriving at an idle
+                // engine has never been offered at all, and waiting for a
+                // completion that will never come (nothing is running) leaves it
+                // queued indefinitely.
+                self.settled_since_admit = true;
                 self.prefill_queue.push_back(PrefillWork {
                     sequence_id: view_id,
                     tokens: prefill_tokens,
@@ -4132,13 +4299,13 @@ impl Scheduler {
                 self.sampling_states.remove(&sequence_id);
                 // Drop the conversation handle and projection target
                 // bound to this slot.
-                self.slot_conversations.remove(&sequence_id);
+                let freed_conversation = self.slot_conversations.remove(&sequence_id);
                 let freed_target = self.slot_targets.remove(&sequence_id);
                 self.ephemeral_slots.remove(&sequence_id);
                 self.ephemeral_sigs.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
-                self.slot_projection_state.remove(&sequence_id);
+                self.retire_slot_projection_state(sequence_id, freed_conversation);
                 // Purge any DEFERRED glue plan for this slot. A queued gap-fill
                 // must never outlive the slot layout it was planned against: the
                 // freed id is recycled immediately (the code_read scope workers
@@ -4220,6 +4387,18 @@ impl Scheduler {
                         .map_err(ConversationError::Model)
                 };
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::ScoreSealedTurn {
+                substrate,
+                projection,
+                target,
+                sealed,
+                response_tx,
+            } => {
+                let scores = self.score_sealed_turn(&substrate, &projection, target, &sealed);
+                let _ = response_tx.send(scores);
                 true
             }
 
@@ -4480,6 +4659,25 @@ impl Scheduler {
             } => {
                 let result = self.handle_memory_catch_up(sequence_id, &tokens, adopted_from);
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::SeedRecurrentFromLineage {
+                sequence_id,
+                response_tx,
+            } => {
+                let seeded = match (
+                    self.slot_conversations.get(&sequence_id).cloned(),
+                    self.slot_targets.get(&sequence_id).copied(),
+                ) {
+                    (Some(conversation), Some(target)) => {
+                        self.restore_recurrent_state(sequence_id, &conversation, target.timeline)
+                    }
+                    // A scratch slot, or one already gone. Neither is an error:
+                    // there is no conversation whose memory this would be.
+                    _ => false,
+                };
+                let _ = response_tx.send(Ok(seeded));
                 true
             }
 
@@ -5574,6 +5772,8 @@ impl Scheduler {
                 response_tx,
             },
         );
+        // An arrival is an admission opportunity — see the sibling enqueue.
+        self.settled_since_admit = true;
         self.prefill_queue.push_back(PrefillWork {
             sequence_id: slot,
             tokens: TokenBuffer::from(token_ids),
@@ -5812,9 +6012,37 @@ impl Scheduler {
                 return;
             }
         };
-        let block_count = self.session.sequence_block_count(slot.0).unwrap_or(0);
+        // Reconcile a windowed creep's per-layer skew before this seal —
+        // see `perform_seal_and_write` and `BatchedInferenceSession::reconcile_block_counts`.
+        if let Err(e) = self.session.reconcile_block_counts(slot.0) {
+            let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
+                "SubmitSummaryProbe: reconcile before snapshot: {e}"
+            ))));
+            self.free_summary_slot(slot);
+            return;
+        }
+        // **The block count comes from the snapshot, not from the slot**, and one
+        // resolution serves both the slice and the `sign(Q)` gather below so they
+        // cannot disagree. `snapshot_sequence_per_layer` drops each layer's trailing
+        // empty chunk while `sequence_block_count` counts it, so the two differ by one
+        // whenever that chunk is empty — see the note in
+        // `projection_assembler::apply_projection`, where the same pair made a boot
+        // from a fresh substrate impossible.
+        let block_count;
         let sealed_gpu = match self.session.snapshot_sequence_per_layer(slot.0) {
-            Ok(snap) => slice_per_layer_sealed(&snap, 0, block_count),
+            Ok(snap) => {
+                block_count = snap.iter().map(|s| s.chunks.len()).min().unwrap_or(0);
+                match slice_per_layer_sealed(&snap, 0, block_count) {
+                    Ok(sliced) => sliced,
+                    Err(e) => {
+                        let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
+                            "SubmitSummaryProbe: reproject slice: {e}"
+                        ))));
+                        self.free_summary_slot(slot);
+                        return;
+                    }
+                }
+            }
             Err(e) => {
                 let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
                     "SubmitSummaryProbe: reproject snapshot: {e}"
@@ -5978,10 +6206,15 @@ impl Scheduler {
     /// sequences before it is capped, whatever it believes they are worth.
     pub(super) const MAX_PREFILL_WIDTH: usize = 24;
 
-    /// Throughput floor the admission planner never closes past — one prefill
-    /// always in flight so the engine keeps making progress even under sustained
-    /// pressure (a lone oversized turn is then bounded by the per-arena VRAM gate).
-    const MIN_PREFILL_WIDTH: usize = 1;
+    /// The decode counterpart of [`Self::MAX_PREFILL_WIDTH`], and a backstop of
+    /// exactly the same kind: the rate model is the real throttle, and this is
+    /// the dumb ceiling beneath it so an error in the cost model costs
+    /// throughput rather than the daemon.
+    ///
+    /// Sixty-four, which is the width the aggregate benchmark runs at — the
+    /// engine is known to carry that many sessions, so a cap below it would
+    /// refuse work the hardware has already been shown to do.
+    pub(super) const MAX_DECODE_WIDTH: usize = 64;
 
     /// Multiplicative-decrease the admission budget: halve it toward one quantum.
     /// Called from every throttle signal — VRAM pressure surviving an eviction
@@ -6088,6 +6321,9 @@ impl Scheduler {
         self.prefill_queue.retain(|w| w.sequence_id != id);
         self.active_prefills.retain(|p| p.work.sequence_id != id);
         self.active_decodes.remove(&id);
+        // A terminal free is a completion as far as admission is concerned: the
+        // slot's ground is back whether it finished or was abandoned.
+        self.settled_since_admit = true;
         // The held wave cohort's residual is indexed by member POSITION, so a
         // member vanishing mid-cohort would desync every later member's slice
         // against the residual (the exact reason the cohort is otherwise held
@@ -6112,10 +6348,10 @@ impl Scheduler {
     fn free_summary_slot(&mut self, slot: SequenceId) {
         let _ = self.session.free_sequence(slot.0);
         let _ = self.model.release_sequence(slot.0);
-        self.slot_conversations.remove(&slot);
+        let freed_conversation = self.slot_conversations.remove(&slot);
         let freed_target = self.slot_targets.remove(&slot);
         self.sampling_states.remove(&slot);
-        self.slot_projection_state.remove(&slot);
+        self.retire_slot_projection_state(slot, freed_conversation);
         self.compression_event_sinks.remove(&slot);
         // A queued glue plan must not outlive the slot layout it was planned
         // against (see the FreeSequence handler's purge).
@@ -6136,9 +6372,9 @@ impl Scheduler {
     /// parent's whole projected prefix borrowed for the daemon's lifetime, and
     /// a failed wave never gave that KV back.
     fn discard_turn_view(&mut self, view_id: SequenceId) {
-        if self.turn_views.remove(&view_id).is_none() {
+        let Some(view_state) = self.turn_views.remove(&view_id) else {
             return;
-        }
+        };
         if let Err(e) = self.session.free_sequence(view_id.0) {
             tracing::warn!("failed to free turn view {}: {}", view_id, e);
         }
@@ -6151,7 +6387,10 @@ impl Scheduler {
         }
         self.sampling_states.remove(&view_id);
         self.slot_tokens.remove(&view_id);
-        self.slot_projection_state.remove(&view_id);
+        // A view's working set is recorded under its PARENT, so the parent's
+        // conversation is the substrate this republishes on.
+        let parent_conversation = self.slot_conversations.get(&view_state.parent_id).cloned();
+        self.retire_slot_projection_state(view_id, parent_conversation);
         self.purge_freed_slot_scheduling_state(view_id);
     }
 
@@ -6250,7 +6489,7 @@ impl Scheduler {
         // it must not be the *quiet* error path: each reason logs at WARN, and
         // the reasons are distinguishable.
         if let (Some(target), StateSeed::FromTimeline) = (target, seed) {
-            self.restore_recurrent_state(slot_id, &conversation, target.timeline);
+            let _ = self.restore_recurrent_state(slot_id, &conversation, target.timeline);
             self.restore_carried_belief(slot_id, &conversation, target.timeline);
         }
 
@@ -6379,33 +6618,70 @@ impl Scheduler {
     /// logs a **distinguishable** reason, because "resumed with no memory" and
     /// "resumed correctly" are indistinguishable from the outside — both read
     /// fluently, and only one of them is right.
+    ///
+    /// Returns whether a snapshot was found and an install attempted — `false`
+    /// means this slot starts from the sequence-start state.
     fn restore_recurrent_state(
         &mut self,
         slot_id: SequenceId,
         conversation: &Conversation,
         timeline: TimelineId,
-    ) {
-        let payload = match conversation.read_recurrent_snapshot(timeline) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
+    ) -> bool {
+        // **The seed is resolved through the fork lineage, nearest ancestor
+        // first.**
+        //
+        // A conversation that continues another starts from where that one left
+        // off — that is what "forking the recurrent buffer" means. A forked
+        // conversation is minted on a FRESH timeline, so it has no snapshot of
+        // its own on its first turn; without this it would start from the
+        // sequence-start state and remember nothing of the documents its
+        // ancestors read, even though its K/V context carries their turns
+        // (`Substrate::inherited_chain`) — state and context disagreeing is the
+        // exact failure the rest of this function exists to prevent.
+        //
+        // Recursive, and bounded: `inherited_chain` walks `forked_from` all the
+        // way up, guards against a cycle, and stops at the token cap. It reads
+        // oldest-first, so reversing it asks the NEAREST ancestor first — the
+        // most specific memory available.
+        let lineage = conversation.read().inherited_chain(timeline);
+        let mut resolved = None;
+        for candidate in lineage.iter().rev() {
+            match conversation.read_recurrent_snapshot(*candidate) {
+                Ok(Some(p)) => {
+                    resolved = Some((p, *candidate));
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        "RECURRENT RESUME FAILED (unreadable) for timeline {candidate}: {e} — \
+                         the conversation will continue with NO recurrent memory of its \
+                         history. It will read fluently and have forgotten."
+                    );
+                    return false;
+                }
+            }
+        }
+        let (payload, snapshot_timeline) = match resolved {
+            Some(found) => found,
+            None => {
                 // Not an error and not always worth a warning: a model with no
                 // recurrent state never writes one, and a conversation whose
                 // first turn has not sealed has nothing to write yet.
                 tracing::debug!(
-                    "no recurrent snapshot for timeline {timeline}; starting from the \
-                     sequence-start state"
+                    "no recurrent snapshot for timeline {timeline} or any ancestor; \
+                     starting from the sequence-start state"
                 );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "RECURRENT RESUME FAILED (unreadable) for timeline {timeline}: {e} — \
-                     the conversation will continue with NO recurrent memory of its \
-                     history. It will read fluently and have forgotten."
-                );
-                return;
+                return false;
             }
         };
+        if snapshot_timeline != timeline {
+            tracing::debug!(
+                "timeline {timeline} seeds its recurrent state from ancestor \
+                 {snapshot_timeline} (turn {})",
+                payload.turn_index,
+            );
+        }
 
         // **The torn-shutdown check, and the reason the seal writes in the order
         // it does.**
@@ -6424,18 +6700,24 @@ impl Scheduler {
         // shedding the turn the snapshot was taken at leaves the index
         // unreachable, and this rejects it without the tombstone path needing to
         // know about snapshots at all.
-        let recovered_turns = conversation.read().turn_count(timeline);
+        // Judged against the timeline the snapshot BELONGS to, not the one
+        // being seeded. The check asks "does this snapshot describe a turn that
+        // actually survived?" — a question about the conversation that wrote
+        // it. Measuring an ancestor's snapshot against a fresh fork's own
+        // (zero) turn count would reject every inherited seed on sight, which
+        // is the quiet failure this whole path exists to remove.
+        let recovered_turns = conversation.read().turn_count(snapshot_timeline);
         if !snapshot_within_recovered_history(payload.turn_index, recovered_turns) {
             tracing::warn!(
                 "RECURRENT RESUME REJECTED (snapshot is newer than the recovered \
-                 history) for timeline {timeline}: the snapshot was taken at turn {} \
-                 but only {recovered_turns} turn(s) recovered — a torn shutdown \
+                 history) for timeline {snapshot_timeline}: the snapshot was taken at \
+                 turn {} but only {recovered_turns} turn(s) recovered — a torn shutdown \
                  between the snapshot and the turn's records. Installing it would \
                  put the recurrent layers a turn ahead of the K/V. The conversation \
                  continues with NO recurrent memory of its history.",
                 payload.turn_index,
             );
-            return;
+            return false;
         }
 
         let layers: Vec<ExportedLayerState> = payload
@@ -6495,6 +6777,7 @@ impl Scheduler {
         // and the delta-rule import failing on geometry says nothing about
         // whether this blob is installable.
         self.restore_aux_from_payload(slot_id, timeline, payload.turn_index, &payload.aux);
+        true
     }
 
     /// Install a snapshot's model-opaque blob, reporting what happened.
@@ -6772,6 +7055,9 @@ impl Scheduler {
 
         for seq_id in finished_seq_ids {
             if let Some(state) = self.active_decodes.remove(&seq_id) {
+                // The slot's ground is back, so an admission that did not fit
+                // before may fit now.
+                self.settled_since_admit = true;
                 // The summarise decode completes through the job registry, not
                 // the substrate seal path: its body becomes the node's assistant
                 // half and is sealed with the derived scope. No view to finalize,
@@ -7350,6 +7636,34 @@ impl Scheduler {
         close_unit_boundary(self.model.as_ref(), slot, unit, held);
     }
 
+    /// Install prefix section `prefix_id`'s index page on `seq`, ahead of the
+    /// `tokens` of its K/V the ingest borrows.
+    ///
+    /// **A section without a page the model takes is advanced over as a gap.**
+    /// Its span stays unindexed, which is the truth about it, and everything
+    /// after it still sits where its K/V does. Left short instead, the index
+    /// covers fewer tokens than the slot holds, every select of the ingest
+    /// refuses, and the wave step fails on each retry for as long as the daemon
+    /// runs — a startup wedged in "Prefilling tool sections".
+    fn push_prefix_section_index(&self, seq: SequenceId, prefix_id: SectionId, tokens: usize) {
+        let refused = match self.section_positional.get(&prefix_id) {
+            Some(blob) => match self.model.push_positional_state(seq.0, blob) {
+                Ok(_) => None,
+                Err(e) => Some(format!("index page refused: {e}")),
+            },
+            None if self.model.carries_positional_state() => Some("has no index page".to_string()),
+            None => None,
+        };
+        if let Some(why) = refused {
+            let advanced = self.model.push_positional_gap(seq.0, tokens);
+            tracing::warn!(
+                "prepare_section_ingest: prefix section {prefix_id:?} {why} — its {tokens} \
+                 token(s) stay unindexed (gap advanced: {})",
+                advanced.is_ok()
+            );
+        }
+    }
+
     /// CPU-only setup for a section ingest: truncate slot, inject prefix,
     /// capture `seal_block_from`, push writer chunk, pin tokens on substrate.
     /// Returns `seal_block_from` (the chunk index lower bound for the seal).
@@ -7439,25 +7753,12 @@ impl Scheduler {
                         }
                         // The one thing borrowing the chunks does not bring
                         // along. Pushed in prefix order, so the pages sit at
-                        // the positions their K/V does; a section without one
-                        // leaves this ingest's queries asking for blocks the
-                        // model does not hold, and the select refuses.
-                        if let Some(blob) = self.section_positional.get(&prefix_id) {
-                            if let Err(e) = self.model.push_positional_state(sequence_id.0, blob) {
-                                tracing::warn!(
-                                    "prepare_section_ingest: prefix section {:?} index page \
-                                     refused: {e}",
-                                    prefix_id
-                                );
-                            }
-                        } else if self.model.carries_positional_state() {
-                            tracing::warn!(
-                                "prepare_section_ingest: prefix section {:?} has no index \
-                                 page — this ingest will select against a prefix it never \
-                                 indexed",
-                                prefix_id
-                            );
-                        }
+                        // the positions their K/V does.
+                        self.push_prefix_section_index(
+                            sequence_id,
+                            prefix_id,
+                            sealed[0].token_count,
+                        );
                     }
                 }
                 let total_tokens = per_layer_token_count.first().copied().unwrap_or(0);
@@ -7981,6 +8282,111 @@ impl Scheduler {
         last
     }
 
+    /// React to a `snapshot_sequence_per_layer` seal failure that names a
+    /// per-layer token-window divergence — `assert_sealed_layers_aligned`'s
+    /// "refusing to seal … different token windows" family
+    /// (`candle-transformers/src/models/batched_inference.rs`). This is the
+    /// production symptom of a shared base-conversation section whose
+    /// persisted chunks disagree across layers at the same chunk index: the
+    /// forward fails, the sequence is dropped, and every conversation
+    /// forking that section hits the same wall on every attempt until
+    /// something removes the bad data.
+    ///
+    /// **Narrow by design**, per the standing decision to fix the error
+    /// handling rather than build a scanner: this fires on exactly this
+    /// error family, and only when the failed seal was for a section
+    /// (`SealAction::Section`) — a dialogue-turn seal failure is the
+    /// existing `CorruptTurnPolicy` / `reconstruct_from_log` machinery's
+    /// job and is untouched here.
+    ///
+    /// A live failure here is not by itself proof that the SEALING
+    /// section's own persisted data is bad — the same divergence can
+    /// originate in an already-resident PREFIX section this ingest
+    /// borrowed as context, in which case the section actually being
+    /// sealed has no persisted stream yet to be wrong. So rather than trust
+    /// the live failure, this re-reads the sealing section's own persisted
+    /// chunks off disk (`Conversation::check_section_window_integrity`,
+    /// built on the generic, reusable
+    /// `persistence::chunk_window_integrity::first_divergent_chunk`) and
+    /// only tombstones on a CONFIRMED divergence in that data. An
+    /// unconfirmed case (this section's own persisted data is clean, or it
+    /// has none yet) is logged and left alone — the check this calls is
+    /// generic precisely so a later, broader pass can reuse it against the
+    /// prefix chain without this narrow hook growing into one.
+    fn repair_section_if_window_divergence_confirmed(
+        &self,
+        seal_slot: SequenceId,
+        seal_action: &SealAction,
+        seal_error: &candle::Error,
+    ) {
+        let SealAction::Section {
+            section_id,
+            address,
+            ..
+        } = seal_action
+        else {
+            return;
+        };
+        // Matched on `assert_sealed_layers_aligned`'s own shared marker
+        // constant (not a duplicated literal) so an unrelated
+        // `snapshot_sequence_per_layer` failure (e.g. a slot that was never
+        // allocated) is left alone instead of treated as corruption — the
+        // trigger stays exactly this one error class, and the two sides
+        // can't silently drift apart if the message is ever reworded.
+        if !seal_error.to_string().contains(WINDOW_DIVERGENCE_MARKER) {
+            return;
+        }
+        let Some(conversation) = self.slot_conversations.get(&seal_slot).cloned() else {
+            tracing::warn!(
+                section_id = ?section_id,
+                seal_slot = seal_slot.0,
+                "section window-divergence repair: no conversation registered for the failed slot",
+            );
+            return;
+        };
+        let stream_id = section_stream_id(*address);
+        let n_layers = self.session.num_layers();
+        match conversation.check_section_window_integrity(stream_id, n_layers) {
+            Ok(Some(divergence)) => {
+                let reason = divergence.describe();
+                tracing::error!(
+                    section_id = ?section_id,
+                    stream_id = stream_id.0,
+                    seal_slot = seal_slot.0,
+                    divergence = %reason,
+                    "section window-divergence CONFIRMED on persisted data — tombstoning so \
+                     the next request re-prefills fresh instead of restoring the corrupted \
+                     chunks",
+                );
+                if let Err(e) = conversation.tombstone_section(stream_id, Some(&reason)) {
+                    tracing::error!(
+                        section_id = ?section_id,
+                        stream_id = stream_id.0,
+                        "section window-divergence repair: tombstone write failed: {e}",
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    section_id = ?section_id,
+                    stream_id = stream_id.0,
+                    seal_slot = seal_slot.0,
+                    "seal failed on a per-layer window divergence, but this section's own \
+                     persisted chunks read back clean (or it has none yet) — the divergence's \
+                     root chunk is most likely in an already-resident prefix section this \
+                     ingest borrowed, which this narrow hook does not trace; left unrepaired",
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    section_id = ?section_id,
+                    stream_id = stream_id.0,
+                    "section window-divergence repair: integrity re-read failed: {e}",
+                );
+            }
+        }
+    }
+
     /// `turn_content`, when `seal_action == SealAction::Turn`, carries
     /// the role / text / token IDs the substrate pins on the new turn
     /// entry so the on-disk record can be reconstructed later without
@@ -7997,6 +8403,17 @@ impl Scheduler {
         // lands) is read from `slot_targets` rather than threaded
         // through the request — see [`Self::slot_targets`].
         let seal_target = self.slot_targets.get(&seal_slot).copied();
+        // A windowed creep prefill can leave layers in a later window one
+        // empty writer chunk behind layers in an earlier one
+        // (`BatchedInferenceSession::reconcile_block_counts`). This is the
+        // seal that persists the slot's K/V to the substrate for every future
+        // reload and every future conversation that borrows it, so a skew
+        // reconciled here is fixed for good; left alone, it is what produces
+        // "chunked decode layout diverged... on the first message of a new
+        // conversation" on every subsequent replay of this exact record.
+        self.session
+            .reconcile_block_counts(seal_slot.0)
+            .map_err(ConversationError::Model)?;
         let snapshot = self
             .session
             .snapshot_sequence(seal_slot.0)
@@ -8049,14 +8466,34 @@ impl Scheduler {
         // snapshot, once per sealed turn, was invisible on the dashboard and its
         // wall-clock fell through to the housekeeping remainder.
         let t_snap = Instant::now();
-        let sealed_per_layer = match self.session.snapshot_sequence_per_layer(seal_slot.0) {
+        // Snapshot the sealed prefix `[0, block_to)`, not the whole slot. The two
+        // are the same for a settled slot, but during a windowed creep prefill the
+        // layers advance incrementally: layer 0 (and its window) push an empty
+        // (0-token) writer chunk for the next window ahead of the layers still
+        // pending resume, so the slot's per-layer block counts differ by that one
+        // trailing empty chunk (`per_layer=[626×7, 625×4]` for a section sealed
+        // mid-creep; see `sequence_block_count`'s skew note). A full-slot
+        // `snapshot_sequence_per_layer` walks that trailing phantom and its
+        // `assert_sealed_layers_aligned` rightly refuses the uneven layers —
+        // which returned `None` here and failed the seal ("seal returned None"),
+        // stranding every conversation whose prime crossed the pressure point
+        // that starts the creep windowing. `block_to` is `min(block_count,
+        // chunk_len)` — the block count EVERY layer holds — so `[0, block_to)` is
+        // the aligned common prefix, excludes the phantom, and still covers the
+        // seal range `[block_from, block_to)` the slice below extracts.
+        let sealed_per_layer = match self
+            .session
+            .snapshot_sequence_blocks(seal_slot.0, 0, block_to)
+        {
             Ok(sealed) => std::sync::Arc::new(sealed),
             Err(e) => {
                 tracing::error!(
-                    "snapshot_per_layer failed: seal_slot={} err={}",
+                    "snapshot_sequence_blocks failed: seal_slot={} range=[0,{}) err={}",
                     seal_slot.0,
+                    block_to,
                     e,
                 );
+                self.repair_section_if_window_divergence_confirmed(seal_slot, seal_action, &e);
                 return Ok(None);
             }
         };
@@ -8160,7 +8597,7 @@ impl Scheduler {
                     layout,
                     token_ids,
                 } = turn_content.unwrap_or_default();
-                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
+                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to)?;
                 // Snapshot what the resume path needs before the substrate
                 // consumes `delta_gpu` / `token_ids` (§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
@@ -8529,7 +8966,7 @@ impl Scheduler {
                 debug_name,
                 in_collection,
             } => {
-                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
+                let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to)?;
                 let stream_id = section_stream_id(*address);
                 let policy_active = self.session.compression_policy().is_some();
                 {
@@ -8720,11 +9157,28 @@ impl Scheduler {
     ///
     /// Read per forward rather than once at construction: the model's cap includes
     /// what the KV side can still hold, which moves with every claim.
-    fn prefill_pass_budget(&self) -> usize {
-        admission::prefill_pass_budget(
+    pub(super) fn prefill_pass_budget(&self) -> usize {
+        admit::pass_budget::prefill_pass_budget(
             self.max_prefill_pass_tokens,
             self.model
                 .prefill_width_cap(self.session.activation_dtype()),
+            // The KV side's own bound: the admit phase claims every chunk a
+            // forward will write before it computes anything, so a chunk wider
+            // than the free ground can back fails part way through claiming.
+            //
+            // Priced through `kv_token_cap`, which is the only thing here that
+            // knows the units. The KV side counts 16 MiB regions and this budget
+            // is in tokens; `vram_budget_available` is that same free count in
+            // bytes (`(free + blocked) × REGION_BYTES`, so it reads the ground a
+            // standing tier releases before these claims run, exactly as
+            // `kv_region_state` does), and the block price turns bytes into
+            // tokens.
+            self.session
+                .vram_budget_available()
+                .and_then(|free| admit::pass_budget::kv_token_cap(free, self.per_block_kv_bytes())),
+            // A tier budget that prices to a single row would make no progress,
+            // so the cap never falls below one chunk.
+            CHUNK_SIZE,
         )
     }
 
@@ -9347,6 +9801,49 @@ impl Scheduler {
             .set_working_set_pins(&keep_turns, &keep_sections);
     }
 
+    /// Drop `slot`'s projection working set and republish the keep-set without
+    /// it, on that slot's own substrate.
+    ///
+    /// **A pin outliving its slot wedges durability, not just eviction.** The
+    /// keep-set is defined as the union of every *live* slot's working set, but
+    /// [`Self::publish_working_set_pins`] only ever runs from an elevate — so a
+    /// slot that goes away between elevates leaves its pins standing, and
+    /// nothing recomputes the union until some other slot happens to elevate.
+    /// `Substrate::snapshot_pending_cold` skips a pinned residence, so a turn
+    /// still named by a dead slot's working set is never appended to the redo
+    /// log at all: it sits hot+warm and un-durable for the rest of the
+    /// daemon's life. It is silent in every gauge, because `pending_cold_count`
+    /// mirrors the same pin filter and therefore reports nothing pending, and
+    /// the shutdown drain clears the pins wholesale before its final pass — so
+    /// a graceful stop writes the turn through and only a hard kill loses it.
+    ///
+    /// Measured on a `repo_map` unit: the summary decode's last reprojection
+    /// selects exactly the unit's first turn, whose slot is then freed, so
+    /// **every** folder conversation carried a turn with token_ids, a block
+    /// range and no `Chunk` records — `MISSING KV` from the inspector, with no
+    /// error on any path.
+    ///
+    /// Republished on the freed slot's OWN substrate: the scheduler hosts
+    /// conversations on many substrates at once and the pin set lives per
+    /// substrate, so the handle has to come from the slot being retired.
+    ///
+    /// This is the only place [`Self::slot_projection_state`] is removed from,
+    /// which is what makes "a removal is always followed by a republish" hold
+    /// by construction rather than by every caller remembering. Keep it that
+    /// way: a bare `remove` elsewhere re-opens the wedge silently.
+    fn retire_slot_projection_state(
+        &mut self,
+        slot: SequenceId,
+        conversation: Option<Conversation>,
+    ) {
+        if self.slot_projection_state.remove(&slot).is_none() {
+            return;
+        }
+        if let Some(conversation) = conversation {
+            self.publish_working_set_pins(&conversation, &[], &[]);
+        }
+    }
+
     fn elevate_projection_working_set(
         &mut self,
         conversation: &Conversation,
@@ -9686,6 +10183,7 @@ impl Scheduler {
         //    `group_candidates` carries each turn group's freshly-scored turns for
         //    the turn-boundary challenger below.
         let t_scan = Instant::now();
+        self.queue_norm_warm(&policy.substrate, &policy.projection, policy.target);
         let schema = policy.projection.schema();
         // observe = false: a live reprojection only READS the normalization hit
         // levels; learning happens once per turn at seal (last_turn_belief_scores).
@@ -9693,9 +10191,8 @@ impl Scheduler {
         // resident gallery arena, per-file z) — one launch for the whole group,
         // numerically equivalent to the CPU per-file scan up to fast-math ULP /
         // same ranking (see `examples/gpu_belief_parity.rs`). Seal-time learning
-        // still runs CPU (`last_turn_belief_scores`, arena=None), so learned
-        // normalization levels and live GPU scores differ by ~1e-3 — negligible for
-        // the 0-1000 bands.
+        // runs the same launch here (`SchedulerRequest::ScoreSealedTurn`), so the
+        // levels are learned from the scores they later normalize.
         let (projection_scores, group_candidates) = policy.substrate.score_beliefs(
             schema,
             policy.target,
@@ -9904,6 +10401,29 @@ impl Scheduler {
             .filter(|s| matches!(s, ProjectionSegment::Sealed(SealedKind::Turn(..))))
             .count();
 
+        // The parent already holds this selection when its last rebuild came
+        // from a segment list with the same identity and placed all of it:
+        // rebuilding would reproduce it exactly, at ~190 ms a time.
+        let identity = {
+            let read = policy.substrate.read();
+            segments_identity(&projected_segments, |id| {
+                section_content_stamp(&read.section_tokens_of(id))
+            })
+        };
+        if view_state.applied_identity == Some(identity) {
+            self.keep_unchanged_projection(view_id, composition);
+            tracing::debug!(
+                target: "candle_conversation::scheduler::reproject",
+                view = view_id.0,
+                total_ms = t_repro.elapsed().as_millis() as u64,
+                probe_ms,
+                scan_ms,
+                project_ms,
+                "reproject: selection unchanged — the parent is kept"
+            );
+            return Ok(None);
+        }
+
         // 6. Zero-copy rebuild.
         //
         //    The previous implementation tried to *narrow* the view's
@@ -9985,6 +10505,15 @@ impl Scheduler {
         // user message" symptom that derails generation past the
         // first reproject.
         let tail_per_layer = {
+            // Reconcile a windowed creep's per-layer skew before this snapshot
+            // — see `perform_seal_and_write` and
+            // `BatchedInferenceSession::reconcile_block_counts`. This capture
+            // takes each layer's own `chunks.len()` rather than a shared
+            // min-based bound, so an unreconciled skew would carry a
+            // different tail length per layer into the rebuilt view.
+            self.session
+                .reconcile_block_counts(view_id.0)
+                .map_err(ConversationError::Model)?;
             let snapshot = self
                 .session
                 .snapshot_sequence_per_layer(view_id.0)
@@ -10144,6 +10673,7 @@ impl Scheduler {
             project_ms,
             elevate_ms,
             question_tokens: old_view_state.map(|v| v.question_tokens).unwrap_or(0),
+            identity,
         }))
     }
 
@@ -10177,6 +10707,7 @@ impl Scheduler {
             project_ms,
             elevate_ms,
             question_tokens,
+            identity,
         } = inflight;
 
         // Carry the belief forward: the next reprojection seeds from what this one
@@ -10210,6 +10741,7 @@ impl Scheduler {
         decode_state.last_projection_end = repro_gen;
 
         let t_finish = Instant::now();
+        let applied_identity = plan.complete.then_some(identity);
         self.apply_projection_finish(parent_id, plan)?;
         // The rebuilt prefix ends here, so the turn's anchor moves here — and
         // the index closes with it. The rebuild re-supplies the turn's user half
@@ -10339,6 +10871,7 @@ impl Scheduler {
                 // include the tail.
                 turn_start_parent_blocks: new_prefix_block_count,
                 question_tokens,
+                applied_identity,
             },
         );
 
@@ -10810,9 +11343,19 @@ mod tests {
                 n_experts: 1,
                 act_dtype,
                 accum_dtype: DType::F32,
-                projection_accum_roundtrip: false,
+                vocab: 64,
+                delta_net: None,
+                shared_expert: None,
+                packed_norm: false,
+                packed_head: false,
                 gated_qkv: false,
+                fused_qkv: false,
+                qkv_bias: false,
+                head_qk_norm: false,
+                head_norm_reshapes: false,
                 partial_rotary: false,
+                decode_q8_context: false,
+                hyper: None,
             }
         }
         fn device(&self) -> &candle::Device {
@@ -10975,7 +11518,23 @@ mod tests {
         /// survive exactly one `offset == 0` reset. The store-level `seeded`
         /// flag of §10 decision 2, modelled per sequence.
         seeded: Arc<Mutex<HashSet<usize>>>,
+        /// What the scheduler installed ahead of each sequence's borrowed K/V,
+        /// in order.
+        pushed: Arc<Mutex<HashMap<usize, Vec<Pushed>>>>,
     }
+
+    /// One piece installed ahead of borrowed K/V.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Pushed {
+        /// A page the model took.
+        Page(Vec<u8>),
+        /// Tokens advanced over unindexed.
+        Gap(usize),
+    }
+
+    /// The prefix of a page in the double's own format — the stand-in for a
+    /// container version the build reads.
+    const TOY_PAGE: &[u8] = b"TOYPAGE";
 
     impl RecurrentProbe {
         fn get(&self, seq: usize) -> Option<ToyState> {
@@ -11049,6 +11608,13 @@ mod tests {
         /// This double's layer-schedule fingerprint. Arbitrary, but fixed: what
         /// matters is that a restore under a *different* one is refused.
         const SCHEDULE_HASH: u64 = 0xD0D0_1234_5678_9ABC;
+
+        /// One sequence's recurrent store, the size a hybrid stack really runs.
+        const STORE_BYTES: usize = 126 * 1024 * 1024;
+
+        /// What the process holds with ten conversations' stores standing —
+        /// the figure admission must **not** reach for, whole or divided.
+        const RESERVED_TOTAL: usize = 10 * Self::STORE_BYTES;
 
         fn new() -> Self {
             Self {
@@ -11179,6 +11745,26 @@ mod tests {
             true
         }
 
+        /// Takes a page only in its own format, and refuses anything else the
+        /// way the real model refuses a malformed page.
+        fn push_positional_state(&self, seq: usize, blob: &[u8]) -> candle::Result<bool> {
+            if !blob.starts_with(TOY_PAGE) {
+                candle::bail!("toy page: a format this double does not read");
+            }
+            let mut pushed = self.probe.pushed.lock().unwrap();
+            pushed
+                .entry(seq)
+                .or_default()
+                .push(Pushed::Page(blob.to_vec()));
+            Ok(true)
+        }
+
+        fn push_positional_gap(&self, seq: usize, tokens: usize) -> candle::Result<()> {
+            let mut pushed = self.probe.pushed.lock().unwrap();
+            pushed.entry(seq).or_default().push(Pushed::Gap(tokens));
+            Ok(())
+        }
+
         /// Close the live tail into a page, returning the width it covered.
         ///
         /// `0` for an already-empty tail, which is the legitimate no-op every
@@ -11192,6 +11778,17 @@ mod tests {
                 entry.closed.push(width);
             }
             Ok(width as usize)
+        }
+
+        /// What one store costs, and what the process is holding — deliberately
+        /// far apart, because the difference is what admission used to divide
+        /// by an unrelated count.
+        fn recurrent_store_bytes(&self) -> usize {
+            DummyRecurrentModel::STORE_BYTES
+        }
+
+        fn recurrent_reserved_bytes(&self) -> usize {
+            DummyRecurrentModel::RESERVED_TOTAL
         }
 
         fn positional_coverage(&self, seq: usize) -> Option<usize> {
@@ -11392,6 +11989,42 @@ mod tests {
             Arc::new(crate::guest::Guests::new()),
         );
         (scheduler, tx, probe)
+    }
+
+    /// **A prefix section whose page the model will not take still advances
+    /// the index, as a gap of the section's width.** Pages in order where the
+    /// model reads them; the section with a stale page and the section with
+    /// none each become a gap of exactly their tokens, so every later piece
+    /// sits where its K/V does. Before, both only warned, left the index short
+    /// of the slot, and every select of the ingest refused for as long as the
+    /// daemon ran.
+    #[test]
+    fn a_prefix_section_the_model_cannot_index_is_advanced_over_as_a_gap() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let (good, stale, missing) = (SectionId::new(1), SectionId::new(2), SectionId::new(3));
+        let good_page = [TOY_PAGE, b"-good"].concat();
+        sched
+            .section_positional
+            .insert(good, Arc::new(good_page.clone()));
+        sched
+            .section_positional
+            .insert(stale, Arc::new(b"\x02\x00\x00\x00rotated".to_vec()));
+
+        let seq = SequenceId(5);
+        sched.push_prefix_section_index(seq, good, 40);
+        sched.push_prefix_section_index(seq, stale, 23);
+        sched.push_prefix_section_index(seq, missing, 17);
+
+        assert_eq!(
+            probe
+                .pushed
+                .lock()
+                .unwrap()
+                .get(&5)
+                .cloned()
+                .unwrap_or_default(),
+            vec![Pushed::Page(good_page), Pushed::Gap(23), Pushed::Gap(17)],
+        );
     }
 
     // ── Branch checkpoints (P6) ──────────────────────────────────────────────
@@ -12182,6 +12815,41 @@ mod tests {
         );
     }
 
+    /// **One turn is priced at one store, whatever the engine is holding.**
+    ///
+    /// The price comes from the model's geometry, so nothing about the
+    /// scheduler's occupancy can enter it. Both answers the old arithmetic gave
+    /// are asserted against by name, because both were wrong in production and
+    /// either would come back if someone reached for the total again:
+    ///
+    /// * `total / live` with nothing in flight divided by zero and answered
+    ///   **0** — a 126 MiB claim priced as free, admitted, and refused by the
+    ///   span on contact.
+    /// * the same expression with one sequence in flight answered the **whole
+    ///   total**, which is how a 41-row turn came to be priced at 4,450 MiB and
+    ///   refused as throughput-worse with seven turns queued behind it.
+    ///
+    /// A `live.max(1)` patch is caught by the second assertion too — it returns
+    /// the total here rather than one store.
+    #[test]
+    fn one_turn_is_priced_at_one_store_however_many_are_parked() {
+        let (sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let store = DummyRecurrentModel::STORE_BYTES as u64;
+        let total = DummyRecurrentModel::RESERVED_TOTAL as u64;
+
+        assert_eq!(
+            sched.recurrent_cost(),
+            store,
+            "one store, from the geometry"
+        );
+        assert_ne!(sched.recurrent_cost(), 0, "priced free with nothing live");
+        assert_ne!(
+            sched.recurrent_cost(),
+            total,
+            "billed for every store the process holds"
+        );
+    }
+
     /// **Speculative decode is refused up front on a model that cannot rewind.**
     ///
     /// The accept step puts the sequence back to the accepted prefix, which a
@@ -12651,6 +13319,7 @@ mod tests {
                 original_borrowed: BlockCount(0),
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
+                applied_identity: None,
             },
         );
 
@@ -12696,6 +13365,7 @@ mod tests {
                 original_borrowed: BlockCount(0),
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
+                applied_identity: None,
             },
         );
 
@@ -12740,6 +13410,7 @@ mod tests {
                 original_borrowed: BlockCount(0),
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
+                applied_identity: None,
             },
         );
         scheduler.discard_turn_view(view);
@@ -13037,6 +13708,182 @@ mod tests {
         );
     }
 
+    // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————
+
+    /// A scheduler over the stub model, for the admission tests below.
+    fn admission_scheduler() -> Scheduler {
+        let (_tx, rx) = flume::bounded(16);
+        Scheduler::new(
+            rx,
+            Box::new(DummyModel::new()) as Box<dyn ManagedBatchedModel + Send>,
+            make_test_session(),
+            make_dummy_tokenizer(),
+            vec![0u32].into(),
+            64,
+            8,
+            false,
+            None,
+            DecodeHealthConfig::default(),
+            512,
+            PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
+            Arc::new(crate::guest::Guests::new()),
+        )
+    }
+
+    /// A minimal queued turn: the only fields admission reads are the slot and
+    /// the token count it prices.
+    fn test_prefill_work(sequence_id: SequenceId) -> PrefillWork {
+        let (event_tx, _rx) = flume::bounded(16);
+        PrefillWork {
+            sequence_id,
+            tokens: TokenBuffer::from(vec![1u32; 64]),
+            prefill_text: String::new(),
+            user_text: String::new(),
+            tags: Vec::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            prefill_assistant_text: String::new(),
+            event_tx,
+            max_decode_tokens: 16,
+            sampling: SamplingConfig::default(),
+            submitted_at: Instant::now(),
+            reprojection: None,
+            belief: PriorBelief::default(),
+            seal_action: SealAction::Turn,
+            post_decode_tokens: TokenBuffer::default(),
+            projection_offsets: Vec::new(),
+            staged_composition: None,
+            triggers: Arc::new(TriggerRegistry::default()),
+            turn_grammar: None,
+            free_tool_calls_from_penalties: false,
+            recorded_reply: None,
+        }
+    }
+
+    /// **Every figure admission compares must be in one currency.**
+    ///
+    /// This integration has been wedged twice by mixing them — expert-cache
+    /// occupancy against a zone capacity, then the zone's lagging extent against
+    /// a live-region identity — and each time the symptom was every offer
+    /// refused on a healthy card. The invariant that would have caught both is
+    /// simply that `Budget::resident` is the same quantity `Headroom::zone` is,
+    /// and that the floor is at or above the hold.
+    #[test]
+    fn the_headroom_and_the_budget_agree_on_one_currency() {
+        let sched = admission_scheduler();
+        let standing = sched.standing_tier_bytes();
+        let room = sched.admit_headroom(standing);
+        let budget = sched.admit_budget_terms(&room, 512);
+
+        assert_eq!(
+            budget.resident, room.zone,
+            "residency and the zone must be the same measurement",
+        );
+        assert!(
+            budget.decode_floor >= room.zone_min,
+            "the decode floor may never sit under the hold: {} < {}",
+            budget.decode_floor,
+            room.zone_min,
+        );
+        // The prefill floor is deliberately lower — it is the ground a prefill may
+        // spend for rows — but never below its own hold, and never above the
+        // decode's.
+        assert!(
+            budget.prefill_floor >= room.zone_min_prefill
+                && budget.prefill_floor <= budget.decode_floor,
+            "the prefill floor sits between its own hold and the decode's: {} / {} / {}",
+            room.zone_min_prefill,
+            budget.prefill_floor,
+            budget.decode_floor,
+        );
+        // The spendable ground is one subtraction, never the free list added
+        // beside the zone — that double-counts the same regions.
+        assert!(
+            room.free_kv <= room.zone,
+            "spendable ground cannot exceed the zone it comes out of",
+        );
+    }
+
+    /// **The tier is held back from admission, so the floor clears the hold by
+    /// a useful forward's worth.**
+    ///
+    /// Reserve nothing and K/V claims to the weight floor: the tier is the
+    /// span's third tenant and gets what is left, which is nothing, so no
+    /// forward can be planned at all — not a narrow one, none — and nothing
+    /// completes to give the ground back.
+    #[test]
+    fn the_floor_holds_back_a_useful_forwards_tier() {
+        let sched = admission_scheduler();
+        let room = sched.admit_headroom(0);
+        let budget = sched.admit_budget_terms(&room, 512);
+        assert_eq!(
+            budget.decode_floor,
+            room.floor().saturating_add(sched.min_forward_tier_bytes()),
+            "the floor is the hold, the eviction margin and a forward's tier",
+        );
+        // The prefill floor holds the tier back too: spending weights for rows is a
+        // trade, leaving no ground for the tier is a stall.
+        assert_eq!(
+            budget.prefill_floor,
+            room.prefill_floor()
+                .saturating_add(sched.min_forward_tier_bytes()),
+            "the prefill floor is its own hold, the margin and a forward's tier",
+        );
+    }
+
+    /// **A store cost is never derived from a division by zero.**
+    ///
+    /// The per-sequence figure is a whole-engine total over the live count, so
+    /// the empty engine is the case that has to be stated rather than computed.
+    #[test]
+    fn the_recurrent_cost_is_zero_on_an_empty_engine() {
+        let sched = admission_scheduler();
+        assert!(sched.active_decodes.is_empty() && sched.active_prefills.is_empty());
+        assert_eq!(sched.recurrent_cost(), 0);
+    }
+
+    /// **A stack that cannot describe its weight side still admits.**
+    ///
+    /// `weight_plan` is [`WeightPlanning::Dense`] for a model with no expert cache, and
+    /// such a stack has no residency to trade a wave's rows against — so admission
+    /// proceeds on its width backstop alone rather than waiting for a planner that will
+    /// never arm.
+    ///
+    /// The stub is `Dense` specifically, not merely "no plan": a routed model reporting
+    /// no plan is [`WeightPlanning::Incomplete`] and panics, because an unarmed planner
+    /// narrows every wave to one row. This test covers the case that is legitimate.
+    #[test]
+    fn an_engine_with_no_planner_still_takes_its_queue_head() {
+        let mut sched = admission_scheduler();
+        assert!(
+            matches!(
+                sched.model.weight_plan(),
+                candle_transformers::models::expert_lre::WeightPlanning::Dense
+            ),
+            "the stub reports no expert cache at all, which is the case under test",
+        );
+        let slot = sched.session.create_sequence().unwrap();
+        sched
+            .prefill_queue
+            .push_back(test_prefill_work(SequenceId(slot)));
+
+        sched.promote_new_prefills();
+
+        assert!(
+            sched.prefill_queue.is_empty(),
+            "the head must leave the queue",
+        );
+        assert_eq!(
+            sched.active_prefills.len(),
+            1,
+            "and must be in flight, or the engine never starts",
+        );
+    }
+
     // —— view-creation tests —————————————————————————————————————————————————
 
     /// Explicit `visible_block_ranges` over a populated parent must create a valid view.
@@ -13278,6 +14125,7 @@ mod tests {
                 original_borrowed: borrowed,
                 turn_start_parent_blocks: borrowed.0,
                 question_tokens: 0,
+                applied_identity: None,
             },
         );
         view

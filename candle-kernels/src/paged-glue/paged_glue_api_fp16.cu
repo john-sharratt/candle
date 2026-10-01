@@ -27,7 +27,7 @@ extern "C" void run_paged_glue_fp16(
     float softmax_scale,
     const void* k_new,
     const void* v_new,
-    const float* rope_cs,
+    const RopeRungs rungs,
     int32_t rope_interleaved,
     const uint32_t* cu_seqlens_q,
     const uint32_t* q_lens,
@@ -42,7 +42,7 @@ extern "C" void run_paged_glue_fp16(
         paged_glue::launch_paged_glue_attn<__half, __half, __half, HD>( \
             (const __half*)q_ptr, headers_ptr, (__half*)o_ptr, \
             batch, max_glue, total_q, max_kv, n_q_head, n_kv_head, softmax_scale, \
-            (const __half*)k_new, (const __half*)v_new, rope_cs, rope_interleaved, \
+            (const __half*)k_new, (const __half*)v_new, rungs, rope_interleaved, \
             cu_seqlens_q, q_lens, kv_lens, \
             glue_write_slice, glue_write_in_blk, fwd_ahead, stream)
     switch (head_dim) {

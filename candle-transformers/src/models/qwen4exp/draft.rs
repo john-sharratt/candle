@@ -61,13 +61,13 @@ use super::wave::Qwen4ExpBatched;
 use crate::models::batched_inference::BatchedInferenceSession;
 use crate::models::batched_layer::{forward_attn_batched, BatchedAttentionParams, DecodeHeaders};
 use crate::models::delta_net::SeqSpan;
-use crate::models::draft_walk::{draft_reserve, draft_rope_depth, draft_walk};
+use crate::models::draft_walk::{draft_reserve, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::prefill_utils::SharedPm;
-use crate::models::qwen35::attention::RopeTables;
+use crate::models::rope_schedule::FactoredRope;
 use crate::models::tensor_cat::TensorCat;
 use candle::quantized::cuda::to_dynamic;
-use candle_nn::kv_cache::KvCache;
+use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
 
 /// Each sequence's last wide residual, carried between waves so the head's
 /// first row has the `h(t-1)` the wave before it produced.
@@ -94,8 +94,8 @@ pub struct HeadWave<'a> {
     pub spans: &'a [SeqSpan],
     /// Every row's sequence position, decode rows then prefill rows.
     pub offsets_all: &'a [usize],
-    /// The indexer's RoPE tables, built for this wave's depth.
-    pub index_rope: &'a RopeTables,
+    /// The indexer's factored RoPE table.
+    pub index_rope: &'a FactoredRope,
     /// The head's KV layer, which is also its index into a sequence's index
     /// caches — past every trunk attention layer.
     pub kv_layer: usize,
@@ -125,6 +125,25 @@ impl Qwen4ExpBatched {
         let dev = &self.model.device;
         let (total_rows, hc, n_embd) = res.dims3()?;
         let g = crate::models::profile::gpu_span("q4e:mtp_head", dev);
+
+        // **The head's own phase.** It runs one layer's worth of work after the
+        // trunk's loop has closed its phases, and until now it ran with none
+        // open at all — so its projections, its DeltaNet scan buffers and the
+        // split block under `project_qkv` all went to the pool, which is where
+        // the largest remaining allocations were.
+        //
+        // Safe because the head already escapes the arena where it must: the
+        // seeds it carries forward are taken with `to_owned_tensor`
+        // specifically so a generation reset cannot reclaim what the next wave
+        // reads (see the carry below). Everything else it allocates dies with
+        // the pass.
+        #[cfg(feature = "cuda")]
+        let head_wave = match dev {
+            candle::Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
+            _ => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let head_wave: Option<()> = None;
 
         // ── The shift, as one gather. ──
         //
@@ -182,7 +201,7 @@ impl Qwen4ExpBatched {
             );
         };
 
-        let (h, _) = hc_mix(&x_head, &head.block.hc_attn, eps)?;
+        let (h, _) = hc_mix(&x_head, &head.block.hc_attn, eps, None)?;
 
         // QSA over the head's OWN cache. The head selects exactly as a trunk
         // attention layer does — same indexer weights, same budget — because a
@@ -203,6 +222,9 @@ impl Qwen4ExpBatched {
             // and leave the thirteenth holding the rejected tokens' keys.
             capture.as_deref_mut(),
             total_rows,
+            // The draft head runs outside the trunk's forward-scoped span, so
+            // its tables take the ordinary upload.
+            None,
         )?;
         let dec_sel = match &qsa {
             Some(s) if w.n_decode > 0 => Some(s.rows_slice(0, w.n_decode)?),
@@ -242,7 +264,7 @@ impl Qwen4ExpBatched {
                 w.dec_params,
                 w.kv_layer,
                 dec_sel.as_ref(),
-                None,
+                head_wave.as_ref(),
             )?;
         }
         if w.pre_rows > 0 {
@@ -260,7 +282,7 @@ impl Qwen4ExpBatched {
                 w.pre_params,
                 w.kv_layer,
                 pre_sel.as_ref(),
-                None,
+                head_wave.as_ref(),
             )?;
         }
 
@@ -332,7 +354,7 @@ impl Qwen4ExpBatched {
         at: &[usize],
         params: &BatchedAttentionParams<'_>,
         idx_map: &mut HashMap<usize, Vec<IndexCache>>,
-        index_rope: &RopeTables,
+        index_rope: &FactoredRope,
         kv_layer: usize,
         eps: f64,
     ) -> Result<(Tensor, Tensor)> {
@@ -354,7 +376,7 @@ impl Qwen4ExpBatched {
         let mut res = head.block_input(embeds, prev_wide, eps)?;
 
         // ── Attention half. ──
-        let (h, inject) = hc_mix(&res, &head.block.hc_attn, eps)?;
+        let (h, inject) = hc_mix(&res, &head.block.hc_attn, eps, None)?;
         let inject = inject.expect("a block's HC modules carry an inject");
         // One decode row per sequence, so the spans are one row each. The span
         // names the SEQUENCE, not the row: `layer_selection` keys each
@@ -382,6 +404,8 @@ impl Qwen4ExpBatched {
             // partially and nothing to capture.
             None,
             n,
+            // As above: no forward-scoped span is open on this path.
+            None,
         )?;
         let alayer = Qwen4ExpAttentionLayer {
             w: aw,
@@ -404,34 +428,40 @@ impl Qwen4ExpBatched {
         //
         // [`Self::head_wave_pass`] passes the absolute index for the opposite
         // reason: it rides the wave's own metadata, which covers every layer.
+        // No wave is open on this path, so the projection's output is ordinary
+        // owned memory and owning it again was a straight `[n, n_embd]` copy.
+        // The compiler is what keeps that honest: were a generation passed
+        // above, `'w` would bind and the combine would have to stay inside it.
         let y = forward_attn_batched(&alayer, caches, &x_g, at, params, 0, sel.as_ref(), None)?
-            .to_owned_tensor()?
             .reshape((n, n_embd))?;
-        res = hc_combine(&res, &y, &inject)?;
+        hc_combine(&mut res, &y, &inject)?;
 
         // ── MoE half. ──
-        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps)?;
+        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps, None)?;
         let inject2 = inject2.expect("a block's HC modules carry an inject");
         let candle::Device::Cuda(cuda) = dev else {
             candle::bail!("qwen4exp draft runs on CUDA");
         };
-        // Float activations for the same reason the trunk's MoE uses them: the
-        // int8 expert gather tiles at 1024 and this stack's hidden is 2560.
+        // Quantized once in the session's mode, as the trunk's MoE input is:
+        // the router, the shared expert and the routed experts' tile gather all
+        // read the one operand.
         let acts = to_dynamic(
             &h2.reshape((1, n, n_embd))?,
-            candle::quantized::Int8Mode::Off,
+            m.lm_head.int8mode(),
             cuda,
             // Raw Σx — a language model's block sums stay far below f16's
-            // ceiling. (`Off` produces no q8a128 here anyway.)
+            // ceiling.
             candle::quantized::SumScale::Raw,
         )?;
         let y2 = head
             .block
             .moe
-            .forward_dynamic(acts, DType::F32, None)?
-            .to_owned_tensor()?
+            // A draft head only ever runs behind a decode step — there is no
+            // prefill/prompt traffic through one — so all `n` rows are
+            // decode-attributed.
+            .forward_dynamic(acts, DType::F32, n, None)?
             .reshape((n, n_embd))?;
-        res = hc_combine(&res, &y2, &inject2)?;
+        hc_combine(&mut res, &y2, &inject2)?;
 
         // ── The shared head. ──
         let narrow = head.to_shared_head(&res, eps)?;
@@ -537,18 +567,6 @@ impl Qwen4ExpBatched {
             }
         }
 
-        // **A draft walk is a forward, and has to be bracketed like one.**
-        //
-        // `forward_attn_batched` opens a wave per phase, but a wave only *lays
-        // out* spans inside a tier someone else placed — `plan_wave_transient`
-        // is what buys that ground, and `begin_forward` is what freezes the
-        // partition while the walk runs on it. Skip the bracket and the head's
-        // attention writes into whatever tenant owns the address instead, which
-        // is hot-path invariant 7 and surfaces as an illegal access inside the
-        // out-projection rather than anywhere near the cause.
-        //
-        // Priced for this walk: one decode row per sequence, the same way the
-        // forward prices its own rows.
         // **The walk opens no forward of its own, deliberately.**
         //
         // A forward's transient tier is not released when the forward ends — it
@@ -566,13 +584,12 @@ impl Qwen4ExpBatched {
         // reaches it. Uncompressed runs survive only because every key they
         // touch already exists; C8 does not.
         //
-        // This bracket was originally added to fix a `CUDA_ERROR_ILLEGAL_ADDRESS`
-        // in the head's out-projection. It did not: the run after adding it
-        // failed identically. What fixed that was passing the GROUP-RELATIVE
-        // slot-header index (`0`, not the absolute KV layer) — see
-        // `head_draft_step`. The bracket was credited for a fix it had no part
-        // in, and then cost every compressed rung.
-        let open_forward = || Ok(());
+        // A bracket here was originally added to fix a
+        // `CUDA_ERROR_ILLEGAL_ADDRESS` in the head's out-projection. It did not:
+        // the run after adding it failed identically. What fixed that was
+        // passing the GROUP-RELATIVE slot-header index (`0`, not the absolute KV
+        // layer) — see `head_draft_step`. The bracket was credited for a fix it
+        // had no part in, and then cost every compressed rung.
 
         // **The walk rolls back the KV; the index cache is ours to roll back.**
         //
@@ -598,11 +615,7 @@ impl Qwen4ExpBatched {
             })
             .collect::<Result<_>>()?;
 
-        let depth = draft_rope_depth(session, seqs, kv_layer)?;
-        let rope_cs = self.rope_cs_for(depth)?;
-        // Hoisted: the indexer's tables are wave-invariant, and building them
-        // per drafted position would take a lock and rebuild a table per token.
-        let index_rope = self.index_rope_for(depth)?;
+        let index_rope = self.index_rope().clone();
 
         let mut step = |ids: &Tensor,
                         h: &Tensor,
@@ -612,14 +625,13 @@ impl Qwen4ExpBatched {
                         generation: &Generation|
          -> Result<(Tensor, Tensor)> {
             let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-            let (cos, sin) = m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev)?;
+            let (cos, sin) = m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev, None)?;
             let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
             let params = BatchedAttentionParams::new(
                 &cos,
                 &sin,
                 false,
-                &self.inv_freq,
-                &rope_cs,
+                &self.rope,
                 DecodeHeaders::Decode {
                     buf: Some(headers.0.clone()),
                     stride: headers.1,
@@ -628,7 +640,9 @@ impl Qwen4ExpBatched {
                 generation,
                 &pm,
             );
-            let embeds = m.embed.index_select(ids, 0)?.to_dtype(DType::F32)?;
+            // Fully written by the lookup (invariant 6), in the head's F32.
+            let embeds = Tensor::empty((ids.elem_count(), m.embed.ncols()), DType::F32, dev)?;
+            m.embed.gather_into(ids, None, Some(&embeds))?;
             self.head_draft_step(
                 head,
                 &embeds,
@@ -650,7 +664,6 @@ impl Qwen4ExpBatched {
             committed,
             &seed_block,
             max_len,
-            open_forward,
             &mut step,
         );
         for (&s, snap) in seqs.iter().zip(&snaps) {

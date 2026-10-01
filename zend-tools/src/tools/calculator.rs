@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext, ToolError};
+use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
@@ -71,6 +71,11 @@ impl Tool for CalculatorTool {
     type Request = Request;
     type Response = Response;
     type Error = CalcError;
+
+    /// Pure arithmetic over the expression — no state and no I/O.
+    fn replay(_req: &Self::Request) -> Replay {
+        Replay::Safe
+    }
 
     fn run(_ctx: &ToolContext, req: Request) -> Result<Response, CalcError> {
         // evalexpr parses (respecting precedence / parens); we walk the tree

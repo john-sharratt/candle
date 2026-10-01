@@ -193,6 +193,38 @@ impl Drop for RegionHandle {
             // Stamp the quiesce epoch current at release. `claim_region` reads it
             // to decide whether this region still needs a wait, and its being
             // non-zero is what tells the next tenant to clean it at all.
+            // **A region released twice is what puts one index on the free list
+            // twice, and that is a double-issue waiting to happen.** The counts
+            // cannot catch it: the duplicate pops twice, so `live` rises twice
+            // and falls twice and `region_stats` still balances. Only the
+            // per-index answer shows it, and it has to be checked *before* the
+            // push, because after the push the damage is queued.
+            //
+            // **Panics.** `Drop` has nowhere to return an error to, and the two
+            // quiet alternatives are both worse than stopping. Queuing the index
+            // anyway hands the same ground to a second tenant, which writes over
+            // live data and does not fault. Skipping the push instead keeps memory
+            // safe but leaks a region and lets the process continue with its
+            // bookkeeping known to be wrong — so the next occurrence is silent
+            // too, and the run's results are no longer evidence of anything.
+            //
+            // There is no correct recovery here because the pool has already lost
+            // track of an owner; whatever is wrong happened before this line. The
+            // panic is the report.
+            if !pool.owned[self.index] {
+                panic!(
+                    "reservation: region {} released while not held — the pool \
+                     already had it free, so an owner has been lost. Releasing it \
+                     again would queue one index twice and hand the same ground to \
+                     two tenants, which writes over live data without faulting. \
+                     {} live of {}, {} free.",
+                    self.index,
+                    pool.live,
+                    pool.total,
+                    pool.free.len(),
+                );
+            }
+            pool.owned[self.index] = false;
             pool.dirty_epoch[self.index] = pool.quiesce_epoch;
             pool.free.push(Reverse(self.index));
             pool.live -= 1;
@@ -206,8 +238,23 @@ impl Drop for RegionHandle {
 pub struct RegionStats {
     /// Regions the reservation actually claimed.
     pub total: usize,
-    /// Regions held by an arena right now.
+    /// Regions held by any tenant right now — a KV arena, a record arena, or a
+    /// span tenant such as the recurrent state store or the provenance gallery.
+    ///
+    /// **Not "held by an arena", which is what this said.** Three unlike tenants
+    /// claim from one free list, and reading this as the arena count is how the
+    /// fragmentation efficiency figure came to divide the KV pools' packed arena
+    /// count by a frontier that a recurrent state store was holding up: on
+    /// Qwen3.8-Flash-Next that reads 4% with the KV pools packed to within two
+    /// arenas of perfect. [`Self::span_tenant`] is the part that is not an arena.
     pub live: usize,
+    /// Of [`Self::live`], the regions held by a span tenant rather than an arena.
+    ///
+    /// Counted where the handles are minted rather than derived by subtracting the
+    /// arena pools' totals, because those come from a different snapshot behind a
+    /// different lock — and a figure formed by subtracting two populations is the
+    /// shape that produced the wrong reading in the first place.
+    pub span_tenant: usize,
     /// Regions claimable right now without evicting anything — the pressure
     /// signal, and the admission budget. Excludes anything the transient tier's
     /// ceiling forbids; see [`blocked`](Self::blocked).
@@ -239,6 +286,17 @@ pub struct RegionStats {
     pub blocked: usize,
     /// Most regions ever live at once — how close the partition came to full.
     pub peak_live: usize,
+    /// One past the **highest live region index** — the arena frontier, in
+    /// regions, and the figure a compaction exists to reduce.
+    ///
+    /// `live_watermark - live` is the number of free regions stranded *below* the
+    /// frontier: ground the KV side owns and reports as available, which the wave
+    /// transient tier cannot use because it must stand above every live arena, and
+    /// which therefore pushes `weight_floor` right and costs expert residency.
+    /// Zero holes means `live_watermark == live`, which is what a perfect
+    /// compaction pass leaves behind and what a test can assert exactly — unlike a
+    /// throughput figure.
+    pub live_watermark: usize,
     /// Bytes the wave transient tier occupies **right now**, and the ceiling it
     /// imposes on the region count while it does.
     ///
@@ -345,7 +403,38 @@ struct RegionPool {
     /// Returned regions, lowest first (principle 5: keep live data left-packed).
     free: BinaryHeap<Reverse<usize>>,
     live: usize,
+    /// Of `live`, the regions a [`SpanRegion`] holds rather than an arena.
+    ///
+    /// Maintained by `SpanRegion`'s own construction and drop, which is the only
+    /// place a span tenant's handle is minted, so it cannot drift from the handles
+    /// that exist. What it is for is the fragmentation efficiency figure: without
+    /// it, ground a recurrent state store legitimately holds is charged to the KV
+    /// side as fragmentation nothing can pack away.
+    span_live: usize,
     peak_live: usize,
+    /// Per region, whether a live [`RegionHandle`] holds it right now.
+    ///
+    /// **The one thing `live`, `free` and `next` cannot tell you: whether a
+    /// region has been handed to two tenants at once.** Those three are counts
+    /// and a heap, and every double-issue keeps all of them self-consistent — a
+    /// duplicate free-list entry pops twice, so `live` rises twice and `free`
+    /// falls twice, and the arithmetic in `region_stats` still balances. The
+    /// overlap is only visible per index, which is what this is.
+    ///
+    /// It matters more here than in an ordinary allocator because every address
+    /// in the reservation is mapped: a second tenant handed a live region does
+    /// not fault, it writes over the first one's data and the fault surfaces as
+    /// a wrong number in whatever reads it next. The tenants are not alike
+    /// either — a KV arena, the wave transient tier, and a sequence's recurrent
+    /// store all claim from this list — so the reader of the corrupted bytes is
+    /// usually in a different subsystem from the writer.
+    ///
+    /// Not behind `tensor-assert`: this is one indexed bool per claim and
+    /// release, both of which already hold the pool mutex and one of which
+    /// already does a device-wide quiesce. There is no fence and no allocation,
+    /// so it costs nothing measurable, and a guard that is compiled out is not
+    /// watching the production run where this actually happens.
+    owned: Vec<bool>,
     /// Count of whole-device quiesces this pool has performed.
     ///
     /// A `cuCtxSynchronize` waits for every task on every stream of the context,
@@ -916,6 +1005,7 @@ impl RegionPool {
             next: 0,
             free: BinaryHeap::new(),
             live: 0,
+            span_live: 0,
             peak_live: 0,
             // **Epochs start at one**, so that zero can mean "never dirtied" in
             // `dirty_epoch` without colliding with a real epoch. A pristine
@@ -924,6 +1014,7 @@ impl RegionPool {
             // quiesce — otherwise every region on the card claims as dirty once.
             quiesce_epoch: 1,
             dirty_epoch: vec![0; total],
+            owned: vec![false; total],
             transient_base: None,
             transient_bytes: 0,
             transient_high_water: 0,
@@ -963,6 +1054,27 @@ impl RegionPool {
     /// no region has been handed out — so there is nothing to relocate and
     /// `dirty_epoch` can simply be resized. Every region in the new grid is
     /// still pristine (`0`), because the span was mapped and never written.
+    /// Widen the ownership bitmap to cover `total` regions.
+    ///
+    /// **Grow-only, unlike `dirty_epoch`.** A shrink that truncated this would
+    /// throw away the record that a high region is still held, and the very next
+    /// grow would restore it as `false` — so the pool would have forgotten the
+    /// owner of a live region and the double-issue guard would wave it through.
+    /// `set_weight_floor` refuses to cut below the live watermark, so an index
+    /// past `total` should never be owned; keeping the flag is what makes that a
+    /// checked claim rather than an assumed one.
+    fn cover_regions(&mut self, total: usize) {
+        if total > self.owned.len() {
+            self.owned.resize(total, false);
+        }
+    }
+
+    /// Re-derive the region grid after the dense block grew.
+    ///
+    /// Only reachable from [`claim_dense`], which has already established that
+    /// no region has been handed out — so there is nothing to relocate and
+    /// `dirty_epoch` can simply be resized. Every region in the new grid is
+    /// still pristine (`0`), because the span was mapped and never written.
     fn relayout_for_dense(&mut self) {
         let layout = layout_span(
             self.span_base,
@@ -973,6 +1085,7 @@ impl RegionPool {
         self.region_base = layout.region_base;
         self.total = layout.total;
         self.dirty_epoch.resize(layout.total, 0);
+        self.cover_regions(layout.total);
     }
 
     /// The lowest address the wave transient tier may not reach below: one past
@@ -1177,6 +1290,7 @@ impl RegionPool {
         // no readers left to wait for — but the bytes are still there, so it
         // still needs zeroing.
         self.dirty_epoch.resize(layout.total, 0);
+        self.cover_regions(layout.total);
         if gained > 0 {
             let stale = self.quiesce_epoch.saturating_sub(1);
             for slot in self.dirty_epoch.iter_mut().skip(layout.total - gained) {
@@ -1247,6 +1361,7 @@ impl RegionPool {
             live: self.live,
             free_below_ceiling: self.free_count(),
             ceiling_blocked: self.ceiling_blocked(),
+            free_above_live: self.total.saturating_sub(self.live_watermark()),
             tier_bytes: self.transient_bytes,
             tier_high_water: self.transient_high_water,
         };
@@ -1260,6 +1375,7 @@ impl RegionPool {
                     Refusal::Observing => 0,
                     Refusal::Pressure => 1,
                     Refusal::Occupied => 2,
+                    Refusal::Fragmented => 6,
                 };
                 SPARE_TALLY[idx].fetch_add(1, Ordering::Relaxed);
                 0
@@ -1583,6 +1699,47 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
             // than from having watched it happen.
             pool.dirty_epoch[index] = 0;
         }
+        // **Refuse to hand out a region somebody still holds.**
+        //
+        // Reached only if the free list carried an index that was never released,
+        // or if `next` advanced over a live region. Both are bookkeeping faults,
+        // and both are silent without this: the second tenant's writes land on
+        // the first tenant's live data, every address involved is mapped, and
+        // nothing faults. It has been measured as a sequence's whole recurrent
+        // state going non-finite while the KV side read perfectly — the reader of
+        // the damage was in a different subsystem from the writer, with no path
+        // between them to inspect.
+        //
+        // **An error, which reaches the turn — not `Ok(None)`, which would not.**
+        //
+        // The distinction is the whole point. `None` is this function's pressure
+        // signal: the caller buys ground from the weight side, retries, and carries
+        // on. Returning it here would turn a broken partition into a slightly
+        // slower run with nothing in the output naming it. An `Err` takes a
+        // different path — every caller propagates it with `?` (`alloc.rs`'s arena
+        // creation, `SpanClaims::claim`, the guest ground) up to the prefill or
+        // decode that asked, which fails the turn.
+        //
+        // That is the right blast radius, and it is why this is not a panic: the
+        // conversation that asked for the region fails and says why, while the
+        // daemon and every other session stay up to be inspected. Nothing is
+        // recovered — the duplicate is already in the free list or already past
+        // `next`, and this line is where it is noticed, not where it was made.
+        if pool.owned[index] {
+            candle::bail!(
+                "reservation: region {index} was issued while still held — \
+                 {} live of {}, {} free, next {}, watermark {}. The free list or \
+                 the fresh-claim frontier has lost track of an owner; handing it \
+                 over would write over a live tenant (a KV arena, the wave tier, \
+                 or a sequence's recurrent store) without faulting.",
+                pool.live,
+                pool.total,
+                pool.free.len(),
+                pool.next,
+                pool.live_watermark(),
+            )
+        }
+        pool.owned[index] = true;
         pool.live += 1;
         pool.peak_live = pool.peak_live.max(pool.live);
         // Paired with the release log below: a fault correlated between a
@@ -2192,6 +2349,7 @@ pub fn reclaim_load_headroom(stream: &std::sync::Arc<CudaStream>) -> Result<usiz
         pool.region_base = layout.region_base;
         pool.total = layout.total;
         pool.dirty_epoch.resize(layout.total, 0);
+        pool.cover_regions(layout.total);
         log::info!(
             "reservation: reclaimed {} MiB of load headroom — span now {} MiB, {} regions",
             gained / (1024 * 1024),
@@ -2307,21 +2465,22 @@ static SWEEP_CALLS: AtomicU64 = AtomicU64::new(0);
 /// purchases succeed:
 ///
 /// `[observing, pressure, occupancy_bound, regions_granted, buy_conceded,
-///   buy_refused]`
+///   buy_refused, fragmented]`
 ///
-/// The first three attribute a zero to one of the three things that can produce
-/// it, which is the difference between "the mechanism is inert" and "the
-/// mechanism is working and the ground is genuinely spoken for". The last two
-/// say whether a claim that waited would ever have anything to wait for.
+/// `observing`, `pressure`, `occupancy_bound` and `fragmented` attribute a zero
+/// to one of the four things that can produce it, which is the difference
+/// between "the mechanism is inert", "the ground is genuinely spoken for" and
+/// "the ground is free but in holes the floor cannot reach". The two `buy_`
+/// slots say whether a claim that waited would ever have anything to wait for.
 ///
 /// There were four attributions while the weight side also measured against a
 /// windowed history of KV demand; that term is gone (see
 /// [`RegionPool::spare_regions`]) and its slot with it, rather than being left
 /// to report a permanent zero under a name nothing can produce.
-static SPARE_TALLY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static SPARE_TALLY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// See [`SPARE_TALLY`].
-pub fn spare_tally() -> [u64; 6] {
+pub fn spare_tally() -> [u64; 7] {
     std::array::from_fn(|i| SPARE_TALLY[i].load(Ordering::Relaxed))
 }
 
@@ -2413,14 +2572,45 @@ pub struct SpanRegion {
 }
 
 impl SpanRegion {
+    /// Wrap a claimed region as a span tenant's, counting it as one.
+    ///
+    /// The only constructor, so `span_live` cannot disagree with the handles that
+    /// exist — which is the property the efficiency figure needs, because it is
+    /// otherwise formed by subtracting two populations sampled behind two locks.
+    fn adopt(inner: RegionHandle) -> Self {
+        let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pool) = map.get_mut(&inner.ordinal) {
+            pool.span_live += 1;
+        }
+        drop(map);
+        Self { inner }
+    }
+
     /// Device address of the region's first byte.
     pub fn base(&self) -> u64 {
         self.inner.base()
     }
 
+    /// The region's position in the span, ascending with address.
+    pub fn index(&self) -> usize {
+        self.inner.index()
+    }
+
     /// Bytes in a region — the unit this allocator deals in.
     pub const fn bytes() -> usize {
         REGION_BYTES
+    }
+}
+
+impl Drop for SpanRegion {
+    fn drop(&mut self) {
+        // Before the inner handle's own drop returns the region to the free list,
+        // and on the same lock it takes — so a reader between the two sees the
+        // region as neither a span tenant's nor free, never as both.
+        let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pool) = map.get_mut(&self.inner.ordinal) {
+            pool.span_live = pool.span_live.saturating_sub(1);
+        }
     }
 }
 
@@ -2464,15 +2654,18 @@ impl std::fmt::Debug for SpanRegion {
 ///
 /// So a span tenant is bound by the same rule as an arena: **allocate between
 /// forwards.** Inside one, this refuses rather than corrupts.
-pub fn claim_span_region(device: &candle::Device) -> Result<Option<SpanRegion>> {
+pub fn claim_span_region(
+    device: &candle::Device,
+    tenant: &'static str,
+) -> Result<Option<SpanRegion>> {
     let candle::Device::Cuda(cuda) = device else {
         candle::bail!("claim_span_region: the reservation is a CUDA allocation");
     };
     let stream = cuda.cuda_stream();
     // Held across the claim, so a forward cannot open between the gate and the
     // frontier moving.
-    let _window = super::bump_arena::enter_arena_window(&stream)?;
-    Ok(claim_region(&stream)?.map(|inner| SpanRegion { inner }))
+    let _window = super::bump_arena::enter_arena_window(&stream, tenant)?;
+    Ok(claim_region(&stream)?.map(SpanRegion::adopt))
 }
 
 /// An open arena window, for a tenant claiming SEVERAL regions at once.
@@ -2497,18 +2690,18 @@ pub struct SpanClaims {
 impl SpanClaims {
     /// Open the window. Refuses inside a forward, for the reason on
     /// [`claim_span_region`].
-    pub fn open(device: &candle::Device) -> Result<Self> {
+    pub fn open(device: &candle::Device, tenant: &'static str) -> Result<Self> {
         let candle::Device::Cuda(cuda) = device else {
             candle::bail!("SpanClaims: the reservation is a CUDA allocation");
         };
         let stream = cuda.cuda_stream();
-        let _window = super::bump_arena::enter_arena_window(&stream)?;
+        let _window = super::bump_arena::enter_arena_window(&stream, tenant)?;
         Ok(Self { stream, _window })
     }
 
     /// One more region, or `None` when the KV side has none spare.
     pub fn claim(&self) -> Result<Option<SpanRegion>> {
-        Ok(claim_region(&self.stream)?.map(|inner| SpanRegion { inner }))
+        Ok(claim_region(&self.stream)?.map(SpanRegion::adopt))
     }
 }
 
@@ -2625,9 +2818,11 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
     map.get(&ordinal).map(|pool| RegionStats {
         total: pool.total,
         live: pool.live,
+        span_tenant: pool.span_live,
         free: pool.free_count(),
         blocked: pool.ceiling_blocked(),
         peak_live: pool.peak_live,
+        live_watermark: pool.live_watermark(),
         transient_bytes: pool.transient_bytes,
         transient_ceiling: pool.region_ceiling(),
         fresh_claims_during_wave: pool.fresh_claims_during_wave,
@@ -2770,6 +2965,11 @@ mod tests {
     }
 
     use candle::cuda_backend::cudarc::driver::CudaStream;
+    use std::cmp::Reverse;
+
+    /// Direct pool access, for the two ownership guards: the states they refuse
+    /// are bookkeeping faults, so a test has to write one rather than provoke it.
+    use super::with_pool;
 
     /// The pool is process-global and cargo runs tests in parallel, so region
     /// counts are only stable while one test at a time is looking at them — and
@@ -2845,6 +3045,121 @@ mod tests {
             b.base() - a.base(),
             ((b.index() - a.index()) * REGION_BYTES) as u64,
             "region bases step by exactly the region stride"
+        );
+        Ok(())
+    }
+
+    /// A region the pool still has an owner for is never handed to a second
+    /// tenant, however it came to be on the free list.
+    ///
+    /// **The fault this catches writes over live data and does not fault**, so
+    /// there is no crash to work back from. Every address in the reservation is
+    /// mapped, and the tenants are unalike — a KV arena, the wave transient tier,
+    /// and a sequence's recurrent store all claim here — so the second tenant's
+    /// writes surface as a wrong number read by a different subsystem entirely.
+    /// It was measured as a whole recurrent state going non-finite, in contiguous
+    /// runs of layers, while the KV side read perfectly.
+    ///
+    /// The duplicate is injected rather than provoked: the point under test is
+    /// that the claim path refuses it, not which bookkeeping slip produced it.
+    /// The free list is emptied for the duration so the injected index is
+    /// certainly the one popped — the pool is process-global and another test's
+    /// releases would otherwise sit below it — and restored afterwards.
+    #[test]
+    fn a_region_still_held_is_never_issued_twice() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let held = claim_region(&s)?.expect("a region");
+        let idx = held.index();
+
+        // Stand the free list aside and offer only the live index.
+        let saved = with_pool(&s, |pool| {
+            let saved = std::mem::take(&mut pool.free);
+            pool.free.push(Reverse(idx));
+            Ok(saved)
+        })?;
+
+        let refused = claim_region(&s);
+
+        // Restore before asserting, so a failed assertion cannot wedge the pool for
+        // every test after it — it is process-global.
+        with_pool(&s, |pool| {
+            pool.free = saved;
+            Ok(())
+        })?;
+
+        // **`Err`, not `Ok(None)`.** `None` is this function's ordinary pressure
+        // signal and the caller answers it by buying ground and retrying, so
+        // returning it here would hide the breach behind a slower run. An `Err`
+        // propagates to the turn that asked.
+        let err = refused.expect_err("a region that is still held must not be issued");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("region {idx} was issued while still held")),
+            "the error must name the region and say what is wrong, got: {msg}"
+        );
+        // The guard must not have re-queued it, and must not have counted it as a
+        // second live region.
+        with_pool(&s, |pool| {
+            assert!(pool.owned[idx], "the real owner still holds it");
+            assert!(
+                !pool.free.iter().any(|Reverse(i)| *i == idx),
+                "a live region must not be left on the free list"
+            );
+            Ok(())
+        })?;
+        drop(held);
+        Ok(())
+    }
+
+    /// Releasing a region the pool does not think is held panics, rather than
+    /// quietly queuing a duplicate or quietly leaking it.
+    ///
+    /// Both quiet options were written and both were wrong. Queuing the index
+    /// hands the same ground to two tenants. Skipping the push keeps memory safe
+    /// but continues with the pool's bookkeeping known to be broken, so the next
+    /// occurrence is silent too and the run stops being evidence of anything.
+    #[test]
+    fn a_release_of_an_unheld_region_panics() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let held = claim_region(&s)?.expect("a region");
+        let idx = held.index();
+        let before = with_pool(&s, |pool| {
+            // Simulate the pool having lost track of this owner, which is the
+            // state a double release arrives in.
+            pool.owned[idx] = false;
+            Ok(pool.free.len())
+        })?;
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(held)));
+
+        // The unwind left `Drop` half-run: nothing queued, nothing decremented.
+        // Put the pool back before asserting — it is process-global, and
+        // `every_region_is_live_free_or_blocked` checks the partition over it, so a
+        // region left neither live nor free fails a later, unrelated test.
+        with_pool(&s, |pool| {
+            let queued = pool.free.len();
+            let on_list = pool.free.iter().any(|Reverse(i)| *i == idx);
+            pool.live -= 1;
+            pool.free.push(Reverse(idx));
+            pool.owned[idx] = false;
+            Ok((queued, on_list))
+        })
+        .map(|(queued, on_list)| {
+            assert_eq!(queued, before, "the panic must not have queued the region");
+            assert!(!on_list, "region {idx} must not have reached the free list");
+        })?;
+
+        let err = panicked.expect_err("an unheld release must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains(&format!("region {idx} released while not held")),
+            "the panic must name the region and say an owner was lost, got: {msg}"
         );
         Ok(())
     }

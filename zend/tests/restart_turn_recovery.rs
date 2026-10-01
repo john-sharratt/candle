@@ -13,8 +13,14 @@
 //! Runs on the 0.8B: the same hybrid stack as the production model, at a size
 //! that loads twice in seconds.
 //!
+//! Every test holds [`exclusive_engine_slot`] for its whole length. Each opens
+//! its own engines, and the wave gate is one per device, not one per engine: a
+//! forward on one engine refuses every other engine's arena creation, so tests
+//! run side by side refused each other's conversations mid-setup. The slot runs
+//! them one at a time whatever the thread count.
+//!
 //! ```text
-//! cargo test -p zend --features cuda --test restart_turn_recovery -- --test-threads=1
+//! cargo test -p zend --features cuda --test restart_turn_recovery
 //! ```
 
 mod common;
@@ -22,12 +28,13 @@ mod common;
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection::SectionLoads;
-use common::{say, Workspace};
+use common::{exclusive_engine_slot, say, Workspace};
 
 const MODEL: Model = Model::Qwen35_0_8B_Q8;
 
 #[test]
 fn a_clean_restart_recovers_every_sealed_turn() {
+    let _slot = exclusive_engine_slot();
     let device = Device::new_cuda(0).expect("cuda");
     let ws = Workspace::for_model(MODEL);
 
@@ -71,6 +78,7 @@ fn a_clean_restart_recovers_every_sealed_turn() {
 /// seals has.
 #[test]
 fn a_resumed_conversation_recovers_every_sealed_turn() {
+    let _slot = exclusive_engine_slot();
     let device = Device::new_cuda(0).expect("cuda");
     let ws = Workspace::for_model(MODEL);
 
@@ -121,6 +129,7 @@ fn a_resumed_conversation_recovers_every_sealed_turn() {
 /// log its successor writes.
 #[test]
 fn a_held_shut_down_engine_costs_its_successor_no_turns() {
+    let _slot = exclusive_engine_slot();
     let device = Device::new_cuda(0).expect("cuda");
     let ws = Workspace::for_model(MODEL);
 
@@ -170,6 +179,7 @@ fn a_held_shut_down_engine_costs_its_successor_no_turns() {
 /// whole system prompt again, one section per forward.
 #[test]
 fn a_restart_restores_every_section_instead_of_prefilling_it() {
+    let _slot = exclusive_engine_slot();
     let device = Device::new_cuda(0).expect("cuda");
     let ws = Workspace::for_model(MODEL);
 

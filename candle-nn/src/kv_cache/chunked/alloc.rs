@@ -18,7 +18,7 @@ use std::time::Instant;
 use candle::wave_provenance::LeaseOrigin;
 use candle::{DType, Device, Result, Tensor};
 
-use super::arena::ArenaKey;
+use super::arena::{ArenaKey, ArenaKind};
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
 use super::backing::KV_DEVICE_OOM_MARKER;
@@ -30,11 +30,18 @@ use super::head_gids::HeadGids;
 use super::region_pool;
 use super::size_class::{elems_per_chunk, SizeClass};
 use super::types::{ChunkWindow, DecodeLayout, CHUNK_SIZE};
+use super::write_placement::appended_tokens;
 use super::{Arena, ArenaLocation};
 use crate::kv_cache::arena_table::ArenaFormatTag;
 use crate::kv_cache::chunked::backing::BackingInner;
 use crate::kv_cache::chunked::ArenaStorageState;
 use crate::kv_cache::{KvFormat, QuantFormat};
+
+/// Stamps [`BackingInner::claim_slot_promoting`] makes before calling a lost claim a
+/// failure. A stamped arena is reclaimable at once, so a concurrent sweep can win it;
+/// losing that race several times in a row means the sweep and the stamp are fighting
+/// over every free region, which is not a race to keep retrying.
+const STAMP_ATTEMPTS: usize = 4;
 
 /// How many bytes of KV the reservation can still hold: free regions × the
 /// region size.
@@ -281,7 +288,7 @@ impl BackingInner {
         if key.location == ArenaLocation::Cpu {
             return Ok(None);
         }
-        enter_arena_window(&cd.cuda_stream()).map(Some)
+        enter_arena_window(&cd.cuda_stream(), "a KV arena").map(Some)
     }
 
     /// The same gate for an operation that **cannot be refused part-way**.
@@ -461,7 +468,7 @@ impl BackingInner {
     fn claim_slab(&self, key: ArenaKey, index: usize, arena_bytes: usize) -> Result<Arena> {
         if key.location == ArenaLocation::Cpu {
             let data = Tensor::zeros(arena_bytes, DType::U8, &Device::Cpu)?;
-            return Ok(Arena::new(data, key.class, key.location, index));
+            return Ok(Arena::new(data, key, index));
         }
         let Device::Cuda(cuda) = &self.device else {
             candle::bail!("a GPU arena needs a CUDA device, not {:?}", self.device)
@@ -501,12 +508,36 @@ impl BackingInner {
                     tier / (1 << 20),
                 )
             }
+            // A region under an arena that holds no chunk is occupied in name only, so
+            // say how many there are and what kept the sweep off them.
+            let empty = self.pool.empty_census();
+            let holding: Vec<String> = self
+                .pool
+                .occupancy()
+                .iter()
+                .map(|o| {
+                    format!(
+                        "{:?} class {} B: {} arenas, {} of {} slots live",
+                        o.key.kind,
+                        o.key.class.bytes(),
+                        o.arenas,
+                        o.live,
+                        o.arenas * o.arena_chunks,
+                    )
+                })
+                .collect();
             candle::bail!(
                 "{KV_DEVICE_OOM_MARKER}: no region is claimable for class {} B — every one of \
                  the KV reservation's {total} regions is occupied ({live} live), and the weight \
                  side would not sell any. It is at its floor: the fewest expert slots the cache \
-                 can serve a token with. The partition has nothing left to trade.",
+                 can serve a token with. The partition has nothing left to trade. This \
+                 backing's arenas holding no chunk: {} ({} inside their creation window, {} \
+                 protected). Held by: {}.",
                 key.class.bytes(),
+                empty.empty,
+                empty.in_creation,
+                empty.protected,
+                holding.join("; "),
             )
         };
         // A lease over the region: writes through it land in the reservation,
@@ -525,7 +556,7 @@ impl BackingInner {
                 LeaseOrigin::Foreign,
             )?
         };
-        Ok(Arena::new(data, key.class, key.location, index).in_region(region))
+        Ok(Arena::new(data, key, index).in_region(region))
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -535,7 +566,7 @@ impl BackingInner {
             ArenaLocation::Cpu => &Device::Cpu,
         };
         let data = Tensor::zeros(arena_bytes, DType::U8, device)?;
-        Ok(Arena::new(data, key.class, key.location, index))
+        Ok(Arena::new(data, key, index))
     }
 }
 
@@ -580,11 +611,17 @@ impl ChunkedKvBacking {
         // inline against the `&mut ArenaStorageState` the caller lent us.
         let mut key = key;
         let arena_idx = self.inner.pool.register_arena(key);
+        // The arena registered here, when there is one, is what the claim below takes
+        // from — by name, so its first `occupy` is what closes its creation window.
+        // `allocate_for` could land in another arena that freed a slot meanwhile, and
+        // this one would then keep its window open with nothing ever claiming from it.
+        let mut made = Some(arena_idx);
         if !arena_state.has_arena(arena_idx) {
             match self.create_arena(key, arena_idx) {
                 Ok(arena) => arena_state.push_arena(arena, arena_idx),
                 Err(e) => {
                     self.inner.pool.force_release_arena(arena_idx);
+                    made = None;
                     // Reactive empty sweep, exactly as `stamp_region_promoting`
                     // does before promoting: seal/requantize churn strands
                     // empty arenas that each pin a region, and the periodic
@@ -605,6 +642,7 @@ impl ChunkedKvBacking {
                         match self.create_arena(key, retry_idx) {
                             Ok(arena) => {
                                 arena_state.push_arena(arena, retry_idx);
+                                made = Some(retry_idx);
                                 created = true;
                             }
                             Err(_) => self.inner.pool.force_release_arena(retry_idx),
@@ -635,11 +673,18 @@ impl ChunkedKvBacking {
             }
         }
 
-        let gid = self
-            .inner
-            .pool
-            .allocate_for(key)
-            .ok_or_else(|| candle::Error::Msg("no slot in the region just claimed".into()))?;
+        let gid = match made {
+            Some(idx) => {
+                let gid = self.inner.pool.allocate_from_arena(key, idx);
+                // A claim that came back empty did not close the window, and an arena
+                // whose window stays open is never released.
+                self.inner.pool.finish_creation(key, idx);
+                gid
+            }
+            // Promoted: the probe above found a wider arena with room, not a named one.
+            None => self.inner.pool.allocate_for(key),
+        }
+        .ok_or_else(|| candle::Error::Msg("no slot in the region just claimed".into()))?;
         Ok(gid)
     }
 
@@ -882,8 +927,14 @@ impl BackingInner {
     /// Strictly scarcity-gated, and in this order: a class gets its own region
     /// whenever one is available, so promotion cannot become a background
     /// mixing vector.
+    ///
+    /// **A stamped arena comes back inside its creation window** (see
+    /// [`Self::claim_fresh_region_open`]), so the caller must claim from it by name and
+    /// then call `ChunkGidPool::finish_creation(placed, arena_idx)` whatever the claim's
+    /// outcome. For a promoted placement the arena already existed and that call is a
+    /// no-op, so a caller never needs to know which it got.
     fn stamp_region_promoting(&self, key: ArenaKey) -> Result<(ArenaKey, usize)> {
-        let stamp_err = match self.claim_fresh_region(key) {
+        let stamp_err = match self.claim_fresh_region_open(key) {
             Ok(arena_idx) => return Ok((key, arena_idx)),
             // **A wave-in-flight deferral is not scarcity, and must not be
             // treated as it.** Promotion exists to stop a rare format stamping a
@@ -906,12 +957,33 @@ impl BackingInner {
         // between-configs call) don't run inside a config's own churn, so the
         // claim that would otherwise fail is exactly the place to pay for one.
         if self.pool.has_reclaimable() && self.release_empty_arenas()? > 0 {
-            match self.claim_fresh_region(key) {
+            match self.claim_fresh_region_open(key) {
                 Ok(arena_idx) => return Ok((key, arena_idx)),
                 #[cfg(feature = "cuda")]
                 Err(e) if Self::is_wave_deferral(&e) => return Err(e),
                 Err(_) => {}
             }
+        }
+        // **Only a band claim may be promoted, and a record claim must NOT be.**
+        //
+        // Promotion widens `key.class` and rebuilds the key with `ArenaKey::new`, which
+        // is a `Band` key by construction. For a band that is the whole point — a rare
+        // format borrows a wider class's region instead of stamping one for itself. For a
+        // `KvHead` record it is silent corruption: the record would be handed a slot in a
+        // **band arena** and its bytes written on top of live K/V, which nothing
+        // downstream can catch. A record's size is model geometry
+        // (`n_kv_head × (head_dim/2 + 26 × n_palette)`), not a rung of the size-class
+        // ladder, so there is no wider class it belongs in and the stride check a caller
+        // does — "the slot is at least `record_bytes`" — passes happily on a 2 KiB band
+        // slot holding somebody's keys.
+        //
+        // Measured: with a compaction minting a fresh record per relocated chunk (800–1,400
+        // claims per pass) against a pool driven to saturation, the Flash-Next engine probe
+        // answered wrongly on one to three sessions of eight. A record claim that cannot
+        // get a region fails as itself instead, which the seal path and the compaction both
+        // already handle.
+        if !matches!(key.kind, ArenaKind::Band) {
+            return Err(stamp_err);
         }
         // No region. Look for a wider class that already has one with room.
         let mut class = key.class;
@@ -937,17 +1009,45 @@ impl BackingInner {
     }
 
     /// Register and materialise one region for `key`, rolling the registration
-    /// back if it cannot be materialised.
+    /// back if it cannot be materialised — and return it **still inside its creation
+    /// window**.
     ///
     /// Without the rollback the pool would advertise free slots that storage
     /// cannot produce: every later claim into that arena fails the same way,
     /// and `total_arenas` inflates the occupancy diagnostic.
-    fn claim_fresh_region(&self, key: ArenaKey) -> Result<usize> {
+    ///
+    /// **The caller closes the window, on every path.** While it is open no sweep can
+    /// release the arena, which is what lets the caller claim from it by name without
+    /// racing another thread's sweep — and an index released under a claimer can be
+    /// re-registered for someone else mid-creation, so the claim would land in a
+    /// half-built arena. Once the caller has claimed, or decided not to, it calls
+    /// `ChunkGidPool::finish_creation`: a no-op if its claim already closed the window,
+    /// and otherwise the step that makes an arena nothing used reclaimable. A window
+    /// left open is a region no sweep will ever release.
+    pub(super) fn claim_fresh_region_open(&self, key: ArenaKey) -> Result<usize> {
         let arena_idx = self.pool.register_arena(key);
         if let Err(e) = self.ensure_arena_exists(arena_idx, key) {
             self.pool.force_release_arena(arena_idx);
             return Err(e);
         }
+        Ok(arena_idx)
+    }
+
+    /// One region for `key`, running `hold` on the new index before its creation
+    /// window closes, and returned reclaimable.
+    ///
+    /// For a creator that means to keep the arena empty for a while: whatever `hold`
+    /// does to keep it (protecting it, in practice) is in place before any sweep can
+    /// see the arena as reclaimable. Doing it after the return leaves a gap in which a
+    /// sweep on another thread can take the arena the creator is about to use.
+    pub(super) fn claim_fresh_region_then(
+        &self,
+        key: ArenaKey,
+        hold: impl FnOnce(usize),
+    ) -> Result<usize> {
+        let arena_idx = self.claim_fresh_region_open(key)?;
+        hold(arena_idx);
+        self.pool.finish_creation(key, arena_idx);
         Ok(arena_idx)
     }
 
@@ -958,17 +1058,31 @@ impl BackingInner {
     /// from the band's *format* bytes, never from the stride, so a chunk in a
     /// larger class is simply a chunk with more unread pad
     /// (`docs/archived/arena_unification.md` §3.4, invariant 8). Only the waste changes.
-    pub(super) fn claim_slot_promoting(&self, key: ArenaKey) -> Result<super::gid_pool::ChunkGid> {
-        if let Some(gid) = self.pool.allocate_for(key) {
-            self.ensure_arena_exists(gid.arena_idx(), key)?;
-            return Ok(gid);
+    ///
+    /// **The claim names the arena the stamp produced**, while that arena's creation
+    /// window is still open — so no sweep can release it in between — and the window is
+    /// closed after the claim whatever it returned. Left to `allocate_for` the claim
+    /// could land in another arena that freed a slot meanwhile, and the stamped one
+    /// would then sit empty. A promoted placement is an existing arena other claimers
+    /// share, so its free slot can be taken first; that goes round again, and a stamp
+    /// that fails ends the loop.
+    pub(super) fn claim_slot_promoting(&self, key: ArenaKey) -> Result<ChunkGid> {
+        for _ in 0..STAMP_ATTEMPTS {
+            if let Some(gid) = self.pool.allocate_for(key) {
+                self.ensure_arena_exists(gid.arena_idx(), key)?;
+                return Ok(gid);
+            }
+            let (placed, arena_idx) = self.stamp_region_promoting(key)?;
+            let claimed = self.pool.allocate_from_arena(placed, arena_idx);
+            self.pool.finish_creation(placed, arena_idx);
+            if let Some(gid) = claimed {
+                return Ok(gid);
+            }
         }
-        let (placed, _) = self.stamp_region_promoting(key)?;
-        self.pool.allocate_for(placed).ok_or_else(|| {
-            candle::Error::Msg(
-                "claim_slot_promoting: the region that just reported room has none".into(),
-            )
-        })
+        candle::bail!(
+            "claim_slot_promoting: {STAMP_ATTEMPTS} placements for {key:?} each had their \
+             free slot taken by another claimer before this one could take it"
+        )
     }
 
     pub(super) fn alloc_chunk_for_key(
@@ -1027,7 +1141,11 @@ impl BackingInner {
             let (placed, arena_idx) = self.stamp_region_promoting(key)?;
             key = placed;
             let _ = arena_chunks;
-            if let Some(gids) = self.pool.allocate_run_for_in(key, arena_idx, len) {
+            let run = self.pool.allocate_run_for_in(key, arena_idx, len);
+            // Closed after the claim, whatever it returned — see
+            // `stamp_region_promoting`.
+            self.pool.finish_creation(key, arena_idx);
+            if let Some(gids) = run {
                 self.replenish_if_nearly_dry(key, len);
                 return Ok(gids);
             }
@@ -1072,17 +1190,37 @@ impl BackingInner {
         }
         let mut out: Vec<super::gid_pool::ChunkGid> = Vec::with_capacity(n);
         let mut key = key;
+        // Placements in a row whose slots other claimers took before this batch could.
+        // Each placement either feeds the batch or is lost that way; a run of losses is
+        // contention, not progress, and is not retried forever.
+        let mut fruitless = 0usize;
         while out.len() < n {
             let remaining = n - out.len();
-            let batch = self.pool.allocate_n_for(key, remaining);
+            let mut batch = self.pool.allocate_n_for(key, remaining);
             if batch.is_empty() {
+                if fruitless == STAMP_ATTEMPTS {
+                    candle::bail!(
+                        "alloc_chunks_for_key_bulk: {STAMP_ATTEMPTS} placements for {key:?} \
+                         in a row were taken by other claimers before this batch could \
+                         claim from them ({} of {n} allocated)",
+                        out.len(),
+                    );
+                }
                 // Pool exhausted — stamp a fresh region, widening if this
                 // class cannot get one. Later passes then fill from the class
-                // that could, so a partially-promoted batch is normal.
-                let (placed, _) = self.stamp_region_promoting(key)?;
+                // that could, so a partially-promoted batch is normal. The batch
+                // claims while the stamped arena's creation window is open, and
+                // closes it after — see `stamp_region_promoting`.
+                let (placed, arena_idx) = self.stamp_region_promoting(key)?;
                 key = placed;
-                continue;
+                batch = self.pool.allocate_n_for(key, remaining);
+                self.pool.finish_creation(key, arena_idx);
+                if batch.is_empty() {
+                    fruitless += 1;
+                    continue;
+                }
             }
+            fruitless = 0;
             // Ensure every unique arena index we just got is materialised
             // in storage. Most calls hit the cheap `storage.read`-only
             // path because the arena already exists.
@@ -2157,5 +2295,20 @@ impl ChunkedKvBacking {
         }
 
         Ok(())
+    }
+
+    /// Allocate writer capacity for a write of logical tokens `offset..offset +
+    /// add`, by the placement rule `write_contiguous` writes them by
+    /// (`write_placement`): positions the sequence already holds need nothing,
+    /// the rest need writer capacity from the writer boundary.
+    pub(super) fn ensure_for_append(&self, batch_idx: usize, offset: usize, add: usize) -> Result<()> {
+        let appended = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            appended_tokens(state.sequences[batch_idx].as_ref(), offset, add)
+        };
+        self.ensure_for_batch_entries(&[(batch_idx, offset)], appended)
     }
 }

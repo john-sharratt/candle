@@ -1,0 +1,58 @@
+name: run_command
+questions:
+- run the tests
+- does it still build after that change
+- npm test
+- run cargo check on it
+- execute the unit tests and tell me what failed
+- run the linter over the source
+- format the code with the project's formatter
+- build the project in release mode
+- run the benchmark script in the scripts folder
+- does the test suite pass now
+- try compiling it
+- run node on the entry file and show me the output
+- run pytest for the parser module
+- regenerate the lockfile with npm install
+- kick off the integration tests
+- run the failing test again to see if the fix works
+- check whether the typescript type-checker is happy
+- run the demo and paste what it prints
+category: Commands
+description: 'Run a program — a build, a test suite, a formatter, a script — in the named repository, on your branch with your uncommitted changes laid down, and wait for it to finish. `program` is the program alone (`npm`, `node`, `cargo`, `python`) and `args` its arguments, each passed exactly as written — `npm test` is program `npm` with args `["test"]`, and a script in the repository runs through its interpreter: program `node`, args `["scripts/report.js"]`. There is no shell, so no `&&`, pipes or redirects — run one program per call; a refusal names the programs that do run. Files the program changes come back into your uncommitted changes, as if you had edited them. git cannot be run here; use the git tools. Refused while your files and your branch disagree: when the branch has commits you do not have, git_merge them in first; when a merge brought commits your branch does not have yet, git_commit with `from: all_changes` publishes them first. Use for: running the tests after an edit, building, formatting, running a script or the program itself. Triggered by "run the tests", "does it build", "npm test", "cargo check". Returns the exit code, whether it timed out, the files it changed, and the first page of what it printed; read further pages with run_output.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    repo:
+      description: The repository to run in. Required.
+      minLength: 1
+      type: string
+    program:
+      description: 'The program to start, by name (`npm`, `node`, `cargo`, `python`). The program alone — no shell, so no `&&`, pipes or redirects; a script in the repository is an argument to its interpreter. Required.'
+      minLength: 1
+      type: string
+    args:
+      description: 'Its arguments, each passed exactly as written, with no shell quoting or globbing: `["test"]` for `npm test`, `["test", "--", "--test-name-pattern", "lowStock"]`, `[]` for none. Required.'
+      items:
+        type: string
+      type: array
+    timeout_secs:
+      description: Seconds before the program and everything it started are killed. Optional; 600 by default, at most 1800.
+      format: uint32
+      maximum: 1800.0
+      minimum: 1.0
+      type: integer
+  required:
+  - repo
+  - program
+  - args
+  title: RunRequest
+  type: object
+examples:
+- run the tests in zend-test<|im_end|>
+- does the project still build?<|im_end|>
+- run npm test and tell me which tests fail<|im_end|>
+- format the source with the project's formatter<|im_end|>
+- run the script scripts/report.js with node<|im_end|>
+- run node src/index.js and show me what it prints<|im_end|>

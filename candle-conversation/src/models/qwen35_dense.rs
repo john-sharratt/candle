@@ -36,7 +36,7 @@
 //! [`crate::models::overrides`] for why that indirection exists — a private
 //! fine-tune belongs on the machine that runs it, not in a public repository.
 
-use super::{ModelArch, ModelSpec};
+use super::{ModelArch, ModelSpec, RopePreset};
 use crate::{config::SamplingConfig, models::DialectType};
 use candle_transformers::models::quantized_qwen35;
 
@@ -114,6 +114,7 @@ pub(super) fn qwen35_9b_q6() -> ModelSpec {
         tokenizer_rev: quantized_qwen35::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
+        rope: RopePreset::Lineage,
         // **The lineage's own arch string, not Qwen3's.** A preset's sampling is taken as-is by
         // `ModelBuilder::from_spec` — only `Model::custom` re-detects from the GGUF — so asking
         // for `"qwen3"` here is the whole decision, and it silently ran this model on the
@@ -149,6 +150,7 @@ pub(super) fn qwen35_0_8b_q8() -> ModelSpec {
         tokenizer_rev: quantized_qwen35::TOKENIZER_REV.into(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 8192,
+        rope: RopePreset::Lineage,
         default_sampling: SamplingConfig::for_gguf_architecture(ARCH),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture(ARCH),

@@ -47,8 +47,8 @@ __device__ __forceinline__ void quantize_block_q8_1_vec(
     float sum = local_sum;
     #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xff, amax, offset, 8));
-        sum += __shfl_xor_sync(0xff, sum, offset, 8);
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
+        sum += __shfl_xor_sync(0xffffffff, sum, offset, 8);
     }
     amax = __shfl_sync(0xffffffff, amax, 0, 32);
     sum = __shfl_sync(0xffffffff, sum, 0, 32);
@@ -136,8 +136,8 @@ __device__ __forceinline__ void quantize_blocks_q8_1(
         float sum = local_sum;
         #pragma unroll
         for (int offset = 4; offset > 0; offset >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(0xff, amax, offset, 8));
-            sum += __shfl_xor_sync(0xff, sum, offset, 8);
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
+            sum += __shfl_xor_sync(0xffffffff, sum, offset, 8);
         }
         amax = __shfl_sync(0xffffffff, amax, 0, 32);
         sum = __shfl_sync(0xffffffff, sum, 0, 32);

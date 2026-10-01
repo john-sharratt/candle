@@ -32,6 +32,7 @@ use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
 use candle_transformers::models::batched_model::BatchedInference;
+use candle_transformers::models::rope_schedule::{DeclaredScaling, RopePreset, RopeSchedule};
 use candle_transformers::models::{
     quantized_llama, quantized_qwen2, quantized_qwen3, quantized_qwen3_moe,
 };
@@ -149,6 +150,29 @@ enum ModelArch {
     Llama,
 }
 
+// ── RoPE schedules ────────────────────────────────────────────────────────────
+
+/// Qwen3 dense files' declared `context_length`.
+const QWEN3_DENSE_CONTEXT: usize = 40_960;
+/// Qwen3-30B-A3B-Instruct-2507 is trained natively to 262K: its file's
+/// frequencies run as stated at every length, with no YaRN rungs over them.
+const QWEN3_MOE_2507_CONTEXT: usize = 262_144;
+/// Qwen2's trained window.
+const QWEN2_CONTEXT: usize = 32_768;
+/// Llama 3.1 / 3.2's window, reached by the Llama3 scaling the file states.
+const LLAMA3_CONTEXT: usize = 131_072;
+
+/// The schedule the engine runs Qwen3 dense on: progressive YaRN over the
+/// file's plain frequencies at base `theta` — refused for a file declaring a
+/// scaling of its own.
+fn qwen3_dense_schedule(
+    inv_freq: Vec<f32>,
+    theta: f32,
+    declared: DeclaredScaling,
+) -> Result<RopeSchedule> {
+    RopePreset::qwen3().gqa_schedule(inv_freq, Some(theta), declared, QWEN3_DENSE_CONTEXT)
+}
+
 // ── Compression arg (same as perplexity-eval) ─────────────────────────────────
 
 #[allow(non_camel_case_types)]
@@ -228,10 +252,27 @@ impl CompressionArg {
 // ── Model enum ────────────────────────────────────────────────────────────────
 
 enum Model {
-    Qwen3(quantized_qwen3::ModelWeights),
+    /// The weights, the file's RoPE base θ, which the progressive Qwen3
+    /// schedule computes its YaRN rungs from, and the scaling the file declares.
+    Qwen3(quantized_qwen3::ModelWeights, f32, DeclaredScaling),
     Qwen3Moe(quantized_qwen3_moe::ModelWeights),
     Qwen2(quantized_qwen2::ModelWeights),
     Llama(quantized_llama::ModelWeights),
+}
+
+/// A GGUF's RoPE base θ, from `{arch}.rope.freq_base`.
+fn gguf_rope_theta(content: &gguf_file::Content) -> Result<f32> {
+    let arch = content
+        .metadata
+        .get("general.architecture")
+        .ok_or_else(|| candle::Error::Msg("gguf states no general.architecture".into()))?
+        .to_string()?;
+    let key = format!("{arch}.rope.freq_base");
+    content
+        .metadata
+        .get(&key)
+        .ok_or_else(|| candle::Error::Msg(format!("gguf states no {key}")))?
+        .to_f32()
 }
 
 impl Model {
@@ -246,9 +287,13 @@ impl Model {
                 let mut file = std::fs::File::open(model_path)?;
                 let content = gguf_file::Content::read(&mut file)?;
                 match arch {
-                    ModelArch::Qwen3 => Ok(Model::Qwen3(quantized_qwen3::ModelWeights::from_gguf(
-                        content, &mut file, device,
-                    )?)),
+                    ModelArch::Qwen3 => {
+                        let theta = gguf_rope_theta(&content)?;
+                        let declared = DeclaredScaling::from_gguf(&content.metadata, "qwen3")?;
+                        let m =
+                            quantized_qwen3::ModelWeights::from_gguf(content, &mut file, device)?;
+                        Ok(Model::Qwen3(m, theta, declared))
+                    }
                     ModelArch::Qwen2 => Ok(Model::Qwen2(quantized_qwen2::ModelWeights::from_gguf(
                         content, &mut file, device,
                     )?)),
@@ -275,36 +320,40 @@ enum BatchedModel {
 impl BatchedModel {
     fn from_model(model: Model, device: &Device) -> Result<Self> {
         match model {
-            Model::Qwen3(m) => {
+            Model::Qwen3(m, theta, declared) => {
                 let inv_freq = m
                     .rope_inv_freq()
                     .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
-                Ok(Self::Qwen3(BatchedInference::new_with_inv_freq(
-                    m, inv_freq, 4096, device,
+                let schedule = qwen3_dense_schedule(inv_freq, theta, declared)?;
+                Ok(Self::Qwen3(BatchedInference::new_with_schedule(
+                    m, &schedule, 4096, device,
                 )?))
             }
             Model::Qwen3Moe(m) => {
                 let inv_freq = m
                     .rope_inv_freq()
                     .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
-                Ok(Self::Qwen3Moe(BatchedInference::new_with_inv_freq(
-                    m, inv_freq, 4096, device,
+                let schedule = RopeSchedule::stated(inv_freq, QWEN3_MOE_2507_CONTEXT)?;
+                Ok(Self::Qwen3Moe(BatchedInference::new_with_schedule(
+                    m, &schedule, 4096, device,
                 )?))
             }
             Model::Qwen2(m) => {
                 let inv_freq = m
                     .rope_inv_freq()
                     .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
-                Ok(Self::Qwen2(BatchedInference::new_with_inv_freq(
-                    m, inv_freq, 4096, device,
+                let schedule = RopeSchedule::stated(inv_freq, QWEN2_CONTEXT)?;
+                Ok(Self::Qwen2(BatchedInference::new_with_schedule(
+                    m, &schedule, 4096, device,
                 )?))
             }
             Model::Llama(m) => {
                 let inv_freq = m
                     .rope_inv_freq()
                     .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
-                Ok(Self::Llama(BatchedInference::new_with_inv_freq(
-                    m, inv_freq, 4096, device,
+                let schedule = RopeSchedule::stated(inv_freq, LLAMA3_CONTEXT)?;
+                Ok(Self::Llama(BatchedInference::new_with_schedule(
+                    m, &schedule, 4096, device,
                 )?))
             }
         }

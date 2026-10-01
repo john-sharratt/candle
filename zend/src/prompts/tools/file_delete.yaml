@@ -25,121 +25,126 @@ questions:
 - remove the file to free up session space
 - discard the file I wrote by mistake
 category: Files
-description: 'Remove a file from this session''s view. Use for: removing a draft that''s no longer needed, cleaning up before exporting, getting rid of an uploaded file the user wants gone, freeing space within the 10 MiB session budget. Triggered by "delete the file", "remove", "rm", "get rid of the file called". Returns the path and a deleted flag. A project file on disk is NOT erased — it is only hidden from this session, and reappears in a new one. For removing files on remote systems use remote_fs_session_delete.'
-high_risk: true
+description: 'Remove a file from this session''s view, in the named repo. Use for: removing a draft that''s no longer needed, cleaning up before exporting, getting rid of an uploaded file the user wants gone, freeing space within the 10 MiB session budget. Triggered by "delete the file", "remove", "rm", "get rid of the file called". Returns the repo, the path and a deleted flag. A project file is NOT erased — it is only hidden from this conversation. For removing files on remote systems use remote_fs_session_delete.'
+high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
+    repo:
+      description: The repository the file belongs to. Required.
+      minLength: 1
+      type: string
     path:
-      description: 'Path of the file to remove from this session''s view (e.g. `src/main.rs`). A project file is hidden, not erased from disk. Required.'
+      description: 'Path of the file to remove from this session''s view, relative to the repository (e.g. `src/main.rs`). A project file is hidden, not erased from disk. Required.'
       minLength: 1
       type: string
   required:
+  - repo
   - path
   title: DeleteRequest
   type: object
 examples:
 - |-
-  delete the file /workspace/tmp/scratch.txt<|im_end|>
+  delete the file tmp/scratch.txt<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to delete the file at /workspace/tmp/scratch.txt. Let me check the available tools. There's a function called file_delete that takes a path parameter. The description says it deletes a file from the VFS. The required parameter is "path", which should be the relative path<|projection|> in the session's filesystem.
+  Okay, the user wants to delete the file at tmp/scratch.txt, without naming a repository — the workspace's generic app repository is where this goes. Let me check the available tools. There's a function called file_delete that takes repo and path parameters. The description says it deletes a file from the VFS, in a named repo. The required parameters are "repo" and "path", where path should be relative<|projection|> to the repository.
 
-  The user provided the exact path, so I just need to call file_delete with {"path": "/workspace/tmp/scratch.txt"}. I don't see any issues here. The response will confirm the deletion. Alright, let's make the tool call.
+  The user provided the exact path, so I just need to call file_delete with {"repo": "app", "path": "tmp/scratch.txt"}. I don't see any issues here. The response will confirm the deletion. Alright, let's make the tool call.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/tmp/scratch.txt"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "tmp/scratch.txt"}}
   </tool_call><|projection|>
 - |-
-  remove /workspace/config.bak<|im_end|>
+  remove config.bak<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to remove the file at /workspace/config.bak. Let me check the available tools. There's a function called file_delete that deletes a file from the VFS. The parameters require the path, which in this case is /workspace/config.bak. I need to make sure the<|projection|> path is correctly specified. Since the user provided the exact path, I can directly call the tool with that path. No other parameters are needed. Alright, time to structure the tool call.
+  Okay, the user wants to remove the file config.bak, without naming a repository — the workspace's generic app repository is where this root file belongs. Let me check the available tools. There's a function called file_delete that deletes a file from the VFS, in a named repo. The parameters require repo and path, which in this case are "app" and "config.bak". I need to make sure the<|projection|> path is correctly specified, relative to the repository. Since the user provided the exact path, I can directly call the tool with that path. Alright, time to structure the tool call.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/config.bak"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "config.bak"}}
   </tool_call><|projection|>
 - |-
-  delete /workspace/build/output.log<|im_end|>
+  delete build/output.log<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to delete the file at /workspace/build/output.log. Let me check the available tools. There's a file_delete tool that takes a path parameter. The description says it's for deleting files from the session VFS. The required parameter is "path", which should be the relative path<|projection|> in the session.
+  Okay, the user wants to delete the file at build/output.log, without naming a repository — the workspace's generic app repository is where this goes. Let me check the available tools. There's a file_delete tool that takes repo and path parameters. The description says it's for deleting files from the session VFS, in a named repo. The required parameters are "repo" and "path", where path should be relative<|projection|> to the repository.
 
-  The user provided the path as "/workspace/build/output.log". I need to pass that exact path to the tool. Since the tool expects a JSON object with the "path" key, I'll structure the arguments accordingly. No other parameters are needed here. Just make sure the JSON is correctly formatted.
+  The user provided the path as "build/output.log". I need to pass that exact path to the tool, along with the repo "app". Since the tool expects a JSON object with the "repo" and "path" keys, I'll structure the arguments accordingly. Just make sure the JSON is correctly formatted.
   <|projection|></think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/build/output.log"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "build/output.log"}}
   </tool_call><|projection|>
 - |-
-  get rid of the file /workspace/notes/draft.md<|im_end|>
+  get rid of the file notes/draft.md<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to delete the file /workspace/notes/draft.md. Let me check the available tools. There's a function called file_delete that takes a path parameter. The description says it's for deleting files from the VFS. The required parameter is "path", which should be the session<|projection|>-relative path. The user provided the absolute path, but I think in this context, the path should be relative to the session's root. So I should use "/workspace/notes/draft.md" as the path. I need to make sure the JSON is correctly formatted with the path. No other parameters are needed.<|projection|> The response should be a JSON object inside the tool_call tags.
+  Okay, the user wants to delete the file notes/draft.md, without naming a repository — the workspace's generic app repository is where this goes. Let me check the available tools. There's a function called file_delete that takes repo and path parameters. The description says it's for deleting files from the VFS, in a named repo. The required parameters are "repo" and "path", where path<|projection|> should be relative to the repository. So I should use repo "app" and path "notes/draft.md". I need to make sure the JSON is correctly formatted with both.<|projection|> The response should be a JSON object inside the tool_call tags.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/notes/draft.md"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "notes/draft.md"}}
   </tool_call><|projection|>
 - |-
-  can you clean up /workspace/target/debug/incremental.tmp<|im_end|>
+  can you clean up target/debug/incremental.tmp<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user is asking to delete the file at /workspace/target/debug/incremental.tmp. Let me check the tools available. There's a file_delete tool that takes a path parameter. The required parameter is "path", which needs to be a string. The example given is something like "src/main<|projection|>.rs". So I need to call file_delete with the path "/workspace/target/debug/incremental.tmp". I should make sure the JSON is correctly formatted with the path inside a JSON object. No other parameters are needed since the tool only requires the path. Let me double-check the syntax for the tool call. Yep,<|projection|> the name is "file_delete" and the arguments are a JSON object with the path. Alright, that's all.
+  Okay, the user is asking to delete the file at target/debug/incremental.tmp, without naming a repository — the workspace's generic app repository is where this goes. Let me check the tools available. There's a file_delete tool that takes repo and path parameters. Both are required, and path needs to be a string relative to the repository. The example given is something like "src/main<|projection|>.rs". So I need to call file_delete with repo "app" and path "target/debug/incremental.tmp". I should make sure the JSON is correctly formatted with both inside a JSON object. Let me double-check the syntax for the tool call. Yep,<|projection|> the name is "file_delete" and the arguments are a JSON object with repo and path. Alright, that's all.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/target/debug/incremental.tmp"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "target/debug/incremental.tmp"}}
   </tool_call><|projection|>
 - |-
-  I don't need /workspace/old/legacy.py anymore, delete it<|im_end|>
+  I don't need old/legacy.py anymore, delete it<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to delete the file /workspace/old/legacy.py. Let me check the tools available. There's a function called file_delete that takes a path. The parameters require the path as a string. The user provided the exact path, so I just need to call file_delete with that<|projection|> path. Make sure the JSON is correctly formatted.
+  Okay, the user wants to delete the file old/legacy.py, without naming a repository — the workspace's generic app repository is where this goes. Let me check the tools available. There's a function called file_delete that takes repo and path. Both parameters are required, path as a string relative to the repository. The user provided the exact path, so I just need to call file_delete with repo "app" and that<|projection|> path. Make sure the JSON is correctly formatted.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/old/legacy.py"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "old/legacy.py"}}
   </tool_call><|projection|>
 - |-
-  wipe /workspace/cache/session.dat<|im_end|>
+  wipe cache/session.dat<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to delete the file located at /workspace/cache/session.dat. Let me check the available tools. There's a function called file_delete which takes a path parameter. The description says it's for deleting files from the session VFS. The required parameter is the path, which in this case<|projection|> is /workspace/cache/session.dat. I need to structure the tool call correctly. The JSON should have the name as "file_delete" and the arguments with the path. I'll make sure the JSON is properly formatted without any syntax errors.
+  Okay, the user wants to delete the file located at cache/session.dat, without naming a repository — the workspace's generic app repository is where this goes. Let me check the available tools. There's a function called file_delete which takes repo and path parameters. The description says it's for deleting files from the session VFS, in a named repo. The required parameters are repo and path, which in this case<|projection|> are "app" and "cache/session.dat". I need to structure the tool call correctly. The JSON should have the name as "file_delete" and the arguments with repo and path. I'll make sure the JSON is properly formatted without any syntax errors.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/cache/session.dat"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "cache/session.dat"}}
   </tool_call><|projection|>
 - |-
-  trash the file at /workspace/downloads/duplicate(1).zip<|im_end|>
+  trash the file at downloads/duplicate(1).zip<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Okay, the user wants to delete the file at /workspace/downloads/duplicate(1).zip. Let me check the available tools. There's a function called file_delete that takes a path. The parameters require the path as a string. The user specified the exact path, so I should call file_delete with<|projection|> that path. I need to make sure the JSON is correctly formatted with the path inside the arguments. No other tools are needed here. Just trigger the deletion.
+  Okay, the user wants to delete the file at downloads/duplicate(1).zip, without naming a repository — the workspace's generic app repository is where this goes. Let me check the available tools. There's a function called file_delete that takes repo and path. Both parameters are required, path as a string relative to the repository. The user specified the exact path, so I should call file_delete with<|projection|> repo "app" and that path. I need to make sure the JSON is correctly formatted with both inside the arguments. Just trigger the deletion.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "/workspace/downloads/duplicate(1).zip"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "downloads/duplicate(1).zip"}}
   </tool_call><|projection|>
 - |-
-  remove scratch/example.rs<|im_end|>
+  remove scratch/example.rs from the candle repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants that file gone. file_delete removes a path from this session's view. scratch/example.rs was created during this session, so it simply disappears;<|projection|> had it been a project file it would only be hidden, not erased from disk.
+  The user wants that file gone, and names the candle repository. file_delete removes a path from this session's view within a repo. scratch/example.rs was created during this session, so it simply disappears;<|projection|> had it been a project file it would only be hidden, not erased from disk.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "scratch/example.rs"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "candle", "path": "scratch/example.rs"}}
   </tool_call><|projection|>
 - |-
   delete the draft notes.md<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A request to drop the draft. file_delete takes the path and returns a deleted flag. The path here is notes.md.<|projection|> Nothing on disk is erased by this — it only removes the file from what this session sees.
+  A request to drop the draft, without naming a repository — the workspace's generic app repository is where this goes. file_delete takes the repo and path and returns a deleted flag. The repo here is "app" and the path is notes.md.<|projection|> Nothing on disk is erased by this — it only removes the file from what this session sees.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_delete", "arguments": {"path": "notes.md"}}
+  <|projection|>{"name": "file_delete", "arguments": {"repo": "app", "path": "notes.md"}}
   </tool_call><|projection|>

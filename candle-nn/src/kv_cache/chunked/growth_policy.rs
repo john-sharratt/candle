@@ -29,7 +29,9 @@
 //! 1. **Observation.** Nothing is spare until something has been demanded.
 //! 2. **The derivative.** Demand rising, or a purchase since the last look, means
 //!    whatever is free is about to be taken.
-//! 3. **Occupancy.** What the KV side does not hold, less a slack margin.
+//! 3. **Occupancy.** What the KV side does not hold *above its highest live
+//!    region*, less a slack margin — the floor moves as one edge, so a hole below
+//!    a live arena is not ground the weights can take.
 //!
 //! There used to be a fourth — a windowed maximum of past demand — and removing
 //! it is what un-stuck the boundary. See [`GrowthPolicy::spare`].
@@ -125,6 +127,15 @@ pub struct Occupancy {
     /// wave open, so a standing tier's bytes are dead until phase 0 releases
     /// them.
     pub ceiling_blocked: usize,
+    /// Regions between the highest live one and the top of the KV side — the
+    /// frontier gap, and the only ground the weight side can actually take.
+    ///
+    /// The floor moves as one edge, so a free region *below* a live one is spare
+    /// to the KV side and unreachable to the weights: `set_weight_floor` refuses
+    /// any floor that would cut a live region. Offering holes produced a floor the
+    /// pool then refused — 489 `requested boundary move failed … region 198 is
+    /// live` in one night's ingest, each after a whole-device quiesce.
+    pub free_above_live: usize,
     /// The transient tier's current footprint, bytes.
     pub tier_bytes: usize,
     /// The widest tier this process has stood, bytes.
@@ -153,6 +164,9 @@ pub enum Refusal {
     /// The KV side is holding it. This is the only refusal that means the
     /// partition is working and the answer is simply no.
     Occupied,
+    /// Ground is free, but in holes below a live region — nothing the floor can
+    /// reach. Compaction packs the arenas down and turns this into a gap.
+    Fragmented,
 }
 
 /// The growth direction's decision and the state it carries between calls.
@@ -258,8 +272,14 @@ impl GrowthPolicy {
         // planned tier, which `WavePlan` knows and this signature does not — so
         // it is left undeducted deliberately, and named.
         let by_occupancy = occ.free_below_ceiling + occ.ceiling_blocked;
-        match by_occupancy.saturating_sub(slack) {
-            0 => Err(Refusal::Occupied),
+        if by_occupancy.saturating_sub(slack) == 0 {
+            return Err(Refusal::Occupied);
+        }
+        // **Only the frontier gap is takeable.** The free count includes holes
+        // below live regions, which the floor cannot cross; the grant is the gap
+        // less the slack, whatever the free list says.
+        match by_occupancy.min(occ.free_above_live).saturating_sub(slack) {
+            0 => Err(Refusal::Fragmented),
             n => Ok(n),
         }
     }
@@ -271,11 +291,13 @@ mod tests {
 
     const R: usize = 16 * 1024 * 1024;
 
+    /// A packed KV side: every free region sits above the live ones.
     fn steady(live: usize, free: usize) -> Occupancy {
         Occupancy {
             live,
             free_below_ceiling: free,
             ceiling_blocked: 0,
+            free_above_live: free,
             tier_bytes: 0,
             tier_high_water: 0,
         }
@@ -321,6 +343,7 @@ mod tests {
             live: 100,
             free_below_ceiling: 20,
             ceiling_blocked: 80,
+            free_above_live: 100,
             tier_bytes: 0,
             tier_high_water: 57 * R,
         };
@@ -339,6 +362,43 @@ mod tests {
         assert_eq!(p.spare(steady(500, 0), 32, R), Err(Refusal::Occupied));
         // And slack is never underflowed into a grant.
         assert_eq!(p.spare(steady(500, 10), 32, R), Err(Refusal::Occupied));
+    }
+
+    /// Holes below a live region are not offered: the grant is the frontier gap
+    /// less the slack. The numbers are the refusal the daemon logged — 587
+    /// regions, region 198 live, a free list that reached below it.
+    #[test]
+    fn only_the_frontier_gap_is_offered() {
+        let mut p = GrowthPolicy::new();
+        let occ = Occupancy {
+            live: 150,
+            free_below_ceiling: 437,
+            ceiling_blocked: 0,
+            free_above_live: 587 - 199,
+            tier_bytes: 0,
+            tier_high_water: 0,
+        };
+        let _ = p.spare(occ, 32, R);
+        let _ = p.spare(occ, 32, R);
+        assert_eq!(p.spare(occ, 32, R), Ok(587 - 199 - 32));
+    }
+
+    /// Free ground that is all holes refuses as fragmented, not as occupied —
+    /// the fix for one is compaction, for the other nothing.
+    #[test]
+    fn free_ground_below_a_live_region_refuses_as_fragmented() {
+        let mut p = GrowthPolicy::new();
+        let occ = Occupancy {
+            live: 100,
+            free_below_ceiling: 300,
+            ceiling_blocked: 0,
+            free_above_live: 20,
+            tier_bytes: 0,
+            tier_high_water: 0,
+        };
+        let _ = p.spare(occ, 32, R);
+        let _ = p.spare(occ, 32, R);
+        assert_eq!(p.spare(occ, 32, R), Err(Refusal::Fragmented));
     }
 
     /// **The ratchet, as a trajectory.** Demand rises and falls; the ground that

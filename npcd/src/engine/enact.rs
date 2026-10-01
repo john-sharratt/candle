@@ -49,6 +49,8 @@ pub fn is_mine(tool: &str) -> bool {
             | "engage"
             | "operate"
             | "recall"
+            | "lift_call"
+            | "lift_use"
             | "scan"
             | "command_tower"
             | "produce"
@@ -80,6 +82,8 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         "engage" => engage(hosted, body, a),
         "operate" => operate(hosted, body, a),
         "recall" => recall(hosted, body),
+        "lift_call" => lift_call(hosted, body),
+        "lift_use" => lift_use(hosted, body, a),
         "scan" => scan(hosted, body, a),
         "command_tower" => command_tower(hosted, a),
         "produce" => produce(hosted, a),
@@ -506,6 +510,52 @@ fn recall(hosted: &Hosted, body: &str) -> Outcome {
     match hosted.with(|w| w.place(body, to.clone())) {
         Ok(()) => Outcome::Did("The ground goes out from under you, and you are home.".into()),
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
+    }
+}
+
+/// Call the lift to the floor you are on. Grammar-gated to the landing with the
+/// car away (see [`tools::Availability::AtLift`]); the refusals here cover the
+/// paths a grammar does not — the API, an unarmed decode.
+fn lift_call(hosted: &Hosted, body: &str) -> Outcome {
+    let Some(floor) = hosted.read(|w| w.at_landing(body)) else {
+        return Outcome::Refused("You are not at the lift. Make your way to it first.".into());
+    };
+    if hosted.read(|w| w.lift().is_some_and(|l| l.boardable_at(floor))) {
+        return Outcome::Refused(
+            "The lift is already here, its doors open — step in and ride it with `lift_use`."
+                .into(),
+        );
+    }
+    hosted.with(|w| w.call_lift(floor));
+    Outcome::Did("You call the lift. It is on its way; wait for its doors to open.".into())
+}
+
+/// Ride the lift to another level. Grammar-gated to being in the car (see
+/// [`tools::Availability::InLift`]).
+fn lift_use(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    let Some(name) = text(args, "floor") else {
+        return Outcome::Refused(
+            "You meant to ride the lift, but did not say to which level.".into(),
+        );
+    };
+    let Some(from) = hosted.read(|w| w.at_landing(body)) else {
+        return Outcome::Refused("You are not in the lift. Go to it first.".into());
+    };
+    if !hosted.read(|w| w.lift().is_some_and(|l| l.boardable_at(from))) {
+        return Outcome::Refused("The lift is not here. Call it first with `lift_call`.".into());
+    }
+    let Some(dest) = hosted.read(|w| w.floor_named(&name)) else {
+        return Outcome::Refused(format!("There is no level called \"{name}\" to ride to."));
+    };
+    if dest == from {
+        return Outcome::Refused("You are already on that level.".into());
+    }
+    if hosted.with(|w| w.ride_lift(body, dest)) {
+        Outcome::Did(format!(
+            "You get in and ride the lift toward {name}. It sets off."
+        ))
+    } else {
+        Outcome::Refused("The lift would not take you — its doors are not open here.".into())
     }
 }
 
@@ -1042,6 +1092,13 @@ mod tests {
             // no body reaches a world for it. Named here rather than filtered
             // by category, so a second such act has to be argued for.
             if name == "send_image" {
+                continue;
+            }
+            // The effector device's two verbs reach the world through the
+            // effector router on the async fast path (`Runtime::enact_device`),
+            // not through any synchronous body/enact dispatch — so this layer
+            // deliberately does not perform them.
+            if crate::engine::body::is_device(name) {
                 continue;
             }
             assert!(

@@ -1,7 +1,6 @@
 //! telnet_session_open tool.
 
 use std::io::Read;
-use std::net::TcpStream;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -11,6 +10,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::TelnetError;
+use crate::net;
 use crate::state::sessions::{SessionMeta, TelnetEntry};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
@@ -66,13 +66,8 @@ impl Tool for TelnetSessionOpen {
         let port = req.port.unwrap_or(23);
         let addr = format!("{}:{}", req.host, port);
         let timeout = Duration::from_secs(req.timeout_sec.unwrap_or(10) as u64);
-        let stream = TcpStream::connect_timeout(
-            &addr.parse().map_err(|e: std::net::AddrParseError| {
-                TelnetError::ConnectionFailed(e.to_string())
-            })?,
-            timeout,
-        )
-        .map_err(|e| TelnetError::ConnectionFailed(e.to_string()))?;
+        let stream = net::tcp_connect_to(ctx.grants(), &addr, Some(timeout))
+            .map_err(|e| TelnetError::ConnectionFailed(e.to_string()))?;
         stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
 
         let prompt_pattern = req
@@ -87,7 +82,7 @@ impl Tool for TelnetSessionOpen {
         }
 
         if let Some(cred_name) = &req.credential_name {
-            if let Some(cred) = ctx.credentials.get_by_name(cred_name) {
+            if let Some(cred) = ctx.credentials()?.get_by_name(cred_name) {
                 use std::io::Write;
                 let mut stream_clone = stream.try_clone().unwrap();
                 if let Some(username) = &cred.username {

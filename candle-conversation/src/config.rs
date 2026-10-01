@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use candle_nn::kv_cache::{KvFormat, QuantFormat};
 use candle_transformers::models::batched_inference::BatchedConfig;
 
+use crate::line_ends::line_end_token_ids;
 use crate::models::Dialect;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
@@ -118,8 +120,7 @@ pub struct SamplingConfig {
     ///
     /// The penalty is flat — a token used once costs what one used a hundred
     /// times does — so without a bound it ends up on a character's whole
-    /// vocabulary and stops distinguishing anything. See
-    /// [`Self::for_character_dialogue`].
+    /// vocabulary and stops distinguishing anything.
     pub cross_turn_window: usize,
 
     // ── EOS Control ────────────────────────────────────────────────────
@@ -199,11 +200,22 @@ pub struct SamplingConfig {
     /// as the hard backstop.
     pub graceful_segment_close_after: i32,
 
-    /// Token IDs that count as sentence-end boundaries for `graceful_segment_close_after`.
-    ///
-    /// Resolved automatically from the tokenizer at engine startup (looks up
-    /// `.`, `!`, `?`, `\n`).  If empty, `graceful_segment_close_after` is a no-op.
+    /// Token IDs that end a sentence (`.`, `!`, `?`) — the boundaries the
+    /// graceful EOS waits for, together with [`Self::line_end_token_ids`].
+    /// Resolved from the tokenizer at engine startup.
     pub sentence_end_token_ids: Vec<i32>,
+
+    /// Every token ID whose text ends a line (decodes to something ending in
+    /// `\n`), ascending. The boundary `graceful_segment_close_after` waits for.
+    ///
+    /// A thinking block is closed at the end of a line, not of a sentence: a
+    /// `.` also appears inside numbers, addresses and paths, and a close fired
+    /// there cut a security review mid-thought at `169.` of `169.254.169.254` —
+    /// the model carried on reasoning where its answer belonged and never gave
+    /// one. Reasoning breaks into lines every few dozen tokens, well inside the
+    /// window between the graceful and forced closes. Resolved once, by scanning
+    /// the vocabulary at engine startup; empty makes the graceful close a no-op.
+    pub line_end_token_ids: Arc<[i32]>,
 
     /// Closer phrase played when the HARD segment cap
     /// (`force_segment_close_after`) fires mid-sentence: a canned
@@ -311,6 +323,7 @@ impl Default for SamplingConfig {
             force_segment_close_after: 0,
             graceful_segment_close_after: 0,
             sentence_end_token_ids: Vec::new(),
+            line_end_token_ids: Arc::from([]),
             segment_close_script: Vec::new(),
             graceful_eos_after: 0,
             forced_eos_after: 0,
@@ -449,14 +462,6 @@ impl SamplingConfig {
     /// `(temperature, top_p)` Qwen publish for a Qwen3.5-lineage **instruct**
     /// (think-suppressed) turn, general tasks.
     const QWEN35_INSTRUCT: (f32, f32) = (0.7, 0.8);
-
-    /// `(temperature, top_p)` a cast decodes on when it is not reasoning — see
-    /// [`Self::for_character_dialogue`].
-    const CHARACTER_DIALOGUE: (f32, f32) = (1.0, 0.95);
-
-    /// How many turns back a cast's cross-turn penalty looks — see
-    /// [`Self::for_character_dialogue`].
-    const CHARACTER_CROSS_TURN_WINDOW: usize = 4;
 
     pub fn for_gguf_architecture(arch: &str) -> Self {
         match arch {
@@ -714,161 +719,6 @@ impl SamplingConfig {
         self
     }
 
-    /// Retune an architecture default for **dialogue that has to be different
-    /// every time** — a character speaking, not an assistant answering.
-    ///
-    /// # The two published pairings
-    ///
-    /// Qwen publishes `temperature=0.7, top_p=0.8` for general tasks and
-    /// `temperature=1.0, top_p=0.95` for reasoning, both with `top_k=20`; its
-    /// technical report used `presence_penalty=1.5` for the Creative Writing v3
-    /// and WritingBench runs. The architecture defaults here take the first
-    /// pairing, which is the right conservative choice for an assistant and the
-    /// wrong one for a cast: 0.7 with `top_p` 0.8 is a narrow nucleus, and a
-    /// character re-answering a situation much like the last one lands on the
-    /// same sentence.
-    ///
-    /// So this takes the wider pairing and leaves `top_k` and the penalties
-    /// alone — `presence_penalty` is already at the figure Qwen used for
-    /// creative work, and raising it further is what their guidance warns
-    /// brings on language mixing.
-    ///
-    /// Applied by the caller rather than folded into the architecture default,
-    /// because the architecture does not say what the model is *for*: the same
-    /// checkpoint serving a coding assistant wants the narrow pairing, and
-    /// silently widening it there would be retuning code generation to fix
-    /// dialogue.
-    ///
-    /// # Repetition: the pressure moves from presence onto runs
-    ///
-    /// Both penalties subtract from the logit, so they are comparable in nats:
-    /// presence takes a flat `p` off **every token used at all this turn**;
-    /// DRY takes `multiplier · base^(match_len − allowed)` off the one token
-    /// that would *continue a repeated run*.
-    ///
-    /// **Presence at the architecture's 1.5 is what makes a character ramble.**
-    /// It cannot see a phrase — the twentieth repetition of a five-word clause
-    /// costs exactly what the second use of "the" costs — and its scope grows
-    /// with the utterance, so the longer a character speaks the more of its own
-    /// natural vocabulary is suppressed and the stranger the continuations it
-    /// has left. A live cast produced two hundred words of "again today
-    /// tomorrow forever more whatever comes first whichever part wins" from
-    /// exactly this: not too little pressure against repetition, too much
-    /// against *reuse*.
-    ///
-    /// Reference guidance puts presence at 0.1–0.35 where DRY is carrying the
-    /// load. 0.3 is the top of that band, because a character restating itself
-    /// is still the thing being fought — it is a fifth of the old pressure,
-    /// not none of it.
-    ///
-    /// DRY is already on from [`Self::with_qwen_thinking_steering`] and is
-    /// strengthened a little here, 0.8 → 1.0, to take up what presence gives
-    /// back — inside the 0.8–1.12 band the reference recommends. With
-    /// `base = 1.75, allowed = 2`:
-    ///
-    /// | repeated run | before (1.5 + 0.8·b^n) | after (0.3 + 1.0·b^n) |
-    /// |---|---|---|
-    /// | ordinary word | 1.50 | **0.30** |
-    /// | 3 tokens | 2.90 | 2.05 |
-    /// | 5 tokens | 5.79 | 5.66 |
-    /// | 7 tokens | 14.63 | **16.71** |
-    ///
-    /// — far less on reuse, the same in the middle, more where a run has become
-    /// a loop.
-    ///
-    /// # What this does not reach
-    ///
-    /// DRY is **span-scoped**: the kernel windows it on `dry_lens[seq]`, reset
-    /// at every `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, so it sees
-    /// only the span being written. It therefore cannot see the previous
-    /// utterance, and cannot see another character's speech quoted in the
-    /// prompt — so a cast echoing each other's phrasing is invisible to it by
-    /// construction, and `range` is bounded by the span long before it reaches
-    /// 512. That scoping is deliberate and right for an assistant reproducing
-    /// identifiers from an earlier span; for dialogue it is the reason a
-    /// stronger multiplier alone will not stop two characters converging on one
-    /// another's words.
-    /// # What `cross_turn_penalty` adds, and what it does not
-    ///
-    /// DRY cannot see the previous utterance (above), so nothing here reached
-    /// across a turn boundary at all: a character repeating one sentence every
-    /// turn was invisible to every penalty on this config. `cross_turn_penalty`
-    /// is the one that does — a flat subtraction from any token the character
-    /// has already used today.
-    ///
-    /// **Lighter than `presence_penalty` on purpose.** It is a blunt instrument:
-    /// the kernel takes `min(count, 1)`, so a token used once is penalised
-    /// exactly as hard as one used a hundred times. Set high it would push a
-    /// character out of its own vocabulary — its name, the words its persona is
-    /// written in — for no reason beyond having used them.
-    ///
-    /// **It looks back a finite number of turns:**
-    /// [`Self::CHARACTER_CROSS_TURN_WINDOW`], four. It used to see every turn
-    /// since the conversation opened, and a flat penalty that never forgets
-    /// saturates: once most of a character's working vocabulary has been used it
-    /// is a uniform shift, softmax is shift-invariant, and it stops telling one
-    /// act from another. The cast was seen looping with it nominally on — one
-    /// character walked between two rooms twenty times running. Four turns
-    /// covers a two-act oscillation twice over, and is short enough that a word
-    /// out of use is cheap again a few turns later.
-    ///
-    /// It still will not break a distribution that has already collapsed: a
-    /// character whose window holds ten copies of one act is choosing the next
-    /// token at p ≈ 1, and a tenth of a logit against that is nothing. That
-    /// collapse is not the sampler's to break — it is stopped at the grammar,
-    /// where npcd's loop guard strikes the looping act from the turn's stencil
-    /// before it can form. What the window does is discourage the near miss the
-    /// grammar does not catch: the same words in a different act.
-    /// # The think-off row is widened, not left on the card
-    ///
-    /// Qwen's card gives a think-suppressed turn `0.7 / 0.8`, and a cast is
-    /// think-suppressed on almost every turn. On that row the cast loops: over
-    /// about ninety turns measured live, one character walked between two rooms
-    /// twenty times running without answering the question every perception
-    /// reminded it of, and another asked one question more than a dozen times in
-    /// fresh words. It is the failure recorded against this row before — a
-    /// character handed a situation much like the last one lands on the same act
-    /// out of a nucleus that narrow.
-    ///
-    /// So the **instruct row** becomes [`Self::CHARACTER_DIALOGUE`], `1.0 /
-    /// 0.95`, and the thinking row stays as the card has it. It is set on the row
-    /// rather than on `temperature` because the think mode is applied per turn
-    /// and adopts its row each time — a value written straight into
-    /// `temperature` would be overwritten by the first turn that declared a
-    /// mode. A family with no per-mode rows has the one pair, and takes it
-    /// directly.
-    ///
-    /// The rest is about dialogue rather than the checkpoint, and it is now
-    /// LIGHT. These penalties once carried the whole job of keeping a character
-    /// off a loop and were set hard for it — a DRY that punished any repeated
-    /// pair of tokens, a presence penalty, a cross-turn penalty. That job has
-    /// moved up to the grammar: npcd's loop guard strikes a repeated act from
-    /// the turn's own stencil, breaking a loop where it forms instead of leaning
-    /// on the sampler to price the looping token out. So these come down to a
-    /// mild degeneracy guard — enough to stop a decode stuttering a phrase
-    /// verbatim, not so much that it pushes ordinary prose out of its natural
-    /// vocabulary. The hard settings reached every path that borrows this
-    /// sampling — the dream and the narrator among them — and read as stilted
-    /// there.
-    pub fn for_character_dialogue(mut self) -> Self {
-        match self.mode_sampling.as_mut() {
-            Some(modes) => modes.instruct = Self::CHARACTER_DIALOGUE,
-            None => (self.temperature, self.top_p) = Self::CHARACTER_DIALOGUE,
-        }
-        self.adopt_mode_pair();
-        self.presence_penalty = 0.1;
-        // Lighter than presence, as it must be: it is flat (the kernel takes
-        // `min(count, 1)`), so it cannot tell a word used once from one used a
-        // hundred times and must not outweigh the graded within-turn penalty.
-        self.cross_turn_penalty = 0.05;
-        self.cross_turn_window = Self::CHARACTER_CROSS_TURN_WINDOW;
-        // A gentle DRY: only a verbatim run of three or more tokens is
-        // penalised, and lightly — natural repetition (a refrain, a name,
-        // parallel phrasing) is left alone. The old (1.0, 1.75, 2, 512) leant on
-        // every repeated pair, which the loop guard now makes unnecessary.
-        self.with_dry_penalty(0.8, 1.25, 3, 256)
-    }
-
     /// Set the repeat window (last N tokens considered for penalties).
     /// `0` = use full history.
     pub fn with_repeat_last_n(mut self, n: i32) -> Self {
@@ -983,10 +833,9 @@ impl SamplingConfig {
             self.tool_call_open_token_id = id as i32;
             tracing::trace!("Resolved <tool_call> token ID: {}", id);
         }
-        // Resolve sentence-end token IDs for graceful_segment_close_after.
-        // We probe both the bare character and common BPE compound forms.
+        // Resolve sentence-end token IDs for the graceful EOS.
         self.sentence_end_token_ids.clear();
-        for boundary in [".", "\n", ".\n", "!\n", "?\n", "!", "?"] {
+        for boundary in [".", "!", "?"] {
             if let Some(id) = tokenizer.token_to_id(boundary) {
                 let id = id as i32;
                 if !self.sentence_end_token_ids.contains(&id) {
@@ -994,10 +843,15 @@ impl SamplingConfig {
                 }
             }
         }
-        tracing::trace!(
-            "Resolved {} sentence-end token IDs: {:?}",
-            self.sentence_end_token_ids.len(),
-            self.sentence_end_token_ids
+        // The line ends are a vocabulary scan; a config that already carries
+        // them (every per-turn clone of the engine's) keeps what it has.
+        if self.line_end_token_ids.is_empty() {
+            self.line_end_token_ids = line_end_token_ids(tokenizer);
+        }
+        tracing::debug!(
+            sentence_ends = self.sentence_end_token_ids.len(),
+            line_ends = self.line_end_token_ids.len(),
+            "resolved sampling boundary tokens",
         );
 
         // Resolve the reflection-marker family (`Wait`/`Hmm`/`Alternatively`/
@@ -1705,7 +1559,7 @@ pub struct EngineConfig {
     /// `health.enabled == true`. Safe to set unconditionally.
     pub health: DecodeHealthConfig,
 
-    /// Workspace root whose `.substrate/` directory backs the persistence
+    /// Workspace root whose `substrate/` directory backs the persistence
     /// redo log. When `None`, the engine opens the substrate under the
     /// process working directory (`SubstratePersistence::open`).
     ///
@@ -1716,7 +1570,7 @@ pub struct EngineConfig {
     ///
     /// `None` — the ordinary case — and the engine opens
     /// [`Self::workspace_path`] itself. `Some` is for a host with its own
-    /// record classes in the same log: one `.substrate/` admits exactly one
+    /// record classes in the same log: one `substrate/` admits exactly one
     /// writable handle per process, and a second silently loses records rather
     /// than failing. See [`SharedSubstrate`].
     pub substrate: Option<SharedSubstrate>,
@@ -1726,7 +1580,7 @@ pub struct EngineConfig {
     ///
     /// For a tool that reads a workspace another process — the daemon — may be
     /// appending to at the same time. The store must already exist, and nothing
-    /// under `.substrate/` is created, renamed, deleted, truncated, grown or
+    /// under `substrate/` is created, renamed, deleted, truncated, grown or
     /// written from engine start through shutdown. Everything in RAM works as it
     /// does on a writable substrate — seals update the substrate mirror; labels,
     /// tombstones and projection events apply — and a turn that would have gone
@@ -2197,46 +2051,6 @@ mod sampling_config_tests {
         );
     }
 
-    /// **The penalties are a light degeneracy guard now, not the loop-breaker.**
-    ///
-    /// Breaking a character's loop moved to the grammar — npcd's loop guard
-    /// strikes a repeated act from the turn's stencil — so this sampling no
-    /// longer has to price a loop out with a hard DRY and a heavy presence
-    /// penalty, and it must not, because every prose path that borrows it (the
-    /// dream, the narrator) was reading as stilted under the old settings. What
-    /// it keeps is gentle: reuse costs a fraction of the card's, natural
-    /// repetition is free, and a long verbatim run is discouraged rather than
-    /// banned.
-    #[test]
-    fn character_dialogue_penalties_are_a_light_guard_not_the_loop_breaker() {
-        let base = SamplingConfig::for_gguf_architecture("qwen35");
-        let c = base.clone().for_character_dialogue();
-
-        // Reuse of a word costs a small fraction of the card's.
-        assert_eq!(base.presence_penalty, 1.5);
-        assert!(c.presence_penalty <= 0.15, "presence is a light nudge now");
-        assert!(c.presence_penalty < base.presence_penalty / 5.0);
-
-        let d = c
-            .dry
-            .as_ref()
-            .expect("a gentle DRY stays as a degeneracy guard");
-        let run = |n: i32| d.multiplier * d.base.powi(n - d.allowed_length);
-        // Natural repetition is free: a repeated pair or trigram costs nothing
-        // (`allowed_length` is at least 3, so a run must exceed it to be
-        // penalised) — a refrain and parallel phrasing are how prose reads.
-        assert!(
-            d.allowed_length >= 3,
-            "a repeated pair must be free in prose"
-        );
-        // Escalation is still monotonic: a longer verbatim run costs more…
-        assert!(run(4) < run(6) && run(6) < run(8));
-        // …but it is a NUDGE, not a ban. The grammar forbids a loop; the sampler
-        // only discourages a stutter, so an eight-token run stays well under the
-        // old "unreachable" bar of 20.
-        assert!(run(8) < 5.0, "DRY should discourage a run, not forbid it");
-    }
-
     /// **Both of Qwen's published rows exist, and they are the right way round.**
     ///
     /// The lineage publishes a temperature and nucleus per think mode — `1.0/0.95`
@@ -2296,103 +2110,6 @@ mod sampling_config_tests {
         for mode in [ThinkMode::Off, ThinkMode::Deep] {
             let m = base.clone().with_think_mode(mode, 4096);
             assert_eq!((m.temperature, m.top_p), (t, p), "{mode:?}");
-        }
-    }
-
-    /// **The cast decodes on the wide pair, whichever order things are applied in.**
-    ///
-    /// The think mode is applied per turn and adopts its row each time, so the
-    /// dialogue tuning lives on the row — and the config records which row it is
-    /// on, so tuning one that was already think-off takes effect at once rather
-    /// than on whichever later turn next re-applies a mode. The reflection and
-    /// `open_conversation` read the config directly, and would otherwise have
-    /// decoded on the card's narrow row while the probe did not.
-    #[test]
-    fn the_cast_decodes_on_the_wide_pair_in_both_modes() {
-        use crate::stencil::ThinkMode;
-        let base = SamplingConfig::for_gguf_architecture("qwen35");
-
-        let tuned_first = base
-            .clone()
-            .for_character_dialogue()
-            .with_think_mode(ThinkMode::Off, 4096);
-        let mode_first = base
-            .clone()
-            .with_think_mode(ThinkMode::Off, 4096)
-            .for_character_dialogue();
-        for cast in [&tuned_first, &mode_first] {
-            assert_eq!((cast.temperature, cast.top_p), (1.0, 0.95));
-            assert_eq!(cast.presence_penalty, 0.1);
-            assert_eq!(cast.cross_turn_penalty, 0.05);
-            assert!(cast.dry.is_some());
-        }
-
-        // A deliberating turn is on the card's thinking row — the same pair here.
-        let deliberating = mode_first.with_think_mode(ThinkMode::Deep, 4096);
-        assert_eq!((deliberating.temperature, deliberating.top_p), (1.0, 0.95));
-        // And coming back out of it lands on the cast's row, not the card's.
-        let back = deliberating.with_think_mode(ThinkMode::Off, 4096);
-        assert_eq!((back.temperature, back.top_p), (1.0, 0.95));
-
-        // A caller that is not a cast keeps the card's instruct row.
-        let assistant = base.with_think_mode(ThinkMode::Off, 4096);
-        assert_eq!((assistant.temperature, assistant.top_p), (0.7, 0.8));
-    }
-
-    /// A family with one published pairing has no rows to widen, so the cast
-    /// takes the pair directly — as every family did before per-mode rows.
-    #[test]
-    fn a_family_without_rows_takes_the_dialogue_pair_directly() {
-        let cast = SamplingConfig::for_gguf_architecture("qwen3").for_character_dialogue();
-        assert!(cast.mode_sampling.is_none());
-        assert_eq!((cast.temperature, cast.top_p), (1.0, 0.95));
-    }
-
-    /// **Something has to reach across a turn boundary.**
-    ///
-    /// DRY is span-scoped — the kernel resets its window at every `<think>` and
-    /// `<tool_call>` — and presence and frequency are per-turn, cleared by
-    /// `end_turn`. So before this, *nothing* on a character's config could see
-    /// the previous utterance, and a character emitting one identical sentence
-    /// every turn was invisible to the whole sampler.
-    ///
-    /// Lighter than presence because it is flat: the kernel takes
-    /// `min(count, 1)`, so it cannot tell a word used once from one used a
-    /// hundred times, and it must not price a character out of its own
-    /// vocabulary.
-    #[test]
-    fn a_character_is_penalised_for_repeating_itself_across_turns() {
-        let c = SamplingConfig::for_gguf_architecture("qwen35").for_character_dialogue();
-        assert!(
-            c.cross_turn_penalty > 0.0,
-            "nothing on this config reaches past the current turn"
-        );
-        assert!(
-            c.cross_turn_penalty < c.presence_penalty,
-            "a flat cross-turn penalty must not outweigh the within-turn one"
-        );
-        assert!(
-            c.cross_turn_window > 0,
-            "a flat penalty that never forgets ends up on the whole vocabulary and tells no act \
-             from any other"
-        );
-        assert_eq!(
-            SamplingConfig::for_gguf_architecture("qwen35").cross_turn_window,
-            0,
-            "callers that are not a cast keep the unbounded default"
-        );
-    }
-
-    /// The assistant presets are untouched: this is a dialogue setting, and a
-    /// model reproducing an identifier from an earlier turn is doing its job.
-    #[test]
-    fn cross_turn_repetition_is_only_penalised_for_characters() {
-        for arch in ["qwen3", "qwen35", "qwen3moe"] {
-            assert_eq!(
-                SamplingConfig::for_gguf_architecture(arch).cross_turn_penalty,
-                0.0,
-                "{arch} penalises an assistant for reusing a name"
-            );
         }
     }
 

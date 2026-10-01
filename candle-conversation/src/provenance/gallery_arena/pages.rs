@@ -25,25 +25,36 @@ pub fn pages_for(n_tokens: usize) -> usize {
     n_tokens.div_ceil(PAGE_TOKENS)
 }
 
-/// Transpose a turn's token-major folded sigs into group-major pages. Each output
-/// page is `page_u64(wpt)` words; token `t` lands in page `t / PAGE_TOKENS` at
-/// group-major offset `g*(PAGE_TOKENS*gw) + (t % PAGE_TOKENS)*gw`. Unused tail
-/// slots of the last page stay zero (never addressed by a scan).
-pub fn transpose_to_pages(sigs: &[WideQSig], wpt: usize, n_groups: usize) -> Vec<Vec<u64>> {
+/// Transpose a turn's token-major folded sigs into group-major pages, laid end to
+/// end in one buffer with page `p` starting at word `p * stride_words` — the slot
+/// stride, so a run of address-contiguous slots is one contiguous slice of it.
+/// Within a page, token `t` lands at group-major offset
+/// `g*(PAGE_TOKENS*gw) + (t % PAGE_TOKENS)*gw`. The unused tail of the last page,
+/// and any stride beyond a page's `page_u64(wpt)` words, stay zero (never
+/// addressed by a scan).
+pub fn transpose_to_pages(
+    sigs: &[WideQSig],
+    wpt: usize,
+    n_groups: usize,
+    stride_words: usize,
+) -> Vec<u64> {
+    assert!(
+        stride_words >= page_u64(wpt),
+        "a {stride_words}-word slot cannot hold a {}-word page",
+        page_u64(wpt)
+    );
     let gw = wpt / n_groups;
-    let pu64 = page_u64(wpt);
-    let n_pages = pages_for(sigs.len());
-    let mut pages = vec![vec![0u64; pu64]; n_pages];
+    let mut pages = vec![0u64; pages_for(sigs.len()) * stride_words];
     for (t, sig) in sigs.iter().enumerate() {
-        let page = t / PAGE_TOKENS;
+        let base = (t / PAGE_TOKENS) * stride_words;
         let in_pg = t % PAGE_TOKENS;
         for g in 0..n_groups {
             let s = g * gw;
             // Defensive: a well-formed folded sig is exactly `wpt` wide; a short
             // one leaves that group's slot zero rather than panicking.
             if s + gw <= sig.words.len() {
-                let dst = g * (PAGE_TOKENS * gw) + in_pg * gw;
-                pages[page][dst..dst + gw].copy_from_slice(&sig.words[s..s + gw]);
+                let dst = base + g * (PAGE_TOKENS * gw) + in_pg * gw;
+                pages[dst..dst + gw].copy_from_slice(&sig.words[s..s + gw]);
             }
         }
     }
@@ -65,14 +76,13 @@ mod tests {
     fn one_full_page_group_major_layout() {
         // 32 tokens, wpt=24, 3 groups, gw=8 → one full page of 768 words.
         let sigs: Vec<WideQSig> = (0..32).map(|t| sig((t as u64) << 32)).collect();
-        let pages = transpose_to_pages(&sigs, 24, 3);
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0].len(), 768);
+        let pages = transpose_to_pages(&sigs, 24, 3, 768);
+        assert_eq!(pages.len(), 768);
         // Group g, token t, word w must equal sigs[t].words[g*8 + w].
         for t in 0..32 {
             for g in 0..3 {
                 for w in 0..8 {
-                    let got = pages[0][g * (32 * 8) + t * 8 + w];
+                    let got = pages[g * (32 * 8) + t * 8 + w];
                     let want = sigs[t].words[g * 8 + w];
                     assert_eq!(got, want, "mismatch at token {t} group {g} word {w}");
                 }
@@ -84,22 +94,47 @@ mod tests {
     fn partial_last_page_zero_tail() {
         // 33 tokens → 2 pages; page 1 holds token 32 only, rest zero.
         let sigs: Vec<WideQSig> = (0..33).map(|t| sig(0xA000 + t as u64)).collect();
-        let pages = transpose_to_pages(&sigs, 24, 3);
-        assert_eq!(pages.len(), 2);
+        let pages = transpose_to_pages(&sigs, 24, 3, 768);
+        assert_eq!(pages.len(), 2 * 768);
+        let page1 = &pages[768..];
         // Token 32 → page 1, in_pg 0, so its words sit at each group's base.
         for g in 0..3 {
             for w in 0..8 {
-                assert_eq!(pages[1][g * 256 + w], sigs[32].words[g * 8 + w]);
+                assert_eq!(page1[g * 256 + w], sigs[32].words[g * 8 + w]);
             }
         }
         // in_pg 1..32 of page 1 are zero (unused tail).
         for in_pg in 1..32 {
             for g in 0..3 {
                 for w in 0..8 {
-                    assert_eq!(pages[1][g * 256 + in_pg * 8 + w], 0);
+                    assert_eq!(page1[g * 256 + in_pg * 8 + w], 0);
                 }
             }
         }
+    }
+
+    /// A slot wider than a page starts each page at the slot stride, and the
+    /// words between a page's end and the next page's start stay zero.
+    #[test]
+    fn pages_sit_at_the_slot_stride() {
+        let sigs: Vec<WideQSig> = (0..64).map(|t| sig(0xB000 + t as u64)).collect();
+        let pages = transpose_to_pages(&sigs, 24, 3, 800);
+        assert_eq!(pages.len(), 2 * 800);
+        let narrow = transpose_to_pages(&sigs, 24, 3, 768);
+        assert_eq!(
+            &pages[..768],
+            &narrow[..768],
+            "page 0 is laid out unchanged"
+        );
+        assert_eq!(
+            &pages[800..1568],
+            &narrow[768..],
+            "page 1 starts at the stride"
+        );
+        assert!(
+            pages[768..800].iter().all(|&w| w == 0),
+            "the gap between pages is zero"
+        );
     }
 
     #[test]

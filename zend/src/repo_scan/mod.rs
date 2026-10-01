@@ -1,49 +1,51 @@
 //! `repo_map` layer ingestion — **one conversation per directory**.
 //!
-//! Walks the workspace, groups the files by their directory, and explores each
-//! directory as TWO `code_read`-shaped tool round-trips — list it, then read its
-//! module doc — the last of which DECODES a two-sentence summary of what the
-//! folder is for (see [`render`] for the turn shape). That summary is the
-//! layer's retrieval surface: a query about "the KV cache paging code" matches
-//! prose describing that folder, where a bare file listing would only match on a
-//! filename the asker already knew.
+//! Each folder a branch lists (`crate::branch_ingest`) is explored as ONE
+//! `code_read`-shaped tool round-trip — list it — after which the conversation
+//! DECODES a one-sentence summary of what the folder is for (see [`render`]
+//! for the turn shape, and why nothing of the folder is read). That summary is the layer's retrieval
+//! surface: a query about "the KV cache paging code" matches prose describing
+//! that folder, where a bare file listing would only match on a filename the
+//! asker already knew.
 //!
 //! Structurally this mirrors [`crate::code_read`]: a bounded worker pool over
-//! per-unit conversations, each tagged with a content hash that serves as the
-//! restart-resume cache key and the refresh's change detector, and each freed
-//! after its turns seal into the substrate. [`DirState`] records those hashes so
-//! a filesystem event re-ingests only the directories that actually changed.
+//! per-unit conversations, each tagged with the unit's content key — what the
+//! pass plans from and what retrieval scopes by — and each freed after its
+//! turns seal into the substrate. A unit's tools read the commit it was found
+//! on, so its turns show exactly what its key names.
 
-pub mod anchor;
 pub mod binary_sniff;
+pub mod converse;
 pub mod dir_unit;
+mod link;
 pub mod render;
 pub mod types;
-pub mod walk;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::memory_report::MemoryReport;
-use candle_conversation::projection::{self, GroupId, LayerId, TimelineId};
+use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::stencil::{ThinkMode, ToolCallEnvelope, TriggerRegistry};
-use candle_conversation::{ConversationEngine, SequenceConfig};
+use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
+use zend_vfs::Oid;
 
+use crate::branch_ingest::keys::{branches_value, BRANCHES_KEY, CONTENT_KEY};
+use crate::branch_ingest::plan::Committed;
+use crate::branch_ingest::units::FolderUnit;
 use crate::ingest_report::{Failures, IngestReport};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
 pub use binary_sniff::is_binary_sample;
-pub use dir_unit::{build_units, DirRecord, DirState, DirUnit};
-pub use types::{FileEntry, Language, RepoMap};
-pub use walk::{walk_workspace, MAX_FILE_BYTES};
+pub use dir_unit::DirUnit;
+pub(crate) use link::ingest_link;
+pub use types::Language;
 
 /// Directories ingested concurrently. Each unit is ONE conversation running a
-/// short chain (two prefills + one bounded decode), so this is the whole
+/// short chain (one prefill + one bounded decode), so this is the whole
 /// concurrent conversation count for the layer.
 ///
 /// Sized to feed BOTH row-groups. A directory's worker is a three-phase state
@@ -71,7 +73,7 @@ pub use walk::{walk_workspace, MAX_FILE_BYTES};
 /// **61% of the phase's wall time against prefill's 24%**, and decode has no
 /// width cap of its own. At a pool of 24 both phases averaged only ~9 wide
 /// (max 23) — roughly a third of workers in a forward at any instant, since each
-/// unit's chain is two prefills then a decode. Prefill is capped at 24 per wave
+/// unit's chain then ran two prefills before its decode. Prefill is capped at 24 per wave
 /// regardless, so workers beyond that queue for prefill but still add to decode
 /// width, which is the phase that dominates.
 ///
@@ -165,7 +167,34 @@ fn max_live_conversations() -> Option<usize> {
         kv,
         SCAN_KV_BASELINE.load(Ordering::Relaxed),
         SCAN_LIVE_CONVS.load(Ordering::Relaxed),
+        // Zero when the model reports no zone to defend — a dense checkpoint or
+        // a CPU device, where the weight side has no elastic boundary and
+        // nothing is taken from it by a K/V claim.
+        report.weights.floor_bytes.unwrap_or(0),
+        weights_now(&report.weights),
     ))
+}
+
+/// What the weight side is holding right now, in the units the floor is
+/// expressed in.
+///
+/// **A zone figure, not base + zone.** `floor_bytes` is
+/// `interleave::optimal_weight_bytes` — a fraction of the achievable residency
+/// of the *elastic expert zone*, measured inside a span that is the KV regions
+/// plus that zone and nothing else. Dense base weights are allocated outside
+/// that span and no concession can ever release them, so counting them here
+/// reports ground the scan cannot have: `(base + zone) − zone_floor`, halved by
+/// the caller, overstates the concession by `base_bytes / 2`. It read correct on
+/// this card only because a wave stack reports no separate base at all.
+///
+/// With no floor to defend the answer is UNBOUNDED rather than zero: a stack
+/// that reports no zone has none for K/V to take from, so capacity alone is the
+/// bound and the caller's `min` must not clamp it to nothing.
+fn weights_now(weights: &candle_conversation::memory_report::WeightSection) -> u64 {
+    match weights.floor_bytes {
+        Some(_) => weights.resident_expert_bytes.unwrap_or(0),
+        None => u64::MAX,
+    }
 }
 
 /// Total reserved KV arena bytes in a memory report — the quantity the arena
@@ -213,6 +242,7 @@ fn kv_reserved(report: &MemoryReport) -> u64 {
 /// back the scratch margin instead spends the room the governor already reserved
 /// for KV — while [`SCAN_CONV_KV_MIN`] keeps the resulting width on the safe
 /// side of that point.
+#[allow(clippy::too_many_arguments)]
 fn scan_width(
     capacity: u64,
     scratch_margin: u64,
@@ -220,12 +250,51 @@ fn scan_width(
     kv: u64,
     baseline: u64,
     live: usize,
+    weight_floor: u64,
+    weights_now: u64,
 ) -> usize {
     let fixed = pool_used.saturating_sub(kv);
+    // **The scan may take what the weight zone can concede, and not a byte
+    // more.**
+    //
+    // `capacity` is the governor's balloon-measured resident capacity — the
+    // whole elastic span, not a K/V-only share — and the weight zone lives in
+    // that same span. Ground K/V claims is ground the weight side loses, so a
+    // width planned from capacity alone plans to evict the model.
+    //
+    // It did. At 96 directory conversations the pool's K/V reached 48 GB, the
+    // weight zone fell from 53.5 GB to 10.9 GB — 19 GB below its floor — and
+    // admission refused every prefill for the rest of the run, which is both
+    // correct and unrecoverable: the floor check compares residency against the
+    // floor, and no number of refusals hands K/V back.
+    //
+    // The bound is `weights_now - floor`, not `capacity - floor`. Subtracting
+    // the floor from capacity charges the scan for ground the weights are
+    // already standing on, which it can never take anyway; measured, that cut
+    // the pool from 96 to 7 on a card with 21 GB genuinely available and left
+    // admission idle at `queued=0` while decode ran at the pool's width.
+    // **Half of what it could concede, because the floor is a limit and not an
+    // optimum.**
+    //
+    // Conceding weight ground is permitted down to the floor and is not free on
+    // the way there: a smaller expert zone pages more, and the paging costs the
+    // forwards the extra conversations were opened to fill. Measured on the
+    // 72 GB card, over the same directory corpus:
+    //
+    //   pool 7   zone stable at 50.2 GB   12.2 units/min
+    //   pool 53  zone pinned at the floor  ~9.0 units/min   decode width 50
+    //
+    // The wide pool got everything it asked for — decode ran 50 sequences to the
+    // narrow pool's 4-7 — and still finished less work, because the zone spent
+    // the run at 28 GB. Taking half leaves the expert cache its working set and
+    // still opens several times the conversations a capacity-minus-floor bound
+    // allowed.
+    let concedeable = weights_now.saturating_sub(weight_floor) / 2;
     let for_kv = capacity
         .saturating_sub(scratch_margin)
         .saturating_sub(fixed)
-        .saturating_sub(baseline);
+        .saturating_sub(baseline)
+        .min(concedeable);
     let per_conv = per_conversation_kv(kv, baseline, live);
     ((for_kv / per_conv.max(1)) as usize).clamp(1, REPO_MAP_PARALLELISM)
 }
@@ -440,8 +509,9 @@ const MAX_DECODE_FAILURES: usize = 24;
 pub const PASS_NAME: &str = "repo_map";
 
 /// Gather-scope tags for a directory's turns: `["repo_map", <dir>]`. The second
-/// tag is the unit's directory (`"."` for the workspace root), so a tag-scoped
-/// provenance gallery can admit exactly one folder's turns.
+/// tag is the unit's workspace-relative directory (`candle/` for a
+/// repository's root), so a tag-scoped provenance gallery can admit exactly one
+/// folder's turns.
 fn dir_tags(unit: &DirUnit) -> Vec<String> {
     vec!["repo_map".to_string(), unit.dir.clone()]
 }
@@ -460,8 +530,7 @@ fn dir_tags(unit: &DirUnit) -> Vec<String> {
 /// without blocking ingest, and provenance scans expand the compressed nodes on
 /// retrieval.
 pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
-    config.tree.summarize_every = 0;
-    config.tree.segment_summarize_every = 0;
+    config.tree.disable_summarization();
     // Utility ingests (repo_map, code_reading) are append-only cumulative
     // trunks — each turn just extends the layer. Skip the per-turn projection
     // rebuild (reset + re-project the whole trunk, which is O(n²) and serial on
@@ -476,123 +545,47 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
     config
 }
 
-/// Top-level `repo_map` ingestion.
-///
-/// Walks `workspace`, builds one [`DirUnit`] per directory holding files, and
-/// runs the units through a bounded worker pool. Returns the walked [`RepoMap`]
-/// so a co-located `code_reading` pass doesn't re-walk, plus the [`DirState`]
-/// the refresh path compares against.
-///
-/// The closing decode is a summary *of the folder* because the request names the
-/// folder. The conversation itself frames on the shared prompt — the schema's
-/// own sections, injected by priming at the default branch (see
-/// [`shared_system_prompt`]) — and `disable_reprojection` (see
-/// [`utility_config`]) means it never re-projects, so nothing a runtime
-/// selection sets can change that framing.
-#[allow(clippy::too_many_arguments)]
-pub fn ingest_repo_map(
-    engine: &Mutex<ConversationEngine>,
-    proj_builder: projection::Builder,
-    workspace: &Path,
-    max_depth: Option<usize>,
-    config: SequenceConfig,
-    progress: &Arc<LoadProgress>,
-    layer_name: &str,
-    group_name: &str,
-) -> anyhow::Result<(RepoMap, DirState, IngestReport)> {
-    let map = walk_workspace(workspace, max_depth);
-    let units = build_units(&map, workspace);
-
-    tracing::info!(
-        n_files = map.files.len(),
-        n_dirs = units.len(),
-        n_anchored = units.iter().filter(|u| u.anchor.is_some()).count(),
-        skipped_extension = map.files_skipped_extension,
-        skipped_oversize = map.files_skipped_oversize,
-        skipped_binary = map.files_skipped_binary,
-        "repo map walk complete; ingesting one conversation per directory",
-    );
-
-    let plan = IngestPlan::new(engine, &proj_builder, &config, layer_name, group_name)?;
-    // Retire conversations for directories that no longer exist, then snapshot
-    // the surviving hashes once for O(1) per-unit resume-cache probes.
-    // Crashed partials are NOT swept here. The sweep has to run whether or not
-    // this pass does, so it belongs to the caller — see
-    // [`retire_crashed_partials`].
-    let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
-    reconcile_deleted(engine, &map, &present);
-    let report = run_dir_pool(engine, &plan, workspace, &units, progress);
-    Ok((map, dir_state_from_substrate(engine), report))
+/// One folder to ingest: the unit as a branch lists it, and the commit its
+/// listing and files are read from.
+#[derive(Debug, Clone)]
+pub struct UnitJob {
+    pub unit: FolderUnit,
+    pub at: Oid,
+    /// Every branch whose tip lists the folder this way, recorded on the
+    /// conversation ([`BRANCHES_KEY`]).
+    pub branches: Vec<String>,
 }
 
-/// Outcome of a [`refresh_repo_map`] call. `Replaced` carries only the new
-/// per-directory hash record — per-unit conversations are freed once their
-/// turns seal, so there is no live sequence to swap.
-pub enum RefreshOutcome {
-    NoOp,
-    Replaced { state: DirState },
-}
-
-/// Selective refresh of the `repo_map` layer.
-///
-/// Re-derives the units from `map` (which the caller already walked, usually
-/// once per filesystem-event burst and shared with the `code_reading` refresh)
-/// and returns `NoOp` when no directory's hash moved. Otherwise it runs the same
-/// reconcile + pool as [`ingest_repo_map`]: directories whose hash is unchanged
-/// hit the resume-cache snapshot and are skipped, so only changed, added, or
-/// removed directories cost anything.
+/// Ingest `jobs` — the units the pass queued (`docs/zend_branch_ingest.md`
+/// §7.3). `live` is every unit key on any branch: when a unit commits, each
+/// other conversation of its folder whose key is not in it is tombstoned,
+/// and one whose key is — the folder as another branch lists it — is left.
 ///
 /// The engine mutex is taken only for the quick create/tombstone ops inside the
 /// pool — never across a decode — so chat consumers keep running throughout.
-pub fn refresh_repo_map(
+pub fn ingest_units(
     ctx: &RefreshContext<'_>,
-    workspace: &Path,
-    map: &RepoMap,
-    prior: &DirState,
+    jobs: &[UnitJob],
+    live: &HashSet<String>,
     progress: &Arc<LoadProgress>,
     layer_name: &str,
-    group_name: &str,
-) -> anyhow::Result<RefreshOutcome> {
-    let units = build_units(map, workspace);
-    let prior = prior.without_frozen(map);
-    if prior.equivalent_to(&units) {
-        tracing::trace!("repo map refresh: no directory hash changed, skipping refresh");
-        return Ok(RefreshOutcome::NoOp);
-    }
-
-    let changed = prior.changed_dirs(&units);
+    base: &Mutex<Sequence>,
+) -> anyhow::Result<IngestReport> {
     tracing::info!(
-        n_changed = changed.len(),
-        sample_changed = ?changed.iter().take(5).collect::<Vec<_>>(),
-        n_total_dirs = units.len(),
-        "repo map refresh: re-ingesting changed directories",
+        n_units = jobs.len(),
+        sample = ?jobs.iter().take(5).map(|j| j.unit.dir.as_str()).collect::<Vec<_>>(),
+        "repo map: ingesting the folders no conversation holds yet",
     );
-
-    let plan = IngestPlan::new(
-        ctx.engine,
-        &ctx.proj_builder,
-        &ctx.config,
-        layer_name,
-        group_name,
-    )?;
-    let present: HashSet<&str> = units.iter().map(|u| u.dir.as_str()).collect();
-    reconcile_deleted(ctx.engine, map, &present);
-    let report = run_dir_pool(ctx.engine, &plan, workspace, &units, progress);
-    crate::ingest_report::publish(PASS_NAME, report);
-    Ok(RefreshOutcome::Replaced {
-        state: dir_state_from_substrate(ctx.engine),
-    })
+    let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
+    let report = run_dir_pool(ctx, base, &plan, jobs, live, progress);
+    crate::ingest_report::publish(PASS_NAME, report.clone());
+    Ok(report)
 }
 
-/// The per-pass constants every worker needs to mint its unit's conversation:
-/// the resolved layer/group ids, the shared system prompt, and the utility
-/// config. Assembled once so the pool's per-unit signature stays small.
+/// The per-pass constants every worker needs to drive its unit's
+/// conversation. Assembled once so the pool's per-unit signature stays
+/// small.
 struct IngestPlan {
-    layer: LayerId,
-    group: GroupId,
-    proj_builder: projection::Builder,
-    system_prompt: String,
-    config: SequenceConfig,
     /// `<think>` bound to [`ThinkMode::Off`]'s tree, for every folder summary
     /// decode in the pass.
     ///
@@ -612,14 +605,10 @@ impl IngestPlan {
         proj_builder: &projection::Builder,
         config: &SequenceConfig,
         layer_name: &str,
-        group_name: &str,
     ) -> anyhow::Result<Self> {
         let layer = proj_builder
             .id_for_layer(layer_name)
             .ok_or_else(|| anyhow::anyhow!("projection schema missing '{layer_name}' layer"))?;
-        let group = proj_builder
-            .id_for_group(group_name)
-            .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
         // Append-only ingest layer (in-memory flag, re-applied every load): folder
         // summaries score self-local during ingest, so a summary is grounded in its
         // own folder rather than derailed by cross-directory retrieval.
@@ -635,55 +624,23 @@ impl IngestPlan {
         };
         engine.lock().unwrap().mark_layer_append_only(layer);
         let envelope = ToolCallEnvelope::for_dialect(&config.dialect);
-        Ok(Self {
-            layer,
-            group,
-            proj_builder: proj_builder.clone(),
-            system_prompt: shared_system_prompt(proj_builder, layer_name, config),
-            config: utility_config(config.clone()),
-            triggers,
-            envelope,
-        })
-    }
-}
-
-/// Tombstone every live `repo_map` conversation whose directory is no longer
-/// present. Covers directories deleted while the daemon was down (the walk only
-/// visits directories that still exist) and those removed between refreshes.
-/// A still-present *changed* directory is handled by [`process_one_dir`], which
-/// supersedes its own stale generation.
-///
-/// A directory at or past `map`'s `--max-depth` bound is FROZEN, not deleted:
-/// the walk read none of its files, so its absence from `present` proves
-/// nothing.
-fn reconcile_deleted(engine: &Mutex<ConversationEngine>, map: &RepoMap, present: &HashSet<&str>) {
-    let e = engine.lock().unwrap();
-    for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
-        if !present.contains(dir.as_str()) && !map.is_frozen_dir(&dir) {
-            if let Err(err) = e.tombstone_timeline(tl) {
-                tracing::warn!(
-                    target: "zend::repo_scan",
-                    dir = %dir,
-                    "tombstone of removed directory's conversation failed: {err:#}",
-                );
-            }
-        }
+        Ok(Self { triggers, envelope })
     }
 }
 
 /// Retire every crashed-partial `repo_map` conversation, up front.
 ///
-/// A partial carries [`DIR_KEY`] but no [`HASH_KEY`] — the directory tag is
-/// written at conversation creation and the content hash only after the unit's
+/// A partial carries [`DIR_KEY`] but no [`CONTENT_KEY`] — the directory tag is
+/// written at conversation creation and the content key only after the unit's
 /// ingest succeeds, so the pair says "this attempt started and never finished".
+/// A conversation ingested before units were keyed by content carries no
+/// content key either, and goes the same way: nothing can scope it to a
+/// conversation's files.
 ///
-/// **Why eagerly, when [`process_one_dir`] already retires one.** That retirement
-/// is per-directory and lazy: it runs only when *that* directory comes back
-/// through the pool on a resume-cache miss. Across ordinary runs the two are
-/// equivalent, because a partial has no hash, so it always misses the cache and
-/// always gets re-ingested. They stop being equivalent the moment the pass does
-/// not run — `--skip-layer repo_map`, an aborted pass, a failure cap — and then
-/// the debris simply stays live.
+/// **Why here.** An attempt that fails retires its own conversation
+/// ([`process_one_dir`]); what a crash left has nobody to retire it, and a
+/// pool cannot tell it from another worker's attempt in flight — so it is
+/// retired once, at boot, before any pool runs, or it simply stays live.
 ///
 /// Live is the problem. A partial is a half-built chain: a request and a
 /// `file_list` round-trip with the summary decode missing, and because it was
@@ -698,17 +655,13 @@ fn reconcile_deleted(engine: &Mutex<ConversationEngine>, map: &RepoMap, present:
 /// answered by nothing.
 ///
 /// Called ONCE per boot from the session's ingest pre-loop, for every layer the
-/// operator did not `--disable-layer` — so a `--skip-layer repo_map` boot, which
-/// runs no pass at all, still leaves with its debris retired. That is why the
-/// call does not live in [`ingest_repo_map`]: a sweep that only runs when the
-/// pass runs cannot clean up the one case that produces debris and then declines
-/// to re-ingest it.
+/// operator did not `--disable-layer`.
 ///
-/// Never called from [`refresh_repo_map`]. A refresh can overlap a pool that is
+/// Never called from [`ingest_units`]. A pass can overlap a pool that is
 /// mid-flight, and an in-flight unit is indistinguishable from a crashed one by
-/// metadata alone — both carry `dir` with no hash — so sweeping there would
+/// metadata alone — both carry `dir` with no key — so sweeping there would
 /// tombstone the conversation a worker is still building. The pre-loop runs
-/// before any pool starts, so nothing is in flight.
+/// before the background ingest worker is even woken, so nothing is in flight.
 pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
     let e = engine.lock().unwrap();
     let mut retired = 0usize;
@@ -731,91 +684,121 @@ pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
         tracing::info!(
             target: "zend::repo_scan",
             retired,
-            "retired crashed-partial repo_map conversations (no content hash) \
-             so their half-built chains leave the provenance gather",
+            "retired repo_map conversations with no content key (crashed partials, \
+             or ingested before units were keyed by content) so they leave the \
+             provenance gather",
         );
     }
+}
+
+/// Tombstone EVERY `repo_map` conversation, committed or not — `--wipe-layer
+/// repo_map`'s targeted counterpart to [`retire_crashed_partials`], which only
+/// removes the never-committed half.
+///
+/// Called from the session's ingest pre-loop, before the background ingest
+/// worker's first pass — which then finds nothing committed and ingests every
+/// folder as new, exactly as it would on a truly fresh install. This is the
+/// "test the background ingest end to end without deleting the whole
+/// substrate" tool: unlike `--wipe-substrate`, every other layer's content
+/// (dialogue, `code_reading` unless it too is named) survives untouched.
+pub(crate) fn wipe_layer(engine: &Mutex<ConversationEngine>) {
+    let e = engine.lock().unwrap();
+    let mut wiped = 0usize;
+    for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
+        match e.tombstone_timeline(tl) {
+            Ok(()) => wiped += 1,
+            Err(err) => tracing::warn!(
+                target: "zend::repo_scan",
+                dir = %dir,
+                "--wipe-layer repo_map: tombstone failed: {err:#}",
+            ),
+        }
+    }
+    tracing::info!(
+        target: "zend::repo_scan",
+        wiped,
+        "--wipe-layer repo_map: every repo_map conversation tombstoned — the next \
+         pass re-ingests the whole layer",
+    );
 }
 
 /// Whether a `repo_map` conversation's ingest ever committed.
 ///
 /// The two keys are a completion protocol, not two independent tags: [`DIR_KEY`]
-/// is written at conversation creation and [`HASH_KEY`] only after the unit's
-/// ingest succeeds, so their combination is the only durable record of whether
-/// an attempt finished. `dir` alone therefore means "started, never committed" —
-/// a crashed partial — and that is what both the eager sweep
-/// ([`retire_crashed_partials`]) and the per-directory deferred tombstone in
-/// [`process_one_dir`] key on.
+/// is written at conversation creation and [`CONTENT_KEY`] only after the
+/// unit's ingest succeeds, so their combination is the only durable record of
+/// whether an attempt finished. `dir` alone therefore means "started, never
+/// committed" — a crashed partial, or another worker's attempt in flight — and
+/// that is what the boot sweep ([`retire_crashed_partials`]) keys on.
 ///
 /// Named and separate so the rule is stated once and testable without an
 /// engine; the sweep that applies it needs a loaded model and so is covered by
 /// the engine-backed suite rather than here.
 fn ingest_committed(meta: &BTreeMap<String, String>) -> bool {
-    meta.contains_key(HASH_KEY)
+    meta.contains_key(CONTENT_KEY)
 }
 
-/// Metadata key holding a unit's directory — the invalidation-scan key. Distinct
-/// from `code_read`'s `path` so the two layers' reconcile sweeps never touch each
-/// other's conversations.
-const DIR_KEY: &str = "dir";
+/// Metadata key holding a unit's directory. Distinct from `code_read`'s
+/// `path` so the two layers' conversations are never taken for each other's.
+pub(crate) const DIR_KEY: &str = "dir";
 
-/// Metadata key holding a unit's content hash — the resume-cache key, written
-/// only after the unit's ingest succeeds.
-const HASH_KEY: &str = "content_sha256";
-
-/// Rebuild the [`DirState`] from what the substrate has ACTUALLY ingested,
-/// joining each conversation's [`DIR_KEY`] and [`HASH_KEY`] metadata by timeline
-/// — the same durable record `code_read` derives its state from.
-///
-/// The state must come from the substrate, never from the walk. A walk-derived
-/// state records every directory the pass *attempted*, so a directory whose
-/// ingest failed still gets its content hash stored as ingested; the next walk
-/// then sees an unchanged hash, `equivalent_to` returns true, the refresh is a
-/// `NoOp`, and the directory is never retried — silently absent from the repo
-/// map for the life of the workspace, while `process_one_dir` logs that it will
-/// be picked up next run. [`HASH_KEY`] is written only after a unit's ingest
-/// succeeds, so joining on it records exactly what is really there.
-fn dir_state_from_substrate(engine: &Mutex<ConversationEngine>) -> DirState {
+/// Every committed `repo_map` conversation: its content key and its folder —
+/// what the pass plans against. Read from the substrate, never from what a
+/// pass attempted: a unit whose ingest failed wrote no key, so it is not
+/// committed and is queued again.
+pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
     let e = engine.lock().unwrap();
-    let hashes: HashMap<TimelineId, String> = e
-        .conversations_with_metadata_key(HASH_KEY)
+    let keys: HashMap<TimelineId, String> = e
+        .conversations_with_metadata_key(CONTENT_KEY)
         .into_iter()
         .collect();
-    let mut units: Vec<DirRecord> = e
-        .conversations_with_metadata_key(DIR_KEY)
+    e.conversations_with_metadata_key(DIR_KEY)
         .into_iter()
-        .filter_map(|(tl, dir)| {
-            hashes.get(&tl).map(|content_hash| DirRecord {
-                dir,
-                content_hash: content_hash.clone(),
+        .filter_map(|(timeline, dir)| {
+            Some(Committed {
+                timeline,
+                key: keys.get(&timeline)?.clone(),
+                subject: dir,
             })
         })
-        .collect();
-    units.sort_by(|a, b| a.dir.cmp(&b.dir));
-    DirState { units }
+        .collect()
 }
 
-/// Drive a bounded worker pool over `units`: each worker pulls the next
+/// Drive a bounded worker pool over `jobs`: each worker pulls the next
 /// directory from a shared cursor and runs [`process_one_dir`]. Workers share
 /// the progress counter, a tolerated-failure counter, and an abort flag (the
 /// first hard error stops the rest).
 fn run_dir_pool(
-    engine: &Mutex<ConversationEngine>,
+    ctx: &RefreshContext<'_>,
+    base: &Mutex<Sequence>,
     plan: &IngestPlan,
-    workspace: &Path,
-    units: &[DirUnit],
+    jobs: &[UnitJob],
+    live: &HashSet<String>,
     progress: &Arc<LoadProgress>,
 ) -> IngestReport {
-    let total = units.len();
+    let engine = ctx.engine;
+    let total = jobs.len();
     progress.set_step_progress(0, total as u64);
     // Price the pool against the arenas it is about to add, not the ones it
     // inherits. Must precede the width sizing below, which reads the estimate.
     anchor_scan_kv_baseline();
-    // One snapshot of the live hashes drives every worker's O(1) resume probe.
-    let present_hashes = engine
+    // One snapshot of the committed keys: a unit another pass committed since
+    // this one planned is not ingested twice.
+    let present_keys = engine
         .lock()
         .unwrap()
-        .conversation_metadata_values(HASH_KEY);
+        .conversation_metadata_values(CONTENT_KEY);
+
+    // The GUI's merged background-ingest bar (`crate::ingest_backlog`) counts
+    // only units that will REALLY run. Counted from the same snapshot the
+    // workers probe below, so registration and the per-unit completions can
+    // never disagree.
+    let backlog_pending = jobs
+        .iter()
+        .filter(|j| !present_keys.contains(&j.unit.key))
+        .count() as u64;
+    crate::ingest_backlog::add_pending(backlog_pending);
+    let backlog_done = AtomicUsize::new(0);
 
     let cursor = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
@@ -860,10 +843,6 @@ fn run_dir_pool(
         let mut handles = Vec::with_capacity(n_workers);
         for _ in 0..n_workers.max(1) {
             handles.push(s.spawn(|| {
-                // One overlay context per worker: the prefilled `file_list`
-                // response is produced by RUNNING the tool, so the listing the
-                // model sees can never drift from the live tool's output.
-                let ctx = ToolContext::with_workspace(workspace);
                 loop {
                     // Stop before claiming the next directory on a first-error
                     // abort OR a shutdown cancel. The in-flight conversation
@@ -878,20 +857,19 @@ fn run_dir_pool(
                     // last workers to notice would each pin a slot against the
                     // conversations still finishing.
                     let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                    if idx >= units.len() {
+                    if idx >= jobs.len() {
                         return;
                     }
-                    // Probe the resume cache BEFORE queueing for VRAM. A hit
-                    // opens no conversation and costs one hash lookup, so
-                    // waiting on the KV gate for it buys nothing — and on a
-                    // fully-cached restart every unit is a hit, which put ~700
-                    // free lookups through a gate that admits a handful at a
-                    // time.
-                    let result = if present_hashes.contains(&units[idx].content_hash) {
+                    let job = &jobs[idx];
+                    // Probe the committed keys BEFORE queueing for VRAM. A hit
+                    // opens no conversation, so waiting on the KV gate for it
+                    // buys nothing.
+                    let tracked = !present_keys.contains(&job.unit.key);
+                    let result = if !tracked {
                         tracing::debug!(
                             target: "zend::repo_scan",
-                            dir = %units[idx].dir,
-                            "skip: directory already in substrate (resume cache hit)",
+                            dir = %job.unit.dir,
+                            "skip: directory already committed",
                         );
                         Ok(())
                     } else {
@@ -901,19 +879,27 @@ fn run_dir_pool(
                         // decide against this state, and an unwind cannot leak
                         // it from the process-global gauge.
                         let _slot = ScanSlot::reserve(&live_convs);
-                        process_one_dir(engine, plan, &ctx, &units[idx], &failures)
+                        process_one_dir(ctx, base, plan, job, live, &failures)
                     };
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     progress.set_step_progress(d as u64, total as u64);
+                    // A registered unit is "done" on every exit — success or a
+                    // tolerated failure — so the backlog can never wedge
+                    // non-empty waiting on a unit that will just be retried
+                    // next pass.
+                    if tracked {
+                        backlog_done.fetch_add(1, Ordering::Relaxed);
+                        crate::ingest_backlog::item_done(&job.unit.dir);
+                    }
                     // An error escaping `process_one_dir` is an unexpected one
                     // (its own two failure modes record and return Ok). Record
                     // it the same way so it lands in the report rather than
                     // vanishing, and let the cap decide whether to stop.
                     if let Err(e) = result {
-                        let n = failures.record(&units[idx].dir, format!("{e:#}"));
+                        let n = failures.record(&job.unit.dir, format!("{e:#}"));
                         tracing::warn!(
                             target: "zend::repo_scan",
-                            dir = %units[idx].dir,
+                            dir = %job.unit.dir,
                             "directory ingest failed (will retry next run): {e:#}",
                         );
                         if n > MAX_DECODE_FAILURES {
@@ -927,6 +913,12 @@ fn run_dir_pool(
             h.join().expect("repo_map worker panicked");
         }
     });
+
+    // An abort or a shutdown cancel can leave units claimed but never run —
+    // hand them back, or the GUI's backlog bar never reaches zero.
+    crate::ingest_backlog::drop_pending(
+        backlog_pending.saturating_sub(backlog_done.load(Ordering::Relaxed) as u64),
+    );
 
     // Pin the bar to 100%: workers store from their own `done` snapshot without a
     // max, so the last stored value can settle a step short even though every
@@ -954,28 +946,47 @@ fn run_dir_pool(
     report
 }
 
+/// The tools a unit's chain runs against: file stores reading the commit the
+/// unit was found on, so the listing and the manifest hint its turns show are the
+/// ones its key names. `None` when the unit's repository is not read through
+/// git.
+fn unit_tools(tools: &ToolContext, job: &UnitJob) -> Option<ToolContext> {
+    let files = tools.files.fresh_at(&job.unit.repo, &job.at)?;
+    Some(tools.with_files(Arc::new(files)))
+}
+
 /// Ingest one directory into a fresh conversation: render the folder's
-/// round-trip chain, run it (two prefills + the summary decode), tag the
+/// round-trip chain, run it (the prefill + the summary decode), tag the
 /// conversation, and free it.
 ///
-/// The caller has already established this unit is not a resume-cache hit, and
-/// holds its [`ScanSlot`] for the duration.
+/// The caller has already established this unit is not committed, and holds
+/// its [`ScanSlot`] for the duration.
 ///
 /// A per-directory ingest failure is TOLERATED up to [`MAX_DECODE_FAILURES`]:
 /// the attempt's partial is tombstoned, the prior generation is left live, and
-/// the unit simply misses the resume cache next run and is retried.
+/// the unit is queued again next pass.
 fn process_one_dir(
-    engine: &Mutex<ConversationEngine>,
+    ctx: &RefreshContext<'_>,
+    base: &Mutex<Sequence>,
     plan: &IngestPlan,
-    ctx: &ToolContext,
-    unit: &DirUnit,
+    job: &UnitJob,
+    live: &HashSet<String>,
     failures: &Failures,
 ) -> anyhow::Result<()> {
+    let engine = ctx.engine;
+    let Some(tools) = unit_tools(&ctx.tool_ctx, job) else {
+        failures.record(
+            &job.unit.dir,
+            "its repository is not read through git".to_string(),
+        );
+        return Ok(());
+    };
+    let unit = &DirUnit::of(&job.unit);
     // Render BEFORE minting anything: the tool responses come from actually
     // running the tools, so a directory the tools can't read is caught here and
     // costs no conversation. Prefilling an error body would be worse than
     // skipping — it teaches the model a tool interaction that failed.
-    let (prefilled, decode_user) = render::render_chain(ctx, unit, &plan.envelope);
+    let (prefilled, decode_user) = render::render_chain(&tools, unit, &plan.envelope);
     if let Some(detail) = render::chain_error(&prefilled, &decode_user) {
         let n = failures.record(&unit.dir, format!("file_list failed: {detail}"));
         tracing::warn!(
@@ -994,40 +1005,59 @@ fn process_one_dir(
         return Ok(());
     }
 
-    // Cache miss → new / changed / crashed-partial directory. Reconcile this
-    // directory's existing conversations WITHOUT invalidating good content up
-    // front — a DEFERRED tombstone. A PARTIAL (carries `dir` but no
-    // `content_sha256`: a crashed prior attempt) has nothing to lose and goes
-    // now; a GOOD generation is deferred into `superseded`, staying live as the
-    // folder's content until this ingest commits its own hash. Without the
-    // deferral a failed re-ingest would destroy the only summary the folder has —
-    // and two live generations would both vote in the same provenance scan.
+    // Reconcile this directory's existing conversations WITHOUT invalidating
+    // good content up front — a DEFERRED tombstone. A committed generation
+    // whose key no branch holds any more is deferred into `superseded`,
+    // staying live as the folder's content until this ingest commits its own
+    // key. One whose key a branch still holds is the folder as that branch
+    // lists it, and is left alone — and so is one with no key yet, another
+    // worker's attempt at the folder as another branch lists it. An attempt
+    // that fails retires its own; a crash's are retired at boot
+    // ([`retire_crashed_partials`]).
     let (mut conv, superseded) = {
         let e = engine.lock().unwrap();
-        let mut superseded = Vec::new();
-        for tl in e.find_conversations_by_metadata(DIR_KEY, &unit.dir) {
-            let is_good = e
-                .conversation_metadata(tl)
-                .is_some_and(|m| m.contains_key(HASH_KEY));
-            if is_good {
-                superseded.push(tl);
-            } else if let Err(err) = e.tombstone_timeline(tl) {
+        let superseded: Vec<TimelineId> = e
+            .find_conversations_by_metadata(DIR_KEY, &unit.dir)
+            .into_iter()
+            .filter(|&tl| {
+                e.conversation_metadata(tl)
+                    .and_then(|m| m.get(CONTENT_KEY).cloned())
+                    .is_some_and(|key| !live.contains(&key))
+            })
+            .collect();
+        drop(e);
+        // Forks off `base` — this layer's prefilled template, `base_conv`'s
+        // exact counterpart for ingestion (see `InferenceState::ingest_bases`)
+        // — so this conversation shares the SAME already-computed prefix a
+        // live dialogue turn forks from, rather than this pool's workers each
+        // independently re-running the schema's "eager section ingestion"
+        // under concurrent load.
+        let conv = base
+            .lock()
+            .unwrap()
+            .fork()
+            .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
+        // The priming chain is this conversation's parent, recorded BEFORE its
+        // own listing and summary run, so its turns are projected with the
+        // chain already in context (`Substrate::inherited_chain`). Metadata
+        // only: nothing is copied, and the parent needs no residency of its own.
+        if let Some(parent) = ctx.chain_end {
+            engine
+                .lock()
+                .unwrap()
+                .set_forked_from(conv.timeline_id(), parent)
+                .map_err(|err| anyhow::anyhow!("repo_map priming-chain parent: {err}"))?;
+            // The fork seeded the recurrent slot before this pointer existed,
+            // so ask again now that the lineage is on record.
+            if let Err(err) = conv.seed_recurrent_from_lineage() {
                 tracing::warn!(
                     target: "zend::repo_scan",
                     dir = %unit.dir,
-                    "tombstone of stale partial conversation failed: {err:#}",
+                    "seeding recurrent memory from the priming chain failed: {err:#}",
                 );
             }
         }
-        let conv = e
-            .new_conversation_with_projection(
-                &plan.system_prompt,
-                plan.proj_builder.clone(),
-                plan.layer,
-                plan.group,
-                plan.config.clone(),
-            )
-            .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
+        let e = engine.lock().unwrap();
         // The folder's closing turn is its own decoded summary, so the AVL
         // summariser must not compress these turns into a second summary tree.
         e.set_timeline_summarize(conv.timeline_id(), false);
@@ -1040,11 +1070,11 @@ fn process_one_dir(
     };
 
     // Tag `dir` IMMEDIATELY — before the decode below that can fail. A partial
-    // left by such a failure then still names the directory it covers, so it (a)
-    // shows in the substrate as that folder rather than "(untitled)", and (b) is
-    // found by the invalidation scan above on the next run, which tombstones it
-    // and retries. The resume-cache key is withheld until success, so a partial is
-    // never mistaken for a completed ingest and skipped.
+    // left by a crash then still names the directory it covers, so it (a) shows
+    // in the substrate as that folder rather than "(untitled)", and (b) is found
+    // by the next boot's [`retire_crashed_partials`]. The content key is withheld
+    // until success, so a partial is never mistaken for a completed ingest and
+    // skipped.
     {
         let mut early = BTreeMap::new();
         early.insert("kind".to_string(), "repo_map".to_string());
@@ -1058,29 +1088,29 @@ fn process_one_dir(
         }
     }
 
-    // One chain on this conversation: request → list → read → DECODE. The
-    // conversation projects its own turns (`target_is_ingest_self`), so the
-    // request is in the decode's context where it belongs, and there is no
+    // One conversation, seeded with request → list → response and then driven as
+    // a REAL tool loop until it answers — see `converse::run_folder_conversation`.
+    // Any follow-up call runs against the same commit-pinned tools the seed
+    // listing came from, so every turn shows what the unit's key names.
+    // The conversation projects its own turns (`target_is_ingest_self`), so the
+    // request is in every decode's context where it belongs, and there is no
     // throwaway intermediate decode to set the wrong style.
-    let force_tools: Vec<String> = render::CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
-    let emit = {
-        let mut sink = SequenceTurnSink::new(&mut conv, Arc::clone(&plan.triggers));
-        sink.ingest_chain(
-            &prefilled,
-            &decode_user,
-            dir_tags(unit),
-            FOLDER_SUMMARY_MAX_TOKENS,
-            &force_tools,
-        )
-    };
+    let emit = converse::run_folder_conversation(
+        &mut conv,
+        unit,
+        &prefilled,
+        decode_user,
+        Arc::clone(&plan.triggers),
+        &tools,
+    );
 
-    let tokens = match emit {
-        Ok(tokens) => tokens,
+    let summary = match emit {
+        Ok(summary) => summary,
         Err(e) => {
             // The deferred tombstone is the safety net: `superseded` was never
-            // tombstoned, so the prior generation stays live and its resume hash
-            // stays in the cache — this failed attempt invalidates nothing. Drop
-            // only THIS attempt's partial; the retry re-mints cleanly.
+            // tombstoned, so the prior generation stays live and committed —
+            // this failed attempt invalidates nothing. Drop only THIS attempt's
+            // partial; the retry re-mints cleanly.
             {
                 let en = engine.lock().unwrap();
                 if let Err(err) = en.tombstone_timeline(conv.timeline_id()) {
@@ -1132,18 +1162,17 @@ fn process_one_dir(
     let mut tags = BTreeMap::new();
     tags.insert("kind".to_string(), "repo_map".to_string());
     tags.insert(DIR_KEY.to_string(), unit.dir.clone());
-    tags.insert(HASH_KEY.to_string(), unit.content_hash.clone());
-    tags.insert("files".to_string(), unit.files.len().to_string());
-    if let Some(a) = &unit.anchor {
-        tags.insert("anchor".to_string(), a.path.clone());
+    tags.insert(CONTENT_KEY.to_string(), unit.content_key.clone());
+    tags.insert("files".to_string(), unit.listed.len().to_string());
+    if !job.branches.is_empty() {
+        tags.insert(BRANCHES_KEY.to_string(), branches_value(&job.branches));
     }
     // The tag write is what commits the new generation. If it fails, this
     // attempt has to go: keeping the prior generation live is right, but keeping
-    // BOTH is not — the untagged replacement is invisible to the resume cache
-    // and to the invalidation sweep, yet its turns are perfectly visible to
-    // provenance, so the folder would vote twice in every scan from then on,
-    // permanently. Drop it and let the unit retry, exactly like a decode
-    // failure.
+    // BOTH is not — the untagged replacement is invisible to the pass's plan and
+    // to every scope, yet until the next boot's sweep its turns stay visible to
+    // provenance, so the folder would vote twice in every scan. Drop it and let
+    // the unit retry, exactly like a decode failure.
     if let Err(e) = conv.set_metadata_many(&tags) {
         {
             let en = engine.lock().unwrap();
@@ -1161,7 +1190,7 @@ fn process_one_dir(
             target: "zend::repo_scan",
             dir = %unit.dir,
             superseded_kept = superseded.len(),
-            "failed to tag conversation metadata (resume cache); dropped the replacement \
+            "failed to tag conversation metadata (content key); dropped the replacement \
              and kept the prior generation: {e:#}",
         );
         if n > MAX_DECODE_FAILURES {
@@ -1174,11 +1203,12 @@ fn process_one_dir(
         }
         return Ok(());
     }
+    ctx.retrieval.mark_stale();
 
     // Deferred tombstone ACTIVATES, now that the new generation is truly
-    // committed (its hash landed above). Until this instant a projection saw the
-    // prior generation (stale but present); from here it sees this one, and only
-    // this one.
+    // committed (its content key landed above). Until this instant a
+    // projection saw the prior generation (stale but present); from here it
+    // sees this one, and only this one.
     if !superseded.is_empty() {
         let e = engine.lock().unwrap();
         for tl in &superseded {
@@ -1204,7 +1234,8 @@ fn process_one_dir(
     tracing::debug!(
         target: "zend::repo_scan",
         dir = %unit.dir,
-        tokens,
+        tokens = summary.tokens,
+        tool_rounds = summary.tool_rounds,
         "directory ingested (chain prefilled + summary decoded)",
     );
     Ok(())
@@ -1281,18 +1312,50 @@ pub(crate) fn shared_prompt_body(builder: &projection::Builder) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo_scan::types::Language;
+
+    /// **The concession is measured against the ZONE, never base + zone.**
+    ///
+    /// `floor_bytes` is a fraction of the elastic expert zone's achievable
+    /// residency, and dense base weights live outside the span it is measured
+    /// in — no concession can release them. Counting them overstated the ground
+    /// a scan could take by `base_bytes / 2`, and `scan_width`'s own tests
+    /// cannot see it because the unit is chosen at the call site.
+    #[test]
+    fn what_the_weight_side_holds_is_the_zone_not_the_dense_base() {
+        use candle_conversation::memory_report::WeightSection;
+        let section = |base: Option<u64>, floor: Option<u64>| WeightSection {
+            base_bytes: base,
+            resident_expert_bytes: Some(40 << 30),
+            floor_bytes: floor,
+        };
+        assert_eq!(
+            weights_now(&section(Some(20 << 30), Some(30 << 30))),
+            40 << 30,
+            "the dense base is not the zone's and is not conceded",
+        );
+        assert_eq!(
+            weights_now(&section(None, Some(30 << 30))),
+            40 << 30,
+            "a stack reporting no base reads the same — which is why this was latent",
+        );
+        assert_eq!(
+            weights_now(&section(Some(20 << 30), None)),
+            u64::MAX,
+            "no floor to defend ⇒ unbounded, so the caller's `min` cannot clamp \
+             the width to nothing",
+        );
+    }
 
     /// The completion protocol the crashed-partial sweep rests on: the directory
-    /// tag is written at creation, the content hash only on success, so `dir`
-    /// without a hash is the signature of an attempt that never finished.
+    /// tag is written at creation, the content key only on success, so `dir`
+    /// without a key is the signature of an attempt that never finished.
     ///
     /// Pinned because the sweep tombstones on it. Keying on the wrong half would
     /// retire every GOOD generation on the next pass — the folder summaries are
-    /// exactly the conversations that DO carry a hash — and the blast radius is
+    /// exactly the conversations that DO carry a key — and the blast radius is
     /// the whole layer, silently, one boot later.
     #[test]
-    fn a_conversation_is_committed_only_once_it_carries_a_content_hash() {
+    fn a_conversation_is_committed_only_once_it_carries_a_content_key() {
         let mut meta = BTreeMap::new();
         assert!(
             !ingest_committed(&meta),
@@ -1306,34 +1369,34 @@ mod tests {
              conversation creation, before any work"
         );
 
-        meta.insert(HASH_KEY.to_string(), "abc123".to_string());
+        meta.insert(CONTENT_KEY.to_string(), "abc123".to_string());
         assert!(
             ingest_committed(&meta),
-            "the content hash is the commit, and is written only on success"
+            "the content key is the commit, and is written only on success"
         );
 
-        // The hash is what counts, not the tag: a generation that somehow lost
+        // The key is what counts, not the tag: a generation that somehow lost
         // its directory tag has still committed its content and must not be
         // swept. (`retire_crashed_partials` only visits `DIR_KEY` holders, so
         // this is belt-and-braces on the predicate itself.)
-        let mut hash_only = BTreeMap::new();
-        hash_only.insert(HASH_KEY.to_string(), "abc123".to_string());
-        assert!(ingest_committed(&hash_only));
+        let mut key_only = BTreeMap::new();
+        key_only.insert(CONTENT_KEY.to_string(), "abc123".to_string());
+        assert!(ingest_committed(&key_only));
+
+        // A generation from before units were keyed by content carries only
+        // the old hash, and is not committed.
+        let mut old = BTreeMap::new();
+        old.insert(DIR_KEY.to_string(), "candle-nn/src/".to_string());
+        old.insert("content_sha256".to_string(), "abc123".to_string());
+        assert!(!ingest_committed(&old));
     }
 
     fn unit(dir: &str) -> DirUnit {
         DirUnit {
             dir: dir.to_string(),
-            files: vec![FileEntry {
-                path: format!("{dir}x.rs"),
-                line_count: 1,
-                language: Language::Rust,
-                size_bytes: 1,
-                module_hint: None,
-            }],
             listed: vec![format!("{dir}x.rs")],
-            anchor: None,
-            content_hash: "abc".to_string(),
+            module_hint: None,
+            content_key: "abc".to_string(),
         }
     }
 
@@ -1348,10 +1411,10 @@ mod tests {
     }
 
     #[test]
-    fn the_root_unit_tags_with_a_usable_label() {
+    fn a_repository_root_tags_with_its_repository() {
         assert_eq!(
-            dir_tags(&unit(".")),
-            vec!["repo_map".to_string(), ".".to_string()],
+            dir_tags(&unit("candle/")),
+            vec!["repo_map".to_string(), "candle/".to_string()],
         );
     }
 
@@ -1414,9 +1477,10 @@ mod tests {
         );
     }
 
-    /// `repo_map` keys its invalidation sweep on `dir`, `code_read` on `path`.
-    /// If they shared a key, each layer's reconcile would tombstone the other's
-    /// conversations (a directory is never in the file walk, and vice versa).
+    /// `repo_map` finds a unit's conversations by `dir`, `code_read` by `path`.
+    /// If they shared a key, each layer's plan would take the other's
+    /// conversations for its own (a folder is never a file unit, and vice
+    /// versa) and tombstone them.
     #[test]
     fn the_invalidation_key_is_distinct_from_code_reads() {
         assert_eq!(DIR_KEY, "dir");
@@ -1452,7 +1516,7 @@ mod tests {
     #[test]
     fn the_inherited_corpus_is_not_free_room() {
         const EXTRA: u64 = 2 * 1024 * 1024 * 1024;
-        let base = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2);
+        let base = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX);
         let with_corpus = scan_width(
             CAPACITY,
             SCRATCH,
@@ -1460,6 +1524,8 @@ mod tests {
             KV + EXTRA,
             PRE_SCAN + EXTRA,
             2,
+            0,
+            u64::MAX,
         );
         assert!(with_corpus < base, "{with_corpus} vs {base}");
     }
@@ -1478,9 +1544,68 @@ mod tests {
         let by_fraction = (((CAPACITY as f64) * 0.70) as u64)
             .saturating_sub(POOL_USED - KV + PRE_SCAN)
             / per_conv;
-        let by_governor = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2) as u64;
+        let by_governor =
+            scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX) as u64;
         assert_eq!(by_fraction, 0);
         assert_eq!(by_governor, 6);
+    }
+
+    /// **The weight zone's floor is not room the scan may plan against.**
+    ///
+    /// K/V and the model's weights share one span, so every region the pool
+    /// claims is ground the weight side loses. A width computed from capacity
+    /// alone therefore plans to evict the model — and did: 96 directory
+    /// conversations grew 48 GB of K/V, drove the weight zone from 53.5 GB to
+    /// 10.9 GB against a 28.8 GB floor, and left admission refusing every
+    /// prefill from then on, because the floor check compares residency to the
+    /// floor and refusing a prefill gives no K/V back.
+    #[test]
+    fn the_scan_may_take_only_what_the_weight_zone_can_concede() {
+        let unbounded = scan_width(CAPACITY, SCRATCH, POOL_USED, KV, PRE_SCAN, 2, 0, u64::MAX);
+        // A zone holding 9 GiB over an 8 GiB floor may concede 1 GiB, which is
+        // less than the capacity arithmetic would have allowed.
+        let defended = scan_width(
+            CAPACITY,
+            SCRATCH,
+            POOL_USED,
+            KV,
+            PRE_SCAN,
+            2,
+            8 * 1024 * 1024 * 1024,
+            9 * 1024 * 1024 * 1024,
+        );
+        assert!(defended < unbounded, "{defended} vs {unbounded}");
+        // A zone already at its floor concedes nothing, and the pool still does
+        // not reach zero: one conversation has to be able to run, or the ingest
+        // cannot make progress at all.
+        assert_eq!(
+            scan_width(
+                CAPACITY,
+                SCRATCH,
+                POOL_USED,
+                KV,
+                PRE_SCAN,
+                2,
+                8 * 1024 * 1024 * 1024,
+                8 * 1024 * 1024 * 1024,
+            ),
+            1,
+        );
+        // Ground the weights already hold is not charged to the scan: a zone
+        // far above its floor is bounded by capacity, exactly as before.
+        assert_eq!(
+            scan_width(
+                CAPACITY,
+                SCRATCH,
+                POOL_USED,
+                KV,
+                PRE_SCAN,
+                2,
+                8 * 1024 * 1024 * 1024,
+                u64::MAX,
+            ),
+            unbounded,
+        );
     }
 
     /// The floor charges a conversation for RESERVED arena, not for the live
@@ -1554,11 +1679,17 @@ mod tests {
     /// exceeds the thread count the pool actually spawns.
     #[test]
     fn the_width_stays_between_one_and_the_pool_ceiling() {
-        assert_eq!(scan_width(CAPACITY, SCRATCH, 14_000_000_000, 0, 0, 0), 1);
-        // A margin wider than the card leaves nothing, and still not zero.
-        assert_eq!(scan_width(CAPACITY, 2 * CAPACITY, 0, 0, 0, 0), 1);
         assert_eq!(
-            scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0),
+            scan_width(CAPACITY, SCRATCH, 14_000_000_000, 0, 0, 0, 0, u64::MAX),
+            1,
+        );
+        // A margin wider than the card leaves nothing, and still not zero.
+        assert_eq!(
+            scan_width(CAPACITY, 2 * CAPACITY, 0, 0, 0, 0, 0, u64::MAX),
+            1,
+        );
+        assert_eq!(
+            scan_width(1024 * 1024 * 1024 * 1024, SCRATCH, 0, 0, 0, 0, 0, u64::MAX),
             REPO_MAP_PARALLELISM,
         );
     }
