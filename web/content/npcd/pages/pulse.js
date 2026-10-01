@@ -56,23 +56,22 @@ const FEED_LIMIT = 60;
 const FEED_KEEP = 100;
 
 /* Why a character woke, and how that reads. The colours are the point of the
- * column: a run of quiet grey with one amber preempt in it is legible at a
- * glance in a way a text column never is. */
+ * column: a run of quiet grey with one amber interrupt in it is legible at a
+ * glance in a way a text column never is. The three keys are the readiness
+ * states the scheduler serializes (`quiet` / `waiting` / `interrupted`). */
 const CAUSE = {
-  quiet:     { label: 'quiet',   hint: 'came back on its own from a pause, with nothing waiting' },
-  pending:   { label: 'batch',   hint: 'drained the events that were waiting' },
-  preempted: { label: 'preempt', hint: 'a high-salience event forced this tick now' },
+  quiet:       { label: 'quiet',       hint: 'came back on its own from a pause, with nothing waiting' },
+  waiting:     { label: 'waiting',     hint: 'its beat came and it thought about the events that were waiting' },
+  interrupted: { label: 'interrupted', hint: 'a high-salience event forced this tick now' },
 };
 
 /* The same three states, read as "what is it doing now" rather than "why did it
- * wake". `quiet` was `blocked` on both maps and rendered under two different
- * words — and "blocked" is wrong twice over: it reads as stuck, and since idle
- * ticks were removed it is the resting state of every character with nothing
- * happening to it rather than a rare one. */
+ * wake". Keyed on the same serialized names as CAUSE above, so the two columns
+ * can never disagree about a state. */
 const READY = {
-  quiet:     { label: 'quiet',     hint: 'inbox empty — burns no decode, waiting on the world' },
-  pending:   { label: 'pending',   hint: 'events waiting for the next tick' },
-  preempted: { label: 'preempted', hint: 'ticking now' },
+  quiet:       { label: 'quiet',       hint: 'inbox empty — burns no decode, waiting on the world' },
+  waiting:     { label: 'waiting',     hint: 'events waiting; will think at its next beat' },
+  interrupted: { label: 'interrupted', hint: 'a high-salience event is forcing a tick now' },
 };
 
 /* A stable hue per character, so the same character is the same colour on every

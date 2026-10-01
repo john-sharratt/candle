@@ -7,7 +7,7 @@ tags: [inference, performance, benchmarks]
 summary: >-
   A 180B model on a 16 GB laptop. Context that gets longer without getting
   slower. KV compressed 7× inline, as it's written. And one card that
-  out-serves llama.cpp's best published decode by up to 6×. Measured on three
+  out-serves llama.cpp's best published decode by nearly 10×. Measured on three
   machines, set against everything published, with every source cited.
 ---
 
@@ -16,53 +16,55 @@ laptop — faster than every published run of it, all of them on desktops with t
 to four times the memory.**
 
 <figure class="fig">
-<svg viewBox="0 0 640 252" role="img" aria-label="Every headline result as a multiple of the best published figure for the same thing, which is 1 times. Concurrent sessions on one card 6.4 times; aggregate decode against llama.cpp 6.1 times; KV-cache compression 4.0 times; a 284B model's decode on one GPU 2.6 times; speed kept at 128K context 1.7 times; a 180B model on a laptop 1.35 times.">
+<svg viewBox="0 0 640 252" role="img" aria-label="Every headline result as a multiple of the best published figure for the same thing, which is 1 times. Aggregate decode against llama.cpp 9.8 times; concurrent sessions on one card 6.4 times; KV-cache compression 4.0 times; a 284B model's decode on one GPU 2.6 times; speed kept at 128K context 1.7 times; a 180B model on a laptop 1.35 times.">
   <text class="ttl" x="16" y="20">Every result, against the best published figure</text>
   <text class="ttl-sub" x="16" y="38">best published = 1× · ours in green · details in each section below</text>
   <path class="grid base" d="M260 50 V226"/>
-  <path class="grid" d="M360 50 V226 M460 50 V226 M560 50 V226"/>
-  <path class="parity" d="M310 50 V226"/>
-  <text class="cat" x="16" y="64">Concurrent sessions, one card</text>
-  <text class="cat-sub" x="16" y="77">64 against 10 published</text>
-  <path class="line-us" d="M310 66 H580"/>
-  <circle class="dot-them" cx="310" cy="66" r="5"/>
-  <circle class="dot-us" cx="580" cy="66" r="6.5"/>
-  <text class="v-us" x="592" y="71">6.4×</text>
-  <text class="cat" x="16" y="94">Aggregate decode vs llama.cpp</text>
-  <text class="cat-sub" x="16" y="107">1,187.7 against 194.0 t/s</text>
-  <path class="line-us" d="M310 96 H565"/>
-  <circle class="dot-them" cx="310" cy="96" r="5"/>
-  <circle class="dot-us" cx="565" cy="96" r="6.5"/>
-  <text class="v-us" x="577" y="101">6.1×</text>
+  <path class="grid" d="M326 50 V226 M392 50 V226 M458 50 V226 M524 50 V226 M590 50 V226"/>
+  <path class="parity" d="M293 50 V226"/>
+  <text class="cat" x="16" y="64">Aggregate decode vs llama.cpp</text>
+  <text class="cat-sub" x="16" y="77">Flash-Next, RTX 3090: 147.0 against 15 t/s</text>
+  <path class="line-us" d="M293 66 H583.4"/>
+  <circle class="dot-them" cx="293" cy="66" r="5"/>
+  <circle class="dot-us" cx="583.4" cy="66" r="6.5"/>
+  <text class="v-us" x="595.4" y="71">9.8×</text>
+  <text class="cat" x="16" y="94">Concurrent sessions, one card</text>
+  <text class="cat-sub" x="16" y="107">64 against 10 published</text>
+  <path class="line-us" d="M293 96 H471.2"/>
+  <circle class="dot-them" cx="293" cy="96" r="5"/>
+  <circle class="dot-us" cx="471.2" cy="96" r="6.5"/>
+  <text class="v-us" x="483.2" y="101">6.4×</text>
   <text class="cat" x="16" y="124">KV-cache compression</text>
   <text class="cat-sub" x="16" y="137">7.6× against llama.cpp q8_0's 1.9×</text>
-  <path class="line-us" d="M310 126 H460"/>
-  <circle class="dot-them" cx="310" cy="126" r="5"/>
-  <circle class="dot-us" cx="460" cy="126" r="6.5"/>
-  <text class="v-us" x="472" y="131">4.0×</text>
+  <path class="line-us" d="M293 126 H392"/>
+  <circle class="dot-them" cx="293" cy="126" r="5"/>
+  <circle class="dot-us" cx="392" cy="126" r="6.5"/>
+  <text class="v-us" x="404" y="131">4.0×</text>
   <text class="cat" x="16" y="154">284B model, one GPU, decode</text>
   <text class="cat-sub" x="16" y="167">73.5 against 28 t/s</text>
-  <path class="line-us" d="M310 156 H390"/>
-  <circle class="dot-them" cx="310" cy="156" r="5"/>
-  <circle class="dot-us" cx="390" cy="156" r="6.5"/>
-  <text class="v-us" x="402" y="161">2.6×</text>
+  <path class="line-us" d="M293 156 H345.8"/>
+  <circle class="dot-them" cx="293" cy="156" r="5"/>
+  <circle class="dot-us" cx="345.8" cy="156" r="6.5"/>
+  <text class="v-us" x="357.8" y="161">2.6×</text>
   <text class="cat" x="16" y="184">Speed kept at 128K context</text>
   <text class="cat-sub" x="16" y="197">decode 111% against 65%</text>
-  <path class="line-us" d="M310 186 H345"/>
-  <circle class="dot-them" cx="310" cy="186" r="5"/>
-  <circle class="dot-us" cx="345" cy="186" r="6.5"/>
-  <text class="v-us" x="357" y="191">1.7×</text>
+  <path class="line-us" d="M293 186 H316.1"/>
+  <circle class="dot-them" cx="293" cy="186" r="5"/>
+  <circle class="dot-us" cx="316.1" cy="186" r="6.5"/>
+  <text class="v-us" x="328.1" y="191">1.7×</text>
   <text class="cat" x="16" y="214">180B model on a laptop</text>
   <text class="cat-sub" x="16" y="227">64.7 against 48.0 t/s on an RTX 5090</text>
-  <path class="line-us" d="M310 216 H327.5"/>
-  <circle class="dot-them" cx="310" cy="216" r="5"/>
-  <circle class="dot-us" cx="327.5" cy="216" r="6.5"/>
-  <text class="v-us" x="339.5" y="221">1.35×</text>
+  <path class="line-us" d="M293 216 H304.55"/>
+  <circle class="dot-them" cx="293" cy="216" r="5"/>
+  <circle class="dot-us" cx="304.55" cy="216" r="6.5"/>
+  <text class="v-us" x="316.55" y="221">1.35×</text>
   <text class="tick mid" x="260" y="244">0×</text>
-  <text class="tick mid" x="310" y="244">1×</text>
-  <text class="tick mid" x="360" y="244">2×</text>
-  <text class="tick mid" x="460" y="244">4×</text>
-  <text class="tick mid" x="560" y="244">6×</text>
+  <text class="tick mid" x="293" y="244">1×</text>
+  <text class="tick mid" x="326" y="244">2×</text>
+  <text class="tick mid" x="392" y="244">4×</text>
+  <text class="tick mid" x="458" y="244">6×</text>
+  <text class="tick mid" x="524" y="244">8×</text>
+  <text class="tick mid" x="590" y="244">10×</text>
 </svg>
 </figure>
 
@@ -78,7 +80,7 @@ model on the same class of card.
    no calibration data, no per-model calibration.
 4. **Nearly 4× the compression of llama.cpp's q8_0 cache — while slowing decode
    less.**
-5. **Up to 6× llama.cpp's best published decode, from one card** — 1.8× to 6.1×
+5. **Nearly 10× llama.cpp's best published decode, from one card** — 1.8× to 9.8×
    on every model measured.
 6. **Sixty-four conversations on one card:** 1,201.6 t/s aggregate, 11.5× a
    single session, with prefill untouched.
@@ -131,59 +133,67 @@ aggregate**, with the experts streaming VRAM → RAM → NVMe underneath it the
 whole time.
 
 <figure class="fig">
-<svg viewBox="0 0 640 370" role="img" aria-label="Qwen3.8-Flash-Next decode rate by machine. This engine on a 16 GB laptop with 32 GB RAM: 64.7 tokens per second aggregate at eight sessions and 20.0 single. Published runs: llama.cpp on an RTX 5090 with 128 GB RAM 48.0, RTX 4090 with 96 GB 30, RTX 5080 with 64 GB 29, an RTX 4090 with unstated engine and RAM 21, RTX 3090 with 128 GB 15.">
+<svg viewBox="0 0 640 446" role="img" aria-label="Qwen3.8-Flash-Next decode rate by machine. This engine on an RTX 3090 with 64 GB RAM: 147.0 tokens per second aggregate at sixteen sessions and 24.3 single. This engine on a 16 GB laptop with 32 GB RAM: 64.7 aggregate at eight sessions and 20.0 single. Published runs: llama.cpp on an RTX 5090 with 128 GB RAM 48.0, RTX 4090 with 96 GB 30, RTX 5080 with 64 GB 29, an RTX 4090 with unstated engine and RAM 21, RTX 3090 with 128 GB 15.">
   <text class="ttl" x="16" y="20">Qwen3.8-Flash-Next (180B) · decode, tokens per second</text>
   <text class="ttl-sub" x="16" y="38">one GPU each · the host RAM behind every run</text>
   <rect class="us" x="452" y="11" width="10" height="10" rx="2"/>
   <text class="cat-sub" x="467" y="20">This engine</text>
   <rect class="them" x="542" y="11" width="10" height="10" rx="2"/>
   <text class="cat-sub" x="557" y="20">Published</text>
-  <path class="grid base" d="M250 52 V320"/>
-  <path class="grid" d="M300 52 V320 M350 52 V320 M400 52 V320 M450 52 V320 M500 52 V320 M550 52 V320 M600 52 V320"/>
-  <text class="cat" x="16" y="72">This engine · 8 sessions</text>
-  <text class="cat-sub" x="16" y="86">RTX 4090 Laptop 16 GB · 32 GB RAM</text>
-  <rect class="us" x="250" y="62" width="323.5" height="22" rx="4"/>
-  <text class="v-us" x="581.5" y="78">64.7</text>
-  <text class="cat" x="16" y="110">llama.cpp · RTX 5090</text>
-  <text class="cat-sub" x="16" y="124">32 GB · 128 GB RAM</text>
-  <rect class="them" x="250" y="100" width="240.1" height="22" rx="4"/>
-  <text class="v-them" x="498.1" y="115">48.0</text>
-  <text class="cat" x="16" y="148">llama.cpp · RTX 4090</text>
-  <text class="cat-sub" x="16" y="162">24 GB · 96 GB RAM</text>
-  <rect class="them" x="250" y="138" width="150" height="22" rx="4"/>
-  <text class="v-them" x="408" y="153">30</text>
-  <text class="cat" x="16" y="186">llama.cpp · RTX 5080</text>
-  <text class="cat-sub" x="16" y="200">16 GB · 64 GB RAM · n-gram speculation</text>
-  <rect class="them" x="250" y="176" width="145" height="22" rx="4"/>
-  <text class="v-them" x="403" y="191">29</text>
-  <text class="cat" x="16" y="224">RTX 4090, engine not stated</text>
-  <text class="cat-sub" x="16" y="238">24 GB · RAM not stated · 250K context</text>
-  <rect class="them" x="250" y="214" width="105" height="22" rx="4"/>
-  <text class="v-them" x="363" y="229">21</text>
+  <path class="grid base" d="M250 52 V396"/>
+  <path class="grid" d="M295 52 V396 M340 52 V396 M385 52 V396 M430 52 V396 M475 52 V396 M520 52 V396 M565 52 V396"/>
+  <text class="cat" x="16" y="72">This engine · 16 sessions</text>
+  <text class="cat-sub" x="16" y="86">RTX 3090 24 GB · 64 GB RAM</text>
+  <rect class="us" x="250" y="62" width="330.75" height="22" rx="4"/>
+  <text class="v-us" x="588.75" y="78">147.0</text>
+  <text class="cat" x="16" y="110">This engine · 8 sessions</text>
+  <text class="cat-sub" x="16" y="124">RTX 4090 Laptop 16 GB · 32 GB RAM</text>
+  <rect class="us" x="250" y="100" width="145.6" height="22" rx="4"/>
+  <text class="v-us" x="403.6" y="116">64.7</text>
+  <text class="cat" x="16" y="148">llama.cpp · RTX 5090</text>
+  <text class="cat-sub" x="16" y="162">32 GB · 128 GB RAM</text>
+  <rect class="them" x="250" y="138" width="108" height="22" rx="4"/>
+  <text class="v-them" x="366" y="154">48.0</text>
+  <text class="cat" x="16" y="186">llama.cpp · RTX 4090</text>
+  <text class="cat-sub" x="16" y="200">24 GB · 96 GB RAM</text>
+  <rect class="them" x="250" y="176" width="67.5" height="22" rx="4"/>
+  <text class="v-them" x="325.5" y="192">30</text>
+  <text class="cat" x="16" y="224">llama.cpp · RTX 5080</text>
+  <text class="cat-sub" x="16" y="238">16 GB · 64 GB RAM · n-gram speculation</text>
+  <rect class="them" x="250" y="214" width="65.25" height="22" rx="4"/>
+  <text class="v-them" x="323.25" y="230">29</text>
   <text class="cat" x="16" y="262">This engine · 1 session</text>
-  <text class="cat-sub" x="16" y="276">RTX 4090 Laptop 16 GB · 32 GB RAM</text>
-  <rect class="us-soft" x="250" y="252" width="100" height="22" rx="4"/>
-  <text class="v-us" x="358" y="267">20.0</text>
-  <text class="cat" x="16" y="300">llama.cpp · RTX 3090</text>
-  <text class="cat-sub" x="16" y="314">24 GB · 128 GB RAM</text>
-  <rect class="them" x="250" y="290" width="75" height="22" rx="4"/>
-  <text class="v-them" x="333" y="305">15</text>
-  <text class="tick mid" x="250" y="338">0</text>
-  <text class="tick mid" x="300" y="338">10</text>
-  <text class="tick mid" x="350" y="338">20</text>
-  <text class="tick mid" x="400" y="338">30</text>
-  <text class="tick mid" x="450" y="338">40</text>
-  <text class="tick mid" x="500" y="338">50</text>
-  <text class="tick mid" x="550" y="338">60</text>
-  <text class="tick mid" x="600" y="338">70</text>
-  <text class="t-dim" x="16" y="362">this engine decodes speculatively with the model's own MTP head; the RTX 5080 run uses n-gram speculation</text>
+  <text class="cat-sub" x="16" y="276">RTX 3090 24 GB · 64 GB RAM</text>
+  <rect class="us-soft" x="250" y="252" width="54.7" height="22" rx="4"/>
+  <text class="v-us" x="312.7" y="268">24.3</text>
+  <text class="cat" x="16" y="300">RTX 4090, engine not stated</text>
+  <text class="cat-sub" x="16" y="314">24 GB · RAM not stated · 250K context</text>
+  <rect class="them" x="250" y="290" width="47.25" height="22" rx="4"/>
+  <text class="v-them" x="305.25" y="306">21</text>
+  <text class="cat" x="16" y="338">This engine · 1 session</text>
+  <text class="cat-sub" x="16" y="352">RTX 4090 Laptop 16 GB · 32 GB RAM</text>
+  <rect class="us-soft" x="250" y="328" width="45" height="22" rx="4"/>
+  <text class="v-us" x="303" y="344">20.0</text>
+  <text class="cat" x="16" y="376">llama.cpp · RTX 3090</text>
+  <text class="cat-sub" x="16" y="390">24 GB · 128 GB RAM · 130K context</text>
+  <rect class="them" x="250" y="366" width="33.75" height="22" rx="4"/>
+  <text class="v-them" x="291.75" y="382">15</text>
+  <text class="tick mid" x="250" y="414">0</text>
+  <text class="tick mid" x="295" y="414">20</text>
+  <text class="tick mid" x="340" y="414">40</text>
+  <text class="tick mid" x="385" y="414">60</text>
+  <text class="tick mid" x="430" y="414">80</text>
+  <text class="tick mid" x="475" y="414">100</text>
+  <text class="tick mid" x="520" y="414">120</text>
+  <text class="tick mid" x="565" y="414">140</text>
+  <text class="t-dim" x="16" y="438">this engine decodes speculatively with the model's own MTP head; the RTX 5080 run uses n-gram speculation</text>
 </svg>
 <figcaption>Every published single-GPU run of this model that states its host uses
-64–128 GB of RAM. The laptop has 32, and is the only one serving eight people at
-once.</figcaption>
+64–128 GB of RAM. The laptop has 32 and serves eight people at once; the RTX 3090
+has 64 and serves sixteen.</figcaption>
 </figure>
 
-Look at the two green bars, because together they tell the whole story.
+Look at the laptop's two green bars, because together they tell the whole story.
 
 The single session — 20 t/s — sits among the desktop runs, which is exactly where
 you'd expect a laptop with half the model on an NVMe drive to sit.
@@ -193,6 +203,15 @@ of RAM behind it. Every expert that crosses the bus serves every session that
 routed to it, so the eighth conversation costs a fraction of the first. That's
 the [wave](/blog/waves-and-the-pcie-bottleneck) doing its job, on a model six
 times bigger than the one it was designed on.
+
+Then there's the RTX 3090 — a six-year-old card on PCIe 3.0, with no native
+FP8, and the one card where there's a published run to put ours directly beside.
+llama.cpp on a 3090 with 128 GB of RAM decodes this model at 15 t/s. Ours has
+half that RAM, and a single session decodes at **24.3 t/s**. Give it sixteen
+conversations — a rung the laptop can't fit — and it reaches **147.0 t/s
+aggregate**, ten times the published figure, every session validated. (Their
+run was at a 130K context and a 4-bit quant; ours is a short prompt on the 2-bit
+expert artifact. The width is the part no published run has.)
 
 As far as I can find, this is the first time anyone has published this model
 running on a laptop GPU — or in 32 GB of host memory at all.
@@ -438,7 +457,7 @@ perplexity number, not a cosine threshold, the actual text.</p>
 starts failing. That's what makes it the top rung.</p>
 </div>
 
-## One card out-decodes llama.cpp by up to 6×
+## One card out-decodes llama.cpp by nearly 10×
 
 This is the one I'd most like people to go and check, so here's exactly what it
 claims.
@@ -450,86 +469,93 @@ Then take this engine's **aggregate** decode serving concurrent conversations on
 the same class of card. Divide.
 
 <figure class="fig">
-<svg viewBox="0 0 640 420" role="img" aria-label="Our aggregate decode divided by llama.cpp's best published single-stream decode, same model and card class. Qwen3.5-35B on Blackwell 6.12 times; Qwen3.6-35B Blackwell 3.60; Llama-2-7B on RTX 3090 3.38; Qwen3.5-35B RTX 3090 3.38; Qwen3.8-27B RTX 3090 3.05; Llama-2-7B Blackwell 3.05; Qwen3-8B RTX 3090 2.63; Qwen3-30B Blackwell 2.63; Qwen3.6-35B RTX 3090 2.46; Qwen3-8B Blackwell 2.30; Qwen3-8B 16 GB 2.24; Flash-Next 16 GB 2.23; Qwen3-30B RTX 3090 1.79.">
+<svg viewBox="0 0 640 446" role="img" aria-label="Our aggregate decode divided by llama.cpp's best published single-stream decode, same model and card class. Flash-Next on RTX 3090 9.80 times; Qwen3.5-35B on Blackwell 6.12; Qwen3.6-35B Blackwell 3.60; Llama-2-7B on RTX 3090 3.38; Qwen3.5-35B RTX 3090 3.38; Qwen3.8-27B RTX 3090 3.05; Llama-2-7B Blackwell 3.05; Qwen3-8B RTX 3090 2.63; Qwen3-30B Blackwell 2.63; Qwen3.6-35B RTX 3090 2.46; Qwen3-8B Blackwell 2.30; Qwen3-8B 16 GB 2.24; Flash-Next 16 GB 2.23; Qwen3-30B RTX 3090 1.79.">
   <text class="ttl" x="16" y="20">Our aggregate decode ÷ llama.cpp's best published decode</text>
   <text class="ttl-sub" x="16" y="38">same model, same class of card · 1× is parity</text>
-  <path class="grid base" d="M250 56 V396"/>
-  <path class="grid" d="M350 56 V396 M400 56 V396 M450 56 V396 M500 56 V396 M550 56 V396 M600 56 V396"/>
-  <path class="parity" d="M300 56 V396"/>
-  <text class="t-them" x="304" y="52">llama.cpp's best = 1×</text>
-  <text class="cat" x="16" y="75">Qwen3.5-35B</text>
-  <text class="cat-sub" x="240" y="75" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="62" width="306" height="17" rx="4"/>
-  <text class="v-us" x="564" y="76">6.12×</text>
-  <text class="cat" x="16" y="101">Qwen3.6-35B</text>
+  <path class="grid base" d="M250 56 V422"/>
+  <path class="grid" d="M318 56 V422 M386 56 V422 M454 56 V422 M522 56 V422 M590 56 V422"/>
+  <path class="parity" d="M284 56 V422"/>
+  <text class="t-them" x="288" y="52">llama.cpp's best = 1×</text>
+  <text class="cat" x="16" y="75">Flash-Next</text>
+  <text class="cat-sub" x="240" y="75" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="62" width="333.2" height="17" rx="4"/>
+  <text class="v-us" x="591.2" y="76">9.80×</text>
+  <text class="cat" x="16" y="101">Qwen3.5-35B</text>
   <text class="cat-sub" x="240" y="101" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="88" width="180" height="17" rx="4"/>
-  <text class="v-us" x="438" y="102">3.60×</text>
-  <text class="cat" x="16" y="127">Llama-2-7B</text>
-  <text class="cat-sub" x="240" y="127" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="114" width="169" height="17" rx="4"/>
-  <text class="v-us" x="427" y="128">3.38×</text>
-  <text class="cat" x="16" y="153">Qwen3.5-35B</text>
+  <rect class="us" x="250" y="88" width="208.08" height="17" rx="4"/>
+  <text class="v-us" x="466.08" y="102">6.12×</text>
+  <text class="cat" x="16" y="127">Qwen3.6-35B</text>
+  <text class="cat-sub" x="240" y="127" text-anchor="end">Blackwell</text>
+  <rect class="us" x="250" y="114" width="122.4" height="17" rx="4"/>
+  <text class="v-us" x="380.4" y="128">3.60×</text>
+  <text class="cat" x="16" y="153">Llama-2-7B</text>
   <text class="cat-sub" x="240" y="153" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="140" width="169" height="17" rx="4"/>
-  <text class="v-us" x="427" y="154">3.38×</text>
-  <text class="cat" x="16" y="179">Qwen3.8-27B</text>
+  <rect class="us" x="250" y="140" width="114.92" height="17" rx="4"/>
+  <text class="v-us" x="372.92" y="154">3.38×</text>
+  <text class="cat" x="16" y="179">Qwen3.5-35B</text>
   <text class="cat-sub" x="240" y="179" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="166" width="152.5" height="17" rx="4"/>
-  <text class="v-us" x="410.5" y="180">3.05×</text>
-  <text class="cat" x="16" y="205">Llama-2-7B</text>
-  <text class="cat-sub" x="240" y="205" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="192" width="152.5" height="17" rx="4"/>
-  <text class="v-us" x="410.5" y="206">3.05×</text>
-  <text class="cat" x="16" y="231">Qwen3-8B</text>
-  <text class="cat-sub" x="240" y="231" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="218" width="131.5" height="17" rx="4"/>
-  <text class="v-us" x="389.5" y="232">2.63×</text>
-  <text class="cat" x="16" y="257">Qwen3-30B</text>
-  <text class="cat-sub" x="240" y="257" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="244" width="131.5" height="17" rx="4"/>
-  <text class="v-us" x="389.5" y="258">2.63×</text>
-  <text class="cat" x="16" y="283">Qwen3.6-35B</text>
-  <text class="cat-sub" x="240" y="283" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="270" width="123" height="17" rx="4"/>
-  <text class="v-us" x="381" y="284">2.46×</text>
-  <text class="cat" x="16" y="309">Qwen3-8B</text>
-  <text class="cat-sub" x="240" y="309" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="296" width="115" height="17" rx="4"/>
-  <text class="v-us" x="373" y="310">2.30×</text>
+  <rect class="us" x="250" y="166" width="114.92" height="17" rx="4"/>
+  <text class="v-us" x="372.92" y="180">3.38×</text>
+  <text class="cat" x="16" y="205">Qwen3.8-27B</text>
+  <text class="cat-sub" x="240" y="205" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="192" width="103.7" height="17" rx="4"/>
+  <text class="v-us" x="361.7" y="206">3.05×</text>
+  <text class="cat" x="16" y="231">Llama-2-7B</text>
+  <text class="cat-sub" x="240" y="231" text-anchor="end">Blackwell</text>
+  <rect class="us" x="250" y="218" width="103.7" height="17" rx="4"/>
+  <text class="v-us" x="361.7" y="232">3.05×</text>
+  <text class="cat" x="16" y="257">Qwen3-8B</text>
+  <text class="cat-sub" x="240" y="257" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="244" width="89.42" height="17" rx="4"/>
+  <text class="v-us" x="347.42" y="258">2.63×</text>
+  <text class="cat" x="16" y="283">Qwen3-30B</text>
+  <text class="cat-sub" x="240" y="283" text-anchor="end">Blackwell</text>
+  <rect class="us" x="250" y="270" width="89.42" height="17" rx="4"/>
+  <text class="v-us" x="347.42" y="284">2.63×</text>
+  <text class="cat" x="16" y="309">Qwen3.6-35B</text>
+  <text class="cat-sub" x="240" y="309" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="296" width="83.64" height="17" rx="4"/>
+  <text class="v-us" x="341.64" y="310">2.46×</text>
   <text class="cat" x="16" y="335">Qwen3-8B</text>
-  <text class="cat-sub" x="240" y="335" text-anchor="end">16 GB</text>
-  <rect class="us" x="250" y="322" width="112" height="17" rx="4"/>
-  <text class="v-us" x="370" y="336">2.24×</text>
-  <text class="cat" x="16" y="361">Flash-Next</text>
+  <text class="cat-sub" x="240" y="335" text-anchor="end">Blackwell</text>
+  <rect class="us" x="250" y="322" width="78.2" height="17" rx="4"/>
+  <text class="v-us" x="336.2" y="336">2.30×</text>
+  <text class="cat" x="16" y="361">Qwen3-8B</text>
   <text class="cat-sub" x="240" y="361" text-anchor="end">16 GB</text>
-  <rect class="us" x="250" y="348" width="111.5" height="17" rx="4"/>
-  <text class="v-us" x="369.5" y="362">2.23×</text>
-  <text class="cat" x="16" y="387">Qwen3-30B</text>
-  <text class="cat-sub" x="240" y="387" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="374" width="89.5" height="17" rx="4"/>
-  <text class="v-us" x="347.5" y="388">1.79×</text>
-  <text class="tick mid" x="250" y="412">0×</text>
-  <text class="tick mid" x="300" y="412">1×</text>
-  <text class="tick mid" x="350" y="412">2×</text>
-  <text class="tick mid" x="400" y="412">3×</text>
-  <text class="tick mid" x="450" y="412">4×</text>
-  <text class="tick mid" x="500" y="412">5×</text>
-  <text class="tick mid" x="550" y="412">6×</text>
-  <text class="tick mid" x="600" y="412">7×</text>
+  <rect class="us" x="250" y="348" width="76.16" height="17" rx="4"/>
+  <text class="v-us" x="334.16" y="362">2.24×</text>
+  <text class="cat" x="16" y="387">Flash-Next</text>
+  <text class="cat-sub" x="240" y="387" text-anchor="end">16 GB</text>
+  <rect class="us" x="250" y="374" width="75.82" height="17" rx="4"/>
+  <text class="v-us" x="333.82" y="388">2.23×</text>
+  <text class="cat" x="16" y="413">Qwen3-30B</text>
+  <text class="cat-sub" x="240" y="413" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="400" width="60.86" height="17" rx="4"/>
+  <text class="v-us" x="318.86" y="414">1.79×</text>
+  <text class="tick mid" x="250" y="438">0×</text>
+  <text class="tick mid" x="284" y="438">1×</text>
+  <text class="tick mid" x="318" y="438">2×</text>
+  <text class="tick mid" x="386" y="438">4×</text>
+  <text class="tick mid" x="454" y="438">6×</text>
+  <text class="tick mid" x="522" y="438">8×</text>
+  <text class="tick mid" x="590" y="438">10×</text>
 </svg>
-<figcaption>Every row clears parity. The widest is Qwen3.5-35B on Blackwell:
-1,187.7 t/s against a published 194.0.</figcaption>
+<figcaption>Every row clears parity. The widest is Flash-Next on the RTX 3090:
+147.0 t/s against a published 15 — their run at a 130K context on a 4-bit quant,
+ours at a short prompt on 2-bit experts, so it is the least like-for-like row.
+The widest like-for-like one is Qwen3.5-35B on Blackwell: 1,187.7 against 194.0.</figcaption>
 </figure>
 
-**Between 1.8× and 6.1×, on every row.**
+**Between 1.8× and 9.8×, on every row.**
 
 My favourite is the oldest card in the fleet. A 3090, behind a PCIe 3.0 bus, with
 no native FP8, serves Qwen3.5-35B at **375.9 t/s aggregate** — against a
 published 111.2. Qwen3.8-27B on the same card does 198.9 against a published
 65.3, and that published figure already has speculative decoding switched on.
+And the 180B Flash-Next, streaming its experts from 64 GB of RAM, serves sixteen
+conversations at **147.0 t/s** against a published 15.
 
-A five-year-old card, doing the work of three.
+A six-year-old card, doing the work of three — and on the biggest model, of ten.
 
 Aggregate against single-stream is exactly the comparison that matters when
 you're deciding how many cards to buy. llama.cpp can serve parallel requests too,

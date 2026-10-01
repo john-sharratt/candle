@@ -47,6 +47,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::Authored;
+use crate::npcs;
 
 /// The framing a portrait needs and a character description does not carry.
 ///
@@ -187,7 +188,7 @@ pub async fn post_generate(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let Ok(npc_id) = nid.parse::<u64>() else {
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return refused(
             StatusCode::NOT_FOUND,
             "npc_not_found",

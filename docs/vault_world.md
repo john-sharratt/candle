@@ -1,8 +1,8 @@
 # The Vault
 
-The Makers work in a building. Six levels, a lift and a stair. A Maker comes up
-to the command level for orders, descends to the level that holds the job, walks
-to a console, and works. Sixteen of them, at once, and every working level can
+The Makers work in a building. Six levels, joined by one lift. A Maker comes up
+to the command level for orders, rides the lift down to the level that holds the
+job, walks to a console, and works. Sixteen of them, at once, and every working level can
 hold all sixteen.
 
 **The building is data, not prose.** It lives as YAML in `npc-map/maps/`,
@@ -338,7 +338,7 @@ NPC's mental map.
 
 Every level is the same shape: a ring corridor braced across by two cross runs,
 so circulation is a loop with rungs rather than a spine with dead ends and no
-doorway the whole crew funnels through. The lift and the stair land at the same
+doorway the whole crew funnels through. The lift lands at the same
 place on every level.
 
 ## The rooms the repertoire needed

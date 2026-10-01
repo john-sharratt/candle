@@ -28,7 +28,9 @@ use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
 use crate::engine::body::Outcome;
-use crate::sim::record::{Condition, Item, Kind, State};
+use crate::engine::mission::bank::Facts;
+use crate::engine::mission::Outcome as Verdict;
+use crate::sim::record::{slug_of, Condition, Item, Kind, State};
 use crate::world::Hosted;
 
 /// The acts this module performs.
@@ -36,6 +38,7 @@ pub fn is_mine(tool: &str) -> bool {
     crate::engine::station::STATION_ACTS
         .iter()
         .chain(crate::engine::bench::BENCH_ACTS)
+        .chain(crate::engine::mission_acts::MISSION_ACTS)
         .any(|t| t.name == tool)
 }
 
@@ -79,6 +82,93 @@ fn subject(args: &Map<String, Value>) -> Option<String> {
     None
 }
 
+/// Perform a mission act.
+///
+/// Take one up at the desk, record progress on it wherever the work happened, or
+/// report how it went. The rich model is [`crate::engine::mission`]; whose it is
+/// is [`crate::sim::missions`]; this moves a mission between those states and
+/// hands the character back a line it reads.
+fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
+    let a = &act.args;
+    match act.tool {
+        "collect_mission" => {
+            // **One mission at a time.** `collect_mission` is offered whenever a
+            // body stands at the desk, including when it has come back to report
+            // — so without this a character could draw a fresh mission over an
+            // open one, discarding the answer it built and never filing it to
+            // `done`. Report it first; then the desk has something new to give.
+            if hosted.sim(|s| s.missions.is_on_mission(body)) {
+                return Outcome::Refused(
+                    "You are already carrying a mission. Report how it went at the \
+                     desk — report_done or report_stuck — before taking another."
+                        .into(),
+                );
+            }
+            // The character's own name, so a routine that would send it to visit
+            // "the makers here" is not built around visiting itself.
+            let me = hosted
+                .read(|w| w.actor(body).map(|actor| actor.name.clone()))
+                .unwrap_or_default();
+            hosted.with_sim(|s| {
+                let (makers, records) = s.mission_material(&me);
+                let facts = Facts {
+                    makers: &makers,
+                    records: &records,
+                };
+                let mission = s.missions.collect(body, &facts);
+                let brief = mission.standing_text();
+                tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
+                Outcome::Did(format!("You take it up.\n{brief}"))
+            })
+        }
+        "report_done" => {
+            let Some(account) = text(a, "account") else {
+                return Outcome::Refused(
+                    "You meant to report it done, but did not say what you found.".into(),
+                );
+            };
+            hosted.with_sim(|s| {
+                // The account is both the report's notes (how it went) and the
+                // answer (what was found) — for a mission done, the two are the
+                // same line, so it is filed under both.
+                match s
+                    .missions
+                    .report(body, Verdict::Pass, &account, Some(account.clone()))
+                {
+                    Some(m) => {
+                        tracing::info!(npc = body, prompt = %m.mission_text(), "mission reported DONE at the command table");
+                        Outcome::Did(format!(
+                            "Reported done, and your answer filed: {}",
+                            m.mission_text()
+                        ))
+                    }
+                    None => Outcome::Refused("You are not carrying a mission to report on.".into()),
+                }
+            })
+        }
+        "report_stuck" => {
+            let Some(why) = text(a, "why") else {
+                return Outcome::Refused(
+                    "You meant to report it stuck, but did not say why.".into(),
+                );
+            };
+            hosted.with_sim(
+                |s| match s.missions.report(body, Verdict::Fail, &why, None) {
+                    Some(m) => {
+                        tracing::info!(npc = body, prompt = %m.mission_text(), "mission reported STUCK at the command table");
+                        Outcome::Did(format!(
+                            "Reported as not done, with your reasons: {}",
+                            m.mission_text()
+                        ))
+                    }
+                    None => Outcome::Refused("You are not carrying a mission to report on.".into()),
+                },
+            )
+        }
+        other => Outcome::Refused(format!("`{other}` is not a mission act.")),
+    }
+}
+
 /// Perform one station or bench act.
 pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     let a = &act.args;
@@ -89,6 +179,12 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     if matches!(act.tool, "library_read" | "library_write") {
         return library(hosted, body, act.tool, a);
     }
+    // The mission acts before the subject is looked for: `collect_mission`
+    // names nothing, and the reports carry their subject under `account` / `why`,
+    // which the shared [`subject`] list does not scan.
+    if crate::engine::mission_acts::is_mine(act.tool) {
+        return mission(hosted, body, act);
+    }
     let Some(what) = subject(a)
         .or_else(|| Some(String::new()))
         .filter(|s| !s.is_empty())
@@ -98,15 +194,16 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     };
 
     match act.tool {
-        // ── writing into the record ─────────────────────────────────────────
-        "chronicle_add_entry"
-        | "story_draft"
-        | "character_write_identity"
-        | "character_write_wants"
-        | "character_write_memories"
-        | "place_write_entry"
-        | "place_write_local_history"
-        | "chronicle_rewrite_page" => {
+        // ── writing a document into the record ──────────────────────────────
+        //
+        // Everything here is an era-shaped document: a record item with a path
+        // [`crate::sim::record::Record::settle_path`] mints, so the write goes
+        // through the bench's working set and lands on the disk at the commit. A
+        // place's entry is one of them — its `Place` kind now settles into
+        // `layers/world/locations`. The character verbs and a place's local
+        // history are *not* here: they reach the mind folder a different way and
+        // are handled below.
+        "chronicle_add_entry" | "story_draft" | "place_write_entry" | "chronicle_rewrite_page" => {
             // **The subject is the naming argument, never `what`.** Every act
             // here carries its text in `what` and the thing it writes into in a
             // preposition — `to` an era, `for` a gap, `in` a page, `of` a
@@ -124,6 +221,76 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 return Outcome::Refused("You meant to write something, but not what.".into());
             };
             write_into(hosted, body, &target, &body_text)
+        }
+        // ── the character sheet, and the memory beside it ───────────────────
+        //
+        // **Not era-shaped documents.** Who a character is and what they want
+        // are fields on their personality sheet, edited in place the way a
+        // portrait's art direction is (`portrait_draw`, below) so the comments a
+        // person wrote around them survive; what they remember is appended to
+        // their own memory layer. None is a record item with a path, so none
+        // goes through `write_into` — each reaches the mind folder straight
+        // through the bench, and a world with no mind folder keeps the in-RAM
+        // draft the shipped handler always did.
+        "character_write_identity" => author_sheet(hosted, body, a, &["anchor"]),
+        "character_write_wants" => author_sheet(hosted, body, a, &["wants"]),
+        "character_write_memories" => {
+            let (Some(who), Some(t)) = (text(a, "of"), text(a, "what")) else {
+                return Outcome::Refused(
+                    "You meant to write a memory, but not whose, or not what.".into(),
+                );
+            };
+            hosted.with_sim(|s| {
+                // No mind folder — the mind-less test daemon — keeps the draft
+                // in the record, exactly as it did before any of this reached
+                // disk.
+                if !s.bench.has_root() {
+                    return match s.record.write(&who, body, &t) {
+                        Ok(n) => Outcome::Did(format!("You write into {n}: {t}")),
+                        Err(why) => Outcome::Refused(why),
+                    };
+                }
+                let path = format!("layers/memory/{}/memories.md", slug_of(&who));
+                match s.bench.append(body, &who, &path, &t) {
+                    Ok(p) => Outcome::Did(format!(
+                        "Something that happened to {who} is written down ({p}). Nobody else sees \
+                         it until you commit."
+                    )),
+                    Err(why) => Outcome::Refused(why),
+                }
+            })
+        }
+        "place_write_local_history" => {
+            let (Some(place), Some(t)) = (text(a, "of"), text(a, "what")) else {
+                return Outcome::Refused(
+                    "You meant to write a place's history, but not whose, or not what.".into(),
+                );
+            };
+            hosted.with_sim(|s| {
+                // A place's local history is a second document, in geography —
+                // its entry (its own `path`) is where you stand, this is what
+                // happened here. No mind folder keeps it in the record's draft.
+                let path = match s.bench.has_root() {
+                    true => s.record.history_path(&place),
+                    false => None,
+                };
+                let Some(path) = path else {
+                    return match s.record.write(&place, body, &t) {
+                        Ok(n) => Outcome::Did(format!("You write into {n}: {t}")),
+                        Err(why) => Outcome::Refused(why),
+                    };
+                };
+                if let Err(why) = s.record.claim_for_write(&place, body) {
+                    return Outcome::Refused(why);
+                }
+                match s.bench.append(body, &place, &path, &t) {
+                    Ok(p) => Outcome::Did(format!(
+                        "The local history of {place} is written down ({p}). Nobody else sees it \
+                         until you commit."
+                    )),
+                    Err(why) => Outcome::Refused(why),
+                }
+            })
         }
         // ── likenesses ──────────────────────────────────────────────────────
         //
@@ -559,7 +726,38 @@ const LIBRARY_FIELDS: &[&str] = &["description", "template"];
 
 /// The document a personality is.
 fn personality_path(who: &str) -> String {
-    format!("personalities/{}.yaml", slug(who))
+    format!("personalities/{}.yaml", slug_of(who))
+}
+
+/// Write one field of a character's founding sheet, in place.
+///
+/// The `portrait_draw` pattern for the two identity fields — `anchor` (who they
+/// are) and `wants` (what they are after). The sheet is a YAML document and the
+/// field is spliced into it through [`crate::sim::bench::Benches::write_field`],
+/// so the reasoning a person wrote around it in comments survives where a
+/// round-trip would lose it. A world with no mind folder has no sheet to edit
+/// and keeps the in-RAM draft the shipped handler always kept.
+fn author_sheet(hosted: &Hosted, body: &str, args: &Map<String, Value>, at: &[&str]) -> Outcome {
+    let (Some(who), Some(t)) = (text(args, "of"), text(args, "what")) else {
+        return Outcome::Refused(
+            "You meant to write who somebody is, but not whose, or not what.".into(),
+        );
+    };
+    hosted.with_sim(|s| {
+        if !s.bench.has_root() {
+            return match s.record.write(&who, body, &t) {
+                Ok(n) => Outcome::Did(format!("You write into {n}: {t}")),
+                Err(why) => Outcome::Refused(why),
+            };
+        }
+        let path = personality_path(&who);
+        match s.bench.write_field(body, &who, &path, at, &t) {
+            Ok(p) => Outcome::Did(format!(
+                "{who} is written into {p}: {t}. Nobody else sees it until you commit."
+            )),
+            Err(why) => Outcome::Refused(why),
+        }
+    })
 }
 
 /// The document a piece of the craft is, from the two halves that address it.
@@ -576,21 +774,7 @@ fn library_path(args: &Map<String, Value>) -> Result<String, String> {
             ))
         }
     };
-    Ok(format!("{dir}/{}.yaml", slug(&id)))
-}
-
-/// A name as a filename: what a character calls a thing, as the disk spells it.
-fn slug(name: &str) -> String {
-    let s: String = name
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| match c.is_ascii_alphanumeric() || c == '_' {
-            true => c,
-            false => '-',
-        })
-        .collect();
-    s.trim_matches('-').replace("--", "-")
+    Ok(format!("{dir}/{}.yaml", slug_of(&id)))
 }
 
 /// Write into something, taking it if nobody has it.
@@ -1796,6 +1980,388 @@ mod tests {
         );
     }
 
+    // ── character and place authoring reach the disk ─────────────────────────
+    //
+    // D.6 #1: `character_write_*` and `place_write_*` used to fall to an in-RAM
+    // `Record.body` that a restart threw away. They write the mind folder now,
+    // through the bench working copy, and survive a reload.
+
+    /// The vault, with a mind folder holding a courier's sheet — everything the
+    /// character and place authoring tests write into or read back.
+    fn vault_authoring(name: &str) -> (Hosted, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("npcd-author-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("personalities")).unwrap();
+        std::fs::write(
+            root.join("personalities/the-courier.yaml"),
+            "# the courier — identity definition.\nid: the-courier\nname: The Courier\n",
+        )
+        .unwrap();
+        // The record already names the courier and the eastern flats (the vault
+        // seed); the world/ layers are made on the first commit into them.
+        let h = vault();
+        h.set_bench_root(&root);
+        (h, root)
+    }
+
+    /// **Who a character is reaches the sheet on disk, and not before the
+    /// commit.** The `anchor` field, written the way a portrait's words are.
+    #[test]
+    fn character_identity_is_written_to_the_sheet_and_survives_a_commit() {
+        let (h, root) = vault_authoring("identity");
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "character_write_identity",
+                json!({"of":"the courier","what":"steady so long that being doubted is the thing they cannot take"}),
+            ),
+        );
+        assert!(out.happened(), "{out:?}");
+        assert!(
+            !std::fs::read_to_string(root.join("personalities/the-courier.yaml"))
+                .unwrap()
+                .contains("cannot take"),
+            "the sheet moved before the commit"
+        );
+
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"cast the courier"}))
+        )
+        .happened());
+        let sheet = std::fs::read_to_string(root.join("personalities/the-courier.yaml")).unwrap();
+        let doc: Value = serde_yaml::from_str(&sheet).unwrap();
+        assert_eq!(
+            doc["anchor"],
+            json!("steady so long that being doubted is the thing they cannot take")
+        );
+        // The splice kept the sheet's own header and its other fields.
+        assert!(
+            sheet.contains("# the courier — identity definition."),
+            "the header was lost: {sheet}"
+        );
+        assert_eq!(
+            doc["name"],
+            json!("The Courier"),
+            "an untouched field moved"
+        );
+    }
+
+    /// **What a character wants becomes a new top-level field on the sheet**,
+    /// beside the anchor, and the anchor written first is still there.
+    #[test]
+    fn character_wants_becomes_a_new_field_beside_the_anchor() {
+        let (h, root) = vault_authoring("wants");
+        perform(
+            &h,
+            "m1",
+            &act(
+                "character_write_identity",
+                json!({"of":"the courier","what":"reliable to a fault"}),
+            ),
+        );
+        perform(
+            &h,
+            "m1",
+            &act(
+                "character_write_wants",
+                json!({"of":"the courier","what":"to be trusted again by the one house that stopped"}),
+            ),
+        );
+        perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"gave the courier a reason"})),
+        );
+
+        let sheet = std::fs::read_to_string(root.join("personalities/the-courier.yaml")).unwrap();
+        let doc: Value = serde_yaml::from_str(&sheet).unwrap();
+        assert_eq!(doc["anchor"], json!("reliable to a fault"));
+        assert_eq!(
+            doc["wants"],
+            json!("to be trusted again by the one house that stopped")
+        );
+    }
+
+    /// **A memory lands as a document in the character's own memory layer**, not
+    /// on the sheet — and not before the commit.
+    #[test]
+    fn a_memory_lands_in_the_characters_memory_layer() {
+        let (h, root) = vault_authoring("memory");
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "character_write_memories",
+                json!({"of":"the courier","what":"the afternoon they waited four hours at a gate that was never going to open"}),
+            ),
+        );
+        assert!(out.happened(), "{out:?}");
+        let p = root.join("layers/memory/the-courier/memories.md");
+        assert!(!p.exists(), "the memory reached the disk before the commit");
+
+        perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"remembered the gate"})),
+        );
+        let written = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            written.contains("waited four hours at a gate that was never going to open"),
+            "{written}"
+        );
+    }
+
+    /// **A second memory is added to the first**, the way an era's entries are.
+    #[test]
+    fn a_second_memory_is_added_rather_than_replacing_the_first() {
+        let (h, root) = vault_authoring("memory-append");
+        perform(
+            &h,
+            "m1",
+            &act(
+                "character_write_memories",
+                json!({"of":"the courier","what":"First."}),
+            ),
+        );
+        perform(
+            &h,
+            "m1",
+            &act(
+                "character_write_memories",
+                json!({"of":"the courier","what":"Second."}),
+            ),
+        );
+        perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"two afternoons"})),
+        );
+        let written =
+            std::fs::read_to_string(root.join("layers/memory/the-courier/memories.md")).unwrap();
+        assert!(written.contains("First."), "{written}");
+        assert!(
+            written.find("First.") < written.find("Second."),
+            "the memories came back out of order: {written}"
+        );
+    }
+
+    /// **A place entry lands in the locations layer and survives a reload.** A
+    /// fresh, empty record reads the committed disk and the place is part of the
+    /// record again — the durability this whole change exists for.
+    #[test]
+    fn a_place_entry_lands_in_the_locations_layer_and_survives_a_reload() {
+        let (h, root) = vault_authoring("place-entry");
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "place_write_entry",
+                json!({"of":"the eastern flats","what":"ground fused smooth, no cover anywhere on it, and a wind that does not stop"}),
+            ),
+        );
+        assert!(out.happened(), "{out:?}");
+        let p = root.join("layers/world/locations/the-eastern-flats.md");
+        assert!(!p.exists(), "the disk moved before the commit");
+
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"surveyed the flats"}))
+        )
+        .happened());
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("a wind that does not stop"),
+            "the entry did not reach the locations layer"
+        );
+
+        // A fresh process, an empty record: it reads the committed disk and the
+        // place is filed, at its path, again.
+        let mut fresh = crate::sim::record::Record::new();
+        fresh.index_canon(&root);
+        assert_eq!(
+            fresh.path_of("the eastern flats").as_deref(),
+            Some("layers/world/locations/the-eastern-flats.md")
+        );
+        assert_eq!(
+            fresh.by_name("the eastern flats").unwrap().state,
+            State::Filed
+        );
+        assert_eq!(
+            fresh.by_name("the eastern flats").unwrap().kind,
+            Kind::Place
+        );
+    }
+
+    /// **A place's local history lands in geography, not on its entry**, and
+    /// survives a reload the same way.
+    #[test]
+    fn a_places_local_history_lands_in_geography_and_survives_a_reload() {
+        let (h, root) = vault_authoring("place-history");
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "place_write_local_history",
+                json!({"of":"the eastern flats","what":"why the road stops here — what came across it, and the year it stopped being worth rebuilding"}),
+            ),
+        );
+        assert!(out.happened(), "{out:?}");
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"gave the flats a reason"}))
+        )
+        .happened());
+        let p = root.join("layers/world/geography/the-eastern-flats.md");
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("the year it stopped being worth rebuilding"),
+            "the history did not reach the geography layer"
+        );
+
+        // A place known only by its history is part of the record again, but its
+        // history is NOT its entry path: `Item.path` names the entry, which is
+        // still unwritten here, and the history is found name-derived instead.
+        let mut fresh = crate::sim::record::Record::new();
+        fresh.index_canon(&root);
+        assert!(
+            fresh.path_of("the eastern flats").is_none(),
+            "the geography history was adopted as the entry path"
+        );
+        assert_eq!(
+            fresh.history_path("the eastern flats").as_deref(),
+            Some("layers/world/geography/the-eastern-flats.md")
+        );
+        assert_eq!(
+            fresh.by_name("the eastern flats").unwrap().state,
+            State::Filed
+        );
+    }
+
+    /// **A place with BOTH documents writes its entries into the entry file, not
+    /// its history.** After both are on disk and the record has re-indexed them,
+    /// `Item.path` names the locations entry — so `place_write_entry` appends
+    /// there, and the geography history it also has is left untouched. This is
+    /// the defect the geography-pass fix closes: an entry that leaked into the
+    /// history because indexing re-pointed `Item.path` at geography.
+    #[test]
+    fn a_place_with_both_documents_writes_entries_to_the_entry_not_the_history() {
+        let (h, root) = vault_authoring("place-both");
+        std::fs::create_dir_all(root.join("layers/world/locations")).unwrap();
+        std::fs::create_dir_all(root.join("layers/world/geography")).unwrap();
+        std::fs::write(
+            root.join("layers/world/locations/the-eastern-flats.md"),
+            "# the eastern flats\n\nGround fused smooth.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("layers/world/geography/the-eastern-flats.md"),
+            "# the eastern flats\n\nWhy the road stops here.\n",
+        )
+        .unwrap();
+        // Re-index off the disk so the record adopts both documents.
+        h.set_bench_root(&root);
+        h.sim(|s| {
+            assert_eq!(
+                s.record.path_of("the eastern flats").as_deref(),
+                Some("layers/world/locations/the-eastern-flats.md"),
+                "the entry path was overwritten by the geography history"
+            );
+        });
+
+        let out = perform(
+            &h,
+            "m1",
+            &act(
+                "place_write_entry",
+                json!({"of":"the eastern flats","what":"a new survey line about the wind"}),
+            ),
+        );
+        assert!(out.happened(), "{out:?}");
+        assert!(perform(
+            &h,
+            "m1",
+            &act("bench_commit", json!({"why":"surveyed the flats again"}))
+        )
+        .happened());
+
+        let entry =
+            std::fs::read_to_string(root.join("layers/world/locations/the-eastern-flats.md"))
+                .unwrap();
+        assert!(
+            entry.contains("a new survey line about the wind"),
+            "the entry prose did not reach the entry file: {entry}"
+        );
+        let history =
+            std::fs::read_to_string(root.join("layers/world/geography/the-eastern-flats.md"))
+                .unwrap();
+        assert!(
+            !history.contains("a new survey line about the wind"),
+            "the entry prose leaked into the history file: {history}"
+        );
+    }
+
+    /// **The mind-less daemon still works.** With no mind folder, every one of
+    /// the five verbs keeps its in-RAM draft rather than panicking — the shipped
+    /// behaviour, preserved for the world (Battle Cities) that has no disk.
+    #[test]
+    fn character_and_place_authoring_without_a_mind_folder_stays_in_ram() {
+        let h = vault();
+        for a in [
+            act(
+                "character_write_identity",
+                json!({"of":"the courier","what":"steady"}),
+            ),
+            act(
+                "character_write_wants",
+                json!({"of":"the courier","what":"to be trusted"}),
+            ),
+            act(
+                "character_write_memories",
+                json!({"of":"the courier","what":"an afternoon at a gate"}),
+            ),
+            act(
+                "place_write_entry",
+                json!({"of":"the eastern flats","what":"smooth ground and a wind"}),
+            ),
+            act(
+                "place_write_local_history",
+                json!({"of":"the eastern flats","what":"why the road stops"}),
+            ),
+        ] {
+            let out = perform(&h, "m1", &a);
+            assert!(
+                out.happened(),
+                "{} did not survive the no-root path: {out:?}",
+                a.tool
+            );
+        }
+        h.sim(|s| {
+            assert!(
+                s.record
+                    .by_name("the courier")
+                    .unwrap()
+                    .body
+                    .contains("steady"),
+                "the courier's draft was lost"
+            );
+            assert!(
+                s.record
+                    .by_name("the eastern flats")
+                    .unwrap()
+                    .body
+                    .contains("smooth ground"),
+                "the flats' draft was lost"
+            );
+        });
+    }
+
     // ── the craft libraries ─────────────────────────────────────────────────
 
     #[test]
@@ -2081,11 +2647,57 @@ mod tests {
         assert!(!out.happened(), "{out:?}");
     }
 
+    /// A mission taken up at the desk, worked with its progress recorded, and
+    /// reported — the whole loop through `perform`. `perform` does not gate on
+    /// availability (the grammar does), so this drives the acts directly.
+    #[test]
+    fn a_mission_is_collected_worked_and_reported() {
+        let h = vault();
+        // Nothing to report before collecting.
+        assert!(matches!(
+            perform(&h, "m1", &act("report_done", json!({"account":"nothing"}))),
+            Outcome::Refused(_)
+        ));
+
+        // Collecting draws a mission (a bank routine here — the vault has no
+        // records indexed) and makes it the body's open one.
+        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        assert!(h.sim(|s| s.missions.is_on_mission("m1")));
+
+        // A second collect while already carrying one is refused — one at a
+        // time, so a mission in progress is never discarded by drawing another.
+        assert!(matches!(
+            perform(&h, "m1", &act("collect_mission", json!({}))),
+            Outcome::Refused(_)
+        ));
+
+        // Reporting done closes it, frees the character, and files the answer so
+        // an operator can still read it.
+        assert!(perform(
+            &h,
+            "m1",
+            &act(
+                "report_done",
+                json!({"account":"the ledger is two years out"})
+            )
+        )
+        .happened());
+        assert!(
+            !h.sim(|s| s.missions.is_on_mission("m1")),
+            "reporting frees the character for the next mission"
+        );
+        assert_eq!(
+            h.sim(|s| s.missions.done("m1").unwrap().answer.clone()),
+            Some("the ledger is two years out".to_string())
+        );
+    }
+
     #[test]
     fn every_station_and_bench_act_is_dispatched() {
         for t in crate::engine::station::STATION_ACTS
             .iter()
             .chain(crate::engine::bench::BENCH_ACTS)
+            .chain(crate::engine::mission_acts::MISSION_ACTS)
         {
             assert!(
                 is_mine(t.name),

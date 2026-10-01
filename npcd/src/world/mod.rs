@@ -24,6 +24,7 @@
 //! this design would otherwise have.
 
 pub mod binding;
+pub mod mapstore;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use npc_map::delta::{Attention, Delta};
 use npc_map::world::World;
-use npc_map::MapSet;
+use npc_map::{MapEdit, MapSet};
 
 use crate::engine::rooms::Rooms;
 use crate::sim::{seed, Sim};
@@ -41,6 +42,20 @@ use crate::sim::{seed, Sim};
 pub struct Hosted {
     id: String,
     state: Mutex<State>,
+    /// The directory this world's map was loaded from, when it was loaded from
+    /// disk — where a runtime reshape ([`Hosted::reshape`]) writes the change
+    /// back so it survives a restart. `None` for an in-memory world
+    /// ([`Hosted::of`], a generated world or a test), whose reshapes are
+    /// ephemeral by construction: there is no authored file to keep them in.
+    map_dir: Option<PathBuf>,
+    /// Serialises the write-back half of [`Hosted::reshape`] — deliberately a
+    /// second lock, separate from `state`, because that write is deliberately
+    /// off the world lock for latency. Without it, two reshapes landing on the
+    /// same area at once would both call [`mapstore::persist`] and both write
+    /// the identical `<area>.yaml.tmp` path at once, with nothing stopping the
+    /// two `File::create`/`write_all` calls from interleaving before either
+    /// `rename` lands.
+    writeback: Mutex<()>,
 }
 
 struct State {
@@ -61,6 +76,28 @@ struct State {
     /// written into the world log, so producing one *is* a world mutation and
     /// has to be serialised with every other.
     rooms: Rooms,
+}
+
+/// What a successful reshape did — who it displaced, and whether it was kept.
+#[derive(Debug, Clone)]
+pub struct Reshaped {
+    /// The ids of bodies relocated because the room they stood in was drowned,
+    /// in a stable order. Empty when the reshape displaced nobody.
+    pub relocated: Vec<String>,
+    /// Whether the change was written back to the authored map.
+    pub durability: Durability,
+}
+
+/// Whether a reshape survives a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Durability {
+    /// Written back to the authored YAML — it will still be there after a reboot.
+    Written,
+    /// The change is live but was not written back (the write failed). The reason
+    /// is carried so an operator learns the reshape is not yet durable.
+    Failed(String),
+    /// This world has no authored directory, so the change holds for the run only.
+    Ephemeral,
 }
 
 impl Hosted {
@@ -86,6 +123,8 @@ impl Hosted {
                 sim,
                 rooms: Rooms::new(),
             }),
+            map_dir: Some(dir.to_path_buf()),
+            writeback: Mutex::new(()),
         })
     }
 
@@ -102,6 +141,10 @@ impl Hosted {
                 sim,
                 rooms: Rooms::new(),
             }),
+            // An in-memory world has no authored directory, so its reshapes are
+            // ephemeral: nothing to write them back to.
+            map_dir: None,
+            writeback: Mutex::new(()),
         }
     }
 
@@ -146,6 +189,61 @@ impl Hosted {
         let mut state = self.state.lock().expect("world lock");
         let State { world, sim, .. } = &mut *state;
         f(world, sim)
+    }
+
+    /// Reshape this world's walkable map while it runs, and keep the change
+    /// (effector design Appendix F).
+    ///
+    /// **Two steps, in order: mutate, then persist.** The in-RAM mutation runs
+    /// under the world lock ([`World::reshape`]) — swap the map, re-derive the
+    /// lift shaft, relocate anyone standing where a room was drowned — and refuses
+    /// without touching the world if the edit would not validate. Only once that
+    /// has landed is the change written back to the authored YAML, so the swap is
+    /// the source of truth and the file follows it.
+    ///
+    /// **The write is off the lock, and best-effort.** The map is snapshotted
+    /// under the lock and serialised outside it, so a disk stall never freezes
+    /// ticks; and a write that fails is *reported* ([`Durability::Failed`]) rather
+    /// than un-happening a reshape that already took — the operator is told the
+    /// change is live but not yet durable, which is the truth, instead of a lie in
+    /// either direction. A world with no authored directory ([`Hosted::of`]) is
+    /// [`Durability::Ephemeral`]: the reshape holds for the run and is gone on
+    /// restart, because there is nowhere to keep it.
+    ///
+    /// **The write-back itself is serialised** against every other reshape's
+    /// write-back on this world ([`Self::writeback`]), so two edits landing on
+    /// the same area in quick succession still write it one at a time rather
+    /// than racing on the same temp file.
+    ///
+    /// `Err(reason)` is the world's own words on why the edit was refused, with
+    /// nothing changed.
+    pub fn reshape(&self, edit: &MapEdit) -> Result<Reshaped, String> {
+        let relocated = self.with(|w| w.reshape(edit))?;
+        let durability = match &self.map_dir {
+            None => Durability::Ephemeral,
+            Some(dir) => {
+                // Held for the snapshot and the write together, so no other
+                // reshape's write-back can interleave with this one's.
+                let _writeback = self.writeback.lock().expect("writeback lock");
+                let map = self.read(|w| w.map().clone());
+                match mapstore::persist(dir, edit, &map) {
+                    Ok(()) => Durability::Written,
+                    Err(e) => {
+                        tracing::error!(
+                            world = %self.id,
+                            area = %edit.area(),
+                            error = %e,
+                            "reshape landed in memory but could not be written back"
+                        );
+                        Durability::Failed(e.to_string())
+                    }
+                }
+            }
+        };
+        Ok(Reshaped {
+            relocated,
+            durability,
+        })
     }
 
     /// Point this world's benches at the documents they work on.
@@ -457,5 +555,72 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
         assert!(second.read(|w| w.actor("m1").is_none()), "a body survived");
         assert_eq!(worlds.len(), 1);
+    }
+
+    /// **Concurrent reshapes to the same area do not corrupt the write-back.**
+    /// Eight threads each add their own room off `core` at once; the write-back
+    /// mutex ([`Hosted::writeback`]) must serialise their write-backs to
+    /// `a.yaml.tmp` so the file on disk is never a torn write of two of them at
+    /// once, and every room they added survives to the reloaded map.
+    #[test]
+    fn concurrent_reshapes_to_the_same_area_do_not_corrupt_the_written_file() {
+        use npc_map::schema::{Node, NodeKind};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "npcd-world-race-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.yaml"),
+            "id: a\nkind: level\nname: A\nsummary: a place\nnodes:\n  - id: core\n    kind: core\n    name: core\n",
+        )
+        .unwrap();
+
+        let hosted = Arc::new(Hosted::load("race", &dir).expect("the base map loads"));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let hosted = Arc::clone(&hosted);
+                std::thread::spawn(move || {
+                    let edit = MapEdit::AddNode {
+                        area: "a".into(),
+                        node: Box::new(Node {
+                            id: format!("room-{i}"),
+                            kind: NodeKind::Social,
+                            name: format!("room {i}"),
+                            plural: false,
+                            stand: None,
+                            off: vec!["core".into()],
+                            character: None,
+                            parts: vec![],
+                            ground: vec![],
+                            habit: None,
+                            sees: vec![],
+                            exits: vec![],
+                            visible: vec![],
+                        }),
+                    };
+                    hosted.reshape(&edit).expect("each add lands")
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Still valid YAML — a torn write would fail to parse here — and every
+        // room every thread added is in it.
+        let reloaded = MapSet::load_dir(&dir).expect("the written map still parses");
+        let area = reloaded.get("a").expect("the area survives");
+        for i in 0..8 {
+            assert!(
+                area.node(&format!("room-{i}")).is_some(),
+                "room-{i} did not survive concurrent write-back"
+            );
+        }
     }
 }

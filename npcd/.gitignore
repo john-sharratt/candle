@@ -13,6 +13,13 @@
 # is given.
 accounts/
 
+# Effector device tokens — one opaque secret per character, the whole of the
+# device surface's auth (see `src/effector/token.rs`). A token is a credential,
+# so it stays out of a public repository for the same reason accounts do: git
+# history is the one place you cannot quietly remove something from later, so the
+# exclusion holds before the first write rather than after the first leak.
+tokens/
+
 # `npcd` holds no key — sign-in belongs to the gateway, which never shares the
 # one it signs sessions with. Kept as a rule so that anything later dropped here
 # stays out of a public repository by default rather than by remembering.

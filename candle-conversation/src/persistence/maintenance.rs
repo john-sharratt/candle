@@ -701,6 +701,20 @@ fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             .encode(),
         });
     }
+    // Host-defined keyed state — the npcd command-table flag and anything else
+    // stored through `SharedSubstrate::put_custom_object`. Resident, so the same
+    // re-emit contract as the couplings above: the winner for each key is held
+    // in `Substrate::custom_objects` and carried forward from RAM. The key's
+    // hash rides in the header `stream_id` so supersession accounting is
+    // mechanical (see the twin block in `compaction::collect_live_records`).
+    for obj in substrate.live_custom_objects() {
+        out.push(Resident {
+            rt: RecordType::CustomObject,
+            stream_id: obj.stream_id(),
+            chunk_index: 0,
+            payload: obj.encode(),
+        });
+    }
     out
 }
 
@@ -1555,6 +1569,12 @@ impl SubstratePersistence {
     /// lose. `carried` maps each carried stream to whether its signature
     /// records (`ProjectionEvents` / `WideQSig` / `TurnIndexPage`) go with it;
     /// the decl and commit always do.
+    ///
+    /// `CustomObject` is always carried. It is keyed by a content hash of its
+    /// key, not by a stream, so it has no `StreamDecl` lifecycle for `carried`
+    /// to consult — it is host-defined resident state like the cast in
+    /// `npc_locs`. Gating it on `carried` (which never holds a key hash) would
+    /// count its segment dead and let a drop take its only current copy.
     fn carried_metadata<'a>(
         &'a self,
         carried: &'a CarriedStreams,
@@ -1562,6 +1582,9 @@ impl SubstratePersistence {
         self.metadata_locs
             .iter()
             .filter_map(move |(&(rt, stream_id), loc)| {
+                if rt == RecordType::CustomObject {
+                    return Some(loc);
+                }
                 let keep_sig = *carried.get(&stream_id)?;
                 let is_signature = matches!(
                     rt,
@@ -2333,6 +2356,87 @@ mod tests {
             vec![7],
             "the character must still be on disk after maintenance rewrote its segment"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `CustomObject` (npcd's command-table flag, and host state generally)
+    /// survives a maintenance pass that rewrites its segment — the
+    /// content-hash-keyed twin of [`a_character_survives_segment_maintenance`].
+    /// It is protected two ways, both exercised here: its location is tracked in
+    /// `metadata_locs` (so [`SubstratePersistence::need_resident_reemit`] forces
+    /// a re-emit when its segment is a target) and [`segment_liveness`] counts it
+    /// (so its segment is not understated as reclaimable and churned forward each
+    /// pass). Before both, the object was neither tracked nor counted: the flag
+    /// read back missing after maintenance rewrote its segment — the same silent
+    /// loss the character bug had.
+    #[test]
+    fn a_custom_object_survives_segment_maintenance() {
+        use crate::persistence::record::CustomObjectPayload;
+        let dir = tmp_dir("custom_object_maintenance");
+        let sid = StreamId(404);
+        let key = "command-table";
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            // seg 1: the object, beside a chunk a later write supersedes — the
+            // dead weight is what draws maintenance to this segment.
+            let obj = CustomObjectPayload::new(key, serde_json::json!({ "open": true }));
+            sp.write_custom_object(&obj).unwrap();
+            substrate.apply_custom_object(obj);
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1))
+                .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let stream_id = CustomObjectPayload::stream_id_for(key);
+            assert_eq!(
+                sp.metadata_locs
+                    .get(&(RecordType::CustomObject, stream_id))
+                    .map(|l| l.segment),
+                Some(SegmentId(1)),
+                "the object's location is tracked, in the segment about to be maintained"
+            );
+            assert!(
+                sp.segment_liveness(&substrate)
+                    .get(&SegmentId(1))
+                    .copied()
+                    .unwrap_or(0)
+                    > 0,
+                "the live object pins its segment's weight, so it does not read as fully dead"
+            );
+            // Forced, so the test does not wait out the settle age — the same
+            // phased path the daemon runs.
+            let plan = sp
+                .plan_maintenance(&substrate, true)
+                .unwrap()
+                .expect("seg 1 carries dead weight, so a pass runs");
+            let op = plan.op();
+            let result = sp.execute_maintenance(&plan).unwrap();
+            result.apply_to_substrate(&mut substrate);
+            sp.finish_maintenance(&plan).unwrap();
+            assert!(
+                op.targets().contains(&SegmentId(1)),
+                "the pass targets the segment holding the object, got {op:?}"
+            );
+        }
+        // Across a restart, which is where the loss actually showed.
+        {
+            let mut substrate = Substrate::new();
+            SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(
+                substrate.custom_object(key).map(|o| o.blob.clone()),
+                Some(serde_json::json!({ "open": true })),
+                "the object must still be on disk after maintenance rewrote its segment"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

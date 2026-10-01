@@ -54,7 +54,8 @@ extern "C" void run_batched_sampling_f16(
     // Output
     uint32_t* output_tokens,
     uint64_t seed,
-    uint64_t* rng_offsets
+    uint64_t* rng_offsets,
+    const void* seq_dials
 ) {
     launch_batched_sampling_typed<half>(
         logits, batch_size, vocab_size,
@@ -71,6 +72,7 @@ extern "C" void run_batched_sampling_f16(
         recent_tokens, recent_lens, max_recent_len,
         stencil, stencil_size,
         temperature, top_k, top_p,
-        output_tokens, seed, rng_offsets
+        output_tokens, seed, rng_offsets,
+        reinterpret_cast<const SeqDials*>(seq_dials)
     );
 }

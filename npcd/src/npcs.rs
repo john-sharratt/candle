@@ -800,6 +800,38 @@ impl Npcs {
         self.bump(npc, owner, now_ms)
     }
 
+    /// State a strategy on a character's **own** agency, owner-blind.
+    ///
+    /// The effector device acts as the character's own body and carries no
+    /// operator owner to authorise the write, so this resolves the owner from
+    /// the record itself ([`Self::payload`]) and then performs the ordinary
+    /// [`Self::put_strategy`]. That is the whole of the effector's *projected
+    /// store* (effector design §9.2): a `plan_*`/`orders_*` call the character
+    /// makes lands in the same `agency` layer the operator API writes, supersedes
+    /// the record, and projects into the next turn's prompt through the `agency`
+    /// collection and [`crate::engine::persona`].
+    ///
+    /// **Agency only.** This writes a character's own goals; the belief-write
+    /// invariant is untouched — a belief is never a tool's silent edit (§9.2),
+    /// and there is deliberately no `put_belief_self`.
+    pub fn put_strategy_self(
+        &mut self,
+        npc_id: u64,
+        strategy_id: &str,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value, NpcError> {
+        // Resolved and owned before the mutable write borrows `self`. A
+        // tombstoned or unknown character reads as absent, the same as every
+        // other read path.
+        let owner = self
+            .payload(npc_id)
+            .ok_or(NpcError::NotFound)?
+            .owner_id
+            .clone();
+        self.put_strategy(npc_id, &owner, strategy_id, body, now_ms)
+    }
+
     /// Attach an uploaded portrait.
     ///
     /// Deliberately **not** part of [`Self::patch`]. That takes the fields a
@@ -868,6 +900,41 @@ impl Npcs {
         Ok(())
     }
 
+    /// Every character record, live and tombstoned, for a backup.
+    ///
+    /// Tombstoned ones travel too, so a restore keeps the whole id-space taken —
+    /// an id that was retired must not be minted again for a different character
+    /// after a wipe-and-restore.
+    pub fn export_all(&self) -> Vec<NpcPayload> {
+        self.by_id.values().cloned().collect()
+    }
+
+    /// Restore backed-up character records into a fresh substrate.
+    ///
+    /// Each payload is written verbatim — its id, owner, revision and last place
+    /// are preserved — so a restored cast is the same characters, only with the
+    /// conversation/belief/dream history the wipe cleared. One fsync covers the
+    /// batch. Returns how many were written.
+    pub fn import(&mut self, payloads: Vec<NpcPayload>) -> Result<usize, NpcError> {
+        {
+            let mut p = self
+                .shared
+                .persistence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for npc in &payloads {
+                p.write_npc(npc)
+                    .map_err(|e| NpcError::Persist(e.to_string()))?;
+            }
+            p.commit().map_err(|e| NpcError::Persist(e.to_string()))?;
+        }
+        let n = payloads.len();
+        for npc in payloads {
+            self.by_id.insert(npc.npc_id, npc);
+        }
+        Ok(n)
+    }
+
     /// Write the record, then update memory — in that order.
     ///
     /// If the append fails the map is untouched, so the daemon's view still
@@ -927,13 +994,72 @@ impl Npcs {
     }
 }
 
+/// Write a character id in base-36 (`0-9a-z`), lowercase.
+///
+/// The same reason and the same alphabet as a world instance id's ordinal
+/// (`npc_map::instance::base36`): this id is bandied around every page that
+/// lists a character and every route that names one, so it is spent in a
+/// human's read and a console's URL far more than the twenty digits a minted
+/// hash needs in decimal — a real id is `6817662845163923144`, base-36 is
+/// `1gtpgs1gobgkw`. It is still carried as a JSON **string**, never a bare
+/// number: a `u64` this wide already sits well past 2^53, so a bare JSON
+/// number would round in any JavaScript reader before the encoding even
+/// mattered — see [`wire`] and [`npc_id_of_wire`].
+pub fn npc_id_wire(mut n: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut buf = Vec::new();
+    while n > 0 {
+        buf.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    buf.reverse();
+    // Every byte is an ASCII digit from `DIGITS`, so this is always valid UTF-8.
+    String::from_utf8(buf).expect("base-36 digits are ASCII")
+}
+
+/// The inverse of [`npc_id_wire`]: read a character id back off the wire.
+///
+/// `None` for anything that is not a valid base-36 numeral — an empty string,
+/// a character outside `0-9a-z` (read case-insensitively, so a hand-typed
+/// uppercase id still resolves), or digits that overflow `u64`. Every route
+/// that used to treat a failed decimal parse as "no such character" treats a
+/// `None` here the same way.
+///
+/// **There is no version tag distinguishing this from the decimal `to_string`
+/// this format replaced**, because every decimal numeral is also a valid
+/// base-36 one — a caller holding a pre-migration decimal id decodes it here
+/// as a base-36 number instead of getting a clean parse failure. No shim
+/// carries that old format forward (`CLAUDE.md`: no backward compatibility in
+/// this pre-publication codebase), so the residual risk is bounded by how the
+/// id itself is minted rather than guarded against here: character ids are
+/// drawn across the full `u64` range, so a real id's base-36 form is 13
+/// characters wide and the odds every one of them lands on a digit — the only
+/// way it would still read as a plausible decimal number — are
+/// `(10/36)^13`, on the order of one in ten million. A short, hand-authored
+/// test id (`npc_id: 5`) does not carry that guarantee, so treat any
+/// deliberately small id as decimal-shaped and pick a large one instead.
+pub fn npc_id_of_wire(s: &str) -> Option<u64> {
+    u64::from_str_radix(s, 36).ok()
+}
+
+/// A `#[serde(serialize_with = "npcs::npc_id_wire_serde")]` for a struct field
+/// that is a character id — [`npc_id_wire`] in the shape `serde` wants of a
+/// field serializer, for a wire type derived rather than built by hand.
+pub fn npc_id_wire_serde<S: serde::Serializer>(id: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&npc_id_wire(*id))
+}
+
 /// One character as §10 defines it on the wire.
 ///
-/// Ids cross as decimal **strings**: they are `u64`, and a JSON number above
-/// 2^53 is silently rounded by every browser that parses it.
+/// Ids cross as base-36 **strings** ([`npc_id_wire`]): they are `u64`, and a
+/// JSON number above 2^53 is silently rounded by every browser that parses
+/// it, so the string is mandatory with or without the encoding underneath it.
 fn wire(n: &NpcPayload, caller: &str) -> Value {
     json!({
-        "npc_id": n.npc_id.to_string(),
+        "npc_id": npc_id_wire(n.npc_id),
         "name": n.name,
         "world_id": n.world_id,
         "personality_id": n.personality_id,
@@ -1200,6 +1326,11 @@ mod tests {
         json!({ "name": name, "world_id": "battle-cities", "personality_id": "commander" })
     }
 
+    /// A wire record's `npc_id`, decoded back to the `u64` the tests key on.
+    fn nid(v: &Value) -> u64 {
+        npc_id_of_wire(v["npc_id"].as_str().unwrap()).unwrap()
+    }
+
     /// The property the whole module exists for: a character outlives the
     /// process. Written by one registry, read back by another over the same
     /// directory, with no engine in between.
@@ -1210,7 +1341,7 @@ mod tests {
             let mut n = Npcs::load(&dir).unwrap();
             n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()
         };
-        let npc_id: u64 = created["npc_id"].as_str().unwrap().parse().unwrap();
+        let npc_id: u64 = nid(&created);
 
         // A second registry over the same log — a restart, in effect.
         let reopened = Npcs::load(&dir).unwrap();
@@ -1251,7 +1382,7 @@ mod tests {
                 let mut s = engine.substrate.write().unwrap();
                 p.compact(&mut s, None).unwrap();
             }
-            created["npc_id"].as_str().unwrap().parse().unwrap()
+            nid(&created)
         };
 
         // A restart.
@@ -1278,11 +1409,7 @@ mod tests {
     fn an_authoring_layer_stops_growing_but_stays_editable() {
         let dir = tmp();
         let mut n = Npcs::load(&dir).unwrap();
-        let id: u64 = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()["npc_id"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
 
         for i in 0..MAX_BELIEFS {
             let b = json!({ "statement": format!("belief {i}") });
@@ -1319,6 +1446,44 @@ mod tests {
             .expect("a deletion frees a slot");
     }
 
+    /// **`put_strategy_self` writes the character's own agency owner-blind.**
+    ///
+    /// The effector device is the character's own body and carries no operator
+    /// owner, so this resolves the owner from the record and lands the write in
+    /// the same `agency` layer the owner-scoped `put_strategy` writes — the
+    /// bridge the projected store depends on (effector design §9.2).
+    #[test]
+    fn put_strategy_self_resolves_the_owner_and_writes_the_agency() {
+        let dir = tmp();
+        let mut n = Npcs::load(&dir).unwrap();
+        let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
+
+        // No owner passed — the caller does not have one.
+        n.put_strategy_self(
+            id,
+            "hold-the-gate",
+            &json!({ "statement": "Hold the toll gate.", "state": "active" }),
+            2_000,
+        )
+        .expect("the owner-blind write lands");
+
+        let held = n.payload(id).expect("still there");
+        let strat = held
+            .agency
+            .iter()
+            .find(|s| s.strategy_id == "hold-the-gate")
+            .expect("the strategy is in the agency layer");
+        assert_eq!(strat.statement, "Hold the toll gate.");
+        assert_eq!(strat.state, "active");
+
+        // A character nobody has is absent, the same as every other read path —
+        // never a panic, never a write under a mislaid owner.
+        assert!(matches!(
+            n.put_strategy_self(id + 1, "x", &json!({ "statement": "no" }), 3_000),
+            Err(NpcError::NotFound)
+        ));
+    }
+
     /// **Where a character is survives a restart, so the world can be rebuilt
     /// from the cast.**
     ///
@@ -1332,11 +1497,7 @@ mod tests {
         let dir = tmp();
         let id: u64 = {
             let mut n = Npcs::load(&dir).unwrap();
-            let id: u64 = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()["npc_id"]
-                .as_str()
-                .unwrap()
-                .parse()
-                .unwrap();
+            let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
             assert_eq!(n.place_of(id), None, "a new character stands nowhere yet");
 
             assert!(
@@ -1370,11 +1531,7 @@ mod tests {
         let dir = tmp();
         let id: u64 = {
             let mut n = Npcs::load(&dir).unwrap();
-            let id: u64 = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()["npc_id"]
-                .as_str()
-                .unwrap()
-                .parse()
-                .unwrap();
+            let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
             // Absent, not calm. Nobody has asked it yet, and those are
             // different facts about a character.
             assert_eq!(n.mood_of(id), None);
@@ -1411,7 +1568,7 @@ mod tests {
         let dir = tmp();
         let mut n = Npcs::load(&dir).unwrap();
         let made = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
-        let id: u64 = made["npc_id"].as_str().unwrap().parse().unwrap();
+        let id: u64 = nid(&made);
         let before = n.payload(id).unwrap().clone();
 
         assert!(n.remember_mood(id, "bitter"));
@@ -1438,11 +1595,7 @@ mod tests {
     fn a_moving_body_is_checkpointed_rather_than_written_every_step() {
         let dir = tmp();
         let mut n = Npcs::load(&dir).unwrap();
-        let id: u64 = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()["npc_id"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
 
         assert!(n.remember_place(id, "vault-command/command-room", 1_000));
         // Standing still costs nothing, however often it is asked.
@@ -1469,7 +1622,7 @@ mod tests {
         let dir = tmp();
         let mut n = Npcs::load(&dir).unwrap();
         let made = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
-        let id: u64 = made["npc_id"].as_str().unwrap().parse().unwrap();
+        let id: u64 = nid(&made);
 
         n.remember_place(id, "vault-casting/green-room", 50_000);
 
@@ -1486,7 +1639,7 @@ mod tests {
         let npc_id: u64 = {
             let mut n = Npcs::load(&dir).unwrap();
             let c = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
-            let id: u64 = c["npc_id"].as_str().unwrap().parse().unwrap();
+            let id: u64 = nid(&c);
             n.patch(id, ME, &json!({ "name": "Varek the Elder" }), 2_000)
                 .unwrap();
             n.patch(id, ME, &json!({ "state": "active" }), 3_000)
@@ -1511,7 +1664,7 @@ mod tests {
         let npc_id: u64 = {
             let mut n = Npcs::load(&dir).unwrap();
             let c = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
-            let id: u64 = c["npc_id"].as_str().unwrap().parse().unwrap();
+            let id: u64 = nid(&c);
             n.delete(id, ME, 2_000).unwrap();
             assert!(n.list(ME, &Filter::default()).is_empty());
             assert!(matches!(n.get(id, ME), Err(NpcError::NotFound)));
@@ -1533,7 +1686,7 @@ mod tests {
         let dir = tmp();
         let mut n = Npcs::load(&dir).unwrap();
         let c = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
-        let id: u64 = c["npc_id"].as_str().unwrap().parse().unwrap();
+        let id: u64 = nid(&c);
 
         assert!(matches!(n.get(id, OTHER), Err(NpcError::NotFound)));
         assert!(n.list(OTHER, &Filter::default()).is_empty());
@@ -1634,7 +1787,7 @@ mod tests {
             let c = n
                 .create(&ident("u1"), ME, &body(&format!("N{i}")), 1_000 + i)
                 .unwrap();
-            ids.push(c["npc_id"].as_str().unwrap().parse::<u64>().unwrap());
+            ids.push(nid(&c));
         }
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -1683,7 +1836,7 @@ mod tests {
         ));
 
         let c = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
-        let id: u64 = c["npc_id"].as_str().unwrap().parse().unwrap();
+        let id: u64 = nid(&c);
         for bad in [
             json!({ "state": "melting" }),
             json!({ "state": "tombstoned" }),
@@ -1779,9 +1932,7 @@ mod tests {
             )
             .iter()
             .find(|v| v["name"] == "Ilse")
-            .and_then(|v| v["npc_id"].as_str())
-            .unwrap()
-            .parse()
+            .map(nid)
             .unwrap();
         n.patch(ilse, ME, &json!({ "hidden": false }), 1_500)
             .unwrap();
@@ -1800,9 +1951,7 @@ mod tests {
             .list(ME, &Filter::default())
             .iter()
             .find(|v| v["name"] == "Varek")
-            .and_then(|v| v["npc_id"].as_str())
-            .unwrap()
-            .parse()
+            .map(nid)
             .unwrap();
         n.delete(id, ME, 2_000).unwrap();
         assert_eq!(

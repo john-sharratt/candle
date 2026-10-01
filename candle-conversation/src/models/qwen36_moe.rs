@@ -89,9 +89,8 @@ const ARCH: &str = "qwen35moe";
 /// reasons, `0.7 / 0.8` while it does not): the cooler temperature with the wider nucleus.
 /// `top_k 20` and `presence_penalty 1.5` are the lineage's own and arrive with the arch row.
 ///
-/// A cast decodes on this only when a mission has it reason.
-/// `SamplingConfig::for_character_dialogue` widens the think-off row for characters on top of
-/// it — see `npcd::engine::mind`.
+/// A cast decodes on this too — the daemon runs the checkpoint's own published
+/// sampling rather than retuning it per role.
 const HYBRID_SAMPLING: (f32, f32) = (0.7, 0.95);
 
 /// **The hybrid — AntiLoop's trunk under StyleTune's output head** — `npcd`'s model.
@@ -281,16 +280,5 @@ mod tests {
             .clone()
             .with_mode_sampling_for(ThinkMode::Off);
         assert_eq!((declared.temperature, declared.top_p), (0.7, 0.95));
-    }
-
-    /// **The cast's boost survives.** `for_character_dialogue` widens the think-off row on top
-    /// of the preset, so a character on an ordinary turn decodes at `1.0 / 0.95`.
-    #[test]
-    fn a_cast_still_decodes_hotter_on_a_think_off_turn() {
-        let cast = qwen36_35b_a3b_antiloop_styletune()
-            .default_sampling
-            .for_character_dialogue()
-            .with_think_mode(ThinkMode::Off, 512);
-        assert_eq!((cast.temperature, cast.top_p), (1.0, 0.95));
     }
 }

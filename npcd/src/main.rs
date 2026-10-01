@@ -37,8 +37,8 @@ use web::{Builder, Config, Roots};
 // The whole core is the library beside this file; the binary is a shim that
 // binds a port over it. See `lib.rs` for why the split exists.
 use npcd::{
-    accounts, api, clock, collections, engine, guard, identity, images, logs, mind, npcs, ops,
-    personality_portrait, projection, registry,
+    accounts, api, clock, collections, effector, engine, guard, identity, images, logs, mind, npcs,
+    ops, personality_portrait, projection, registry,
 };
 
 /// The console, compiled in. Two directories, searched in order: a request for
@@ -457,7 +457,24 @@ async fn main() -> anyhow::Result<()> {
     // opening `--data` a second time. One `substrate/` takes one writable
     // handle per process; two lose records silently. See `Npcs::substrate`.
     runtime.set_substrate(authored.npcs.read().await.substrate());
+    // And the cast itself — the same `Arc<RwLock<Npcs>>` the authored state
+    // holds, so the effector device reads a character's own projected state and
+    // writes its agency plane through the one cast, never a second (effector
+    // design Appendix E "The bridge"; `Npcs::substrate` for what a second would
+    // cost).
+    runtime.set_npcs(authored.npcs.clone());
     let authored = authored.with_runtime(runtime.clone());
+
+    // The effector device (see `effector`): one durable token per character,
+    // beside the accounts under the data directory and git-ignored for the same
+    // reason. The `local` router is built from it and installed on the runtime,
+    // so the engine's fast path can drive it in-process (effector design §8.1)
+    // and the external mount below can answer the same routes on the socket.
+    let tokens = Arc::new(effector::token::Tokens::load(data.join("tokens"))?);
+    runtime.set_tokens(tokens.clone());
+    let effector_router =
+        effector::router::router(effector::router::Local::new(tokens.clone(), &runtime));
+    runtime.set_effector_router(effector_router.clone());
 
     // The clock resolver closes over the state rather than reading a single
     // daemon-wide clock: worlds run at their own pace and can be paused
@@ -635,7 +652,16 @@ async fn main() -> anyhow::Result<()> {
     let mut router = api_routes
         .into_router(authored.clone())
         .merge(ops_routes.into_router(ops_state))
-        .merge(engine_routes.into_router(authored.clone()));
+        .merge(engine_routes.into_router(authored.clone()))
+        // The effector device, externally reachable under `/v1/local` on the
+        // same gateway-fronted domain (effector design §8.2). It is nested into
+        // this router rather than declared as a second `local_api` site, because
+        // `web`'s local routers are keyed by *host*, not path — a second site
+        // would need its own hostname, where a `/v1/local` **path** already
+        // dispatches here through the site's `/v1` prefix. Its auth is the
+        // device token, not the operator roles: a client may send both a token
+        // and `x-tokera-*`, and only the token is read.
+        .nest("/v1/local", effector_router);
 
     /* **There is no fallback.**
      *

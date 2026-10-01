@@ -201,6 +201,14 @@ pub enum Addressed {
 pub enum EventKind {
     /// Something happened, described in words. The general case.
     Description { text: String },
+    /// A word put to the whole world at once — a proclamation, a klaxon, an
+    /// announcement from the command desk. Its own kind rather than a
+    /// `Description`, for the reason `Operator` is its own kind: it reads as
+    /// something said *to everyone*, not as something that happened in the
+    /// character's own room, and Pulse can then pick announcements out of the
+    /// feed. Delivered by broadcast at a salience that reaches even a waiting
+    /// character — see `pulse::announce`.
+    Announcement { text: String },
     /// Someone said something to, or near, the character.
     Speech {
         speaker: String,
@@ -267,6 +275,20 @@ pub enum EventKind {
     /// own state would be its own reasoning read back as instruction, which is
     /// the runaway loop with extra steps.
     Nudge { text: String },
+    /// The effector device's near-you screen — what is reachable from where the
+    /// body stands right now (effector design §6), already rendered as the
+    /// "YOUR EFFECTOR DEVICE / Reachable from here: …" section by
+    /// [`crate::engine::prompt::near_you_section`].
+    ///
+    /// **Replaces** the previous one — see [`EventKind::replaces`]. It is a
+    /// point-in-time fact, true only where the body stands *now*: a second one
+    /// is the current screen and the first is a reading of a place the character
+    /// has walked away from. Its own band, beside the situation, because the two
+    /// change together as the body moves but read as different things — where you
+    /// are, and what you can reach from there. The `query`/`invoke` calls and
+    /// their responses are acts and outcomes and stay inline in the turn stream;
+    /// only this ambient list supersedes.
+    Reachable { text: String },
     /// The day ended. The character consolidates and its conversation rolls over
     /// — see `engine::sleep`.
     Sleep { day: u64 },
@@ -283,10 +305,12 @@ impl EventKind {
     pub fn tag(&self) -> &'static str {
         match self {
             EventKind::Description { .. } => "description",
+            EventKind::Announcement { .. } => "announcement",
             EventKind::Speech { .. } => "speech",
             EventKind::Message { .. } => "message",
             EventKind::Situation { .. } => "situation",
             EventKind::Nudge { .. } => "nudge",
+            EventKind::Reachable { .. } => "reachable",
             EventKind::Entity { .. } => "entity",
             EventKind::Heartbeat => "heartbeat",
             EventKind::Sleep { .. } => "sleep",
@@ -312,6 +336,10 @@ impl EventKind {
             // a character working to a task it has been taken off, which reads
             // as one that has forgotten what it was doing.
             EventKind::Nudge { .. } => Some("nudge".to_string()),
+            // Its own band too: the near-you screen is only ever true now, so a
+            // second one supersedes the first rather than leaving a stale list
+            // of a place the body has left sitting in the window.
+            EventKind::Reachable { .. } => Some("reachable".to_string()),
             _ => None,
         }
     }
@@ -352,6 +380,12 @@ impl Event {
     pub fn prose(&self) -> String {
         match &self.kind {
             EventKind::Description { text } => text.trim().to_string(),
+            // Framed as reaching everyone, so the character reads it as a word
+            // put to the whole world rather than as something that happened in
+            // front of it — the one thing the raw text cannot say for itself.
+            EventKind::Announcement { text } => {
+                format!("Word goes out across the world: {}", text.trim())
+            }
             EventKind::Speech { speaker, text, to } => {
                 let t = text.trim();
                 // Three readings of one utterance, and the difference between
@@ -395,7 +429,12 @@ impl Event {
             // Both arrive already written — a situation is generated from a
             // map, a nudge is authored beside the task it belongs to — so
             // rendering passes them through rather than decorating them.
-            EventKind::Situation { text } | EventKind::Nudge { text } => text.trim().to_string(),
+            // The near-you screen arrives already rendered by
+            // `prompt::near_you_section`, so it passes through verbatim like the
+            // situation and the nudge.
+            EventKind::Situation { text }
+            | EventKind::Nudge { text }
+            | EventKind::Reachable { text } => text.trim().to_string(),
             EventKind::Entity {
                 entity_id,
                 observation,
@@ -503,6 +542,37 @@ mod tests {
         ] {
             assert!(k.replaces().is_none(), "{k:?} must accumulate, not replace");
         }
+    }
+
+    /// The near-you screen supersedes in its own band, beside the situation, and
+    /// reaches the character verbatim — it is already the finished device section
+    /// (effector design §6), so a second reading of a place the body has left
+    /// never sits in the window as current, and the list itself is never
+    /// re-voiced or decorated.
+    #[test]
+    fn the_reachable_screen_supersedes_in_its_own_band_and_reads_verbatim() {
+        let screen = "YOUR EFFECTOR DEVICE\nReachable from here: the lift · your phone";
+        let here = EventKind::Reachable {
+            text: screen.into(),
+        };
+        // Its own band — one current screen, whatever it lists.
+        assert_eq!(here.replaces().as_deref(), Some("reachable"));
+        let later = EventKind::Reachable {
+            text: "YOUR EFFECTOR DEVICE\nReachable from here: your phone".into(),
+        };
+        assert_eq!(here.replaces(), later.replaces());
+        // A band of its own, distinct from the situation and the standing task,
+        // so the three supersede independently.
+        assert_ne!(
+            here.replaces(),
+            EventKind::Situation { text: "x".into() }.replaces()
+        );
+        assert_ne!(
+            here.replaces(),
+            EventKind::Nudge { text: "x".into() }.replaces()
+        );
+        // Verbatim: the finished section is what the character reads.
+        assert_eq!(Event::new(1, 0, Salience::IDLE, here).prose(), screen);
     }
 
     /// Prose is what the character actually reads, so it must never contain the

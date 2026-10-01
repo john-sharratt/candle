@@ -26,6 +26,112 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 /// the length cap.
 pub const DEGENERATE_TOKEN_RUN: u32 = 8;
 
+/// Per-sequence sampling dials, uploaded as a `[batch_size]` array and read by
+/// the kernel at `seq_dials[row]` so every row samples on its own config.
+///
+/// **The C twin is `batched_sampling::SeqDials` in `batched_sampling.cuh`.** The
+/// kernel reads these bytes back as that struct, so the field order and types
+/// here must match it exactly — every field is 4 bytes (`f32`/`i32`), packed
+/// with no padding, and `#[repr(C)]` keeps the layout. The token ids and vocab
+/// size are not here (they are the same across the wave and stay scalar).
+///
+/// Before this existed the kernel took these dials as scalars from the first
+/// row's config and applied them to the whole launch, so a wave that mixed
+/// configs — a deliberating turn beside an impulsive one, a narrator beside a
+/// reflection — sampled every row at whichever config sorted first, and one
+/// row's EOS ramp could cut another's turn off after a single token.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeqDials {
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    repeat_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    dry_multiplier: f32,
+    dry_base: f32,
+    dry_allowed_length: i32,
+    dry_range: i32,
+    eos_boost: f32,
+    eos_ramp_start: i32,
+    eos_ramp_len: i32,
+    eos_boost_max_multiplier: f32,
+    cross_turn_penalty: f32,
+    segment_close_boost: f32,
+    segment_close_token_id: i32,
+    segment_close_ramp_start: i32,
+    segment_close_ramp_len: i32,
+    segment_close_max_multiplier: f32,
+    segment_temp_boost: f32,
+}
+
+// The kernel reads this struct as a flat run of 4-byte words (all fields are
+// f32/i32), one per row of the batch, and casts back to the identically-laid-out
+// CUDA `SeqDials`. If the size or field count drifts from the CUDA side the
+// kernel reads a row at the wrong stride, so pin it: 21 fields × 4 bytes.
+const _: () = assert!(std::mem::size_of::<SeqDials>() == 84);
+
+impl SeqDials {
+    /// Read one row's dials from its config, resolving the same Option/gate logic
+    /// the scalar path applies (DRY defaults, the dynamic-EOS gate, the
+    /// segment-close-active gate) so a per-row wave behaves identically to a
+    /// uniform one row-for-row.
+    fn from_config(c: &SamplingConfig) -> Self {
+        let (dry_multiplier, dry_base, dry_allowed_length, dry_range) = match &c.dry {
+            Some(d) => (d.multiplier, d.base, d.allowed_length, d.range),
+            None => (0.0, 1.75, 2, 0),
+        };
+        let (eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier) = if c.dynamic_eos_boost {
+            (c.eos_ramp_start, c.eos_ramp_len, c.eos_boost_max_multiplier)
+        } else {
+            (0, 0, 0.0)
+        };
+        let (
+            segment_close_boost,
+            segment_close_token_id,
+            segment_close_ramp_start,
+            segment_close_ramp_len,
+            segment_close_max_multiplier,
+        ) = if c.segment_close_boost != 0.0 && c.segment_close_token_id >= 0 {
+            (
+                c.segment_close_boost,
+                c.segment_close_token_id,
+                c.segment_close_ramp_start,
+                c.segment_close_ramp_len,
+                c.segment_close_max_multiplier,
+            )
+        } else {
+            // Disabled for this row: -1 token id keeps the kernel's per-row
+            // segment-close path off even when a co-batched row has it on.
+            (0.0, -1, 0, 0, 0.0)
+        };
+        SeqDials {
+            temperature: c.temperature,
+            top_k: c.top_k,
+            top_p: c.top_p,
+            repeat_penalty: c.repeat_penalty,
+            frequency_penalty: c.frequency_penalty,
+            presence_penalty: c.presence_penalty,
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length,
+            dry_range,
+            eos_boost: c.eos_boost,
+            eos_ramp_start,
+            eos_ramp_len,
+            eos_boost_max_multiplier,
+            cross_turn_penalty: c.cross_turn_penalty,
+            segment_close_boost,
+            segment_close_token_id,
+            segment_close_ramp_start,
+            segment_close_ramp_len,
+            segment_close_max_multiplier,
+            segment_temp_boost: c.segment_temp_boost,
+        }
+    }
+}
+
 /// This struct persists across turns (owned by the Scheduler) so that
 /// DRY penalty can see a rolling window of recent tokens spanning
 /// turn boundaries.  Per-turn state (token_counts, current_len) is
@@ -572,29 +678,24 @@ impl BatchedSampler {
             }
         }
 
-        // **The kernel's scalar parameters are shared across the launch.**
-        // Temperature, top-k/top-p, the repetition and DRY penalties and the EOS
-        // ramp are passed once per launch and applied to every row;
-        // `sample_batch_cuda` reads them from `configs[0]`. (Banned tokens are
-        // the exception — per row, see `banned_rows`.) A wave that
-        // mixes dials — a `ThinkMode::Off` ingest summary at
-        // `SamplingConfig::compression()` beside a dialogue turn — therefore
-        // samples every row at whichever config sorts first.
+        // **Each row samples on its OWN dials.** Temperature, top-k/top-p, the
+        // repetition and DRY penalties, the EOS ramp and the segment-close ramp
+        // are packed per row into the `SeqDials` array (`SeqDials::from_config`
+        // below) and the kernel reads `seq_dials[row]`, so a wave that mixes
+        // dials — a `ThinkMode::Off` ingest summary at
+        // `SamplingConfig::compression()` beside a dialogue turn, or a narrator
+        // beside a deliberating reflection — samples each row correctly instead
+        // of collapsing the whole launch onto row 0's config. This is the
+        // per-sequence-array shape `banned_tokens_per_seq` already uses, not
+        // host-side regrouping (splitting into one launch per distinct config
+        // would be ~one launch per sequence, since `zend` randomises `seed` per
+        // turn — the batching the engine exists to do, thrown away).
         //
-        // That is a real limitation, and it is deliberately NOT worked around by
-        // splitting the wave into one launch per distinct config. `seed` is part
-        // of the config and `zend` randomises it per turn, so "distinct config"
-        // is very nearly "distinct sequence": a 64-session wave would fall back to
-        // ~64 sampler launches plus 64 `index_select` gathers per decode step,
-        // trading a small sampling-fidelity gain for the batching the engine
-        // exists to do. Fixing it properly means per-sequence scalar arrays in the
-        // kernel (the shape `banned_tokens_per_seq` and `segment_suppress_penalty`
-        // already use), not host-side regrouping.
-        //
-        // What must NOT ride on this is anything resolved per row on the host —
-        // the segment-close budget and the EOS failsafes read `configs[i]` in the
-        // post-kernel loop, precisely because that loop visits every row and has
-        // no reason to inherit row 0's limits.
+        // The remaining scalars — `eos_token_id`, `vocab_size`, the shared
+        // banned/suppress token *lists* — are genuinely model-wide and stay
+        // scalar. And anything resolved per row on the HOST still reads
+        // `configs[i]` directly (the segment-close budget and EOS failsafes in
+        // the post-kernel loop), never row 0.
         if !kernel_idx.is_empty() {
             // Gather just the kernel rows — unless they ARE the whole batch, in
             // which case skip the copy and run the kernel over every row.
@@ -967,8 +1068,10 @@ impl BatchedSampler {
 
         // This path only ever receives unconstrained (full-vocab) rows —
         // stencil-constrained rows are resolved by `sample_batch` before the
-        // kernel and never reach here.  Scalar params still come from the first
-        // config for the whole sub-batch (the kernel's shared-config behavior).
+        // kernel and never reach here. `config` (the first row's) supplies the
+        // scalar FFI arguments below, but those are only the null-fallback
+        // defaults: the kernel reads its real per-row dials from the `seq_dials`
+        // array built further down, so no row inherits row 0's dials.
         let config = configs[0];
 
         // Get DRY params
@@ -1073,6 +1176,14 @@ impl BatchedSampler {
             (0.0, -1, 0, 0, 0.0)
         };
 
+        // **Per-sequence dials — every row samples on its own config.** Built
+        // from each row's config (not `configs[0]`), so the kernel's scalar
+        // arguments below are only the null-fallback defaults; the kernel reads
+        // its dials from this array instead. This is what stops one row's EOS
+        // ramp (or temperature, or penalties) bleeding into another in a wave
+        // that mixes configs.
+        let seq_dials: Vec<SeqDials> = configs.iter().map(|c| SeqDials::from_config(c)).collect();
+
         // Invoke the CUDA kernel
         self.invoke_cuda_kernel(
             &logits_flat,
@@ -1119,6 +1230,7 @@ impl BatchedSampler {
             &mut output_tokens,
             config.seed,
             &mut rng_offsets,
+            &seq_dials,
         )?;
 
         // Update states with sampled tokens and new RNG offsets.
@@ -1374,6 +1486,7 @@ impl BatchedSampler {
         output_tokens: &mut [u32],
         seed: u64,
         rng_offsets: &mut [u64],
+        seq_dials: &[SeqDials],
     ) -> candle::Result<()> {
         // Get the CUDA device and stream
         let cuda_device = match &self.device {
@@ -1471,6 +1584,33 @@ impl BatchedSampler {
             .memcpy_stod(rng_offsets)
             .map_err(|e| candle::Error::Msg(format!("failed to upload rng_offsets: {}", e)))?;
 
+        // Per-sequence dials. Uploaded as raw 4-byte words — `SeqDials` is 20
+        // packed `f32`/`i32` fields (its C twin `batched_sampling::SeqDials` has
+        // the identical layout), so the byte image is what the kernel reads back.
+        // Empty only on a zero-row launch, which never reaches this kernel path;
+        // guard anyway so the copy is never zero-length (cudarc rejects that).
+        const SEQ_DIALS_WORDS: usize = std::mem::size_of::<SeqDials>() / 4;
+        let seq_dials_words: &[i32] = if seq_dials.is_empty() {
+            &[]
+        } else {
+            // SAFETY: `SeqDials` is `#[repr(C)]` with only 4-byte `f32`/`i32`
+            // fields and no padding, so a contiguous slice of them is a valid
+            // `[i32]` of `len * SEQ_DIALS_WORDS` words.
+            unsafe {
+                std::slice::from_raw_parts(
+                    seq_dials.as_ptr() as *const i32,
+                    seq_dials.len() * SEQ_DIALS_WORDS,
+                )
+            }
+        };
+        let seq_dials_gpu: cudarc::driver::CudaSlice<i32> = stream
+            .memcpy_stod(if seq_dials_words.is_empty() {
+                &[0i32][..]
+            } else {
+                seq_dials_words
+            })
+            .map_err(|e| candle::Error::Msg(format!("failed to upload seq_dials: {}", e)))?;
+
         // Get device pointers and call kernel in a scoped block
         // so guards are dropped before download
         {
@@ -1487,6 +1627,7 @@ impl BatchedSampler {
             let (stencil_ptr, _g7) = stencil_gpu.device_ptr(&stream);
             let (output_ptr, _g8) = output_gpu.device_ptr_mut(&stream);
             let (rng_ptr, _g9) = rng_gpu.device_ptr_mut(&stream);
+            let (seq_dials_ptr, _g10) = seq_dials_gpu.device_ptr(&stream);
 
             // Helper closure to call kernel with logits pointer
             let call_kernel = |logits_ptr: *const std::ffi::c_void| unsafe {
@@ -1556,6 +1697,12 @@ impl BatchedSampler {
                     output_ptr as *mut u32,
                     seed,
                     rng_ptr as *mut u64,
+                    // Null on an empty (guard) upload, else the per-row dials.
+                    if seq_dials.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        seq_dials_ptr as *const std::ffi::c_void
+                    },
                 );
             };
 
@@ -1760,6 +1907,62 @@ mod tests {
     const VOCAB_SIZE: usize = 100;
     const MAX_RECENT: usize = 32;
     const EOS_TOKEN: u32 = 2;
+
+    /// The per-row dials the kernel reads must carry each config's OWN
+    /// segment-close token, not row 0's. A wave that co-batches a deliberating
+    /// row (closes `</think>` = 90) with a narrator row (no segment) must give
+    /// the deliberating row token 90 and the narrator row -1 — the exact bleed
+    /// `SeqDials` exists to remove, and the one a scalar `configs[0]` reintroduced.
+    #[test]
+    fn seq_dials_carry_each_rows_own_segment_close_token() {
+        let mut deliberating = SamplingConfig::argmax();
+        deliberating.temperature = 0.7;
+        deliberating.segment_close_boost = 3.0;
+        deliberating.segment_close_token_id = 90;
+        deliberating.segment_close_ramp_start = 2;
+        deliberating.segment_close_ramp_len = 16;
+        deliberating.segment_close_max_multiplier = 4.0;
+
+        // A narrator: no segment close at all.
+        let mut narrator = SamplingConfig::argmax();
+        narrator.temperature = 0.9;
+        narrator.segment_close_boost = 0.0;
+        narrator.segment_close_token_id = -1;
+
+        let d = SeqDials::from_config(&deliberating);
+        let n = SeqDials::from_config(&narrator);
+
+        assert_eq!(
+            d.segment_close_token_id, 90,
+            "deliberating row keeps its close token"
+        );
+        assert_eq!(d.segment_close_boost, 3.0);
+        assert_eq!(d.segment_close_ramp_len, 16);
+        assert_eq!(d.temperature, 0.7);
+
+        assert_eq!(
+            n.segment_close_token_id, -1,
+            "narrator row's close path stays off"
+        );
+        assert_eq!(n.segment_close_boost, 0.0);
+        assert_eq!(n.temperature, 0.9);
+    }
+
+    /// A config with the boost dialled up but NO token id is not "half on": the
+    /// whole segment-close path is gated off (token id -1), so a co-batched row
+    /// with it genuinely on is unaffected.
+    #[test]
+    fn seq_dials_gate_segment_close_off_when_token_missing() {
+        let mut c = SamplingConfig::argmax();
+        c.segment_close_boost = 5.0;
+        c.segment_close_token_id = -1; // boost set, but no token to boost
+        let d = SeqDials::from_config(&c);
+        assert_eq!(d.segment_close_token_id, -1);
+        assert_eq!(
+            d.segment_close_boost, 0.0,
+            "boost neutralised without a token"
+        );
+    }
 
     /// A run of token 0 is counted, and any other token clears it — the guard
     /// must fire on a *consecutive* run, not on token 0 being frequent.
@@ -2494,11 +2697,11 @@ mod tests {
 
     /// **A row's own segment-close budget applies inside a shared launch.**
     ///
-    /// The kernel's scalar params come from `configs[0]` for the whole launch,
-    /// which is its contract; the host-side post-kernel loop is not bound by it
-    /// and must read `configs[i]`. Both rows here go through ONE launch: row 0 is
-    /// greedy over a decisive logit row, row 1 is mid-block with a hard cap of 1
-    /// and must still be forced closed on its own config, not row 0's.
+    /// The host-side post-kernel loop resolves the segment-close budget (and the
+    /// EOS failsafes) per row from `configs[i]`, never row 0. Both rows here go
+    /// through ONE launch: row 0 is greedy over a decisive logit row, row 1 is
+    /// mid-block with a hard cap of 1 and must still be forced closed on its own
+    /// config, not row 0's.
     #[test]
     fn a_row_obeys_its_own_close_budget_in_a_shared_launch() {
         let sampler = make_sampler();

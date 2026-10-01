@@ -8512,12 +8512,31 @@ impl Scheduler {
         // snapshot, once per sealed turn, was invisible on the dashboard and its
         // wall-clock fell through to the housekeeping remainder.
         let t_snap = Instant::now();
-        let sealed_per_layer = match self.session.snapshot_sequence_per_layer(seal_slot.0) {
+        // Snapshot the sealed prefix `[0, block_to)`, not the whole slot. The two
+        // are the same for a settled slot, but during a windowed creep prefill the
+        // layers advance incrementally: layer 0 (and its window) push an empty
+        // (0-token) writer chunk for the next window ahead of the layers still
+        // pending resume, so the slot's per-layer block counts differ by that one
+        // trailing empty chunk (`per_layer=[626×7, 625×4]` for a section sealed
+        // mid-creep; see `sequence_block_count`'s skew note). A full-slot
+        // `snapshot_sequence_per_layer` walks that trailing phantom and its
+        // `assert_sealed_layers_aligned` rightly refuses the uneven layers —
+        // which returned `None` here and failed the seal ("seal returned None"),
+        // stranding every conversation whose prime crossed the pressure point
+        // that starts the creep windowing. `block_to` is `min(block_count,
+        // chunk_len)` — the block count EVERY layer holds — so `[0, block_to)` is
+        // the aligned common prefix, excludes the phantom, and still covers the
+        // seal range `[block_from, block_to)` the slice below extracts.
+        let sealed_per_layer = match self
+            .session
+            .snapshot_sequence_blocks(seal_slot.0, 0, block_to)
+        {
             Ok(sealed) => std::sync::Arc::new(sealed),
             Err(e) => {
                 tracing::error!(
-                    "snapshot_per_layer failed: seal_slot={} err={}",
+                    "snapshot_sequence_blocks failed: seal_slot={} range=[0,{}) err={}",
                     seal_slot.0,
+                    block_to,
                     e,
                 );
                 self.repair_section_if_window_divergence_confirmed(seal_slot, seal_action, &e);

@@ -117,6 +117,10 @@ pub fn survival(rt: RecordType) -> Survival {
         // The exchange grouping for a tool round-trip, held in
         // `Timeline::couplings` and re-emitted from `live_couplings`.
         RecordType::TurnCoupling => Survival::Resident,
+        // Host-defined keyed state (e.g. npcd's command-table open flag), held
+        // in `Substrate::custom_objects` and re-emitted from
+        // `live_custom_objects`.
+        RecordType::CustomObject => Survival::Resident,
 
         // ── Maintained, not compacted ───────────────────────────────────────
         // Kills file events by sequence number; located through `VfsIndex`.
@@ -161,6 +165,7 @@ pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
     RecordType::SectionTombstone,
     RecordType::VfsEvent,
     RecordType::VfsTombstone,
+    RecordType::CustomObject,
 ];
 
 /// A per-record-type tally, for reporting what a store holds and what a rewrite
@@ -268,6 +273,7 @@ pub fn type_label(rt: RecordType) -> &'static str {
         RecordType::SectionTombstone => "section_tombstone",
         RecordType::VfsEvent => "vfs_event",
         RecordType::VfsTombstone => "vfs_tombstone",
+        RecordType::CustomObject => "custom_object",
         RecordType::Unknown => "unknown",
     }
 }

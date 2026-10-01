@@ -238,6 +238,7 @@ impl Manifest {
             | RecordType::WideQSig
             | RecordType::Snapshot
             | RecordType::BranchCheckpoint
+            | RecordType::CustomObject
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }

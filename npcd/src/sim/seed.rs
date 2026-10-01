@@ -15,8 +15,10 @@
 //! byte-identical state. That is what lets a tool test say *these are the four
 //! things you may name* rather than *something plausible was offered*.
 
+use std::collections::BTreeMap;
+
 use npc_map::part::{Part, PartKind};
-use npc_map::MapSet;
+use npc_map::{MapSet, Where};
 
 use crate::sim::device::{Device, Devices, Kind as DeviceKind};
 use crate::sim::field::{Breed, Deposit, Field, Hostile, Resource};
@@ -95,34 +97,50 @@ pub fn devices_and_tools(map: &MapSet) -> (Devices, Vec<(String, Vec<String>)>) 
             if !here.is_empty() {
                 tools.push((at.clone(), here));
             }
+            // How many of each machine part stand here, so a lone one is named
+            // "the terminal" and one of several is numbered.
+            let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
             for (part, count) in map.parts_at(node) {
+                if part.is_machine() {
+                    *counts.entry(part.id.as_str()).or_default() += count;
+                }
+            }
+            // **A device is keyed by the map's own per-instance id.** Each
+            // placement is its own machine — six terminals in a room are six
+            // things to claim — and keying them by [`npc_map::PartInstance::id`]
+            // is what lets an effector route addressing one placed station of
+            // several reach exactly that one and leave its neighbours alone.
+            let place = Where::new(area.id.as_str(), node.id.as_str());
+            for inst in map.instances_at(&place) {
+                let part = inst.part();
                 if !part.is_machine() {
                     continue;
                 }
                 let modes: Vec<&str> = part.modes.iter().map(String::as_str).collect();
-                // A counted part is several machines, each claimable on its own.
-                // Numbering starts at one, because "the second terminal" is what
-                // a body would say and "terminal 0" is not.
-                for n in 1..=count {
-                    let id = format!("{}/{}#{n}", at, part.id);
-                    // A part authored as "the catalogue" already carries its
-                    // article; one authored as "fabricator" does not. Prefixing
-                    // blindly gives "the the catalogue", which a character
-                    // would then have to name back exactly.
-                    let name = if count == 1 {
-                        if part.name.starts_with("the ") {
-                            part.name.clone()
-                        } else {
-                            format!("the {}", part.name)
-                        }
+                let count = counts.get(part.id.as_str()).copied().unwrap_or(1);
+                // A part authored as "the catalogue" already carries its
+                // article; one authored as "fabricator" does not. Prefixing
+                // blindly gives "the the catalogue", which a character would
+                // then have to name back exactly. A part placed more than once
+                // is numbered from one, because "the second terminal" is what a
+                // body would say and "terminal 0" is not.
+                let name = if count == 1 {
+                    if part.name.starts_with("the ") {
+                        part.name.clone()
                     } else {
-                        format!("{} {n}", part.name.trim_start_matches("the "))
-                    };
-                    let mut device = Device::new(id, name, kind_of(part), &at, &modes);
-                    // A station is claimed while it is worked; a fixture is not.
-                    device.claimable = part.kind == PartKind::Station;
-                    out.install(device);
-                }
+                        format!("the {}", part.name)
+                    }
+                } else {
+                    format!(
+                        "{} {}",
+                        part.name.trim_start_matches("the "),
+                        inst.ordinal() + 1
+                    )
+                };
+                let mut device = Device::new(inst.id(), name, kind_of(part), &at, &modes);
+                // A station is claimed while it is worked; a fixture is not.
+                device.claimable = part.kind == PartKind::Station;
+                out.install(device);
             }
         }
     }
@@ -462,6 +480,50 @@ mod tests {
         // The catalogue plus two terminals, all three of them machines.
         assert_eq!(many.len(), 3, "{many:?}");
         assert!(many.contains(&"the catalogue".to_string()));
+    }
+
+    /// **Two terminals in one room are addressed and set independently by their
+    /// map instance ids.** The seed keys each device by [`npc_map::PartInstance::
+    /// id`], so the effector's `http://local/<ns>/<instance-id>` reaches exactly
+    /// one placed station — the whole point of minting per-instance ids.
+    #[test]
+    fn two_terminals_in_a_room_are_set_independently_by_instance_id() {
+        let map = maps();
+        let mut s = vault(Some(&map));
+        // Derived from the map: the ids of the first two character terminals in
+        // band one, as `<part>~<ordinal>`. The seed keys devices by exactly these.
+        let terminals: Vec<String> = map
+            .instances_at(&npc_map::schema::Where::new("vault-casting", "band-one"))
+            .into_iter()
+            .filter(|i| i.part_id() == "character-terminal")
+            .map(|i| i.id())
+            .collect();
+        let first = terminals[0].as_str();
+        let second = terminals[1].as_str();
+
+        // Both are placed, both stand in the same room, and they are two things.
+        let a = s.station(first).expect("the first terminal");
+        let b = s.station(second).expect("the second terminal");
+        assert_eq!(a.at, "vault-casting/band-one");
+        assert_eq!(b.at, "vault-casting/band-one");
+        assert_ne!(a.id, b.id, "two placements collapsed to one device");
+        assert!(a.claimable && b.claimable, "a worked terminal is claimed");
+        assert_eq!(a.mode, "reading", "a terminal starts in its first mode");
+
+        // Setting one moves only that one — the neighbour is untouched.
+        s.station_mut(first).unwrap().set("working");
+        assert_eq!(s.station(first).unwrap().mode, "working");
+        assert_eq!(
+            s.station(second).unwrap().mode,
+            "reading",
+            "setting one terminal moved the one beside it"
+        );
+
+        // An ordinal past every character terminal in the world names nothing.
+        assert!(
+            s.station("character-terminal~999").is_none(),
+            "an id past the placement count resolved to a device"
+        );
     }
 
     #[test]

@@ -52,6 +52,8 @@ mod yaml;
 #[cfg(test)]
 mod edge_tests;
 #[cfg(test)]
+mod invoke_body_tests;
+#[cfg(test)]
 mod tests;
 
 pub use builder::StencilTreeBuilder;
@@ -67,8 +69,10 @@ pub use spec::{LabeledNode, LabeledTree, NodeSpec, SpecId, TreeSpec};
 pub use terminator::{Feed, Terminator, TerminatorState};
 pub use think::{compile_think_tree, ThinkMode, ThinkSteerEnvelope};
 pub use tool_call::{
-    compile_action_loop, compile_tool_call_loop, compile_tool_call_tree, parse_tools, Param,
-    ParamType, ToolCallEnvelope, ToolSpec, MAX_TOOL_CALLS_PER_TURN, TOOL_CALL_TREE_LABEL,
+    compile_action_loop, compile_action_loop_with_body, compile_invoke_body_tree,
+    compile_tool_call_loop, compile_tool_call_tree, parse_tools, Param, ParamType,
+    ToolCallEnvelope, ToolSpec, INVOKE_BODY_TREE_LABEL, MAX_TOOL_CALLS_PER_TURN,
+    TOOL_CALL_TREE_LABEL,
 };
 // `ToolCallEnvelope::style` is public, so a consumer has to be able to name its
 // type to match on it — and `npcd` does, to describe the call format in a

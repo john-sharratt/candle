@@ -1700,9 +1700,15 @@ impl Sequence {
         }
 
         // Every section still in `to_ingest` — a refused restore included —
-        // costs a prefill from here on.
+        // costs a prefill from here on. `out_skip` (pass 1, above) is counted
+        // into `restored` too: a section that `section_exists` already found
+        // resident — a cold-marker reconstructed when the substrate was
+        // opened — needed no fresh prefill just as surely as one this call
+        // explicitly restored, so excluding it from `SectionLoads` undercounts
+        // a restart that mostly restores through substrate-open reconstruction
+        // rather than this triage's own `RestoreSection` round trip.
         self.substrate
-            .record_section_loads(restore_out.len(), to_ingest.len());
+            .record_section_loads(restore_out.len() + out_skip.len(), to_ingest.len());
 
         // Bulk-allocate-then-fire: allocate one scratch slot per
         // section first (cheap, no timeline minting), then fire every
@@ -4410,6 +4416,43 @@ impl Sequence {
         self.current_blocks = BlockCount(0);
 
         // Clear turn history (keeps system prompt, config, beliefs).
+        self.tree.clear_turns();
+
+        Ok(())
+    }
+
+    /// [`Self::reset`]'s async counterpart — awaits the scheduler's
+    /// acknowledgement with `recv_async` instead of parking the thread in a
+    /// blocking `recv`, exactly as [`crate::TurnHandle::wait_async`] mirrors
+    /// [`crate::TurnHandle::wait`]. Identical effect; which one a caller uses is
+    /// a property of the caller.
+    ///
+    /// This is the one to use on an async hot path: the per-narration narrator
+    /// reset runs on the tokio worker pool under a per-character lock, and a
+    /// blocking round-trip there parks the worker so no other character's turn
+    /// can be polled or submitted — the batched engine then forms one-session
+    /// waves and the GPU sits idle between them.
+    pub async fn reset_async(&mut self) -> crate::Result<()> {
+        if self.turn_in_flight {
+            return Err(ConversationError::TurnInFlight {
+                sequence_id: self.id,
+            });
+        }
+
+        let (response_tx, response_rx) = flume::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::ResetSequence {
+                sequence_id: self.id,
+                response_tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        response_rx
+            .recv_async()
+            .await
+            .map_err(|_| ConversationError::SchedulerGone)??;
+
+        self.pending_user = None;
+        self.current_blocks = BlockCount(0);
         self.tree.clear_turns();
 
         Ok(())

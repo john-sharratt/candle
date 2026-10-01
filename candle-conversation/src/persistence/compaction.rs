@@ -715,6 +715,24 @@ pub fn collect_live_records(
             bytes,
         ));
     }
+    // Generic keyed custom objects — re-emitted from the live in-RAM set so a
+    // last-writer-wins object outlives the compaction pass, keyed on the same
+    // stable key-hash `stream_id` it was written under.
+    for obj in substrate.live_custom_objects() {
+        let bytes = obj.encode();
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: RecordType::CustomObject,
+                format: 0,
+                payload_len: bytes.len() as u64,
+                crc: 0,
+                stream_id: obj.stream_id(),
+                chunk_index: 0,
+                token_count: 0,
+            },
+            bytes,
+        ));
+    }
     // Per-distilled-timeline marker — re-emitted (with mode) so a distilled
     // timeline stays distilled across the compaction it just shed through.
     // Without this the marker is lost and, e.g., a text-only archived
@@ -2380,7 +2398,9 @@ mod tests {
     #[test]
     fn every_record_type_survives_compaction() {
         use crate::persistence::content_hash::snapshot_stream_id;
-        use crate::persistence::record::{DistillMode, DistillPayload, TreeMetadataPayload};
+        use crate::persistence::record::{
+            CustomObjectPayload, DistillMode, DistillPayload, TreeMetadataPayload,
+        };
         use crate::persistence::streams::{StreamDecl, TurnDecl};
         use crate::persistence::survival::{survival, Survival, WRITTEN_RECORD_TYPES};
         use std::collections::BTreeMap;
@@ -2532,6 +2552,20 @@ mod tests {
                 mode: DistillMode::ProvenanceOnly,
             }
             .encode(),
+        ));
+        // A host-defined keyed object — the key's hash rides in the header
+        // `stream_id`, exactly as `put_custom_object` writes it.
+        let custom_obj = CustomObjectPayload::new(
+            "command-table:vault",
+            serde_json::json!({
+                "open": true
+            }),
+        );
+        blob.extend_from_slice(&record(
+            RecordType::CustomObject,
+            custom_obj.stream_id(),
+            0,
+            &custom_obj.encode(),
         ));
         // A tombstoned section stream — the section counterpart of the
         // turn-scoped `Tombstone` above.

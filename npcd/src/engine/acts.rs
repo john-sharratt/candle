@@ -80,13 +80,17 @@ use super::tools::{Availability, Example, Param, Plane, Tool};
 ///
 /// A generic verb over a specific one is the trade `act` makes, and its cost is
 /// the opposite of `touch`'s: where `touch` was too gentle to reach for in a
-/// fight, `act` is broad enough that a model reaches for it to *speak*. It was
-/// caught calling `act` where `tell` was meant — and the description invited it,
-/// by saying "Like `tell`, you give what you MEAN by it", which likens the two
-/// acts at the exact point they must not be confused. So the description no
-/// longer compares it to speech; it rules speech out by name (`tell`, `ask`,
-/// `whisper`, `shout` for words; `gesture` for a signal; `reflect` for a
-/// thought) and states, more than once, that this is only ever a body on a body.
+/// fight, `act` is broad enough that a model reaches for it to *speak* — and to
+/// *travel*, stating a plan to be somewhere else on its own body ("act on
+/// yourself: return to the command level"), which moves it nowhere and leaves it
+/// believing it has gone. It was caught calling `act` where `tell` was meant —
+/// and the description invited it, by saying "Like `tell`, you give what you
+/// MEAN by it", which likens the two acts at the exact point they must not be
+/// confused. So the description no longer compares it to speech; it rules the
+/// near misses out by name (`tell`, `ask`, `whisper`, `shout` for words;
+/// `gesture` for a signal; `reflect` for a thought; `move_to` for going
+/// anywhere) and states, more than once, that this is only ever a body on a
+/// body, and that acting on your own body changes nothing about where you are.
 /// The name is read first, but the description is what stops the near miss.
 pub const ACT: Tool = Tool {
     name: "act",
@@ -107,14 +111,17 @@ pub const ACT: Tool = Tool {
                   theirs, and nothing you say. Hands-on only: steady them, block their way, \
                   take something out of their hand, put yourself between them and something \
                   else — or put them on the floor, break their grip, hurt them. **This is not \
-                  how you say anything.** To tell, ask, warn, promise or order somebody, use \
-                  `tell`, `ask`, `whisper` or `shout`; to signal without touching, `gesture`; \
-                  to stop and take stock, `reflect`. This is only ever the act of a body on a \
-                  body. You give what you MEAN by the contact, not the choreography; the \
-                  narrator renders the movement. They feel it, they may refuse it, and what \
-                  they do next is theirs. On `yourself` it is still physical — binding a wound, \
-                  getting your own weapon clear, dragging yourself up — never a feeling or a \
-                  thought.",
+                  how you say anything, and not how you go anywhere.** To tell, ask, warn, \
+                  promise or order somebody, use `tell`, `ask`, `whisper` or `shout`; to signal \
+                  without touching, `gesture`; to stop and take stock, `reflect`; **to set off \
+                  somewhere — a room, another level, back the way you came — use `move_to`, \
+                  never this.** This is only ever the act of a body on a body. You give what \
+                  you MEAN by the contact, not the choreography; the narrator renders the \
+                  movement. They feel it, they may refuse it, and what they do next is theirs. \
+                  On `yourself` it is still physical — binding a wound, getting your own weapon \
+                  clear, dragging yourself up — never a feeling, a thought, or a plan to be \
+                  elsewhere. Acting on your own body never changes where you are or what anyone \
+                  else heard.",
     params: &[
         Param {
             name: "on",
@@ -127,9 +134,11 @@ pub const ACT: Tool = Tool {
             name: "intent",
             ty: "string",
             required: true,
-            description: "What you mean by it. Substance, not movement: \"steady her before she \
-                          goes over\" or \"put him down before he reaches the door\" — never \
-                          \"I put my hand under her elbow\".",
+            description: "What you mean by it. Substance, not movement or choreography, and \
+                          never a destination or a plan: \"steady her before she goes over\" or \
+                          \"put him down before he reaches the door\" — never \"I put my hand \
+                          under her elbow\", and never \"return to the command level\" (going \
+                          somewhere is `move_to`).",
         },
     ],
     examples: &[
@@ -354,7 +363,7 @@ pub const POST_NOTICE: Tool = Tool {
         Example {
             situation: "You have just found that the lift on five is not answering, and you are \
                         the only one who knows.",
-            call: r#"{"on":"the muster board","what":"that the lift on five is not answering and the stairwell is the only way up until somebody looks at it"}"#,
+            call: r#"{"on":"the muster board","what":"that the lift on five is not answering and nobody can get up or down until somebody looks at it"}"#,
             because: "It matters to people who are not here, and will still matter in an hour. \
                       Saying it to an empty room reaches nobody and keeps nothing.",
         },
@@ -659,6 +668,61 @@ pub const RECALL: Tool = Tool {
         call: r#"{}"#,
         because: "Walking is `move_to`. This is the journey that is not walked, and it is the \
                   reason going out is survivable.",
+    }],
+};
+
+/// Call the lift to the floor you are standing on.
+///
+/// **The lift is a shared, slow thing, and that is the point of it.** There is
+/// one car; getting between levels is calling it, waiting for it, getting in and
+/// riding — which is where two bodies crossing the building on their own errands
+/// are made to be in the same place at the same time. Only offered while you are
+/// at the lift and it is elsewhere; when it is already here there is nothing to
+/// call and [`LIFT_USE`] is what you are offered instead. See [`crate::engine::lift`].
+pub const LIFT_CALL: Tool = Tool {
+    name: "lift_call",
+    at: &[],
+    category: "Movement",
+    plane: Plane::World,
+    availability: Availability::AtLift,
+    description: "Bring the lift to the floor you are standing on. It takes a moment to arrive, \
+                  and its doors open when it does — then you can get in and ride it. Only worth \
+                  doing when the lift is on another floor; when it is already here, `lift_use` it.",
+    params: &[],
+    examples: &[Example {
+        situation: "You are at the lift, and the car is on another level.",
+        call: r#"{}"#,
+        because: "The car has to come to you before you can ride it. Standing at the shaft is not \
+                  being in the car.",
+    }],
+};
+
+/// Ride the lift to another level.
+///
+/// Offered only while you are in the car — at the shaft with its doors open on
+/// your floor. The floor is named from the levels the lift serves, never the one
+/// you are on.
+pub const LIFT_USE: Tool = Tool {
+    name: "lift_use",
+    at: &[],
+    category: "Movement",
+    plane: Plane::World,
+    availability: Availability::InLift,
+    description:
+        "Ride the lift to another level. You are in it — its doors are open on your floor \
+                  — so name the level to go to and it carries you there, setting you down when it \
+                  arrives.",
+    params: &[Param {
+        name: "floor",
+        ty: "string",
+        required: true,
+        description: "The level to ride to, by its name.",
+    }],
+    examples: &[Example {
+        situation: "You are in the lift with its doors open, and what you were sent for is on the \
+                    chronicle level.",
+        call: r#"{"floor":"the chronicle level"}"#,
+        because: "The lift is how you change levels. Name where you are going and ride.",
     }],
 };
 
@@ -1261,6 +1325,8 @@ pub const WORLD_ACTS: &[Tool] = &[
     ENGAGE,
     OPERATE,
     RECALL,
+    LIFT_CALL,
+    LIFT_USE,
     SCAN,
     COMMAND_TOWER,
     PRODUCE,

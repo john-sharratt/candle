@@ -60,7 +60,7 @@ not identities.
 | Address | Hostname | Runs | Repo |
 |---|---|---|---|
 | `192.168.0.5` | BlackWorld | web, zend, cf-ddns | `D:\prog\candle` |
-| `192.168.0.6` | — | npcd | the checkout `/up` is run from; its mind is `C:\Users\johna\prog\mind` |
+| `192.168.0.6` | — | npcd | the checkout `/up` is run from; its mind is `D:\prog\mind` |
 
 ## Services
 
@@ -85,7 +85,7 @@ Paths are relative to the repo root.
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
 | .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --max-depth 3 -v` | 2026-09-29, from the running process — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`, `battle-cities`); its substrate is `D:\prog\substrate`. `repo_map` and `code_reading` ingest to three path components below each repository's root; what was ingested deeper is retained while a branch holds it; `-v` (DEBUG) |
-| .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind C:/Users/johna/prog/mind --forget-conversations` | 2026-09-13, from the user (not yet confirmed by a `/down`) |
+| .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`) |
 
 Notes on the arguments:
 
@@ -109,9 +109,7 @@ Notes on the arguments:
   state. `/up` replays one only when the recorded line has it (the last run wiped) or the
   user asks for a wipe in that run, and says so before launching. It never adds one on its
   own.
-- **Every flag must exist in the binary.** `--forget-conversations` is not in this repo's
-  `npcd` at `14eacff5` (2026-09-13) — it is either newer than that on `.6` or has since been
-  removed. `/up` checks each recorded flag against `<exe> --help` and asks rather than
+- **Every flag must exist in the binary.** `/up` checks each recorded flag against `<exe> --help` and asks rather than
   dropping one silently, because clap refuses to start on an unknown flag.
 
 ### cf-ddns

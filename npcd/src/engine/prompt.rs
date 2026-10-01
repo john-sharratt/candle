@@ -32,6 +32,7 @@
 //! the model to try to reach one.
 
 use candle_conversation::stencil::{CallStyle, ToolCallEnvelope};
+use serde_json::Value;
 
 use crate::engine::tools::{one_line, Mode, Tool};
 
@@ -524,6 +525,27 @@ fn frame_acting(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
          worse than either of them saying nothing.\n\n",
     );
 
+    // ── the effector device ────────────────────────────────────────────────
+    //
+    // §6.1: the character is told once, in its own register, what the device is
+    // and how to use it, so no turn is the first time it learns the device
+    // exists. The auth token is never mentioned — it is carried for the
+    // character, not by it (§8.3).
+    s.push_str(
+        "YOUR EFFECTOR DEVICE\n\
+         \n\
+         You carry a small effector — a handheld that senses what is around you and lets you \
+         act on it. Its screen lists addresses, and the world answers at them. An address looks \
+         like `http://local/...`; each one names a single thing in the world. Read \
+         `http://local/` for what is reachable from where you stand — and it changes as you \
+         move, so what is on the screen is what is near you now.\n\
+         \n\
+         `query` an address to look — what lives beneath it, or what a thing will accept. \
+         Looking never changes anything, so look as freely as you like. `invoke` an address to \
+         act, giving it the fields it asked for. The world does the thing and answers, or tells \
+         you plainly what was wrong so you can fix it and try again.\n\n",
+    );
+
     // ── the vocabulary ─────────────────────────────────────────────────────
     s.push_str("WHAT YOU CAN DO\n\n");
     s.push_str(&catalog(tools));
@@ -670,6 +692,65 @@ pub fn build_for(
     }
     s.push_str(&frame_for(stance, mode, tools, env));
     s
+}
+
+/// The near-you index, rendered as the dynamic **YOUR EFFECTOR DEVICE** section
+/// the character reads at the top of its system prompt (effector design §6).
+///
+/// This is the point-in-time list of what is reachable from where the body
+/// stands *now* — the ambient screen of the effector device, top level only. It
+/// belongs in a dynamic system-prompt section rather than the turn stream
+/// precisely because it is only ever true this moment: re-projected each turn
+/// and superseded, never carried as turns, so the conversation window holds one
+/// current list rather than a history of every list the body ever saw. The
+/// `query`/`invoke` calls and their responses stay inline in the turn stream;
+/// only this ambient list moves to the prompt.
+///
+/// `index` is the value [`crate::engine::runtime::Runtime::effector_query`]
+/// answers `GET http://local/` with — `{ "routes": [ { "url", "summary" }, … ] }`
+/// (effector design §6, §13). Each route renders as its `summary` in the
+/// character's register, falling back to the bare `url` when a route carries no
+/// summary. An empty or shapeless index renders **nothing** — `None`, no
+/// section, never a stub — so a body that can reach nothing (and, upstream, a
+/// fetch that errored or a device that is not installed) simply has no device
+/// section this turn rather than a lie about an empty screen.
+pub fn near_you_section(index: &Value) -> Option<String> {
+    let routes = index.get("routes")?.as_array()?;
+    let lines: Vec<String> = routes
+        .iter()
+        .filter_map(|route| {
+            // **Both the summary and the address, one route per line.** The
+            // summary is what the screen calls a thing; the url is what a `query`
+            // or `invoke` must name, exactly. Rendering the summary alone left a
+            // character reading "the table" with no way to reach it but to guess
+            // an address (`http://local/command-table`, a 404) — the address has
+            // to be on the screen for the device to be usable. A route with only
+            // one of the two shows that one.
+            let summary = route
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let url = route
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match (summary, url) {
+                (Some(summary), Some(url)) => Some(format!("- {summary} — {url}")),
+                (Some(only), None) | (None, Some(only)) => Some(format!("- {only}")),
+                (None, None) => None,
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "YOUR EFFECTOR DEVICE\nReachable from here (read an address with `query`, act on it with \
+         `invoke`):\n{}",
+        lines.join("\n")
+    ))
 }
 
 #[cfg(test)]
@@ -1159,6 +1240,104 @@ mod tests {
         assert!(
             !s.contains("\n\n\n\n"),
             "empty sections left a hole in the prompt"
+        );
+    }
+
+    /// **The character is told the effector device exists, in its own register
+    /// (§6.1).** No turn should be the first time it learns it can `query` and
+    /// `invoke` addresses — and the auth token is never mentioned (§8.3).
+    #[test]
+    fn the_prompt_explains_the_effector_device() {
+        let s = build(
+            &persona(),
+            Mode::Physical,
+            &for_mode(Mode::Physical),
+            &env(),
+        );
+        assert!(s.contains("YOUR EFFECTOR DEVICE"), "no device section");
+        assert!(
+            s.contains("http://local/"),
+            "the address shape is not shown"
+        );
+        for verb in ["query", "invoke"] {
+            assert!(s.contains(verb), "the device section never names `{verb}`");
+        }
+        // The device is explained before the character reaches the act list.
+        let device = s.find("YOUR EFFECTOR DEVICE").unwrap();
+        let acts = s.find("WHAT YOU CAN DO").unwrap();
+        assert!(
+            device < acts,
+            "the device is explained after the acts it names"
+        );
+        // The token is carried for the character, not by it — never named to it.
+        for leak in ["token", "Bearer", "Authorization"] {
+            assert!(!s.contains(leak), "the prompt leaked the auth `{leak}`");
+        }
+    }
+
+    /// **The near-you index renders to the exact section a character reads.**
+    ///
+    /// Raw expected text — the heading, then the reachable summaries in the
+    /// index's order, joined by the middle dot the doc's own example uses
+    /// (effector design §6). Asserted verbatim rather than by fragments: this is
+    /// the copy that reaches the model, and a stray space or a lost separator is
+    /// exactly the kind of drift a contains-check would miss.
+    #[test]
+    fn the_near_you_index_renders_the_reachable_summaries() {
+        let index = serde_json::json!({
+            "routes": [
+                { "url": "http://local/lift/command-shaft", "summary": "the lift" },
+                { "url": "http://local/table/command-3", "summary": "the command table" },
+                { "url": "http://local/chronicle/ct-command-1", "summary": "a world-history terminal" },
+                { "url": "http://local/history", "summary": "world history" },
+                { "url": "http://local/phone", "summary": "your phone" },
+            ]
+        });
+        assert_eq!(
+            near_you_section(&index).as_deref(),
+            Some(
+                "YOUR EFFECTOR DEVICE\nReachable from here (read an address with `query`, act on \
+                 it with `invoke`):\n- the lift — http://local/lift/command-shaft\n- the command \
+                 table — http://local/table/command-3\n- a world-history terminal — \
+                 http://local/chronicle/ct-command-1\n- world history — http://local/history\n- \
+                 your phone — http://local/phone"
+            )
+        );
+    }
+
+    /// A route published without a summary shows its bare url, so the character
+    /// still reads a real address rather than a blank line.
+    #[test]
+    fn a_route_with_no_summary_falls_back_to_its_url() {
+        let index = serde_json::json!({
+            "routes": [
+                { "url": "http://local/phone", "summary": "your phone" },
+                { "url": "http://local/table/command-3" },
+                { "url": "http://local/self", "summary": "   " },
+            ]
+        });
+        assert_eq!(
+            near_you_section(&index).as_deref(),
+            Some(
+                "YOUR EFFECTOR DEVICE\nReachable from here (read an address with `query`, act on \
+                 it with `invoke`):\n- your phone — http://local/phone\n- \
+                 http://local/table/command-3\n- http://local/self"
+            )
+        );
+    }
+
+    /// An empty or shapeless index renders **no section** — never a heading over
+    /// a blank screen. A body that can reach nothing, a fetch that errored into
+    /// a null, an index missing its `routes`: all degrade to `None`.
+    #[test]
+    fn an_empty_index_renders_no_section() {
+        assert_eq!(near_you_section(&serde_json::json!({ "routes": [] })), None);
+        assert_eq!(near_you_section(&serde_json::json!({})), None);
+        assert_eq!(near_you_section(&Value::Null), None);
+        // Routes present but none carries a usable label.
+        assert_eq!(
+            near_you_section(&serde_json::json!({ "routes": [ { "summary": "" }, {} ] })),
+            None
         );
     }
 }
