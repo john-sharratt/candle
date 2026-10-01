@@ -66,6 +66,7 @@ use candle_conversation::projection::{
 use candle_conversation::substrate::{StreamRuntime, Substrate};
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::turn_layout::TurnSegment;
+use candle_conversation::working_set::marks::is_dialogue;
 use candle_nn::kv_cache::KvFormat;
 use serde_json::json;
 use tokenizers::Tokenizer;
@@ -1782,6 +1783,11 @@ fn print_projection_event_json(
                 "score": t.score,
                 "selected": t.selected,
                 "reason": t.reason.map(|r| format!("{r:?}")),
+                // The turn's source conversation: `(timeline, index)` is its
+                // identity, and a group holds many conversations, so `index`
+                // alone cannot say which file or thread a turn came from. A
+                // string, like the event's own `timeline` below.
+                "timeline": t.timeline.map(|tl| tl.to_string()),
             })
         })
         .collect();
@@ -2119,7 +2125,7 @@ fn selection_replay(
         let Some(StreamDecl::Turn(d)) = &s.decl else {
             continue;
         };
-        if !d.tags.is_empty() {
+        if !is_dialogue(&d.tags) {
             continue; // gallery turn, not dialogue
         }
         let tl = d.timeline_id;
@@ -2147,7 +2153,7 @@ fn selection_replay(
         let Some(StreamDecl::Turn(d)) = &s.decl else {
             continue;
         };
-        if d.timeline_id != dialogue_tl || !d.tags.is_empty() {
+        if d.timeline_id != dialogue_tl || !is_dialogue(&d.tags) {
             continue;
         }
         if let Some(sig) = s.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) {

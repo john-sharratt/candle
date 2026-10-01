@@ -102,9 +102,10 @@ use super::ids::{
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
     GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
-    SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection,
+    SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, WorkingSetShare,
 };
 use super::selection::{apply_selection, trim_to_budget_low_score_first};
+use super::working_set_pick;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
 
@@ -1233,6 +1234,13 @@ pub fn run_with_sink<R: ContentResolver>(
         /// rule-based selection or re-sort by raw `TurnIndex` (that would place
         /// every summary AFTER its own content); the order is emitted verbatim.
         score_density: bool,
+        /// A `working_set` group of a target that carries one: filled from the
+        /// target's working set once every group has been walked, sized by the
+        /// working set's own budget, kept off the flexbox and emitted verbatim.
+        working_set: Option<WorkingSetShare>,
+        /// The target's own group while it generates: every turn selected
+        /// unconditionally, and the bounded pass only trims to the budget.
+        ingest_self: bool,
     }
 
     let mut group_states: Vec<GroupState> = Vec::new();
@@ -1283,6 +1291,28 @@ pub fn run_with_sink<R: ContentResolver>(
             // Masking: for the target layer, only the target group is visible.
             if layer_is_target && group.id != target.group {
                 continue;
+            }
+
+            // A working-set group is filled from the target's working set once
+            // every group has been walked (Step 4b) — the folder groups' share
+            // has to be known before the file groups can be sized, whatever
+            // order the layers run in — so its corpus is never walked here. The
+            // exception is an ingest conversation generating into this very
+            // group, which reads its own turns below like any other.
+            if let SelectionRule::WorkingSet { share } = group.selection {
+                if !(resolver.target_is_ingest_self() && group.id == target.group) {
+                    group_states.push(GroupState {
+                        schema: group,
+                        layer_idx: li,
+                        selected: Vec::new(),
+                        members: HashMap::new(),
+                        group_score: 0.0,
+                        score_density: false,
+                        working_set: Some(share),
+                        ingest_self: false,
+                    });
+                    continue;
+                }
             }
 
             // Candidates are every turn in the group — raw turns AND summary
@@ -1402,9 +1432,10 @@ pub fn run_with_sink<R: ContentResolver>(
 
             // Fall through to the rule-based unbounded selection path
             // when score-density wasn't applicable.
+            let ingest_self = resolver.target_is_ingest_self() && group.id == target.group;
             let mut selected: Vec<(TurnKey, f32)> = if score_density_used {
                 selected
-            } else if resolver.target_is_ingest_self() && group.id == target.group {
+            } else if ingest_self {
                 // An append-only ingest conversation reading its OWN turns while
                 // it generates. Every candidate is selected, unconditionally.
                 //
@@ -1652,7 +1683,36 @@ pub fn run_with_sink<R: ContentResolver>(
                 members,
                 group_score: 0.0,
                 score_density: score_density_used,
+                working_set: None,
+                ingest_self,
             });
+        }
+    }
+
+    // ── Step 4b: Working-set groups ─────────────────────────────────────────
+    // `docs/zend_working_set.md` §4.4. Each group emits the target's working-set
+    // members in it, whole, in the working set's own order — the set enforced
+    // the budget as they entered, so nothing is chosen here. A target whose
+    // layer declares no working set — or that holds none — selects nothing.
+    let declares_working_set = schema
+        .layers
+        .iter()
+        .any(|l| l.id == target.layer && l.working_set.is_some());
+    if declares_working_set {
+        for gs in group_states
+            .iter_mut()
+            .filter(|gs| gs.working_set.is_some())
+        {
+            let Some(members) = resolver.working_set_members(gs.schema.id) else {
+                continue;
+            };
+            for p in working_set_pick::pick(&members) {
+                for key in resolver.timeline_turns(p.timeline) {
+                    selection_scores.set_turn(key, p.score, true);
+                    selection_origins.insert(key, p.origin);
+                    gs.selected.push((key, p.score));
+                }
+            }
         }
     }
 
@@ -1665,9 +1725,11 @@ pub fn run_with_sink<R: ContentResolver>(
     // ── Step 6: Layer score threshold ────────────────────────────────────────
     // Doc §9.6: "Apply layer score thresholds → surviving groups". Groups whose
     // derived score falls below their layer's threshold are dropped wholesale.
+    // A working-set group is exempt: its pinned members are promises already
+    // made to the model, not candidates a threshold may turn away.
     group_states.retain(|gs| {
         let layer = &visible_layers[gs.layer_idx];
-        gs.group_score >= layer.score_threshold
+        gs.working_set.is_some() || gs.group_score >= layer.score_threshold
     });
 
     // ── Step 7: Filter empty groups and (transitively) empty layers ───────────
@@ -1764,9 +1826,25 @@ pub fn run_with_sink<R: ContentResolver>(
         .map(|l| l.window)
         .unwrap_or(0);
 
+    // The working set is sized by its own budget and never shares the target's
+    // `window`: its groups take no part in the flexbox, and a layer holding only
+    // such groups takes none either. The dialogue's window is distributed over
+    // the other groups exactly as if the working set were not there.
+    let flexed = |gs: &GroupState| gs.working_set.is_none();
+    let flex_layer_indices: Vec<usize> = surviving_layer_indices
+        .iter()
+        .copied()
+        .filter(|&li| {
+            group_states
+                .iter()
+                .any(|gs| gs.layer_idx == li && flexed(gs))
+        })
+        .collect();
+
     // Natural token consumption per group (unbounded selection result).
     let natural_tokens: HashMap<GroupId, usize> = group_states
         .iter()
+        .filter(|gs| flexed(gs))
         .map(|gs| {
             // Priced per EXCHANGE — what emitting the candidate actually costs —
             // so the flexbox natural cap matches the tokens the group emits.
@@ -1780,12 +1858,12 @@ pub fn run_with_sink<R: ContentResolver>(
         .collect();
 
     // Natural consumption per layer (sum of groups).
-    let layer_natural: Vec<usize> = surviving_layer_indices
+    let layer_natural: Vec<usize> = flex_layer_indices
         .iter()
         .map(|&li| {
             group_states
                 .iter()
-                .filter(|gs| gs.layer_idx == li)
+                .filter(|gs| gs.layer_idx == li && flexed(gs))
                 .map(|gs| natural_tokens[&gs.schema.id])
                 .sum()
         })
@@ -1795,13 +1873,13 @@ pub fn run_with_sink<R: ContentResolver>(
     // B: a layer's attention mass (the sum over its groups') scales its
     // priority within the declared rails — a tour-shaped probe lifts repo_map
     // above its static share, a code probe grows the scopes layer.
-    let layer_items: Vec<FlexItem> = surviving_layer_indices
+    let layer_items: Vec<FlexItem> = flex_layer_indices
         .iter()
         .enumerate()
         .map(|(slot, &li)| {
             let layer_mass: f32 = group_states
                 .iter()
-                .filter(|gs| gs.layer_idx == li)
+                .filter(|gs| gs.layer_idx == li && flexed(gs))
                 .map(|gs| resolver.group_attention_mass(gs.schema.id))
                 .sum();
             let mut item = FlexItem::from_budget_with_mass(
@@ -1818,12 +1896,19 @@ pub fn run_with_sink<R: ContentResolver>(
 
     let mut final_selected: Vec<(GroupId, TurnKey)> = vec![];
 
-    for (slot, &li) in surviving_layer_indices.iter().enumerate() {
+    // Working-set groups emit what Step 4b picked, verbatim and untrimmed.
+    for gs in group_states.iter().filter(|gs| !flexed(gs)) {
+        for (key, _) in &gs.selected {
+            push_exchange(&mut final_selected, gs.schema.id, &gs.members, *key);
+        }
+    }
+
+    for (slot, &li) in flex_layer_indices.iter().enumerate() {
         let layer_budget = layer_budgets[slot];
 
         let layer_groups: Vec<&GroupState> = group_states
             .iter()
-            .filter(|gs| gs.layer_idx == li)
+            .filter(|gs| gs.layer_idx == li && flexed(gs))
             .collect();
 
         if layer_groups.is_empty() {
@@ -1865,14 +1950,16 @@ pub fn run_with_sink<R: ContentResolver>(
             let group_budget = group_budgets[gi];
             let tc = |key: TurnKey| exchange_token_count(resolver, &gs.members, key);
 
-            let selected_indices = if gs.schema.is_belief_driven() {
+            let selected_indices = if gs.schema.is_belief_driven() || gs.ingest_self {
                 // Belief already decided the surviving set (RelLeak + the rule's
                 // budget); the bounded pass must ONLY trim to the token budget,
                 // not re-apply the rule's `score_threshold` to the post-leak
                 // belief scores — a selected turn whose leaked score fell below
                 // the threshold would otherwise be silently dropped here,
                 // diverging from the belief decision. Trim low-score-first, then
-                // restore turn order for emission.
+                // restore turn order for emission. An ingest conversation's own
+                // group selected every turn itself, whatever rule it declares,
+                // so it is only trimmed too.
                 let mut kept = gs.selected.clone();
                 trim_to_budget_low_score_first(&mut kept, group_budget, &tc);
                 kept.sort_by_key(|(idx, _)| *idx);
@@ -1940,8 +2027,11 @@ pub fn run_with_sink<R: ContentResolver>(
             // stands alone as the coarse cover of an older span (reference context
             // for a non-target group), not stacked on top of its own content. The
             // score-density path emits its own chronological order (summary above
-            // the turns it refines); leave it untouched.
-            if !gs.score_density {
+            // the turns it refines); leave it untouched. So does a working-set
+            // group: its members come in the order they joined the set, each
+            // conversation's turns in order, so that a rebuild keeps the slot's
+            // prefix up to the newest member (`working_set_pick::pick`).
+            if !gs.score_density && gs.working_set.is_none() {
                 group_turns.sort();
             }
 
@@ -2346,6 +2436,8 @@ fn select_collection_indices<R: ContentResolver>(
             .unwrap_or_default(),
         // Score-independent: whatever the runtime selector names.
         SelectionRule::Named { selector } => named_indices(coll, selector, selection_state),
+        // A collection carries no conversations (the YAML loader refuses it).
+        SelectionRule::WorkingSet { .. } => Vec::new(),
     }
 }
 
@@ -2579,6 +2671,9 @@ fn select_collection_sections<R: ContentResolver>(
             }
             out
         }
+        // A working set carries whole conversations into turn groups; a
+        // collection has none to carry (the YAML loader refuses the pairing).
+        SelectionRule::WorkingSet { .. } => Vec::new(),
     }
 }
 

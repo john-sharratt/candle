@@ -26,7 +26,7 @@ Under provenance-selected attention (not full-sequence attention), total numeric
 ### Adaptive Quantization (C0–C10)
 Every 32-token block is independently evaluated. The `CompressionPolicy` selects K/V formats per block based on cosine distance thresholds:
 - **C0** — near-lossless (K: R16/F16 fallback, V: Q8_0). Reference quality.
-- **C4–C5** — moderate compression (K: Q8_0/Q8_KS, V: Q4_1/Q4_KS)
+- **C4–C5** — moderate compression (K: Q4_0 … Q8_0, V: Q3_0 … Q8_0; Q5_0/Q5_1 fill the Q4_1 → Q8_0 gap on C4–C6, and on K at C7)
 - **C9–C10** — maximum compression (sub-4-bit formats down to Q0_V/Q1_S); C10 is calibrated just inside each model's validation edge by its `*_KV_FACTORS` row in `sampled_selection/params.rs`, and reaches 4.1×–7.6× across the fleet
 
 **Asymmetric K/V**: Keys are sensitive by channel, Values by token. Separate threshold tables exist for each (`PRODUCTION_K_QREL_*`, `PRODUCTION_V_QREL_*`).

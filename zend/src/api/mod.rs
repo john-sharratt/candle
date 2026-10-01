@@ -97,7 +97,10 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/phases", get(telemetry::phases))
         .route("/v1/promotes", get(telemetry::promotes))
         .route("/v1/substrate", get(substrate::overview))
-        .route("/v1/substrate/system-prompt", get(substrate::system_prompt))
+        .route(
+            "/v1/substrate/system-prompt",
+            get(substrate::system_prompt).delete(substrate::retire_system_prompt),
+        )
         .route("/v1/substrate/tools", get(substrate::tools))
         .route("/v1/substrate/layer/:name", get(substrate::layer))
         .route(

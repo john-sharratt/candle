@@ -70,10 +70,11 @@ use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
 use crate::models::expert_lre::{WeightPlan, WeightPlanning};
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
+use crate::models::profile::span;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows};
-use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule};
+use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
 use super::rope::flash_next_schedule;
@@ -153,6 +154,15 @@ pub struct Qwen4ExpBatched {
     /// The resident index pages of every injected piece some cache still holds,
     /// so a piece pushed into many slots is placed once and shared.
     pages: PageRegistry,
+    /// Per sequence, the pages its last reset dropped, held until its next
+    /// reset or its release.
+    ///
+    /// The registry holds pages weakly, so a page lives only while some cache
+    /// holds it — and a reprojection resets the slot, the pieces' only holder,
+    /// before re-injecting them. Without this every rebuild decodes and places
+    /// every page it had a moment ago: measured at 12,372 placements against
+    /// 12,503 lookups on one dialogue turn, 5.0 s of a 75 s turn.
+    retired: RwLock<HashMap<usize, Vec<Arc<ResidentPage>>>>,
     /// Per-sequence carried residual for the draft head's next first row — the
     /// `h(t-1)` its input assembly needs across a wave boundary. Empty on a
     /// checkpoint with no head, and reset with the other carried state when a
@@ -427,13 +437,43 @@ impl Qwen4ExpBatched {
     }
 
     /// Drop `seq`'s index — the slot's K/V was truncated to nothing.
+    ///
+    /// The pages it held stay resident until `seq` resets again or is released
+    /// (see the `retired` field), so the rebuild that follows a reset finds the
+    /// pieces it re-injects already placed.
     pub fn reset_positional_state(&self, seq: usize) -> Result<()> {
+        let mut dropped: Vec<Arc<ResidentPage>> = Vec::new();
         if let Ok(mut map) = self.index.write() {
             if let Some(caches) = map.get_mut(&seq) {
                 for c in caches.iter_mut() {
-                    c.reset();
+                    dropped.extend(c.reset());
                 }
             }
+        }
+        if let Ok(mut retired) = self.retired.write() {
+            retired.insert(seq, dropped);
+        }
+        Ok(())
+    }
+
+    /// Cut `seq`'s index back to `tokens` — the slot's K/V was truncated to a
+    /// piece boundary there, and what follows is about to be re-injected. The
+    /// pages above the cut are retired like a reset's (see the `retired` field).
+    pub fn truncate_positional_state(&self, seq: usize, tokens: usize) -> Result<()> {
+        let mut dropped: Vec<Arc<ResidentPage>> = Vec::new();
+        {
+            let mut map = self
+                .index
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+            if let Some(caches) = map.get_mut(&seq) {
+                for c in caches.iter_mut() {
+                    dropped.extend(c.truncate_to(tokens)?);
+                }
+            }
+        }
+        if let Ok(mut retired) = self.retired.write() {
+            retired.insert(seq, dropped);
         }
         Ok(())
     }
@@ -753,10 +793,13 @@ impl Qwen4ExpBatched {
     fn resident_pages(&self, blob: &[u8]) -> Result<Vec<Option<Arc<ResidentPage>>>> {
         let cfg = &self.model.cfg;
         let want = cfg.kv_layers().total();
+        let hash = span("qsa:page:key");
         let key = PieceKey::of(blob);
+        hash.end();
         if let Some(layers) = self.pages.get(&key) {
             return Ok(layers);
         }
+        let _place = span("qsa:page:decode_place");
         let (_, sealed) = paged_index::decode_aux(blob)?;
         if sealed.len() != want {
             candle::bail!(
@@ -1195,6 +1238,7 @@ impl Qwen4ExpBatched {
             ple: RwLock::new(HashMap::new()),
             index: RwLock::new(HashMap::new()),
             pages: PageRegistry::default(),
+            retired: RwLock::new(HashMap::new()),
             index_rope,
             qsa_rows: AtomicU64::new(0),
             rope,
@@ -1469,6 +1513,15 @@ impl Qwen4ExpBatched {
         self.rope = rope;
         Ok(())
     }
+
+    /// Run no sequence on a rung whose YaRN factor is below `min`, for the
+    /// attention and the indexer alike ([`RopeRungs::with_min_factor`]). Set
+    /// before any session opens.
+    pub fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
+        self.rope = self.rope.clone().with_min_factor(min)?;
+        self.index_rope = self.index_rope.clone().with_min_factor(min)?;
+        Ok(())
+    }
 }
 
 impl ManagedBatchedModel for Qwen4ExpBatched {
@@ -1679,6 +1732,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn reset_positional_state(&self, seq: usize) -> Result<()> {
         Qwen4ExpBatched::reset_positional_state(self, seq)
+    }
+
+    fn truncate_positional_state(&self, seq: usize, tokens: usize) -> Result<()> {
+        Qwen4ExpBatched::truncate_positional_state(self, seq, tokens)
     }
 
     fn seal_positional_state(&self, seq: usize) -> Result<Option<Vec<u8>>> {
@@ -1934,8 +1991,12 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.rewind_cohort(session, targets)
     }
 
-    fn rope_ceilings(&self) -> Vec<usize> {
-        self.rope.ceilings().to_vec()
+    fn rope_select(&self) -> RungSelect {
+        self.rope.select().clone()
+    }
+
+    fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
+        Qwen4ExpBatched::set_rope_min_factor(self, min)
     }
 
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
@@ -1964,7 +2025,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             &self.model.device,
             config,
         )?;
-        session.set_rope_ceilings(self.rope.ceilings().to_vec())?;
+        session.set_rope_select(self.rope.select().clone());
         // **The draft head's layer is capped; the trunk's twelve take the
         // session's level unchanged.**
         //
@@ -2004,6 +2065,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if let Ok(mut m) = self.index.write() {
             m.clear();
         }
+        if let Ok(mut m) = self.retired.write() {
+            m.clear();
+        }
         if let Ok(mut m) = self.seeds.write() {
             m.clear();
         }
@@ -2023,6 +2087,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             m.remove(&seq);
         }
         if let Ok(mut m) = self.index.write() {
+            m.remove(&seq);
+        }
+        if let Ok(mut m) = self.retired.write() {
             m.remove(&seq);
         }
         if let Ok(mut m) = self.seeds.write() {
@@ -2073,7 +2140,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
-        session.expect_rope_ceilings(self.rope.ceilings())?;
+        session.expect_rope_select(self.rope.select())?;
         drive_wave(
             self,
             session,

@@ -75,7 +75,7 @@ fn excerpt_source(resp: &serde_json::Value) -> String {
 
 // ── file_read ────────────────────────────────────────────────────────────────
 
-/// The same path in two repositories is two different files, and the header
+/// The same path in two repositories is two different files, and the fence
 /// names which repository was read.
 #[test]
 fn file_read_of_the_same_path_returns_each_repositorys_own_content() {
@@ -88,7 +88,7 @@ fn file_read_of_the_same_path_returns_each_repositorys_own_content() {
         &c,
     ));
     assert_eq!(excerpt_source(&a), "content from a");
-    assert!(a.as_str().unwrap().contains("shared.txt in a "));
+    assert!(a.as_str().unwrap().contains(" file=a/shared.txt "));
 
     let b = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
@@ -96,7 +96,7 @@ fn file_read_of_the_same_path_returns_each_repositorys_own_content() {
         &c,
     ));
     assert_eq!(excerpt_source(&b), "content from b");
-    assert!(b.as_str().unwrap().contains("shared.txt in b "));
+    assert!(b.as_str().unwrap().contains(" file=b/shared.txt "));
 }
 
 #[test]

@@ -19,10 +19,12 @@
 //! the dead estimate stays conservative (it can under-count dead
 //! weight, never over-count it).
 //!
-//! Records made dead by a **tombstone** (every record of a deleted
-//! timeline's streams) are also invisible to the header-keyed map;
-//! `Substrate::tombstoned_stream_bytes` sums them from the in-RAM
-//! stream index and the compaction trigger adds that on top.
+//! Records made dead by a **timeline tombstone** (every record of a deleted
+//! timeline's streams) are invisible to the header-keyed map, since the
+//! tombstone names its timeline in the payload; `Substrate::tombstoned_stream_bytes`
+//! sums them from the in-RAM stream index and the compaction trigger adds
+//! that on top. A **section tombstone** names its stream in the header, so it
+//! retires that stream's records here directly — see [`RecordAccounting::record`].
 
 use std::collections::HashMap;
 
@@ -45,7 +47,18 @@ impl RecordAccounting {
     /// Note one appended (or recovery-walked) record. O(1): when the
     /// key was already live, its previous on-disk size becomes dead
     /// weight.
+    ///
+    /// A `SectionTombstone` also retires every live record its stream owns:
+    /// the tombstone ends that generation of the section
+    /// (`Substrate::reset_tombstoned_stream`), and a fresh prefill of the same
+    /// content writes a new one under the same keys — which, with the old keys
+    /// retired here, count as new rather than as superseding the dead bytes a
+    /// second time. That retirement walks the live map, which is fine for a
+    /// record written once per section rebuild or repair.
     pub fn record(&mut self, header: &RecordHeader, padded_size: u64) {
+        if header.record_type == RecordType::SectionTombstone {
+            self.retire_stream(header.stream_id);
+        }
         let key = match header.record_type {
             RecordType::Chunk => (RecordType::Chunk, header.stream_id, header.chunk_index),
             // A conversation's file events and tombstones are keyed by timeline
@@ -113,6 +126,32 @@ impl RecordAccounting {
         if let Some(size) = self.live_sizes.remove(&(rt, stream_id, index)) {
             self.dead_bytes += size;
         }
+    }
+
+    /// Count every live record `stream_id` owns as dead — its chunks and its
+    /// per-stream records. Keyed only on the stream-owned types, since
+    /// `Snapshot`, `Npc` and `ConvState` reuse the header's `stream_id` for
+    /// ids of their own.
+    fn retire_stream(&mut self, stream_id: u64) {
+        let mut retired = 0u64;
+        self.live_sizes.retain(|&(rt, sid, _), size| {
+            let owned = sid == stream_id
+                && matches!(
+                    rt,
+                    RecordType::Chunk
+                        | RecordType::Tokens
+                        | RecordType::StreamDecl
+                        | RecordType::Commit
+                        | RecordType::ProjectionEvents
+                        | RecordType::WideQSig
+                        | RecordType::TurnIndexPage
+                );
+            if owned {
+                retired += *size;
+            }
+            !owned
+        });
+        self.dead_bytes += retired;
     }
 
     /// Total padded bytes of superseded records seen so far.
@@ -217,6 +256,36 @@ mod tests {
         assert_eq!(acc.dead_bytes(), 8192);
         acc.retire(RecordType::VfsEvent, 7, 9);
         assert_eq!(acc.dead_bytes(), 8192, "a key never live retires nothing");
+    }
+
+    /// **A section tombstone retires its stream's records, and only its
+    /// stream's** — a fresh generation written under the same keys afterwards
+    /// starts live without counting the dead ones a second time.
+    #[test]
+    fn a_section_tombstone_retires_its_stream() {
+        let mut acc = RecordAccounting::new();
+        acc.record(&header(RecordType::StreamDecl, 40, 0), 4096);
+        acc.record(&header(RecordType::Chunk, 40, 0), 8192);
+        acc.record(&header(RecordType::Chunk, 40, 1), 8192);
+        acc.record(&header(RecordType::Tokens, 40, 0), 4096);
+        acc.record(&header(RecordType::Chunk, 41, 0), 8192);
+        acc.record(&header(RecordType::Npc, 40, 0), 4096);
+        assert_eq!(acc.dead_bytes(), 0);
+
+        acc.record(&header(RecordType::SectionTombstone, 40, 0), 4096);
+        assert_eq!(
+            acc.dead_bytes(),
+            4096 + 8192 + 8192 + 4096,
+            "stream 40's decl, chunks and tokens; not stream 41, not the Npc keyed 40"
+        );
+
+        acc.record(&header(RecordType::StreamDecl, 40, 0), 4096);
+        acc.record(&header(RecordType::Chunk, 40, 0), 8192);
+        assert_eq!(
+            acc.dead_bytes(),
+            4096 + 8192 + 8192 + 4096,
+            "the new generation is live and supersedes nothing"
+        );
     }
 
     #[test]

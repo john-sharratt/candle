@@ -226,7 +226,7 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
     // (`grounding` / `grounding_no_tools` are commented out in projection.yaml.)
     // (`frame` is now the `assistant` option of the `persona` selector, not a
     // standalone section — see `projection.yaml`.)
-    for name in ["history_stance", "tools_overview"] {
+    for name in ["history_stance", "in_context", "tools_overview"] {
         assert!(
             builder.id_for_system_section(name).is_some(),
             "static section {name:?} must still resolve",
@@ -455,11 +455,10 @@ fn format_tool_responses_escapes_nested_json_correctly() {
     assert!(formatted.contains("\"nested\""));
 }
 
-/// The bundled schema's belief gates, resolved the way projection does it.
-/// `repo_map/structure` declares a `policy:` band and no `score_threshold`; the
-/// gate must be that band (600/400), not the `0.0` default that previously
-/// overwrote it and made every cluster eligible at zero evidence. Every other
-/// group declares a `score_threshold` and must keep it verbatim.
+/// The bundled schema's belief gates, resolved the way projection does it, for
+/// every belief-driven group. Each declares a `score_threshold` and must keep
+/// it verbatim. `repo_map/structure` and `code_reading/scopes` are not among
+/// them: they are filled from the dialogue's working set, not by belief.
 #[test]
 fn bundled_schema_belief_gates_resolve_from_the_right_source() {
     use candle_conversation::models::Dialect;
@@ -472,7 +471,7 @@ fn bundled_schema_belief_gates_resolve_from_the_right_source() {
     let schema = builder.schema();
     let mut seen = std::collections::BTreeMap::new();
     for layer in &schema.layers {
-        for group in &layer.groups {
+        for group in layer.groups.iter().filter(|g| g.is_belief_driven()) {
             let cfg = group.belief_config(32);
             seen.insert(
                 format!("{}/{}", layer.name, group.name),
@@ -480,22 +479,21 @@ fn bundled_schema_belief_gates_resolve_from_the_right_source() {
             );
         }
     }
-    assert_eq!(
-        seen.get("repo_map/structure"),
-        Some(&(250.0, 250.0)),
-        "repo_map must use its declared policy band, not the 0.0 default; got {seen:?}",
-    );
     assert_eq!(seen.get("bug_analysis/bugs"), Some(&(250.0, 250.0)));
     assert_eq!(seen.get("dream_log/dreams"), Some(&(100.0, 100.0)));
-    assert_eq!(seen.get("code_reading/scopes"), Some(&(100.0, 100.0)));
+    for working_set_group in ["repo_map/structure", "code_reading/scopes"] {
+        assert!(
+            !seen.contains_key(working_set_group),
+            "{working_set_group} is a working-set group, not belief-driven: {seen:?}",
+        );
+    }
 
     // The early band is a GRACE window: it must never sit above the steady one,
-    // or the opening tokens of a turn are gated harder than the rest. Only
-    // repo_map currently enables an early window (`early_window_tokens: 24`);
-    // the rest inherit `early_window_tokens: 0`, which makes their early band
-    // inert — so this guards repo_map today and any group that turns one on.
+    // or the opening tokens of a turn are gated harder than the rest. Every
+    // bundled group inherits `early_window_tokens: 0`, which makes its early
+    // band inert — so this guards any group that turns one on.
     for layer in &schema.layers {
-        for group in &layer.groups {
+        for group in layer.groups.iter().filter(|g| g.is_belief_driven()) {
             let cfg = group.belief_config(32);
             if cfg.early_window_tokens == 0 {
                 continue;

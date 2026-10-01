@@ -238,8 +238,8 @@ pub struct GrepOutcome {
 /// One entry in a directory listing: normalised path, byte size. No line
 /// count — that would cost opening every file in the walk to compute, and a
 /// listing that never opens a file is the whole point of `file_list`. A file's length reaches the model
-/// through `file_read`'s own header instead (`(page 0 of 13, lines 1-200 of
-/// 2499)`), which is exact, costs nothing extra, and arrives at the moment the
+/// through `file_read`'s own opening fence instead (`page=0/13 lines=2499`),
+/// which is exact, costs nothing extra, and arrives at the moment the
 /// number is actually needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListEntry {

@@ -753,13 +753,17 @@ import { estateSwitcher } from './common/lib/estate.js';
     // "page 0" reads as a computer's off-by-one to a human, not the top.
     let detail = '';
     if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + (args.page + 1);
-    // file_read's excerpt header, once the response lands: `\npath (page 0 of
-    // 5, lines 301-600 of 1420):` / `(empty)` — richer than the call alone.
-    // The page number is captured on its own so it can be shown one-based
-    // too; the rest of the header (total pages, line range) passes through
-    // as the tool itself renders it.
-    const hdr = resp && /^\s*\S[^\n]*? \((?:page (\d+) (of \d+, lines \d+-\d+ of \d+)|(empty))\):/.exec(resp.raw);
-    if (hdr) detail = hdr[3] || ('page ' + (Number(hdr[1]) + 1) + ' ' + hdr[2]);
+    // file_read's opening fence, once the response lands:
+    // "```rust file=repo/path page=1/5 lines=1420", or "lines=0" alone for an
+    // empty file — richer than the call alone. The page is shown one-based, and
+    // the line range it covers is derived from the fixed 200-line page stride.
+    const fence = resp && /^\s*```\S* file=\S+(?: page=(\d+)\/(\d+))? lines=(\d+)\n/.exec(resp.raw);
+    if (fence && fence[1] === undefined) detail = 'empty';
+    else if (fence) {
+      const page = Number(fence[1]), total = Number(fence[3]);
+      const first = page * 200 + 1, last = Math.min((page + 1) * 200, total);
+      detail = 'page ' + (page + 1) + ' of ' + fence[2] + ', lines ' + first + '-' + last + ' of ' + total;
+    }
     else if (resp && resp.obj && resp.obj.paging && typeof resp.obj.paging.total === 'number') {
       const p = resp.obj.paging;
       detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + (p.page + 1) + '/' + p.pages : '');

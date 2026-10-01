@@ -761,19 +761,56 @@ impl IndexCache {
             .ensure(tokens.saturating_sub(self.tail_base) / ratio + 1)
     }
 
-    /// Start the sequence over — including its injected prefix.
+    /// Start the sequence over — including its injected prefix. Returns the
+    /// injected pages it held.
     ///
     /// The pages go too. They describe positions this slot held; a slot
     /// starting over holds none of them, and leaving them would put the next
     /// sequence's first token at the old prefix's end. The key pages go back to
     /// the span with them; admission claims what the new sequence needs.
-    pub fn reset(&mut self) {
+    ///
+    /// The pages are handed back rather than dropped because a slot that starts
+    /// over to be rebuilt re-injects most of the same pieces: a caller that
+    /// keeps them alive across the rebuild finds each one still resident
+    /// instead of decoding and placing it again.
+    pub fn reset(&mut self) -> Vec<Arc<ResidentPage>> {
         self.keys.clear();
         self.n_blocks = 0;
         self.n_open = 0;
-        self.pages.clear();
         self.page_rows.truncate(1);
         self.tail_base = 0;
+        self.pages.drain(..).map(|p| p.page).collect()
+    }
+
+    /// Cut the cache back to position `pos`: keep the injected pages that end at
+    /// or below it, drop the rest and the live tail, and resume the tail at
+    /// `pos`. Returns the pages dropped.
+    ///
+    /// For a rebuild that keeps its slot's prefix up to a piece boundary and
+    /// re-injects only what follows. A page is atomic — its last row is ragged —
+    /// so a cut that falls inside one is refused rather than splitting it: the
+    /// caller's piece boundaries are exactly the page boundaries, and a cut
+    /// anywhere else means the two have diverged.
+    pub fn truncate_to(&mut self, pos: usize) -> Result<Vec<Arc<ResidentPage>>> {
+        let keep = self
+            .pages
+            .iter()
+            .take_while(|p| p.base + p.tokens <= pos)
+            .count();
+        if let Some(straddles) = self.pages.get(keep).filter(|p| p.base < pos) {
+            candle::bail!(
+                "qsa index: a cut at {pos} falls inside the page covering {}..{} — pages \
+                 are atomic, so a cut must land on a page boundary",
+                straddles.base,
+                straddles.base + straddles.tokens,
+            );
+        }
+        self.keys.clear();
+        self.n_blocks = 0;
+        self.n_open = 0;
+        self.page_rows.truncate(keep + 1);
+        self.tail_base = pos;
+        Ok(self.pages.drain(keep..).map(|p| p.page).collect())
     }
 
     /// Blocks this span would complete, and the rows it would leave open.
@@ -2215,6 +2252,43 @@ mod tests {
             let (page, _) = cache.page_at(0).expect("the page survives the pass");
             assert_eq!(page.host_rows()?, page_rows);
         }
+        Ok(())
+    }
+
+    /// **A cut keeps the pages below it whole and drops the rest.** Three pages
+    /// of 8 rows at ratio 4, the last row covering 2 tokens — 30 tokens each,
+    /// abutting at 0, 30 and 60. A cut at 60 keeps two and hands back the third,
+    /// and the tail resumes at the cut; a cut inside a page is refused.
+    #[test]
+    fn a_cut_keeps_whole_pages_below_it() -> Result<()> {
+        let Some(device) = cuda() else {
+            return Ok(());
+        };
+        let d = 128usize;
+        let mut c = IndexCache::new(d, &device)?;
+        for seed in 1..=3 {
+            let page = placed_page(&lcg(8 * d, seed, 1.0), 2, d, &device)?;
+            let base = c.next_base();
+            c.push_page(page, base, 4)?;
+        }
+        assert_eq!(c.next_base(), 90);
+
+        let dropped = c.truncate_to(60)?;
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(c.page_count(), 2);
+        assert_eq!(c.page_row_span(), 16);
+        assert_eq!(c.next_base(), 60);
+
+        assert!(
+            c.truncate_to(45).is_err(),
+            "45 is inside the page at 30..60"
+        );
+        assert_eq!(c.page_count(), 2, "a refused cut changes nothing");
+
+        let dropped = c.truncate_to(0)?;
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(c.page_count(), 0);
+        assert_eq!(c.next_base(), 0);
         Ok(())
     }
 

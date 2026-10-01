@@ -1235,6 +1235,9 @@ impl Builder {
             // arguments are quotations asks with
             // [`Builder::free_tool_calls_from_penalties`].
             free_tool_calls_from_penalties: false,
+            // A single-section schema leaves the model's rungs to each
+            // sequence's reach.
+            min_yarn_factor: None,
             system_prompt: SystemPromptSchema {
                 items: vec![SystemPromptItem::Section(SectionSchema {
                     id: section_id,
@@ -1256,8 +1259,8 @@ impl Builder {
                 score_threshold: 0.0,
                 window: 32_768,
                 // A programmatic schema has no ingest layer to read from, so
-                // there is nothing for the fast path to inject.
-                fast_path_window: 0,
+                // there is nothing for a working set to carry.
+                working_set: None,
                 budget: Budget {
                     priority: 100.0,
                     min_percent: None,

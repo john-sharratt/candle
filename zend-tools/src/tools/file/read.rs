@@ -35,7 +35,7 @@ pub struct ReadRequest {
     pub path: String,
     /// Zero-based page of the file to return, 200 lines a page. Required —
     /// pass 0 to start at the top of the file. A page past the end clamps to
-    /// the last one — read page 0 first, its header names the total, then
+    /// the last one — read page 0 first, its fence names the total, then
     /// keep incrementing until a response's own page number stops advancing.
     pub page: u32,
 }
@@ -50,12 +50,13 @@ impl Tool for FileRead {
          project files can be read directly. The repo, the path within it, and \
          the page are all required — pass page 0 to read the top of the file; it \
          is zero-based, so page 1 is lines 201-400. Returns the page as numbered \
-         source in a fenced block, headed by the path, the repo, the page and \
-         total page count, and the line range covered — `src/lib.rs in candle \
-         (page 1 of 5, lines 201-400 of 1420)`. Keep incrementing page \
-         until the header's page number stops advancing; a short file is entirely \
-         on page 0. There is no need to find a file's length first: read page 0 \
-         and the header reports it. To find the page worth reading, use file_grep \
+         source in a fenced block whose opening fence names the file, the page \
+         and page count, and the file's length — `rust file=candle/src/lib.rs \
+         page=1/5 lines=1420` — and which ends with `end of candle/src/lib.rs \
+         page 1/5`. Keep incrementing page until the fence's page number stops \
+         advancing; a short file is entirely on page 0. There is no need to find \
+         a file's length first: read page 0 and its fence reports it. To find the \
+         page worth reading, use file_grep \
          rather than paging a large file to look for it. For remote filesystems \
          use remote_fs_session_get to download first, then file_read.";
 

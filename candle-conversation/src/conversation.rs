@@ -37,6 +37,7 @@ use crate::tree::token_text::TokenizedText;
 use crate::tree::{ConversationTree, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
 use crate::turn_layout::TurnLayout;
+use crate::working_set::marks::gather_tags;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
 use candle_transformers::models::dialect::Dialect;
@@ -3794,8 +3795,11 @@ impl Sequence {
             // user span — the sig grid is 1:1 with the real-KV layout.
             let q_span = read.user_sig_span(timeline, idx);
             // The turn's own gather-scope tags, which route the observation below
-            // to the scopes this turn belongs to.
-            let tags = read.turn_tags(timeline, idx);
+            // to the scopes this turn belongs to. A working-set mark is not
+            // scope, so a dialogue turn carrying one still observes as dialogue.
+            let tags: Vec<String> = gather_tags(&read.turn_tags(timeline, idx))
+                .cloned()
+                .collect();
             // The turn's own stream id keys the observation, so a later replay of
             // this turn folds nothing a second time.
             let source = turn_stream_id(timeline.raw(), idx.0).0;

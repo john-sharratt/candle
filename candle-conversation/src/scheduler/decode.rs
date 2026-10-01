@@ -479,6 +479,7 @@ impl Scheduler {
         // shrinks as the wave widens, and where it stops paying depends on the
         // checkpoint's shape rather than on anything the scheduler knows.
         let budget = self.model.draft_budget(seq_ids.len());
+        let draft_span = profile::span("decode:draft");
         let mut drafts = match self.model.speculative_draft(
             &mut self.session,
             &seq_ids_raw,
@@ -540,12 +541,14 @@ impl Scheduler {
         let spec_idx: Vec<usize> = (0..blocks.len()).filter(|&i| blocks[i].len() > 1).collect();
         let spec_seqs: Vec<usize> = spec_idx.iter().map(|&i| seq_ids_raw[i]).collect();
         let spec_blocks: Vec<Vec<u32>> = spec_idx.iter().map(|&i| blocks[i].clone()).collect();
+        draft_span.end();
 
         // ── The wave ─────────────────────────────────────────────────────────
         //
         // The model plans its rows; this owns the forward, so the verify blocks
         // ride the SAME continuous-fair wave as the creep group and the glue and
         // speculation costs no prefill throughput.
+        let begin_span = profile::span("decode:begin_verify");
         let plan = match self.model.begin_verify(
             &mut self.session,
             &plain,
@@ -571,7 +574,9 @@ impl Scheduler {
                 return;
             }
         };
+        begin_span.end();
         let wave_rows = plan.rows;
+        let forward_span = profile::span("decode:forward_cobatched");
         let logits = match self.decode_forward_cobatched(
             &plan.decode_seqs,
             &plan.decode_inputs,
@@ -585,6 +590,7 @@ impl Scheduler {
                 return;
             }
         };
+        forward_span.end();
         let fwd_elapsed = t_fwd.elapsed();
         let fwd_ms = fwd_elapsed.as_millis() as u64;
         // Charge the forward's FULL duration to every sequence in it — this is
@@ -617,6 +623,7 @@ impl Scheduler {
 
         // Reads the scored rows back and advances each sequence by what the wave
         // actually wrote — the walk below rolls the rejected tail off again.
+        let _accept_span = profile::span("decode:end_verify_and_sample");
         let (plain_rows, spec_rows) =
             match self
                 .model
@@ -1838,6 +1845,11 @@ impl Scheduler {
                 "batched gap-fill forward failed; aborting decode for all prepared views"
             );
             for inflight in inflights {
+                // Its assembly recorded the glue pieces as placed; unfilled,
+                // they are zero chunks no later rebuild may keep.
+                if let Some(state) = self.slot_projection_state.get_mut(&inflight.plan.parent_id) {
+                    state.placed_pieces.clear();
+                }
                 let _ = inflight.decode_state.event_tx.send(TurnEvent::Error(
                     ConversationError::Channel(format!("gap-fill wave forward failed: {e}")),
                 ));

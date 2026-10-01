@@ -165,6 +165,17 @@ impl RopeSchedule {
         self.rope_dim / 2
     }
 
+    /// Each rung's scaling factor, in rung order — what a minimum factor is
+    /// judged against. A plain or stated schedule's one rung is unscaled (1);
+    /// a linear one's is its factor.
+    pub fn factors(&self) -> Vec<f32> {
+        match &self.scaling {
+            Scaling::Yarn { rungs, .. } => rungs.iter().map(|r| r.factor).collect(),
+            Scaling::Linear { factor } => vec![*factor],
+            Scaling::Plain | Scaling::Stated { .. } => vec![1.0],
+        }
+    }
+
     /// The highest reach each rung covers, ascending. One entry, the supported
     /// maximum, for a schedule with a single rung.
     pub fn ceilings(&self) -> Vec<usize> {
@@ -303,6 +314,23 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].q_rot_scale, 1.0);
         assert_eq!(s.supported_max(), 1_048_576);
+    }
+
+    /// Every rung reports its factor; a single-rung schedule its one.
+    #[test]
+    fn each_rung_reports_its_factor() {
+        assert_eq!(hybrid().factors(), vec![1.0, 2.0, 4.0]);
+        assert_eq!(RopeSchedule::plain(128, 1e6, 32_768).factors(), vec![1.0]);
+        assert_eq!(
+            RopeSchedule::linear(128, 1e6, 2.0, 65_536).factors(),
+            vec![2.0]
+        );
+        assert_eq!(
+            RopeSchedule::stated(vec![1.0, 0.5], 8_192)
+                .unwrap()
+                .factors(),
+            vec![1.0]
+        );
     }
 
     /// Malformed schedules are refused at construction.

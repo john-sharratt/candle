@@ -197,6 +197,7 @@
 //! | [`plain_prompt`] | Where a plain prompt's frame section is sealed               |
 
 pub mod adaptive;
+mod belief_files;
 mod builder;
 mod error;
 pub(crate) mod event;
@@ -211,10 +212,14 @@ mod schema;
 mod score;
 mod selection;
 pub mod warm_pool;
+mod working_set_observe;
+mod working_set_pick;
 mod yaml;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod working_set_tests;
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
@@ -250,5 +255,6 @@ pub use schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection,
     SectionSchema, SectionTree, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim,
-    TreeNode, TreeOption, TreeVariant, TurnSummary,
+    TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
 };
+pub use working_set_pick::{Standing, WorkingSetMembers};

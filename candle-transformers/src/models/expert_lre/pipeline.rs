@@ -135,6 +135,8 @@ use candle::direct_io::AlignedScratch;
 use candle::quantized::pinned_staging::PinnedBuf;
 #[cfg(not(feature = "cuda"))]
 use candle::quantized::Int8Mode;
+#[cfg(feature = "cuda")]
+use candle::vram::{available_physical_ram, host_pinned_bytes};
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, weight_floor_after};
@@ -537,13 +539,14 @@ pub(crate) fn startup_from_pack(
                 break 'fill;
             };
             let slot_base = t.inner.slot_base(slot_idx);
-            // Names the upload that failed: which expert, which source, and how
-            // far the fill had got.
-            let at = |source: &'static str| {
+            // Names the upload that failed: which expert, which source, how far
+            // the fill had got, and the memory state at the moment it failed.
+            let at = |source: String| {
                 move |e: candle::Error| {
                     e.context(format!(
                         "startup fill: L{moe_idx}E{expert_idx} from {source} into VRAM slot \
-                         {slot_idx} ({vram_count} resident so far)"
+                         {slot_idx} ({vram_count} resident so far; {})",
+                        memory_state(cuda_dev)
                     ))
                 }
             };
@@ -560,7 +563,7 @@ pub(crate) fn startup_from_pack(
                         cuda_dev,
                         slot_base,
                     )
-                    .map_err(at("a pinned warm slot"))?
+                    .map_err(at("a pinned warm slot".to_string()))?
                 },
                 // A pageable one is never an upload source: through staging.
                 Some(warm_slot) => {
@@ -576,7 +579,10 @@ pub(crate) fn startup_from_pack(
                             cuda_dev,
                             slot_base,
                         )
-                        .map_err(at("a pageable warm slot, staged"))?
+                        .map_err(at(format!(
+                            "a pageable warm slot, staged through {}",
+                            staging_kind(staging, idx)
+                        )))?
                     };
                     staging.publish(idx, stream.record_event(None).map_err(candle::Error::wrap)?);
                     slot
@@ -592,7 +598,10 @@ pub(crate) fn startup_from_pack(
                             cuda_dev,
                             slot_base,
                         )
-                        .map_err(at("the pack, staged"))?
+                        .map_err(at(format!(
+                            "the pack, staged through {}",
+                            staging_kind(staging, idx)
+                        )))?
                     };
                     staging.publish(idx, stream.record_event(None).map_err(candle::Error::wrap)?);
                     cold_reads += 1;
@@ -906,6 +915,39 @@ unsafe fn build_slot_from_repacked_with_device(
     )
 }
 
+/// Which kind of buffer staging slot `idx` is, for an upload's error context.
+#[cfg(feature = "cuda")]
+fn staging_kind(staging: &ColdStaging, idx: usize) -> &'static str {
+    if staging.is_pinned(idx) {
+        "a pinned staging buffer"
+    } else {
+        "a PAGEABLE staging buffer (its pinned allocation was refused)"
+    }
+}
+
+/// VRAM free, host RAM available, and host bytes pinned by this process, read
+/// at the moment an upload failed — the three things a
+/// `CUDA_ERROR_OUT_OF_MEMORY` on an upload can be about.
+#[cfg(feature = "cuda")]
+fn memory_state(cuda_dev: &candle::CudaDevice) -> String {
+    const GIB: f64 = (1u64 << 30) as f64;
+    let vram = match cuda_dev.mem_get_info() {
+        Ok((free, total)) => format!(
+            "VRAM free {:.2} of {:.2} GiB",
+            free as f64 / GIB,
+            total as f64 / GIB
+        ),
+        Err(e) => format!("VRAM unreadable: {e}"),
+    };
+    let available = available_physical_ram().map_or("unknown".to_string(), |b| {
+        format!("{:.2} GiB", b as f64 / GIB)
+    });
+    format!(
+        "{vram}, host RAM available {available}, host pinned {:.2} GiB",
+        host_pinned_bytes() as f64 / GIB
+    )
+}
+
 /// The one upload path, shared by the startup fill and the miss path.
 ///
 /// Both used to allocate three buffers from the CUDA pool and hand ownership to
@@ -1090,6 +1132,10 @@ impl StagingBuf {
         }
     }
 
+    fn is_pinned(&self) -> bool {
+        matches!(self, Self::Pinned(_))
+    }
+
     fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
         match self {
             Self::Pinned(b) => &mut b.as_mut_slice()[..len],
@@ -1139,6 +1185,12 @@ impl ColdStaging {
     /// Total bytes held, for the memory report.
     fn total_bytes(&self) -> usize {
         self.bufs.iter().map(|b| b.len()).sum()
+    }
+
+    /// Whether buffer `idx` is page-locked — a direct DMA source — or the
+    /// aligned pageable fallback, which the driver must bounce.
+    pub(crate) fn is_pinned(&self, idx: usize) -> bool {
+        self.bufs[idx].is_pinned()
     }
 
     /// The next buffer, once the upload it last fed has retired.

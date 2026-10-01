@@ -41,6 +41,7 @@ pub mod manifest;
 pub mod pipeline;
 pub mod record;
 pub mod recovery;
+pub mod relocation_watch;
 pub mod resume;
 pub mod sealed_reader;
 pub mod segment;
@@ -73,6 +74,7 @@ use record::{
     decode_record, encode_record, ChunkPayload, DebugIdPayload, NpcPayload, RecordHeader,
     RecordType, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
 };
+use relocation_watch::RelocationWatch;
 use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -318,6 +320,11 @@ pub struct SubstratePersistence {
     /// re-emit→looks-dead→compact→re-emit churn. `None` forces a re-emit (no
     /// durable snapshot yet, or reset by a full `compact`).
     resident_reemit_floor: Option<SegmentId>,
+    /// The writes made since the running maintenance op was planned that its
+    /// relocation must step around — see [`RelocationWatch`]. `Some` from the
+    /// plan until the op's sources are unlinked (or the op fails), so it also
+    /// marks an op in flight: a handle runs one at a time.
+    relocation_watch: Option<RelocationWatch>,
     /// On-disk location of each stream's CURRENT per-stream metadata record —
     /// `StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit` — keyed by
     /// `(record_type, stream_id)`, last-writer-wins. The substrate index caches
@@ -720,6 +727,7 @@ impl SubstratePersistence {
             recovered_records,
             last_maintenance: None,
             resident_reemit_floor: None,
+            relocation_watch: None,
             metadata_locs,
             snapshot_locs,
             npc_locs,
@@ -855,6 +863,9 @@ impl SubstratePersistence {
         let bytes = encode_record(&header, payload);
         let (segment, offset) = self.segments.stage(&bytes);
         let size = bytes.len() as u64;
+        if let Some(watch) = self.relocation_watch.as_mut() {
+            watch.record(&header);
+        }
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_snapshot_loc(&header, segment, offset, size);

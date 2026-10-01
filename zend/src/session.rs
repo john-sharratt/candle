@@ -23,11 +23,13 @@ use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
     self, Builder, GroupSchema, Reserved, SectionId, SectionLoads, SelectionRule, SystemItem,
-    SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex,
+    SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex, WorkingSetShare,
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
+use candle_conversation::working_set::marks::RELEASE_TAG;
+use candle_conversation::working_set::WorkingSetConfig;
 use candle_conversation::FinishReason;
 use candle_conversation::RecoveredMessage;
 use candle_conversation::Role as TurnRole;
@@ -49,7 +51,7 @@ use crate::api::chat::{
 use crate::api::substrate::{
     ConvView, Counts, GroupView, LayerConversations, LayerView, ProjectTile, ProjectView,
     SectionView, SegmentView, SelectedNodeView, SelectionView, Storage, SubstrateOverview,
-    SystemPromptView, TimelineDetail, ToolView, ToolsView, TurnView,
+    SystemPromptRetired, SystemPromptView, TimelineDetail, ToolView, ToolsView, TurnView,
 };
 use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
@@ -61,6 +63,7 @@ use crate::conv_branches::{self, BaseBranches};
 use crate::conv_file_store::ConvFileStore;
 use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
+use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
@@ -80,9 +83,12 @@ use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tool_round;
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, Dispatch,
-    ToolCall, ToolHost, CALIB_TOOL_SELECTOR,
+    ToolCall, ToolHost, ToolResult, CALIB_TOOL_SELECTOR,
 };
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
+use crate::working_set::restore::restore_locks;
+use crate::working_set::seeds::Seeding;
+use crate::working_set::{dialogue_config, releases, round_marks};
 use crate::workspace::UPLOADS_REPO;
 
 mod replay;
@@ -500,6 +506,14 @@ struct InferenceState {
     /// that can move a branch wakes it, since a push moves the tracking refs
     /// itself and no origin probe will see a difference afterwards.
     ingest_wake: OnceLock<Arc<Notify>>,
+    /// The dialogue layer's working set (`docs/zend_working_set.md`), its
+    /// `release_on` names checked against the tool registry at load. `None`
+    /// when the schema declares none: nothing is seeded, locked or released,
+    /// and every tool call runs for real.
+    working_set: Option<WorkingSetConfig>,
+    /// Whether each `code_reading` chain read its whole file — asked before a
+    /// file is served or seeded, answered once per chain.
+    read_coverage: Coverage,
     /// The workspace captured at startup — its folder and repositories.
     workspace: Workspace,
     /// The branch a conversation starts on in each git repository — `main`,
@@ -1049,6 +1063,7 @@ impl InferenceState {
             .ok_or_else(|| {
                 anyhow::anyhow!("projection schema missing 'primary_conversation' group")
             })?;
+        let working_set = dialogue_config(proj_builder.schema(), dialogue_layer)?;
         // (layer, group) are passed through to
         // `new_conversation_with_projection`, which mints a fresh
         // `TimelineId` internally.
@@ -1201,6 +1216,9 @@ impl InferenceState {
             .workspace_path(root.clone())
             .read_only_substrate(read_only_substrate)
             .qsa_selection_budget(qsa_selection_budget)
+            // The schema's `rope: min_yarn_factor:` — engine-wide, so it is
+            // read once here rather than per layer.
+            .min_rope_factor(proj_builder.schema().min_yarn_factor)
             .max_response_tokens(MAX_TURN_TOKENS)
             // Dialogue turns compress at C5 (moderate adaptive quantization).
             // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
@@ -2341,6 +2359,24 @@ impl InferenceState {
         // before each of its turns by `retrieval_scope`. Marked for a disabled
         // layer too — it is out of the gather already, and scoped it could
         // never offer another branch's content if it came back.
+        // Every working-set group's share of the budget, as the schema declares
+        // it, so the working set can price what it admits: a conversation in
+        // one of these groups draws on its group's share, one in no such group
+        // is never a member.
+        for group in proj_builder_refresh
+            .schema()
+            .layers
+            .iter()
+            .flat_map(|l| l.groups.iter())
+        {
+            if let SelectionRule::WorkingSet { share } = group.selection {
+                engine
+                    .lock()
+                    .unwrap()
+                    .set_working_set_share(group.id, share);
+            }
+        }
+
         let mut branch_layers: Vec<(IngestLayer, IngestScope)> = Vec::new();
         let mut files_group = None;
         let mut folders_group = None;
@@ -2436,6 +2472,8 @@ impl InferenceState {
             branch_ingest: BranchIngest::default(),
             retrieval_scope,
             ingest_wake: OnceLock::new(),
+            working_set,
+            read_coverage: Coverage::default(),
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
             formatted_prompt,
@@ -3163,37 +3201,34 @@ fn run_inference_stream(
             // — reads each repository through its own branch, and gets back
             // the changes its tool rounds made there.
             conv_overlay::restore(&state.engine.lock().unwrap(), timeline, &files, &mirror);
-            // It still holds the reads it asked for, but the set that says so
-            // is in-memory and did not survive. Replay its own calls so it
-            // knows what it is carrying — otherwise it re-reads every file it
-            // had already been given.
-            let rebuild_state = Arc::clone(&state);
-            let _ = tokio::task::spawn_blocking(move || {
-                let budget = rebuild_state
-                    .refresh_builder
-                    .schema()
-                    .layers
-                    .iter()
-                    .find(|l| l.name == "code_reading")
-                    .map_or(0, |l| l.fast_path_window);
-                let folder_of = |repo: &str, inner: &str| {
-                    rebuild_state.retrieval_scope.folder_unit(
-                        &rebuild_state.engine,
-                        &files,
-                        repo,
-                        inner,
-                    )
-                };
-                fast_path::rebuild(&Screen {
-                    engine: &rebuild_state.engine,
-                    target: timeline,
-                    workspace: &rebuild_state.workspace,
-                    files: &files,
-                    folder_of: &folder_of,
-                    budget_tokens: budget,
-                });
-            })
-            .await;
+            // Its working set is in-memory and did not survive. The seeds
+            // resolve again on its own branch and enter provenance at the
+            // seeding momentum; the locks come back from the marks its turns
+            // carry — the promises it was actually given — and the rest of
+            // the momentum rebuilds from the scan.
+            if let Some(config) = state.working_set.clone() {
+                let open_state = Arc::clone(&state);
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    open_state
+                        .engine
+                        .lock()
+                        .unwrap()
+                        .working_set_clear(timeline);
+                    let seeded = seed_working_set(&open_state, timeline, &files, &config);
+                    let restored = restore_locks(&open_state.engine.lock().unwrap(), timeline);
+                    tracing::info!(
+                        target: "zend::working_set",
+                        timeline = timeline.raw(),
+                        seeded,
+                        restored,
+                        "working set opened: seeds in provenance, locks restored from the turn marks",
+                    );
+                })
+                .await
+                {
+                    tracing::warn!(conv_id = %conv_id, "opening the working set panicked: {e}");
+                }
+            }
         }
 
         // An explicit request `identity` overrides and is persisted, so later
@@ -3330,6 +3365,10 @@ fn run_inference_stream(
         // cognitive tasks — so one held across the await would make this whole
         // task non-`Send`, and the spawn would not compile.
         let mut start_iteration = 0usize;
+        // The working-set marks the next submitted turn carries: what the
+        // round it answers did to the working set, in the order it happened
+        // (`docs/zend_working_set.md` §4.8).
+        let mut marks: Vec<String> = Vec::new();
         if let Some(call_turn) = resume_call_turn {
             let calls = resumed_calls(&cs.conv, &conv_id, timeline, call_turn);
             let n_calls = calls.len();
@@ -3349,8 +3388,8 @@ fn run_inference_stream(
                 &cs.files,
                 &cs.mirror,
             );
-            let text = match dispatched {
-                Ok(results) => format_tool_responses(&results),
+            let results = match dispatched {
+                Ok(results) => results,
                 Err(e) => {
                     tracing::error!(
                         conv_id = %conv_id,
@@ -3361,6 +3400,14 @@ fn run_inference_stream(
                     return;
                 }
             };
+            // A resumed round never passed the screen, but it can still have
+            // written: then its locks go, exactly as a live round's would.
+            let released = round_releases(&state, &results);
+            if released {
+                release_working_set(&state, timeline).await;
+            }
+            marks.extend(round_marks(&[], released));
+            let text = format_tool_responses(&results);
             if text.is_blank() {
                 tracing::warn!(
                     conv_id = %conv_id,
@@ -3447,6 +3494,13 @@ fn run_inference_stream(
                 };
                 repeat_guard::closing_answer(&mut this_turn, open);
             }
+            // A real user turn starts a new task, so the reads the last one
+            // was promised go back into provenance and the seeds re-resolve.
+            // A resumed turn enters at 1 and is never taken for one.
+            if iteration == 0 && state.working_set.is_some() {
+                release_working_set(&state, timeline).await;
+                marks.push(RELEASE_TAG.to_string());
+            }
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(this_turn),
@@ -3467,6 +3521,7 @@ fn run_inference_stream(
                     tool_round_selection(&selection)
                 },
                 triggers: turn_triggers(&state, think_mode),
+                tags: std::mem::take(&mut marks),
                 ..Default::default()
             };
             // What this turn may retrieve from the branch layers: the units its
@@ -3866,65 +3921,70 @@ fn run_inference_stream(
             }
 
             // Answer what the corpus has already ingested before dispatching the
-            // rest. A `file_read` whose bytes hash to an existing `code_reading`
-            // conversation, or a `file_list` of a folder an existing `repo_map`
-            // conversation lists, is served by carrying that conversation into
-            // this projection — the K/V exists, so it costs an elevation rather
-            // than a prefill and a decode. Anything unsure (file unreadable, no
-            // conversation, over budget) is left in the round and runs for real.
-            // On the blocking pool, like the dispatch below: it hashes each
-            // candidate file from disk, and this task's every wait is an await.
-            let screen_state = Arc::clone(&state);
-            let screen_files = Arc::clone(&cs.files);
-            let unscreened = round.clone();
-            let round = match tokio::task::spawn_blocking(move || {
-                let budget = screen_state
-                    .refresh_builder
-                    .schema()
-                    .layers
-                    .iter()
-                    .find(|l| l.name == "code_reading")
-                    .map_or(0, |l| l.fast_path_window);
-                let folder_of = |repo: &str, inner: &str| {
-                    screen_state.retrieval_scope.folder_unit(
-                        &screen_state.engine,
-                        &screen_files,
-                        repo,
-                        inner,
-                    )
-                };
-                fast_path::screen(
-                    &Screen {
-                        engine: &screen_state.engine,
-                        target: timeline,
-                        workspace: &screen_state.workspace,
-                        files: &screen_files,
-                        folder_of: &folder_of,
-                        budget_tokens: budget,
-                    },
-                    round,
-                )
-            })
-            .await
-            {
-                Ok((screened, served)) => {
-                    for hit in &served {
-                        tracing::info!(
-                            conv_id = %conv_id,
-                            iteration,
-                            tool = hit.tool,
-                            path = %hit.path,
-                            timeline = hit.timeline.raw(),
-                            "tool call served from the corpus — nothing re-read",
-                        );
+            // rest. A `file_read` of a file an existing `code_reading`
+            // conversation read whole, or a `file_list` of a folder an existing
+            // `repo_map` conversation lists, is served by locking that
+            // conversation into this one's working set — the K/V exists, so it
+            // costs an elevation rather than a prefill and a decode. Anything
+            // unsure (changed file, no complete conversation, the working set
+            // full) is left in the round and runs for real, and so is every
+            // call from the round's first write on. Each served call marks the
+            // turn that carries the results, so a restart restores the lock.
+            // On the blocking pool, like the dispatch below: the lookups are
+            // git work, and this task's every wait is an await.
+            let mut served: Vec<TimelineId> = Vec::new();
+            let round = match state.working_set.clone() {
+                None => round,
+                Some(config) => {
+                    let screen_state = Arc::clone(&state);
+                    let screen_files = Arc::clone(&cs.files);
+                    let unscreened = round.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let folder_of = |repo: &str, inner: &str| {
+                            screen_state.retrieval_scope.folder_unit(
+                                &screen_state.engine,
+                                &screen_files,
+                                repo,
+                                inner,
+                            )
+                        };
+                        fast_path::screen(
+                            &Screen {
+                                engine: &screen_state.engine,
+                                target: timeline,
+                                workspace: &screen_state.workspace,
+                                files: &screen_files,
+                                folder_of: &folder_of,
+                                config: &config,
+                                coverage: &screen_state.read_coverage,
+                            },
+                            round,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(screened) => {
+                            for hit in &screened.served {
+                                tracing::info!(
+                                    conv_id = %conv_id,
+                                    iteration,
+                                    tool = hit.tool,
+                                    path = %hit.path,
+                                    timeline = hit.timeline.raw(),
+                                    "tool call served from the working set — nothing re-read",
+                                );
+                                served.push(hit.timeline);
+                            }
+                            screened.steps
+                        }
+                        Err(e) => {
+                            // The fast path is an optimisation; losing it costs
+                            // reads, not correctness. Dispatch the round as the
+                            // model wrote it.
+                            tracing::warn!(conv_id = %conv_id, "fast-path screen panicked: {e}");
+                            unscreened
+                        }
                     }
-                    screened
-                }
-                Err(e) => {
-                    // The fast path is an optimisation; losing it costs reads,
-                    // not correctness. Dispatch the round as the model wrote it.
-                    tracing::warn!(conv_id = %conv_id, "fast-path screen panicked: {e}");
-                    unscreened
                 }
             };
 
@@ -3969,6 +4029,14 @@ fn run_inference_stream(
                     wake.notify_one();
                 }
             }
+            // A round that changed code releases the working set's locks, after
+            // the reads it served before its first write — so the results
+            // turn's marks read in the order the round ran.
+            let released = round_releases(&state, &results);
+            if released {
+                release_working_set(&state, timeline).await;
+            }
+            marks.extend(round_marks(&served, released));
             if repeat_guard.screen(&mut results) == Verdict::Close {
                 tracing::warn!(
                     conv_id = %conv_id,
@@ -4050,6 +4118,62 @@ fn run_inference_stream(
     });
 
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Whether a dispatched round made a call that releases the working set's
+/// locks — anything that may change what a later read returns.
+fn round_releases(state: &InferenceState, results: &[ToolResult]) -> bool {
+    state
+        .working_set
+        .as_ref()
+        .is_some_and(|config| results.iter().any(|r| releases(config, &r.call.name)))
+}
+
+/// Release `timeline`'s working-set locks into provenance
+/// (`docs/zend_working_set.md` §4.6). The seeds are not touched: they entered
+/// provenance when the conversation opened and fade there like any other file.
+/// On the blocking pool: the engine lock can be held by a wave.
+async fn release_working_set(state: &Arc<InferenceState>, timeline: TimelineId) {
+    let Some(config) = state.working_set.clone() else {
+        return;
+    };
+    let state = Arc::clone(state);
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .lock()
+            .unwrap()
+            .working_set_release(timeline, config.released_momentum());
+    })
+    .await
+    {
+        tracing::warn!(
+            timeline = timeline.raw(),
+            "releasing the working set panicked: {e}"
+        );
+    }
+}
+
+/// Resolve `config`'s seeds for `timeline` on its own branch and seed its
+/// provenance with them. Returns how many were seeded.
+fn seed_working_set(
+    state: &InferenceState,
+    timeline: TimelineId,
+    files: &RepoFiles,
+    config: &WorkingSetConfig,
+) -> usize {
+    let folder_of = |repo: &str, inner: &str| {
+        state
+            .retrieval_scope
+            .folder_unit(&state.engine, files, repo, inner)
+    };
+    Seeding {
+        engine: &state.engine,
+        files,
+        folder_of: &folder_of,
+        coverage: &state.read_coverage,
+    }
+    .apply(timeline, config)
 }
 
 /// The tool calls a sealed call turn is still waiting on — the round this
@@ -5516,6 +5640,57 @@ impl ZendSession {
         Some(result)
     }
 
+    /// Retire the persisted copy of every section of the dialogue system
+    /// prompt — the schema's sections (prelude, tool catalog, outro, every
+    /// section-tree variant) and each tools mode's catalog summary — so the next
+    /// start prefills them fresh under the current compression thresholds.
+    ///
+    /// Backs `DELETE /v1/substrate/system-prompt`. The running daemon keeps
+    /// serving from its resident copies
+    /// ([`candle_conversation::Conversation::retire_section_generation`]); the
+    /// rebuild happens on restart. Ingest frames are not touched: a sealed
+    /// ingest turn was computed against its frame as stored.
+    ///
+    /// `None` when the model is not loaded.
+    pub fn retire_system_prompt(&self) -> Option<candle::Result<SystemPromptRetired>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let conv = { state.engine.lock().unwrap().conversation() };
+        let summaries = ToolMode::ALL
+            .into_iter()
+            .filter_map(tool_summary_section)
+            .map(SectionId::reserved);
+        let mut streams = HashSet::new();
+        let mut unregistered = 0usize;
+        for id in state
+            .refresh_builder
+            .schema()
+            .system_prompt
+            .all_section_ids()
+            .chain(summaries)
+        {
+            match conv.section_stream(id) {
+                Some(stream) => {
+                    streams.insert(stream);
+                }
+                None => unregistered += 1,
+            }
+        }
+        for &stream in &streams {
+            if let Err(e) = conv.retire_section_generation(stream, "system prompt rebuild") {
+                return Some(Err(e));
+            }
+        }
+        tracing::info!(
+            retired = streams.len(),
+            unregistered,
+            "system prompt sections retired; a restart prefills them fresh",
+        );
+        Some(Ok(SystemPromptRetired {
+            retired_streams: streams.len(),
+            unregistered_sections: unregistered,
+        }))
+    }
+
     /// Decoded turn history for a single recovered conversation — backs
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
@@ -6035,14 +6210,15 @@ impl ZendSession {
                                     // the heavy self-match scan during ingest
                                     // freezes the scheduler). Covers the
                                     // first-run ingest and every restart's
-                                    // reconcile. Grab a cheap conversation handle
-                                    // so the ~1-2 min scan never holds the engine
-                                    // lock. The tool catalog's own levels are
-                                    // already warmed by the load's `Normalizing`
-                                    // step, before ready.
-                                    let conv = { warm_state.engine.lock().unwrap().conversation() };
+                                    // reconcile. It scores on the scheduler's GPU
+                                    // arena a slice of files at a time; the
+                                    // warmer is a handle, so the engine lock is
+                                    // not held while it runs. The tool catalog's
+                                    // own levels are already warmed by the load's
+                                    // `Normalizing` step, before ready.
+                                    let warmer = { warm_state.engine.lock().unwrap().ingest_warmer() };
                                     let schema = warm_state.refresh_builder.schema().clone();
-                                    conv.warm_ingest_normalization(&schema);
+                                    warmer.run(&schema);
                                 });
                             let worker =
                                 crate::ingest_worker::spawn(Arc::clone(&wake), pass, after_first_pass);
@@ -6622,6 +6798,10 @@ fn fmt_selection(rule: &SelectionRule) -> String {
             recent,
             historical_top_k,
         } => format!("recent {recent} + top {historical_top_k}"),
+        SelectionRule::WorkingSet { share } => match share {
+            WorkingSetShare::Folders => "working set (folders)".to_string(),
+            WorkingSetShare::Remainder => "working set (files)".to_string(),
+        },
     }
 }
 
@@ -6763,7 +6943,7 @@ mod sanitize_tests {
 #[cfg(test)]
 mod projection_schema_tests {
     use super::{build_projection_builder, fmt_selection, system_prompt_labels};
-    use candle_conversation::projection::SelectionRule;
+    use candle_conversation::projection::{SelectionRule, WorkingSetShare};
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -6785,6 +6965,18 @@ mod projection_schema_tests {
                 historical_top_k: 8,
             }),
             "recent 16 + top 8"
+        );
+        assert_eq!(
+            fmt_selection(&SelectionRule::WorkingSet {
+                share: WorkingSetShare::Folders
+            }),
+            "working set (folders)"
+        );
+        assert_eq!(
+            fmt_selection(&SelectionRule::WorkingSet {
+                share: WorkingSetShare::Remainder
+            }),
+            "working set (files)"
         );
     }
 
@@ -6810,15 +7002,16 @@ mod projection_schema_tests {
         );
     }
 
-    /// The provenance-adaptive projection blocks
-    /// (`docs/provenance_adaptive_projection.md`) parse out of the embedded
-    /// schema onto the right nodes: content axes get content-gated fusion +
-    /// question pinning, scopes get locality + anchor, the adaptive budget
-    /// rails land on repo_map/code_reading, and the tools collection stays
-    /// additive (the measured per-axis split).
+    /// The embedded schema carries the working set (`docs/zend_working_set.md`)
+    /// onto the right nodes: `repo_map/structure` and `code_reading/scopes`
+    /// fill from the dialogue's working set, in tool rounds too, with the
+    /// scan's settings kept (they build the momentum) and the belief-only
+    /// tuning — locality, anchor, adaptive budgets — gone; the dialogue layer
+    /// declares the budget; the tools collection stays additive (the measured
+    /// per-axis split).
     #[test]
-    fn embedded_schema_carries_the_adaptive_projection_config() {
-        use candle_conversation::projection::{AnchorMember, SystemPromptItem};
+    fn embedded_schema_carries_the_working_set_config() {
+        use candle_conversation::projection::SystemPromptItem;
         use candle_conversation::provenance::FusionMode;
         let builder = build_projection_builder(Path::new("demo-project"));
         let schema = builder.schema();
@@ -6830,28 +7023,34 @@ mod projection_schema_tests {
                 .find(|l| l.name == name)
                 .unwrap_or_else(|| panic!("layer {name} present"))
         };
-        let repo_map = layer("repo_map");
-        let structure = &repo_map.groups[0];
-        // Content axes are ADDITIVE — content_gated was reverted after live
-        // testing showed it zeros NL→code retrieval (the domain gap).
-        assert_eq!(structure.policy.scan.fusion, FusionMode::Additive);
-        assert!(structure.policy.scan.question_pin);
-        assert!(repo_map.budget.adaptive.is_some());
-        assert_eq!(structure.budget_adaptive.unwrap().absolute_max, 5);
+        for (name, share) in [
+            ("repo_map", WorkingSetShare::Folders),
+            ("code_reading", WorkingSetShare::Remainder),
+        ] {
+            let l = layer(name);
+            let g = &l.groups[0];
+            assert_eq!(g.selection, SelectionRule::WorkingSet { share }, "{name}");
+            assert!(l.in_tool_rounds, "{name} is in tool rounds");
+            // Content axes are ADDITIVE — content_gated was reverted after live
+            // testing showed it zeros NL→code retrieval (the domain gap).
+            assert_eq!(g.policy.scan.fusion, FusionMode::Additive, "{name}");
+            assert!(g.policy.scan.question_pin, "{name}");
+            assert!(g.locality.is_none() && g.anchor.is_none(), "{name}");
+            assert!(g.budget_adaptive.is_none(), "{name}");
+            assert!(l.budget.adaptive.is_none(), "{name}");
+        }
 
-        let code = layer("code_reading");
-        let scopes = &code.groups[0];
-        assert_eq!(scopes.policy.scan.fusion, FusionMode::Additive);
-        assert!(scopes.policy.scan.question_pin);
-        let loc = scopes.locality.expect("scopes locality");
-        assert_eq!(loc.seed_threshold, 600.0);
-        assert_eq!(loc.base_radius, 1);
-        assert_eq!(
-            scopes.anchor.map(|a| a.member),
-            Some(AnchorMember::First),
-            "the file-header anchor"
-        );
-        assert!(code.budget.adaptive.is_some());
+        let ws = layer("dialogue")
+            .working_set
+            .as_ref()
+            .expect("the dialogue declares a working set");
+        assert_eq!(ws.budget_tokens, 250_000);
+        assert_eq!(ws.folder_tokens, 10_000);
+        assert_eq!(ws.beta, 0.2);
+        assert_eq!(ws.min_momentum, 100.0);
+        assert_eq!(ws.max_file_tokens, 100_000);
+        assert_eq!(ws.seeds.len(), 17);
+        assert_eq!(ws.seeds[0], "candle/zend/");
 
         let tools = schema
             .system_prompt
@@ -6986,31 +7185,32 @@ mod projection_schema_tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
-    /// The shipped `projection.yaml` parses, and the reconstructed repo map is
-    /// capped and floored: `structure` is a `top_k(3)` group with a `"."`
-    /// default so the workspace-root folder always survives selection.
+    /// The shipped `projection.yaml` parses, and the repo map a dialogue sees is
+    /// its working set's folders — no group-level threshold or default: a cold
+    /// probe selects only what is pinned, because a folder is a provenance
+    /// candidate only once its momentum clears `min_momentum`.
     #[test]
-    fn projection_yaml_parses_and_repo_map_is_capped_with_default() {
+    fn projection_yaml_parses_and_repo_map_is_the_working_sets_folders() {
         let builder = build_projection_builder(Path::new("demo-project"));
         let structure = builder
             .id_for_group("structure")
             .expect("repo_map declares a 'structure' group");
         let group = builder.group(structure).expect("group schema present");
-
-        match &group.selection {
-            SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 folders"),
-            other => panic!("structure should be top_k(3), got {other:?}"),
-        }
-        // No floor: repo_map contributes only what clears the threshold. The
-        // group carried `default: { tag: "." }`, which re-injected the
-        // workspace-root folder whenever the threshold filtered everything out —
-        // so a cold probe (every folder scoring exactly 0 against the 1.0 gate)
-        // still paid ~4,000 tokens for a folder listing nobody asked for.
         assert_eq!(
-            group.score_threshold,
-            Some(1.0),
-            "repo_map gates on score alone, so the threshold must be explicit",
+            group.selection,
+            SelectionRule::WorkingSet {
+                share: WorkingSetShare::Folders
+            },
         );
+        assert_eq!(group.score_threshold, None);
+    }
+
+    /// The shipped schema floors every sequence at the ×2 YaRN rung — the
+    /// value `load` hands to `ModelBuilder::min_rope_factor`.
+    #[test]
+    fn projection_yaml_sets_the_min_yarn_factor() {
+        let builder = build_projection_builder(Path::new("demo-project"));
+        assert_eq!(builder.schema().min_yarn_factor, Some(2.0));
     }
 }
 

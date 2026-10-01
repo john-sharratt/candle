@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokenizers::Tokenizer;
 
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
+use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
 use crate::models::batch_test::span_report::print_span;
 use crate::models::batch_test::story_normalize::normalize_story;
 use crate::models::batched_inference::{
@@ -481,7 +482,11 @@ pub struct TestResults {
     pub all_valid: bool,            // Whether all sessions passed validation
     pub quantized_token_percent: Option<f64>, // Percentage of tokens stored in quantized arenas
     pub compression_ratio: Option<f64>, // Float-equivalent bytes / actual quantized bytes
-    pub peak_tokens: usize,         // Total tokens across all sessions at peak (after generation)
+    /// K's side of `compression_ratio`: its ratio and format mix.
+    pub k_side: SideCompression,
+    /// V's side of `compression_ratio`: its ratio and format mix.
+    pub v_side: SideCompression,
+    pub peak_tokens: usize, // Total tokens across all sessions at peak (after generation)
     pub expert_stats: Option<PipelineStats>, // Expert cache telemetry (if model has MoE)
     /// This process's host RAM at the end of the decode. `None` where the
     /// platform has no address-space walk.
@@ -1854,6 +1859,14 @@ impl TestParams {
         } else {
             None
         };
+        let (k_side, v_side) = if config.mode.is_quantized() {
+            (
+                SideCompression::measure(&session, &sequence_indices, false),
+                SideCompression::measure(&session, &sequence_indices, true),
+            )
+        } else {
+            Default::default()
+        };
 
         #[cfg(feature = "verbose")]
         let compression_distribution = if config.mode.is_quantized() {
@@ -1978,6 +1991,8 @@ impl TestParams {
             all_valid: true,
             quantized_token_percent,
             compression_ratio,
+            k_side,
+            v_side,
             peak_tokens,
             expert_stats: None, // Filled by run() after collection
             host_after_decode,
@@ -2700,6 +2715,19 @@ impl TestParams {
         }
 
         println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┴──────────┴───────┘");
+        let side_rows: Vec<_> = results
+            .iter()
+            .filter(|r| r.compression_ratio.is_some())
+            .map(|r| {
+                (
+                    format!("{:?}", r.config.mode),
+                    r.compression_ratio,
+                    &r.k_side,
+                    &r.v_side,
+                )
+            })
+            .collect();
+        print_side_table(&side_rows);
         if !self.extra_rows.is_empty() {
             println!(
                 "  Rows marked `engine` run through the real ConversationEngine — admission, \

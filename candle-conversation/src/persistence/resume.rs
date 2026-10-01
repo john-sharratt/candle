@@ -1309,6 +1309,77 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **A section rebuilt after its tombstone is a section again, across a
+    /// restart.** The rebuild re-prefills the same text, so it lands on the same
+    /// content-addressed stream id; the reload must read `old generation →
+    /// tombstone → new generation` as exactly the new generation — untombstoned,
+    /// indexing only the new chunks — or a rebuilt section re-prefills on every
+    /// boot forever. The new generation is written with fewer chunks than the
+    /// old so a leftover would show.
+    #[test]
+    fn a_section_rebuilt_after_its_tombstone_reloads_as_the_new_generation() {
+        use super::super::content_hash::ContentHash;
+        use super::super::streams::{ContentAddress, SectionDecl};
+
+        let dir = tmp_dir("section_rebuilt_after_tombstone");
+        let decl = StreamDecl::PromptSection(SectionDecl {
+            address: ContentAddress {
+                prefix_hash: ContentHash { lo: 0x91, hi: 0x92 },
+                section_hash: ContentHash { lo: 0x93, hi: 0x94 },
+            },
+            debug_name: "rebuilt_tool".to_string(),
+        });
+        let stream_id = decl.stream_id();
+        let write_generation = |sp: &mut SubstratePersistence, chunks: usize, seed: u8| {
+            sp.declare_stream(&decl).unwrap();
+            for flat in 0..chunks {
+                let image = chunk_image(seed + flat as u8, 17);
+                sp.write_chunk(
+                    stream_id,
+                    flat as u64,
+                    image.token_count as u64,
+                    image.payload.k_formats.first().copied().unwrap_or(0),
+                    Some(image.golden),
+                    &image.payload,
+                )
+                .unwrap();
+            }
+            sp.commit().unwrap();
+        };
+
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            write_generation(&mut sp, 6, 0);
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            substrate.tombstone_section(stream_id);
+            sp.write_section_tombstone(stream_id.0, Some("system prompt rebuild"))
+                .unwrap();
+            sp.commit().unwrap();
+            write_generation(&mut sp, 2, 100);
+        }
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert!(
+                !substrate.is_section_tombstoned(stream_id),
+                "the new generation's decl must lift the tombstone on reload",
+            );
+            let stream = substrate
+                .stream_of(stream_id)
+                .expect("the rebuilt stream is indexed");
+            assert_eq!(
+                stream.chunks.keys().copied().collect::<Vec<_>>(),
+                vec![0, 1],
+                "exactly the new generation's two chunks — none of the old six",
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Last-writer-wins: re-sealing a turn replaces its page rather than
     /// leaving the stale one to be handed to the next projection.
     #[test]

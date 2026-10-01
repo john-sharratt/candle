@@ -16,7 +16,7 @@ use candle_kernels::rope::RopeRungsFfi;
 
 use super::angle::AngleArithmetic;
 use super::schedule::RopeSchedule;
-use super::select::rung_of;
+use super::select::RungSelect;
 use super::table::{build, lookup, ROPE_HI_DIM, ROPE_LO_DIM, ROPE_REACH};
 
 /// Every rung of a schedule, uploaded, with the host copies the float
@@ -42,7 +42,11 @@ pub struct RopeRungs {
     /// built beside these tables must share.
     lo_angle: AngleArithmetic,
     pairs: usize,
-    ceilings: Vec<usize>,
+    /// How a sequence's rung is chosen: the ceilings, and the floor a minimum
+    /// factor sets.
+    select: RungSelect,
+    /// Each rung's scaling factor, as the schedule gave it.
+    factors: Vec<f32>,
 }
 
 impl RopeRungs {
@@ -70,12 +74,38 @@ impl RopeRungs {
             // No ceiling past the table's reach: the kernel lookup clamps a
             // position beyond it, so a schedule "without a ceiling" still
             // refuses one rather than rotating it wrongly.
-            ceilings: schedule
-                .ceilings()
-                .into_iter()
-                .map(|c| c.min(ROPE_REACH))
-                .collect(),
+            select: RungSelect::new(
+                schedule
+                    .ceilings()
+                    .into_iter()
+                    .map(|c| c.min(ROPE_REACH))
+                    .collect(),
+                0,
+            )?,
+            factors: schedule.factors(),
         })
+    }
+
+    /// This set with no sequence on a rung whose factor is below `min` — the
+    /// floor is the first rung scaling by at least `min`, so a deployment can
+    /// run even its shortest sequences interpolated. Every table stays; only
+    /// the choice is raised. A schedule with no such rung is refused, naming
+    /// the factors it has.
+    pub fn with_min_factor(mut self, min: f32) -> Result<Self> {
+        let Some(floor) = self.factors.iter().position(|&f| f >= min) else {
+            candle::bail!(
+                "rope: a minimum factor of {min}, but this schedule's rungs scale by {:?}",
+                self.factors
+            );
+        };
+        self.select = RungSelect::new(self.select.ceilings().to_vec(), floor as u32)?;
+        Ok(self)
+    }
+
+    /// How a sequence's rung is chosen — what every session writing headers
+    /// for this set must hold.
+    pub fn select(&self) -> &RungSelect {
+        &self.select
     }
 
     /// Rung `rung`'s frequencies — rung 0's are the trained RoPE, what a
@@ -99,15 +129,15 @@ impl RopeRungs {
         self.host_tables.len()
     }
 
-    /// Each rung's highest reach, ascending — what a header writer picks a
-    /// sequence's rung by.
+    /// Each rung's highest reach, ascending.
     pub fn ceilings(&self) -> &[usize] {
-        &self.ceilings
+        self.select.ceilings()
     }
 
-    /// The rung a sequence with `reach` positions rotates by.
+    /// The rung a sequence with `reach` positions rotates by — never below the
+    /// floor.
     pub fn rung_for(&self, reach: usize) -> Result<u32> {
-        rung_of(&self.ceilings, reach)
+        self.select.rung_for(reach)
     }
 
     /// Rung `rung`'s Q rotary scale (`m²`).
@@ -257,6 +287,54 @@ mod tests {
         assert_eq!(r.rung_for(262_145).unwrap(), 1);
         assert_eq!(r.rung_for(1_010_000).unwrap(), 2);
         assert!(r.rung_for(1_010_001).is_err());
+    }
+
+    /// **A minimum factor puts every sequence on at least the first rung that
+    /// scales by it** — a short reach runs ×2 instead of the trained RoPE —
+    /// and a longer reach still climbs. Every table stays.
+    #[test]
+    fn a_minimum_factor_raises_the_floor() {
+        let r = RopeRungs::new(&hybrid(), &Device::Cpu)
+            .unwrap()
+            .with_min_factor(2.0)
+            .unwrap();
+        assert_eq!(r.rung_for(1).unwrap(), 1);
+        assert_eq!(r.rung_for(262_144).unwrap(), 1);
+        assert_eq!(r.rung_for(524_289).unwrap(), 2);
+        assert_eq!(r.select().floor(), 1);
+        assert_eq!(r.n_rungs(), 3);
+        let r = RopeRungs::new(&hybrid(), &Device::Cpu)
+            .unwrap()
+            .with_min_factor(3.0)
+            .unwrap();
+        assert_eq!(
+            r.rung_for(1).unwrap(),
+            2,
+            "the first rung of at least ×3 is ×4"
+        );
+        let unit = RopeRungs::new(&hybrid(), &Device::Cpu)
+            .unwrap()
+            .with_min_factor(1.0)
+            .unwrap();
+        assert_eq!(
+            unit.rung_for(1).unwrap(),
+            0,
+            "a minimum of 1 changes nothing"
+        );
+    }
+
+    /// A minimum no rung reaches is refused rather than ignored.
+    #[test]
+    fn a_minimum_no_rung_reaches_is_refused() {
+        assert!(RopeRungs::new(&hybrid(), &Device::Cpu)
+            .unwrap()
+            .with_min_factor(8.0)
+            .is_err());
+        let plain = RopeSchedule::plain(64, 1e7, 32_768);
+        assert!(RopeRungs::new(&plain, &Device::Cpu)
+            .unwrap()
+            .with_min_factor(2.0)
+            .is_err());
     }
 
     /// A schedule with no ceiling of its own stops at the table's reach.

@@ -62,7 +62,7 @@ use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, LayerId, ProjectionTarget, SectionId,
-    TimelineAllocator, TimelineId, TurnIndex, TurnKey,
+    TimelineAllocator, TimelineId, TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
 };
 use crate::provenance::{decode_wide_sigs_for_scoring, WideQSig};
 use crate::summary_tree::exchange::Couplings;
@@ -72,6 +72,7 @@ use crate::summary_tree::{
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{phase_span_of, TurnLayout, TurnSegment};
+use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
 use crate::ConversationError;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
@@ -162,15 +163,12 @@ pub struct Substrate {
     /// workspace corpus). Maintained on section install (overwrite-aware).
     section_token_total: usize,
 
-    /// Per-conversation fast-path injections, most recently admitted first.
-    ///
-    /// A tool call that resolves to content the corpus has already read injects
-    /// that ingest conversation here instead of re-reading the file, and the
-    /// projection then carries it as if this conversation had read it
-    /// ([`Self::fast_path_injections`]). In-memory only and derived: it is
-    /// rebuilt by replaying the conversation's own tool calls, so losing it
-    /// costs a re-read, never correctness.
-    fast_path: HashMap<TimelineId, Vec<TimelineId>>,
+    /// Per dialogue, the already-ingested content it carries ahead of its own
+    /// turns — seeds, fast-path locks and provenance
+    /// (`docs/zend_working_set.md`). In-memory only: the locks are rebuilt
+    /// from the marks on the dialogue's own turns and the momentum from the
+    /// belief scan.
+    working_sets: HashMap<TimelineId, WorkingSet>,
 
     /// Groups whose conversations are offered to a projection only as its
     /// target's scope names them ([`Self::set_retrieval_scope`]). Ingested
@@ -179,6 +177,12 @@ pub struct Substrate {
     /// group offers nothing a target was not given. In-memory only, marked
     /// once at engine setup.
     scoped_groups: HashSet<GroupId>,
+
+    /// Which share of a dialogue's working-set budget each working-set group's
+    /// conversations draw on — the schema's `selection: { kind: working_set,
+    /// share }`. A conversation in no such group is never a working-set
+    /// member. In-memory only, set once at engine setup.
+    working_set_shares: HashMap<GroupId, WorkingSetShare>,
 
     /// Per target, per scoped group, the conversations that group may offer
     /// it ([`Self::scoped_timelines_for_group`]). In-memory only and derived:
@@ -1190,6 +1194,20 @@ pub trait ContentResolver {
     /// the scheduler recorded. Default `0.0`; concrete resolvers override.
     fn section_score(&self, _section: SectionId) -> f32 {
         0.0
+    }
+
+    /// The projection target's working set as it bears on `group` — its pinned
+    /// and provenance conversations that belong to that group
+    /// (`docs/zend_working_set.md` §4.4). `None` when the target carries no
+    /// working set, which is every ingest conversation. Default `None`.
+    fn working_set_members(&self, _group: GroupId) -> Option<WorkingSetMembers> {
+        None
+    }
+
+    /// Every turn of `timeline`, ascending — how a working-set group takes a
+    /// conversation whole. Default empty.
+    fn timeline_turns(&self, _timeline: TimelineId) -> Vec<TurnKey> {
+        Vec::new()
     }
 }
 
@@ -2382,6 +2400,14 @@ impl Substrate {
         self.sections.get(&section).map(|e| e.residence)
     }
 
+    /// The persisted stream `section` is registered against — its content
+    /// address's stream id. `None` when the section is not registered.
+    pub fn section_stream(&self, section: SectionId) -> Option<StreamId> {
+        self.sections
+            .get(&section)
+            .map(|e| self.residence[e.residence.0].stream_id)
+    }
+
     /// Every section id currently registered in the substrate, in
     /// unspecified order.  Used by tooling that needs to walk the
     /// section map — integration tests, workspace diagnostics, the
@@ -2650,6 +2676,10 @@ impl Substrate {
     /// (`keep_sections` / `keep_turns`) and sections (never on `hot_lru`) are
     /// always protected. Only items with both a hot and a warm copy are evicted,
     /// so eviction is hot→warm (the warm copy survives for a fast reload).
+    ///
+    /// **Every dialogue's pinned working set is protected too**, not only the
+    /// projection being elevated: a pinned item is content a model was told it
+    /// has, and one dialogue's elevation must not evict another's promise.
     pub fn evict_hot_to_free(
         &mut self,
         keep_sections: &[SectionId],
@@ -2669,6 +2699,11 @@ impl Substrate {
         for &key in keep_turns {
             if let Some(e) = self.turn(key.timeline, key.index) {
                 keep.insert(e.content.residence);
+            }
+        }
+        for timeline in self.pinned_anywhere() {
+            if let Some(entry) = self.timelines.get(&timeline) {
+                keep.extend(entry.turns.values().map(|t| t.content.residence));
             }
         }
 
@@ -3028,87 +3063,146 @@ impl Substrate {
         Some(parent)
     }
 
-    // ── fast-path tool reads ────────────────────────────────────────────────
+    // ── working sets ────────────────────────────────────────────────────────
 
-    /// Admit `injected` to `target`'s fast-path set and evict from the tail
-    /// until the set fits `budget_tokens`.
+    /// Whether `timeline` can deliver its content into `target`'s projection.
     ///
-    /// Most-recently-admitted first, so eviction drops what the conversation
-    /// touched longest ago. Re-admitting something already present moves it to
-    /// the front rather than duplicating it — the same file resolved twice is
-    /// one injection, which is what makes the content hash a dedupe key.
-    ///
-    /// `target` itself always stays out of its own set; a conversation does not
-    /// inject itself.
-    ///
-    /// Returns whether `injected` is in the set afterwards. `false` means it
-    /// alone exceeds the budget, and the caller must fall back to a real read —
-    /// admitting it would evict everything and still not fit.
-    pub fn fast_path_admit(
+    /// A pinned item is a promise made to the model — "already in context" —
+    /// so a tombstoned, archived or empty conversation must read as a miss and
+    /// send the call to a real read: being told it has a file it does not have
+    /// is worse than reading the file twice. A conversation never carries
+    /// itself.
+    fn deliverable(&self, target: TimelineId, timeline: TimelineId) -> bool {
+        timeline != target
+            && !self.tombstoned_timelines.contains(&timeline)
+            && self.timelines.get(&timeline).is_some_and(|e| !e.archived)
+            && Substrate::turn_count(self, timeline) > 0
+    }
+
+    /// `target`'s working set, when it has one.
+    pub fn working_set(&self, target: TimelineId) -> Option<&WorkingSet> {
+        self.working_sets.get(&target)
+    }
+
+    /// Record which share of the working-set budget `group`'s conversations
+    /// draw on. Idempotent.
+    pub fn set_working_set_share(&mut self, group: GroupId, share: WorkingSetShare) {
+        self.working_set_shares.insert(group, share);
+    }
+
+    /// What admitting `timeline` into `target`'s working set needs: its
+    /// recorded size and its share — or `None` when it cannot be a member at
+    /// all: it cannot deliver ([`Self::deliverable`]), or the scope of its
+    /// group no longer offers it to `target`.
+    fn working_set_candidate(&self, target: TimelineId, timeline: TimelineId) -> Option<Candidate> {
+        if !self.deliverable(target, timeline) {
+            return None;
+        }
+        let group = self.timeline_target(timeline).map(|(_, g)| g);
+        if group.is_some_and(|g| !self.scope_offers(g, target, timeline)) {
+            return None;
+        }
+        Some(Candidate {
+            tokens: self.timeline_token_totals.get(&timeline).copied(),
+            share: group.and_then(|g| self.working_set_shares.get(&g).copied()),
+        })
+    }
+
+    /// Lock `timeline` into `target`'s working set, priced at its recorded
+    /// token total. A refusal means the call must run for real.
+    pub fn working_set_lock(
         &mut self,
         target: TimelineId,
-        injected: TimelineId,
-        budget_tokens: usize,
-    ) -> bool {
-        if injected == target {
-            return false;
-        }
-        // Refuse anything that cannot actually deliver its content. The caller
-        // tells the model the file is already in context on the strength of
-        // this answer, so a tombstoned, archived or empty conversation must
-        // read as a miss and send it to a real read — being told it has a file
-        // it does not have is worse than reading the file twice.
-        if self.tombstoned_timelines.contains(&injected) {
-            return false;
-        }
-        if !self
-            .timelines
-            .get(&injected)
-            .map(|e| !e.archived)
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        if Substrate::turn_count(self, injected) == 0 {
-            return false;
-        }
-        let cost = |tl: &TimelineId| self.timeline_token_totals.get(tl).copied().unwrap_or(0);
-        if cost(&injected) > budget_tokens {
-            return false;
-        }
-        let entry = self.fast_path.entry(target).or_default();
-        entry.retain(|tl| *tl != injected);
-        entry.insert(0, injected);
+        timeline: TimelineId,
+        limits: Limits,
+    ) -> Result<(), Refusal> {
+        let candidate = self
+            .working_set_candidate(target, timeline)
+            .ok_or(Refusal::Gone)?;
+        self.working_sets
+            .entry(target)
+            .or_default()
+            .lock(timeline, candidate, limits)
+    }
 
-        let mut spent = 0usize;
-        let mut keep = 0usize;
-        for tl in entry.iter() {
-            let c = self.timeline_token_totals.get(tl).copied().unwrap_or(0);
-            if spent + c > budget_tokens {
-                break;
-            }
-            spent += c;
-            keep += 1;
-        }
-        self.fast_path
-            .get_mut(&target)
-            .expect("just inserted")
-            .truncate(keep);
+    /// Put back a lock `target`'s history records as served. `false` when the
+    /// conversation it names can no longer deliver anything.
+    pub fn working_set_restore_lock(&mut self, target: TimelineId, timeline: TimelineId) -> bool {
+        let Some(Candidate {
+            share: Some(share), ..
+        }) = self.working_set_candidate(target, timeline)
+        else {
+            return false;
+        };
+        let tokens = self.timeline_token_total(timeline);
+        self.working_sets
+            .entry(target)
+            .or_default()
+            .restore_lock(timeline, tokens, share);
         true
     }
 
-    /// The conversations `target` has fast-path injected, most recent first.
-    pub fn fast_path_injections(&self, target: TimelineId) -> &[TimelineId] {
-        self.fast_path
-            .get(&target)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+    /// Seed `target`'s provenance with `candidates` at `momentum`
+    /// ([`WorkingSet::seed`]). Returns the candidates that did not enter.
+    pub fn working_set_seed(
+        &mut self,
+        target: TimelineId,
+        candidates: &[TimelineId],
+        limits: Limits,
+        momentum: f32,
+    ) -> Vec<TimelineId> {
+        let mut refused = Vec::new();
+        let mut admissible = Vec::new();
+        for &timeline in candidates {
+            match self.working_set_candidate(target, timeline) {
+                Some(candidate) => admissible.push((timeline, candidate)),
+                None => refused.push(timeline),
+            }
+        }
+        refused.extend(self.working_sets.entry(target).or_default().seed(
+            &admissible,
+            limits,
+            momentum,
+        ));
+        refused
     }
 
-    /// Drop `target`'s fast-path set — the conversation is going away, or its
+    /// Release `target`'s locks into provenance at `released` momentum.
+    pub fn working_set_release(&mut self, target: TimelineId, released: f32) {
+        if let Some(ws) = self.working_sets.get_mut(&target) {
+            ws.release(released);
+        }
+    }
+
+    /// Fold one reprojection's per-file fresh scores into `target`'s working
+    /// set ([`WorkingSet::observe`]).
+    pub fn working_set_observe(
+        &mut self,
+        target: TimelineId,
+        fresh: &HashMap<TimelineId, f32>,
+        beta: f32,
+        min_momentum: f32,
+        limits: Limits,
+    ) {
+        let mut ws = self.working_sets.remove(&target).unwrap_or_default();
+        ws.observe(fresh, beta, min_momentum, limits, &|timeline| {
+            self.working_set_candidate(target, timeline)
+        });
+        self.working_sets.insert(target, ws);
+    }
+
+    /// Drop `target`'s working set — the conversation is going away, or its
     /// set is about to be rebuilt from its own history.
-    pub fn fast_path_clear(&mut self, target: TimelineId) {
-        self.fast_path.remove(&target);
+    pub fn working_set_clear(&mut self, target: TimelineId) {
+        self.working_sets.remove(&target);
+    }
+
+    /// Every conversation pinned in any dialogue's working set.
+    fn pinned_anywhere(&self) -> HashSet<TimelineId> {
+        self.working_sets
+            .values()
+            .flat_map(|ws| ws.pinned())
+            .collect()
     }
 
     // ── retrieval scope ─────────────────────────────────────────────────────
@@ -3163,6 +3257,18 @@ impl Substrate {
                 Some(None) => false,
                 Some(Some(allowed)) => allowed.contains(tl),
             })
+    }
+
+    /// Whether `group` may offer `timeline` to `target` — the scope test
+    /// [`Self::scoped_timelines_for_group`] applies, for one conversation.
+    pub fn scope_offers(&self, group: GroupId, target: TimelineId, timeline: TimelineId) -> bool {
+        if !self.scoped_groups.contains(&group) {
+            return true;
+        }
+        self.retrieval_scopes
+            .get(&target)
+            .and_then(|by_group| by_group.get(&group))
+            .is_some_and(|allowed| allowed.contains(&timeline))
     }
 
     /// `tl` together with the ancestors it inherits, **oldest first**.
@@ -3821,7 +3927,15 @@ impl Substrate {
 
     /// Install a stream declaration.  Idempotent: subsequent decls for
     /// the same stream overwrite (last-writer-wins).
+    ///
+    /// A section declaration on a tombstoned stream starts the stream's next
+    /// generation: the tombstone emptied the index for it
+    /// ([`Self::reset_tombstoned_stream`]), and this lifts the flag so the
+    /// fresh prefill's records read as persisted again.
     pub fn apply_stream_decl(&mut self, stream_id: StreamId, decl: StreamDecl) {
+        if matches!(decl, StreamDecl::PromptSection(_)) {
+            self.tombstoned_sections.remove(&stream_id);
+        }
         // Turn decls implicitly register their timeline.  The walker
         // pass applies records in log order; without this, a `Label`
         // record carrying the conv_id (written after `NewConversation`
@@ -4178,6 +4292,12 @@ impl Substrate {
         self.splice_source_timelines.remove(&timeline);
         // A tombstoned conversation is never a projection's target again.
         self.retrieval_scopes.remove(&timeline);
+        // Nor carries anything, nor is carried: a pinned item whose turns are
+        // gone would keep emitting a promise nothing can deliver.
+        self.working_sets.remove(&timeline);
+        for ws in self.working_sets.values_mut() {
+            ws.remove(timeline);
+        }
         // A tombstoned timeline's KV is dead — release its resident VRAM now.
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
             Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),
@@ -4196,12 +4316,13 @@ impl Substrate {
     /// this same process would restore the corrupted chunks again.
     ///
     /// Releases any hot/warm VRAM a currently-registered section pointing at
-    /// this stream holds. A tombstoned section is never legitimately read
-    /// again, so there is nothing later that depends on keeping its resident
-    /// bytes around — unlike an ordinary LRU eviction, this is not something
-    /// a future projection will need back.
+    /// this stream holds, and forgets the stream's indexed records — see
+    /// [`Self::reset_tombstoned_stream`]. A tombstoned section is never read
+    /// again in this generation, so nothing later depends on keeping its
+    /// resident bytes around — unlike an ordinary LRU eviction, this is not
+    /// something a future projection will need back.
     pub fn tombstone_section(&mut self, stream_id: StreamId) {
-        self.tombstoned_sections.insert(stream_id);
+        self.reset_tombstoned_stream(stream_id);
         let residences: Vec<ResidenceIndex> = self
             .sections
             .values()
@@ -4211,6 +4332,22 @@ impl Substrate {
         for r in residences {
             self.release_dead_residence(r);
         }
+    }
+
+    /// End the persisted generation of `stream_id` for a **rebuild**, leaving
+    /// every resident copy serving.
+    ///
+    /// [`Self::tombstone_section`] is the corruption path: those bytes must
+    /// never be read again, so it releases them. A rebuild retires sound bytes
+    /// that are merely stale — compressed under thresholds since changed — and
+    /// the conversations reading them now should keep reading them until the
+    /// replacement exists. So this only flags the stream and forgets its
+    /// records ([`Self::reset_tombstoned_stream`]): nothing reloads them, the
+    /// compactor stops carrying them, and the next triage that asks for the
+    /// section prefills it fresh — at the next start, or earlier if this
+    /// process asks first.
+    pub fn retire_section_generation(&mut self, stream_id: StreamId) {
+        self.reset_tombstoned_stream(stream_id);
     }
 
     /// Whether the section stream `stream_id` has been tombstoned.
@@ -4228,9 +4365,9 @@ impl Substrate {
     }
 
     /// Apply a decoded [`SectionTombstonePayload`] read back from the redo
-    /// log. Sets the in-RAM flag only — replay runs before anything is
-    /// restored, so there is no VRAM to release the way the live
-    /// [`Self::tombstone_section`] does mid-process.
+    /// log. Flags the stream and forgets its records the way the live
+    /// [`Self::tombstone_section`] does — replay runs before anything is
+    /// restored, so there is no VRAM to release.
     pub fn apply_section_tombstone(
         &mut self,
         stream_id: StreamId,
@@ -4243,7 +4380,27 @@ impl Substrate {
                 "replaying section tombstone with recorded reason",
             );
         }
+        self.reset_tombstoned_stream(stream_id);
+    }
+
+    /// A section tombstone ends one **generation** of a stream, not the stream.
+    ///
+    /// A section's stream id is a pure function of its content address, so a
+    /// fresh prefill of the same text lands on the same id. The tombstone
+    /// therefore flags the stream *and* drops every record the index holds for
+    /// it — decl, chunks, tokens, commit — so what was written before the
+    /// tombstone is unreachable from the index. Compaction and segment
+    /// maintenance both copy only what the index names, so those records are
+    /// reclaimed rather than carried forward.
+    ///
+    /// The next `StreamDecl` for the stream is a new generation and lifts the
+    /// flag ([`Self::apply_stream_decl`]); its records then index normally.
+    /// Replay walks the log in append order, so `old records → tombstone →
+    /// new decl + records` rebuilds exactly the new generation.
+    fn reset_tombstoned_stream(&mut self, stream_id: StreamId) {
         self.tombstoned_sections.insert(stream_id);
+        self.streams.remove(&stream_id);
+        self.gallery_epoch += 1;
     }
 
     /// Mark `timeline`'s durable state as **ephemeral**: nothing will ever read
@@ -4501,17 +4658,18 @@ impl Substrate {
         &self.distilled_timelines
     }
 
-    /// On-disk bytes held by streams of tombstoned timelines and tombstoned
-    /// section streams — dead weight the header-keyed accounting can't see
-    /// (a tombstone names its target in the payload, not the header, and the
-    /// doomed records were live appends at write time). Summed from the
-    /// in-RAM stream index, no disk I/O; the compaction trigger adds this to
-    /// the incremental dead-byte counter.
+    /// On-disk bytes held by streams of tombstoned timelines and turns — dead
+    /// weight the header-keyed accounting can't see (a timeline tombstone names
+    /// its target in the payload, not the header, and the doomed records were
+    /// live appends at write time). Summed from the in-RAM stream index, no
+    /// disk I/O; the compaction trigger adds this to the incremental dead-byte
+    /// counter.
+    ///
+    /// A tombstoned section is not here: its tombstone names the stream in the
+    /// header, so the accounting retires its records itself, and the stream's
+    /// index entry is gone ([`Self::reset_tombstoned_stream`]).
     pub fn tombstoned_stream_bytes(&self) -> u64 {
-        if self.tombstoned_timelines.is_empty()
-            && self.tombstoned_turns.is_empty()
-            && self.tombstoned_sections.is_empty()
-        {
+        if self.tombstoned_timelines.is_empty() && self.tombstoned_turns.is_empty() {
             return 0;
         }
         self.streams
@@ -4523,10 +4681,7 @@ impl Substrate {
                             || self.tombstoned_turns.contains(&(tl, t.turn_index))
                     })
                 }
-                Some(decl @ StreamDecl::PromptSection(_)) => {
-                    self.tombstoned_sections.contains(&decl.stream_id())
-                }
-                None => false,
+                Some(StreamDecl::PromptSection(_)) | None => false,
             })
             .map(|s| {
                 s.chunks.values().map(|c| c.record_size).sum::<u64>()
@@ -6722,16 +6877,20 @@ mod tests {
         assert!(sub.retrieval_scopes.is_empty());
     }
 
-    // ── fast-path tool reads ────────────────────────────────────────────────
+    // ── working sets ────────────────────────────────────────────────────────
 
-    /// A conversation plus `n` ingest conversations of `tokens_each`, none of
-    /// them related — the fast path joins conversations that never forked from
+    /// A dialogue plus `n` ingest conversations of `tokens_each`, none of them
+    /// related — a working set carries conversations that never forked from
     /// one another.
-    fn fast_path_fixture(n: usize, tokens_each: usize) -> (Substrate, TimelineId, Vec<TimelineId>) {
+    fn working_set_fixture(
+        n: usize,
+        tokens_each: usize,
+    ) -> (Substrate, TimelineId, Vec<TimelineId>) {
         let layer = LayerId::for_test(1);
         let group = GroupId::for_test(1);
         let alloc = TimelineAllocator::new();
         let mut sub = Substrate::new();
+        sub.set_working_set_share(group, WorkingSetShare::Remainder);
         let target = alloc.next();
         sub.register_timeline(target, layer, group);
         let mut reads = Vec::new();
@@ -6744,106 +6903,121 @@ mod tests {
         (sub, target, reads)
     }
 
-    #[test]
-    fn an_admitted_read_is_injected_most_recent_first() {
-        let (mut sub, target, reads) = fast_path_fixture(3, 10);
-        for r in &reads {
-            assert!(sub.fast_path_admit(target, *r, 1000));
+    fn ws_limits(budget_tokens: usize) -> Limits {
+        Limits {
+            budget_tokens,
+            folder_tokens: budget_tokens,
+            max_file_tokens: 100_000,
         }
+    }
+
+    /// A lock is priced at the conversation's recorded token total, and one
+    /// that would not fit beside the locks already held is refused while they
+    /// stay — each new lock entering before the older ones.
+    #[test]
+    fn a_lock_is_priced_at_the_recorded_token_total() {
+        let (mut sub, target, reads) = working_set_fixture(3, 100);
         assert_eq!(
-            sub.fast_path_injections(target),
-            vec![reads[2], reads[1], reads[0]],
+            sub.working_set_lock(target, reads[0], ws_limits(250)),
+            Ok(())
+        );
+        assert_eq!(
+            sub.working_set_lock(target, reads[1], ws_limits(250)),
+            Ok(())
+        );
+        assert_eq!(
+            sub.working_set_lock(target, reads[2], ws_limits(250)),
+            Err(Refusal::Full)
+        );
+        assert_eq!(
+            sub.working_set(target).unwrap().pinned(),
+            vec![reads[1], reads[0]]
         );
     }
 
-    /// The same file resolved twice is one injection — what makes the content
-    /// hash a dedupe key rather than an append log.
+    /// A conversation in no working-set group can never be a member.
     #[test]
-    fn re_admitting_the_same_read_moves_it_to_the_front_without_duplicating() {
-        let (mut sub, target, reads) = fast_path_fixture(3, 10);
-        for r in &reads {
-            sub.fast_path_admit(target, *r, 1000);
-        }
-        sub.fast_path_admit(target, reads[0], 1000);
+    fn a_conversation_outside_every_working_set_group_is_gone() {
+        let (mut sub, target, _) = working_set_fixture(0, 10);
+        let elsewhere = unshared_timeline(7);
+        sub.register_timeline(elsewhere, LayerId::for_test(1), GroupId::for_test(9));
+        sub.append_with_blocks(elsewhere, 10, 0, 1);
         assert_eq!(
-            sub.fast_path_injections(target),
-            vec![reads[0], reads[2], reads[1]],
-            "re-admitted entry leads, and appears exactly once",
+            sub.working_set_lock(target, elsewhere, ws_limits(1000)),
+            Err(Refusal::Gone)
         );
-    }
-
-    #[test]
-    fn the_budget_evicts_from_the_tail() {
-        let (mut sub, target, reads) = fast_path_fixture(4, 100);
-        for r in &reads {
-            sub.fast_path_admit(target, *r, 250);
-        }
-        assert_eq!(
-            sub.fast_path_injections(target),
-            vec![reads[3], reads[2]],
-            "two 100-token reads fit a 250 budget; the older two are dropped",
-        );
-    }
-
-    /// A read too big for the budget is refused rather than admitted — it would
-    /// evict every other entry and still not fit, and the caller needs to know
-    /// so it can do a real read instead.
-    #[test]
-    fn a_read_larger_than_the_budget_is_refused_and_disturbs_nothing() {
-        let (mut sub, target, reads) = fast_path_fixture(2, 100);
-        assert!(sub.fast_path_admit(target, reads[0], 250));
-        let huge = unshared_timeline(1);
-        sub.register_timeline(huge, LayerId::for_test(1), GroupId::for_test(1));
-        sub.append_with_blocks(huge, 5_000, 0, 1);
-        assert!(!sub.fast_path_admit(target, huge, 250));
-        assert_eq!(
-            sub.fast_path_injections(target),
-            vec![reads[0]],
-            "the refused read left the existing set intact",
-        );
+        assert!(!sub.working_set_restore_lock(target, elsewhere));
     }
 
     /// A retired conversation reads as a miss. Its turns are gone, so serving
     /// it would tell the model it has a file that nothing will deliver.
     #[test]
-    fn a_tombstoned_read_is_refused() {
-        let (mut sub, target, reads) = fast_path_fixture(1, 10);
+    fn a_tombstoned_archived_empty_or_own_conversation_is_gone() {
+        let (mut sub, target, reads) = working_set_fixture(2, 10);
         sub.tombstone_timeline(reads[0]);
-        assert!(!sub.fast_path_admit(target, reads[0], 1000));
-        assert!(sub.fast_path_injections(target).is_empty());
-    }
-
-    #[test]
-    fn an_archived_read_is_refused() {
-        let (mut sub, target, reads) = fast_path_fixture(1, 10);
-        sub.set_archived(reads[0], true);
-        assert!(!sub.fast_path_admit(target, reads[0], 1000));
-    }
-
-    /// A registered conversation that never sealed a turn carries nothing.
-    #[test]
-    fn a_read_with_no_turns_is_refused() {
-        let (mut sub, target, _) = fast_path_fixture(0, 0);
+        sub.set_archived(reads[1], true);
         let empty = unshared_timeline(1);
         sub.register_timeline(empty, LayerId::for_test(1), GroupId::for_test(1));
-        assert!(!sub.fast_path_admit(target, empty, 1000));
+        for tl in [reads[0], reads[1], empty, target] {
+            assert_eq!(
+                sub.working_set_lock(target, tl, ws_limits(1000)),
+                Err(Refusal::Gone)
+            );
+            assert!(!sub.working_set_restore_lock(target, tl));
+        }
+        assert_eq!(
+            sub.working_set_seed(target, &[reads[0], empty], ws_limits(1000), 1000.0),
+            vec![reads[0], empty],
+        );
+        assert!(sub.working_set(target).unwrap().provenance().is_empty());
+    }
+
+    /// A tombstoned conversation leaves every dialogue's working set — a pinned
+    /// item whose turns are gone would keep emitting a broken promise — and a
+    /// tombstoned dialogue's own set goes with it.
+    #[test]
+    fn a_tombstone_leaves_every_working_set() {
+        let (mut sub, target, reads) = working_set_fixture(3, 10);
+        sub.working_set_seed(target, &[reads[0]], ws_limits(1000), 1000.0);
+        sub.working_set_lock(target, reads[1], ws_limits(1000))
+            .unwrap();
+        sub.working_set_observe(
+            target,
+            &HashMap::from([(reads[2], 500.0)]),
+            0.2,
+            100.0,
+            ws_limits(1000),
+        );
+        assert_eq!(sub.working_set(target).unwrap().members().len(), 3);
+        for r in &reads {
+            sub.tombstone_timeline(*r);
+        }
+        let ws = sub.working_set(target).unwrap();
+        assert!(ws.pinned().is_empty());
+        assert!(ws.provenance().is_empty());
+        sub.tombstone_timeline(target);
+        assert!(sub.working_set(target).is_none());
     }
 
     #[test]
-    fn a_conversation_never_injects_itself() {
-        let (mut sub, target, _) = fast_path_fixture(1, 10);
-        assert!(!sub.fast_path_admit(target, target, 1000));
-        assert!(sub.fast_path_injections(target).is_empty());
+    fn release_moves_the_locks_into_provenance() {
+        let (mut sub, target, reads) = working_set_fixture(1, 10);
+        sub.working_set_lock(target, reads[0], ws_limits(1000))
+            .unwrap();
+        sub.working_set_release(target, 5000.0);
+        let ws = sub.working_set(target).unwrap();
+        assert!(ws.pinned().is_empty());
+        assert_eq!(ws.provenance(), vec![(reads[0], 5000.0)]);
     }
 
     #[test]
     fn clearing_drops_the_set_for_a_rebuild() {
-        let (mut sub, target, reads) = fast_path_fixture(2, 10);
+        let (mut sub, target, reads) = working_set_fixture(2, 10);
         for r in &reads {
-            sub.fast_path_admit(target, *r, 1000);
+            sub.working_set_lock(target, *r, ws_limits(1000)).unwrap();
         }
-        sub.fast_path_clear(target);
-        assert!(sub.fast_path_injections(target).is_empty());
+        sub.working_set_clear(target);
+        assert!(sub.working_set(target).is_none());
     }
 
     #[test]
@@ -7997,6 +8171,30 @@ mod tests {
         assert_eq!(report.count, 1);
         assert!(sub.residence[a.0].hot.is_some(), "a protected by keep set");
         assert!(sub.residence[b.0].hot.is_none(), "b evicted instead");
+    }
+
+    /// A conversation pinned in ANY dialogue's working set is protected, not
+    /// only the projection being elevated: one dialogue's elevation must not
+    /// evict content another dialogue was told it has.
+    #[test]
+    fn evict_hot_to_free_protects_every_dialogues_pinned_working_set() {
+        let (layer, group, file, mut sub) = make_timeline();
+        let (_, a) = install_hot_and_warm(&mut sub, file, 100_000_000);
+        let other = unshared_timeline(1);
+        sub.register_timeline(other, layer, group);
+        let (_, b) = install_hot_and_warm(&mut sub, other, 100_000_000);
+        let dialogue = unshared_timeline(2);
+        sub.register_timeline(dialogue, layer, group);
+        sub.set_working_set_share(group, WorkingSetShare::Remainder);
+        assert!(sub.working_set_restore_lock(dialogue, file));
+
+        let report = sub.evict_hot_to_free(&[], &[], 100_000_000);
+        assert_eq!(report.count, 1);
+        assert!(
+            sub.residence[a.0].hot.is_some(),
+            "the pinned file stays hot"
+        );
+        assert!(sub.residence[b.0].hot.is_none(), "the unpinned one goes");
     }
 
     /// Targeted demotion drops the hot copy of exactly the NAMED turns (keeping
@@ -9430,12 +9628,14 @@ mod tests {
         );
     }
 
-    /// The section counterpart of [`tombstoned_stream_bytes_sums_dead_timelines`]
-    /// — a tombstoned section's on-disk bytes must count as dead weight too,
-    /// or the compaction trigger never sees the corrupted chunks a reactive
-    /// repair leaves behind.
+    /// **A section tombstone ends a generation; the next declaration starts
+    /// one.** The tombstone drops the stream's index entry — so neither the
+    /// compactor nor `tombstoned_stream_bytes` sees its records (the record
+    /// accounting retires them instead) — and a fresh declaration of the same
+    /// content-addressed stream lifts the flag and indexes only its own
+    /// records. The other stream is untouched throughout.
     #[test]
-    fn tombstoned_stream_bytes_sums_dead_sections() {
+    fn a_section_tombstone_ends_a_generation_and_a_new_decl_starts_one() {
         use crate::persistence::content_hash::ContentHash;
         use crate::persistence::streams::{ContentAddress, SectionDecl};
 
@@ -9477,13 +9677,43 @@ mod tests {
                 },
             );
         }
-        assert_eq!(sub.tombstoned_stream_bytes(), 0, "nothing tombstoned yet");
         sub.tombstone_section(dead_sid);
+        assert!(sub.is_section_tombstoned(dead_sid));
+        assert!(
+            sub.stream_of(dead_sid).is_none(),
+            "the old generation is unindexed"
+        );
+        assert!(sub.stream_of(live_sid).is_some());
         assert_eq!(
             sub.tombstoned_stream_bytes(),
-            8192 + 4096,
-            "only the tombstoned section's chunk + tokens bytes count"
+            0,
+            "sections are the accounting's"
         );
+
+        sub.apply_stream_decl(dead_sid, decl_for(7));
+        sub.apply_chunk_loc(
+            dead_sid,
+            1,
+            ChunkLoc {
+                segment: FIRST_SEGMENT,
+                offset: 40_960,
+                payload_len: 100,
+                record_size: 8192,
+                token_count: 32,
+                format: 4,
+            },
+        );
+        assert!(
+            !sub.is_section_tombstoned(dead_sid),
+            "the new decl revives it"
+        );
+        let revived = sub.stream_of(dead_sid).expect("revived stream is indexed");
+        assert_eq!(
+            revived.chunks.keys().copied().collect::<Vec<_>>(),
+            vec![1],
+            "only the new generation's chunk"
+        );
+        assert!(revived.tokens.is_none(), "the old tokens record stays dead");
     }
 
     /// Gather-scope tag semantics, pinned.

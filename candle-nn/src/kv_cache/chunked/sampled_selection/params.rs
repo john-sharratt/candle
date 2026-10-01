@@ -74,21 +74,25 @@ pub const PRODUCTION_K_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q8_0,
             QuantFormat::Q8_1,
         ],
-        // C4
+        // C4 — K stays at 4 bits or better through C5: keys decide what
+        // attention reads, so the strong rungs spend their bits there and push
+        // V instead. 3-bit K starts at C6. Q5_0/Q5_1 (5.5/6.0 bpe) sit in the
+        // gap between Q4_1 (5.0) and Q8_0 (8.5) on C4–C7, so a block that
+        // misses 4 bits takes one more bit, not three and a half.
         &[
-            QuantFormat::Q3_0,
-            QuantFormat::Q3_1,
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
             QuantFormat::Q8_1,
         ],
         // C5
         &[
-            QuantFormat::Q3_0,
-            QuantFormat::Q3_1,
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
         ],
         // C6 (midpoint between old C6 and old C7 — union of formats)
@@ -101,10 +105,13 @@ pub const PRODUCTION_K_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
             QuantFormat::Q8_1,
         ],
-        // C7
+        // C7 — the last K rung with a Q8 ceiling, so the last where Q5 buys
+        // compression; above it Q5 would be a new ceiling and cost it.
         &[
             QuantFormat::Q1_S,
             QuantFormat::Q2_A,
@@ -113,6 +120,8 @@ pub const PRODUCTION_K_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
             QuantFormat::Q8_1,
         ],
@@ -194,12 +203,14 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q4_1,
             QuantFormat::Q8_0,
         ],
-        // C4
+        // C4 — Q5_0/Q5_1 fill the Q4_1 → Q8_0 gap on C4–C6, as on K.
         &[
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
         ],
         // C5
@@ -208,6 +219,8 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
         ],
         // C6
@@ -219,6 +232,8 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
             QuantFormat::Q8_1,
         ],
@@ -311,14 +326,14 @@ pub fn production_adaptive_candidates(level: u8) -> (Vec<KvFormat>, Vec<KvFormat
 pub const PRODUCTION_K_QREL_HIGH_THRESHOLDS: [f32; 11] = [
     0.003096, // C0  (provisional — needs re-derivation)
     0.004725, // C1  (provisional) — must be < K_LOW[C1]
-    0.008944, // C2  (provisional)
-    0.014703, // C3  (provisional)
-    0.018199, // C4  (provisional)
-    0.020700, // C5  (provisional)
-    0.020758, // C6  (provisional — midpoint between old C6 and old C7)
-    0.021735, // C7  (provisional)
-    0.018771, // C8  (provisional)
-    0.025236, // C9  (provisional)
+    0.006654, // C2  (2026-10-01 monotone ladder, iteration 2)
+    0.006324, // C3  (2026-10-01 monotone ladder, iteration 2)
+    0.004000, // C4  (2026-10-01 Q5 K buy-back, iteration 6)
+    0.006300, // C5  (2026-10-01 Q5 K buy-back, iteration 6)
+    0.012200, // C6  (2026-10-01 Q5 K buy-back, iteration 7)
+    0.014000, // C7  (2026-10-01 Q5 K buy-back, iteration 8)
+    0.016500, // C8  (2026-10-01 Q5 K buy-back, iteration 9)
+    0.017700, // C9  (2026-10-01 Q5 K buy-back, iteration 10)
     0.028884, // C10 (re-derived 2026-08-16, see the C10 note on the LOW table)
 ];
 
@@ -326,14 +341,14 @@ pub const PRODUCTION_K_QREL_HIGH_THRESHOLDS: [f32; 11] = [
 pub const PRODUCTION_K_QREL_LOW_THRESHOLDS: [f32; 11] = [
     0.011315, // C0  (provisional)
     0.051794, // C1  (provisional) — must be > K_HIGH[C1]
-    0.072130, // C2  (provisional)
-    0.102114, // C3  (provisional)
-    0.136622, // C4  (provisional)
-    0.216643, // C5  (provisional)
-    0.232942, // C6  (provisional — midpoint between old C6 and old C7)
-    0.248296, // C7  (provisional)
-    0.284827, // C8  (provisional)
-    0.274433, // C9  (provisional)
+    0.043430, // C2  (2026-10-01 monotone ladder, iteration 2)
+    0.041170, // C3  (2026-10-01 monotone ladder, iteration 2)
+    0.028500, // C4  (2026-10-01 Q5 K buy-back, iteration 6)
+    0.056000, // C5  (2026-10-01 Q5 K buy-back, iteration 6)
+    0.101000, // C6  (2026-10-01 Q5 K buy-back, iteration 7)
+    0.133000, // C7  (2026-10-01 Q5 K buy-back, iteration 8)
+    0.268000, // C8  (2026-10-01 Q5 K buy-back, iteration 9)
+    0.233000, // C9  (2026-10-01 Q5 K buy-back, iteration 10)
     // C10: re-derived 2026-08-16 against the current unsloth Qwen3-8B-Q6_K
     // snapshot. The original C10 row (K_HIGH 0.031321, K_LOW 0.453389,
     // V_HIGH 0.024824, V_LOW 0.653093) was tuned 2026-05-05 against the
@@ -355,12 +370,12 @@ pub const PRODUCTION_K_QREL_LOW_THRESHOLDS: [f32; 11] = [
 pub const PRODUCTION_V_QREL_HIGH_THRESHOLDS: [f32; 11] = [
     0.012232, // C0
     0.018664, // C1
-    0.015596, // C2
-    0.019366, // C3
-    0.022474, // C4
-    0.023001, // C5
-    0.023768, // C6 (midpoint between old C6 and old C7)
-    0.024000, // C7
+    0.021300, // C2 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.029800, // C3 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.029800, // C4 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.031500, // C5 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.034000, // C6 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.034000, // C7 (2026-10-01 Q5 V buy-back, iteration 2)
     0.022167, // C8
     0.023852, // C9
     0.024455, // C10 (re-derived 2026-08-16, see the C10 note on the K LOW table)
@@ -372,12 +387,12 @@ pub const PRODUCTION_V_QREL_HIGH_THRESHOLDS: [f32; 11] = [
 pub const PRODUCTION_V_QREL_LOW_THRESHOLDS: [f32; 11] = [
     0.012730, // C0
     0.025898, // C1
-    0.022541, // C2
-    0.030230, // C3
-    0.050119, // C4
-    0.153698, // C5
-    0.170920, // C6 (midpoint between old C6 and old C7)
-    0.187766, // C7
+    0.038000, // C2 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.085000, // C3 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.102000, // C4 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.119000, // C5 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.145000, // C6 (2026-10-01 Q5 V buy-back, iteration 2)
+    0.187000, // C7 (2026-10-01 Q5 V buy-back, iteration 2)
     0.215390, // C8
     0.250035, // C9
     0.358398, // C10 (re-derived 2026-08-16, see the C10 note on the K LOW table)

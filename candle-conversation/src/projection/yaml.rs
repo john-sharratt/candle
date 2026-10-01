@@ -79,9 +79,10 @@ use super::schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
     SectionTree, SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema,
-    TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
+    TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
 };
 use crate::summary_tree::scope::Scope;
+use crate::working_set::WorkingSetConfig;
 
 /// Sequential SectionId allocator. Ids are globally unique across the whole
 /// schema even though names are per-layer scoped.
@@ -159,6 +160,20 @@ struct YamlSchema {
     /// other.** See [`super::schema::Schema::free_tool_calls_from_penalties`].
     #[serde(default)]
     free_tool_calls_from_penalties: bool,
+    /// Engine-wide RoPE settings — see [`YamlRope`].
+    #[serde(default)]
+    rope: YamlRope,
+}
+
+/// The top-level `rope:` block. RoPE is a property of the model every layer
+/// shares, so it sits beside `layers:`, not inside one.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct YamlRope {
+    /// The lowest progressive-YaRN factor any sequence runs at — see
+    /// [`super::schema::Schema::min_yarn_factor`].
+    #[serde(default)]
+    min_yarn_factor: Option<f32>,
 }
 
 /// A `policy:` block: an optional preset base plus per-field overrides and an
@@ -529,11 +544,10 @@ struct YamlLayer {
     description: String,
     /// Total turn-budget when this layer is the projection target.
     window: usize,
-    /// Tokens of THIS layer's conversations a fast-path tool read may inject
-    /// into another conversation. `0` (the default) keeps the layer out of the
-    /// fast path entirely, so a tool read of its content always runs for real.
+    /// The already-ingested content a conversation targeting this layer carries
+    /// ahead of its own turns — see [`LayerSchema::working_set`].
     #[serde(default)]
-    fast_path_window: usize,
+    working_set: Option<YamlWorkingSet>,
     #[serde(default)]
     score_threshold: f32,
     #[serde(default)]
@@ -732,9 +746,64 @@ struct YamlSelection {
     historical_top_k: Option<usize>,
     #[serde(default)]
     selector: Option<String>,
+    /// `kind: working_set` only — `folders` or `remainder`.
+    #[serde(default)]
+    share: Option<String>,
+}
+
+/// A dialogue layer's `working_set:` block — see [`WorkingSetConfig`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlWorkingSet {
+    budget_tokens: usize,
+    folder_tokens: usize,
+    beta: f32,
+    min_momentum: f32,
+    max_file_tokens: usize,
+    #[serde(default)]
+    seeds: Vec<String>,
+    #[serde(default)]
+    release_on: Vec<String>,
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────────
+
+/// Resolve a layer's `working_set:` block, refusing values the arithmetic
+/// cannot use: a leak outside `(0, 1]`, a folder share larger than the whole,
+/// a negative floor, a zero file cap.
+fn parse_working_set(
+    layer: &str,
+    yw: Option<&YamlWorkingSet>,
+) -> Result<Option<WorkingSetConfig>, ConstructionError> {
+    let Some(yw) = yw else {
+        return Ok(None);
+    };
+    let invalid = |reason: &str| ConstructionError::InvalidPolicy {
+        name: layer.to_string(),
+        reason: format!("working_set.{reason}"),
+    };
+    if !(yw.beta > 0.0 && yw.beta <= 1.0) {
+        return Err(invalid("beta must be in (0, 1]"));
+    }
+    if yw.folder_tokens > yw.budget_tokens {
+        return Err(invalid("folder_tokens must not exceed budget_tokens"));
+    }
+    if yw.min_momentum < 0.0 {
+        return Err(invalid("min_momentum must be >= 0"));
+    }
+    if yw.max_file_tokens == 0 {
+        return Err(invalid("max_file_tokens must be > 0"));
+    }
+    Ok(Some(WorkingSetConfig {
+        budget_tokens: yw.budget_tokens,
+        folder_tokens: yw.folder_tokens,
+        beta: yw.beta,
+        min_momentum: yw.min_momentum,
+        max_file_tokens: yw.max_file_tokens,
+        seeds: yw.seeds.clone(),
+        release_on: yw.release_on.clone(),
+    }))
+}
 
 /// Resolve a `policy:` block against an inherited base. A named `preset:` sets
 /// the base config; individual fields then override it; `tags` replaces the
@@ -1062,7 +1131,7 @@ fn build(
             description: yl.description.clone(),
             score_threshold: yl.score_threshold,
             window: yl.window,
-            fast_path_window: yl.fast_path_window,
+            working_set: parse_working_set(&yl.name, yl.working_set.as_ref())?,
             budget: layer_budget,
             dials,
             summary: layer_summary,
@@ -1082,10 +1151,17 @@ fn build(
         });
     }
 
+    if let Some(f) = raw.rope.min_yarn_factor {
+        if !f.is_finite() || f < 1.0 {
+            return Err(ConstructionError::InvalidMinYarnFactor(f));
+        }
+    }
+
     let schema = Schema {
         layers,
         system_prompt,
         free_tool_calls_from_penalties: raw.free_tool_calls_from_penalties,
+        min_yarn_factor: raw.rope.min_yarn_factor,
     };
     Ok((schema, maps))
 }
@@ -1276,7 +1352,7 @@ fn build_system_prompt(
                     .get(name)
                     .expect("first-pass pre-allocated every collection id");
                 let label = format!("{}/{}", owner, name);
-                let coll_selection = parse_selection(&label, selection)?;
+                let coll_selection = parse_collection_selection(&label, selection)?;
                 if *score_threshold < 0.0 {
                     return Err(ConstructionError::NegativeScoreThreshold {
                         name: label.clone(),
@@ -2006,7 +2082,7 @@ fn build_section_tree<'a>(
                         "{layer_name}: embedded collection '{name}' has no pre-allocated id",
                     ))
                 })?;
-                let coll_selection = parse_selection(&label, selection)?;
+                let coll_selection = parse_collection_selection(&label, selection)?;
                 if *score_threshold < 0.0 {
                     return Err(ConstructionError::NegativeScoreThreshold {
                         name: label.clone(),
@@ -2283,6 +2359,21 @@ fn parse_budget(name: &str, yb: &YamlBudget) -> Result<Budget, ConstructionError
     })
 }
 
+/// A collection's selection rule: any a turn group may declare but
+/// `working_set`, which carries whole conversations and a collection has none.
+fn parse_collection_selection(
+    name: &str,
+    ys: &YamlSelection,
+) -> Result<SelectionRule, ConstructionError> {
+    match parse_selection(name, ys)? {
+        SelectionRule::WorkingSet { .. } => Err(ConstructionError::InvalidPolicy {
+            name: name.to_string(),
+            reason: "a collection cannot select by working_set".to_string(),
+        }),
+        rule => Ok(rule),
+    }
+}
+
 fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, ConstructionError> {
     match ys.kind.as_str() {
         "" | "always_visible" => Ok(SelectionRule::AlwaysVisible),
@@ -2321,6 +2412,22 @@ fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, Cons
                 recent,
                 historical_top_k,
             })
+        }
+        "working_set" => {
+            let share = match ys.share.as_deref() {
+                Some("folders") => WorkingSetShare::Folders,
+                Some("remainder") => WorkingSetShare::Remainder,
+                other => {
+                    let reason = format!(
+                        "a working_set selection needs share: folders | remainder, got {other:?}"
+                    );
+                    return Err(ConstructionError::InvalidPolicy {
+                        name: name.to_string(),
+                        reason,
+                    });
+                }
+            };
+            Ok(SelectionRule::WorkingSet { share })
         }
         other => Err(ConstructionError::UnknownSelectionKind(other.to_string())),
     }

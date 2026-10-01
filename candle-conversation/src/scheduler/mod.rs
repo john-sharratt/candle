@@ -39,6 +39,7 @@ pub mod memory_report;
 mod named_tool;
 mod norm_warm;
 pub mod phase_ring;
+mod piece_identity;
 mod prefill;
 mod priority_pause;
 pub(crate) mod profile;
@@ -79,7 +80,7 @@ use crate::projection::{
     ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
     TimelineId, TurnId, TurnIndex, TurnKey,
 };
-use crate::projection::{CollectionWarm, Schema};
+use crate::projection::{CollectionWarm, GroupId, LayerId, Schema};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -692,6 +693,20 @@ pub(crate) enum SchedulerRequest {
         conversation: Conversation,
         schema: Box<Schema>,
         response_tx: Sender<CollectionWarm>,
+    },
+
+    /// Warm one slice of an ingest group's per-file hit levels on this thread's
+    /// GPU gallery arena ([`Conversation::warm_ingest_timelines`]). Sent a slice
+    /// at a time by [`crate::IngestWarmer`], so decode waves run between slices.
+    /// Replies with the timelines warmed, or `None` when this scheduler has no
+    /// arena and the caller must score on the host.
+    WarmIngestSlice {
+        conversation: Conversation,
+        schema: Arc<Schema>,
+        layer: LayerId,
+        group: GroupId,
+        timelines: Vec<TimelineId>,
+        response_tx: Sender<Option<usize>>,
     },
 
     /// Reclaim VRAM by demoting the hot K/V of specific (already-sealed,
@@ -4836,6 +4851,21 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::WarmIngestSlice {
+                conversation,
+                schema,
+                layer,
+                group,
+                timelines,
+                response_tx,
+            } => {
+                let warmed = self.gallery_arena.as_deref().map(|arena| {
+                    conversation.warm_ingest_timelines(&schema, layer, group, &timelines, arena)
+                });
+                let _ = response_tx.send(warmed);
+                true
+            }
+
             SchedulerRequest::DemoteTimelinesHot {
                 conversation,
                 timelines,
@@ -6923,14 +6953,23 @@ impl Scheduler {
         // (current) plan fires against the slot as this call built it.
         // Read before any of `self`'s fields are borrowed out of it below.
         let pass_budget = self.prefill_pass_budget();
+        let mut superseded = false;
         let defer = if self.batch_drain_gap_fills {
+            let queued = self.deferred_glue_fires.len();
             self.deferred_glue_fires
                 .retain(|p| p.parent_id != parent_id);
+            superseded = self.deferred_glue_fires.len() != queued;
             Some(&mut self.deferred_glue_fires)
         } else {
             None
         };
         let state = self.slot_projection_state.entry(parent_id).or_default();
+        // The dropped plan's glue was never filled, but the last assembly
+        // recorded its pieces as placed: a rebuild that kept them would keep
+        // zero chunks. Nothing it placed may be kept.
+        if superseded {
+            state.placed_pieces.clear();
+        }
         // Record the sealed working set this projection attends over, so relief
         // eviction can protect it (see `evict_cold_tail`).
         state.working_set = projection_assembler::working_set_from_segments(segments);
@@ -7466,6 +7505,10 @@ impl Scheduler {
                         e
                     );
                 }
+                // The slot no longer holds what its last assembly placed.
+                if let Some(slot_state) = self.slot_projection_state.get_mut(&seal_slot) {
+                    slot_state.placed_pieces.clear();
+                }
 
                 let _ = state.event_tx.send(TurnEvent::Done(TurnResponse {
                     text,
@@ -7680,6 +7723,9 @@ impl Scheduler {
         self.session
             .truncate_sequence_to_blocks(sequence_id.0, 0)
             .map_err(ConversationError::Model)?;
+        if let Some(slot_state) = self.slot_projection_state.get_mut(&sequence_id) {
+            slot_state.placed_pieces.clear();
+        }
         // The slot's per-position state goes with its K/V. A reused slot starts
         // at position 0, and pages describing the previous occupant's positions
         // would put this section's first token at that prefix's end.
@@ -10184,6 +10230,12 @@ impl Scheduler {
             Observe::No,
             self.gallery_arena.as_deref(),
         );
+        // The same fresh scores feed the dialogue's working-set momentum — once
+        // per reprojection, the cadence the momentum's leak is defined over
+        // (`docs/zend_working_set.md` §4.3).
+        policy
+            .substrate
+            .observe_working_set(schema, policy.target, &group_candidates);
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");
@@ -10239,6 +10291,11 @@ impl Scheduler {
                 else {
                     continue;
                 };
+                // A working-set group is not selected by belief, so there is no
+                // carried selection for a challenger to break into.
+                if group.is_working_set() {
+                    continue;
+                }
                 let cfg = group.belief_config(cands.len());
                 if cfg.budget_max < 3 {
                     continue;
@@ -10590,11 +10647,13 @@ impl Scheduler {
             .release_sequence(view_id.0)
             .map_err(ConversationError::Model)?;
 
-        // Reset parent and re-project onto it.  `apply_projection`'s
-        // populated-slot guard returns early when the slot is non-empty,
-        // so truncate first.
+        // Cut the parent back to the pieces its last assembly placed — the
+        // active turn it also holds past them was captured above from the
+        // view and goes back on after the rebuild. The assembler then keeps
+        // whatever prefix of those pieces the new projection shares and
+        // re-injects only from the first that differs.
         self.session
-            .truncate_sequence_to_blocks(parent_id.0, 0)
+            .truncate_sequence_to_blocks(parent_id.0, view_state.turn_start_parent_blocks)
             .map_err(ConversationError::Model)?;
         // Reset the slot_tokens diagnostic log so it stays in sync with
         // the post-rebuild slot contents.  apply_projection re-populates
@@ -11266,7 +11325,7 @@ mod tests {
     }
 
     use candle_transformers::models::batched_inference::{
-        BatchedConfig, BatchedInferenceSession, KvLayers, ManagedBatchedModel,
+        BatchedConfig, BatchedInferenceSession, KvLayers, ManagedBatchedModel, WaveResult,
     };
     use std::str::FromStr;
 
@@ -11781,6 +11840,25 @@ mod tests {
             Ok(())
         }
 
+        /// Keep the closed pages that fit within `tokens` and drop the live
+        /// tail — the shape the real cut has.
+        fn truncate_positional_state(&self, seq: usize, tokens: usize) -> candle::Result<()> {
+            let mut pages = self.probe.pages.lock().unwrap();
+            let entry = pages.entry(seq).or_default();
+            let mut covered = 0usize;
+            let keep = entry
+                .closed
+                .iter()
+                .take_while(|&&w| {
+                    covered += w as usize;
+                    covered <= tokens
+                })
+                .count();
+            entry.closed.truncate(keep);
+            entry.tail = 0;
+            Ok(())
+        }
+
         /// The toy state as snapshot rows. One "layer" per `ToyState` row, with
         /// the row's four floats standing in for the delta-rule matrix and a
         /// zero-length conv tail — enough shape for the record round-trip and
@@ -11970,6 +12048,110 @@ mod tests {
             Arc::new(crate::guest::Guests::new()),
         );
         (scheduler, tx, probe)
+    }
+
+    /// A model whose every wave forward fails — what a glue fill can meet.
+    #[derive(Clone)]
+    struct FailingWave(DummyModel);
+
+    impl ManagedBatchedModel for FailingWave {
+        fn maybe_change_dtype(&self, dtype: DType) -> candle::Result<()> {
+            self.0.maybe_change_dtype(dtype)
+        }
+        fn num_layers(&self) -> usize {
+            self.0.num_layers()
+        }
+        fn n_kv_head(&self) -> usize {
+            self.0.n_kv_head()
+        }
+        fn head_dim(&self) -> usize {
+            self.0.head_dim()
+        }
+        fn wave_geometry(&self, act_dtype: DType) -> candle_nn::kv_cache::ModelGeometry {
+            self.0.wave_geometry(act_dtype)
+        }
+        fn device(&self) -> &candle::Device {
+            self.0.device()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn forward_wave(
+            &self,
+            _session: &mut BatchedInferenceSession,
+            _decode_seqs: &[usize],
+            _decode_inputs: &[Tensor],
+            _prefill_seqs: &[usize],
+            _prefill_inputs: &[Tensor],
+            _glue_seqs: &[usize],
+            _glue_inputs: &[Tensor],
+            _layer_start: usize,
+            _layer_end: usize,
+            _residual_in: Option<Tensor>,
+        ) -> candle::Result<WaveResult> {
+            candle::bail!("wave forward failed")
+        }
+        fn prune(&self) -> candle::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// **A glue fill that fails leaves nothing of its assembly to keep.** The
+    /// walk records each glue piece as placed before the fill computes it; a
+    /// deferred fill taken off the queue and lost with its wave left those
+    /// pieces as zero chunks, and every later rebuild kept them because its
+    /// identities still matched. Losing the record costs one full rebuild.
+    #[test]
+    fn a_failed_glue_fill_forgets_the_pieces_its_assembly_placed() {
+        use projection_assembler::{GapFillPlan, PlacedPiece};
+
+        let (_tx, rx) = flume::bounded(16);
+        let mut sched = Scheduler::new(
+            rx,
+            Box::new(FailingWave(DummyModel::new())),
+            make_test_session(),
+            make_dummy_tokenizer(),
+            vec![0u32].into(),
+            64,
+            8,
+            false,
+            None,
+            DecodeHealthConfig::default(),
+            512,
+            PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
+            Arc::new(crate::guest::Guests::new()),
+        );
+        let slot = SequenceId(3);
+        sched
+            .slot_projection_state
+            .entry(slot)
+            .or_default()
+            .placed_pieces
+            .push(PlacedPiece::ending_at(2));
+        sched.deferred_glue_fires.push(GapFillPlan {
+            parent_id: slot,
+            glue_tokens: vec![5, 6],
+            glue_write_slice: vec![2, 2],
+            glue_write_in_blk: vec![0, 1],
+            fwd_ahead: vec![0, 0],
+            deferred_user: None,
+            tail_per_layer: Vec::new(),
+            held_before: None,
+            placed_before: 0,
+            n_glue_tokens: 2,
+            islands: Vec::new(),
+            complete: true,
+        });
+
+        assert!(sched.decode_forward_cobatched(&[], &[], &[], &[]).is_err());
+        assert!(
+            sched.deferred_glue_fires.is_empty(),
+            "the wave took the glue"
+        );
+        assert!(
+            sched.slot_projection_state[&slot].placed_pieces.is_empty(),
+            "a rebuild must not keep glue that was never filled"
+        );
     }
 
     /// **A prefix section whose page the model will not take still advances

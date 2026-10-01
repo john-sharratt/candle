@@ -101,6 +101,10 @@ pub fn apply_selection(
         // member names, so nothing survives. (Collections resolve `Named` in
         // `project::select_collection_sections`, not here.)
         SelectionRule::Named { .. } => Vec::new(),
+        // A working-set group is filled from the target's working set, whole
+        // conversations sized by its own budget (`project::working_set_picks`);
+        // it never reaches a per-turn rule.
+        SelectionRule::WorkingSet { .. } => Vec::new(),
         SelectionRule::Sequence {
             recent,
             historical_top_k,

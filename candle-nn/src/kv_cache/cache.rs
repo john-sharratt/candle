@@ -326,6 +326,15 @@ impl Cache {
         }
     }
 
+    /// [`Self::compression_bpe`] for one side — K when `is_value` is false.
+    /// `None` for contiguous storage.
+    pub fn compression_bpe_side(&self, batch_idx: usize, is_value: bool) -> Option<(f64, usize)> {
+        match &self.storage {
+            CacheStorage::Chunked(c) => c.backing.compression_bpe_side(batch_idx, is_value).ok(),
+            CacheStorage::Contiguous { .. } => None,
+        }
+    }
+
     /// Get the K and V format tags for this chunked cache's backing storage.
     ///
     /// Returns `(k_format_tag, v_format_tag)` derived from the backing's configured
@@ -928,6 +937,22 @@ impl KvCache {
     pub fn compression_dist(&self, batch_idx: usize, ret: &mut HashMap<GgmlDType, usize>) {
         self.k.compression_dist(batch_idx, false, ret);
         self.v.compression_dist(batch_idx, true, ret);
+    }
+
+    /// One side's compression stats — K when `is_value` is false. Read from the
+    /// K cache's backing, which holds both sides' bands.
+    pub fn compression_bpe_side(&self, batch_idx: usize, is_value: bool) -> Option<(f64, usize)> {
+        self.k.compression_bpe_side(batch_idx, is_value)
+    }
+
+    /// One side's format histogram — K when `is_value` is false.
+    pub fn compression_dist_side(
+        &self,
+        batch_idx: usize,
+        is_value: bool,
+        ret: &mut HashMap<GgmlDType, usize>,
+    ) {
+        self.k.compression_dist(batch_idx, is_value, ret);
     }
 
     /// Ensure chunked backing has the chunks needed for a batched decode step.
