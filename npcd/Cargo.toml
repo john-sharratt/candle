@@ -129,6 +129,7 @@ nvml-wrapper = "0.12"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # The scenario harness talks to the *running* daemon over HTTP — it needs the
 # live checkpoint, and the daemon is holding it. A blocking client, because the
 # example is a script and a decode is measured in seconds.

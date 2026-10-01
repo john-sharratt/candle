@@ -1,6 +1,7 @@
-//! Test repositories, inside this crate's `scratch/` folder — nested in the
-//! candle checkout, ignored by it — and deleted when the test ends. Each is a
-//! copy of an empty repository built with `git init` once per test process.
+//! Test repositories, inside a `zend-vfs-scratch/` folder under cargo's target
+//! directory — nested in the candle checkout, never in its source tree — and
+//! deleted when the test ends. Each is a copy of an empty repository built
+//! with `git init` once per test process.
 //!
 //! Setup runs git directly (not through the layer under test) with a fixed
 //! identity and fixed dates, so every setup commit id is reproducible.
@@ -18,9 +19,13 @@ use crate::Repo;
 /// The fixed date every setup commit carries.
 pub(crate) const SETUP_DATE: &str = "1700000000 +0000";
 
-/// The folder test repositories are created in.
+/// The folder test repositories are created in. The test executable lives at
+/// `<target>/<profile>/deps/<name>`, so the target directory is three levels
+/// up whatever `CARGO_TARGET_DIR` is.
 pub(crate) fn scratch() -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scratch");
+    let exe = std::env::current_exe().expect("test executable path");
+    let target = exe.ancestors().nth(3).expect("target directory");
+    let dir = target.join("zend-vfs-scratch");
     std::fs::create_dir_all(&dir).expect("scratch folder");
     dir
 }

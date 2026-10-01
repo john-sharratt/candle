@@ -1,3 +1,0 @@
-# Test repositories. The tests `git init` each one here, nested inside this
-# checkout, and delete it when the test ends.
-/scratch/

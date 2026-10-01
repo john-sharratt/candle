@@ -7,7 +7,7 @@
 //! stencil's mask; prefilled static runs are emitted automatically.  This is the
 //! decode loop, minus the forward pass.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use candle_conversation::stencil::{
     compile, compile_tool_call_loop, compile_tool_call_tree, AllowedSet, FreeTextLimits, HfVocab,
@@ -77,9 +77,14 @@ fn loop_spec(max_calls: usize) -> TreeSpec {
 /// the single-call tree would be exercising a grammar that no longer runs —
 /// which is how a suite goes green against a shape production does not have.
 fn build_tree() -> (Arc<StencilTree>, TestVocab) {
-    let vocab = TestVocab::new();
-    let tree = compile(&loop_spec(MAX_TOOL_CALLS_PER_TURN), &vocab).expect("the spec tokenizes");
-    (Arc::new(tree), vocab)
+    // Compiled once per process: the tree is immutable and every test drives it.
+    static TREE: OnceLock<Arc<StencilTree>> = OnceLock::new();
+    let tree = TREE.get_or_init(|| {
+        let tree = compile(&loop_spec(MAX_TOOL_CALLS_PER_TURN), &TestVocab::new())
+            .expect("the spec tokenizes");
+        Arc::new(tree)
+    });
+    (Arc::clone(tree), TestVocab::new())
 }
 
 /// The full registry must also compile against a tokenizer that *merges* across
