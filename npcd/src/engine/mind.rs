@@ -55,8 +55,8 @@ use tokio::sync::Mutex as ConversationLock;
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, TimelineId};
 use candle_conversation::stencil::{
-    compile_action_loop_with_body, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
-    ToolCallEnvelope, TreeSpec,
+    compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
+    ToolCallEnvelope,
 };
 use candle_conversation::{
     ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
@@ -66,9 +66,9 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::act::{self, Parsed};
 use crate::engine::dreams;
-use crate::engine::effector_focus::{Focus, FocusTable, InvokeStencils};
 use crate::engine::event::Event;
 use crate::engine::identity;
+use crate::engine::invoke_body::Invokable;
 use crate::engine::layers;
 use crate::engine::narration;
 use crate::engine::narrator;
@@ -142,11 +142,6 @@ struct Live {
     pending: Vec<String>,
 }
 
-/// The key of the focused-turn grammar cache: the frame key
-/// `(Deliberation, Within)` plus the focus's `(resource-id, schema-fingerprint)`.
-/// The focus half keeps focused trees out of the plain frame cache (Blocker 1).
-type FocusedKey = (identity::Deliberation, tools::Within, String, String);
-
 /// Every character's conversation, and the engine they run on.
 pub struct Minds {
     engine: Arc<Mutex<ConversationEngine>>,
@@ -178,22 +173,6 @@ pub struct Minds {
     /// miss costs one compile of a nine-act catalog, against a decode measured
     /// in seconds.
     acts: Mutex<HashMap<(identity::Deliberation, tools::Within), Arc<StencilTree>>>,
-    /// Each character's effector **focus** — the resource whose schema arms its
-    /// next `invoke` body (effector design §11). Held here, beside the frame
-    /// cache, and deliberately **not** in [`tools::Within`]: a per-character,
-    /// per-resource fact must never enter the `(Deliberation, Within)` key above,
-    /// or the frame's near-perfect hit rate collapses (Blocker 1). See
-    /// [`crate::engine::effector_focus`].
-    focus: FocusTable,
-    /// The `invoke`-body sub-stencils, cached by `(resource-id,
-    /// schema-fingerprint)` — the SEPARATE cache Blocker 1 requires (§11).
-    invoke_specs: InvokeStencils,
-    /// Whole-turn grammars for a *focused* turn: the same frame the [`Self::acts`]
-    /// cache holds, but with the `invoke` body spliced from the focus's
-    /// sub-stencil. Keyed by the frame key **and** the focus's
-    /// `(resource, fingerprint)`, in its own cache so the frame cache above stays
-    /// keyed on `Within` alone and shared across characters whatever their focus.
-    focused: Mutex<HashMap<FocusedKey, Arc<StencilTree>>>,
     /// Whether the catalog compiled at boot. `false` means this checkpoint
     /// cannot be held to a shape at all, and every turn free-decodes — asked
     /// once here rather than inferred from an empty cache, which would also be
@@ -302,26 +281,6 @@ fn compile_act_loop(
     thinking: identity::Deliberation,
     within: &tools::Within,
 ) -> anyhow::Result<Arc<StencilTree>> {
-    compile_act_loop_with(engine, cfg, thinking, within, None)
-}
-
-/// [`compile_act_loop`] with the `invoke` body **spliced** from a focus
-/// resource's sub-stencil rather than left as free JSON (effector design §11).
-///
-/// `body_override` is the focus's `{ … }` body [`TreeSpec`] (from
-/// [`crate::engine::effector_focus`]); it is spliced onto the `invoke` branch of
-/// the ordinary frame, so a focused turn keeps every body act and the whole
-/// device surface — only `invoke`'s body is typed. `None` reproduces the frame
-/// exactly. The composition is at compile time because the turn driver does not
-/// expose a decode-time tree-swap; the frame it is built from is unchanged, so
-/// the frame cache stays shared (Blocker 1).
-fn compile_act_loop_with(
-    engine: &Arc<Mutex<ConversationEngine>>,
-    cfg: &SequenceConfig,
-    thinking: identity::Deliberation,
-    within: &tools::Within,
-    body_override: Option<&TreeSpec>,
-) -> anyhow::Result<Arc<StencilTree>> {
     let e = engine.lock().unwrap();
     let tok = e.tokenizer();
     let (Some(_call_open), Some(think_open), Some(think_close)) = (
@@ -383,15 +342,12 @@ fn compile_act_loop_with(
         }
     };
     let specs = tools::specs_within(Mode::Physical, within);
-    let spec = compile_action_loop_with_body(
+    let spec = compile_action_loop(
         &specs,
         &env,
         tools::ACTS_PER_TURN,
         cfg.dialect.assistant_end,
         prelude.as_ref(),
-        // Splice the focus's typed body onto the `invoke` branch, when one is
-        // armed. `invoke`'s free-JSON `body` param is the splice target (§11).
-        body_override.map(|spec| ("invoke", "body", spec)),
     )?;
     Ok(Arc::new(e.compile_stencil(&spec)?))
 }
@@ -514,6 +470,10 @@ impl Minds {
         // free-decode cleanly rather than run to the token ceiling.
         let mut at_table = tools::Within::nowhere();
         at_table.station = vec!["order-table".to_string()];
+        at_table.invokable = vec![Invokable::new(
+            "http://local/command/order-table~0/collect_mission",
+            "collect_mission",
+        )];
         for level in LEVELS {
             if let Err(e) = compile_act_loop(&engine, &base_config, level, &at_table) {
                 tracing::error!(
@@ -540,9 +500,6 @@ impl Minds {
             engine,
             base_config,
             acts,
-            focus: FocusTable::new(),
-            invoke_specs: InvokeStencils::new(),
-            focused: Mutex::new(HashMap::new()),
             grammar_ok: ok,
             projection: RwLock::new(None),
             live: Mutex::new(HashMap::new()),
@@ -966,82 +923,6 @@ impl Minds {
         // Last writer wins: two characters in one room race to build the same
         // tree and either is correct, since the key determines the contents.
         self.acts.lock().unwrap().insert(key, Arc::clone(&built));
-        Some(built)
-    }
-
-    /// Arm a character's effector focus — the resource whose schema types its
-    /// next `invoke` body (effector design §11). Called from
-    /// [`crate::engine::runtime::Runtime::enact_device`] when a `query` reads a
-    /// resource with an invokable body.
-    pub fn set_focus(&self, npc_id: u64, resource: &str, body_schema: serde_json::Value) {
-        self.focus.set(npc_id, Focus::new(resource, body_schema));
-    }
-
-    /// Disarm a character's focus — a query of the index or a readable leaf, or
-    /// of a resource with nothing invokable, leaves the next `invoke` free JSON.
-    pub fn clear_focus(&self, npc_id: u64) {
-        self.focus.clear(npc_id);
-    }
-
-    /// A character's current focus, if any — read at the start of its turn to
-    /// decide whether to arm the typed-body grammar.
-    pub fn focus_of(&self, npc_id: u64) -> Option<Focus> {
-        self.focus.get(npc_id)
-    }
-
-    /// The whole-turn grammar for a **focused** turn — the frame with `invoke`'s
-    /// body typed from the focus's schema (effector design §11).
-    ///
-    /// Cached in its own map keyed by the frame key **and** the focus's
-    /// `(resource, fingerprint)`, so the [`Self::acts`] frame cache stays keyed on
-    /// `(Deliberation, Within)` alone and is shared across characters whatever
-    /// their focus (Blocker 1). The body sub-stencil itself is cached by
-    /// `(resource, fingerprint)` in [`Self::invoke_specs`] — the separate cache
-    /// §11 requires — so the same schema recompiles nothing.
-    ///
-    /// `None` (no grammar this turn, or a schema that will not compile) falls the
-    /// caller back to the plain frame, which falls back to free-decode — a stale
-    /// or malformed focus is never fatal (§11).
-    fn grammar_for_focused(
-        &self,
-        thinking: identity::Deliberation,
-        within: &tools::Within,
-        focus: &Focus,
-    ) -> Option<Arc<StencilTree>> {
-        if !self.grammar_ok {
-            return None;
-        }
-        let key = (
-            thinking,
-            within.clone(),
-            focus.resource.clone(),
-            focus.fingerprint.clone(),
-        );
-        if let Some(tree) = self.focused.lock().unwrap().get(&key) {
-            return Some(Arc::clone(tree));
-        }
-        // The body sub-stencil, from the separate `(resource, fingerprint)` cache.
-        let body_spec = self.invoke_specs.get_or_build(focus)?;
-        // Compiled outside the cache locks, like the frame — a second character
-        // must not wait behind the engine lock.
-        let built = match compile_act_loop_with(
-            &self.engine,
-            &self.base_config,
-            thinking,
-            within,
-            Some(&body_spec),
-        ) {
-            Ok(tree) => tree,
-            Err(e) => {
-                tracing::warn!(
-                    "the {thinking:?} focused grammar for {} would not compile: {e:#} — this turn \
-                     falls back to a free-JSON invoke body",
-                    focus.resource
-                );
-                return None;
-            }
-        };
-        self.focused.lock().unwrap().insert(key, Arc::clone(&built));
         Some(built)
     }
 
@@ -1552,19 +1433,7 @@ impl Minds {
         // what it can decode. A character alone reads no `tell`; one standing at
         // a chronicle terminal reads the terminal's acts until it walks away.
         tools::show_within(&mut selection, Mode::Physical, within);
-        // **A focused turn types its `invoke` body.** When the character queried
-        // a resource last turn, its schema arms a per-`(resource, fingerprint)`
-        // grammar whose `invoke` body is that schema's fields rather than free
-        // JSON (effector design §11). The frame it is built from is unchanged, so
-        // this never touches the shared `(Deliberation, Within)` cache (Blocker
-        // 1); a stale or uncompilable focus falls back to the plain frame.
-        let deliberation = identity::Deliberation::default();
-        let turn_grammar = match self.focus_of(npc_id) {
-            Some(focus) => self
-                .grammar_for_focused(deliberation, within, &focus)
-                .or_else(|| self.grammar_for(deliberation, within)),
-            None => self.grammar_for(deliberation, within),
-        };
+        let turn_grammar = self.grammar_for(identity::Deliberation::default(), within);
         let options = TurnOptions {
             assistant_prefill: self
                 .opening(identity::Deliberation::default(), turn_grammar.is_some()),

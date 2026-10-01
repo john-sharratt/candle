@@ -81,6 +81,36 @@ JSON schema.
   `{"type": "null"}`. Arrays of booleans and enums are guided like arrays of
   strings, their elements chosen per level (`true`, `false`, `]`, then
   `, true`, …). Numbers, and values with no schema, stay free.
+- **A value can bring its own fields** (§8.3; `Param::shapes`, built). A
+  required, non-nullable enum carries `(value, fields)` pairs: once the model has
+  chosen a value, the object continues with exactly those fields — required,
+  typed as given, and replacing any same-named sibling — so the choice decides
+  what may be written beside it. The compiler lays this out as a branch over the
+  enum's token trie in which each arm leads to the tail for its value's fields.
+  The same machinery serves `requires` (the schema's `if`/`then`: fields a value
+  makes required). The effector's `invoke` uses it: `url` brings the `body` its
+  address takes (`the_effector.md` §11), which is what lets one tree type every
+  address a character can reach without a second compile per address.
+  - **Equal shapes share one tail.** The spec is a DAG and the compile memoises on
+    `(spec node, left context)`, so values whose field lists are equal point at
+    one tail `SpecId` and lower it once. The tree grows with the number of
+    *distinct* shapes, not the number of values: two hundred addresses that take
+    `{}` cost their url arms and one body.
+  - **Measured** (npcd `invoke_body` tests, `TestVocab` byte-level vocabulary, one
+    turn of `ACTS_PER_TURN` calls over the whole catalogue): a room offering 286
+    station addresses — two of every part, everything a body could name in reach —
+    compiles to 612 nodes in about 6 ms, and 572 addresses compile to the same
+    612 (node count does not track the url count in this range); adding an
+    address costs its url, not its body, and the test holds that cost under 400
+    nodes.
+  - **The budget counts paths, not nodes.** `estimated_paths` (npcd
+    `tools.rs`) sums a shaped parameter over its shapes and multiplies over
+    properties, then raises to `ACTS_PER_TURN`. It is the larger number and is
+    quadratic in the address count: it bounds what a change to the catalogue can
+    multiply, while the node count above is what the compile costs.
+  - **Limit.** A required free-text string can still be written as `""`; the
+    grammar has no non-empty terminator, and the handler's prescriptive error
+    (`the_effector.md` §12) is what catches it.
 
 ---
 

@@ -276,6 +276,11 @@ in, which is the failure the whole availability system exists to prevent.
 `gather` `engage` `equip` `use` `recall` `claim` `give`. Keeper keeps speech,
 attention, waiting, and everything below.
 
+**Added: `Availability::Holding`.** `release` gives back what the body holds, so it
+is offered only while an order taken off a board or a claimed station is held, read
+from `Within.held`. Offered to a body holding nothing, it would be refused every
+time.
+
 This is not a special case for one character. Any mind without a body — a tower
 consciousness, an uploaded lord between avatars, a companion whose body is
 destroyed — gets the same treatment, and the world decides rather than the roster.
@@ -292,9 +297,30 @@ value**, which is the dependent binding of §4 in its strongest form:
 | Action | Takes | Rung |
 |---|---|---|
 | relocate | `x`, `y` — somewhere the tower can fold to | scalar, bounds-checked |
-| siege | `target` — a city or rival tower in reach | bound enum |
-| drill down | `depth` — how far | scalar |
-| surface · shields · gates | nothing | — |
+| siege | `target` — a city or rival tower in reach | scalar |
+| drill down | `depth` — how far, in metres | scalar |
+| lift siege · surface · shields · gates | nothing | — |
+
+**What an action takes is required after it, in the grammar.** No one of
+`target`, `x`, `y` or `depth` is needed by every action, so none can be listed
+required outright; left optional, the grammar offers the close straight after
+`relocate`, and a body took it — the tower answered "A fold needs somewhere to
+fold to." The `REQUIRES` table in `engine/tools.rs` names, per choosing
+parameter, the fields each value requires, and `stencil_params` hands them to the
+stencil as `Param.requires`: after `relocate` the call must write `x` and `y`
+before it may close, after `drill down` a `depth`. A value with no entry may
+close at once. The same parameters type the body an `invoke` address carries, so
+a fold sent through the device is held to it too.
+
+**`x`, `y` and `depth` are `integer` parameters, not strings.** A required string
+is free text, and its opening quote is the model's to write — a live tower wrote
+`"depth": ""`, which closes the field with nothing in it. An integer is written
+digit by digit under the mask, so it cannot be empty or anything but a number;
+`x` and `y` may take a leading `-`, and `depth` may not (the `MINIMUM` table in
+`engine/tools.rs` bounds it at zero, so `-` is never offered). The act reads them
+as JSON numbers; a string, a zero depth or a number past the map is refused
+(`A drill needs a depth to drill to, a whole number of metres.`, `That is off the
+map.`), for the caller that does not go through the grammar.
 
 **`action` binds to what the tower can actually do right now**, which is where this
 earns its shape. Relocation is

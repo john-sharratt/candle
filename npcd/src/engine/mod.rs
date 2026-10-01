@@ -54,13 +54,13 @@ pub mod body;
 pub mod cooldown;
 pub mod dreams;
 pub mod driver;
-pub mod effector_focus;
 pub mod enact;
 pub mod environment;
 pub mod event;
 pub mod identity;
 pub mod ingest;
 pub mod interaction;
+pub mod invoke_body;
 pub mod layers;
 pub mod life;
 pub mod loading;
@@ -106,7 +106,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use serde_json::{json, Value};
-use web::auth::Role;
+use web::auth::{Identity, Role};
 
 use crate::api::{err, owner_of, Authored};
 use crate::engine::interaction::Interlocutor;
@@ -320,7 +320,21 @@ async fn events(ws: WebSocketUpgrade) -> Response {
 /// large value and a `Result` is as big as its widest arm, so an unboxed one
 /// makes every success on this path carry the refusal's footprint.
 async fn owned(s: &Arc<Authored>, headers: &HeaderMap, nid: &str) -> Result<u64, Box<Response>> {
-    let (_, owner) = owner_of(s, headers).await?;
+    Ok(owned_by(s, headers, nid).await?.2)
+}
+
+/// [`owned`], with the caller it resolved along the way.
+///
+/// The routes that write to a character — a line, a command, a mission — need to
+/// say *who* wrote it, and that is the identity and account handle this has
+/// already read. `nid` is the wire form, base-36: a route that parsed the path
+/// segment as a decimal number answered 400 for every real id.
+pub(crate) async fn owned_by(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    nid: &str,
+) -> Result<(Identity, String, u64), Box<Response>> {
+    let (id, owner) = owner_of(s, headers).await?;
     let not_found = || {
         Box::new(err(
             StatusCode::NOT_FOUND,
@@ -334,7 +348,7 @@ async fn owned(s: &Arc<Authored>, headers: &HeaderMap, nid: &str) -> Result<u64,
     if s.npcs.read().await.visible_to(npc_id, &owner).is_none() {
         return Err(not_found());
     }
-    Ok(npc_id)
+    Ok((id, owner, npc_id))
 }
 
 /// The layer occupancy: every layer the schema declares, and what is in it.

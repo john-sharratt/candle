@@ -48,7 +48,9 @@ use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::draft_walk::{draft_reserve, draft_walk};
-use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
+use candle_nn::kv_cache::{
+    begin_wave, cover_wave_transient, KvCache, LayerPhase, WavePlan, WaveWidth,
+};
 
 use std::cell::RefCell;
 
@@ -333,6 +335,24 @@ pub fn draft_cohort(
     // `draft_walk`'s module docs carry why that is load-bearing rather than
     // tidy, and the walk does it itself.
     draft_reserve(session, seqs, kv_layer, max_len)?;
+
+    // **The walk runs on the previous forward's tier, which was priced for that
+    // forward's width, not this cohort's.** Each step is one decode row per
+    // sequence through the head's attention and FFN, so the tier must hold the
+    // plan for `n` decode rows; a cohort wider than the forward behind it
+    // exhausted the span one carve short of its first `DecodeContext`.
+    if let Device::Cuda(d) = dev {
+        let plan = WavePlan::new(model.wave_geometry(act_dtype));
+        let width = WaveWidth::decode(n);
+        cover_wave_transient(
+            &d.cuda_stream(),
+            [
+                plan.phase_bytes(LayerPhase::Attention, width),
+                plan.phase_bytes(LayerPhase::Ffn, width),
+                plan.phase_bytes(LayerPhase::Forward, width),
+            ],
+        )?;
+    }
 
     let theta = q.cfg.rope_theta;
     let rope_dtype = if act_dtype == DType::F8E4M3 {

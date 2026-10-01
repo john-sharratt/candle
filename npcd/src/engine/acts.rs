@@ -420,7 +420,7 @@ pub const RELEASE: Tool = Tool {
     at: &[],
     category: "Work",
     plane: Plane::World,
-    availability: Availability::Always,
+    availability: Availability::Holding,
     description: "Give back what you are holding so somebody else can take it. Walking away does \
                   this too; use this when you mean to stay where you are.",
     params: &[],
@@ -561,7 +561,7 @@ pub const ENGAGE: Tool = Tool {
         // than an oversight.** The grammar's compile is exponential in the
         // number of distinct decodes a turn admits (see
         // [`super::tools::estimated_paths`]), and each enumerated argument
-        // multiplies that count. Two is what a four-act turn affords.
+        // multiplies that count. Two is what a turn affords.
         //
         // Little is lost. Every constraint worth honouring was already sayable
         // as one of the other two — `cover` *is* staying in cover, `hold` is
@@ -812,25 +812,25 @@ pub const COMMAND_TOWER: Tool = Tool {
             name: "target",
             ty: "string",
             required: false,
-            description: "What is being besieged, when you are opening a siege.",
+            description: "What is being besieged. Required when opening a siege.",
         },
         Param {
             name: "x",
-            ty: "string",
+            ty: "integer",
             required: false,
             description: "Where to fold to, east-west. Required when relocating.",
         },
         Param {
             name: "y",
-            ty: "string",
+            ty: "integer",
             required: false,
             description: "Where to fold to, north-south. Required when relocating.",
         },
         Param {
             name: "depth",
-            ty: "string",
+            ty: "integer",
             required: false,
-            description: "How far down, in metres, when drilling.",
+            description: "How far down, in metres. Required when drilling.",
         },
     ],
     examples: &[

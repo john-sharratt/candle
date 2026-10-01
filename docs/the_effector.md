@@ -210,12 +210,12 @@ it for *its* schema, `invoke` it to act. The parent (`.../chronicle/<id>`) answe
 what the thing is and lists the verbs beneath it; a verb answers exactly one body.
 
 This is the decision that makes typed `invoke` total rather than partial. A resource
-that afforded several verbs could not be typed by a single focus — the schema the
-character queried could not know which verb the next `invoke` would pick (the
-multi-verb limit §11 first hit). Addressing the **verb** removes the ambiguity by
-construction: every invokable address has exactly one body, so the schema a `query`
-returns is exactly the schema the following `invoke` needs. There is nothing left to
-disambiguate, and no per-branch decode-time machinery is required (§11).
+that afforded several verbs could not be typed by a single body — the address could
+not say which verb the `invoke` would pick. Addressing the **verb** removes the
+ambiguity by construction: every invokable address has exactly one body, so the
+grammar can pair each address the `invoke` enum offers with the body it takes
+(§11), and the schema a `query` returns is exactly the schema the following
+`invoke` needs.
 
 So the grammar of an address is:
 
@@ -227,12 +227,9 @@ http://local/<ns>/<id>/<verb>     a verb — GET/OPTIONS its one body, POST to a
 The personal surfaces follow the same shape: `http://local/phone/message` is a verb
 resource; `http://local/self/plan` is a readable one.
 
-*As-built delta: the shipped station router mounts each verb as a `POST`-only
-sub-path of the thing and types the body by a compile-time splice, which leaves a
-multi-verb thing's body free-JSON (Step 4's honest gap). Closing it is this section:
-give each verb path its own `GET`/`OPTIONS`, and arm the focus (§11) when a character
-queries a **verb** — then every focus is single-body and every `invoke` is typed. It
-is a small, additive change to the station route and the focus, not a rewrite.*
+The station router mounts each verb as a sub-path of the thing, and the `invoke`
+grammar types its body from the act's own parameters (§11), so every address the
+character is offered is typed, single-verb or not.
 
 ## 6. The near-you index is a route, shown as a superseding device percept
 
@@ -597,12 +594,24 @@ by this instance id (`sim/seed.rs`, `Sim::station`), while record *custody* stay
 `invoke`'s `url` are grammar-forced enums, not free strings: `query.url` is bound to the
 near-you set (`Choices::QueryUrl` ← `Within::reachable`), and `invoke.url` to each
 reachable resource's verb-paths (`Choices::InvokeUrl` ← `Within::invokable`,
-`<resource-url>/<verb>` from `station::verbs_of`). So the decoder is forced through a real
+`<resource-url>/<verb>` from `station::verbs_at`). So the decoder is forced through a real
 address the device actually lists — a character can never `query http://local/command-table`
 (a hallucinated guess that 404s) nor `invoke` a bare resource (a 405); it reads and acts
 on exactly what stands within reach. The near-you percept renders each route as
 `- <summary> — <url>` so the address it must name is on the screen to copy
 (`prompt::near_you_section`).
+
+**Only an address a route answers for is offered.** A station namespace is mounted only
+when some catalogue act attaches to a part under it, and `map` is held back from the
+generic routes, so an instance of a part with no verbs (a seat, a blast door, a wall
+turret) or of a `map` part has nothing behind its url: `GET /room/seat~0` is a `404`.
+`router::address_of` is the single place an instance's url is composed, and it returns
+`None` for such a part (`router::serves`: its namespace is mounted, or is `orders`, which
+the plan bridge serves). The near-you index and the grammar's `query` and `invoke` enums
+all read it, so what a character is shown, what it may name and what the router serves
+are one set; `every_address_a_body_is_offered_is_served` stands a body at every place in
+the vault and reads every offered address. A part that later gains a verb is served the
+moment its act names it, with no change here.
 
 Handlers reach the world through the one lock: `Hosted`, a single mutex over
 `{ world, attention, sim, rooms }` (`world/mod.rs:41`), with `with` the sole write
@@ -650,7 +659,7 @@ and it also bounds *how deep* the reach can be: as deep as `Sim`'s, no deeper.
 ### 9.1.1 The `WorldRoutes` trait (Step 7)
 
 The device machinery is world-agnostic: the token auth (§8.3), the near-you framing
-(§6), the `query`/`invoke` verbs (§5), the focus and the schema→stencil (§11), and the
+(§6), the `query`/`invoke` verbs (§5), the per-address body stencil (§11), and the
 personal roots (`/history`, `/phone`, `/self`, §7.2) are all npcd's and know nothing of
 what world sits behind them. Everything world-specific is one trait:
 
@@ -838,85 +847,64 @@ rules are enforced by the handler, which returns a prescriptive error (§8.4, §
 character corrects against. The schema mixes strong and weak typing per field; the
 decoder enforces the strong half it can, the handler enforces the rest.
 
-**How the schema reaches the stencil without breaking the grammar cache.** The
-whole-turn grammar is cached on `(Deliberation, Within)` and hits almost always
-*because `Within` is a room fact shared across the cast* (`mind.rs:174`). A
-per-character, per-resource `invoke` body must **not** enter that key, or the hit
-rate collapses and a fresh whole-turn tree compiles on the tick path every focused
-turn (`compile_action_loop` cannot memoise across a spliced tree, `tools.rs:1919`).
-So:
+**How the body reaches the stencil: one tree, every address carries its own body.**
+The whole-turn grammar is cached on `(Deliberation, Within)` and hits almost always
+*because `Within` is a room fact shared across the cast*. `Within` carries
+`invokable: Vec<Invokable>` — each `(url, act)` the body can reach from where it
+stands (`Runtime::reachable_urls`, the verbs `station::verbs_at` lists under each
+part) — so the address set is part of the key and two characters in the same room
+share one tree. There is no per-character focus, no second cache and no spliced
+tree.
 
-1. The turn grammar is the **fixed frame** — body acts, `query`, `invoke` — keyed on
-   `Within` alone, cached as today (and, post-§15, with a much smaller `Within`).
-2. The **invoke body** is a *separate* small sub-stencil, compiled from one
-   resource's schema and cached by `(resource-id, schema-fingerprint)`, composed with
-   the fixed frame at decode time. The composition reuses the as-built stencil
-   driver's tree-swap machinery — the `TriggerRegistry` / `with_trigger` mechanism
-   that already swaps a per-turn `<think>` tree onto the tool-call base
-   (`stencil_tree.md`, as-built deltas) — armed on the `invoke` branch for the focus
-   resource. This is §13's caching rule applied to the stencil: it keeps the
-   near-perfect hit rate on the frame while giving `invoke` its typed body.
+`invoke.url` is a closed enum over those addresses, and each value brings the body
+it takes. The stencil expresses that as `Param::shapes`: a list of
+`(enum value, sibling fields)`, where a value's fields are the *required* siblings
+that follow it and replace any same-named sibling (`stencil/tool_call.rs`,
+`build_discriminated`). `engine/invoke_body.rs` builds the shapes: an address's body
+is its act's own parameters, typed exactly as the compiled act types them, so a
+station verb's body is the body the same act would carry as a native call, an
+act with no parameters takes `{}`, and an address nobody could perform here (a
+required parameter with no live value, or the act cooling down) is not offered at
+all — the same `tools::performable` gate that decides whether the act is compiled.
+Equal shapes share one tail `SpecId`, and the compile memoises on
+`(SpecId, left context)`, so the tree grows with the number of *distinct* bodies and
+the cost of one more address is its url, not its body. The lift's `invoke` is a
+compiled act with its floor enum and is unaffected.
 
-*As-built (Step 4): the **compile-time-splice fallback**, not the decode-time swap.*
-*A true decode-time tree-swap on the `invoke` branch is not reachable without editing*
-*the turn driver (`candle-conversation/src/conversation.rs`, a reserved WIP file): a*
-*character turn is entered directly inside a single prefilled `turn_grammar` tree, not*
-*driven through the `TriggerRegistry` the assistant/think path uses, so there is no*
-*live branch to arm a swap on. So the acceptable fallback of the build order is what*
-*shipped: the focus's typed body is a `{ … }` sub-stencil compiled by front-end B*
-*(`compile_invoke_body_tree`, `ToolSpec::from_json_schema` over the OPTIONS body*
-*schema) and cached by `(resource-id, schema-fingerprint)`; a focused turn's grammar is*
-*the ordinary frame with that sub-stencil **spliced** onto the `invoke` body at compile*
-*time (`compile_action_loop_with_body`), cached in its own map keyed by the frame key*
-*plus `(resource-id, fingerprint)`. Blocker 1 holds exactly: the `(Deliberation, Within)`*
-*frame cache is never keyed by focus, so two characters with different focuses still*
-*share the frame; a no-focus turn is byte-identical to the plain frame. Only the JSON*
-*call styles get the typed body; a function-block body keeps its free span. Focus lives*
-*on `Minds` beside the frame cache (`engine/effector_focus.rs`), set by a resource*
-*`query`'s in-process `OPTIONS` in `Runtime::enact_device`, whose schema also rides back*
-*inline. A multi-verb station arms nothing (the focus arms one body and cannot know the*
-*verb), so its body stays free JSON. **Resolved by verb-as-resource (§5.2), not the*
-*decode-time swap:** once each verb is its own queryable address, every focus is one*
-*verb's single body and the compile-time splice types it — editing the reserved*
-*`conversation.rs` is not needed at all. The remaining work is the §5.2 as-built delta*
-*(each verb path gets its own `GET`/`OPTIONS`; the focus arms on a verb query), small*
-*and additive; single-body things (the lift) and single-verb things are already typed.*
+The measured cost is in `stencil_tree.md` (as-built deltas, "A value can bring its
+own fields"); `invoke_body`'s tests hold it: a room with two of every station part
+and everything a body could name in reach compiles in milliseconds, and the
+per-address cost is bounded by test.
 
 **How the character reaches a schema without spending a turn on it.** The naive path
 — discover, `query` for schema, then `invoke` — is three turns to do one thing, and
-at 2 Hz that is slow. Two changes collapse it, both keeping the fixed surface:
+at 2 Hz that is slow. Two changes collapse it:
 
 - The near-you index (§6) carries each reachable leaf's schema *inline* — a `GET`
   returning JSON, still ordinary HTTP — and it is re-projected into the dynamic
-  system-prompt section *this* turn (§6), so the schema the `invoke` stencil needs is
-  already in front of the model. No separate schema-query turn, and because it is a
-  point-in-time section it never accumulates in the window.
-- The engine **pre-arms the focus** for the leaf the body is standing at, so
-  "operate the thing in front of me" is one `invoke`, no explicit `OPTIONS`. Bounded
-  to the reachable leaves, so it does not reopen the cache-key explosion.
+  system-prompt section *this* turn (§6), so the body the character is about to
+  write is already in front of it. A `query` of a resource answers `{state, schema}`
+  in one call (`Runtime::schema_of`), and because it is a point-in-time section it
+  never accumulates in the window.
+- Every address the `invoke` enum offers is already typed, so "operate the thing in
+  front of me" is one `invoke` with no preceding `OPTIONS`.
 
-The `url` of `query`/`invoke` is itself constrained: an enum of the currently-
-reachable ids with a free-string fallback for deeper paths (post-migration the frame
-is tiny, so there is ample path budget to spend on it, `tools.rs:1946`). A
-hallucinated address is thus unlikely, and a wrong one 404s cheaply (§12). With no
-focus at all, `invoke`'s `body` decodes as `FreeText{Balanced '{','}'}` — free,
-well-formed JSON (`stencil_tree.md` §6.1) — and validation plus prescriptive errors
-catch the rest.
+A hallucinated address is impossible (the enum is closed) and a body that does not
+fit its address is impossible (the shape is that address's own). The remaining
+failures are the ones the decoder cannot see: a free-text field left empty, and the
+world refusing for a reason only the world knows (§12).
 
-**The schema is live, so it is re-read each focused turn.** Between the turn a schema
+**The schema is live, so `Within` is rebuilt every turn.** Between the turn a schema
 is seen and the turn `invoke` fires, the world ticks and other bodies act under the
-one lock, so an `OPTIONS` enum (`floor_names()`, `claimable_at`, `modes_here`) can go
-stale — the car arrives, a floor opens, someone claims the terminal, the body walks
-and the route 404s. The focus's schema is recomputed at the start of each focused
-turn, not reused from when it was first seen; §13's "pure function of world state" is
-what makes that safe and cheap. A schema that went stale mid-flight fails benignly —
-the world refuses and says why (§12) — but the design does not pretend the first read
-is durable.
+one lock, so an enum (`floor_names()`, `claimable_at`, `modes_here`) can go stale —
+the car arrives, a floor opens, someone claims the terminal, the body walks and the
+route 404s. The address set and every live enum are recomputed from the world at the
+start of each turn; §13's "pure function of world state" is what makes that safe and
+cheap. A schema that went stale mid-flight fails benignly — the world refuses and
+says why (§12) — but the design does not pretend the first read is durable.
 
-The API stays stateless (§13); the per-character *focus* that arms the sub-stencil
-lives in the engine, beside the grammar cache — the same split the engine already
-keeps between the world read-cursor (`Actor.looked`) and what was last shown
-(`Attention`) (`delta.rs:28`).
+The API stays stateless (§13); the engine keeps no per-character state for the
+stencil.
 
 ## 12. Prescriptive errors close the loop the model already knows
 
@@ -933,8 +921,8 @@ clever** — an invented format would forfeit the whole prior the wager rests on
 The API is a pure function of `(world state, caller token → standpoint, method,
 path, body)`. No session, no handshake, no cursor inside it. The engine calls it for
 three reasons and none may leave residue: to fill the **near-you index** (`GET
-http://local/`), to build the **invoke stencil** (the focus resource's schema, via
-`OPTIONS`), and to render a **world event** referring to a capability. Because the
+http://local/`), to read a resource's **schema** (`OPTIONS`, bundled with its state
+on a `query`), and to render a **world event** referring to a capability. Because the
 answer is a function of world state, asking repeatedly and from more than one place
 is safe — two callers get the same answer, the property `perceive.rs` guarantees for
 percepts (`perceive.rs:9`). Any caching is the *engine's*, keyed on
@@ -953,8 +941,8 @@ model. The per-character `ConversationLock`, projection/window/prompt structure.
 
 **New.** `query` and `invoke` (§5). The `local` router + its external mount (§8).
 `OPTIONS` schema responses (§5.1). The near-you index route (§6). The token auth and
-quick-lookup table (§8.3). The in-process fast path (§8.1). The per-character focus
-that arms the invoke stencil (§11). The world-routes extension point (§9.1). Item
+quick-lookup table (§8.3). The in-process fast path (§8.1). The per-address body
+stencil on `invoke` (§11). The world-routes extension point (§9.1). Item
 ids on placed instances and the per-item state record (§7, §7.1; Q2). Routing of
 `plan_*`/`orders_*` to the projected store so the plan stays in the system prompt
 (§9.2).
@@ -1013,8 +1001,8 @@ by **token scope** — as-NPC (proximity-gated) vs direct by-id (§8.3); `act`, 
 `promise`, `remind` stay body/human interactions, the phone acts and every
 world/station verb become routes (§4); an embedder world **replaces** the vault, one
 per daemon, under npcd's one lock (§9.1); fast JSON with field-level errors (§8.4);
-the query's schema is the invoke's stencil, cached separately from the turn grammar
-(§11); stateless API, focus in the engine (§11, §13).
+each invokable address brings its own body into the one turn grammar (§11); stateless
+API, no per-character state in the engine (§11, §13).
 
 Open — none. The product questions (external scope, act placement, embedder
 replacement, schema verb) are decided above; the engineering calls are now settled for
@@ -1093,11 +1081,9 @@ Build order, dependency-first, each step green before the next:
    full (every part, its conditions, the verbs each condition affords).
 3. `query`/`invoke` as the fixed-frame tools; `OPTIONS` schema; the "Your effector
    device shows:" band and the system-prompt copy (§6.1).
-4. Schema→stencil for the focus resource: the `invoke` sub-stencil cached by
-   `(resource-id, schema-fingerprint)` and composed with the `Within`-keyed frame
-   (§11) — *not* folded into the grammar cache key; inline schema on the near-you
-   index and focus pre-armed for the standing leaf (so the common call is one turn);
-   the simulator suite. This rides on Step 6's `Within` shrink (§15), so the two
+4. The per-address body stencil: each `invoke` address pairs with its act's body in
+   the `Within`-keyed grammar (§11); inline schema on the near-you index (so the
+   common call is one turn); the simulator suite. This rides on Step 6's `Within` shrink (§15), so the two
    proceed together.
 5. The lift, migrated end-to-end (`http://local/lift/<id>/{status,call}`, enum from
    `world.floor_names()`, consequence loop tested) — the smallest complete example.
@@ -1130,7 +1116,7 @@ Step 1–2; "sharp" = scoped but real; "minor" = watch.
 | 5 | sharp | Re-entering the non-reentrant world mutex from a handler that calls the router deadlocks silently | §8.1 (no-reentry-under-lock invariant, tested) |
 | 6 | sharp | "Strong typing" only truly binds string enums and booleans; `integer`/`array`/`object` are shaped, not enforced | §11 (world validation is load-bearing, not a backstop) |
 | 7 | sharp | The `{error,detail,field}` shape does not exist yet (`err()` has no `field`), and path→field mapping is real work | §8.4 (add `field`; it is the correction signal, not plumbing) |
-| 8 | sharp | The focus schema can go stale between the `OPTIONS` turn and the `invoke` turn | §11 (re-read schema each focused turn; stale fails benignly) |
+| 8 | sharp | An enum can go stale between the turn it is seen and the turn `invoke` fires | §11 (`Within` is rebuilt every turn; stale fails benignly) |
 | 9 | sharp | An embedder world with its own lock reintroduces the two-lock bug the design avoids | §9.1 (provider runs under `Hosted`'s one lock, like `Sim`) |
 | 10 | minor | `within` is already non-atomic (~8 lock acquisitions); the device adds reads | §13 note; fold into a `with`-scoped builder if it grows |
 | 11 | minor | An external token dies across restart unless persisted; must not be derived from `body_id` | §8.3 (real secret; persist — Q6) |
@@ -1347,7 +1333,7 @@ here just names which node and which ordinal.)*
 | archive | fixture | — | — | chronicle → stacks ×1 | no | `chronicle/stacks-archive` |
 | timeline-wall | fixture | — | — | chronicle → stacks ×1 | no | `chronicle/stacks-timeline` |
 | enquiry-desk | station | an open enquiry | — | command → enquiry ×1 | no | `enquiry/enquiry-1` |
-| order-table | fixture | — | — | command → command-room ×1 | no | `command/command-room-1` (Step 6 split it from `orders`; see §C.11) |
+| order-table | fixture | — | — | command → command-room ×1, tower-redoubt muster-hall ×1 | no | `command/command-room-1` (Step 6 split it from `orders`; see §C.11); the Redoubt's is `order-table~0`, the vault's `order-table~1` |
 | creators-chair | fixture | — | — | command → command-room ×1 | no | `creator/command-room-1` |
 | dispatch-board | fixture | — | — | command → dispatch ×1 | no | `dispatch/dispatch-1` |
 | stores | fixture | — | — | command → receiving ×1 | no | `stores/receiving-1` |
@@ -2381,8 +2367,11 @@ direct-scope `/reshape/:world` route, and the `mapstore` YAML writeback.*
 
 The generic station mechanism (§C, Step 6) mounts only the acts an authored `Part`
 names in its `at`. The world-state half of `WORLD_ACTS` (`acts.rs:1311`) is not
-`at`-bound — its availability is `Always`/`Nearby`/`Embodied`/`AwayFromHome`, not "at
-this part" — so those verbs need their own mounting.
+`at`-bound — its availability is `Always`/`Nearby`/`Embodied`/`AwayFromHome`/`Holding`,
+not "at this part" — so those verbs need their own mounting. `Holding` is the
+availability of `release`: it is offered only while the body holds an order it took
+off a board or a station it claimed (`Within.held`), so the index never lists a verb
+that would be refused with "You are not holding anything to give back".
 
 ## G.1 One surface, name-addressed — not instance-addressed
 

@@ -73,9 +73,10 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    begin_forward, begin_guest, begin_wave, close_guest_arena, end_wave_transient,
-    guest_domain_stats, open_guest_arena, plan_wave_transient, wave_domain_stats, wave_is_live,
-    BumpRange, ForwardOpen, WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
+    begin_forward, begin_guest, begin_wave, close_guest_arena, cover_wave_transient,
+    end_wave_transient, guest_domain_stats, open_guest_arena, plan_wave_transient,
+    wave_domain_stats, wave_is_live, BumpRange, ForwardOpen, WaveGeneration, GUEST_ARENA,
+    KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

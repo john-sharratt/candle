@@ -48,6 +48,7 @@ use candle_conversation::projection::{Builder, SelectionRule, SelectionState};
 use candle_conversation::stencil::{Param as StencilParam, ParamType, ToolSpec};
 use serde::Serialize;
 
+use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::{acts, bench, mission_acts, station};
 
 /// What a tool changes, which decides where it can be used and what it must be
@@ -131,6 +132,15 @@ pub enum Availability {
     /// ladder is for — the same shape as [`Availability::Nearby`], where what
     /// decides is a fact about the room rather than a value in the call.
     AwayFromHome,
+    /// Only while holding something — an order taken, or a station claimed.
+    ///
+    /// **Giving back what you do not have is not a thing that can happen.**
+    /// `release` takes no argument, so the empty-set rule has nothing to empty
+    /// and cannot reach it; the condition is about the body's hands rather than
+    /// about anything it could name, which is what this ladder is for. Absent
+    /// rather than refused, so a body with nothing to give back is never invited
+    /// to try.
+    Holding,
     /// Only for a mind with a body.
     ///
     /// **Not a special case for one character.** Keeper has no body and never
@@ -883,27 +893,28 @@ const INVOKE: Tool = Tool {
             ty: "string",
             required: true,
             description: "The address to act at, exactly as it appears on your device — e.g. \
-                          \"http://local/lift/command-shaft/call\".",
+                          \"http://local/command/order-table~0/collect_mission\".",
         },
-        // **The body is a JSON object written out as a string.** It is free text
-        // the handler parses and validates against the resource's own schema, and
-        // a malformed one comes back as a prescriptive `{error:"bad_json",…}`
-        // rather than a crash — see
+        // **The body is a JSON object, typed by the address.** The grammar
+        // replaces this parameter with the fields the chosen address takes — see
+        // [`crate::engine::invoke_body`] — so what is declared here is the prose
+        // a character reads. The handler still parses a body written out as a
+        // string for a caller that is not the grammar; see
         // [`crate::engine::runtime::Runtime::enact_device`].
         Param {
             name: "body",
             ty: "string",
             required: false,
-            description: "The fields the address asked for, as a JSON object written out — e.g. \
-                          {\"powered\": true}. Leave it off for an address that takes none.",
+            description: "The fields the address asked for, as a JSON object — e.g. \
+                          {\"what\": \"the muster board\"}. `{}` for an address that takes none.",
         },
     ],
     examples: &[Example {
-        situation: "You are standing on the lift's landing and the car is somewhere else. You \
-                    want it here.",
-        call: r#"{"url":"http://local/lift/command-shaft/call","body":"{}"}"#,
-        because: "Calling the lift takes no fields, so the body is an empty object. The world \
-                  answers that the car is on its way; you learn it arrived by looking again.",
+        situation: "You are at the command table with nothing you have been asked to do, and \
+                    want the next thing worth doing.",
+        call: r#"{"url":"http://local/command/order-table~0/collect_mission","body":{}}"#,
+        because: "Taking up a mission names nothing, so the body is an empty object. The world \
+                  answers with what has been asked of you.",
     }],
 };
 
@@ -1082,6 +1093,9 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             // it walks. The prompt is written once, so this is the situation's
             // to offer — the same reason `Nearby` is absent here.
             Availability::AwayFromHome => false,
+            // What a body holds changes whenever it claims or gives back, so it
+            // is the situation's to offer, not the prompt's.
+            Availability::Holding => false,
             // Whether you are at the lift, and whether the car is there, are both
             // facts about where the body is standing this moment — the
             // situation's to offer, not the prompt's.
@@ -1272,13 +1286,12 @@ pub fn show_within(selection: &mut SelectionState, mode: Mode, within: &Within) 
 /// acting in a moment, it is narrating a plan; the turn comes round again in
 /// half a second.
 ///
-/// **It is also the exponent on the grammar's compile, which is what fixed the
-/// number.** `stencil::compile` tokenises in left context and therefore cannot
-/// memoise, so the compiled tree is the spec's full path expansion and a turn
-/// admitting `p` paths per act costs `p^ACTS_PER_TURN`. Measured on the shipped
-/// catalog in a busy room: `p` is about 360, so four acts is 1.7 × 10¹⁰ paths —
-/// a compile that allocated ~390 MB a second without bound and took the machine
-/// down twice. Two acts is about 130,000, which compiles in milliseconds.
+/// **It is also the exponent on the decodes a turn admits, which is what fixed
+/// the number.** A turn admitting `p` paths per act admits `p^ACTS_PER_TURN`.
+/// Measured on the shipped catalog in a busy room: `p` is about 360, so four acts
+/// is 1.7 × 10¹⁰ paths — a compile that allocated ~390 MB a second without bound
+/// and took the machine down twice. Two acts is about 130,000, which compiles in
+/// milliseconds.
 ///
 /// [`tests::a_full_room_stays_inside_the_path_budget`] holds the whole product
 /// under [`MAX_TURN_PATHS`], so a future act with two enumerated arguments fails
@@ -1519,12 +1532,13 @@ pub enum Choices {
     QueryUrl,
 
     /// **Every verb-path an `invoke` may act on** ([`Within::invokable`]) — each
-    /// reachable resource's `<url>/<verb>` for the verbs it affords. Bound to
+    /// reachable resource's `<url>/<verb>` for the verbs it affords, and only the
+    /// ones the world would take from this body now ([`invoke_body`]). Bound to
     /// `invoke`'s `url`, so the decoder is forced through a whole verb-path the
     /// world actually serves: a character cannot `invoke` a bare resource
     /// (a `405`), nor a verb the resource does not have. The complement of
     /// [`Choices::QueryUrl`] — query reads a resource, invoke acts on a verb of
-    /// one.
+    /// one. Each address brings the typed `body` of the act behind it.
     InvokeUrl,
 }
 
@@ -1578,6 +1592,63 @@ pub fn fixed_values(tool: &str, param: &str) -> Option<&'static [&'static str]> 
         .iter()
         .find(|(t, p, _)| *t == tool && *p == param)
         .map(|(_, _, v)| *v)
+}
+
+/// The smallest value an integer parameter may take, where that is not
+/// negative infinity. `(tool, param, minimum)`.
+///
+/// A coordinate is signed and a depth is not: with no minimum the grammar
+/// offers `-` first, and a drill to `-5` metres is written only to be refused.
+const MINIMUM: &[(&str, &str, f64)] = &[("command_tower", "depth", 0.0)];
+
+/// The minimum for an integer parameter, if it has one. See [`MINIMUM`].
+fn minimum_of(tool: &str, param: &str) -> Option<f64> {
+    MINIMUM
+        .iter()
+        .find(|(t, p, _)| *t == tool && *p == param)
+        .map(|(_, _, m)| *m)
+}
+
+/// One value of a choosing parameter and the fields it requires.
+type Needs = (&'static str, &'static [&'static str]);
+
+/// What each value of a choosing parameter requires beside it.
+/// `(tool, param) → [(value, fields)]`.
+///
+/// `command_tower`'s fields belong to its action — a fold takes `x` and `y`, a
+/// siege a `target`, a drill a `depth` — so none of them is needed by every
+/// action and none can be listed required outright. Left optional, the grammar
+/// offers the close straight after `relocate`, and a body took it: the tower
+/// was refused "A fold needs somewhere to fold to." The stencil writes the
+/// listed fields as required after that value ([`StencilParam::requires`]), so
+/// the call cannot close without what its choice depends on. A value with no
+/// entry takes nothing and may close at once.
+///
+/// A side table like [`LIVE`], and closed by
+/// [`tests::every_requirement_names_a_real_choice_and_real_fields`].
+const REQUIRES: &[(&str, &str, &[Needs])] = &[(
+    "command_tower",
+    "action",
+    &[
+        ("relocate", &["x", "y"]),
+        ("siege", &["target"]),
+        ("drill down", &["depth"]),
+    ],
+)];
+
+/// The fields each value of a parameter requires. See [`REQUIRES`].
+fn value_requirements(tool: &str, param: &str) -> Vec<(String, Vec<String>)> {
+    REQUIRES
+        .iter()
+        .filter(|(t, p, _)| *t == tool && *p == param)
+        .flat_map(|(_, _, rules)| rules.iter())
+        .map(|(value, fields)| {
+            (
+                (*value).to_string(),
+                fields.iter().map(|f| (*f).to_string()).collect(),
+            )
+        })
+        .collect()
 }
 
 /// The parameters the **world** enumerates. `(tool, param) → Choices`.
@@ -1715,6 +1786,9 @@ pub struct Within {
     pub owed: Vec<String>,
     /// What can be taken and held from here.
     pub claimable: Vec<String>,
+    /// What this body is holding now — the orders it has taken and the station
+    /// it has claimed. What [`Availability::Holding`] reads.
+    pub held: Vec<String>,
     /// What there is here to read.
     pub readable: Vec<String>,
     /// The surfaces here that can be written on, whether or not anything is on
@@ -1745,11 +1819,12 @@ pub struct Within {
     /// See [`Choices::QueryUrl`].
     pub reachable: Vec<String>,
     /// **Every address an `invoke` may act on** — each reachable resource's
-    /// verb-paths (`<resource-url>/<verb>`). Bound to `invoke`'s `url` so the
-    /// grammar forces a whole verb-path a resource actually affords: a character
-    /// cannot `invoke` a bare resource (a `405`) or a verb that is not there. See
-    /// [`Choices::InvokeUrl`].
-    pub invokable: Vec<String>,
+    /// verb-paths (`<resource-url>/<verb>`), with the act each one runs. Bound to
+    /// `invoke`'s `url` so the grammar forces a whole verb-path a resource
+    /// actually affords: a character cannot `invoke` a bare resource (a `405`) or
+    /// a verb that is not there. The act is what types the body that goes with
+    /// it — see [`Choices::InvokeUrl`] and [`invoke_body`].
+    pub invokable: Vec<Invokable>,
     /// Whether this body is standing somewhere that is not where it musters
     /// from — what [`Availability::AwayFromHome`] reads.
     ///
@@ -1841,6 +1916,9 @@ impl Within {
             .collect();
         let _ = body;
         self.claimable = sim.claimable_at(place);
+        // The orders only: a claimed station lives in the world, not the sim, so
+        // the caller that has the world adds it ahead of this call.
+        self.held.extend(sim.orders_held_by(body));
         // By body id, not by display name: a read cursor is bookkeeping nobody
         // addresses, so it keys on the thing a rename cannot move.
         self.readable = sim.readable_at(place, body);
@@ -1895,11 +1973,6 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
         // in the catalogue because the device route builds its schema from it;
         // this is the one place it leaves the *grammar*. See [`routed`].
         .filter(|t| !routed(t.name))
-        // **A body that has just done this cannot do it again yet.** Absent
-        // rather than refused, for the reason every other absence here is: a
-        // refusal is the most recent thing in the character's window, and a
-        // live cast read its own refusals back and emitted the same act again.
-        .filter(|t| !within.cooling.iter().any(|c| c == t.name))
         .filter(|t| match t.availability {
             Availability::Always => true,
             Availability::MessagingOnly => mode.remote(),
@@ -1913,6 +1986,8 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             Availability::AmongOthers => within.company.len() >= 2,
             // A journey home is only a journey from somewhere else.
             Availability::AwayFromHome => within.away_from_home,
+            // Only a body with something in its hands can give it back.
+            Availability::Holding => !within.held.is_empty(),
             // The map decides. A station in the room is what puts its acts in
             // reach, and walking out takes them with you.
             Availability::AtPart => within.station.iter().any(|s| s == t.name),
@@ -1922,76 +1997,101 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             Availability::AtLift => within.at_lift && !within.lift_here,
             Availability::InLift => within.at_lift && within.lift_here,
         })
-        // **An act whose required argument has nothing to choose from is an act
-        // that cannot be performed**, so it goes.
-        //
-        // The other half of the rule below. An optional parameter with an empty
-        // set drops the parameter; a required one drops the act, because a
-        // branch with no arms is not a constraint but an unrepresentable node,
-        // and the whole grammar fails to compile over it — silently, since the
-        // only symptom is that no turn is ever constrained again. A character
-        // in a room with nowhere to walk to genuinely cannot `move_to`.
-        .filter(|t| {
-            !t.params
-                .iter()
-                .any(|p| p.required && live_empty(t.name, p.name, within))
-        })
+        .filter(|t| performable(t, within))
         .map(|t| ToolSpec {
             name: t.name.to_string(),
-            params: t
-                .params
-                .iter()
-                // **An empty set removes the parameter; it never empties its
-                // branch.** A branch with no arms is not a constraint, it is an
-                // unrepresentable node, and the whole catalog fails to compile
-                // over it — which fails *quietly*: the grammar simply does not
-                // arm, every turn free-decodes, and what comes back is a model
-                // writing an essay where a call should be.
-                //
-                // Only optional parameters reach this. A required one with
-                // nothing to choose from means the act itself is impossible, and
-                // those are gated a level up by `Availability::Nearby` — `ask`
-                // and `tell` are absent when alone rather than present with
-                // nobody to name. `gesture` is the case this is for: aimed at
-                // nobody it is still a thing you can do, so the aim drops and
-                // the act stays.
-                .filter(|p| !(live_empty(t.name, p.name, within) && !p.required))
-                .map(|p| StencilParam {
-                    name: p.name.to_string(),
-                    ty: param_type(p.ty),
-                    required: p.required,
-                    // Free unless the world enumerates it. A closed set over an
-                    // argument the character *means* would be the machinery
-                    // writing its lines; a closed set over one that merely
-                    // names something present is the machinery declining to let
-                    // it name what is not.
-                    enum_values: match live_choice(t.name, p.name) {
-                        // **A vocabulary with nothing in it steers nothing.**
-                        // The empty set here would be a branch with no arms, so
-                        // it falls back to free text — see [`Choices::steers`]
-                        // for why that is right for a vocabulary and wrong for
-                        // everything else.
-                        Some(c) => match live_set(c, within) {
-                            v if v.is_empty() => None,
-                            v => Some(v),
-                        },
-                        // Not world-enumerated. A fixed set is still a closed
-                        // branch — the difference is only who computed it.
-                        None => fixed_values(t.name, p.name)
-                            .map(|v| v.iter().map(|s| (*s).to_string()).collect()),
-                    },
-                    // An act's arguments are scalars; none is a container, and
-                    // none may be null. The effector `invoke` body's typed
-                    // sub-object is spliced in separately (§11), not declared
-                    // here.
-                    items: None,
-                    min_items: 0,
-                    properties: None,
-                    nullable: false,
-                    minimum: None,
-                    requires: Vec::new(),
-                })
-                .collect(),
+            params: stencil_params(t, within),
+        })
+        .collect()
+}
+
+/// Whether a body standing *here* could do this act right now, apart from
+/// whether the act is offered by name: it is not cooling, and every required
+/// argument has something to choose from.
+///
+/// The one test both ways of reaching an act ask — the compiled call in
+/// [`specs_within`] and the `invoke` address in [`invoke_body`] — so a station
+/// act is offered at its address exactly when it would be offered as a call.
+///
+/// **A body that has just done this cannot do it again yet.** Absent rather than
+/// refused, for the reason every other absence here is: a refusal is the most
+/// recent thing in the character's window, and a live cast read its own refusals
+/// back and emitted the same act again.
+///
+/// **An act whose required argument has nothing to choose from cannot be
+/// performed**, so it goes. An optional parameter with an empty set drops the
+/// parameter; a required one drops the act, because a branch with no arms is not
+/// a constraint but an unrepresentable node, and the whole grammar fails to
+/// compile over it — silently, since the only symptom is that no turn is ever
+/// constrained again. A character in a room with nowhere to walk to genuinely
+/// cannot `move_to`.
+pub(super) fn performable(t: &Tool, within: &Within) -> bool {
+    !within.cooling.iter().any(|c| c == t.name)
+        && !t
+            .params
+            .iter()
+            .any(|p| p.required && live_empty(t.name, p.name, within))
+}
+
+/// One act's parameters as the grammar's own, for a character standing *here*.
+///
+/// The one mapping every grammar is built through: the act's own call, and the
+/// `body` object each `invoke` address carries ([`invoke_body`]) — so a station
+/// act is decoded against the same enums whether it is named as a call or
+/// reached through the device.
+pub(super) fn stencil_params(t: &Tool, within: &Within) -> Vec<StencilParam> {
+    t.params
+        .iter()
+        // **An empty set removes the parameter; it never empties its branch.** A
+        // branch with no arms is not a constraint, it is an unrepresentable node,
+        // and the whole catalog fails to compile over it — which fails *quietly*:
+        // the grammar simply does not arm, every turn free-decodes, and what
+        // comes back is a model writing an essay where a call should be.
+        //
+        // Only optional parameters reach this. A required one with nothing to
+        // choose from means the act itself is impossible, and those are gated a
+        // level up by `Availability::Nearby` — `ask` and `tell` are absent when
+        // alone rather than present with nobody to name. `gesture` is the case
+        // this is for: aimed at nobody it is still a thing you can do, so the aim
+        // drops and the act stays.
+        .filter(|p| !(live_empty(t.name, p.name, within) && !p.required))
+        .map(|p| StencilParam {
+            name: p.name.to_string(),
+            ty: param_type(p.ty),
+            required: p.required,
+            // Free unless the world enumerates it. A closed set over an argument
+            // the character *means* would be the machinery writing its lines; a
+            // closed set over one that merely names something present is the
+            // machinery declining to let it name what is not.
+            enum_values: match live_choice(t.name, p.name) {
+                // **A vocabulary with nothing in it steers nothing.** The empty
+                // set here would be a branch with no arms, so it falls back to
+                // free text — see [`Choices::steers`] for why that is right for a
+                // vocabulary and wrong for everything else.
+                Some(c) => match live_set(c, within) {
+                    v if v.is_empty() => None,
+                    v => Some(v),
+                },
+                // Not world-enumerated. A fixed set is still a closed branch —
+                // the difference is only who computed it.
+                None => fixed_values(t.name, p.name)
+                    .map(|v| v.iter().map(|s| (*s).to_string()).collect()),
+            },
+            // An act's arguments are scalars; none is a container, and none may
+            // be null.
+            items: None,
+            min_items: 0,
+            properties: None,
+            nullable: false,
+            minimum: minimum_of(t.name, p.name),
+            requires: value_requirements(t.name, p.name),
+            // **What each address carries is decided by which address it is.**
+            // Only `invoke`'s `url` brings fields of its own: the typed body its
+            // endpoint accepts, in place of a free `body` beside it.
+            shapes: match live_choice(t.name, p.name) {
+                Some(Choices::InvokeUrl) => invoke_body::shapes(within),
+                _ => Vec::new(),
+            },
         })
         .collect()
 }
@@ -2065,7 +2165,7 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Invitees => within.invitees.clone(),
         Choices::Contacts => within.contacts.clone(),
         Choices::QueryUrl => within.reachable.clone(),
-        Choices::InvokeUrl => within.invokable.clone(),
+        Choices::InvokeUrl => invoke_body::urls(within),
     }
 }
 
@@ -2099,16 +2199,21 @@ fn live_empty(tool: &str, param: &str, within: &Within) -> bool {
 
 /// How many distinct decodes a turn's grammar admits, near enough to budget it.
 ///
-/// **The compile is exponential in this number and nothing else bounds it.**
-/// `stencil::compile` tokenises each node *in its left context*, so a real
-/// tokenizer's boundary merges are honoured — and that means it cannot memoise:
-/// one spec node reached along two different paths lowers twice. The compiled
-/// tree is therefore the spec's full path expansion, and an action loop of
-/// `ACTS_PER_TURN` acts raises the per-act count to that power.
+/// **A budget on what the grammar means, not on what the compile costs.** The
+/// compile memoises on `(spec node, left context)`, and a choice's successors
+/// are shared, so the lowered tree grows with the number of *distinct* nodes —
+/// which [`invoke_body`]'s tests hold separately. The path count is the larger
+/// number: every combination of arguments the grammar admits, which is what a
+/// change to the catalog multiplies. A catalog that keeps it inside
+/// [`MAX_TURN_PATHS`] keeps the tree small whatever the sharing does, and an act
+/// with three enumerated arguments is still the thing this catches first.
 ///
 /// A parameter contributes its enum's width, or 1 when it is free text (one
 /// path, whatever the model writes). An *optional* parameter contributes
-/// `1 + width`, because absent is a path of its own.
+/// `1 + width`, because absent is a path of its own. A parameter whose values
+/// bring fields of their own ([`StencilParam::shapes`]) contributes the *sum*
+/// over its values of those fields' paths — each value is one shape, not a
+/// factor.
 ///
 /// This is not theoretical. Nine all-string acts gave about eight paths an act —
 /// four thousand over a turn, and instant. Adding one act with three enumerated
@@ -2116,18 +2221,34 @@ fn live_empty(tool: &str, param: &str, within: &Within) -> bool {
 /// compile allocated about 390 MB a second, without bound, and took the machine
 /// down twice before the cause was understood.
 pub fn estimated_paths(specs: &[ToolSpec]) -> u128 {
-    let per_act: u128 = specs
-        .iter()
-        .map(|t| {
-            t.params.iter().fold(1u128, |acc, p| {
-                let width = p.enum_values.as_ref().map_or(1, |v| v.len() as u128);
-                // Absent is a path too, for anything optional.
-                let choices = if p.required { width } else { 1 + width };
-                acc.saturating_mul(choices)
-            })
-        })
-        .sum();
+    let per_act: u128 = specs.iter().map(|t| paths_of(&t.params)).sum();
     per_act.saturating_pow(ACTS_PER_TURN as u32)
+}
+
+/// The paths through a list of sibling parameters: the product of each one's.
+fn paths_of(params: &[StencilParam]) -> u128 {
+    params
+        .iter()
+        .fold(1u128, |acc, p| acc.saturating_mul(param_paths(p)))
+}
+
+/// The paths through one parameter, absent included when it is optional.
+fn param_paths(p: &StencilParam) -> u128 {
+    let choices = if !p.shapes.is_empty() {
+        p.shapes
+            .iter()
+            .map(|(_, fields)| paths_of(fields))
+            .fold(0u128, u128::saturating_add)
+    } else if let Some(fields) = &p.properties {
+        paths_of(fields)
+    } else {
+        p.enum_values.as_ref().map_or(1, |v| v.len() as u128)
+    };
+    if p.required {
+        choices
+    } else {
+        choices.saturating_add(1)
+    }
 }
 
 /// The most paths a turn's grammar may admit before it is refused.
@@ -2630,28 +2751,26 @@ mod tests {
     /// **No parameter may declare a type the grammar cannot bound.**
     ///
     /// The stencil compiles `string` to a terminated span, `boolean` to a
-    /// two-arm branch, and an `enum` to a closed branch over its values. For
-    /// `integer`, `number`, `array` and `object` it compiles *any
+    /// two-arm branch, an `enum` to a closed branch over its values, and an
+    /// `integer` to digits unrolled to
+    /// [`candle_conversation::stencil::MAX_INTEGER_DIGITS`] with nothing but a
+    /// digit admitted. For `number`, `array` and `object` it compiles *any
     /// structurally-valid JSON value* — and JSON nests without limit, so
     /// enumerating those states never terminates.
     ///
-    /// This is not a style rule. The original nine acts were all-string, so the
-    /// path was never reached; the first `integer` added here made
+    /// This is not a style rule. A catalog `number` or `array` made
     /// [`tests::the_grammar_compiles_for_an_empty_room_and_for_a_full_one`]
     /// allocate about 390 MB every second without bound, which exhausts a
     /// 64 GB machine's RAM and page file in roughly three minutes and takes
     /// down whatever else is running with it. It cost two crashed editors
-    /// before it was understood.
-    ///
-    /// A count or a coordinate is therefore carried as a string and parsed by
-    /// the act that receives it. That is the weaker-looking type and the
-    /// stronger guarantee.
+    /// before it was understood. The path budget below is what keeps the
+    /// integers honest.
     #[test]
     fn every_parameter_is_a_type_the_grammar_can_bound() {
         for tool in CATALOG.iter() {
             for p in tool.params {
                 assert!(
-                    matches!(p.ty, "string" | "boolean"),
+                    matches!(p.ty, "string" | "boolean" | "integer"),
                     "`{}` declares `{}` as `{}` — the grammar cannot bound that type, and \
                      compiling it does not terminate. Carry it as a string and parse it in the \
                      act.",
@@ -2666,11 +2785,10 @@ mod tests {
     /// **The grammar a busy room compiles must stay inside its path budget.**
     ///
     /// The guard that stands between a catalog change and a machine that stops
-    /// responding. `stencil::compile` tokenises in left context and so cannot
-    /// memoise, which makes the compiled tree the spec's full path expansion —
-    /// exponential in [`ACTS_PER_TURN`]. Adding one act with three enumerated
-    /// arguments took a turn from about four thousand paths to 10¹¹, and the
-    /// compile then allocated without bound until the machine died.
+    /// responding. The decodes a turn admits are exponential in
+    /// [`ACTS_PER_TURN`]. Adding one act with three enumerated arguments took a
+    /// turn from about four thousand paths to 10¹¹, and the compile then
+    /// allocated without bound until the machine died.
     ///
     /// The worst case is not the empty room: it is a character with company to
     /// address, somewhere to walk, things to carry and things to fight, because
@@ -2719,6 +2837,124 @@ mod tests {
             assert!(
                 t.params.iter().any(|p| p.name == *param),
                 "`{tool}` has no `{param}` parameter"
+            );
+        }
+    }
+
+    /// A typo in [`REQUIRES`] names nothing and would leave the call free to
+    /// close without what its choice depends on.
+    #[test]
+    fn every_requirement_names_a_real_choice_and_real_fields() {
+        for (tool, param, rules) in REQUIRES {
+            let t = by_name(tool).unwrap_or_else(|| panic!("`{tool}` is not in the catalog"));
+            let chooser = t
+                .params
+                .iter()
+                .find(|p| p.name == *param)
+                .unwrap_or_else(|| panic!("`{tool}` has no `{param}` parameter"));
+            assert!(
+                chooser.required,
+                "`{tool}.{param}` decides, so it is required"
+            );
+            assert!(
+                live_choice(tool, param).is_some() || fixed_values(tool, param).is_some(),
+                "`{tool}.{param}` has no closed set to decide over"
+            );
+            for (value, fields) in *rules {
+                assert!(!fields.is_empty(), "`{value}` requires nothing");
+                for field in *fields {
+                    let f = t
+                        .params
+                        .iter()
+                        .find(|p| p.name == *field)
+                        .unwrap_or_else(|| panic!("`{tool}` has no `{field}` parameter"));
+                    assert!(!f.required, "`{tool}.{field}` is already required outright");
+                }
+            }
+        }
+    }
+
+    /// **A fold cannot be sent without somewhere to fold to.** The refusal
+    /// "A fold needs somewhere to fold to" was a grammar that offered the close
+    /// right after `relocate`: each action takes different fields, none of them
+    /// is needed by every action, so left to `required` the lot were optional.
+    #[test]
+    fn each_tower_action_requires_the_fields_it_takes() {
+        let mut within = Within::among(&[]);
+        within.tower_actions = vec!["relocate".into(), "siege".into(), "drill down".into()];
+        let params = stencil_params(by_name("command_tower").unwrap(), &within);
+        let action = params.iter().find(|p| p.name == "action").unwrap();
+        let needs = |value: &str| -> Vec<&str> {
+            action
+                .requires
+                .iter()
+                .filter(|(v, _)| v == value)
+                .flat_map(|(_, fields)| fields.iter().map(String::as_str))
+                .collect()
+        };
+        assert_eq!(needs("relocate"), ["x", "y"]);
+        assert_eq!(needs("siege"), ["target"]);
+        assert_eq!(needs("drill down"), ["depth"]);
+        for free in ["lift siege", "surface", "raise shields", "drop shields"] {
+            assert!(needs(free).is_empty(), "{free} takes nothing");
+        }
+        assert!(
+            params
+                .iter()
+                .filter(|p| p.name != "action")
+                .all(|p| p.requires.is_empty()),
+            "only the choosing field carries requirements"
+        );
+    }
+
+    /// **A coordinate and a depth are numbers in the grammar, so they cannot be
+    /// empty.** Written as strings they were free text, and a live tower wrote
+    /// `"depth": ""` — the model's own closing quote lands where its opening one
+    /// does. An integer is written digit by digit under the mask; a depth is
+    /// never negative, and a coordinate may be.
+    #[test]
+    fn a_tower_coordinate_and_depth_are_integers() {
+        let within = Within::among(&[]);
+        let params = stencil_params(by_name("command_tower").unwrap(), &within);
+        let field = |name: &str| params.iter().find(|p| p.name == name).unwrap();
+        for name in ["x", "y", "depth"] {
+            assert_eq!(field(name).ty, ParamType::Integer, "{name}");
+        }
+        assert_eq!(field("x").minimum, None);
+        assert_eq!(field("y").minimum, None);
+        assert_eq!(field("depth").minimum, Some(0.0));
+        assert_eq!(field("target").ty, ParamType::String);
+    }
+
+    /// A rename would otherwise leave a minimum bounding nothing, or bounding a
+    /// string, which the grammar ignores.
+    #[test]
+    fn every_minimum_names_a_real_integer_parameter() {
+        for (tool, param, _) in MINIMUM {
+            let t = by_name(tool).unwrap_or_else(|| panic!("no tool `{tool}`"));
+            let p = t
+                .params
+                .iter()
+                .find(|p| p.name == *param)
+                .unwrap_or_else(|| panic!("`{tool}` has no `{param}` parameter"));
+            assert_eq!(p.ty, "integer", "`{tool}.{param}` is not an integer");
+        }
+    }
+
+    /// An act with no dependent fields compiles exactly as before.
+    #[test]
+    fn an_act_with_no_dependent_fields_requires_nothing() {
+        let within = Within::among(&["Perrin Vastwood"]);
+        for t in CATALOG
+            .iter()
+            .filter(|t| !REQUIRES.iter().any(|(tool, _, _)| *tool == t.name))
+        {
+            assert!(
+                stencil_params(t, &within)
+                    .iter()
+                    .all(|p| p.requires.is_empty()),
+                "{} carries a requirement",
+                t.name
             );
         }
     }
@@ -3025,6 +3261,53 @@ mod tests {
     fn a_physically_present_character_is_not_offered_a_camera() {
         assert!(!named(Mode::Physical).contains(&"send_image"));
         assert!(named(Mode::InstantMessage).contains(&"send_image"));
+    }
+
+    fn offered_to(within: &Within) -> Vec<String> {
+        specs_within(Mode::Physical, within)
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    /// **Giving back is offered only to a body that is holding something.**
+    ///
+    /// `release` takes no argument, so the empty-set rule has nothing to empty,
+    /// and it was `Always` — offered to a body with nothing in its hands and
+    /// refused afterwards, which a live cast did twice in a minute.
+    #[test]
+    fn release_is_offered_only_while_holding_something() {
+        let empty_handed = Within::among(&["Perrin Vastwood"]);
+        assert!(
+            !offered_to(&empty_handed).contains(&"release".to_string()),
+            "release was offered to a body holding nothing"
+        );
+
+        let holding = Within {
+            held: vec!["fabricator 1".into()],
+            ..Within::among(&["Perrin Vastwood"])
+        };
+        assert!(offered_to(&holding).contains(&"release".to_string()));
+    }
+
+    /// Holding something is not company, a place or a station: it is offered
+    /// alone in a corridor as much as in a crowd.
+    #[test]
+    fn release_does_not_depend_on_the_room() {
+        let alone = Within {
+            held: vec!["close the longest silence in the record".into()],
+            ..Within::nowhere()
+        };
+        assert!(offered_to(&alone).contains(&"release".to_string()));
+        assert!(!offered_to(&Within::nowhere()).contains(&"release".to_string()));
+    }
+
+    /// The prompt is written once, so an act that depends on what a body holds
+    /// this moment cannot be in it — it arrives with the situation.
+    #[test]
+    fn release_is_not_in_the_prompt_written_once() {
+        assert!(!named(Mode::Physical).contains(&"release"));
+        assert!(!named(Mode::InstantMessage).contains(&"release"));
     }
 
     /// **Carrying a picture is asked separately from being apart**, and it has
@@ -3482,7 +3765,10 @@ mod tests {
             "http://local/here".to_string(),
             "http://local/command/order-table~0".to_string(),
         ];
-        at_table.invokable = vec!["http://local/command/order-table~0/collect_mission".to_string()];
+        at_table.invokable = vec![Invokable::new(
+            "http://local/command/order-table~0/collect_mission",
+            "collect_mission",
+        )];
         let offered: Vec<String> = specs_within(Mode::Physical, &at_table)
             .iter()
             .map(|s| s.name.clone())

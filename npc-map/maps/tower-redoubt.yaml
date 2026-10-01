@@ -36,7 +36,7 @@ nodes:
     kind: work
     name: the muster hall
     off: [spine-lower]
-    parts: [muster-board, { part: seat, count: 12 }]
+    parts: [muster-board, order-table, { part: seat, count: 12 }]
     habit: busy before a sortie and empty during one
     character: >
       Where orders are given and where a body comes back to. Everything that
