@@ -890,7 +890,7 @@ impl SubstratePersistence {
         let (segment, offset) = self.segments.stage(&bytes);
         let size = bytes.len() as u64;
         if let Some(watch) = self.relocation_watch.as_mut() {
-            watch.record(&header);
+            watch.record(&header, payload);
         }
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
