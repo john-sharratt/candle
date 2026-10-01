@@ -104,18 +104,12 @@ fn logging() {
 /// Print the outcome's own summary line — the figures the table cannot carry.
 fn summarise(name: &str, outcome: &candle_conversation::fragmentation_probe::ProbeOutcome) {
     println!(
-        "\n{name}: story {}/{}, worst sustained efficiency {}%, worst single sample {}%, \
-         weight uptake {}%{}",
+        "\n{name}: story {}/{}, worst sustained efficiency {}%, worst single sample {}%, {}",
         outcome.story_pass,
         outcome.story_total,
         outcome.worst_sustained_efficiency,
         outcome.worst_single_efficiency,
-        outcome.weight_uptake_pct,
-        if outcome.weight_at_limit {
-            " (weight side at its limit — every expert resident)"
-        } else {
-            ""
-        },
+        outcome.weight_uptake_label(),
     );
 }
 
