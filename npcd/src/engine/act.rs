@@ -1171,8 +1171,17 @@ mod tests {
             i.acts[0].args["url"],
             "http://local/lift/command-shaft/call"
         );
-        // The body is a JSON object written out as a string, for now.
+        // A body written as a JSON string is carried as a string.
         assert_eq!(i.acts[0].args["body"], "{}");
+
+        // The grammar writes the body as an object, which is carried as one.
+        let typed = parse(
+            "<tool_call>\n{\"name\": \"invoke\", \"arguments\": \
+             {\"url\": \"http://local/command/order-table~0/collect_mission\", \"body\": {}}}\n\
+             </tool_call>",
+        );
+        assert_eq!(typed.rejected, Vec::new(), "{:?}", typed.rejected);
+        assert_eq!(typed.acts[0].args["body"], serde_json::json!({}));
 
         // The url is required on both, so a call without it is refused, not
         // half-performed.

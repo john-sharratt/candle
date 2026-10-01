@@ -221,7 +221,14 @@ fn legible(reach: Reach, what: &Happening, reader: &str) -> Option<Happening> {
         return None;
     }
     match reach {
-        Reach::OutOfReach => None,
+        // Nothing carries across the building, except a line aimed at you: the
+        // one called after you as you left carries to wherever you have got to.
+        // This is the reciprocal of [`crate::world::World::call_after`], which
+        // is the only way such a line is ever logged away from its addressee.
+        Reach::OutOfReach => match what {
+            Happening::Said { to: Some(t), .. } if t == reader => Some(what.clone()),
+            _ => None,
+        },
         Reach::Here => match what {
             // A whisper is seen by the room and heard by one person: everybody
             // else is told it happened, and to whom, and not a word of it.
@@ -243,11 +250,10 @@ fn legible(reach: Reach, what: &Happening, reader: &str) -> Option<Happening> {
                 voice: Voice::Shouted,
                 ..
             } => Some(what.clone()),
-            // An aimed line called after somebody as they leave carries one room
-            // — to the one it was aimed at, and to nobody else. Everybody in the
-            // room the speaker is in still hears it (that is `Reach::Here`); a
+            // An aimed line called after somebody as they leave carries to the
+            // one it was aimed at, and to nobody else. Everybody in the room
+            // the speaker is in still hears it (that is `Reach::Here`); a
             // bystander one doorway away, who is not who it was for, does not.
-            // This is the reciprocal of [`crate::world::World::call_after`].
             Happening::Said { to: Some(t), .. } if t == reader => Some(what.clone()),
             Happening::Said { .. } => None,
             // A building noise belongs to the room it happened in. Carrying it
@@ -685,6 +691,7 @@ mod tests {
         w.enter("m3", "Maker-03", casting("ring-north")).unwrap();
         w.mark_seen("m2");
         w.mark_seen("m3");
+        w.begin_decision("m1");
         w.set_off("m2", casting("ring-north")).unwrap();
         w.settle();
         assert!(
@@ -693,7 +700,7 @@ mod tests {
         );
 
         assert_eq!(
-            w.within_earshot("m1", "Maker-02"),
+            w.just_left("m1", "Maker-02"),
             Some("m2".to_string()),
             "the walker who just stepped out is who a call-after resolves to"
         );
@@ -728,27 +735,26 @@ mod tests {
         );
     }
 
-    /// `within_earshot` resolves *only* the one who has stepped out: a body
-    /// still in the room with the speaker is `here_by_name`'s to answer for, not
-    /// this, and a name nobody answers to resolves to nobody. (That the
-    /// addressee was in the room a moment ago is the grammar's guarantee — `to`
-    /// is bound to the room's company — so the world does not re-derive it.)
+    /// `just_left` resolves *only* the one who has stepped out: a body still in
+    /// the room with the speaker is `here_by_name`'s to answer for, not this, and
+    /// a name nobody answers to resolves to nobody.
     #[test]
-    fn within_earshot_is_the_leaver_only_never_here_and_never_nobody() {
+    fn just_left_is_the_leaver_only_never_here_and_never_nobody() {
         let mut w = vault();
         w.enter("m1", "Maker-01", casting("band-one")).unwrap();
         w.enter("m2", "Maker-02", casting("band-one")).unwrap();
+        w.begin_decision("m1");
         assert_eq!(
-            w.within_earshot("m1", "Maker-02"),
+            w.just_left("m1", "Maker-02"),
             None,
             "somebody still in the room is not called after — that is `here_by_name`"
         );
         assert_eq!(
-            w.within_earshot("m1", "Nobody At All"),
+            w.just_left("m1", "Nobody At All"),
             None,
             "a name nobody answers to resolves to nobody"
         );
-        assert!(w.call_after("m1", "m2", "wait", Voice::Said).is_err());
+        assert!(w.call_after("m1", "m3", "wait", Voice::Said).is_err());
     }
 
     /// **A collision reads as a bump from both sides.** The mover reads it as

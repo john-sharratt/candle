@@ -591,6 +591,16 @@ impl Sim {
         self.ledger.unheld()
     }
 
+    /// The orders one body has taken on and not finished — what `release` puts
+    /// back on the board.
+    pub fn orders_held_by(&self, body: &str) -> Vec<String> {
+        self.ledger
+            .held_by(body)
+            .into_iter()
+            .map(|o| o.what.clone())
+            .collect()
+    }
+
     /// Whether this world has anywhere to be recalled to.
     pub fn has_home(&self) -> bool {
         self.home.is_some()

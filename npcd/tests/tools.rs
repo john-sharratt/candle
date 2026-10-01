@@ -413,6 +413,101 @@ fn a_worked_out_seam_stops_being_offered_rather_than_refusing() {
     );
 }
 
+/// **Every surface `post_notice` offers is one the act then accepts.**
+///
+/// The grammar's `on` and the act's lookup are two readings of one fact, and a
+/// live cast was refused "nothing here called the wall turret to write on" for a
+/// name the grammar had offered. Each offered surface is written on in turn, in
+/// every room of the waste.
+#[test]
+fn every_surface_offered_to_write_on_can_be_written_on() {
+    let h = waste();
+    let rooms: Vec<(String, String)> = h.read(|w| {
+        w.map()
+            .areas()
+            .flat_map(|a| {
+                a.nodes
+                    .iter()
+                    .map(|n| (a.id.clone(), n.id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    });
+    let mut written = 0;
+    for (area, node) in rooms {
+        if h.with(|w| w.place("c1", Where::new(&area, &node))).is_err() {
+            continue;
+        }
+        for on in admits(&h, "c1", "post_notice", "on").unwrap_or_default() {
+            let out = perform(
+                &h,
+                "c1",
+                &act(
+                    "post_notice",
+                    json!({"on": on, "what": "a line left behind"}),
+                ),
+            );
+            assert!(
+                out.happened(),
+                "`{on}` was offered at {area}/{node} and then refused: {out:?}"
+            );
+            written += 1;
+        }
+    }
+    assert!(written > 0, "no room offered anything to write on");
+}
+
+/// **A body that walks on while it decides still acts on what it was offered.**
+///
+/// The grammar is built from the room a body stands in when it begins deciding,
+/// and a decode takes seconds — long enough for the metronome to carry a moving
+/// body a leg away. A live cast was offered "the wall turret" on the rampart and
+/// refused "nothing here called the wall turret to write on" by the time the
+/// call landed, a room away. Every act that names something in the room reads
+/// that room as the body decided in, and as the room it is in once the decision
+/// is over.
+#[test]
+fn a_body_that_walks_on_while_deciding_still_acts_on_what_it_was_offered() {
+    let h = waste();
+    stand(&h, "c1", "tower-redoubt", "rampart");
+    h.with(|w| w.begin_decision("c1"));
+    stand(&h, "c1", "tower-redoubt", "bridge");
+
+    let wrote = perform(
+        &h,
+        "c1",
+        &act(
+            "post_notice",
+            json!({"on": "the wall turret", "what": "set to air only"}),
+        ),
+    );
+    assert!(wrote.happened(), "{wrote:?}");
+
+    let set = perform(
+        &h,
+        "c1",
+        &act(
+            "operate",
+            json!({"what": "wall turret 1", "mode": "air only"}),
+        ),
+    );
+    assert!(set.happened(), "{set:?}");
+
+    h.with(|w| w.end_decision("c1"));
+    let late = perform(
+        &h,
+        "c1",
+        &act(
+            "post_notice",
+            json!({"on": "the wall turret", "what": "again"}),
+        ),
+    );
+    assert!(
+        !late.happened(),
+        "a finished decision still reached the room it was made in: {late:?}"
+    );
+}
+
 /// A machine offers its own states and not another machine's — **less the one
 /// it is already in.**
 ///
@@ -783,7 +878,7 @@ fn folding_the_tower_moves_it_and_spends_what_it_costs() {
         "c1",
         &act(
             "command_tower",
-            json!({"action":"relocate","x":"-300","y":"180"}),
+            json!({"action":"relocate","x":-300,"y":180}),
         ),
     );
     assert!(out.happened(), "{out:?}");
@@ -801,7 +896,7 @@ fn drilling_in_takes_the_fold_away_until_the_tower_surfaces() {
     perform(
         &h,
         "c1",
-        &act("command_tower", json!({"action":"drill down","depth":"60"})),
+        &act("command_tower", json!({"action":"drill down","depth":60})),
     );
     assert_eq!(h.sim(|s| s.tower.as_ref().unwrap().depth), 60);
 
@@ -817,6 +912,55 @@ fn drilling_in_takes_the_fold_away_until_the_tower_surfaces() {
     assert!(admits(&h, "c1", "command_tower", "action")
         .unwrap()
         .contains(&"relocate".to_string()));
+}
+
+#[test]
+fn a_drill_that_names_no_depth_or_a_bad_one_is_refused_and_spends_nothing() {
+    let h = waste();
+    stand(&h, "c1", "tower-redoubt", "bridge");
+    let before = h.sim(|s| s.tower.as_ref().unwrap().stock_of(Resource::Energy));
+
+    let none = perform(
+        &h,
+        "c1",
+        &act("command_tower", json!({"action":"drill down"})),
+    );
+    assert!(refused(&none).contains("needs a depth"), "{none:?}");
+    for bad in [json!("deep"), json!("60"), json!(""), json!(0), json!(-5)] {
+        let out = perform(
+            &h,
+            "c1",
+            &act(
+                "command_tower",
+                json!({"action":"drill down","depth":bad.clone()}),
+            ),
+        );
+        assert!(refused(&out).contains("depth"), "{bad}: {out:?}");
+    }
+    let past = perform(
+        &h,
+        "c1",
+        &act(
+            "command_tower",
+            json!({"action":"relocate","x":"-300","y":"180"}),
+        ),
+    );
+    assert!(refused(&past).contains("somewhere to fold to"), "{past:?}");
+    let off = perform(
+        &h,
+        "c1",
+        &act(
+            "command_tower",
+            json!({"action":"relocate","x":99999999999i64,"y":0}),
+        ),
+    );
+    assert!(refused(&off).contains("off the map"), "{off:?}");
+
+    h.sim(|s| {
+        let t = s.tower.as_ref().unwrap();
+        assert_eq!(t.depth, 0);
+        assert_eq!(t.stock_of(Resource::Energy), before);
+    });
 }
 
 #[test]
@@ -1373,6 +1517,23 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
         )
     });
     for name in offered(&waste, "c1") {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+
+    // `release` becomes reachable only once something is held — a state has to
+    // exist before its act does. The vault seeds orders any body can take.
+    assert!(perform(
+        &vault,
+        "m1",
+        &act(
+            "claim",
+            json!({"what": "close the longest silence in the record"})
+        )
+    )
+    .happened());
+    for name in offered(&vault, "m1") {
         if !seen.contains(&name) {
             seen.push(name);
         }

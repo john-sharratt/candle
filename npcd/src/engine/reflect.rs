@@ -376,6 +376,7 @@ fn call_tree(
                 nullable: false,
                 minimum: None,
                 requires: Vec::new(),
+                shapes: Vec::new(),
             })
             .collect(),
     };

@@ -244,10 +244,11 @@ fn ask(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         };
     };
     let Some(id) = here_by_name(hosted, body, &to) else {
-        // Not in the room. If they have just stepped out and are still within
-        // earshot, the question is called after them rather than lost — the same
-        // parting-line exception `tell` and `whisper` make below.
-        if let Some(id) = hosted.read(|w| w.within_earshot(body, &to)) {
+        // Not in the room. If they were in the company this character decided
+        // with and have stepped out since, the question is called after them
+        // rather than lost — the same parting-line exception `tell` and
+        // `whisper` make below.
+        if let Some(id) = hosted.read(|w| w.just_left(body, &to)) {
             return match hosted
                 .with(|w| w.call_after(body, &id, format!("asking {about}"), Voice::Said))
             {
@@ -343,9 +344,9 @@ fn tell(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     // Addressed by the name the character knows them by, resolved against who
     // is actually here. A name it cannot see is not a name it can speak to.
     let Some(id) = here_by_name(hosted, body, &to) else {
-        // Just stepped out and still within earshot: call the line after them
+        // Stepped out since the character decided: call the line after them
         // rather than lose it. See [`npc_map::world::World::call_after`].
-        if let Some(id) = hosted.read(|w| w.within_earshot(body, &to)) {
+        if let Some(id) = hosted.read(|w| w.just_left(body, &to)) {
             return match hosted.with(|w| w.call_after(body, &id, intent.clone(), Voice::Said)) {
                 Ok(()) => {
                     hosted.with_sim(|s| s.ledger.answered(body, &id));
@@ -382,9 +383,9 @@ fn whisper(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         return Outcome::Refused("You meant to whisper to somebody, but not to whom.".into());
     };
     let Some(id) = here_by_name(hosted, body, &to) else {
-        // Just stepped out and still within earshot: the line goes after them,
+        // Stepped out since the character decided: the line goes after them,
         // low, meant only for them. See [`npc_map::world::World::call_after`].
-        if let Some(id) = hosted.read(|w| w.within_earshot(body, &to)) {
+        if let Some(id) = hosted.read(|w| w.just_left(body, &to)) {
             return match hosted.with(|w| w.call_after(body, &id, intent.clone(), Voice::Whispered))
             {
                 Ok(()) => {
@@ -570,7 +571,18 @@ fn thing_here_called(hosted: &Hosted, body: &str, want: &str) -> Option<String> 
 /// a list that named sixty rooms would be a list nobody could read.
 pub fn destinations(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
     hosted.read(|w| {
-        let Some(here) = w.actor(body).map(|a| a.at.clone()) else {
+        // **From where the body began deciding, while it is deciding.** The
+        // grammar offers these names before a decode that outlasts a step of
+        // the metronome, and the act chosen from them is answered after it.
+        // Measured from the room the body has since reached, the room it
+        // walked into is no longer a place to go or look at, and an act naming
+        // it was refused for using what it was offered. See
+        // [`npc_map::world::World::decided_at`].
+        let Some(here) = w
+            .decided_at(body)
+            .cloned()
+            .or_else(|| w.actor(body).map(|a| a.at.clone()))
+        else {
             return Vec::new();
         };
         // One pass over the graph. Everything below asks this rather than
@@ -1040,17 +1052,19 @@ mod tests {
         );
     }
 
-    /// Two together in a room; one walks out and its whole journey settles (so
-    /// it arrives with `walk` cleared, the everyday state); then the one left
-    /// behind speaks. This drives the *real* movement path — enter together,
-    /// `set_off`, `settle` — rather than a hand-frozen mid-walk, because the
-    /// frozen state is not the one a reply actually meets.
-    fn one_walks_out() -> Hosted {
+    /// Two together in a room, the first beginning to decide; the other walks
+    /// out to `to` and its whole journey settles (so it arrives with `walk`
+    /// cleared, the everyday state); then the one left behind speaks. This drives
+    /// the *real* movement path — enter together, `set_off`, `settle` — rather
+    /// than a hand-frozen mid-walk, because the frozen state is not the one a
+    /// reply actually meets.
+    fn walks_out_to(to: Where) -> Hosted {
         let h = vault();
         h.with(|w| {
             w.enter("m1", "Maker-01", at("band-one")).unwrap();
             w.enter("m2", "Maker-02", at("band-one")).unwrap();
-            w.set_off("m2", at("ring-north")).unwrap();
+            w.begin_decision("m1");
+            w.set_off("m2", to).unwrap();
             w.settle();
             assert!(
                 w.actor("m2").unwrap().walk.is_none(),
@@ -1060,6 +1074,10 @@ mod tests {
         h.delta("m1");
         h.delta("m2");
         h
+    }
+
+    fn one_walks_out() -> Hosted {
+        walks_out_to(at("ring-north"))
     }
 
     fn heard_words(h: &Hosted, id: &str, needle: &str) -> bool {
@@ -1136,6 +1154,54 @@ mod tests {
         assert!(
             heard_words(&h, "m2", "do not trust the record"),
             "the walker did not hear the whisper called after them"
+        );
+    }
+
+    /// **Out of sight is no excuse.** The addressee was in the company the
+    /// speaker decided with, so a line to them is delivered however far they
+    /// have gone while the decode ran — the case that was being refused as
+    /// "is not here" when the walker had left the speaker's view.
+    #[test]
+    fn a_tell_ask_and_whisper_reach_somebody_who_walked_out_of_sight() {
+        for (tool, args, words) in [
+            (
+                "tell",
+                json!({"to": "Maker-02", "intent": "that the record holds"}),
+                "record holds",
+            ),
+            (
+                "ask",
+                json!({"to": "Maker-02", "about": "whether the gap widened"}),
+                "gap widened",
+            ),
+            (
+                "whisper",
+                json!({"to": "Maker-02", "intent": "that I distrust it"}),
+                "distrust it",
+            ),
+        ] {
+            let h = walks_out_to(Where::new("vault-chronicle", "core"));
+            let out = perform(&h, "m1", &act(tool, args));
+            assert!(out.departing(), "{tool}: {out:?}");
+            assert!(heard_words(&h, "m2", words), "{tool}: not heard");
+        }
+    }
+
+    /// Somebody who was never in the speaker's company is still "not here", with
+    /// who is — the refusal stays for the name nobody could have been offered.
+    #[test]
+    fn a_tell_to_somebody_never_in_the_company_is_refused() {
+        let h = one_walks_out();
+        h.with(|w| w.enter("m3", "Maker-03", at("ring-north")).unwrap());
+        let out = perform(
+            &h,
+            "m1",
+            &act("tell", json!({"to": "Maker-03", "intent": "hello"})),
+        );
+        assert!(!out.happened(), "{out:?}");
+        assert!(
+            out.line().unwrap().contains("Maker-03 is not here"),
+            "{out:?}"
         );
     }
 

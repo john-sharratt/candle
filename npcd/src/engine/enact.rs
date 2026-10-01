@@ -104,12 +104,16 @@ fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// A count written as a string, which is how every number reaches this catalog.
-///
-/// The grammar can bound a string and cannot bound a JSON number — enumerating
-/// a number's states does not terminate, because JSON values nest without limit
-/// — so a count arrives as text and is parsed here. An unparseable one is one,
-/// which is what a character that wrote "a few" meant.
+/// A whole number written as a JSON number, which is how an `integer`
+/// parameter arrives. A string, even one of digits, is not one: the grammar
+/// writes an integer digit by digit, so a string here came from outside it.
+fn whole(args: &Map<String, Value>, key: &str) -> Option<i64> {
+    args.get(key)?.as_i64()
+}
+
+/// A count written as a string, the way an optional quantity reaches this
+/// catalog: left out, or empty, it is one, and so is an unparseable one, which
+/// is what a character that wrote "a few" meant.
 fn count(args: &Map<String, Value>, key: &str) -> u32 {
     text(args, key)
         .and_then(|s| s.trim().parse::<u32>().ok())
@@ -237,7 +241,7 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let Some(what) = text(args, "what") else {
         return Outcome::Refused("You meant to read something, but not what.".into());
     };
-    let place = hosted.place_of(body);
+    let place = hosted.standpoint_of(body);
     let me = my_name(hosted, body);
     hosted.with_sim(|s| {
         // Marked read as it is handed over, which is what makes the act
@@ -292,7 +296,7 @@ fn post_notice(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcom
             "You meant to write something down, but not where, or not what.".into(),
         );
     };
-    let place = hosted.place_of(body);
+    let place = hosted.standpoint_of(body);
     let me = my_name(hosted, body);
     hosted.with_sim(|s| {
         if s.postings.by_name_at(&place, &on).is_none() {
@@ -312,7 +316,7 @@ fn claim(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let Some(what) = text(args, "what") else {
         return Outcome::Refused("You meant to take something on, but not what.".into());
     };
-    let place = hosted.place_of(body);
+    let place = hosted.standpoint_of(body);
     // A station first, then the board: both are "taking something on", which is
     // why one act covers them, and the world knows which of the two this is.
     let station = hosted.sim(|s| {
@@ -395,7 +399,7 @@ fn gather(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let Some(what) = text(args, "what") else {
         return Outcome::Refused("You meant to work something, but not what.".into());
     };
-    let place = hosted.place_of(body);
+    let place = hosted.standpoint_of(body);
     hosted.with_sim(|s| match s.field.work(&place, &what) {
         None => Outcome::Refused(format!("There is nothing here called {what} to work.")),
         Some((_, 0)) => Outcome::Refused(format!(
@@ -425,7 +429,7 @@ fn engage(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         hosted.with_sim(|s| s.field.clear_stance(body));
         return Outcome::Did("You break off. You are not fighting anybody.".into());
     }
-    let place = hosted.place_of(body);
+    let place = hosted.standpoint_of(body);
     if let Some(target) = text(args, "target") {
         if hosted.sim(|s| s.field.hostile_by_name_at(&place, &target).is_none()) {
             return Outcome::Refused(format!("{target} is not here to fight."));
@@ -455,7 +459,7 @@ fn operate(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             "You meant to work something, but not what, or not into what state.".into(),
         );
     };
-    let place = hosted.place_of(body);
+    let place = hosted.standpoint_of(body);
     hosted.with_sim(|s| {
         let Some(d) = s.devices.by_name_at_mut(&place, &what) else {
             return Outcome::Refused(format!("There is nothing here called {what}."));
@@ -696,11 +700,11 @@ fn command_tower(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
         use crate::sim::tower::{Coord, Posture, FOLD_COST, SIEGE_COST};
         match action.as_str() {
             "relocate" => {
-                let (Some(x), Some(y)) = (text(args, "x"), text(args, "y")) else {
+                let (Some(x), Some(y)) = (whole(args, "x"), whole(args, "y")) else {
                     return Outcome::Refused("A fold needs somewhere to fold to.".into());
                 };
-                let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) else {
-                    return Outcome::Refused("A destination is two numbers.".into());
+                let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y)) else {
+                    return Outcome::Refused("That is off the map.".into());
                 };
                 if !crate::sim::tower::on_map(Coord::new(x, y)) {
                     return Outcome::Refused("That is off the map.".into());
@@ -727,9 +731,14 @@ fn command_tower(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
                 })
             }
             "drill down" => {
-                let depth: u32 = text(args, "depth")
-                    .and_then(|d| d.parse().ok())
-                    .unwrap_or(20);
+                let Some(depth) = whole(args, "depth").filter(|d| *d > 0) else {
+                    return Outcome::Refused(
+                        "A drill needs a depth to drill to, a whole number of metres.".into(),
+                    );
+                };
+                let Ok(depth) = u32::try_from(depth) else {
+                    return Outcome::Refused("That is deeper than the ground goes.".into());
+                };
                 tower.draw(
                     Resource::Energy,
                     crate::sim::tower::DRILL_COST_PER_METRE * depth as u64,
@@ -1050,6 +1059,51 @@ mod tests {
         );
     }
 
+    /// **A place the grammar offered is a place the scan resolves, however far
+    /// the body has walked during the decode.** The character read the rooms
+    /// off the muster hall, chose to look at the rampart, and was a leg onto it
+    /// by the time the act landed — where "the rampart" is the room it stands
+    /// in and so is no longer in the list of places to look at. It was refused
+    /// "You cannot see the rampart from here" for naming exactly what it was
+    /// offered.
+    #[test]
+    fn a_scan_resolves_a_place_offered_before_the_body_walked_there() {
+        let h = tower_with(&[("c1", "Wren Weaver", "muster-hall")]);
+        h.with(|w| w.begin_decision("c1"));
+        let offered = crate::engine::body::reachable(&h, "c1");
+        assert!(
+            offered.iter().any(|n| n == "the rampart"),
+            "the rampart was not offered: {offered:?}"
+        );
+        h.with(|w| {
+            w.set_off("c1", Where::new("tower-redoubt", "rampart"))
+                .unwrap();
+            w.settle();
+        });
+        assert_eq!(
+            crate::engine::body::reachable(&h, "c1"),
+            offered,
+            "the places on offer moved with the body during the decode"
+        );
+
+        let out = perform(&h, "c1", &act("scan", json!({"at": "the rampart"})));
+        assert!(
+            out.line().unwrap().starts_with("You look at the rampart."),
+            "{out:?}"
+        );
+
+        h.with(|w| w.end_decision("c1"));
+        let after = crate::engine::body::reachable(&h, "c1");
+        assert!(
+            !after.iter().any(|n| n == "the rampart"),
+            "once decided, the body's own room is not a place to look at: {after:?}"
+        );
+        assert!(
+            after.iter().any(|n| n == "the muster hall"),
+            "once decided, the room it left is: {after:?}"
+        );
+    }
+
     /// With nobody else on the floor, the handset is where to look.
     #[test]
     fn a_scan_of_an_empty_floor_points_at_the_handset() {
@@ -1334,10 +1388,7 @@ mod tests {
         let out = perform(
             &h,
             "c1",
-            &act(
-                "command_tower",
-                json!({"action":"relocate","x":"10","y":"10"}),
-            ),
+            &act("command_tower", json!({"action":"relocate","x":10,"y":10})),
         );
         assert!(!out.happened());
         assert!(out.line().unwrap().contains("cannot relocate"), "{out:?}");
@@ -1352,7 +1403,7 @@ mod tests {
             "c1",
             &act(
                 "command_tower",
-                json!({"action":"relocate","x":"-300","y":"180"}),
+                json!({"action":"relocate","x":-300,"y":180}),
             ),
         );
         assert!(out.happened(), "{out:?}");

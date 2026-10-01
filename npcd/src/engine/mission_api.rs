@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::mission::{Mission, Origin, Todo};
-use crate::engine::{no_engine, speaking_as};
+use crate::engine::{no_engine, owned, owned_by, speaking_as};
 
 #[derive(Debug, Deserialize)]
 pub struct LodgeBody {
@@ -43,17 +43,14 @@ pub struct LodgeBody {
 /// it is a write to something they own.
 pub async fn lodge(
     State(s): State<Arc<Authored>>,
-    Path(nid): Path<u64>,
+    Path(nid): Path<String>,
     headers: HeaderMap,
     Json(body): Json<LodgeBody>,
 ) -> Response {
-    let (id, owner) = match owner_of(&s, &headers).await {
+    let (id, owner, nid) = match owned_by(&s, &headers, &nid).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    if s.npcs.read().await.visible_to(nid, &owner).is_none() {
-        return err(StatusCode::NOT_FOUND, "not_found", "no such character");
-    }
     let prompt = body.prompt.trim().to_owned();
     if prompt.is_empty() {
         return err(
@@ -123,16 +120,13 @@ pub async fn lodge(
 /// reported and moved on.
 pub async fn status(
     State(s): State<Arc<Authored>>,
-    Path(nid): Path<u64>,
+    Path(nid): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let (_, owner) = match owner_of(&s, &headers).await {
-        Ok(v) => v,
+    let nid = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
         Err(r) => return *r,
     };
-    if s.npcs.read().await.visible_to(nid, &owner).is_none() {
-        return err(StatusCode::NOT_FOUND, "not_found", "no such character");
-    }
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("reading a mission");
     };
@@ -180,7 +174,7 @@ pub async fn command_table(
     let (line, salience) = if body.open {
         (
             "The command table is open. Any of you without a task in hand, come to the command \
-             room and take one up."
+             table and take one up."
                 .to_string(),
             Salience::URGENT,
         )
@@ -228,16 +222,13 @@ pub async fn cancel_all(State(s): State<Arc<Authored>>, headers: HeaderMap) -> R
 /// `POST /v1/npc/:nid/mission/cancel` — call off one character's mission.
 pub async fn cancel(
     State(s): State<Arc<Authored>>,
-    Path(nid): Path<u64>,
+    Path(nid): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let (_, owner) = match owner_of(&s, &headers).await {
-        Ok(v) => v,
+    let nid = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
         Err(r) => return *r,
     };
-    if s.npcs.read().await.visible_to(nid, &owner).is_none() {
-        return err(StatusCode::NOT_FOUND, "not_found", "no such character");
-    }
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("cancelling a mission");
     };

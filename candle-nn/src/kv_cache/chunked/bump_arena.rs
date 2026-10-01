@@ -1491,6 +1491,44 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
     })
 }
 
+/// The plan that covers both `standing` and `wanted`, phase by phase.
+fn covering_plan(standing: [usize; 3], wanted: [usize; 3]) -> [usize; 3] {
+    [
+        standing[0].max(wanted[0]),
+        standing[1].max(wanted[1]),
+        standing[2].max(wanted[2]),
+    ]
+}
+
+/// Raise the recorded plan so a caller that runs **between forwards** has room.
+///
+/// A forward prices its tier from its own width, and the tier then stands for
+/// whoever runs before the next forward. A draft walk is such a caller, and its
+/// cohort is not the forward's: it is every sequence that came out of accept
+/// drafting together, which can be wider than the forward that preceded it. The
+/// head's attention step then carves `rows × (per-row chain)` from a span priced
+/// for fewer rows and exhausts it — measured on the 35B-A3B, a 2-row cohort
+/// asking 9,216 B at offset 61,952 of a 64,256 B span, which is one row's price.
+///
+/// The recorded plan is raised to the per-phase maximum of itself and
+/// `per_phase`, never replaced: the forward that priced it may have reserved
+/// for work still to come (a rewind's replay), and a plan shrunk to the walk's
+/// width would take that room back. A plan that already covers `per_phase`
+/// changes nothing and moves nothing.
+pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
+    let wanted = align_phase_plan(per_phase);
+    let merged = {
+        let mut map = lock_domains();
+        let (_, domain) = domain_entry(&mut map, stream);
+        match domain.planned {
+            Some(standing) if covering_plan(standing, wanted) == standing => return Ok(()),
+            Some(standing) => covering_plan(standing, wanted),
+            None => wanted,
+        }
+    };
+    plan_wave_transient(stream, merged)
+}
+
 /// Open a generation on `phase`'s span.
 ///
 /// **The guard must be held for the whole phase**, and the borrow checker holds
@@ -1921,7 +1959,18 @@ pub(crate) fn persistence_domain(stream: &Arc<CudaStream>) -> Result<BumpArena> 
 #[cfg(test)]
 mod tests {
 
-    use super::{align_phase_plan, aligned_start, WAVE_SPAN_ALIGN};
+    use super::{align_phase_plan, aligned_start, covering_plan, WAVE_SPAN_ALIGN};
+
+    /// A walk wider than the forward raises the phases it outgrows and keeps the
+    /// ones the forward reserved for something else.
+    #[test]
+    fn a_covering_plan_takes_the_larger_of_each_phase() {
+        let forward = [64_256, 30_720, 4_096];
+        let walk = [128_512, 20_480, 8_192];
+        assert_eq!(covering_plan(forward, walk), [128_512, 30_720, 8_192]);
+        assert_eq!(covering_plan(walk, forward), [128_512, 30_720, 8_192]);
+        assert_eq!(covering_plan(forward, forward), forward);
+    }
 
     /// Ranges from one generation never overlap — the property that removes
     /// the need for any slot table or disjointness bookkeeping (§3.6).

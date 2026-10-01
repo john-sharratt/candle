@@ -47,14 +47,17 @@
 //!    - (a) a **nudge** into the next turn's perception ("you seem stuck, try
 //!      something different"). Weak alone — the model demonstrably reads such
 //!      self-nudges and repeats anyway — so it only *explains* the redirect;
-//!    - (b) an **adaptive cooldown** on the offending act for `repetitions + 1`
-//!      turns. This is the *guarantee*: whatever the model concludes, it
-//!      cannot re-emit the act;
+//!    - (b) an **adaptive cooldown** on the offending act that doubles with each
+//!      detection of that act (`2^detections` turns, capped), and is kept per act
+//!      so an intervening walk or different act does not restart it. This is the
+//!      *guarantee*: whatever the model concludes, it cannot re-emit the act;
 //!    - (c) a **forced single reflect** next turn — everything but `reflect` (and
 //!      `move_to`, so the grammar is never empty) is struck. `reflect` is a
 //!      genuinely different activity (the entropy channel), and when the
 //!      character returns the offending act is still cooled, so it must land
-//!      somewhere new. Single-shot, so it cannot become a reflect loop itself.
+//!      somewhere new. Single-shot, and never forced by a looping `reflect`
+//!      itself: that reflect is struck by (b) instead, so the redirect cannot
+//!      become a reflect loop.
 //!
 //!    Per-act opt-out: acts the game *wants* repeated (`act` — a fight needs
 //!    repetition) skip the whole guard, paced only by `cooldown`'s fight rate.
@@ -117,6 +120,9 @@ const ALWAYS_REFLECT: &str = "reflect";
 const WINDOW: usize = 6;
 /// The ceiling on any single cooldown, in turns.
 const COOL_CAP: usize = 16;
+/// The detection count at which the breaker's cooldown stops doubling (`2^4`
+/// turns), before [`COOL_CAP`] applies.
+const LOOP_ESCALATION_CAP: usize = 4;
 /// Jaccard token overlap between two intents that counts as "the same".
 const CLOSE_THRESHOLD: f32 = 0.6;
 /// How many past same-act intents the breaker compares against.
@@ -191,9 +197,10 @@ struct Guard {
     /// Set by the breaker, read by [`Guard::cooling`] on the following turn, and
     /// reset by the next [`Guard::record`].
     force_reflect: bool,
-    /// Consecutive breaker detections for the currently-looping act, so the
-    /// adaptive cooldown grows as `repetitions + 1`.
-    loop_reps: usize,
+    /// Act name → consecutive breaker detections for that act. An act's count
+    /// ends only when that same act is taken without looping, so a walk or a
+    /// different act between two repeats does not restart the escalation.
+    loop_reps: HashMap<String, usize>,
 }
 
 impl Guard {
@@ -269,13 +276,19 @@ impl Guard {
                     .iter()
                     .all(|prev| similarity(prev, intent) >= CLOSE_THRESHOLD);
             if looping {
-                self.loop_reps += 1;
-                self.cool_until
-                    .insert(act.to_string(), turn + self.loop_reps + 1);
-                self.force_reflect = true;
+                let reps = self.loop_reps.entry(act.to_string()).or_insert(0);
+                *reps += 1;
+                let cool = (1usize << (*reps).min(LOOP_ESCALATION_CAP)).min(COOL_CAP);
+                let until = self.cool_until.entry(act.to_string()).or_insert(0);
+                *until = (*until).max(turn + 1 + cool);
+                // A looping reflect is the redirect itself; forcing another
+                // reflect would feed the loop it is meant to break.
+                if act != ALWAYS_REFLECT {
+                    self.force_reflect = true;
+                }
                 fired = true;
             } else {
-                self.loop_reps = 0;
+                self.loop_reps.remove(act);
             }
         }
 
@@ -558,5 +571,137 @@ mod tests {
         took(&g, 1, "ask", "stuck on this");
         assert!(g.cooling(1).contains(&"ask".to_string()));
         assert!(g.cooling(2).is_empty());
+    }
+
+    /// Plays `turns` turns for a character that takes `wants` with `intent`
+    /// whenever the grammar offers it and walks somewhere otherwise — the shape of
+    /// a character with nothing to do, which is the one that loops. Returns how
+    /// many times it took `wants`.
+    fn times_taken(g: &LoopGuards, wants: &'static str, intent: &str, turns: usize) -> usize {
+        let mut taken = 0;
+        for turn in 0..turns {
+            if g.cooling(1).contains(&wants.to_string()) {
+                took(g, 1, "move_to", &format!("room{turn}"));
+            } else {
+                took(g, 1, wants, intent);
+                taken += 1;
+            }
+        }
+        taken
+    }
+
+    /// How many turns `act` stays struck after a loop is caught, walking in the
+    /// meantime.
+    fn turns_struck(g: &LoopGuards, act: &str) -> usize {
+        let mut turns = 0;
+        while g.cooling(1).contains(&act.to_string()) {
+            took(g, 1, "move_to", &format!("room{turns}"));
+            turns += 1;
+        }
+        turns
+    }
+
+    /// **The loop the pulse showed.** A character repeating a self-directed `act`
+    /// with a walk in between came back to the same act every few turns for ever:
+    /// the walk reset the escalation, so each catch struck the act for the same
+    /// short stretch. The escalation belongs to the act, so the stretch grows
+    /// however much else the character does between repeats.
+    #[test]
+    fn a_walk_between_repeats_does_not_reset_the_escalation() {
+        let g = LoopGuards::new();
+        let taken = times_taken(&g, "act", "binding your own wound tighter on the bench", 40);
+        assert!(
+            taken <= 6,
+            "the act came back {taken} times in 40 turns; the cooldown must keep growing"
+        );
+    }
+
+    /// A repeated `reflect` is struck, not forced. The breaker redirects a loop
+    /// into a reflect, so when the loop *is* a reflect there is nowhere to
+    /// redirect it: forcing one more reflect sustained the loop for ever.
+    #[test]
+    fn a_looping_reflect_is_struck_and_not_forced_again() {
+        let g = LoopGuards::new();
+        let thought = "I keep returning to this same place, this same question, this same absence";
+        took(&g, 1, "reflect", thought);
+        assert!(
+            took(&g, 1, "reflect", thought),
+            "the repeat trips the breaker"
+        );
+        let cooling = g.cooling(1);
+        assert!(
+            cooling.contains(&"reflect".to_string()),
+            "the looping reflect is struck"
+        );
+        assert!(
+            !cooling.contains(&"gesture".to_string()),
+            "no reflect is forced, so the other acts stay on offer"
+        );
+    }
+
+    /// The same character wanting only to reflect does it a handful of times in
+    /// 40 turns, not on every turn the guard allows.
+    #[test]
+    fn a_reflect_loop_thins_out() {
+        let g = LoopGuards::new();
+        let taken = times_taken(
+            &g,
+            "reflect",
+            "I keep returning to this same place, this same question, this same absence",
+            40,
+        );
+        assert!(
+            taken <= 7,
+            "reflected {taken} times in 40 turns; the loop must thin out"
+        );
+    }
+
+    /// A character that varies what it does is let go: the escalation is for the
+    /// loop, not a record that follows the act for ever. Once the act is taken
+    /// with something new, a later repeat is caught from the short cooldown.
+    #[test]
+    fn a_different_intent_ends_the_escalation() {
+        let g = LoopGuards::new();
+        let same = "binding your own wound tighter on the bench";
+        for _ in 0..5 {
+            took(&g, 1, "act", same);
+        }
+        assert!(
+            turns_struck(&g, "act") > 4,
+            "a long loop is struck for a long stretch"
+        );
+        took(
+            &g,
+            1,
+            "act",
+            "checking the valve on the coolant loop for a leak",
+        );
+        took(
+            &g,
+            1,
+            "act",
+            "reading the gauge on the far wall until it settles",
+        );
+        took(
+            &g,
+            1,
+            "act",
+            "wiping the dust from the console glass with a sleeve",
+        );
+        took(
+            &g,
+            1,
+            "act",
+            "counting the bolts along the lower rail one by one",
+        );
+        for turn in 0..HISTORY_CAP {
+            took(&g, 1, "move_to", &format!("room{turn}"));
+        }
+        took(&g, 1, "act", same);
+        assert!(took(&g, 1, "act", same), "the repeat is caught again");
+        assert!(
+            turns_struck(&g, "act") <= 3,
+            "a fresh loop starts from the short cooldown"
+        );
     }
 }

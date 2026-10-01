@@ -219,6 +219,34 @@ Nothing said in a room reaches the corridor outside it. You can see who is in
 the green room from the south run; you cannot hear them, which is why walking in
 to ask is still necessary.
 
+**The person you answer may leave while you decide.** A character reads its
+situation, spends seconds decoding, and then acts; the room moves in that time.
+So who a character can address is fixed at the moment it begins deciding
+(`World::begin_decision`, taken just before the grammar is built, ended when the
+turn's acts have run) — the same set the grammar offers `to` from. A `tell`,
+`ask` or `whisper` to somebody who was in that company and is no longer in the
+room is **called after them** (`World::call_after`): logged where the speaker
+decided, and delivered to the addressee alone, at any distance — a bystander in
+either room hears nothing. It reads back as "You tell Maker-02 as they walk
+away." Somebody who was never in the company, or who arrived after the decision
+began, is still refused as "not here", with who is. Without the snapshot the
+only check left is the room as it has become, which refuses a line the grammar
+correctly offered.
+
+**The same goes for the room itself.** The decision also records where the body
+stood (`World::decided_at`), and the acts that name something in the room —
+`read`, `post_notice`, `claim`, `gather`, `engage`, `operate` — look it up there
+(`Hosted::standpoint_of`) rather than wherever the metronome has since carried a
+moving body. A character offered "the wall turret" on the rampart and a leg
+later on is not refused "nothing here called the wall turret". Once the decision
+ends, the room it stands in is the room it acts in.
+
+**And for the places on offer.** The rooms `move_to` and `scan` bind their
+destination to (`body::destinations`) are measured from that same standpoint
+while the body is deciding. Measured from where the body has walked to, the room
+it just entered drops out of the list ("never where it stands"), and a `scan` of
+the room the grammar offered was refused "You cannot see the rampart from here".
+
 ## How a level memory is shaped
 
 Four beats, and no more: what the level is for, what it is like, one sentence
