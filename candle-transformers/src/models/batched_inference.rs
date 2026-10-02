@@ -52,7 +52,7 @@ use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePh
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::{gpu_span, pipeline_record_duration, span};
-use crate::models::speculative_choice::{AcceptWalk, TokenChooser};
+use crate::models::speculative_choice::{AcceptWalk, SpeculativeStep, TokenChooser};
 use crate::models::verify_wave::{issue_verify_wave, VerifyPlan, WaveCoBatch};
 
 /// One R16 chunk's unpacked contents: `(block_idx, k_flat, v_flat, q_flat)`.
@@ -4937,16 +4937,16 @@ pub trait ManagedBatchedModel {
     ) -> Result<Option<u32>> {
         // The batch-of-1 case of the batched driver — one implementation.
         let mut emits: Vec<Box<dyn FnMut(u32) -> bool + '_>> = vec![Box::new(emit)];
-        let next = self.speculative_decode_step_batch(
+        let step = self.speculative_decode_step_batch(
             session,
             &[seq],
             &[committed],
-            max_draft,
+            &[max_draft],
             layer_end,
             chooser,
             &mut emits,
         )?;
-        Ok(next[0])
+        Ok(step.next[0])
     }
 
     /// One lossless speculative-decode step for MANY sequences — semantics identical to running
@@ -4962,6 +4962,12 @@ pub trait ManagedBatchedModel {
     /// under sampling as well as under greedy decode — see [`speculative_choice`] for why a
     /// greedy drafter reduces the textbook accept/reject rule to "sample the row, accept the
     /// proposal iff the sample agrees". Pass [`GreedyChooser`] for bit-identical greedy output.
+    ///
+    /// `max_drafts` is each sequence's own draft depth (see [`super::draft_depth`]): the drafter
+    /// walks the cohort to the deepest of them, once, and each sequence keeps only its own
+    /// prefix of what was drafted. The step reports what each sequence actually drafted
+    /// ([`SpeculativeStep::drafted`]) — fewer than its depth where the drafter proposed less —
+    /// which is what an acceptance estimate must divide by.
     // As [`Self::speculative_decode_step`], over a cohort.
     #[allow(clippy::too_many_arguments)]
     fn speculative_decode_step_batch(
@@ -4969,27 +4975,35 @@ pub trait ManagedBatchedModel {
         session: &mut BatchedInferenceSession,
         seqs: &[usize],
         committed: &[u32],
-        max_draft: usize,
+        max_drafts: &[usize],
         layer_end: usize,
         chooser: &mut dyn TokenChooser,
         emits: &mut [Box<dyn FnMut(u32) -> bool + '_>],
-    ) -> Result<Vec<Option<u32>>> {
+    ) -> Result<SpeculativeStep> {
         // Everything before the forward: drafting, the plain/spec partition and
         // the per-sequence block clones. Spanned so the step's CPU time is
         // covered end to end — `spec:setup` + `spec:verify` + `spec:gather` +
         // `spec:accept` should now sum to the step.
         let t_setup = std::time::Instant::now();
-        if seqs.len() != committed.len() || seqs.len() != emits.len() {
+        if seqs.len() != committed.len()
+            || seqs.len() != emits.len()
+            || seqs.len() != max_drafts.len()
+        {
             candle::bail!(
-                "speculative_decode_step_batch: {} seqs, {} committed, {} emits",
+                "speculative_decode_step_batch: {} seqs, {} committed, {} emits, {} draft depths",
                 seqs.len(),
                 committed.len(),
-                emits.len()
+                emits.len(),
+                max_drafts.len()
             );
         }
         if seqs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SpeculativeStep {
+                next: Vec::new(),
+                drafted: Vec::new(),
+            });
         }
+        let max_draft = max_drafts.iter().copied().max().unwrap_or(0);
         // **Refused up front for a model that cannot rewind.**
         //
         // Speculative decode is built on "decode the whole draft block, then put
@@ -5045,13 +5059,18 @@ pub trait ManagedBatchedModel {
         }
         // ONE call for the whole cohort: the drafter batches its own passes so
         // the weights it reads are read once for the step, not once per session.
-        let drafts = self.speculative_draft(session, seqs, committed, max_draft)?;
+        // It walks to the deepest sequence's depth; each sequence then keeps its
+        // own prefix, so a shallow one verifies — and pays — only that.
+        let mut drafts = self.speculative_draft(session, seqs, committed, max_draft)?;
         if drafts.len() != seqs.len() {
             candle::bail!(
                 "speculative_decode_step_batch: drafter returned {} proposal lists for {} sequences",
                 drafts.len(),
                 seqs.len()
             );
+        }
+        for (d, &depth) in drafts.iter_mut().zip(max_drafts) {
+            d.truncate(depth);
         }
         let blocks: Vec<Vec<u32>> = drafts
             .iter()
@@ -5199,7 +5218,10 @@ pub trait ManagedBatchedModel {
         self.truncate_sequences(session, &targets)?;
         pipeline_record_duration("spec:rollback", t_rollback.elapsed(), 1);
         pipeline_record_duration("spec:accept", t_accept.elapsed(), 1);
-        Ok(next)
+        Ok(SpeculativeStep {
+            next,
+            drafted: blocks.iter().map(|b| b.len() - 1).collect(),
+        })
     }
 
     /// How a session's headers pick each sequence's RoPE rung — the model's

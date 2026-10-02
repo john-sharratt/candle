@@ -49,6 +49,7 @@ pub mod debertav2;
 pub mod decode_utils;
 pub mod deepseek2;
 pub mod delta_net;
+pub mod draft_depth;
 pub mod draft_ladder;
 /// The cohort draft walk drives a `BatchedInferenceSession`, so it shares
 /// `batched_inference`'s gate.

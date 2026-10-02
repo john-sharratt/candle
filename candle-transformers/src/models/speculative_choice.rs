@@ -98,6 +98,17 @@ pub fn continues(block: &[u32], position: usize, token: u32) -> bool {
     position + 1 < block.len() && token == block[position + 1]
 }
 
+/// One cohort speculative step's outcome, per sequence in the order the step was given them.
+pub struct SpeculativeStep {
+    /// The next committed seed (already emitted, held out of the KV), or `None` where the
+    /// sequence's sink asked to stop.
+    pub next: Vec<Option<u32>>,
+    /// The tokens the sequence actually drafted — its requested depth, or fewer where the
+    /// drafter proposed less (none at all takes a plain decode row). An acceptance estimate
+    /// divides by this, never by the depth asked for.
+    pub drafted: Vec<usize>,
+}
+
 /// One speculative step's accept walk, position by position.
 ///
 /// The rule in [`continues`] applied across a cohort, holding the bookkeeping

@@ -14,7 +14,7 @@ use crate::cuda_backend::INHERIT_ALIGN;
 use crate::quantized::k_quants::GgmlType;
 use crate::quantized::ko_quant::ko_tileable;
 use crate::LiveTensor;
-use crate::{CudaDevice, CudaStorage, Result, Shape};
+use crate::{CudaDevice, CudaStorage, DType, Layout, Result, Shape, Storage};
 use half::{bf16, f16};
 
 use crate::cuda_backend::WrapErr;
@@ -48,7 +48,12 @@ use candle_kernels::quantized::{
 use candle_kernels::quantized::{get_repacked_size_bytes, is_gemx_supported, run_repack_gemx};
 
 use super::int8_matmul_mode::q8a128_dense_use_mode2;
+use super::int8_split_k::q8a128_dense_k_splits;
 use super::table_ring::table_ring;
+
+mod split_k;
+pub use split_k::ensure_split_k_scratch;
+use split_k::q8a128_dense_matmul_split_k;
 
 /// Process-cached SM count for the int8 dense tiling (occupancy) heuristic. SM count is a fixed
 /// device property; querying the driver attribute on every matmul would add an FFI call to the hot
@@ -5930,6 +5935,38 @@ pub fn quantize_acts_q8a128<'w>(
     .with_sum_scale(sum_scale))
 }
 
+/// A q8a128 operand for `[rows, cols]` written by a caller's own fused producer.
+///
+/// The buffer is carved where `beside` lives — the open wave's span when it is
+/// wave-scoped, the pool otherwise — exactly as [`quantize_acts_q8a128`] carves
+/// its own, so a producer outside this crate (a model's fused norm or activation
+/// kernel) emits the int8 operand with no standalone quantize launch and no
+/// allocation the arena did not plan. `fill` receives the device address and
+/// must launch the kernel that writes all `q8a1024_byte_len(rows, cols)` bytes
+/// in the q8a1024 layout, with the Σx convention `sum_scale` names.
+pub fn produce_q8a128<'w>(
+    beside: &LiveTensor<'w>,
+    rows: usize,
+    cols: usize,
+    sum_scale: SumScale,
+    fill: impl FnOnce(u64) -> Result<()>,
+) -> Result<Q8a128Operand<'w>> {
+    if !cols.is_multiple_of(128) {
+        crate::bail!("produce_q8a128: cols={cols} must be a multiple of 128");
+    }
+    let (storage, _) = beside.storage_and_layout();
+    let Storage::Cuda(cuda) = &*storage else {
+        crate::bail!("produce_q8a128: the producer's tensor must be on CUDA");
+    };
+    let device = cuda.device().clone();
+    let origin = cuda.backing;
+    drop(storage);
+    let bytes = q8a1024_byte_len(rows, cols);
+    let (ptr, owned, backing) = resolve_u8_out(origin, &device, bytes)?;
+    fill(ptr)?;
+    Ok(q8a128_from_out(owned, ptr, backing, bytes, rows, cols, &device)?.with_sum_scale(sum_scale))
+}
+
 /// Fused RMSNorm → q8a128: normalize each row of `xs` `[.. × K]` by `alpha` `[K]` and emit the
 /// q8a128 activation operand directly, in ONE kernel — the producer epilogue for B1/B3/B5. This
 /// replaces the unfused `rms_norm` (FP store) + [`quantize_acts_q8a128`] (re-read) pair, removing
@@ -6058,11 +6095,13 @@ pub fn rms_norm_q8a128<'w>(
 /// operand directly, in ONE kernel — the producer epilogue for B4 (feeds the down projection).
 /// Replaces the unfused `silu_mul` (FP store) + [`quantize_acts_q8a128`] (re-read). `gate`/`up`
 /// must share shape `[.. × K]` and dtype; `K` (and the total element count) must be a multiple of
-/// 128. Tracks the two-call path within float margin (silu uses the same fast-exp path, the
-/// result is rounded through the input dtype before quantization). Leading dims are preserved.
+/// 128. Bit-identical to the two-call path: silu uses the same fast-exp path, the product is
+/// rounded through the input dtype as the eager store rounds it, and the tile goes through the one
+/// q8a128 emitter (`quantized_mlp`'s test asserts it at F32 and BF16, under both `Σx`
+/// conventions). Leading dims are preserved.
 pub fn silu_mul_q8a128<'w>(
-    gate: &crate::Tensor,
-    up: &crate::Tensor,
+    gate: &LiveTensor<'w>,
+    up: &LiveTensor<'w>,
     device: &CudaDevice,
     origin: Backing,
     // The Σx convention this fused producer writes — see [`SumScale`]. **This is
@@ -6098,9 +6137,9 @@ pub fn silu_mul_q8a128<'w>(
     }
     // FusedSiluMul dtype code: 0=f32, 1=f16, 2=bf16.
     let dtype_code: i32 = match gate.dtype() {
-        crate::DType::F32 => 0,
-        crate::DType::F16 => 1,
-        crate::DType::BF16 => 2,
+        DType::F32 => 0,
+        DType::F16 => 1,
+        DType::BF16 => 2,
         d => crate::bail!("silu_mul_q8a128: unsupported dtype {d:?}"),
     };
 
@@ -6108,26 +6147,36 @@ pub fn silu_mul_q8a128<'w>(
     let out_bytes = bytes;
     let (out_ptr_planned, owned, out_backing) = resolve_u8_out(origin, device, out_bytes)?;
 
+    // Rows read in place: a dense operand, or a row-strided view such as one half
+    // of a fused gate|up projection. Both operands must step rows identically.
     let (g_storage, g_layout) = gate.storage_and_layout();
-    let (go1, go2) = g_layout.contiguous_offsets().ok_or_else(|| {
-        crate::Error::RequiresContiguous {
-            op: "silu_mul_q8a128(gate)",
-        }
-        .bt()
-    })?;
+    let (go1, g_stride) = silu_mul_rows(g_layout, "gate")?;
+    let (u_storage, u_layout) = up.storage_and_layout();
+    let (uo1, u_stride) = silu_mul_rows(u_layout, "up")?;
+    // A single row has no second row to step to, whatever stride its view records.
+    let (g_stride, u_stride) = if rows == 1 {
+        (cols, cols)
+    } else {
+        (g_stride, u_stride)
+    };
+    if g_stride != u_stride {
+        crate::bail!("silu_mul_q8a128: gate rows are {g_stride} apart but up rows {u_stride}");
+    }
+    if g_stride != cols && !cols.is_multiple_of(128) {
+        crate::bail!(
+            "silu_mul_q8a128: strided rows need cols ({cols}) to be a multiple of 128, so no \
+             tile straddles two rows"
+        );
+    }
+    // Each operand's extent, from its first element to the last one read.
+    let span = (rows - 1) * g_stride + cols;
+    let (go2, uo2) = (go1 + span, uo1 + span);
     let g_cuda = match &*g_storage {
-        crate::Storage::Cuda(c) => c,
+        Storage::Cuda(c) => c,
         _ => crate::bail!("silu_mul_q8a128: gate must be a CUDA tensor"),
     };
-    let (u_storage, u_layout) = up.storage_and_layout();
-    let (uo1, uo2) = u_layout.contiguous_offsets().ok_or_else(|| {
-        crate::Error::RequiresContiguous {
-            op: "silu_mul_q8a128(up)",
-        }
-        .bt()
-    })?;
     let u_cuda = match &*u_storage {
-        crate::Storage::Cuda(c) => c,
+        Storage::Cuda(c) => c,
         _ => crate::bail!("silu_mul_q8a128: up must be a CUDA tensor"),
     };
 
@@ -6149,6 +6198,7 @@ pub fn silu_mul_q8a128<'w>(
                         rows as i32,
                         cols as i32,
                         sum_scale.as_code(),
+                        g_stride as i32,
                     );
                 }
             }};
@@ -6172,6 +6222,30 @@ pub fn silu_mul_q8a128<'w>(
         device,
     )
     .map(|o| o.with_lead(lead).with_sum_scale(sum_scale))
+}
+
+/// `(start offset, row stride)` of a [`silu_mul_q8a128`] operand: unit column
+/// stride, and every row one stride after the last — a dense tensor, or a row
+/// range of a wider one, at rank 2 or 3 (a rank-3 batch must continue the same
+/// row grid, so its stride is `rows × row stride`).
+fn silu_mul_rows(layout: &Layout, what: &str) -> Result<(usize, usize)> {
+    let dims = layout.dims();
+    let stride = layout.stride();
+    let rank = dims.len();
+    if !(rank == 2 || rank == 3) || stride[rank - 1] != 1 {
+        crate::bail!(
+            "silu_mul_q8a128: {what} is {dims:?} stride {stride:?}; rows must be unit-stride at \
+             rank 2 or 3"
+        );
+    }
+    let row_stride = stride[rank - 2];
+    if rank == 3 && dims[0] > 1 && stride[0] != dims[1] * row_stride {
+        crate::bail!(
+            "silu_mul_q8a128: {what} is {dims:?} stride {stride:?}; its batches do not continue \
+             one row grid"
+        );
+    }
+    Ok((layout.start_offset(), row_stride))
 }
 
 /// Quantize F32 weights `[nrows × ncols]` (row-major) → a GPU buffer in the lane-major KO
@@ -6864,14 +6938,64 @@ pub fn dense_qmatmul<'w>(
     out_dtype: crate::DType,
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
+    dense_qmatmul_with_splits(
+        input,
+        weight_ptr,
+        weight_dtype,
+        nrows,
+        weight_len,
+        out_dtype,
+        None,
+        device,
+    )
+}
+
+/// [`dense_qmatmul`] with the int8 path's K split chosen by the caller: `Some(s)` runs `s`
+/// slices (`1` is the unsplit kernel), `None` takes [`q8a128_dense_k_splits`]'s answer. The
+/// forced form is what the KO projection bench sweeps; production calls [`dense_qmatmul`].
+#[allow(clippy::too_many_arguments)]
+pub fn dense_qmatmul_with_splits<'w>(
+    input: DynamicTensor<'_, 'w>,
+    weight_ptr: u64,
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    weight_len: usize,
+    out_dtype: crate::DType,
+    splits: Option<usize>,
+    device: &CudaDevice,
+) -> Result<crate::LiveTensor<'w>> {
     ensure_qmatmul_pairing(&input, weight_dtype)?;
     let qtype = dtype_to_qtype(weight_dtype)? as i32;
     match input {
         DynamicTensor::Int8(op) => {
+            // A decode-width projection with a narrow N cannot fill the card unsplit — 13 blocks
+            // for the 416-wide hyper-connection `down` on 110 SMs. Split K there; everything the
+            // rule declines (every prefill shape among them) takes the tilings below unchanged.
+            // MXFP4 never splits: its per-sub fold accumulates straight into the running sum,
+            // which per-tile partials cannot reproduce bit for bit.
+            let sm = cached_sm_count(device);
+            let splits = splits.unwrap_or_else(|| {
+                if weight_dtype == GgmlDType::MXFP4_KO {
+                    1
+                } else {
+                    q8a128_dense_k_splits(op.rows, nrows, op.cols, sm)
+                }
+            });
+            if splits > 1 {
+                return q8a128_dense_matmul_split_k(
+                    op,
+                    weight_ptr,
+                    weight_dtype,
+                    nrows,
+                    splits,
+                    out_dtype,
+                    device,
+                );
+            }
             // Tiling choice (mode-1 Bm=16 vs mode-2 Bm=32, N_SUB=2): an occupancy decision driven by
             // M and N (block count vs SM count) plus the [17,32] trap — not weight bytes. The bench
             // reaches the same launch with a forced mode via `q8a128_dense_matmul`.
-            let mode2 = q8a128_dense_use_mode2(op.rows, nrows, op.cols, cached_sm_count(device));
+            let mode2 = q8a128_dense_use_mode2(op.rows, nrows, op.cols, sm);
             q8a128_dense_matmul(
                 op,
                 weight_ptr,

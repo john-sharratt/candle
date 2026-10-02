@@ -328,6 +328,12 @@ pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS);
 /// does not fit. It is kept because it binds correctly when the reservation is
 /// genuinely small, but it must not be treated as a licence to widen a bracket
 /// past what has been run — which is exactly the mistake this table replaced.
+///
+/// **These are ceilings, not the depth a sequence drafts at.** Each sequence
+/// drafts `round(acceptance) + 1` clipped here ([`super::draft_depth`]): the
+/// rewrite above fills the block, but free continuation accepts ~2.1 per step
+/// (`docs/performance.md` §3.6), and drafting it four deep pays the head's walk
+/// and a wider verify for tokens the walk throws away.
 const QWEN38_FLASH_NEXT_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
 pub const QWEN38_FLASH_NEXT_DRAFT: DraftLadder = DraftLadder::new(QWEN38_FLASH_NEXT_BRACKETS);
 

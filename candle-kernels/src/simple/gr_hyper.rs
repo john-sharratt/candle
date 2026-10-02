@@ -26,6 +26,13 @@ use std::ffi::c_void;
 /// it host-side with [`gr_hc_supported`].
 pub const GR_MAX_HC: usize = 16;
 
+/// A q8a128-emitting launcher ran (or had no rows to run). Mirrors `GR_Q8_LAUNCHED` in
+/// `simple/gr_hyper.cu`.
+pub const GR_Q8_LAUNCHED: i32 = 0;
+
+/// A q8a128-emitting launcher refused its shape and wrote nothing. Mirrors `GR_Q8_REFUSED`.
+pub const GR_Q8_REFUSED: i32 = 1;
+
 /// Whether the mix and combine launchers are instantiated for `hc` streams.
 pub const fn gr_hc_supported(hc: usize) -> bool {
     hc.is_power_of_two() && hc <= GR_MAX_HC
@@ -48,6 +55,42 @@ extern "C" {
         stream: *mut c_void,
     );
 
+    /// [`run_gr_norm`] that also writes `xn` as a q8a128 operand into `q8`
+    /// (`q8a1024` layout, `n·hc·d/128` tiles) — bit-identical to running the
+    /// norm and then quantizing its output. `sum_norm` is `SumScale::as_code()`.
+    ///
+    /// Returns [`GR_Q8_LAUNCHED`], or [`GR_Q8_REFUSED`] when `d` is not a multiple of
+    /// 128 — having written nothing, which the caller must treat as an error. Every
+    /// operand must be 16-byte aligned; that is the caller's check, not the launcher's.
+    pub fn run_gr_norm_q8(
+        x: *const f32,
+        gain: *const f32,
+        xn: *mut f32,
+        q8: *mut c_void,
+        n: i32,
+        hc: i32,
+        d: i32,
+        eps: f32,
+        sum_norm: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// `q8 ← q8a128(silu(proj[t, 0..cols]))`, reading `proj` `[n, row_stride]`
+    /// through its row stride — bit-identical to a dense `silu` then a quantize.
+    ///
+    /// Returns [`GR_Q8_LAUNCHED`], or [`GR_Q8_REFUSED`] when `cols` is not a multiple
+    /// of 128 or exceeds `row_stride` — having written nothing. `proj` and
+    /// `row_stride` must be 16-byte aligned; that is the caller's check.
+    pub fn run_gr_silu_q8(
+        proj: *const f32,
+        q8: *mut c_void,
+        n: i32,
+        cols: i32,
+        row_stride: i32,
+        sum_norm: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// The read collapse: `mixed[t,j] = (1/hc) · Σ_s xn[t, s·d+j] · sigmoid(gate_raw[t, s·d+j])`.
     ///
     ///   xn/gate_raw `[n, hc·d]`, mixed `[n, d]`
@@ -62,6 +105,25 @@ extern "C" {
         stream: *mut c_void,
     );
 
+    /// [`run_gr_mix`] that also writes `mixed` as a q8a128 operand into `q8`
+    /// (`q8a1024` layout, `n·d/128` tiles) — bit-identical to the collapse then a
+    /// quantize.
+    ///
+    /// Returns [`GR_Q8_LAUNCHED`], or [`GR_Q8_REFUSED`] when `d` is not a multiple of
+    /// 128 or `hc` is not one of 1, 2, 4, 8, 16 — having written nothing. Every
+    /// operand must be 16-byte aligned; that is the caller's check.
+    pub fn run_gr_mix_q8(
+        xn: *const f32,
+        gate_raw: *const f32,
+        mixed: *mut f32,
+        q8: *mut c_void,
+        n: i32,
+        hc: i32,
+        d: i32,
+        sum_norm: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// The write scatter, in place on the residual:
     /// `res[t,s,j] += block_out[t,j] · 2·sigmoid(inject[t,s] / hc)`.
     ///
@@ -75,6 +137,27 @@ extern "C" {
         hc: i32,
         d: i32,
         inject_stride: i32,
+        vec_ok: i32,
+        stream: *mut c_void,
+    );
+
+    /// [`run_gr_combine`] with the MoE's block output assembled in the same pass:
+    /// `res[t,s,j] += (routed[t,j] + shared[t,j] · sigmoid(gate[t])) · 2·sigmoid(inject[t,s] / hc)`
+    /// — bit-identical to the sigmoid, broadcast multiply and add it replaces.
+    ///
+    ///   routed/shared `[n, d]`, gate `[n]` with rows `gate_stride ≥ 1` elements
+    ///   apart, the rest as [`run_gr_combine`]
+    pub fn run_gr_combine_gated(
+        res: *mut f32,
+        routed: *const f32,
+        shared: *const f32,
+        gate: *const f32,
+        inject: *const f32,
+        n: i32,
+        hc: i32,
+        d: i32,
+        inject_stride: i32,
+        gate_stride: i32,
         vec_ok: i32,
         stream: *mut c_void,
     );

@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use candle::quantized::cuda::to_dynamic;
+use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
@@ -44,7 +44,7 @@ use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
-use super::hyper::{hc_combine, hc_mix};
+use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{compact_index_caches, select_layer, IndexCache, IndexSnapshot};
 use super::paged_index;
 use super::paged_index::SealedIndex;
@@ -3182,15 +3182,14 @@ impl Qwen4ExpBatched {
                 _ => None,
             };
             let g_pre2 = crate::models::profile::gpu_span("q4e:gr_pre_ffn", dev);
-            #[cfg(feature = "cuda")]
-            let (h2, inject2) = hc_mix(
+            // The FFN's input arrives already quantized when the module runs int8:
+            // the collapse writes the operand as it stores `h2`.
+            let (h2, inject2, h2_q8) = hc_mix_with_operand(
                 &res,
                 &layer.hc_ffn,
                 eps,
                 ffn_wave.as_ref().map(|g| g.ticket()),
             )?;
-            #[cfg(not(feature = "cuda"))]
-            let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps, None)?;
             let inject2 = inject2.expect("layer HC modules carry an inject");
             g_pre2.end();
             let candle::Device::Cuda(cuda) = dev else {
@@ -3218,12 +3217,16 @@ impl Qwen4ExpBatched {
             // Raw Σx — a language model's block sums stay far below f16's
             // ceiling.
             let g_acts = crate::models::profile::gpu_span("q4e:moe_acts", dev);
-            let acts = to_dynamic(
-                &h2_3d,
-                m.lm_head.int8mode(),
-                cuda,
-                candle::quantized::SumScale::Raw,
-            )?;
+            let acts = match h2_q8 {
+                // The mix's own operand, at the flat layout's leading dims.
+                Some(op) => DynamicActs::Int8(op.with_lead(vec![1, total_rows])),
+                None => to_dynamic(
+                    &h2_3d,
+                    m.lm_head.int8mode(),
+                    cuda,
+                    candle::quantized::SumScale::Raw,
+                )?,
+            };
             g_acts.end();
             #[cfg(feature = "tensor-assert")]
             {
@@ -3252,15 +3255,18 @@ impl Qwen4ExpBatched {
             // the profile's largest row a measure of the queue rather than of the
             // readback, and left the work that filled the queue unattributed.
             let g_moe = crate::models::profile::gpu_span("q4e:moe_routed", dev);
-            let y2 = layer
+            // The layer's output in its three parts: the shared expert's gate is
+            // applied by the combine below, which reads the block output anyway,
+            // rather than by three launches of its own.
+            let parts = layer
                 .moe
-                .forward_dynamic(acts, DType::F32, n_decode, moe_wave)?
-                .reshape((total_rows, n_embd))?;
+                .forward_parts(acts, DType::F32, n_decode, moe_wave)?;
+            let routed = parts.routed.reshape((total_rows, n_embd))?;
             g_moe.end();
             #[cfg(feature = "tensor-assert")]
-            probe(site("q4e.moe.y2.L", li), &y2);
+            probe(site("q4e.moe.routed.L", li), &routed);
             let g_comb2 = crate::models::profile::gpu_span("q4e:gr_combine_ffn", dev);
-            hc_combine(&mut res, &y2, &inject2)?;
+            hc_combine_gated(&mut res, &routed, &parts.shared, &inject2)?;
             g_comb2.end();
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.post_moe.res.L", li), &res);

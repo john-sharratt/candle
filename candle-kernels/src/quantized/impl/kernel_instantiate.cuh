@@ -395,7 +395,7 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_dense( \
 }
 
 #define INSTANTIATE_KERNEL_DENSE_INT8_M2(name, qk, qi, block_type, vdr, dst_t) \
-extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_dense_m2( \
+extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_m2( \
     const void* __restrict__ weights, \
     const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
     const int ncols_x, const int nrows_x, const int total_batch, \
@@ -413,10 +413,34 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_dense_m2( \
     INSTANTIATE_KERNEL_DENSE_INT8(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
     INSTANTIATE_KERNEL_DENSE_INT8(base##_f32, qk, qi, block_type, vdr, float)
 
+//   name##_dense_sk — the mode-1 tile with K split across gridDim.z slices, for a
+//                     decode-width projection whose unsplit grid cannot fill the
+//                     card. F32 partials in `ws`, self-resetting per-tile counters;
+//                     see grouped_tc::quantized_matmul_dense_splitk_entry_int8.
+#define INSTANTIATE_KERNEL_DENSE_INT8_SK(name, qk, qi, block_type, vdr, dst_t) \
+extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_sk( \
+    const void* __restrict__ weights, \
+    const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int total_batch, \
+    const int dst_stride, const int sum_norm, \
+    float* __restrict__ ws, unsigned int* __restrict__ counters) { \
+    grouped_tc::quantized_matmul_dense_splitk_entry_int8<qk, qi, block_type, vdr, dst_t>( \
+        reinterpret_cast<const block_compact_t<block_type>*>(weights), \
+        vy, dst, ncols_x, nrows_x, total_batch, dst_stride, sum_norm, ws, counters); \
+}
+
+// The KO formats: mode-2 for prefill, at every output width.
 #define INSTANTIATE_KERNEL_DENSE_INT8_M2_ALL(base, qk, qi, block_type, vdr) \
     INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_f16, qk, qi, block_type, vdr, half) \
     INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
     INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_f32, qk, qi, block_type, vdr, float)
+
+// The affine KO formats: split-K for decode, at every output width. MXFP4 has none — its
+// per-sub fold accumulates straight into the sum, which per-tile partials cannot reproduce.
+#define INSTANTIATE_KERNEL_DENSE_INT8_SK_ALL(base, qk, qi, block_type, vdr) \
+    INSTANTIATE_KERNEL_DENSE_INT8_SK(base##_f16, qk, qi, block_type, vdr, half) \
+    INSTANTIATE_KERNEL_DENSE_INT8_SK(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
+    INSTANTIATE_KERNEL_DENSE_INT8_SK(base##_f32, qk, qi, block_type, vdr, float)
 
 #define INSTANTIATE_KERNEL_GROUPED_INT8(name, qk, qi, block_type, vdr, dst_t) \
 extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \

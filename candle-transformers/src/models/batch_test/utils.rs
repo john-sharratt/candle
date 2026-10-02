@@ -27,6 +27,7 @@ use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
 use crate::models::dialect::Dialect;
+use crate::models::draft_depth::DraftDepth;
 use crate::models::expert_lre::PipelineStats;
 use crate::models::speculative_choice::GreedyChooser;
 use candle::vram::process_ram::ProcessRam;
@@ -1765,6 +1766,14 @@ impl TestParams {
         )?;
         self.device.synchronize()?;
         drop(detector);
+        // **The clock stops here, before the reporting below** — the same rule the
+        // prefill clock keeps. `ProcessRam::capture` walks every page of the address
+        // space (~17M on Flash-Next's 54 GB mapping), and inside the window it was
+        // charged to decode: ~0.9 s a row, which read as a 43–54% decode regression
+        // at one context while the speculative steps themselves ran at the recorded
+        // rate.
+        pipeline_record("bench:decode_total", t_decode_total);
+        let generate_duration = generate_start.elapsed();
         // Every session of the row is still alive here, so KV stands at its
         // high-water for the row and the weight zone at what decode ran against.
         print_span(
@@ -1826,9 +1835,6 @@ impl TestParams {
                 if streaming == 0 { " (whole)" } else { "" }
             );
         }
-        pipeline_record("bench:decode_total", t_decode_total);
-
-        let generate_duration = generate_start.elapsed();
         let generate_tokens = steps_run * config.num_contexts;
         let generate_tokens_per_sec = if generate_tokens == 0 {
             0.0
@@ -2098,7 +2104,10 @@ impl TestParams {
         // one plain wave and yields however many tokens the verify confirmed,
         // so mean accepted/step IS the speedup ceiling. Reported rather than
         // asserted — it is a property of the text, not of the code.
-        let (mut steps, mut emitted) = (0usize, 0usize);
+        let (mut steps, mut emitted, mut drafted) = (0usize, 0usize, 0usize);
+        // Each session drafts one past its own acceptance, clipped at the
+        // model's ladder — the same rule the scheduler applies.
+        let mut depths = vec![DraftDepth::default(); sequence_indices.len()];
         let t_spec = std::time::Instant::now();
         loop {
             let idxs: Vec<usize> = (0..sequence_indices.len()).filter(|&i| active[i]).collect();
@@ -2106,9 +2115,11 @@ impl TestParams {
                 break;
             }
             steps += 1;
-            let before: usize = idxs.iter().map(|&i| runs[i].output.len()).sum();
+            let lens: Vec<usize> = idxs.iter().map(|&i| runs[i].output.len()).collect();
+            let before: usize = lens.iter().sum();
             let seqs: Vec<usize> = idxs.iter().map(|&i| sequence_indices[i]).collect();
             let comms: Vec<u32> = idxs.iter().map(|&i| committed[i]).collect();
+            let budgets: Vec<usize> = idxs.iter().map(|&i| depths[i].budget(max_draft)).collect();
             // Per-session emit sinks over DISJOINT `runs` borrows: each pushes
             // into its own output and applies the budget/EOS policy — the exact
             // per-token loop plain decode uses.
@@ -2128,21 +2139,27 @@ impl TestParams {
             // validates every run against a fixed expected string, so the
             // speculative path must reproduce plain greedy decode token for
             // token.
-            let next = model.speculative_decode_step_batch(
+            let step = model.speculative_decode_step_batch(
                 session,
                 &seqs,
                 &comms,
-                max_draft,
+                &budgets,
                 nl,
                 &mut GreedyChooser,
                 &mut emits,
             )?;
             drop(emits);
+            // What each session actually drafted, not what it asked for: a drafter
+            // that proposes less (or nothing) must not read as rejected drafts.
+            drafted += step.drafted.iter().sum::<usize>();
+            for (k, &i) in idxs.iter().enumerate() {
+                depths[i].record(step.drafted[k], runs[i].output.len() - lens[k]);
+            }
             for (k, &i) in idxs.iter().enumerate() {
                 // `Some(c)` ⇒ the sink accepted `c` under budget/EOS policy (it
                 // is already emitted and becomes the next seed); `None` ⇒ the
                 // sink stopped this session.
-                match next[k] {
+                match step.next[k] {
                     Some(c) => committed[i] = c,
                     None => active[i] = false,
                 }
@@ -2152,7 +2169,7 @@ impl TestParams {
         let secs = t_spec.elapsed().as_secs_f64();
         println!(
             "  speculative: {steps} steps, {emitted} tokens, {:.2} accepted/step \
-             ({:.1} tok/s over the cohort, draft budget {max_draft})",
+             ({:.1} tok/s over the cohort, {drafted} drafted at a ceiling of {max_draft})",
             if steps > 0 {
                 emitted as f64 / steps as f64
             } else {

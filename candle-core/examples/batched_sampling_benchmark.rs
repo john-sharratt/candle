@@ -299,6 +299,7 @@ mod bench {
                     output_ptr as *mut u32,
                     42,
                     rng_ptr as *mut u64,
+                    std::ptr::null(), // seq_dials: every row on the shared scalars above
                 );
             }
             stream.synchronize().expect("sync");

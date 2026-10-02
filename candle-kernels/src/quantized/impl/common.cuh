@@ -87,6 +87,11 @@ __device__ __forceinline__ int gemx_unpermute_64(int linear_idx) {
 #define LAUNCH_BOUNDS_ITER __launch_bounds__(128, 4)
 #define LAUNCH_BOUNDS_VEC __launch_bounds__(128, 1)
 #define LAUNCH_BOUNDS_TC16 __launch_bounds__(128, 10)  // 10 blocks/SM target
+// TC16 kernels whose shared memory already holds them to ≤ 8 blocks/SM — the int8 dense
+// mode-2 kernel (32-token double-buffered activations: 6 blocks/SM at Q8_KO, 8 at Q4_KO) and
+// its split-K twin (three activation stages: 6 at Q8_KO). A 10-block register bound (48 regs)
+// buys them no occupancy and costs registers; 8 blocks leaves 64 at no occupancy cost.
+#define LAUNCH_BOUNDS_TC16_SMEM8 __launch_bounds__(128, 8)
 #define LAUNCH_BOUNDS_TC32 __launch_bounds__(128, 8)  // 8 blocks/SM, ~15% faster FP8
 
 // =============================================================================

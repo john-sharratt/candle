@@ -16,6 +16,7 @@
 #include "binary_op_macros.cuh"
 #include "../fast_exp.cuh"
 #include "../blocks.cuh"
+#include "../quantize/q8a128_tile.cuh"
 #include <stdint.h>
 
 // silu_fwd template — same as in unary.cu but needed here since it's not in a header
@@ -244,51 +245,47 @@ __device__ void silu_mul_q8a128_impl(
     // intermediate is where Σx runs away — Z-Image's reaches ≈2×10⁵ against
     // f16's 65504 ceiling — so a model that needs `ByAmax` needs it here above
     // all, and one that does not must still get its raw bytes unchanged.
-    int sum_norm)
+    int sum_norm,
+    // Elements between the starts of consecutive rows of `gate` and `up`. `cols`
+    // for dense operands; wider when they are the two halves of one fused
+    // gate|up projection, read where it wrote them rather than compacted (a
+    // strided row then needs `cols` to be a multiple of 128, so a tile never
+    // straddles two rows — the host checks).
+    int row_stride)
 {
     const int total_tiles = (int)(((int64_t)rows * cols) / 128);
     const int total_warps = (gridDim.x * blockDim.x) >> 5;
     const int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     const int lane = threadIdx.x & 31;
+    const int tiles_per_row = cols >> 7;
     uint8_t* obytes = reinterpret_cast<uint8_t*>(out);
     for (int tile = warp; tile < total_tiles; tile += total_warps) {
-        const int64_t base = (int64_t)tile * 128 + (int64_t)lane * 4;
+        int64_t base;
+        if (row_stride == cols) {
+            base = (int64_t)tile * 128 + (int64_t)lane * 4;
+        } else {
+            const int row = tile / tiles_per_row;
+            base = (int64_t)row * row_stride + (int64_t)(tile - row * tiles_per_row) * 128
+                 + (int64_t)lane * 4;
+        }
         float g0, g1, g2, g3; smq8_load4<T>(gate + base, g0, g1, g2, g3);
         float u0, u1, u2, u3; smq8_load4<T>(up + base, u0, u1, u2, u3);
         const float n0 = smq8_round<T>(fused_silu_fwd<float>(g0) * u0);
         const float n1 = smq8_round<T>(fused_silu_fwd<float>(g1) * u1);
         const float n2 = smq8_round<T>(fused_silu_fwd<float>(g2) * u2);
         const float n3 = smq8_round<T>(fused_silu_fwd<float>(g3) * u3);
-
-        float amax = fmaxf(fmaxf(fabsf(n0), fabsf(n1)), fmaxf(fabsf(n2), fabsf(n3)));
-        float s = n0 + n1 + n2 + n3;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
-            s += __shfl_xor_sync(0xffffffff, s, off, 32);
-        }
-        const float id = (amax != 0.f) ? 127.f / amax : 0.f;
-        *reinterpret_cast<char4*>(obytes + q8a1024_qs_off(tile) + lane * 4) = make_char4(
-            (int8_t)__float2int_rn(n0 * id),
-            (int8_t)__float2int_rn(n1 * id),
-            (int8_t)__float2int_rn(n2 * id),
-            (int8_t)__float2int_rn(n3 * id));
-        if (lane == 0) {
-            half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(tile));
-            // Σx normalised by amax — see blocks.cuh. This producer especially:
-            // a SwiGLU intermediate is the widest activation in a model, and it
-            // is where the raw f16 sum overflows first.
-            ds[0] = make_half2(__float2half_rn(amax / 127.f),
-                               __float2half_rn(sum_norm ? (s * id * (1.f / 127.f)) : s));
-        }
+        // The SwiGLU intermediate is the widest activation in a model and where the
+        // raw f16 sum overflows first — the producer `sum_norm` exists for.
+        emit_q8a128_tile(obytes, tile, lane, n0, n1, n2, n3, sum_norm);
     }
 }
 
 #define SILU_MUL_Q8A128_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME( \
       const TYPENAME* gate, const TYPENAME* up, void* out, int rows, int cols, \
-      int sum_norm) { \
-    silu_mul_q8a128_impl<TYPENAME>(gate, up, reinterpret_cast<block_q8a128*>(out), rows, cols, sum_norm); \
+      int sum_norm, int row_stride) { \
+    silu_mul_q8a128_impl<TYPENAME>(gate, up, reinterpret_cast<block_q8a128*>(out), rows, cols, \
+                                   sum_norm, row_stride); \
   }
 
 SILU_MUL_Q8A128_OP(float, silu_mul_q8a128_f32)

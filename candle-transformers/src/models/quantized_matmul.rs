@@ -1,7 +1,9 @@
 #[cfg(feature = "cuda")]
+use candle::quantized::cuda::DynamicTensor;
+#[cfg(feature = "cuda")]
 use candle::quantized::ko_quant::ko_tileable;
 use candle::quantized::{GgmlDType, Int8Mode, QTensor, SumScale};
-use candle::{DType, Module, Result, Tensor};
+use candle::{DType, LiveTensor, Module, Result, Tensor};
 
 use crate::models::profile::{pipeline_record, profile_now};
 
@@ -325,6 +327,12 @@ impl QMatMul {
         self
     }
 
+    /// How this layer's activation stores its per-128 `Σx` — what a producer emitting this
+    /// layer's q8a128 operand must write.
+    pub fn sum_scale(&self) -> SumScale {
+        self.sum_scale
+    }
+
     /// Wrap a QTensor that **views** memory someone else owns, reporting the
     /// numeric mode the weight was placed for.
     ///
@@ -419,10 +427,9 @@ impl QMatMul {
     #[cfg(feature = "cuda")]
     pub fn forward_dynamic<'w>(
         &self,
-        input: candle::quantized::cuda::DynamicTensor<'_, 'w>,
+        input: DynamicTensor<'_, 'w>,
         out_dtype: DType,
-    ) -> Result<candle::LiveTensor<'w>> {
-        use candle::quantized::cuda::DynamicTensor;
+    ) -> Result<LiveTensor<'w>> {
         // Float activation → the ordinary path (handles Off gemx and any non-int8 weight). It tags
         // its own profile bucket, so don't double-record here.
         //
@@ -445,6 +452,18 @@ impl QMatMul {
         Ok(out)
     }
 
+    /// [`Self::forward_dynamic`] on an int8 operand with the K split forced to `splits` — the
+    /// projection bench's sweep over what the split rule would choose.
+    #[cfg(feature = "cuda")]
+    pub fn forward_dynamic_split_k<'w>(
+        &self,
+        input: DynamicTensor<'_, 'w>,
+        out_dtype: DType,
+        splits: usize,
+    ) -> Result<LiveTensor<'w>> {
+        self.inner.forward_dynamic_split_k(input, out_dtype, splits)
+    }
+
     /// Dequantize the underlying tensor.
     /// This is primarily for testing/validation.
     pub fn dequantize(&self) -> Result<Tensor> {
@@ -461,7 +480,7 @@ impl QMatMul {
     /// activation and returns a result bounded by the same generation, because
     /// the output is allocated from whichever arena `xs` came from. The
     /// `Module` impl below is this at `'static`, where the bound is vacuous.
-    pub fn forward_live<'w>(&self, xs: &candle::LiveTensor<'w>) -> Result<candle::LiveTensor<'w>> {
+    pub fn forward_live<'w>(&self, xs: &LiveTensor<'w>) -> Result<LiveTensor<'w>> {
         self.forward_live_as(xs, xs.dtype())
     }
 
@@ -474,9 +493,9 @@ impl QMatMul {
     /// a loss of the accumulator's own precision.
     pub fn forward_live_as<'w>(
         &self,
-        xs: &candle::LiveTensor<'w>,
+        xs: &LiveTensor<'w>,
         out_dtype: DType,
-    ) -> Result<candle::LiveTensor<'w>> {
+    ) -> Result<LiveTensor<'w>> {
         let _enter = self.span.enter();
         // Tag the profile entry with the format the matmul actually ran in (`_q8` int8 tensor-core,
         // `_f16`/`_f32` FP) so a perf-vs-off run shows at a glance whether int8 engaged.

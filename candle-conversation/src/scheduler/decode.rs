@@ -475,10 +475,29 @@ impl Scheduler {
         // the accept walk below commits exactly one token each — so there is no
         // second, plain decode path to drift out of step with this one.
         let t_fwd = std::time::Instant::now();
-        // The model's own measured width ladder: how far it is worth drafting
-        // shrinks as the wave widens, and where it stops paying depends on the
-        // checkpoint's shape rather than on anything the scheduler knows.
-        let budget = self.model.draft_budget(seq_ids.len());
+        // The model's own measured width ladder is the CEILING: how far it is
+        // worth drafting shrinks as the wave widens, and where it stops paying
+        // depends on the checkpoint's shape rather than on anything the
+        // scheduler knows. Each turn drafts one past its own acceptance under
+        // it, and the drafter walks the cohort to the deepest of them.
+        let ceiling = self.model.draft_budget(seq_ids.len());
+        // A turn under a grammar stencil or replaying a recording takes a plain
+        // row (see below), so it drafts nothing — and must not set the depth the
+        // drafter walks the cohort to, or one such turn keeps the whole wave
+        // drafting at the ceiling for proposals that are all thrown away.
+        let depths: Vec<usize> = seq_ids
+            .iter()
+            .map(|id| {
+                // Every id here was read from `active_decodes` above.
+                let s = &self.active_decodes[id];
+                if s.stencil.is_some() || s.recorded_reply.is_some() {
+                    0
+                } else {
+                    s.draft_depth.budget(ceiling)
+                }
+            })
+            .collect();
+        let budget = depths.iter().copied().max().unwrap_or(0);
         let draft_span = profile::span("decode:draft");
         let mut drafts = match self.model.speculative_draft(
             &mut self.session,
@@ -512,6 +531,7 @@ impl Scheduler {
         // So does a replayed turn: its next token is its recording's, so there
         // is nothing to propose.
         for (i, &id) in seq_ids.iter().enumerate() {
+            drafts[i].truncate(depths[i]);
             if self
                 .active_decodes
                 .get(&id)
@@ -809,7 +829,18 @@ impl Scheduler {
             // The walk's next-seed is not read here: the scheduler takes each
             // step's input from `generated_tokens.last()`, which the commit
             // below fills, so a second copy of it could only disagree.
-            Ok((_, kept)) => kept,
+            Ok((_, kept)) => {
+                // What the walk kept sets the depth the next step drafts at.
+                // The walk's sink stops on EOS and on the turn's room, so a block
+                // cut short there reads as a partial accept — harmless, because
+                // that turn ends and its depth is never read again.
+                for (i, id) in seq_ids.iter().enumerate() {
+                    if let Some(s) = self.active_decodes.get_mut(id) {
+                        s.draft_depth.record(blocks[i].len() - 1, kept[i]);
+                    }
+                }
+                kept
+            }
             Err(e) => {
                 for (id, state) in state_ids.into_iter().zip(chooser.into_states()) {
                     self.sampling_states.insert(id, state);
