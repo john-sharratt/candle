@@ -10,25 +10,39 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::GitError;
+use crate::library::config;
 use crate::runner::utf8;
 use crate::types::{GitTime, Signature};
 use crate::Repo;
 
 impl Repo {
-    /// One configured value, or `None` when it is unset.
+    /// The configured `user.name` and `user.email`, either `None` when unset,
+    /// from one `config` process rather than one each.
     ///
-    /// No `--end-of-options`: older releases' `config` rejects it, and `key`
-    /// is a fixed literal from this file rather than anything a caller chose.
-    fn config(&self, key: &str) -> Result<Option<String>, GitError> {
+    /// `--get-regexp` prints every entry in the order git reads its files, so
+    /// the last one for a key is the value `--get` would have answered: the one
+    /// that wins. No `--end-of-options`: older releases' `config` rejects it,
+    /// and the pattern is a fixed literal from this file.
+    fn configured_identity(&self) -> Result<(Option<String>, Option<String>), GitError> {
+        if let Some(lib) = self.library() {
+            return config::identity(&lib);
+        }
         let out = self
             .git("config")
-            .args(["--get", key])
+            .args(["-z", "--get-regexp", r"^user\.(name|email)$"])
             .read_only()
             .run_accepting(&[0, 1])?;
-        match out.status {
-            Some(0) => Ok(Some(utf8("config", out.stdout)?.trim().to_string())),
-            _ => Ok(None),
+        let text = utf8("config", out.stdout)?;
+        let (mut name, mut email) = (None, None);
+        for entry in text.split('\0').filter(|e| !e.is_empty()) {
+            let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+            match key {
+                "user.name" => name = Some(value.trim().to_string()),
+                "user.email" => email = Some(value.trim().to_string()),
+                _ => {}
+            }
         }
+        Ok((name, email))
     }
 
     /// The repository's configured `user.name` and `user.email`, stamped with
@@ -44,12 +58,11 @@ impl Repo {
                  commit under; set it with `git config {key} …`"
             ))
         };
-        let name = self
-            .config("user.name")?
+        let (name, email) = self.configured_identity()?;
+        let name = name
             .filter(|v| !v.is_empty())
             .ok_or_else(|| missing("user.name"))?;
-        let email = self
-            .config("user.email")?
+        let email = email
             .filter(|v| !v.is_empty())
             .ok_or_else(|| missing("user.email"))?;
         let seconds = SystemTime::now()

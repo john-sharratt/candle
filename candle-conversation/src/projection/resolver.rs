@@ -8,8 +8,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use super::belief_files::{assemble_file_scans, scan_file_scans};
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
@@ -18,6 +19,8 @@ use super::schema::{
     SystemPromptSchema,
 };
 use super::warm_pool;
+use super::working_set_observe::{working_set_config, working_set_fresh};
+use super::working_set_pick::{Standing, WorkingSetMembers};
 use crate::cancel::ingest_cancelled;
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
@@ -26,6 +29,7 @@ use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
+use crate::persistence::maintenance::RELOCATION_BATCH_BYTES;
 use crate::persistence::manifest::{self, ConvState, RecordLoc};
 use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SnapshotPayload,
@@ -36,7 +40,7 @@ use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
-use crate::persistence::{SharedSubstrate, SubstratePersistence};
+use crate::persistence::{Result as PersistenceResult, SharedSubstrate, SubstratePersistence};
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
@@ -54,6 +58,7 @@ use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::TurnLayout;
+use crate::working_set::marks::is_dialogue;
 use candle_nn::kv_cache::SealedSequence;
 
 /// Upper bound on how many recent dialogue turns the normalization warm-up
@@ -160,7 +165,8 @@ impl Observe<'_> {
 
 /// Whether a group's hit levels can be learned by self-match.
 ///
-/// Belief-driven, because only a belief group normalizes at all; and additive,
+/// Scanned (belief-driven or a working-set group), because only a scanned
+/// group normalizes at all; and additive,
 /// because a gated-fusion group normalizes traffic-relative (the A.4 floored
 /// path keys on observed-traffic PEAKS, so a rare hit on a quiet file stands
 /// out). Self-match warming would stamp every file's peak at its own self-match
@@ -168,7 +174,7 @@ impl Observe<'_> {
 /// domination this warm-up was built to fix. Config-keyed, not axis-keyed: any
 /// additive-fusion group warms.
 fn is_warmable(group: &GroupSchema) -> bool {
-    group.is_belief_driven() && group.policy.scan.fusion == FusionMode::Additive
+    group.is_scanned() && group.policy.scan.fusion == FusionMode::Additive
 }
 
 /// `group` of `layer`, if the schema declares it there and it [`is_warmable`].
@@ -185,17 +191,15 @@ fn warmable(
     (layer.gathered && is_warmable(group)).then_some((layer, group))
 }
 
-/// `layer` with `group` as its only group.
-///
-/// The view a single group's self-match warm scores under.
-/// [`Conversation::score_belief_groups`] scores — and, observing, teaches —
-/// every belief group in the layer it is handed, so a probe of one group's
-/// timeline would otherwise teach its siblings a scope that is not theirs.
-fn alone(layer: &LayerSchema, group: &GroupSchema) -> LayerSchema {
-    LayerSchema {
-        groups: vec![group.clone()],
-        ..layer.clone()
-    }
+/// `group` of `layer` for the bulk ingest warm-up: [`is_warmable`], but NOT
+/// gated on `gathered`. An append-only layer's own conversations score
+/// self-local whether or not other conversations draw from it, so its levels
+/// have a reader either way — see
+/// [`Conversation::ingest_warm_work`].
+fn ingest_group(schema: &Schema, layer: LayerId, group: GroupId) -> Option<&GroupSchema> {
+    let layer = schema.layers.iter().find(|l| l.id == layer)?;
+    let group = layer.groups.iter().find(|g| g.id == group)?;
+    is_warmable(group).then_some(group)
 }
 
 /// Which corpus turns warm which collection member, in a deterministic order.
@@ -245,7 +249,7 @@ fn collection_warm_plan<'a>(
 /// sorted, deduped `seams`. An empty `seams` yields one window `[0, len)` — the
 /// prior whole-turn behaviour. Seams at 0, at/past `len`, or that don't advance
 /// are ignored, so a malformed seam can never produce an empty or inverted range.
-fn subwindow_bounds(len: usize, seams: &[usize]) -> Vec<(usize, usize)> {
+pub(super) fn subwindow_bounds(len: usize, seams: &[usize]) -> Vec<(usize, usize)> {
     let mut bounds = Vec::with_capacity(seams.len() + 1);
     let mut prev = 0usize;
     for &s in seams {
@@ -475,7 +479,7 @@ impl Drop for TempDirGuard {
 /// frees an Arc and the allocator reuses the address with the same window
 /// structure, the sampled words still differ, so stale arena pages are never
 /// served. Shared by the group and collection scans.
-fn sig_fingerprint(arc: &Arc<Vec<WideQSig>>) -> u64 {
+pub(super) fn sig_fingerprint(arc: &Arc<Vec<WideQSig>>) -> u64 {
     let mut h = DefaultHasher::new();
     (Arc::as_ptr(arc) as usize).hash(&mut h);
     arc.len().hash(&mut h);
@@ -830,8 +834,10 @@ impl Conversation {
                     continue;
                 }
             }
+            // A working-set mark is not scope: a dialogue turn carrying only
+            // marks is still an untagged turn.
             let in_scope = if tags.is_empty() {
-                d.tags.is_empty()
+                is_dialogue(&d.tags)
             } else {
                 d.tags.iter().any(|t| tags.contains(t))
             };
@@ -1208,6 +1214,29 @@ impl Conversation {
         scores
     }
 
+    /// Fold one reprojection's scan into `target`'s working-set momentum
+    /// (`docs/zend_working_set.md` §4.3). `candidates` is what
+    /// [`Self::score_beliefs`] returned; a target whose layer declares no
+    /// working set learns nothing.
+    pub fn observe_working_set(
+        &self,
+        schema: &Schema,
+        target: ProjectionTarget,
+        candidates: &[(GroupId, Vec<(TurnKey, f32)>)],
+    ) {
+        let Some(cfg) = working_set_config(schema, target) else {
+            return;
+        };
+        let fresh = working_set_fresh(schema, candidates);
+        self.inner.write().unwrap().working_set_observe(
+            target.timeline,
+            &fresh,
+            cfg.beta,
+            cfg.min_momentum,
+            cfg.limits(),
+        );
+    }
+
     /// Score every belief node the projection will consult: the **target
     /// layer's collections** (the tool catalog) plus **every layer's
     /// belief-driven turn groups** (repo_map clusters, code scopes, memory tiers
@@ -1323,7 +1352,7 @@ impl Conversation {
                     let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
                         return None;
                     };
-                    if !d.tags.is_empty() {
+                    if !is_dialogue(&d.tags) {
                         return None;
                     }
                     let sig = e
@@ -1711,6 +1740,28 @@ impl Conversation {
     fn warm_ingest_normalization_on_pool(&self, schema: &Schema) {
         let t_warm = Instant::now();
         let mut warmed_timelines = 0usize;
+        for (layer, group, timelines) in self.ingest_warm_work(schema) {
+            let Some(group) = ingest_group(schema, layer, group) else {
+                continue;
+            };
+            warmed_timelines += self.warm_timelines(group, &timelines, None);
+        }
+        tracing::info!(
+            timelines = warmed_timelines,
+            elapsed_ms = t_warm.elapsed().as_millis() as u64,
+            "normalization warm-up: learned per-file hit levels for ingest-layer timelines \
+             (0 ⇒ no append-only ingest layer marked — belief levels stay cold)"
+        );
+    }
+
+    /// What the ingest warm-up has to do: every warmable group of every
+    /// append-only ingest layer, with its active timelines, in schema order.
+    ///
+    /// Split from the scoring so the caller can hand the timelines to whichever
+    /// thread holds the GPU gallery arena, a slice at a time
+    /// ([`Self::warm_ingest_timelines`]).
+    pub fn ingest_warm_work(&self, schema: &Schema) -> Vec<(LayerId, GroupId, Vec<TimelineId>)> {
+        let mut work = Vec::new();
         for layer in &schema.layers {
             // This function only ever warms an append-only ingest layer — the
             // loop body below is unreached otherwise, so this is the real
@@ -1734,15 +1785,35 @@ impl Conversation {
             // them, so a conversation several turns into its own history
             // could no longer retrieve its own earlier turns.
             for group in layer.groups.iter().filter(|g| is_warmable(g)) {
-                warmed_timelines += self.warm_group(layer, group);
+                let timelines: Vec<TimelineId> = self
+                    .inner
+                    .read()
+                    .unwrap()
+                    .active_timelines_for_group(group.id)
+                    .collect();
+                work.push((layer.id, group.id, timelines));
             }
         }
-        tracing::info!(
-            timelines = warmed_timelines,
-            elapsed_ms = t_warm.elapsed().as_millis() as u64,
-            "normalization warm-up: learned per-file hit levels for ingest-layer timelines \
-             (0 ⇒ no append-only ingest layer marked — belief levels stay cold)"
-        );
+        work
+    }
+
+    /// Warm `timelines` of `group` — a slice of [`Self::ingest_warm_work`] —
+    /// scoring on `arena`, the GPU gallery arena. Returns how many were warmed.
+    /// Called on the thread that owns the arena; each file costs one batched
+    /// launch for all of its self-probes, where the host path costs a
+    /// probe × window scan per probe (270 s over 1,344 files on eight cores).
+    pub fn warm_ingest_timelines(
+        &self,
+        schema: &Schema,
+        layer: LayerId,
+        group: GroupId,
+        timelines: &[TimelineId],
+        arena: &GalleryArena,
+    ) -> usize {
+        let Some(group) = ingest_group(schema, layer, group) else {
+            return 0;
+        };
+        self.warm_timelines(group, timelines, Some(arena))
     }
 
     /// Warm one belief group's per-timeline hit levels by self-match —
@@ -1769,10 +1840,16 @@ impl Conversation {
         else {
             return 0;
         };
-        let Some((layer, group)) = warmable(schema, layer.id, group) else {
+        let Some((_, group)) = warmable(schema, layer.id, group) else {
             return 0;
         };
-        self.warm_group(&alone(layer, group), group)
+        let timelines: Vec<TimelineId> = self
+            .inner
+            .read()
+            .unwrap()
+            .active_timelines_for_group(group.id)
+            .collect();
+        self.warm_timelines(group, &timelines, None)
     }
 
     /// Warm one timeline's hit levels by self-match — a conversation written
@@ -1788,27 +1865,27 @@ impl Conversation {
         let Some((layer, group)) = self.timeline_target(timeline) else {
             return false;
         };
-        let Some((layer, group)) = warmable(schema, layer, group) else {
+        let Some((_, group)) = warmable(schema, layer, group) else {
             return false;
         };
-        self.warm_timeline(&alone(layer, group), group, timeline);
+        self.warm_timeline(group, timeline, None);
         true
     }
 
-    /// Every active timeline of `group`, warmed under `layer`. Returns how many.
-    fn warm_group(&self, layer: &LayerSchema, group: &GroupSchema) -> usize {
-        let timelines: Vec<TimelineId> = self
-            .inner
-            .read()
-            .unwrap()
-            .active_timelines_for_group(group.id)
-            .collect();
-        for &tl in &timelines {
+    /// Warm each of `timelines` of `group`, on `arena` when given. Returns how
+    /// many were asked for.
+    fn warm_timelines(
+        &self,
+        group: &GroupSchema,
+        timelines: &[TimelineId],
+        arena: Option<&GalleryArena>,
+    ) -> usize {
+        for &tl in timelines {
             // A shutdown ends the warm-up here too, not one timeline at a time.
             if ingest_cancelled() {
                 break;
             }
-            self.warm_timeline(layer, group, tl);
+            self.warm_timeline(group, tl, arena);
         }
         timelines.len()
     }
@@ -1816,56 +1893,67 @@ impl Conversation {
     /// Self-match one timeline of `group`: a handful of its own turns probe it,
     /// folding its hit levels under the SAME `scope = turn_group(group,
     /// timeline)` a live query reads back.
-    fn warm_timeline(&self, layer: &LayerSchema, group: &GroupSchema, tl: TimelineId) {
-        // This file's / cluster's own turn signatures. Gathered under a
-        // short-lived read lock so the per-turn `score_belief_groups` calls
-        // below (which take the lock themselves) never re-enter it.
-        let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = {
+    ///
+    /// The observation is the live seal scan's: each probe's raw per-exchange
+    /// scores against the file's own exchanges (self-local — an ingest file
+    /// scores only against itself), folded in probe order. The file is
+    /// assembled once and every probe scored in one call — one launch on
+    /// `arena` — where scoring probe by probe re-assembled it each time and
+    /// took the host path.
+    fn warm_timeline(&self, group: &GroupSchema, tl: TimelineId, arena: Option<&GalleryArena>) {
+        // The file's own turn signatures and its candidates, under one
+        // short-lived read lock, released before any scoring.
+        let (sigs, files) = {
             let sub = self.inner.read().unwrap();
             let count = sub.turn_count(tl);
-            (0..count)
+            let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = (0..count)
                 .filter_map(|i| {
                     let sid = turn_stream_id(tl.raw(), i);
                     sub.decoded_wide_sig(sid).map(|s| (sid.0, s))
                 })
-                .collect()
-        };
-        let self_target = ProjectionTarget {
-            layer: layer.id,
-            group: group.id,
-            timeline: tl,
+                .collect();
+            let (files, _) = assemble_file_scans(&sub, vec![tl]);
+            (sigs, files)
         };
         // A handful of self-probes is enough: the asymmetric EWMA (alpha_up
-        // 0.30) is ~94% converged after 8 observes, and each call already scores
-        // against ALL the file's exchanges, so this caps the one-time warm cost
-        // without materially moving the level.
-        for (source, sig) in sigs.iter().take(WARM_INGEST_PROBES_PER_TIMELINE) {
-            // Stops between probes once a shutdown asks — see
-            // `warm_collection_normalization`.
-            if ingest_cancelled() {
-                return;
-            }
-            if sig.is_empty() {
+        // 0.30) is ~94% converged after 8 observes, and each already scores
+        // against ALL the file's exchanges, so this caps the warm cost without
+        // materially moving the level.
+        let probes: Vec<(u64, &[WideQSig])> = sigs
+            .iter()
+            .take(WARM_INGEST_PROBES_PER_TIMELINE)
+            .filter(|(_, sig)| !sig.is_empty())
+            .map(|(source, sig)| (*source, sig.as_slice()))
+            .collect();
+        let Some(file) = files.first() else {
+            return;
+        };
+        if probes.is_empty() || ingest_cancelled() {
+            return;
+        }
+        let probe_refs: Vec<&[WideQSig]> = probes.iter().map(|(_, p)| *p).collect();
+        let scanned = scan_file_scans(&files, group, &probe_refs, arena);
+        let scope = ScopeKey::turn_group(group.id.raw() as u64, tl.raw());
+        let child_of =
+            |slot: usize| ChildKey::turn(file.arc_turn[file.ex_ranges[slot].start].0 as u64);
+        let mut cache = self.normalization.lock().unwrap();
+        for ((source, probe), per_file) in probes.iter().zip(&scanned) {
+            // Self-match: the probe is this group's own turn, so it is inside
+            // the scope by construction.
+            let observe = Observe::Yes {
+                tags: &group.policy.tags,
+                source: *source,
+            };
+            if !observe.teaches(&group.policy.tags) {
                 continue;
             }
-            let mut throwaway = ProjectionScores::new();
-            // CPU fallback (`device: None`): the warm-up runs off the reproject
-            // hot path and only needs the learned hit level, which the CPU and
-            // GPU scans agree on up to fast-math ULP.
-            let _ = self.score_belief_groups(
-                layer,
-                self_target,
-                sig.as_slice(),
-                None,
-                &mut throwaway,
-                // Self-match: the probe is this group's own turn, so it is
-                // inside the scope by construction.
-                Observe::Yes {
-                    tags: &group.policy.tags,
-                    source: *source,
-                },
-                None,
-            );
+            let Some((fused, _)) = per_file.first() else {
+                continue;
+            };
+            let raw_pairs: Vec<(ChildKey, f32)> = (0..file.n_slots)
+                .map(|slot| (child_of(slot), fused.get(slot).copied().unwrap_or(0.0)))
+                .collect();
+            cache.observe(&scope, *source, &raw_pairs, probe.len());
         }
     }
 
@@ -1877,7 +1965,8 @@ impl Conversation {
     /// slots, a turn group's retrieval target IS the turn itself, so each
     /// candidate turn is its own slot (identity map) and the probe scores against
     /// each turn's stored `WideQSig` window directly. A `Sequence` (recency) group
-    /// is skipped — it isn't belief-driven. The group's timeline is resolved the
+    /// is skipped — it is never scanned; a working-set group is scanned, since
+    /// its momentum is built from these scores. The group's timeline is resolved the
     /// same way the projection will (`resolve_turn_timeline(Some(target), …)`) and
     /// its turns enumerated `0..turn_count(timeline)` exactly as selection does,
     /// so the `(timeline, index)` keys line up with what selection reads back.
@@ -1891,7 +1980,6 @@ impl Conversation {
         observe: Observe<'_>,
         arena: Option<&GalleryArena>,
     ) -> Vec<(GroupId, Vec<(TurnKey, f32)>)> {
-        use crate::persistence::content_hash::turn_stream_id;
         let mut per_group: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
         if probe.is_empty() {
             return per_group;
@@ -1946,7 +2034,7 @@ impl Conversation {
             .unwrap()
             .is_append_only_layer(target.layer);
         for group in &layer.groups {
-            if !group.is_belief_driven() {
+            if !group.is_scanned() {
                 continue;
             }
             // Per-group phase split. `groups_us` in the caller covers a whole
@@ -1996,150 +2084,11 @@ impl Conversation {
             // All files in the group are built first so the whole group can be scored
             // in ONE batched GPU launch (per-file z), or file-by-file on the CPU
             // fallback — the two paths are numerically equivalent up to fast-math ULP
-            // (same ranking; see `examples/gpu_belief_parity.rs`). `arcs_kept` holds
-            // the referenced sig windows alive so the scan can borrow slices out of them.
-            struct FileScan {
-                timeline: TimelineId,
-                arc_turn: Vec<TurnIndex>,
-                ex_ranges: Vec<Range<usize>>,
-                n_slots: usize,
-                arcs_kept: Vec<Arc<Vec<WideQSig>>>,
-                // Stream id of each kept arc's turn — the arena residency key.
-                arc_sids: Vec<StreamId>,
-                // (arc index into `arcs_kept`, window start, window end, exchange slot)
-                windows: Vec<(usize, usize, usize, usize)>,
-                // Real sig tokens per exchange slot — the Concept A.4 size input.
-                ex_tokens: Vec<usize>,
-            }
+            // (same ranking; see `examples/gpu_belief_parity.rs`).
             let select_us = t_select.elapsed().as_micros() as u64;
             let n_timelines = timelines.len();
             let t_assemble = Instant::now();
-            let mut turns_walked = 0usize;
-            let mut files: Vec<FileScan> = Vec::new();
-            for timeline in timelines {
-                // Enumerate the group's turns exactly as selection does — the whole
-                // resolved timeline, `0..turn_count`, fetched by stream id — instead
-                // of scanning `all_streams()` per group (which is O(all timelines'
-                // streams) on the reproject hot path).
-                let count = sub.turn_count(timeline);
-                turns_walked += count as usize;
-                // Per candidate turn: its full sig plus the self-referencing sub-window
-                // seams recorded on it. A turn with no seams scores as one whole-turn
-                // window (the prior behaviour); a turn with N seams scores as N+1
-                // focused windows that all resolve back to it — so a query matching one
-                // structural region of a prefilled listing surfaces the whole turn
-                // without diluting against the rest.
-                let mut arcs: Vec<Option<Arc<Vec<WideQSig>>>> = Vec::new();
-                let mut arc_turn: Vec<TurnIndex> = Vec::new();
-                let mut arc_bounds: Vec<Vec<(usize, usize)>> = Vec::new();
-                for i in 0..count {
-                    let idx = TurnIndex(i);
-                    // Summary forest nodes are selected only by the score-density
-                    // path, never the belief/rule path — mirror project.rs and skip
-                    // them so a summary can't take a raw turn's belief slot.
-                    if sub
-                        .tree_meta_of(timeline, idx)
-                        .map(|m| m.kind.is_summary())
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    // Keep EVERY non-summary (Normal) turn in `arc_turn`, so it is the
-                    // COMPLETE Normal subsequence the couplings project onto. A turn that
-                    // has no wide-Q sig (e.g. a prefilled tool-response half) must still
-                    // hold its position, or `over_normals`/`exchanges` would fuse a
-                    // coupled call with the wrong later turn. A sig-less turn contributes
-                    // no gallery window (empty bounds) but still joins its exchange.
-                    arc_turn.push(idx);
-                    match sub.decoded_wide_sig(turn_stream_id(timeline.raw(), i)) {
-                        Some(window) => {
-                            // Self-referencing projection events mark sub-window seams.
-                            // Read the memoized (sorted, deduped) seams — decoded from the
-                            // events JSON once per session, not re-parsed for every gallery
-                            // turn on every reprojection — and derive contiguous
-                            // `[start, end)` bounds; no seams ⇒ one whole-turn window.
-                            // `subwindow_bounds` ignores any seam at/past `len`, so the raw
-                            // offsets are safe to pass straight through.
-                            let len = window.len();
-                            let seams = sub.decoded_seams(turn_stream_id(timeline.raw(), i));
-                            arc_bounds.push(subwindow_bounds(len, &seams));
-                            arcs.push(Some(window));
-                        }
-                        None => {
-                            arc_bounds.push(Vec::new());
-                            arcs.push(None);
-                        }
-                    }
-                }
-                if arc_turn.is_empty() {
-                    continue;
-                }
-                // Group the kept turns into EXCHANGES before scoring. A code-read scope
-                // (and any tool round-trip) is a *coupled pair* — a `<tool_call>` turn
-                // and its `<tool_response>` turn joined by a `TurnCoupling` record — and
-                // provenance must hit the pair as ONE unit (`exchange_of`): scoring the
-                // two halves as separate candidates splits the scope's vote and lets the
-                // generic call framing (near-identical across every scope) compete on
-                // its own. `arc_turn` is the COMPLETE Normal subsequence in chronological
-                // order, so `over_normals` maps the call-turn indices straight onto arc
-                // positions and the response is always the next position. Uncoupled turns
-                // are their own singleton exchange (no behaviour change).
-                let couplings = over_normals(&sub.couplings_of(timeline), &arc_turn);
-                let ex_ranges = exchanges(&couplings, arc_turn.len());
-                let mut ex_slot = vec![0usize; arc_turn.len()];
-                for (slot, r) in ex_ranges.iter().enumerate() {
-                    for ai in r.clone() {
-                        ex_slot[ai] = slot;
-                    }
-                }
-                let n_slots = ex_ranges.len();
-                // Flatten every turn's sub-windows into gallery windows, all tagged with
-                // their EXCHANGE slot (`wslot[i] = exchange index`). So the scan
-                // aggregates a whole round-trip — every sub-window of the call AND the
-                // response — into ONE case (best-token agreement across the pair),
-                // rather than letting the halves (or a turn's own regions) compete as
-                // separate cases and split the scope's vote. The seams still bound the
-                // windows, ready for the diverse-window step, but never fight each
-                // other. Then the L46-weighted vote (§83) decides the exchange. Only the
-                // arcs actually referenced by a window are kept alive.
-                let mut arcs_kept: Vec<Arc<Vec<WideQSig>>> = Vec::new();
-                let mut arc_sids: Vec<StreamId> = Vec::new();
-                let mut windows: Vec<(usize, usize, usize, usize)> = Vec::new();
-                for (ai, arc) in arcs.iter().enumerate() {
-                    let Some(arc) = arc else {
-                        continue; // sig-less turn: no window, but keeps its exchange slot
-                    };
-                    let sid = turn_stream_id(timeline.raw(), arc_turn[ai].0);
-                    let mut ki: Option<usize> = None;
-                    for &(s, e) in &arc_bounds[ai] {
-                        if e > s {
-                            let k = *ki.get_or_insert_with(|| {
-                                arcs_kept.push(arc.clone());
-                                arc_sids.push(sid);
-                                arcs_kept.len() - 1
-                            });
-                            windows.push((k, s, e, ex_slot[ai]));
-                        }
-                    }
-                }
-                if windows.is_empty() {
-                    continue;
-                }
-                let mut ex_tokens = vec![0usize; n_slots];
-                for &(_, s, e, slot) in &windows {
-                    ex_tokens[slot] += e - s;
-                }
-                files.push(FileScan {
-                    timeline,
-                    arc_turn,
-                    ex_ranges,
-                    n_slots,
-                    arcs_kept,
-                    arc_sids,
-                    windows,
-                    ex_tokens,
-                });
-            }
+            let (files, turns_walked) = assemble_file_scans(&sub, timelines);
             // End of Phase A — release the substrate before the scan. Every
             // `FileScan` owns its data (`arcs_kept` holds `Arc`s), so nothing
             // below borrows the guard.
@@ -2151,181 +2100,12 @@ impl Conversation {
             }
             let t_scan = Instant::now();
 
-            // ── Phase B: score every file. GPU = ONE paged segmented launch over the
-            // resident gallery arena (per-file z / margin / needle gate, numerically
-            // equivalent to the CPU per-file scan up to fast-math ULP — same ranking);
-            // CPU fallback = the identical `score_slots_weighted` per file. Per-layer-
-            // group vote weights come from the group's `policy.layer_weights` (empty ⇒
-            // uniform — repo_map peaks on L46 (§83), configured in the schema YAML). ──
-            let weights = &group.policy.layer_weights;
-            // The CPU per-file scan of one probe — the path a host without the
-            // arena takes.
-            let scan_files_cpu = |p: &[WideQSig]| -> Vec<(Vec<f32>, Vec<f32>)> {
-                files
-                    .iter()
-                    .map(|f| {
-                        let wref: Vec<&[WideQSig]> = f
-                            .windows
-                            .iter()
-                            .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
-                            .collect();
-                        let wslot: Vec<usize> =
-                            f.windows.iter().map(|&(_, _, _, slot)| slot).collect();
-                        match group.policy.scan.fusion {
-                            FusionMode::Additive => {
-                                let v = score_slots_weighted(p, &wref, &wslot, f.n_slots, weights);
-                                (v.clone(), v)
-                            }
-                            mode => {
-                                let grouped =
-                                    score_slots_grouped(p, &wref, &wslot, f.n_slots, weights);
-                                if grouped.is_empty() {
-                                    (vec![0.0; f.n_slots], vec![0.0; f.n_slots])
-                                } else {
-                                    (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
-                                }
-                            }
-                        }
-                    })
-                    .collect()
-            };
-            // Returns, per probe, per-file `(fused, mass_base)`: the policy-fused
-            // per-exchange scores and the UNGATED additive sum for Concept B. Every
-            // probe rides the same launch — one pass over the gallery and one sync
-            // for the tail and question windows together, each voting exactly as
-            // it would alone.
-            let scan_files = |probes: &[&[WideQSig]]| -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
-                let gpu_scores: Option<Vec<Vec<(Vec<f32>, Vec<f32>)>>> = arena.and_then(|arena| {
-                // Per-turn residency fingerprint: the decoded-sig `Arc` identity + a
-                // content sample (first/last words). The memo serves a STABLE `Arc`
-                // that changes identity only when a turn's blob is rewritten (and keeps
-                // unchanged Arcs alive), so the pointer is a cheap content key — a seal
-                // bumps it, a reprojection against unchanged turns does not. The word
-                // sample is the ABA guard against an in-place re-seal / substrate reset
-                // reusing an address. Keyed per turn, so a seal re-uploads only that
-                // turn's pages; unchanged turns stay resident (no upload).
-                let segments: Vec<PagedSegment> = files
-                    .iter()
-                    .map(|f| PagedSegment {
-                        windows: f
-                            .windows
-                            .iter()
-                            .map(|&(k, s, e, slot)| PagedWindow {
-                                sid: f.arc_sids[k],
-                                fingerprint: sig_fingerprint(&f.arcs_kept[k]),
-                                turn: f.arcs_kept[k].as_slice(),
-                                start: s,
-                                end: e,
-                                case: slot,
-                            })
-                            .collect(),
-                        n_cases: f.n_slots,
-                    })
-                    .collect();
-                // `[probe][file][slot]`.
-                let arena_scan = |w: &[f32]| -> Option<Vec<Vec<Vec<f32>>>> {
-                    match arena.scan_weighted(&segments, probes, w) {
-                        Ok(out) => {
-                            // One per-GLOBAL-case vote vector per probe, in segment
-                            // (file) order. Split each back per file by cumulative
-                            // `n_slots`.
-                            Some(
-                                out.into_iter()
-                                    .map(|votes| {
-                                        let mut cum = 0usize;
-                                        files
-                                            .iter()
-                                            .map(|f| {
-                                                let end = (cum + f.n_slots).min(votes.len());
-                                                let mut v =
-                                                    votes.get(cum..end).unwrap_or(&[]).to_vec();
-                                                v.resize(f.n_slots, 0.0);
-                                                cum += f.n_slots;
-                                                v
-                                            })
-                                            .collect()
-                                    })
-                                    .collect(),
-                            )
-                        }
-                        // WARN, and on the crate-qualified target — both
-                        // deliberate.
-                        //
-                        // The target must fall under one of the host's
-                        // `EnvFilter` directives (`zend=`, `candle_conversation=`,
-                        // `candle_transformers=`, `candle_nn=`); a bare
-                        // `provenance` matches none, so the fallback could never
-                        // be printed and its absence from a log would read as
-                        // proof it had not happened.
-                        //
-                        // And on a CUDA host a declined GPU scan is not a debug
-                        // detail: the CPU per-file path is orders of magnitude
-                        // slower over a large corpus, so the symptom is a daemon
-                        // that has quietly become slow rather than one that
-                        // reports a fault. The CPU path stays — a host without
-                        // CUDA has no other way to score beliefs — but taking it
-                        // on a machine that has a GPU is worth saying out loud.
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "candle_conversation::provenance",
-                                "paged GPU belief scan unavailable, using CPU per-file scan: {e}"
-                            );
-                            None
-                        }
-                    }
-                };
-                // Concept G on the arena: non-additive modes run one one-hot
-                // scan per fold group (each IS that group's needle-gated
-                // tally), then fuse per the mode — the same law as the CPU
-                // `score_slots_fused`. The ungated group sum rides along as
-                // the mass base.
-                match group.policy.scan.fusion {
-                    FusionMode::Additive => arena_scan(weights).map(|per_probe| {
-                        per_probe
-                            .into_iter()
-                            .map(|per_file| per_file.into_iter().map(|v| (v.clone(), v)).collect())
-                            .collect()
-                    }),
-                    mode => {
-                        // Derived, not the locked constant — see the turn-group
-                        // scan above.
-                        let n_groups = probes.first().and_then(|p| p.first()).map(|s| {
-                            let n = s.n_heads as usize;
-                            match heads_per_group(n) {
-                                0 => 1,
-                                per => (n / per).max(1),
-                            }
-                        })?;
-                        // grouped[g][probe][file][slot]
-                        let mut grouped: Vec<Vec<Vec<Vec<f32>>>> = Vec::with_capacity(n_groups);
-                        for g in 0..n_groups {
-                            let mut one_hot = vec![0.0f32; n_groups];
-                            one_hot[g] = weights.get(g).copied().unwrap_or(1.0);
-                            grouped.push(arena_scan(&one_hot)?);
-                        }
-                        Some(
-                            (0..probes.len())
-                                .map(|pi| {
-                                    (0..files.len())
-                                        .map(|fi| {
-                                            let per_group: Vec<Vec<f32>> = grouped
-                                                .iter()
-                                                .map(|gp| gp[pi][fi].clone())
-                                                .collect();
-                                            (
-                                                mode.fuse(&per_group),
-                                                FusionMode::Additive.fuse(&per_group),
-                                            )
-                                        })
-                                        .collect()
-                                })
-                                .collect(),
-                        )
-                    }
-                }
-            });
-                gpu_scores.unwrap_or_else(|| probes.iter().map(|p| scan_files_cpu(p)).collect())
-            };
+            // ── Phase B: score every file (`belief_files::scan_file_scans`). Per-
+            // layer-group vote weights come from the group's `policy.layer_weights`
+            // (empty ⇒ uniform — repo_map peaks on L46 (§83), configured in the
+            // schema YAML). Per probe, per file: `(fused, mass_base)`, the tail and
+            // question windows riding one launch. ──
+            let scan_files = |probes: &[&[WideQSig]]| scan_file_scans(&files, group, probes, arena);
             // Concept F: the pinned question window scans as a second probe,
             // max-fused with the tail per exchange AFTER normalization.
             let question = match probe_q {
@@ -3176,6 +2956,13 @@ impl Conversation {
         use crate::persistence::streams::StreamDecl;
         use crate::persistence::transfer::load_turn_into_hot;
 
+        // Nothing cold, nothing to read: an elevate calls this whether or not
+        // its plan holds a cold turn, and taking the persistence lock for an
+        // empty batch queued a warm-only lift behind whatever held it — a
+        // segment relocation, 37 s.
+        if keys.is_empty() {
+            return Vec::new();
+        }
         let mut p = self.persistence.lock().unwrap();
         let substrate = self.read();
         keys.iter()
@@ -3561,6 +3348,34 @@ impl Conversation {
         p.write_section_tombstone(stream_id.0, reason)
             .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
         Ok(())
+    }
+
+    /// End a section stream's persisted generation so its next request prefills
+    /// it fresh — the rebuild counterpart of [`Self::tombstone_section`], which
+    /// is for corrupted bytes and releases them. Resident copies keep serving
+    /// ([`crate::substrate::Substrate::retire_section_generation`]); the
+    /// durable [`crate::persistence::record::RecordType::SectionTombstone`] is
+    /// the same record, so a restart rebuilds the section.
+    pub fn retire_section_generation(
+        &self,
+        stream_id: StreamId,
+        reason: &str,
+    ) -> candle::Result<()> {
+        self.write().retire_section_generation(stream_id);
+        if self.read_only {
+            return Ok(());
+        }
+        let mut p = self.persistence.lock().unwrap();
+        p.write_section_tombstone(stream_id.0, Some(reason))
+            .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+        Ok(())
+    }
+
+    /// The persisted stream `section` is registered against, if it is
+    /// registered — what [`Self::tombstone_section`] and
+    /// [`Self::retire_section_generation`] take.
+    pub fn section_stream(&self, section: SectionId) -> Option<StreamId> {
+        self.read().section_stream(section)
     }
 
     /// Re-read a persisted section's per-layer chunk windows off disk and
@@ -4454,17 +4269,54 @@ impl Conversation {
         self.run_maintenance_pass(true)
     }
 
+    /// Run one step of a maintenance op under its own hold of the persistence
+    /// lock, adding the time the lock was held to `held`. A step that fails
+    /// ends the op's relocation watch, since no later step of it will run.
+    fn maintenance_hold<T>(
+        &self,
+        held: &mut Duration,
+        step: impl FnOnce(&mut SubstratePersistence) -> PersistenceResult<T>,
+    ) -> candle::Result<T> {
+        let mut p = self.persistence.lock().unwrap();
+        let t = Instant::now();
+        let out = step(&mut p);
+        *held += t.elapsed();
+        if out.is_err() {
+            p.end_relocation_watch();
+        }
+        out.map_err(|e| candle::Error::Msg(format!("substrate maintenance exec: {e}")))
+    }
+
     /// One maintenance pass under phased locking so the slow relocation I/O never
     /// holds the substrate write lock (which would stall every decode `read()`),
     /// mirroring the persistence thread's hot→warm / warm→cold discipline. When
     /// `force` is set the age/ratio gates are waived (`pick_maintenance_op`).
     fn run_maintenance_pass(&self, force: bool) -> candle::Result<bool> {
-        // 1. Plan under a brief read + persistence lock (snapshot only).
+        // 1. Plan under a brief read + persistence lock (snapshot only). The
+        //    relocation watch starts in the same hold, so every write after the
+        //    plan is known to the relocation below.
+        //
+        //    One op at a time: an op releases this lock between its batches, so
+        //    a second pass — the forced `POST /v1/debug/maintenance` beside the
+        //    background thread's — can arrive mid-op. It plans nothing and
+        //    leaves the status alone: the op in flight owns `running`.
         let plan = {
-            let p = self.persistence.lock().unwrap();
+            let mut p = self.persistence.lock().unwrap();
+            if p.relocation_in_flight() {
+                tracing::debug!(
+                    target: "candle_conversation::persistence::maintenance",
+                    "a maintenance op is already relocating — this pass plans none"
+                );
+                return Ok(false);
+            }
             let substrate = self.read();
-            p.plan_maintenance(&substrate, force)
-                .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?
+            let plan = p
+                .plan_maintenance(&substrate, force)
+                .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?;
+            if plan.is_some() {
+                p.watch_relocation();
+            }
+            plan
         };
         let outcome = if let Some(plan) = plan {
             // Signal "in progress" so the GUI shows a live spinner across the I/O.
@@ -4476,30 +4328,33 @@ impl Conversation {
             (|| -> candle::Result<bool> {
                 // 2. Relocation I/O under the persistence lock ONLY — the
                 //    substrate lock is released, so decode's in-RAM projection
-                //    proceeds during the read + re-append + fsync. BUT the
-                //    scheduler thread's seal writes DO share this persistence lock,
-                //    so they block for the whole relocation — an off-thread stall
-                //    the scheduler can't time itself. Record the I/O wall-clock into
-                //    the scheduler's Sync bucket so a multi-second compaction shows
-                //    as Sync (a persistence wait) rather than unattributed Blocked,
-                //    and log it so the op's cost is visible on its own line.
+                //    proceeds during the read + re-append + fsync. The scheduler's
+                //    seal writes and cold loads DO share this persistence lock, so
+                //    the lock is taken per batch: the resident re-emit, then the
+                //    chunks `RELOCATION_BATCH_BYTES` at a time, then the small
+                //    record types — each its own hold. A cold load that arrives
+                //    mid-relocation waits for one batch. Held across the whole
+                //    relocation it waited for all of it: a 3.6 GB segment stalled
+                //    an elevate — and the decode behind it — for 37 s.
+                //
+                //    Only the time the lock is actually held is charged to the
+                //    scheduler's Sync bucket.
                 let t_exec = Instant::now();
-                let result = {
-                    let mut p = self.persistence.lock().unwrap();
-                    p.execute_maintenance(&plan).map_err(|e| {
-                        candle::Error::Msg(format!("substrate maintenance exec: {e}"))
-                    })?
-                };
-                let exec_ms = t_exec.elapsed().as_millis() as u64;
-                note_persistence_maint_us(t_exec.elapsed().as_micros() as u64);
-                if exec_ms > 200 {
-                    tracing::trace!(
-                        target: "candle_conversation::persistence::maintenance",
-                        exec_ms,
-                        "segment-maintenance relocation I/O held the persistence lock \
-                         (scheduler seal writes block for this duration → Sync phase)"
-                    );
-                }
+                let mut held = Duration::ZERO;
+                let mut run = self.maintenance_hold(&mut held, |p| p.begin_maintenance(&plan))?;
+                while self.maintenance_hold(&mut held, |p| {
+                    p.relocate_chunk_batch(&plan, &mut run, RELOCATION_BATCH_BYTES)
+                })? {}
+                let result =
+                    self.maintenance_hold(&mut held, |p| p.complete_maintenance(&plan, run))?;
+                note_persistence_maint_us(held.as_micros() as u64);
+                tracing::debug!(
+                    target: "candle_conversation::persistence::maintenance",
+                    exec_ms = t_exec.elapsed().as_millis() as u64,
+                    held_ms = held.as_millis() as u64,
+                    "segment-maintenance relocation: the persistence lock was held for \
+                     held_ms of exec_ms, one batch at a time"
+                );
                 // 3. Repoint the index at the relocated records under a brief write lock.
                 {
                     let mut substrate = self.write();
@@ -4673,27 +4528,15 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             // sitting warm or cold is elevated by the ordinary projection
             // working-set path, which is why nothing has to be pinned hot.
             //
-            // Fast-path reads join them: a tool call that resolved to content
-            // the corpus had already read injected that conversation instead of
-            // re-reading the file, and it belongs in the same place the read it
-            // stands in for would have gone. Oldest first for the same reason —
-            // a read the conversation did earlier reads as earlier.
-            //
-            // Ahead of the lineage, because the lineage is what the conversation
-            // was founded on and these are things it went and looked at since.
-            let mut keys: Vec<TurnKey> = self
+            // The dialogue's working set is NOT here: it sits in its own
+            // layers' groups (`working_set_members`), so this group holds the
+            // lineage and the conversation's own turns only.
+            return self
                 .read
                 .inherited_chain(self.target.timeline)
                 .into_iter()
                 .flat_map(turns_of)
                 .collect();
-            let mut injected: Vec<TimelineId> = self
-                .read
-                .fast_path_injections(self.target.timeline)
-                .to_vec();
-            injected.reverse();
-            keys.extend(injected.into_iter().flat_map(turns_of));
-            return keys;
         }
         // The same scope the belief scan applied: what was never scored for
         // this target is never selected for it either.
@@ -4818,12 +4661,48 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         // timeline's summary forest (see `select_dense` in `select.rs`).
         self.read.summary_tree_select(timeline, budget)
     }
+
+    /// The target's working-set members in `group`, in the working set's order.
+    ///
+    /// A lock is kept whatever the retrieval scope says now — it is a promise
+    /// already made to the model. Provenance the scope no longer offers is left
+    /// out, the same as every other selection from a scoped group; the next
+    /// observation takes it out of the set.
+    fn working_set_members(&self, group: GroupId) -> Option<WorkingSetMembers> {
+        let target = self.target.timeline;
+        let ws = self.read.working_set(target)?;
+        let members = ws
+            .members()
+            .into_iter()
+            .filter(|(tl, _)| {
+                self.read
+                    .timeline_target(*tl)
+                    .is_some_and(|(_, g)| g == group)
+            })
+            .filter(|(tl, locked)| *locked || self.read.scope_offers(group, target, *tl))
+            .map(|(tl, locked)| {
+                let standing = if locked {
+                    Standing::Locked
+                } else {
+                    Standing::Provenance(ws.momentum_of(tl).unwrap_or(0.0))
+                };
+                (tl, standing)
+            })
+            .collect();
+        Some(WorkingSetMembers { members })
+    }
+
+    fn timeline_turns(&self, timeline: TimelineId) -> Vec<TurnKey> {
+        (0..Substrate::turn_count(&self.read, timeline))
+            .map(|i| TurnKey::new(timeline, TurnIndex(i)))
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        alone, collection_warm_plan, is_warmable, selected_in_collection, subwindow_bounds,
+        collection_warm_plan, ingest_group, is_warmable, selected_in_collection, subwindow_bounds,
         warmable, Conversation, Observe,
     };
 
@@ -5340,29 +5219,20 @@ layers:
         assert!(warmable(b.schema(), ground, facts).is_none());
     }
 
-    /// **A warm scores one group, not its layer.** `score_belief_groups` scores
-    /// and teaches every belief group it is handed, so the view a single
-    /// group's warm runs under must hold that group alone — and nothing else
-    /// about the layer may change, or the scan would read a different layer.
+    /// The bulk ingest warm-up finds an append-only layer's group whether or
+    /// not the layer is gathered — the flag promises only that no OTHER
+    /// conversation draws from it — while [`warmable`] refuses it.
     #[test]
-    fn a_single_group_warm_scores_under_a_layer_holding_only_that_group() {
-        let b = Builder::from_yaml(WARM_YAML).unwrap();
+    fn an_ingest_group_is_found_whether_or_not_its_layer_is_gathered() {
+        let mut b = Builder::from_yaml(WARM_YAML).unwrap();
         let ground = b.id_for_layer("ground").unwrap();
-        let rumours = b.id_for_group("rumours").unwrap();
-        let (layer, group) = warmable(b.schema(), ground, rumours).unwrap();
+        let facts = b.id_for_group("facts").unwrap();
+        assert!(b.set_layer_gathered("ground", false));
+        assert!(warmable(b.schema(), ground, facts).is_none());
         assert_eq!(
-            layer.groups.len(),
-            2,
-            "the fixture has a sibling to leave out"
+            ingest_group(b.schema(), ground, facts).map(|g| g.id),
+            Some(facts)
         );
-
-        let view = alone(layer, group);
-        assert_eq!(view.groups.len(), 1);
-        assert_eq!(view.groups[0].id, rumours);
-        assert_eq!(view.id, layer.id);
-        assert_eq!(view.name, layer.name);
-        assert_eq!(view.window, layer.window);
-        assert_eq!(view.score_threshold, layer.score_threshold);
     }
 
     /// `(tags, timeline, index)` rows in the shape `collection_warm_plan` reads.

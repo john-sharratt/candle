@@ -62,6 +62,14 @@ impl FactoredRope {
         self.rungs.rung_for(reach)
     }
 
+    /// The indexer with the attention's minimum factor
+    /// ([`RopeRungs::with_min_factor`]), so its queries rotate on the rung the
+    /// attention does. The step tables cover every rung already.
+    pub fn with_min_factor(mut self, min: f32) -> Result<Self> {
+        self.rungs = self.rungs.with_min_factor(min)?;
+        Ok(self)
+    }
+
     /// Rung `rung`'s table, `f32[(HI + LO) · pairs · 2]`.
     pub fn table(&self, rung: u32) -> Result<Tensor> {
         self.rungs.table(rung)

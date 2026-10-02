@@ -263,6 +263,25 @@ impl Hosted {
         })
     }
 
+    /// The room an act is about, as the `area/node` string the sim keys on: the
+    /// one the body began deciding in, while it is deciding, and where it stands
+    /// otherwise.
+    ///
+    /// **The grammar names what is in the room the body read, and the decode
+    /// outlasts a step of the metronome.** A moving body can be a leg on by the
+    /// time its call lands, and an act that looked its target up in the room it
+    /// had reached would refuse a name the grammar had just offered. Acts that
+    /// name something in the room read it here, so what was offered is what is
+    /// acted on.
+    pub fn standpoint_of(&self, body: &str) -> String {
+        self.read(|w| {
+            w.decided_at(body)
+                .or_else(|| w.actor(body).map(|a| &a.at))
+                .map(|at| format!("{}/{}", at.area, at.node))
+                .unwrap_or_default()
+        })
+    }
+
     /// Advance one moment: everybody on their way covers a leg.
     ///
     /// Returns how many bodies moved. Nobody walking is the common case and

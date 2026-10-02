@@ -25,6 +25,7 @@ mod gpu_chunks_tests;
 mod io_tests;
 mod kv_stats_tests;
 mod q0_v_codebook_side_tests;
+mod q5_selection_tests;
 mod selection_table_tests;
 mod sequence_ops_tests;
 mod types_tests;

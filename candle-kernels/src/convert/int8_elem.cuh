@@ -40,6 +40,7 @@ namespace int8_elem {
 ///
 /// Callers must be warp-uniform (every lane executes the shuffle): every
 /// call site guards on warp-uniform row/token conditions.
+///
 /// RoPE over one pair of windows, `lo` = window w and `hi` = window
 /// w + N_WIN/2 (w < N_WIN/2): the rotary layout rotates dim d against
 /// d + HEAD_DIM/2, the same lane in those two windows; the interleaved layout

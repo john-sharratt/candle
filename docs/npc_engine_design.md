@@ -238,6 +238,16 @@ and is the KV prefix. Both are superseding turns in their own bands (Part V), wh
 them in the most recent position — where the present belongs — without disturbing the prefix
 above them.
 
+**The command table's summons is for bodies that can walk to it.** While the table is open,
+a character with no mission is told every turn to go to it (or, standing at it, to take a
+mission up). The summons is set only when a room offering `collect_mission` is the body's own
+room or lies on a route from it across the map's doors, portals and lifts
+(`Runtime::command_table_way`, which names the room and whether the way is on foot). A table in
+the body's own area is preferred. The vault's command room and the Redoubt's muster hall each
+hold an `order-table`, so a Redoubt character is sent to its own muster hall, on foot, and is
+never told to ride a lift to the vault's level. A body with no table in reach (the waste) gets no
+summons and reads the ordinary standing task for its company instead.
+
 ### The idle turn is authored, not generated
 
 An NPC with a high pace floor never truly blocks, so most of its turns arrive with nothing
@@ -857,7 +867,10 @@ worked example of a character's history materialised as substrate turns.
 
 ## Part XI — API surface
 
-Versioned under `/v1`, mirroring zend's conventions.
+Versioned under `/v1`, mirroring zend's conventions. `{id}` is the character's wire id — the
+base-36 string every response carries as `npc_id`, never a decimal number — and every route that
+names one resolves it through the same ownership check (`engine::owned`/`owned_by`), so an
+unparseable id and somebody else's id are the same 404.
 
 ```
   NPC lifecycle
@@ -892,6 +905,14 @@ Versioned under `/v1`, mirroring zend's conventions.
     POST   /v1/interaction/{ix}/inject      operator/player event into the inbox
     GET    /v1/interaction/{ix}/stream      SSE: live acts, then tick-bounded narration
     DELETE /v1/interaction/{ix}             end explicitly
+
+  Operator writes  (owner only — 404 for a character that is not yours)
+    POST   /v1/npc/{id}/direct              a line spoken into its world: text, speaker, salience, to
+    POST   /v1/npc/{id}/pulse               a `/` command: { "line": "/say …" }
+    GET    /v1/npc/{id}/window              the verbatim tail it is carrying into its next decode
+    POST   /v1/npc/{id}/mission             lodge a mission (start: carry it at once)
+    GET    /v1/npc/{id}/mission             the open mission, or the last one finished
+    POST   /v1/npc/{id}/mission/cancel      call it off
 
   Environment
     GET    /v1/npc/{id}/environment         simulator state + enabled flag

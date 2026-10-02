@@ -121,6 +121,36 @@ fn make_qkv_at(
     device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let mut q = Vec::with_capacity(n_tokens * g.n_head * g.head_dim);
+    for local in 0..n_tokens {
+        for h in 0..g.n_head {
+            for d in 0..g.head_dim {
+                q.push(pseudo(base + local, h, d, seed ^ 0x111));
+            }
+        }
+    }
+    let (k, v) = make_kv_at(g, base, n_tokens, seed, alt, device)?;
+    Ok((
+        Tensor::from_vec(q, (n_tokens, g.n_head, g.head_dim), device)?.to_dtype(DType::BF16)?,
+        k,
+        v,
+    ))
+}
+
+/// The K and V of [`make_qkv_at`], without the Q.
+///
+/// A history is built by prefilling it, and what a history needs from that
+/// prefill is the K and V it leaves in the cache: the prefill's own output is
+/// dropped. Q is `n_head` times K's width, and at a 32K-token depth on
+/// 24 heads × 256 dims its hash-per-element generation is two hundred million
+/// values of host work for an answer nobody reads.
+fn make_kv_at(
+    g: Geom,
+    base: usize,
+    n_tokens: usize,
+    seed: u64,
+    alt: &[bool],
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
     let mut k = Vec::with_capacity(n_tokens * g.n_kv_head * g.head_dim);
     let mut v = Vec::with_capacity(n_tokens * g.n_kv_head * g.head_dim);
     for local in 0..n_tokens {
@@ -130,11 +160,6 @@ fn make_qkv_at(
         } else {
             1.0
         };
-        for h in 0..g.n_head {
-            for d in 0..g.head_dim {
-                q.push(pseudo(t, h, d, seed ^ 0x111));
-            }
-        }
         for h in 0..g.n_kv_head {
             for d in 0..g.head_dim {
                 k.push(sign * pseudo(t, h, d, seed ^ 0x222));
@@ -143,7 +168,6 @@ fn make_qkv_at(
         }
     }
     Ok((
-        Tensor::from_vec(q, (n_tokens, g.n_head, g.head_dim), device)?.to_dtype(DType::BF16)?,
         Tensor::from_vec(k, (n_tokens, g.n_kv_head, g.head_dim), device)?.to_dtype(DType::BF16)?,
         Tensor::from_vec(v, (n_tokens, g.n_kv_head, g.head_dim), device)?.to_dtype(DType::BF16)?,
     ))
@@ -190,7 +214,10 @@ fn build_history_slot(
     // rope base both come off the cache's own length, and getting that wrong is
     // silent), so it is left as the harness's known ceiling rather than a
     // half-verified builder.
-    let (q, k, v) = make_qkv(g, history, seed, alt, device)?;
+    // The prefill's output is dropped below, so its Q is zeros: only the K and V
+    // it writes into the cache are the history (see [`make_kv_at`]).
+    let (k, v) = make_kv_at(g, 0, history, seed, alt, device)?;
+    let q = Tensor::zeros((history, g.n_head, g.head_dim), DType::BF16, device)?;
     backing.ensure_for_batch_entries(&[(0, 0)], history)?;
     let generation = stager.begin_generation();
     {

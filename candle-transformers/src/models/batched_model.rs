@@ -583,6 +583,13 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         &self.rope
     }
 
+    /// Run no sequence on a rung whose YaRN factor is below `min`
+    /// ([`RopeRungs::with_min_factor`]).
+    pub fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
+        self.rope = self.rope.clone().with_min_factor(min)?;
+        Ok(())
+    }
+
     /// When true, `forward_batch` returns logits for ALL positions, not just last.
     pub fn set_all_logits(&mut self, enabled: bool) {
         self.all_logits = enabled;

@@ -24,6 +24,7 @@ use candle_conversation::persistence::streams::StreamDecl;
 use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::provenance::{decode_wide_sigs, score_provenance_late_fusion, WideQSig};
 use candle_conversation::substrate::Substrate;
+use candle_conversation::working_set::marks::is_dialogue;
 
 fn env_f32(key: &str, default: f32) -> f32 {
     std::env::var(key)
@@ -119,13 +120,13 @@ fn main() -> anyhow::Result<()> {
     }
     let gref: Vec<&WideQSig> = gallery.iter().collect();
 
-    // ── Probes: dialogue turns (empty tags) with a signature, in substrate order ─
+    // ── Probes: dialogue turns (no gather-scope tags) with a signature, in order ─
     let mut probes: Vec<(u64, Vec<WideQSig>)> = Vec::new();
     for (sid, e) in substrate.all_streams() {
         let Some(StreamDecl::Turn(d)) = &e.decl else {
             continue;
         };
-        if !d.tags.is_empty() {
+        if !is_dialogue(&d.tags) {
             continue;
         }
         let Some(sig) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {

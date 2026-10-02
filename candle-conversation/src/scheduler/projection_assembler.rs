@@ -43,8 +43,11 @@ use crate::projection::{
     ContentResolver, Conversation, GroupId, MaterializedPiece, ProjectionSegment, ProjectionTarget,
     Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
 };
+use crate::scheduler::piece_identity::{chained_identities, kept_prefix, piece_label, PieceReads};
 use crate::scheduler::profile;
+use crate::scheduler::projection_identity::section_content_stamp;
 use crate::sequence_handle::SequenceId;
+use crate::substrate::Substrate;
 use crate::summary_tree::SelectionOrigin;
 use crate::summary_tree::TurnKind;
 
@@ -87,6 +90,40 @@ pub(super) struct SlotState {
     /// the slot held more than this: a placement is chosen afresh by every
     /// projection, and only the rest exists nowhere but the slot.
     pub(super) placed: usize,
+    /// The pieces this slot's last complete assembly placed, in order — each
+    /// one's chained identity and where the slot stood after it. A rebuild
+    /// keeps the longest prefix whose identities match and re-injects only from
+    /// the first piece that differs (`super::piece_identity`). Emptied by an
+    /// incomplete assembly, whose slot does not hold what its pieces describe.
+    pub(super) placed_pieces: Vec<PlacedPiece>,
+}
+
+/// One piece an assembly placed, and the slot as it stood right after it.
+#[derive(Clone)]
+pub(super) struct PlacedPiece {
+    /// The piece's identity chained through every piece before it.
+    identity: u64,
+    /// The slot's block count after the piece — where a kept prefix is cut.
+    blocks_after: usize,
+    /// The slot's logical position after the piece.
+    pos_after: u32,
+    /// The glue-island cache key's running prefix hash after the piece, so a
+    /// walk resumed here keys its islands exactly as a whole walk would.
+    prefix_h: DefaultHasher,
+}
+
+#[cfg(test)]
+impl PlacedPiece {
+    /// A record of one piece the slot holds through `blocks_after` — for tests
+    /// that need a kept prefix on record without walking an assembly.
+    pub(super) fn ending_at(blocks_after: usize) -> Self {
+        Self {
+            identity: 1,
+            blocks_after,
+            pos_after: (blocks_after * 32) as u32,
+            prefix_h: DefaultHasher::new(),
+        }
+    }
 }
 
 impl SlotState {
@@ -669,7 +706,12 @@ pub(super) fn apply_segments(
         }
     }
     let t_glue = std::time::Instant::now();
-    fire_gap_fill_batch(ctx.session, &**ctx.model, ctx.device, &[&plan])?;
+    if let Err(e) = fire_gap_fill_batch(ctx.session, &**ctx.model, ctx.device, &[&plan]) {
+        // The walk recorded the glue pieces as placed; unfilled, they are
+        // zero chunks no later rebuild may keep.
+        state.placed_pieces.clear();
+        return Err(e);
+    }
     super::drain_add_us(&super::DRAIN_GLUE_US, t_glue.elapsed().as_micros() as u64);
     apply_segments_finish(state, &mut ctx, plan, true)
 }
@@ -786,23 +828,7 @@ pub(super) fn apply_segments_build(
         snapshot_tail(ctx.session, parent_id)?
     };
 
-    // 2. Truncate the slot. Its per-position state goes with the K/V: the
-    //    rebuild below re-injects every segment from position 0, and pages left
-    //    from the previous assembly would sit at positions this one does not
-    //    have.
-    ctx.session
-        .truncate_sequence_to_blocks(parent_id.0, 0)
-        .map_err(ConversationError::Model)?;
-    ctx.model
-        .reset_positional_state(parent_id.0)
-        .map_err(ConversationError::Model)?;
-
-    // 3. Full rebuild — rewrite the slot_tokens record from scratch.
-    if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
-        entry.clear();
-    }
-
-    // 4. Walk segments in logical order, building the slot's chunk list IN
+    // 2–4. Walk segments in logical order, building the slot's chunk list IN
     //    PLACE: a sealed section/turn is Arc-injected; a glue island reserves a
     //    real, writer-owned GAP chunk at its position (zeros, filled later). The
     //    chunks therefore land in logical order, so every chunk's cumulative-
@@ -838,6 +864,107 @@ pub(super) fn apply_segments_build(
     };
     let bakes = |tl: TimelineId, idx: TurnIndex| !unbaked.contains(&(tl, idx));
     let pieces = assemble_pieces_with(new_segments, ctx.boundary_markers, &bakes);
+
+    // ── Keep the prefix this slot already holds ─────────────────────────────
+    // Each piece's identity, chained through the pieces before it, against what
+    // the slot's last complete assembly placed: the longest run that matches is
+    // already in the slot, exactly as this walk would build it, so the slot is
+    // cut back to the end of that run — K/V, index and token log together — and
+    // only the rest is walked. A projection whose selection moved at the end
+    // costs the end, not the whole prefix (`super::piece_identity`).
+    let identities = {
+        let read = ctx.conversation.read();
+        let slot_timeline = ctx.slot_target.map(|t| t.timeline);
+        let mut newest: HashMap<TimelineId, Option<TurnIndex>> = HashMap::new();
+        for piece in &pieces {
+            if let AssembledPiece::Turn {
+                timeline: Some(tl), ..
+            } = piece
+            {
+                newest
+                    .entry(*tl)
+                    .or_insert_with(|| read.turn_indices(*tl).max());
+            }
+        }
+        let whole = |tl: TimelineId, idx: TurnIndex| {
+            keeps_reasoning(slot_timeline, tl, newest.get(&tl).copied().flatten(), idx)
+        };
+        let stamp = |id: SectionId| section_content_stamp(&read.section_tokens_of(id));
+        let causal_only = ctx.boundary_markers.causal_only_glue;
+        let bridge = |next: Option<&AssembledPiece>| {
+            if causal_only {
+                0
+            } else {
+                glue_bridge_window(next)
+            }
+        };
+        chained_identities(
+            &pieces,
+            &PieceReads {
+                whole: &whole,
+                section_stamp: &stamp,
+                bridge: &bridge,
+            },
+        )
+    };
+    // A record is trusted only while the slot still reaches its end: anything
+    // that cut the slot shorter since has taken the kept pieces with it.
+    let slot_blocks = block_count_of(ctx, parent_id)?;
+    let placed_ids: Vec<u64> = state
+        .placed_pieces
+        .iter()
+        .take_while(|p| p.blocks_after <= slot_blocks)
+        .map(|p| p.identity)
+        .collect();
+    let keep = kept_prefix(&placed_ids, &identities, &pieces);
+    // Where the prefix stopped matching, and what stands there now — the one
+    // fact that says why a rebuild cost what it did.
+    tracing::debug!(
+        target: "candle_conversation::scheduler::reproject",
+        slot = parent_id.0,
+        placed = state.placed_pieces.len(),
+        trusted = placed_ids.len(),
+        kept = keep,
+        pieces = pieces.len(),
+        first_new = ?pieces.get(keep).map(piece_label),
+        "apply_segments: kept prefix"
+    );
+    state.placed_pieces.truncate(keep);
+    let mut prefix_h = DefaultHasher::new();
+    match state.placed_pieces.last() {
+        None => {
+            // Nothing to keep: truncate the slot. Its per-position state goes
+            // with the K/V — the walk re-injects every piece from position 0,
+            // and pages left from the previous assembly would sit at positions
+            // this one does not have.
+            ctx.session
+                .truncate_sequence_to_blocks(parent_id.0, 0)
+                .map_err(ConversationError::Model)?;
+            ctx.model
+                .reset_positional_state(parent_id.0)
+                .map_err(ConversationError::Model)?;
+            if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
+                entry.clear();
+            }
+        }
+        Some(last) => {
+            ctx.session
+                .truncate_sequence_to_blocks(parent_id.0, last.blocks_after)
+                .map_err(ConversationError::Model)?;
+            ctx.model
+                .truncate_positional_state(parent_id.0, last.pos_after as usize)
+                .map_err(ConversationError::Model)?;
+            if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
+                entry.truncate(last.pos_after as usize);
+            }
+            walker.logical_pos = last.pos_after;
+            // Every piece ends on a complete region — a sealed inject or a
+            // reserved gap — so the next one starts a fresh writer chunk.
+            walker.last_was_sealed = true;
+            prefix_h = last.prefix_h.clone();
+        }
+    }
+    walker.kept_pieces = keep;
     // ── Island-cache keying: a rolling hash over the CONTENT identity of every
     // piece the walk has placed so far. A glue island's K/V is a function of its
     // own tokens, its (backward-unbounded) attended prefix, and — when its
@@ -849,10 +976,10 @@ pub(super) fn apply_segments_build(
     // (a skipped not-hot section hashes as a zero-length placement, distinct
     // from an injected one), and — for sections, whose content can re-seal
     // under the same id — the sealed unit's `Arc` identity (a reseal mints a
-    // new Arc, forcing a conservative recompute).
-    let mut prefix_h = DefaultHasher::new();
+    // new Arc, forcing a conservative recompute). Resumed from the kept prefix's
+    // end, where it stood when that piece was placed.
     let mut islands: Vec<PlannedIsland> = Vec::new();
-    for i in 0..pieces.len() {
+    for i in keep..pieces.len() {
         let pos_before = walker.logical_pos;
         match &pieces[i] {
             AssembledPiece::Glue(tokens) => {
@@ -1020,6 +1147,17 @@ pub(super) fn apply_segments_build(
                 prefix_h.write_u32(walker.logical_pos - pos_before);
             }
         }
+        // What the slot holds after this piece, for the next rebuild to keep.
+        // The deferred user message is prefilled after the walk and never
+        // part of a kept prefix.
+        if !matches!(pieces[i], AssembledPiece::DeferredUser(_)) {
+            state.placed_pieces.push(PlacedPiece {
+                identity: identities[i],
+                blocks_after: block_count_of(ctx, parent_id)?,
+                pos_after: walker.logical_pos,
+                prefix_h: prefix_h.clone(),
+            });
+        }
     }
 
     // Convention assert: the slot's chunks were built in logical order (gaps
@@ -1057,6 +1195,8 @@ pub(super) fn apply_segments_build(
         reused_glue_tokens = walker.reused_glue_tokens,
         deferred_user = walker.deferred_user.is_some(),
         pages_pushed = walker.pages_pushed,
+        kept_pieces = walker.kept_pieces,
+        walked_pieces = pieces.len() - walker.kept_pieces,
         "apply_segments: assembled slot prefix"
     );
     // Sealed K/V went in and no index page came with it. Every borrow site
@@ -1074,6 +1214,13 @@ pub(super) fn apply_segments_build(
         );
     }
 
+    let complete = walker.skipped_turns == 0 && walker.skipped_sections == 0;
+    // A slot missing a piece its list names does not hold what the list
+    // describes, so no later rebuild may keep any of it.
+    if !complete {
+        state.placed_pieces.clear();
+    }
+
     Ok(GapFillPlan {
         parent_id,
         glue_tokens: std::mem::take(&mut walker.glue_tokens),
@@ -1086,7 +1233,7 @@ pub(super) fn apply_segments_build(
         placed_before: state.placed,
         n_glue_tokens: walker.n_glue_tokens,
         islands,
-        complete: walker.skipped_turns == 0 && walker.skipped_sections == 0,
+        complete,
     })
 }
 
@@ -1130,6 +1277,8 @@ struct SegmentWalker {
     /// assembled prefix can be checked against it: a walk that injects sealed
     /// tokens and pushes no pages has built a slot whose K/V nothing indexes.
     pages_pushed: usize,
+    /// Leading pieces kept from the slot's last assembly rather than walked.
+    kept_pieces: usize,
 }
 
 impl SegmentWalker {
@@ -1150,6 +1299,7 @@ impl SegmentWalker {
             skipped_turns: 0,
             skipped_sections: 0,
             pages_pushed: 0,
+            kept_pieces: 0,
         }
     }
 
@@ -1395,6 +1545,21 @@ fn keeps_reasoning(
     slot_timeline == Some(turn_timeline) && newest_of_turn_timeline == Some(index)
 }
 
+/// Whether `timeline` is pinned in the working set of the slot being assembled
+/// — content the model was told it has, so a turn of it that cannot be injected
+/// must fail the projection rather than drop out of it.
+fn is_promised(
+    substrate: &Substrate,
+    slot_target: Option<ProjectionTarget>,
+    timeline: TimelineId,
+) -> bool {
+    slot_target.is_some_and(|t| {
+        substrate
+            .working_set(t.timeline)
+            .is_some_and(|ws| ws.is_pinned(timeline))
+    })
+}
+
 fn inject_sealed_turn(
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
@@ -1452,10 +1617,13 @@ fn inject_sealed_turn(
     // that predates it misses there and the record is the only copy — which is
     // the whole reason the pages are written to the log rather than kept in RAM.
     let key = TurnKey { timeline, index };
+    let fetch = profile::span("inject:turn:fetch_page");
     let resident = ctx.turn_positional.get(&key).map(|b| b.to_vec());
     let (sealed, page) = {
         let conv = ctx.conversation.read();
         let stored = resident.or_else(|| conv.index_page_blob(timeline, index).map(|b| b.to_vec()));
+        fetch.end();
+        let _window = profile::span("inject:turn:window");
         // **"Most recent" is the SLOT's most recent, not each timeline's.**
         //
         // A projection can span timelines — retrieval pulls in other
@@ -1521,7 +1689,22 @@ fn inject_sealed_turn(
                 None => (None, None, None),
             };
             let tok_count = conv.turn_token_count_of(timeline, index);
+            // **A pinned turn is a promise, not a candidate.** The model was
+            // told this content is in its context ("already read"), so leaving
+            // it out would have it answer from nothing. Refuse the projection
+            // loudly instead; a provenance turn carries no promise and is
+            // dropped as before.
+            let pinned = is_promised(&conv, ctx.slot_target, timeline);
             drop(conv);
+            if pinned {
+                return Err(ConversationError::Other(format!(
+                    "apply_projection: working-set turn {}:{} is pinned but has no hot \
+                     sealed K/V (tier hot={tier_hot:?} warm={tier_warm:?} cold={tier_cold:?}) \
+                     — the working set does not fit this card",
+                    timeline.raw(),
+                    index.0,
+                )));
+            }
             tracing::warn!(
                 target: "candle_conversation::scheduler::reproject",
                 slot = parent_id.0,
@@ -1574,6 +1757,7 @@ fn inject_sealed_turn(
         let model: &(dyn ManagedBatchedModel + Send) = &**ctx.model;
         let carries = model.carries_positional_state();
         let mut advanced = true;
+        let _push = profile::span("inject:turn:push_pages");
         let pushed = index_pages::push_in_order(
             &blob,
             |p| model.push_positional_state(parent_id.0, p).map(|_| ()),
@@ -2389,7 +2573,10 @@ fn log_injected_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId};
+    use crate::projection::{
+        GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId, WorkingSetShare,
+    };
+    use crate::working_set::Limits;
 
     fn tl(raw: u64) -> TimelineId {
         TimelineId::from_raw(raw).expect("timeline id")
@@ -2432,6 +2619,44 @@ mod tests {
             !keeps_reasoning(Some(slot), ancestor, Some(TurnIndex(1)), TurnIndex(1)),
             "the newest turn of a FOREIGN timeline is not the slot's live turn",
         );
+    }
+
+    /// A turn the slot's working set pins is a promise — it may not drop out
+    /// of the projection — while a provenance pick carries none, and nor does
+    /// a projection with no slot identity.
+    #[test]
+    fn only_a_pinned_working_set_turn_is_a_promise() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let (dialogue, file, other) = (tl(7), tl(8), tl(9));
+        let mut sub = Substrate::new();
+        sub.set_working_set_share(group, WorkingSetShare::Remainder);
+        for t in [dialogue, file, other] {
+            sub.register_timeline(t, layer, group);
+        }
+        sub.append_with_blocks(file, 10, 0, 1);
+        sub.append_with_blocks(other, 10, 0, 1);
+        assert!(sub.working_set_restore_lock(dialogue, file));
+        let limits = Limits {
+            budget_tokens: 1_000,
+            folder_tokens: 1_000,
+            max_file_tokens: 1_000,
+        };
+        sub.working_set_observe(
+            dialogue,
+            &HashMap::from([(other, 500.0)]),
+            0.2,
+            100.0,
+            limits,
+        );
+        let target = ProjectionTarget {
+            layer,
+            group,
+            timeline: dialogue,
+        };
+        assert!(is_promised(&sub, Some(target), file));
+        assert!(!is_promised(&sub, Some(target), other));
+        assert!(!is_promised(&sub, None, file));
     }
 
     /// With no slot identity there is no turn being continued, so nothing keeps

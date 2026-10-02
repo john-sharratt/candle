@@ -234,7 +234,11 @@ fn expand_bmod(latex: &str) -> String {
     while let Some(at) = rest.find(CMD) {
         let after = &rest[at + CMD.len()..];
         out.push_str(&rest[..at]);
-        if after.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        {
             out.push_str(CMD);
         } else {
             out.push_str("\\:\\mathrm{mod}\\:");
@@ -249,9 +253,9 @@ fn expand_bmod(latex: &str) -> String {
 /// page. Each one is documented where it is defined; none of them guesses, and
 /// each leaves untouched every expression that already converts.
 fn preprocess(latex: &str) -> String {
-    upright_text(&strip_delimiter_sizing(&expand_script_letters(&expand_bmod(
-        latex,
-    ))))
+    upright_text(&strip_delimiter_sizing(&expand_script_letters(
+        &expand_bmod(latex),
+    )))
 }
 
 fn convert(latex: &str, style: DisplayStyle, class: &str) -> String {

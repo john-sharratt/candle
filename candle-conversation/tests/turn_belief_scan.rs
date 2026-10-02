@@ -1084,6 +1084,98 @@ fn the_gpu_collection_warm_up_learns_the_cpu_levels() {
     }
 }
 
+/// The ingest warm-up on the GPU arena learns the host's per-file levels: a
+/// file warmed through `warm_ingest_timelines` scores a probe as the same file
+/// warmed on the warm pool does, to the scan's fast-math tolerance — and both
+/// differ from cold, so each actually taught the level. Skips without CUDA.
+#[test]
+fn the_gpu_ingest_warm_up_learns_the_cpu_levels() {
+    use candle_conversation::projection::{TimelineId, TurnIndex};
+
+    let device = match candle::Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => return, // no GPU here — skip
+    };
+    let builder = Builder::from_yaml(SCAN_YAML).unwrap();
+    let layer = builder.id_for_layer("mem").unwrap();
+    let group = builder.id_for_group("clusters").unwrap();
+    let timeline = TimelineId::from_raw(21).expect("timeline id");
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64,
+        0x5555_5555_5555_5555u64,
+        0xFFFF_FFFF_FFFF_FFFFu64,
+    ];
+    let corpus = |dir: &std::path::Path| -> Conversation {
+        let conv = open_conversation(dir);
+        conv.mark_layer_append_only(layer);
+        conv.register_timeline(timeline, layer, group);
+        for fill in fills {
+            let idx = conv
+                .record_turn(
+                    timeline,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: 4,
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            conv.persist_wide_q_sigs(
+                turn_stream_id(timeline.raw(), idx.0),
+                &encode_wide_sigs(&[sig(fill)]),
+            )
+            .expect("persist sigs");
+        }
+        conv
+    };
+    let probe = vec![sig(fills[1])];
+    let target = ProjectionTarget {
+        layer,
+        group,
+        timeline,
+    };
+    let score_of = |conv: &Conversation| {
+        let mut scores = ProjectionScores::new();
+        conv.score_belief_groups(
+            &builder.schema().layers[0],
+            target,
+            &probe,
+            None,
+            &mut scores,
+            Observe::No,
+            None,
+        );
+        scores.turn(timeline, TurnIndex(1))
+    };
+
+    let cpu_dir = tempfile::tempdir().unwrap();
+    let cpu = corpus(cpu_dir.path());
+    let cold = score_of(&cpu);
+    cpu.warm_ingest_normalization(builder.schema());
+    let from_cpu = score_of(&cpu);
+
+    let gpu_dir = tempfile::tempdir().unwrap();
+    let gpu = corpus(gpu_dir.path());
+    let arena = candle_conversation::provenance::GalleryArena::new(&device, 24, 3).unwrap();
+    let work = gpu.ingest_warm_work(builder.schema());
+    assert_eq!(
+        work,
+        vec![(layer, group, vec![timeline])],
+        "one file to warm"
+    );
+    let warmed = gpu.warm_ingest_timelines(builder.schema(), layer, group, &[timeline], &arena);
+    assert_eq!(warmed, 1);
+    let from_gpu = score_of(&gpu);
+
+    assert_ne!(cold, from_cpu, "the host warm-up taught nothing");
+    assert_ne!(cold, from_gpu, "the arena warm-up taught nothing");
+    assert!(
+        (from_cpu - from_gpu).abs() <= 1e-3 * (1.0 + from_cpu.abs().max(from_gpu.abs())),
+        "CPU-warmed {from_cpu} vs GPU-warmed {from_gpu} exceeds tolerance"
+    );
+}
+
 #[test]
 fn score_belief_groups_ignores_recency_groups_and_empty_probe() {
     let dir = tempfile::tempdir().unwrap();

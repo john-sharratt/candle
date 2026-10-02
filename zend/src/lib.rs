@@ -60,4 +60,5 @@ pub mod tool_summary;
 pub mod tools;
 pub mod turn_sink;
 pub mod types;
+pub mod working_set;
 pub mod workspace;

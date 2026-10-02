@@ -19,6 +19,9 @@ pub mod host_ram_report;
 #[cfg(test)]
 pub mod long_context;
 pub mod ruler_gen;
+/// Each quantized rung's K and V ratios and format mixes, beside the table's
+/// combined `Compress`.
+pub mod side_compression;
 /// The whole-card VRAM decomposition off the span's accounting, printed at each
 /// config's decode end and at the end of the run.
 pub mod span_report;

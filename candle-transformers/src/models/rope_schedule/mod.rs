@@ -25,7 +25,7 @@ pub use llama3::{from_rope_freqs, llama_inv_freq};
 pub use preset::RopePreset;
 pub use rungs::{rung_table_len, RopeRungs};
 pub use schedule::{RopeSchedule, Rung, RungFreqs, Scaling};
-pub use select::{rung_for, rung_of};
+pub use select::{rung_for, rung_of, RungSelect};
 pub use table::{
     plain_inv_freq, MAX_STEP, ROPE_HI_DIM, ROPE_LO_BITS, ROPE_LO_DIM, ROPE_REACH, STEP_LANES,
 };

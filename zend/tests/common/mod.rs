@@ -35,7 +35,9 @@ use candle_conversation::persistence::content_hash::ContentHash;
 use candle_conversation::persistence::record::SnapshotPayload;
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::projection::{self, TimelineId};
-use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, SequenceConfig};
+use candle_conversation::{
+    ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
+};
 use zend_vfs::Workspace as ServedWorkspace;
 
 const PROJECTION_YAML: &str = include_str!("../../src/prompts/projection.yaml");
@@ -325,19 +327,30 @@ pub fn served(ws: &Path) -> ServedWorkspace {
 /// its tools should see.
 pub const PROJECT_REPO: &str = "project";
 
-/// Past this size a reused workspace is compacted on its next boot.
+/// A reused workspace is not compacted below this size.
 ///
-/// Every boot re-seals the whole tool catalog into the redo log. The section
-/// streams are content-addressed, so each boot's records supersede the last
-/// boot's rather than adding live data — but a test daemon lives far too
-/// briefly for background maintenance to reclaim them, and left alone
-/// `tools_integration`'s workspace grew ~140 MB a boot (4.83 GB before its
-/// first compaction). A forced compaction on load sheds the dead records.
-///
-/// That workspace's live store — mostly the calibration corpus — is ~1.2 GB,
-/// so the bound sits above it. Below it every boot pays a ~2 s rewrite that
-/// reclaims nothing (measured at 256 MiB: 1.7–2.2 s a boot, size unchanged).
+/// Every boot may re-seal sections into the redo log. The section streams are
+/// content-addressed, so a re-seal's records supersede the last boot's rather
+/// than adding live data — but a test daemon lives far too briefly for
+/// background maintenance to reclaim them, and left alone `tools_integration`'s
+/// workspace grew ~140 MB a boot (4.83 GB before its first compaction). A
+/// forced compaction on load sheds the dead records. Below this size a rewrite
+/// reclaims nothing worth its seconds (measured at 256 MiB: 1.7–2.2 s a boot,
+/// size unchanged).
 pub const COMPACT_ABOVE_BYTES: u64 = 2 << 30;
+
+/// Growth since the last compaction that earns the next one.
+///
+/// **The size alone is not the question, because the live store moves.** A
+/// workspace whose live store — mostly the calibration corpus — has grown past
+/// [`COMPACT_ABOVE_BYTES`] is over it on every boot however clean its log is,
+/// and a size test then rewrites 2.4 GB at every boot (6.6 s) to reclaim a few
+/// percent of it. What dead records add is growth, so the rewrite is earned by
+/// growth: this much past the size the log had when it was last compacted.
+pub const COMPACT_AFTER_GROWTH_BYTES: u64 = 512 << 20;
+
+/// The file, in the workspace, holding the log's size at its last compaction.
+const COMPACTED_AT_FILE: &str = "compacted-at-bytes";
 
 /// Bytes the workspace's redo log occupies on disk.
 pub fn substrate_bytes(ws: &Path) -> u64 {
@@ -351,9 +364,25 @@ pub fn substrate_bytes(ws: &Path) -> u64 {
         .sum()
 }
 
-/// Whether a reused workspace is compacted on this boot.
+/// Whether a reused workspace is compacted on this boot: past
+/// [`COMPACT_ABOVE_BYTES`], and [`COMPACT_AFTER_GROWTH_BYTES`] larger than it
+/// was when it was last compacted.
+///
+/// **Answering yes is the claim on that compaction**: the log's size now is
+/// recorded as the size it was compacted at, so the next boot asks about growth
+/// past this one. Called once per boot, by the boot that will compact.
 pub fn needs_compaction(ws: &Path) -> bool {
-    substrate_bytes(ws) > COMPACT_ABOVE_BYTES
+    let now = substrate_bytes(ws);
+    let marker = ws.join(COMPACTED_AT_FILE);
+    let last = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let compact = now > COMPACT_ABOVE_BYTES && now > last + COMPACT_AFTER_GROWTH_BYTES;
+    if compact {
+        std::fs::write(&marker, now.to_string()).expect("record the size compacted at");
+    }
+    compact
 }
 
 /// `base` made unique to this test process.
@@ -490,6 +519,31 @@ pub fn say(conv: &mut Sequence, text: &str) -> String {
             .expect("persist projection events");
     }
     resp.text
+}
+
+/// The reply budget of [`say_briefly`]: enough for the turn to open, decode and
+/// seal like any other, little enough that the decode is not the test.
+const BRIEF_REPLY_TOKENS: usize = 8;
+
+/// [`say`] for a scenario about what a turn **leaves behind** — its sealed
+/// records, its recurrent snapshot, its place in the log — and not about what
+/// it says. The reply is cut at [`BRIEF_REPLY_TOKENS`] instead of running the
+/// full [`MAX_RESPONSE_TOKENS`] a reasoning model spends before it answers,
+/// which on the 0.8B is four seconds of decode per turn that no assertion
+/// reads. The turn is sealed and its projection event persisted exactly as
+/// [`say`] does, so what is left behind is what a full reply leaves.
+pub fn say_briefly(conv: &mut Sequence, text: &str) {
+    let options = TurnOptions {
+        max_tokens: Some(BRIEF_REPLY_TOKENS),
+        ..TurnOptions::default()
+    };
+    let resp = conv
+        .send_turn_with_options(text, options)
+        .expect("send_turn");
+    if let Some(event) = conv.projection_event(&resp.stats) {
+        conv.persist_projection_events(&[event])
+            .expect("persist projection events");
+    }
 }
 
 /// [`say`], also returning a full rendering of the turn's **opening context**:

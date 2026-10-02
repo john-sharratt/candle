@@ -43,6 +43,7 @@ use super::journal::Flag;
 use crate::checkout::materialize;
 use crate::checkout::target::{self, Found};
 use crate::checkout::CheckoutError;
+use crate::library::objects;
 use crate::runner::utf8;
 use crate::write::scratch::PrivateIndex;
 use crate::{
@@ -117,16 +118,23 @@ pub(super) fn capture(
     let me = recorder()?;
     let index_tree = {
         let _write = repo.write_lock();
-        let out = repo.git("write-tree").run().map_err(CheckoutError::Git)?;
-        if out.status != Some(0) {
-            return Err(GitError::invalid(format!(
+        let refused = |why: &str| {
+            GitError::invalid(format!(
                 "the checkout's index cannot be set aside — it holds unresolved conflicts, \
                  or entries git cannot write as a tree: {}",
-                out.stderr.trim()
+                why.trim()
             ))
-            .into());
+        };
+        match repo.library() {
+            Some(lib) => objects::index_tree(&lib)?.map_err(|why| refused(&why))?,
+            None => {
+                let out = repo.git("write-tree").run().map_err(CheckoutError::Git)?;
+                if out.status != Some(0) {
+                    return Err(refused(&out.stderr).into());
+                }
+                Oid::parse(utf8("write-tree", out.stdout)?.trim())?
+            }
         }
-        Oid::parse(utf8("write-tree", out.stdout)?.trim())?
     };
     let index = repo.commit_tree(
         &index_tree,
@@ -287,12 +295,19 @@ pub(super) fn restore(
                 continue;
             }
             materialize::clear_the_way(&root, path, &mut cleared)?;
-            let bytes = repo
-                .git("cat-file")
-                .args(["blob", "--end-of-options"])
-                .arg(entry.oid.as_str())
-                .read_only()
-                .run_ok()?;
+            let held = match repo.library() {
+                Some(lib) => objects::blob_bytes(&lib, &entry.oid)?,
+                None => None,
+            };
+            let bytes = match held {
+                Some(bytes) => bytes,
+                None => repo
+                    .git("cat-file")
+                    .args(["blob", "--end-of-options"])
+                    .arg(entry.oid.as_str())
+                    .read_only()
+                    .run_ok()?,
+            };
             let abs = root.join(path);
             if entry.mode == FileMode::Symlink {
                 materialize::remove(&root, path, &mut cleared)?;
@@ -422,6 +437,17 @@ fn recorder() -> Result<Signature, CheckoutError> {
 /// Every index entry git was told to leave alone, from `ls-files -v`: `S`
 /// (or `s`) marks skip-worktree, a lower-case tag assume-unchanged.
 fn flags(repo: &Repo) -> Result<Vec<Flag>, CheckoutError> {
+    if let Some(lib) = repo.library() {
+        return Ok(objects::index_listing(&lib)?
+            .into_iter()
+            .filter(|e| e.skip_worktree || e.assume_unchanged)
+            .map(|e| Flag {
+                path: e.path,
+                skip_worktree: e.skip_worktree,
+                assume_unchanged: e.assume_unchanged,
+            })
+            .collect());
+    }
     let out = repo
         .git("ls-files")
         .args(["-v", "-z"])
@@ -446,6 +472,12 @@ fn flags(repo: &Repo) -> Result<Vec<Flag>, CheckoutError> {
 
 /// Every path the index holds, with its mode.
 fn index_modes(repo: &Repo) -> Result<BTreeMap<String, FileMode>, CheckoutError> {
+    if let Some(lib) = repo.library() {
+        return Ok(objects::index_listing(&lib)?
+            .into_iter()
+            .map(|e| (e.path, e.mode))
+            .collect());
+    }
     let out = repo
         .git("ls-files")
         .args(["-s", "-z"])
@@ -564,6 +596,9 @@ fn link(points_to: &str, abs: &Path, to_folder: bool) -> std::io::Result<()> {
 
 /// `bytes` stored as a blob, unconverted.
 fn hash_bytes(repo: &Repo, bytes: Vec<u8>) -> Result<Oid, CheckoutError> {
+    if let Some(lib) = repo.library() {
+        return Ok(objects::hash_raw(&lib, &bytes)?);
+    }
     let out = repo
         .git("hash-object")
         .args(["-w", "--no-filters", "--stdin"])
@@ -577,6 +612,15 @@ fn hash_paths<'a>(
     repo: &Repo,
     paths: impl Iterator<Item = &'a str>,
 ) -> Result<Vec<Oid>, CheckoutError> {
+    if let Some(lib) = repo.library() {
+        return paths
+            .map(|path| {
+                let bytes =
+                    std::fs::read(repo.dir().join(path)).map_err(|e| CheckoutError::io(path, e))?;
+                Ok(objects::hash_raw(&lib, &bytes)?)
+            })
+            .collect();
+    }
     let list: Vec<u8> = paths
         .flat_map(|p| p.bytes().chain(std::iter::once(b'\n')))
         .collect();
@@ -596,6 +640,9 @@ fn hash_paths<'a>(
 
 /// A tree holding exactly `entries`.
 fn tree_of(repo: &Repo, entries: &[(FileMode, Oid, String)]) -> Result<Oid, CheckoutError> {
+    if let Some(lib) = repo.library() {
+        return Ok(objects::tree_from_entries(&lib, entries)?);
+    }
     let index = PrivateIndex::new(repo.git_dir());
     let info: Vec<u8> = entries
         .iter()

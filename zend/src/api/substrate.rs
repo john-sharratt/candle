@@ -169,6 +169,39 @@ pub async fn delete_timeline(
     }
 }
 
+/// What `DELETE /v1/substrate/system-prompt` retired.
+#[derive(Debug, Serialize)]
+pub struct SystemPromptRetired {
+    /// Persisted section streams whose generation was ended — prefilled fresh
+    /// at the next start.
+    pub retired_streams: usize,
+    /// Schema sections this process never registered (a section-tree variant
+    /// no conversation has selected yet): nothing persisted to retire, and the
+    /// first request for one prefills it under the current thresholds anyway.
+    pub unregistered_sections: usize,
+}
+
+/// `DELETE /v1/substrate/system-prompt` — retire the persisted copy of every
+/// dialogue system-prompt section so the next start prefills them fresh.
+///
+/// A persisted section is keyed by its content, not by how it was compressed,
+/// so a section whose text is unchanged is restored as first sealed however
+/// the compression thresholds have moved since. This is how a threshold change
+/// reaches the system prompt. The daemon keeps serving from its resident
+/// copies until it restarts.
+pub async fn retire_system_prompt(
+    State(session): State<Arc<ZendSession>>,
+) -> Result<Json<SystemPromptRetired>, StatusCode> {
+    match session.retire_system_prompt() {
+        Some(Ok(retired)) => Ok(Json(retired)),
+        Some(Err(e)) => {
+            tracing::warn!("retire_system_prompt failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
 /// `GET /v1/substrate` — the lightweight top of the tree. No conversations,
 /// section text, or tool catalog: those are fetched per-expansion so init and
 /// the periodic refresh stay cheap regardless of corpus size.

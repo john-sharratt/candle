@@ -30,7 +30,7 @@ use super::expert_lre::WeightPlanning;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
-use crate::models::rope_schedule::rung_of;
+use crate::models::rope_schedule::RungSelect;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
@@ -51,7 +51,7 @@ use super::batched_layer::GlueMeta;
 use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePhase};
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
-use crate::models::profile::{gpu_span, pipeline_record_duration};
+use crate::models::profile::{gpu_span, pipeline_record_duration, span};
 use crate::models::speculative_choice::{AcceptWalk, TokenChooser};
 use crate::models::verify_wave::{issue_verify_wave, VerifyPlan, WaveCoBatch};
 
@@ -625,11 +625,11 @@ pub struct BatchedInferenceSession {
     /// `seq_indices` order). Taken + cleared inside `forward_batched`, which
     /// routes HD128 glue to the paged-glue kernel.
     pending_glue: Option<Vec<PendingGlue>>,
-    /// The model's RoPE rung ceilings, ascending — what every header writer
-    /// picks a sequence's `SlotHeader.rope_rung` by, from its reach
+    /// How the model picks a sequence's RoPE rung — its ceilings and floor —
+    /// what every header writer picks `SlotHeader.rope_rung` by, from its reach
     /// (`docs/progressive_yarn.md` §8). One unbounded rung until the model sets
-    /// its schedule's: the latent kernels read no rung.
-    rope_ceilings: Vec<usize>,
+    /// its own: the latent kernels read no rung.
+    rope: RungSelect,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -707,52 +707,43 @@ impl BatchedInferenceSession {
             layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
-            rope_ceilings: vec![usize::MAX],
+            rope: RungSelect::unbounded(),
         })
     }
 
-    /// Set the RoPE rung ceilings the headers pick each sequence's rung by —
-    /// the model's schedule's, from its `RopeRungs::ceilings`.
-    pub fn set_rope_ceilings(&mut self, ceilings: Vec<usize>) -> Result<()> {
-        if ceilings.is_empty() || ceilings.windows(2).any(|w| w[0] >= w[1]) {
-            candle::bail!("rope ceilings must be non-empty and ascending, got {ceilings:?}");
-        }
-        self.rope_ceilings = ceilings;
-        Ok(())
+    /// Set how the headers pick each sequence's rung — the model's own, from
+    /// its `RopeRungs::select`.
+    pub fn set_rope_select(&mut self, select: RungSelect) {
+        self.rope = select;
     }
 
     /// The RoPE rung a sequence reaching `reach` positions rotates by; a reach
     /// past the schedule's supported maximum is refused.
     pub fn rope_rung_for(&self, reach: usize) -> Result<u32> {
-        rung_of(&self.rope_ceilings, reach)
-    }
-
-    /// The rung ceilings, for a header writer outside the session.
-    pub fn rope_ceilings(&self) -> &[usize] {
-        &self.rope_ceilings
+        self.rope.rung_for(reach)
     }
 
     /// The deepest reach, in positions, any sequence may have: the last
     /// ceiling. A sequence that would write past it is refused.
     pub fn rope_reach(&self) -> usize {
-        self.rope_ceilings.last().copied().unwrap_or(0)
+        self.rope.reach()
     }
 
-    /// Refuse a forward whose model rotates from rungs other than the ones
-    /// this session's headers pick by.
+    /// Refuse a forward whose model picks rungs other than the way this
+    /// session's headers do.
     ///
-    /// Decode headers take a sequence's rung from the session's ceilings while
-    /// prefill, glue and the QSA indexer take it from the model's rung set, so
-    /// the two must be one schedule: a session opened before the model's
-    /// schedule was replaced, or one whose ceilings were never set, would name
-    /// rungs the set does not hold — a kernel trap — or disagree with prefill
-    /// about a sequence's rung.
-    pub fn expect_rope_ceilings(&self, model: &[usize]) -> Result<()> {
-        if self.rope_ceilings != model {
+    /// Decode headers take a sequence's rung from the session while prefill,
+    /// glue and the QSA indexer take it from the model's rung set, so the two
+    /// must be one schedule with one floor: a session opened before the
+    /// model's schedule was replaced, or one never given the model's, would
+    /// name rungs the set does not hold — a kernel trap — or disagree with
+    /// prefill about a sequence's rung.
+    pub fn expect_rope_select(&self, model: &RungSelect) -> Result<()> {
+        if &self.rope != model {
             candle::bail!(
-                "rope: this session picks rungs by ceilings {:?} but the model rotates from \
-                 {model:?} — the session was opened under another schedule",
-                self.rope_ceilings
+                "rope: this session picks rungs by {:?} but the model by {model:?} — the \
+                 session was opened under another schedule",
+                self.rope
             );
         }
         Ok(())
@@ -823,7 +814,7 @@ impl BatchedInferenceSession {
             layer_seal_cap: vec![None; num_layers],
             device: device.clone(),
             pending_glue: None,
-            rope_ceilings: vec![usize::MAX],
+            rope: RungSelect::unbounded(),
         }
     }
 
@@ -1197,29 +1188,30 @@ impl BatchedInferenceSession {
             .copied()
             .filter(|(s, _)| !non_writer.contains(s))
             .collect();
-        ChunkedKvBacking::ensure_for_batch_entries_all(group, &writer_offsets, 1)?;
+        {
+            let _g = span("decode:ensure_layout");
+            ChunkedKvBacking::ensure_for_batch_entries_all(group, &writer_offsets, 1)?;
+        }
         for &(seq_idx, seq_offset) in &seq_offsets {
-            let chunks = group[0].live_chunks_as_sealed(seq_idx).unwrap_or_default();
-            let cum_tokens: usize = chunks.iter().map(|c| c.token_count as usize).sum();
-            debug_assert_eq!(
-                cum_tokens, seq_offset,
-                "decode metadata: cum_tokens {cum_tokens} != state.offset {seq_offset} for seq {seq_idx}",
-            );
+            #[cfg(debug_assertions)]
+            {
+                let cum_tokens: usize = group[0]
+                    .visit_live_chunks(seq_idx, |it| it.map(|c| c.token_count as usize).sum())
+                    .unwrap_or(0);
+                debug_assert_eq!(
+                    cum_tokens, seq_offset,
+                    "decode metadata: cum_tokens {cum_tokens} != state.offset {seq_offset} for seq {seq_idx}",
+                );
+            }
+            #[cfg(not(debug_assertions))]
+            let _ = seq_offset;
             // The new token lands in the WRITE chunk — the first non-full
-            // chunk from `writer_start_idx`, NOT `chunks.last()` (which may be
-            // a trailing empty sitting past the writer). This MUST match the
-            // `write_slice` rule in `sync_decode_gpu_chunks`, which is what
-            // every layer is checked against below.
-            let wstart = group[0].writer_start_idx_for_seq(seq_idx).unwrap_or(0);
-            let n_ch = chunks.len();
-            let wi = if n_ch == 0 {
-                0
-            } else {
-                let start = wstart.min(n_ch - 1);
-                (start..n_ch)
-                    .find(|&i| (chunks[i].offset as usize + chunks[i].token_count as usize) < 32)
-                    .unwrap_or(n_ch - 1)
-            };
+            // chunk from `writer_start_idx`, NOT the last chunk (which may be a
+            // trailing empty sitting past the writer). The same rule as the
+            // `write_slice` in `sync_decode_gpu_chunks`, which every layer is
+            // checked against below. Read in place: this runs every decode
+            // step, and a copy of the chunk list here cost one clone per block.
+            let (n_ch, wi) = group[0].decode_write_shape(seq_idx).unwrap_or((0, 0));
             slot_shape.push((n_ch as u32, wi as u32));
         }
 
@@ -3255,6 +3247,7 @@ impl BatchedInferenceSession {
         // evidence about the stream's, and a minimum that included it would
         // report 0 and drive the wave-entry reconciler to clamp the sequence
         // back to the start of its history. See [`KvLayers`].
+        let _g = span("session:backing_tokens");
         let mut min_cum: Option<usize> = None;
         for cache in caches.caches.iter().take(self.stream_layers) {
             let mut cum: usize = 0;
@@ -3591,6 +3584,44 @@ impl BatchedInferenceSession {
         } else {
             None
         }
+    }
+
+    /// [`Self::compression_ratio_by_sequences`] for one side — K when
+    /// `is_value` is false. A rung that trades bits between K and V shows it
+    /// here and nowhere else: the combined ratio can stand still while the two
+    /// sides move in opposite directions.
+    pub fn compression_ratio_by_side(
+        &self,
+        sequence_indices: &[usize],
+        is_value: bool,
+    ) -> Option<f64> {
+        let mut total_actual = 0.0f64;
+        let mut total_elements = 0usize;
+        for (seq_idx, _, caches) in &self.caches_for_sequences(sequence_indices) {
+            for kv_cache in &caches.caches {
+                if let Some((actual, n)) = kv_cache.compression_bpe_side(*seq_idx, is_value) {
+                    total_actual += actual;
+                    total_elements += n;
+                }
+            }
+        }
+        (total_elements > 1).then(|| 16.0f64 / (total_actual / total_elements as f64))
+    }
+
+    /// One side's format histogram across sequences — K when `is_value` is
+    /// false — as `(format, bands)`.
+    pub fn compression_dist_by_side(
+        &self,
+        sequence_indices: &[usize],
+        is_value: bool,
+    ) -> ahash::HashMap<GgmlDType, usize> {
+        let mut ret = ahash::HashMap::default();
+        for (seq_idx, _, caches) in &self.caches_for_sequences(sequence_indices) {
+            for kv_cache in &caches.caches {
+                kv_cache.compression_dist_side(*seq_idx, is_value, &mut ret);
+            }
+        }
+        ret
     }
 
     /// Compression distribution across sequences, measured over all layers.
@@ -4478,6 +4509,15 @@ pub trait ManagedBatchedModel {
         Ok(())
     }
 
+    /// Cut `seq`'s per-position state back to its first `tokens` positions —
+    /// paired with truncating the sequence's K/V to the piece boundary there, so
+    /// a rebuild keeps the prefix it shares with the last one and re-injects only
+    /// what follows. `tokens` is always a boundary between injected pieces. No-op
+    /// for a model with no such state.
+    fn truncate_positional_state(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// The per-position state produced for whatever `seq` has forwarded since
     /// its last reset — a sealed section's page.
     ///
@@ -5112,11 +5152,18 @@ pub trait ManagedBatchedModel {
         Ok(next)
     }
 
-    /// The RoPE rung ceilings a session's headers pick each sequence's rung by
-    /// — the model's schedule's (`docs/progressive_yarn.md` §8). One unbounded
-    /// rung for a model whose kernels read none.
-    fn rope_ceilings(&self) -> Vec<usize> {
-        vec![usize::MAX]
+    /// How a session's headers pick each sequence's RoPE rung — the model's
+    /// schedule's ceilings and floor (`docs/progressive_yarn.md` §8). One
+    /// unbounded rung for a model whose kernels read none.
+    fn rope_select(&self) -> RungSelect {
+        RungSelect::unbounded()
+    }
+
+    /// Run no sequence on a RoPE rung whose YaRN factor is below `min`
+    /// ([`crate::models::rope_schedule::RopeRungs::with_min_factor`]). Set
+    /// before any session opens; a model whose kernels read no rung refuses.
+    fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
+        candle::bail!("this model's kernels read no RoPE rung, so a minimum factor of {min} has nothing to raise")
     }
 
     /// Create a batched inference session configured for this model.
@@ -5136,7 +5183,7 @@ pub trait ManagedBatchedModel {
             self.device(),
             config,
         )?;
-        session.set_rope_ceilings(self.rope_ceilings())?;
+        session.set_rope_select(self.rope_select());
         // Materialise the norm weights for this session's activation dtype, here
         // rather than at each call site. A session is where the dtype is decided,
         // it is created outside any wave, and the forward *refuses* a mismatch —
@@ -5172,7 +5219,7 @@ pub trait ManagedBatchedModel {
         let backings = source.backings().to_vec();
         let mut session =
             BatchedInferenceSession::new_with_backings(backings, config, source.device());
-        session.set_rope_ceilings(self.rope_ceilings())?;
+        session.set_rope_select(self.rope_select());
         // The other way a session comes into being, and it decides an activation
         // dtype just as `create_batched_session` does — so it materialises the
         // norm weights the same way.
@@ -5365,8 +5412,12 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().wave_geometry(act_dtype)
     }
 
-    fn rope_ceilings(&self) -> Vec<usize> {
-        self.rope().ceilings().to_vec()
+    fn rope_select(&self) -> RungSelect {
+        self.rope().select().clone()
+    }
+
+    fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
+        BatchedInference::set_rope_min_factor(self, min)
     }
 
     fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {
@@ -5443,7 +5494,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
-        session.expect_rope_ceilings(self.rope().ceilings())?;
+        session.expect_rope_select(self.rope().select())?;
         drive_wave(
             self,
             session,

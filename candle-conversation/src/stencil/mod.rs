@@ -32,6 +32,7 @@
 mod builder;
 mod compile;
 mod driver;
+mod encode_cache;
 mod error;
 mod function_block;
 mod json_lexer;
@@ -53,6 +54,10 @@ mod yaml;
 mod edge_tests;
 #[cfg(test)]
 mod invoke_body_tests;
+#[cfg(test)]
+mod shaped_params_tests;
+#[cfg(test)]
+mod sub_stencil_tests;
 #[cfg(test)]
 mod tests;
 

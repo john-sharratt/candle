@@ -522,6 +522,8 @@ __device__ __forceinline__ int select_fmt_to_arena_fmt(int sfmt) {
         case SELECT_FMT_Q8_KS:   return ArenaFormat::Q8_KS;
         case SELECT_FMT_Q8_0:    return ArenaFormat::Q8_0;
         case SELECT_FMT_Q8_1:    return ArenaFormat::Q8_1;
+        case SELECT_FMT_Q5_1:    return ArenaFormat::Q5_1;
+        case SELECT_FMT_Q5_0:    return ArenaFormat::Q5_0;
         case SELECT_FMT_Q4_KS:   return ArenaFormat::Q4_KS;
         case SELECT_FMT_Q4_1:    return ArenaFormat::Q4_1;
         case SELECT_FMT_Q4_0:    return ArenaFormat::Q4_0;
@@ -571,6 +573,8 @@ void quantize_to_smem(const float* __restrict__ src, uint8_t* __restrict__ dst, 
         case SELECT_FMT_Q8_KS:   quantize_block_q8_ks  (src, (block_q8_ks*)  dst); break;
         case SELECT_FMT_Q8_0:    quantize_block_q8_0   (src, (block_q8_0*)   dst); break;
         case SELECT_FMT_Q8_1:    quantize_block_q8_1   (src, (block_q8_1*)   dst); break;
+        case SELECT_FMT_Q5_1:    quantize_block_q5_1   (src, (block_q5_1*)   dst); break;
+        case SELECT_FMT_Q5_0:    quantize_block_q5_0   (src, (block_q5_0*)   dst); break;
         case SELECT_FMT_Q4_KS:   quantize_block_q4_ks  (src, (block_q4_ks*)  dst); break;
         case SELECT_FMT_Q4_1:    quantize_block_q4_1   (src, (block_q4_1*)   dst); break;
         case SELECT_FMT_Q4_0:    quantize_block_q4_0   (src, (block_q4_0*)   dst); break;
@@ -600,7 +604,7 @@ void quantize_to_smem(const float* __restrict__ src, uint8_t* __restrict__ dst, 
 // =============================================================================
 // `quantize_to_smem` and `dequant_element` both switch over the format
 // tag at runtime. Inside the selection kernel's hot loop that would cost
-// ~19 case-arms of i-cache walk per block, plus a `__noinline__` call
+// ~21 case-arms of i-cache walk per block, plus a `__noinline__` call
 // into `dequant_element_slow` for any format outside the 5 hot-path
 // cases — well over an order of magnitude more expensive than the
 // useful work. The fused selection kernel pays this cost once per
@@ -628,8 +632,8 @@ void quantize_to_smem(const float* __restrict__ src, uint8_t* __restrict__ dst, 
 // format ignores it**, which is why it is a runtime argument rather than a
 // template parameter: as a template parameter it doubled every instantiation
 // below it — `search_scales_for_fmt<FMT, IS_K, HB>` and everything it inlines —
-// to serve one arm of a nineteen-arm switch. Two full copies of eighteen codecs
-// so that the nineteenth could choose a table.
+// to serve one arm of a twenty-one-arm switch. Two full copies of twenty codecs
+// so that the twenty-first could choose a table.
 //
 // Q0_V keeps its compile-time choice, one `if constexpr` deeper, where it costs
 // two small table-indexed encoders instead of two of everything.
@@ -643,6 +647,8 @@ __device__ __forceinline__ void quantize_block_for_fmt(
     if      constexpr (FMT == SELECT_FMT_Q8_KS)  quantize_block_q8_ks_vec(src, (block_q8_ks*) dst);
     else if constexpr (FMT == SELECT_FMT_Q8_0)   quantize_block_q8_0_vec(src, (block_q8_0*)  dst);
     else if constexpr (FMT == SELECT_FMT_Q8_1)   quantize_block_q8_1   (src, (block_q8_1*)   dst);
+    else if constexpr (FMT == SELECT_FMT_Q5_1)   quantize_block_q5_1   (src, (block_q5_1*)   dst);
+    else if constexpr (FMT == SELECT_FMT_Q5_0)   quantize_block_q5_0   (src, (block_q5_0*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q4_KS)  quantize_block_q4_ks_vec(src, (block_q4_ks*) dst);
     else if constexpr (FMT == SELECT_FMT_Q4_1)   quantize_block_q4_1   (src, (block_q4_1*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q4_0)   quantize_block_q4_0_vec(src, (block_q4_0*)  dst);
@@ -718,6 +724,10 @@ __device__ __forceinline__ float dequant_element_for_fmt(
         return BlockConverter<block_q8_0,  float>::load_element(reinterpret_cast<const block_q8_0*>(blk),  lane, outer);
     else if constexpr (FMT == SELECT_FMT_Q8_1)
         return BlockConverter<block_q8_1,  float>::load_element(reinterpret_cast<const block_q8_1*>(blk),  lane, outer);
+    else if constexpr (FMT == SELECT_FMT_Q5_1)
+        return BlockConverter<block_q5_1,  float>::load_element(reinterpret_cast<const block_q5_1*>(blk),  lane, outer);
+    else if constexpr (FMT == SELECT_FMT_Q5_0)
+        return BlockConverter<block_q5_0,  float>::load_element(reinterpret_cast<const block_q5_0*>(blk),  lane, outer);
     else if constexpr (FMT == SELECT_FMT_Q4_KS)
         return BlockConverter<block_q4_ks, float>::load_element(reinterpret_cast<const block_q4_ks*>(blk), lane, outer);
     else if constexpr (FMT == SELECT_FMT_Q4_1)
@@ -813,7 +823,7 @@ __device__ __forceinline__ int alive_count(const uint64_t* mask) {
 //
 // The K/V side is a *runtime* argument, not a second template parameter. Only
 // Q0_V's calibrated table set reads it, and templating it doubled every one of
-// these — nineteen codecs, twice — so that one arm could pick a table.
+// these — twenty-one codecs, twice — so that one arm could pick a table.
 //
 // Cooperative warp model: every helper assumes a fully-active warp (all
 // 32 lanes call simultaneously). `warp_f32_smem` and `warp_quant_smem`
@@ -986,7 +996,7 @@ __device__ __forceinline__ void compute_pass_metric(
 
 // `is_k` is a runtime argument rather than a template parameter: only Q0_V's
 // table choice ever reads it, and templating it emitted a second copy of this
-// function — and of every codec it inlines — for all nineteen formats. See
+// function — and of every codec it inlines — for all twenty-one formats. See
 // `quantize_block_for_fmt`.
 template <int FMT, int HB>
 __device__ __noinline__ void search_scales_for_fmt(
@@ -1223,7 +1233,7 @@ __device__ __forceinline__ int claim_passing_blocks_from_mask(
 // =============================================================================
 // RUNTIME-FMT → COMPILE-TIME-FMT DISPATCH
 // =============================================================================
-// `with_select_fmt` is the only place the 19-arm fmt switch lives in
+// `with_select_fmt` is the only place the 21-arm fmt switch lives in
 // the fused selection kernel. Given a runtime fmt value and a callable
 // `f`, it invokes `f(FmtTag<FMT>{})` where FMT is the matching
 // SELECT_FMT_* constant. Inside the callable, the tag's `::value` is
@@ -1239,7 +1249,7 @@ __device__ __forceinline__ int claim_passing_blocks_from_mask(
 //
 // Replaces the older macro-based dispatch: the cases are written once
 // here, and the call sites read as normal C++ lambdas with no
-// preprocessor games. The 19-arm switch costs i-cache once per
+// preprocessor games. The 21-arm switch costs i-cache once per
 // candidate (≤ 6 candidates per slot × 4 slots × 2 sides = ≤ 48 calls
 // per kernel block), vs. once per (block, fmt, scale) iteration if the
 // switch lived in the inner loop.
@@ -1254,6 +1264,8 @@ __device__ __forceinline__ void with_select_fmt(int fmt, F&& f) {
         case SELECT_FMT_Q8_KS: f(FmtTag<SELECT_FMT_Q8_KS>{}); return;
         case SELECT_FMT_Q8_0:  f(FmtTag<SELECT_FMT_Q8_0>{});  return;
         case SELECT_FMT_Q8_1:  f(FmtTag<SELECT_FMT_Q8_1>{});  return;
+        case SELECT_FMT_Q5_1:  f(FmtTag<SELECT_FMT_Q5_1>{});  return;
+        case SELECT_FMT_Q5_0:  f(FmtTag<SELECT_FMT_Q5_0>{});  return;
         case SELECT_FMT_Q4_KS: f(FmtTag<SELECT_FMT_Q4_KS>{}); return;
         case SELECT_FMT_Q4_1:  f(FmtTag<SELECT_FMT_Q4_1>{});  return;
         case SELECT_FMT_Q4_0:  f(FmtTag<SELECT_FMT_Q4_0>{});  return;

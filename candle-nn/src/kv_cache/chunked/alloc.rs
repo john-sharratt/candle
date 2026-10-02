@@ -2301,7 +2301,12 @@ impl ChunkedKvBacking {
     /// add`, by the placement rule `write_contiguous` writes them by
     /// (`write_placement`): positions the sequence already holds need nothing,
     /// the rest need writer capacity from the writer boundary.
-    pub(super) fn ensure_for_append(&self, batch_idx: usize, offset: usize, add: usize) -> Result<()> {
+    pub(super) fn ensure_for_append(
+        &self,
+        batch_idx: usize,
+        offset: usize,
+        add: usize,
+    ) -> Result<()> {
         let appended = {
             let state = self
                 .state

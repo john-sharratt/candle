@@ -87,9 +87,21 @@ const SUMMARY_ASK: &str = "in ONE complete sentence, ending with a full stop. \
 /// name, any other folder by its path in backticks with the repository it is
 /// in.
 fn folder_phrase(unit: &DirUnit) -> String {
-    match split(&unit.dir) {
-        (repo, "") => format!("the `{repo}` repository"),
-        (repo, inner) => format!("the `{inner}/` folder in the `{repo}` repository"),
+    let (repo, inner) = split(&unit.dir);
+    folder_anchor(repo, inner)
+}
+
+/// How a folder unit names its folder — the repository, and the folder inside
+/// it (`""` for its root) — which is the folder's anchor. The listing itself
+/// names only its repository, and the call that made it is rendered in the
+/// checkpoint's own syntax, so the request's phrase is the one string every
+/// folder unit carries regardless of dialect. A reply that points the model at
+/// a listing it already holds names it by exactly this.
+pub fn folder_anchor(repo: &str, inner: &str) -> String {
+    if inner.is_empty() {
+        format!("the `{repo}` repository")
+    } else {
+        format!("the `{inner}/` folder in the `{repo}` repository")
     }
 }
 
@@ -252,6 +264,29 @@ mod tests {
             render_request(&units[0]),
             format!("Summarize the `a` repository {SUMMARY_ASK}"),
         );
+    }
+
+    /// Every folder unit's request carries the folder's anchor verbatim — the
+    /// string a served `file_list` points the model at.
+    #[test]
+    fn the_request_carries_the_folders_anchor() {
+        let d = workspace(&[("a/src/x.rs", "fn x() {}\n"), ("a/y.rs", "fn y() {}\n")]);
+        let units = build_units(
+            d.path(),
+            &[("a/src/x.rs", Language::Rust), ("a/y.rs", Language::Rust)],
+        );
+        let anchors: Vec<String> = units
+            .iter()
+            .map(|u| {
+                let (repo, inner) = split(&u.dir);
+                folder_anchor(repo, inner)
+            })
+            .collect();
+        assert!(anchors.contains(&"the `a` repository".to_string()));
+        assert!(anchors.contains(&"the `src/` folder in the `a` repository".to_string()));
+        for (unit, anchor) in units.iter().zip(&anchors) {
+            assert!(render_request(unit).contains(anchor.as_str()), "{anchor}");
+        }
     }
 
     /// The three properties the ask exists to obtain, named so a reworded prompt

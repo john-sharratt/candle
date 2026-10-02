@@ -68,6 +68,7 @@ use super::record::{
     DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, SectionTombstonePayload,
     TombstonePayload, TurnCouplingPayload,
 };
+use super::relocation_watch::RelocationWatch;
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
 use super::stripes::{stripes, MAX_STRIPE_BYTES};
@@ -354,6 +355,21 @@ impl MaintenancePlan {
     pub fn op(&self) -> MaintenanceOp {
         self.op
     }
+}
+
+/// Chunk records one relocation batch moves under a single hold of the
+/// persistence lock. Relocation reads and re-appends at ~100 MB/s (a 3.6 GB
+/// segment took 37 s), so this bounds what a seal write or cold load waits
+/// behind maintenance to roughly 150 ms.
+pub const RELOCATION_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A maintenance op's chunk relocation in progress, carried between the
+/// batches of [`SubstratePersistence::relocate_chunk_batch`].
+pub struct MaintenanceRun {
+    /// How many of the plan's `chunk_relocs` have been taken.
+    chunk_cursor: usize,
+    /// `(stream, chunk_index, old_loc, new_loc)` of every chunk moved so far.
+    chunk_updates: Vec<(StreamId, u64, ChunkLoc, ChunkLoc)>,
 }
 
 /// The relocated records' new locations, produced by
@@ -891,6 +907,44 @@ impl SubstratePersistence {
     /// new locations for [`MaintenanceResult::apply_to_substrate`]. A
     /// read-only handle refuses with [`PersistenceError::ReadOnly`].
     pub fn execute_maintenance(&mut self, plan: &MaintenancePlan) -> Result<MaintenanceResult> {
+        let mut run = self.begin_maintenance(plan)?;
+        while self.relocate_chunk_batch(plan, &mut run, u64::MAX)? {}
+        self.complete_maintenance(plan, run)
+    }
+
+    /// Start watching the writes the op about to run must step around — called
+    /// in the same hold of this handle's lock as [`Self::plan_maintenance`], so
+    /// no append can fall between the plan and the watch. See
+    /// [`RelocationWatch`].
+    ///
+    /// # Panics
+    ///
+    /// When an op is already in flight ([`Self::relocation_in_flight`]): two
+    /// ops would share one watch, and the second would relocate out of
+    /// segments the first is about to unlink. Callers check first.
+    pub fn watch_relocation(&mut self) {
+        assert!(
+            self.relocation_watch.is_none(),
+            "a second maintenance op was planned while one is relocating"
+        );
+        self.relocation_watch = Some(RelocationWatch::default());
+    }
+
+    /// Whether a maintenance op is between its plan and the unlink of its
+    /// sources (or its failure). A caller that finds one in flight plans none.
+    pub fn relocation_in_flight(&self) -> bool {
+        self.relocation_watch.is_some()
+    }
+
+    /// Stop watching — the op finished or was abandoned.
+    pub fn end_relocation_watch(&mut self) {
+        self.relocation_watch = None;
+    }
+
+    /// The first step of [`Self::execute_maintenance`]: re-emit the resident
+    /// set. One hold of the lock, as the resident records' ordering guards
+    /// assume. Returns the run the chunk batches advance.
+    pub fn begin_maintenance(&mut self, plan: &MaintenancePlan) -> Result<MaintenanceRun> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
@@ -907,15 +961,51 @@ impl SubstratePersistence {
             }
             self.resident_reemit_floor = Some(reemit_floor);
         }
+        Ok(MaintenanceRun {
+            chunk_cursor: 0,
+            chunk_updates: Vec::with_capacity(plan.chunk_relocs.len()),
+        })
+    }
 
-        // Chunks — the relocation bulk. Group by source segment and move each
-        // group with **coalesced reads + verbatim staging** (no decode / CRC /
-        // re-encode) so the fast block-read path is used, not a syscall per
-        // record.
-        let mut chunk_updates = Vec::with_capacity(plan.chunk_relocs.len());
+    /// Relocate the next run of the plan's chunks — up to `budget_bytes` of
+    /// records, at least one — and commit them. Answers whether chunks remain.
+    ///
+    /// The chunks are the bulk of an op (gigabytes for a large segment), and
+    /// this is the unit the caller takes the lock for, so a seal write or a cold
+    /// load waits for one batch instead of the whole relocation. A chunk
+    /// re-appended since the plan is skipped (see `relocation_watch`).
+    ///
+    /// Grouped by source segment and moved with **coalesced reads + verbatim
+    /// staging** (no decode / CRC / re-encode), so the fast block-read path is
+    /// used rather than a syscall per record.
+    pub fn relocate_chunk_batch(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget_bytes: u64,
+    ) -> Result<bool> {
+        let rest = &plan.chunk_relocs[run.chunk_cursor..];
+        let mut take = 0usize;
+        let mut bytes = 0u64;
+        for &(_, _, old) in rest {
+            if take > 0 && bytes + old.record_size > budget_bytes {
+                break;
+            }
+            bytes += old.record_size;
+            take += 1;
+        }
+        let batch = &rest[..take];
+        run.chunk_cursor += take;
+        let keeps = |sid: StreamId, idx: u64| {
+            self.relocation_watch
+                .as_ref()
+                .is_none_or(|w| w.keeps_chunk(sid.0, idx))
+        };
         let mut by_seg: BTreeMap<SegmentId, Vec<(StreamId, u64, ChunkLoc)>> = BTreeMap::new();
-        for &(sid, idx, old) in &plan.chunk_relocs {
-            by_seg.entry(old.segment).or_default().push((sid, idx, old));
+        for &(sid, idx, old) in batch {
+            if keeps(sid, idx) {
+                by_seg.entry(old.segment).or_default().push((sid, idx, old));
+            }
         }
         for (source, recs) in by_seg {
             let items: Vec<RawReloc> = recs
@@ -936,7 +1026,7 @@ impl SubstratePersistence {
                 .collect();
             let new = self.relocate_raw_from_segment(source, &items)?;
             for ((sid, idx, old), (segment, offset, record_size)) in recs.into_iter().zip(new) {
-                chunk_updates.push((
+                run.chunk_updates.push((
                     sid,
                     idx,
                     old,
@@ -951,9 +1041,39 @@ impl SubstratePersistence {
                 ));
             }
         }
+        // Durable per batch, so the op's closing commit — which the durability
+        // barrier before the unlink needs — does not fsync the whole relocation
+        // in one hold.
+        self.commit()?;
+        Ok(run.chunk_cursor < plan.chunk_relocs.len())
+    }
 
-        // Tokens — same coalesced verbatim path.
-        let token_updates = self.relocate_stream_records(RecordType::Tokens, &plan.token_relocs)?;
+    /// The last step of [`Self::execute_maintenance`]: the small record types,
+    /// each behind its own supersession check, then the commit every relocated
+    /// copy is durable under before [`Self::finish_maintenance`] unlinks a
+    /// source. One hold of the lock. The watch stays up until that unlink.
+    pub fn complete_maintenance(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: MaintenanceRun,
+    ) -> Result<MaintenanceResult> {
+        let chunk_updates = run.chunk_updates;
+
+        // Tokens — same coalesced verbatim path, behind the watch the chunks
+        // take: a stream whose tokens were rewritten since the plan, or a
+        // section retired since, has no planned copy worth carrying, and
+        // carrying it would put it after the newer record or the tombstone.
+        let live_tokens: Vec<(StreamId, RecordLoc)> = plan
+            .token_relocs
+            .iter()
+            .filter(|(sid, _)| {
+                self.relocation_watch
+                    .as_ref()
+                    .is_none_or(|w| w.keeps_tokens(sid.0))
+            })
+            .copied()
+            .collect();
+        let token_updates = self.relocate_stream_records(RecordType::Tokens, &live_tokens)?;
 
         // Snapshots — the same verbatim path, behind a supersession check.
         // Snapshot records are last-writer-wins by append order (keyed
@@ -1204,6 +1324,9 @@ impl SubstratePersistence {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
+        // The op ends here whether or not the unlink succeeds: nothing of it
+        // runs after this call.
+        self.end_relocation_watch();
         let targets = plan.op.targets();
         for &t in &targets {
             self.segments.drop_sealed(t)?;
@@ -2835,6 +2958,198 @@ mod tests {
             assert_eq!(substrate.live_chunk_count(), 2);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A relocation run in batches holds the lock one batch at a time, and a
+    /// chunk re-appended between batches keeps its newer copy.** Four chunks
+    /// stand in a sealed segment; the op moves them one per batch, and after the
+    /// first batch chunk 2 is written again — a partial tail sealed final. The
+    /// planned copy of chunk 2 is then superseded: relocating it would append
+    /// it after the new one, and the reload's last-writer-wins walk would bring
+    /// the old bytes back. It must be skipped, and everything else moved.
+    #[test]
+    fn a_chunk_rewritten_between_batches_keeps_its_newer_copy() {
+        let dir = tmp_dir("batched");
+        let decl = turn_decl(404, 0);
+        let sid = decl.stream_id();
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            for i in 0..4u64 {
+                sp.write_chunk(sid, i, 32, 4, None, &chunk_payload(10 + i as u32))
+                    .unwrap();
+            }
+            sp.write_chunk(sid, 4, 32, 4, None, &chunk_payload(1))
+                .unwrap(); // superseded below: the segment carries dead weight
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, 4, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let plan = sp.plan_maintenance(&substrate, true).unwrap().unwrap();
+            assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+            sp.watch_relocation();
+            let mut run = sp.begin_maintenance(&plan).unwrap();
+            let mut batches = 0;
+            loop {
+                let more = sp.relocate_chunk_batch(&plan, &mut run, 1).unwrap();
+                batches += 1;
+                if batches == 1 {
+                    sp.write_chunk(sid, 2, 32, 4, None, &chunk_payload(99))
+                        .unwrap();
+                    sp.commit().unwrap();
+                }
+                if !more {
+                    break;
+                }
+            }
+            assert_eq!(batches, 4, "one chunk per batch at a one-byte budget");
+            let result = sp.complete_maintenance(&plan, run).unwrap();
+            let moved: Vec<u64> = result.chunk_updates.iter().map(|u| u.1).collect();
+            assert_eq!(
+                moved,
+                vec![0, 1, 3],
+                "chunk 2's planned copy was superseded"
+            );
+            result.apply_to_substrate(&mut substrate);
+            sp.finish_maintenance(&plan).unwrap();
+            assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let mut read = |i: u64| sp.read_chunk(&substrate, sid, i).unwrap();
+            assert_eq!(read(0), chunk_payload(10));
+            assert_eq!(read(1), chunk_payload(11));
+            assert_eq!(
+                read(2),
+                chunk_payload(99),
+                "the newer copy survives the reload"
+            );
+            assert_eq!(read(3), chunk_payload(13));
+            assert_eq!(read(4), chunk_payload(2));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Writes during an op's batches are stepped around, for tokens and for a
+    /// retired section as for chunks.** A section retired after the plan — the
+    /// system-prompt rebuild route does this — must carry none of its old
+    /// generation past its tombstone, or a reload revives it under the new
+    /// one; a turn whose tokens were rewritten keeps the newer copy. The op is
+    /// in flight from the plan until its sources are unlinked.
+    #[test]
+    fn a_retired_section_and_rewritten_tokens_are_not_relocated_past_them() {
+        use crate::persistence::content_hash::ContentHash;
+        use crate::persistence::streams::{ContentAddress, SectionDecl};
+
+        let dir = tmp_dir("retired_mid_op");
+        let section = StreamDecl::PromptSection(SectionDecl {
+            address: ContentAddress {
+                prefix_hash: ContentHash { lo: 0x91, hi: 0x92 },
+                section_hash: ContentHash { lo: 0x93, hi: 0x94 },
+            },
+            debug_name: "framing".to_string(),
+        });
+        let ssid = section.stream_id();
+        let turn = turn_decl(505, 0);
+        let tsid = turn.stream_id();
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&section).unwrap();
+            sp.declare_stream(&turn).unwrap();
+            for i in 0..2u64 {
+                sp.write_chunk(ssid, i, 32, 4, None, &chunk_payload(20 + i as u32))
+                    .unwrap();
+            }
+            sp.append_tokens(ssid, b"section-tokens").unwrap();
+            sp.write_chunk(tsid, 0, 32, 4, None, &chunk_payload(30))
+                .unwrap();
+            sp.append_tokens(tsid, b"turn-old").unwrap();
+            sp.write_chunk(tsid, 1, 32, 4, None, &chunk_payload(1))
+                .unwrap(); // superseded below: the segment carries dead weight
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(tsid, 1, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let plan = sp.plan_maintenance(&substrate, true).unwrap().unwrap();
+            assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+            sp.watch_relocation();
+            assert!(sp.relocation_in_flight());
+            let mut run = sp.begin_maintenance(&plan).unwrap();
+            sp.write_section_tombstone(ssid.0, None).unwrap();
+            let (seg, off, size) = sp.append_tokens(tsid, b"turn-new").unwrap();
+            substrate.apply_tokens_loc(
+                tsid,
+                RecordLoc {
+                    segment: seg,
+                    offset: off,
+                    payload_len: b"turn-new".len() as u64,
+                    record_size: size,
+                },
+            );
+            sp.commit().unwrap();
+            while sp.relocate_chunk_batch(&plan, &mut run, 1).unwrap() {}
+            let result = sp.complete_maintenance(&plan, run).unwrap();
+            let moved: Vec<(StreamId, u64)> =
+                result.chunk_updates.iter().map(|u| (u.0, u.1)).collect();
+            assert_eq!(moved, vec![(tsid, 0)], "no chunk of the retired section");
+            assert!(
+                result.token_updates.is_empty(),
+                "neither the retired section's tokens nor the turn's superseded ones"
+            );
+            assert!(sp.relocation_in_flight(), "in flight until the unlink");
+            result.apply_to_substrate(&mut substrate);
+            sp.finish_maintenance(&plan).unwrap();
+            assert!(!sp.relocation_in_flight());
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(
+                sp.read_tokens(&substrate, tsid).unwrap().as_deref(),
+                Some(&b"turn-new"[..]),
+                "the newer tokens survive the reload"
+            );
+            assert_eq!(
+                sp.read_chunk(&substrate, tsid, 0).unwrap(),
+                chunk_payload(30)
+            );
+            assert_eq!(
+                sp.read_chunk(&substrate, tsid, 1).unwrap(),
+                chunk_payload(2)
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **One op at a time.** Planning a second while one is in flight panics:
+    /// it would relocate out of segments the first is about to unlink.
+    #[test]
+    #[should_panic(expected = "a second maintenance op was planned while one is relocating")]
+    fn a_second_watch_while_one_is_in_flight_panics() {
+        // A `TempDir`, so the unwind removes it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut sp = SubstratePersistence::open_in(dir.path()).unwrap();
+        sp.watch_relocation();
+        sp.watch_relocation();
     }
 
     /// **A live run longer than one read stripe is relocated whole.** Seventy

@@ -4,6 +4,7 @@ use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
+use crate::ingest_warmer::IngestWarmer;
 use crate::persistence::manifest::ConvState;
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
@@ -11,7 +12,7 @@ use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
     Builder, CollectionWarm, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget,
-    Reserved, Schema, SectionId, TimelineId, TurnIndex,
+    Reserved, Schema, SectionId, TimelineId, TurnIndex, WorkingSetShare,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
@@ -21,11 +22,12 @@ use crate::stencil::{
     MAX_TOOL_CALLS_PER_TURN,
 };
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
-// disconnected, so nothing constructs a runner. `Substrate` comes from our side.
+// disconnected, so nothing constructs a runner.
 use crate::substrate::ConvCompression;
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::literal_tokenizer;
+use crate::working_set::{Limits, Refusal, WorkingSet};
 
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
@@ -831,12 +833,15 @@ impl ConversationEngine {
         self.conversation.reset_normalization_warm();
     }
 
-    /// Warm the ingest layers' per-file hit levels from their own turns. Call
-    /// AFTER an ingest pass / reconcile finishes (never concurrently — it would
-    /// starve the ingest writer). See
-    /// [`crate::projection::Conversation::warm_ingest_normalization`].
-    pub fn warm_ingest_normalization(&self, schema: &Schema) {
-        self.conversation.warm_ingest_normalization(schema);
+    /// A handle that warms the ingest layers' per-file hit levels on the
+    /// scheduler's GPU gallery arena, a slice of files at a time, without
+    /// holding this engine. Run it AFTER an ingest pass / reconcile finishes
+    /// (never concurrently — it would starve the ingest writer).
+    pub fn ingest_warmer(&self) -> IngestWarmer {
+        IngestWarmer {
+            conversation: self.conversation.clone(),
+            scheduler_tx: self.scheduler_tx.clone(),
+        }
     }
 
     /// Warm one belief group's per-timeline hit levels by self-match — for a
@@ -945,36 +950,99 @@ impl ConversationEngine {
         self.conversation.find_timelines_by_metadata(key, value)
     }
 
-    /// Inject `read` into `target`'s fast-path set — the conversation that
-    /// already read this content, standing in for reading it again.
-    ///
-    /// `budget_tokens` is the reading layer's `fast_path_window`; the set is
-    /// evicted least-recently-used down to it. `false` means the read did not
-    /// fit and the caller must do the real read.
-    pub fn fast_path_admit(
+    /// Lock `read` into `target`'s working set — the conversation that already
+    /// read this content, standing in for reading it again
+    /// (`docs/zend_working_set.md` §4.5). A refusal means the caller must do
+    /// the real read.
+    pub fn working_set_lock(
         &self,
         target: TimelineId,
         read: TimelineId,
-        budget_tokens: usize,
-    ) -> bool {
+        limits: Limits,
+    ) -> Result<(), Refusal> {
         self.conversation
             .write()
-            .fast_path_admit(target, read, budget_tokens)
+            .working_set_lock(target, read, limits)
     }
 
-    /// The conversations `target` currently carries from the fast path, most
-    /// recently admitted first.
-    pub fn fast_path_injections(&self, target: TimelineId) -> Vec<TimelineId> {
+    /// Put back a lock `target`'s own history records as served. `false` when
+    /// the conversation it names can no longer deliver anything.
+    pub fn working_set_restore_lock(&self, target: TimelineId, read: TimelineId) -> bool {
         self.conversation
-            .read()
-            .fast_path_injections(target)
-            .to_vec()
+            .write()
+            .working_set_restore_lock(target, read)
     }
 
-    /// Forget `target`'s fast-path set, so the next call rebuilds it from the
-    /// conversation's own history.
-    pub fn fast_path_clear(&self, target: TimelineId) {
-        self.conversation.write().fast_path_clear(target);
+    /// Seed `target`'s provenance with `candidates` at `momentum`, in list
+    /// order while the budget has room. Returns the candidates that did not
+    /// enter.
+    pub fn working_set_seed(
+        &self,
+        target: TimelineId,
+        candidates: &[TimelineId],
+        limits: Limits,
+        momentum: f32,
+    ) -> Vec<TimelineId> {
+        self.conversation
+            .write()
+            .working_set_seed(target, candidates, limits, momentum)
+    }
+
+    /// Release `target`'s locks into provenance at `released` momentum.
+    pub fn working_set_release(&self, target: TimelineId, released: f32) {
+        self.conversation
+            .write()
+            .working_set_release(target, released);
+    }
+
+    /// A copy of `target`'s working set, when it has one.
+    pub fn working_set(&self, target: TimelineId) -> Option<WorkingSet> {
+        self.conversation.read().working_set(target).cloned()
+    }
+
+    /// Forget `target`'s working set, so it is rebuilt from the conversation's
+    /// own history.
+    pub fn working_set_clear(&self, target: TimelineId) {
+        self.conversation.write().working_set_clear(target);
+    }
+
+    /// Every turn's tags on `timeline`, oldest first — the record the working
+    /// set's locks are rebuilt from.
+    pub fn turn_tag_lists(&self, timeline: TimelineId) -> Vec<Vec<String>> {
+        let view = self.conversation.read();
+        let mut indices: Vec<_> = view.turn_indices(timeline).collect();
+        indices.sort_by_key(|i| i.0);
+        indices
+            .into_iter()
+            .map(|idx| view.turn_tags(timeline, idx))
+            .collect()
+    }
+
+    /// Every turn's `(user, assistant)` text on `timeline`, oldest first.
+    pub fn turn_texts(&self, timeline: TimelineId) -> Vec<(String, String)> {
+        let view = self.conversation.read();
+        let mut indices: Vec<_> = view.turn_indices(timeline).collect();
+        indices.sort_by_key(|i| i.0);
+        indices
+            .into_iter()
+            .map(|idx| {
+                (
+                    view.user_text_of(timeline, idx),
+                    view.assistant_text_of(timeline, idx),
+                )
+            })
+            .collect()
+    }
+
+    /// `timeline`'s recorded token total, when one was recorded.
+    pub fn timeline_token_total(&self, timeline: TimelineId) -> usize {
+        self.conversation.read().timeline_token_total(timeline)
+    }
+
+    /// The fork lineage `timeline` inherits, oldest ancestor first, ending at
+    /// `timeline` itself.
+    pub fn inherited_chain(&self, timeline: TimelineId) -> Vec<TimelineId> {
+        self.conversation.read().inherited_chain(timeline)
     }
 
     /// Offer `group`'s conversations to a projection only as its target's
@@ -983,6 +1051,16 @@ impl ConversationEngine {
     /// same. Idempotent; in-memory, so it is marked at every setup.
     pub fn mark_group_scoped(&self, group: GroupId) {
         self.conversation.write().mark_group_scoped(group);
+    }
+
+    /// Record which share of a dialogue's working-set budget `group`'s
+    /// conversations draw on — what the schema's `working_set` selection rule
+    /// declares for it. A conversation in no such group is never a working-set
+    /// member. Idempotent; in-memory, so it is set at every setup.
+    pub fn set_working_set_share(&self, group: GroupId, share: WorkingSetShare) {
+        self.conversation
+            .write()
+            .set_working_set_share(group, share);
     }
 
     /// Name the conversations the scoped `group` may offer `target`, replacing
@@ -1001,23 +1079,6 @@ impl ConversationEngine {
     /// Forget every scope `target` was given.
     pub fn clear_retrieval_scope(&self, target: TimelineId) {
         self.conversation.write().clear_retrieval_scope(target);
-    }
-
-    /// Every assistant turn's text on `timeline`, oldest first.
-    ///
-    /// The durable record of what a conversation asked for: the `<tool_call>`
-    /// blocks it wrote are in here verbatim, which is what lets a resumed
-    /// conversation replay its own calls without any of them having been
-    /// recorded a second time as metadata.
-    pub fn assistant_turn_texts(&self, timeline: TimelineId) -> Vec<String> {
-        let view = self.conversation.read();
-        let mut indices: Vec<_> = view.turn_indices(timeline).collect();
-        indices.sort_by_key(|i| i.0);
-        indices
-            .into_iter()
-            .map(|idx| view.assistant_text_of(timeline, idx))
-            .filter(|t| !t.is_empty())
-            .collect()
     }
 
     /// [`Self::find_conversations_by_metadata`] plus tombstoned conversations
@@ -1531,18 +1592,30 @@ impl ConversationEngine {
         // in `assistant_end` cannot be allowed to ride along.
         let envelope = ToolCallEnvelope::for_assistant_calls(&self.config.dialect);
         let close_turn = ToolCallEnvelope::turn_close(&self.config.dialect);
+        let started = std::time::Instant::now();
         let spec = compile_tool_call_loop(tools, &envelope, MAX_TOOL_CALLS_PER_TURN, &close_turn)
             .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
+        let spec_ms = started.elapsed().as_millis() as u64;
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),
             &self.config.eos_tokens,
             self.config.vocab_size as u64,
         );
+        let vocab_ms = started.elapsed().as_millis() as u64 - spec_ms;
         let tree = compile(&spec, &vocab).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
+        tracing::info!(
+            tools = tools.len(),
+            spec_nodes = spec.nodes.len(),
+            tree_nodes = tree.len(),
+            spec_ms,
+            vocab_ms,
+            compile_ms = started.elapsed().as_millis() as u64 - spec_ms - vocab_ms,
+            "tool stencil compiled"
+        );
         let mut registry = TriggerRegistry::new();
         registry.register(trigger, Arc::new(tree));
         Ok(Arc::new(registry))

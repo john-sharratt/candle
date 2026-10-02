@@ -1,6 +1,7 @@
 //! Listing tags.
 
 use crate::error::GitError;
+use crate::library::refs;
 use crate::runner::utf8;
 use crate::types::{Oid, RefName, TagName};
 use crate::Repo;
@@ -46,6 +47,9 @@ pub(crate) fn parse_tags(out: &str) -> Result<Vec<Tag>, GitError> {
 impl Repo {
     /// Every tag, by name.
     pub fn tags(&self) -> Result<Vec<Tag>, GitError> {
+        if let Some(lib) = self.library() {
+            return refs::tags(&lib);
+        }
         let out = self
             .git("for-each-ref")
             .arg("--format=%(refname)%00%(objectname)%00%(objecttype)%00%(*objectname)")

@@ -580,11 +580,11 @@ fn read_returns_a_numbered_fenced_excerpt() {
     let text = resp.as_str().expect("file_read returns a rendered string");
     assert_eq!(
         text,
-        "\nsrc/main.rs in proj (page 0 of 1, lines 1-3 of 3):\n\n```rust\n1  fn main() {\n2      println!(\"hi\");\n3  }\n```\n",
+        "\n```rust file=proj/src/main.rs page=0/1 lines=3\n1  fn main() {\n2      println!(\"hi\");\n3  }\n```\nend of proj/src/main.rs page 0/1\n",
     );
 }
 
-/// Without a page a read is rejected — a page is required, and the header
+/// Without a page a read is rejected — a page is required, and the fence
 /// states the total so the model knows to keep going.
 #[test]
 fn read_without_a_page_is_rejected() {
@@ -615,7 +615,7 @@ fn read_returns_the_requested_page_and_clamps_one_past_the_end() {
     assert_eq!(
         middle.as_str().unwrap(),
         format!(
-            "\nbig.rs in proj (page 1 of 5, lines 201-400 of 900):\n\n```rust\n{numbered}```\n"
+            "\n```rust file=proj/big.rs page=1/5 lines=900\n{numbered}```\nend of proj/big.rs page 1/5\n"
         ),
     );
 
@@ -633,7 +633,7 @@ fn read_returns_the_requested_page_and_clamps_one_past_the_end() {
     );
     let numbered: String = (801..=900).map(|i| format!("{i}  line {i}\n")).collect();
     let expected = format!(
-        "\nbig.rs in proj (page 4 of 5, lines 801-900 of 900):\n\n```rust\n{numbered}```\n"
+        "\n```rust file=proj/big.rs page=4/5 lines=900\n{numbered}```\nend of proj/big.rs page 4/5\n"
     );
     assert_eq!(last.as_str().unwrap(), expected);
     assert_eq!(clamped.as_str().unwrap(), expected, "clamps to page 4");
@@ -652,19 +652,19 @@ fn read_past_the_end_clamps_into_the_file() {
     );
     let text = resp.as_str().unwrap();
     assert!(
-        text.starts_with("\nsrc/main.rs in proj (page 0 of 1, lines 1-3 of 3):\n"),
+        text.starts_with("\n```rust file=proj/src/main.rs page=0/1 lines=3\n"),
         "{text:.60}"
     );
 }
 
-/// **The read header is the only place a file's length is reported, so it has to
+/// **The read fence is the only place a file's length is reported, so it has to
 /// be right for every shape of ending.**
 ///
-/// A listing carries no line count, so the header's `of N` is the single source
+/// A listing carries no line count, so the fence's `lines=N` is the single source
 /// of a file's length — the number the model pages against — and an off-by-one over
 /// a trailing newline would misplace the last range of every file.
 #[test]
-fn the_read_header_reports_the_files_true_length() {
+fn the_read_fence_reports_the_files_true_length() {
     let dir = tempfile::tempdir().unwrap();
     let root = harness::repo_root(dir.path());
     // Each shape that has ever made a line count ambiguous.
@@ -683,23 +683,23 @@ fn the_read_header_reports_the_files_true_length() {
 
     for (name, _, expected) in cases {
         // Every case fits on page 0, so this is always the whole file — the
-        // header's `of N` is stated unconditionally either way.
+        // fence's `lines=N` is stated unconditionally either way.
         let resp = harness::invoke_with_ctx(
             "file_read",
             json!({"repo": REPO, "path": name, "page": 0}),
             &ctx,
         );
         let text = resp.as_str().unwrap();
-        // The header is "(page P of N, lines a-b of total)" — the LAST " of "
-        // before the closing paren names the file's true length.
+        // The fence line ends "page=P/M lines=N" — `lines=` names the file's
+        // true length.
         let total: i64 = text
-            .rsplit_once(" of ")
-            .and_then(|(_, rest)| rest.split_once(')'))
+            .split_once(" lines=")
+            .and_then(|(_, rest)| rest.split_once('\n'))
             .map(|(n, _)| n.parse().unwrap())
-            .unwrap_or_else(|| panic!("{name}: header carries no `of N`: {text:?}"));
+            .unwrap_or_else(|| panic!("{name}: fence carries no `lines=N`: {text:?}"));
         assert_eq!(
             total, expected,
-            "{name}: header total {total} != true length {expected}",
+            "{name}: fence total {total} != true length {expected}",
         );
     }
 }
@@ -717,6 +717,6 @@ fn read_of_an_empty_file_reports_empty() {
     );
     assert_eq!(
         resp.as_str().unwrap(),
-        "\nblank.rs in proj (empty):\n\n```rust\n```\n"
+        "\n```rust file=proj/blank.rs lines=0\n```\nend of proj/blank.rs\n"
     );
 }

@@ -136,7 +136,7 @@ supersedes the last boot's records — dead records only compaction reclaims; th
 every section on the hybrid lineage (the persisted grid checked against transformer depth
 instead of the KV backing count), fixed in `01b5c559`: a refused restore falls back to a
 prefill, and the prefill's seal is the rewrite. `tools_integration::
-a_second_boot_restores_every_prompt_section` boots a `ZendSession` twice on the suite's
+a_boot_after_a_boot_restores_every_prompt_section` boots a `ZendSession` twice on the suite's
 workspace — the tool catalog included, which only a zend boot installs — and asserts the
 second boot prefills no prompt section (passes, 23 s). The `zend/src/session.rs` comment that
 called section cold-load disabled now describes the triage.

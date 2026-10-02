@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::builder::Builder;
+use super::error::ConstructionError;
 use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::{
     OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
@@ -375,6 +376,31 @@ fn tool_calls_keep_their_penalties_unless_the_schema_asks_otherwise() {
         .unwrap()
         .free_tool_calls_from_penalties();
     assert!(built.schema().free_tool_calls_from_penalties);
+}
+
+/// `rope: min_yarn_factor:` reaches the schema; a schema that says nothing
+/// floors no rung, and a factor under 1 is refused at parse.
+#[test]
+fn rope_min_yarn_factor_parses_and_is_validated() {
+    let quiet = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    assert_eq!(quiet.schema().min_yarn_factor, None);
+
+    let floored =
+        Builder::from_yaml(&format!("rope:\n  min_yarn_factor: 2\n{SIMPLE_YAML}")).unwrap();
+    assert_eq!(floored.schema().min_yarn_factor, Some(2.0));
+
+    for bad in ["0.5", ".nan"] {
+        let err = Builder::from_yaml(&format!("rope:\n  min_yarn_factor: {bad}\n{SIMPLE_YAML}"))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, ConstructionError::InvalidMinYarnFactor(_)),
+            "{bad}: {err}"
+        );
+    }
+
+    let unknown = Builder::from_yaml(&format!("rope:\n  min_yarn: 2\n{SIMPLE_YAML}"));
+    assert!(unknown.is_err(), "a misspelt rope key must not be ignored");
 }
 
 #[test]

@@ -197,10 +197,13 @@ fn tiny_segments_gap_walk() -> Result<()> {
         theta: 1e6,
         seed: 0x222,
         golden_band: 2.5e-1,
-        // Measured 0.9527 once the harness actually reached this assertion (it
-        // panicked on the missing write-region allocation before), so the 0.975
-        // floor had never run against a real number. 0.95 clears it with margin.
-        min_cos: 0.95,
+        // Measured 0.9527 when the harness first reached this assertion, then
+        // 0.9485 once the production ladder spent more of V's error budget on
+        // C2–C7 (the Q5 buy-back retune of `params.rs`, whose V thresholds rose
+        // there). The segments sit at C4, C5 and C7, so the drop is that
+        // retune, and it is deterministic: identical on every rerun. 0.94 clears
+        // the measurement by the margin the 0.95 floor had over the first.
+        min_cos: 0.94,
         structured_dims: false,
     })
 }
@@ -813,7 +816,10 @@ fn ab_gap_walk_hostile() -> Result<()> {
         ),
         0xAB60,
         false,
-        (4.5e-1, 0.95),
+        // Row cosine measured 0.949077 under the production ladder's V
+        // thresholds on C2–C7 (the segments here sit at C2, C4, C5, C7 and C9),
+        // deterministic across reruns; 0.94 keeps the margin the 0.95 floor had.
+        (4.5e-1, 0.94),
     )
 }
 

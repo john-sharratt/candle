@@ -66,6 +66,7 @@ pub mod fragmentation_probe;
 pub mod guest;
 mod handle;
 pub mod index_pages;
+mod ingest_warmer;
 mod line_ends;
 pub mod models;
 pub mod narrator;
@@ -107,6 +108,7 @@ pub mod tree;
 pub mod turn;
 pub mod turn_layout;
 pub mod turn_text;
+pub mod working_set;
 
 pub use cancel::{ingest_cancelled, request_ingest_cancel, reset_ingest_cancel};
 pub use config::{
@@ -117,6 +119,7 @@ pub use conversation::{ChainRound, GlueMarkers, Sequence};
 pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
+pub use ingest_warmer::IngestWarmer;
 pub use projection::{
     BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, SelectionState,
     NO_THINK_SELECTOR, TOOL_ROUND_SELECTOR,

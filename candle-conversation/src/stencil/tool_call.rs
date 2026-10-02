@@ -113,6 +113,15 @@ pub struct Param {
     /// what its choice depends on.
     #[serde(default)]
     pub requires: Vec<(String, Vec<String>)>,
+    /// A required enum field: the fields each value **brings with it**, as
+    /// `(value, fields)`. After that value the object carries exactly those
+    /// fields, required and typed as given, in place of any sibling of the same
+    /// name — so what a value means decides what may be written beside it. An
+    /// `invoke` call's `url` brings the `body` its endpoint accepts. Values
+    /// with equal field lists share one sub-tree, so the tree grows with the
+    /// number of distinct shapes and not the number of values.
+    #[serde(default)]
+    pub shapes: Vec<(String, Vec<Param>)>,
 }
 
 /// One tool: a name and an ordered parameter list.
@@ -283,6 +292,7 @@ fn merge_variants(arms: &[&Value], root: &Value, depth: usize) -> Option<Param> 
         nullable: false,
         minimum: None,
         requires: Vec::new(),
+        shapes: Vec::new(),
     })
 }
 
@@ -431,6 +441,7 @@ fn param_of(schema: &Value, root: &Value) -> Param {
         nullable,
         minimum: schema.get("minimum").and_then(Value::as_f64),
         requires: Vec::new(),
+        shapes: Vec::new(),
     }
 }
 
@@ -792,12 +803,9 @@ pub fn compile_tool_call_tree(
 
     // Each tool: name arm -> args_open static -> its argument object -> close.
     let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(tools.len());
+    let mut shared = HashMap::new();
     for tool in tools {
-        let args_entry = b.build_fields(&tool.params, &env.close, end)?;
-        let arm_target = b.spec.push(NodeSpec::Static {
-            text: env.args_open.clone(),
-            next: args_entry,
-        });
+        let arm_target = b.tool_arm_target(tool, end, &mut shared)?;
         // The arm carries the name's own terminator so prefix-related names
         // stay distinguishable in the trie — see `ToolCallEnvelope::name_close`.
         arms.push((format!("{}{}", tool.name, env.name_close), arm_target));
@@ -1013,16 +1021,13 @@ pub fn compile_action_loop_with_body<'a>(
     for level in (0..max_calls).rev() {
         // One call: choose a name, fill its arguments, close the block.
         let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(tools.len());
+        let mut shared = HashMap::new();
         for tool in tools {
             // The typed body applies only to the tool it is armed for; every
             // other tool builds its arguments free-typed as before.
             b.body_override =
                 body_override.and_then(|(tn, pn, spec)| (tn == tool.name).then_some((pn, spec)));
-            let args_entry = b.build_fields(&tool.params, &env.close, after_call)?;
-            let arm_target = b.spec.push(NodeSpec::Static {
-                text: env.args_open.clone(),
-                next: args_entry,
-            });
+            let arm_target = b.tool_arm_target(tool, after_call, &mut shared)?;
             // The name's own terminator, from the envelope — a hardcoded `"`
             // here spliced a JSON quote into a function block and produced act
             // names like `reflect"<parameter=inner_thoughts"`, rejected on
@@ -1118,6 +1123,42 @@ impl<'a> ToolTreeBuilder<'a> {
         }
     }
 
+    /// What a tool's name arm leads to: the arguments' opening, then its
+    /// argument object through the envelope close, ending at `end`.
+    ///
+    /// **One node per distinct parameter list.** A tool and each alias it
+    /// answers to take the same arguments, so what follows their names is one
+    /// grammar, and the arms lead to one node: the compiler lowers a node once
+    /// however many arms reach it, so an alias costs a name arm instead of a
+    /// copy of its tool's whole argument grammar. The catalog's aliases outnumber
+    /// its tools five to one, and a copy each made the tree — and the seconds it
+    /// took to compile at every daemon start — five times what it needed to be.
+    /// `shared` is the memo for one level, whose `end` is fixed; a tool with a
+    /// typed body spliced in is its own.
+    fn tool_arm_target(
+        &mut self,
+        tool: &ToolSpec,
+        end: SpecId,
+        shared: &mut HashMap<String, SpecId>,
+    ) -> Result<SpecId, BuildError> {
+        let key = format!("{:?}", tool.params);
+        if self.body_override.is_none() {
+            if let Some(&target) = shared.get(&key) {
+                return Ok(target);
+            }
+        }
+        let close = self.env.close.clone();
+        let args_entry = self.build_fields(&tool.params, &close, end)?;
+        let target = self.spec.push(NodeSpec::Static {
+            text: self.env.args_open.clone(),
+            next: args_entry,
+        });
+        if self.body_override.is_none() {
+            shared.insert(key, target);
+        }
+        Ok(target)
+    }
+
     /// An object's field sequence, written up to and including `close` — the
     /// envelope close for a call's arguments, `}` for an object value — and
     /// ending at `end`.  Returns the entry node.
@@ -1147,7 +1188,8 @@ impl<'a> ToolTreeBuilder<'a> {
             let mut memo = FieldMemo::default();
             return self.opt_gates(optional, 0, !first, close, end, &mut memo);
         };
-        if let (false, Some(values), false) = (p.requires.is_empty(), &p.enum_values, p.nullable) {
+        let decides = !p.requires.is_empty() || !p.shapes.is_empty();
+        if let (true, Some(values), false) = (decides, &p.enum_values, p.nullable) {
             return self.build_discriminated(p, values, rest, optional, first, close, end);
         }
         let tail = self.build_sequence(rest, optional, false, close, end)?;
@@ -1158,10 +1200,15 @@ impl<'a> ToolTreeBuilder<'a> {
         }))
     }
 
-    /// A required enum field `p` whose values require fields of their own
-    /// ([`Param::requires`]): each value goes on to the rest of the object
-    /// with the fields it requires moved from `optional` to required, after
-    /// `rest`. Values that require nothing share one tail.
+    /// A required enum field `p` whose values decide the rest of the object
+    /// ([`Param::requires`], [`Param::shapes`]): each value goes on to the rest
+    /// of the object with the fields it requires moved from `optional` to
+    /// required, and the fields it brings added, after `rest`.
+    ///
+    /// **One tail per distinct continuation.** A value's tail is fixed by the
+    /// fields it promotes and the fields it brings, so values that agree on
+    /// both point at the same sub-tree: a thousand endpoints that accept the
+    /// same body cost that body once.
     #[allow(clippy::too_many_arguments)]
     fn build_discriminated(
         &mut self,
@@ -1173,7 +1220,7 @@ impl<'a> ToolTreeBuilder<'a> {
         close: &str,
         end: SpecId,
     ) -> Result<SpecId, BuildError> {
-        let mut shared: Option<SpecId> = None;
+        let mut tails: HashMap<String, SpecId> = HashMap::new();
         let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(values.len());
         for value in values {
             // Every rule naming the value counts.
@@ -1183,29 +1230,44 @@ impl<'a> ToolTreeBuilder<'a> {
                 .filter(|(v, _)| v == value)
                 .flat_map(|(_, fields)| fields)
                 .collect();
+            let brought: Vec<Param> = p
+                .shapes
+                .iter()
+                .filter(|(v, _)| v == value)
+                .flat_map(|(_, fields)| fields)
+                .map(|f| Param {
+                    required: true,
+                    ..f.clone()
+                })
+                .collect();
+            let brings = |o: &&Param| brought.iter().any(|b| b.name == o.name);
             let wanted = |o: &&Param| needs.contains(&&o.name);
-            let tail = match (optional.iter().any(wanted), shared) {
-                (false, Some(tail)) => tail,
-                (false, None) => {
-                    let tail = self.build_sequence(rest, optional, false, close, end)?;
-                    shared = Some(tail);
-                    tail
-                }
-                (true, _) => {
-                    let promoted: Vec<Param> = optional
+            let promoted: Vec<Param> = optional
+                .iter()
+                .copied()
+                .filter(|o| wanted(o) && !brings(o))
+                .map(|o| Param {
+                    required: true,
+                    ..o.clone()
+                })
+                .collect();
+            let key = format!("{promoted:?}{brought:?}");
+            let tail = match tails.get(&key) {
+                Some(&tail) => tail,
+                None => {
+                    let mut now_required: Vec<&Param> =
+                        rest.iter().copied().filter(|r| !brings(r)).collect();
+                    now_required.extend(promoted.iter());
+                    now_required.extend(brought.iter());
+                    let still_optional: Vec<&Param> = optional
                         .iter()
                         .copied()
-                        .filter(|o| wanted(o))
-                        .map(|o| Param {
-                            required: true,
-                            ..o.clone()
-                        })
+                        .filter(|o| !wanted(o) && !brings(o))
                         .collect();
-                    let mut now_required: Vec<&Param> = rest.to_vec();
-                    now_required.extend(promoted.iter());
-                    let still_optional: Vec<&Param> =
-                        optional.iter().copied().filter(|o| !wanted(o)).collect();
-                    self.build_sequence(&now_required, &still_optional, false, close, end)?
+                    let tail =
+                        self.build_sequence(&now_required, &still_optional, false, close, end)?;
+                    tails.insert(key, tail);
+                    tail
                 }
             };
             arms.push((value.clone(), tail));
@@ -1330,9 +1392,9 @@ impl<'a> ToolTreeBuilder<'a> {
         }
         // A nested JSON object refined into typed fields (`object | recurse`).
         // Function blocks keep the raw free value below. The opening brace
-        // rides on the lead-in, same as `value_arms`'s object arm. A nullable
-        // object is a choice between ` {` and ` null`, so it goes through
-        // `value_arms` instead of prefilling the brace.
+        // rides on the lead-in, same as `value_arms`'s object arm. A
+        // *nullable* object still needs the null-vs-object choice `value_arms`
+        // builds below — forcing the object here would deny the model `null`.
         if self.env.style != CallStyle::FunctionBlock && !p.nullable {
             if let Some(fields) = &p.properties {
                 let entry = self.build_fields(fields, "}", next)?;

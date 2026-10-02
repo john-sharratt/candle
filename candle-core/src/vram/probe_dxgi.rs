@@ -15,7 +15,8 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, LUID, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter3, IDXGIFactory1, DXGI_ADAPTER_DESC1,
-    DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+    DXGI_MEMORY_SEGMENT_GROUP, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+    DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -42,16 +43,28 @@ impl DxgiProbe {
             node: 0,
         })
     }
+
+    /// The NON_LOCAL segment — host memory the GPU can address — as
+    /// `(Budget, CurrentUsage)` for this process.
+    pub fn non_local(&self) -> Result<(u64, u64)> {
+        let info = self.query(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?;
+        Ok((info.Budget, info.CurrentUsage))
+    }
+
+    fn query(&self, group: DXGI_MEMORY_SEGMENT_GROUP) -> Result<DXGI_QUERY_VIDEO_MEMORY_INFO> {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        unsafe {
+            self.adapter
+                .QueryVideoMemoryInfo(self.node, group, &mut info)
+        }
+        .map_err(|e| Error::Msg(format!("QueryVideoMemoryInfo failed: {e}")))?;
+        Ok(info)
+    }
 }
 
 impl VramProbe for DxgiProbe {
     fn read(&self) -> Result<VramReading> {
-        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        unsafe {
-            self.adapter
-                .QueryVideoMemoryInfo(self.node, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
-        }
-        .map_err(|e| Error::Msg(format!("QueryVideoMemoryInfo failed: {e}")))?;
+        let info = self.query(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?;
         let headroom = info.Budget.saturating_sub(info.CurrentUsage);
         Ok(VramReading::new(headroom, self.total, ProbeKind::Dxgi))
     }

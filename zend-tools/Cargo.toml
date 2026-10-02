@@ -73,3 +73,6 @@ tokio     = { version = "1", features = ["macros", "rt"] }
 wiremock  = "0.6"
 pretty_assertions = "1"
 tempfile  = "3"
+# The git tools' fixtures commit in this process: two `git` processes per
+# commit, a few hundred commits a run.
+git2      = { version = "0.20", default-features = false }

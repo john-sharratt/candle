@@ -66,7 +66,6 @@ use crate::part::PartKind;
 use crate::route;
 use crate::salience::Weight;
 use crate::schema::{AreaKind, Node, NodeKind};
-use crate::witness::{Reach, Scope};
 
 pub use crate::schema::Where;
 
@@ -481,6 +480,18 @@ pub struct World {
     /// Who is riding, and the floor each is bound for. They come off at their
     /// floor when the car opens there.
     riders: BTreeMap<String, usize>,
+    /// The company each body was in when it began deciding, for the bodies that
+    /// are deciding now. See [`World::begin_decision`].
+    deciding: BTreeMap<String, Deliberation>,
+}
+
+/// Who was in a body's room at the moment it began deciding what to do.
+#[derive(Debug, Clone)]
+struct Deliberation {
+    /// Where the body stood.
+    at: Where,
+    /// Everybody else standing there, by id.
+    company: BTreeSet<String>,
 }
 
 impl World {
@@ -503,6 +514,7 @@ impl World {
             lift,
             shaft,
             riders: BTreeMap::new(),
+            deciding: BTreeMap::new(),
         }
     }
 
@@ -730,28 +742,67 @@ impl World {
         self.actors.values().filter(|a| &a.at == place).collect()
     }
 
-    /// Somebody `speaker` could call after: named `name`, no longer in the room
-    /// but one doorway away, in a room the speaker's voice still reaches
-    /// ([`Reach::InSight`] of the *walker's* scope, since it is the walker who
-    /// must make out the voice).
+    /// Fix who `id` can address, as of now: everybody standing in its room.
     ///
-    /// **It does not re-check that they were just in the speaker's room**, and it
-    /// does not need to: that guarantee is the caller's. The grammar only ever
-    /// offers an addressee drawn from the room's own company (`tell`/`ask`/
-    /// `whisper` bind `to` to `Choices::Company`), so a named addressee who is no
-    /// longer present is, by construction, somebody who was standing here a
-    /// moment ago and has stepped out. The world's part is only to find where
-    /// they went and confirm the line can still carry. Speech does not otherwise
-    /// cross a room — this is the one aimed exception, and it reaches only the
-    /// one it is aimed at.
-    pub fn within_earshot(&self, speaker: &str, name: &str) -> Option<String> {
+    /// **A body decides over seconds, and the room does not wait.** What it may
+    /// say and to whom is read once, before it starts, and the person it means
+    /// to answer can walk out while it works. Without a record of who was there,
+    /// the only thing left to check the finished act against is the room as it
+    /// has become, and that refuses a line the body was correctly offered. This
+    /// is the record: [`World::just_left`] and [`World::call_after`] read it, so
+    /// an addressee drawn from the company the body decided with is still
+    /// reachable after they step out.
+    ///
+    /// Does not move the clock — it observes the world, it does not happen in
+    /// it. A second call replaces the first, and [`World::end_decision`] ends it.
+    pub fn begin_decision(&mut self, id: &str) {
+        let Some(actor) = self.actors.get(id) else {
+            return;
+        };
+        let at = actor.at.clone();
+        let company = self
+            .actors_at(&at)
+            .into_iter()
+            .filter(|a| a.id != id)
+            .map(|a| a.id.clone())
+            .collect();
+        self.deciding
+            .insert(id.into(), Deliberation { at, company });
+    }
+
+    /// The decision `id` was making is over: nothing it does from here on is
+    /// answered from the company it decided with.
+    pub fn end_decision(&mut self, id: &str) {
+        self.deciding.remove(id);
+    }
+
+    /// Where `id` stood when it began deciding, while it is deciding.
+    ///
+    /// The room the grammar was built from, and so the room an act chosen from it
+    /// is about — whatever leg a moving body has covered since. `None` once
+    /// [`World::end_decision`] has run, and for a body that is not deciding.
+    pub fn decided_at(&self, id: &str) -> Option<&Where> {
+        self.deciding.get(id).map(|d| &d.at)
+    }
+
+    /// Somebody `speaker` could call after: named `name`, in the company it
+    /// began deciding with ([`World::begin_decision`]), and no longer in the room
+    /// it stands in now.
+    ///
+    /// The name must be the whole of theirs, in any case. Somebody still with
+    /// the speaker is not here — that is the ordinary case, answered by an
+    /// ordinary aimed line — and a name nobody in the company answered to
+    /// resolves to nobody.
+    pub fn just_left(&self, speaker: &str, name: &str) -> Option<String> {
         let want = name.trim();
-        let place = self.actor(speaker)?.at.clone();
-        self.actors
-            .values()
-            .filter(|a| a.id != speaker && a.at != place)
-            .filter(|a| a.name.eq_ignore_ascii_case(want))
-            .find(|a| Scope::at(self, &a.at).reach(&place) == Reach::InSight)
+        let now_at = &self.actor(speaker)?.at;
+        self.deciding
+            .get(speaker)?
+            .company
+            .iter()
+            .filter_map(|id| self.actor(id))
+            .filter(|a| &a.at != now_at)
+            .find(|a| a.name.eq_ignore_ascii_case(want))
             .map(|a| a.id.clone())
     }
 
@@ -846,6 +897,7 @@ impl World {
             self.release_at(id, at)?;
         }
         self.actors.remove(id);
+        self.deciding.remove(id);
         // Logged as a departure, so everybody standing there perceives it the
         // way they perceive an arrival. Somebody vanishing from a room without
         // the room being told is the same defect as somebody appearing in it
@@ -1509,17 +1561,21 @@ impl World {
 
     /// Raise your voice after somebody who has just left the room.
     ///
-    /// The one aimed line that carries through a doorway. [`World::tell`] and its
+    /// The one aimed line that carries to somebody out of the room. [`World::tell`] and its
     /// kin refuse an addressee who is not here, because two people talking need
     /// to be in the same room — but somebody mid-sentence when the other steps
     /// out has one parting line to call after them, and losing it turned a moving
     /// cast's exchanges into questions nobody ever answered.
     ///
-    /// Delivered under the same rule the world enforces itself rather than trusts
-    /// from the caller: `to` must be one doorway away ([`Reach::InSight`]),
-    /// exactly what [`World::within_earshot`] resolves. It logs at the speaker's
-    /// place, so [`crate::witness`] carries it to the one it is aimed at and to
-    /// nobody else.
+    /// Delivered under a rule the world enforces itself rather than trusts from
+    /// the caller: `to` must have been in the company `id` began deciding with
+    /// ([`World::begin_decision`]) — somebody who was there when the line was
+    /// chosen — and must still be in the world. How far they have got does not
+    /// matter: the line is addressed to them, and [`crate::witness`] carries it
+    /// to the one it is aimed at and to nobody else, at any distance.
+    ///
+    /// It logs where the speaker decided, which is where the line was meant
+    /// for, so a speaker who has also walked out has not moved its words.
     pub fn call_after(
         &mut self,
         id: &str,
@@ -1527,20 +1583,16 @@ impl World {
         words: impl Into<String>,
         voice: Voice,
     ) -> Done {
-        let place = self
-            .actor(id)
-            .ok_or_else(|| Refused::NoSuchActor(id.into()))?
-            .at
-            .clone();
+        if !self.actors.contains_key(id) {
+            return Err(Refused::NoSuchActor(id.into()));
+        }
         if id == to {
             return Err(Refused::SpeakingToYourself);
         }
-        let in_sight = self.actor(to).is_some_and(|a| {
-            a.at != place && Scope::at(self, &a.at).reach(&place) == Reach::InSight
-        });
-        if !in_sight {
-            return Err(Refused::NotHere { who: to.into() });
-        }
+        let place = match self.deciding.get(id) {
+            Some(d) if d.company.contains(to) && self.actors.contains_key(to) => d.at.clone(),
+            _ => return Err(Refused::NotHere { who: to.into() }),
+        };
         self.now += 1;
         self.log.push(Event {
             at: self.now,

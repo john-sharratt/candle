@@ -4,8 +4,121 @@
 //! value is the printout, not an assertion.
 #![cfg(all(feature = "cuda", windows))]
 
-use candle_core::vram::{DxgiProbe, VramProbe};
+use candle_core::quantized::pinned_staging::PinnedBuf;
+use candle_core::vram::{available_physical_ram, total_physical_ram, DxgiProbe, VramProbe};
 use candle_core::Device;
+
+const GIB: u64 = 1 << 30;
+
+/// Pins host memory in 4 GiB steps to `total/2 − 1 GiB` — the expert warm
+/// tier's page-lock ceiling — then uploads 14 MiB from PAGEABLE memory, which
+/// needs the driver to lock a bounce buffer. Prints whether that upload lands at
+/// each step.
+#[test]
+#[ignore]
+fn print_pageable_upload_under_pinning() -> candle_core::Result<()> {
+    let device = Device::new_cuda(0)?;
+    let Device::Cuda(cuda) = &device else {
+        unreachable!()
+    };
+    let total = total_physical_ram().expect("ram probe");
+    let ceiling = (total / 2).saturating_sub(GIB);
+    let src = vec![7u8; 14 << 20];
+    let stream = cuda.cuda_stream();
+    let mut held = Vec::new();
+    loop {
+        let upload = stream
+            .memcpy_stod(&src)
+            .and_then(|d| stream.synchronize().map(|_| d));
+        println!(
+            "pinned {:>3} GiB: pageable upload {}",
+            held.len() * 4,
+            match &upload {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("FAILED: {e:?}"),
+            }
+        );
+        if (held.len() as u64 + 1) * 4 * GIB > ceiling {
+            break;
+        }
+        held.push(PinnedBuf::alloc_owned_default(4 * GIB as usize)?);
+    }
+    Ok(())
+}
+
+/// Pins 80 GiB, then commits and touches pageable memory in 4 GiB steps while
+/// available RAM stays above 6 GiB, printing the NON_LOCAL budget after each —
+/// the measurement that says whether pageable growth shrinks the budget the
+/// pinned part is already charged against.
+#[test]
+#[ignore]
+fn print_non_local_budget_under_pageable_growth() -> candle_core::Result<()> {
+    let device = Device::new_cuda(0)?;
+    let Device::Cuda(cuda) = &device else {
+        unreachable!()
+    };
+    let probe = DxgiProbe::for_cuda_device(cuda)?;
+    let report = |label: String| -> candle_core::Result<()> {
+        let (budget, usage) = probe.non_local()?;
+        let avail = available_physical_ram().unwrap_or(0);
+        println!(
+            "{label}: budget={:.2} GiB usage={:.2} GiB available={:.2} GiB",
+            budget as f64 / GIB as f64,
+            usage as f64 / GIB as f64,
+            avail as f64 / GIB as f64
+        );
+        Ok(())
+    };
+    report("start".into())?;
+    let pinned: Vec<PinnedBuf> = (0..20)
+        .map(|_| PinnedBuf::alloc_owned_default(4 * GIB as usize))
+        .collect::<candle_core::Result<_>>()?;
+    report(format!("pinned {} GiB", pinned.len() * 4))?;
+    let mut paged: Vec<Vec<u8>> = Vec::new();
+    while available_physical_ram().unwrap_or(0) > 10 * GIB {
+        paged.push(vec![1u8; 4 * GIB as usize]);
+        report(format!("pageable {:>3} GiB", paged.len() * 4))?;
+    }
+    Ok(())
+}
+
+/// Pins host memory in 4 GiB steps until the driver refuses, printing the
+/// NON_LOCAL segment's budget and usage after each — the measurement that says
+/// whether page-locked memory is charged against that budget, and where the
+/// driver stops.
+#[test]
+#[ignore]
+fn print_non_local_budget_under_pinning() -> candle_core::Result<()> {
+    let device = Device::new_cuda(0)?;
+    let Device::Cuda(cuda) = &device else {
+        unreachable!()
+    };
+    let probe = DxgiProbe::for_cuda_device(cuda)?;
+    let (budget, usage) = probe.non_local()?;
+    println!(
+        "non-local before: budget={:.2} GiB usage={:.2} GiB",
+        budget as f64 / GIB as f64,
+        usage as f64 / GIB as f64
+    );
+    let mut held = Vec::new();
+    loop {
+        match PinnedBuf::alloc_owned_default(4 * GIB as usize) {
+            Ok(b) => held.push(b),
+            Err(e) => {
+                println!("refused at {} GiB pinned: {e}", held.len() * 4);
+                break;
+            }
+        }
+        let (budget, usage) = probe.non_local()?;
+        println!(
+            "pinned {:>3} GiB: budget={:.2} GiB usage={:.2} GiB",
+            held.len() * 4,
+            budget as f64 / GIB as f64,
+            usage as f64 / GIB as f64
+        );
+    }
+    Ok(())
+}
 
 #[test]
 #[ignore]

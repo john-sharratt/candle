@@ -859,6 +859,7 @@ fn main() -> anyhow::Result<()> {
                         | "reasoning_stance"
                         | "grounding"
                         | "history_stance"
+                        | "in_context"
                         | "tools_overview"
                         | "thinking_effort"
                         | "response_length"

@@ -36,14 +36,53 @@ struct SideScore {
     blocks: usize,
 }
 
+impl SideScore {
+    fn empty() -> Self {
+        Self {
+            sse_k: 0.0,
+            sse_v: 0.0,
+            k_wins: 0,
+            v_wins: 0,
+            blocks: 0,
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.sse_k += other.sse_k;
+        self.sse_v += other.sse_v;
+        self.k_wins += other.k_wins;
+        self.v_wins += other.v_wins;
+        self.blocks += other.blocks;
+    }
+}
+
+/// [`score_chunks`] over the whole dump, one contiguous share of the chunks per
+/// core. The encoder is the CUDA kernel's bit-exact reference — 128 curves of
+/// 32 products per block, a million blocks per side — so one thread spends
+/// twenty seconds here and every core spends a second. The shares are added in
+/// chunk order, so a given core count always gives the same sums.
 fn score_side(chunks: &[ChunkData], n_kv_head: usize, head_dim: usize, keys: bool) -> SideScore {
-    let mut s = SideScore {
-        sse_k: 0.0,
-        sse_v: 0.0,
-        k_wins: 0,
-        v_wins: 0,
-        blocks: 0,
-    };
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let share = chunks.len().div_ceil(cores).max(1);
+    let partials: Vec<SideScore> = std::thread::scope(|scope| {
+        let workers: Vec<_> = chunks
+            .chunks(share)
+            .map(|part| scope.spawn(move || score_chunks(part, n_kv_head, head_dim, keys)))
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().expect("scoring thread"))
+            .collect()
+    });
+    let mut total = SideScore::empty();
+    for partial in &partials {
+        total.add(partial);
+    }
+    total
+}
+
+fn score_chunks(chunks: &[ChunkData], n_kv_head: usize, head_dim: usize, keys: bool) -> SideScore {
+    let mut s = SideScore::empty();
     for chunk in chunks {
         let data = if keys { &chunk.k } else { &chunk.v };
         for h in 0..n_kv_head {

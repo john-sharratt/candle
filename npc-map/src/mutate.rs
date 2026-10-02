@@ -1,26 +1,39 @@
-//! Reshaping a map while the world is running.
+//! Changing the shape of a world while it runs.
 //!
-//! A [`MapEdit`] is one change to the authored half of a [`MapSet`] — a room
-//! added, a door cut, a terminal set down. [`MapSet::apply`] makes it the way
-//! everything else about a map is made: it takes the authored areas and parts,
-//! applies the edit to the copies, and assembles a whole new set from them, so
-//! the edited map is woven, joined and validated exactly as a loaded one is.
-//! There is no half-edited map: an edit either yields a set that validates or an
-//! error saying why not, and the set it was applied to is untouched.
+//! Everywhere else in this crate the map is frozen once [`MapSet::assemble`] has
+//! woven and checked it: bodies move, the lift runs, events accrue, but the
+//! rooms and the ways between them do not change. This is where they can — where
+//! a Maker adds a level, drowns a room, or opens a gate that was not there
+//! before (effector design Appendix F).
 //!
-//! # Wire form
+//! # A mutation is apply-to-a-copy, re-derive, validate, swap
 //!
-//! Adjacently tagged — `{"op": "add_node", "with": { … }}` — so a client writes
-//! the operation by name and its arguments beside it.
+//! There is no partial edit of a live [`MapSet`], and that is the whole safety
+//! of it. A [`MapEdit`] is applied to a **clone of the authored data**
+//! ([`MapSet::authored`]), and the result is handed straight back through
+//! [`MapSet::assemble`] — the same pipeline a load runs: [`weave`](crate::load)
+//! doors and sight both ways, index the portals, and [`validate`](crate::
+//! validate) the whole set. So every derived thing (`exits`, `visible`, the
+//! portal graph) is recomputed from scratch, and every invariant the loader
+//! enforces is enforced again:
 //!
-//! # Instance ids survive an edit
+//! - a door is mutual and derived — a one-way `off` is impossible to write, and
+//!   `exits`/`visible` are never hand-set (they are overwritten by the re-weave);
+//! - a portal is both-way, or it is dropped and reported;
+//! - the whole set validates, or the mutation is refused and **nothing changes**.
 //!
-//! The rebuild carries the set's part offsets forward ([`MapSet::offsets`]), so
-//! an id already handed out — `terminal~4` — keeps naming the same machine
-//! however the map around it changes. A placement is therefore set down once per
-//! node and part: [`MapEdit::PlacePart`] refuses a node that already places the
-//! part, because growing a kept placement would run its ordinals into the next
-//! one's.
+//! A mutation that would break the map therefore returns `Err` and the caller
+//! keeps the map it had. There is no state in which half an edit has landed,
+//! because the edit only ever lands as a whole new set that already passed the
+//! same gate a freshly-loaded world does.
+//!
+//! # This is the map only; the world around it is [`World::reshape`]
+//!
+//! [`MapSet::apply`] produces a new set and no more. Swapping it into a running
+//! [`World`](crate::world::World) — re-deriving the lift shaft, and relocating
+//! any body left standing where a node used to be — is [`crate::world::World::
+//! reshape`], which calls this and then reconciles the state that hangs off the
+//! map.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -29,197 +42,216 @@ use crate::load::MapSet;
 use crate::part::Placement;
 use crate::schema::{Area, Node, Portal, Where};
 
-/// One change to a map.
+/// One change to the shape of a world.
+///
+/// Each variant names a target by id, so an edit that names nothing real is
+/// refused with a clear reason *before* the rebuild, rather than surfacing as a
+/// weave or validate error against a set the caller cannot see. Everything that
+/// survives the target check is then handed to [`MapSet::assemble`], whose own
+/// errors carry the structural reason (a door to nowhere, a stranded level).
+///
+/// [`Area`] and [`Node`] are boxed because they are large and the enum would
+/// otherwise be sized to its biggest variant on every value.
+///
+/// **The wire form is adjacently tagged** — `{ "op": "add_node", "with": {…} }`
+/// — so an operator or embedder route ([`crate::world`]'s reshape surface) reads
+/// one straight off a request body, and every variant (a bare string, a
+/// [`Where`], a struct) tags uniformly. This is the operator/embedder surface's
+/// format, not the NPC device's; it carries whole `Area`/`Node` structures, which
+/// is the honest shape of "add this room", not a thing a character types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", content = "with", rename_all = "snake_case")]
 pub enum MapEdit {
-    /// A new area. When it says it is `within` a parent that does not yet list
-    /// it, the parent's `contains` gains it in the same edit.
+    /// Add a whole area — a level, a region, a building.
     AddArea(Box<Area>),
-    /// A new node in an existing area.
-    AddNode { area: String, node: Box<Node> },
-    /// A new portal, declared by the area that contains both ends.
-    AddPortal { area: String, portal: Portal },
-    /// A part set down in a node that does not place it yet.
-    PlacePart { at: Where, placement: Placement },
-    /// A node taken out, with every door, sightline and spine stop that named it.
-    RemoveNode(Where),
-    /// An empty area taken out.
+    /// Remove an area and everything in it.
     RemoveArea(String),
-    /// A portal taken out, named by its two ends.
-    RemovePortal { area: String, between: [String; 2] },
-    /// Every placement of a part taken out of a node.
-    UnplacePart { at: Where, part: String },
-    /// A node's name changed.
+    /// Add a node to an existing area.
+    AddNode { area: String, node: Box<Node> },
+    /// Remove one node from an area.
+    RemoveNode(Where),
+    /// Rename a node in place, without moving it or what it opens off.
     Retitle { at: Where, name: String },
-}
-
-impl MapEdit {
-    /// The id of the area this edit touches — the one authored file it changes.
-    pub fn area(&self) -> &str {
-        match self {
-            MapEdit::AddArea(area) => &area.id,
-            MapEdit::AddNode { area, .. }
-            | MapEdit::AddPortal { area, .. }
-            | MapEdit::RemovePortal { area, .. } => area,
-            MapEdit::PlacePart { at, .. }
-            | MapEdit::UnplacePart { at, .. }
-            | MapEdit::Retitle { at, .. }
-            | MapEdit::RemoveNode(at) => &at.area,
-            MapEdit::RemoveArea(id) => id,
-        }
-    }
+    /// Add a portal to an area (which must hold, or reach, both ends).
+    AddPortal { area: String, portal: Portal },
+    /// Remove a portal from an area, matched on the pair it joins in either
+    /// order.
+    RemovePortal { area: String, between: [String; 2] },
+    /// Place a part in a node.
+    PlacePart { at: Where, placement: Placement },
+    /// Remove every placement of one part from a node.
+    UnplacePart { at: Where, part: String },
 }
 
 impl MapSet {
-    /// The map this one becomes under `edit`, or why it cannot.
+    /// Apply one edit, returning the rebuilt set — or `Err`, leaving `self`
+    /// untouched.
+    ///
+    /// The transaction described in the module docs: clone the authored data,
+    /// apply the edit to it, and re-[`assemble`](MapSet::assemble). The parts
+    /// catalogue is carried through unchanged — topology mutation reshapes where
+    /// things stand, never what kinds of thing exist.
     pub fn apply(&self, edit: &MapEdit) -> Result<MapSet> {
         let (mut areas, parts) = self.authored();
-        match edit {
+        edit.apply_to(&mut areas)?;
+        // Carries this set's own instance offsets forward ([`part_offsets`])
+        // so the edit can only ever add new instance ids, never renumber one
+        // already handed out.
+        MapSet::assemble_from(areas, parts, self.offsets())
+    }
+}
+
+impl MapEdit {
+    /// Apply this edit to the authored areas, in place.
+    ///
+    /// Only the target-existence checks live here — "no such area", "a node with
+    /// that id is already here". Structural validity (a door to nowhere, a level
+    /// with no core) is [`assemble`](MapSet::assemble)'s to judge over the whole
+    /// rebuilt set, because it is a property of the set and not of the edit.
+    fn apply_to(&self, areas: &mut Vec<Area>) -> Result<()> {
+        match self {
             MapEdit::AddArea(area) => {
                 if areas.iter().any(|a| a.id == area.id) {
-                    bail!("there is already an area `{}`", area.id);
-                }
-                if let Some(parent) = &area.within {
-                    let Some(parent) = areas.iter_mut().find(|a| &a.id == parent) else {
-                        bail!(
-                            "`{}` sits within `{}`, which is not an area",
-                            area.id,
-                            parent
-                        );
-                    };
-                    if !parent.contains.contains(&area.id) {
-                        parent.contains.push(area.id.clone());
-                    }
+                    bail!("an area `{}` is already here", area.id);
                 }
                 areas.push((**area).clone());
             }
+            MapEdit::RemoveArea(id) => {
+                let before = areas.len();
+                areas.retain(|a| &a.id != id);
+                if areas.len() == before {
+                    bail!("no area `{id}` to remove");
+                }
+            }
             MapEdit::AddNode { area, node } => {
-                let target = area_mut(&mut areas, area)?;
-                if target.node(&node.id).is_some() {
-                    bail!("`{area}` already has a node `{}`", node.id);
+                let a = area_mut(areas, area)?;
+                if a.nodes.iter().any(|n| n.id == node.id) {
+                    bail!("`{area}` already holds a node `{}`", node.id);
                 }
-                target.nodes.push((**node).clone());
-            }
-            MapEdit::AddPortal { area, portal } => {
-                area_mut(&mut areas, area)?.portals.push(portal.clone());
-            }
-            MapEdit::PlacePart { at, placement } => {
-                let node = node_mut(&mut areas, at)?;
-                if node.parts.iter().any(|p| p.part() == placement.part()) {
-                    bail!("`{at}` already places `{}`", placement.part());
-                }
-                node.parts.push(placement.clone());
+                a.nodes.push((**node).clone());
             }
             MapEdit::RemoveNode(at) => {
-                let area = area_mut(&mut areas, &at.area)?;
-                if area.node(&at.node).is_none() {
-                    bail!("`{at}` is not a node here");
-                }
-                let reference = at.to_string();
-                if area.arrival.as_deref() == Some(&reference)
-                    || area.teleport_to.as_deref() == Some(&reference)
-                {
-                    bail!("`{at}` is where `{}` arrives or teleports to", area.id);
-                }
-                area.nodes.retain(|n| n.id != at.node);
-                for node in &mut area.nodes {
-                    node.off.retain(|id| id != &at.node);
-                    node.sees.retain(|id| id != &at.node);
-                }
-                if let Some(spine) = &mut area.spine {
-                    spine.through.retain(|id| id != &at.node);
-                }
-                for other in &mut areas {
-                    other
-                        .portals
-                        .retain(|p| !p.between.iter().any(|end| end == &reference));
+                let a = area_mut(areas, &at.area)?;
+                let before = a.nodes.len();
+                a.nodes.retain(|n| n.id != at.node);
+                if a.nodes.len() == before {
+                    bail!("no node `{at}` to remove");
                 }
             }
-            MapEdit::RemoveArea(id) => {
-                let area = area_mut(&mut areas, id)?;
-                if !area.contains.is_empty() {
-                    bail!("`{id}` still contains {}", area.contains.join(", "));
-                }
-                if !area.nodes.is_empty() {
-                    bail!("`{id}` still holds nodes");
-                }
-                areas.retain(|a| &a.id != id);
-                for other in &mut areas {
-                    other.contains.retain(|child| child != id);
-                    other.portals.retain(|p| {
-                        !p.between
-                            .iter()
-                            .any(|end| end.split('/').next() == Some(id))
-                    });
-                }
+            MapEdit::Retitle { at, name } => {
+                let a = area_mut(areas, &at.area)?;
+                let node = a
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.id == at.node)
+                    .ok_or_else(|| anyhow::anyhow!("no node `{at}` to rename"))?;
+                node.name = name.clone();
+            }
+            MapEdit::AddPortal { area, portal } => {
+                area_mut(areas, area)?.portals.push(portal.clone());
             }
             MapEdit::RemovePortal { area, between } => {
-                let target = area_mut(&mut areas, area)?;
-                let before = target.portals.len();
-                target.portals.retain(|p| &p.between != between);
-                if target.portals.len() == before {
+                let a = area_mut(areas, area)?;
+                let before = a.portals.len();
+                a.portals.retain(|p| !joins_same(&p.between, between));
+                if a.portals.len() == before {
                     bail!(
-                        "`{area}` has no portal between {} and {}",
+                        "no portal between `{}` and `{}` on `{area}`",
                         between[0],
                         between[1]
                     );
                 }
             }
+            MapEdit::PlacePart { at, placement } => {
+                node_mut(areas, at)?.parts.push(placement.clone());
+            }
             MapEdit::UnplacePart { at, part } => {
-                let node = node_mut(&mut areas, at)?;
+                let node = node_mut(areas, at)?;
                 let before = node.parts.len();
                 node.parts.retain(|p| p.part() != part);
                 if node.parts.len() == before {
-                    bail!("`{at}` does not place `{part}`");
+                    bail!("no `{part}` placed at `{at}` to remove");
                 }
-            }
-            MapEdit::Retitle { at, name } => {
-                if name.trim().is_empty() {
-                    bail!("a node cannot be retitled to nothing");
-                }
-                node_mut(&mut areas, at)?.name = name.clone();
             }
         }
-        MapSet::assemble_from(areas, parts, self.offsets())
+        Ok(())
     }
 }
 
+impl MapEdit {
+    /// The id of the area this edit changes — the file a persistence layer must
+    /// rewrite (or, for [`MapEdit::RemoveArea`], remove) after a reshape.
+    ///
+    /// Every edit changes exactly one area: an area itself, the area a node or
+    /// portal or placement lives in. That single id is what lets writeback touch
+    /// one authored file rather than rewriting the whole map (and stripping the
+    /// comments off every untouched one).
+    pub fn area(&self) -> &str {
+        match self {
+            MapEdit::AddArea(a) => &a.id,
+            MapEdit::RemoveArea(id) => id,
+            MapEdit::AddNode { area, .. }
+            | MapEdit::AddPortal { area, .. }
+            | MapEdit::RemovePortal { area, .. } => area,
+            MapEdit::RemoveNode(at)
+            | MapEdit::Retitle { at, .. }
+            | MapEdit::PlacePart { at, .. }
+            | MapEdit::UnplacePart { at, .. } => &at.area,
+        }
+    }
+
+    /// Whether this edit removes its area outright — the one case writeback
+    /// deletes a file rather than rewriting it.
+    pub fn removes_area(&self) -> bool {
+        matches!(self, MapEdit::RemoveArea(_))
+    }
+}
+
+/// The authored area with this id, mutably, or a clear "no such area".
 fn area_mut<'a>(areas: &'a mut [Area], id: &str) -> Result<&'a mut Area> {
-    match areas.iter_mut().find(|a| a.id == id) {
-        Some(area) => Ok(area),
-        None => bail!("`{id}` is not an area"),
-    }
+    areas
+        .iter_mut()
+        .find(|a| a.id == id)
+        .ok_or_else(|| anyhow::anyhow!("no area `{id}`"))
 }
 
+/// The authored node at a place, mutably, or a clear "no such area/node".
 fn node_mut<'a>(areas: &'a mut [Area], at: &Where) -> Result<&'a mut Node> {
-    let area = area_mut(areas, &at.area)?;
-    match area.nodes.iter_mut().find(|n| n.id == at.node) {
-        Some(node) => Ok(node),
-        None => bail!("`{at}` is not a node here"),
-    }
+    let a = area_mut(areas, &at.area)?;
+    a.nodes
+        .iter_mut()
+        .find(|n| n.id == at.node)
+        .ok_or_else(|| anyhow::anyhow!("no node `{at}`"))
+}
+
+/// Whether two portals join the same pair of ends, in either order — the match
+/// [`MapEdit::RemovePortal`] identifies a portal by, since a portal is declared
+/// once but reads both ways.
+fn joins_same(a: &[String; 2], b: &[String; 2]) -> bool {
+    (a[0] == b[0] && a[1] == b[1]) || (a[0] == b[1] && a[1] == b[0])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::part::{Part, PartKind};
-    use crate::schema::{AreaKind, NodeKind};
+    use crate::part::{Part, PartKind, Placement};
+    use crate::schema::{Area, AreaKind, Node, NodeKind, Where};
 
+    /// A catalogue part, the smallest that validates — a named fixture.
     fn part(id: &str) -> Part {
         Part {
             id: id.into(),
-            kind: PartKind::Station,
+            kind: PartKind::Fixture,
             name: id.into(),
             plural: None,
             binds: None,
             short: None,
-            long: "l".into(),
+            long: "what it is".into(),
             modes: vec![],
         }
     }
 
-    fn node(id: &str, kind: NodeKind, off: &[&str], parts: Vec<Placement>) -> Node {
+    fn node(id: &str, kind: NodeKind, off: &[&str]) -> Node {
         Node {
             id: id.into(),
             kind,
@@ -228,19 +260,12 @@ mod tests {
             stand: None,
             off: off.iter().map(|s| s.to_string()).collect(),
             character: None,
-            parts,
+            parts: vec![],
             ground: vec![],
             habit: None,
             sees: vec![],
             exits: vec![],
             visible: vec![],
-        }
-    }
-
-    fn counted(part: &str, count: u32) -> Placement {
-        Placement::Counted {
-            part: part.into(),
-            count,
         }
     }
 
@@ -251,7 +276,7 @@ mod tests {
             name: id.into(),
             within: None,
             ordinal: None,
-            summary: "s".into(),
+            summary: "a place".into(),
             character: None,
             lacks: vec![],
             announcements: vec![],
@@ -264,202 +289,245 @@ mod tests {
         }
     }
 
-    fn set() -> MapSet {
-        let hall = area(
-            "hall",
+    /// A one-level set with a core and a hall, the smallest thing that validates.
+    fn base() -> MapSet {
+        MapSet::from_areas([area(
+            "a",
             vec![
-                node("core", NodeKind::Core, &[], vec![counted("desk", 2)]),
-                node(
-                    "annex",
-                    NodeKind::Social,
-                    &["core"],
-                    vec![counted("desk", 1)],
-                ),
+                node("core", NodeKind::Core, &["hall"]),
+                node("hall", NodeKind::Passage, &[]),
             ],
+        )])
+        .expect("the base set validates")
+    }
+
+    /// **Adding a node re-weaves the doors both ways.** The new room opens off
+    /// the hall; after the rebuild the hall opens back onto it, though only one
+    /// end was written — the same guarantee a fresh load gives.
+    #[test]
+    fn adding_a_node_weaves_the_door_both_ways() {
+        let set = base();
+        let grown = set
+            .apply(&MapEdit::AddNode {
+                area: "a".into(),
+                node: Box::new(node("green", NodeKind::Social, &["hall"])),
+            })
+            .expect("a room off the hall validates");
+        let hall = grown.get("a").unwrap().node("hall").unwrap();
+        assert!(
+            hall.exits.contains(&"green".to_string()),
+            "the door was not woven back: {:?}",
+            hall.exits
         );
-        MapSet::assemble([hall], [part("desk"), part("lamp")]).unwrap()
+        // The original set is untouched — a mutation returns a new set.
+        assert!(set.get("a").unwrap().node("green").is_none());
     }
 
-    fn at(node: &str) -> Where {
-        Where::new("hall", node)
-    }
-
-    fn ids(map: &MapSet, node: &str) -> Vec<String> {
-        map.instances_at(&at(node)).iter().map(|i| i.id()).collect()
-    }
-
+    /// **A node that opens off nothing real is refused, and nothing changes.**
+    /// The rebuild's weave catches the door to nowhere, so `apply` returns `Err`
+    /// and the caller keeps the set it had.
     #[test]
-    fn an_edit_names_the_one_area_it_touches() {
-        let edits = [
-            (MapEdit::AddArea(Box::new(area("yard", vec![]))), "yard"),
-            (MapEdit::RemoveNode(at("annex")), "hall"),
-            (MapEdit::RemoveArea("yard".into()), "yard"),
-            (
-                MapEdit::RemovePortal {
-                    area: "hall".into(),
-                    between: ["a".into(), "b".into()],
-                },
-                "hall",
-            ),
-            (
-                MapEdit::Retitle {
-                    at: at("core"),
-                    name: "Core".into(),
-                },
-                "hall",
-            ),
-        ];
-        for (edit, expected) in edits {
-            assert_eq!(edit.area(), expected);
-        }
-    }
-
-    #[test]
-    fn a_node_added_is_woven_in() {
-        let map = set()
+    fn a_node_that_opens_off_nowhere_is_refused() {
+        let set = base();
+        let err = set
             .apply(&MapEdit::AddNode {
-                area: "hall".into(),
-                node: Box::new(node("store", NodeKind::Store, &["core"], vec![])),
+                area: "a".into(),
+                node: Box::new(node("green", NodeKind::Social, &["nowhere"])),
             })
-            .unwrap();
-        assert!(map.node_at(&at("store")).is_some());
-        assert!(map
-            .node_at(&at("core"))
-            .unwrap()
-            .exits
-            .contains(&"store".to_string()));
+            .expect_err("a door to nowhere cannot validate");
+        assert!(err.to_string().contains("not a node here"), "{err}");
     }
 
+    /// **Removing a node is refused when another room still opens off it.** The
+    /// hall opens off the core; removing the core leaves a door to nowhere, which
+    /// the re-weave will not have.
     #[test]
-    fn a_node_removed_takes_the_doors_to_it() {
-        let map = set().apply(&MapEdit::RemoveNode(at("annex"))).unwrap();
-        assert!(map.node_at(&at("annex")).is_none());
-        assert!(!map
-            .node_at(&at("core"))
-            .unwrap()
-            .exits
-            .contains(&"annex".to_string()));
-    }
-
-    #[test]
-    fn a_door_to_nowhere_is_refused_and_the_old_map_stands() {
-        let before = set();
-        let err = before
-            .apply(&MapEdit::AddNode {
-                area: "hall".into(),
-                node: Box::new(node("store", NodeKind::Store, &["nowhere"], vec![])),
-            })
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not a node here"), "{err}");
-        assert!(before.node_at(&at("store")).is_none());
-    }
-
-    #[test]
-    fn instance_ids_do_not_move_when_another_room_gains_the_same_part() {
-        let before = set();
-        assert_eq!(ids(&before, "core"), vec!["desk~0", "desk~1"]);
-        assert_eq!(ids(&before, "annex"), vec!["desk~2"]);
-        let after = before
-            .apply(&MapEdit::AddNode {
-                area: "hall".into(),
-                node: Box::new(node(
-                    "aaa",
-                    NodeKind::Store,
-                    &["core"],
-                    vec![counted("desk", 3)],
-                )),
-            })
-            .unwrap();
-        assert_eq!(ids(&after, "core"), vec!["desk~0", "desk~1"]);
-        assert_eq!(ids(&after, "annex"), vec!["desk~2"]);
-        assert_eq!(ids(&after, "aaa"), vec!["desk~3", "desk~4", "desk~5"]);
-    }
-
-    #[test]
-    fn a_part_is_placed_once_per_node() {
-        let map = set()
-            .apply(&MapEdit::PlacePart {
-                at: at("annex"),
-                placement: Placement::Bare("lamp".into()),
-            })
-            .unwrap();
-        assert_eq!(ids(&map, "annex"), vec!["desk~2", "lamp~0"]);
-        let err = map
-            .apply(&MapEdit::PlacePart {
-                at: at("annex"),
-                placement: counted("desk", 2),
-            })
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("already places"), "{err}");
-    }
-
-    #[test]
-    fn a_placement_past_the_limit_is_refused() {
-        let err = set()
-            .apply(&MapEdit::PlacePart {
-                at: at("annex"),
-                placement: counted("lamp", 257),
-            })
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("more than the"), "{err}");
-    }
-
-    #[test]
-    fn a_part_unplaced_leaves_the_node() {
-        let map = set()
-            .apply(&MapEdit::UnplacePart {
-                at: at("core"),
-                part: "desk".into(),
-            })
-            .unwrap();
-        assert!(ids(&map, "core").is_empty());
-        assert_eq!(ids(&map, "annex"), vec!["desk~2"]);
-    }
-
-    #[test]
-    fn a_retitle_changes_the_name_and_refuses_a_blank_one() {
-        let map = set()
-            .apply(&MapEdit::Retitle {
-                at: at("annex"),
-                name: "the long annex".into(),
-            })
-            .unwrap();
-        assert_eq!(map.node_at(&at("annex")).unwrap().name, "the long annex");
-        assert!(set()
-            .apply(&MapEdit::Retitle {
-                at: at("annex"),
-                name: "  ".into()
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn an_area_with_children_is_not_removed() {
-        let mut hall = area("hall", vec![node("core", NodeKind::Core, &[], vec![])]);
-        hall.contains = vec!["wing".into()];
-        let mut wing = area("wing", vec![]);
-        wing.within = Some("hall".into());
-        let map = MapSet::assemble([hall, wing], Vec::<Part>::new()).unwrap();
-        let err = map
-            .apply(&MapEdit::RemoveArea("hall".into()))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("still contains"), "{err}");
-        let map = map.apply(&MapEdit::RemoveArea("wing".into())).unwrap();
-        assert!(map.get("wing").is_none());
-        assert!(map.get("hall").unwrap().contains.is_empty());
-    }
-
-    #[test]
-    fn the_wire_form_is_adjacently_tagged() {
-        let edit: MapEdit = serde_yaml::from_str(
-            "op: retitle\nwith:\n  at: { area: hall, node: annex }\n  name: the annex\n",
-        )
+    fn removing_a_node_others_open_off_is_refused() {
+        let set = MapSet::from_areas([area(
+            "a",
+            vec![
+                node("core", NodeKind::Core, &[]),
+                node("hall", NodeKind::Passage, &["core"]),
+            ],
+        )])
         .unwrap();
-        let map = set().apply(&edit).unwrap();
-        assert_eq!(map.node_at(&at("annex")).unwrap().name, "the annex");
+        let err = set
+            .apply(&MapEdit::RemoveNode(Where::new("a", "core")))
+            .expect_err("a room still opens off the core");
+        assert!(err.to_string().contains("not a node here"), "{err}");
+    }
+
+    /// **A placement lands, and reads back at the node.** The part must be one
+    /// the catalogue holds — a placement of an unknown part does not validate, so
+    /// the set is assembled with a real one first.
+    #[test]
+    fn a_part_can_be_placed_and_unplaced() {
+        let set = MapSet::assemble(
+            [area(
+                "a",
+                vec![
+                    node("core", NodeKind::Core, &["hall"]),
+                    node("hall", NodeKind::Passage, &[]),
+                ],
+            )],
+            [part("a-board")],
+        )
+        .expect("the base set validates");
+        let placed = set
+            .apply(&MapEdit::PlacePart {
+                at: Where::new("a", "hall"),
+                placement: Placement::Bare("a-board".into()),
+            })
+            .expect("a placement of a real part does not break the map");
+        let hall = placed.get("a").unwrap().node("hall").unwrap();
+        assert_eq!(hall.parts.len(), 1);
+        assert_eq!(hall.parts[0].part(), "a-board");
+
+        let bare = placed
+            .apply(&MapEdit::UnplacePart {
+                at: Where::new("a", "hall"),
+                part: "a-board".into(),
+            })
+            .expect("removing it does not break the map");
+        assert!(bare
+            .get("a")
+            .unwrap()
+            .node("hall")
+            .unwrap()
+            .parts
+            .is_empty());
+    }
+
+    /// **A runtime edit never renumbers an instance id already handed out.**
+    /// Area `b` places two `board`s before the edit, at ordinals `0` and `1`.
+    /// Adding a new area `a` — which sorts *before* `b` in the `BTreeMap` walk
+    /// [`part_offsets`] uses — with a `board` of its own must not shift `b`'s
+    /// ordinals down to make room; the new placement is appended after them
+    /// instead. This is the failure this crate's own id-stability promise
+    /// names (`crate::instance`'s module doc): a URL a character followed
+    /// before the edit has to still resolve to the same thing after it.
+    #[test]
+    fn a_runtime_edit_never_renumbers_an_existing_instance_id() {
+        let set = MapSet::assemble(
+            [area(
+                "b",
+                vec![node("core", NodeKind::Core, &["hall"]), {
+                    let mut hall = node("hall", NodeKind::Passage, &[]);
+                    hall.parts = vec![Placement::Counted {
+                        part: "board".into(),
+                        count: 2,
+                    }];
+                    hall
+                }],
+            )],
+            [part("board")],
+        )
+        .expect("the base set validates");
+        let before: Vec<u32> = set
+            .instances_at(&Where::new("b", "hall"))
+            .iter()
+            .map(|i| i.ordinal())
+            .collect();
+        assert_eq!(before, vec![0, 1], "the base placements start at 0");
+
+        let mut new_area = area("a", vec![node("core", NodeKind::Core, &[])]);
+        new_area.nodes[0].parts = vec![Placement::Bare("board".into())];
+        let edited = set
+            .apply(&MapEdit::AddArea(Box::new(new_area)))
+            .expect("adding an earlier-sorting area validates");
+
+        // `b`'s instances kept the exact ordinals they had before the edit.
+        let after: Vec<u32> = edited
+            .instances_at(&Where::new("b", "hall"))
+            .iter()
+            .map(|i| i.ordinal())
+            .collect();
+        assert_eq!(after, before, "an existing instance's id moved");
+
+        // The new placement in `a` was appended after them, not slotted in
+        // front by virtue of `a` sorting first.
+        let new_ordinal = edited
+            .instances_at(&Where::new("a", "core"))
+            .first()
+            .expect("the new board placed")
+            .ordinal();
+        assert_eq!(
+            new_ordinal, 2,
+            "the new placement did not append at the end"
+        );
+    }
+
+    /// **A placement of a part the catalogue does not hold is refused.** The
+    /// validator will not have a node standing something that does not exist, so
+    /// the transaction fails and the map is unchanged.
+    #[test]
+    fn placing_an_unknown_part_is_refused() {
+        let set = base();
+        let err = set
+            .apply(&MapEdit::PlacePart {
+                at: Where::new("a", "hall"),
+                placement: Placement::Bare("a-ghost".into()),
+            })
+            .expect_err("an unknown part cannot be placed");
+        assert!(err.to_string().contains("not a part"), "{err}");
+    }
+
+    /// **Renaming a node keeps its doors.** The title changes; `exits` are
+    /// re-derived from the untouched `off`, so the room stays where it was.
+    #[test]
+    fn retitle_keeps_the_doors() {
+        let set = base();
+        let renamed = set
+            .apply(&MapEdit::Retitle {
+                at: Where::new("a", "hall"),
+                name: "the long hall".into(),
+            })
+            .expect("a rename is always valid");
+        let hall = renamed.get("a").unwrap().node("hall").unwrap();
+        assert_eq!(hall.name, "the long hall");
+        assert!(hall.exits.contains(&"core".to_string()));
+    }
+
+    /// **The wire form round-trips, and names the area it touches.** An operator
+    /// route reads a [`MapEdit`] straight off a request body, so the tagged form
+    /// has to parse back to the same edit — and [`MapEdit::area`] must name the
+    /// file writeback rewrites. (The exact JSON shape is pinned in the npcd route
+    /// test, which has `serde_json`; here it round-trips through `serde_yaml`, the
+    /// serializer this crate carries.)
+    #[test]
+    fn the_wire_form_round_trips_and_names_its_area() {
+        let edit = MapEdit::AddNode {
+            area: "vault-casting".into(),
+            node: Box::new(node("annex", NodeKind::Social, &["green-room"])),
+        };
+        let wire = serde_yaml::to_string(&edit).expect("serialises");
+        assert!(wire.contains("op: add_node"), "{wire}");
+        let back: MapEdit = serde_yaml::from_str(&wire).expect("parses back");
+        assert_eq!(back.area(), "vault-casting");
+        assert!(!back.removes_area());
+
+        // A bare-string variant tags the same way and reports a removal.
+        let drown = MapEdit::RemoveArea("vault-annex".into());
+        let back: MapEdit = serde_yaml::from_str(&serde_yaml::to_string(&drown).unwrap()).unwrap();
+        assert_eq!(back.area(), "vault-annex");
+        assert!(back.removes_area());
+    }
+
+    /// **An edit that names nothing real is refused with a clear reason**, before
+    /// any rebuild.
+    #[test]
+    fn an_edit_on_a_missing_target_is_refused() {
+        let set = base();
+        let err = set
+            .apply(&MapEdit::RemoveNode(Where::new("a", "ghost")))
+            .expect_err("there is no such node");
+        assert!(err.to_string().contains("no node"), "{err}");
+        let err = set
+            .apply(&MapEdit::AddNode {
+                area: "nowhere".into(),
+                node: Box::new(node("x", NodeKind::Social, &[])),
+            })
+            .expect_err("there is no such area");
+        assert!(err.to_string().contains("no area"), "{err}");
     }
 }

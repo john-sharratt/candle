@@ -615,13 +615,12 @@ impl ChunkedKvBacking {
             Some(s) => s,
             None => return vec![0i32; max_blocks],
         };
+        // One running sum: `rope_pos(i)` re-sums every chunk before `i`.
         let mut positions = vec![0i32; max_blocks];
-        for (i, pos) in positions
-            .iter_mut()
-            .enumerate()
-            .take(slot.block_count().min(max_blocks))
-        {
-            *pos = slot.rope_pos(i);
+        let mut at = slot.rope_pos(0);
+        for (pos, cw) in positions.iter_mut().zip(slot.chunks_slice()) {
+            *pos = at;
+            at += cw.usage as i32;
         }
         positions
     }
@@ -1539,11 +1538,14 @@ impl ChunkedKvBacking {
         // points the view at the same arena bytes *and* preserves the routing
         // and outer scaling needed to decode them.
         let _parent_seq_len = state.sequences[parent_batch].as_ref().unwrap().seq_len();
+        // No rope position is carried: a view's positions are its cumulative
+        // usage, read at decode like any slot's. Computing one here per block
+        // was a prefix sum per block — O(n²) over the borrow, 75 M additions per
+        // layer at a 12K-block prefix, for a value nothing read.
         let borrowed_meta: Vec<(
             HeadGids,
             u32,
             u16,
-            i32,
             Arc<Vec<u8>>,
             Arc<Vec<u8>>,
             Arc<Vec<f32>>,
@@ -1581,7 +1583,6 @@ impl ChunkedKvBacking {
                         cw.gids.clone(),
                         cw.usage,
                         cw.offset,
-                        ps.rope_pos(parent_blk),
                         cw.k_pal.clone(),
                         cw.v_pal.clone(),
                         cw.k_scale.clone(),
@@ -1622,7 +1623,6 @@ impl ChunkedKvBacking {
                 source_gids,
                 usage,
                 offset,
-                _rope_base,
                 source_k_pal,
                 source_v_pal,
                 source_k_scale,

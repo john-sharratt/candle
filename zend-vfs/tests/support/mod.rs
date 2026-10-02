@@ -38,6 +38,13 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
             "user.email=t@example.com",
             "-c",
             "commit.gpgSign=false",
+            // A commit otherwise ends by starting `git maintenance` in
+            // another process, which a fixture that lives for one test has no
+            // use for.
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
         ])
         .args(args)
         .env_remove("GIT_DIR")

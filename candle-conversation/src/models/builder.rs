@@ -166,6 +166,10 @@ pub struct ModelBuilder {
     /// selects. `None` runs the checkpoint's own. See
     /// [`ModelBuilder::qsa_selection_budget`].
     qsa_selection_budget: Option<usize>,
+    /// The lowest progressive-YaRN factor any sequence runs at. `None` lets a
+    /// sequence inside the trained window run the trained RoPE. See
+    /// [`ModelBuilder::min_rope_factor`].
+    min_rope_factor: Option<f32>,
 }
 
 impl ModelBuilder {
@@ -198,6 +202,7 @@ impl ModelBuilder {
             prefill_pass_tokens: None,
             loras: Vec::new(),
             qsa_selection_budget: None,
+            min_rope_factor: None,
             spec,
         }
     }
@@ -349,6 +354,23 @@ impl ModelBuilder {
     /// nothing, and refuses a budget its selection kernel cannot run.
     pub fn qsa_selection_budget(mut self, positions: Option<usize>) -> Self {
         self.qsa_selection_budget = positions;
+        self
+    }
+
+    /// The lowest YaRN factor any sequence runs at (`docs/progressive_yarn.md`).
+    ///
+    /// Progressive YaRN runs a sequence on the trained RoPE (factor 1) while
+    /// it fits the trained window, and climbs to the next published factor as
+    /// it outgrows each ceiling. With a minimum of `2`, every sequence runs at
+    /// least the first rung scaling by 2 — even a short one — and still climbs
+    /// past it as it grows. Every rung's table stays; only the choice is
+    /// raised. `None` (the default) or `1` changes nothing.
+    ///
+    /// A schedule with no rung scaling by at least `min` is refused at load,
+    /// as is a model whose kernels read no rung — a setting that cannot take
+    /// effect is never accepted silently.
+    pub fn min_rope_factor(mut self, min: Option<f32>) -> Self {
+        self.min_rope_factor = min;
         self
     }
 
@@ -890,8 +912,32 @@ impl ModelBuilder {
 
     /// Load quantised model weights from a local GGUF file.
     ///
-    /// Uses the builder's `max_seq_len` for KV cache sizing.
+    /// Uses the builder's `max_seq_len` for KV cache sizing, and raises the
+    /// model's RoPE floor to the builder's [`Self::min_rope_factor`] before any
+    /// session opens.
     pub fn load_model(
+        &self,
+        model_path: &Path,
+        device: &Device,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> crate::Result<Box<dyn crate::ManagedBatchedModel + Send>> {
+        let mut model = self.load_arch(model_path, device, progress)?;
+        if let Some(min) = self.min_rope_factor {
+            model
+                .set_rope_min_factor(min)
+                .map_err(ConversationError::Model)?;
+            tracing::info!(
+                min_factor = min,
+                floor = model.rope_select().floor(),
+                "RoPE: no sequence runs below the minimum YaRN factor"
+            );
+        }
+        Ok(model)
+    }
+
+    /// The model `spec.arch` names, loaded from `model_path` — every
+    /// architecture's own loader.
+    fn load_arch(
         &self,
         model_path: &Path,
         device: &Device,

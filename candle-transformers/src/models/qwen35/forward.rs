@@ -64,6 +64,7 @@ use crate::models::batched_layer::{
 use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::expert_lre::{PipelineStats, ProfileSnapshot, WeightPlan, WeightPlanning};
 use crate::models::prefill_utils::SharedPm;
+use crate::models::rope_schedule::RungSelect;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_buffers::wave_root;
@@ -144,8 +145,12 @@ impl ManagedBatchedModel for HybridBatched {
         HybridBatched::create_batched_session(self, config)
     }
 
-    fn rope_ceilings(&self) -> Vec<usize> {
-        self.rope().ceilings().to_vec()
+    fn rope_select(&self) -> RungSelect {
+        self.rope().select().clone()
+    }
+
+    fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
+        HybridBatched::set_rope_min_factor(self, min)
     }
 
     fn forward_wave(
@@ -161,7 +166,7 @@ impl ManagedBatchedModel for HybridBatched {
         layer_end: usize,
         residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
-        session.expect_rope_ceilings(self.rope().ceilings())?;
+        session.expect_rope_select(self.rope().select())?;
         drive_wave(
             self,
             session,

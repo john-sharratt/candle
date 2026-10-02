@@ -59,18 +59,18 @@ use serde_json::{from_slice, json, to_string, to_vec, Value};
 use tower::ServiceExt;
 
 use crate::effector::auth::PinnedStandpoint;
-use crate::effector::namespace::namespace_of;
+use crate::effector::router::address_of;
 use crate::effector::station;
 use crate::effector::token::Tokens;
 use crate::engine::act::Act;
 use crate::engine::authoring;
 use crate::engine::body::{self, Outcome};
 use crate::engine::driver::{self, Metronome};
-use crate::engine::effector_focus;
 use crate::engine::environment;
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::identity;
 use crate::engine::ingest;
+use crate::engine::invoke_body::Invokable;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
 use crate::engine::mind::{frame_fingerprint, Minds, Projected};
@@ -87,7 +87,7 @@ use crate::npcs::{Casting, Npcs};
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use npc_map::world::Where;
-use npc_map::{describe, perceive};
+use npc_map::{describe, perceive, route};
 
 /// Tokens one prefill forward carries when the model can take them — the
 /// scheduler's per-forward *target*.
@@ -455,6 +455,15 @@ struct CharacterTask {
     attempt: Arc<Mutex<AttemptSlot>>,
 }
 
+/// Where a character's command table is, as the standing task words it.
+struct TableWay {
+    /// The room the table stands in.
+    room: String,
+    /// Whether that room is on the character's own level, so a walk is all it
+    /// takes. When it is not, the lift is the way.
+    on_foot: bool,
+}
+
 /// The supervisor's current attempt, or the tombstone that tells a supervisor
 /// racing [`CharacterTask::stop`] to put its fresh attempt down: the stop may
 /// land between the attempt's spawn and its registration here, and without
@@ -535,6 +544,13 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
                               within reach — a ledger, a filed story, a date on the wall — and \
                               carry it far enough to have a view about it you could defend.";
 
+/// Substrate key for the durable command-table open flag — see
+/// [`Runtime::set_table_open`], which writes it, and [`Runtime::host`], which
+/// reads it back as a world loads. One key for the daemon: `set_table_open`
+/// drives every loaded world identically, so the flag is a single daemon-wide
+/// state rather than per-world.
+pub const TABLE_OPEN_KEY: &str = "command-table";
+
 /// What a character with no mission is set on **while the command table is
 /// open**: go to it and take one up.
 ///
@@ -547,13 +563,6 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
 /// records — it is only the *surface* that moved. The loud call that reaches a
 /// character mid-conversation is the tannoy the table's opening sends; this is
 /// what keeps drawing one that has drifted, and what a character reads on its way.
-/// Substrate key for the durable command-table open flag — see
-/// [`Runtime::set_table_open`], which writes it, and [`Runtime::host`], which
-/// reads it back as a world loads. One key for the daemon: `set_table_open`
-/// drives every loaded world identically, so the flag is a single daemon-wide
-/// state rather than per-world.
-pub const TABLE_OPEN_KEY: &str = "command-table";
-
 pub const TO_THE_TABLE: &str =
     "The command table is open and there is work waiting for you. Leave off \
      whatever you are doing or saying and go to it now. The table is in the \
@@ -562,6 +571,17 @@ pub const TO_THE_TABLE: &str =
      `lift_use`, and then `move_to` the command room — you cannot walk between \
      floors. This comes before talk — do not answer the room, go. Once you are \
      there, the table is on your effector device: `query` its address (your \
+     device lists it) to see what it offers, then take up a mission by `invoke` \
+     on its `collect_mission`. Carry it out, and when it is done come back and \
+     report it at the table the same way, then take up the next.";
+
+/// [`TO_THE_TABLE`] for a character whose table is **on its own level**: no lift,
+/// no floors, just a room to walk to. `{room}` is the room the table stands in.
+pub const TO_THE_TABLE_ON_FOOT: &str =
+    "The command table is open and there is work waiting for you. Leave off \
+     whatever you are doing or saying and go to it now. The table is in {room}: \
+     `move_to` it. This comes before talk — do not answer the room, go. Once you \
+     are there, the table is on your effector device: `query` its address (your \
      device lists it) to see what it offers, then take up a mission by `invoke` \
      on its `collect_mission`. Carry it out, and when it is done come back and \
      report it at the table the same way, then take up the next.";
@@ -923,7 +943,7 @@ impl Runtime {
         if let Some(text) = on_mission {
             return Some(text);
         }
-        if table_open {
+        if let Some(way) = self.command_table_way(npc_id).filter(|_| table_open) {
             // Location-aware, the same split the active summons makes (see
             // [`Self::table_summons`] / [`Self::at_table_summons`]): a character
             // that has arrived reads [`AT_THE_TABLE`] — take one up here — and one
@@ -934,7 +954,7 @@ impl Runtime {
             // arrived-then-told-to-travel confusion the summons split removed.
             return Some(match self.at_command_table(npc_id) {
                 true => AT_THE_TABLE.to_string(),
-                false => TO_THE_TABLE.to_string(),
+                false => Self::to_the_table(&way),
             });
         }
         // Who is here — which decides *which* standing task this is, and, when
@@ -986,7 +1006,8 @@ impl Runtime {
         if on_mission || !table_open || self.at_command_table(npc_id) {
             return None;
         }
-        Some(TO_THE_TABLE.to_string())
+        self.command_table_way(npc_id)
+            .map(|way| Self::to_the_table(&way))
     }
 
     /// The summons for a character **standing at the command table** with no
@@ -1020,6 +1041,48 @@ impl Runtime {
                 .iter()
                 .any(|t| t == mission_acts::COLLECT_MISSION.name)
         })
+    }
+
+    /// The command table this character can get to from where it stands, and
+    /// whether it is on its own level: the room it is in, or any room the map's
+    /// doors, portals and lifts lead on to, that offers `collect_mission`. A
+    /// table on the character's own level is preferred to one on another.
+    ///
+    /// `None` for a world with no order table, or a building cut off from the one
+    /// that has it, so the table's standing task is not set for a character that
+    /// has no way to obey it.
+    fn command_table_way(&self, npc_id: u64) -> Option<TableWay> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        hosted.with_both(|w, s| {
+            let here = w.actor(&body).map(|a| a.at.clone())?;
+            let offers = |at: &Where| {
+                s.part_offers(
+                    &format!("{}/{}", at.area, at.node),
+                    mission_acts::COLLECT_MISSION.name,
+                )
+            };
+            let mut candidates = vec![here.clone()];
+            candidates.extend(route::reachable_from(w.map(), &here));
+            let offering: Vec<Where> = candidates.into_iter().filter(|at| offers(at)).collect();
+            let table = offering
+                .iter()
+                .find(|at| at.area == here.area)
+                .or_else(|| offering.first())?;
+            Some(TableWay {
+                room: w.node(table).map(|n| n.name.clone())?,
+                on_foot: table.area == here.area,
+            })
+        })
+    }
+
+    /// The traveling summons, worded for the way this character has to go:
+    /// walk to a named room when the table is on its own level, ride the lift to
+    /// the command level when it is not.
+    fn to_the_table(way: &TableWay) -> String {
+        match way.on_foot {
+            true => TO_THE_TABLE_ON_FOOT.replace("{room}", &way.room),
+            false => TO_THE_TABLE.to_string(),
+        }
     }
 
     /// Open or shut the command table on every loaded world.
@@ -1147,6 +1210,15 @@ impl Runtime {
             },
             feelings: self.feelings.read().unwrap().clone(),
             me: hosted.read(|w| w.actor(&body).map(|a| a.name.clone()).unwrap_or_default()),
+            // The station this body has claimed, named by what it binds or else
+            // by the part itself. The orders it holds are the sim's, added below.
+            held: hosted.read(|w| {
+                w.actor(&body)
+                    .and_then(|a| a.hold.as_ref())
+                    .map(|h| h.subject.clone().unwrap_or_else(|| h.part.clone()))
+                    .into_iter()
+                    .collect()
+            }),
             ..Default::default()
         };
         // What the world's own state adds: what this body carries, what stands
@@ -1155,6 +1227,25 @@ impl Runtime {
         // without hostiles ends up without `engage`.
         let place = hosted.place_of(&body);
         hosted.sim(|sim| base.clone().from_sim(sim, &body, &place))
+    }
+
+    /// Fix who this character can address, as of now — taken just before the
+    /// grammar is built, so the company the grammar offers and the company the
+    /// world will answer an addressee against are one set. A person it offered
+    /// who walks out during the decode is then called after, not refused. See
+    /// [`npc_map::world::World::begin_decision`].
+    pub fn begin_decision(&self, npc_id: u64) {
+        if let Some((hosted, body)) = self.body_of(npc_id) {
+            hosted.with(|w| w.begin_decision(&body));
+        }
+    }
+
+    /// The decision is over: acts that follow are answered from the room as it
+    /// is. See [`npc_map::world::World::end_decision`].
+    pub fn end_decision(&self, npc_id: u64) {
+        if let Some((hosted, body)) = self.body_of(npc_id) {
+            hosted.with(|w| w.end_decision(&body));
+        }
     }
 
     /// The addresses reachable from where `body` stands — the near-you index as
@@ -1167,20 +1258,21 @@ impl Runtime {
     /// the device screen a character reads and the addresses its grammar will let
     /// it name are one set. Returns `(query, invoke)`:
     ///
-    /// - **query** — a resource per line: the personal routes, the lift, each
-    ///   instance's url, and the bare `http://local/` so the whole index can be
-    ///   re-read.
+    /// - **query** — a resource per line: the personal routes, the lift, the url
+    ///   of each instance a route serves ([`address_of`]), and the bare
+    ///   `http://local/` so the whole index can be re-read. A part no route
+    ///   answers for (a seat, a blast door) is not listed, so `query` can only
+    ///   ever name an address that answers.
     /// - **invoke** — a whole verb-path per line: `<instance-url>/<verb>` for
-    ///   every verb an instance affords ([`station::verbs_of`]). A resource with
-    ///   no verbs (a seat) contributes nothing, so `invoke` can only ever name a
-    ///   verb the world will actually serve — not a bare resource, not a missing
-    ///   verb.
+    ///   every verb a served instance affords ([`station::verbs_at`]), with the
+    ///   act each one runs. `invoke` can only ever name a verb the world will
+    ///   actually serve — not a bare resource, not a missing verb.
     fn reachable_urls(
         &self,
         hosted: &Arc<Hosted>,
         body: &str,
         at_landing: bool,
-    ) -> (Vec<String>, Vec<String>) {
+    ) -> (Vec<String>, Vec<Invokable>) {
         let mut query = vec![
             "http://local/".to_string(),
             "http://local/here".to_string(),
@@ -1195,13 +1287,11 @@ impl Runtime {
         hosted.read(|w| {
             if let Some(at) = w.actor(body).map(|a| a.at.clone()) {
                 for inst in w.map().instances_at(&at) {
-                    let url = format!(
-                        "http://local/{}/{}",
-                        namespace_of(inst.part_id()),
-                        inst.id()
-                    );
-                    for verb in station::verbs_of(inst.part_id()) {
-                        invoke.push(format!("{url}/{verb}"));
+                    let Some(url) = address_of(&inst) else {
+                        continue;
+                    };
+                    for (verb, tool) in station::verbs_at(inst.part_id()) {
+                        invoke.push(Invokable::new(format!("{url}/{verb}"), tool.name));
                     }
                     query.push(url);
                 }
@@ -1744,7 +1834,9 @@ impl Runtime {
         path: &str,
         pinned: Option<&npc_map::world::Where>,
     ) -> anyhow::Result<Value> {
-        let (status, value) = self.effector_call(npc_id, "GET", path, None, pinned).await?;
+        let (status, value) = self
+            .effector_call(npc_id, "GET", path, None, pinned)
+            .await?;
         // A `query` is a read that is expected to answer — a non-2xx is a bug in
         // the caller's path, not a normal outcome — so it is surfaced as an
         // error rather than handed back. (`invoke` keeps the status, because a
@@ -1874,6 +1966,29 @@ impl Runtime {
         Ok((status, value))
     }
 
+    /// The `OPTIONS` schema of a resource address, or `None` for the GET-only
+    /// addresses (the index, `/history`, `/self`) and for any address that does
+    /// not answer `OPTIONS`.
+    async fn schema_of(
+        &self,
+        npc_id: u64,
+        path: &str,
+        pinned: Option<&npc_map::world::Where>,
+    ) -> Option<Value> {
+        let bare = path.split('?').next().unwrap_or(path);
+        let get_only = bare == "/" || bare.starts_with("/history") || bare.starts_with("/self");
+        if get_only {
+            return None;
+        }
+        match self
+            .effector_call(npc_id, "OPTIONS", path, None, pinned)
+            .await
+        {
+            Ok((status, options)) if status.is_success() => Some(options),
+            _ => None,
+        }
+    }
+
     /// Enact one effector-device call — `query` or `invoke` — on the async fast
     /// path and build the same [`Recorded`] a body act produces through
     /// [`Self::record_act`], so the character reads a device call's outcome back
@@ -1892,10 +2007,12 @@ impl Runtime {
     /// `/lift/command-shaft/call` address the same route, and `http://local/`
     /// reaches the near-you index at `/`.
     ///
-    /// **The `invoke` body is a JSON object written out as a string** (§11): an
+    /// **The `invoke` body is a JSON object** (§11), and the grammar writes it as
+    /// one, typed by the address it was sent to ([`crate::engine::invoke_body`]).
+    /// A caller that is not the grammar may still write it out as a string: an
     /// absent or blank one defaults to `{}`, and a string that will not parse is
     /// answered with a prescriptive `{error:"bad_json",…}` rather than panicking,
-    /// so the character can correct it.
+    /// so the caller can correct it.
     ///
     /// A cooldown is charged only when the call landed, mirroring `record_act`.
     ///
@@ -1903,57 +2020,6 @@ impl Runtime {
     /// [`Self::effector_query`] / [`Self::effector_invoke`], whose handlers take
     /// the non-reentrant world lock themselves; this method holds nothing, so the
     /// lock is never re-entered (§8.1).
-    /// Arm a character's effector **focus** from a resource `query`, and return
-    /// the resource's `OPTIONS` schema so it can ride back inline (effector
-    /// design §11).
-    ///
-    /// A `query` is a `GET`; this is the paired `OPTIONS` that fetches the
-    /// resource's schema. It arms the focus — the schema of the effectful body,
-    /// so the next `invoke`'s body is decoded against it — and hands the schema
-    /// back to be read this turn, collapsing discover→schema→act into one turn.
-    ///
-    /// **The index and personal readables arm nothing.** `http://local/`,
-    /// `/history`, and `/self` are GET-only readables (§7.2); they have no
-    /// effectful body, so no `OPTIONS` is issued and any prior focus is left as
-    /// it was — a stale focus is harmless and re-read each focused turn (§11). A
-    /// resource whose schema advertises nothing armable clears the focus, so the
-    /// next `invoke` falls back to free JSON. `None` is returned (no schema
-    /// inline, focus unchanged) whenever the device is not installed, the
-    /// `OPTIONS` did not answer, or the engine holds no minds.
-    ///
-    /// **Never holds the world lock across the await.** It calls
-    /// [`Self::effector_call`], whose handler takes the world lock itself; this
-    /// method holds nothing (§8.1).
-    async fn arm_focus(
-        &self,
-        npc_id: u64,
-        path: &str,
-        pinned: Option<&npc_map::world::Where>,
-    ) -> Option<Value> {
-        // GET-only readables have no schema to fetch — leave any focus be.
-        if path == "/" || path.starts_with("/history") || path.starts_with("/self") {
-            return None;
-        }
-        let (status, options) = self
-            .effector_call(npc_id, "OPTIONS", path, None, pinned)
-            .await
-            .ok()?;
-        if !status.is_success() {
-            return None;
-        }
-        let minds = self.minds.read().unwrap().clone()?;
-        match effector_focus::body_schema_from_options(&options) {
-            Some(body_schema) => {
-                let resource = effector_focus::resource_id(&options, path);
-                minds.set_focus(npc_id, &resource, body_schema);
-            }
-            // A resource with nothing armable (a multi-verb station, a read-only
-            // resource) disarms rather than leaves a stale body typed.
-            None => minds.clear_focus(npc_id),
-        }
-        Some(options)
-    }
-
     pub(crate) async fn enact_device(
         &self,
         npc_id: u64,
@@ -1972,14 +2038,12 @@ impl Runtime {
         match act.tool {
             "query" => match self.effector_query(npc_id, &path, pinned).await {
                 Ok(value) => {
-                    // A resource query also fetches the `OPTIONS` schema: it arms
-                    // the character's focus so the next `invoke` body is typed
-                    // (§11), and the schema rides back inline so the character can
-                    // act in one turn. The index and personal readables are
-                    // GET-only and arm nothing. The value the address returned is
-                    // still what the character reads; the feed line just names
-                    // what was looked at.
-                    let schema = self.arm_focus(npc_id, &path, pinned).await;
+                    // A resource query also fetches the `OPTIONS` schema, which
+                    // rides back inline so the character can read what the
+                    // resource accepts. The index and personal readables are
+                    // GET-only and carry none. The feed line just names what was
+                    // looked at.
+                    let schema = self.schema_of(npc_id, &path, pinned).await;
                     let answer = match schema {
                         Some(schema) => {
                             let bundled = json!({ "state": value, "schema": schema });
@@ -2027,8 +2091,7 @@ impl Runtime {
                             };
                         }
                     },
-                    // The grammar writes `body` as a string; an already-structured
-                    // value is a caller passing an object directly — taken as-is.
+                    // The grammar writes `body` as an object — taken as-is.
                     Some(other) => other.clone(),
                 };
                 match self.effector_invoke(npc_id, &path, body, pinned).await {
@@ -4135,6 +4198,11 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // the world moves under a decode that takes seconds, and a
             // grammar built halfway through it would be masked to a room
             // that no longer matches the situation the character read.
+            //
+            // The company is fixed first, so the world answers an addressee
+            // against the very set the grammar offers: somebody who walks out
+            // during the decode is called after, not refused as "not here".
+            rt.begin_decision(id);
             let within = rt.within(id);
             // The standpoint the grammar above was built from, captured at the
             // same pre-decode instant. A device act the character then chooses is
@@ -4151,6 +4219,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // [`Scheduler::end_tick`] are `tick` split at exactly that
             // seam, so this loop and the scheduler tests run one path.
             let Some(mut start) = rt.scheduler.begin_tick(id) else {
+                rt.end_decision(id);
                 continue;
             };
             // **A character standing at the table is told to take one up, every
@@ -4377,6 +4446,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 // answer rather than an invented one.
                 _ => Vec::new(),
             };
+            rt.end_decision(id);
             // Report the curated prose as what was perceived, when a narration
             // was produced — the raw events behind it are not what the model
             // read. A quiet tick with no narration keeps its raw perceived.
@@ -4521,7 +4591,11 @@ mod tests {
             inv.answer
         );
         // The feed line carries the status for the operator watching the pulse.
-        assert!(inv.feed.contains("200"), "the feed lost the status: {}", inv.feed);
+        assert!(
+            inv.feed.contains("200"),
+            "the feed lost the status: {}",
+            inv.feed
+        );
 
         // query — the bare host returns the near-you index.
         let q = rt
@@ -4563,11 +4637,17 @@ mod tests {
         let refused = rt
             .enact_device(
                 npc_id,
-                &device_act("invoke", json!({ "url": "http://local/lift/command-shaft/use" })),
+                &device_act(
+                    "invoke",
+                    json!({ "url": "http://local/lift/command-shaft/use" }),
+                ),
                 None,
             )
             .await;
-        assert!(!refused.landed, "the floorless ride should be refused: {refused:?}");
+        assert!(
+            !refused.landed,
+            "the floorless ride should be refused: {refused:?}"
+        );
         assert!(
             !refused.answer.trim().is_empty(),
             "a refusal read back an empty reason: {refused:?}"
@@ -5408,6 +5488,87 @@ mod tests {
         assert!(!r.answer.contains("gesture —"), "{}", r.answer);
     }
 
+    /// **A tell survives its addressee walking out during the decode.** The
+    /// company is fixed before the grammar is built; the addressee then leaves
+    /// the speaker's sight while the decode runs; the act that follows lands and
+    /// the addressee reads it, instead of the character being told "is not here"
+    /// about somebody its own grammar offered. Once the decision ends, the same
+    /// line is refused again.
+    #[tokio::test]
+    async fn a_tell_to_somebody_who_walked_out_during_the_decode_lands() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        run(&rt, 1);
+
+        rt.begin_decision(1);
+        let world = rt.hosted.get(WORLD).unwrap();
+        world.with(|w| {
+            w.set_off("m2", Where::new("vault-chronicle", "core"))
+                .unwrap();
+            w.settle();
+        });
+        let tell = act(
+            "tell",
+            json!({"to": "Maker-02", "intent": "the redoubt held"}),
+        );
+        let landed = rt.record_act(1, &tell);
+        assert!(landed.landed, "{}", landed.answer);
+        assert!(
+            landed.answer.contains("as they walk away"),
+            "{}",
+            landed.answer
+        );
+
+        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        run(&rt, 10_000);
+        let heard = window(&rt, 2).join("\n");
+        assert!(heard.contains("redoubt"), "{heard}");
+
+        rt.end_decision(1);
+        let refused = rt.record_act(1, &tell);
+        assert!(!refused.landed, "{}", refused.answer);
+        assert!(refused.answer.contains("is not here"), "{}", refused.answer);
+    }
+
+    /// **What a body holds is read from both places it can be held.** A claimed
+    /// station lives in the world and an order in the sim; either puts `release`
+    /// in the grammar, and giving it back takes it out again.
+    #[tokio::test]
+    async fn release_is_offered_exactly_while_something_is_held() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        embody(&rt, 2, "m2", "band-one");
+        let offered = |npc: u64| {
+            tools::specs_within(tools::Mode::Physical, &rt.within(npc))
+                .iter()
+                .any(|t| t.name == "release")
+        };
+        assert!(!offered(1), "offered to a body holding nothing");
+
+        let world = rt.hosted.get(WORLD).unwrap();
+        world.with(|w| w.take("m1", Some("cindy")).unwrap());
+        assert!(offered(1), "a claimed station was not read as held");
+        assert!(
+            !offered(2),
+            "somebody else's claim was offered to a bystander"
+        );
+        assert!(rt.record_act(1, &act("release", json!({}))).landed);
+        assert!(
+            !offered(1),
+            "still offered after the station was given back"
+        );
+
+        let order = "close the longest silence in the record";
+        assert!(
+            rt.record_act(2, &act("claim", json!({"what": order})))
+                .landed
+        );
+        assert!(offered(2), "a taken order was not read as held");
+        assert!(rt.record_act(2, &act("release", json!({}))).landed);
+        assert!(!offered(2), "still offered after the order was put back");
+    }
+
     /// **A reflect's row is its thought, then what came back.** Its situation
     /// and feeling are the reflection's input and are not listed; and what a
     /// pause says back is only that it happened — never the character's own
@@ -5989,6 +6150,82 @@ mod tests {
             Some(TO_THE_TABLE),
             "a character on its way is told to make its way to the table"
         );
+    }
+
+    /// A body standing at `at`, bound to character `npc_id`.
+    fn embody_at(rt: &Arc<Runtime>, npc_id: u64, body: &str, at: Where) {
+        let w = rt.hosted.get(WORLD).expect("hosted");
+        w.with(|w| {
+            w.enter(body, format!("Maker-{npc_id:02}"), at)
+                .expect("a real place")
+        });
+        rt.scheduler.wake(npc_id, 0, 0);
+        rt.embody(npc_id, WORLD, body, 0).expect("bound");
+    }
+
+    /// **A character is only summoned to a table it can get to.** The waste is
+    /// open ground with no door, stair or lift to any building, so a character
+    /// out there has no way to a command table. Told every turn to go to one, it
+    /// could only loop on the summons and never took up a mission. All three
+    /// standing-task paths stay silent for it, and speak again for a character
+    /// in the vault.
+    #[tokio::test]
+    async fn no_summons_reaches_a_character_with_no_way_to_the_table() {
+        let rt = vaulted();
+        embody_at(&rt, 1, "m1", Where::new("the-waste", "ruins"));
+        rt.set_table_open(true);
+
+        assert_eq!(rt.table_summons(1), None, "no route to the table");
+        assert_eq!(rt.at_table_summons(1), None, "not standing at a table");
+        assert_eq!(
+            rt.nudge_for(1).as_deref(),
+            Some(NO_MISSION),
+            "the idle nudge does not send a character where it cannot go"
+        );
+
+        // A character in the vault, however far from the table, can ride to it.
+        embody(&rt, 2, "m2", "green-room");
+        assert_eq!(rt.table_summons(2).as_deref(), Some(TO_THE_TABLE));
+        assert_eq!(rt.nudge_for(2).as_deref(), Some(TO_THE_TABLE));
+    }
+
+    /// **The Redoubt has a command table of its own, in the muster hall where
+    /// orders are given.** A character living there is not sent up a lift it does
+    /// not have: from the gatehouse it is told to `move_to` the muster hall, and
+    /// once there it is told to take a mission up where it stands.
+    #[tokio::test]
+    async fn the_redoubt_has_its_own_table_and_its_summons_walks_there() {
+        let rt = vaulted();
+        rt.set_table_open(true);
+
+        embody_at(&rt, 1, "m1", Where::new("tower-redoubt", "gatehouse"));
+        let on_foot = rt.table_summons(1).expect("a table to walk to");
+        assert!(
+            on_foot.contains("The table is in the muster hall"),
+            "{on_foot}"
+        );
+        assert!(
+            !on_foot.contains("lift"),
+            "no lift in the Redoubt: {on_foot}"
+        );
+        assert_eq!(rt.at_table_summons(1), None, "not yet at the table");
+
+        embody_at(&rt, 2, "m2", Where::new("tower-redoubt", "muster-hall"));
+        assert_eq!(rt.at_table_summons(2).as_deref(), Some(AT_THE_TABLE));
+        assert_eq!(rt.table_summons(2), None, "arrived");
+    }
+
+    /// A table on the character's own level is a walk, even in the vault: from
+    /// the lift landing of the command level it is one `move_to`, not a ride.
+    #[tokio::test]
+    async fn a_table_on_the_characters_own_level_is_walked_to() {
+        let rt = vaulted();
+        rt.set_table_open(true);
+        let landing = Where::new("vault-command", "core");
+        embody_at(&rt, 1, "m1", landing);
+        let said = rt.table_summons(1).expect("a table to walk to");
+        assert!(said.contains("The table is in the command room"), "{said}");
+        assert!(!said.contains("lift"), "{said}");
     }
 
     /// **The standing task is for the quiet turns, and the situation is not

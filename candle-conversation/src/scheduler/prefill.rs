@@ -2443,6 +2443,11 @@ impl Scheduler {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("wave glue input build failed: {e}");
+                    // Dropped unfilled: the slot's assembly recorded these glue
+                    // pieces as placed, and no later rebuild may keep them.
+                    if let Some(state) = self.slot_projection_state.get_mut(&p.parent_id) {
+                        state.placed_pieces.clear();
+                    }
                     continue;
                 }
             };
@@ -2565,6 +2570,41 @@ impl Scheduler {
         verify_seqs: &[usize],
         verify_inputs: &[Tensor],
     ) -> candle::Result<Vec<Tensor>> {
+        // Fold this wave's deferred glue in as a full-sweep member co-batched with
+        // decode (see `take_wave_glue`). A slot that decodes this wave is never
+        // also a glue member — `take_active_decode_batch` excludes slots with a
+        // pending deferred glue fire (they reproject this wave and resume decode
+        // next), so the two groups are disjoint and the assembled context list
+        // never lists a slot twice.
+        let glue = self.take_wave_glue();
+        let glue_slots: Vec<usize> = glue
+            .as_ref()
+            .map(|(ids, _, _)| ids.clone())
+            .unwrap_or_default();
+        let out = self.wave_step(decode_seqs, decode_inputs, verify_seqs, verify_inputs, glue);
+        if out.is_err() {
+            // The glue was taken off the queue and its fill did not complete.
+            // Each slot's assembly recorded those glue pieces as placed;
+            // unfilled, they are zero chunks no later rebuild may keep.
+            for slot in glue_slots {
+                if let Some(state) = self.slot_projection_state.get_mut(&SequenceId(slot)) {
+                    state.placed_pieces.clear();
+                }
+            }
+        }
+        out
+    }
+
+    /// One wave step of [`Self::decode_forward_cobatched`], with the wave's
+    /// deferred glue already taken.
+    fn wave_step(
+        &mut self,
+        decode_seqs: &[usize],
+        decode_inputs: &[Tensor],
+        verify_seqs: &[usize],
+        verify_inputs: &[Tensor],
+        glue: Option<(Vec<usize>, Vec<Tensor>, Vec<PendingGlue>)>,
+    ) -> candle::Result<Vec<Tensor>> {
         let n = self.model.num_layers().max(1);
         let n_dec = decode_seqs.len();
         let none_seqs: [usize; 0] = [];
@@ -2589,13 +2629,6 @@ impl Scheduler {
         // decode's sweep in one forward) rather than reading zero.
         let t_wave = Instant::now();
 
-        // Fold this wave's deferred glue in as a full-sweep member co-batched with
-        // decode (see `take_wave_glue`). A slot that decodes this wave is never
-        // also a glue member — `take_active_decode_batch` excludes slots with a
-        // pending deferred glue fire (they reproject this wave and resume decode
-        // next), so the two groups are disjoint and the assembled context list
-        // never lists a slot twice.
-        let glue = self.take_wave_glue();
         let (glue_seqs, glue_inputs): (&[usize], &[Tensor]) = match &glue {
             Some((ids, ins, _)) => (ids.as_slice(), ins.as_slice()),
             None => (&none_seqs, &none_inputs),
@@ -3878,6 +3911,8 @@ mod wave_chunk_tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    use candle_transformers::models::rope_schedule::RungSelect;
+
     use super::super::tests::make_test_scheduler;
     use super::super::*;
 
@@ -3991,8 +4026,7 @@ mod wave_chunk_tests {
         let (mut scheduler, _tx) = make_test_scheduler();
         scheduler
             .session
-            .set_rope_ceilings(vec![64])
-            .expect("ceilings");
+            .set_rope_select(RungSelect::new(vec![64], 0).expect("ceilings"));
         let fits = SequenceId(scheduler.session.create_sequence().expect("create"));
         let over = SequenceId(scheduler.session.create_sequence().expect("create"));
         scheduler

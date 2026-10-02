@@ -1589,6 +1589,16 @@ impl ChunkedKvBacking {
         Some(seq.writer_start_idx())
     }
 
+    /// `(block count, write chunk)` for a sequence — the shape a decode header
+    /// describes, read without copying the chunk list. The write chunk is
+    /// [`super::types::SequenceState::decode_write_chunk_idx`], the rule the
+    /// slot buffer's `write_slice` follows. `None` if the slot is unallocated.
+    pub fn decode_write_shape(&self, batch_idx: usize) -> Option<(usize, usize)> {
+        let state = self.state.read().ok()?;
+        let seq = state.sequences.get(batch_idx)?.as_ref()?;
+        Some((seq.block_count(), seq.decode_write_chunk_idx()))
+    }
+
     /// Per-chunk `(offset, len, cum_before)` real-token window for a sequence — the
     /// exact layout attention reads (writer chunk gets the `seq_offset`-derived
     /// length). A provenance / diagnostic gather consults this to check only real
@@ -2738,6 +2748,40 @@ impl ChunkedKvBacking {
         let mut n_quant = 0usize;
         for cw in slot.chunks_slice() {
             for (_, tag) in cw.bands() {
+                let Some(KvFormat::Quantized(qf)) = tag.to_kv_format() else {
+                    continue;
+                };
+                if qf == QuantFormat::R16 {
+                    continue;
+                }
+                actual += qf.bits_per_elem() as f64 * cw.usage as f64;
+                n_quant += cw.usage as usize;
+            }
+        }
+        Ok((actual, n_quant))
+    }
+
+    /// [`Self::compression_bpe`] for one side: K bands when `is_value` is
+    /// false, V bands when true. Bands interleave `[K, V, K, V, …]` per
+    /// `(head, palette)` — the stride [`Self::compression_dist`] reads — so the
+    /// ladder can show how a rung splits its bits between the two.
+    pub fn compression_bpe_side(
+        &self,
+        batch_idx: usize,
+        is_value: bool,
+    ) -> candle::Result<(f64, usize)> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let Some(slot) = state.sequences.get(batch_idx).and_then(|s| s.as_ref()) else {
+            return Ok((0.0f64, 0));
+        };
+        let start = usize::from(is_value);
+        let mut actual = 0f64;
+        let mut n_quant = 0usize;
+        for cw in slot.chunks_slice() {
+            for (_, tag) in cw.bands().skip(start).step_by(2) {
                 let Some(KvFormat::Quantized(qf)) = tag.to_kv_format() else {
                     continue;
                 };

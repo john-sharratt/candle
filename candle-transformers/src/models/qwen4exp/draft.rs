@@ -64,6 +64,7 @@ use crate::models::delta_net::SeqSpan;
 use crate::models::draft_walk::{draft_reserve, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::prefill_utils::SharedPm;
+use crate::models::profile::gpu_span;
 use crate::models::rope_schedule::FactoredRope;
 use crate::models::tensor_cat::TensorCat;
 use candle::quantized::cuda::to_dynamic;
@@ -124,7 +125,7 @@ impl Qwen4ExpBatched {
         let cfg = &self.model.cfg;
         let dev = &self.model.device;
         let (total_rows, hc, n_embd) = res.dims3()?;
-        let g = crate::models::profile::gpu_span("q4e:mtp_head", dev);
+        let g = gpu_span("q4e:mtp_head", dev);
 
         // **The head's own phase.** It runs one layer's worth of work after the
         // trunk's loop has closed its phases, and until now it ran with none
@@ -391,6 +392,7 @@ impl Qwen4ExpBatched {
                 len: 1,
             })
             .collect();
+        let g_sel = gpu_span("q4e:draft:select", dev);
         let sel = self.layer_selection(
             kv_layer,
             *compress_ratio,
@@ -407,6 +409,8 @@ impl Qwen4ExpBatched {
             // As above: no forward-scoped span is open on this path.
             None,
         )?;
+        g_sel.end();
+        let g_attn = gpu_span("q4e:draft:attn", dev);
         let alayer = Qwen4ExpAttentionLayer {
             w: aw,
             n_head: cfg.num_attention_heads,
@@ -435,8 +439,10 @@ impl Qwen4ExpBatched {
         let y = forward_attn_batched(&alayer, caches, &x_g, at, params, 0, sel.as_ref(), None)?
             .reshape((n, n_embd))?;
         hc_combine(&mut res, &y, &inject)?;
+        g_attn.end();
 
         // ── MoE half. ──
+        let g_moe = gpu_span("q4e:draft:moe", dev);
         let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps, None)?;
         let inject2 = inject2.expect("a block's HC modules carry an inject");
         let candle::Device::Cuda(cuda) = dev else {
@@ -462,8 +468,10 @@ impl Qwen4ExpBatched {
             .forward_dynamic(acts, DType::F32, n, None)?
             .reshape((n, n_embd))?;
         hc_combine(&mut res, &y2, &inject2)?;
+        g_moe.end();
 
         // ── The shared head. ──
+        let g_head = gpu_span("q4e:draft:lm_head", dev);
         let narrow = head.to_shared_head(&res, eps)?;
         let acts = to_dynamic(
             &narrow,
@@ -476,6 +484,7 @@ impl Qwen4ExpBatched {
             .forward_dynamic(acts.as_dynamic(), DType::F32)?
             .to_owned_tensor()?
             .reshape((n, cfg.vocab_size))?;
+        g_head.end();
         Ok((res, logits))
     }
 

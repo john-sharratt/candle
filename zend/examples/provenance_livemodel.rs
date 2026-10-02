@@ -23,6 +23,7 @@ use candle_conversation::persistence::streams::StreamDecl;
 use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::provenance::{decode_wide_sigs, score_provenance_late_fusion, WideQSig};
 use candle_conversation::substrate::Substrate;
+use candle_conversation::working_set::marks::is_dialogue;
 
 const QUERY_HEAD: usize = 64; // QUERY_HEAD_CHUNKS(2) * 32
 const MAX_PROBE: usize = 256; // reproject_max_probe_tokens
@@ -124,13 +125,13 @@ fn main() -> anyhow::Result<()> {
     let child_keys: Vec<ChildKey> = names.iter().map(ChildKey::named).collect();
     let score = |probe: &[WideQSig]| score_provenance_late_fusion(probe, &gref, &gcase, n);
 
-    // Dialogue turns (empty tags) in deterministic order.
+    // Dialogue turns (no gather-scope tags) in deterministic order.
     let mut dialogue: Vec<(u64, u64, u32, Vec<WideQSig>)> = Vec::new();
     for (sid, e) in substrate.all_streams() {
         let Some(StreamDecl::Turn(dd)) = &e.decl else {
             continue;
         };
-        if !dd.tags.is_empty() {
+        if !is_dialogue(&dd.tags) {
             continue;
         }
         let Some(sig) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {

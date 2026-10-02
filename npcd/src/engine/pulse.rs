@@ -36,6 +36,7 @@ use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{Addressed, Event, EventKind, Salience};
 use crate::engine::runtime::Runtime;
 use crate::engine::slash;
+use crate::engine::{owned, owned_by};
 use crate::npcs;
 
 /// How many ticks a feed request may ask for. The scheduler's own ring is the
@@ -372,16 +373,13 @@ pub async fn world(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Respon
 /// a turn that never reached the feed.
 pub async fn window(
     State(s): State<Arc<Authored>>,
-    Path(nid): Path<u64>,
+    Path(nid): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let (_, owner) = match owner_of(&s, &headers).await {
-        Ok(v) => v,
+    let nid = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
         Err(r) => return *r,
     };
-    if s.npcs.read().await.visible_to(nid, &owner).is_none() {
-        return err(StatusCode::NOT_FOUND, "not_found", "no such character");
-    }
     let Some(rt) = s.runtime.as_ref() else {
         return no_scheduler();
     };
@@ -543,17 +541,14 @@ pub struct InjectBody {
 /// specific character is a write to something somebody owns.
 pub async fn inject(
     State(s): State<Arc<Authored>>,
-    Path(nid): Path<u64>,
+    Path(nid): Path<String>,
     headers: HeaderMap,
     Json(body): Json<InjectBody>,
 ) -> Response {
-    let (id, owner) = match owner_of(&s, &headers).await {
+    let (id, owner, nid) = match owned_by(&s, &headers, &nid).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    if s.npcs.read().await.visible_to(nid, &owner).is_none() {
-        return err(StatusCode::NOT_FOUND, "not_found", "no such character");
-    }
     let Some(rt) = s.runtime.as_ref() else {
         return no_scheduler();
     };
@@ -695,17 +690,14 @@ fn direct_event(body: DirectBody, operator: &str) -> Option<(Salience, EventKind
 /// character's ear is a write to something somebody owns.
 pub async fn direct(
     State(s): State<Arc<Authored>>,
-    Path(nid): Path<u64>,
+    Path(nid): Path<String>,
     headers: HeaderMap,
     Json(body): Json<DirectBody>,
 ) -> Response {
-    let (id, owner) = match owner_of(&s, &headers).await {
+    let (id, owner, nid) = match owned_by(&s, &headers, &nid).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    if s.npcs.read().await.visible_to(nid, &owner).is_none() {
-        return err(StatusCode::NOT_FOUND, "not_found", "no such character");
-    }
     let Some(rt) = s.runtime.as_ref() else {
         return no_scheduler();
     };
@@ -875,6 +867,8 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     | Availability::AmongOthers
                     | Availability::Embodied
                     | Availability::AwayFromHome
+                    // What the hands hold is where the body is, not the channel.
+                    | Availability::Holding
                     // Being at the lift, or in it, is where the body is standing,
                     // not a fact about the channel — said in `needs` instead.
                     | Availability::AtLift
@@ -929,6 +923,7 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     Availability::AmongOthers => json!("two or more others here"),
                     Availability::Embodied => json!("a body"),
                     Availability::AwayFromHome => json!("being somewhere that is not home"),
+                    Availability::Holding => json!("holding an order or a station"),
                     Availability::PhysicalOnly => json!("being present"),
                     Availability::MessagingOnly => json!("being at a distance"),
                     Availability::Pictorial => json!("a channel that carries pictures"),

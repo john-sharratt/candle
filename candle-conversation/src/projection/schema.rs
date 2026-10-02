@@ -58,6 +58,7 @@ use super::adaptive::{AnchorConfig, BudgetAdaptive, LocalityConfig, MemberBudget
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, SelectionPolicy};
 use crate::summary_tree::scope::Scope;
+use crate::working_set::WorkingSetConfig;
 
 /// Schema for one layer's system-prompt content.
 ///
@@ -822,15 +823,11 @@ pub struct LayerSchema {
     /// Total turn-budget (in tokens) distributed across all visible layers
     /// when this layer is the projection target.
     pub window: usize,
-    /// Tokens of THIS layer's conversations a fast-path tool read may inject
-    /// into another conversation.
-    ///
-    /// A tool call whose content the corpus has already read injects that
-    /// conversation instead of re-reading the file; this bounds how much of
-    /// this layer one conversation may accumulate that way, evicted
-    /// least-recently-used. `0` keeps the layer out of the fast path, so a read
-    /// of its content always runs for real.
-    pub fast_path_window: usize,
+    /// The already-ingested content a conversation targeting this layer
+    /// carries ahead of its own turns (`working_set:` in YAML,
+    /// `docs/zend_working_set.md`). `None` — every layer but the dialogue — and
+    /// its `working_set` groups select nothing.
+    pub working_set: Option<WorkingSetConfig>,
     /// Flex weight when *some other layer* is the projection target and
     /// this layer is visible (lower than the target). Determines how much
     /// of the target's `window` this layer receives.
@@ -1059,7 +1056,24 @@ impl GroupSchema {
     /// other rule ranks by score and so becomes belief-driven once turns carry
     /// a fresh wide-Q score.
     pub fn is_belief_driven(&self) -> bool {
-        !matches!(self.selection, SelectionRule::Sequence { .. })
+        !matches!(
+            self.selection,
+            SelectionRule::Sequence { .. } | SelectionRule::WorkingSet { .. }
+        )
+    }
+
+    /// Whether this group is filled from the projection target's working set.
+    ///
+    /// Not belief-driven — its selection is the working set's, not the RelLeak
+    /// band's — but still **scanned**: the belief scan's fresh per-file scores
+    /// are what the working set's momentum is built from.
+    pub fn is_working_set(&self) -> bool {
+        matches!(self.selection, SelectionRule::WorkingSet { .. })
+    }
+
+    /// Whether the belief scan scores this group's turns.
+    pub fn is_scanned(&self) -> bool {
+        self.is_belief_driven() || self.is_working_set()
     }
 
     /// The belief [`PolicyConfig`] for a belief-driven group: the group's policy
@@ -1104,10 +1118,12 @@ impl GroupSchema {
             SelectionRule::TopK { k } => *k,
             SelectionRule::Single => 1,
             SelectionRule::AlwaysVisible => n_candidates.max(1),
-            // Named/Sequence aren't belief-driven; fall back to the policy budget.
-            SelectionRule::Named { .. } | SelectionRule::Sequence { .. } => {
-                self.policy.config.budget_max
-            }
+            // Named/Sequence aren't belief-driven, and a working-set group is
+            // sized by its target's budget rather than a member count; fall back
+            // to the policy budget.
+            SelectionRule::Named { .. }
+            | SelectionRule::Sequence { .. }
+            | SelectionRule::WorkingSet { .. } => self.policy.config.budget_max,
         };
         match (self.score_threshold, self.policy_band_declared) {
             // An explicit zero disables the gate outright, band or no band.
@@ -1236,6 +1252,24 @@ pub enum SelectionRule {
         recent: usize,
         historical_top_k: usize,
     },
+
+    /// A turn group of whole ingest conversations sized by the projection
+    /// target's working set (`docs/zend_working_set.md` §4.4): the target's
+    /// pinned conversations in this group, whole, then its provenance
+    /// candidates by momentum until `share`'s budget is spent. Emitted
+    /// verbatim, outside the flexbox — never trimmed. A target whose layer
+    /// declares no working set selects nothing here.
+    WorkingSet { share: WorkingSetShare },
+}
+
+/// Which part of the target's working-set budget a
+/// [`SelectionRule::WorkingSet`] group fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetShare {
+    /// Up to the working set's `folder_tokens`, shared by every folder group.
+    Folders,
+    /// What `budget_tokens` leaves once the folder groups have selected.
+    Remainder,
 }
 
 /// A fallback section injected when a **collection's** normal selection
@@ -1343,6 +1377,13 @@ pub struct Schema {
     /// Off by default: the penalties a caller configured are the ones it gets.
     /// A schema that needs verbatim arguments asks for the exemption by name.
     pub free_tool_calls_from_penalties: bool,
+    /// The lowest progressive-YaRN factor any sequence runs at (`rope:
+    /// min_yarn_factor:`). With `2`, even a short sequence runs on the first
+    /// rung scaling by at least ×2 rather than on the trained RoPE. `None` lets
+    /// each sequence take the lowest rung its reach allows. Applied when the
+    /// model loads (`ModelBuilder::min_rope_factor`), which refuses a factor
+    /// that no rung of the model's schedule reaches.
+    pub min_yarn_factor: Option<f32>,
 }
 
 impl Schema {

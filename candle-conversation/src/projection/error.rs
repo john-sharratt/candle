@@ -15,6 +15,7 @@
 //!   │                      │ UnknownSelectionKind                        │
 //!   │                      │ InvalidPriority      (priority <= 0)        │
 //!   │                      │ InvalidPercentage    (outside 0..=100)      │
+//!   │                      │ InvalidMinYarnFactor (below 1)              │
 //!   │                      │ InvalidTopK          (k missing or 0)       │
 //!   │                      │ InvalidConversationK (recent=0 AND tk=0)    │
 //!   ├──────────────────────┼─────────────────────────────────────────────┤
@@ -64,6 +65,11 @@ pub enum ConstructionError {
     /// `min_percent` and `max_percent` are bounded to 0..=100.
     #[error("percentage for {name:?} must be in 0..=100, got {value}")]
     InvalidPercentage { name: String, value: f32 },
+
+    /// `rope.min_yarn_factor` below 1 (or not finite). A factor scales the
+    /// trained context; under 1 would shrink it, and no rung does that.
+    #[error("rope.min_yarn_factor must be a finite factor >= 1, got {0}")]
+    InvalidMinYarnFactor(f32),
 
     // ── Construction-time ─────────────────────────────────────────────────────
     /// Sum of declared `min_percent` across siblings exceeds 100. Statically
