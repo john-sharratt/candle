@@ -27,15 +27,18 @@
 //! weight-read bandwidth, so a prefill width that slows down shows here before
 //! it shows in a gate.
 
-use candle::quantized::cuda::to_dynamic;
+use std::time::Instant;
+
+use candle::quantized::cuda::{produce_q8a128, to_dynamic, DynamicTensor};
 use candle::quantized::int8_split_k::{
     dense_k_split_depth, dense_k_split_fits, q8a128_dense_k_splits,
 };
 use candle::quantized::{Int8Mode, SumScale};
 use candle::{DType, Device, Result, Tensor};
 
+use super::cuda_fused;
 use super::ko::HcWeightsKo;
-use super::{HcProject, HcWeights};
+use super::{hc_mix_with_operand, HcProject, HcWeights};
 use crate::models::quantized_matmul::QMatMul;
 
 /// Distinct modules the timed loop cycles through: 16 × ~8.7 MB ≈ 139 MB of
@@ -84,7 +87,7 @@ fn time_rotating(
         f(i % MODULES)?;
     }
     dev.synchronize()?;
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     for i in 0..iters {
         f(i % MODULES)?;
     }
@@ -150,8 +153,17 @@ pub fn run_ko_projections(dev: &Device, widths: &[usize], iters: usize) -> Resul
     }
 
     println!(
-        "{:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>10}",
-        "rows", "q(xn)", "down", "silu", "q(lo)", "up", "lowrank", "down GB/s", "up GB/s"
+        "{:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9}",
+        "rows",
+        "q(xn)",
+        "down",
+        "silu",
+        "q(lo)",
+        "up",
+        "lowrank",
+        "down GB/s",
+        "up GB/s",
+        "up_silu"
     );
     for &t in widths {
         let warmup = MODULES;
@@ -187,10 +199,18 @@ pub fn run_ko_projections(dev: &Device, widths: &[usize], iters: usize) -> Resul
             ko_modules[m].up(&l)?;
             Ok(())
         })?;
+        // `up` as the engine runs it: the SiLU and the quantize inside the matmul.
+        let up_silu = time_rotating(dev, warmup, iters, |m| {
+            ko_modules[m]
+                .matmuls()
+                .1
+                .forward_silu_f32(&proj, gate_cols)?;
+            Ok(())
+        })?;
         let gbps = |bytes: f64, us: f64| bytes / (us.max(1e-3) * 1e-6) / 1e9;
         println!(
             "{t:>6} {q_xn:>9.1} {down:>9.1} {silu:>9.1} {q_lo:>9.1} {up:>9.1} {lowrank:>9.1} \
-             {:>10.0} {:>10.0}",
+             {:>10.0} {:>10.0} {up_silu:>9.1}",
             gbps(down_bytes, down - q_xn),
             gbps(up_bytes, up - q_lo),
         );
@@ -199,6 +219,70 @@ pub fn run_ko_projections(dev: &Device, widths: &[usize], iters: usize) -> Resul
         "(µs per call; `down`/`up` include their operand's quantize, the GB/s columns \
          subtract it — weight bytes over GEMM time)"
     );
+
+    // The production pre-mix, as a decode layer calls it: norm → down → SiLU → up →
+    // collapse with the block operand, five launches. Timed twice — synchronised at
+    // the end (the GPU's pace, when it is the bound), and as the host's issue time
+    // alone (the loop's own wall clock before the final sync, which is the bound
+    // whenever the GPU drains faster than the host can feed it).
+    println!("\n{:>6} {:>11} {:>11}", "rows", "hc_mix µs", "host µs");
+    for &t in widths {
+        let x = lcg(&[t, hc, n_embd], 0x800 + t as u64, 2.0, dev)?;
+        for module in &ko_modules {
+            hc_mix_with_operand(&x, module, 1e-6, None)?;
+        }
+        dev.synchronize()?;
+        let t0 = Instant::now();
+        for i in 0..iters {
+            hc_mix_with_operand(&x, &ko_modules[i % MODULES], 1e-6, None)?;
+        }
+        let host = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        dev.synchronize()?;
+        let total = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!("{t:>6} {total:>11.1} {host:>11.1}");
+    }
+
+    // The same steps one at a time, host issue time only — which of them carries
+    // the host cost the pre-mix pays beyond its launches.
+    println!(
+        "\n{:>6} {:>8} {:>8} {:>8} {:>8}   (host µs per op)",
+        "rows", "norm_q8", "down", "up_silu", "mix_q8"
+    );
+    for &t in widths {
+        let x = lcg(&[t, hc, n_embd], 0x900 + t as u64, 2.0, dev)?;
+        let ss = SumScale::Raw;
+        let (xn, xn_q8) = cuda_fused::norm_q8(&x, ko_modules[0].norm(), 1e-6, None, ss)?;
+        let (d, u, _) = ko_modules[0].matmuls();
+        let proj = d.forward_dynamic(DynamicTensor::Int8(&xn_q8), DType::F32)?;
+        let gate_raw = u.forward_silu_f32(&proj, gate_cols)?;
+        let host_us = |f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+            dev.synchronize()?;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                f()?;
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            dev.synchronize()?;
+            Ok(us)
+        };
+        let norm = host_us(&mut || {
+            cuda_fused::norm_q8(&x, ko_modules[0].norm(), 1e-6, None, ss).map(|_| ())
+        })?;
+        let down = host_us(&mut || {
+            d.forward_dynamic(DynamicTensor::Int8(&xn_q8), DType::F32)
+                .map(|_| ())
+        })?;
+        let up = host_us(&mut || u.forward_silu_f32(&proj, gate_cols).map(|_| ()))?;
+        let mix =
+            host_us(&mut || cuda_fused::mix_q8(&xn, &gate_raw, hc, n_embd, None, ss).map(|_| ()))?;
+        // The operand's allocation and wrapping with no kernel behind it: what a
+        // producer costs the host before its launch.
+        let produce =
+            host_us(&mut || produce_q8a128(&proj, t, gate_cols, ss, |_| Ok(())).map(|_| ()))?;
+        println!(
+            "{t:>6} {norm:>8.1} {down:>8.1} {up:>8.1} {mix:>8.1}   produce alone {produce:.1}"
+        );
+    }
 
     let down = Gemm {
         name: "down",

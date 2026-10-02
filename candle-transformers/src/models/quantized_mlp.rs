@@ -357,13 +357,13 @@ impl QuantizedMlp {
         // **The SwiGLU emits the down projection's operand itself** when that
         // projection runs int8 and no adapter needs the float result: one launch
         // for `silu(gate) · up` and its quantize, reading the two halves of the
-        // fused projection where it wrote them. Its arithmetic is the fused FP
-        // SwiGLU's (`candle_nn::ops::silu_mul`, the MoE experts' path): the F32
-        // `fast_exp::silu` times `up`, rounded ONCE through `work_dtype`, then the
-        // one q8a128 tile emitter — the bytes `silu_mul` + quantize write. At F32
-        // that is also the eager chain below bit for bit; at BF16 the eager chain
-        // rounds `silu(gate)` and the product separately, so the fused operand is
-        // the more precise of the two, not the same bytes.
+        // fused projection where it wrote them. Its arithmetic is the eager chain
+        // below, bit for bit, at both working widths — at BF16 that is `silu(gate)`
+        // rounded, then the product rounded, exactly the two stores the chain
+        // makes — then the one q8a128 tile emitter, so the bytes are the ones
+        // `down` would quantize from `gated`. The KV calibration rows were derived
+        // on that arithmetic; a single rounding of the F32 product, though more
+        // precise, moved the 0.8B's top rungs across their edge.
         //
         // Unadapted only: an adapter on gate or up alone turns that half into a
         // fresh dense tensor whose rows no longer step with the other half's
@@ -400,7 +400,7 @@ mod tests {
     use crate::models::gpu_test_lock::gpu_serial as gpu_guard;
     use candle::quantized::cuda::to_dynamic;
     use candle::quantized::SumScale;
-    use candle_nn::ops::{silu, silu_mul};
+    use candle_nn::ops::silu;
 
     fn lcg(shape: &[usize], seed: u64, scale: f32, dev: &Device) -> Tensor {
         let n: usize = shape.iter().product();
@@ -416,16 +416,15 @@ mod tests {
         Tensor::from_vec(v, shape, dev).unwrap()
     }
 
-    /// The int8 MLP's SwiGLU emitting the down projection's operand is the fused
-    /// FP SwiGLU (`silu_mul`) followed by the down projection quantizing its own
+    /// The int8 MLP's SwiGLU emitting the down projection's operand is the eager
+    /// `silu(gate) · up` chain followed by the down projection quantizing its own
     /// input, bit for bit — with gate and up read as the two halves of the fused
     /// projection rather than compacted. At both intermediate widths (F32, and
-    /// the BF16 production runs, where the product's single rounding through
-    /// `work_dtype` is what has to agree) and both `Σx` conventions (the operand
-    /// carries whichever one `down` reads). At F32 it is also the eager
-    /// `silu` · `up` chain, asserted separately.
+    /// the BF16 production runs, where the chain's two separate roundings are
+    /// what has to agree) and both `Σx` conventions (the operand carries
+    /// whichever one `down` reads).
     #[test]
-    fn the_fused_swiglu_operand_is_silu_mul_then_quantize_bit_for_bit() {
+    fn the_fused_swiglu_operand_is_the_eager_chain_then_quantize_bit_for_bit() {
         let _gpu = gpu_guard();
         let Ok(dev) = Device::new_cuda(0) else { return };
         let Device::Cuda(cuda) = &dev else {
@@ -455,20 +454,12 @@ mod tests {
                     let gu = gate_up.forward_dynamic(acts.as_dynamic(), work).unwrap();
                     let gate = gu.narrow(2, 0, inter).unwrap();
                     let up = gu.narrow(2, inter, inter).unwrap();
-                    // The FP kernel reads dense operands; compacting the halves
-                    // changes no value.
-                    let fused =
-                        silu_mul(&gate.contiguous().unwrap(), &up.contiguous().unwrap()).unwrap();
-                    let want = down.forward_live_as(&fused, DType::F32).unwrap();
+                    let eager = (silu(&gate).unwrap() * &up).unwrap();
+                    let want = down.forward_live_as(&eager, DType::F32).unwrap();
 
                     let bits =
                         |a: &LiveTensor<'_>| a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
                     assert_eq!(bits(&got), bits(&want), "{sum_scale:?} {work:?} {t} tokens");
-                    if work == DType::F32 {
-                        let eager = (silu(&gate).unwrap() * &up).unwrap();
-                        let want = down.forward_live_as(&eager, DType::F32).unwrap();
-                        assert_eq!(bits(&got), bits(&want), "eager {sum_scale:?} {t} tokens");
-                    }
                 }
             }
         }

@@ -4,6 +4,8 @@
 #include "cuda_utils.cuh"
 #include "unary_utils.cuh"
 #include "../fast_exp.cuh"
+#include "sigmoid_fwd.cuh"
+#include "silu_fwd.cuh"
 
 // =============================================================================
 // LEGACY UNARY_OP MACRO - For types without vectorization or simple ops
@@ -72,41 +74,6 @@ __device__ __forceinline__ T relu_fwd(T x) {
     return maxg(x, zero);
 }
 
-// SiLU: Generic version uses standard math
-template<typename T>
-__device__ __forceinline__ T silu_fwd(T x) {
-    return x / (static_cast<T>(1) + expg(-x));
-}
-
-// SiLU: Float specialization with fast_exp library
-template<>
-__device__ __forceinline__ float silu_fwd<float>(float x) {
-    return fast_exp::silu<float>(x);
-}
-
-// SiLU: Double specialization (can't use fast intrinsics)
-template<>
-__device__ __forceinline__ double silu_fwd<double>(double x) {
-    return x / (1.0 + exp(-x));
-}
-
-// Sigmoid: Generic version
-template<typename T>
-__device__ __forceinline__ T sigmoid_fwd(T x) {
-    return recipg(static_cast<T>(1) + expg(-x));
-}
-
-// Sigmoid: Float specialization with fast_exp library
-template<>
-__device__ __forceinline__ float sigmoid_fwd<float>(float x) {
-    return fast_exp::sigmoid<float>(x);
-}
-
-// Sigmoid: Double specialization
-template<>
-__device__ __forceinline__ double sigmoid_fwd<double>(double x) {
-    return 1.0 / (1.0 + exp(-x));
-}
 
 #define UNARY_OP1(TYPENAME, FN_NAME, FUNC) \
 extern "C" __global__ void FN_NAME( \

@@ -56,7 +56,7 @@
 //! The MoE combine target is here too, via [`wave_empty`]. It is *returned*
 //! from the expert forward, so nothing inside the MoE code bounds it — the
 //! bound comes from one level up, where the layer opens a generation around
-//! `ffn_forward` and the residual add that consumes the result. That is the
+//! `ffn_residual`, whose residual update consumes the result. That is the
 //! same layer scoping the attention path uses, applied to the layer's other
 //! half.
 

@@ -65,6 +65,8 @@
 // Tokens the state pass stages per half-chunk — half of DNP_CHUNK, so its
 // stage buffer is half-size and two blocks fit an SM (see the kernel header).
 #define DNP_TH 32
+// State-tile elements each state-pass thread moves on load and on write-back.
+#define DNP_TILE_PER_THREAD (DNP_TV * DNP_DIM / DNP_THREADS)
 
 namespace delta_net {
 
@@ -177,8 +179,13 @@ static __global__ void delta_net_conv_prefill_f32_kernel(
 // ============================================================================
 // Intra-chunk kernel: one block per (chunk, V head).
 //
-// Dynamic smem partition (83.5 KB — the launcher opts in past the 48 KB
-// default): sk [C][LD], sq [C][LD], A [C][ALD], G [C], β [C].
+// Dynamic smem partition: sk [R][LD], sq [R][LD], A [R][ALD], G [C], β [C], where
+// R = `rows` is the launch's chunk-row capacity — DNP_CHUNK (83.5 KB, the
+// launcher opts in past the 48 KB default) when any span fills a chunk, and the
+// longest span's length rounded up to 4 otherwise (the A/kq grid reads k rows a
+// whole 4-wide j-tile at a time). A verify wave's spans are a few tokens long, and
+// sizing them for a 64-token chunk held the kernel to one block per SM for rows it
+// never touches. G and β stay chunk-wide: the scan walks all DNP_CHUNK slots.
 //
 // The solve assigns one right-hand-side column per thread: d_v + d_k = 256
 // columns = 256 threads exactly. X lives in registers with the 64-step
@@ -205,12 +212,14 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
         int n_v_heads,
         int n_k_heads,
         int tok_stride, // conv_dim: q, k and v are strided views of one buffer
-        float q_scale) {
+        float q_scale,
+        int rows) {     // chunk rows the row buffers hold — every span's c_len,
+                        // rounded up to the A/kq grid's 4-wide j-tile
     extern __shared__ float smem[];
-    float* sk = smem;                          // [C][LD]
-    float* sq = sk + DNP_CHUNK * DNP_LD;       // [C][LD]
-    float* sA = sq + DNP_CHUNK * DNP_LD;       // [C][ALD]
-    float* sg = sA + DNP_CHUNK * DNP_ALD;      // [C] G cumsum
+    float* sk = smem;                          // [R][LD]
+    float* sq = sk + rows * DNP_LD;            // [R][LD]
+    float* sA = sq + rows * DNP_LD;            // [R][ALD]
+    float* sg = sA + rows * DNP_ALD;           // [C] G cumsum
     float* sb = sg + DNP_CHUNK;                // [C] β
 
     const int z = blockIdx.z;
@@ -326,8 +335,14 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
     __syncthreads(); // A complete before the substitution reads it
 
     // (I + A) x = b  →  x[i] = b[i] − Σ_{j<i} A[i][j] x[j].
+    //
+    // Stops at `c_len` (block-uniform): rows past it are never stored, and a row
+    // only reads the rows before it, so the stored ones are the same values — at a
+    // verify-width span of four tokens the full walk was ~2,000 FMAs a thread for
+    // four rows. The loop stays fully unrolled so `xr` keeps static indices.
     #pragma unroll
     for (int i = 1; i < DNP_CHUNK; ++i) {
+        if (i >= c_len) break;
         float acc = xr[i];
         #pragma unroll
         for (int j = 0; j < i; ++j) {
@@ -410,12 +425,25 @@ static __global__ void delta_net_prefill_state_f32_kernel(
     const size_t o_stride = (size_t)n_v_heads * DNP_DIM;
 
     // Load the tile: [TV, D] rows are contiguous in global, staged onto the
-    // padded stride.
-    for (int idx = tid; idx < DNP_TV * DNP_DIM; idx += (int)blockDim.x) {
-        const int r = idx / DNP_DIM;
-        const int d = idx % DNP_DIM;
-        s_tile[r * DNP_LD + d] =
-            state[((size_t)h * DNP_DIM + (i_base + r)) * DNP_DIM + d];
+    // padded stride. Every load is issued before the first store: the compiler
+    // does not hoist a global load past a shared store, so the interleaved loop
+    // paid DNP_TILE_PER_THREAD dependent DRAM round trips per thread — at a
+    // verify-width span, whose phases are a few tokens deep, that load was 36% of
+    // the kernel's stall samples (ncu, 4 tokens × 8 spans). Same mapping as the
+    // loop it replaces, so lanes still write consecutive `d`, bank-clean.
+    {
+        float v[DNP_TILE_PER_THREAD];
+        #pragma unroll
+        for (int k = 0; k < DNP_TILE_PER_THREAD; ++k) {
+            const int idx = tid + k * DNP_THREADS;
+            v[k] = state[((size_t)h * DNP_DIM + (i_base + idx / DNP_DIM)) * DNP_DIM +
+                         idx % DNP_DIM];
+        }
+        #pragma unroll
+        for (int k = 0; k < DNP_TILE_PER_THREAD; ++k) {
+            const int idx = tid + k * DNP_THREADS;
+            s_tile[(idx / DNP_DIM) * DNP_LD + idx % DNP_DIM] = v[k];
+        }
     }
 
     const int n_chunks = (t_len + DNP_CHUNK - 1) / DNP_CHUNK;
@@ -454,8 +482,12 @@ static __global__ void delta_net_prefill_state_f32_kernel(
             // broadcasts, s_tile[r][j] hits distinct banks per lane, u/vnew
             // accesses are consecutive in r. The 4-way t-tile is register
             // reuse against the smem bandwidth ceiling: one s_tile operand
-            // load feeds four FMAs.
-            {
+            // load feeds four FMAs. A warp with no token in this half skips the
+            // dot outright (warp-uniform): at a verify-width span of a few
+            // tokens, most warps have none, and running the loop with every
+            // operation predicated off still spent the shared-memory issue the
+            // live warps were waiting on.
+            if (warp < hlen) {
                 const float* srow = &s_tile[lane * DNP_LD];
                 float acc[4] = {0.f, 0.f, 0.f, 0.f};
                 #pragma unroll 8
@@ -490,7 +522,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
                     qk[(size_t)(t0 + hb + i) * qk_stride + kh * DNP_DIM + d] * q_scale;
             }
             __syncthreads();
-            {
+            if (warp < hlen) { // as phase 1: a warp with no token skips the dot
                 const float* srow = &s_tile[lane * DNP_LD];
                 float inter[4] = {0.f, 0.f, 0.f, 0.f};
                 #pragma unroll 8
@@ -573,11 +605,20 @@ static __global__ void delta_net_prefill_state_f32_kernel(
     // (the reference path passes one buffer twice): the tile is already resident
     // in shared memory by the time it is stored.
     __syncthreads();
-    for (int idx = tid; idx < DNP_TV * DNP_DIM; idx += (int)blockDim.x) {
-        const int r = idx / DNP_DIM;
-        const int d = idx % DNP_DIM;
-        state_out[((size_t)h * DNP_DIM + (i_base + r)) * DNP_DIM + d] =
-            s_tile[r * DNP_LD + d];
+    {
+        // Every shared read first, then the stores — as the load above.
+        float v[DNP_TILE_PER_THREAD];
+        #pragma unroll
+        for (int k = 0; k < DNP_TILE_PER_THREAD; ++k) {
+            const int idx = tid + k * DNP_THREADS;
+            v[k] = s_tile[(idx / DNP_DIM) * DNP_LD + idx % DNP_DIM];
+        }
+        #pragma unroll
+        for (int k = 0; k < DNP_TILE_PER_THREAD; ++k) {
+            const int idx = tid + k * DNP_THREADS;
+            state_out[((size_t)h * DNP_DIM + (i_base + idx / DNP_DIM)) * DNP_DIM +
+                      idx % DNP_DIM] = v[k];
+        }
     }
 }
 
@@ -626,16 +667,23 @@ static inline void launch_prefill_intra_f32(
         float q_scale,
         cudaStream_t stream) {
     if (n_spans <= 0 || max_len <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return;
-    const int smem_bytes =
-        (2 * DNP_CHUNK * DNP_LD + DNP_CHUNK * DNP_ALD + 2 * DNP_CHUNK) *
-        (int)sizeof(float);
-    // 83.5 KB exceeds the 48 KB default dynamic-smem ceiling; raise it once.
+    // The row buffers hold the longest chunk any block of this launch walks,
+    // rounded up to the A/kq grid's 4-wide j-tile: a tile reads k rows jt..jt+3
+    // whole, past c_len when c_len is not a multiple of 4, and those reads must
+    // land inside the buffer (their products are discarded, the loads are not).
+    const int rows = max_len < DNP_CHUNK ? ((max_len + 3) & ~3) : DNP_CHUNK;
+    const auto smem_for = [](int r) {
+        return (2 * r * DNP_LD + r * DNP_ALD + 2 * DNP_CHUNK) * (int)sizeof(float);
+    };
+    const int smem_bytes = smem_for(rows);
+    // A full chunk's 83.5 KB exceeds the 48 KB default dynamic-smem ceiling; the
+    // ceiling is raised once to the full-chunk size, which covers every launch.
     // The attribute is per-function and sticky, so a redundant set is a no-op.
     static int smem_raised = 0;
     if (!smem_raised) {
         cudaFuncSetAttribute(delta_net_prefill_intra_f32_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             smem_bytes);
+                             smem_for(DNP_CHUNK));
         smem_raised = 1;
     }
     // Chunks for the WIDEST span: shorter spans' surplus blocks return at the
@@ -645,7 +693,7 @@ static inline void launch_prefill_intra_f32(
     dim3 grid(n_chunks, n_v_heads, n_spans);
     delta_net_prefill_intra_f32_kernel<<<grid, DNP_THREADS, smem_bytes, stream>>>(
         qk_wave, v_wave, alpha_wave, blin_wave, dt_bias, a_neg, u, w, kq, g_cs,
-        spans, n_spans, t_tran, n_v_heads, n_k_heads, tok_stride, q_scale);
+        spans, n_spans, t_tran, n_v_heads, n_k_heads, tok_stride, q_scale, rows);
 }
 
 static inline void launch_prefill_state_f32(

@@ -1788,7 +1788,7 @@ impl ExpertCache {
     ///
     /// This used to be driven from the pipeline thread's `post_compute`, which
     /// runs the instant a MoE layer's work is answered — with the forward thread
-    /// still inside `ffn_forward` holding that layer's FFN wave guard. So it was
+    /// still inside `ffn_residual` holding that layer's FFN wave guard. So it was
     /// asked forty-eight times a forward from inside the wave, and whether it
     /// landed came down to a race with the forward thread's phase transitions:
     /// refused in the common case, and in the narrow window between one layer's

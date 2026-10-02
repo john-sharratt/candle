@@ -2944,6 +2944,44 @@ impl QMatMul {
         )
     }
 
+    /// `silu(proj[:, 0..cols]) · Wᵀ` as F32, the activation quantized to q8a128 by the
+    /// kernel's own tile loader under `sum_scale` — one launch where a SiLU producer and this
+    /// matmul took two, with the same bits. `proj` is `[M, width ≥ cols]` F32 read through its
+    /// row stride. The weight must be the Q8_KO twin on CUDA. See
+    /// [`cuda::q8a128_dense_matmul_silu`].
+    #[cfg(feature = "cuda")]
+    pub fn forward_silu_f32<'w>(
+        &self,
+        proj: &LiveTensor<'w>,
+        cols: usize,
+        sum_scale: SumScale,
+    ) -> Result<LiveTensor<'w>> {
+        let t = match self {
+            Self::QTensor(t) => t,
+            _ => crate::bail!("forward_silu_f32 requires a QTensor weight"),
+        };
+        let cs = match &t.storage {
+            QStorage::Cuda(cs) => cs,
+            _ => crate::bail!("forward_silu_f32 requires CUDA storage"),
+        };
+        if t.shape().dims()[1] != cols {
+            crate::bail!(
+                "forward_silu_f32: a {:?} weight against {cols} activation columns",
+                t.shape().dims()
+            );
+        }
+        let device = cs.device().clone();
+        cuda::q8a128_dense_matmul_silu(
+            proj,
+            cols,
+            cs.data_ptr(),
+            t.dtype(),
+            t.shape().dims()[0],
+            sum_scale,
+            &device,
+        )
+    }
+
     /// Fused q/k/v projection in ONE launch: the shared q8a128 activation `op` × the separate KO
     /// weights `q/k/v` (any KO formats — no weight concatenation needed), returning the concatenated
     /// `[lead.., Nq+Nk+Nv]` output cast to `out_dtype`. Float-identical to three separate

@@ -1547,6 +1547,71 @@ mod tests {
         assert!(sd < 3e-4, "state diverged from the sequential rule: {sd}");
     }
 
+    /// A verify wave's spans — one to five tokens each, in one launch — match the
+    /// sequential rule, output and state. These are the lengths where the intra
+    /// pass sizes its row buffers to the span rather than the chunk, and where the
+    /// A/kq grid's 4-wide tiles read rows past `c_len`: one- and two-token spans
+    /// are the ones a buffer cut to the bare length would overrun.
+    #[test]
+    fn verify_width_spans_match_the_sequential_reference() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let cpu = Device::Cpu;
+        let (h_k, h_v, d) = (2usize, 4usize, 128usize);
+        for lens in [&[1usize][..], &[2, 1], &[3, 5, 1, 2]] {
+            let t: usize = lens.iter().sum();
+            let case = FusedCase::build(t, h_k, h_v, 61 + t as u64, &cpu, &gpu);
+            let states: Vec<Tensor> = (0..lens.len())
+                .map(|i| lcg_tensor(&[h_v, d, d], 700 + i as u64, &cpu))
+                .collect();
+            let gpu_states: Vec<Tensor> = states
+                .iter()
+                .map(|s| s.to_device(&gpu).unwrap().contiguous().unwrap())
+                .collect();
+            let mut start = 0usize;
+            let rows: Vec<TestSpan<'_>> = lens
+                .iter()
+                .zip(&gpu_states)
+                .map(|(&len, s)| {
+                    let row = TestSpan {
+                        tail: s,
+                        tail_out: s,
+                        state: s,
+                        state_out: s,
+                        start,
+                        len,
+                    };
+                    start += len;
+                    row
+                })
+                .collect();
+            let o = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
+            delta_net_prefill_scan(&case.fused(&o), &span_table(&rows)).unwrap();
+            let o_gpu = o.reshape((t, h_v, d)).unwrap().to_device(&cpu).unwrap();
+
+            let mut start = 0usize;
+            for (i, &len) in lens.iter().enumerate() {
+                let span = |x: &Tensor| x.narrow(0, start, len).unwrap().contiguous().unwrap();
+                let (o_ref, s_ref) = delta_recurrence(
+                    states[i].copy().unwrap(),
+                    &span(&case.q_ref),
+                    &span(&case.k_ref),
+                    &span(&case.v_ref),
+                    &span(&case.g_ref),
+                    &span(&case.b_ref),
+                )
+                .unwrap();
+                let od = max_diff(&span(&o_gpu), &o_ref);
+                let sd = max_diff(&gpu_states[i].to_device(&cpu).unwrap(), &s_ref);
+                assert!(od < 3e-4, "{lens:?} span {i}: output diverged by {od}");
+                assert!(sd < 3e-4, "{lens:?} span {i}: state diverged by {sd}");
+                start += len;
+            }
+        }
+    }
+
     /// **Several sequences in one launch must equal each of them alone.**
     ///
     /// This is what the span table exists for, and the property it can break:

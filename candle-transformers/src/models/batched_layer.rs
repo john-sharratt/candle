@@ -370,34 +370,39 @@ pub trait BatchedAttentionLayer {
         wave: WaveRef<'w>,
     ) -> Result<DynamicActs<'w>>;
 
-    /// FFN/MoE module consuming the producer-prepared `DynamicActs` (the fused `ffn_norm`): the
-    /// router + expert gather take the q8a128 directly (no standalone quantize).
+    /// The FFN/MoE sub-block's residual update, `x += ffn(acts)`, consuming the
+    /// producer-prepared `DynamicActs` (the fused `ffn_norm`): the router + expert
+    /// gather take the q8a128 directly (no standalone quantize).
     ///
-    /// Two widths, because they are two different questions. `work_dtype` is the
-    /// FP-stable width the SwiGLU intermediates need — an F16 activation runs
-    /// them in BF16, whose range they can exceed F16's. `out_dtype` is what the
-    /// residual stream wants back, and the implementation **returns that**: the
-    /// down projection stores it, so nothing narrows a full tensor per layer per
-    /// wave to undo a widening only the intermediates needed.
+    /// The residual is the implementation's to update rather than a result to
+    /// hand back, because the last step of an FFN is often cheapest folded into
+    /// that add — a gated shared expert's sigmoid, multiply and combine run in
+    /// the same launch as the residual add ([`super::qwen35::shared_residual`]).
+    /// An implementation with nothing to fold adds its output with
+    /// [`add_ffn_residual`].
     ///
-    /// `'w` bounds the *result*, not the input: the FFN activations always come
-    /// from [`Self::ffn_norm`], which allocates, while the MoE combine target is
-    /// taken from the wave. A dense MLP hands its activations to a `Module` and
-    /// so could not accept a wave-scoped operand anyway.
+    /// `work_dtype` is the FP-stable width the SwiGLU intermediates need — an
+    /// F16 activation runs them in BF16, whose range they can exceed F16's. The
+    /// residual's own type is what lands in it: a down projection stores it
+    /// directly, so nothing narrows a full tensor per layer per wave to undo a
+    /// widening only the intermediates needed.
+    ///
+    /// `'w` bounds the FFN's transients: the activations come from
+    /// [`Self::ffn_norm`], and the MoE combine target is taken from the wave.
     /// `decode_tokens` is the count of leading rows (of this call's combined
     /// buffer) that are decode-attributed. Only an MoE implementation reads it,
     /// to weight expert-cache residency scoring — a decode row's reuse of a
     /// given expert is near-certain step to step, a prefill row's is close to
     /// zero, so the two must not bid for slots on equal footing. A dense FFN
     /// ignores it.
-    fn ffn_forward<'w>(
+    fn ffn_residual<'w>(
         &self,
+        x: &mut Tensor,
         acts: DynamicActs<'w>,
         work_dtype: DType,
-        out_dtype: DType,
         decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
-    ) -> Result<LiveTensor<'w>>;
+    ) -> Result<()>;
 
     /// Project Q/K/V over the producer-prepared `DynamicActs` (the fused `attention_norm`), folding
     /// in any Q/K/V bias and q/k-norm. q/k/v share the single quantize (B1).
@@ -598,9 +603,9 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     // The layer's other transient scope, and the same shape as the attention
     // one: it spans the FFN through the residual add that consumes its result,
     // after which nothing the expert forward produced is live. The MoE combine
-    // target is what this bounds — it is returned from `ffn_forward`, so no
-    // scope inside the MoE code could have bounded it (§3.6, and see
-    // `wave_buffers`).
+    // target is what this bounds — it is returned from the expert forward to
+    // the residual update in `ffn_residual`, so no scope inside the expert code
+    // could have bounded it (§3.6, and see `wave_buffers`).
     #[cfg(feature = "cuda")]
     let ffn_wave = match x.as_cat_tensor().device() {
         Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Ffn)?),
@@ -608,10 +613,6 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     };
     #[cfg(not(feature = "cuda"))]
     let ffn_wave: Option<()> = None;
-    // `ffn_forward` returns `orig_dtype` — its down projection stores it — so
-    // the residual add takes the result as it stands. Narrowing here instead
-    // cost a full-tensor pass per layer per wave to undo the widening only the
-    // SwiGLU intermediates needed.
     // Decode rows (plus any single-token prefills folded into the decode
     // group) sit first in the combined buffer — see `WaveAttnGroup::rows`'s
     // accumulation above. `take_while` rather than an unconditional filter+sum
@@ -622,29 +623,30 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
         .take_while(|g| g.decode_layout)
         .map(|g| g.rows)
         .sum();
-    let h2 = {
-        let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode(), ffn_wave.as_ref())?;
-        layer.ffn_forward(
-            acts,
-            mlp_dtype,
-            orig_dtype,
-            decode_tokens,
-            ffn_wave.as_ref(),
-        )?
-    };
-    // Same contract as the attention residual above: `ffn_forward` stores
-    // `orig_dtype`, and the residual never left it, so this is an assertion.
-    expect_dtype(
-        &h2,
-        orig_dtype,
-        "ffn residual: ffn(x) vs the residual stream",
+    let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode(), ffn_wave.as_ref())?;
+    layer.ffn_residual(
+        x.as_cat_tensor_mut(),
+        acts,
+        mlp_dtype,
+        decode_tokens,
+        ffn_wave.as_ref(),
     )?;
-    x.add_mut(&h2)?;
-    // No `drop(h2)` / `drop(ffn_wave)` here: `h2` borrows `ffn_wave`, so the
-    // compiler already refuses any order but this one. The guard falls out of
-    // scope at the end of the function, fencing the stream and rewinding the
-    // half — which is exactly where the hand-written drops used to put it.
+    // The guard falls out of scope at the end of the function, after the
+    // residual update that consumed everything the FFN put on it, fencing the
+    // stream and rewinding the half.
     Ok(())
+}
+
+/// `x += h`, the FFN residual add for an implementation of
+/// [`BatchedAttentionLayer::ffn_residual`] with nothing to fold into it.
+///
+/// VALIDATED, not converted: an FFN's down projection stores the residual's own
+/// type, so the two agree by construction. Rewriting `x` to meet the FFN output
+/// would be a full-tensor pass per layer per wave, and one that silently absorbs
+/// a producer that later starts emitting the wrong width (hot-path invariant 1b).
+pub fn add_ffn_residual(x: &mut Tensor, h: &LiveTensor<'_>) -> Result<()> {
+    expect_dtype(h, x.dtype(), "ffn residual: ffn(x) vs the residual stream")?;
+    x.add_mut(h)
 }
 
 /// Compute batched attention for a layer.

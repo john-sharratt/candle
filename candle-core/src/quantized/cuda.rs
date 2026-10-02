@@ -51,7 +51,9 @@ use super::int8_matmul_mode::q8a128_dense_use_mode2;
 use super::int8_split_k::q8a128_dense_k_splits;
 use super::table_ring::table_ring;
 
+mod silu_matmul;
 mod split_k;
+pub(crate) use silu_matmul::q8a128_dense_matmul_silu;
 pub use split_k::ensure_split_k_scratch;
 use split_k::q8a128_dense_matmul_split_k;
 

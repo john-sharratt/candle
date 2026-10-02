@@ -20,13 +20,15 @@
 //! call takes ownership last.
 
 use candle::quantized::cuda::DynamicActs;
-use candle::{DType, LiveTensor, Result};
+use candle::{DType, LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 use candle_nn::ops::sigmoid;
 
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::quantized_mlp::QuantizedMlp;
 use crate::models::quantized_qwen3_moe::SparseMoeBlock;
+
+use super::shared_residual::add_moe_residual;
 
 /// One Qwen3.5 MoE layer.
 ///
@@ -138,49 +140,62 @@ impl Qwen35MoeBlock {
         Ok(MoeParts { routed, shared })
     }
 
-    /// `routed(x) + sigmoid(w_gate · x) · shared(x)`.
+    /// `x += routed(a) + sigmoid(w_gate · a) · shared(a)`, where `a` is the
+    /// layer's normed activation and `x` the residual stream it came from.
     ///
     /// Matches `qwen35moe.cpp`'s combine and the F32 reference in
-    /// [`super::moe`], which is validated against llama.cpp.
-    pub fn forward_dynamic<'w>(
+    /// [`super::moe`], which is validated against llama.cpp. The combine and the
+    /// residual add are one launch ([`add_moe_residual`]): the parts are at
+    /// `work_dtype` and narrow to the stream's type after their sum, exactly
+    /// where the separate launches did.
+    pub fn forward_residual<'w>(
         &self,
+        x: &mut Tensor,
         acts: DynamicActs<'w>,
-        out_dtype: DType,
+        work_dtype: DType,
         decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
-    ) -> Result<LiveTensor<'w>> {
+    ) -> Result<()> {
         let MoeParts { routed, shared } =
-            self.forward_parts(acts, out_dtype, decode_tokens, wave)?;
-        let gated = shared.gated()?;
-        // The three values the layer's output is made of, checked where they
-        // are still separable.
-        //
-        // The routed half is instrumented all the way down; the SHARED half was
-        // not instrumented at all, and it is the other half of the sum. Its
-        // `sigmoid` and its per-token broadcast are the only broadcast ops in
-        // the FFN — and a broadcast add is what the fault's kernel breadcrumb
-        // named. Checking `gated` and `routed` apart, then their sum, is what
-        // separates "one of the addends was already bad" from "the combine
-        // produced it".
+            self.forward_parts(acts, work_dtype, decode_tokens, wave)?;
+        // The values the layer's output is made of, checked where they are
+        // still separable — the routed sum, the shared expert and its gate apart,
+        // then the residual they land in. Bad on an input names the addend; bad
+        // only on the residual names the combine.
         #[cfg(feature = "tensor-assert")]
-        {
+        let cuda = {
             use crate::models::nan_capture::checkpoint;
             use candle::tensor_assert::site;
-            if let candle::Device::Cuda(d) = routed.device() {
-                let li = self.routed.moe_layer_idx;
-                checkpoint(site("moe.shared_gated.L", li), &gated, &[], d)?;
-                checkpoint(site("moe.routed_sum_in.L", li), &routed, &[], d)?;
-                let sum = (&routed + &gated)?;
-                checkpoint(
-                    site("moe.combined.L", li),
-                    &sum,
-                    &[("routed", &routed), ("gated", &gated)],
-                    d,
-                )?;
-                return Ok(sum);
+            use candle::Device;
+            match routed.device() {
+                Device::Cuda(d) => {
+                    let li = self.routed.moe_layer_idx;
+                    checkpoint(site("moe.shared_out.L", li), &shared.y, &[], d)?;
+                    checkpoint(site("moe.shared_gate.L", li), &shared.gate, &[], d)?;
+                    checkpoint(site("moe.routed_sum_in.L", li), &routed, &[], d)?;
+                    checkpoint(site("moe.residual_in.L", li), x, &[], d)?;
+                    Some(d.clone())
+                }
+                _ => None,
             }
+        };
+        add_moe_residual(x, &routed, &shared)?;
+        #[cfg(feature = "tensor-assert")]
+        if let Some(d) = cuda {
+            use crate::models::nan_capture::checkpoint;
+            use candle::tensor_assert::site;
+            checkpoint(
+                site("moe.combined.L", self.routed.moe_layer_idx),
+                x,
+                &[
+                    ("routed", &routed),
+                    ("shared", &shared.y),
+                    ("gate", &shared.gate),
+                ],
+                &d,
+            )?;
         }
-        &routed + &gated
+        Ok(())
     }
 }
 

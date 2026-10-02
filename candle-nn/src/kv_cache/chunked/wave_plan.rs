@@ -990,7 +990,7 @@ pub enum WaveBuffer {
     /// The MoE result **narrowed to the residual's dtype**, when the experts ran
     /// in a different one. Both paths.
     ///
-    /// `ffn_forward` hands the experts `work_dtype` — BF16 for an F16 session,
+    /// `ffn_residual` hands the experts `work_dtype` — BF16 for an F16 session,
     /// the F16-overflow stability cast — and then calls
     /// `to_dtype_mut(out_dtype)` on the combine. That returns early when the
     /// dtypes agree and **allocates** a fresh `rows × hidden` buffer when they do

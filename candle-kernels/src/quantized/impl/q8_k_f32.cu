@@ -67,3 +67,9 @@ INSTANTIATE_KERNEL_DENSE_INT8_SK_ALL(
     q8_ko_int8,
     QK8_K_KTILE, QI8_K_KTILE, block_c_q8_KO, VDR_Q8_K_KTILE
 )
+// The fused-activation matmul is the hyper-connection `up` projection's, whose module is
+// Q8_KO with an F32 output (`qwen4exp::hyper::ko`) — the one instantiation it needs.
+INSTANTIATE_KERNEL_DENSE_INT8_SILU(
+    q8_ko_int8_f32,
+    QK8_K_KTILE, QI8_K_KTILE, block_c_q8_KO, VDR_Q8_K_KTILE, float
+)

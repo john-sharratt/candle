@@ -18,7 +18,7 @@
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::quantized::{Int8Mode, SumScale};
-use candle::{DType, LiveTensor, Result, Tensor};
+use candle::{DType, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 
 use crate::models::batched_layer::{BatchedAttentionLayer, QkvProjection, WaveRef};
@@ -84,14 +84,14 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
         )
     }
 
-    fn ffn_forward<'w>(
+    fn ffn_residual<'w>(
         &self,
+        _x: &mut Tensor,
         _acts: DynamicActs<'w>,
         _work_dtype: DType,
-        _out_dtype: DType,
         _decode_tokens: usize,
         _wave: Option<&'w WaveGeneration>,
-    ) -> Result<LiveTensor<'w>> {
+    ) -> Result<()> {
         candle::bail!(
             "qwen4exp: the FFN runs under the Gated Residual in the sweep, never \
              through the attention layer's hooks"

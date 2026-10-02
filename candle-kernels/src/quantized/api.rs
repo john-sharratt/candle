@@ -222,6 +222,24 @@ extern "C" {
         counters: *mut u32,
     ) -> i32;
 
+    /// Fused-activation int8 dense matmul for a Q8_KO weight `[N, K]`:
+    /// `dst [M, N] (F32) = silu(proj[:, 0..K]) · Wᵀ`, the activation quantized to q8a128 by
+    /// the kernel's own tile loader — the bytes `gr_silu_q8` would have written, without its
+    /// launch. `proj` is `[M, proj_stride]` F32 (`proj_stride ≥ K`, rows 16-byte aligned);
+    /// `mode2` picks the Bm=32 tile as the dense launch does. Returns a [`MatmulStatus`] code:
+    /// `NoKernel` for a K that is not whole 128-tiles inside a row, or an N not whole 32-rows.
+    pub fn run_dense_int8_silu_q8ko_f32(
+        weights: *const c_void,
+        proj: *const f32,
+        proj_stride: i32,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        total_batch: i32,
+        sum_norm: i32,
+        mode2: i32,
+    ) -> i32;
+
     /// Segmented qkv int8 dense matmul: one launch over a shared q8a128 activation × up to 3 KO
     /// weights of possibly-different formats, writing the concatenated `[M, N_total]` output.
     /// - `h_segs`: HOST pointer to a `num_segs`-long (≤3) `qkv_seg_t` array (24 bytes each); the

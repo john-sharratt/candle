@@ -1048,6 +1048,49 @@ extern "C" int run_dense_int8_splitk(
     return QMM_OK;
 }
 
+// The fused-activation dense matmul: `dst [M, N] = silu(proj[:, 0..K]) · Wᵀ` for a Q8_KO
+// weight and an F32 output, the activation quantized by the kernel's own loader
+// (grouped_tc::quantized_matmul_dense_silu_entry_int8). `proj` rows are `proj_stride`
+// floats apart; `mode2` picks the Bm=32 tile exactly as the dense launch's does.
+extern "C" __global__ void q8_ko_int8_f32_dense_silu(
+    const void*, const float*, int, float*, int, int, int, int, int);
+extern "C" __global__ void q8_ko_int8_f32_dense_silu_m2(
+    const void*, const float*, int, float*, int, int, int, int, int);
+
+extern "C" int run_dense_int8_silu_q8ko_f32(
+    const void* weights,
+    const float* proj,
+    int32_t proj_stride,
+    float* dst,
+    int32_t ncols_x,      // K: the activation's width, the weight's columns
+    int32_t nrows_x,      // N
+    int32_t total_batch,  // M
+    int32_t sum_norm,
+    int32_t mode2
+) {
+    // K whole tiles inside each row; N whole 32-row tiles.
+    if (ncols_x <= 0 || ncols_x % 128 != 0 || proj_stride < ncols_x || nrows_x % 32 != 0) {
+        return QMM_NO_KERNEL;
+    }
+    // An empty product has nothing to write — and a zero-sized grid is a launch
+    // error that would otherwise surface at whatever op checks next.
+    if (total_batch <= 0 || nrows_x <= 0) {
+        return QMM_OK;
+    }
+    const int bm = mode2 ? 32 : 16;
+    dim3 grid((total_batch + bm - 1) / bm, (nrows_x + 31) / 32, 1);
+    dim3 block(WARP_SIZE, 4, 1);
+    const int dst_stride = nrows_x;
+    void* args[] = {
+        (void*)&weights, (void*)&proj, (void*)&proj_stride, (void*)&dst,
+        (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
+        (void*)&dst_stride, (void*)&sum_norm,
+    };
+    cudaLaunchKernel(mode2 ? (void*)q8_ko_int8_f32_dense_silu_m2 : (void*)q8_ko_int8_f32_dense_silu,
+                     grid, block, args, 0, nullptr);
+    return QMM_OK;
+}
+
 extern "C" int run_quantized_matmul(
     const vx_segment_t* segments,
     int32_t num_segments,

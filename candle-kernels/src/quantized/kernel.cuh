@@ -67,6 +67,8 @@ struct YTiles {
 #include "mma_dequant.cuh"
 #include "../dequant/dequant.cuh"
 #include "../mma/mma_wrappers.cuh"  // fused_attn INT8 MMA wrappers + frag loaders (grouped_tc int8 path)
+#include "../fast_exp.cuh"           // the SiLU the fused-activation loader applies
+#include "../quantize/q8a128_tile.cuh" // the one q8a128 quantization, for that loader
 
 // =============================================================================
 // FORWARD DECLARATIONS - Optimized standalone dequant functions
@@ -1873,6 +1875,71 @@ __device__ __forceinline__ void load_q8a128_activations(
     }
 }
 
+// Activation tile computed in place from F32 rows: `silu(proj[token, k·128 + ·])`, quantized
+// straight into the shared tile — the operand `gr_silu_q8` would have written and
+// load_q8a128_activations copied, with neither the producer's launch nor its round trip.
+// One warp per token row of the tile (4 warps stride over N_SUB·16 tokens), lane `l` owning
+// elements [4l, 4l+4) — `gr_silu_q8`'s mapping, through the same `fast_exp::silu` and the same
+// `quantize_q8a128_tile`, so the bytes are its. `proj` rows are `proj_stride` floats apart
+// (the gate columns of a wider projection) and 16-byte aligned. Synchronous stores, not
+// cp.async: the caller's next barrier publishes them exactly as it publishes the copies.
+// Rows ≥ b_cnt are zero-padded as the copying loader pads them.
+//
+// Every one of a warp's token rows is loaded before the first is quantized: the loads are
+// independent and the quantize is a serial butterfly, so issuing them one token at a time
+// paid a round trip per token where this pays one per tile.
+template <int N_SUB = 1>
+__device__ __forceinline__ void load_silu_f32_activations(
+    const float* __restrict__ proj, int proj_stride, int b_start, int b_cnt, int k_blk,
+    int tid, int sum_norm,
+    int8_t smem_A_i8[N_SUB * 16][KI8_STRIDE],
+    half2 smem_A_ds[N_SUB * 16])
+{
+    constexpr int ROWS_PER_WARP = N_SUB * 16 / 4;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    float4 v[ROWS_PER_WARP];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        const int token = warp + r * 4;
+        if (token < b_cnt) {
+            v[r] = *reinterpret_cast<const float4*>(
+                proj + (int64_t)(b_start + token) * proj_stride + k_blk * K_TILE + lane * 4);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        const int token = warp + r * 4;
+        if (token < b_cnt) {   // warp-uniform: the quantize's butterfly is full-warp
+            const Q8a128Lane t = quantize_q8a128_tile(
+                fast_exp::silu<float>(v[r].x), fast_exp::silu<float>(v[r].y),
+                fast_exp::silu<float>(v[r].z), fast_exp::silu<float>(v[r].w), sum_norm);
+            *reinterpret_cast<char4*>(&smem_A_i8[token][lane * 4]) = t.q;
+            if (lane == 0) smem_A_ds[token] = t.ds;
+        } else {
+            *reinterpret_cast<char4*>(&smem_A_i8[token][lane * 4]) = make_char4(0, 0, 0, 0);
+            if (lane == 0) smem_A_ds[token] = make_half2(__float2half(1.f), __float2half(0.f));
+        }
+    }
+}
+
+// The impl's one activation-tile load, from whichever source the instantiation reads:
+// the q8a128 operand (copied, cp.async) or, with ACT_SILU, F32 rows quantized in place.
+template <int N_SUB, bool ACT_SILU>
+__device__ __forceinline__ void load_act_tile(
+    const block_q8a128* __restrict__ act, const float* __restrict__ act_f32, int act_f32_stride,
+    int b_start, int b_cnt, int k_blk, int tiles_per_row, int tid, int sum_norm,
+    int8_t smem_A_i8[N_SUB * 16][KI8_STRIDE], half2 smem_A_ds[N_SUB * 16])
+{
+    if constexpr (ACT_SILU) {
+        load_silu_f32_activations<N_SUB>(act_f32, act_f32_stride, b_start, b_cnt, k_blk, tid,
+                                         sum_norm, smem_A_i8, smem_A_ds);
+    } else {
+        load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk, tiles_per_row, tid,
+                                       smem_A_i8, smem_A_ds);
+    }
+}
+
 // One (expert-tile, row-tile) on the INT8 tensor core: load_q8a128_activations + a per-warp
 // weight ring, in 8-row chunks. At the two-stage pipeline every unsplit launch runs, each warp
 // streams its row-group's chunks through ONE slot — the dequant drains the loaded chunk to
@@ -1940,8 +2007,12 @@ struct is_mxfp4_persub<block_c_mxfp4_k1024> {
 // row's output never depends on how many rows its wave carried, and the unsplit kernel
 // carries nothing for it. (MXFP4's per-sub fold accumulates straight into the sum, which a
 // per-tile partial cannot reproduce; it never splits — see `dense_qmatmul_with_splits`.)
+//
+// ACT_SILU: the activation is `silu` of F32 rows (`act_f32`, `act_f32_stride` apart) and
+// each tile is quantized as it is loaded (`load_silu_f32_activations`) — no q8a128 operand
+// exists; `act` is unread.
 template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1,
-          int STAGES = 2, bool TILE_PARTIALS = false>
+          int STAGES = 2, bool TILE_PARTIALS = false, bool ACT_SILU = false>
 __device__ void grouped_matmul_impl_int8(
     const block_compact_t<block_q_t>* __restrict__ weights,
     const block_q8a128* __restrict__ act,
@@ -1960,7 +2031,10 @@ __device__ void grouped_matmul_impl_int8(
     // TILE_PARTIALS: the per-tile F32 partials, tile `k` at `partial + k · partial_stride`,
     // each laid out like `dst` (`dst_stride` wide). See the split-K dense entry.
     float* __restrict__ partial = nullptr,
-    size_t partial_stride = 0)
+    size_t partial_stride = 0,
+    // ACT_SILU: the F32 rows the activation is `silu` of, and their stride in floats.
+    const float* __restrict__ act_f32 = nullptr,
+    int act_f32_stride = 0)
 {
     using block_c_t = block_compact_t<block_q_t>;
     // The operand's sum convention, as the two coefficients that rebuild Σx.
@@ -2019,7 +2093,8 @@ __device__ void grouped_matmul_impl_int8(
         const int t = k_begin + s;
         if (t < k_blocks) {
             load_warp_chunk_int8<block_c_t>(w_slot(t), weights, t, warp_row_base, nrows, lane);
-            load_q8a128_activations<N_SUB>(act, b_start, b_cnt, t, tiles_per_row, tid,
+            load_act_tile<N_SUB, ACT_SILU>(act, act_f32, act_f32_stride, b_start, b_cnt, t,
+                                           tiles_per_row, tid, sum_norm,
                                            smem_A_i8[a_buf(t)], smem_A_ds[a_buf(t)]);
             if constexpr (STAGES == 2) cp_async_commit();
         }
@@ -2068,7 +2143,8 @@ __device__ void grouped_matmul_impl_int8(
             const int next = k_blk + AHEAD;
             if (next < k_blocks) {
                 load_warp_chunk_int8<block_c_t>(w_slot(next), weights, next, warp_row_base, nrows, lane);
-                load_q8a128_activations<N_SUB>(act, b_start, b_cnt, next, tiles_per_row, tid,
+                load_act_tile<N_SUB, ACT_SILU>(act, act_f32, act_f32_stride, b_start, b_cnt,
+                                               next, tiles_per_row, tid, sum_norm,
                                                smem_A_i8[a_buf(next)], smem_A_ds[a_buf(next)]);
                 if constexpr (STAGES == 2) cp_async_commit();
             }
@@ -2159,7 +2235,8 @@ __device__ void grouped_matmul_impl_int8(
             // WAR: every warp is done reading tile k's activation — safe to reload in place.
             __syncthreads();
             if (k_blk + 1 < k_blocks) {
-                load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk + 1, tiles_per_row, tid,
+                load_act_tile<N_SUB, ACT_SILU>(act, act_f32, act_f32_stride, b_start, b_cnt,
+                                               k_blk + 1, tiles_per_row, tid, sum_norm,
                                                smem_A_i8[0], smem_A_ds[0]);
                 cp_async_commit();
             }
@@ -2209,6 +2286,38 @@ static __device__ void quantized_matmul_dense_entry_int8(
         grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
             weights, act, dst, ncols_x, nrows_x, y_stride, dst_stride,
             b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
+    }
+}
+
+// INT8 dense entry over a FUSED activation: `dst = silu(proj[:, 0..K]) · Wᵀ`, with the
+// activation quantized tile by tile as the impl loads it (ACT_SILU) — the matmul the
+// hyper-connection's `up` projection runs, without the `gr_silu_q8` launch that wrote its
+// operand. `proj` is the bottleneck's `[M, proj_stride]` F32 output, read through its row
+// stride. Same tile schedule as the dense entry, and the same bits as `gr_silu_q8` followed
+// by it.
+template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1>
+static __device__ void quantized_matmul_dense_silu_entry_int8(
+    const block_compact_t<block_q_t>* __restrict__ weights,
+    const float* __restrict__ proj,
+    int proj_stride,
+    output_t* __restrict__ dst,
+    int ncols_x, int nrows_x, int total_batch, int dst_stride,
+    int sum_norm)
+{
+    constexpr int BATCH = N_SUB * 16;
+    const int b_start = blockIdx.x * BATCH;
+    const int b_cnt = min(BATCH, total_batch - b_start);
+    const int row_tile_idx = blockIdx.y;
+
+    __shared__ __align__(16) int8_t smem_A_i8[2][BATCH][KI8_STRIDE];
+    __shared__ __align__(16) half2 smem_A_ds[2][BATCH];
+    __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
+
+    if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
+        grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB, 2, false, true>(
+            weights, nullptr, dst, ncols_x, nrows_x, 0, dst_stride,
+            b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm,
+            0, -1, nullptr, 0, proj, proj_stride);
     }
 }
 

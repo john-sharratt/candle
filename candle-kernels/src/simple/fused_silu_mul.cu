@@ -17,22 +17,12 @@
 #include "../fast_exp.cuh"
 #include "../blocks.cuh"
 #include "../quantize/q8a128_tile.cuh"
+#include "silu_fwd.cuh"
 #include <stdint.h>
 
-// silu_fwd template — same as in unary.cu but needed here since it's not in a header
-template<typename T>
-__device__ __forceinline__ T fused_silu_fwd(T x) {
-    return x / (static_cast<T>(1) + expg(-x));
-}
-
-template<>
-__device__ __forceinline__ float fused_silu_fwd<float>(float x) {
-    return fast_exp::silu<float>(x);
-}
-
-template<>
-__device__ __forceinline__ double fused_silu_fwd<double>(double x) {
-    return x / (1.0 + exp(-x));
+// The F32 SiLU every float-computed SwiGLU below runs: `usilu_f32`'s.
+__device__ __forceinline__ float fused_silu_fwd(float x) {
+    return silu_fwd<float>(x);
 }
 
 // =============================================================================
@@ -198,13 +188,18 @@ BINARY_OP_F8E4M3_VEC4(fused_silu_mul_f8_e4m3, f8_silu_mul)
 // FUSED SwiGLU → q8a128 (producer epilogue B4)
 // =============================================================================
 // out[i] = silu(gate[i]) * up[i], quantized directly to q8a128 — one kernel that
-// replaces silu_mul (FP store) + quantize_acts_q8a128 (re-read). One warp per
-// 128-tile: lane owns 4 contiguous elements; the SwiGLU result is rounded through
-// the store dtype T (mirrors the FP store), then the per-128 amax/Σx butterfly +
+// replaces the SwiGLU's FP store + quantize_acts_q8a128 (re-read). One warp per
+// 128-tile: lane owns 4 contiguous elements, then the per-128 amax/Σx butterfly +
 // char4 store + lane-0 ds write the q8a1024 flat-grouped block (see blocks.cuh),
-// identical to quantize_q8a128_kernel on the SwiGLU output. silu uses the same
-// fused_silu_fwd<float> (fast_exp) as the unfused kernel, so the result tracks the
-// two-call path within float margin. Requires (rows*cols) % 128 == 0.
+// identical to quantize_q8a128_kernel on the SwiGLU output.
+//
+// **The SwiGLU is the eager `silu(gate) · up` at T, bit for bit** — `smq8_swiglu`:
+// at F32 `usilu_f32`'s SiLU times `up`; at BF16 `usilu_bf16`'s SiLU in BF16
+// arithmetic, rounded, then the BF16 product, rounded — the two stores the eager
+// chain made, which is the arithmetic every KV calibration row was derived on.
+// (A single rounding of the F32 product is more precise and is NOT the same
+// bytes; it moved the 0.8B's top rungs across their edge.) Requires
+// (rows*cols) % 128 == 0.
 
 template <typename T>
 __device__ __forceinline__ void smq8_load4(const T* p, float& a, float& b, float& c, float& d);
@@ -228,11 +223,21 @@ __device__ __forceinline__ void smq8_load4<__nv_bfloat16>(const __nv_bfloat16* p
     a = lo.x; b = lo.y; c = hi.x; d = hi.y;
 }
 
-// Round a float through the store dtype T and back (mirrors silu_mul's FP store).
-template <typename T> __device__ __forceinline__ float smq8_round(float v);
-template <> __device__ __forceinline__ float smq8_round<float>(float v) { return v; }
-template <> __device__ __forceinline__ float smq8_round<__half>(float v) { return __half2float(__float2half_rn(v)); }
-template <> __device__ __forceinline__ float smq8_round<__nv_bfloat16>(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+// `silu(g) · u` as the eager chain computes it at T, from operands loaded as
+// floats (exact: every T widens to F32 losslessly), returned widened.
+template <typename T> __device__ __forceinline__ float smq8_swiglu(float g, float u);
+template <> __device__ __forceinline__ float smq8_swiglu<float>(float g, float u) {
+    return __fmul_rn(silu_fwd<float>(g), u);
+}
+template <> __device__ __forceinline__ float smq8_swiglu<__nv_bfloat16>(float g, float u) {
+    const __nv_bfloat16 s = silu_fwd<__nv_bfloat16>(__float2bfloat16_rn(g));
+    return __bfloat162float(__hmul_rn(s, __float2bfloat16_rn(u)));
+}
+// F16 is never a SwiGLU working width (an F16 stream runs its MLP in BF16), so
+// this one rounds the F32 product once through the store.
+template <> __device__ __forceinline__ float smq8_swiglu<__half>(float g, float u) {
+    return __half2float(__float2half_rn(silu_fwd<float>(g) * u));
+}
 
 template <typename T>
 __device__ void silu_mul_q8a128_impl(
@@ -270,10 +275,10 @@ __device__ void silu_mul_q8a128_impl(
         }
         float g0, g1, g2, g3; smq8_load4<T>(gate + base, g0, g1, g2, g3);
         float u0, u1, u2, u3; smq8_load4<T>(up + base, u0, u1, u2, u3);
-        const float n0 = smq8_round<T>(fused_silu_fwd<float>(g0) * u0);
-        const float n1 = smq8_round<T>(fused_silu_fwd<float>(g1) * u1);
-        const float n2 = smq8_round<T>(fused_silu_fwd<float>(g2) * u2);
-        const float n3 = smq8_round<T>(fused_silu_fwd<float>(g3) * u3);
+        const float n0 = smq8_swiglu<T>(g0, u0);
+        const float n1 = smq8_swiglu<T>(g1, u1);
+        const float n2 = smq8_swiglu<T>(g2, u2);
+        const float n3 = smq8_swiglu<T>(g3, u3);
         // The SwiGLU intermediate is the widest activation in a model and where the
         // raw f16 sum overflows first — the producer `sum_norm` exists for.
         emit_q8a128_tile(obytes, tile, lane, n0, n1, n2, n3, sum_norm);

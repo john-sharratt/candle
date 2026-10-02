@@ -2425,7 +2425,7 @@ pub fn set_weight_floor(stream: &std::sync::Arc<CudaStream>, floor: u64) -> Resu
     // It has already caught a call site that was wrong about that. The weight
     // side's take-back was driven from the expert pipeline's end-of-pass, which
     // reads as "outside a wave" and is not: the pipeline answers a MoE layer
-    // while the forward thread sits inside `ffn_forward`, under that layer's FFN
+    // while the forward thread sits inside `ffn_residual`, under that layer's FFN
     // wave guard. Callers must treat a refusal as a refusal — see
     // `renegotiate_boundary`, which for a while applied its half of the move and
     // then let this bail propagate as a warning.

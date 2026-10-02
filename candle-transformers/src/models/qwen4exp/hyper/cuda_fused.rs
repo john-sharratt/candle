@@ -205,8 +205,9 @@ fn q8_launched(status: i32, what: &str) -> Result<()> {
 
 /// The q8a128 operand of `silu(proj[:, 0..cols])` for the up projection, read
 /// through `proj`'s row stride — one launch in place of a strided `silu` into a
-/// fresh dense buffer and a quantize that re-reads it. Bit-identical to that pair
-/// (`gr_hyper.cu`, `gr_silu_q8`).
+/// fresh dense buffer and a quantize that re-reads it, and bit-identical to that
+/// pair (`gr_hyper.cu`, `gr_silu_q8`). The producer for waves past the fused `up`
+/// loader's width (see [`super::HC_FUSED_SILU_MAX_ROWS`]).
 pub fn silu_q8<'w>(
     proj: &LiveTensor<'w>,
     cols: usize,

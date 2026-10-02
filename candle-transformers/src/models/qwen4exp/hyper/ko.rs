@@ -147,9 +147,11 @@ impl HcProject for HcWeightsKo {
 }
 
 impl HcProjectQ8 for HcWeightsKo {
+    /// The weights' own convention — one for both, since `new` builds them alike —
+    /// so the producers' operands and `up_silu`'s in-loader quantize agree by
+    /// construction rather than by two defaults happening to match.
     fn sum_scale(&self) -> SumScale {
-        // Raw Σx — the mix's block sums stay far below f16's ceiling.
-        SumScale::Raw
+        self.up.sum_scale()
     }
 
     fn down_q8<'w>(&self, xn: &Q8a128Operand<'w>) -> Result<LiveTensor<'w>> {
@@ -159,6 +161,11 @@ impl HcProjectQ8 for HcWeightsKo {
 
     fn up_q8<'w>(&self, lo: &Q8a128Operand<'w>) -> Result<LiveTensor<'w>> {
         self.up.forward_dynamic(DynamicTensor::Int8(lo), DType::F32)
+    }
+
+    fn up_silu<'w>(&self, proj: &LiveTensor<'w>, gate_cols: usize) -> Result<LiveTensor<'w>> {
+        // Quantizes under `up`'s Σx convention, which is the module's (`sum_scale`).
+        self.up.forward_silu_f32(proj, gate_cols)
     }
 }
 
@@ -280,6 +287,49 @@ mod tests {
             panic!("an int8 mode quantizes")
         };
         tile_bytes(op, dev)
+    }
+
+    /// `up` over the bottleneck's SiLU, quantized by the matmul's own loader, is the
+    /// two-step chain bit for bit: `silu` of the gate columns, the standalone
+    /// quantize, then the int8 GEMM over that operand. Across decode widths that run
+    /// the mode-1 tile (1, 3, 16 and the 17–32 band) and prefill widths that run
+    /// mode-2 (40, 96), a partial token tile, and the gate columns read through the
+    /// padded projection's row stride.
+    #[test]
+    fn the_fused_up_is_the_silu_then_quantize_chain_bit_for_bit() {
+        let _gpu = gpu_guard();
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!()
+        };
+        let (hc, d, lr) = (4usize, 2560usize, 320usize);
+        let w = HcWeights::from_checkpoint(
+            lcg(&[hc * d], 71, 0.4, &dev).affine(1.0, 1.0).unwrap(),
+            lcg(&[lr + hc, hc * d], 72, 0.1, &dev),
+            lcg(&[hc * d, lr], 73, 0.1, &dev),
+            hc,
+        )
+        .unwrap();
+        let mode = Int8Mode::auto(&dev);
+        let ko = HcWeightsKo::from_weights(&w, mode).unwrap();
+        let q8 = ko.as_q8().expect("an int8 KO module");
+        let (cols, width) = (ko.gate_cols(), ko.inject_col().unwrap() + hc);
+        for t in [1usize, 3, 16, 17, 40, 96] {
+            let proj = lcg(&[t, width.div_ceil(32) * 32], 74 + t as u64, 4.0, &dev);
+            let got = q8.up_silu(&proj, cols).unwrap();
+            let lo = proj.narrow(1, 0, cols).unwrap().silu().unwrap();
+            let acts = to_dynamic(&lo, mode, cuda, SumScale::Raw).unwrap();
+            let DynamicTensor::Int8(op) = acts.as_dynamic() else {
+                panic!("an int8 mode quantizes")
+            };
+            let want = ko
+                .matmuls()
+                .1
+                .forward_dynamic(DynamicTensor::Int8(op), DType::F32)
+                .unwrap();
+            let bits = |a: &Tensor| a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(bits(&got), bits(&want), "{t} rows");
+        }
     }
 
     /// Each fused producer writes, byte for byte, the operand the standalone

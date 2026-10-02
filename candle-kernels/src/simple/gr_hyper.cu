@@ -286,14 +286,14 @@ extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_q8_kernel(
 //
 // `proj` is the stacked down-projection's output, `[n, rows_stride]` with the
 // gate columns first (the inject columns after them are left alone), read
-// through its row stride. One launch, where a strided `silu` into a fresh dense
-// `[n, cols]` and a quantize that re-read it would be two launches and a round
-// trip for an operand only the next GEMM ever reads.
+// through its row stride. The producer for waves wider than the `up` matmul's
+// fused loader serves (`HC_FUSED_SILU_MAX_ROWS`): there each of `up`'s row tiles would
+// re-quantize its token tile, and one pass here is cheaper than that.
 //
 // One warp per 128-element tile — tile `t` is row `t / (cols/128)`, columns
-// `128·(t mod cols/128) + [0, 128)` — so a decode wave of one row is
-// `cols/128` warps. The SiLU is `fast_exp::silu`, the one `usilu_f32` calls, so
-// the quantized values are those of the two-launch path bit for bit.
+// `128·(t mod cols/128) + [0, 128)`. The SiLU is `fast_exp::silu`, the one
+// `usilu_f32` calls and the fused loader calls, so every path's quantized values
+// are the same bit for bit.
 extern "C" __global__ void __launch_bounds__(THREADS) gr_silu_q8_kernel(
     const float* __restrict__ proj,  // [n, row_stride], gate columns 0..cols
     uint8_t* __restrict__ q8,        // q8a128 operand for [n, cols]

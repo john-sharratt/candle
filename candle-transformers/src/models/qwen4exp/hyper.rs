@@ -144,8 +144,22 @@ pub trait HcProject {
     }
 }
 
-/// The projections of a module that runs on the int8 tensor cores, taking the
-/// q8a128 operands [`cuda_fused::norm_q8`] and [`cuda_fused::silu_q8`] emit.
+/// The widest pre-mix whose `up` runs the fused SiLU loader rather than the
+/// [`cuda_fused::silu_q8`] producer and a plain matmul.
+///
+/// The fused form saves a launch — at decode width a host issue of ~9 µs against
+/// ~1.5 µs of GPU work — and pays for it by having every one of `up`'s 320 row tiles
+/// re-quantize its own token tile, so its cost grows with the wave while the launch it
+/// saves does not. Measured with `gr_hyper_bench ko` on the RTX PRO 5000; the
+/// crossover is set by host launch cost against GPU time, so it moves with the
+/// machine — re-measure it there before trusting it on the 3090 or 4090 Mobile.
+#[cfg(feature = "cuda")]
+pub const HC_FUSED_SILU_MAX_ROWS: usize = 16;
+
+/// The projections of a module that runs on the int8 tensor cores: `down` from the
+/// q8a128 operand [`cuda_fused::norm_q8`] emits, and `up` either from
+/// [`cuda_fused::silu_q8`]'s operand or straight from `down`'s F32 output with its
+/// SiLU and quantize done by the matmul's own loader — the same bits either way.
 #[cfg(feature = "cuda")]
 pub trait HcProjectQ8 {
     /// The Σx convention its operands are written in.
@@ -154,6 +168,9 @@ pub trait HcProjectQ8 {
     fn down_q8<'w>(&self, xn: &Q8a128Operand<'w>) -> Result<LiveTensor<'w>>;
     /// `silu(lo) · upᵀ` from `silu(lo)`'s q8a128 operand.
     fn up_q8<'w>(&self, lo: &Q8a128Operand<'w>) -> Result<LiveTensor<'w>>;
+    /// `silu(proj[:, 0..gate_cols]) · upᵀ`, read from `down`'s output through its row
+    /// stride — one launch, the SiLU and the q8a128 quantize inside it.
+    fn up_silu<'w>(&self, proj: &LiveTensor<'w>, gate_cols: usize) -> Result<LiveTensor<'w>>;
 }
 
 impl HcProject for HcWeights {
@@ -288,13 +305,14 @@ pub fn hc_mix(
 
 /// [`hc_mix`] on the int8 tensor cores, with every operand emitted by the kernel
 /// that produces its values: the norm writes `xn` and its q8a128 operand in one
-/// pass, and the bottleneck's SiLU writes `up`'s operand straight from `down`'s
-/// output. Four launches — norm, down, SiLU, up — and the collapse, where the
-/// unfused chain took seven, each of the extra three a round trip at decode width
-/// that held the GPU idle while the host issued it.
+/// pass, and at decode width `up` quantizes the bottleneck's SiLU itself, tile by
+/// tile, from `down`'s F32 output (wider waves take the SiLU producer — see
+/// [`HC_FUSED_SILU_MAX_ROWS`]). Three launches — norm, down, up — and the
+/// collapse, where the unfused chain took seven: at decode width each launch is a
+/// host issue of several microseconds against a GPU that would otherwise sit idle.
 ///
-/// The arithmetic is the unfused chain's, bit for bit: both producers quantize
-/// with `quantize_q8a128_kernel`'s mapping and order from the same floats.
+/// The arithmetic is the unfused chain's, bit for bit: every operand is quantized
+/// with `quantize_q8a128_kernel`'s mapping and arithmetic from the same floats.
 ///
 /// `emit_block` also returns the block input as its own q8a128 operand, written by
 /// the collapse as it stores it — for a block whose projections run int8, in
@@ -316,8 +334,11 @@ fn hc_mix_q8(
     g.end();
     let g = crate::models::profile::gpu_span("hc_mix:lowrank", dev);
     let proj = q8.down_q8(&xn_q8)?;
-    let lo_q8 = cuda_fused::silu_q8(&proj, w.gate_cols(), ss)?;
-    let gate_raw = q8.up_q8(&lo_q8)?;
+    let gate_raw = if proj.dim(0)? <= HC_FUSED_SILU_MAX_ROWS {
+        q8.up_silu(&proj, w.gate_cols())?
+    } else {
+        q8.up_q8(&cuda_fused::silu_q8(&proj, w.gate_cols(), ss)?)?
+    };
     g.end();
     let g = crate::models::profile::gpu_span("hc_mix:gate_mean", dev);
     let (mixed, block_q8) = if emit_block {

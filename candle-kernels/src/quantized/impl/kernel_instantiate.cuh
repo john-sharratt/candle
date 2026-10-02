@@ -405,6 +405,28 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_m2( \
         vy, dst, ncols_x, nrows_x, total_batch, y_stride, dst_stride, sum_norm); \
 }
 
+//   name##_dense_silu / name##_dense_silu_m2 — the mode-1 / mode-2 tiles over a fused
+//                     activation: `silu` of F32 rows `proj_stride` apart, quantized as it
+//                     loads (grouped_tc::quantized_matmul_dense_silu_entry_int8). The
+//                     hyper-connection `up` projection's matmul.
+#define INSTANTIATE_KERNEL_DENSE_INT8_SILU(name, qk, qi, block_type, vdr, dst_t) \
+extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_dense_silu( \
+    const void* __restrict__ weights, const float* __restrict__ proj, const int proj_stride, \
+    dst_t* __restrict__ dst, const int ncols_x, const int nrows_x, const int total_batch, \
+    const int dst_stride, const int sum_norm) { \
+    grouped_tc::quantized_matmul_dense_silu_entry_int8<qk, qi, block_type, vdr, dst_t, 1>( \
+        reinterpret_cast<const block_compact_t<block_type>*>(weights), \
+        proj, proj_stride, dst, ncols_x, nrows_x, total_batch, dst_stride, sum_norm); \
+} \
+extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_silu_m2( \
+    const void* __restrict__ weights, const float* __restrict__ proj, const int proj_stride, \
+    dst_t* __restrict__ dst, const int ncols_x, const int nrows_x, const int total_batch, \
+    const int dst_stride, const int sum_norm) { \
+    grouped_tc::quantized_matmul_dense_silu_entry_int8<qk, qi, block_type, vdr, dst_t, 2>( \
+        reinterpret_cast<const block_compact_t<block_type>*>(weights), \
+        proj, proj_stride, dst, ncols_x, nrows_x, total_batch, dst_stride, sum_norm); \
+}
+
 // The three narrowed dense entries for one format: `base` names the format's int8
 // kernel family without its output-dtype tag (e.g. q4_k_int8), so this emits
 // base##_f16_dense, base##_bf16_dense and base##_f32_dense.

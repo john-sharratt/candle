@@ -53,7 +53,7 @@ use candle::{DType, Result, Tensor};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::engine::GpuLayerMix;
-use super::hyper::{hc_combine, hc_mix};
+use super::hyper::{hc_combine, hc_combine_gated, hc_mix};
 use super::indexer::{IndexCache, IndexSnapshot};
 use super::mtp::MtpHead;
 use super::spec::SpecCapture;
@@ -459,15 +459,13 @@ impl Qwen4ExpBatched {
             // ceiling.
             candle::quantized::SumScale::Raw,
         )?;
-        let y2 = head
-            .block
-            .moe
-            // A draft head only ever runs behind a decode step — there is no
-            // prefill/prompt traffic through one — so all `n` rows are
-            // decode-attributed.
-            .forward_dynamic(acts, DType::F32, n, None)?
-            .reshape((n, n_embd))?;
-        hc_combine(&mut res, &y2, &inject2)?;
+        // The layer's output in its three parts, assembled by the combine as
+        // the trunk's are. A draft head only ever runs behind a decode step —
+        // there is no prefill/prompt traffic through one — so all `n` rows are
+        // decode-attributed.
+        let parts = head.block.moe.forward_parts(acts, DType::F32, n, None)?;
+        let routed = parts.routed.reshape((n, n_embd))?;
+        hc_combine_gated(&mut res, &routed, &parts.shared, &inject2)?;
         g_moe.end();
 
         // ── The shared head. ──

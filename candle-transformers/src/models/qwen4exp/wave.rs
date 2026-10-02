@@ -2938,13 +2938,30 @@ impl Qwen4ExpBatched {
                 _ => None,
             };
             let g_pre = crate::models::profile::gpu_span("q4e:gr_pre", dev);
+            // A DeltaNet layer whose four input projections run int8 reads the
+            // mix's own q8a128 operand, written as the collapse stores `h` — the
+            // bytes a quantize of `h` would produce, without the launch, provided
+            // the mix quantizes under the projections' `Σx` convention (checked
+            // where the operand is handed over). Any other layer's projections
+            // take the float: an attention layer quantizes through its own hook.
             #[cfg(feature = "cuda")]
-            let (h, inject) = hc_mix(
-                &res,
-                &layer.hc_attn,
-                eps,
-                mix_wave.as_ref().map(|g| g.ticket()),
-            )?;
+            let (h, inject, h_q8) = match &layer.mix {
+                GpuLayerMix::DeltaNet(w) if w.input_mode().is_int8() => hc_mix_with_operand(
+                    &res,
+                    &layer.hc_attn,
+                    eps,
+                    mix_wave.as_ref().map(|g| g.ticket()),
+                )?,
+                _ => {
+                    let (h, inject) = hc_mix(
+                        &res,
+                        &layer.hc_attn,
+                        eps,
+                        mix_wave.as_ref().map(|g| g.ticket()),
+                    )?;
+                    (h, inject, None)
+                }
+            };
             #[cfg(not(feature = "cuda"))]
             let (h, inject) = hc_mix(&res, &layer.hc_attn, eps, None)?;
             let inject = inject.expect("layer HC modules carry an inject");
@@ -2991,8 +3008,22 @@ impl Qwen4ExpBatched {
                             stash,
                         });
                     }
+                    let acts = match h_q8 {
+                        Some(op) if op.sum_scale == w.input_sum_scale() => {
+                            DynamicActs::Int8(op.with_lead(vec![total_rows]))
+                        }
+                        Some(op) => candle::bail!(
+                            "layer {li}: the hyper-connection mix quantized under {:?} but the \
+                             DeltaNet projections read {:?} — the operand would be the wrong \
+                             bytes for them",
+                            op.sum_scale,
+                            w.input_sum_scale()
+                        ),
+                        None => DynamicActs::Float(h.clone()),
+                    };
                     let mixed = quantized_delta_net_layer_forward_spans(
-                        &h.clone(),
+                        &acts,
+                        h.dtype(),
                         w,
                         &cfg.delta_net,
                         &mut seqs,

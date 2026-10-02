@@ -452,6 +452,21 @@ impl QMatMul {
         Ok(out)
     }
 
+    /// `silu(proj[:, 0..cols]) · Wᵀ` as F32, the activation quantized under this layer's `Σx`
+    /// convention by the matmul's own tile loader — no SiLU producer, no operand in memory.
+    /// The int8 Q8_KO weight only (the hyper-connection `up` projection).
+    #[cfg(feature = "cuda")]
+    pub fn forward_silu_f32<'w>(
+        &self,
+        proj: &LiveTensor<'w>,
+        cols: usize,
+    ) -> Result<LiveTensor<'w>> {
+        let t_mm = profile_now();
+        let out = self.inner.forward_silu_f32(proj, cols, self.sum_scale)?;
+        pipeline_record("qmatmul_q8", t_mm);
+        Ok(out)
+    }
+
     /// [`Self::forward_dynamic`] on an int8 operand with the K split forced to `splits` — the
     /// projection bench's sweep over what the split rule would choose.
     #[cfg(feature = "cuda")]
