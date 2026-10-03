@@ -71,13 +71,15 @@ pub const PRODUCTION_K_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
         &[
             QuantFormat::Q4_0,
             QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
+            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
             QuantFormat::Q8_1,
         ],
         // C4 — K stays at 4 bits or better through C5: keys decide what
         // attention reads, so the strong rungs spend their bits there and push
         // V instead. 3-bit K starts at C6. Q5_0/Q5_1 (5.5/6.0 bpe) sit in the
-        // gap between Q4_1 (5.0) and Q8_0 (8.5) on C4–C7, so a block that
+        // gap between Q4_1 (5.0) and Q8_0 (8.5) on C3–C7, so a block that
         // misses 4 bits takes one more bit, not three and a half.
         &[
             QuantFormat::Q4_0,
@@ -192,7 +194,6 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
-            QuantFormat::Q4_1,
             QuantFormat::Q8_0,
         ],
         // C3
@@ -200,27 +201,32 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
-            QuantFormat::Q4_1,
+            QuantFormat::Q5_0,
             QuantFormat::Q8_0,
         ],
-        // C4 — Q5_0/Q5_1 fill the Q4_1 → Q8_0 gap on C4–C6, as on K.
+        // C4 — Q5_0 fills the Q4_0 → Q8_0 gap on C3–C6, as on K. Of the
+        // asymmetric (QX_1) formats V keeps only Q3_1: at 3 bits a block's own
+        // offset costs a level; from 4 bits up the symmetric formats lose
+        // nothing, and Q4_1/Q5_1/Q8_1 are never selected on this side.
         &[
+            QuantFormat::Q1_S,
+            QuantFormat::Q2_A,
+            QuantFormat::Q2_S,
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
-            QuantFormat::Q4_1,
             QuantFormat::Q5_0,
-            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
         ],
         // C5
         &[
+            QuantFormat::Q1_S,
+            QuantFormat::Q2_A,
+            QuantFormat::Q2_S,
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
-            QuantFormat::Q4_1,
             QuantFormat::Q5_0,
-            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
         ],
         // C6
@@ -231,11 +237,8 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
-            QuantFormat::Q4_1,
             QuantFormat::Q5_0,
-            QuantFormat::Q5_1,
             QuantFormat::Q8_0,
-            QuantFormat::Q8_1,
         ],
         // C7
         &[
@@ -254,7 +257,6 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
-            QuantFormat::Q4_1,
         ],
         // C9
         &[
@@ -270,15 +272,9 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
-            QuantFormat::Q4_1,
         ],
-        // C10 — Q4_0/Q4_1 restored 2026-09-01. C10 topped out at Q3_1 while C9
-        // carried both, so the top rung had no high-quality fallback: a block
-        // the thresholds said needed better than Q3_1 got Q3_1 anyway, because
-        // that was the whole list. That is why tuning the error factors did
-        // nothing across six settings — the selector was already at the top of
-        // its candidates and the threshold had nothing left to buy. A ceiling is
-        // not an aggressiveness knob.
+        // C10 — Q4_0 is the ceiling: a block the thresholds say needs better
+        // than Q3_1 takes Q4_0, so the top rung keeps a high-quality fallback.
         &[
             QuantFormat::Q0,
             QuantFormat::Q0_V,
@@ -292,7 +288,6 @@ pub const PRODUCTION_V_CANDIDATE_FORMATS: [&[QuantFormat]; 11] =
             QuantFormat::Q3_0,
             QuantFormat::Q3_1,
             QuantFormat::Q4_0,
-            QuantFormat::Q4_1,
         ],
     ];
 
@@ -1225,9 +1220,17 @@ pub const QWEN4EXP_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors
 /// step. At 1.45 / 2.1 the whole ladder passed on two consecutive runs, C10×8
 /// 8/8 both times; C10 went 5.43× → 5.38× and C5, the level zend runs,
 /// 4.01× → 3.98×.
+///
+/// **Re-derived 2026-10-03: k 1.45 → 1.40, v 2.1 → 2.0.** The quantizer no
+/// longer reads a partial chunk's dead slots, and Q0 is offered only flat
+/// blocks; at 1.45 / 2.1 that took this model's C10 from 5.38× to 6.14×, and
+/// C10×2 then dropped one word at character 256 (C10×8 8/8) — the early-edge
+/// shape above. Both axes take the smallest step. The whole ladder passed in one
+/// gate run: C10×2 2/2 at 5.97×, C10×8 8/8 at 5.96×. The step costs C10 2.8%
+/// (6.14× → 5.97×), C8 1.6% and C5, the level zend runs, 0.3% (3.44× → 3.43×).
 pub const QWEN4EXP_Q2KO_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.45,
-    k_low: 1.45,
-    v_hi: 2.1,
-    v_low: 2.1,
+    k_hi: 1.40,
+    k_low: 1.40,
+    v_hi: 2.0,
+    v_low: 2.0,
 };
