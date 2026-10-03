@@ -167,10 +167,15 @@ pub(super) fn pack_f16(data: &[f32]) -> Vec<u8> {
 
 mod benchmark;
 mod calibration;
+mod early_reject;
+mod flat_and_sink;
 mod float_layout;
 mod gpu_vs_cpu;
 pub(super) mod helpers;
+mod lane_roundtrip;
+mod mirror;
 mod model;
 mod projection;
+mod selection_cost;
 pub(super) mod test_data;
 mod token_window;

@@ -183,13 +183,15 @@ __device__ __forceinline__ void compute_target_and_indices(
 // so each score is the reference's to the bit. For a negated curve every
 // chain, and so the sum, is the positive one negated (round-to-nearest is
 // sign-symmetric), and fma(2, R, E) is exactly the reference's fma(−2, −R, E).
-template <bool IS_K>
-__device__ __forceinline__ int find_best_curve_exhaustive(float target_scaled, int lane)
+//
+// Every lane needs all 32 target values. `target_at(e)` supplies element e: the
+// encoder gathers them into registers by shuffle; a caller whose register
+// budget cannot hold 32 more floats reads them from a warp's shared-memory row,
+// where every lane loads the same address and the read is a broadcast. The
+// values, and so the scores, are the same either way.
+template <bool IS_K, typename TargetAt>
+__device__ __forceinline__ int find_best_curve_exhaustive_with(TargetAt target_at, int lane)
 {
-    float t[32];
-    #pragma unroll
-    for (int e = 0; e < 32; ++e) t[e] = __shfl_sync(0xffffffff, target_scaled, e, 32);
-
     float best_err = INFINITY;
     int   best_idx = 0;
     #pragma unroll
@@ -201,8 +203,8 @@ __device__ __forceinline__ int find_best_curve_exhaustive(float target_scaled, i
         #pragma unroll
         for (int i = 0; i < 16; ++i) {
             const float2 v = __ldg(row + i);
-            acc[(2 * i) & 3]     = __fmaf_rn(t[2 * i], v.x, acc[(2 * i) & 3]);
-            acc[(2 * i + 1) & 3] = __fmaf_rn(t[2 * i + 1], v.y, acc[(2 * i + 1) & 3]);
+            acc[(2 * i) & 3]     = __fmaf_rn(target_at(2 * i), v.x, acc[(2 * i) & 3]);
+            acc[(2 * i + 1) & 3] = __fmaf_rn(target_at(2 * i + 1), v.y, acc[(2 * i + 1) & 3]);
         }
         const float r = __fadd_rn(__fadd_rn(acc[0], acc[1]), __fadd_rn(acc[2], acc[3]));
         const float e = (float)Q0VDecodeTables<IS_K>::energy(k >> 4);  // ≤ 32 · 127², exact
@@ -216,6 +218,15 @@ __device__ __forceinline__ int find_best_curve_exhaustive(float target_scaled, i
         if (err < best_err || (err == best_err && idx < best_idx)) { best_err = err; best_idx = idx; }
     }
     return warp_argmin_idx(best_err, best_idx);
+}
+
+template <bool IS_K>
+__device__ __forceinline__ int find_best_curve_exhaustive(float target_scaled, int lane)
+{
+    float t[32];
+    #pragma unroll
+    for (int e = 0; e < 32; ++e) t[e] = __shfl_sync(0xffffffff, target_scaled, e, 32);
+    return find_best_curve_exhaustive_with<IS_K>([&](int e) { return t[e]; }, lane);
 }
 
 // =============================================================================
