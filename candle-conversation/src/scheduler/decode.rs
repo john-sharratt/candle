@@ -1,9 +1,24 @@
+use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
 use super::spec_chooser::SpecChooser;
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use candle_transformers::models::speculative_choice::{AcceptWalk, TokenChooser};
+
+/// The leading tokens of a healed token, waiting to be forwarded.
+///
+/// A heal commits a sampled token as other text, and when that text is several
+/// tokens long, all but the last have to be written into the sequence's KV —
+/// the last rides the next decode like any committed token. They cannot be
+/// written at commit time: inside a speculative step the wave has written the
+/// whole verified block, so the KV runs past the healed position until the
+/// rollback trims it. The commit records them; the step forwards them after the
+/// rollback, where the KV ends at the last committed position.
+pub(super) struct HealPrefill {
+    seq: SequenceId,
+    tokens: Vec<u32>,
+}
 
 impl Scheduler {
     /// Emit the steering finish trace: a one-line summary of the path the
@@ -475,26 +490,47 @@ impl Scheduler {
         // the accept walk below commits exactly one token each — so there is no
         // second, plain decode path to drift out of step with this one.
         let t_fwd = std::time::Instant::now();
-        // The model's own measured width ladder is the CEILING: how far it is
-        // worth drafting shrinks as the wave widens, and where it stops paying
-        // depends on the checkpoint's shape rather than on anything the
-        // scheduler knows. Each turn drafts one past its own acceptance under
-        // it, and the drafter walks the cohort to the deepest of them.
-        let ceiling = self.model.draft_budget(seq_ids.len());
-        // A turn under a grammar stencil or replaying a recording takes a plain
-        // row (see below), so it drafts nothing — and must not set the depth the
-        // drafter walks the cohort to, or one such turn keeps the whole wave
-        // drafting at the ceiling for proposals that are all thrown away.
-        let depths: Vec<usize> = seq_ids
+        // Who drafts, and where each block stops — see `BlockGuard`. Free decode
+        // drafts, and so does a grammar inside a free-text span (a think block,
+        // a tool-call value): nothing is masked there, so the proposals are
+        // judged under exactly the rules a plain step applies, and the block
+        // stops at the token that leaves the span. A grammar at a branch, a
+        // static run or its exit takes a plain row: its next token is
+        // constrained or written, and there is nothing to speculate about.
+        //
+        // So does a replayed turn: its next token is its recording's, so there
+        // is nothing to propose.
+        let mut guards: Vec<Option<BlockGuard>> = seq_ids
             .iter()
             .map(|id| {
                 // Every id here was read from `active_decodes` above.
                 let s = &self.active_decodes[id];
-                if s.stencil.is_some() || s.recorded_reply.is_some() {
-                    0
-                } else {
-                    s.draft_depth.budget(ceiling)
+                if s.recorded_reply.is_some() {
+                    return None;
                 }
+                BlockGuard::for_step(
+                    s.stencil.as_ref(),
+                    s.pending_mask.as_ref(),
+                    &s.triggers,
+                    s.generated_tokens.last().copied(),
+                )
+            })
+            .collect();
+        // The model's own measured width ladder is the CEILING: how far it is
+        // worth drafting shrinks as the wave widens, and where it stops paying
+        // depends on the checkpoint's shape rather than on anything the
+        // scheduler knows. Each turn drafts one past its own acceptance under
+        // it, and the drafter walks the cohort to the deepest of them. A turn
+        // its guard keeps to a plain row drafts nothing and must not set that
+        // depth, or one such turn keeps the whole wave drafting at the ceiling
+        // for proposals that are all thrown away.
+        let ceiling = self.model.draft_budget(seq_ids.len());
+        let depths: Vec<usize> = seq_ids
+            .iter()
+            .zip(&guards)
+            .map(|(id, guard)| match guard {
+                Some(_) => self.active_decodes[id].draft_depth.budget(ceiling),
+                None => 0,
             })
             .collect();
         let budget = depths.iter().copied().max().unwrap_or(0);
@@ -522,23 +558,10 @@ impl Scheduler {
             );
             return;
         }
-        // A sequence under a grammar stencil takes a plain row. Its next token is
-        // constrained to the stencil's frontier, so there is nothing to
-        // speculate about — and drafting past it would mean advancing that
-        // grammar through positions the walk may reject, which is a rollback the
-        // stencil driver has no notion of.
-        //
-        // So does a replayed turn: its next token is its recording's, so there
-        // is nothing to propose.
-        for (i, &id) in seq_ids.iter().enumerate() {
-            drafts[i].truncate(depths[i]);
-            if self
-                .active_decodes
-                .get(&id)
-                .is_some_and(|s| s.stencil.is_some() || s.recorded_reply.is_some())
-            {
-                drafts[i].clear();
-            }
+        // The drafter walks the cohort to the deepest turn's depth; each turn
+        // keeps only its own, and one its guard keeps to a plain row keeps none.
+        for (draft, &depth) in drafts.iter_mut().zip(&depths) {
+            draft.truncate(depth);
         }
 
         // A block is the sequence's committed token followed by its proposals.
@@ -789,8 +812,13 @@ impl Scheduler {
             .collect();
         let walked = {
             let eos = &self.eos_tokens;
+            let breaks = &self.page_break_tokens;
+            let tokenizer = &self.tokenizer;
             let mut walk = AcceptWalk::new(&blocks);
             let mut failure = None;
+            // Whether each block was stopped by a rule (EOS, the turn's room,
+            // its guard) rather than by a rejected proposal.
+            let mut ruled = vec![false; blocks.len()];
             while !walk.finished() {
                 let rows = walk.rows();
                 let picked: Vec<Tensor> = walk
@@ -812,9 +840,25 @@ impl Scheduler {
                         break;
                     }
                 };
+                // A sequence leaves the walk where its commit path will stop it,
+                // so its sampling state never advances past what it commits. A
+                // sequence with no guard drafted nothing and leaves after this
+                // position anyway.
                 if let Err(e) = walk.commit(&tokens, |i, t| {
                     emitted[i].push(t);
-                    !eos.contains(&t) && emitted[i].len() < room[i]
+                    let goes_on = !eos.contains(&t)
+                        && emitted[i].len() < room[i]
+                        && guards[i].as_mut().is_some_and(|g| {
+                            let bytes = || {
+                                tokenizer
+                                    .decode(&[t], false)
+                                    .map(String::into_bytes)
+                                    .unwrap_or_default()
+                            };
+                            g.continues_after(t, bytes, breaks)
+                        });
+                    ruled[i] |= !goes_on;
+                    goes_on
                 }) {
                     failure = Some(e);
                     break;
@@ -822,19 +866,23 @@ impl Scheduler {
             }
             match failure {
                 Some(e) => Err(e),
-                None => Ok(walk.finish()),
+                None => Ok((walk.finish(), ruled)),
             }
         };
         let kept = match walked {
             // The walk's next-seed is not read here: the scheduler takes each
             // step's input from `generated_tokens.last()`, which the commit
             // below fills, so a second copy of it could only disagree.
-            Ok((_, kept)) => {
-                // What the walk kept sets the depth the next step drafts at.
-                // The walk's sink stops on EOS and on the turn's room, so a block
-                // cut short there reads as a partial accept — harmless, because
-                // that turn ends and its depth is never read again.
+            Ok(((_, kept), ruled)) => {
+                // What the walk kept sets the depth the next step drafts at —
+                // when it measured the drafter. A block a rule cut short (a
+                // span's exit, a trigger, a page break, EOS, the turn's room)
+                // says how far the grammar let it run, not how far the
+                // proposals held, so it is recorded only if it kept everything.
                 for (i, id) in seq_ids.iter().enumerate() {
+                    if ruled[i] && kept[i] < blocks[i].len() {
+                        continue;
+                    }
                     if let Some(s) = self.active_decodes.get_mut(id) {
                         s.draft_depth.record(blocks[i].len() - 1, kept[i]);
                     }
@@ -929,6 +977,9 @@ impl Scheduler {
         // further than the per-token path will tolerate simply stops appearing.
         let deepest = emitted.iter().map(|e| e.len()).max().unwrap_or(0);
         let mut committed = vec![0usize; blocks.len()];
+        // Healed prefixes to forward once the rollback has settled — see
+        // `HealPrefill`.
+        let mut heal_prefills: Vec<HealPrefill> = Vec::new();
         for p in 0..deepest {
             let at: Vec<usize> = (0..blocks.len())
                 .filter(|&i| emitted[i].len() > p)
@@ -937,20 +988,21 @@ impl Scheduler {
                         // Stopped by the per-token path — a health abort, a sink
                         // that closed.
                         !s.finished
-                            // **A grammar that opened inside this block ends
-                            // it.** A sequence with no stencil was allowed to
-                            // draft, so its later positions were sampled with no
-                            // allow-list; if position `p - 1` turned out to be a
-                            // trigger token, those tokens are exactly the ones
-                            // the grammar was supposed to constrain. Committing
-                            // them would feed unconstrained text to
-                            // `driver.accept`, whose heal path then rewrites the
-                            // token and prefills a corrected prefix — against a
-                            // sequence whose KV already holds the rest of the
-                            // block. Stop instead and let the truncation below
-                            // discard the tail; the grammar decodes properly
-                            // from the next wave.
-                            && (p == 0 || s.stencil.is_none())
+                            // **Past the first position, only free text goes
+                            // on.** The walk stops a block at the token that
+                            // opens a grammar or leaves a free-text span
+                            // (`BlockGuard`), so a later position here was
+                            // sampled under the rules the sequence still
+                            // decodes under: no grammar at all, or a grammar
+                            // still inside the span it drafted in. This
+                            // restates that rule where the tokens are
+                            // committed. A position past a grammar's edge
+                            // would feed text it was supposed to constrain to
+                            // `driver.accept`, whose heal path then rewrites
+                            // the token against a sequence whose KV already
+                            // holds the rest of the block.
+                            && (p == 0
+                                || s.stencil.as_ref().is_none_or(StencilDriver::mid_free_span))
                             // **A page cut armed inside this block ends it too,
                             // for the same reason.** The cut is taken once per
                             // step, after the rollback, against whatever the K/V
@@ -976,9 +1028,27 @@ impl Scheduler {
                 break;
             }
             let ids: Vec<SequenceId> = at.iter().map(|&i| seq_ids[i]).collect();
+            if p > 0 {
+                for id in &ids {
+                    if let Some(s) = self.active_decodes.get_mut(id) {
+                        // The previous position's token is the block's next
+                        // drafted token, so the wave already wrote its KV, and
+                        // the rollback keeps it: this position commits too.
+                        s.mark_forwarded();
+                        // A plain step asks the walk for its action before every
+                        // token it samples; inside the span that is `Free`, and
+                        // asking keeps the walk's own account of the span in
+                        // step with a plain decode's.
+                        if let Some(driver) = s.stencil.as_mut() {
+                            let action = driver.step();
+                            debug_assert!(matches!(action, StepMask::Free { .. }));
+                        }
+                    }
+                }
+            }
             let mut toks: Vec<u32> = at.iter().map(|&i| emitted[i][p]).collect();
             let rows: Vec<Tensor> = at.iter().map(|&i| captured[i][p].clone()).collect();
-            self.commit_decoded_tokens(&ids, &mut toks, &rows);
+            heal_prefills.extend(self.commit_decoded_tokens(&ids, &mut toks, &rows));
             for &i in &at {
                 committed[i] += 1;
             }
@@ -1007,6 +1077,11 @@ impl Scheduler {
         if let Err(e) = self.model.truncate_sequences(&mut self.session, &targets) {
             self.fail_all_decodes(&seq_ids, &format!("speculative rollback failed: {e}"));
             return;
+        }
+        // The healed prefixes, now that each sequence's KV ends at its last
+        // committed position — the only place they belong.
+        for heal in heal_prefills {
+            self.forward_heal_prefill(heal);
         }
         // **Now the cuts.** The rollback has settled, so the live tail is the
         // accepted prefix rather than the drafted block — which is both the only
@@ -1053,12 +1128,17 @@ impl Scheduler {
     /// `logits_vec[i]` must be the row that PRODUCED `next_tokens[i]`: the
     /// health checks read its distribution, so handing over a later position's
     /// row would judge a token against logits that did not choose it.
+    ///
+    /// Returns the prefixes of healed tokens, which the caller forwards with
+    /// [`Self::forward_heal_prefill`] once each sequence's KV ends at its last
+    /// committed position — see [`HealPrefill`].
     pub(super) fn commit_decoded_tokens(
         &mut self,
         seq_ids: &[SequenceId],
         next_tokens: &mut [u32],
         logits_vec: &[Tensor],
-    ) {
+    ) -> Vec<HealPrefill> {
+        let mut heal_prefills = Vec::new();
         // A replayed turn commits its recording, whatever was sampled — here,
         // ahead of every stage below, so each one sees the token the turn takes.
         if let Some(&eos) = self.eos_tokens.first() {
@@ -1275,8 +1355,9 @@ impl Scheduler {
         // delimiter — or the token could not be committed as written, and the
         // bytes are its repair (an escaped character, a completed value, the
         // text replacing an EOS inside a value). Common case (a single token) is
-        // a plain swap; a multi-token rewrite forwards all-but-last and lets the
-        // last ride this step's decode.
+        // a plain swap; a multi-token rewrite records all-but-last as forwarded,
+        // hands them back to be forwarded once the step's KV is final, and lets
+        // the last ride the next decode.
         for (i, bytes) in heals {
             let seq_id = seq_ids[i];
             let text = String::from_utf8_lossy(&bytes);
@@ -1288,41 +1369,19 @@ impl Scheduler {
             let Some((&last, prefix)) = healed.split_last() else {
                 continue; // nothing valid to commit (degenerate) — leave as-is
             };
-            if !prefix.is_empty() && self.run_prefill(seq_id, prefix).is_ok() {
+            if !prefix.is_empty() {
                 let think_close = self.think_close;
                 let breaks = &self.page_break_tokens;
-                // `run_prefill` cuts this span at any break token it CONTAINS —
-                // but `reasoning_split` deliberately declines to split when the
-                // break token is the pass's LAST, on the understanding that the
-                // caller commits it and cuts at its own commit. That holds for
-                // the stencil run above, whose final token rides the next decode
-                // step; here every token is already forwarded, so a healed prefix
-                // ending on a marker would leave that boundary uncut and the
-                // turn's reasoning would not occupy whole pages.
-                let ends_on_break = prefix.last().is_some_and(|t| breaks.contains(t));
                 if let Some(state) = self.active_decodes.get_mut(&seq_id) {
                     for &t in prefix {
                         state.push_forwarded(t, think_close, breaks);
                         let _ = state.event_tx.send(TurnEvent::Token(t));
                     }
                 }
-                if ends_on_break {
-                    match self.model.close_positional_page(seq_id.0) {
-                        Ok(closed) => tracing::info!(
-                            target: "candle_conversation::scheduler::unit_boundary",
-                            seq_id = seq_id.0,
-                            site = "heal-trailing-break-token",
-                            closed,
-                            "index: closed a page after a healed prefix ending on a break token"
-                        ),
-                        Err(e) => tracing::warn!(
-                            seq_id = seq_id.0,
-                            "closing the index page after a healed break token failed ({e}); the \
-                             region it bounds will not occupy whole pages and cannot be windowed \
-                             out of a later projection"
-                        ),
-                    }
-                }
+                heal_prefills.push(HealPrefill {
+                    seq: seq_id,
+                    tokens: prefix.to_vec(),
+                });
             }
             next_tokens[i] = last;
         }
@@ -1774,6 +1833,52 @@ impl Scheduler {
                     }
                 }
             }
+        }
+        heal_prefills
+    }
+
+    /// Forward a healed token's prefix into its sequence.
+    ///
+    /// `run_prefill` cuts the span at any break token it CONTAINS — but
+    /// `reasoning_split` deliberately declines to split when the break token is
+    /// the pass's LAST, on the understanding that the caller commits it and cuts
+    /// at its own commit. That holds for a stencil's static run, whose final
+    /// token rides the next decode step; here every token is already recorded
+    /// as forwarded, so a prefix ending on a marker closes its page here, or the
+    /// turn's reasoning would not occupy whole pages.
+    ///
+    /// The prefix is already in the turn's output, so a forward that fails
+    /// leaves output with no KV behind it, and the sequence is failed rather
+    /// than left to decode on from a cache that does not hold what it said.
+    pub(super) fn forward_heal_prefill(&mut self, heal: HealPrefill) {
+        let HealPrefill { seq, tokens } = heal;
+        if let Err(e) = self.run_prefill(seq, &tokens) {
+            self.fail_all_decodes(
+                &[seq],
+                &format!("forwarding a healed token's prefix failed: {e}"),
+            );
+            return;
+        }
+        if !tokens
+            .last()
+            .is_some_and(|t| self.page_break_tokens.contains(t))
+        {
+            return;
+        }
+        match self.model.close_positional_page(seq.0) {
+            Ok(closed) => tracing::info!(
+                target: "candle_conversation::scheduler::unit_boundary",
+                seq_id = seq.0,
+                site = "heal-trailing-break-token",
+                closed,
+                "index: closed a page after a healed prefix ending on a break token"
+            ),
+            Err(e) => tracing::warn!(
+                seq_id = seq.0,
+                "closing the index page after a healed break token failed ({e}); the \
+                 region it bounds will not occupy whole pages and cannot be windowed \
+                 out of a later projection"
+            ),
         }
     }
 

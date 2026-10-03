@@ -803,12 +803,9 @@ pub fn compile_tool_call_tree(
 
     // Each tool: name arm -> args_open static -> its argument object -> close.
     let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(tools.len());
+    let mut shared = HashMap::new();
     for tool in tools {
-        let args_entry = b.build_fields(&tool.params, &env.close, end)?;
-        let arm_target = b.spec.push(NodeSpec::Static {
-            text: env.args_open.clone(),
-            next: args_entry,
-        });
+        let arm_target = b.tool_arm_target(tool, end, &mut shared)?;
         // The arm carries the name's own terminator so prefix-related names
         // stay distinguishable in the trie — see `ToolCallEnvelope::name_close`.
         arms.push((format!("{}{}", tool.name, env.name_close), arm_target));
@@ -914,6 +911,46 @@ pub fn compile_tool_call_loop(
     compile_action_loop(tools, env, max_calls, close_turn, None)
 }
 
+/// The tree label for a standalone invoke-body sub-stencil (effector design §11).
+pub const INVOKE_BODY_TREE_LABEL: &str = "invoke_body";
+
+/// Compile a resource's invoke **body** — a JSON object of the schema's fields —
+/// into a standalone sub-stencil (effector design §11).
+///
+/// This is front-end B applied to a body schema's parameters: the same
+/// value-typing as a tool's argument object (string enums and booleans enforced
+/// exactly; integer/number/array/object shaped as any structurally-valid JSON;
+/// nested objects recursed), emitted as a bare `{ … }` object ending at [`End`]
+/// so it can be simulated on its own **and** spliced into a turn's `invoke`
+/// branch by [`compile_action_loop_with_body`]. Always JSON, whatever the outer
+/// call style — an invoke body is a JSON object regardless of how the call that
+/// carries it is written.
+///
+/// An empty schema (no fields) compiles to `{}` and nothing else.
+///
+/// [`End`]: crate::stencil::StencilNode::End
+pub fn compile_invoke_body_tree(params: &[Param]) -> Result<TreeSpec, BuildError> {
+    let env = ToolCallEnvelope::qwen3();
+    let mut b = ToolTreeBuilder {
+        spec: TreeSpec::new(INVOKE_BODY_TREE_LABEL),
+        env: &env,
+        array_depth: 0,
+        body_override: None,
+    };
+    let end = b.spec.push(NodeSpec::End);
+    let fields_entry = b.build_fields(params, "}", end)?;
+    // The opening brace is always static — never a token in question.
+    let root = b.spec.push(NodeSpec::Static {
+        text: "{".to_string(),
+        next: fields_entry,
+    });
+    b.spec.root = root;
+    // Failsafe: close the object if a token ever escapes the mask, so a partial
+    // body is at least a terminated JSON object for the parser.
+    b.spec.bail = "}".to_string();
+    Ok(b.spec)
+}
+
 /// The action loop, optionally preceded by a reasoning block.
 ///
 /// **The whole turn in one grammar.** With `think` set the tree is: the block's
@@ -932,6 +969,33 @@ pub fn compile_action_loop(
     max_calls: usize,
     close_turn: &str,
     think: Option<&TreeSpec>,
+) -> Result<TreeSpec, BuildError> {
+    compile_action_loop_with_body(tools, env, max_calls, close_turn, think, None)
+}
+
+/// [`compile_action_loop`] with one tool's one parameter's value **spliced in**
+/// from a pre-compiled body sub-stencil rather than free-typed (effector design
+/// §11).
+///
+/// This is the fallback composition for the schema→stencil migration: rather
+/// than swap a sub-tree onto the `invoke` branch at decode time (which the turn
+/// driver does not expose), the typed body is spliced at compile time, giving a
+/// per-`(resource, schema-fingerprint)` turn grammar while the frame it is built
+/// from is unchanged. `body_override` is `(tool name, param name, body spec)`;
+/// the body spec is a `{ … }` object from [`compile_invoke_body_tree`], and it
+/// is spliced as the named parameter's value on every level's call to that tool.
+/// `None` leaves every value free-typed, so a no-focus turn is byte-identical to
+/// [`compile_action_loop`].
+///
+/// The override is ignored for [`CallStyle::FunctionBlock`], whose raw values
+/// carry a JSON object as free text; only the JSON styles get the typed body.
+pub fn compile_action_loop_with_body<'a>(
+    tools: &[ToolSpec],
+    env: &'a ToolCallEnvelope,
+    max_calls: usize,
+    close_turn: &str,
+    think: Option<&TreeSpec>,
+    body_override: Option<(&'a str, &'a str, &'a TreeSpec)>,
 ) -> Result<TreeSpec, BuildError> {
     if tools.is_empty() {
         return Err(BuildError::ToolSchema("empty tool catalog".into()));
@@ -957,12 +1021,13 @@ pub fn compile_action_loop(
     for level in (0..max_calls).rev() {
         // One call: choose a name, fill its arguments, close the block.
         let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(tools.len());
+        let mut shared = HashMap::new();
         for tool in tools {
-            let args_entry = b.build_fields(&tool.params, &env.close, after_call)?;
-            let arm_target = b.spec.push(NodeSpec::Static {
-                text: env.args_open.clone(),
-                next: args_entry,
-            });
+            // The typed body applies only to the tool it is armed for; every
+            // other tool builds its arguments free-typed as before.
+            b.body_override =
+                body_override.and_then(|(tn, pn, spec)| (tn == tool.name).then_some((pn, spec)));
+            let arm_target = b.tool_arm_target(tool, after_call, &mut shared)?;
             // The name's own terminator, from the envelope — a hardcoded `"`
             // here spliced a JSON quote into a function block and produced act
             // names like `reflect"<parameter=inner_thoughts"`, rejected on
@@ -1018,6 +1083,11 @@ struct ToolTreeBuilder<'a> {
     /// one decodes free: unrolled, it would repeat per enclosing element and
     /// the tree would grow as the product of the bounds.
     array_depth: u32,
+    /// `(param name, its pre-compiled body sub-stencil)` for the one parameter
+    /// whose value is spliced in from a resource's schema rather than free-typed
+    /// (effector design §11). Set per-tool by [`compile_action_loop_with_body`],
+    /// `None` everywhere else. JSON styles only.
+    body_override: Option<(&'a str, &'a TreeSpec)>,
 }
 
 /// One object's gate and value memo, so the gate graph stays linear instead of
@@ -1049,7 +1119,44 @@ impl<'a> ToolTreeBuilder<'a> {
             spec: TreeSpec::new(TOOL_CALL_TREE_LABEL),
             env,
             array_depth: 0,
+            body_override: None,
         }
+    }
+
+    /// What a tool's name arm leads to: the arguments' opening, then its
+    /// argument object through the envelope close, ending at `end`.
+    ///
+    /// **One node per distinct parameter list.** A tool and each alias it
+    /// answers to take the same arguments, so what follows their names is one
+    /// grammar, and the arms lead to one node: the compiler lowers a node once
+    /// however many arms reach it, so an alias costs a name arm instead of a
+    /// copy of its tool's whole argument grammar. The catalog's aliases outnumber
+    /// its tools five to one, and a copy each made the tree — and the seconds it
+    /// took to compile at every daemon start — five times what it needed to be.
+    /// `shared` is the memo for one level, whose `end` is fixed; a tool with a
+    /// typed body spliced in is its own.
+    fn tool_arm_target(
+        &mut self,
+        tool: &ToolSpec,
+        end: SpecId,
+        shared: &mut HashMap<String, SpecId>,
+    ) -> Result<SpecId, BuildError> {
+        let key = format!("{:?}", tool.params);
+        if self.body_override.is_none() {
+            if let Some(&target) = shared.get(&key) {
+                return Ok(target);
+            }
+        }
+        let close = self.env.close.clone();
+        let args_entry = self.build_fields(&tool.params, &close, end)?;
+        let target = self.spec.push(NodeSpec::Static {
+            text: self.env.args_open.clone(),
+            next: args_entry,
+        });
+        if self.body_override.is_none() {
+            shared.insert(key, target);
+        }
+        Ok(target)
     }
 
     /// An object's field sequence, written up to and including `close` — the
@@ -1273,6 +1380,16 @@ impl<'a> ToolTreeBuilder<'a> {
     /// internal to one static, rather than leaving a lone `"` after a branch arm
     /// that merges backward into the committed arm (an unrepresentable retract).
     fn build_value(&mut self, p: &Param, next: SpecId) -> Result<(String, SpecId), BuildError> {
+        // **A resource's typed invoke body, spliced in** from its own pre-compiled
+        // sub-stencil (effector design §11). The key ends at its colon and the
+        // body opens with `{`, so the value has no lead-in. JSON styles only — a
+        // function block's raw value keeps its free span below.
+        if let Some((pname, spec)) = self.body_override {
+            if pname == p.name && self.env.style != CallStyle::FunctionBlock {
+                let entry = splice(&mut self.spec, spec, next);
+                return Ok((String::new(), entry));
+            }
+        }
         // A nested JSON object refined into typed fields (`object | recurse`).
         // Function blocks keep the raw free value below. The opening brace
         // rides on the lead-in, same as `value_arms`'s object arm. A

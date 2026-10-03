@@ -3683,56 +3683,6 @@ impl BatchedInferenceSession {
         ret
     }
 
-    /// Read contiguous K/V float data for a token range across **all** layers.
-    ///
-    /// Returns one `(K, V)` pair per layer (length = `num_layers`).  Each tensor
-    /// is float dtype, shape `(1, n_kv_heads, len, head_dim)`.  For quantized KV
-    /// storage the data is dequantized on-the-fly before returning.
-    ///
-    /// Intended for Hot → Warm eviction: the caller reads the float K/V tensors,
-    /// re-quantizes to Q8_0 on CPU, and writes the bytes into a [`WarmPool`].
-    ///
-    /// # Arguments
-    ///
-    /// * `seq_idx` — The batch index (sequence slot) whose KV data to read.
-    /// * `offset`  — First token position to read.
-    /// * `len`     — Number of tokens to read.
-    pub fn read_all_layers_contiguous(
-        &self,
-        seq_idx: usize,
-        offset: usize,
-        len: usize,
-    ) -> Result<Vec<(candle::Tensor, candle::Tensor)>> {
-        self.backings
-            .iter()
-            .map(|backing| backing.read_contiguous(seq_idx, offset, len))
-            .collect()
-    }
-
-    /// Write float K/V tensors into a sequence across **all** layers.
-    ///
-    /// The inverse of [`read_all_layers_contiguous`].  Used when restoring
-    /// a Warm-tier turn directly from dequantized bytes without a forward
-    /// pass.
-    ///
-    /// # Arguments
-    ///
-    /// * `seq_idx` — The batch index (sequence slot) to write into.
-    /// * `offset`  — First token position to start writing at.
-    /// * `kv_per_layer` — One `(K, V)` pair per layer, each shaped
-    ///   `(1, n_kv_heads, len, head_dim)`.
-    pub fn write_all_layers_contiguous(
-        &self,
-        seq_idx: usize,
-        offset: usize,
-        kv_per_layer: &[(candle::Tensor, candle::Tensor)],
-    ) -> Result<()> {
-        for (backing, (k, v)) in self.backings.iter().zip(kv_per_layer.iter()) {
-            backing.write_contiguous(seq_idx, offset, k, v)?;
-        }
-        Ok(())
-    }
-
     /// Read raw quantized bytes for one block across **all** layers.
     ///
     /// Called per-block during Hot→Warm eviction.  Returns one `(k_bytes, v_bytes)`

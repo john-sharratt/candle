@@ -29,6 +29,7 @@ mod admission;
 /// AIMD setpoint the *ingest* regulator moves.
 mod admit;
 mod admit_ground;
+mod block_guard;
 mod decode;
 pub mod exported_state;
 mod guest_room;
@@ -13898,6 +13899,8 @@ mod tests {
             "the end of turn after the recording finishes it"
         );
     }
+
+    mod speculation_in_a_grammar;
 
     // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————
 

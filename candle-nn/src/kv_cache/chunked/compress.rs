@@ -38,7 +38,9 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::CudaStream;
 #[cfg(feature = "cuda")]
-use candle::quantized::cuda::{dtype_to_ggml_float, identity_pal_map, PalHeadDesc};
+use candle::quantized::cuda::{
+    dtype_to_ggml_float, identity_pal_map, PalHeadDesc, FULL_CHUNK_WINDOW,
+};
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::{Generation, PinnedBuf};
 #[cfg(feature = "cuda")]
@@ -434,9 +436,9 @@ struct QuantBucket {
 /// convert kernels read directly. Location comes from the arena (it is arena
 /// identity); the format comes from the chunk's own band tags, because under
 /// size classes an arena holds whatever fits its stride and cannot answer the
-/// question. Full and partial chunks both qualify (partial dead
-/// slots are zero — arenas are zeroed at creation/recycle — and the packed
-/// valid range corrects the count-normalized metrics). Ineligible chunks (e.g. a
+/// question. Full and partial chunks both qualify: the kernels read a partial
+/// chunk's dead slots as zero whatever they hold, and the packed valid range
+/// corrects the count-normalized metrics. Ineligible chunks (e.g. a
 /// view borrowing cold-loaded mixed-Q chunks) go to `preserve` and merge back
 /// unchanged. `Ok(None)` ⇒ nothing eligible (caller passes the sequences
 /// through verbatim).
@@ -933,6 +935,9 @@ fn quantize_sealed_in_place_impl(
                     v_dst_pal_map,
                     k_dst_scales,
                     v_dst_scales,
+                    // The same window the selection measured: the convert
+                    // reads every dead slot of a partial chunk as zero.
+                    valid_range: chunk_valid_ranges[chunk_i],
                 });
             }
         }
@@ -1445,6 +1450,8 @@ pub fn dequantize_sealed_in_place(
                     v_dst_pal_map: ident,
                     k_dst_scales: [1.0f32; N_PALETTE],
                     v_dst_scales: [1.0f32; N_PALETTE],
+                    // The bucket above admits full chunks only.
+                    valid_range: FULL_CHUNK_WINDOW,
                 });
             }
         }

@@ -1,6 +1,7 @@
 //! Atomic, compare-and-swap reference updates, via `update-ref --stdin -z`.
 
 use crate::error::GitError;
+use crate::library::ref_txn;
 use crate::types::{BranchName, Oid, RefName};
 use crate::Repo;
 
@@ -18,7 +19,7 @@ pub enum RefOp {
 }
 
 impl RefOp {
-    fn name(&self) -> &RefName {
+    pub(crate) fn name(&self) -> &RefName {
         match self {
             Self::Create { name, .. } | Self::Update { name, .. } | Self::Delete { name, .. } => {
                 name
@@ -111,6 +112,9 @@ impl Repo {
     /// execution checkout, which owns its branch for the length of a run.
     /// The caller holds the write lock.
     pub(crate) fn write_refs(&self, txn: &RefTransaction) -> Result<(), GitError> {
+        if let Some(lib) = self.library() {
+            return ref_txn::apply(&lib, txn.ops());
+        }
         // `--no-deref`: an op changes the ref it names and never the one a
         // symbolic ref points at, so the check in `update_refs_locked` —
         // which compares names — cannot be walked around through an alias of

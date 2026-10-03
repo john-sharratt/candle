@@ -43,14 +43,9 @@
 //!   exactly equivalent on those formats, and faithful on Q4_KS/Q8_KS and
 //!   the INT8-scale / Q0-family formats where `outer` does not cancel.
 
-use candle::quantized::k_quants::{
-    BlockQ0, BlockQ0M2, BlockQ0M4, BlockQ0V, BlockQ0X, BlockQ1A, BlockQ1S, BlockQ2A, BlockQ2S,
-    BlockQ2_0, BlockQ2_1, BlockQ3_0, BlockQ3_1, BlockQ4_0, BlockQ4_1, BlockQ4_KS, BlockQ5_0,
-    BlockQ5_1, BlockQ8_0, BlockQ8_KS, BlockR16, GgmlType,
-};
-use candle::quantized::GgmlDType;
 use half::f16;
 
+use super::block_round_trip::block_round_trip;
 use crate::kv_cache::QuantFormat;
 use std::cmp::Ordering;
 
@@ -65,9 +60,73 @@ const HEAD_DIM: usize = 128;
 const N_PALETTE: usize = 4;
 const SLOT_QUOTA: usize = HEAD_DIM / N_PALETTE;
 const NUM_SCALE_CANDIDATES: usize = 6;
+/// Histogram bins of the head |x| percentile pass (`QREL_HIST_BINS`).
+const P95_HIST_BINS: usize = 64;
+/// A block whose standard deviation is below `head scale / FLAT_BLOCK_STEPS`
+/// carries less than one INT8 step of variation (`FLAT_BLOCK_STEPS`).
+const FLAT_BLOCK_STEPS: f32 = 127.0;
+/// The head scale is capped at this many times the head's p95 |x|
+/// (`HEAD_SCALE_P95_CAP`).
+const HEAD_SCALE_P95_CAP: f32 = 8.0;
 
-/// Inputs to the full selection pipeline. Layout matches the CUDA kernel's
-/// view of the arena (chunk × head × dim × token, row-major in that order).
+/// Formats offered only flat blocks (`flat_only`). Q0 stores a block's mean and
+/// nothing else, so it keeps none of the variation between the block's tokens;
+/// the error metrics judge an error against the head's scale and would pass it
+/// on a dim whose tokens vary by a small fraction of the head's range.
+fn flat_only(fmt: QuantFormat) -> bool {
+    fmt == QuantFormat::Q0
+}
+
+/// The scale the error metrics divide by (`head_scale`): the head's amax capped
+/// at [`HEAD_SCALE_P95_CAP`] times its p95 |x|, so a sink token's few large
+/// elements cannot loosen every threshold in the chunk that holds them.
+pub fn head_scale(amax: f32, p95: f32) -> f32 {
+    amax.min(HEAD_SCALE_P95_CAP * p95).max(1.0e-8)
+}
+
+/// 95th percentile of `|x|` over a head's elements, as the kernel's percentile
+/// pass computes it: sqrt-spaced bins over `[0, amax]`, answered as the upper
+/// edge of the bin the percentile falls in, so it never understates the true
+/// value. Every element of `data` is a valid token.
+pub fn head_p95(data: &[f32], amax: f32) -> f32 {
+    let amax_safe = if amax > 1.0e-8 { amax } else { 1.0 };
+    let inv_amax = 1.0 / amax_safe;
+    let mut hist = [0usize; P95_HIST_BINS];
+    for &x in data {
+        let bin = ((x.abs() * inv_amax).sqrt() * (P95_HIST_BINS - 1) as f32).floor() as usize;
+        hist[bin.min(P95_HIST_BINS - 1)] += 1;
+    }
+    let target = (0.95 * (data.len() - 1) as f32).floor() as usize;
+    let mut accum = 0usize;
+    let mut p95_bin = P95_HIST_BINS - 1;
+    for (b, &count) in hist.iter().enumerate() {
+        accum += count;
+        if accum > target {
+            p95_bin = b;
+            break;
+        }
+    }
+    let edge = (p95_bin + 1) as f32 / (P95_HIST_BINS - 1) as f32;
+    amax_safe.min(amax_safe * edge * edge)
+}
+
+/// Is `block` flat — its standard deviation below one INT8 step of `head_norm`?
+/// The variance is E[x^2] - mean^2 from the first and second moments, as the
+/// kernel computes it.
+fn block_is_flat(block: &[f32; CHUNK_SIZE], head_norm: f32) -> bool {
+    let n_inv = 1.0 / CHUNK_SIZE as f32;
+    let s1: f32 = block.iter().sum();
+    let s2: f32 = block.iter().map(|x| x * x).sum();
+    let mean = s1 * n_inv;
+    let var = s2 * n_inv - mean * mean;
+    let step = head_norm * (1.0 / FLAT_BLOCK_STEPS);
+    var <= step * step
+}
+
+/// Inputs to the full selection pipeline, in the CUDA kernel's logical block
+/// view (chunk × head × dim × token, row-major in that order): each 32-element
+/// block is one dim's tokens. Float arenas hold `[t][pd]` bands in memory; the
+/// kernel reads them into this view (`float_band_elem`).
 pub struct SelectionInput<'a> {
     pub k_data: &'a [f32],
     pub v_data: &'a [f32],
@@ -160,6 +219,8 @@ pub struct PerBlockStats {
     pub q_mean: [f32; HEAD_DIM],
     pub k_head_amax: f32,
     pub v_head_amax: f32,
+    pub k_head_p95: f32,
+    pub v_head_p95: f32,
 }
 
 /// Phase 1: per-block amax / q-relevance / Q-mean over (dim, token).
@@ -240,6 +301,8 @@ pub fn per_block_amax_qrel(k_block: &[f32], v_block: &[f32], q_block_f16: &[u16]
         q_mean,
         k_head_amax,
         v_head_amax,
+        k_head_p95: head_p95(k_block, k_head_amax),
+        v_head_p95: head_p95(v_block, v_head_amax),
     }
 }
 
@@ -573,80 +636,21 @@ pub fn slot_stats(amax: &[f32; HEAD_DIM], idx_compact: &[u16]) -> SlotStats {
     }
 }
 
-/// Map QuantFormat to a `GgmlDType` we can dispatch round-trip through.
-///
-/// Unsupported formats and why:
-///
-/// * `R16` — K-source carrier format that stores Q activations alongside
-///   K values. It is never a *quant target* in the candidate ladders, so
-///   its round-trip semantics differ from every other format (the `q[]`
-///   field would round-trip as zero on V data).
-/// * `Q8_1` — `BlockQ8_1::to_float` is `unimplemented!()` in
-///   `candle-core` (Q8_1 is a vec-dot intermediate, not a storage
-///   format). Q8_1 appears in production candidate ladders for K-side
-///   C1–C7 but its kernel-side round-trip uses a CUDA-only dequant path
-///   that has no Rust analogue. Returning `None` here lets the search
-///   skip it cleanly.
-fn ggml_supported(fmt: QuantFormat) -> Option<GgmlDType> {
-    match fmt {
-        QuantFormat::R16 | QuantFormat::Q8_1 => None,
-        _ => Some(fmt.to_ggml_dtype()),
-    }
-}
-
-/// Round-trip 32 floats through `fmt` after pre-scaling by `outer`. Returns
-/// the dequantized vector pre-divided by `outer` (so the caller compares
-/// against the original directly). Returns `None` for formats not mirrored
-/// (currently `R16` only — see [`ggml_supported`]).
+/// Round-trip 32 floats through `fmt` on side `is_k` after pre-scaling by
+/// `outer` (`block_round_trip`). Returns the dequantized vector pre-divided
+/// by `outer` (so the caller compares against the original directly), or
+/// `None` for a format that is never a quant target (R16, the active K
+/// carrier: its Q-capture half has no round trip).
 pub fn roundtrip_block(
     fmt: QuantFormat,
     src: &[f32; CHUNK_SIZE],
     outer: f32,
+    is_k: bool,
 ) -> Option<[f32; CHUNK_SIZE]> {
-    let dtype = ggml_supported(fmt)?;
-    let mut scaled = [0.0f32; CHUNK_SIZE];
-    for i in 0..CHUNK_SIZE {
-        scaled[i] = src[i] * outer;
-    }
-    let mut recon = [0.0f32; CHUNK_SIZE];
-    match dtype {
-        GgmlDType::Q4_0 => roundtrip_via::<BlockQ4_0>(&scaled, &mut recon),
-        GgmlDType::Q4_1 => roundtrip_via::<BlockQ4_1>(&scaled, &mut recon),
-        GgmlDType::Q5_0 => roundtrip_via::<BlockQ5_0>(&scaled, &mut recon),
-        GgmlDType::Q5_1 => roundtrip_via::<BlockQ5_1>(&scaled, &mut recon),
-        GgmlDType::Q8_0 => roundtrip_via::<BlockQ8_0>(&scaled, &mut recon),
-        // Q8_1 filtered by ggml_supported — to_float is unimplemented.
-        GgmlDType::Q8_1 => return None,
-        GgmlDType::Q4_KS => roundtrip_via::<BlockQ4_KS>(&scaled, &mut recon),
-        GgmlDType::Q8_KS => roundtrip_via::<BlockQ8_KS>(&scaled, &mut recon),
-        GgmlDType::Q2_0 => roundtrip_via::<BlockQ2_0>(&scaled, &mut recon),
-        GgmlDType::Q3_0 => roundtrip_via::<BlockQ3_0>(&scaled, &mut recon),
-        GgmlDType::Q2_1 => roundtrip_via::<BlockQ2_1>(&scaled, &mut recon),
-        GgmlDType::Q3_1 => roundtrip_via::<BlockQ3_1>(&scaled, &mut recon),
-        GgmlDType::Q0 => roundtrip_via::<BlockQ0>(&scaled, &mut recon),
-        GgmlDType::Q1_S => roundtrip_via::<BlockQ1S>(&scaled, &mut recon),
-        GgmlDType::Q2_S => roundtrip_via::<BlockQ2S>(&scaled, &mut recon),
-        GgmlDType::Q2_A => roundtrip_via::<BlockQ2A>(&scaled, &mut recon),
-        GgmlDType::Q0_V => roundtrip_via::<BlockQ0V>(&scaled, &mut recon),
-        GgmlDType::Q1_A => roundtrip_via::<BlockQ1A>(&scaled, &mut recon),
-        GgmlDType::Q0_X => roundtrip_via::<BlockQ0X>(&scaled, &mut recon),
-        GgmlDType::Q0_M2 => roundtrip_via::<BlockQ0M2>(&scaled, &mut recon),
-        GgmlDType::Q0_M4 => roundtrip_via::<BlockQ0M4>(&scaled, &mut recon),
-        GgmlDType::R16 => roundtrip_via::<BlockR16>(&scaled, &mut recon),
-        _ => return None,
-    }
+    let scaled: [f32; CHUNK_SIZE] = std::array::from_fn(|i| src[i] * outer);
+    let recon = block_round_trip(fmt.to_ggml_dtype(), &scaled, is_k)?;
     let inv_outer = if outer != 0.0 { 1.0 / outer } else { 0.0 };
-    let mut out = [0.0f32; CHUNK_SIZE];
-    for i in 0..CHUNK_SIZE {
-        out[i] = recon[i] * inv_outer;
-    }
-    Some(out)
-}
-
-fn roundtrip_via<B: GgmlType>(scaled: &[f32; CHUNK_SIZE], recon: &mut [f32; CHUNK_SIZE]) {
-    let mut blk = [B::zeros()];
-    B::from_float(scaled, &mut blk);
-    B::to_float(&blk, recon);
+    Some(recon.map(|r| r * inv_outer))
 }
 
 /// Mean of the four largest absolute errors across the 32 lanes.
@@ -730,10 +734,16 @@ pub fn search_scales_for_fmt(
     inv_head_amax: f32,
     inv_head_amax_sq: f32,
     v_thr_sq: f32,
+    head_norm: f32,
 ) -> Option<PerFmtSearch> {
-    ggml_supported(fmt)?;
+    block_round_trip(fmt.to_ggml_dtype(), &[0.0; CHUNK_SIZE], is_k)?;
     let mut best: Option<ScaleResult> = None;
     let mut fallback: Option<ScaleResult> = None;
+    // A flat-only format that skipped any block cannot take the whole slot, so
+    // it is not a fallback candidate; it can still win outright on its passing
+    // blocks. Set by the first scale's pass over the blocks, which is the same
+    // set for every scale.
+    let mut skipped_nonflat = false;
     for si in 0..NUM_SCALE_CANDIDATES {
         let outer = preferred_range_outer(
             si,
@@ -750,7 +760,14 @@ pub fn search_scales_for_fmt(
             let bu = b as usize;
             let mut orig = [0.0f32; CHUNK_SIZE];
             orig.copy_from_slice(&data[bu * CHUNK_SIZE..(bu + 1) * CHUNK_SIZE]);
-            let recon = roundtrip_block(fmt, &orig, outer)?;
+            // A flat-only format cannot pass a block that is not flat: the
+            // kernel skips the round trip, and so does this. Its error then
+            // covers only the blocks it was offered.
+            if flat_only(fmt) && !block_is_flat(&orig, head_norm) {
+                skipped_nonflat = true;
+                continue;
+            }
+            let recon = roundtrip_block(fmt, &orig, outer, is_k)?;
             let (pass_metric, thr) = if is_k {
                 let e = mean_top4_abs_error(&orig, &recon);
                 (e * inv_head_amax, kthresh[bu])
@@ -773,16 +790,18 @@ pub fn search_scales_for_fmt(
             pass_mask,
             max_pass_metric: max_pm,
         };
-        fallback = Some(match fallback {
-            None => cand,
-            Some(prev) => {
-                if cand.max_pass_metric < prev.max_pass_metric {
-                    cand
-                } else {
-                    prev
+        if !skipped_nonflat {
+            fallback = Some(match fallback {
+                None => cand,
+                Some(prev) => {
+                    if cand.max_pass_metric < prev.max_pass_metric {
+                        cand
+                    } else {
+                        prev
+                    }
                 }
-            }
-        });
+            });
+        }
         if pass_count >= SLOT_QUOTA {
             best = Some(match best {
                 None => cand,
@@ -800,7 +819,8 @@ pub fn search_scales_for_fmt(
 }
 
 /// Phase 4+5 driver for one side (K or V). Returns per-slot format/scale
-/// and per-dim palette assignments.
+/// and per-dim palette assignments. `head_amax` is the head scale the error
+/// metrics divide by — the head's amax as capped by [`head_scale`].
 #[allow(clippy::too_many_arguments)]
 pub fn process_side(
     data: &[f32],
@@ -849,6 +869,7 @@ pub fn process_side(
                 inv_head_amax,
                 inv_head_amax_sq,
                 v_thr_sq,
+                safe_head_amax,
             ) {
                 Some(r) => r,
                 None => continue,
@@ -953,7 +974,7 @@ fn select_one_head(
         &stats.amax_k,
         &kidx,
         k_candidates,
-        stats.k_head_amax,
+        head_scale(stats.k_head_amax, stats.k_head_p95),
         true,
         &kthresh,
         sink.v_thr_sq,
@@ -963,7 +984,7 @@ fn select_one_head(
         &stats.amax_v,
         &vidx,
         v_candidates,
-        stats.v_head_amax,
+        head_scale(stats.v_head_amax, stats.v_head_p95),
         false,
         &kthresh,
         sink.v_thr_sq,
@@ -1162,7 +1183,7 @@ mod tests {
         for i in 0..CHUNK_SIZE {
             src[i] = (i as f32 - 16.0) * 0.1;
         }
-        let out = roundtrip_block(QuantFormat::Q4_0, &src, 1.0).unwrap();
+        let out = roundtrip_block(QuantFormat::Q4_0, &src, 1.0, false).unwrap();
         for i in 0..CHUNK_SIZE {
             let e = (src[i] - out[i]).abs();
             assert!(e < 0.25, "Q4_0 element {i} error {e} too large");
@@ -1175,7 +1196,7 @@ mod tests {
         for i in 0..CHUNK_SIZE {
             src[i] = (i as f32 - 16.0) * 0.1;
         }
-        let out = roundtrip_block(QuantFormat::Q8_0, &src, 1.0).unwrap();
+        let out = roundtrip_block(QuantFormat::Q8_0, &src, 1.0, false).unwrap();
         for i in 0..CHUNK_SIZE {
             let e = (src[i] - out[i]).abs();
             assert!(e < 0.02, "Q8_0 element {i} error {e} too large");
@@ -1211,7 +1232,7 @@ mod tests {
 
     fn run_roundtrip(fmt: QuantFormat) {
         let src = ramp_src();
-        let out = roundtrip_block(fmt, &src, 1.0)
+        let out = roundtrip_block(fmt, &src, 1.0, true)
             .unwrap_or_else(|| panic!("{:?} dispatch returned None", fmt));
         let bound = fmt_error_bound(fmt);
         let mut max_err = 0.0f32;
@@ -1304,13 +1325,16 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_q8_1() {
+        run_roundtrip(QuantFormat::Q8_1);
+    }
+
+    #[test]
     fn roundtrip_unsupported_format_returns_none() {
         let src = ramp_src();
         // R16 carries Q activations in the `q[]` field; round-tripping
         // would lose them.
-        assert!(roundtrip_block(QuantFormat::R16, &src, 1.0).is_none());
-        // Q8_1::to_float is unimplemented in candle-core.
-        assert!(roundtrip_block(QuantFormat::Q8_1, &src, 1.0).is_none());
+        assert!(roundtrip_block(QuantFormat::R16, &src, 1.0, true).is_none());
     }
 
     #[test]
@@ -1676,10 +1700,14 @@ mod tests {
     #[test]
     fn production_c5_candidates_all_round_trip() {
         let (k_cands, v_cands) = production_adaptive_candidates(5);
-        for kv in k_cands.iter().chain(v_cands.iter()) {
+        let sides = k_cands
+            .iter()
+            .map(|kv| (kv, true))
+            .chain(v_cands.iter().map(|kv| (kv, false)));
+        for (kv, is_k) in sides {
             let q = quant_from_kv(*kv);
             let src = ramp_src();
-            let out = roundtrip_block(q, &src, 1.0)
+            let out = roundtrip_block(q, &src, 1.0, is_k)
                 .unwrap_or_else(|| panic!("C5 candidate {:?} round-trip None", q));
             let mut max_err = 0.0f32;
             for i in 0..CHUNK_SIZE {
@@ -1763,6 +1791,183 @@ mod tests {
             );
             assert!(h.k_pal_scale[s].is_finite() && h.k_pal_scale[s] > 0.0);
             assert!(h.v_pal_scale[s].is_finite() && h.v_pal_scale[s] > 0.0);
+        }
+    }
+
+    /// One chunk, one head, no Q: `fill(d, t, seed)` gives K and V at (dim d,
+    /// token t); the seed differs between the two sides.
+    fn one_head_selection(
+        fill: impl Fn(usize, usize, u64) -> f32,
+        cands: &[QuantFormat],
+        lo: f32,
+        hi: f32,
+    ) -> PerHeadSelection {
+        let total = HEAD_DIM * CHUNK_SIZE;
+        let k: Vec<f32> = (0..total)
+            .map(|i| fill(i / CHUNK_SIZE, i % CHUNK_SIZE, 0xA1))
+            .collect();
+        let v: Vec<f32> = (0..total)
+            .map(|i| fill(i / CHUNK_SIZE, i % CHUNK_SIZE, 0xB2))
+            .collect();
+        let q = vec![0u16; total];
+        let out = select_palette4(SelectionInput {
+            k_data: &k,
+            v_data: &v,
+            q_data: &q,
+            k_candidates: cands,
+            v_candidates: cands,
+            k_threshold_hi: hi,
+            k_threshold_lo: lo,
+            v_threshold_hi: hi,
+            v_threshold_lo: lo,
+            n_chunks: 1,
+            n_kv_head: 1,
+            head_dim: HEAD_DIM,
+        });
+        out.heads.into_iter().next().expect("one head")
+    }
+
+    /// **A block with real variation is never stored as its mean.** Dim 0 swings
+    /// ±100 and sets the head's range; every other dim varies with σ = 2 across
+    /// its tokens. At a lenient threshold the error metric alone lets Q0 take
+    /// those blocks — the variation is small against the head's amax — and Q0
+    /// keeps none of it.
+    #[test]
+    fn a_block_with_real_variation_is_never_stored_as_its_mean() {
+        let sel = one_head_selection(
+            |d, t, seed| {
+                if d == 0 {
+                    if t % 2 == 0 {
+                        100.0
+                    } else {
+                        -100.0
+                    }
+                } else {
+                    2.0 * deterministic_gauss(seed, d * CHUNK_SIZE + t)
+                }
+            },
+            &[QuantFormat::Q0, QuantFormat::Q4_0, QuantFormat::Q8_0],
+            0.3,
+            0.3,
+        );
+        for s in 0..N_PALETTE {
+            assert_ne!(sel.k_pal_format[s], QuantFormat::Q0, "K slot {s}");
+            assert_ne!(sel.v_pal_format[s], QuantFormat::Q0, "V slot {s}");
+        }
+    }
+
+    /// **Flat blocks still compress to Q0.** Every dim is constant across its
+    /// tokens to within 1e-5, far below one INT8 step of the head scale: there is
+    /// no variation to retain, so the retention test must not stand in the way.
+    #[test]
+    fn a_flat_block_still_takes_q0() {
+        let sel = one_head_selection(
+            |d, t, seed| {
+                let level = (d as f32 / 64.0 - 1.0) * 0.9 + 0.05;
+                level + 1.0e-5 * deterministic_gauss(seed, d * CHUNK_SIZE + t)
+            },
+            &[QuantFormat::Q0, QuantFormat::Q4_0],
+            0.3,
+            0.3,
+        );
+        for s in 0..N_PALETTE {
+            assert_eq!(sel.k_pal_format[s], QuantFormat::Q0, "K slot {s}");
+            assert_eq!(sel.v_pal_format[s], QuantFormat::Q0, "V slot {s}");
+        }
+    }
+
+    /// Only Q0, which keeps nothing but a block's mean, is offered flat blocks
+    /// alone. Every other format keeps at least a few levels per block.
+    #[test]
+    fn only_q0_is_offered_flat_blocks_alone() {
+        assert!(flat_only(QuantFormat::Q0));
+        for fmt in [
+            QuantFormat::Q0_V,
+            QuantFormat::Q0_X,
+            QuantFormat::Q0_M2,
+            QuantFormat::Q0_M4,
+            QuantFormat::Q1_S,
+            QuantFormat::Q1_A,
+            QuantFormat::Q2_S,
+            QuantFormat::Q2_A,
+            QuantFormat::Q3_0,
+            QuantFormat::Q4_0,
+            QuantFormat::Q8_0,
+        ] {
+            assert!(!flat_only(fmt), "{fmt:?}");
+        }
+    }
+
+    /// Flatness on raw numbers, against one INT8 step of the head scale: at a
+    /// head scale of 127 a step is 1.0, so a standard deviation of 0.5 is flat and
+    /// one of 2.0 is not — wherever the block's mean sits.
+    #[test]
+    fn flatness_is_judged_against_one_int8_step_of_the_head_scale() {
+        let wobble = |sd: f32, mean: f32| -> [f32; CHUNK_SIZE] {
+            std::array::from_fn(|t| mean + if t % 2 == 0 { sd } else { -sd })
+        };
+        assert!(block_is_flat(&wobble(0.5, 0.0), 127.0));
+        assert!(block_is_flat(&wobble(0.5, 80.0), 127.0));
+        assert!(!block_is_flat(&wobble(2.0, 0.0), 127.0));
+        assert!(!block_is_flat(&wobble(2.0, 80.0), 127.0));
+        assert!(block_is_flat(&[7.0; CHUNK_SIZE], 127.0));
+        // The same wobble is flat against a coarser head scale.
+        assert!(block_is_flat(&wobble(2.0, 0.0), 1270.0));
+    }
+
+    /// **A sink token cannot stretch the head scale.** One element at 1000
+    /// against a bulk of σ = 1 sets the amax a thousand times above the bulk;
+    /// the scale the metrics divide by is capped at 8× the p95 instead.
+    #[test]
+    fn a_sink_token_cannot_stretch_the_head_scale() {
+        let total = HEAD_DIM * CHUNK_SIZE;
+        let mut data: Vec<f32> = (0..total).map(|i| deterministic_gauss(0x51, i)).collect();
+        data[0] = 1000.0;
+        let amax = data.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let p95 = head_p95(&data, amax);
+        // The bulk's own p95 is ~2; the percentile answers the upper edge of its
+        // bin, which at sqrt spacing over a 1000 range is ~2.3.
+        assert!((2.0..3.0).contains(&p95), "p95 {p95}");
+        let scale = head_scale(amax, p95);
+        assert_eq!(scale, HEAD_SCALE_P95_CAP * p95);
+        assert!(scale < 25.0, "head scale {scale} against an amax of {amax}");
+    }
+
+    /// A head with no outlier elements keeps its amax exactly: the cap only ever
+    /// binds when something has stretched the range.
+    #[test]
+    fn a_head_without_a_sink_keeps_its_amax() {
+        let total = HEAD_DIM * CHUNK_SIZE;
+        let data: Vec<f32> = (0..total).map(|i| deterministic_uniform(0x52, i)).collect();
+        let amax = data.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let p95 = head_p95(&data, amax);
+        assert_eq!(head_scale(amax, p95), amax);
+    }
+
+    /// **The capped scale reaches the selection.** The same K and V, with one
+    /// sink element at 1000: against the raw amax Q4_0's error is 1e-4 of the
+    /// scale and passes a 2e-3 threshold; against the capped scale it is
+    /// several times the threshold, so the slots that have a choice move up to
+    /// Q8_0. The sink element's own block fits no format at that scale and is
+    /// left to the last slot, which then takes the lowest-error fallback — a tie
+    /// between the two here — so the last slot is not asserted.
+    #[test]
+    fn a_sink_token_does_not_loosen_every_threshold_in_its_chunk() {
+        let sel = one_head_selection(
+            |d, t, seed| {
+                if d == 0 && t == 0 {
+                    1000.0
+                } else {
+                    deterministic_gauss(seed, d * CHUNK_SIZE + t)
+                }
+            },
+            &[QuantFormat::Q4_0, QuantFormat::Q8_0],
+            0.002,
+            0.002,
+        );
+        for s in 0..N_PALETTE - 1 {
+            assert_eq!(sel.k_pal_format[s], QuantFormat::Q8_0, "K slot {s}");
+            assert_eq!(sel.v_pal_format[s], QuantFormat::Q8_0, "V slot {s}");
         }
     }
 }

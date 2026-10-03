@@ -438,14 +438,19 @@ __device__ __forceinline__ void int8_decode_attn_impl(
 
         // V skip-dequant eligibility (Track A §1A): read V straight from the
         // arena (no FP round-trip) only when EVERY palette's V format is a
-        // passthrough int8 family (Q8_0/Q4_0/Q5_0/Q2_0/Q3_0/Q4_KS/Q8_KS).
-        // Mixed/asymmetric/FP formats keep the dequant→requant path. K never
+        // passthrough int8 family whose scale is the same for every token of a
+        // block. The warps of a tile stage different tokens but share one
+        // per-dim scale row (`shared_v_dim_scale[stage]`), so a format whose
+        // scale depends on the token — the sink-protected Q4_KS/Q8_KS, tokens
+        // 0–3 on their own fine scale — would have the warps overwrite each
+        // other's scales; it takes the dequant→requant path, as it does in the
+        // tile kernel. Mixed/asymmetric/FP formats keep that path too. K never
         // skips — RoPE needs FP.
         bool v_readthrough = true;
         #pragma unroll
         for (int p = 0; p < N_PALETTE; ++p) {
             int vf = kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
-            if (!ArenaAccessor::is_int8_readthrough_format(vf)) v_readthrough = false;
+            if (!int8_elem::i8_tile_readthrough_format(vf)) v_readthrough = false;
         }
         if (lane == 0) shared_v_readthrough[stage] = v_readthrough ? 1 : 0;
 
@@ -457,7 +462,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             float k_scale_p = kvhead_k_scale<HEAD_DIM>(head_ptr, p);
             float v_scale_p = kvhead_v_scale<HEAD_DIM>(head_ptr, p);
             ArenaAccessor k_acc((const char*)(uintptr_t)k_ptr_p, k_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-            k_acc.template load_head_scaled<T, SUB_HEAD_DIM, USE_TC>(k_dst + p * SUB_HEAD_DIM, 0, 0, within, lane, k_scale_p);
+            k_acc.template load_head_scaled<T, SUB_HEAD_DIM, USE_TC, true>(k_dst + p * SUB_HEAD_DIM, 0, 0, within, lane, k_scale_p);
             ArenaAccessor v_acc((const char*)(uintptr_t)v_ptr_p, v_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
             // V load. The per-tile gate `v_readthrough` (= is_int8_readthrough_format
             // over ALL palettes) selects the layout — read straight through (the
@@ -472,7 +477,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                     shared_v_dim_scale[stage] + p * SUB_HEAD_DIM,
                     0, 0, within, lane, v_scale_p);
             } else {
-                v_acc.template load_head_scaled<T, SUB_HEAD_DIM, USE_TC>(v_dst + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
+                v_acc.template load_head_scaled<T, SUB_HEAD_DIM, USE_TC, false>(v_dst + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
             }
         }
     };
@@ -1031,7 +1036,7 @@ __device__ __forceinline__ void stripe_process_cell(
             if (k_ptr_p) {
                 ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, kvhead_k_fmt<HEAD_DIM>(head_ptr, p),
                                  sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                ka.template load_head_scaled<T, SUB_HEAD_DIM, false>(
+                ka.template load_head_scaled<T, SUB_HEAD_DIM, false, true>(
                     k_stage + p * SUB_HEAD_DIM, 0, 0, within, c.lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
             }
         }
@@ -1042,7 +1047,7 @@ __device__ __forceinline__ void stripe_process_cell(
             if (v_ptr_p) {
                 ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, kvhead_v_fmt<HEAD_DIM>(head_ptr, p),
                                  sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                va.template load_head_scaled<T, SUB_HEAD_DIM, false>(
+                va.template load_head_scaled<T, SUB_HEAD_DIM, false, false>(
                     v_stage + p * SUB_HEAD_DIM, 0, 0, within, c.lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
             }
         }
@@ -1758,19 +1763,61 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // are discarded (their mask bit is clear) below.
         #define TOK_VALID(t) (((tok_mask >> (t)) & 1u) != 0u)
         #define TOK_WITHIN(t) (TOK_VALID(t) ? within_base + (t) : (int)off)
+        // ── A Q0_V palette's block header, once per tile. A lane's dim of a
+        // palette is one block (32 tokens of that dim), and every token of the
+        // tile lies in this one chunk, so the lane reads the SAME block for all
+        // eight: its code, scale and centroid are loaded once here, with the
+        // palette scale folded in (`q0_v_header`), and each token below costs
+        // one curve byte and one FMA. Formats are warp-uniform per palette. ──
+        static_assert(BLOCKS_PER_DIM == 1, "a lane's dim of a palette is one block per chunk");
+        const auto q0v_headers = [&](auto is_k_const, Q0VHeader (&h)[N_PALETTE]) -> uint32_t {
+            constexpr bool IS_K = decltype(is_k_const)::value;
+            uint32_t mask = 0u;
+            #pragma unroll
+            for (int p = 0; p < N_PALETTE; ++p) {
+                const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
+                const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+                h[p] = Q0VHeader{ nullptr, 0.f, 0.f };
+                if (ptr != 0 && fmt == ArenaFormat::Q0_V) {
+                    const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
+                    h[p] = q0_v_header<IS_K>((const block_q0_v*)(uintptr_t)ptr + lane, __frcp_rn(scale));
+                    mask |= 1u << p;
+                }
+            }
+            return mask;
+        };
+        // Stage token t's K (IS_K) or V into skt[buf]: a Q0_V palette from its
+        // header, any other through the accessor (cp.async for a same-type
+        // dtype palette).
+        const auto stage_tok = [&](auto is_k_const, const Q0VHeader (&h)[N_PALETTE], uint32_t q0v_mask,
+                                   int buf, int t) {
+            constexpr bool IS_K = decltype(is_k_const)::value;
+            #pragma unroll
+            for (int p = 0; p < N_PALETTE; ++p) {
+                const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
+                if (ptr == 0) continue;
+                T* dst = skt[buf][warp] + p * SUB_HEAD_DIM;
+                if ((q0v_mask >> p) & 1u) {
+                    dst[lane] = q0_v_load_dispatch_detail::narrow(T{}, q0_v_header_elem(h[p], TOK_WITHIN(t)));
+                } else {
+                    const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+                    const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
+                    ArenaAccessor acc((const char*)(uintptr_t)ptr, fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                    acc.template load_head_scaled<T, SUB_HEAD_DIM, true, IS_K>(dst, 0, 0, TOK_WITHIN(t), lane, scale);
+                }
+            }
+        };
+        using KSide = std::integral_constant<bool, true>;
+        using VSide = std::integral_constant<bool, false>;
+        Q0VHeader q0h[N_PALETTE];
+
         // ── stage the 8 tokens' K → shared_kb, cp.async double-buffered so each
         // token's load overlaps the previous token's gather/RoPE/quant. The
         // prefetch is unconditional when slice_ok (all 8 tokens share the chunk,
         // so every `within` is in-bounds); invalid tokens just zero shared_kb.
+        uint32_t q0v_mask = q0v_headers(KSide{}, q0h);
         if (slice_ok) {
-            #pragma unroll
-            for (int p = 0; p < N_PALETTE; ++p) {
-                uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
-                if (k_ptr_p) {
-                    ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, kvhead_k_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                    ka.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, TOK_WITHIN(0), lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
-                }
-            }
+            stage_tok(KSide{}, q0h, q0v_mask, 0, 0);
             cp_async_commit<true>();
         }
         // A real loop over the 8 tokens, not unrolled: each iteration inlines
@@ -1784,14 +1831,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         for (int t = 0; t < 8; ++t) {
             if (slice_ok) {
                 if (t + 1 < 8) {
-                    #pragma unroll
-                    for (int p = 0; p < N_PALETTE; ++p) {
-                        uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
-                        if (k_ptr_p) {
-                            ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, kvhead_k_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                            ka.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[(t + 1) & 1][warp] + p * SUB_HEAD_DIM, 0, 0, TOK_WITHIN(t + 1), lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
-                        }
-                    }
+                    stage_tok(KSide{}, q0h, q0v_mask, (t + 1) & 1, t + 1);
                     cp_async_commit<true>();
                     cp_async_wait<1, true>();
                 } else {
@@ -1884,15 +1924,9 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // accumulate, and add it across all heads — no per-tile V smem staging.
         // Prefetch is unconditional when slice_ok (in-bounds); invalid tokens are
         // skipped in the accumulate. ──
+        q0v_mask = q0v_headers(VSide{}, q0h);
         if (slice_ok) {
-            #pragma unroll
-            for (int p = 0; p < N_PALETTE; ++p) {
-                uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
-                if (v_ptr_p) {
-                    ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, kvhead_v_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                    va.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, TOK_WITHIN(0), lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
-                }
-            }
+            stage_tok(VSide{}, q0h, q0v_mask, 0, 0);
             cp_async_commit<true>();
         }
         // A real loop for the same reason as the K stage above.
@@ -1900,14 +1934,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         for (int t = 0; t < 8; ++t) {
             if (slice_ok) {
                 if (t + 1 < 8) {
-                    #pragma unroll
-                    for (int p = 0; p < N_PALETTE; ++p) {
-                        uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
-                        if (v_ptr_p) {
-                            ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, kvhead_v_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                            va.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[(t + 1) & 1][warp] + p * SUB_HEAD_DIM, 0, 0, TOK_WITHIN(t + 1), lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
-                        }
-                    }
+                    stage_tok(VSide{}, q0h, q0v_mask, (t + 1) & 1, t + 1);
                     cp_async_commit<true>();
                     cp_async_wait<1, true>();
                 } else {

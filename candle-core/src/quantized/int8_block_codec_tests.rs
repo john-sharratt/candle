@@ -55,7 +55,7 @@ fn q2_a_encodes_scale_and_bias_as_int8_bytes() {
     let mut ys = vec![BlockQ2A::zeros(); 1];
     BlockQ2A::from_float(&xs, &mut ys);
     assert_eq!(ys[0].scale, 64);
-    assert_eq!(ys[0].bias, (-64i8) as u8);
+    assert_eq!(ys[0].bias, -64);
     // q = round((x − m) / d) with d = 64/127, m = −64/127:
     // −0.5 → 0, 1.0 → round(2.98) = 3, 0.0 → round(0.99) = 1, 0.5 → round(1.98) = 2.
     assert_eq!(ys[0].qs, [0b10_01_11_00; 8]);
@@ -63,8 +63,9 @@ fn q2_a_encodes_scale_and_bias_as_int8_bytes() {
     let mut back = vec![0f32; 32];
     BlockQ2A::to_float(&ys, &mut back);
     let (d, m) = (64.0 * UNIT, -64.0 * UNIT);
-    assert_eq!(back[0], d.mul_add(0.0, m));
-    assert_eq!(back[1], d.mul_add(3.0, m));
+    // `block_q2_a.cuh`'s `d * q + m`.
+    assert_eq!(back[0], d * 0.0 + m);
+    assert_eq!(back[1], d * 3.0 + m);
 }
 
 /// An all-zero block encodes to zero scale and decodes to zeros, not NaN.

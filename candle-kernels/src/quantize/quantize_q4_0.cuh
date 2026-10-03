@@ -59,9 +59,9 @@ __device__ __forceinline__ void quantize_block_q4_0_vec(
     int max_idx = local_max_idx;
     #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1) {
-        float other_amax = __shfl_xor_sync(0xff, amax, offset, 8);
-        float other_val = __shfl_xor_sync(0xff, max_val, offset, 8);
-        int other_idx = __shfl_xor_sync(0xff, max_idx, offset, 8);
+        float other_amax = __shfl_xor_sync(0xffffffff, amax, offset, 8);
+        float other_val = __shfl_xor_sync(0xffffffff, max_val, offset, 8);
+        int other_idx = __shfl_xor_sync(0xffffffff, max_idx, offset, 8);
         if (other_amax > amax || (other_amax == amax && other_idx < max_idx)) {
             amax = other_amax;
             max_val = other_val;
@@ -195,9 +195,9 @@ __device__ __forceinline__ void quantize_blocks_q4_0(
         int max_idx = local_max_idx;
         #pragma unroll
         for (int offset = 4; offset > 0; offset >>= 1) {
-            float other_amax = __shfl_xor_sync(0xff, amax, offset, 8);
-            float other_val = __shfl_xor_sync(0xff, max_val, offset, 8);
-            int other_idx = __shfl_xor_sync(0xff, max_idx, offset, 8);
+            float other_amax = __shfl_xor_sync(0xffffffff, amax, offset, 8);
+            float other_val = __shfl_xor_sync(0xffffffff, max_val, offset, 8);
+            int other_idx = __shfl_xor_sync(0xffffffff, max_idx, offset, 8);
             if (other_amax > amax || (other_amax == amax && other_idx < max_idx)) {
                 amax = other_amax;
                 max_val = other_val;

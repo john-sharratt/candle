@@ -52,6 +52,7 @@ pub mod file_changes;
 pub mod file_delta;
 pub mod files;
 mod kill_tree;
+mod library;
 pub mod origin;
 mod read;
 mod redact;
@@ -140,6 +141,10 @@ pub struct Repo {
     git_dir: PathBuf,
     format: ObjectFormat,
     write: Mutex<()>,
+    /// The repository held in this process, which answers what its own files
+    /// can without a `git` process (see [`library`]). `None` for a repository
+    /// libgit2 cannot hold, whose every question goes to the `git` program.
+    library: Option<Mutex<git2::Repository>>,
 }
 
 impl fmt::Debug for Repo {
@@ -157,6 +162,10 @@ impl Repo {
     /// Refuses a directory that is not itself a top level — a subfolder of a
     /// repository, or a plain folder nested inside one — because git would
     /// otherwise walk up and operate on the enclosing repository.
+    ///
+    /// A repository libgit2 can hold is opened in this process, and no `git`
+    /// process starts; anything else is asked of `git`, which also gives the
+    /// reason for a refusal.
     pub fn open(dir: &Path) -> Result<Self, GitError> {
         version::installed()?;
         let not_a_repo = || GitError::NotARepository {
@@ -164,6 +173,9 @@ impl Repo {
         };
         if !dir.is_dir() {
             return Err(not_a_repo());
+        }
+        if let Some(repo) = library::open_in_process(dir) {
+            return Ok(repo);
         }
         // The top level, this working tree's git folder and the repository's
         // hash, in one process.
@@ -213,6 +225,7 @@ impl Repo {
             git_dir,
             format,
             write: Mutex::new(()),
+            library: None,
         })
     }
 
@@ -294,6 +307,33 @@ mod tests {
         let t = TestRepo::init();
         assert!(matches!(
             Repo::open(&t.path.join("nope")),
+            Err(GitError::NotARepository { .. })
+        ));
+    }
+
+    /// **A folder opened twice answers the same both times**: the second open
+    /// is the first one's answer kept, not a second question to git.
+    #[test]
+    fn a_folder_opened_again_is_the_same_repository() {
+        let t = TestRepo::init();
+        let first = Repo::open(&t.path).unwrap();
+        let second = Repo::open(&t.path).unwrap();
+        assert_eq!(first.dir(), second.dir());
+        assert_eq!(first.git_dir(), second.git_dir());
+        assert!(first.git_dir().ends_with(".git"), "{:?}", first.git_dir());
+        assert_eq!(second.format(), ObjectFormat::Sha1);
+    }
+
+    /// **A kept answer is only trusted while the repository is still there.**
+    /// A folder whose `.git` was deleted is not a repository however recently
+    /// it was opened as one.
+    #[test]
+    fn a_folder_that_stopped_being_a_repository_is_refused_again() {
+        let t = TestRepo::init();
+        Repo::open(&t.path).unwrap();
+        std::fs::remove_dir_all(t.path.join(".git")).unwrap();
+        assert!(matches!(
+            Repo::open(&t.path),
             Err(GitError::NotARepository { .. })
         ));
     }

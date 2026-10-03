@@ -59,10 +59,11 @@ mod common;
 mod tool_scenarios {
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
     use futures::StreamExt;
+    use tokio::runtime::Runtime;
 
     use crate::common::{needs_compaction, production_workspace, run_conv_id, served};
     use candle::quantized::pinned_staging::recycled_stats;
@@ -88,9 +89,82 @@ mod tool_scenarios {
     const MODEL: Model = Model::Qwen35_0_8B_Q8;
 
     /// Scenarios run one at a time. They share one workspace and its substrate
-    /// admits one daemon, so each boots, answers and shuts down before the next
-    /// opens it.
+    /// admits one daemon, and one engine fills the card.
     static SCENARIO: Mutex<()> = Mutex::new(());
+
+    /// The runtime the shared daemon lives on, for the life of the process.
+    ///
+    /// A session's own tasks run on the runtime that booted it, so a daemon
+    /// every scenario uses cannot be booted on a runtime that ends with one
+    /// scenario. Every scenario's future runs here instead.
+    fn runtime() -> &'static Runtime {
+        static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+        })
+    }
+
+    /// The one daemon the 0.8B scenarios share, booted by the first that needs
+    /// it.
+    static SHARED: tokio::sync::Mutex<Option<Arc<ZendSession>>> =
+        tokio::sync::Mutex::const_new(None);
+
+    /// The shared daemon, booted if no scenario has yet.
+    ///
+    /// **One boot for the suite, not one per scenario.** A boot — the model, the
+    /// tool catalog's stencil, the catalog's sections out of the log — is ~15 s
+    /// of the ~16 a scenario took, and each scenario is one query on a
+    /// conversation of its own, retired afterwards (`run_on`). What the old
+    /// layout bought was a clean substrate per scenario, and the measurement
+    /// that justified it was the production model's, where a shared engine's
+    /// corpus grew with every query; on the 0.8B a query is a fraction of a
+    /// second and a conversation retired is a conversation gone.
+    async fn small_session() -> Arc<ZendSession> {
+        let mut shared = SHARED.lock().await;
+        if let Some(session) = shared.as_ref() {
+            return Arc::clone(session);
+        }
+        let session = boot(workspace(), ModelChoice::Preset(Box::new(MODEL))).await;
+        shutdown_at_exit();
+        *shared = Some(Arc::clone(&session));
+        session
+    }
+
+    /// Make `session`, booted by a test that wanted it for itself, the daemon the
+    /// scenarios share.
+    async fn keep_as_shared(session: Arc<ZendSession>) {
+        shutdown_at_exit();
+        *SHARED.lock().await = Some(session);
+    }
+
+    /// Shut the shared daemon down, if one is up: before a scenario that boots
+    /// a daemon of its own, which needs the card and the workspace.
+    async fn release_shared_session() {
+        let session = SHARED.lock().await.take();
+        if let Some(session) = session {
+            session.shutdown().await;
+        }
+    }
+
+    /// Shut the shared daemon down when the process ends. A test binary has no
+    /// hook after its last test, and a daemon left running is a log left
+    /// mid-write.
+    fn shutdown_at_exit() {
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        extern "C" fn at_exit() {
+            runtime().block_on(release_shared_session());
+        }
+        REGISTERED.call_once(|| {
+            // SAFETY: `at_exit` is a plain function that takes nothing and
+            // returns nothing, and `atexit` only stores it.
+            unsafe {
+                libc::atexit(at_exit);
+            }
+        });
+    }
 
     /// The suite's own workspace, kept under `target/tmp` between runs.
     ///
@@ -135,14 +209,27 @@ mod tool_scenarios {
         Production,
     }
 
+    /// A reply's budget when the scenario reads the answer: generous, because
+    /// this model opens a reasoning block before it answers.
+    const ANSWER_TOKENS: usize = 512;
+
+    /// A reply's budget when the scenario reads what provenance projected and
+    /// not what the model said. Projection happens as the turn opens and as its
+    /// first tokens move the belief, and a tool call, when the model makes one,
+    /// is inside these; past them the 0.8B runs on to the full budget saying
+    /// nothing a scenario asserts — four seconds of decode per scenario.
+    const OBSERVED_TOKENS: usize = 64;
+
     /// [`run_on`] the small rig — what every scenario the 0.8B handles runs.
     async fn run_query(prompt: &str, conv_id: &str) -> String {
-        run_on(Rig::Small, prompt, conv_id).await.response
+        run_on(Rig::Small, prompt, conv_id, ANSWER_TOKENS)
+            .await
+            .response
     }
 
     /// [`run_on`] the small rig, keeping what provenance did with the query.
     async fn run_query_observed(prompt: &str, conv_id: &str) -> Outcome {
-        run_on(Rig::Small, prompt, conv_id).await
+        run_on(Rig::Small, prompt, conv_id, OBSERVED_TOKENS).await
     }
 
     /// What one scenario observed.
@@ -208,36 +295,44 @@ mod tool_scenarios {
         }
     }
 
-    /// Boot a ZendSession on `rig`, wait for ready, send `prompt`, shut the
-    /// session down, and return what the turn did.
-    async fn run_on(rig: Rig, prompt: &str, conv_id: &str) -> Outcome {
-        // A conversation of this run's own — both workspaces persist across runs.
-        let conv_id = run_conv_id(conv_id);
-        let (workspace, model, mut selection) = match rig {
-            Rig::Small => (
-                workspace(),
-                ModelChoice::Preset(Box::new(MODEL)),
-                dial_selection(None, None, Some(false)),
-            ),
-            Rig::Production => (
-                production_workspace(),
-                ModelChoice::MeasuredVram,
-                SelectionState::default(),
-            ),
-        };
+    /// Boot a ZendSession on `model` over `workspace` and wait for every startup
+    /// step to finish.
+    async fn boot(workspace: PathBuf, model: ModelChoice) -> Arc<ZendSession> {
         let compact_substrate = needs_compaction(&workspace);
-        // The tool prompt a chat turn gets — the block AND its worked call — so
-        // the suite exercises what a user is shown, not a catalog with no example.
-        apply_tools_dial(&mut selection, ToolMode::Comprehensive);
-        let log = LogBus::new();
         let config = DaemonConfig {
             port: 0,
             model,
             compact_substrate,
             ..DaemonConfig::new(served(&workspace))
         };
-        let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
+        let session = Arc::new(ZendSession::new(config, LogBus::new()));
         session.start_loading();
+        while session.status_snapshot().loading.is_some() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        session
+    }
+
+    /// Send `prompt` to the daemon `rig` names and return what the turn did: the
+    /// shared one for the small rig, one booted for the call — and shut down
+    /// after it — for the production model.
+    async fn run_on(rig: Rig, prompt: &str, conv_id: &str, max_tokens: usize) -> Outcome {
+        // A conversation of this run's own — both workspaces persist across runs.
+        let conv_id = run_conv_id(conv_id);
+        let mut selection = match rig {
+            Rig::Small => dial_selection(None, None, Some(false)),
+            Rig::Production => SelectionState::default(),
+        };
+        // The tool prompt a chat turn gets — the block AND its worked call — so
+        // the suite exercises what a user is shown, not a catalog with no example.
+        apply_tools_dial(&mut selection, ToolMode::Comprehensive);
+        let session = match rig {
+            Rig::Small => small_session().await,
+            Rig::Production => {
+                release_shared_session().await;
+                boot(production_workspace(), ModelChoice::MeasuredVram).await
+            }
+        };
 
         let messages = vec![ChatMessage::new(Role::User, prompt)];
         // Argmax, so a scenario is one fixed decode of its prompt. Left to the
@@ -246,7 +341,7 @@ mod tool_scenarios {
         let mut stream = session
             .submit_with_sampling(
                 messages,
-                Some(512),
+                Some(max_tokens),
                 conv_id.to_string(),
                 Some(SamplingConfig::argmax()),
                 None,
@@ -314,8 +409,11 @@ mod tool_scenarios {
         if let Some(Err(e)) = session.tombstone_timeline_raw(timeline_for(&conv_id).raw()) {
             panic!("tombstoning {conv_id}: {e}");
         }
-        // Release the workspace's substrate for the next scenario.
-        session.shutdown().await;
+        // A daemon booted for this call releases the workspace's substrate; the
+        // shared one stays up for the next scenario.
+        if matches!(rig, Rig::Production) {
+            session.shutdown().await;
+        }
         Outcome {
             response,
             tools_called,
@@ -324,78 +422,37 @@ mod tool_scenarios {
         }
     }
 
-    /// Host-pinned bytes still allocated once the previous scenario's session had
-    /// shut down and been released.
-    static PINNED_AFTER_PREVIOUS: Mutex<Option<u64>> = Mutex::new(None);
-
-    /// How long a finished scenario's runtime may take to wind its tasks down.
-    const RUNTIME_WIND_DOWN: Duration = Duration::from_secs(60);
-
+    /// Run a scenario's future on the suite's runtime, one scenario at a time.
     fn run_with_timeout<T, F: std::future::Future<Output = T> + Send + 'static>(f: F) -> T {
         let _one_at_a_time = SCENARIO.lock().unwrap_or_else(|e| e.into_inner());
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        let result =
-            rt.block_on(async { tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), f).await });
-        // Wait for everything the session spawned, so what is still pinned below
-        // is what the session left behind rather than what is still unwinding.
-        rt.shutdown_timeout(RUNTIME_WIND_DOWN);
-        let response = result.unwrap_or_else(|_| panic!("test timed out after {TIMEOUT_SECS}s"));
-        assert_session_released_its_pinned_memory();
-        response
+        runtime()
+            .block_on(async { tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), f).await })
+            .unwrap_or_else(|_| panic!("test timed out after {TIMEOUT_SECS}s"))
     }
 
     /// **A shut-down session releases what it pinned.**
     ///
-    /// Every scenario boots and shuts down a full session in this one process, so
-    /// each one's residue is measurable against the last. The first reading is
-    /// the baseline — it includes what the process pins once and keeps — and every
-    /// later session must leave exactly that behind. A session still reachable
-    /// after `shutdown` keeps its expert warm tier pinned, and its engine
-    /// competes with the next session for the card.
-    fn assert_session_released_its_pinned_memory() {
-        let now = host_pinned_bytes();
-        let mut previous = PINNED_AFTER_PREVIOUS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(before) = *previous {
-            assert_eq!(
-                now,
-                before,
-                "a shut-down session left pinned host memory behind: {before} bytes after \
-                 the previous scenario, {now} after this one — by consumer now: {:?}, \
-                 idle in the staging recycler (buffers, bytes): {:?}",
-                host_pinned_breakdown(),
-                recycled_stats()
-            );
-        }
-        *previous = Some(now);
+    /// Host-pinned bytes still allocated now, less the staging recycler's idle
+    /// buffers. A session still reachable after `shutdown` keeps its expert warm
+    /// tier pinned, and its engine competes with the next session for the card.
+    ///
+    /// **The staging recycler is not a session's residue.** Its idle write-combined
+    /// buffers are process-wide, kept up to `RECYCLER_MAX_BYTES` so the next
+    /// session reuses them, and a scenario that stages a new buffer size (a
+    /// scenario that makes a tool call stages differently from one that does not)
+    /// leaves the pool larger by exactly that buffer — 768 KiB, measured. They are
+    /// subtracted: what is compared is pinned memory the pool does not own.
+    fn pinned_outside_the_recycler() -> u64 {
+        let (_, idle_in_recycler) = recycled_stats();
+        host_pinned_bytes().saturating_sub(idle_in_recycler as u64)
     }
 
-    /// Boot a ZendSession on the small rig, wait for every startup step to
-    /// finish, and report how it loaded its prompt sections — the tool catalog
-    /// among them.
-    async fn boot_and_count_sections() -> SectionLoads {
-        let workspace = workspace();
-        let compact_substrate = needs_compaction(&workspace);
-        let config = DaemonConfig {
-            port: 0,
-            model: ModelChoice::Preset(Box::new(MODEL)),
-            compact_substrate,
-            ..DaemonConfig::new(served(&workspace))
-        };
-        let session = Arc::new(ZendSession::new(config, LogBus::new()));
-        session.start_loading();
-        while session.status_snapshot().loading.is_some() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let loads = session
+    /// How a booted session loaded its prompt sections — the tool catalog among
+    /// them.
+    fn section_loads_of(session: &ZendSession) -> SectionLoads {
+        session
             .section_loads()
-            .expect("the model is loaded once every startup step has finished");
-        session.shutdown().await;
-        loads
+            .expect("the model is loaded once every startup step has finished")
     }
 
     // ── A boot seals no prompt section a previous boot already sealed ────────
@@ -407,9 +464,11 @@ mod tool_scenarios {
     // ~140 MB a boot.
     //
     // **The two boots' counts are deliberately NOT compared.** This workspace
-    // is shared and persistent, and `needs_compaction` is a size test
-    // (`> COMPACT_ABOVE_BYTES`), so it can be true on BOTH boots: the second
-    // compaction sheds the records the first boot's re-seals superseded, and
+    // is shared and persistent, and `needs_compaction` asks whether the log has
+    // outgrown its last compaction, so it can be true on a run's FIRST boot —
+    // and the boot after a compaction rewrites the log it restores from, so
+    // `restored` can differ between the two even though nothing is recomputed:
+    // a compaction sheds the records the first boot's re-seals superseded, and
     // `restored` legitimately falls — 321 to 226 on the run that exposed this.
     // Asserting `restored == first.restored + first.prefilled` reported that
     // reclamation as "the second boot prefilled N sections" while `prefilled`
@@ -417,14 +476,43 @@ mod tool_scenarios {
     // what had happened. What the suite is protecting is that nothing is
     // recomputed, so that is what is asserted.
 
+    // Named to sort before every scenario: it releases the shared daemon, so
+    // run after one it would make the suite boot a daemon only to shut it down.
     #[test]
-    fn a_second_boot_restores_every_prompt_section() {
+    fn a_boot_after_a_boot_restores_every_prompt_section() {
         init_tracing();
         // Both boots under one scenario lock, so no other scenario runs on the
-        // shared workspace between them.
-        let (first, second) = run_with_timeout(async {
-            let first = boot_and_count_sections().await;
-            (first, boot_and_count_sections().await)
+        // shared workspace between them — and with the shared daemon released
+        // first, which holds the workspace and the card.
+        let _one_at_a_time = SCENARIO.lock().unwrap_or_else(|e| e.into_inner());
+        let (first, second) = runtime().block_on(async {
+            release_shared_session().await;
+            // The shared runtime outlives its daemons, so a daemon's tasks
+            // unwind while it runs on: give them the time before measuring.
+            let unwind = || tokio::time::sleep(Duration::from_secs(2));
+            unwind().await;
+            let pinned_before = pinned_outside_the_recycler();
+
+            let session = boot(workspace(), ModelChoice::Preset(Box::new(MODEL))).await;
+            let first = section_loads_of(&session);
+            session.shutdown().await;
+            unwind().await;
+            // **A shut-down session releases what it pinned.** A full boot and
+            // shutdown in this one process must leave exactly what was pinned
+            // before it.
+            assert_eq!(
+                pinned_outside_the_recycler(),
+                pinned_before,
+                "a shut-down session left pinned host memory behind (by consumer: {:?})",
+                host_pinned_breakdown(),
+            );
+
+            // The second boot is the daemon the scenarios share: it has been
+            // booted, so it is kept.
+            let session = boot(workspace(), ModelChoice::Preset(Box::new(MODEL))).await;
+            let second = section_loads_of(&session);
+            keep_as_shared(session).await;
+            (first, second)
         });
         assert_eq!(
             second.prefilled, 0,
@@ -494,6 +582,7 @@ mod tool_scenarios {
             Rig::Production,
             "What is 2 plus 2? Reply with just the number.",
             "test-add",
+            ANSWER_TOKENS,
         ))
         .response;
         assert!(!response.is_empty());
@@ -505,15 +594,24 @@ mod tool_scenarios {
 
     // ── Scenario 4: unit conversion ──────────────────────────────────────────
 
+    // **Asserts PROJECTION, not the answer's theme.** The 0.8B is deterministic
+    // here and, with `unit_convert` projected, answers with a bare citation
+    // ("[1] https://en.wikipedia.org/…") and calls nothing — measured, twice on a
+    // freshly recalibrated substrate. Whether it then emits a call is the model's
+    // choice; whether provenance put the tool in front of it is what this
+    // scenario owns.
     #[test]
     fn unit_convert_query_uses_unit_convert_tool() {
         init_tracing();
-        let response = run_with_timeout(run_query("Convert 100 km to miles.", "test-units"));
-        assert!(!response.is_empty(), "unit_convert produced no response");
-        // 100 km ≈ 62.137 miles.  Look for "62" prefix as a sanity check.
+        let out = run_with_timeout(run_query_observed("Convert 100 km to miles.", "test-units"));
         assert!(
-            response.contains("62") || response.to_lowercase().contains("mile"),
-            "expected a miles-flavoured answer, got: {response:?}",
+            out.selected.contains("unit_convert"),
+            "unit_convert was never PROJECTED for a unit-conversion request \
+             (called: {}). Its belief peaked at {:.0} while the turn's strongest \
+             tools were: {}",
+            out.called("unit_convert"),
+            out.peak("unit_convert"),
+            out.ranking(),
         );
     }
 
@@ -595,6 +693,7 @@ mod tool_scenarios {
             Rig::Production,
             "Compute the SHA256 hash of the text \"hello\".",
             "test-hash",
+            ANSWER_TOKENS,
         ))
         .response;
         assert!(!response.is_empty());

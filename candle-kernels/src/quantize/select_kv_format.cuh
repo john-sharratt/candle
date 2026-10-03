@@ -109,11 +109,14 @@
 // ------------------
 // Per-block error metrics are side-asymmetric:
 //
-//   K side: pass_metric = mean_top4(|orig − recon|) · (1 / head_amax)
+//   K side: pass_metric = mean_top4(|orig − recon|) · (1 / head_scale)
 //           threshold   = kthresh[b]    (q-relevance scaled, per block)
 //
-//   V side: pass_metric = mean_{32 lanes}(orig − recon)² · (1 / head_amax²)
+//   V side: pass_metric = mean_{32 lanes}(orig − recon)² · (1 / head_scale²)
 //           threshold   = v_thr_sq      (sink-aware, constant per head)
+//
+// `head_scale` is the head's amax capped at HEAD_SCALE_P95_CAP times its 95th
+// percentile |x| (`head_scale()`), so a few sink elements cannot stretch it.
 //
 // The K choice is top-4 mean because K errors enter the softmax directly
 // and outliers dominate the score perturbation. The V choice is MSE
@@ -137,8 +140,8 @@
 //
 // O(1) error contract
 // -------------------
-// Every metric the search measures is normalised (by head_amax for K,
-// head_amax² for V) so the threshold values are dimensionless and
+// Every metric the search measures is normalised (by head_scale for K,
+// head_scale² for V) so the threshold values are dimensionless and
 // transferable across heads, layers, and models. Combined with the
 // candidate set's BPE ladder, this gives the per-block error budget
 // the O(1) bound required by the unbounded-context attention design.
@@ -203,6 +206,9 @@
 #define SELECT_FMT_Q0       33
 #define SELECT_FMT_F8E4M3   34
 #define SELECT_FMT_F8E5M2   35
+
+// Register round trips for the search; reads the SELECT_FMT_* tags above.
+#include "select_lane_roundtrip.cuh"
 
 // =============================================================================
 // FUSED-KERNEL DIMENSIONS
@@ -458,18 +464,27 @@ __device__ __forceinline__ float mean_top4_abs_error_warp(
     float orig, float recon, float w_lane
 ) {
     const int lane = threadIdx.x & 31;
-    float e = fabsf(orig - recon) * w_lane;
+    // Errors are non-negative (`fmaxf` also turns a NaN into 0, as the shuffle
+    // reduction's `fmaxf` ignored it), so a removed lane is marked with 0.0f
+    // rather than -FLT_MAX: the next maximum is the same either way, and a
+    // non-negative float orders as its bit pattern, which lets sm_80+ take each
+    // warp maximum with one `REDUX.MAX` instead of five shuffles.
+    float e = fmaxf(fabsf(orig - recon) * w_lane, 0.0f);
     float sum = 0.0f;
     #pragma unroll
     for (int pass = 0; pass < 4; pass++) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        const float m = __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(e)));
+#else
         float m = e;
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off, 32));
+#endif
         sum += m;
         const unsigned ballot = __ballot_sync(0xffffffff, e == m);
         const int first_lane = __ffs(ballot) - 1;
-        if (lane == first_lane) e = -FLT_MAX;
+        if (lane == first_lane) e = 0.0f;
     }
     return __fmul_rn(sum, 0.25f);
 }
@@ -702,6 +717,33 @@ template <> struct outer_cancels_in_roundtrip<SELECT_FMT_Q3_0>  { static constex
 template <> struct outer_cancels_in_roundtrip<SELECT_FMT_Q3_1>  { static constexpr bool value = true; };
 template <> struct outer_cancels_in_roundtrip<SELECT_FMT_R16>   { static constexpr bool value = true; };
 
+// =============================================================================
+// FLAT-ONLY TRAIT
+// =============================================================================
+// Q0 stores a block's mean and nothing else, so it keeps none of the variation
+// between the block's 32 tokens. The error metrics compare an error against the
+// HEAD's scale, so a dim whose tokens vary by a small fraction of the head's
+// range passes them even when that variation is the whole of what the dim
+// contributes to a score (K) or an output (V). Q0 is therefore offered only the
+// blocks that have no variation to keep: those flat to within one INT8 step of
+// the head scale (`block_var_is_flat`). Flatness is a property of the block, not of
+// the format or the outer scale, so it is decided once per head in Phase 1 and
+// the search skips Q0's quantize-and-measure round trip for every other block.
+// No other format is touched: each keeps at least a few levels per block. A
+// candidate list is never Q0 alone: every list in use ends in a format with
+// per-block levels, which is what a slot Q0 cannot take falls back to.
+template <int FMT> struct flat_only {
+    static constexpr bool value = false;
+};
+template <> struct flat_only<SELECT_FMT_Q0> { static constexpr bool value = true; };
+// A block whose standard deviation is below head scale / FLAT_BLOCK_STEPS carries
+// less than one INT8 step of variation: nothing there to keep.
+#define FLAT_BLOCK_STEPS 127.0f
+// The head scale the error metrics divide by is capped at this many times the
+// head's 95th-percentile |x|, so a few sink-token elements cannot loosen every
+// threshold in the chunk that holds them.
+#define HEAD_SCALE_P95_CAP 8.0f
+
 // Dequant a single element. `outer` is the same scale value the caller
 // passed to `quantize_block_for_fmt`; the BlockConverter divides by it
 // internally, matching the runtime `dequant_element` path. Returns
@@ -837,16 +879,16 @@ __device__ __forceinline__ int alive_count(const uint64_t* mask) {
 //   compute_pass_metric       (orig, recon) → (pass_metric, threshold)
 //   search_scales_for_fmt     for one fmt: 6 candidates × live blocks →
 //                             update best/fallback in shared smem
-//   claim_passing_blocks…     mask-driven claim (no round-trip)
 
-// One-block warp-cooperative round-trip: scale up by `outer`, quantize
-// into the warp's scratch buffer, dequantize element `lane`. Returns
-// the per-lane reconstructed float.
+// One-block warp-cooperative round-trip: scale up by `outer`, quantize,
+// dequantize element `lane`. Returns the per-lane reconstructed float.
 //
-// The two `__syncwarp()` calls ensure all 32 lanes have written their
-// scaled values before the (collectively-called) `quantize_block_for_fmt`
-// reads them, and that the quantized bytes are visible before the
-// per-lane `dequant_element_for_fmt` load. Since the scratch buffers
+// A format with a register round trip (`lane_roundtrip`) never touches the
+// scratch buffers. Every other format quantizes into the warp's scratch buffer
+// and decodes from it: the two `__syncwarp()` calls ensure all 32 lanes have
+// written their scaled values before the (collectively-called)
+// `quantize_block_for_fmt` reads them, and that the quantized bytes are visible
+// before the per-lane `dequant_element_for_fmt` load. Since the scratch buffers
 // are warp-private smem, no broader barrier is needed.
 template <int FMT>
 __device__ __forceinline__ float roundtrip_block_for_fmt(
@@ -857,6 +899,9 @@ __device__ __forceinline__ float roundtrip_block_for_fmt(
     uint8_t* warp_quant_smem,
     bool is_k
 ) {
+    if constexpr (lane_roundtrip<FMT>::value) {
+        return lane_roundtrip_for_fmt<FMT>(orig * outer, outer, warp_f32_smem, is_k);
+    }
     warp_f32_smem[lane] = orig * outer;
     __syncwarp();
     quantize_block_for_fmt<FMT>(warp_f32_smem, warp_quant_smem, is_k);
@@ -867,16 +912,16 @@ __device__ __forceinline__ float roundtrip_block_for_fmt(
 // Compute the (pass_metric, threshold) pair for a single (orig, recon)
 // block. The two sides use structurally different metrics:
 //
-//   K side  pass_metric    = mean_top4(|orig − recon|) · (1 / head_amax)
+//   K side  pass_metric    = mean_top4(|orig − recon|) · (1 / head_scale)
 //           thr_to_compare = kthresh[b]   (q-relevance scaled, per block)
 //
-//   V side  pass_metric    = mean_{32 lanes}(orig − recon)² · (1 / head_amax²)
+//   V side  pass_metric    = mean_{32 lanes}(orig − recon)² · (1 / head_scale²)
 //           thr_to_compare = v_thr_sq     (sink-aware, constant per head)
 //
 // Both pass_metric and thr_to_compare are warp-uniform after the
-// reductions inside this function: K's `mean_top4_abs_error_warp`
-// broadcasts via __shfl_xor_sync, and V's MSE reduction is a sum over
-// the 32 lanes followed by a constant divide. That uniformity is what
+// reductions inside this function: K's `mean_top4_abs_error_warp` takes
+// each maximum as a warp-wide reduction every lane receives, and V's MSE
+// reduction is a sum over the 32 lanes followed by a constant divide. That uniformity is what
 // makes the lane-0-only mask accumulation in `search_scales_for_fmt`
 // safe — every lane sees the same predicate value.
 //
@@ -885,14 +930,11 @@ __device__ __forceinline__ float roundtrip_block_for_fmt(
 // collective reductions below stay safe; what it is not worth is a second copy
 // of everything that calls this, which is what templating it cost.
 //
-// Hoisted constants (`inv_head_amax`, `inv_head_amax_sq`, `v_thr_sq`)
-// are computed once per side in `process_side`. The V-side hoist
-// matters most: the prior implementation re-derived `thr_eff²` inside
-// this function, which forced a warp-max reduction over
-// `sink_weight[lane]` on every (block, fmt, scale) iteration even
-// though sink_weight is fixed after Phase 2.5. With ~7,680 search
-// iterations per side, that hoist eliminates ~15K redundant warp-max
-// reductions per head.
+// The constants (`inv_head_amax` and `inv_head_amax_sq`, the reciprocals of
+// the head scale, and `v_thr_sq`) are computed once per side in
+// `process_side`. `v_thr_sq` depends only on the sink weights, which are fixed
+// after Phase 2.5, so deriving it here would repeat a warp-max reduction over
+// `sink_weight[lane]` on every (block, fmt, scale) round trip for nothing.
 __device__ __forceinline__ void compute_pass_metric(
     float orig,
     float recon,
@@ -922,6 +964,25 @@ __device__ __forceinline__ void compute_pass_metric(
     }
 }
 
+// The scale the error metrics divide by: the head's amax, capped at
+// `HEAD_SCALE_P95_CAP` times its 95th-percentile |x| (`approximate_q_relevance_
+// quantiles`). A sink token puts a few elements far above the rest of the head;
+// they set the amax, and an amax-relative threshold then admits errors that are
+// large against everything else in the chunk. The p95 is not moved by a handful
+// of elements, so it bounds how far they can stretch the scale. A head with no
+// such elements has amax within the cap and keeps its amax exactly.
+__device__ __forceinline__ float head_scale(float amax, float p95) {
+    return fmaxf(fminf(amax, HEAD_SCALE_P95_CAP * p95), 1.0e-8f);
+}
+
+// Is a block with this variance (across its valid tokens) flat — its standard
+// deviation below `step`, one INT8 step of the head scale? The variance is
+// E[x^2] - mean^2 from warp-reduced moments; its rounding error is far below the
+// step^2 it is compared with, which is (head scale / 127)^2.
+__device__ __forceinline__ bool block_var_is_flat(float var, float step) {
+    return var <= step * step;
+}
+
 // Per-fmt scale × block search.
 //
 // For one format, walks NUM_SCALE_CANDIDATES outer scales; per scale,
@@ -948,13 +1009,13 @@ __device__ __forceinline__ void compute_pass_metric(
 // elements (one round-trip via `roundtrip_block_for_fmt`; per-lane
 // pass_metric, all warp-reduced; broadcast).
 //
-// Per warp: tracks `my_count` (# blocks passing this warp's slice) and
-// a per-warp pass mask `my_pass[AW]` covering the blocks it processed.
+// Per warp and scale: a pass-mask row in shared memory covering the blocks
+// the warp processed, and the running max error in a register.
 //
-// Cross-warp: tid 0 sums the per-warp counts and OR-merges the pass
-// masks (disjoint by construction — different warps process different
-// block IDs). It then takes max over warp_amax_err to produce the
-// (fmt, scale) summary, and updates the shared best/fallback fields.
+// Cross-warp: tid 0 OR-merges the pass masks (disjoint by construction —
+// different warps process different block IDs) and counts the passing blocks
+// as the merged mask's population. It then takes max over warp_amax_err to
+// produce the (fmt, scale) summary, and updates the shared best/fallback fields.
 //
 // Best vs. fallback
 // -----------------
@@ -1016,8 +1077,9 @@ __device__ __noinline__ void search_scales_for_fmt(
     float inv_head_amax,
     float inv_head_amax_sq,
     float v_thr_sq,
-    // Cross-warp aggregation scratch (one slot per warp)
-    int*      warp_count,
+    const uint64_t* flat_mask,       // [HB/64] bit b set = block b is flat (this side)
+    int*      warp_nonflat,          // [warps] flat-only formats: a non-flat block was skipped
+    // Cross-warp aggregation scratch (one row per (warp, scale))
     uint64_t* warp_pass,             // [warps × NUM_SCALE_CANDIDATES × HB/64] pass-mask words
     float*    warp_amax_err,
     // Cross-thread best/fallback state, written by tid 0 only
@@ -1029,7 +1091,12 @@ __device__ __noinline__ void search_scales_for_fmt(
     int*      s_fallback_fmt,
     float*    s_fallback_scale,
     float*    s_fallback_err,
-    uint64_t* s_fallback_pass        // [HB/64]
+    uint64_t* s_fallback_pass,       // [HB/64]
+    // Early rejection (see below). Zero on entry; tid 0 re-zeroes them on exit.
+    bool      drop_hopeless,         // stop measuring a scale once it cannot fill the slot
+    int*      s_fail,                // [NUM_SCALE_CANDIDATES + 1] failures per scale; last = every scale
+    int*      s_dropped,             // bit si: some warp stopped measuring scale si
+    int*      s_fallback_incomplete  // set: a fallback candidate was dropped, so the fallback is unknown
 ) {
     // Alive/pass masks are HB bits = AW u64 words; the slot quota is one
     // palette band's worth of blocks.
@@ -1056,30 +1123,84 @@ __device__ __noinline__ void search_scales_for_fmt(
     // The outer ci-loop in process_side already checks s_search_done to stop
     // climbing to higher BPE.
     //
-    // Batched sync strategy: all warps write their per-(warp,si) accumulators
-    // into distinct slots [warp_id * NUM_SCALE_CANDIDATES + si] without any
-    // intermediate __syncthreads. A single __syncthreads after the loop makes
-    // all slots visible; tid 0 reduces all si slices in one pass. The slot
-    // stride uses NUM_SCALE_CANDIDATES (the smem allocation) regardless of
-    // kNumScales — unused slots are simply not written or read.
+    // Block-outer, scale-inner: each block is loaded once and measured at every
+    // scale, and the scales' round trips are independent of each other, so the
+    // scheduler overlaps their shuffle chains instead of waiting out each one.
+    //
+    // Each warp owns the rows [warp_id * NUM_SCALE_CANDIDATES + si] of the
+    // cross-warp scratch. Lane 0 ORs a passing block's bit straight into its
+    // warp's pass row (warp-private, so no atomic and no barrier), and the pass
+    // count is the population of the merged mask, so nothing per block lives
+    // outside registers but the six running maxima. A single __syncthreads after
+    // the loop makes every row visible; tid 0 reduces all si slices in one pass.
+    // The row stride is NUM_SCALE_CANDIDATES (the smem allocation) regardless of
+    // kNumScales — unused rows are neither written nor read.
+    //
+    // Early rejection. A scale with more than `live_count - SLOT_QUOTA` failing
+    // blocks can no longer reach the quota, so it can never be the best. With
+    // `drop_hopeless`, lane 0 counts each failure into `s_fail`, and a warp stops
+    // as soon as the shared counts say every scale is hopeless. Until then it
+    // measures every scale: skipping one inside the unrolled scale loop puts a
+    // branch between the scales' shuffle chains, which costs more overlap than
+    // the round trip saves. The counts only grow, so a count read while other
+    // warps are still adding is never past the limit when the final count is
+    // not: dropping is never wrong for the best. The fallback is another
+    // matter — it ranks every scale by its error over ALL blocks, which a
+    // dropped scale no longer has — so a dropped scale is not ranked, and
+    // `s_fallback_incomplete` tells the caller to search again without dropping
+    // in the one case the fallback is used: no candidate filled the slot.
+    const int fail_budget = live_count - SLOT_QUOTA;
+    constexpr int ALL_SCALES = (1 << kNumScales) - 1;
+    int live_scales = ALL_SCALES;
+    volatile int* fail_count = s_fail;
+    float outer[kNumScales];
+    float my_amax_err[kNumScales];
     #pragma unroll
     for (int si = 0; si < kNumScales; si++) {
-        const float outer = preferred_range(si, slot_amax, safe_p95, safe_p80, slot_mean, safe_p25);
+        outer[si]       = preferred_range(si, slot_amax, safe_p95, safe_p80, slot_mean, safe_p25);
+        my_amax_err[si] = 0.0f;
+    }
+    uint64_t* my_pass_rows = warp_pass + (size_t)warp_id * NUM_SCALE_CANDIDATES * AW;
+    if (lane < kNumScales * AW) my_pass_rows[lane] = 0ULL;
+    __syncwarp();
 
-        // Per-warp accumulators. idx_compact contains only alive entries —
-        // no per-block alive_get probe needed. Each warp processes
-        // live_count / FUSED_WARPS_PER_BLOCK blocks on average.
-        float    my_amax_err = 0.0f;
-        int      my_count    = 0;
-        uint64_t my_pass[AW];
+    int my_nonflat = 0;   // flat-only formats: a non-flat block was skipped
+    // idx_compact contains only alive entries — no per-block alive_get probe.
+    // Each warp processes live_count / FUSED_WARPS_PER_BLOCK blocks on average.
+    for (int i = warp_id; i < live_count; i += FUSED_WARPS_PER_BLOCK) {
+        const int b = idx_compact[i];
+
+        if (drop_hopeless) {
+            // Lane 0's read decides for the warp, so the drop is warp-uniform.
+            int dead = 0;
+            if (lane == 0) {
+                const int all = fail_count[NUM_SCALE_CANDIDATES];
+                #pragma unroll
+                for (int si = 0; si < kNumScales; si++)
+                    if (fail_count[si] + all > fail_budget) dead |= 1 << si;
+            }
+            live_scales &= ~__shfl_sync(0xffffffff, dead, 0, 32);
+            if (live_scales == 0) break;
+        }
+
+        // A flat-only format (Q0) is offered only the blocks flagged flat in
+        // Phase 1. For any other block it cannot pass, so the round trip is
+        // skipped outright and the slot is marked as holding a block the format
+        // cannot take (it then cannot be the fallback). `b` is warp-uniform, so
+        // the skip is too. Compiled out for every other format.
+        if constexpr (flat_only<FMT>::value) {
+            if (((flat_mask[b >> 6] >> (b & 63)) & 1ULL) == 0ULL) {
+                my_nonflat = 1;
+                if (drop_hopeless && lane == 0) atomicAdd(&s_fail[NUM_SCALE_CANDIDATES], 1);
+                continue;
+            }
+        }
+
+        const float orig = __half2float(smem_data[b * FUSED_WARP_SIZE + lane]);
         #pragma unroll
-        for (int w = 0; w < AW; w++) my_pass[w] = 0;
-        for (int i = warp_id; i < live_count; i += FUSED_WARPS_PER_BLOCK) {
-            const int b = idx_compact[i];
-
-            const float orig  = __half2float(smem_data[b * FUSED_WARP_SIZE + lane]);
+        for (int si = 0; si < kNumScales; si++) {
             const float recon = roundtrip_block_for_fmt<FMT>(
-                orig, outer, lane, warp_f32_warp, warp_quant_warp, is_k);
+                orig, outer[si], lane, warp_f32_warp, warp_quant_warp, is_k);
 
             float pass_metric, thr_to_compare;
             compute_pass_metric(
@@ -1088,53 +1209,48 @@ __device__ __noinline__ void search_scales_for_fmt(
                 kthresh,
                 pass_metric, thr_to_compare, is_k);
 
-            // pass_metric and thr_to_compare are warp-uniform after the
-            // metric reductions, so all 32 lanes evaluate the same predicate.
-            // Track max pass_metric across ALL blocks (passing and failing)
-            // so the fallback can pick the candidate with the lowest worst-case
-            // error rather than the highest BPE.
-            my_amax_err = fmaxf(my_amax_err, pass_metric);
-            if (pass_metric <= thr_to_compare) {
-                if (lane == 0) {
-                    // Unrolled predicated word select keeps my_pass in
-                    // registers (a dynamic index would demote it to local).
-                    #pragma unroll
-                    for (int w = 0; w < AW; w++)
-                        if (w == (b >> 6)) my_pass[w] |= (1ULL << (b & 63));
-                    my_count++;
-                }
+            // pass_metric and thr_to_compare are warp-uniform after the metric
+            // reductions, so all 32 lanes evaluate the same predicate. The max
+            // runs over ALL blocks (passing and failing) so the fallback can
+            // pick the candidate with the lowest worst-case error rather than
+            // the highest BPE.
+            my_amax_err[si] = fmaxf(my_amax_err[si], pass_metric);
+            if (lane == 0) {
+                if (pass_metric <= thr_to_compare)
+                    my_pass_rows[si * AW + (b >> 6)] |= (1ULL << (b & 63));
+                else if (drop_hopeless)
+                    atomicAdd(&s_fail[si], 1);
             }
-            // No per-warp early-exit on count — we don't know the cross-warp
-            // total until the reduction below. The per-(fmt,scale) overshoot
-            // cost is small relative to the cross-warp synchronisation we'd
-            // otherwise need every block iteration.
-        }
-
-        // Write per-warp accumulators into the exclusive (warp, si) slot.
-        // No __syncthreads here: each warp writes only to its own row
-        // [warp_id * NUM_SCALE_CANDIDATES + si]; there is no cross-warp
-        // aliasing, so no synchronisation is needed between si iterations.
-        // Visibility to tid 0 is established by the __syncthreads below.
-        if (lane == 0) {
-            const int base = warp_id * NUM_SCALE_CANDIDATES + si;
-            warp_count   [base] = my_count;
-            #pragma unroll
-            for (int w = 0; w < AW; w++) warp_pass[base * AW + w] = my_pass[w];
-            warp_amax_err[base] = my_amax_err;
         }
     }
 
-    // One sync makes all (warp, si) slots visible to tid 0.
+    if (lane == 0) {
+        #pragma unroll
+        for (int si = 0; si < kNumScales; si++)
+            warp_amax_err[warp_id * NUM_SCALE_CANDIDATES + si] = my_amax_err[si];
+        if constexpr (flat_only<FMT>::value) warp_nonflat[warp_id] = my_nonflat;
+        if (live_scales != ALL_SCALES) atomicOr(s_dropped, ALL_SCALES & ~live_scales);
+    }
+
+    // One sync makes all (warp, si) rows visible to tid 0.
     __syncthreads();
 
     // Cross-warp reduction by tid 0 across all si slices in one sequential pass.
-    // Counts sum (warps process disjoint blocks); masks OR (disjoint →
-    // OR == add for bit-presence); amax_err takes the max.
+    // Masks OR (warps process disjoint blocks), and the pass count is the merged
+    // mask's population; amax_err takes the max.
     if (tid == 0) {
+        // A flat-only format that skipped any block cannot take the whole slot,
+        // so it is not a fallback candidate: its error covers only the blocks it
+        // was offered. It can still win outright on its passing blocks.
+        bool skipped_nonflat = false;
+        if constexpr (flat_only<FMT>::value) {
+            #pragma unroll
+            for (int w = 0; w < FUSED_WARPS_PER_BLOCK; w++)
+                skipped_nonflat = skipped_nonflat || (warp_nonflat[w] != 0);
+        }
         #pragma unroll
         for (int si = 0; si < kNumScales; si++) {
             const float outer = preferred_range(si, slot_amax, safe_p95, safe_p80, slot_mean, safe_p25);
-            int      total = 0;
             uint64_t mask[AW];
             #pragma unroll
             for (int w = 0; w < AW; w++) mask[w] = 0;
@@ -1142,19 +1258,25 @@ __device__ __noinline__ void search_scales_for_fmt(
             #pragma unroll
             for (int w = 0; w < FUSED_WARPS_PER_BLOCK; w++) {
                 const int base = w * NUM_SCALE_CANDIDATES + si;
-                total += warp_count   [base];
                 #pragma unroll
                 for (int word = 0; word < AW; word++)
                     mask[word] |= warp_pass[base * AW + word];
                 aerr   = fmaxf(aerr, warp_amax_err[base]);
             }
+            int total = 0;
+            #pragma unroll
+            for (int w = 0; w < AW; w++) total += __popcll(mask[w]);
 
             // Fallback: candidate with the lowest max error across all blocks.
             // amax_err here is taken over every alive block (passing and
             // failing) — see the inner loop. Picking the lowest steers the
             // forced-claim path toward the format that fits the worst block
             // best, rather than the highest-BPE / most-conservative option.
-            if (aerr < *s_fallback_err) {
+            // A dropped scale's error covers only the blocks measured before
+            // the drop, so it is not ranked, and the fallback is marked unknown.
+            const bool dropped = ((*s_dropped >> si) & 1) != 0;
+            if (!skipped_nonflat && dropped) *s_fallback_incomplete = 1;
+            if (!skipped_nonflat && !dropped && aerr < *s_fallback_err) {
                 *s_fallback_fmt     = FMT;
                 *s_fallback_scale   = outer;
                 *s_fallback_err     = aerr;
@@ -1174,60 +1296,12 @@ __device__ __noinline__ void search_scales_for_fmt(
                 }
             }
         }
+        // Zero the early-rejection state for the next search.
+        #pragma unroll
+        for (int si = 0; si <= NUM_SCALE_CANDIDATES; si++) s_fail[si] = 0;
+        *s_dropped = 0;
     }
     __syncthreads();
-}
-
-// Mask-driven claim pass, single-threaded by tid 0.
-//
-// Walks idx_compact (alive entries in sort order) and claims any block
-// whose bit is set in the cached pass mask, up to HB/N_PALETTE blocks
-// total (the slot quota). The search phase already determined which
-// blocks pass at the winning (fmt, scale), so re-running the round-trip
-// here would just recompute the same answer.
-//
-// Single-threaded because the work is bookkeeping only — smem reads,
-// 2 global writes per claim, 1 atomicAnd on the alive mask. Parallelising
-// would require a ballot + prefix-popcount dance similar to the
-// second-pass fill in the caller for very little win — claim handles
-// at most one slot quota per call, and on most slots the search hits the
-// quota well before that.
-//
-// `alive` is updated via `alive_clear` (atomicAnd) so the caller's
-// second-pass fill loop observes the cleared bits without needing an
-// explicit __threadfence_block. The closing __syncthreads orders the
-// smem `*s_claimed_out` write so all threads see the returned count.
-template <int HB>
-__device__ __forceinline__ int claim_passing_blocks_from_mask(
-    int s,
-    int head_id,
-    int best_fmt,
-    int tid,
-    const uint16_t* idx_compact,
-    int live_count,
-    const uint64_t* pass_mask,  // [HB/64] winning pass mask (shared memory)
-    uint64_t* alive,            // [HB/64] alive bitmask (shared memory)
-    int* out_pal_map,
-    int* out_eff_tags,
-    int* s_claimed_out
-) {
-    constexpr int SLOT_QUOTA = HB / N_PALETTE;
-    if (tid == 0) {
-        int claimed = 0;
-        for (int i = 0; i < live_count && claimed < SLOT_QUOTA; i++) {
-            const int b = idx_compact[i];
-            const bool passes = ((pass_mask[b >> 6] >> (b & 63)) & 1ULL) != 0ULL;
-            if (passes) {
-                out_pal_map [head_id * HB + b] = s;
-                out_eff_tags[head_id * HB + b] = best_fmt;
-                alive_clear(alive, b);
-                claimed++;
-            }
-        }
-        *s_claimed_out = claimed;
-    }
-    __syncthreads();
-    return *s_claimed_out;
 }
 
 // =============================================================================
@@ -1323,6 +1397,39 @@ __device__ __forceinline__ float load_as_float(const void* __restrict__ data, in
     } else {
         return ((const float*)data)[idx];
     }
+}
+
+// =============================================================================
+// VALID TOKEN WINDOW
+// =============================================================================
+// A chunk's live tokens are [lo, hi), unpacked from `(offset << 8) | len`.
+// Every load of chunk data below reads a token outside the window as ZERO.
+// A partial chunk's dead slots hold whatever the ground held before the
+// chunk was claimed — the pool does not clear a claimed slot, and a recycled
+// region is not cleared either — so a stale inf there would otherwise set the
+// head amax, a block amax and every candidate scale for the live tokens.
+//
+// Every load is arranged so the lane is the token. A quantized / R16 band is
+// token-oriented (block `bib` is one dim's 32 tokens); a float band is
+// token-major `[t][pd]` and is read at `lane * band_dims + bib`, dim `bib`'s
+// value for token `lane`. Block `bib` is therefore dim `bib`'s 32 tokens in
+// either layout — the block the convert encodes and the palette map assigns.
+struct TokenWindow { int lo; int hi; };
+
+__device__ __forceinline__ TokenWindow unpack_token_window(int packed) {
+    const int lo  = (packed >> 8) & 0xff;
+    const int len = max(1, min(32, packed & 0xff));
+    return { lo, lo + len };
+}
+
+__device__ __forceinline__ bool lane_in_window(int lane, TokenWindow w) {
+    return lane >= w.lo && lane < w.hi;
+}
+
+// Flat index, in a token-major float band `band_dims` wide, of dim `dim`'s
+// value for token `lane`.
+__device__ __forceinline__ int float_band_elem(int dim, int lane, int band_dims) {
+    return lane * band_dims + dim;
 }
 
 // =============================================================================
@@ -1565,11 +1672,50 @@ __device__ __forceinline__ void resolve_band_source(
     }
 }
 
+// Lane `lane`'s K (and Q, when WITH_Q) and V values of LOAD_GROUP blocks of one
+// head, `g`, `g + stride`, …, all inside one band, read through that band's
+// source views (`band_*[0]` K, `band_*[1]` V). Every load is issued before any
+// value is used, so a warp waits out one memory latency per group rather than
+// one per block. Q is zero where the K source does not carry it. Values are as
+// read, before any token-window masking.
+template <int LOAD_GROUP, bool WITH_Q>
+__device__ __forceinline__ void load_band_group(
+    const char* const (*band_ptr)[N_PALETTE],
+    const int   (*band_fmt)[N_PALETTE],
+    const float (*band_outer)[N_PALETTE],
+    int g, int stride, int band_blocks, int lane,
+    float (&k)[LOAD_GROUP], float (&q)[LOAD_GROUP], float (&v)[LOAD_GROUP])
+{
+    const int p = g / band_blocks;
+    const int   k_fmt  = band_fmt[0][p];
+    const char* k_data = band_ptr[0][p];
+    const int   v_fmt  = band_fmt[1][p];
+    const char* v_data = band_ptr[1][p];
+    #pragma unroll
+    for (int j = 0; j < LOAD_GROUP; j++) {
+        const int bib = g + j * stride - p * band_blocks; // block within band
+        q[j] = 0.0f;
+        if (ArenaFormat::is_quantized(k_fmt)) {
+            const char* k_blk = k_data + (int64_t)bib * quant_block_bytes(k_fmt);
+            k[j] = dequant_element_inline<float, true>(k_blk, lane, k_fmt, band_outer[0][p]);
+            if constexpr (WITH_Q) q[j] = dequant_q_element(k_blk, lane, k_fmt);
+        } else {
+            k[j] = load_as_float(k_data, float_band_elem(bib, lane, band_blocks), arena_fmt_to_dtype_code(k_fmt));
+        }
+        if (ArenaFormat::is_quantized(v_fmt)) {
+            const char* v_blk = v_data + (int64_t)bib * quant_block_bytes(v_fmt);
+            v[j] = dequant_element_inline<float, false>(v_blk, lane, v_fmt, band_outer[1][p]);
+        } else {
+            v[j] = load_as_float(v_data, float_band_elem(bib, lane, band_blocks), arena_fmt_to_dtype_code(v_fmt));
+        }
+    }
+}
+
 // =============================================================================
 // PER-(CHUNK, HEAD) QUANTILE KERNEL
 // =============================================================================
 // Pass 1 of the selection pipeline. One CUDA block per (chunk, head),
-// 4 warps × 32 lanes = 128 threads. For each (chunk, head), emits:
+// QREL_WARPS_PER_BLOCK warps. For each (chunk, head), emits:
 //
 //   k_head_amax_out [head_id]   max |K| across the 128 blocks
 //   v_head_amax_out [head_id]   max |V| across the 128 blocks
@@ -1605,6 +1751,13 @@ __device__ __forceinline__ void resolve_band_source(
 #define QREL_WARPS_PER_BLOCK SELECT_WARPS_PER_BLOCK
 #define QREL_QUANTILE_THREADS (QREL_WARPS_PER_BLOCK * WARP_SIZE)
 #define QREL_HIST_BINS 64
+// Blocks per head the pass holds per-block state for: the largest head_dim the
+// selection supports (pass 2 dispatches HB ∈ {128, 256}).
+#define QREL_MAX_BLOCKS 256
+// Blocks a warp loads before processing any (`load_band_group`). A group spans
+// QREL_LOAD_GROUP × QREL_WARPS_PER_BLOCK = 16 consecutive blocks, inside the
+// 32- or 64-block band of a supported head.
+#define QREL_LOAD_GROUP 4
 
 __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_relevance_quantiles(
     const int64_t* __restrict__ per_head_table_raw,
@@ -1618,16 +1771,21 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
     int blocks_per_head,
     int total_heads,
     int n_kv_head,
-    int arena_chunks
+    int arena_chunks,
+    const int* __restrict__ valid_ranges  // [n_chunks] packed (offset << 8) | len
 ) {
     const int head_id       = blockIdx.x;
     const int tid           = threadIdx.x;
     const int warp_in_block = tid / WARP_SIZE;
     const int lane          = tid % WARP_SIZE;
-    if (head_id >= total_heads) return;
+    // Only the head widths pass 2 dispatches are supported: no wider than the
+    // per-block state holds, with bands a whole number of load groups.
+    if (head_id >= total_heads || blocks_per_head > QREL_MAX_BLOCKS
+        || blocks_per_head % (N_PALETTE * QREL_WARPS_PER_BLOCK * QREL_LOAD_GROUP) != 0) return;
 
     const int chunk_idx = head_id / n_kv_head;
     const int head_idx  = head_id % n_kv_head;
+    const TokenWindow win = unpack_token_window(__ldg(&valid_ranges[chunk_idx]));
 
     // Per-band source views, resolved through each band's own gid. Held in
     // shared memory so the walk loops stay register-neutral under the
@@ -1662,6 +1820,11 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
     __shared__ int   sample_count;
     __shared__ float smem_head_k_amax;
     __shared__ float smem_head_v_amax;
+    // Each block's q-relevance, and whether it has one (its K source carries Q),
+    // as the first walk computes them; the q-relevance histogram is built from
+    // these rather than from a third read of the head's K and Q.
+    __shared__ float   block_qrel  [QREL_MAX_BLOCKS];
+    __shared__ uint8_t block_has_q [QREL_MAX_BLOCKS];
 
     float local_min    = 0.0f;
     float local_max    = 0.0f;
@@ -1669,31 +1832,21 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
     float local_k_amax = 0.0f;
     float local_v_amax = 0.0f;
 
-    for (int block_in_head = warp_in_block; block_in_head < blocks_per_head; block_in_head += QREL_WARPS_PER_BLOCK) {
-        const int p   = block_in_head / band_blocks;
-        const int bib = block_in_head - p * band_blocks; // block within band
-        const int   k_fmt        = s_band_fmt[0][p];
-        const char* k_chunk_data = s_band_ptr[0][p];
-        float k_val, q_val;
-        if (ArenaFormat::is_quantized(k_fmt)) {
-            const int   k_blk_bytes = quant_block_bytes(k_fmt);
-            const char* k_blk_ptr   = k_chunk_data + (int64_t)bib * k_blk_bytes;
-            k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
-            q_val = dequant_q_element(k_blk_ptr, lane, k_fmt);
-        } else {
-            k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_fmt));
+    // Each warp loads QREL_LOAD_GROUP of its blocks before processing any of them
+    // (`load_band_group`), in the order the one-at-a-time walk took them.
+    for (int g = warp_in_block; g < blocks_per_head; g += QREL_WARPS_PER_BLOCK * QREL_LOAD_GROUP) {
+    float k_in[QREL_LOAD_GROUP], q_in[QREL_LOAD_GROUP], v_in[QREL_LOAD_GROUP];
+    load_band_group<QREL_LOAD_GROUP, true>(s_band_ptr, s_band_fmt, s_band_outer,
+                                           g, QREL_WARPS_PER_BLOCK, band_blocks, lane,
+                                           k_in, q_in, v_in);
+    #pragma unroll
+    for (int j = 0; j < QREL_LOAD_GROUP; j++) {
+        const int block_in_head = g + j * QREL_WARPS_PER_BLOCK;
+        float k_val = k_in[j], q_val = q_in[j], v_val = v_in[j];
+        if (!lane_in_window(lane, win)) {
+            k_val = 0.0f;
             q_val = 0.0f;
-        }
-
-        const int   v_fmt        = s_band_fmt[1][p];
-        const char* v_chunk_data = s_band_ptr[1][p];
-        float v_val;
-        if (ArenaFormat::is_quantized(v_fmt)) {
-            const int   v_blk_bytes = quant_block_bytes(v_fmt);
-            const char* v_blk_ptr   = v_chunk_data + (int64_t)bib * v_blk_bytes;
-            v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
-        } else {
-            v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
+            v_val = 0.0f;
         }
 
         // All 32 lanes participate in the warp reduce; only lane 0 accumulates.
@@ -1705,10 +1858,12 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
         }
 
         const int has_q = __any_sync(0xffffffff, q_val != 0.0f);
+        if (lane == 0) block_has_q[block_in_head] = has_q ? 1 : 0;
         if (has_q) {
             float q_relevance = block_relevance(k_val, q_val);
             q_relevance = __shfl_sync(0xffffffff, q_relevance, 0, 32);
             if (lane == 0) {
+                block_qrel[block_in_head] = q_relevance;
                 if (local_count == 0) {
                     local_min = q_relevance;
                     local_max = q_relevance;
@@ -1719,6 +1874,7 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
                 local_count += 1;
             }
         }
+    }
     }
 
     if (lane == 0) {
@@ -1773,50 +1929,47 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
     {
         const float k_amax_safe     = (smem_head_k_amax > 1.0e-8f) ? smem_head_k_amax : 1.0f;
         const float v_amax_safe     = (smem_head_v_amax > 1.0e-8f) ? smem_head_v_amax : 1.0f;
-        const float k_abs_inv_range = __fdiv_rn((float)(QREL_HIST_BINS - 1), k_amax_safe);
-        const float v_abs_inv_range = __fdiv_rn((float)(QREL_HIST_BINS - 1), v_amax_safe);
-        for (int block_in_head = warp_in_block; block_in_head < blocks_per_head; block_in_head += QREL_WARPS_PER_BLOCK) {
-            const int p   = block_in_head / band_blocks;
-            const int bib = block_in_head - p * band_blocks;
-            const int   k_fmt        = s_band_fmt[0][p];
-            const char* k_chunk_data = s_band_ptr[0][p];
-            float k_val;
-            if (ArenaFormat::is_quantized(k_fmt)) {
-                const int   k_blk_bytes = quant_block_bytes(k_fmt);
-                const char* k_blk_ptr   = k_chunk_data + (int64_t)bib * k_blk_bytes;
-                k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
-            } else {
-                k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_fmt));
+        // |x| bins are spaced by sqrt(|x| / amax), not linearly: a linear bin
+        // is amax/63 wide, so when a sink puts the amax 100x above the bulk the
+        // whole bulk lands in bin 0 and the percentile cannot be told from 0.
+        // Square-root spacing resolves |x| / amax down to ~2.5e-4.
+        const float k_inv_amax = __fdiv_rn(1.0f, k_amax_safe);
+        const float v_inv_amax = __fdiv_rn(1.0f, v_amax_safe);
+        for (int g = warp_in_block; g < blocks_per_head; g += QREL_WARPS_PER_BLOCK * QREL_LOAD_GROUP) {
+            float k_in[QREL_LOAD_GROUP], q_in[QREL_LOAD_GROUP], v_in[QREL_LOAD_GROUP];
+            load_band_group<QREL_LOAD_GROUP, false>(s_band_ptr, s_band_fmt, s_band_outer,
+                                                    g, QREL_WARPS_PER_BLOCK, band_blocks, lane,
+                                                    k_in, q_in, v_in);
+            // Dead lanes of a partial chunk are not elements of the head: they
+            // would count as zeros and drag the percentile toward 0.
+            if (lane_in_window(lane, win)) {
+                #pragma unroll
+                for (int j = 0; j < QREL_LOAD_GROUP; j++) {
+                    int k_bin = (int)floorf(__fmul_rn(sqrtf(__fmul_rn(fabsf(k_in[j]), k_inv_amax)), (float)(QREL_HIST_BINS - 1)));
+                    k_bin = max(0, min(QREL_HIST_BINS - 1, k_bin));
+                    atomicAdd(&hist[k_bin], 1);
+                    int v_bin = (int)floorf(__fmul_rn(sqrtf(__fmul_rn(fabsf(v_in[j]), v_inv_amax)), (float)(QREL_HIST_BINS - 1)));
+                    v_bin = max(0, min(QREL_HIST_BINS - 1, v_bin));
+                    atomicAdd(&hist[QREL_HIST_BINS + v_bin], 1);
+                }
             }
-            const int   v_fmt        = s_band_fmt[1][p];
-            const char* v_chunk_data = s_band_ptr[1][p];
-            float v_val;
-            if (ArenaFormat::is_quantized(v_fmt)) {
-                const int   v_blk_bytes = quant_block_bytes(v_fmt);
-                const char* v_blk_ptr   = v_chunk_data + (int64_t)bib * v_blk_bytes;
-                v_val = dequant_element_inline<float>(v_blk_ptr, lane, v_fmt, s_band_outer[1][p]);
-            } else {
-                v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_fmt));
-            }
-            int k_bin = (int)floorf(__fmul_rn(fabsf(k_val), k_abs_inv_range));
-            k_bin = max(0, min(QREL_HIST_BINS - 1, k_bin));
-            atomicAdd(&hist[k_bin], 1);
-            int v_bin = (int)floorf(__fmul_rn(fabsf(v_val), v_abs_inv_range));
-            v_bin = max(0, min(QREL_HIST_BINS - 1, v_bin));
-            atomicAdd(&hist[QREL_HIST_BINS + v_bin], 1);
         }
         __syncthreads();
         if (tid == 0) {
-            const int total_elems = blocks_per_head * 32;
+            const int total_elems = blocks_per_head * (win.hi - win.lo);
             const int target_p95  = (int)floorf(0.95f * (float)(total_elems - 1));
+            // The percentile is the UPPER edge of the bin it falls in, amax *
+            // ((bin + 1) / (BINS - 1))^2, so it never understates |x|'s p95 and
+            // the cap it feeds never tightens the head scale below what the
+            // data supports. The top bin's edge is clamped to the amax.
             {
                 int accum = 0, p95_bin = QREL_HIST_BINS - 1;
                 for (int b = 0; b < QREL_HIST_BINS; ++b) {
                     accum += hist[b];
                     if (accum > target_p95) { p95_bin = b; break; }
                 }
-                float k_p95 = __fmul_rn((float)p95_bin, __fdiv_rn(k_amax_safe, (float)(QREL_HIST_BINS - 1)));
-                k_head_p95_out[head_id] = (k_p95 > 1.0e-8f) ? k_p95 : k_amax_safe;
+                const float edge = __fdiv_rn((float)(p95_bin + 1), (float)(QREL_HIST_BINS - 1));
+                k_head_p95_out[head_id] = fminf(k_amax_safe, __fmul_rn(k_amax_safe, __fmul_rn(edge, edge)));
             }
             {
                 int accum = 0, p95_bin = QREL_HIST_BINS - 1;
@@ -1824,8 +1977,8 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
                     accum += hist[QREL_HIST_BINS + b];
                     if (accum > target_p95) { p95_bin = b; break; }
                 }
-                float v_p95 = __fmul_rn((float)p95_bin, __fdiv_rn(v_amax_safe, (float)(QREL_HIST_BINS - 1)));
-                v_head_p95_out[head_id] = (v_p95 > 1.0e-8f) ? v_p95 : v_amax_safe;
+                const float edge = __fdiv_rn((float)(p95_bin + 1), (float)(QREL_HIST_BINS - 1));
+                v_head_p95_out[head_id] = fminf(v_amax_safe, __fmul_rn(v_amax_safe, __fmul_rn(edge, edge)));
             }
         }
     }
@@ -1840,34 +1993,14 @@ __global__ __launch_bounds__(QREL_QUANTILE_THREADS, 8) void approximate_q_releva
     }
     __syncthreads();
 
+    // The q-relevance histogram, over the per-block values the first walk kept:
+    // one thread per block, no reload of the head's K and Q.
     const float inv_range = __fdiv_rn((float)(QREL_HIST_BINS - 1), head_max - head_min);
-    for (int block_in_head = warp_in_block; block_in_head < blocks_per_head; block_in_head += QREL_WARPS_PER_BLOCK) {
-        const int p   = block_in_head / band_blocks;
-        const int bib = block_in_head - p * band_blocks;
-        const int   k_fmt        = s_band_fmt[0][p];
-        const char* k_chunk_data = s_band_ptr[0][p];
-        float k_val;
-        float q_val;
-        if (ArenaFormat::is_quantized(k_fmt)) {
-            const int k_blk_bytes = quant_block_bytes(k_fmt);
-            const char* k_blk_ptr = k_chunk_data + (int64_t)bib * k_blk_bytes;
-            k_val = dequant_element_inline<float, true>(k_blk_ptr, lane, k_fmt, s_band_outer[0][p]);
-            q_val = dequant_q_element(k_blk_ptr, lane, k_fmt);
-        } else {
-            const int k_elem_in_chunk = bib * 32 + lane;
-            k_val = load_as_float(k_chunk_data, k_elem_in_chunk, arena_fmt_to_dtype_code(k_fmt));
-            q_val = 0.0f;
-        }
-
-        const int has_q = __any_sync(0xffffffff, q_val != 0.0f);
-        if (has_q) {
-            float q_relevance = block_relevance(k_val, q_val);
-            q_relevance = __shfl_sync(0xffffffff, q_relevance, 0, 32);
-            if (lane == 0) {
-                int bin = (int)floorf(__fmul_rn(q_relevance - head_min, inv_range));
-                bin = max(0, min(QREL_HIST_BINS - 1, bin));
-                atomicAdd(&hist[bin], 1);
-            }
+    for (int b = tid; b < blocks_per_head; b += QREL_QUANTILE_THREADS) {
+        if (block_has_q[b]) {
+            int bin = (int)floorf(__fmul_rn(block_qrel[b] - head_min, inv_range));
+            bin = max(0, min(QREL_HIST_BINS - 1, bin));
+            atomicAdd(&hist[bin], 1);
         }
     }
     __syncthreads();
@@ -2104,7 +2237,9 @@ __device__ __forceinline__ void bitonic_sort_amax_desc(
 //   qrel_k        [HB]         f16      256 /   512 B  per-block q-relevance
 //   kthresh       [HB]         f16      256 /   512 B  per-block K threshold
 //   q_mean        [HB]         f32      512 / 1,024 B  per-head_dim mean Q for Phase 2.5
-//                                              (head_dim = HB: one block per dim)
+//                                              (head_dim = HB: one block per dim);
+//                                              then amax_compact, the live amaxes
+//                                              in sort order, for each slot
 //   sink_score    [32]         f32      128 B  per-token raw Q·K (2.5)
 //   sink_weight   [32]         f32      128 B  per-token weight ∈ [0,1] (2.5)
 //   warp_f32      [4][32]      f32      512 B  per-warp round-trip scratch
@@ -2113,14 +2248,12 @@ __device__ __forceinline__ void bitonic_sort_amax_desc(
 //   slot_scales   [4]          f32       16 B  winning outer scale per slot
 //   k_alive,v_alive [AW]       u64     32 / 64 B  K/V alive bitmask (1 bit/block)
 //   idx_compact   [HB]         u16      256 /   512 B  compacted live entries per slot
-//   warp_count    [4×6]        i32       96 B  search reduction scratch [warp][si]
 //   warp_pass     [4×6×AW]     u64      384 /   768 B  pass-mask words   [warp][si][w]
 //   warp_amax_err [4×6]        f32       96 B  max passing error        [warp][si]
 //   s_best_*, s_fallback_*              ~60 /   ~92 B  search winner / fallback state
-//   s_seg_pop, s_seg_first_alive [HB/32] i32  32 / 64 B  compaction scratch (one
+//   s_seg_pop     [HB/32]      i32     16 / 32 B  compaction scratch (one
 //                                              entry per 32-position sort segment)
-//   s_live_count, s_slot_{amax,p95,p80,mean,p25}  ~24 B  cross-warp scalars
-//   s_claim_count                          ~4 B  pass-1 claim count
+//   s_slot_{amax,p95,p80,mean,p25}       ~20 B  cross-warp scalars
 //   s_band_ptr    [2][4]       ptr       64 B  } per-band source views (one per
 //   s_band_fmt    [2][4]       i32       32 B  } (side, palette) gid) — resolved
 //   s_band_outer  [2][4]       f32       32 B  } up front, read by Phase 1 and
@@ -2154,8 +2287,8 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     const float*   __restrict__ q_relevance_spread,   // [total_heads]
     const float*   __restrict__ k_head_amax_in,       // [total_heads]
     const float*   __restrict__ v_head_amax_in,       // [total_heads]
-    const float*   __restrict__ k_head_p95_in,        // [total_heads] (unused; kept for ABI)
-    const float*   __restrict__ v_head_p95_in,        // [total_heads] (unused; kept for ABI)
+    const float*   __restrict__ k_head_p95_in,        // [total_heads] 95th pct of |K|; caps the head scale
+    const float*   __restrict__ v_head_p95_in,        // [total_heads] 95th pct of |V|; caps the head scale
     const int*     __restrict__ k_candidates,
     const int*     __restrict__ v_candidates,
     int num_k_candidates,
@@ -2169,12 +2302,12 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     int n_kv_head,
     int arena_chunks,
     // Per-chunk valid token range, packed (offset << 8) | len with
-    // len in [1, 32]. Dead slots outside [offset, offset+len) are ZERO
-    // (arena chunks are zeroed at creation and on free-list recycle —
-    // alloc.rs `zero_recycled_chunk`), so they contribute nothing to
-    // amax or the error sums; the range only fixes the COUNT-normalized
-    // metrics (V's mean-over-32 MSE, K's top-4 mean) and the sink
-    // statistics, which would otherwise be diluted by the zero lanes.
+    // len in [1, 32]. Every load reads a slot outside [offset, offset+len)
+    // as ZERO (`lane_in_window`), so a dead slot contributes nothing to
+    // amax or the error sums whatever bytes it holds; the range also fixes
+    // the COUNT-normalized metrics (V's mean-over-32 MSE, K's top-4 mean)
+    // and the sink statistics, which would otherwise be diluted by the zero
+    // lanes.
     const int* __restrict__ valid_ranges,          // [n_chunks]
     int*   __restrict__ k_palette_tags,            // [total_heads * 4]
     int*   __restrict__ v_palette_tags,            // [total_heads * 4]
@@ -2226,6 +2359,11 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     // bits during the parallel second-pass fill.
     __shared__ uint64_t k_alive[AW];
     __shared__ uint64_t v_alive[AW];
+    // HB-bit flatness mask per side; bit b set iff K/V block b is flat to within
+    // one INT8 step of the head scale (`block_var_is_flat`). Written once, in the
+    // pass that first loads the side's values, and read by the Q0 search.
+    __shared__ uint64_t k_flat[AW];
+    __shared__ uint64_t v_flat[AW];
     // Compacted live-index scratch, rebuilt at the top of each slot from
     // `kidx`/`vidx` + the alive bitmask. The search inner loop walks
     // idx_compact[0..live_count) instead of idx_sorted with a per-block
@@ -2234,14 +2372,15 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     // sequentially.
     __shared__ uint16_t idx_compact[HB];
 
-    // Cross-warp search aggregation — one slot per (warp, si) pair.
-    // All NUM_SCALE_CANDIDATES scales are accumulated in parallel across the
-    // si loop without intermediate __syncthreads; tid 0 reduces all slots in
-    // one pass after a single __syncthreads at the end of the si loop.
+    // Cross-warp search aggregation — one row per (warp, si) pair. Every scale
+    // is accumulated in the same pass over the blocks without intermediate
+    // __syncthreads; tid 0 reduces all rows in one pass after a single
+    // __syncthreads at the end of the search. Pass counts are the merged
+    // masks' populations.
     // Layout: [warp_id * NUM_SCALE_CANDIDATES + si] (× AW words for warp_pass).
-    __shared__ int      warp_count   [FUSED_WARPS_PER_BLOCK * NUM_SCALE_CANDIDATES];
     __shared__ uint64_t warp_pass    [FUSED_WARPS_PER_BLOCK * NUM_SCALE_CANDIDATES * AW];
     __shared__ float    warp_amax_err[FUSED_WARPS_PER_BLOCK * NUM_SCALE_CANDIDATES];
+    __shared__ int      warp_nonflat [FUSED_WARPS_PER_BLOCK];
 
     // Cross-thread best/fallback state for the current slot's search.
     // Lives in shared because the search is now multi-warp: every warp
@@ -2257,24 +2396,25 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     __shared__ float    s_fallback_scale;
     __shared__ float    s_fallback_err;
     __shared__ uint64_t s_fallback_pass[AW];
+    // Early rejection of hopeless scales (`search_scales_for_fmt`): failure
+    // counts per scale (the last entry counts against every scale), which
+    // scales some warp stopped measuring, and whether that left the fallback
+    // unknown. The search re-zeroes the first two on exit.
+    __shared__ int      s_fail[NUM_SCALE_CANDIDATES + 1];
+    __shared__ int      s_dropped;
+    __shared__ int      s_fallback_incomplete;
 
-    // Per-slot scratch shared with all threads: live count and slot-level
-    // amax statistics (max, p95, p80, mean) of the unclaimed set, populated
-    // during compaction by tid 0's alive-walk and broadcast to all threads.
-    // One entry per 32-position sort segment (segments = warps at HB=128;
-    // each warp owns NSEG/4 segments at HB=256).
+    // Per-slot scratch shared with all threads: the live population of each
+    // 32-position sort segment (segments = warps at HB=128; each warp owns
+    // NSEG/4 segments at HB=256), and the slot-level amax statistics (max, p95,
+    // p80, mean, p25) of the unclaimed set, computed by tid 0 from the
+    // compacted amaxes and broadcast to all threads.
     __shared__ int      s_seg_pop[NSEG];
-    __shared__ int      s_seg_first_alive[NSEG];
-    __shared__ int      s_live_count;
     __shared__ float    s_slot_amax;   // max amax of unclaimed set
     __shared__ float    s_slot_p95;    // 95th-percentile amax (5% of blocks exceed this)
     __shared__ float    s_slot_p80;    // 80th-percentile amax (20% of blocks exceed this)
     __shared__ float    s_slot_mean;   // mean amax of unclaimed set
     __shared__ float    s_slot_p25;    // 25th-percentile amax (75% of blocks exceed this)
-
-    // Single-int scratch used by `claim_passing_blocks_from_mask` to return
-    // the pass-1 claim count from tid 0 to the rest of the block.
-    __shared__ int      s_claim_count;
 
     // Per-band source views, resolved through each band's own gid (bands of a
     // head may live in different arenas, at non-contiguous chunk indices, and
@@ -2297,10 +2437,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     const int head_idx = head_id % n_kv_head;
 
     // Valid token window of this chunk (see the parameter comment).
-    const int vr        = __ldg(&valid_ranges[chunk_id]);
-    const int valid_lo  = (vr >> 8) & 0xff;
-    const int valid_len = max(1, min(32, vr & 0xff));
-    const int valid_hi  = valid_lo + valid_len;
+    const TokenWindow win = unpack_token_window(__ldg(&valid_ranges[chunk_id]));
+    const int valid_lo  = win.lo;
+    const int valid_hi  = win.hi;
+    const int valid_len = valid_hi - valid_lo;
     // Count corrections for the fixed-count metric normalizations:
     // V pass_metric divides the error sum by 32 lanes; K's by top-4.
     const float v_valid_corr = 32.0f / (float)valid_len;
@@ -2316,6 +2456,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
                             &s_band_ptr[side][p], &s_band_fmt[side][p],
                             &s_band_outer[side][p]);
     }
+    if (tid < AW) {
+        k_flat[tid] = 0ULL;
+        v_flat[tid] = 0ULL;
+    }
     __syncthreads();
     // Block → band mapping: block b covers dim b of the head; each band holds
     // FUSED_BAND_BLOCKS consecutive dims' blocks in its own arena slot
@@ -2326,43 +2470,66 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     const float q_spread = __ldg(&q_relevance_spread[head_id]);
 
     {
+    // One INT8 step of each side's head scale: a block whose variance is below
+    // its square is flat (`block_var_is_flat`). Scoped to Phase 1, the only
+    // place the flatness masks are written.
+    const float k_flat_step = head_scale(__ldg(&k_head_amax_in[head_id]), __ldg(&k_head_p95_in[head_id])) * (1.0f / FLAT_BLOCK_STEPS);
+    const float v_flat_step = head_scale(__ldg(&v_head_amax_in[head_id]), __ldg(&v_head_p95_in[head_id])) * (1.0f / FLAT_BLOCK_STEPS);
     // ── Phase 1: Load all HB blocks; compute per-block amax and q-relevance ──
     // Multi-warp stride: each of the 4 warps owns HB/4 blocks (warp_id, +4, +8 …).
     // Lanes within a warp cooperate to load one block's 32 elements; warp-
     // local reductions (`__shfl_xor_sync`) compute amax / q-relevance per
     // block. No cross-warp dependencies in this phase — the closing
     // __syncthreads makes Phase 2.5/2 see consistent smem state.
-    for (int blk = warp_id; blk < HB; blk += FUSED_WARPS_PER_BLOCK) {
-        const int p   = blk / FUSED_BAND_BLOCKS;
-        const int bib = blk - p * FUSED_BAND_BLOCKS; // block within band
-        const int   k_src_fmt    = s_band_fmt[0][p];
-        const char* k_chunk_data = s_band_ptr[0][p];
-        const int   v_src_fmt    = s_band_fmt[1][p];
-        const char* v_chunk_data = s_band_ptr[1][p];
-        float k_val = 0.0f, q_val = 0.0f, v_val = 0.0f;
-
-        if (ArenaFormat::is_quantized(k_src_fmt)) {
-            const char* k_blk = k_chunk_data + (int64_t)bib * quant_block_bytes(k_src_fmt);
-            k_val = dequant_element_inline<float, true>(k_blk, lane, k_src_fmt, s_band_outer[0][p]);
-            q_val = dequant_q_element(k_blk, lane, k_src_fmt);
-        } else {
-            k_val = load_as_float(k_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(k_src_fmt));
-        }
-        if (ArenaFormat::is_quantized(v_src_fmt)) {
-            const char* v_blk = v_chunk_data + (int64_t)bib * quant_block_bytes(v_src_fmt);
-            v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt, s_band_outer[1][p]);
-        } else {
-            v_val = load_as_float(v_chunk_data, bib * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt));
+    //
+    // A warp loads LOAD_GROUP of its blocks before it processes any of them, so
+    // their global loads are in flight together rather than one latency apiece.
+    // A group spans LOAD_GROUP × 4 consecutive block ids, which stays inside one
+    // band (FUSED_BAND_BLOCKS is 32 or 64), so the group shares one source view.
+    constexpr int LOAD_GROUP = 4;
+    static_assert(FUSED_BAND_BLOCKS % (LOAD_GROUP * FUSED_WARPS_PER_BLOCK) == 0,
+                  "a load group must not straddle a band");
+    for (int g = warp_id; g < HB; g += FUSED_WARPS_PER_BLOCK * LOAD_GROUP) {
+    float k_in[LOAD_GROUP], q_in[LOAD_GROUP], v_in[LOAD_GROUP];
+    load_band_group<LOAD_GROUP, true>(s_band_ptr, s_band_fmt, s_band_outer,
+                                      g, FUSED_WARPS_PER_BLOCK, FUSED_BAND_BLOCKS, lane,
+                                      k_in, q_in, v_in);
+    #pragma unroll
+    for (int j = 0; j < LOAD_GROUP; j++) {
+        const int blk = g + j * FUSED_WARPS_PER_BLOCK;
+        float k_val = k_in[j], q_val = q_in[j], v_val = v_in[j];
+        if (!lane_in_window(lane, win)) {
+            k_val = 0.0f;
+            q_val = 0.0f;
+            v_val = 0.0f;
         }
 
         smem_kv   [blk * 32 + lane] = __float2half(k_val);   // K stored as f16; V discarded (reloaded before V process_side)
 
         float k_abs = fabsf(k_val);
         float v_abs = fabsf(v_val);
+        // First and second moments of both sides ride along in the amax
+        // reduction (dead lanes are zero, so the sums are over the valid
+        // tokens): they decide each block's flatness below at no extra latency.
+        float k_s1 = k_val, k_s2 = k_val * k_val;
+        float v_s1 = v_val, v_s2 = v_val * v_val;
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             k_abs = fmaxf(k_abs, __shfl_xor_sync(0xffffffff, k_abs, off));
             v_abs = fmaxf(v_abs, __shfl_xor_sync(0xffffffff, v_abs, off));
+            k_s1 += __shfl_xor_sync(0xffffffff, k_s1, off);
+            k_s2 += __shfl_xor_sync(0xffffffff, k_s2, off);
+            v_s1 += __shfl_xor_sync(0xffffffff, v_s1, off);
+            v_s2 += __shfl_xor_sync(0xffffffff, v_s2, off);
+        }
+        if (lane == 0) {
+            const float n_inv = 1.0f / (float)valid_len;
+            const float k_mean = k_s1 * n_inv;
+            const float v_mean = v_s1 * n_inv;
+            if (block_var_is_flat(k_s2 * n_inv - k_mean * k_mean, k_flat_step))
+                atomicOr((unsigned long long*)&k_flat[blk >> 6], 1ULL << (blk & 63));
+            if (block_var_is_flat(v_s2 * n_inv - v_mean * v_mean, v_flat_step))
+                atomicOr((unsigned long long*)&v_flat[blk >> 6], 1ULL << (blk & 63));
         }
 
         // Inline q_mean: all 32 lanes hold q_val for one position in this block,
@@ -2383,8 +2550,8 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
 
         if (lane == 0) {
             // Per-block hash jitter (~6e-8) added to the amax values to
-            // break sort ties on tied amax. Partial-tail chunks zero-pad
-            // positions past `token_count`, producing many near-equal
+            // break sort ties on tied amax. Partial-tail chunks read as
+            // zero outside their token window, producing many near-equal
             // small amax that — under the bitonic sort's tie behaviour —
             // drift toward near-monotonic block-index order; the claim
             // phase then assigns long contiguous dim ranges to a single
@@ -2405,6 +2572,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
         if (lane == 0 && q_relevance_out != nullptr) {
             q_relevance_out[head_id * HB + blk] = qr;
         }
+    }
     }
 
     // Initialise alive masks; the __syncthreads below makes them visible to
@@ -2475,7 +2643,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
         //     VALID tokens (dead lanes of a partial chunk have zero K and
         //     would drag mu toward zero, granting every real token spurious
         //     sink weight). Warp reductions; mu and sigma broadcast.
-        const bool  in_window = (lane >= valid_lo) && (lane < valid_hi);
+        const bool  in_window = lane_in_window(lane, win);
         const float s = sink_score[lane];
         float ssum = in_window ? s : 0.0f;
         #pragma unroll
@@ -2536,7 +2704,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             : sqrtf(k_threshold_lo * k_threshold_hi));
     }
 
-    const float k_head_amax_val = fmaxf(__ldg(&k_head_amax_in[head_id]), 1.0e-8f);
+    const float k_head_amax_val = head_scale(__ldg(&k_head_amax_in[head_id]), __ldg(&k_head_p95_in[head_id]));
     // v_head_amax_val loaded lazily just before V process_side so it is not live
     // across the K process_side register frame.
 
@@ -2552,15 +2720,15 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     //
     // Runs once for K and once for V. For each of 4 slots:
     //
-    //   (a) Compact alive entries from idx_sorted into idx_compact.
-    //       Each warp ballots its 32-position segment(s) of the alive
-    //       bitmask (one segment per warp at HB=128, two at HB=256);
-    //       per-segment prefix-popcount packs ranks into a write offset
-    //       computed by tid 0 (cross-segment prefix sum). tid 0 also walks
-    //       the HB alive sort positions once to compute slot stats
-    //       (amax, p95, p80, mean, p25) broadcast via shared memory to
-    //       all threads; these feed preferred_range to produce the six
-    //       outer-scale candidates for the format search.
+    //   (a) Compact alive entries from idx_sorted into idx_compact, with
+    //       their amaxes into amax_compact. Each warp ballots its 32-position
+    //       segment(s) of the alive bitmask (one segment per warp at HB=128,
+    //       two at HB=256); per-segment prefix-popcount packs ranks, and every
+    //       thread adds its segment's offset from the cross-segment prefix
+    //       sum. tid 0 then reads the slot stats (amax, p95, p80, mean, p25)
+    //       off amax_compact and broadcasts them via shared memory; these feed
+    //       preferred_range to produce the six outer-scale candidates for the
+    //       format search.
     //
     //   (b) Reset best/fallback state. `s_best_err = FLT_MAX`,
     //       `s_fallback_err = FLT_MAX` (so the first measurement wins).
@@ -2573,11 +2741,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     //       If no candidate hits the quota, the lowest-max-error fallback
     //       wins (with its partial pass mask).
     //
-    //   (d) Claim phase: walk idx_compact, claim blocks whose pass-mask
-    //       bit is set (no round-trip), up to FUSED_BAND_BLOCKS — this is
-    //       the work `claim_passing_blocks_from_mask` does single-threaded
-    //       by tid 0. Then a second-pass fill (warp 0) sweeps in remaining
-    //       alive blocks in sort order until the quota is claimed.
+    //   (d) Claim phase (warp 0): walk idx_compact, claim blocks whose
+    //       pass-mask bit is set (no round-trip), up to FUSED_BAND_BLOCKS.
+    //       Then a second-pass fill sweeps in remaining alive blocks in sort
+    //       order until the quota is claimed.
     //       Both phases tombstone via `alive_clear`, so the next slot's
     //       compaction skips them.
     //
@@ -2601,11 +2768,16 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
     // is a word-wise `__popcll` sum; "find first alive in sort order"
     // uses a 32-lane chunked __ballot_sync scan instead of a serial
     // walk.
+    //
+    // `q_mean` is dead once Phase 2.5 has its sink scores, so the slot loop
+    // reuses it for the live amaxes in sort order.
+    float* const amax_compact = q_mean;
     auto process_side = [&](
         const __half* __restrict__ smem_data,  // flat [HB * FUSED_WARP_SIZE] f16 values
         float*    __restrict__ amax_sorted, // [HB] desc-sorted amax, read-only
         const uint16_t* __restrict__ idx_sorted,  // [HB] original indices (read-only after sort)
         uint64_t* alive,                    // → __shared__ alive bitmask [AW]
+        const uint64_t* flat,               // → __shared__ flatness bitmask [AW]
         const int* cands,
         int    num_cands,
         float  head_amax,
@@ -2639,6 +2811,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             uint64_t alive_snap[AW];
             #pragma unroll
             for (int w = 0; w < AW; w++) alive_snap[w] = alive[w];
+            // Live blocks a flat-only format may be offered (see the search).
+            int flat_live = 0;
+            #pragma unroll
+            for (int w = 0; w < AW; w++) flat_live += __popcll(alive_snap[w] & flat[w]);
 
             // ── Compact alive entries into idx_compact, all 4 warps in parallel ──
             // Each warp owns SEGS_PER_WARP 32-position segments (segment g
@@ -2660,50 +2836,50 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
                 seg_b   [c] = b_at_pos;
                 seg_live[c] = is_alive;
                 seg_rank[c] = __popc(bal & ((1u << lane) - 1u));
-                if (lane == 0) {
-                    s_seg_pop[seg]         = __popc(bal);
-                    s_seg_first_alive[seg] = (bal != 0) ? (seg * FUSED_WARP_SIZE + (__ffs(bal) - 1)) : -1;
+                if (lane == 0) s_seg_pop[seg] = __popc(bal);
+            }
+            __syncthreads();
+
+            // Every thread derives its segments' write offsets and the live count
+            // from the NSEG segment populations (an exclusive prefix sum over a
+            // handful of words, cheaper than a barrier round trip through one
+            // thread), then writes its live entries in sort order: the block id
+            // to idx_compact and its amax to amax_compact.
+            int live_count = 0;
+            int seg_off[SEGS_PER_WARP];
+            #pragma unroll
+            for (int g = 0; g < NSEG; g++) {
+                #pragma unroll
+                for (int c = 0; c < SEGS_PER_WARP; c++)
+                    if (g == c * FUSED_WARPS_PER_BLOCK + warp_id) seg_off[c] = live_count;
+                live_count += s_seg_pop[g];
+            }
+            #pragma unroll
+            for (int c = 0; c < SEGS_PER_WARP; c++) {
+                if (seg_live[c]) {
+                    const int pos  = (c * FUSED_WARPS_PER_BLOCK + warp_id) * FUSED_WARP_SIZE + lane;
+                    const int rank = seg_off[c] + seg_rank[c];
+                    idx_compact [rank] = (uint16_t)seg_b[c];
+                    amax_compact[rank] = amax_sorted[pos];
                 }
             }
             __syncthreads();
 
-            // tid 0 computes the per-segment prefix sum (NSEG entries) + total
-            // live count + slot stats (amax, p95, p80, mean) by walking alive
-            // sort positions. amax_sorted is descending so earlier alive
-            // positions have larger values.
+            // tid 0 computes the slot stats (amax, p95, p80, mean, p25) of the
+            // live set from its amaxes in sort order. amax_sorted is descending,
+            // so rank r holds the (r+1)-th largest; each percentile is one read,
+            // and the mean is a sum in sort order.
             if (tid == 0) {
-                int prefix = 0;
-                int first_alive = -1;
-                #pragma unroll
-                for (int g = 0; g < NSEG; g++) {
-                    if (first_alive < 0 && s_seg_first_alive[g] >= 0) first_alive = s_seg_first_alive[g];
-                    const int p = s_seg_pop[g];
-                    s_seg_pop[g] = prefix;   // becomes segment's write offset
-                    prefix += p;
-                }
-                s_live_count = prefix;
-
-                const float slot_amax_raw = (first_alive >= 0) ? amax_sorted[first_alive] : 0.0f;
-                const int   lc    = prefix;
-                float sum_amax    = 0.0f;
-                float p95_val     = slot_amax_raw;
-                float p80_val     = slot_amax_raw;
-                float p25_val     = slot_amax_raw;
-                int   cnt         = 0;
+                const int lc = live_count;
+                float sum_amax = 0.0f;
+                for (int r = 0; r < lc; r++) sum_amax += amax_compact[r];
+                const float slot_amax_raw = (lc > 0) ? amax_compact[0] : 0.0f;
                 const int p95_tgt = max(1, (lc + 19) / 20);  // ceil(5% of lc)
                 const int p80_tgt = max(1, (lc + 4)  /  5);  // ceil(20% of lc)
                 const int p25_tgt = max(1, (3 * lc)  /  4);  // floor(75% of lc)
-                for (int pos = 0; pos < HB; pos++) {
-                    if (alive_get<AW>(alive_snap, (int)idx_sorted[pos])) {
-                        const float av = amax_sorted[pos];
-                        sum_amax += av;
-                        cnt++;
-                        if (cnt == p95_tgt) p95_val = av;
-                        if (cnt == p80_tgt) p80_val = av;
-                        if (cnt == p25_tgt) p25_val = av;
-                        if (cnt == lc) break;
-                    }
-                }
+                const float p95_val = (lc > 0) ? amax_compact[p95_tgt - 1] : 0.0f;
+                const float p80_val = (lc > 0) ? amax_compact[p80_tgt - 1] : 0.0f;
+                const float p25_val = (lc > 0) ? amax_compact[p25_tgt - 1] : 0.0f;
                 s_slot_amax = fmaxf(slot_amax_raw, 1.0e-8f);
                 s_slot_p95  = fmaxf(p95_val,       1.0e-8f);
                 s_slot_p80  = fmaxf(p80_val,       1.0e-8f);
@@ -2712,22 +2888,11 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             }
             __syncthreads();
 
-            const int   live_count = s_live_count;
             const float slot_amax  = s_slot_amax;
             const float safe_p95   = s_slot_p95;
             const float safe_p80   = s_slot_p80;
             const float slot_mean  = s_slot_mean;
             const float safe_p25   = s_slot_p25;
-
-            // Each lane writes its own compacted slot(s) if alive.
-            #pragma unroll
-            for (int c = 0; c < SEGS_PER_WARP; c++) {
-                const int seg = c * FUSED_WARPS_PER_BLOCK + warp_id;
-                if (seg_live[c]) {
-                    idx_compact[s_seg_pop[seg] + seg_rank[c]] = (uint16_t)seg_b[c];
-                }
-            }
-            __syncthreads();
 
             if (live_count == 0) {
                 if (tid == 0) {
@@ -2761,6 +2926,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
                     s_best_pass[w]     = 0;
                     s_fallback_pass[w] = 0;
                 }
+                #pragma unroll
+                for (int si = 0; si <= NUM_SCALE_CANDIDATES; si++) s_fail[si] = 0;
+                s_dropped             = 0;
+                s_fallback_incomplete = 0;
             }
             __syncthreads();
 
@@ -2777,27 +2946,56 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             // 0 after a __syncthreads, so all threads see it consistently
             // at the top of the next ci iteration — break is convergent
             // across the block.
-            for (int ci = 0; ci < num_cands; ci++) {
-                if (s_search_done) break;
-                const int fmt = cands[ci];
-                // One instantiation per format, with the side passed in. This
-                // used to branch on `is_k` here and instantiate the whole search
-                // twice per format — see `search_scales_for_fmt`.
-                with_select_fmt(fmt, [&](auto tag) {
-                    constexpr int FMT = decltype(tag)::value;
-                    search_scales_for_fmt<FMT, HB>(
-                        is_k,
-                        slot_amax, safe_p95, safe_p80, slot_mean, safe_p25,
-                        smem_data, idx_compact, live_count,
-                        tid, warp_id, lane,
-                        warp_f32[warp_id], warp_quant[warp_id], kthresh,
-                        inv_head_amax, inv_head_amax_sq, v_thr_sq,
-                        warp_count, warp_pass, warp_amax_err,
-                        &s_best_fmt, &s_best_scale, &s_best_err,
-                        s_best_pass, &s_search_done,
-                        &s_fallback_fmt, &s_fallback_scale, &s_fallback_err,
-                        s_fallback_pass);
-                });
+            //
+            // The first search drops hopeless scales. If no candidate filled the
+            // slot and a dropped scale was a fallback candidate, the fallback is
+            // unknown, and the search runs again measuring every block: no
+            // candidate fills the slot that time either, and the fallback it
+            // ranks is the full search's.
+            for (int attempt = 0; attempt < 2; attempt++) {
+                const bool drop_hopeless = (attempt == 0);
+                for (int ci = 0; ci < num_cands; ci++) {
+                    if (s_search_done) break;
+                    const int fmt = cands[ci];
+                    // One instantiation per format, with the side passed in. This
+                    // used to branch on `is_k` here and instantiate the whole search
+                    // twice per format — see `search_scales_for_fmt`.
+                    with_select_fmt(fmt, [&](auto tag) {
+                        constexpr int FMT = decltype(tag)::value;
+                        // A flat-only format passes only flat blocks. With fewer
+                        // flat live blocks than the slot quota it cannot fill the
+                        // slot, and with a non-flat block live it is no fallback
+                        // either, so its search would change nothing: skip it.
+                        if constexpr (flat_only<FMT>::value) {
+                            if (flat_live < FUSED_BAND_BLOCKS) return;
+                        }
+                        search_scales_for_fmt<FMT, HB>(
+                            is_k,
+                            slot_amax, safe_p95, safe_p80, slot_mean, safe_p25,
+                            smem_data, idx_compact, live_count,
+                            tid, warp_id, lane,
+                            warp_f32[warp_id], warp_quant[warp_id], kthresh,
+                            inv_head_amax, inv_head_amax_sq, v_thr_sq,
+                            flat, warp_nonflat,
+                            warp_pass, warp_amax_err,
+                            &s_best_fmt, &s_best_scale, &s_best_err,
+                            s_best_pass, &s_search_done,
+                            &s_fallback_fmt, &s_fallback_scale, &s_fallback_err,
+                            s_fallback_pass,
+                            drop_hopeless, s_fail, &s_dropped, &s_fallback_incomplete);
+                    });
+                }
+                if (s_search_done || !s_fallback_incomplete) break;
+                __syncthreads();
+                if (tid == 0) {
+                    s_fallback_fmt        = cands[num_cands - 1];
+                    s_fallback_scale      = 1.0f;
+                    s_fallback_err        = FLT_MAX;
+                    #pragma unroll
+                    for (int w = 0; w < AW; w++) s_fallback_pass[w] = 0;
+                    s_fallback_incomplete = 0;
+                }
+                __syncthreads();
             }
 
             // No candidate hit the slot quota — fall back to the (fmt, scale)
@@ -2829,32 +3027,38 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             }
             __syncthreads();
 
-            // Claim phase: walk idx_compact (alive entries in sort order),
-            // claim blocks whose bit is set in the cached pass mask. No
-            // round-trip; the search already computed the answer at the
-            // winning (fmt, scale). Single-threaded by tid 0; broadcasts
-            // the count via __syncthreads.
-            int claimed = claim_passing_blocks_from_mask<HB>(
-                s, head_id, best_fmt, tid, idx_compact, live_count,
-                s_best_pass, alive,
-                out_pal_map, out_eff_tags,
-                &s_claim_count);
-
-            // ── Second pass: fill remaining quota with non-passing blocks ──
-            // After pass 1 (mask-driven claim), the slot still needs
-            // `FUSED_BAND_BLOCKS - claimed` blocks to hit its quota. Pass 2
-            // walks idx_compact in sort order (highest-amax first among the
-            // remaining live) and claims them with the same `best_fmt`.
+            // ── Claim, warp 0 ──────────────────────────────────────────────
+            // Claim ORDER matters — slot s+1 inherits the next-largest amax
+            // blocks — so both passes walk idx_compact from the top in 32-entry
+            // chunks. Within a chunk, lanes ballot their predicate and a
+            // prefix popcount ranks them, so up to `still_need` lanes commit in
+            // parallel while preserving sort order. Parallelising across warps
+            // would race the chunk pointer and reorder the claim.
             //
-            // Only warp 0 participates: claim ORDER matters because slot
-            // s+1 inherits the next-largest amax blocks, so we must
-            // walk idx_compact from the top sequentially. Parallelising
-            // across warps would race the chunk pointer and reorder the
-            // claim. Within warp 0, lanes ballot the alive mask of the
-            // current 32-lane chunk; prefix-popcount assigns claim ranks
-            // so up to `still_need` lanes commit in parallel within the
-            // chunk while preserving sort order.
+            // Pass 1 claims the blocks whose bit is set in the cached pass mask:
+            // the search already measured them at the winning (fmt, scale), so
+            // there is no round trip here. Pass 2 fills the rest of the quota
+            // with the remaining live blocks, highest amax first, under the same
+            // `best_fmt`.
             if (warp_id == 0) {
+                int claimed = 0;
+                for (int chunk = 0; chunk < live_count && claimed < FUSED_BAND_BLOCKS; chunk += FUSED_WARP_SIZE) {
+                    const int  i       = chunk + lane;
+                    const int  b       = (i < live_count) ? (int)idx_compact[i] : -1;
+                    const bool passes  = (b >= 0) && (((s_best_pass[b >> 6] >> (b & 63)) & 1ULL) != 0ULL);
+                    const unsigned bal = __ballot_sync(0xffffffff, passes);
+                    const int still_need = FUSED_BAND_BLOCKS - claimed;
+                    const int rank       = __popc(bal & ((1u << lane) - 1u));
+                    if (passes && rank < still_need) {
+                        out_pal_map [head_id * HB + b] = s;
+                        out_eff_tags[head_id * HB + b] = best_fmt;
+                        alive_clear(alive, b);
+                    }
+                    claimed += min(__popc(bal), still_need);
+                }
+                // Pass 2 reads the alive bits pass 1 cleared.
+                __syncwarp();
+
                 for (int chunk = 0; chunk < live_count && claimed < FUSED_BAND_BLOCKS; chunk += FUSED_WARP_SIZE) {
                     const int  i        = chunk + lane;
                     const int  b        = (i < live_count) ? (int)idx_compact[i] : -1;
@@ -2906,7 +3110,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
 
     process_side(
         smem_kv, amax_k, kidx,
-        k_alive,
+        k_alive, k_flat,
         k_candidates, num_k_candidates,
         k_head_amax_val, true,
         k_palette_tags, k_palette_scale,
@@ -2915,8 +3119,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
 
     // Reload V values into smem_kv.  K data is consumed; overwriting is safe.
     // Per-band source views come from the s_band_* arrays resolved up front,
-    // so nothing V-related was live across the K process_side frame.
+    // so nothing V-related was live across the K process_side frame. The
+    // iterations are independent, so unrolling lets a warp's loads overlap.
     {
+        #pragma unroll 4
         for (int blk = warp_id; blk < HB; blk += FUSED_WARPS_PER_BLOCK) {
             const int p   = blk / FUSED_BAND_BLOCKS;
             const int bib = blk - p * FUSED_BAND_BLOCKS;
@@ -2925,9 +3131,12 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
             float v_val;
             if (ArenaFormat::is_quantized(v_src_fmt_r)) {
                 const char* v_blk = v_chunk_data_r + (int64_t)bib * quant_block_bytes(v_src_fmt_r);
-                v_val = dequant_element_inline<float>(v_blk, lane, v_src_fmt_r, s_band_outer[1][p]);
+                v_val = dequant_element_inline<float, false>(v_blk, lane, v_src_fmt_r, s_band_outer[1][p]);
             } else {
-                v_val = load_as_float(v_chunk_data_r, bib * 32 + lane, arena_fmt_to_dtype_code(v_src_fmt_r));
+                v_val = load_as_float(v_chunk_data_r, float_band_elem(bib, lane, FUSED_BAND_BLOCKS), arena_fmt_to_dtype_code(v_src_fmt_r));
+            }
+            if (!lane_in_window(lane, win)) {
+                v_val = 0.0f;
             }
             smem_kv[blk * 32 + lane] = __float2half(v_val);
         }
@@ -2936,10 +3145,10 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
 
     // Lazy-load v_head_amax_val just before V process_side so it is not live
     // across the K process_side register frame (saved 1 register there).
-    const float v_head_amax_val = fmaxf(__ldg(&v_head_amax_in[head_id]), 1.0e-8f);
+    const float v_head_amax_val = head_scale(__ldg(&v_head_amax_in[head_id]), __ldg(&v_head_p95_in[head_id]));
     process_side(
         smem_kv, amax_v, vidx,
-        v_alive,
+        v_alive, v_flat,
         v_candidates, num_v_candidates,
         v_head_amax_val, false,
         v_palette_tags, v_palette_scale,
@@ -3036,7 +3245,8 @@ extern "C" void run_select_kv_format_palette4_paged(
         blocks_per_head,
         total_heads,
         n_kv_head,
-        arena_chunks
+        arena_chunks,
+        valid_ranges
     );
 
     // Pass 2: fused selection + palette4 grouping, one block per (chunk, head).
@@ -3090,6 +3300,64 @@ extern "C" void run_select_kv_format_palette4_paged(
         case 256: launch_pass2(HbTag<256>{}); break;
         default:  return;  // unsupported head_dim: no selection outputs written
     }
+}
+
+// =============================================================================
+// REGISTER ROUND-TRIP PARITY — test entry point
+// =============================================================================
+// For each 32-element block, the search's round trip of `fmt` two ways: through
+// the block's bytes (encode into shared memory, decode each element back) and
+// through `lane_roundtrip_for_fmt`. The search uses the register path wherever
+// `lane_roundtrip` has it, on the guarantee that the two agree bit for bit; the
+// test that calls this asserts it. One warp per block, default stream.
+// `recon_lane` gets the bytes path's value for a format without a register path.
+
+__global__ void select_roundtrip_parity_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ recon_bytes,
+    float* __restrict__ recon_lane,
+    int num_blocks,
+    float outer,
+    int fmt,
+    int is_k)
+{
+    __shared__ float   f32_smem[FUSED_WARP_SIZE];
+    __shared__ uint8_t quant_smem[MAX_QUANT_BLOCK_BYTES];
+    const int blk  = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (blk >= num_blocks) return;
+
+    const float orig = src[blk * FUSED_WARP_SIZE + lane];
+    with_select_fmt(fmt, [&](auto tag) {
+        constexpr int FMT = decltype(tag)::value;
+        f32_smem[lane] = orig * outer;
+        __syncwarp();
+        quantize_block_for_fmt<FMT>(f32_smem, quant_smem, is_k != 0);
+        __syncwarp();
+        const float bytes = dequant_element_for_fmt<FMT>(quant_smem, lane, outer, is_k != 0);
+        recon_bytes[blk * FUSED_WARP_SIZE + lane] = bytes;
+        if constexpr (lane_roundtrip<FMT>::value) {
+            recon_lane[blk * FUSED_WARP_SIZE + lane] =
+                lane_roundtrip_for_fmt<FMT>(orig * outer, outer, f32_smem, is_k != 0);
+        } else {
+            recon_lane[blk * FUSED_WARP_SIZE + lane] = bytes;
+        }
+    });
+}
+
+extern "C" void run_select_roundtrip_parity(
+    const void* src,
+    void* recon_bytes,
+    void* recon_lane,
+    int num_blocks,
+    float outer,
+    int fmt,
+    int is_k)
+{
+    if (num_blocks <= 0) return;
+    select_roundtrip_parity_kernel<<<num_blocks, FUSED_WARP_SIZE>>>(
+        (const float*)src, (float*)recon_bytes, (float*)recon_lane,
+        num_blocks, outer, fmt, is_k);
 }
 
 // =============================================================================
@@ -3176,7 +3444,7 @@ extern "C" __global__ void sample_quant_errors_paged(
                 q_val = dequant_q_element(blk_ptr, lane, src_fmt);
             }
         } else {
-            const int elem_in_chunk = dim_in_band * 32 + lane;
+            const int elem_in_chunk = float_band_elem(dim_in_band, lane, sub_head_dim);
             x_val = load_as_float(chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(src_fmt));
             if (side_is_k) {
                 k_val = x_val;
@@ -3326,7 +3594,7 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
             k_val = dequant_element_inline<float, true>(blk_ptr, lane, k_src_fmt, 1.0f);
             q_val = dequant_q_element(blk_ptr, lane, k_src_fmt);
         } else {
-            const int elem_in_chunk = dim_in_band * 32 + lane;
+            const int elem_in_chunk = float_band_elem(dim_in_band, lane, sub_head_dim);
             k_val = load_as_float(k_chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(k_src_fmt));
         }
 
@@ -3361,9 +3629,9 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
         if (ArenaFormat::is_quantized(v_src_fmt)) {
             const int blk_bytes = quant_block_bytes(v_src_fmt);
             const char* blk_ptr = v_chunk_data + (int64_t)dim_in_band * blk_bytes;
-            v_val = dequant_element_inline<float>(blk_ptr, lane, v_src_fmt, 1.0f);
+            v_val = dequant_element_inline<float, false>(blk_ptr, lane, v_src_fmt, 1.0f);
         } else {
-            const int elem_in_chunk = dim_in_band * 32 + lane;
+            const int elem_in_chunk = float_band_elem(dim_in_band, lane, sub_head_dim);
             v_val = load_as_float(v_chunk_data, elem_in_chunk, arena_fmt_to_dtype_code(v_src_fmt));
         }
 
@@ -3375,7 +3643,7 @@ extern "C" __global__ void sample_quant_errors_kv_paged(
             __syncwarp();
             quantize_to_smem(warp_f32, warp_quant, fmt, /*is_k=*/false);
             __syncwarp();
-            v_rt = dequant_element_inline<float>((const char*)warp_quant, lane, select_fmt_to_arena_fmt(fmt), 1.0f);
+            v_rt = dequant_element_inline<float, false>((const char*)warp_quant, lane, select_fmt_to_arena_fmt(fmt), 1.0f);
         }
         const float v_err = max_abs_error_warp(v_val, v_rt);
 

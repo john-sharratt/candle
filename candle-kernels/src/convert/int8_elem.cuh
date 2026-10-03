@@ -40,31 +40,45 @@ namespace int8_elem {
 ///
 /// Callers must be warp-uniform (every lane executes the shuffle): every
 /// call site guards on warp-uniform row/token conditions.
+///
+/// RoPE over one pair of windows, `lo` = window w and `hi` = window
+/// w + N_WIN/2 (w < N_WIN/2): the rotary layout rotates dim d against
+/// d + HEAD_DIM/2, the same lane in those two windows; the interleaved layout
+/// rotates each window on its own, dim d against d ^ 1 in the neighbouring
+/// lane. The windows are independent otherwise, so a caller holding one pair
+/// at a time applies exactly `i8_apply_rope`, which is this over every pair.
+template <int N_WIN>
+__device__ __forceinline__ void i8_apply_rope_pair(
+    float& lo, float& hi, int w, int pos, int lane, int rope_interleaved,
+    const RopeView& rope)
+{
+    if (rope_interleaved) {
+        const float sign = (lane & 1) ? 1.f : -1.f;
+        float c, s;
+        rope_cs_at(rope, pos, (lane + 32 * w) >> 1, c, s);
+        const float plo = __shfl_sync(0xffffffffu, lo, lane ^ 1);
+        lo = lo * c + sign * plo * s;
+        rope_cs_at(rope, pos, (lane + 32 * (w + N_WIN / 2)) >> 1, c, s);
+        const float phi = __shfl_sync(0xffffffffu, hi, lane ^ 1);
+        hi = hi * c + sign * phi * s;
+    } else {
+        float c, s;
+        rope_cs_at(rope, pos, lane + 32 * w, c, s);
+        const float l = lo, h = hi;
+        lo = l * c - h * s;
+        hi = l * s + h * c;
+    }
+}
+
 template <int HEAD_DIM, int N_WIN>
 __device__ __forceinline__ void i8_apply_rope(
     float (&x)[N_WIN], int pos, int lane, int rope_interleaved,
     const RopeView& rope)
 {
-    if (rope_interleaved) {
-        const float sign = (lane & 1) ? 1.f : -1.f;
-        #pragma unroll
-        for (int w = 0; w < N_WIN; ++w) {
-            int d = lane + 32 * w;
-            float c, s;
-            rope_cs_at(rope, pos, d >> 1, c, s);
-            float partner = __shfl_sync(0xffffffffu, x[w], lane ^ 1);
-            x[w] = x[w] * c + sign * partner * s;
-        }
-    } else {
-        #pragma unroll
-        for (int w = 0; w < N_WIN / 2; ++w) {
-            float c, s;
-            rope_cs_at(rope, pos, lane + 32 * w, c, s);
-            float lo = x[w], hi = x[w + N_WIN / 2];
-            x[w] = lo * c - hi * s;
-            x[w + N_WIN / 2] = lo * s + hi * c;
-        }
-    }
+    static_assert(N_WIN % 2 == 0, "windows rotate in pairs: HEAD_DIM is a multiple of 64");
+    #pragma unroll
+    for (int w = 0; w < N_WIN / 2; ++w)
+        i8_apply_rope_pair<N_WIN>(x[w], x[w + N_WIN / 2], w, pos, lane, rope_interleaved, rope);
 }
 
 template <typename QT>
@@ -122,11 +136,15 @@ __device__ __forceinline__ int8_t i8_quant(float v, float inv_scale) {
 
 /// Runtime-format single-element FP decode from a token-oriented quant
 /// block (`blk` points at ONE dim's block; `e` is the token within it).
-/// Same numerics as load_head_quant_token_oriented: value / scale.
+/// Same numerics as load_head_quant_token_oriented: value / scale. `IS_K`
+/// names the side, which Q0_V's codebook depends on.
+template <bool IS_K>
 __device__ __forceinline__ float i8_dequant_elem(
     int fmt, const char* blk, int e, float scale)
 {
     switch (fmt) {
+        case ArenaFormat::Q0_V:
+            return q0_v_load_element_f32<IS_K>((const block_q0_v*)blk, e, scale);
 #define I8_DQ(F, B) \
     case ArenaFormat::F: \
         return BlockConverter<B, float>::load_element((const B*)blk, e, scale)
@@ -147,7 +165,6 @@ __device__ __forceinline__ float i8_dequant_elem(
         I8_DQ(Q2_S, block_q2_s);
         I8_DQ(Q1_S, block_q1_s);
         I8_DQ(Q0, block_q0);
-        I8_DQ(Q0_V, block_q0_v);
         I8_DQ(Q1_A, block_q1_a);
         I8_DQ(Q0_X, block_q0_x);
         I8_DQ(Q0_M2, block_q0_m2);
@@ -339,14 +356,18 @@ __device__ __forceinline__ void i8_with_rt_format(int fmt, F&& f)
 /// scale reciprocal (`v * rcp(scale)` is what the fast-math divide computes,
 /// hoisted out of the token loop).
 // ----------------------------------------------------------------------------
-// Aligned token quads of a quant block. `I8BlockQuad<B>::load4(blk, t, r, o)`
+// Aligned token quads of a quant block. `I8BlockQuad<B, IS_K>::load4(blk, t, r, o)`
 // decodes tokens t..t+3 of one dim's block, t a multiple of 4, as FP32 × r
 // (r the palette scale reciprocal): the block header once, then the quad's
 // codes with the fewest naturally aligned loads the layout allows. A block
 // sits at rank × sizeof(B) from a 16-byte palette span, so a 34-byte block
 // is 2-aligned and a 36-byte one 4-aligned; the offsets below respect
 // that. The primary template is the per-element decoder run four times,
-// which the layouts without a specialisation fall back to.
+// which the layouts without a specialisation fall back to. `IS_K` names the
+// side; only Q0_V's decode depends on it, and Q0_V has its own
+// specialisation (it has no side-less BlockConverter to fall back on), which
+// folds r into the block's scale and centroid rather than multiplying each
+// element by it — the same arithmetic as every other Q0_V read.
 //
 // The block is arena memory, which nothing writes while a decode kernel
 // runs, so every load is `__ldg`: a global load the compiler knows cannot
@@ -366,14 +387,14 @@ __device__ __forceinline__ float i8_s8_of(uint32_t w, int j) {
     return (float)(int)((int8_t)(w >> (8 * j)));
 }
 
-template <typename B> struct I8BlockQuad {
+template <typename B, bool IS_K> struct I8BlockQuad {
     static __device__ __forceinline__ void load4(const B* blk, int t, float r, float (&o)[4]) {
         #pragma unroll
         for (int j = 0; j < 4; ++j)
             o[j] = BlockConverter<B, float>::load_element(blk, t + j, 1.f) * r;
     }
 };
-template <> struct I8BlockQuad<block_q8_0> {          // half d; int8 qs[32]   (2-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q8_0, IS_K> {          // half d; int8 qs[32]   (2-aligned)
     static __device__ __forceinline__ void load4(const block_q8_0* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const float d = i8_h2f(i8_ld_u16(p)) * r;
@@ -382,7 +403,7 @@ template <> struct I8BlockQuad<block_q8_0> {          // half d; int8 qs[32]   (
         for (int j = 0; j < 4; ++j) o[j] = d * i8_s8_of(w, j);
     }
 };
-template <> struct I8BlockQuad<block_q8_1> {          // half2 ds; int8 qs[32] (4-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q8_1, IS_K> {          // half2 ds; int8 qs[32] (4-aligned)
     static __device__ __forceinline__ void load4(const block_q8_1* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const float d = i8_h2f(i8_ld_u32(p)) * r;
@@ -391,7 +412,7 @@ template <> struct I8BlockQuad<block_q8_1> {          // half2 ds; int8 qs[32] (
         for (int j = 0; j < 4; ++j) o[j] = d * i8_s8_of(w, j);
     }
 };
-template <> struct I8BlockQuad<block_q8_ks> {         // half d; u8 sa, sb; int8 qs[32] (4-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q8_ks, IS_K> {         // half d; u8 sa, sb; int8 qs[32] (4-aligned)
     static __device__ __forceinline__ void load4(const block_q8_ks* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const uint32_t h = i8_ld_u32(p);
@@ -402,7 +423,7 @@ template <> struct I8BlockQuad<block_q8_ks> {         // half d; u8 sa, sb; int8
         for (int j = 0; j < 4; ++j) o[j] = d * i8_s8_of(w, j);
     }
 };
-template <> struct I8BlockQuad<block_q4_0> {          // half d; u8 qs[16]      (2-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q4_0, IS_K> {          // half d; u8 qs[16]      (2-aligned)
     static __device__ __forceinline__ void load4(const block_q4_0* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const float d = i8_h2f(i8_ld_u16(p)) * r;
@@ -412,7 +433,7 @@ template <> struct I8BlockQuad<block_q4_0> {          // half d; u8 qs[16]      
         for (int j = 0; j < 4; ++j) o[j] = d * ((float)((w >> (8 * j)) & 15u) - 8.f);
     }
 };
-template <> struct I8BlockQuad<block_q4_1> {          // half2 dm; u8 qs[16]    (4-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q4_1, IS_K> {          // half2 dm; u8 qs[16]    (4-aligned)
     static __device__ __forceinline__ void load4(const block_q4_1* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const uint32_t dm = i8_ld_u32(p);
@@ -422,7 +443,7 @@ template <> struct I8BlockQuad<block_q4_1> {          // half2 dm; u8 qs[16]    
         for (int j = 0; j < 4; ++j) o[j] = d * (float)((w >> (8 * j)) & 15u) + m;
     }
 };
-template <> struct I8BlockQuad<block_q4_ks> {         // half d; u8 sa, sb; u8 qs[16] (4-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q4_ks, IS_K> {         // half d; u8 sa, sb; u8 qs[16] (4-aligned)
     static __device__ __forceinline__ void load4(const block_q4_ks* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const uint32_t h = i8_ld_u32(p);
@@ -433,7 +454,7 @@ template <> struct I8BlockQuad<block_q4_ks> {         // half d; u8 sa, sb; u8 q
         for (int j = 0; j < 4; ++j) o[j] = d * ((float)((w >> (8 * j)) & 15u) - 8.f);
     }
 };
-template <> struct I8BlockQuad<block_q3_0> {          // half d; u8 qh[4]; u8 qs[8] (2-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q3_0, IS_K> {          // half d; u8 qh[4]; u8 qs[8] (2-aligned)
     static __device__ __forceinline__ void load4(const block_q3_0* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const float d = i8_h2f(i8_ld_u16(p)) * r;
@@ -446,7 +467,7 @@ template <> struct I8BlockQuad<block_q3_0> {          // half d; u8 qh[4]; u8 qs
         }
     }
 };
-template <> struct I8BlockQuad<block_q3_1> {          // half2 dm; u8 qh[4]; u8 qs[8] (4-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q3_1, IS_K> {          // half2 dm; u8 qh[4]; u8 qs[8] (4-aligned)
     static __device__ __forceinline__ void load4(const block_q3_1* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const uint32_t dm = i8_ld_u32(p);
@@ -460,7 +481,7 @@ template <> struct I8BlockQuad<block_q3_1> {          // half2 dm; u8 qh[4]; u8 
         }
     }
 };
-template <> struct I8BlockQuad<block_q2_0> {          // half d; u8 qs[8]       (2-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q2_0, IS_K> {          // half d; u8 qs[8]       (2-aligned)
     static __device__ __forceinline__ void load4(const block_q2_0* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const float d = i8_h2f(i8_ld_u16(p)) * r;
@@ -469,7 +490,7 @@ template <> struct I8BlockQuad<block_q2_0> {          // half d; u8 qs[8]       
         for (int j = 0; j < 4; ++j) o[j] = d * ((float)((qs >> (2 * j)) & 3u) - 1.5f);
     }
 };
-template <> struct I8BlockQuad<block_q2_1> {          // half2 dm; u8 qs[8]     (4-aligned)
+template <bool IS_K> struct I8BlockQuad<block_q2_1, IS_K> {          // half2 dm; u8 qs[8]     (4-aligned)
     static __device__ __forceinline__ void load4(const block_q2_1* blk, int t, float r, float (&o)[4]) {
         const uint8_t* p = (const uint8_t*)blk;
         const uint32_t dm = i8_ld_u32(p);
@@ -479,13 +500,43 @@ template <> struct I8BlockQuad<block_q2_1> {          // half2 dm; u8 qs[8]     
         for (int j = 0; j < 4; ++j) o[j] = d * (float)((qs >> (2 * j)) & 3u) + m;
     }
 };
-template <> struct I8BlockQuad<block_r16> {           // half d[32]; u16 q[32]  (16-aligned)
+template <bool IS_K> struct I8BlockQuad<block_r16, IS_K> {  // half d[32]; u16 q[32]  (16-aligned)
     static __device__ __forceinline__ void load4(const block_r16* blk, int t, float r, float (&o)[4]) {
         const uint2 w = __ldg((const uint2*)((const uint8_t*)blk + 2 * t));
         o[0] = i8_h2f(w.x) * r;
         o[1] = i8_h2f(w.x >> 16) * r;
         o[2] = i8_h2f(w.y) * r;
         o[3] = i8_h2f(w.y >> 16) * r;
+    }
+};
+/// Q0_V: u8 lo, hi — a 16-bit code (2-aligned). The quad's four curve
+/// elements are four consecutive bytes of the doubled base curve starting at
+/// t + 2p (see `q0_v_curve_row`); t is a multiple of 4 and 2p is even, so the
+/// run starts on a 2-byte boundary and lies in two aligned words, joined by
+/// one funnel shift. One code load, one scale and one centroid load, and two
+/// curve-word loads per quad — against four full per-element decodes — with
+/// every table read through the read-only cache rather than constant memory,
+/// whose one-address-per-cycle serialises a warp's 32 different curves. The
+/// bytes are negated as integers for buckets 4–7 (exact, as in `q0_v_elem`);
+/// `fmaf(scale, c, centroid) · r` is `q0_v_elem · r`, bit for bit.
+template <bool IS_K> struct I8BlockQuad<block_q0_v, IS_K> {
+    static __device__ __forceinline__ void load4(const block_q0_v* blk, int t, float r, float (&o)[4]) {
+        using namespace q0_v_detail;
+        const uint32_t bits = i8_ld_u16(blk);
+        const int curve = q0_v_curve_idx(bits);
+        const int off = t + 2 * (curve & 15);   // byte offset in the 64-byte row; even, ≤ 58
+        const uint32_t* row = reinterpret_cast<const uint32_t*>(
+            Q0VDecodeTables<IS_K>::base2((curve >> 4) & 3));
+        const uint32_t lo = __ldg(row + (off >> 2));
+        const uint32_t hi = __ldg(row + (off >> 2) + 1);
+        const uint32_t w = __funnelshift_r(lo, hi, (off & 3) * 8);
+        // The folded header's arithmetic (block_q0_v.cuh, `q0_v_header`):
+        // r = 1 / palette scale is in s and c, the bucket's sign on s.
+        const float sr = __fmul_rn(q0_v_scale<IS_K>(bits), r);
+        const float s = q0_v_curve_negated(curve) ? -sr : sr;
+        const float c = __fmul_rn(q0_v_centroid<IS_K>(bits), r);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = __fmaf_rn(s, i8_s8_of(w, j), c);
     }
 };
 
@@ -636,12 +687,13 @@ __device__ __forceinline__ Int8Sample i8_tag_rt(
 /// channel-oriented dtype palette (bb == 0: element addressing).
 /// Matches load_head_scaled's semantics: decoded value / scale (the
 /// dtype identity fast path skips the divide only when scale == 1.0f,
-/// where /1.0f is exact anyway).
+/// where /1.0f is exact anyway). `IS_K` names the side (see i8_dequant_elem).
+template <bool IS_K>
 __device__ __forceinline__ float i8_arena_elem(
     int fmt, int bb, const char* base, int rank, int within, float scale, int sub)
 {
     if (bb > 0)
-        return i8_dequant_elem(fmt, base + (int64_t)rank * bb, within, scale);
+        return i8_dequant_elem<IS_K>(fmt, base + (int64_t)rank * bb, within, scale);
     const int es = ArenaFormat::float_elem_size(fmt);
     const char* pe = base + ((int64_t)within * sub + rank) * es;
     float v;
@@ -655,6 +707,65 @@ __device__ __forceinline__ float i8_arena_elem(
         v = to_float<__nv_fp8_e4m3>(*(const __nv_fp8_e4m3*)pe);
     }
     return v / scale;
+}
+
+/// One arena element as a read-only global load (`__ldg`) — see the
+/// I8BlockQuad note above — of whichever width the element is.
+template <typename E>
+__device__ __forceinline__ E i8_arena_ld(const E* p)
+{
+    if constexpr (sizeof(E) == 4) {
+        const unsigned int w = __ldg(reinterpret_cast<const unsigned int*>(p));
+        return *reinterpret_cast<const E*>(&w);
+    } else if constexpr (sizeof(E) == 2) {
+        const unsigned short w = __ldg(reinterpret_cast<const unsigned short*>(p));
+        return *reinterpret_cast<const E*>(&w);
+    } else {
+        static_assert(sizeof(E) == 1, "arena elements are 1, 2 or 4 bytes");
+        const unsigned char w = __ldg(reinterpret_cast<const unsigned char*>(p));
+        return *reinterpret_cast<const E*>(&w);
+    }
+}
+
+/// Tokens t..t+3 of one dim's block, t any position with t + 3 < 32, as FP32
+/// × r: the unaligned counterpart of `I8BlockQuad::load4`. The block's header
+/// is still read once — Q0_V's through `q0_v_header`, every other format's
+/// by the compiler folding the four elements' identical header loads.
+template <typename B, bool IS_K>
+__device__ __forceinline__ void i8_block_run4(const B* blk, int t, float r, float (&o)[4])
+{
+    if constexpr (std::is_same_v<B, block_q0_v>) {
+        const Q0VHeader h = q0_v_header<IS_K>(blk, r);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = q0_v_header_elem(h, t + j);
+    } else {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            o[j] = BlockConverter<B, float>::load_element(blk, t + j, 1.f) * r;
+    }
+}
+
+/// Tokens within..within+3 of rank `rank` of a palette of format `Tag`,
+/// scaled by `inv` (the reciprocal palette scale): a quant palette's
+/// block run (an aligned quad when `within` is a multiple of 4, which the
+/// block layouts read with the fewest word loads), a dtype palette's four
+/// strided elements. `within + 3` must lie in the same 32-token block.
+/// `IS_K` names the side, which Q0_V's codebook depends on.
+template <bool IS_K, typename Tag>
+__device__ __forceinline__ void i8_pal_rank_load4(
+    Tag, const char* base, int rank, int sub, float inv, int within, float (&o)[4])
+{
+    if constexpr (I8IsDtypeTag<Tag>::value) {
+        using E = typename Tag::Elem;
+        const E* p = reinterpret_cast<const E*>(base) + (int64_t)within * sub + rank;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = to_float<E>(i8_arena_ld(p + j * sub)) * inv;
+    } else {
+        using B = typename Tag::Block;
+        const B* blk = reinterpret_cast<const B*>(base + (int64_t)rank * sizeof(B));
+        if ((within & 3) == 0) I8BlockQuad<B, IS_K>::load4(blk, within, inv, o);
+        else i8_block_run4<B, IS_K>(blk, within, inv, o);
+    }
 }
 
 } // namespace int8_elem

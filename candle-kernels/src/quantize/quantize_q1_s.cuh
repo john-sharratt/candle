@@ -18,10 +18,12 @@ __device__ __forceinline__ void quantize_block_q1_s_vec(
         local_sum = fabsf(v.x) + fabsf(v.y) + fabsf(v.z) + fabsf(v.w);
     }
 
+    // Every lane runs this reduction, so the mask names the whole warp. Width 8
+    // keeps lanes 0..7 a segment of their own; the other segments sum zeros.
     float sum_abs = local_sum;
     #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1)
-        sum_abs += __shfl_xor_sync(0xff, sum_abs, offset, 8);
+        sum_abs += __shfl_xor_sync(0xffffffff, sum_abs, offset, 8);
     const float mean_abs = __shfl_sync(0xffffffff, sum_abs, 0, 32) / 32.0f;
 
     if (lane < 8) {

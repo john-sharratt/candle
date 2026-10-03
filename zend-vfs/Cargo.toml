@@ -31,6 +31,13 @@ rand    = { workspace = true }
 # A checkout that could not be put back as its owner left it, reported when
 # nothing is left to return the error to.
 tracing = { workspace = true }
+# libgit2, for every question a repository's own files can answer: refs,
+# revisions, history, config, trees. A `git` process per question costs a
+# process start — tens of milliseconds, most of it the operating system's
+# scanning of the launch on Windows — and a tool call asks dozens. Network
+# transports are left out: fetch, push and clone stay on the `git` program,
+# which carries the user's credentials and partial-clone promises.
+git2 = { version = "0.20", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

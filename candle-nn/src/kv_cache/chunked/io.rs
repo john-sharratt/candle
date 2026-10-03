@@ -5,40 +5,33 @@
 //! - [`read_contiguous`] - Read K/V data from the backing
 //! - [`write_contiguous`] - Write K/V data to the backing
 
-use std::cmp;
-
 use ahash::AHashMap;
 
-use super::band_layout::{
-    band_of, band_order, band_scale, encode_quantized_band, quantized_to_token_major,
-    route_to_dims, scale, unscale, BandSide,
-};
+use super::band_codec::{band_bytes, decode_band, patch_band};
 use super::gid_pool::ChunkGid;
 use super::head_gids::GIDS_PER_HEAD;
+use super::palette_layout::{is_identity, palette_columns};
+use super::write_placement::{write_runs, WriteRun};
 use super::{Arena, ChunkedKvBacking};
 use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 use crate::kv_cache::KvFormat;
 use crate::CHUNK_SIZE;
-use candle::quantized::ggml_file::qtensor_from_ggml;
-use candle::quantized::k_quants::decode_q0_v_bytes;
-use candle::quantized::GgmlDType;
-use candle::{Device, LiveTensor, Result, Tensor};
+use candle::{DType, Device, LiveTensor, Result, Tensor};
 
-/// Read one band's whole chunk slot as the floats it stores, token-major,
-/// shaped `(chunk_size, sub_head_dim)` — before the band's outer scale is
-/// divided out (`band_layout::unscale`).
+/// Read one band's whole chunk slot as its STORED values — outer-scaled, as
+/// the encoder was handed them — shaped token-major `(CHUNK_SIZE,
+/// sub_head_dim)`, rank order within the palette.
 ///
 /// The band's tag decides how: a float tag is a direct typed view of the slot,
-/// a quantized tag is dequantized from the slot's raw bytes, whose blocks run
-/// one dim at a time (`band_layout`). Only the chunk knows which — the arena is
-/// a run of untyped byte slots. `side` picks Q0_V's codebook, which differs
-/// between K and V bands.
+/// a quantized tag is decoded from the slot's raw bytes in the token-oriented
+/// layout the kernels read (`band_codec`). Only the chunk knows which — the
+/// arena is a run of untyped byte slots. `is_k` names the side, which Q0_V's
+/// codebook depends on.
 pub(super) fn read_band_chunk<'a>(
     arenas: &'a AHashMap<usize, Arena>,
     gid: &ChunkGid,
     tag: ArenaFormatTag,
-    side: BandSide,
-    chunk_size: usize,
+    is_k: bool,
     sub_head_dim: usize,
     device: &Device,
 ) -> Result<LiveTensor<'a>> {
@@ -46,77 +39,123 @@ pub(super) fn read_band_chunk<'a>(
     let arena = arenas
         .get(&ai)
         .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?;
-    let elems = chunk_size * sub_head_dim;
     match tag.to_kv_format() {
         Some(KvFormat::Float(dtype)) => {
-            arena.read_slot_typed(gid.chunk_idx(), dtype, (chunk_size, sub_head_dim))
+            arena.read_slot_typed(gid.chunk_idx(), dtype, (CHUNK_SIZE, sub_head_dim))
         }
         Some(KvFormat::Quantized(qf)) => {
-            let ggml = qf.to_ggml_dtype();
             let bytes = arena
-                .slot_bytes(
-                    gid.chunk_idx(),
-                    (elems / ggml.block_size()) * ggml.type_size(),
-                )?
+                .slot_bytes(gid.chunk_idx(), band_bytes(qf, sub_head_dim))?
                 .to_vec1::<u8>()?;
-            let flat = if ggml == GgmlDType::Q0_V && side == BandSide::K {
-                Tensor::from_vec(decode_q0_v_bytes::<true>(&bytes), elems, device)?
-            } else {
-                qtensor_from_ggml(ggml, &bytes, vec![elems], device)?.dequantize(device)?
-            };
-            quantized_to_token_major(flat, chunk_size, sub_head_dim)
+            let values = decode_band(&bytes, qf, is_k, sub_head_dim)?;
+            Tensor::from_vec(values, (CHUNK_SIZE, sub_head_dim), device)
         }
         None => candle::bail!("band tag {tag:?} names no storage format, so it cannot be read"),
     }
 }
 
-/// Write `band` — the values a band stores, `(1, seg, sub_head_dim)`
-/// token-major — into one band's chunk slot from token `in_blk`.
+/// Whether chunk `cw` stores each head's dims in band order at unit scale:
+/// band p holds dims `p·sub..(p+1)·sub` and nothing is divided back out. True
+/// for every chunk whose palette-4 map is the identity and whose outer scales
+/// are empty or 1.0 — a writer chunk, and any seal under a unity policy — and
+/// for the single latent, whose bands carry no palette metadata.
+fn is_plain_palette4(
+    cw: &super::types::ChunkWindow,
+    head_dim: usize,
+    np: usize,
+    single_latent: bool,
+) -> bool {
+    if single_latent || np != N_PALETTE {
+        return true;
+    }
+    let pal_bytes = head_dim / 4;
+    let unit = |s: &[f32]| s.iter().all(|&x| x == 1.0);
+    unit(&cw.k_scale)
+        && unit(&cw.v_scale)
+        && [&cw.k_pal, &cw.v_pal].iter().all(|pal| {
+            pal.chunks(pal_bytes)
+                .all(|head| is_identity(&palette_columns(head, head_dim, N_PALETTE)))
+        })
+}
+
+/// Band `p` of head `h`'s `(1, seg, head_dim)` values as the band stores them:
+/// the dims the chunk's palette map gives palette `p`, in rank order, times
+/// the palette's outer scale — the inverse of what `read_contiguous` does
+/// with a band. `palette4` is false for the single latent, whose band p is
+/// simply dims `p·sub..(p+1)·sub`.
+fn palette_band<'a>(
+    head: &LiveTensor<'a>,
+    pal: &[u8],
+    scale: &[f32],
+    h: usize,
+    p: usize,
+    sub: usize,
+    palette4: bool,
+) -> Result<LiveTensor<'a>> {
+    let head_dim = head.dim(2)?;
+    let plain = || head.narrow(2, p * sub, sub)?.contiguous();
+    if !palette4 {
+        return plain();
+    }
+    let pal_bytes = head_dim / 4;
+    let cols = palette_columns(
+        &pal[h * pal_bytes..(h + 1) * pal_bytes],
+        head_dim,
+        N_PALETTE,
+    );
+    let band = if is_identity(&cols) {
+        plain()?
+    } else {
+        let mut dims = vec![0u32; sub];
+        for (d, &c) in cols.iter().enumerate() {
+            if c as usize / sub == p {
+                dims[c as usize % sub] = d as u32;
+            }
+        }
+        head.index_select(&Tensor::from_vec(dims, sub, head.device())?, 2)?
+    };
+    let s = if scale.is_empty() {
+        1.0
+    } else {
+        scale[h * N_PALETTE + p]
+    };
+    if s != 1.0 {
+        band * s as f64
+    } else {
+        Ok(band)
+    }
+}
+
+/// Write `band` (shaped `(1, seg, sub_head_dim)`, token-major) into one band's
+/// chunk slot at tokens `in_blk..in_blk + seg`.
 ///
-/// A float band is a direct typed write at the tokens' offset. A quantized
-/// band's blocks each span every token of one dim, so a write of some tokens
-/// re-encodes the whole band: its stored values are read back, the written
-/// tokens replaced, and the band quantized again channel-major.
+/// A float band is a direct typed write. A quantized band is patched in the
+/// token-oriented layout the kernels read (`band_codec::patch_band`).
 fn write_band_chunk(
     arenas: &mut AHashMap<usize, Arena>,
     gid: &ChunkGid,
     tag: ArenaFormatTag,
-    side: BandSide,
+    is_k: bool,
     sub_head_dim: usize,
     in_blk: usize,
     band: &candle::LiveTensor<'_>,
 ) -> Result<()> {
     let ai = gid.arena_idx();
+    let arena = arenas
+        .get_mut(&ai)
+        .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?;
     match tag.to_kv_format() {
-        Some(KvFormat::Float(_)) => arenas
-            .get_mut(&ai)
-            .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?
-            .write_slot_typed(gid.chunk_idx(), in_blk * sub_head_dim, band),
+        Some(KvFormat::Float(_)) => {
+            arena.write_slot_typed(gid.chunk_idx(), in_blk * sub_head_dim, band)
+        }
         Some(KvFormat::Quantized(qf)) => {
-            let rows = band
-                .squeeze(0)?
-                .to_dtype(candle::DType::F32)?
-                .to_owned_tensor()?;
-            let seg = rows.dim(0)?;
-            let device = rows.device().clone();
-            let stored =
-                read_band_chunk(arenas, gid, tag, side, CHUNK_SIZE, sub_head_dim, &device)?
-                    .to_dtype(candle::DType::F32)?
-                    .to_owned_tensor()?;
-            let mut pieces = Vec::with_capacity(3);
-            if in_blk > 0 {
-                pieces.push(stored.narrow(0, 0, in_blk)?);
-            }
-            pieces.push(rows);
-            if in_blk + seg < CHUNK_SIZE {
-                pieces.push(stored.narrow(0, in_blk + seg, CHUNK_SIZE - in_blk - seg)?);
-            }
-            let whole = Tensor::cat(&pieces, 0)?;
-            let bytes = encode_quantized_band(qf.to_ggml_dtype(), side, &whole)?;
-            arenas
-                .get_mut(&ai)
-                .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?
-                .write_slot_bytes(gid.chunk_idx(), &bytes)
+            let len = band_bytes(qf, sub_head_dim);
+            let slot = arena.slot_bytes(gid.chunk_idx(), len)?;
+            let dev = slot.device().clone();
+            let mut bytes = slot.to_vec1::<u8>()?;
+            let rows = band.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            patch_band(&mut bytes, qf, is_k, sub_head_dim, in_blk, &rows)?;
+            arena.write_slot_bytes(gid.chunk_idx(), &Tensor::from_vec(bytes, len, &dev)?)
         }
         None => candle::bail!("band tag {tag:?} names no storage format, so it cannot be written"),
     }
@@ -133,10 +172,12 @@ impl ChunkedKvBacking {
     /// of a walk over block × head × band.
     ///
     /// Refuses — returning `None` for the caller's walk to handle — when a band
-    /// is quantized (`write_band_chunk` re-encodes it; it is not a copy),
-    /// when a band's storage dtype differs from the source (the walk casts per
-    /// band), or when an arena is not on the GPU. Those are the cases the plan
-    /// cannot express, and getting them wrong would write plausible bytes.
+    /// is quantized (it is encoded, not copied), when a band's storage dtype
+    /// differs from the source (the walk casts per band), when a chunk's
+    /// palette map or outer scale is not the identity (the walk places and
+    /// scales each band), or when an arena is not on the GPU. Those are the
+    /// cases the plan cannot express, and getting them wrong would write
+    /// plausible bytes.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn try_plan_batched_write(
@@ -144,7 +185,7 @@ impl ChunkedKvBacking {
         state: &super::types::BlockTableState,
         arena_state: &mut super::arena::ArenaStorageState,
         batch_idx: usize,
-        offset: usize,
+        runs: &[WriteRun],
         len: usize,
         k: &candle::LiveTensor<'_>,
         v: &candle::LiveTensor<'_>,
@@ -190,20 +231,24 @@ impl ChunkedKvBacking {
         let src_stride = (head_dim * elem) as i64;
         let dst_stride = row_bytes;
 
-        let mut remaining = len;
-        let mut pos = offset;
-        while remaining > 0 {
-            let blk = pos / CHUNK_SIZE;
-            let in_blk = pos % CHUNK_SIZE;
-            let seg = cmp::min(CHUNK_SIZE - in_blk, remaining);
-            let src_pos = pos - offset;
-
+        for &WriteRun {
+            blk,
+            in_blk,
+            src: src_pos,
+            count: seg,
+        } in runs
+        {
             let Some(cw) = state.sequences[batch_idx]
                 .as_ref()
                 .and_then(|s| s.chunk_at(blk))
             else {
                 return Ok(None);
             };
+            // A plain copy puts dims p·sub.. in band p at unit scale; a chunk
+            // whose palette map or outer scale says otherwise needs the walk.
+            if !is_plain_palette4(cw, head_dim, np, single_latent) {
+                return Ok(None);
+            }
             let arenas = arena_state.arenas_mut();
 
             // Bands arrive in `(head, palette, k|v)` order — the same
@@ -234,20 +279,21 @@ impl ChunkedKvBacking {
                 let src = base_addr + (((h * len + src_pos) * head_dim + p * sub) * elem) as i64;
                 plan.push_strided(src, dst, row_bytes, seg as i64, src_stride, dst_stride);
             }
-
-            pos += seg;
-            remaining -= seg;
         }
         Ok(Some(plan))
     }
 
-    /// Read K/V data from the backing, dequantizing if necessary.
+    /// Read K/V data from the backing: the values the attention kernels read.
     ///
-    /// Returns float tensors of shape (1, n_kv_head, len, head_dim).
-    /// For quantized storage, data is dequantized on-the-fly.
+    /// Returns float tensors of shape (1, n_kv_head, len, head_dim), dims in
+    /// natural order. A quantized band is decoded in the token-oriented layout
+    /// the kernels address (the right K/V codebook for Q0_V), every band is
+    /// divided by its palette's outer scale, and each dim is taken from the
+    /// band and rank the chunk's palette map gives it — so a sealed,
+    /// palette-quantized chunk reads back exactly as the kernels see it.
     ///
-    /// This is primarily for testing and CPU fallback - CUDA paged attention
-    /// kernels read from arenas directly.
+    /// For testing, CPU fallback and reference comparisons; the CUDA paged
+    /// attention kernels read from arenas directly.
     pub fn read_contiguous(
         &self,
         batch_idx: usize,
@@ -261,7 +307,6 @@ impl ChunkedKvBacking {
 
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
-        let chunk_size = CHUNK_SIZE;
         let device = &self.inner.device;
 
         // Map each requested logical token to its physical `(chunk_idx, in_blk)`,
@@ -269,15 +314,13 @@ impl ChunkedKvBacking {
         // `pos / CHUNK_SIZE` grid: injected/windowed chunks carry a non-zero
         // `offset` (valid data starts mid-chunk) and a `usage` below CHUNK_SIZE,
         // so cumulative token counts — not chunk_size multiples — define the
-        // block boundaries and the in-chunk slot. A chunk's tokens are one run,
-        // `(chunk_idx, first in_blk, count)`, so each band decodes once.
-        let runs: Vec<(usize, usize, usize)> = {
+        // block boundaries and the in-chunk slot.
+        let positions: Vec<(usize, usize)> = {
             let seq = state.sequences[batch_idx].as_ref().ok_or_else(|| {
                 candle::Error::Msg(format!("missing sequence allocation for batch {batch_idx}"))
             })?;
             let want_end = offset + len;
-            let mut runs = Vec::new();
-            let mut covered = 0usize;
+            let mut positions = Vec::with_capacity(len);
             let mut cum = 0usize;
             for blk in 0..seq.block_count() {
                 let cw = seq
@@ -291,167 +334,149 @@ impl ChunkedKvBacking {
                     continue;
                 }
                 let base = cw.offset as usize;
-                runs.push((blk, base + (ov_start - chunk_start), ov_end - ov_start));
-                covered += ov_end - ov_start;
+                for pos in ov_start..ov_end {
+                    positions.push((blk, base + (pos - chunk_start)));
+                }
             }
-            if covered != len {
+            if positions.len() != len {
                 candle::bail!(
                     "read_contiguous: logical range [{offset}, {want_end}) not fully populated \
-                     for batch {batch_idx} (covered {covered} of {len} tokens)",
+                     for batch {batch_idx} (covered {} of {len} tokens)",
+                    positions.len(),
                 );
             }
-            runs
+            positions
         };
 
-        // `Tensor::cat` needs one dtype. A float band reads back in its storage
-        // dtype and a quantized one as F32, so a range mixing them — a single
-        // latent's FP8 nope ‖ BF16 rope bands, or a chunk with float palettes
-        // beside quantized ones — is widened to F32 throughout. A range of one
-        // float dtype keeps it.
-        let widen = self
+        // Consecutive positions in one chunk read together: each chunk's bands
+        // are decoded once, not once per token.
+        let mut runs: Vec<(usize, Vec<u32>)> = Vec::new();
+        for &(blk, in_blk) in positions.iter() {
+            match runs.last_mut() {
+                Some((b, rows)) if *b == blk => rows.push(in_blk as u32),
+                _ => runs.push((blk, vec![in_blk as u32])),
+            }
+        }
+
+        let np = self.inner.n_palette();
+        let sub_head_dim = (head_dim / np).max(1);
+        let single_latent = self
             .inner
             .single_latent
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || {
-                let seq = state.sequences[batch_idx].as_ref();
-                let mut read_dtypes = runs
-                    .iter()
-                    .filter_map(|&(blk, _, _)| seq.and_then(|s| s.chunk_at(blk)))
-                    .flat_map(|cw| cw.bands().map(|(_, tag)| tag).collect::<Vec<_>>())
-                    .map(|tag| match tag.to_kv_format() {
-                        Some(KvFormat::Float(dtype)) => dtype,
-                        _ => candle::DType::F32,
-                    });
-                let first = read_dtypes.next();
-                read_dtypes.any(|d| Some(d) != first)
-            };
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // What the kernels read: a band's stored values divided by its
+        // palette's outer scale, each dim at its place under the chunk's
+        // palette map. Both are GQA palette-4 metadata; the single latent's
+        // bands are its dims in order, unscaled.
+        let palette4 = np == N_PALETTE && !single_latent;
 
-        // Gather K/V chunk by chunk using closure-based arena access
         self.inner.storage.read(|arena_state| {
             let arenas = arena_state.arenas();
             let mut k_slices = Vec::with_capacity(runs.len());
             let mut v_slices = Vec::with_capacity(runs.len());
+            // The output dtype: the storage dtype when every band read is that
+            // float dtype (F32 → dtype is then exact), F32 otherwise.
+            let mut out_dtype: Option<DType> = None;
+            let mut mixed = single_latent;
 
-            for &(blk, in_blk, n_tok) in runs.iter() {
+            for (blk, rows) in runs.iter() {
                 let cw = state.sequences[batch_idx]
                     .as_ref()
-                    .and_then(|s| s.chunk_at(blk))
+                    .and_then(|s| s.chunk_at(*blk))
                     .ok_or_else(|| {
                         candle::Error::Msg(format!(
                             "missing chunk allocation for batch {batch_idx} blk {blk}"
                         ))
                     })?;
-
-                // Band path: each head owns `n_palette` K/V sub-chunks, each
-                // storing CHUNK_SIZE × (head_dim / n_palette) elements (4 for
-                // GQA, LATENT_N_BANDS for the single latent).
-                {
-                    let np = self.inner.n_palette();
-                    let sub_head_dim = (head_dim / np).max(1);
-                    let mut k_head_slices = Vec::with_capacity(n_kv_head);
-                    let mut v_head_slices = Vec::with_capacity(n_kv_head);
-                    // Each band names its own storage format; the arena its gid
-                    // points into is a run of untyped bytes and cannot
-                    // (`docs/archived/arena_unification.md` principle 8).
-                    let bands: Vec<_> = cw.bands().collect();
-                    for h in 0..n_kv_head {
-                        let mut k_pal_slices = Vec::with_capacity(np);
-                        let mut v_pal_slices = Vec::with_capacity(np);
+                let rows = Tensor::from_vec(rows.clone(), rows.len(), device)?;
+                // Each band names its own storage format; the arena its gid
+                // points into is a run of untyped bytes and cannot
+                // (`docs/archived/arena_unification.md` principle 8).
+                let bands: Vec<_> = cw.bands().collect();
+                let mut k_heads = Vec::with_capacity(n_kv_head);
+                let mut v_heads = Vec::with_capacity(n_kv_head);
+                for h in 0..n_kv_head {
+                    for (is_k, heads) in [(true, &mut k_heads), (false, &mut v_heads)] {
+                        let (pal, scale) = if is_k {
+                            (&cw.k_pal, &cw.k_scale)
+                        } else {
+                            (&cw.v_pal, &cw.v_scale)
+                        };
+                        let mut pals = Vec::with_capacity(np);
                         for p in 0..np {
-                            let base = (h * np + p) * 2;
-                            let (k_gid, k_tag) = bands[base];
-                            let (v_gid, v_tag) = bands[base + 1];
-                            let k_scale = band_scale(&cw.k_scale, h * np + p);
-                            let v_scale = band_scale(&cw.v_scale, h * np + p);
-
-                            let k_data = read_band_chunk(
-                                arenas,
-                                k_gid,
-                                k_tag,
-                                BandSide::K,
-                                chunk_size,
-                                sub_head_dim,
-                                device,
-                            )?;
-                            let k_data = if widen {
-                                k_data.to_dtype(candle::DType::F32)?
+                            let (gid, tag) = bands[(h * np + p) * 2 + usize::from(!is_k)];
+                            match tag.to_kv_format() {
+                                Some(KvFormat::Float(dt)) => match out_dtype {
+                                    None => out_dtype = Some(dt),
+                                    Some(o) if o != dt => mixed = true,
+                                    _ => {}
+                                },
+                                _ => mixed = true,
+                            }
+                            let band =
+                                read_band_chunk(arenas, gid, tag, is_k, sub_head_dim, device)?
+                                    .to_dtype(DType::F32)?;
+                            let s = if palette4 && !scale.is_empty() {
+                                scale[h * N_PALETTE + p]
                             } else {
-                                k_data
+                                1.0
                             };
-                            let k_data = unscale(k_data, k_scale)?;
-                            // `read_band_chunk` returns (chunk_size, sub_head_dim),
-                            // so the token is dim 0. The two unsqueezes rebuild
-                            // the (1, head, token, sub_dim) shape the cats below
-                            // join on.
-                            k_pal_slices.push(
-                                k_data
-                                    .narrow(0, in_blk, n_tok)?
-                                    .unsqueeze(0)?
-                                    .unsqueeze(0)?,
-                            );
-
-                            let v_data = read_band_chunk(
-                                arenas,
-                                v_gid,
-                                v_tag,
-                                BandSide::V,
-                                chunk_size,
-                                sub_head_dim,
-                                device,
-                            )?;
-                            let v_data = if widen {
-                                v_data.to_dtype(candle::DType::F32)?
-                            } else {
-                                v_data
-                            };
-                            let v_data = unscale(v_data, v_scale)?;
-                            v_pal_slices.push(
-                                v_data
-                                    .narrow(0, in_blk, n_tok)?
-                                    .unsqueeze(0)?
-                                    .unsqueeze(0)?,
-                            );
+                            pals.push(if s != 1.0 { (band / s as f64)? } else { band });
                         }
-                        // The bands joined in palette order hold palette 0's dims,
-                        // then palette 1's, …; the head's palette map says which
-                        // global dim each of those is.
-                        let k_order = band_order(&cw.k_pal, h, np, head_dim)?;
-                        let v_order = band_order(&cw.v_pal, h, np, head_dim)?;
-                        let k_head = LiveTensor::cat(&k_pal_slices, 3)?;
-                        let v_head = LiveTensor::cat(&v_pal_slices, 3)?;
-                        k_head_slices.push(route_to_dims(k_head, k_order.as_deref())?);
-                        v_head_slices.push(route_to_dims(v_head, v_order.as_deref())?);
+                        // (CHUNK_SIZE, head_dim) in palette-rank column order.
+                        let mut row = LiveTensor::cat(&pals, 1)?;
+                        if palette4 {
+                            let pal_bytes = head_dim / 4;
+                            let cols = palette_columns(
+                                &pal[h * pal_bytes..(h + 1) * pal_bytes],
+                                head_dim,
+                                N_PALETTE,
+                            );
+                            if !is_identity(&cols) {
+                                row = row
+                                    .index_select(&Tensor::from_vec(cols, head_dim, device)?, 1)?;
+                            }
+                        }
+                        // The run's tokens, as (1, 1, n, head_dim).
+                        heads.push(row.index_select(&rows, 0)?.unsqueeze(0)?.unsqueeze(0)?);
                     }
-                    k_slices.push(LiveTensor::cat(&k_head_slices, 1)?);
-                    v_slices.push(LiveTensor::cat(&v_head_slices, 1)?);
                 }
+                k_slices.push(LiveTensor::cat(&k_heads, 1)?);
+                v_slices.push(LiveTensor::cat(&v_heads, 1)?);
             }
 
             // Concatenate along sequence dimension (dim 2), then take the
             // result off the arena.
             //
-            // Every tensor above is a *lease* over arena bytes, and the arena
+            // A float band is read as a *lease* over arena bytes, and the arena
             // read-lock ends with this closure — after which another thread may
             // evict the slot and hand its bytes to a new tenant. `cat` copies
             // whenever it joins two or more pieces, but it short-circuits to
-            // `arg0.clone()` for a single one, so on a one-chunk single-head
-            // read the value that escapes here would be a lease over freed
-            // storage. `to_owned_tensor` makes the copy unconditional, which is
-            // what the `'static` in this function's return type has always
-            // claimed.
+            // `arg0.clone()` for a single one, so the value that escapes here
+            // could be a lease over freed storage. `to_owned_tensor` makes the
+            // copy unconditional, which is what the `'static` in this
+            // function's return type has always claimed.
             let k_out = LiveTensor::cat(&k_slices, 2)?.to_owned_tensor()?;
             let v_out = LiveTensor::cat(&v_slices, 2)?.to_owned_tensor()?;
-
-            Ok((k_out, v_out))
+            match out_dtype {
+                Some(dt) if !mixed && dt != DType::F32 => {
+                    Ok((k_out.to_dtype(dt)?, v_out.to_dtype(dt)?))
+                }
+                _ => Ok((k_out, v_out)),
+            }
         })?
     }
 
-    /// Write contiguous K/V tokens into the chunked backing starting at `offset`.
+    /// Write contiguous K/V tokens into the chunked backing starting at logical
+    /// position `offset`.
     ///
     /// Expects `k` and `v` shaped like `(1, n_kv_head, len, head_dim)`.
     ///
-    /// If any blocks in the write range are shared (via `share_prefix`), they will
-    /// be automatically copied (COW) before writing to avoid affecting other sequences.
+    /// Tokens are placed under the sequence's window geometry
+    /// (`write_placement`): a position the sequence already holds is rewritten
+    /// in place, a new one lands in writer capacity from the writer boundary.
+    /// A range reaching into a chunk below the boundary — shared with a parent
+    /// or sealed — is refused rather than written.
     pub fn write_contiguous(
         &self,
         batch_idx: usize,
@@ -537,30 +562,26 @@ impl ChunkedKvBacking {
             v.to_dtype(storage_dtype)?
         };
 
-        self.ensure_for_offset(batch_idx, offset, len)?;
-
-        // Determine block range we'll write to
-        let start_block = offset / CHUNK_SIZE;
-        let end_pos = offset.saturating_add(len).saturating_sub(1);
-        let end_block = (end_pos / CHUNK_SIZE) + 1;
+        self.ensure_for_append(batch_idx, offset, len)?;
 
         // Acquire state lock first
-        let mut state = self
+        let state = self
             .state
             .write()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
 
+        // Each token's chunk and slot under the sequence's window geometry.
+        let runs = {
+            let seq = state.sequences[batch_idx].as_ref().ok_or_else(|| {
+                candle::Error::Msg(format!("missing sequence allocation for batch {batch_idx}"))
+            })?;
+            write_runs(seq, offset, len)?
+        };
+
         // Then acquire storage write lock and do all work inside
         let n_kv_head = self.inner.n_kv_head;
-        let chunk_size = CHUNK_SIZE;
-        let _device = &self.inner.device;
 
         self.inner.storage.write(|arena_state| {
-            // COW any shared blocks in the write range. Whether a copy happened is
-            // not interesting here: kernel block tables are built per launch from
-            // the slot's current chunk list, so there is nothing to re-sync.
-            self.ensure_blocks_writable_locked(&mut state, batch_idx, start_block, end_block)?;
-
             // **One launch for the whole write, when the bands allow it.**
             //
             // The loop below walks 32-token block × KV head × palette band, and
@@ -582,7 +603,7 @@ impl ChunkedKvBacking {
                 &state,
                 arena_state,
                 batch_idx,
-                offset,
+                &runs,
                 len,
                 &k,
                 &v,
@@ -592,14 +613,13 @@ impl ChunkedKvBacking {
             }
 
             // Now write the data (still holding locks)
-            let mut remaining = len;
-            let mut pos = offset;
-            while remaining > 0 {
-                let blk = pos / chunk_size;
-                let in_blk = pos % chunk_size;
-                let seg = cmp::min(chunk_size - in_blk, remaining);
-                let src_pos = pos - offset;
-
+            for &WriteRun {
+                blk,
+                in_blk,
+                src: src_pos,
+                count: seg,
+            } in runs.iter()
+            {
                 let cw = state.sequences[batch_idx]
                     .as_ref()
                     .and_then(|s| s.chunk_at(blk))
@@ -621,9 +641,9 @@ impl ChunkedKvBacking {
 
                 // Band path: each head has `n_palette` K/V sub-chunks of width
                 // head_dim / n_palette (4 for GQA, LATENT_N_BANDS for the
-                // single latent), routed through the chunk's palette maps and
-                // outer scales (`band_layout`); a quantized band is re-encoded
-                // whole by `write_band_chunk`.
+                // single latent). A quantized band (e.g. the active R16 K) is
+                // patched in the kernels' token-oriented layout
+                // (`write_band_chunk`).
                 {
                     let np = self.inner.n_palette();
                     let sub_head_dim = (self.inner.head_dim / np).max(1);
@@ -631,9 +651,6 @@ impl ChunkedKvBacking {
                     // arena borrow the writes need.
                     let bands: Vec<(super::gid_pool::ChunkGid, ArenaFormatTag)> =
                         cw.bands().map(|(g, tag)| (g.clone(), tag)).collect();
-                    let (k_pal, v_pal) = (cw.k_pal.clone(), cw.v_pal.clone());
-                    let (k_scales, v_scales) = (cw.k_scale.clone(), cw.v_scale.clone());
-                    let head_dim = self.inner.head_dim;
                     let arenas = arena_state.arenas_mut();
                     for h in 0..n_kv_head {
                         let k_head = k_seg.narrow(1, h, 1)?.squeeze(1)?; // (1, seg, head_dim)
@@ -641,13 +658,17 @@ impl ChunkedKvBacking {
                             Some(vs) => Some(vs.narrow(1, h, 1)?.squeeze(1)?), // (1, seg, head_dim)
                             None => None,
                         };
-                        let k_order = band_order(&k_pal, h, np, head_dim)?;
-                        let v_order = band_order(&v_pal, h, np, head_dim)?;
 
+                        let palette4 = np == N_PALETTE && !single_latent;
                         for p in 0..np {
-                            let k_band = scale(
-                                band_of(&k_head, k_order.as_deref(), p, sub_head_dim)?,
-                                band_scale(&k_scales, h * np + p),
+                            let k_band = palette_band(
+                                &k_head,
+                                &cw.k_pal,
+                                &cw.k_scale,
+                                h,
+                                p,
+                                sub_head_dim,
+                                palette4,
                             )?;
 
                             let base = (h * np + p) * 2;
@@ -669,7 +690,7 @@ impl ChunkedKvBacking {
                                 arenas,
                                 k_gid,
                                 *k_tag,
-                                BandSide::K,
+                                true,
                                 sub_head_dim,
                                 in_blk,
                                 &k_band,
@@ -683,16 +704,16 @@ impl ChunkedKvBacking {
 
                             // Reached only for real K/V backings (GQA); build the
                             // V band here so the single-latent path never pays it.
-                            let v_band = scale(
-                                band_of(
-                                    v_head
-                                        .as_ref()
-                                        .expect("v_head present for a real K/V backing"),
-                                    v_order.as_deref(),
-                                    p,
-                                    sub_head_dim,
-                                )?,
-                                band_scale(&v_scales, h * np + p),
+                            let v_band = palette_band(
+                                v_head
+                                    .as_ref()
+                                    .expect("v_head present for a real K/V backing"),
+                                &cw.v_pal,
+                                &cw.v_scale,
+                                h,
+                                p,
+                                sub_head_dim,
+                                palette4,
                             )?;
                             let (v_gid, v_tag) = &bands[base + 1];
                             let v_band = match v_tag.to_kv_format() {
@@ -705,7 +726,7 @@ impl ChunkedKvBacking {
                                 arenas,
                                 v_gid,
                                 *v_tag,
-                                BandSide::V,
+                                false,
                                 sub_head_dim,
                                 in_blk,
                                 &v_band,
@@ -713,9 +734,6 @@ impl ChunkedKvBacking {
                         }
                     }
                 }
-
-                pos += seg;
-                remaining -= seg;
             }
 
             Ok(())
@@ -879,40 +897,36 @@ impl ChunkedKvBacking {
             let arenas = s.arenas();
             let mut bands = Vec::with_capacity(head_gids.len());
             for &((k_ai, k_ci, k_tag), (v_ai, v_ci, v_tag)) in head_gids.iter() {
-                let read = |ai: usize, ci: usize, tag: ArenaFormatTag| -> Result<Vec<f32>> {
-                    let arena = arenas
-                        .get(&ai)
-                        .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?;
-                    // Quantized bands (including R16) store each chunk
-                    // DIM-major — block `pd` holds 32 tokens of dim `pd` — so
-                    // the dequantized flat is `[pd][t]` and has to be
-                    // transposed. Float bands are already `[t][pd]`.
-                    let elems = chunk_size * sub_head_dim;
-                    match tag.to_kv_format() {
-                        Some(KvFormat::Quantized(qf)) => {
-                            let ggml = qf.to_ggml_dtype();
-                            let bytes = arena
-                                .slot_bytes(ci, (elems / ggml.block_size()) * ggml.type_size())?
-                                .to_vec1::<u8>()?;
-                            qtensor_from_ggml(ggml, &bytes, vec![elems], &Device::Cpu)?
-                                .dequantize(&Device::Cpu)?
-                                .reshape((sub_head_dim, chunk_size))?
-                                .transpose(0, 1)?
-                                .contiguous()?
+                let read =
+                    |ai: usize, ci: usize, tag: ArenaFormatTag, is_k: bool| -> Result<Vec<f32>> {
+                        let arena = arenas
+                            .get(&ai)
+                            .ok_or_else(|| candle::Error::Msg(format!("arena {ai} not found")))?;
+                        // Quantized bands (including R16) store each chunk
+                        // DIM-major — block `pd` holds 32 tokens of dim `pd` —
+                        // and `decode_band` returns them token-major `[t][pd]`,
+                        // as float bands already are.
+                        match tag.to_kv_format() {
+                            Some(KvFormat::Quantized(qf)) => {
+                                let bytes = arena
+                                    .slot_bytes(ci, band_bytes(qf, sub_head_dim))?
+                                    .to_vec1::<u8>()?;
+                                decode_band(&bytes, qf, is_k, sub_head_dim)
+                            }
+                            Some(KvFormat::Float(dtype)) => arena
+                                .read_slot_typed(ci, dtype, (chunk_size, sub_head_dim))?
+                                .to_dtype(candle::DType::F32)?
                                 .flatten_all()?
-                                .to_vec1::<f32>()
+                                .to_vec1::<f32>(),
+                            None => candle::bail!(
+                                "read_f32_sampler_chunk: band tag {tag:?} names no storage format"
+                            ),
                         }
-                        Some(KvFormat::Float(dtype)) => arena
-                            .read_slot_typed(ci, dtype, (chunk_size, sub_head_dim))?
-                            .to_dtype(candle::DType::F32)?
-                            .flatten_all()?
-                            .to_vec1::<f32>(),
-                        None => candle::bail!(
-                            "read_f32_sampler_chunk: band tag {tag:?} names no storage format"
-                        ),
-                    }
-                };
-                bands.push((read(k_ai, k_ci, k_tag)?, read(v_ai, v_ci, v_tag)?));
+                    };
+                bands.push((
+                    read(k_ai, k_ci, k_tag, true)?,
+                    read(v_ai, v_ci, v_tag, false)?,
+                ));
             }
             Ok::<_, candle::Error>(bands)
         })??;

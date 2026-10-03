@@ -675,6 +675,28 @@ active — stenciled regions are deliberately low-entropy/repetitive — via a
 `stencil_active` flag the checks short-circuit on, symmetric with how they handle
 `inside_think_block`.
 
+### 10.1 Speculative decode inside a free span
+
+A sequence whose walk sits in a free-text span — a thinking block's body, a
+tool-call value — drafts like free decode does. Nothing is masked there, so a
+drafted token is judged under exactly the rules a plain step would apply. A walk
+at a branch, a static run or its exit takes a one-token row: its next token is
+constrained or written, so there is nothing to propose.
+
+A drafted block stops at the first token after which the next position would be
+sampled under different rules (`scheduler/block_guard.rs`):
+
+- the token leaves the span (a closing quote, a dropped `</think>` or EOS);
+- the walk commits it as other bytes (a heal, §7.3), even when the span stays
+  open;
+- it opens a walk (a trigger token, in free decode);
+- it follows a page-break token.
+
+The accept walk stops there itself, rather than the commit loop discarding the
+tail, because the sampler records every token it draws into the sequence's
+penalty history. A heal's re-tokenized prefix is written into the KV after the
+step's rollback, since until then the KV still holds the whole verified block.
+
 ---
 
 ## 11. Persistence and provenance

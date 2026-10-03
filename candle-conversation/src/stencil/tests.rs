@@ -128,6 +128,75 @@ fn set_mode_enum_value() {
     assert_eq!(parsed["arguments"]["mode"], "exec");
 }
 
+// ── Aliases: a name arm, not a copy of the grammar ──────────────────────────
+
+/// `read_file`, an alias taking the same `path`, and `cat_file` taking a
+/// different one — so one pair shares its arguments and the third does not.
+fn read_file_aliases() -> Vec<super::tool_call::ToolSpec> {
+    parse_tools(
+        r#"[
+          {"name":"read_file","params":[{"name":"path","type":"string","required":true}]},
+          {"name":"open_file","params":[{"name":"path","type":"string","required":true}]},
+          {"name":"cat_file","params":[{"name":"file","type":"string","required":true}]}
+        ]"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_alias_adds_a_name_arm_and_no_argument_grammar() {
+    let catalog = read_file_aliases();
+    let env = ToolCallEnvelope::qwen3();
+    let spec_nodes = |tools: &[super::tool_call::ToolSpec]| {
+        compile_tool_call_tree(tools, &env).unwrap().nodes.len()
+    };
+    // `open_file` takes `read_file`'s arguments: the spec gains nothing.
+    assert_eq!(spec_nodes(&catalog[..2]), spec_nodes(&catalog[..1]));
+    // `cat_file` names its argument differently: that is a grammar of its own.
+    assert!(spec_nodes(&catalog) > spec_nodes(&catalog[..2]));
+}
+
+#[test]
+fn the_compiled_tree_shares_an_aliass_arguments_too() {
+    let v = TestVocab::new();
+    let catalog = read_file_aliases();
+    let nodes = |tools: &[super::tool_call::ToolSpec]| tree_of(tools, &v).len();
+    // Two names over the same arguments compile to a smaller tree than two names
+    // over different ones: the second pair's arguments are written twice.
+    let shared = nodes(&catalog[..2]);
+    let distinct = nodes(&[catalog[0].clone(), catalog[2].clone()]);
+    assert!(
+        shared < distinct,
+        "an alias's tree is {shared} nodes, a tool of its own is {distinct}"
+    );
+}
+
+#[test]
+fn an_alias_decodes_exactly_as_its_tool_does() {
+    let v = TestVocab::new();
+    let tree = tree_of(&read_file_aliases(), &v);
+    for name in ["read_file", "open_file"] {
+        let mut script = bytes_of(&format!("{name}\""));
+        script.extend(bytes_of(" \"src/main.rs\""));
+        let run = simulate(Arc::clone(&tree), &v, Oracle::Scripted(script), 1000).unwrap();
+        assert_eq!(
+            run.text(&v),
+            format!(
+                "<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {{\"path\": \
+                 \"src/main.rs\"}}}}\n</tool_call>"
+            )
+        );
+    }
+    // The alias with its own argument name keeps it.
+    let mut script = bytes_of("cat_file\"");
+    script.extend(bytes_of(" \"a.txt\""));
+    let run = simulate(tree, &v, Oracle::Scripted(script), 1000).unwrap();
+    assert_eq!(
+        run.text(&v),
+        "<tool_call>\n{\"name\": \"cat_file\", \"arguments\": {\"file\": \"a.txt\"}}\n</tool_call>"
+    );
+}
+
 // ── Calculator tool: does the stencil mangle the `expression` value? ─────────
 //
 // Reproduces the live daemon's tool-call path for the calculator tool, built the

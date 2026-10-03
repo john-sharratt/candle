@@ -30,6 +30,7 @@ use super::head_gids::HeadGids;
 use super::region_pool;
 use super::size_class::{elems_per_chunk, SizeClass};
 use super::types::{ChunkWindow, DecodeLayout, CHUNK_SIZE};
+use super::write_placement::appended_tokens;
 use super::{Arena, ArenaLocation};
 use crate::kv_cache::arena_table::ArenaFormatTag;
 use crate::kv_cache::chunked::backing::BackingInner;
@@ -2294,5 +2295,25 @@ impl ChunkedKvBacking {
         }
 
         Ok(())
+    }
+
+    /// Allocate writer capacity for a write of logical tokens `offset..offset +
+    /// add`, by the placement rule `write_contiguous` writes them by
+    /// (`write_placement`): positions the sequence already holds need nothing,
+    /// the rest need writer capacity from the writer boundary.
+    pub(super) fn ensure_for_append(
+        &self,
+        batch_idx: usize,
+        offset: usize,
+        add: usize,
+    ) -> Result<()> {
+        let appended = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            appended_tokens(state.sequences[batch_idx].as_ref(), offset, add)
+        };
+        self.ensure_for_batch_entries(&[(batch_idx, offset)], appended)
     }
 }

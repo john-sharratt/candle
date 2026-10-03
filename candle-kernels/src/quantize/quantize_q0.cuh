@@ -39,6 +39,33 @@ __device__ __forceinline__ float q0_warp_min(float val) {
     return val;
 }
 
+// Several independent warp sums in one butterfly. Each value is reduced by the
+// same five rounds of `x += x[lane ^ off]` as `q0_warp_sum`, so every result is
+// bit-identical to the separate reductions; running them in one loop only lets
+// the shuffles overlap.
+__device__ __forceinline__ void q0_warp_sum2(float& a, float& b) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        a += __shfl_xor_sync(0xffffffff, a, offset, 32);
+        b += __shfl_xor_sync(0xffffffff, b, offset, 32);
+    }
+}
+__device__ __forceinline__ void q0_warp_sum4(float& a, float& b, float& c, float& d) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        a += __shfl_xor_sync(0xffffffff, a, offset, 32);
+        b += __shfl_xor_sync(0xffffffff, b, offset, 32);
+        c += __shfl_xor_sync(0xffffffff, c, offset, 32);
+        d += __shfl_xor_sync(0xffffffff, d, offset, 32);
+    }
+}
+
+// Number of lanes for which `pred` holds, as the float a warp sum of 1.0f / 0.0f
+// would give: a count of at most 32 is exact in float, so the two agree.
+__device__ __forceinline__ float q0_warp_count(bool pred) {
+    return (float)__popc(__ballot_sync(0xffffffff, pred));
+}
+
 // Encode a float centroid (already in [-1,1] after outer applied) to INT8.
 __device__ __forceinline__ int8_t q0_encode_centroid(float val) {
     return (int8_t)__float2int_rn(fmaxf(-127.0f, fminf(127.0f, val * 127.0f)));
@@ -113,16 +140,20 @@ __device__ __forceinline__ void quantize_blocks_q0(
 // Cheaper than every other Q0_* family format — no centroid refinement.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ void quantize_block_q0_x_core(
-    float xi, block_q0_x* __restrict__ dst)
-{
-    const int lane = threadIdx.x % WARP_SIZE;
+// What a Q0_X block encodes, identical on every lane: the bulk anchor and the
+// outlier lane and delta.
+struct Q0XFit {
+    int bulk_anchor;
+    int outlier_idx;
+    int outlier_delta;
+};
 
+__device__ __forceinline__ Q0XFit q0_x_fit(float xi)
+{
     // 1. bulk_anchor = INT8-encoded block mean (full INT8 range)
     const float sum_x = q0_warp_sum(xi);
     const float mean  = sum_x * (1.0f / 32.0f);
     const int bulk_anchor_int = max(-127, min(127, __float2int_rn(mean * 127.0f)));
-    const int8_t bulk_anchor  = (int8_t)bulk_anchor_int;
 
     // 2. Per-lane INT8 residual (target value − bulk_anchor)
     const int x_i8     = max(-127, min(127, __float2int_rn(xi * 127.0f)));
@@ -140,11 +171,20 @@ __device__ __forceinline__ void quantize_block_q0_x_core(
     const int delta_raw     = __float2int_rn((float)residual_at_outlier / (float)Q0_X_S_OUTLIER);
     const int outlier_delta = max(-4, min(3, delta_raw));
 
+    return Q0XFit { bulk_anchor_int, outlier_idx, outlier_delta };
+}
+
+__device__ __forceinline__ void quantize_block_q0_x_core(
+    float xi, block_q0_x* __restrict__ dst)
+{
+    const int lane = threadIdx.x % WARP_SIZE;
+    const Q0XFit fit = q0_x_fit(xi);
+
     // 5. Pack: byte 0 = bulk_anchor, byte 1 = [delta:3 | idx:5]
     if (lane == 0) {
-        const uint8_t packed_idx   = (uint8_t)(outlier_idx & 0x1F);
-        const uint8_t packed_delta = (uint8_t)((outlier_delta & 0x07) << 5);
-        dst->bulk_anchor    = bulk_anchor;
+        const uint8_t packed_idx   = (uint8_t)(fit.outlier_idx & 0x1F);
+        const uint8_t packed_delta = (uint8_t)((fit.outlier_delta & 0x07) << 5);
+        dst->bulk_anchor    = (int8_t)fit.bulk_anchor;
         dst->outlier_packed = packed_idx | packed_delta;
     }
 }
@@ -185,8 +225,14 @@ __device__ __forceinline__ void quantize_blocks_q0_x(
 // don't match the actual encoding.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ void quantize_block_q0_m2_core(
-    float xi, block_q0_m2* __restrict__ dst)
+// What a Q0_M2 block encodes before the centroids are rounded to INT8,
+// identical on every lane: the two centroids and the 8-bit quartet mask.
+struct Q0M2Fit {
+    float c0, c1;
+    uint32_t qmask;
+};
+
+__device__ __forceinline__ Q0M2Fit q0_m2_fit(float xi)
 {
     const int lane = threadIdx.x % WARP_SIZE;
 
@@ -210,10 +256,11 @@ __device__ __forceinline__ void quantize_block_q0_m2_core(
     for (int iter = 0; iter < 4; iter++) {
         const int qt_assign = (fabsf(qt_mean - c1) < fabsf(qt_mean - c0)) ? 1 : 0;
 
-        const float s0 = q0_warp_sum((qt_assign == 0) ? xi   : 0.0f);
-        const float n0 = q0_warp_sum((qt_assign == 0) ? 1.0f : 0.0f);
-        const float s1 = q0_warp_sum((qt_assign == 1) ? xi   : 0.0f);
-        const float n1 = q0_warp_sum((qt_assign == 1) ? 1.0f : 0.0f);
+        float s0 = (qt_assign == 0) ? xi : 0.0f;
+        float s1 = (qt_assign == 1) ? xi : 0.0f;
+        q0_warp_sum2(s0, s1);
+        const float n0 = q0_warp_count(qt_assign == 0);
+        const float n1 = q0_warp_count(qt_assign == 1);
 
         if (n0 > 0.0f) c0 = s0 / n0;
         if (n1 > 0.0f) c1 = s1 / n1;
@@ -228,10 +275,18 @@ __device__ __forceinline__ void quantize_block_q0_m2_core(
     for (int offset = 16; offset > 0; offset >>= 1)
         qmask |= __shfl_xor_sync(0xffffffff, qmask, offset, 32);
 
+    return Q0M2Fit { c0, c1, qmask };
+}
+
+__device__ __forceinline__ void quantize_block_q0_m2_core(
+    float xi, block_q0_m2* __restrict__ dst)
+{
+    const int lane = threadIdx.x % WARP_SIZE;
+    const Q0M2Fit fit = q0_m2_fit(xi);
     if (lane == 0) {
-        dst->centroid[0] = q0_encode_centroid(c0);
-        dst->centroid[1] = q0_encode_centroid(c1);
-        dst->qmask = (uint8_t)(qmask & 0xFF);
+        dst->centroid[0] = q0_encode_centroid(fit.c0);
+        dst->centroid[1] = q0_encode_centroid(fit.c1);
+        dst->qmask = (uint8_t)(fit.qmask & 0xFF);
     }
 }
 
@@ -270,8 +325,14 @@ __device__ __forceinline__ void quantize_blocks_q0_m2(
 // initialised as equally-spaced from min to max of the 16 pair means.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ void quantize_block_q0_m4_core(
-    float xi, block_q0_m4* __restrict__ dst)
+// What a Q0_M4 block encodes before the centroids are rounded to INT8,
+// identical on every lane: the four centroids and the 32-bit pair mask.
+struct Q0M4Fit {
+    float c[4];
+    uint32_t qmask;
+};
+
+__device__ __forceinline__ Q0M4Fit q0_m4_fit(float xi)
 {
     const int lane = threadIdx.x % WARP_SIZE;
 
@@ -305,10 +366,15 @@ __device__ __forceinline__ void quantize_block_q0_m4_core(
         }
 
         // Recompute centroids (empty cluster → keep previous)
+        float s0 = (pair_assign == 0) ? xi : 0.0f;
+        float s1 = (pair_assign == 1) ? xi : 0.0f;
+        float s2 = (pair_assign == 2) ? xi : 0.0f;
+        float s3 = (pair_assign == 3) ? xi : 0.0f;
+        q0_warp_sum4(s0, s1, s2, s3);
+        const float sk[4] = { s0, s1, s2, s3 };
         for (int k = 0; k < 4; k++) {
-            const float sk = q0_warp_sum((pair_assign == k) ? xi   : 0.0f);
-            const float nk = q0_warp_sum((pair_assign == k) ? 1.0f : 0.0f);
-            if (nk > 0.0f) c[k] = sk / nk;
+            const float nk = q0_warp_count(pair_assign == k);
+            if (nk > 0.0f) c[k] = sk[k] / nk;
         }
     }
 
@@ -326,12 +392,20 @@ __device__ __forceinline__ void quantize_block_q0_m4_core(
     for (int offset = 16; offset > 0; offset >>= 1)
         qmask |= __shfl_xor_sync(0xffffffff, qmask, offset, 32);
 
+    return Q0M4Fit { { c[0], c[1], c[2], c[3] }, qmask };
+}
+
+__device__ __forceinline__ void quantize_block_q0_m4_core(
+    float xi, block_q0_m4* __restrict__ dst)
+{
+    const int lane = threadIdx.x % WARP_SIZE;
+    const Q0M4Fit fit = q0_m4_fit(xi);
     if (lane == 0) {
-        dst->centroid[0] = q0_encode_centroid(c[0]);
-        dst->centroid[1] = q0_encode_centroid(c[1]);
-        dst->centroid[2] = q0_encode_centroid(c[2]);
-        dst->centroid[3] = q0_encode_centroid(c[3]);
-        dst->qmask = qmask;
+        dst->centroid[0] = q0_encode_centroid(fit.c[0]);
+        dst->centroid[1] = q0_encode_centroid(fit.c[1]);
+        dst->centroid[2] = q0_encode_centroid(fit.c[2]);
+        dst->centroid[3] = q0_encode_centroid(fit.c[3]);
+        dst->qmask = fit.qmask;
     }
 }
 

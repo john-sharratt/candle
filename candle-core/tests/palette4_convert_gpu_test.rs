@@ -17,6 +17,7 @@
 // Pointer widths are spelled out to match the kernel ABI.
 #![allow(clippy::unnecessary_cast)]
 
+use candle_core::quantized::cuda::FULL_CHUNK_WINDOW;
 use candle_core::quantized::pinned_staging::PinnedStager;
 use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result};
@@ -183,6 +184,7 @@ fn palette4_convert_r16_identity_roundtrip() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         1,
         1,
@@ -288,6 +290,7 @@ fn palette4_convert_f16_to_r16_identity() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         1,
         1,
@@ -316,6 +319,132 @@ fn palette4_convert_f16_to_r16_identity() -> Result<()> {
                     assert_eq!(
                         got, expected,
                         "F16→R16 pal={p} dim={ld} chunk={c} token={t}: got {got}, want {expected}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Live value of token `t`, dim `ld` of palette `p` in the windowed tests.
+fn windowed_live_value(p: usize, t: usize, ld: usize) -> f32 {
+    1.0 + p as f32 * 0.25 + t as f32 * 0.03 + ld as f32 * 0.001
+}
+
+/// Convert one F16 chunk whose tokens in `[lo, lo + len)` are live and whose
+/// other tokens hold `dead` into Q8_0, through a descriptor carrying
+/// `window`; return every destination band's bytes, K's four palettes then
+/// V's (each side has its own destination, so both passes are observed).
+fn convert_windowed_f16_to_q8_0(
+    dev: &Device,
+    lo: usize,
+    len: usize,
+    dead: f32,
+    window: i32,
+) -> Result<Vec<Vec<u8>>> {
+    use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
+    let Device::Cuda(cuda_dev) = dev else {
+        unreachable!("convert_windowed_f16_to_q8_0 requires a CUDA device")
+    };
+    let stream = cuda_dev.cuda_stream();
+    let mut src_gpu = Vec::with_capacity(N_PAL);
+    let mut k_dst_gpu = Vec::with_capacity(N_PAL);
+    let mut v_dst_gpu = Vec::with_capacity(N_PAL);
+    for p in 0..N_PAL {
+        let mut src = vec![0u8; arena_bytes(FMT_F16, PAL_DIM, 1)];
+        for t in 0..CHUNK_SIZE {
+            for ld in 0..PAL_DIM {
+                let val = if (lo..lo + len).contains(&t) {
+                    windowed_live_value(p, t, ld)
+                } else {
+                    dead
+                };
+                let off = (t * PAL_DIM + ld) * 2;
+                src[off..off + 2].copy_from_slice(&f16::from_f32(val).to_le_bytes());
+            }
+        }
+        src_gpu.push(cuda_dev.memcpy_stod(&src)?);
+        let dst_bytes = vec![0u8; arena_bytes(FMT_Q8_0, PAL_DIM, 1)];
+        k_dst_gpu.push(cuda_dev.memcpy_stod(&dst_bytes)?);
+        v_dst_gpu.push(cuda_dev.memcpy_stod(&dst_bytes)?);
+    }
+    let src_ptrs: [u64; N_PAL] = std::array::from_fn(|p| src_gpu[p].device_ptr(&stream).0);
+    let k_dst_ptrs: [u64; N_PAL] = std::array::from_fn(|p| k_dst_gpu[p].device_ptr(&stream).0);
+    let v_dst_ptrs: [u64; N_PAL] = std::array::from_fn(|p| v_dst_gpu[p].device_ptr(&stream).0);
+    let ident = identity_pal_map_local();
+    quantize_palette4_convert_buffered(
+        128,
+        &[PalHeadDesc {
+            k_src_arena_ptrs: src_ptrs,
+            v_src_arena_ptrs: src_ptrs,
+            k_src_fmts: [GgmlDType::F16; N_PAL],
+            v_src_fmts: [GgmlDType::F16; N_PAL],
+            k_src_pal_map: ident,
+            v_src_pal_map: ident,
+            k_src_scales: [1.0f32; N_PAL],
+            v_src_scales: [1.0f32; N_PAL],
+            k_dst_arena_ptrs: k_dst_ptrs,
+            v_dst_arena_ptrs: v_dst_ptrs,
+            k_dst_fmts: [GgmlDType::Q8_0; N_PAL],
+            v_dst_fmts: [GgmlDType::Q8_0; N_PAL],
+            k_dst_pal_map: ident,
+            v_dst_pal_map: ident,
+            k_dst_scales: [1.0f32; N_PAL],
+            v_dst_scales: [1.0f32; N_PAL],
+            valid_range: window,
+        }],
+        1,
+        1,
+        1,
+        &PinnedStager::new(cuda_dev).begin_generation(),
+        &stream,
+    )?;
+    dev.synchronize()?;
+    k_dst_gpu
+        .iter()
+        .chain(&v_dst_gpu)
+        .map(|d| cuda_dev.memcpy_dtov(d))
+        .collect()
+}
+
+/// A partial chunk's dead tokens hold whatever the recycled ground held. The
+/// convert takes each block's scale over all 32 tokens, so it reads the
+/// tokens outside the descriptor's window as zero: a chunk whose dead tokens
+/// hold `+inf`, converted through its window, produces exactly the bytes of
+/// the same chunk zero-padded and converted whole — every block scale finite,
+/// every dead token encoded as 0, every live token as the full-chunk path
+/// encodes it.
+#[test]
+fn palette4_convert_reads_tokens_outside_the_window_as_zero() -> Result<()> {
+    let dev = match get_cuda_dev() {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    let bb = quant_block_bytes(FMT_Q8_0);
+    for (lo, len) in [(0usize, 7usize), (3, 7), (0, 31)] {
+        let hi = lo + len;
+        let window = ((lo as i32) << 8) | len as i32;
+        let zero_padded = convert_windowed_f16_to_q8_0(&dev, lo, len, 0.0, FULL_CHUNK_WINDOW)?;
+        let stale = convert_windowed_f16_to_q8_0(&dev, lo, len, f32::INFINITY, window)?;
+        assert_eq!(
+            stale, zero_padded,
+            "window [{lo}, {hi}): the windowed Q8_0 bytes differ from the zero-padded chunk's"
+        );
+        // Bands 0–3 are K's palettes, 4–7 V's.
+        for (band, pal) in stale.iter().enumerate() {
+            // Q8_0 block = f16 scale + 32 × i8; block `ld` holds dim ld's tokens.
+            for (ld, block) in pal.chunks(bb).enumerate() {
+                let d = f16::from_le_bytes([block[0], block[1]]);
+                assert!(
+                    d.is_finite() && d.to_f32() > 0.0,
+                    "window [{lo}, {hi}): band {band} dim {ld} scale {d} is not a live scale"
+                );
+                for t in (0..CHUNK_SIZE).filter(|t| !(lo..hi).contains(t)) {
+                    assert_eq!(
+                        block[2 + t],
+                        0,
+                        "window [{lo}, {hi}): band {band} dim {ld} dead token {t} is not 0"
                     );
                 }
             }
@@ -402,6 +531,7 @@ fn palette4_convert_multi_layer_multi_head() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         });
     }
     quantize_palette4_convert_buffered(
@@ -515,6 +645,7 @@ fn palette4_convert_batched_matches_per_chunk() -> Result<()> {
                     v_dst_pal_map: dst_pal,
                     k_dst_scales: [1.0f32; N_PAL],
                     v_dst_scales: [1.0f32; N_PAL],
+                    valid_range: FULL_CHUNK_WINDOW,
                 }
             })
             .collect()
@@ -615,6 +746,7 @@ fn palette4_convert_r16_identity_copy_check() -> Result<()> {
                 v_dst_pal_map: ident,
                 k_dst_scales: [1.0f32; N_PAL],
                 v_dst_scales: [1.0f32; N_PAL],
+                valid_range: FULL_CHUNK_WINDOW,
             }],
             1,
             1,
@@ -976,6 +1108,7 @@ fn run_kernel_pass(
         v_dst_pal_map: *dst_pal_map,
         k_dst_scales: [1.0f32; N_PAL],
         v_dst_scales: [1.0f32; N_PAL],
+        valid_range: FULL_CHUNK_WINDOW,
     };
     quantize_palette4_convert_buffered(
         128,
@@ -1381,6 +1514,7 @@ fn palette4_convert_f16_to_r16_single_fmt_sweep_diag() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         1,
         1,
@@ -1409,6 +1543,7 @@ fn palette4_convert_f16_to_r16_single_fmt_sweep_diag() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         1,
         1,
@@ -1518,6 +1653,7 @@ fn multi_format_sweep(
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         });
         p2_descs.push(PalHeadDesc {
             k_src_arena_ptrs: mid_ptrs[fi],
@@ -1536,6 +1672,7 @@ fn multi_format_sweep(
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         });
     }
 
@@ -1989,6 +2126,7 @@ fn palette4_convert_v_channel_identity_roundtrip() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         1,
         1,
@@ -2067,6 +2205,7 @@ fn palette4_convert_v_channel_reversed_pal_map() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         1,
         1,
@@ -2314,6 +2453,7 @@ fn palette4_convert_v_channel_quant() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         1,
         1,
@@ -2342,6 +2482,7 @@ fn palette4_convert_v_channel_quant() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         1,
         1,
@@ -2441,6 +2582,7 @@ fn palette4_convert_multi_layer_quant() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         });
         p2_descs.push(PalHeadDesc {
             k_src_arena_ptrs: mid_ptrs,
@@ -2459,6 +2601,7 @@ fn palette4_convert_multi_layer_quant() -> Result<()> {
             v_dst_pal_map: ident,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         });
     }
     quantize_palette4_convert_buffered(
@@ -2700,6 +2843,7 @@ fn buffered_api_identity_r16_roundtrip() -> Result<()> {
         v_dst_pal_map: id,
         k_dst_scales: [1.0f32; N_PAL],
         v_dst_scales: [1.0f32; N_PAL],
+        valid_range: FULL_CHUNK_WINDOW,
     }];
     let generation = PinnedStager::new(cuda_dev).begin_generation();
     quantize_palette4_convert_buffered(
@@ -2801,6 +2945,7 @@ fn buffered_api_r16_to_q8_roundtrip() -> Result<()> {
             v_dst_pal_map: id,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         num_kv_heads,
         num_layers,
@@ -2830,6 +2975,7 @@ fn buffered_api_r16_to_q8_roundtrip() -> Result<()> {
             v_dst_pal_map: id,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         }],
         num_kv_heads,
         num_layers,
@@ -2932,6 +3078,7 @@ fn buffered_api_identity_multi_layer_multi_head() -> Result<()> {
             v_dst_pal_map: id,
             k_dst_scales: [1.0f32; N_PAL],
             v_dst_scales: [1.0f32; N_PAL],
+            valid_range: FULL_CHUNK_WINDOW,
         })
         .collect();
     let generation = PinnedStager::new(cuda_dev).begin_generation();
@@ -3111,6 +3258,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
                 v_dst_pal_map: id,
                 k_dst_scales: [1.0f32; N_PAL],
                 v_dst_scales: [1.0f32; N_PAL],
+                valid_range: FULL_CHUNK_WINDOW,
             })
             .collect();
 
@@ -3132,6 +3280,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
                 v_dst_pal_map: id,
                 k_dst_scales: [1.0f32; N_PAL],
                 v_dst_scales: [1.0f32; N_PAL],
+                valid_range: FULL_CHUNK_WINDOW,
             })
             .collect();
 

@@ -4730,7 +4730,10 @@ impl Substrate {
     /// header, so the accounting retires its records itself, and the stream's
     /// index entry is gone ([`Self::reset_tombstoned_stream`]).
     pub fn tombstoned_stream_bytes(&self) -> u64 {
-        if self.tombstoned_timelines.is_empty() && self.tombstoned_turns.is_empty() {
+        if self.tombstoned_timelines.is_empty()
+            && self.tombstoned_turns.is_empty()
+            && self.tombstoned_sections.is_empty()
+        {
             return 0;
         }
         self.streams

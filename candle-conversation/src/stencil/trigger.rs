@@ -95,6 +95,11 @@ impl TriggerRegistry {
         self.by_token.is_empty()
     }
 
+    /// Whether emitting `token` in free decode starts a walk.
+    pub fn is_trigger(&self, token: TokenId) -> bool {
+        self.by_token.contains_key(&token)
+    }
+
     /// If `token` is a trigger, return a fresh session at the tree's root.
     /// Called only in free decode (never inside an active session).
     pub fn on_token(&self, token: TokenId) -> Option<StencilSession> {

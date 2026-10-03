@@ -78,6 +78,7 @@ pub enum Observe {
     Bailed,
 }
 
+#[derive(Clone)]
 enum Cursor {
     At(NodeId),
     InBranch {
@@ -95,6 +96,7 @@ enum Cursor {
 }
 
 /// A walk of one tree, attached to a decoding sequence.
+#[derive(Clone)]
 pub struct StencilSession {
     tree: Arc<StencilTree>,
     cursor: Cursor,
@@ -172,6 +174,17 @@ impl StencilSession {
                 _ => return false,
             }
         }
+    }
+
+    /// Whether the cursor is inside a free-text span that the next decoded token
+    /// continues — so [`Self::next_action`] would answer `FreeDecode` without
+    /// moving the cursor.
+    ///
+    /// False at a branch, at static structure, at a span not yet entered, and
+    /// when a lookahead delimiter is waiting to be applied: each of those makes
+    /// the next action something other than a free decode of the same span.
+    pub fn mid_free_span(&self) -> bool {
+        self.pushback.is_none() && matches!(self.cursor, Cursor::InFreeText { .. })
     }
 
     /// What to do at the current cursor.  For static structure this advances the

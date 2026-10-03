@@ -130,7 +130,11 @@ pub(super) fn load_cpu_arena(
                 zero_q.as_slice()
             }
         };
-        let k_bytes = pack_r16_blocks(&chunk.k, q);
+        // The dump chunk is `[H][P][T][D']`; an R16 block is one dim's tokens.
+        let k_bytes = pack_r16_blocks(
+            &dim_major_blocks(&chunk.k, header.n_kv_head, header.head_dim),
+            &dim_major_blocks(q, header.n_kv_head, header.head_dim),
+        );
         let v_bytes = pack_f16(&chunk.v);
         backing
             .write_raw_sealed_chunk(
@@ -265,7 +269,11 @@ pub(super) fn load_gpu_arena(
                 zero_q.as_slice()
             }
         };
-        let k_bytes = pack_r16_blocks(&chunk.k, q);
+        // The dump chunk is `[H][P][T][D']`; an R16 block is one dim's tokens.
+        let k_bytes = pack_r16_blocks(
+            &dim_major_blocks(&chunk.k, header.n_kv_head, header.head_dim),
+            &dim_major_blocks(q, header.n_kv_head, header.head_dim),
+        );
         let v_bytes = pack_f16(&chunk.v);
         backing
             .write_raw_sealed_chunk(

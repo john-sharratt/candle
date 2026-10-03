@@ -6853,10 +6853,9 @@ fn q5q6q8_ko_match_k_int8() -> Result<()> {
     Ok(())
 }
 
-/// Finer-grained M scan for the mode-1 / mode-2 crossover (Q4_KO). Reports the activation
-/// element count (M·K), the weight count (N·K), their ratio (= M/N), and the i8KO time.
-/// Run twice — env KO_M2 unset (mode-1) and KO_M2=1 (mode-2) — and compare the i8KO columns
-/// to locate the M where mode-2 overtakes mode-1.
+/// Finer-grained M scan of the Q4_KO int8 matmul. Reports the activation element count
+/// (M·K), the weight count (N·K), their ratio (= M/N), and the i8KO time, so the M where
+/// the kernel turns from weight-bound to activation-bound reads off the table.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore]
@@ -6874,12 +6873,7 @@ fn q4_crossover_scan() -> Result<()> {
     let stream = dev.cuda_stream();
     let (ko_ptr, _g) = ko_slice.device_ptr(&stream);
     let weight_count = nrows * ncols;
-    let mode = if std::env::var("KO_M2").is_ok() {
-        "MODE-2"
-    } else {
-        "MODE-1"
-    };
-    println!("=== Q4 crossover scan [{mode}] N={nrows} K={ncols} weight_count={weight_count} ===");
+    println!("=== Q4 crossover scan N={nrows} K={ncols} weight_count={weight_count} ===");
     println!("     M    act_count   act/wt   i8KO(ms)   i8KO-tok/s");
     for &m in &[
         16usize, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 1024,
@@ -8192,12 +8186,12 @@ fn kv_path_sign_bug_q5_0() -> Result<()> {
     Ok(())
 }
 
-// Q1_S scalar/vec/multi-block: scale = encode_e4m3(amax).
-// Fix:                             scale = encode_e4m3(mean(|x|)).
+// Q1_S scalar/vec/multi-block: the INT8 scale is the block's mean |x|, not
+// its amax.
 //
 // Input: v[0]=1.0 (outlier), v[1..31]=0.1.
-//   mean_abs = (1.0 + 31*0.1) / 32 = 0.128125 → FP8 → 0.125 → encoded 0x20
-//   amax     = 1.0                              → FP8 → 1.0   → encoded 0x38
+//   mean_abs = (1.0 + 31*0.1) / 32 = 0.128125 → rint(· 127) = 16
+//   amax     = 1.0                              → rint(· 127) = 127
 //
 // With amax-scale: all elements reconstruct as ±1.0.  v[1..31] error = 0.9 each,
 // MSE ≈ 0.785.  With mean-scale: v[1..31] error = 0.025 each, MSE ≈ 0.025.

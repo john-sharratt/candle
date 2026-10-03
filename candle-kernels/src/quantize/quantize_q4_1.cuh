@@ -41,8 +41,8 @@ __device__ __forceinline__ void quantize_block_q4_1_vec(
     float vmin = local_min;
     #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1) {
-        vmax = fmaxf(vmax, __shfl_xor_sync(0xff, vmax, offset, 8));
-        vmin = fminf(vmin, __shfl_xor_sync(0xff, vmin, offset, 8));
+        vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffff, vmax, offset, 8));
+        vmin = fminf(vmin, __shfl_xor_sync(0xffffffff, vmin, offset, 8));
     }
     vmax = __shfl_sync(0xffffffff, vmax, 0, 32);
     vmin = __shfl_sync(0xffffffff, vmin, 0, 32);
@@ -147,8 +147,8 @@ __device__ __forceinline__ void quantize_blocks_q4_1(
         float vmin = local_min;
         #pragma unroll
         for (int offset = 4; offset > 0; offset >>= 1) {
-            vmax = fmaxf(vmax, __shfl_xor_sync(0xff, vmax, offset, 8));
-            vmin = fminf(vmin, __shfl_xor_sync(0xff, vmin, offset, 8));
+            vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffff, vmax, offset, 8));
+            vmin = fminf(vmin, __shfl_xor_sync(0xffffffff, vmin, offset, 8));
         }
         vmax = __shfl_sync(0xffffffff, vmax, 0, 32);
         vmin = __shfl_sync(0xffffffff, vmin, 0, 32);

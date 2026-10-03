@@ -30,7 +30,8 @@
 mod alloc;
 mod arena;
 mod backing;
-mod band_layout;
+mod band_codec;
+mod block_round_trip;
 #[cfg(feature = "cuda")]
 pub(crate) mod bump_arena;
 mod chunk_ops;
@@ -77,6 +78,7 @@ pub mod kv_integrity;
 mod meta_pool;
 pub mod migrate;
 pub mod migrate_flight;
+mod palette_layout;
 #[cfg(feature = "cuda")]
 pub(crate) mod region_pool;
 #[cfg(feature = "tensor-assert")]
@@ -108,6 +110,7 @@ pub mod wave_spans;
 /// so its invariants — the ones a mis-set boundary would violate — are provable
 /// on a machine with no GPU.
 pub mod weight_zone;
+mod write_placement;
 
 #[cfg(test)]
 mod tests;

@@ -853,13 +853,18 @@ fn make_qkv(n_tokens: usize, device: &Device, seed: u64) -> Result<(Tensor, Tens
             }
         }
     }
+    // The fixture arenas are F16, so the operands are emitted at that width once, here —
+    // the attention wrappers validate the dtype and never convert it.
     let q = Tensor::from_vec(q, (1, n_tokens, N_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     let k = Tensor::from_vec(k, (1, n_tokens, N_KV_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     let v = Tensor::from_vec(v, (1, n_tokens, N_KV_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     Ok((q, k, v))

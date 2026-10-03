@@ -289,8 +289,12 @@ pub fn open_gguf(
 ) -> candle::Result<(candle::quantized::gguf_file::Content, std::fs::File)> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| candle::Error::Msg(format!("open {:?}: {e}", path)))?;
-    let content = candle::quantized::gguf_file::Content::read(&mut file)
-        .map_err(|e| candle::Error::Msg(format!("read gguf {:?}: {e}", path)))?;
+    // Buffered: the header's tokenizer vocabulary is hundreds of thousands of
+    // fields, each its own syscall when read straight off the file.
+    let content = candle::quantized::gguf_file::Content::read(
+        &mut std::io::BufReader::with_capacity(1 << 19, &mut file),
+    )
+    .map_err(|e| candle::Error::Msg(format!("read gguf {:?}: {e}", path)))?;
     Ok((content, file))
 }
 

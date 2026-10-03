@@ -291,25 +291,21 @@ static_assert(sizeof(block_q0) == 1, "block_q0 size");
 //
 // Each block is fully self-contained — no group header, no slot-level state.
 // The 16 bits decompose into three orthogonal indexes that pick a curve and
-// the (centroid, scale) pair used to reconstruct it. All three are looked
-// up in constant-memory tables (see q0_v_tables.cuh).
+// the (scale, centroid) pair used to reconstruct it (see q0_v_tables.cuh and
+// docs/palquant.md).
 //
-// Per-block layout (16 bits, little-endian across lo | hi):
-//   bits[6:0]   = curve_idx     (7-bit, indexes the 128-entry curve_table:
-//                                8 buckets × 16 phases, bucket-major)
-//   bits[11:7]  = scale_idx     (5-bit, indexes the 32-entry scale_table)
-//   bits[15:12] = centroid_idx  (4-bit, indexes 16 entries within
-//                                centroid_table[scale_idx])
+// Per-block layout (one little-endian 16-bit code):
+//   bits[6:0]   = curve_idx     (128 curves: signed rotations of four base
+//                                curves per side)
+//   bits[11:7]  = scale_idx     (32-entry scale table)
+//   bits[15:12] = centroid_idx  (16 entries within the scale's centroid row)
 //
-// Reconstruction (outer-normalised), with the f16 tables of the block's side
-// (K or V):
-//   x[e] = fma(scale_table[scale_idx], curve_table[curve_idx][e],
-//              centroid_table[scale_idx][centroid_idx])
-// scale_table holds scale / 127, so the i8 curve values are used raw.
+// Reconstruction (outer-normalised): x[e] = centroid + scale · curve[e], with
+// the K or V codebook by side.
 #define QK_Q0_V 32
 typedef struct {
-    uint8_t lo;   // curve_idx | (scale_idx & 1) << 7
-    uint8_t hi;   // (scale_idx >> 1) | centroid_idx << 4
+    uint8_t lo;   // [7:0] = curve_idx
+    uint8_t hi;   // [4:0] = scale_idx, [7:5] = centroid_idx
 } block_q0_v;
 static_assert(sizeof(block_q0_v) == 2, "block_q0_v size");
 

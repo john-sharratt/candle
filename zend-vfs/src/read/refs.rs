@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::GitError;
+use crate::library::{config, history, refs};
 use crate::redact::redact_urls;
 use crate::runner::utf8;
 use crate::types::{BranchName, Oid, RefName, RemoteName, Rev};
@@ -137,6 +138,15 @@ fn parse_remotes(out: &[u8]) -> Result<Vec<Remote>, GitError> {
             fetch.insert(name.to_string(), value.to_string());
         }
     }
+    remotes_from(fetch, push)
+}
+
+/// The remotes whose fetch URLs and push URLs, by name, these are. URLs are for
+/// display, so any credential in one is redacted.
+pub(crate) fn remotes_from(
+    fetch: BTreeMap<String, String>,
+    push: BTreeMap<String, String>,
+) -> Result<Vec<Remote>, GitError> {
     fetch
         .into_iter()
         .map(|(name, url)| {
@@ -155,6 +165,9 @@ impl Repo {
     /// `rev-parse` takes no `--end-of-options` before 2.30; the value is
     /// safe without it, because no [`Rev`] spelling begins with `-`.
     pub fn resolve(&self, rev: &Rev) -> Result<Oid, GitError> {
+        if let Some(lib) = self.library() {
+            return refs::resolve(&lib, rev);
+        }
         let spec = rev.spec();
         let out = self
             .git("rev-parse")
@@ -170,6 +183,9 @@ impl Repo {
     /// than its commit's. Publishing a tag sends this, or the remote gets a
     /// lightweight tag in its place.
     pub fn resolve_object(&self, rev: &Rev) -> Result<Oid, GitError> {
+        if let Some(lib) = self.library() {
+            return refs::resolve_object(&lib, rev);
+        }
         let spec = rev.spec();
         let out = self
             .git("rev-parse")
@@ -186,6 +202,9 @@ impl Repo {
     /// is shorter than that, how far back it does go.
     pub fn first_parent_ancestor(&self, rev: &Rev, back: u32) -> Result<Ancestor, GitError> {
         let base = self.resolve(rev)?;
+        if let Some(lib) = self.library() {
+            return history::first_parent_ancestor(&lib, &base, back);
+        }
         let out = self
             .git("rev-parse")
             .args(["-q", "--verify"])
@@ -215,6 +234,9 @@ impl Repo {
     /// What `name` points at, or `None` when it does not exist. A
     /// [`RefName`] begins with `refs/`, so it is never read as a flag.
     pub fn ref_target(&self, name: &RefName) -> Result<Option<Oid>, GitError> {
+        if let Some(lib) = self.library() {
+            return refs::ref_target(&lib, name);
+        }
         let out = self
             .git("rev-parse")
             .args(["-q", "--verify"])
@@ -235,6 +257,9 @@ impl Repo {
                 "{folder} is not a folder of refs"
             )));
         }
+        if let Some(lib) = self.library() {
+            return refs::refs_under(&lib, folder);
+        }
         let out = self
             .git("for-each-ref")
             .arg("--format=%(objectname) %(refname)")
@@ -254,6 +279,9 @@ impl Repo {
 
     /// Every local branch, with its upstream when one is configured.
     pub fn branches(&self) -> Result<Vec<Branch>, GitError> {
+        if let Some(lib) = self.library() {
+            return refs::branches(&lib);
+        }
         let out = self
             .git("for-each-ref")
             .arg(format!("--format={BRANCH_FORMAT}"))
@@ -265,6 +293,9 @@ impl Repo {
 
     /// Every configured remote.
     pub fn remotes(&self) -> Result<Vec<Remote>, GitError> {
+        if let Some(lib) = self.library() {
+            return config::remotes(&lib);
+        }
         let out = self
             .git("config")
             .args(["-z", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])
@@ -290,6 +321,9 @@ impl Repo {
 
     /// The best common ancestor of `a` and `b`, if they share history.
     pub fn merge_base(&self, a: &Rev, b: &Rev) -> Result<Option<Oid>, GitError> {
+        if let Some(lib) = self.library() {
+            return history::merge_base(&lib, a, b);
+        }
         let out = self
             .git("merge-base")
             .arg("--end-of-options")
@@ -306,6 +340,9 @@ impl Repo {
 
     /// Whether `ancestor` is reachable from `descendant`.
     pub fn is_ancestor(&self, ancestor: &Rev, descendant: &Rev) -> Result<bool, GitError> {
+        if let Some(lib) = self.library() {
+            return history::is_ancestor(&lib, ancestor, descendant);
+        }
         let out = self
             .git("merge-base")
             .args(["--is-ancestor", "--end-of-options"])
@@ -330,6 +367,42 @@ mod tests {
         assert_eq!(parse_track("ahead 2, behind 3").unwrap(), (2, 3, false));
         assert_eq!(parse_track("gone").unwrap(), (0, 0, true));
         assert!(parse_track("sideways 1").is_err());
+    }
+
+    /// **A remote added by a `git` process since the last check is found**, and
+    /// a name that was never one is refused, however many times it is asked.
+    #[test]
+    fn a_remote_added_after_a_check_is_found_and_an_unknown_one_is_refused() {
+        let t = TestRepo::init();
+        let repo = t.repo();
+        let origin = RemoteName::parse("origin").unwrap();
+        assert!(matches!(
+            repo.require_remote(&origin),
+            Err(GitError::UnknownRemote { .. })
+        ));
+        t.git(&["remote", "add", "origin", "file:///nowhere"]);
+        repo.require_remote(&origin).unwrap();
+        repo.require_remote(&origin).unwrap();
+        assert!(matches!(
+            repo.require_remote(&RemoteName::parse("upstream").unwrap()),
+            Err(GitError::UnknownRemote { .. })
+        ));
+    }
+
+    /// **A remote that was found and then removed is not found again**: what
+    /// `git remote remove` wrote is what the next read sees.
+    #[test]
+    fn a_remote_removed_after_a_check_is_refused() {
+        let t = TestRepo::init();
+        let repo = t.repo();
+        let origin = RemoteName::parse("origin").unwrap();
+        t.git(&["remote", "add", "origin", "file:///nowhere"]);
+        repo.require_remote(&origin).unwrap();
+        t.git(&["remote", "remove", "origin"]);
+        assert!(matches!(
+            repo.require_remote(&origin),
+            Err(GitError::UnknownRemote { .. })
+        ));
     }
 
     #[test]

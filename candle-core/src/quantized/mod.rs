@@ -17,11 +17,6 @@ pub mod int8_split_k;
 pub mod k_quants;
 pub mod ko_quant;
 pub mod prepare;
-#[cfg(test)]
-mod q0_v_side_tests;
-// Note: the previous `q0_v_test` module has been removed — it tested the OLD
-// (sign + shape + curve_pos) Q0_V format that no longer exists. The new
-// (curve + scale + centroid) format will get a fresh test suite.
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(not(feature = "metal"))]
@@ -67,6 +62,7 @@ pub mod neon;
 #[cfg(target_feature = "simd128")]
 pub mod simd128;
 pub mod utils;
+mod warp_mirror;
 use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
