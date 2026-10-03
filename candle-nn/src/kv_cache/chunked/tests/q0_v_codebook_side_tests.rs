@@ -133,11 +133,17 @@ fn check_dump(rel: &str) {
 }
 
 #[test]
+#[ignore = "needs the Qwen3-30B-A3B KV dump, which is generated, not tracked: \
+            cargo test --release --features cuda --lib -p candle-transformers \
+            quantized_qwen3_moe::tests::kv_dump::test_dump_kv_cache_data -- --ignored"]
 fn each_sides_codebook_fits_qwen3_data_best() {
     check_dump(QWEN3_DUMP);
 }
 
 #[test]
+#[ignore = "needs the Llama-3.2-3B KV dump, which is generated, not tracked: \
+            cargo test --release --features cuda --lib -p candle-transformers \
+            quantized_llama::tests::kv_dump::test_dump_kv_cache_data -- --ignored"]
 fn each_sides_codebook_fits_llama_data_best() {
     check_dump(LLAMA_DUMP);
 }
