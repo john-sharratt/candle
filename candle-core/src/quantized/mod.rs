@@ -16,9 +16,9 @@ pub mod int8_matmul_mode;
 pub mod int8_split_k;
 pub mod k_quants;
 pub mod ko_quant;
-pub mod prepare;
 #[cfg(feature = "metal")]
 pub mod metal;
+pub mod prepare;
 #[cfg(not(feature = "metal"))]
 mod metal {
     pub use super::dummy_metal::*;
