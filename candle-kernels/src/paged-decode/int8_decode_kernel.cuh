@@ -1496,6 +1496,60 @@ int8_decode_stripe_kernel(
         k_new, v_new, rungs, partial_acc, partial_ml, sel);
 }
 
+// One side's (K or V) Q0_V block headers for this lane, once per tile, with
+// the palette scale folded in (`q0_v_header`); bit p of the result says
+// palette p is Q0_V. A lane's dim of a palette is one block (32 tokens of that
+// dim) and every token of a tile lies in one chunk, so the lane reads the SAME
+// block for all of them. Free functions with explicit operands, not lambdas:
+// a closure this size is outlined into a real call, and every capture then
+// lives in local memory across the whole kernel body.
+template <bool IS_K, int HEAD_DIM>
+__device__ __forceinline__ uint32_t bmma_q0v_headers(
+    const uint8_t* head_ptr, int lane, Q0VHeader (&h)[N_PALETTE])
+{
+    uint32_t mask = 0u;
+    #pragma unroll
+    for (int p = 0; p < N_PALETTE; ++p) {
+        const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
+        const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+        h[p] = Q0VHeader{ nullptr, 0.f, 0.f };
+        if (ptr != 0 && fmt == ArenaFormat::Q0_V) {
+            const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
+            h[p] = q0_v_header<IS_K>((const block_q0_v*)(uintptr_t)ptr + lane, __frcp_rn(scale));
+            mask |= 1u << p;
+        }
+    }
+    return mask;
+}
+
+// Stage one token's K (IS_K) or V row into `dst` (palette order): a Q0_V
+// palette from its header, any other through the accessor (cp.async for a
+// same-type dtype palette). `within` is the token's slot in the chunk.
+template <typename T, bool IS_K, int HEAD_DIM>
+__device__ __forceinline__ void bmma_stage_token(
+    T* dst, const uint8_t* head_ptr, const Q0VHeader (&h)[N_PALETTE], uint32_t q0v_mask,
+    int within, int lane)
+{
+    constexpr int SUB_HEAD_DIM = HEAD_DIM / N_PALETTE;
+    constexpr int64_t sub_head_stride = (int64_t)SUB_HEAD_DIM * CHUNK_SIZE;
+    constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
+    static_assert(BLOCKS_PER_DIM == 1, "a lane's dim of a palette is one block per chunk");
+    #pragma unroll
+    for (int p = 0; p < N_PALETTE; ++p) {
+        const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
+        if (ptr == 0) continue;
+        T* pal_dst = dst + p * SUB_HEAD_DIM;
+        if ((q0v_mask >> p) & 1u) {
+            pal_dst[lane] = q0_v_load_dispatch_detail::narrow(T{}, q0_v_header_elem(h[p], within));
+        } else {
+            const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+            const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
+            ArenaAccessor acc((const char*)(uintptr_t)ptr, fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+            acc.template load_head_scaled<T, SUB_HEAD_DIM, true, IS_K>(pal_dst, 0, 0, within, lane, scale);
+        }
+    }
+}
+
 // =============================================================================
 // BATCHED-M decode (1C final) — INT8 tensor-core MMA + read-through V.
 // warp = tile-stripe (all warps compute). Per tile the warp runs an m16n8k32
@@ -1763,61 +1817,18 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // are discarded (their mask bit is clear) below.
         #define TOK_VALID(t) (((tok_mask >> (t)) & 1u) != 0u)
         #define TOK_WITHIN(t) (TOK_VALID(t) ? within_base + (t) : (int)off)
-        // ── A Q0_V palette's block header, once per tile. A lane's dim of a
-        // palette is one block (32 tokens of that dim), and every token of the
-        // tile lies in this one chunk, so the lane reads the SAME block for all
-        // eight: its code, scale and centroid are loaded once here, with the
-        // palette scale folded in (`q0_v_header`), and each token below costs
-        // one curve byte and one FMA. Formats are warp-uniform per palette. ──
-        static_assert(BLOCKS_PER_DIM == 1, "a lane's dim of a palette is one block per chunk");
-        const auto q0v_headers = [&](auto is_k_const, Q0VHeader (&h)[N_PALETTE]) -> uint32_t {
-            constexpr bool IS_K = decltype(is_k_const)::value;
-            uint32_t mask = 0u;
-            #pragma unroll
-            for (int p = 0; p < N_PALETTE; ++p) {
-                const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
-                const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
-                h[p] = Q0VHeader{ nullptr, 0.f, 0.f };
-                if (ptr != 0 && fmt == ArenaFormat::Q0_V) {
-                    const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
-                    h[p] = q0_v_header<IS_K>((const block_q0_v*)(uintptr_t)ptr + lane, __frcp_rn(scale));
-                    mask |= 1u << p;
-                }
-            }
-            return mask;
-        };
-        // Stage token t's K (IS_K) or V into skt[buf]: a Q0_V palette from its
-        // header, any other through the accessor (cp.async for a same-type
-        // dtype palette).
-        const auto stage_tok = [&](auto is_k_const, const Q0VHeader (&h)[N_PALETTE], uint32_t q0v_mask,
-                                   int buf, int t) {
-            constexpr bool IS_K = decltype(is_k_const)::value;
-            #pragma unroll
-            for (int p = 0; p < N_PALETTE; ++p) {
-                const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
-                if (ptr == 0) continue;
-                T* dst = skt[buf][warp] + p * SUB_HEAD_DIM;
-                if ((q0v_mask >> p) & 1u) {
-                    dst[lane] = q0_v_load_dispatch_detail::narrow(T{}, q0_v_header_elem(h[p], TOK_WITHIN(t)));
-                } else {
-                    const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
-                    const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
-                    ArenaAccessor acc((const char*)(uintptr_t)ptr, fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                    acc.template load_head_scaled<T, SUB_HEAD_DIM, true, IS_K>(dst, 0, 0, TOK_WITHIN(t), lane, scale);
-                }
-            }
-        };
-        using KSide = std::integral_constant<bool, true>;
-        using VSide = std::integral_constant<bool, false>;
+        // A Q0_V palette's block header is read once per tile
+        // (`bmma_q0v_headers`), so each token below costs one curve byte and
+        // one FMA. Formats are warp-uniform per palette.
         Q0VHeader q0h[N_PALETTE];
 
         // ── stage the 8 tokens' K → shared_kb, cp.async double-buffered so each
         // token's load overlaps the previous token's gather/RoPE/quant. The
         // prefetch is unconditional when slice_ok (all 8 tokens share the chunk,
         // so every `within` is in-bounds); invalid tokens just zero shared_kb.
-        uint32_t q0v_mask = q0v_headers(KSide{}, q0h);
+        uint32_t q0v_mask = bmma_q0v_headers<true, HEAD_DIM>(head_ptr, lane, q0h);
         if (slice_ok) {
-            stage_tok(KSide{}, q0h, q0v_mask, 0, 0);
+            bmma_stage_token<T, true, HEAD_DIM>(skt[0][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(0), lane);
             cp_async_commit<true>();
         }
         // A real loop over the 8 tokens, not unrolled: each iteration inlines
@@ -1831,7 +1842,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         for (int t = 0; t < 8; ++t) {
             if (slice_ok) {
                 if (t + 1 < 8) {
-                    stage_tok(KSide{}, q0h, q0v_mask, (t + 1) & 1, t + 1);
+                    bmma_stage_token<T, true, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(t + 1), lane);
                     cp_async_commit<true>();
                     cp_async_wait<1, true>();
                 } else {
@@ -1924,9 +1935,9 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // accumulate, and add it across all heads — no per-tile V smem staging.
         // Prefetch is unconditional when slice_ok (in-bounds); invalid tokens are
         // skipped in the accumulate. ──
-        q0v_mask = q0v_headers(VSide{}, q0h);
+        q0v_mask = bmma_q0v_headers<false, HEAD_DIM>(head_ptr, lane, q0h);
         if (slice_ok) {
-            stage_tok(VSide{}, q0h, q0v_mask, 0, 0);
+            bmma_stage_token<T, false, HEAD_DIM>(skt[0][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(0), lane);
             cp_async_commit<true>();
         }
         // A real loop for the same reason as the K stage above.
@@ -1934,7 +1945,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         for (int t = 0; t < 8; ++t) {
             if (slice_ok) {
                 if (t + 1 < 8) {
-                    stage_tok(VSide{}, q0h, q0v_mask, (t + 1) & 1, t + 1);
+                    bmma_stage_token<T, false, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(t + 1), lane);
                     cp_async_commit<true>();
                     cp_async_wait<1, true>();
                 } else {
