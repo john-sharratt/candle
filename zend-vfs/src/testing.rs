@@ -1,14 +1,12 @@
 //! Test repositories, inside this crate's `scratch/` folder — nested in the
-//! candle checkout, ignored by it — and deleted when the test ends. Each is a
-//! copy of an empty repository built with `git init` once per test process.
+//! candle checkout, ignored by it — and deleted when the test ends. Each is
+//! initialised in this process, so a test leaves nothing behind.
 //!
 //! Setup runs git directly (not through the layer under test) with a fixed
 //! identity and fixed dates, so every setup commit id is reproducible.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
-use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -57,55 +55,17 @@ pub(crate) struct TestRepo {
     pub path: PathBuf,
 }
 
-/// How long a template folder from an earlier test run is kept before a new
-/// run sweeps it away: long enough that a run still going is never robbed.
-const STALE_TEMPLATE: Duration = Duration::from_secs(60 * 60);
-
-/// An empty repository of each kind — working tree or bare — built once per
-/// test process and copied for every [`TestRepo`]. Building one is eight git
-/// processes; copying it is a handful of small files.
-fn template(bare: bool) -> &'static Path {
-    static WORK: OnceLock<PathBuf> = OnceLock::new();
-    static BARE: OnceLock<PathBuf> = OnceLock::new();
-    let cell = if bare { &BARE } else { &WORK };
-    cell.get_or_init(|| {
-        sweep_stale_templates();
-        let kind = if bare { "bare" } else { "work" };
-        let path = scratch().join(format!("template-{}-{kind}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("template dir");
-        build(&path, bare);
-        path
-    })
-}
-
-/// Remove template folders earlier test runs left behind.
-fn sweep_stale_templates() {
-    let Ok(entries) = std::fs::read_dir(scratch()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let stale = entry.file_name().to_string_lossy().starts_with("template-")
-            && entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > STALE_TEMPLATE));
-        if stale {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
 /// An empty repository at `path`, on `main`, configured for reproducible
-/// setup: no sample hooks, no background maintenance after a commit.
-fn build(path: &Path, bare: bool) {
-    // `init -b` needs 2.28; the suite also runs against 2.24.
-    let mut init = vec!["init", "-q", "--template="];
-    if bare {
-        init.push("--bare");
-    }
-    git_in(path, &init);
-    git_in(path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+/// setup: no sample hooks, no background maintenance after a commit. Made in
+/// this process — no template folder is left behind and no `git` is started.
+fn init_repository(path: &Path, bare: bool) {
+    let mut options = git2::RepositoryInitOptions::new();
+    options
+        .bare(bare)
+        .external_template(false)
+        .initial_head("main");
+    let repository = git2::Repository::init_opts(path, &options).expect("init repository");
+    let mut config = repository.config().expect("repository config");
     for (key, value) in [
         ("core.autocrlf", "false"),
         ("core.filemode", "true"),
@@ -115,31 +75,16 @@ fn build(path: &Path, bare: bool) {
         ("maintenance.auto", "false"),
         ("gc.auto", "0"),
     ] {
-        git_in(path, &["config", key, value]);
+        config.set_str(key, value).expect("repository setting");
     }
     if !bare {
         // The repository must be its own top level, never the candle
         // checkout it is nested in.
-        let top = git_in(path, &["rev-parse", "--show-toplevel"]);
         assert_eq!(
-            PathBuf::from(top.trim()).canonicalize().unwrap(),
+            repository.workdir().unwrap().canonicalize().unwrap(),
             path.canonicalize().unwrap(),
             "test repository resolved to an enclosing repository"
         );
-    }
-}
-
-/// Copy the folder `from` to `to`, everything in it included.
-fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
     }
 }
 
@@ -150,7 +95,7 @@ impl TestRepo {
             .tempdir_in(scratch())
             .expect("temp repo dir");
         let path = dir.path().to_path_buf();
-        copy_tree(template(bare), &path);
+        init_repository(&path, bare);
         Self { _dir: dir, path }
     }
 

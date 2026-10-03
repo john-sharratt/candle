@@ -181,8 +181,10 @@ mod tool_scenarios {
     }
 
     fn init_tracing() {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_env_filter(filter)
             .with_test_writer()
             .try_init();
     }
