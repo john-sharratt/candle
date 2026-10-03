@@ -16,6 +16,7 @@ use candle::Result;
 use super::head_gids::GIDS_PER_HEAD;
 use crate::CHUNK_SIZE;
 
+use super::band_layout::{encode_quantized_band, BandSide};
 use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
 use super::io::read_band_chunk;
@@ -1151,29 +1152,20 @@ impl ChunkedKvBacking {
                     gid_vec.push(gid);
                 }
 
-                // Copy each source slot to its destination, byte-verbatim: the
+                // Copy each source slot to its destination. When source and
+                // destination share a size class the copy is byte-verbatim: the
                 // band's tag travels with the chunk, so a slot's bytes mean the
-                // same thing at the destination as at the source.
+                // same thing at both ends.
                 //
-                // **This requires source and destination to share a size
-                // class**, and that is not guaranteed. Destinations come from
-                // the *active* key above (R16, the 4096 B class) so decode can
+                // **They need not share one.** Destinations come from the
+                // *active* key above (R16, the 4096 B class) so decode can
                 // append to the forked tail, while the source is whatever the
                 // boundary block is in — and a sealed partial tail is quantized
-                // like any other chunk, so it can be sitting in the 1088 B
-                // `Q8_0` class. `copy_slot_bytes` refuses that, correctly.
-                //
-                // An earlier comment here claimed size classes made the formats
-                // agree and that the old `Quantized→Float` dequantize arm was
-                // therefore dead. They do not: the class follows the *format*,
-                // and fork deliberately changes the format of the tail. Closing
-                // this needs that arm rebuilt against tag-driven band reads
-                // (`io.rs`), including the dim-major→token-major transpose the
-                // old one did. Until then the mismatch is named where it can be
-                // acted on rather than surfacing as a bare stride error.
+                // like any other chunk, so it can sit in the 1088 B `Q8_0`
+                // class. Such a band changes format: it is read as the values it
+                // stores through its own tag and re-encoded in the active one.
                 let arenas = arena_state.arenas_mut();
                 let sub_head_dim = (head_dim / N_PALETTE).max(1);
-                let band_elems = CHUNK_SIZE * sub_head_dim;
                 for (i, src_gid) in source_gids.iter().enumerate() {
                     let dst_gid = &gid_vec[i];
                     let is_v = i % 2 == 1;
@@ -1214,10 +1206,12 @@ impl ChunkedKvBacking {
                     // map. The copy is what lets the two coexist, and it is the
                     // reason this arm is the slow path — a same-class band
                     // takes the verbatim byte copy above instead.
+                    let side = if is_v { BandSide::V } else { BandSide::K };
                     let floats = read_band_chunk(
                         arenas,
                         src_gid,
                         src_tag,
+                        side,
                         CHUNK_SIZE,
                         sub_head_dim,
                         &device,
@@ -1234,9 +1228,12 @@ impl ChunkedKvBacking {
                         KvFormat::Float(dtype) => {
                             dst.write_slot_typed(dst_gid.chunk_idx(), 0, &floats.to_dtype(dtype)?)?
                         }
-                        KvFormat::Quantized(qf) => {
-                            dst.quantize_into_slot(dst_gid.chunk_idx(), qf, band_elems, 0, &floats)?
-                        }
+                        // A quantized band's blocks run one dim at a time, so the
+                        // token-major floats are encoded channel-major.
+                        KvFormat::Quantized(qf) => dst.write_slot_bytes(
+                            dst_gid.chunk_idx(),
+                            &encode_quantized_band(qf.to_ggml_dtype(), side, &floats)?,
+                        )?,
                     }
                     // The tag is the only record of how a band's bytes decode,
                     // so it has to move with the format.

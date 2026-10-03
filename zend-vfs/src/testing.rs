@@ -1,6 +1,7 @@
-//! Test repositories, inside this crate's `scratch/` folder — nested in the
-//! candle checkout, ignored by it — and deleted when the test ends. Each is a
-//! copy of an empty repository built with `git init` once per test process.
+//! Test repositories, inside `<target>/tmp/zend-vfs-scratch` — the build's own
+//! scratch space, nested in the candle checkout and ignored by it — and deleted
+//! when the test ends. Each is a copy of an empty repository built with
+//! `git init` once per test process.
 //!
 //! Setup runs git directly (not through the layer under test) with a fixed
 //! identity and fixed dates, so every setup commit id is reproducible.
@@ -18,9 +19,21 @@ use crate::Repo;
 /// The fixed date every setup commit carries.
 pub(crate) const SETUP_DATE: &str = "1700000000 +0000";
 
-/// The folder test repositories are created in.
+/// The folder test repositories are created in: `<target>/tmp`, the directory
+/// cargo hands integration tests as `CARGO_TARGET_TMPDIR`, reached from the test
+/// binary's own path because cargo does not set that variable for unit tests.
+///
+/// Never the crate directory. A test's leftovers there are files in the source
+/// tree, and this module's per-process templates outlive the process that made
+/// them by design — swept only once they are an hour old.
 pub(crate) fn scratch() -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scratch");
+    let exe = std::env::current_exe().expect("the test binary's path");
+    // `<target>/<profile>/deps/<binary>`.
+    let target = exe
+        .ancestors()
+        .nth(3)
+        .expect("a test binary sits in <target>/<profile>/deps");
+    let dir = target.join("tmp").join("zend-vfs-scratch");
     std::fs::create_dir_all(&dir).expect("scratch folder");
     dir
 }

@@ -491,27 +491,30 @@ impl Engine {
     /// on the int8-KO path (`MoeInput::Q8`), add the always-on shared expert. Returns
     /// `[1, 1, dim]`. `token_id` drives the hash-layer `tid2eid` routing.
     fn moe_forward(&self, layer: &EngineLayer, x: &Tensor, token_id: u32) -> Result<Tensor> {
-        self.moe_forward_batch(layer, x, &[token_id])
+        let ids = Tensor::from_vec(vec![token_id], 1, &self.device)?;
+        self.moe_forward_batch(layer, x, &ids)
     }
 
     /// Batched MoE over `nt` rows: ONE routing readback per call (the
     /// counting-sort's expert ids must be host-visible to schedule the
     /// streaming cache's pinned→VRAM uploads — intrinsic to a non-resident
     /// expert set, and amortized across every row of the wave).
+    ///
+    /// `token_ids` is the rows' `[nt]` U32 ids on the device — uploaded once per
+    /// wave by the caller, because every layer routes the same rows.
     pub(super) fn moe_forward_batch(
         &self,
         layer: &EngineLayer,
         x: &Tensor,
-        token_ids: &[u32],
+        token_ids: &Tensor,
     ) -> Result<Tensor> {
         let dim = self.cfg.dim;
-        let nt = token_ids.len();
+        let nt = token_ids.dim(0)?;
         let x2 = x.reshape((nt, dim))?;
         let s_route = span("moe:route");
         // Float-normalized input for routing + the shared expert.
         let normed = rms_norm(&x2, &layer.ffn_norm, self.cfg.norm_eps)?;
-        let ids = Tensor::from_vec(token_ids.to_vec(), nt, &self.device)?;
-        let (weights, indices) = layer.gate.route(&normed, &ids)?; // [nt,k], [nt,k] u32
+        let (weights, indices) = layer.gate.route(&normed, token_ids)?; // [nt,k], [nt,k] u32
 
         // q8a128 activation for the int8-KO grouped expert GEMM: quantize the SAME
         // `normed` the router already saw (a quantize-only launch), rather than

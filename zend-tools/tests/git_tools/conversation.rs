@@ -639,10 +639,7 @@ fn a_soft_reset_back_one_keeps_the_view_and_rewinds_origin() {
 fn a_refused_reset_counts_what_it_would_take_off() {
     let ws = GitWorkspace::new();
     let start = ws.oid("main");
-    for n in 1..=7 {
-        ws.write_worktree("n.txt", &format!("{n}\n"));
-        ws.commit_all(&format!("step {n}"));
-    }
+    ws.commit_steps("n.txt", 1..=7);
     let conv = ws.conversation();
     let out = conv.call(
         "git_reset",
@@ -659,11 +656,7 @@ fn a_refused_reset_counts_what_it_would_take_off() {
     assert!(!detail.contains("step 2"), "only five are named: {detail}");
     assert!(detail.contains("; …."), "{detail}");
 
-    let mut tip = String::new();
-    for n in 8..=102 {
-        ws.write_worktree("n.txt", &format!("{n}\n"));
-        tip = ws.commit_all(&format!("step {n}"));
-    }
+    let tip = ws.commit_steps("n.txt", 8..=102);
     let many = ws.conversation().call(
         "git_reset",
         json!({"repo": "app", "mode": "hard", "to": commit_rev(&start)}),

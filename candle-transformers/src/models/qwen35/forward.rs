@@ -63,6 +63,8 @@ use crate::models::batched_layer::{
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::expert_lre::{PipelineStats, ProfileSnapshot, WeightPlan, WeightPlanning};
+use crate::models::head_rows::select_head_rows;
+use crate::models::lazy_rope::LazyRope;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::rope_schedule::RungSelect;
 use crate::models::tensor_cat::TensorCat;
@@ -1048,15 +1050,17 @@ fn sweep_layers(
     } else {
         embed_dtype
     };
-    let dec_rope = rot.rope_cos_sin(&dec_pos, theta, rope_dtype, dev, None)?;
-    let (pre_cos, pre_sin) = rot.rope_cos_sin(&pre_pos, theta, rope_dtype, dev, None)?;
+    let dec_rope = LazyRope::new(|| rot.rope_cos_sin(&dec_pos, theta, rope_dtype, dev, None));
     // Prefill's activation is the flat batch-of-one `[1, total, …]`, so its
     // tables carry the same leading axis.
     let half = q.cfg.attn_head_dim / 2;
-    let pre_rope = (
-        pre_cos.reshape((1, pre_rows, half))?,
-        pre_sin.reshape((1, pre_rows, half))?,
-    );
+    let pre_rope = LazyRope::new(|| {
+        let (cos, sin) = rot.rope_cos_sin(&pre_pos, theta, rope_dtype, dev, None)?;
+        Ok((
+            cos.reshape((1, pre_rows, half))?,
+            sin.reshape((1, pre_rows, half))?,
+        ))
+    });
 
     let dec_pm: RefCell<Option<SharedPm>> = RefCell::new(None);
     let pre_pm: RefCell<Option<SharedPm>> = RefCell::new(None);
@@ -1064,8 +1068,7 @@ fn sweep_layers(
     // permutes the head dims into, never the interleaved GPT-J form.
     let interleaved = false;
     let dec_params = BatchedAttentionParams::new(
-        &dec_rope.0,
-        &dec_rope.1,
+        &dec_rope,
         interleaved,
         model.rope(),
         decode_headers,
@@ -1074,8 +1077,7 @@ fn sweep_layers(
         &dec_pm,
     );
     let pre_params = BatchedAttentionParams::new(
-        &pre_rope.0,
-        &pre_rope.1,
+        &pre_rope,
         interleaved,
         model.rope(),
         prefill_headers,
@@ -1470,11 +1472,7 @@ fn sweep_layers(
         return Ok((WavePhase::Residual(x), None));
     }
     let g_head = crate::models::profile::gpu_span("fwd:head", dev);
-    let pre_norm = {
-        let n_sel = idx.len();
-        let sel = Tensor::from_vec(idx, n_sel, x_flat.device())?;
-        x_flat.index_select(&sel, 0)?.contiguous()?
-    };
+    let pre_norm = select_head_rows(&x_flat, idx, 0)?;
     // The head's span, reset per forward — the lifetime the norm and the logits
     // actually have. Seeded from `wave_root`, which yields a ticket rather than
     // a borrow, so the logits stay `'static`-typed and physically on the span;

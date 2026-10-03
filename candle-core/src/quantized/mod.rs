@@ -10,11 +10,15 @@ mod dummy_cuda;
 mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
+#[cfg(test)]
+mod int8_block_codec_tests;
 pub mod int8_matmul_mode;
 pub mod int8_split_k;
 pub mod k_quants;
 pub mod ko_quant;
 pub mod prepare;
+#[cfg(test)]
+mod q0_v_side_tests;
 // Note: the previous `q0_v_test` module has been removed — it tested the OLD
 // (sign + shape + curve_pos) Q0_V format that no longer exists. The new
 // (curve + scale + centroid) format will get a fresh test suite.

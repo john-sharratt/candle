@@ -29,6 +29,7 @@ use crate::token_buffer::TokenBuffer;
 use crate::turn_text::literal_tokenizer;
 use crate::working_set::{Limits, Refusal, WorkingSet};
 
+use candle::quantized::pinned_staging::release_recycled_wc;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use flume::{Receiver, Sender};
@@ -2361,6 +2362,11 @@ impl ConversationEngine {
         // without this flush, every warm→cold KV / tokens / sig append still in
         // the writer's queue at exit would be silently lost.
         self.conversation.flush_writer();
+        // The scheduler thread owned every sequence, so by its join each
+        // `(layer, slot)` has handed its staging pair to the process-wide
+        // recycler. Nothing of this engine will take them again; unpin them
+        // rather than leave them held for the life of the process.
+        release_recycled_wc();
         Ok(())
     }
 }

@@ -50,7 +50,12 @@ use candle::wave_provenance::WaveTicket;
 use candle::LeaseAnchor;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
 #[cfg(feature = "cuda")]
+use candle_kernels::simple::rows_scatter::ROWS_SCATTER_INLINE_MAX;
+#[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
+
+#[cfg(feature = "cuda")]
+use crate::models::latent_moe::scatter::{rows_scatter_inline, RowRun};
 
 use super::types::{DeltaNetDims, ZGate};
 
@@ -944,6 +949,78 @@ pub struct StashSlot<'a> {
     pub row: usize,
 }
 
+/// One span's stash capture: `len` rows of the wave's projections from wave row
+/// `start` into `ops` at row `dst_row`.
+#[derive(Clone, Copy)]
+pub struct StashCapture<'a> {
+    pub ops: &'a SpanOperands,
+    pub start: usize,
+    pub dst_row: usize,
+    pub len: usize,
+}
+
+/// Spans adjacent in BOTH the wave and the same stash, merged into single
+/// runs, in order. A verify wave packs its verifying spans back to back and
+/// the stash assigns their rows in the same order, so a whole cohort usually
+/// merges to one run per stash.
+pub(crate) fn coalesce_captures<'a>(spans: &[StashCapture<'a>]) -> Vec<StashCapture<'a>> {
+    let mut merged: Vec<StashCapture<'a>> = Vec::with_capacity(spans.len());
+    for s in spans {
+        if let Some(last) = merged.last_mut() {
+            if std::ptr::eq(last.ops, s.ops)
+                && last.start + last.len == s.start
+                && last.dst_row + last.len == s.dst_row
+            {
+                last.len += s.len;
+                continue;
+            }
+        }
+        merged.push(*s);
+    }
+    merged
+}
+
+/// Every verifying span's operand capture for one layer.
+///
+/// On the device the copies are row-scatter launches over coalesced runs —
+/// four runs per merged span, up to the kernel's inline capacity per launch,
+/// with nothing staged — where copying span by span cost four `slice_set`
+/// launches per span per DeltaNet layer (hot-path invariants 2 and 5). On the
+/// host each merged run is a plain copy.
+pub fn capture_spans(p: &DeltaNetProjections<'_>, spans: &[StashCapture<'_>]) -> Result<()> {
+    for s in spans {
+        let cap = s.ops.capacity()?;
+        if s.len == 0 || s.dst_row + s.len > cap {
+            candle::bail!(
+                "capture_spans: rows {}+{} into a {cap}-row stash",
+                s.dst_row,
+                s.len
+            );
+        }
+    }
+    let merged = coalesce_captures(spans);
+    #[cfg(feature = "cuda")]
+    if matches!(p.qkv.device(), Device::Cuda(_)) {
+        let mut runs: Vec<RowRun<'_>> = Vec::with_capacity(merged.len() * 4);
+        for m in &merged {
+            for (dst, src) in m.ops.pairs(p) {
+                runs.push(RowRun::new(src.narrow(0, m.start, m.len)?, dst, m.dst_row));
+            }
+        }
+        for batch in runs.chunks(ROWS_SCATTER_INLINE_MAX) {
+            rows_scatter_inline(batch)?;
+        }
+        return Ok(());
+    }
+    for m in &merged {
+        for (dst, src) in m.ops.pairs(p) {
+            dst.narrow(0, m.dst_row, m.len)?
+                .slice_set(&src.narrow(0, m.start, m.len)?, 0, 0)?;
+        }
+    }
+    Ok(())
+}
+
 /// One DeltaNet layer's recurrence operands for one span, held in buffers that
 /// outlive the wave arena.
 ///
@@ -1075,8 +1152,7 @@ impl SpanOperands {
     }
 
     /// Copy `len` rows of `p`, starting at wave row `start`, into these buffers
-    /// at row `dst_row`. Four copies per DeltaNet layer per span, paid only by
-    /// spans that will have to rewind.
+    /// at row `dst_row` — the one-span case of [`capture_spans`].
     pub fn capture(
         &self,
         p: &DeltaNetProjections<'_>,
@@ -1084,20 +1160,28 @@ impl SpanOperands {
         dst_row: usize,
         len: usize,
     ) -> Result<()> {
-        let cap = self.capacity()?;
-        if len == 0 || dst_row + len > cap {
-            candle::bail!("SpanOperands::capture: rows {dst_row}+{len} into a {cap}-row stash");
-        }
-        // A row range of a contiguous `[T, ·]` buffer is itself contiguous, so
-        // each of these is one copy and no re-layout.
-        let put = |dst: &Tensor, src: &LiveTensor<'_>| -> Result<()> {
-            dst.narrow(0, dst_row, len)?
-                .slice_set(&src.narrow(0, start, len)?, 0, 0)
-        };
-        put(&self.qkv, &p.qkv)?;
-        put(&self.z, &p.z)?;
-        put(&self.beta_lin, &p.beta_lin)?;
-        put(&self.alpha_lin, &p.alpha_lin)
+        capture_spans(
+            p,
+            &[StashCapture {
+                ops: self,
+                start,
+                dst_row,
+                len,
+            }],
+        )
+    }
+
+    /// The four `(destination, source)` operand pairs, in a fixed order.
+    fn pairs<'a, 'w>(
+        &'a self,
+        p: &'a DeltaNetProjections<'w>,
+    ) -> [(&'a Tensor, &'a LiveTensor<'w>); 4] {
+        [
+            (&self.qkv, &p.qkv),
+            (&self.z, &p.z),
+            (&self.beta_lin, &p.beta_lin),
+            (&self.alpha_lin, &p.alpha_lin),
+        ]
     }
 
     /// `len` rows of each operand starting at `row`, as the projections a
@@ -2136,6 +2220,105 @@ mod tests {
         let conv = lcg_tensor(&[dims.conv_dim(), dims.conv_kernel], 97, dev);
         let norm = lcg_tensor(&[dims.head_dim], 98, dev).abs().unwrap();
         (dt_bias, a, conv, norm)
+    }
+
+    /// Spans merge only when they are adjacent in the wave AND in the same
+    /// stash; a gap on either side, or a different stash, starts a new run.
+    #[test]
+    fn adjacent_captures_coalesce_and_nothing_else_does() {
+        let dims = span_dims();
+        let a = SpanOperands::zeros(&dims, 16, &Device::Cpu).unwrap();
+        let b = SpanOperands::zeros(&dims, 16, &Device::Cpu).unwrap();
+        let cap = |ops, start, dst_row, len| StashCapture {
+            ops,
+            start,
+            dst_row,
+            len,
+        };
+        let merged = coalesce_captures(&[
+            cap(&a, 0, 0, 3),
+            cap(&a, 3, 3, 2),   // adjacent in both → merges
+            cap(&a, 6, 5, 2),   // wave gap → new run
+            cap(&a, 8, 8, 1),   // stash gap → new run
+            cap(&b, 9, 9, 1),   // other stash → new run
+            cap(&b, 10, 10, 4), // adjacent in both → merges
+        ]);
+        let shape: Vec<(usize, usize, usize, bool)> = merged
+            .iter()
+            .map(|m| (m.start, m.dst_row, m.len, std::ptr::eq(m.ops, &a)))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, 0, 5, true),
+                (6, 5, 2, true),
+                (8, 8, 1, true),
+                (9, 9, 5, false)
+            ]
+        );
+    }
+
+    /// Every span of a cohort lands at its own stash rows, exactly, and rows no
+    /// span names stay as they were.
+    fn cohort_capture_lands_exactly(dev: &Device) {
+        let dims = span_dims();
+        let p = span_projections(12, &dims, dev);
+        let stash = SpanOperands::zeros(&dims, 10, dev).unwrap();
+        // Two adjacent spans (merge), then one placed after a stash gap.
+        let spans = [
+            StashCapture {
+                ops: &stash,
+                start: 1,
+                dst_row: 0,
+                len: 3,
+            },
+            StashCapture {
+                ops: &stash,
+                start: 4,
+                dst_row: 3,
+                len: 2,
+            },
+            StashCapture {
+                ops: &stash,
+                start: 8,
+                dst_row: 7,
+                len: 3,
+            },
+        ];
+        capture_spans(&p, &spans).unwrap();
+        for (dst, src) in stash.pairs(&p) {
+            let got = dst
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let src = src
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let width = src[0].len();
+            let mut want = vec![vec![0f32; width]; 10];
+            for s in &spans {
+                for r in 0..s.len {
+                    want[s.dst_row + r] = src[s.start + r].clone();
+                }
+            }
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn a_cohort_capture_lands_exactly_on_the_host() {
+        cohort_capture_lands_exactly(&dev());
+    }
+
+    /// The device path (coalesced row-scatter launches) places the same bytes
+    /// the host copies do.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_cohort_capture_lands_exactly_on_the_device() {
+        cohort_capture_lands_exactly(&Device::new_cuda(0).unwrap());
     }
 
     /// **Batching several sequences into one call must equal running each

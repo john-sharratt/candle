@@ -63,6 +63,7 @@ use crate::models::batched_layer::{forward_attn_batched, BatchedAttentionParams,
 use crate::models::delta_net::SeqSpan;
 use crate::models::draft_walk::{draft_reserve, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
+use crate::models::lazy_rope::LazyRope;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::gpu_span;
 use crate::models::rope_schedule::FactoredRope;
@@ -632,11 +633,11 @@ impl Qwen4ExpBatched {
                         generation: &Generation|
          -> Result<(Tensor, Tensor)> {
             let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-            let (cos, sin) = m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev, None)?;
+            let model_rope =
+                LazyRope::new(|| m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev, None));
             let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
             let params = BatchedAttentionParams::new(
-                &cos,
-                &sin,
+                &model_rope,
                 false,
                 &self.rope,
                 DecodeHeaders::Decode {

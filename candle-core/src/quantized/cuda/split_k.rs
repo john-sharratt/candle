@@ -334,6 +334,87 @@ mod tests {
         Ok(())
     }
 
+    /// Mean device time of one matmul at a forced slice count, over `reps` launches after a
+    /// warm-up, in microseconds.
+    fn time_us(
+        dev: &CudaDevice,
+        w: &QMatMul,
+        x: &Tensor,
+        splits: usize,
+        reps: usize,
+    ) -> Result<f64> {
+        let q = w.qtensor().expect("a KO weight");
+        let (ptr, len) = match &q.storage {
+            QStorage::Cuda(cs) => (cs.data_ptr(), cs.storage_size_in_bytes()),
+            _ => unreachable!("a CUDA weight"),
+        };
+        let acts = to_dynamic(x, Int8Mode::Performance, dev, SumScale::Raw)?;
+        let n = q.shape().dims()[0];
+        let launch = || {
+            dense_qmatmul_with_splits(
+                acts.as_dynamic(),
+                ptr,
+                q.dtype(),
+                n,
+                len,
+                DType::BF16,
+                Some(splits),
+                dev,
+            )
+        };
+        for _ in 0..5 {
+            launch()?;
+        }
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            launch()?;
+        }
+        dev.synchronize()?;
+        Ok(t0.elapsed().as_secs_f64() * 1e6 / reps as f64)
+    }
+
+    /// Split against unsplit on the decode projections of the models the rule serves, at the
+    /// decode widths it splits. Prints one row per shape and width; the rule is worth its
+    /// partials only where the split column is the smaller.
+    #[test]
+    #[ignore = "benchmark — run explicitly with --ignored, card to itself"]
+    fn bench_split_against_unsplit_on_decode_projections() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let sm = dev.multiprocessor_count()?;
+        // (label, N, K): output rows, contraction.
+        let shapes = [
+            ("flash-next hyper down", 416usize, 10_240usize),
+            ("qwen3-8b qkv", 6_144, 4_096),
+            ("qwen3-8b o_proj", 4_096, 4_096),
+            ("qwen3-8b ffn_down", 4_096, 12_288),
+            ("qwen3-30b qkv", 5_120, 2_048),
+            ("qwen3-30b o_proj", 2_048, 4_096),
+            ("qwen3-30b router", 128, 2_048),
+        ];
+        println!(
+            "{:<24} {:>4} {:>7} {:>11} {:>11} {:>8}",
+            "shape", "M", "splits", "unsplit µs", "split µs", "split/un"
+        );
+        for (label, n, k) in shapes {
+            let (w, x_all) = operands(&dev, GgmlDType::Q8_0, 32, n, k, (n + k) as u64)?;
+            for m in [1usize, 2, 5, 10, 16, 20, 32] {
+                let splits = q8a128_dense_k_splits(m, n, k, sm);
+                if splits == 1 {
+                    continue;
+                }
+                let x = x_all.narrow(0, 0, m)?.contiguous()?;
+                let unsplit = time_us(&dev, &w, &x, 1, 200)?;
+                let split = time_us(&dev, &w, &x, splits, 200)?;
+                println!(
+                    "{label:<24} {m:>4} {splits:>7} {unsplit:>11.1} {split:>11.1} {:>8.2}",
+                    split / unsplit
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// A split launch is bit-repeatable — the last block to finish sums in tile order,
     /// whichever block it is — and back-to-back launches see the counters the previous launch
     /// returned to zero.

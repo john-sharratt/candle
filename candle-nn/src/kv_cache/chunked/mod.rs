@@ -30,6 +30,7 @@
 mod alloc;
 mod arena;
 mod backing;
+mod band_layout;
 #[cfg(feature = "cuda")]
 pub(crate) mod bump_arena;
 mod chunk_ops;
@@ -78,6 +79,8 @@ pub mod migrate;
 pub mod migrate_flight;
 #[cfg(feature = "cuda")]
 pub(crate) mod region_pool;
+#[cfg(feature = "tensor-assert")]
+mod release_watch;
 #[cfg(feature = "cuda")]
 pub(crate) mod reservation;
 pub mod sampled_selection;
@@ -142,8 +145,8 @@ pub use gpu_chunks::ChunkPin;
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
 pub use migrate_flight::{
-    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations, try_migrate_flight,
-    LocationFreeze, MigrateFlight,
+    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations,
+    try_hold_chunk_locations, try_migrate_flight, LocationFreeze, LocationHold, MigrateFlight,
 };
 pub use size_class::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,

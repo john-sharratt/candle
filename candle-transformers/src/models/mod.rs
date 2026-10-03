@@ -88,6 +88,7 @@ pub mod gpu_backed;
 mod gpu_test_lock;
 pub mod granite;
 pub mod granitemoehybrid;
+pub mod head_rows;
 pub mod helium;
 pub mod hiera;
 #[cfg(feature = "cuda")]
@@ -100,6 +101,7 @@ pub mod kv_collect_utils;
 #[cfg(feature = "cuda")]
 pub mod latent_moe;
 pub mod layer_stream;
+pub mod lazy_rope;
 pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;

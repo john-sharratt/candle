@@ -294,20 +294,22 @@ static_assert(sizeof(block_q0) == 1, "block_q0 size");
 // the (centroid, scale) pair used to reconstruct it. All three are looked
 // up in constant-memory tables (see q0_v_tables.cuh).
 //
-// Per-block layout (2 bytes total):
-//   byte 0 (lo):  bits[7:0] = curve_idx     (8-bit, indexes 256-entry curve_table)
-//   byte 1 (hi):  bits[4:0] = scale_idx     (5-bit, indexes 32-entry scale_table)
-//                 bits[7:5] = centroid_idx  (3-bit, indexes 8 entries within
-//                                            centroid_table[scale_idx])
+// Per-block layout (16 bits, little-endian across lo | hi):
+//   bits[6:0]   = curve_idx     (7-bit, indexes the 128-entry curve_table:
+//                                8 buckets × 16 phases, bucket-major)
+//   bits[11:7]  = scale_idx     (5-bit, indexes the 32-entry scale_table)
+//   bits[15:12] = centroid_idx  (4-bit, indexes 16 entries within
+//                                centroid_table[scale_idx])
 //
-// Reconstruction (outer-normalised):
-//   x[e] = centroid_table[scale_idx][centroid_idx] / 32767
-//        + (scale_table  [scale_idx]                / 65535)
-//        * (curve_table  [curve_idx][e]             /   127)
+// Reconstruction (outer-normalised), with the f16 tables of the block's side
+// (K or V):
+//   x[e] = fma(scale_table[scale_idx], curve_table[curve_idx][e],
+//              centroid_table[scale_idx][centroid_idx])
+// scale_table holds scale / 127, so the i8 curve values are used raw.
 #define QK_Q0_V 32
 typedef struct {
-    uint8_t lo;   // [7:0] = curve_idx
-    uint8_t hi;   // [4:0] = scale_idx, [7:5] = centroid_idx
+    uint8_t lo;   // curve_idx | (scale_idx & 1) << 7
+    uint8_t hi;   // (scale_idx >> 1) | centroid_idx << 4
 } block_q0_v;
 static_assert(sizeof(block_q0_v) == 2, "block_q0_v size");
 

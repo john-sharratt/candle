@@ -4085,8 +4085,8 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
         p
     };
 
-    // A source with a tileable shape, so it reaches the band loop, and no `QType`, so the
-    // loop's first dequantize refuses.
+    // A source with a tileable shape, so it reaches the band loop, and no device dequant
+    // kernel, so the loop's first dequantize refuses.
     //
     // **This was F16, and F16 stopped working as a provocation** when the float formats gained
     // a widening arm in `dequantize_f32_into` — they now repack like any block format, which
@@ -4109,7 +4109,7 @@ fn a_failed_repack_does_not_free_its_leased_destination() -> Result<()> {
         .expect_err("a P2 source has no QType and must not repack");
     let msg = err.to_string();
     assert!(
-        msg.contains("unsupported dtype"),
+        msg.contains("has no device dequant kernel"),
         "expected the failure to come from the band loop's dequantize, got: {msg}"
     );
 

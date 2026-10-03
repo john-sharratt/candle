@@ -544,6 +544,7 @@ pub fn quantize_to_dtype(
     dtype: GgmlDType,
     dev: &CudaDevice,
 ) -> Result<()> {
+    require_block_quantize_kernel(dtype)?;
     let qtype = dtype_to_qtype(dtype)?;
     let stream = dev.cuda_stream();
     let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -2477,6 +2478,92 @@ pub fn quantized_size(elem_count: usize, dtype: GgmlDType) -> usize {
 /// [`QCudaStorage::repack_ko_into`] hold its whole-tensor f32 intermediate off the card — see
 /// its header for why a buffer that exists for one tensor at load was costing VRAM for the
 /// life of the process.
+/// Whether `run_dequantize_block` has an arm for `dtype` — exactly the formats
+/// its switch names (`quantized_dispatcher.cu`).
+///
+/// **That switch has no `default:`.** A format it does not name launches
+/// nothing, and the caller's freshly allocated destination comes back as `Ok`
+/// holding whatever the allocator left there. The KV formats below 2 bits
+/// (Q1_S, Q2_S, Q2_A, Q0 and its siblings, Q2_1, Q3_1) were routed to it
+/// anyway and read back as magnitudes near 1e34, so every device dequant asks
+/// this first: a format it rejects either decodes on the host
+/// ([`QCudaStorage::dequantize`]) or is refused.
+fn has_block_dequant_kernel(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q8_1
+            | GgmlDType::Q2_K
+            | GgmlDType::Q3_K
+            | GgmlDType::Q4_K
+            | GgmlDType::Q5_K
+            | GgmlDType::Q6_K
+            | GgmlDType::Q8_K
+            | GgmlDType::QAWQ
+            | GgmlDType::QAWQ_G64
+            | GgmlDType::Q4_KS
+            | GgmlDType::Q8_KS
+            | GgmlDType::Q2_0
+            | GgmlDType::Q3_0
+            | GgmlDType::R16
+    )
+}
+
+/// Whether `run_quantize_block` has an arm for `dtype` — the formats its first
+/// switch names (`quantized_dispatcher.cu`). Its `default:` returns without
+/// launching, so any other format leaves the destination as it was and
+/// reports nothing. The KV formats below 2 bits and R16 are encoded by the
+/// palette convert kernel or on the host, never here.
+fn has_block_quantize_kernel(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q8_1
+            | GgmlDType::Q4_KS
+            | GgmlDType::Q8_KS
+            | GgmlDType::Q2_0
+            | GgmlDType::Q3_0
+            | GgmlDType::Q2_K
+            | GgmlDType::Q3_K
+            | GgmlDType::Q4_K
+            | GgmlDType::Q5_K
+            | GgmlDType::Q6_K
+            | GgmlDType::Q8_K
+            | GgmlDType::QAWQ
+            | GgmlDType::QAWQ_G64
+    )
+}
+
+/// Refuse a block format `run_quantize_block` would silently skip.
+fn require_block_quantize_kernel(dtype: GgmlDType) -> Result<()> {
+    if !has_block_quantize_kernel(dtype) {
+        crate::bail!(
+            "{dtype:?} has no device block-quantize kernel; run_quantize_block would \
+             leave the destination unwritten"
+        )
+    }
+    Ok(())
+}
+
+/// Refuse a block format `run_dequantize_block` would silently skip.
+fn require_block_dequant_kernel(dtype: GgmlDType) -> Result<()> {
+    if !has_block_dequant_kernel(dtype) {
+        crate::bail!(
+            "{dtype:?} has no device dequant kernel; run_dequantize_block would return \
+             uninitialised memory for it"
+        )
+    }
+    Ok(())
+}
+
 fn dequantize_f32_into(
     data_ptr: u64,
     dtype: GgmlDType,
@@ -2501,7 +2588,10 @@ fn dequantize_f32_into(
     let widen = match dtype {
         GgmlDType::MXFP4 => Widen::Mxfp4,
         GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => Widen::Float(dtype),
-        _ => Widen::Block(dtype_to_qtype(dtype)? as i32),
+        _ => {
+            require_block_dequant_kernel(dtype)?;
+            Widen::Block(dtype_to_qtype(dtype)? as i32)
+        }
     };
 
     // **Banded, so one launch never runs long enough to trip the GPU watchdog.**
@@ -2616,6 +2706,7 @@ fn dequantize_f16(
         }
         return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
     }
+    require_block_dequant_kernel(dtype)?;
     let qtype = dtype_to_qtype(dtype)?;
     let dst = unsafe { dev.alloc::<f16>(elem_count)? };
     {
@@ -2659,6 +2750,7 @@ fn dequantize_bf16(
         }
         return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
     }
+    require_block_dequant_kernel(dtype)?;
     let qtype = dtype_to_qtype(dtype)?;
     let dst = unsafe { dev.alloc::<bf16>(elem_count)? };
     {
@@ -3190,40 +3282,7 @@ impl QCudaStorage {
             T::to_float(&vec, dst)
         }
 
-        let fast_kernel = matches!(
-            self.dtype,
-            GgmlDType::Q4_0
-                | GgmlDType::Q4_1
-                | GgmlDType::Q5_0
-                | GgmlDType::Q5_1
-                | GgmlDType::Q8_0
-                | GgmlDType::Q8_1
-                | GgmlDType::Q2_K
-                | GgmlDType::Q3_K
-                | GgmlDType::Q4_K
-                | GgmlDType::Q5_K
-                | GgmlDType::Q6_K
-                | GgmlDType::Q8_K
-                | GgmlDType::QAWQ
-                | GgmlDType::QAWQ_G64
-                | GgmlDType::Q4_KS
-                | GgmlDType::Q8_KS
-                | GgmlDType::Q2_0
-                | GgmlDType::Q3_0
-                | GgmlDType::R16
-                | GgmlDType::Q0
-                | GgmlDType::Q0_V
-                | GgmlDType::Q1_A
-                | GgmlDType::Q0_X
-                | GgmlDType::Q0_M2
-                | GgmlDType::Q0_M4
-                | GgmlDType::Q1_S
-                | GgmlDType::Q2_S
-                | GgmlDType::Q2_A
-                | GgmlDType::Q2_1
-                | GgmlDType::Q3_1
-                | GgmlDType::MXFP4
-        );
+        let fast_kernel = self.dtype == GgmlDType::MXFP4 || has_block_dequant_kernel(self.dtype);
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
         }
@@ -3454,6 +3513,7 @@ impl QCudaStorage {
         }
 
         // Get pointers and call kernel
+        require_block_quantize_kernel(self.dtype)?;
         let qtype = dtype_to_qtype(self.dtype)?;
         let stream = self.device.cuda_stream();
         let (src_ptr, _src_guard) = src_f32.device_ptr(&stream);
@@ -3664,6 +3724,7 @@ impl QCudaStorage {
             );
         }
 
+        require_block_dequant_kernel(self.dtype)?;
         let qtype = dtype_to_qtype(self.dtype)?;
         let stream = self.device.cuda_stream();
         let (src_ptr, _src_guard) = self.data.inner.device_ptr(&stream);

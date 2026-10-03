@@ -1940,15 +1940,18 @@ impl BatchedInferenceSession {
         // a clone, in `quantized_per_seq`.
         drop(live_per_layer);
 
+        // Convert kernels must finish before we drop the source float chunks
+        // (truncate) and before decode reads the quantized bytes. One fence
+        // covers the whole cohort — every convert was issued above. No convert
+        // kernel runs when quantization was skipped, so only sync then.
+        if policy.is_some() {
+            copy_stream
+                .synchronize()
+                .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
+        }
         for (s, &seq_idx) in seq_indices.iter().enumerate() {
             let quantized_per_layer = std::mem::take(&mut quantized_per_seq[s]);
-            // Convert kernels must finish before we drop the source float chunks
-            // (truncate) and before decode reads the quantized bytes. No convert
-            // kernel runs when quantization was skipped, so only sync then.
             if policy.is_some() {
-                copy_stream
-                    .synchronize()
-                    .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
                 // Quantized modes must replace the float chunks with the quantized
                 // bytes: truncate the live float layout and re-inject the sealed
                 // quantized chunks.

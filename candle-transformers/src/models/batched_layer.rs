@@ -16,7 +16,8 @@ use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
-use crate::models::operand_guard::expect_dtype;
+use crate::models::lazy_rope::LazyRope;
+use crate::models::operand_guard::{expect_dense_view, expect_dtype};
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn;
 #[cfg(feature = "cuda")]
@@ -81,15 +82,12 @@ pub enum DecodeHeaders {
 
 /// Parameters for batched attention computation.
 ///
-/// These are precomputed values passed to batched attention to avoid redundant
-/// computation across layers. RoPE tables are always precomputed at the model level
-/// and passed down to layers.
+/// Values shared by every layer of one forward for one attention group.
 pub struct BatchedAttentionParams<'a> {
-    /// Precomputed RoPE (cos, sin) for the current batch positions.
-    /// Always provided - computed once at model level.
-    pub rope_cos: &'a Tensor,
-    /// Precomputed RoPE sin for the current batch positions.
-    pub rope_sin: &'a Tensor,
+    /// Model-side RoPE (cos, sin) at the group's positions. Only the non-paged
+    /// path reads them — the paged kernels rotate from `rope` — so they are
+    /// built on the first non-paged layer, never on a paged forward.
+    pub model_rope: &'a LazyRope<'a>,
     /// Whether RoPE uses interleaved format.
     pub rope_interleaved: bool,
     /// The model's RoPE rungs: every paged kernel rotates each sequence by the
@@ -114,12 +112,9 @@ pub struct BatchedAttentionParams<'a> {
 
 impl<'a> BatchedAttentionParams<'a> {
     /// Create params with all fields populated.
-    ///
-    /// RoPE (cos, sin) must always be provided - they are computed once at the model level.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cos: &'a Tensor,
-        sin: &'a Tensor,
+        model_rope: &'a LazyRope<'a>,
         rope_interleaved: bool,
         rope: &'a RopeRungs,
         decode_headers: DecodeHeaders,
@@ -128,8 +123,7 @@ impl<'a> BatchedAttentionParams<'a> {
         shared_prefill_pm: &'a std::cell::RefCell<Option<SharedPm>>,
     ) -> Self {
         Self {
-            rope_cos: cos,
-            rope_sin: sin,
+            model_rope,
             rope_interleaved,
             rope,
             decode_headers,
@@ -518,8 +512,8 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     // not by tensor shape, so a 1-token prefill or a multi-token decode is safe.
     let hidden = x.dim(2)?;
     let xt = x.to_tensor();
-    // The attention generation spans every group's attention, the concatenation
-    // of their contexts, o_proj, and the residual add that consumes the result —
+    // The attention generation spans every group's attention, o_proj, and the
+    // residual add that consumes the result —
     // the same shape as the FFN scope below. Opening it inside
     // `forward_attn_batched` instead would close it one step before the value
     // dies, which is the difference between o_proj's output living on the wave
@@ -539,18 +533,22 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
         #[cfg(not(feature = "cuda"))]
         let attn_wave: Option<()> = None;
 
-        let mut parts: Vec<LiveTensor<'_>> = Vec::with_capacity(groups.len());
         let mut row0 = 0usize;
         for g in groups.iter_mut() {
             if g.rows == 0 {
                 continue;
             }
+            // A row range of the flat `[1, total, hidden]` buffer is itself dense
+            // (the leading axis is one), so each group reads its rows in place —
+            // a view that starts at row `row0` of the shared buffer, which the
+            // attention producers address from its own first element.
             let slice = xt.narrow(1, row0, g.rows)?;
             let x_g = if g.decode_layout {
-                TensorCat::from_cat_tensor(slice.reshape((g.rows, 1, hidden))?.contiguous()?, 0)?
+                TensorCat::from_cat_tensor(slice.reshape((g.rows, 1, hidden))?, 0)?
             } else {
-                TensorCat::from_cat_tensor(slice.contiguous()?, 0)?
+                TensorCat::from_cat_tensor(slice, 0)?
             };
+            expect_dense_view(x_g.as_cat_tensor(), "attention group rows")?;
             let h = forward_attn_batched(
                 layer,
                 g.caches,
@@ -566,31 +564,28 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
             } else {
                 h
             };
-            parts.push(h);
+            // First residual, per group: x[rows] += attn(rows). The add lands
+            // on the group's own row range of the residual stream, so a mixed
+            // wave never concatenates its groups' outputs (hot-path invariant
+            // 2) and the residual never takes a wave allocation. Later groups
+            // read disjoint rows, so adding before they run changes nothing
+            // they see.
+            //
+            // VALIDATED, not converted: both output-projection sites store the
+            // residual's own dtype, so the two agree by construction. Rewriting
+            // `x` here to meet the attention output would be a full-tensor pass
+            // per layer per wave, and one that silently absorbs a producer that
+            // later starts emitting the wrong width (hot-path invariant 1b).
+            expect_dtype(
+                &h,
+                orig_dtype,
+                "attention residual: attn(x) vs the residual stream",
+            )?;
+            x.as_cat_tensor_mut().narrow(1, row0, g.rows)?.add_mut(&h)?;
             row0 += g.rows;
         }
-        let h_attn = if parts.len() == 1 {
-            parts.pop().unwrap()
-        } else {
-            LiveTensor::cat(&parts, 1)?
-        };
-
-        // First residual: x = x + attn(h). `add_mut` reads `h_attn` in place, so
-        // the residual stream never takes a wave allocation and never escapes.
-        //
-        // VALIDATED, not converted: both output-projection sites store the
-        // residual's own dtype, so the two agree by construction. Rewriting `x`
-        // here to meet the attention output would be a full-tensor pass per
-        // layer per wave, and one that silently absorbs a producer that later
-        // starts emitting the wrong width (hot-path invariant 1b).
-        expect_dtype(
-            &h_attn,
-            orig_dtype,
-            "attention residual: attn(x) vs the residual stream",
-        )?;
-        x.add_mut(&h_attn)?;
-        // No `drop(h_attn)` / `drop(attn_wave)`: `h_attn` borrows the guard, so
-        // the compiler refuses any order but this one. Both die at the brace.
+        // No `drop(attn_wave)`: each `h` borrows the guard, so the compiler
+        // refuses any order but this one. The guard dies at the brace.
     }
 
     // ── Shared FFN/MoE over the WHOLE combined buffer — one grouped GEMM whose
@@ -678,8 +673,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
             caches,
             x,
             offsets,
-            params.rope_cos,
-            params.rope_sin,
+            params.model_rope,
             params.rope_interleaved,
             params.rope,
             params.generation,
@@ -709,8 +703,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
             x,
             offsets,
             params.q_lens,
-            params.rope_cos,
-            params.rope_sin,
+            params.model_rope,
             params.rope_interleaved,
             prefill_meta,
             glue_meta,
@@ -731,8 +724,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     caches: &mut [&mut KvCache],
     x: &TensorCat,
     offsets: &[usize],
-    cos: &Tensor,
-    sin: &Tensor,
+    model_rope: &LazyRope<'_>,
     rope_interleaved: bool,
     rope: &RopeRungs,
     #[allow(unused_variables)] generation: &Generation,
@@ -787,7 +779,7 @@ fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
         // The model-side cos/sin are rung 0's frequencies; a slot the schedule
         // has moved up a rung rotates only in the paged kernels.
         refuse_rung_past_zero(rope, offsets, 1)?;
-        // Validate RoPE cos/sin for non-paged path
+        let (cos, sin) = model_rope.tables()?;
         if cos.dtype() != q.dtype() || sin.dtype() != q.dtype() {
             candle::bail!(
                 "rope cos/sin dtype mismatch: q={:?} cos={:?} sin={:?}",
@@ -898,8 +890,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     x: &TensorCat,
     offsets: &[usize],
     q_lens: &[usize],
-    cos: &Tensor,
-    sin: &Tensor,
+    model_rope: &LazyRope<'_>,
     rope_interleaved: bool,
     prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
     glue_meta: Option<&GlueMeta>,
@@ -966,6 +957,7 @@ fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
         // Model-side cos/sin are rung 0's; see `refuse_rung_past_zero`.
         let reach: Vec<usize> = offsets.iter().zip(q_lens).map(|(o, l)| o + l).collect();
         refuse_rung_past_zero(rope, &reach, 0)?;
+        let (cos, sin) = model_rope.tables()?;
         let q4 = q
             .reshape((1, total_q, n_head, head_dim))?
             .transpose(1, 2)?

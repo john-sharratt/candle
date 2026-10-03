@@ -1005,24 +1005,19 @@ impl BatchedAttentionLayer for LayerWeights {
         let n_kv_head = self.self_attn.num_kv_heads;
         let head_dim = self.self_attn.head_dim;
 
-        let q = q
-            .reshape((b_sz, seq_len, n_head, head_dim))?
-            .transpose(1, 2)?;
-        let q_flat = q.flatten(0, 2)?;
-        let q_flat = self.self_attn.q_norm.forward_live(&q_flat)?;
-        let q = q_flat
-            .reshape((b_sz, n_head, seq_len, head_dim))?
-            .transpose(1, 2)?
+        // The per-head norm is over the last axis, so it runs on the token-major
+        // rows as they are — `[tokens·heads, head_dim]` is the same rows a
+        // head-major transpose would visit, and the transpose (with its copies
+        // in and out) buys nothing.
+        let q = self
+            .self_attn
+            .q_norm
+            .forward_live(&q.reshape((b_sz * seq_len * n_head, head_dim))?)?
             .reshape((b_sz, seq_len, n_head * head_dim))?;
-
-        let k = k
-            .reshape((b_sz, seq_len, n_kv_head, head_dim))?
-            .transpose(1, 2)?;
-        let k_flat = k.flatten(0, 2)?;
-        let k_flat = self.self_attn.k_norm.forward_live(&k_flat)?;
-        let k = k_flat
-            .reshape((b_sz, n_kv_head, seq_len, head_dim))?
-            .transpose(1, 2)?
+        let k = self
+            .self_attn
+            .k_norm
+            .forward_live(&k.reshape((b_sz * seq_len * n_kv_head, head_dim))?)?
             .reshape((b_sz, seq_len, n_kv_head * head_dim))?;
 
         Ok(QkvProjection {

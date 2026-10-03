@@ -58,6 +58,8 @@ use super::delta_net::RecurrentCompaction;
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
 use super::expert_lre::{WeightPlan, WeightPlanning};
+use super::head_rows::select_head_rows;
+use super::lazy_rope::LazyRope;
 use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
 use super::rope_schedule::{RopeRungs, RopeSchedule};
@@ -955,18 +957,18 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             Some(resume) => resume,
         };
 
-        // Per-group RoPE (cos/sin) + prefill position-map caches, all alive for the
-        // whole layer loop.
-        let dec_rope = self.compute_rope_for_batch(dec_off, dec_q, embed_dtype)?;
-        let pre_rope = self.compute_rope_for_batch(pre_off, pre_q, embed_dtype)?;
-        let glue_rope = self.compute_rope_for_batch(glue_off, glue_q, embed_dtype)?;
+        // Per-group model-side RoPE (built only if a layer takes the non-paged
+        // path) + prefill position-map caches, all alive for the whole layer loop.
+        let dec_rope = LazyRope::new(|| self.compute_rope_for_batch(dec_off, dec_q, embed_dtype));
+        let pre_rope = LazyRope::new(|| self.compute_rope_for_batch(pre_off, pre_q, embed_dtype));
+        let glue_rope =
+            LazyRope::new(|| self.compute_rope_for_batch(glue_off, glue_q, embed_dtype));
         let dec_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
         let pre_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
         let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
         let interleaved = self.model.rope_interleaved();
         let dec_params = BatchedAttentionParams::new(
-            &dec_rope.0,
-            &dec_rope.1,
+            &dec_rope,
             interleaved,
             &self.rope,
             decode_headers,
@@ -975,8 +977,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &dec_pm,
         );
         let pre_params = BatchedAttentionParams::new(
-            &pre_rope.0,
-            &pre_rope.1,
+            &pre_rope,
             interleaved,
             &self.rope,
             prefill_headers,
@@ -985,8 +986,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &pre_pm,
         );
         let glue_params = BatchedAttentionParams::new(
-            &glue_rope.0,
-            &glue_rope.1,
+            &glue_rope,
             interleaved,
             &self.rope,
             glue_headers,
@@ -1070,10 +1070,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         if idx.is_empty() {
             return Ok((WavePhase::Residual(x), None));
         }
-        let pre_norm = {
-            let sel = Tensor::from_vec(idx, n_decode + n_prefill, x_flat.device())?;
-            x_flat.index_select(&sel, 0)?.contiguous()?
-        };
+        let pre_norm = select_head_rows(&x_flat, idx, 0)?;
         // The head's span. It runs after the last layer, so both phase spans are
         // idle, and this one is reset per *forward* — the lifetime the norm and
         // the logits actually have.

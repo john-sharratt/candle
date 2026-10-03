@@ -347,8 +347,8 @@ system_prompt:
         A request to research, search, look something up, or cite a source is a request to
         call web_search (and web_fetch for a page worth reading) before you answer.
         A source you cite is one a tool returned in this conversation, named as it appeared
-        there, and written into the answer itself — its title or URL. A numbered marker
-        like [1] with no list of what it stands for names nothing. Never make up a value,
+        there, and written into the answer itself — its title or URL. A bare footnote
+        number with no list of what it stands for names nothing. Never make up a value,
         a file's contents, or a tool's result. Never describe an action as done — a file
         written, a command run, a commit, a branch, a push — unless a tool result in this
         conversation shows it happened. When none of your tools can do what is asked, say

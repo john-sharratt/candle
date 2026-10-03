@@ -120,6 +120,42 @@ pub fn try_migrate_flight() -> Option<MigrateFlight> {
     })
 }
 
+/// A shared hold on chunk locations taken to **free** device chunks off the thread
+/// that compacts — see [`try_hold_chunk_locations`].
+#[must_use = "the hold lifts on drop; bind it for the free's scope"]
+pub struct LocationHold {
+    _locations: RwLockReadGuard<'static, ()>,
+}
+
+/// Hold chunk locations still while dropping device chunks on a thread other than
+/// the one that compacts, or `None` while a compaction holds — or is waiting for —
+/// them.
+///
+/// **Freeing a chunk under a pass breaks the pass as surely as moving one does.** A
+/// pass plans from an occupancy census, then claims, copies and sweeps. A slot freed
+/// on another thread inside that window leaves its planned copy named by no holder
+/// (counted as `unwitnessed`), and puts the slot back on the free list, where the
+/// pass's own claims are handed it as a destination it had planned to read — a move
+/// declined (`source_collisions`). Neither reads a wrong byte; both leave the pass
+/// unable to finish packing, and the frontier stays where it was. Measured on the
+/// Qwen3-30B engine probe through a mass retirement: 58,745 slots freed on the
+/// persistence and cold-writer threads inside one pass, 15,252 of its moves wasted,
+/// and the VRAM-efficiency gate failing on the samples that followed.
+///
+/// The same lock and the same rule as [`try_migrate_flight`] — shared, never waits,
+/// defers to a waiting pass — without the in-flight count, which is a statement
+/// about migrate work. A caller that is refused keeps the chunks and lets a later
+/// pass of its own drop them.
+pub fn try_hold_chunk_locations() -> Option<LocationHold> {
+    if COMPACTION_WAITING.load(Ordering::SeqCst) {
+        return None;
+    }
+    let locations = CHUNK_LOCATIONS.try_read().ok()?;
+    Some(LocationHold {
+        _locations: locations,
+    })
+}
+
 /// Exclusive hold on chunk locations for a compaction pass, or `None` while a
 /// migrate is acting on addresses it has already captured.
 ///
@@ -238,5 +274,28 @@ mod tests {
             try_migrate_flight().is_some(),
             "the pass stood down, so nothing is holding the migrate off"
         );
+
+        // ── A free holds locations the same way, and counts no migrate ───────
+        let hold = try_hold_chunk_locations().expect("nothing is compacting");
+        assert!(
+            !migrate_in_flight(),
+            "a free is not migrate work — the advisory count stays clear"
+        );
+        assert!(
+            try_freeze_chunk_locations().is_none(),
+            "a pass refuses while a free off its thread is in progress"
+        );
+        drop(hold);
+        assert!(
+            try_hold_chunk_locations().is_none(),
+            "and the refused pass is waited for: the next free defers to it"
+        );
+        let freeze = try_freeze_chunk_locations().expect("the gap the deferral opened");
+        assert!(
+            try_hold_chunk_locations().is_none(),
+            "no free off the compacting thread while a pass holds the locations"
+        );
+        drop(freeze);
+        assert!(try_hold_chunk_locations().is_some(), "the pass ended");
     }
 }

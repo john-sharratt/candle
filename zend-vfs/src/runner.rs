@@ -20,8 +20,9 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::classify::classify;
 use crate::error::GitError;
@@ -302,34 +303,32 @@ impl Invocation {
             buf
         });
 
-        let deadline = Instant::now() + self.timeout;
-        let mut pause = Duration::from_millis(1);
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break Some(status);
-            }
-            if Instant::now() >= deadline {
-                break None;
-            }
-            thread::sleep(pause);
-            pause = (pause * 2).min(Duration::from_millis(20));
-        };
+        // Blocked on the child's exit rather than polled for it: most git
+        // invocations take tens of milliseconds, and a poll that backs off
+        // notices each one late — across the hundreds of calls one operation
+        // makes, that wait was most of its time.
+        let (exited, exit) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let status = child.wait();
+            let _ = exited.send(());
+            status
+        });
+        let timed_out = exit.recv_timeout(self.timeout).is_err();
         // Whatever the child left behind — a finished hook's shell, an `ssh`
-        // still holding the pipes — goes with it, so the readers see EOF.
+        // still holding the pipes — goes with it, so the readers see EOF. On a
+        // timeout this kills the child itself, which ends the waiter's `wait`.
         tree.kill();
-        let status = match status {
-            Some(status) => status,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = out_reader.join();
-                let _ = err_reader.join();
-                return Err(GitError::Timeout {
-                    args,
-                    after: self.timeout,
-                });
-            }
-        };
+        let status = waiter
+            .join()
+            .map_err(|_| GitError::Io(std::io::Error::other("the git waiter thread panicked")))??;
+        if timed_out {
+            let _ = out_reader.join();
+            let _ = err_reader.join();
+            return Err(GitError::Timeout {
+                args,
+                after: self.timeout,
+            });
+        }
         if let Some(w) = writer {
             let _ = w.join();
         }
@@ -368,6 +367,7 @@ pub(crate) fn utf8(command: &'static str, bytes: Vec<u8>) -> Result<String, GitE
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::time::Instant;
 
     use super::*;
     use crate::testing::TestRepo;

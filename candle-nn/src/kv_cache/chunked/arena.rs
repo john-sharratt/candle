@@ -9,8 +9,6 @@
 
 use crate::kv_cache::{arena_table::ArenaLocation, KvFormat, QuantFormat};
 use ahash::AHashMap;
-#[cfg(feature = "cuda")]
-use candle::quantized::LiveQTensor;
 // Root path, not the CUDA-gated `cuda_backend` re-export — see alloc.rs.
 #[cfg(feature = "cuda")]
 use candle::wave_provenance::LeaseOrigin;
@@ -563,8 +561,7 @@ impl Arena {
         // SAFETY: the bounds check above keeps the view inside slot
         // `chunk_idx`, and zero-on-recycle (invariant 4) means the bytes are
         // always a legal bit pattern. That the slab outlives the view is no
-        // longer an obligation here: `'a` ties it to this borrow of the arena,
-        // exactly as for `qslot_view`.
+        // longer an obligation here: `'a` ties it to this borrow of the arena.
         unsafe {
             LiveTensor::from_leased_cuda_ptr(
                 ptr,
@@ -702,81 +699,6 @@ impl Arena {
     #[cfg(not(feature = "cuda"))]
     fn extract_tensor_ptr(_t: &Tensor) -> Option<u64> {
         None
-    }
-
-    /// A `QTensor` **view** over slot `chunk_idx`, covering exactly the
-    /// `elems`-element band that lives there.
-    ///
-    /// The quantized twin of [`Self::slot_view`], and the way the block
-    /// quantize / dequantize kernels reach a slot now that the arena carries no
-    /// format. Like `slot_view` it is a lease: writes through it land in the
-    /// arena, and dropping it frees nothing.
-    ///
-    /// The view spans the band's **payload**, never the class stride — a
-    /// stride is not generally a whole number of blocks, and the bytes past the
-    /// payload belong to no chunk. That also makes every offset into the
-    /// returned tensor *slot-local*, which is what retires the arena-global
-    /// `chunk_idx * elems_per_chunk + ...` arithmetic invariant 8 is about.
-    ///
-    /// The returned view borrows the arena, so it cannot outlive the slab it
-    /// addresses: `LiveQTensor<'a>` is not `QTensor`, and the difference is
-    /// what the borrow checker enforces here in place of a comment.
-    #[cfg(feature = "cuda")]
-    pub(super) fn qslot_view<'a>(
-        &'a self,
-        chunk_idx: usize,
-        format: QuantFormat,
-        elems: usize,
-    ) -> Result<LiveQTensor<'a>> {
-        let ggml = format.to_ggml_dtype();
-        let payload = (elems / ggml.block_size()) * ggml.type_size();
-        let off = self.slot_offset(chunk_idx, payload)?;
-        let base = self.base_ptr().ok_or_else(|| {
-            candle::Error::Msg("qslot_view: arena is not GPU-resident".to_string())
-        })?;
-        let candle::Device::Cuda(dev) = self.data.device() else {
-            candle::bail!("qslot_view: arena slab is not on a CUDA device");
-        };
-        // SAFETY: the bounds check in `slot_offset` keeps the view inside slot
-        // `chunk_idx`, and zero-on-recycle (invariant 4) means the bytes are
-        // always a legal bit pattern for the format. That the slab is still
-        // live is no longer an obligation here: `'a` ties the view to this
-        // borrow of the arena.
-        unsafe {
-            LiveQTensor::from_leased_cuda_ptr(
-                base + off as u64,
-                ggml,
-                elems,
-                dev,
-                LeaseOrigin::Foreign,
-            )
-        }
-    }
-
-    /// Quantize `src` into slot `chunk_idx`, `elem_offset` elements in.
-    ///
-    /// CUDA-only, and deliberately so: the block quantize kernels are, and the
-    /// only quantized *writer* chunks are GPU-resident (on CPU
-    /// `active_kv_formats` keeps the writer float precisely so partial-token
-    /// appends need no block-aligned quantization).
-    pub(super) fn quantize_into_slot(
-        &mut self,
-        chunk_idx: usize,
-        format: QuantFormat,
-        elems: usize,
-        elem_offset: usize,
-        src: &candle::LiveTensor<'_>,
-    ) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        {
-            let mut view = self.qslot_view(chunk_idx, format, elems)?;
-            view.quantize_into(src, elem_offset)
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = (chunk_idx, format, elems, elem_offset, src);
-            candle::bail!("quantized chunk writes require the cuda feature")
-        }
     }
 
     /// Get the [`ArenaKey`] for this arena.

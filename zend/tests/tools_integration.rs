@@ -65,7 +65,8 @@ mod tool_scenarios {
     use futures::StreamExt;
 
     use crate::common::{needs_compaction, production_workspace, run_conv_id, served};
-    use candle::vram::host_pinned_bytes;
+    use candle::quantized::pinned_staging::recycled_stats;
+    use candle::vram::{host_pinned_breakdown, host_pinned_bytes};
     use candle_conversation::models::Model;
     use candle_conversation::projection::{SectionLoads, SystemItem};
     use candle_conversation::{SamplingConfig, SelectionState};
@@ -361,9 +362,13 @@ mod tool_scenarios {
             .unwrap_or_else(|e| e.into_inner());
         if let Some(before) = *previous {
             assert_eq!(
-                now, before,
+                now,
+                before,
                 "a shut-down session left pinned host memory behind: {before} bytes after \
-                 the previous scenario, {now} after this one"
+                 the previous scenario, {now} after this one — by consumer now: {:?}, \
+                 idle in the staging recycler (buffers, bytes): {:?}",
+                host_pinned_breakdown(),
+                recycled_stats()
             );
         }
         *previous = Some(now);

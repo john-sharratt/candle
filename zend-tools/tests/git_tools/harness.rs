@@ -11,8 +11,10 @@
 //! fixture can never be shaped by the bug it is hunting. The identity and
 //! dates are fixed, so commit ids are reproducible.
 
+use std::io::Write;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -27,31 +29,59 @@ pub struct GitWorkspace {
     pub dir: TempDir,
 }
 
-/// Run git in `dir` for setup, returning stdout; panics on failure.
-pub fn git_in(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
+/// The fixed date every setup commit carries.
+const SETUP_DATE: &str = "1700000000 +0000";
+
+/// git in `dir` with the setup identity, dates and configuration.
+fn setup_git(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(["-c", "core.hooksPath=", "-c", "commit.gpgSign=false"])
         .args(args)
         .env("LC_ALL", "C")
         .env("GIT_AUTHOR_NAME", "Setup")
         .env("GIT_AUTHOR_EMAIL", "setup@example.com")
-        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+        .env("GIT_AUTHOR_DATE", SETUP_DATE)
         .env("GIT_COMMITTER_NAME", "Setup")
         .env("GIT_COMMITTER_EMAIL", "setup@example.com")
-        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+        .env("GIT_COMMITTER_DATE", SETUP_DATE)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .expect("git runs");
+        .env_remove("GIT_INDEX_FILE");
+    cmd
+}
+
+/// stdout of a finished setup command; panics on failure.
+fn setup_output(args: &[&str], out: std::process::Output) -> String {
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).expect("utf-8")
+}
+
+/// Run git in `dir` for setup, returning stdout; panics on failure.
+pub fn git_in(dir: &Path, args: &[&str]) -> String {
+    setup_output(args, setup_git(dir, args).output().expect("git runs"))
+}
+
+/// [`git_in`], with `input` on git's stdin.
+fn git_in_fed(dir: &Path, args: &[&str], input: &[u8]) -> String {
+    let mut child = setup_git(dir, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("git runs");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input)
+        .expect("git reads its input");
+    setup_output(args, child.wait_with_output().expect("git finishes"))
 }
 
 impl GitWorkspace {
@@ -101,6 +131,39 @@ impl GitWorkspace {
         self.git(&["add", "-A"]);
         self.git(&["commit", "-q", "--allow-empty", "-m", message]);
         self.oid("HEAD")
+    }
+
+    /// One commit per step on `main`, each writing the step number to `path`
+    /// with the message `step N` — what [`Self::write_worktree`] plus
+    /// [`Self::commit_all`] per step would make, from one `git fast-import`
+    /// rather than three processes a step. The working tree and index follow
+    /// `main` to the last step. Returns the last commit's id.
+    pub fn commit_steps(&self, path: &str, steps: RangeInclusive<usize>) -> String {
+        let mut stream = String::new();
+        let mut first = true;
+        for n in steps {
+            let message = format!("step {n}");
+            let content = format!("{n}\n");
+            stream.push_str("commit refs/heads/main\n");
+            stream.push_str(&format!("author Setup <setup@example.com> {SETUP_DATE}\n"));
+            stream.push_str(&format!(
+                "committer Setup <setup@example.com> {SETUP_DATE}\n"
+            ));
+            stream.push_str(&format!("data {}\n{message}\n", message.len()));
+            if first {
+                stream.push_str(&format!("from {}\n", self.oid("main")));
+                first = false;
+            }
+            stream.push_str(&format!("M 100644 inline {path}\n"));
+            stream.push_str(&format!("data {}\n{content}\n", content.len()));
+        }
+        git_in_fed(
+            &self.repo_dir(),
+            &["fast-import", "--quiet"],
+            stream.as_bytes(),
+        );
+        self.git(&["reset", "-q", "--hard", "main"]);
+        self.oid("main")
     }
 
     /// The full object id `rev` resolves to.

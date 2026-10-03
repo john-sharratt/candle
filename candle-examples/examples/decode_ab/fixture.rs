@@ -151,7 +151,7 @@ impl Fixture {
             cache.force_dtype(force_dt);
             cache.set_chunked_backing(&backing, slot, None)?;
             let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
-            let (q, k, v) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?;
+            let (q, k, v) = make_prefill_qkv(sc, sc.ctx_len, seed, qkv_dt, device)?;
             if sc.segments.is_empty() {
                 // The prefill writes into the slot's write region, which the
                 // scheduler allocates before the pass; the harness does the same.
@@ -409,7 +409,7 @@ pub fn golden_decode(sc: &Scenario, device: &Device) -> Result<Tensor> {
     let mut out = vec![0f32; sc.num_slots * nq * hd];
     for slot in 0..sc.num_slots {
         let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
-        let (_qp, kp, vp) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?; // (ctx, nkv, hd)
+        let (_qp, kp, vp) = make_prefill_qkv(sc, sc.ctx_len, seed, DType::F32, device)?; // (ctx, nkv, hd)
         let kpv = to_f16_vec(&kp)?;
         let vpv = to_f16_vec(&vp)?;
         let ctx = sc.ctx_len;
@@ -472,13 +472,16 @@ fn pseudo(i: usize, j: usize, k: usize, seed: u64) -> f32 {
     v * 0.5
 }
 
-/// Synthetic prefill Q/K/V, shape `(1, n_head, n_tokens, head_dim)` in F32 (the
-/// cache converts to its `force_dtype` on write). Q uses `n_q_head`, K/V use
+/// Synthetic prefill Q/K/V, token-major `(n_tokens, n_head, head_dim)` in
+/// `qkv_dt` — the fixture's compute dtype, which the prefill wrapper requires
+/// of its operands (the cache converts to its `force_dtype` on write); the
+/// golden asks for F32 and rounds it itself. Q uses `n_q_head`, K/V use
 /// `n_kv_head`.
 fn make_prefill_qkv(
     sc: &Scenario,
     n_tokens: usize,
     seed: u64,
+    qkv_dt: DType,
     device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let mut q = Vec::with_capacity(n_tokens * sc.n_q_head * sc.head_dim);
@@ -500,9 +503,9 @@ fn make_prefill_qkv(
     // Flat / ragged prefill layout: token-major (total_q, n_head, head_dim).
     // The vec was filled token-major (t, h, d), so it maps directly with no
     // transpose. `paged_prefill_batched` takes total_q = sum(q_lens) rows.
-    let q = Tensor::from_vec(q, (n_tokens, sc.n_q_head, sc.head_dim), device)?;
-    let k = Tensor::from_vec(k, (n_tokens, sc.n_kv_head, sc.head_dim), device)?;
-    let v = Tensor::from_vec(v, (n_tokens, sc.n_kv_head, sc.head_dim), device)?;
+    let q = Tensor::from_vec(q, (n_tokens, sc.n_q_head, sc.head_dim), device)?.to_dtype(qkv_dt)?;
+    let k = Tensor::from_vec(k, (n_tokens, sc.n_kv_head, sc.head_dim), device)?.to_dtype(qkv_dt)?;
+    let v = Tensor::from_vec(v, (n_tokens, sc.n_kv_head, sc.head_dim), device)?.to_dtype(qkv_dt)?;
     Ok((q, k, v))
 }
 

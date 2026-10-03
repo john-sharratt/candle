@@ -2248,7 +2248,6 @@ int8_decode_tile_kernel(
     __syncthreads();
 
     const int ns = warp & 3;        // QK n-slice (tokens ns*8 .. ns*8+7) on the softmax warps
-    NextTile nx;
     uint32_t mw = 0u;               // this thread's map word of the tile being decoded
 
     // Per-warp output state: every warp accumulates its own PV_H output
@@ -2284,12 +2283,13 @@ int8_decode_tile_kernel(
 
         // -------------------- STAGE --------------------
         // The next tile's loads go out first; this tile's tables are built
-        // from its map word — tile 0's from the prologue's staging, later tiles'
-        // the word this thread loaded a tile ahead — only for a group whose
-        // word differs from the previous tile's (warp-uniform vote; a
-        // chunk's tile 0 always builds).
+        // from its map word — this thread's own word of s_map, left there by
+        // the prologue's staging for tile 0 and by the previous tile's commit
+        // for every later one — only for a group whose word differs from the
+        // previous tile's (warp-uniform vote; a chunk's tile 0 always builds).
+        NextTile nx;
         {
-            const uint32_t mw_cur = (t == 0) ? s_map[warp][mw_side][mw_word] : nx.map;
+            const uint32_t mw_cur = s_map[warp][mw_side][mw_word];
             stage_issue(t + 1, nx, true);
             if (t == 0 || __any_sync(0xffffffffu, mw_cur != mw)) build_tables(warp, mw_cur);
             mw = mw_cur;
@@ -2323,6 +2323,26 @@ int8_decode_tile_kernel(
         // V side and warp 0's second K round key on it, so an eight-quad
         // tile runs code with no trace of the slot.
         const bool has8 = grp_mask(tg.desc[TILE_GROUPS]) != 0u;
+
+        // The next tile's staging, committed: its descriptors to the other
+        // buffer and its map word to this thread's s_map word — nothing reads
+        // either until the next tile's first barrier publishes them, and
+        // every warp is past this tile's — and its spans warmed in L2 while
+        // this tile decodes. The loads went out at the tile's top and the
+        // table build has run under them. Committed here rather than after
+        // the K decode, nothing of the staged tile rides through the decode:
+        // a `NextTile` is nine words a thread, which the decode's register
+        // peak spilled to local memory and reloaded every tile. What the tile
+        // still needs of it is one word each — the next tile's K staging
+        // decision and its quad count. The prefetch and the commit run on the
+        // stager lanes alone, in loops of per-lane length; the warp
+        // reconverges before the decode's warp-wide votes.
+        stage_prefetch(nx);
+        stage_commit(nxt, nx);
+        s_map[warp][mw_side][mw_word] = nx.map;
+        __syncwarp();
+        const int k_stg_next = (t + 1 < n_tiles) ? stage_k_ahead(nx) : 0;
+        const int ngroups_next = __shfl_sync(0xffffffffu, nx.ngroups, 0);
 
         // K lower-half staging: on a single-pass tile whose group's K is a
         // narrow dtype under a band map (`k_stg_esz`, decided a tile ahead
@@ -2460,29 +2480,20 @@ int8_decode_tile_kernel(
         if (warp >= TILE_SM_WARPS)
             asm volatile("bar.arrive %0, %1;" :: "n"(TILE_K_BARRIER), "n"(TILE_THREADS) : "memory");
 
-        // The next tile's descriptors have landed by now: warm L2 for its
-        // spans while this tile's V decodes and computes, and hand them to
-        // the other descriptor buffer — nothing reads it until the next
-        // tile's first barrier publishes it, and every warp is past this
-        // tile's, so the staged words stop being live here rather than
-        // riding through the V decode and the softmax.
-        stage_prefetch(nx);
-        stage_commit(nxt, nx);
-        // Reconverge before the split. The prefetch and the commit run on
-        // the stager lanes alone, in loops of per-lane length, and the
-        // other lanes are free to run ahead without them: a warp that
-        // arrives here diverged stays diverged through the whole V side,
-        // which has no full-warp barrier before the tile's last one, and
-        // issues every V instruction once per fragment (measured: 16
-        // active lanes per V-side instruction, the phase at twice its
-        // instruction count, every shuffle through the collective slow
-        // path). The softmax warps reconverge at their K barrier below.
+        // Reconverge before the split: a warp that arrives here diverged
+        // stays diverged through the whole V side, which has no full-warp
+        // barrier before the tile's last one, and issues every V instruction
+        // once per fragment (measured: 16 active lanes per V-side
+        // instruction, the phase at twice its instruction count, every
+        // shuffle through the collective slow path). The softmax warps
+        // reconverge at their K barrier below.
         __syncwarp();
-        // Decide the next tile's K staging from its descriptors, in registers.
-        k_stg_esz = (t + 1 < n_tiles) ? stage_k_ahead(nx) : 0;
-        // The next tile's ninth quad, if it has one, into the buffer this
-        // commit just filled (tid 0 holds the next tile's quad count).
-        if (warp == 0) stage_slot8(t + 1, nxt, __shfl_sync(0xffffffffu, nx.ngroups, 0), true);
+        // The next tile's K staging, decided at the commit; this tile's own
+        // was read by its K staging above.
+        k_stg_esz = k_stg_next;
+        // The next tile's ninth quad, if it has one, into the buffer the
+        // commit filled (tid 0 held the next tile's quad count).
+        if (warp == 0) stage_slot8(t + 1, nxt, ngroups_next, true);
 
         // The tile's middle splits the block two ways: warps 0..3 run QK
         // and the softmax, warps 4..7 read and quantise V at the same

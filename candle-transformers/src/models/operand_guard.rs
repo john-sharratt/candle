@@ -99,6 +99,31 @@ pub fn expect_dense_dtype(t: &Tensor, want: DType, what: &str) -> Result<()> {
     expect_dense(t, what)
 }
 
+/// Require `t` to be densely packed, at any start offset — for a launch path
+/// that addresses the operand from its own first element (base pointer plus
+/// `start_offset`), so a dense row range of a wider buffer is read in place.
+///
+/// Only a wrapper that forwards the offset may use this; one that takes the
+/// storage base pointer must keep [`expect_dense`].
+pub fn expect_dense_view(t: &Tensor, what: &str) -> Result<()> {
+    if !t.is_contiguous() {
+        candle::bail!(
+            "{what}: kernel operand has layout {:?} stride {:?}, which is not dense — the \
+             wrapper validates operands rather than copying them (hot-path invariant 2); \
+             give the kernel a stride argument or produce the layout directly",
+            t.dims(),
+            t.stride()
+        );
+    }
+    Ok(())
+}
+
+/// [`expect_dtype`] and [`expect_dense_view`].
+pub fn expect_dense_view_dtype(t: &Tensor, want: DType, what: &str) -> Result<()> {
+    expect_dtype(t, want, what)?;
+    expect_dense_view(t, what)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +182,18 @@ mod tests {
         // Offset zero is the accepted case, narrowed or not.
         expect_dense(&stream.narrow(1, 0, 3)?, "probe")?;
         expect_dense(&stream, "probe")?;
+        Ok(())
+    }
+
+    /// The view form accepts the offset window — its wrapper forwards the
+    /// offset — and still refuses a layout that is not dense.
+    #[test]
+    fn the_view_check_accepts_an_offset_window_but_not_a_transpose() -> Result<()> {
+        let stream = Tensor::zeros((1, 6, 2, 4), DType::F32, &Device::Cpu)?;
+        expect_dense_view_dtype(&stream.narrow(1, 2, 3)?, DType::F32, "probe")?;
+        let t = Tensor::zeros((4, 8), DType::F32, &Device::Cpu)?.t()?;
+        assert!(expect_dense_view(&t, "probe").is_err());
+        assert!(expect_dense_view_dtype(&stream, DType::BF16, "probe").is_err());
         Ok(())
     }
 }

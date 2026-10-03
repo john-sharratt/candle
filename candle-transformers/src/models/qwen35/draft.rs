@@ -63,6 +63,7 @@ use crate::models::batched_layer::{
 };
 use crate::models::delta_net::SeqSpan;
 use crate::models::kv_cache_utils::SequenceContext;
+use crate::models::lazy_rope::LazyRope;
 use crate::models::lora::LayerLora;
 use crate::models::operand_guard::expect_dtype;
 use crate::models::prefill_utils::SharedPm;
@@ -395,13 +396,14 @@ pub fn draft_cohort(
                     generation: &Generation|
      -> Result<(Tensor, Tensor)> {
         let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-        let (cos, sin) = model
-            .rotary()
-            .rope_cos_sin(&pos, theta, rope_dtype, dev, None)?;
+        let model_rope = LazyRope::new(|| {
+            model
+                .rotary()
+                .rope_cos_sin(&pos, theta, rope_dtype, dev, None)
+        });
         let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
         let params = BatchedAttentionParams::new(
-            &cos,
-            &sin,
+            &model_rope,
             false,
             model.rope(),
             DecodeHeaders::Decode {

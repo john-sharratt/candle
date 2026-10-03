@@ -24,6 +24,7 @@ use crate::models::batched_inference::{
     MAX_PREFILL_TOKENS,
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
+use crate::models::head_rows::select_head_rows;
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_driver::{drive_wave, WaveGroups, WaveSweep};
@@ -1942,27 +1943,29 @@ impl BatchedEngine {
                 h.device(),
             )?)
         };
-        // Wave-invariant prefill query positions (`base..base+s_len` per prefill seq):
-        // hoisted for the same reason — each is rebuilt in every layer otherwise.
-        let prefill_q_pos: Vec<Tensor> = prefill_seqs
-            .iter()
-            .enumerate()
-            .map(|(pi, _)| {
-                let s_len = prefill_lens[pi];
-                let base = prefill_base[pi];
-                Tensor::from_vec(
-                    (base as u32..(base + s_len) as u32).collect::<Vec<u32>>(),
-                    s_len,
-                    h.device(),
-                )
-            })
-            .collect::<Result<_>>()?;
-        // The MoE token-id list is identical across layers; assemble it once.
+        // Wave-invariant prefill query positions (`base..base+s_len` per prefill
+        // seq, packed in prefill order): hoisted for the same reason, and built
+        // as ONE upload — every layer's prefill launch reads this same buffer.
+        let prefill_q_pos: Option<Tensor> = if prefill_seqs.is_empty() {
+            None
+        } else {
+            let pos: Vec<u32> = prefill_base
+                .iter()
+                .zip(&prefill_lens)
+                .flat_map(|(&base, &s_len)| base as u32..(base + s_len) as u32)
+                .collect();
+            let n = pos.len();
+            Some(Tensor::from_vec(pos, n, h.device())?)
+        };
+        // The MoE token-id list is identical across layers; assemble and upload
+        // it once, so every layer's router reads the same device buffer.
         let flat_ids: Vec<u32> = decode_ids
             .iter()
             .copied()
             .chain(prefill_ids.iter().chain(&glue_ids).flatten().copied())
             .collect();
+        let n_ids = flat_ids.len();
+        let flat_ids = Tensor::from_vec(flat_ids, n_ids, h.device())?;
 
         // DSpark target-feature capture (paper Eq. 2): when a drafter is attached and this wave runs
         // through the head (full stack), stash `head_reduce(h)` after each real target layer — the
@@ -2839,11 +2842,13 @@ impl BatchedEngine {
                 // device allocation plus a pageable upload each.
                 let seq_of = desc::stage_slice(&seq_of_host, generation)?;
                 let new_meta = desc::stage_slice(&new_meta_host, generation)?;
-                let q_pos_all = Tensor::cat(&prefill_q_pos.iter().collect::<Vec<_>>(), 0)?;
+                let q_pos_all = prefill_q_pos
+                    .as_ref()
+                    .expect("built whenever the wave carries a prefill sequence");
                 let out = super::paged::paged_latent_prefill_raw(
                     &projref.q_bf,
                     hdr_of(l, decode_seqs.len()),
-                    &q_pos_all,
+                    q_pos_all,
                     seq_of.ptr(),
                     &projref.kv_bf,
                     new_meta.ptr(),
@@ -2995,13 +3000,13 @@ impl BatchedEngine {
 
         // Head: decode rows + each prefill sequence's LAST row.
         let s_head = span("deepseek:head_lm");
-        let reduced = hc.head_reduce(&h, e.hc_head())?; // [1, rows, dim]
-        let normed = rms_norm(&reduced, e.output_norm(), cfg.norm_eps)?;
         // Rows to score: every decode row (the [0,n_dec) prefix) + each prefill
-        // sequence's LAST row. Gather them into one [1, R, dim] block and run
-        // lm_head in a SINGLE batched GEMM (was R per-row GEMV launches);
-        // bit-identical since each row's logits are independent.
-        let hdev = normed.device().clone();
+        // sequence's LAST row, selected from the residual stream BEFORE the
+        // head's reduce and norm — both are row-wise, so reducing only the
+        // scored rows is the same per-row arithmetic, and a prefill wave scores
+        // a handful of its rows. The selection is one [1, R, …] block, so
+        // lm_head runs as a SINGLE batched GEMM.
+        //
         // Every decode row gets a logits row — on a verify wave that is every
         // block position (the per-position next-token prediction the
         // speculative driver verifies), one row per position of each block.
@@ -3032,27 +3037,30 @@ impl BatchedEngine {
             cursor += s_len;
         }
         let r_total = sel_rows.len();
-        let idx = Tensor::from_vec(sel_rows, r_total, &hdev)?;
-        let scored_hidden = normed.index_select(&idx, 1)?; // [1, R, dim]
+        let scored_h = select_head_rows(&h, sel_rows.clone(), 1)?; // [1, R, hc, dim]
+        let reduced = hc.head_reduce(&scored_h, e.hc_head())?; // [1, R, dim]
+        let scored_hidden = rms_norm(&reduced, e.output_norm(), cfg.norm_eps)?;
         let logits_all = e.lm_head().forward(&scored_hidden)?; // [1,R,vocab]
-                                                               // Stash each scored row's target-layer feature — the drafter's conditioning source (`fc`
-                                                               // input, paper `Hctx = RMSNorm(Wc·[H^{l₁};…;H^{lₘ}])`), read by `speculative_draft` next
-                                                               // step. The per-layer captures (ordered by `target_layers`) are scored-row-selected and
-                                                               // concatenated along the feature axis → one `[m·dim]` vector per row, keyed by its absolute
-                                                               // position so the next draft picks the feature at `q_start-1`. Drafter only.
+
+        // Stash each scored row's target-layer feature — the drafter's
+        // conditioning source (`fc` input, paper `Hctx = RMSNorm(Wc·[H^{l₁};…;H^{lₘ}])`),
+        // read by `speculative_draft` next step. The per-layer captures (ordered
+        // by `target_layers`) are scored-row-selected and concatenated along the
+        // feature axis → one `[m·dim]` vector per row, keyed by its absolute
+        // position so the next draft picks the feature at `q_start-1`. Drafter only.
         if capture_targets {
             let per_layer: Vec<Tensor> = self
                 .target_layers
                 .iter()
                 .map(|&tl| -> Result<Tensor> {
-                    target_reduced
-                        .iter()
-                        .find(|(l, _)| *l == tl)
-                        .ok_or_else(|| {
-                            candle::Error::msg(format!("target layer {tl} not captured"))
-                        })?
-                        .1
-                        .index_select(&idx, 1) // [1, R, dim]
+                    let captured =
+                        target_reduced
+                            .iter()
+                            .find(|(l, _)| *l == tl)
+                            .ok_or_else(|| {
+                                candle::Error::msg(format!("target layer {tl} not captured"))
+                            })?;
+                    select_head_rows(&captured.1, sel_rows.clone(), 1) // [1, R, dim]
                 })
                 .collect::<Result<_>>()?;
             let feats = Tensor::cat(&per_layer, 2)?; // [1, R, m·dim]

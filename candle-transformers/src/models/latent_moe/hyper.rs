@@ -360,7 +360,7 @@ impl candle::CustomOp1 for SinkhornOp {
 #[cfg(feature = "cuda")]
 mod cuda_fused {
     use super::HyperParams;
-    use crate::models::operand_guard::expect_dense_dtype;
+    use crate::models::operand_guard::{expect_dense_dtype, expect_dense_view_dtype};
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::{DType, Device, Result, Storage, Tensor};
     use candle_kernels::simple::hyper_mhc::{
@@ -370,13 +370,18 @@ mod cuda_fused {
     /// Device pointer of a contiguous f32 CUDA tensor (extracted inline so the
     /// storage-guard and pointer-guard both live to the launch — matching the
     /// `gallery::sign_pack` pattern). `$p` binds the `u64` device address.
+    // The operand's own first element: the storage base advanced by the view's
+    // start offset, so a dense row range of a wider buffer is addressed where
+    // it starts rather than at the buffer's row 0.
     macro_rules! cuda_f32_ptr {
         ($t:expr, $stream:expr, $s:ident, $p:ident, $g:ident) => {
-            let ($s, _) = $t.storage_and_layout();
-            let ($p, $g) = match &*$s {
-                Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.device_ptr($stream),
+            let ($s, layout) = $t.storage_and_layout();
+            let off = layout.start_offset();
+            let view = match &*$s {
+                Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.slice(off..),
                 _ => candle::bail!("mhc fused kernels require CUDA f32 storage"),
             };
+            let ($p, $g) = view.device_ptr($stream);
         };
     }
 
@@ -486,7 +491,10 @@ mod cuda_fused {
         // Validated, not rewritten (invariants 1 and 2) — same reasoning as
         // `pre_gates`: every one of these is already dense F32 on the engine
         // path, so a conversion here would only have hidden a changed producer.
-        expect_dense_dtype(xf, DType::F32, "mhc head_reduce: xf")?;
+        // A row range of the residual stream — the head scores a subset of the
+        // wave's rows — so the operand may start past its storage base; the
+        // pointer macro forwards that offset.
+        expect_dense_view_dtype(xf, DType::F32, "mhc head_reduce: xf")?;
         expect_dense_dtype(mixes_raw, DType::F32, "mhc head_reduce: mixes_raw")?;
         expect_dense_dtype(&p.base, DType::F32, "mhc head_reduce: base")?;
         expect_dense_dtype(&p.scale, DType::F32, "mhc head_reduce: scale")?;

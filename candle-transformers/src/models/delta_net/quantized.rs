@@ -27,8 +27,8 @@ use crate::models::quantized_matmul::QMatMul;
 use crate::models::stacked_proj::project_grouped;
 
 use super::mix::{
-    delta_net_mix_spans, DeltaNetConstants, DeltaNetLayerTable, DeltaNetProjections, DeltaNetSeq,
-    DeltaNetState,
+    capture_spans, delta_net_mix_spans, DeltaNetConstants, DeltaNetLayerTable, DeltaNetProjections,
+    DeltaNetSeq, DeltaNetState, StashCapture,
 };
 use super::types::{DeltaNetDims, ZGate};
 
@@ -205,12 +205,22 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     };
     g_proj.end();
     // A span that will have to rewind keeps this layer's operands, copied out
-    // of the wave arena that is reclaimed at the end of the forward. The
-    // destination is already allocated — see `DeltaNetSeq::stash`.
-    for s in seqs.iter() {
-        if let Some(slot) = s.stash.as_ref() {
-            slot.ops.capture(&p, s.start, slot.row, s.len)?;
-        }
+    // of the wave arena that is reclaimed at the end of the forward — every
+    // such span in one batched capture. The destination is already allocated —
+    // see `DeltaNetSeq::stash`.
+    let captures: Vec<StashCapture<'_>> = seqs
+        .iter()
+        .filter_map(|s| {
+            s.stash.as_ref().map(|slot| StashCapture {
+                ops: slot.ops,
+                start: s.start,
+                dst_row: slot.row,
+                len: s.len,
+            })
+        })
+        .collect();
+    if !captures.is_empty() {
+        capture_spans(&p, &captures)?;
     }
     let c = DeltaNetConstants {
         dt_bias: &w.dt_bias,

@@ -38,7 +38,7 @@ use super::types::{
     PipelineMessage, PipelineStats,
 };
 #[cfg(feature = "cuda")]
-use super::warm_tier::{page_lock_ceiling, WarmTier};
+use super::warm_tier::WarmTier;
 use super::zone_geometry::ZoneGeometry;
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
 
@@ -846,13 +846,9 @@ impl ExpertCache {
                     pinned,
                     WARM_DRAW_SEED,
                 );
-                // Pinned up to the page-lock ceiling, pageable for the rest —
-                // see `warm_tier` for why the driver needs the margin.
-                let pinned_cap_slots = candle::vram::total_physical_ram().map_or(0, |total| {
-                    (page_lock_ceiling(total, candle::vram::host_pinned_bytes()) / stride as u64)
-                        as usize
-                });
-                let mut warm = WarmTier::new(membership.len(), pinned_cap_slots, stride);
+                // Pinned as far as the driver grants while keeping its margin,
+                // pageable for the rest — see `warm_tier`.
+                let mut warm = WarmTier::new(membership.len(), stride);
                 // A refusal shortens the draw rather than leaving slots the tier
                 // does not have: `ram` must never name a slot outside it.
                 let membership = &membership[..membership.len().min(warm.num_slots())];

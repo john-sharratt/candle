@@ -1531,15 +1531,21 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
     if (slot_idx >= num_active_slots || kv_head_idx >= n_kv_head) return;
 
     constexpr int hpg = HPG;
+    constexpr unsigned FULL_MASK = 0xffffffffu;
 
     float out_reg[HPG][VEC];
-    float m_i[HPG], l_i[HPG];
     #pragma unroll
     for (int h = 0; h < HPG; ++h) {
-        m_i[h] = -1e38f; l_i[h] = 0.f;
         #pragma unroll
         for (int j = 0; j < VEC; ++j) out_reg[h][j] = 0.f;
     }
+    // Each head's flash state (running max `m`, running sum `l`) is
+    // warp-uniform — every lane computes it from the same broadcast scores — so
+    // it is held once, by lane `h`, and read with a shuffle where it is used,
+    // instead of HPG copies in every lane. With the PV accumulators taking
+    // HPG·VEC registers this is what keeps the tile loop inside the 4-block
+    // register target without spilling. Same operations, same order.
+    float m_lane = -1e38f, l_lane = 0.f;
 
     // One partial per block per head: the warps' flash states merge through
     // shared memory at the end (`stripe_block_merge_emit`), so the combine
@@ -1548,6 +1554,12 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
     __shared__ alignas(128) float s_merge[WARPS_PER_BLOCK][HEAD_DIM];
     __shared__ float s_ml[WARPS_PER_BLOCK][2];
     auto emit_block = [&]() {
+        float m_i[HPG], l_i[HPG];
+        #pragma unroll
+        for (int h = 0; h < HPG; ++h) {
+            m_i[h] = __shfl_sync(FULL_MASK, m_lane, h);
+            l_i[h] = __shfl_sync(FULL_MASK, l_lane, h);
+        }
         stripe_block_merge_emit<HEAD_DIM, WARPS_PER_BLOCK, HPG, HPG>(
             out_reg, m_i, l_i, /*head_lo=*/0, s_merge, s_ml, partial_acc, partial_ml,
             slot_idx, kv_head_idx, split_idx, num_splits, n_q_head, warp, lane);
@@ -1725,8 +1737,12 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         int32_t rope_base = (int32_t)slice_rope(sl);
         int within_base = (int)off + tile_in_slice * 8;
 
-        int tok_within[8];
-        bool tok_valid[8];
+        // Token validity as one bitmask, and each token's position recomputed
+        // where it is read (`TOK_WITHIN`) — eight positions and eight flags held
+        // across the tile cost registers the PV accumulators need, and the
+        // QK^T write indexed the flag array by a lane-dependent token, which put
+        // it in local memory.
+        uint32_t tok_mask = 0;
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
             int within = within_base + t;
@@ -1736,11 +1752,12 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
             if (valid && qsa_on) {
                 valid = qsa_selects(sel, slot_idx, rope_base + (within - (int)off));
             }
-            // Pad lanes of the slice's last tile read a safe in-bounds slot and
-            // are discarded (tok_valid=false) below.
-            tok_within[t] = valid ? within : (int)off;
-            tok_valid[t] = valid;
+            if (valid) tok_mask |= 1u << t;
         }
+        // Pad lanes of the slice's last tile read a safe in-bounds slot and
+        // are discarded (their mask bit is clear) below.
+        #define TOK_VALID(t) (((tok_mask >> (t)) & 1u) != 0u)
+        #define TOK_WITHIN(t) (TOK_VALID(t) ? within_base + (t) : (int)off)
         // ── stage the 8 tokens' K → shared_kb, cp.async double-buffered so each
         // token's load overlaps the previous token's gather/RoPE/quant. The
         // prefetch is unconditional when slice_ok (all 8 tokens share the chunk,
@@ -1751,12 +1768,19 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                 uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
                 if (k_ptr_p) {
                     ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, kvhead_k_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                    ka.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, tok_within[0], lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
+                    ka.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, TOK_WITHIN(0), lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
                 }
             }
             cp_async_commit<true>();
         }
-        #pragma unroll
+        // A real loop over the 8 tokens, not unrolled: each iteration inlines
+        // the accessor's per-format load dispatch for 4 palettes, and unrolling
+        // pasted that 32 times here (and 32 more in the PV loop), stretching the
+        // tile state's live ranges across all of it — which is what spilled at
+        // the 64-register target. Every index below is runtime arithmetic
+        // already (`t & 1`, the mask shift), and the cp.async double buffer is
+        // what overlaps one token's load with the previous token's work.
+        #pragma unroll 1
         for (int t = 0; t < 8; ++t) {
             if (slice_ok) {
                 if (t + 1 < 8) {
@@ -1765,7 +1789,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                         uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
                         if (k_ptr_p) {
                             ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, kvhead_k_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                            ka.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[(t + 1) & 1][warp] + p * SUB_HEAD_DIM, 0, 0, tok_within[t + 1], lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
+                            ka.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[(t + 1) & 1][warp] + p * SUB_HEAD_DIM, 0, 0, TOK_WITHIN(t + 1), lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
                         }
                     }
                     cp_async_commit<true>();
@@ -1775,7 +1799,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                 }
             }
             __syncwarp();
-            if (!tok_valid[t]) {
+            if (!TOK_VALID(t)) {
                 #pragma unroll
                 for (int j = 0; j < VEC; ++j) shared_kb[warp][t][lane * VEC + j] = 0;
                 if (lane < N_PALETTE) scaleK[warp][t][lane] = 1.f;
@@ -1784,7 +1808,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
             float k_regs[VEC];
             #pragma unroll
             for (int j = 0; j < VEC; ++j) k_regs[j] = to_f32<T>(skt[t & 1][warp][ki[j]]);
-            int32_t rope_pos = rope_base + (tok_within[t] - (int)off);
+            int32_t rope_pos = rope_base + (TOK_WITHIN(t) - (int)off);
             if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
                 apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope);
             else
@@ -1827,13 +1851,14 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
             }
         }
         if (my_m < hpg) {
-            scores_smem[warp][my_m][tok0] = tok_valid[tok0] ? acc_lo : -1e38f;
-            scores_smem[warp][my_m][tok1] = tok_valid[tok1] ? acc_hi : -1e38f;
+            scores_smem[warp][my_m][tok0] = TOK_VALID(tok0) ? acc_lo : -1e38f;
+            scores_smem[warp][my_m][tok1] = TOK_VALID(tok1) ? acc_hi : -1e38f;
         }
         __syncwarp();
 
-        // ── softmax pass 1: per head, running-max + accumulator rescale ──
-        float new_m[HPG];
+        // ── softmax pass 1: per head, running-max + accumulator rescale. The
+        // head's new max is installed in its owning lane here; pass 2 reads it
+        // from there. ──
         #pragma unroll
         for (int h = 0; h < HPG; ++h) {
             float tile_max = -1e38f;
@@ -1842,12 +1867,16 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                 float s = scores_smem[warp][h][t];
                 tile_max = fmaxf(tile_max, (s > -1e37f) ? s * softmax_scale : -1e38f);
             }
-            float nm = fmaxf(m_i[h], tile_max);
-            float alpha = fast_exp::exp2<float, fast_exp::Softmax>(make_float2(m_i[h] - nm, 0.f)).x;
-            l_i[h] *= alpha;
+            const float mh = __shfl_sync(FULL_MASK, m_lane, h);
+            float nm = fmaxf(mh, tile_max);
+            float alpha = fast_exp::exp2<float, fast_exp::Softmax>(make_float2(mh - nm, 0.f)).x;
+            // A select, not a lane-gated branch: the warp never diverges, so
+            // nothing after this is issued per sub-group.
+            const bool own = (lane == h);
+            l_lane = own ? l_lane * alpha : l_lane;
+            m_lane = own ? nm : m_lane;
             #pragma unroll
             for (int j = 0; j < VEC; ++j) out_reg[h][j] *= alpha;
-            new_m[h] = nm;
         }
 
         // ── PV pass 2: load each token's V once (cp.async double-buffered into
@@ -1861,12 +1890,13 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                 uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
                 if (v_ptr_p) {
                     ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, kvhead_v_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                    va.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, tok_within[0], lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
+                    va.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, TOK_WITHIN(0), lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
                 }
             }
             cp_async_commit<true>();
         }
-        #pragma unroll
+        // A real loop for the same reason as the K stage above.
+        #pragma unroll 1
         for (int t = 0; t < 8; ++t) {
             if (slice_ok) {
                 if (t + 1 < 8) {
@@ -1875,7 +1905,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                         uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
                         if (v_ptr_p) {
                             ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, kvhead_v_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                            va.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[(t + 1) & 1][warp] + p * SUB_HEAD_DIM, 0, 0, tok_within[t + 1], lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
+                            va.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[(t + 1) & 1][warp] + p * SUB_HEAD_DIM, 0, 0, TOK_WITHIN(t + 1), lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
                         }
                     }
                     cp_async_commit<true>();
@@ -1885,23 +1915,26 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                 }
             }
             __syncwarp();
-            if (!tok_valid[t]) continue;
+            if (!TOK_VALID(t)) continue;
             float v_regs[VEC];
             #pragma unroll
             for (int j = 0; j < VEC; ++j) v_regs[j] = to_f32<T>(skt[t & 1][warp][vi[j]]);
             #pragma unroll
             for (int h = 0; h < HPG; ++h) {
+                // Warp-uniform (a broadcast smem read), so the whole warp
+                // skips together and the shuffle below stays converged.
                 float s = scores_smem[warp][h][t];
                 if (!(s > -1e37f)) continue;
-                float beta = fast_exp::exp2<float, fast_exp::Softmax>(make_float2(s * softmax_scale - new_m[h], 0.f)).x;
-                l_i[h] += beta;
+                const float mh = __shfl_sync(FULL_MASK, m_lane, h);
+                float beta = fast_exp::exp2<float, fast_exp::Softmax>(make_float2(s * softmax_scale - mh, 0.f)).x;
+                l_lane = (lane == h) ? l_lane + beta : l_lane;
                 #pragma unroll
                 for (int j = 0; j < VEC; ++j) out_reg[h][j] = __fmaf_rn(beta, v_regs[j], out_reg[h][j]);
             }
             __syncwarp();
         }
-        #pragma unroll
-        for (int h = 0; h < HPG; ++h) m_i[h] = new_m[h];
+        #undef TOK_WITHIN
+        #undef TOK_VALID
     }
 
     emit_block();

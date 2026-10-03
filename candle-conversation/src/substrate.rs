@@ -43,7 +43,9 @@
 use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::{AHashMap, AHashSet};
-use candle_nn::kv_cache::{QuantFormat, SealedSequence};
+use candle_nn::kv_cache::{
+    rewrite_sealed, try_hold_chunk_locations, QuantFormat, SealedSequence, Sweep,
+};
 use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
 
@@ -1763,6 +1765,13 @@ impl Substrate {
         if !slot.evict_when_cold || pinned || slot.splice_source {
             return;
         }
+        // Freed on the writer thread, so only while no compaction is relocating —
+        // see `try_hold_chunk_locations`. Refused, both tiers stay and the flag
+        // stays set: `demote_idle_hot` sheds them on the persistence thread's next
+        // pass.
+        let Some(_hold) = try_hold_chunk_locations() else {
+            return;
+        };
         let had_hot = slot.hot.take().is_some();
         let had_warm = slot.warm.take().is_some();
         if had_hot {
@@ -1865,6 +1874,14 @@ impl Substrate {
     /// `pending_quantize` residences are skipped: their `hot` is the interim
     /// native form the scheduler still owes a quantize, and persisting that
     /// would diverge from the final Q form.
+    ///
+    /// **Also the retry for a deferred offload.** A residence flagged
+    /// `evict_when_cold` has its resident tiers dropped the moment a lower tier
+    /// lands — hot once warm holds it, warm too once cold does — but those drops
+    /// run off the compacting thread and so stand aside while a compaction holds
+    /// chunk locations ([`try_hold_chunk_locations`]). One that stood aside is
+    /// shed here, whatever its age: the flag already says it is not wanted resident.
+    /// This pass stands aside on the same terms.
     pub fn demote_idle_hot(&mut self, grace: u64) -> usize {
         // **The pass is the clock.** One tick per call, from the persistence
         // thread's between-forward pass, which wakes on every seal/flush trigger
@@ -1874,6 +1891,9 @@ impl Substrate {
         // generates no traffic at all.
         self.wave_epoch = self.wave_epoch.wrapping_add(1);
         let epoch = self.wave_epoch;
+        let Some(_hold) = try_hold_chunk_locations() else {
+            return 0;
+        };
         // **Sections as well as turns, and sections are NOT on `hot_lru`.**
         // `install_section_hot` sets `hot` without touching the list, so a scan
         // over `hot_lru` alone reaches only turn residences — which would make
@@ -1896,18 +1916,64 @@ impl Substrate {
                 // mechanism: the copy the drop falls back on must already exist.
                 // A residence without one is simply left for a later pass, by
                 // which time the migrate will have made it.
+                let offload = slot.evict_when_cold && (slot.warm.is_some() || slot.cold.is_some());
                 slot.hot.is_some()
-                    && slot.warm.is_some()
                     && !slot.pending_quantize
                     && !slot.splice_source
-                    && idle_for(slot.last_used_epoch, epoch) > grace
+                    && (offload
+                        || (slot.warm.is_some() && idle_for(slot.last_used_epoch, epoch) > grace))
             })
             .collect();
         for idx in &stale {
-            self.residence[idx.0].hot = None;
+            let slot = &mut self.residence[idx.0];
+            slot.hot = None;
+            // A flagged residence whose cold copy has landed sheds warm as well —
+            // what `install_cold` would have done had it not stood aside.
+            let shed_warm =
+                slot.evict_when_cold && slot.cold.is_some() && slot.warm.take().is_some();
             Self::remove_from_lru(&mut self.hot_lru, *idx);
+            if shed_warm {
+                Self::remove_from_lru(&mut self.warm_lru, *idx);
+            }
         }
         stale.len()
+    }
+
+    /// Rewrite every resident sequence's gids through a KV compaction's map.
+    ///
+    /// The substrate's half of a compaction sweep. A chunk's gid *is* its physical
+    /// location, so a pass that relocates one must rewrite every holder of that
+    /// identity inside the same window — and the residences are the largest holder
+    /// outside the backing itself, invisible to any walk of the block tables.
+    ///
+    /// Both tiers are visited. `warm` gids are in the same `arena_idx` namespace as
+    /// hot ones (the pool is one index space; `ArenaKey` only selects which pool the
+    /// refcount table lives in), so leaving them out would be leaving real holders
+    /// stale — and the map's own two-level lookup rejects anything from an untouched
+    /// arena, so a host chunk simply misses.
+    ///
+    /// Returns how many sequences were rewritten, for the pass's log line.
+    pub fn rewrite_for_compaction(&mut self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
+        let mut rewritten = 0usize;
+        for res in self.residence.iter_mut() {
+            let mut any = false;
+            if let Some(hot) = res.hot.as_ref() {
+                if let Some(next) = rewrite_sealed(hot, sweep)? {
+                    res.hot = Some(next);
+                    any = true;
+                }
+            }
+            if let Some(warm) = res.warm.as_ref() {
+                if let Some(next) = rewrite_sealed(warm, sweep)? {
+                    res.warm = Some(next);
+                    any = true;
+                }
+            }
+            if any {
+                rewritten += 1;
+            }
+        }
+        Ok(rewritten)
     }
 
     /// Flag every turn residence of `timeline` for full eviction the moment its
@@ -1929,52 +1995,21 @@ impl Substrate {
     /// migrate, for residences flagged beforehand) never ran for them — nothing
     /// else drops their hot until the async, possibly-lagging cold write lands.
     /// Without this, completed files' hot KV piles up and fills the card mid-ingest.
-    /// Rewrite every resident sequence's gids through a KV compaction's map.
     ///
-    /// The substrate's half of a compaction sweep. A chunk's gid *is* its physical
-    /// location, so a pass that relocates one must rewrite every holder of that
-    /// identity inside the same window — and the residences are the largest holder
-    /// outside the backing itself, invisible to any walk of the block tables.
-    ///
-    /// Both tiers are visited. `warm` gids are in the same `arena_idx` namespace as
-    /// hot ones (the pool is one index space; `ArenaKey` only selects which pool the
-    /// refcount table lives in), so leaving them out would be leaving real holders
-    /// stale — and the map's own two-level lookup rejects anything from an untouched
-    /// arena, so a host chunk simply misses.
-    ///
-    /// Returns how many sequences were rewritten, for the pass's log line.
-    pub fn rewrite_for_compaction(
-        &mut self,
-        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
-    ) -> candle::Result<usize> {
-        let mut rewritten = 0usize;
-        for res in self.residence.iter_mut() {
-            let mut any = false;
-            if let Some(hot) = res.hot.as_ref() {
-                if let Some(next) = candle_nn::kv_cache::rewrite_sealed(hot, sweep)? {
-                    res.hot = Some(next);
-                    any = true;
-                }
-            }
-            if let Some(warm) = res.warm.as_ref() {
-                if let Some(next) = candle_nn::kv_cache::rewrite_sealed(warm, sweep)? {
-                    res.warm = Some(next);
-                    any = true;
-                }
-            }
-            if any {
-                rewritten += 1;
-            }
-        }
-        Ok(rewritten)
-    }
-
+    /// Immediately unless a compaction holds chunk locations: the drop runs on the
+    /// caller's thread, and freeing a chunk under a pass wastes the pass. Then the
+    /// flag alone is set and [`Self::demote_idle_hot`] sheds the hot copy on the
+    /// persistence thread's next pass.
     pub fn mark_timeline_evict_when_cold(&mut self, timeline: TimelineId) -> usize {
         let Some(entry) = self.timelines.get(&timeline) else {
             return 0;
         };
         let residences: Vec<ResidenceIndex> =
             entry.turns.values().map(|t| t.content.residence).collect();
+        // The immediate hot-drops below run on the caller's thread, so only while
+        // no compaction is relocating — see `try_hold_chunk_locations`. Refused,
+        // every residence is still flagged and `demote_idle_hot` sheds it next pass.
+        let hold = try_hold_chunk_locations();
         for r in &residences {
             self.residence[r.0].evict_when_cold = true;
             // Immediate hot-drop for already-warm turns (VRAM back now, warm kept)
@@ -1986,7 +2021,8 @@ impl Substrate {
                 let slot = &self.residence[r.0];
                 (slot.hot.is_some(), slot.warm.is_some())
             };
-            if has_hot
+            if hold.is_some()
+                && has_hot
                 && has_warm
                 && !self.working_set_pins.contains(r)
                 && !self.residence[r.0].splice_source
@@ -8763,6 +8799,50 @@ mod tests {
             "a pending-quantize residence is not the demote's to take"
         );
         assert!(sub.residence[r.0].hot.is_some());
+    }
+
+    /// **The demote is the retry for an offload that stood aside for a compaction.**
+    /// `mark_timeline_evict_when_cold`'s immediate hot-drop defers while a pass holds
+    /// chunk locations, leaving a flagged residence hot with a warm copy beside it.
+    /// The next demote sheds it on the first pass, inside the grace window: the flag
+    /// already says it is not wanted resident, so its age is not the question.
+    #[test]
+    fn a_deferred_offload_is_shed_by_the_next_demote_whatever_its_age() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residence[r.0].evict_when_cold = true;
+
+        assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
+        assert!(sub.residence[r.0].hot.is_none(), "the hot copy is shed");
+        assert!(!sub.hot_lru.contains(&r));
+        assert!(
+            sub.residence[r.0].warm.is_some(),
+            "warm stays until cold lands — it is the only durable-in-session copy"
+        );
+    }
+
+    /// The same retry once the cold copy has landed: `install_cold` stood aside, so
+    /// both resident tiers are still there, and the demote sheds both — what
+    /// `install_cold` would have done.
+    #[test]
+    fn a_deferred_cold_offload_sheds_both_resident_tiers() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residence[r.0].evict_when_cold = true;
+        sub.residence[r.0].cold = Some(vec![StoredSequence {
+            chunks: vec![StoredChunk {
+                log_offset: 0,
+                record_len: 1024,
+                token_count: 32,
+            }],
+            token_count: 32,
+        }]);
+
+        assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
+        assert!(sub.residence[r.0].hot.is_none(), "VRAM reclaimed");
+        assert!(sub.residence[r.0].warm.is_none(), "RAM reclaimed");
+        assert!(!sub.hot_lru.contains(&r) && !sub.warm_lru.contains(&r));
+        assert!(sub.residence[r.0].cold.is_some(), "cold durable");
     }
 
     /// **The idle demote reaches SECTIONS, which are not on `hot_lru`.**
