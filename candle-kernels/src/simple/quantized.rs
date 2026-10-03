@@ -1781,14 +1781,57 @@ extern "C" {
         out_dtype: c_int,
     );
 
-    /// Q0_V dequantize test entrypoint — wraps `BlockConverter<block_q0_v, float>::load`
-    /// so unit tests can exercise the exact production GPU decode path used by
-    /// attention/prefill kernels. Writes `num_blocks * 32` f32 elements to `dst`.
-    pub fn run_dequantize_block_q0_v_f32(
+    /// Q0_V decode oracle — decodes every element of `num_blocks` Q0_V blocks
+    /// under side `is_k`'s codebook, at palette scale `scale`, through each
+    /// production read path: the ArenaAccessor element dispatch
+    /// (`via_dispatch`), the INT8 prefill element decoder (`via_i8_elem`), the
+    /// INT8 tile decoder's four-token quad (`via_quad`) and the hoisted block
+    /// header (`via_header`). Each output holds `num_blocks * 32` f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_q0_v_decode_oracle(
+        src: *const c_void,
+        via_dispatch: *mut c_void,
+        via_i8_elem: *mut c_void,
+        via_quad: *mut c_void,
+        via_header: *mut c_void,
+        num_blocks: c_int,
+        is_k: c_int,
+        scale: f32,
+    );
+
+    /// Q0_V encode oracle — encodes `num_blocks` 32-element f32 blocks (already
+    /// outer-scaled) with the production encoder under side `is_k`'s codebook,
+    /// writing `num_blocks` 2-byte blocks to `dst`.
+    pub fn run_q0_v_encode_oracle(
         src: *const c_void,
         dst: *mut c_void,
         num_blocks: c_int,
-        scale: f32,
+        is_k: c_int,
+    );
+
+    /// KV block decode oracle — decodes every element of `num_blocks` blocks
+    /// of arena format `fmt` (`block_bytes` apart) through the paged attention
+    /// kernels' element path at unit palette scale, under side `is_k`, into
+    /// `num_blocks * 32` f32.
+    pub fn run_kv_decode_oracle(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_blocks: c_int,
+        block_bytes: c_int,
+        fmt: c_int,
+        is_k: c_int,
+    );
+
+    /// KV block encode oracle — encodes `num_blocks` 32-element f32 blocks in
+    /// arena format `fmt` with the palette seal's block encoder, under side
+    /// `is_k`, writing `num_blocks` blocks `block_bytes` apart.
+    pub fn run_kv_encode_oracle(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_blocks: c_int,
+        block_bytes: c_int,
+        fmt: c_int,
+        is_k: c_int,
     );
 
     /// Q0_V round-trip test entrypoint — quantizes then dequantizes each
@@ -1890,6 +1933,7 @@ extern "C" {
     /// - `head_dim`: Number of dimensions per head (block size)
     pub fn run_quantize_palette4_convert(
         heads_base: *const u8,
+        valid_ranges: *const c_int,
         num_heads: c_int,
         num_kv_heads: c_int,
         num_layers: c_int,

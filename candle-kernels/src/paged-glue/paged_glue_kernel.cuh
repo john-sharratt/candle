@@ -306,7 +306,7 @@ __global__ void paged_glue_kernel(
                         const float scale = kvhead_k_scale<HEAD_DIM>(head_ptr, p);
                         ArenaAccessor acc((const char*)(uintptr_t)kp, fmt, sub_head_stride,
                                           sub_head_stride, BLOCKS_PER_DIM, 0);
-                        acc.template load_head_scaled<T, SUB_HEAD_DIM, true>(
+                        acc.template load_head_scaled<T, SUB_HEAD_DIM, true, true>(
                             k_st + p * SUB_HEAD_DIM, 0, 0, in_blk, lane, scale);
                     }
                     const uint64_t vp = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
@@ -315,7 +315,7 @@ __global__ void paged_glue_kernel(
                         const float scale = kvhead_v_scale<HEAD_DIM>(head_ptr, p);
                         ArenaAccessor acc((const char*)(uintptr_t)vp, fmt, sub_head_stride,
                                           sub_head_stride, BLOCKS_PER_DIM, 0);
-                        acc.template load_head_scaled<T, SUB_HEAD_DIM, true>(
+                        acc.template load_head_scaled<T, SUB_HEAD_DIM, true, false>(
                             v_st + p * SUB_HEAD_DIM, 0, 0, in_blk, lane, scale);
                     }
                 }

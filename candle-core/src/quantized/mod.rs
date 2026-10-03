@@ -10,13 +10,13 @@ mod dummy_cuda;
 mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
+#[cfg(test)]
+mod int8_block_codec_tests;
 pub mod int8_matmul_mode;
+pub mod int8_split_k;
 pub mod k_quants;
 pub mod ko_quant;
 pub mod prepare;
-// Note: the previous `q0_v_test` module has been removed — it tested the OLD
-// (sign + shape + curve_pos) Q0_V format that no longer exists. The new
-// (curve + scale + centroid) format will get a fresh test suite.
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(not(feature = "metal"))]
@@ -62,6 +62,7 @@ pub mod neon;
 #[cfg(target_feature = "simd128")]
 pub mod simd128;
 pub mod utils;
+mod warp_mirror;
 use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
@@ -2648,6 +2649,15 @@ impl QMatMul {
             let tensor = qtensor.dequantize_bf16(&qtensor.device())?;
             Self::TensorF16(tensor)
         } else {
+            // A KO weight may run split-K at decode width. Every KO matmul is built here —
+            // repacked at load, read prepared from disk, or viewed in a streaming slot — so
+            // its stream's split-K scratch is created here too, and no forward allocates it.
+            #[cfg(feature = "cuda")]
+            if let QStorage::Cuda(cs) = &qtensor.storage {
+                if qtensor.dtype().is_ko() {
+                    cuda::ensure_split_k_scratch(cs.device())?;
+                }
+            }
             Self::QTensor(qtensor)
         };
         Ok(t)
@@ -2901,6 +2911,75 @@ impl QMatMul {
         let wlen = cs.storage_size_in_bytes();
         let wdtype = t.dtype();
         cuda::dense_qmatmul(input, wptr, wdtype, nrows, wlen, out_dtype, &device)
+    }
+
+    /// [`Self::forward_dynamic`] with the int8 path's K split forced to `splits` slices (`1` is
+    /// the unsplit kernel) rather than chosen by `q8a128_dense_k_splits` — what the projection
+    /// bench sweeps to tune that rule. Production calls [`Self::forward_dynamic`].
+    #[cfg(feature = "cuda")]
+    pub fn forward_dynamic_split_k<'w>(
+        &self,
+        input: cuda::DynamicTensor<'_, 'w>,
+        out_dtype: crate::DType,
+        splits: usize,
+    ) -> Result<LiveTensor<'w>> {
+        let t = match self {
+            Self::QTensor(t) => t,
+            _ => crate::bail!("forward_dynamic_split_k requires a QTensor weight"),
+        };
+        let cs = match &t.storage {
+            QStorage::Cuda(cs) => cs,
+            _ => crate::bail!("forward_dynamic_split_k requires CUDA storage"),
+        };
+        let device = cs.device().clone();
+        cuda::dense_qmatmul_with_splits(
+            input,
+            cs.data_ptr(),
+            t.dtype(),
+            t.shape().dims()[0],
+            cs.storage_size_in_bytes(),
+            out_dtype,
+            Some(splits),
+            &device,
+        )
+    }
+
+    /// `silu(proj[:, 0..cols]) · Wᵀ` as F32, the activation quantized to q8a128 by the
+    /// kernel's own tile loader under `sum_scale` — one launch where a SiLU producer and this
+    /// matmul took two, with the same bits. `proj` is `[M, width ≥ cols]` F32 read through its
+    /// row stride. The weight must be the Q8_KO twin on CUDA. See
+    /// [`cuda::q8a128_dense_matmul_silu`].
+    #[cfg(feature = "cuda")]
+    pub fn forward_silu_f32<'w>(
+        &self,
+        proj: &LiveTensor<'w>,
+        cols: usize,
+        sum_scale: SumScale,
+    ) -> Result<LiveTensor<'w>> {
+        let t = match self {
+            Self::QTensor(t) => t,
+            _ => crate::bail!("forward_silu_f32 requires a QTensor weight"),
+        };
+        let cs = match &t.storage {
+            QStorage::Cuda(cs) => cs,
+            _ => crate::bail!("forward_silu_f32 requires CUDA storage"),
+        };
+        if t.shape().dims()[1] != cols {
+            crate::bail!(
+                "forward_silu_f32: a {:?} weight against {cols} activation columns",
+                t.shape().dims()
+            );
+        }
+        let device = cs.device().clone();
+        cuda::q8a128_dense_matmul_silu(
+            proj,
+            cols,
+            cs.data_ptr(),
+            t.dtype(),
+            t.shape().dims()[0],
+            sum_scale,
+            &device,
+        )
     }
 
     /// Fused q/k/v projection in ONE launch: the shared q8a128 activation `op` × the separate KO

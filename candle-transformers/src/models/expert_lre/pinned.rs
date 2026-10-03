@@ -336,7 +336,7 @@ fn step_slots(slot_size: usize) -> usize {
 /// The slot count to try after `slots` of `slot_size` bytes was refused:
 /// one step fewer, and always at least one fewer so the retry loop terminates.
 #[cfg(feature = "cuda")]
-fn step_down(slots: usize, slot_size: usize) -> usize {
+pub(super) fn step_down(slots: usize, slot_size: usize) -> usize {
     slots.saturating_sub(step_slots(slot_size))
 }
 

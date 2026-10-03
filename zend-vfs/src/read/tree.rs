@@ -1,6 +1,7 @@
 //! Tree listings, from `ls-tree -z`.
 
 use crate::error::GitError;
+use crate::library::trees;
 use crate::types::{FileMode, Oid, RepoPath, Rev};
 use crate::Repo;
 
@@ -98,6 +99,9 @@ impl Repo {
     /// The entries directly inside `dir` at `rev` — the root when `dir` is
     /// `None`. Paths are relative to the repository root.
     pub fn ls_tree(&self, rev: &Rev, dir: Option<&RepoPath>) -> Result<Vec<TreeEntry>, GitError> {
+        if let Some(lib) = self.library() {
+            return trees::ls_tree(&lib, rev, dir);
+        }
         let mut inv = self
             .git("ls-tree")
             .args(["-z", "--full-tree", "--end-of-options"])
@@ -113,6 +117,11 @@ impl Repo {
     /// before what it holds — with every blob's size. One process for the
     /// whole tree.
     pub fn ls_tree_all(&self, tree: &Oid) -> Result<Vec<SizedEntry>, GitError> {
+        if let Some(lib) = self.library() {
+            if let Some(entries) = trees::ls_tree_all(&lib, tree)? {
+                return Ok(entries);
+            }
+        }
         let out = self
             .git("ls-tree")
             .args(["-r", "-t", "-l", "-z", "--full-tree", "--end-of-options"])
@@ -128,6 +137,9 @@ impl Repo {
     pub fn tree_entries(&self, rev: &Rev, paths: &[&RepoPath]) -> Result<Vec<TreeEntry>, GitError> {
         if paths.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(lib) = self.library() {
+            return trees::tree_entries(&lib, rev, paths);
         }
         // `-t`: a folder named alongside a path inside it is listed too — without
         // it, `ls-tree` descends into the folder to reach the inner path and
@@ -154,6 +166,7 @@ impl Repo {
 mod tests {
     use super::*;
     use crate::testing::TestRepo;
+    use crate::types::BranchName;
 
     #[test]
     fn records_parse_from_raw_bytes() {
@@ -264,6 +277,49 @@ mod tests {
             found[2].oid.as_str(),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    /// **The library and `git` list the same trees**: one level, the whole
+    /// tree with sizes, and exact lookups, entry for entry.
+    #[test]
+    fn the_library_and_git_list_the_same_trees() {
+        let t = TestRepo::init();
+        t.write("top.txt", b"hello\n");
+        t.write("src/lib.rs", b"lib\n");
+        t.write("src/deep/x.rs", b"x\n");
+        t.write("a b/ü.txt", b"u\n");
+        t.commit_all("base");
+        let library = t.repo();
+        let git = t.repo().without_library();
+        assert!(library.library().is_some());
+        assert!(git.library().is_none());
+
+        let src = RepoPath::parse("src").unwrap();
+        let top = RepoPath::parse("top.txt").unwrap();
+        let deep = RepoPath::parse("src/deep/x.rs").unwrap();
+        let spaced = RepoPath::parse("a b/ü.txt").unwrap();
+        let missing = RepoPath::parse("nope.txt").unwrap();
+        for dir in [None, Some(&src), Some(&missing), Some(&top)] {
+            assert_eq!(
+                library.ls_tree(&Rev::Head, dir).unwrap(),
+                git.ls_tree(&Rev::Head, dir).unwrap(),
+                "{dir:?}"
+            );
+        }
+        let paths = [&top, &deep, &src, &spaced, &missing];
+        assert_eq!(
+            library.tree_entries(&Rev::Head, &paths).unwrap(),
+            git.tree_entries(&Rev::Head, &paths).unwrap()
+        );
+        let tree = Oid::parse(t.git(&["rev-parse", "HEAD^{tree}"]).trim()).unwrap();
+        assert_eq!(
+            library.ls_tree_all(&tree).unwrap(),
+            git.ls_tree_all(&tree).unwrap()
+        );
+        assert!(matches!(
+            library.ls_tree(&Rev::Branch(BranchName::parse("nope").unwrap()), None),
+            Err(GitError::UnknownRevision { .. })
+        ));
     }
 
     /// A path that looks like pathspec magic names that file literally.

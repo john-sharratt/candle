@@ -17,3 +17,4 @@
 #define QMM_BAD_YTYPE      3  // activation type outside the dispatch table
 #define QMM_NO_KERNEL      4  // no kernel for this (format, output dtype) pair
 #define QMM_BAD_OUT_DTYPE  5  // output dtype outside the dispatch table
+#define QMM_BAD_SPLIT      6  // split-K depth outside [2, K-tiles], or a format that never splits

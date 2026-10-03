@@ -13,7 +13,9 @@
 //! family's weight containers (the `qwen35` lineage's
 //! `quantized_delta_net.rs`).
 
-use candle::{LiveTensor, Result, Tensor};
+use candle::quantized::cuda::DynamicActs;
+use candle::quantized::{Int8Mode, SumScale};
+use candle::{DType, LiveTensor, Result, Tensor};
 
 // Not CUDA-gated: `gpu_span` is defined in both configurations and is a
 // zero-sized no-op without `profile` + `cuda`, so the call sites need no `cfg`
@@ -25,8 +27,8 @@ use crate::models::quantized_matmul::QMatMul;
 use crate::models::stacked_proj::project_grouped;
 
 use super::mix::{
-    delta_net_mix_spans, DeltaNetConstants, DeltaNetLayerTable, DeltaNetProjections, DeltaNetSeq,
-    DeltaNetState,
+    capture_spans, delta_net_mix_spans, DeltaNetConstants, DeltaNetLayerTable, DeltaNetProjections,
+    DeltaNetSeq, DeltaNetState, StashCapture,
 };
 use super::types::{DeltaNetDims, ZGate};
 
@@ -61,6 +63,31 @@ pub struct QuantDeltaNetWeights {
     pub norm: Tensor,
 }
 
+impl QuantDeltaNetWeights {
+    /// The mode the layer's input operand is produced in: int8 when every input
+    /// projection reads q8a128 under one `Σx` convention, so the producer emits
+    /// the one operand all four contract; [`Int8Mode::Off`] otherwise, where the
+    /// projections take the float and each runs its own path.
+    pub fn input_mode(&self) -> Int8Mode {
+        let (mode, ss) = (self.proj[0].int8mode(), self.proj[0].sum_scale());
+        if self
+            .proj
+            .iter()
+            .all(|p| p.int8mode() == mode && p.sum_scale() == ss)
+        {
+            mode
+        } else {
+            Int8Mode::Off
+        }
+    }
+
+    /// The `Σx` convention the input projections quantize under — what a
+    /// producer of their shared operand must emit.
+    pub fn input_sum_scale(&self) -> SumScale {
+        self.proj[0].sum_scale()
+    }
+}
+
 /// One production DeltaNet layer over a `[T, hidden]` activation block, from
 /// a carried state. Returns `[T, hidden]`.
 ///
@@ -88,16 +115,31 @@ pub fn quantized_delta_net_layer_forward<'w>(
     }];
     // The single-sequence convenience path, used off the sweep, so no phase is
     // open for its projections to root on.
-    let mixed =
-        quantized_delta_net_layer_forward_spans(x, w, dims, &mut one, rms_eps, None, zgate, None)?;
+    let acts = DynamicActs::Float(x.clone());
+    let mixed = quantized_delta_net_layer_forward_spans(
+        &acts,
+        x.dtype(),
+        w,
+        dims,
+        &mut one,
+        rms_eps,
+        None,
+        zgate,
+        None,
+    )?;
     let [seq] = one;
     seq.state.absorb_solo(&seq.out)?;
     Ok(mixed)
 }
 
 /// One production DeltaNet layer over a `[T, hidden]` activation block holding
-/// **several** sequences, named by `seqs`. Returns `[T, hidden]`; each
-/// sequence's state is advanced in place.
+/// **several** sequences, named by `seqs`. Returns `[T, hidden]` at `out_dtype`,
+/// the residual stream's type; each sequence's state is advanced in place.
+///
+/// `acts` is the normed block input as its producer emitted it — on an int8
+/// layer the q8a128 operand a fused norm or mix wrote alongside (or instead of)
+/// the float, which the four input projections read as it stands (see
+/// [`QuantDeltaNetWeights::input_mode`]).
 ///
 /// `T` is a flat token count, not a sequence length: the caller packs however
 /// many rows it has and says where each sequence begins. The five projections
@@ -122,22 +164,19 @@ pub fn quantized_delta_net_layer_forward<'w>(
 /// tensor (hot-path invariant 1).
 #[allow(clippy::too_many_arguments)]
 pub fn quantized_delta_net_layer_forward_spans<'w>(
-    x: &LiveTensor<'w>,
+    acts: &DynamicActs<'w>,
+    out_dtype: DType,
     w: &QuantDeltaNetWeights,
     dims: &DeltaNetDims,
     seqs: &mut [DeltaNetSeq<'_>],
     rms_eps: f64,
     table: Option<&DeltaNetLayerTable>,
     zgate: ZGate,
-    // The open layer phase, for the projection block when `x` carries no ticket.
+    // The open layer phase, for the projection block when `acts` carries no ticket.
     wave: Option<&'w WaveGeneration>,
 ) -> Result<LiveTensor<'w>> {
-    let act = x.dtype();
-    // `forward_live`, not `Module::forward`: the input is the layer's own
-    // wave-scoped activation, and the projections' outputs belong in the same
-    // arena. `Module` takes `&Tensor` on purpose — a module may retain what it
-    // is given — so it cannot be the one to see this.
-    let g_proj = gpu_span("dn:proj", x.device());
+    let device = w.dt_bias.device();
+    let g_proj = gpu_span("dn:proj", device);
     // F32 out of the matmul itself, not a cast after it. The recurrence carries
     // `S` in F32, so these four have always been consumed wide — but asking the
     // KO kernel to store narrow and widening afterwards spent a full-tensor pass
@@ -150,10 +189,10 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     let hv = dims.n_v_heads;
     let widths = [dims.conv_dim(), dims.value_dim(), hv, hv];
     let mut take = project_grouped(
-        x,
+        acts,
         &w.proj,
         &widths,
-        candle::DType::F32,
+        DType::F32,
         "delta-net input projections",
         wave,
     )?
@@ -166,12 +205,22 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     };
     g_proj.end();
     // A span that will have to rewind keeps this layer's operands, copied out
-    // of the wave arena that is reclaimed at the end of the forward. The
-    // destination is already allocated — see `DeltaNetSeq::stash`.
-    for s in seqs.iter() {
-        if let Some(slot) = s.stash.as_ref() {
-            slot.ops.capture(&p, s.start, slot.row, s.len)?;
-        }
+    // of the wave arena that is reclaimed at the end of the forward — every
+    // such span in one batched capture. The destination is already allocated —
+    // see `DeltaNetSeq::stash`.
+    let captures: Vec<StashCapture<'_>> = seqs
+        .iter()
+        .filter_map(|s| {
+            s.stash.as_ref().map(|slot| StashCapture {
+                ops: slot.ops,
+                start: s.start,
+                dst_row: slot.row,
+                len: s.len,
+            })
+        })
+        .collect();
+    if !captures.is_empty() {
+        capture_spans(&p, &captures)?;
     }
     let c = DeltaNetConstants {
         dt_bias: &w.dt_bias,
@@ -179,7 +228,7 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
         conv: &w.conv,
         norm: &w.norm,
     };
-    let g_mix = gpu_span("dn:mix", x.device());
+    let g_mix = gpu_span("dn:mix", device);
     let gated = delta_net_mix_spans(
         &p,
         &c,
@@ -192,13 +241,13 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     )?;
     g_mix.end();
 
-    let g_out = gpu_span("dn:out_proj", x.device());
+    let g_out = gpu_span("dn:out_proj", device);
     // The mixer's F32 goes straight in. Narrowing it here first would be a
     // full-tensor pass per DeltaNet layer per wave that rounds away precision
     // the mixer has just computed — and the FP fallback would widen it right
     // back on the next line. `out_dtype` names what the residual stream wants,
     // so the store does the conversion the cast used to.
-    let out = w.w_out.forward_live_as(&gated, act)?;
+    let out = w.w_out.forward_live_as(&gated, out_dtype)?;
     g_out.end();
     Ok(out)
 }

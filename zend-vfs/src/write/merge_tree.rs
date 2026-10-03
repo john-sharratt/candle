@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::GitError;
+use crate::library::objects;
 use crate::runner::{utf8, Invocation};
 use crate::types::{FileMode, Oid, RepoPath, Signature};
 use crate::write::fast_import::normalize_message;
@@ -186,7 +187,14 @@ impl Repo {
     /// Merge three versions of a file line by line: the merged blob, or
     /// `None` when the changes overlap or the content is binary.
     fn merge_file(&self, base: &Oid, ours: &Oid, theirs: &Oid) -> Result<Option<Oid>, GitError> {
+        // A blob the library does not hold is one a partial clone has yet to
+        // fetch, which `git` does on demand.
         let blob = |oid: &Oid| {
+            if let Some(lib) = self.library() {
+                if let Some(bytes) = objects::blob_bytes(&lib, oid)? {
+                    return Ok(bytes);
+                }
+            }
             self.git("cat-file")
                 .args(["blob", "--end-of-options"])
                 .arg(oid.as_str())
@@ -207,6 +215,9 @@ impl Repo {
         if out.status != Some(0) {
             return Ok(None);
         }
+        if let Some(lib) = self.library() {
+            return Ok(Some(objects::hash_raw(&lib, &out.stdout)?));
+        }
         let oid = self
             .git("hash-object")
             .args(["-w", "--stdin", "--no-filters"])
@@ -225,6 +236,16 @@ impl Repo {
         committer: &Signature,
     ) -> Result<Oid, GitError> {
         let _write = self.write_lock();
+        if let Some(lib) = self.library() {
+            return objects::commit_tree(
+                &lib,
+                tree,
+                parents,
+                &normalize_message(message),
+                author,
+                committer,
+            );
+        }
         let date = |s: &Signature| format!("@{}", s.when.to_raw());
         let mut inv = self.git("commit-tree");
         for p in parents {

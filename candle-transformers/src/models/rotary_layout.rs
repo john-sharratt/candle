@@ -194,10 +194,9 @@ impl RotaryLayout {
     /// frequencies, for the non-paged paths.
     ///
     /// The paged kernels rotate from the model's rung set and never touch
-    /// these, but the attention parameters carry both and a caller that
-    /// reached for the split form would otherwise get another model's
-    /// frequencies. Built per wave over the wave's own positions, which is a
-    /// few hundred rows.
+    /// these; the attention parameters hold them behind a `LazyRope`, so they
+    /// are built only when a layer takes the non-paged path, over the wave's
+    /// own positions.
     pub fn rope_cos_sin(
         &self,
         positions: &[u32],

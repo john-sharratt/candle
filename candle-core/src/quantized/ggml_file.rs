@@ -1,6 +1,10 @@
 //! Support for the GGML file format.
 
-use super::{k_quants, GgmlDType, QStorage};
+use super::{
+    k_quants, BlockP2, BlockQ0, BlockQ0M2, BlockQ0M4, BlockQ0V, BlockQ0X, BlockQ1A, BlockQ1S,
+    BlockQ2A, BlockQ2S, BlockQ2_0, BlockQ2_1, BlockQ3_0, BlockQ3_1, BlockQ4_KS, BlockQ8_1,
+    BlockQ8_K, BlockQ8_KS, BlockQAWQ, BlockQAWQ_G64, BlockR16, GgmlDType, QStorage,
+};
 use crate::{Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
@@ -187,6 +191,31 @@ pub fn qtensor_from_ggml(
         GgmlDType::MXFP4 => {
             from_raw_data::<k_quants::BlockMXFP4>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::Q8_1 => from_raw_data::<BlockQ8_1>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q8_K => from_raw_data::<BlockQ8_K>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::QAWQ => from_raw_data::<BlockQAWQ>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::QAWQ_G64 => {
+            from_raw_data::<BlockQAWQ_G64>(raw_data, size_in_bytes, dims, device)
+        }
+        // The KV-cache block formats: each has a host block codec, so its bytes
+        // load on any device exactly like the classic GGML blocks above.
+        GgmlDType::Q4_KS => from_raw_data::<BlockQ4_KS>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q8_KS => from_raw_data::<BlockQ8_KS>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q2_0 => from_raw_data::<BlockQ2_0>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q3_0 => from_raw_data::<BlockQ3_0>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::R16 => from_raw_data::<BlockR16>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0 => from_raw_data::<BlockQ0>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q1_S => from_raw_data::<BlockQ1S>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q2_S => from_raw_data::<BlockQ2S>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q2_A => from_raw_data::<BlockQ2A>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q2_1 => from_raw_data::<BlockQ2_1>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q3_1 => from_raw_data::<BlockQ3_1>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::P2 => from_raw_data::<BlockP2>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0_V => from_raw_data::<BlockQ0V>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q1_A => from_raw_data::<BlockQ1A>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0_X => from_raw_data::<BlockQ0X>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0_M2 => from_raw_data::<BlockQ0M2>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::Q0_M4 => from_raw_data::<BlockQ0M4>(raw_data, size_in_bytes, dims, device),
         // KO twins are GPU-only lane-major chunks with no CPU block struct — their on-disk bytes
         // are already in the exact layout the int8 KO matmul reads (identical to
         // `QCudaStorage::repack_ko` output). Copy them straight to VRAM with no reinterpret and no
@@ -440,6 +469,99 @@ impl Content {
         match self.tensors.remove(name) {
             None => crate::bail!("cannot find tensor with name '{name}'"),
             Some(tensor) => Ok(tensor),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qtensor_from_ggml;
+    use crate::quantized::{GgmlDType, QTensor};
+    use crate::{Device, Tensor};
+
+    /// **Every KV-cache block format loads back from its own bytes.** A sealed
+    /// chunk is read through `qtensor_from_ggml`, so a format the compression
+    /// policy can store but this cannot load is a chunk nobody can read back.
+    /// The reload must hold exactly the bytes it was given.
+    #[test]
+    fn every_kv_block_format_reloads_its_own_bytes() {
+        let dev = Device::Cpu;
+        let src: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let src = Tensor::from_vec(src, 1024, &dev).unwrap();
+        for dtype in [
+            GgmlDType::Q8_1,
+            GgmlDType::Q8_K,
+            GgmlDType::Q4_KS,
+            GgmlDType::Q8_KS,
+            GgmlDType::Q2_0,
+            GgmlDType::Q3_0,
+            GgmlDType::R16,
+            GgmlDType::Q0,
+            GgmlDType::Q1_S,
+            GgmlDType::Q2_S,
+            GgmlDType::Q2_A,
+            GgmlDType::Q2_1,
+            GgmlDType::Q3_1,
+            GgmlDType::P2,
+            GgmlDType::Q0_V,
+            GgmlDType::Q1_A,
+            GgmlDType::Q0_X,
+            GgmlDType::Q0_M2,
+            GgmlDType::Q0_M4,
+        ] {
+            let q = QTensor::quantize(&src, dtype).unwrap();
+            let bytes = q.data().unwrap().into_owned();
+            let back = qtensor_from_ggml(dtype, &bytes, vec![1024], &dev)
+                .unwrap_or_else(|e| panic!("{dtype:?} does not load: {e}"));
+            assert_eq!(back.dtype(), dtype);
+            assert_eq!(back.data().unwrap().as_ref(), &bytes[..], "{dtype:?}");
+        }
+    }
+
+    /// **A KV block loaded onto the GPU dequantizes to what the host decodes.**
+    /// The device dequant kernel has no arm for several of these formats and
+    /// launches nothing for them, so a format routed to it anyway reads back as
+    /// uninitialised memory — magnitudes near 1e34 — with no error.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn every_kv_block_format_dequantizes_alike_on_the_gpu() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let src: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.37).sin() * 0.9).collect();
+        let src = Tensor::from_vec(src, 1024, &cpu).unwrap();
+        for dtype in [
+            GgmlDType::Q8_1,
+            GgmlDType::Q4_KS,
+            GgmlDType::Q8_KS,
+            GgmlDType::Q2_0,
+            GgmlDType::Q3_0,
+            GgmlDType::R16,
+            GgmlDType::Q0,
+            GgmlDType::Q1_S,
+            GgmlDType::Q2_S,
+            GgmlDType::Q2_A,
+            GgmlDType::Q2_1,
+            GgmlDType::Q3_1,
+            GgmlDType::Q0_V,
+            GgmlDType::Q1_A,
+            GgmlDType::Q0_X,
+            GgmlDType::Q0_M2,
+            GgmlDType::Q0_M4,
+        ] {
+            let q = QTensor::quantize(&src, dtype).unwrap();
+            let bytes = q.data().unwrap().into_owned();
+            let host: Vec<f32> = q.dequantize(&cpu).unwrap().to_vec1().unwrap();
+            let on_gpu = qtensor_from_ggml(dtype, &bytes, vec![1024], &gpu).unwrap();
+            let device: Vec<f32> = on_gpu
+                .dequantize(&gpu)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(device, host, "{dtype:?}");
         }
     }
 }

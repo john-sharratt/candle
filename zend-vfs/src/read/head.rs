@@ -1,6 +1,7 @@
 //! What the working tree's `HEAD` points at.
 
 use crate::error::GitError;
+use crate::library::refs;
 use crate::runner::utf8;
 use crate::types::{BranchName, Oid, RefName};
 use crate::Repo;
@@ -34,10 +35,14 @@ impl Head {
 }
 
 impl Repo {
-    /// What `HEAD` points at. One `rev-parse` for a `HEAD` with a commit —
-    /// the commit and the branch name together — and a second look only for
-    /// a branch with no commits yet.
+    /// What `HEAD` points at. Read in this process when the repository is held
+    /// there; otherwise one `rev-parse` for a `HEAD` with a commit — the commit
+    /// and the branch name together — and a second look only for a branch with
+    /// no commits yet.
     pub fn head(&self) -> Result<Head, GitError> {
+        if let Some(lib) = self.library() {
+            return refs::head(&lib);
+        }
         let both = self
             .git("rev-parse")
             .args(["HEAD^{commit}", "--symbolic-full-name", "HEAD"])

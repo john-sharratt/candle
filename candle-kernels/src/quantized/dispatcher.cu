@@ -892,6 +892,23 @@ DECL_DENSE_INT8_M2_ALL(mxfp4_ko_int8)
 DECL_DENSE_INT8_M2_ALL(q2_ko_int8)
 DECL_DENSE_INT8_M2_ALL(q3_ko_int8)
 
+// Split-K twins of the KO dense kernels — decode width, narrow N (see run_dense_int8_splitk).
+#define DECL_DENSE_INT8_SK(name) \
+    extern "C" __global__ void name(const void*, const void*, void*, int, int, int, int, int, \
+                                    float*, unsigned int*);
+#define DECL_DENSE_INT8_SK_ALL(base) \
+    DECL_DENSE_INT8_SK(base##_f16_dense_sk) \
+    DECL_DENSE_INT8_SK(base##_bf16_dense_sk) \
+    DECL_DENSE_INT8_SK(base##_f32_dense_sk)
+DECL_DENSE_INT8_SK_ALL(q4_ko_int8)
+DECL_DENSE_INT8_SK_ALL(q5_ko_int8)
+DECL_DENSE_INT8_SK_ALL(q6_ko_int8)
+DECL_DENSE_INT8_SK_ALL(q8_ko_int8)
+DECL_DENSE_INT8_SK_ALL(q2_ko_int8)
+DECL_DENSE_INT8_SK_ALL(q3_ko_int8)
+#undef DECL_DENSE_INT8_SK_ALL
+#undef DECL_DENSE_INT8_SK
+
 #undef DECL_DENSE_INT8_M2_ALL
 #undef DECL_DENSE_INT8_ALL
 #undef DECL_DENSE_INT8
@@ -962,6 +979,117 @@ static_assert(
     KO_ROW_FIRST + KO_ROW_COUNT
         == (int)(sizeof(dense_kernels_int8[0]) / sizeof(dense_kernels_int8[0][0])),
     "every dense kernel row from KO_ROW_FIRST up must have a mode-2 twin");
+
+// Indexed by [out_dtype][kernel_row - KO_ROW_FIRST], the mode-2 table's order. MXFP4 has no
+// split twin: its per-sub fold accumulates straight into the sum, which per-tile partials
+// cannot reproduce, so a split MXFP4 launch is refused as QMM_BAD_SPLIT.
+#define DENSE_INT8_SK_ROW(tag) { \
+    (void*)q4_ko_int8_##tag##_dense_sk, \
+    (void*)q5_ko_int8_##tag##_dense_sk, \
+    (void*)q6_ko_int8_##tag##_dense_sk, \
+    (void*)q8_ko_int8_##tag##_dense_sk, \
+    nullptr, /* mxfp4: never splits */ \
+    (void*)q2_ko_int8_##tag##_dense_sk, \
+    (void*)q3_ko_int8_##tag##_dense_sk, \
+}
+static void* dense_kernels_int8_sk[3][7] = {
+    DENSE_INT8_SK_ROW(f16),
+    DENSE_INT8_SK_ROW(bf16),
+    DENSE_INT8_SK_ROW(f32),
+};
+#undef DENSE_INT8_SK_ROW
+static_assert(
+    (int)(sizeof(dense_kernels_int8_sk[0]) / sizeof(dense_kernels_int8_sk[0][0])) == KO_ROW_COUNT,
+    "every KO format must have a split-K entry (null where it never splits)");
+
+// Split-K int8 dense matmul: the mode-1 tile grid (ceil(M/16) × N/32) times `splits`
+// slices of K. Rust decides `splits` (q8a128_dense_k_splits) and owns the scratch:
+// `ws` holds K-tiles × M × N F32 partials (one per K tile), `counters` one zeroed u32
+// per (batch tile, row tile), returned to zero by the kernel itself. Both must be
+// stream-ordered with every other split-K launch that shares them.
+extern "C" int run_dense_int8_splitk(
+    const void* weights,
+    const void* vy,
+    void* dst,
+    int32_t ncols_x,      // K
+    int32_t nrows_x,      // N
+    int32_t total_batch,  // M
+    int32_t qtype,
+    int32_t out_dtype,
+    int32_t sum_norm,
+    int32_t splits,
+    float* ws,
+    unsigned int* counters
+) {
+    if (out_dtype < 0 || out_dtype > 2) {
+        return QMM_BAD_OUT_DTYPE;
+    }
+    const int kernel_row = qtype_to_matmul_kernel_index(qtype);
+    if (kernel_row < KO_ROW_FIRST || kernel_row - KO_ROW_FIRST >= KO_ROW_COUNT) {
+        return QMM_BAD_QTYPE;
+    }
+    void* kfn = dense_kernels_int8_sk[out_dtype][kernel_row - KO_ROW_FIRST];
+    // A null entry is a format that never splits; a depth outside [2, K-tiles] would leave
+    // K tiles unwalked or run blocks with nothing to sum.
+    if (kfn == nullptr || splits < 2 || splits > ncols_x / 128) {
+        return QMM_BAD_SPLIT;
+    }
+    const int batch_tiles = (total_batch + 15) / 16;
+    const int row_tiles = (nrows_x + 31) / 32;
+    dim3 grid(batch_tiles, row_tiles, splits);
+    dim3 block(WARP_SIZE, 4, 1);
+    const int dst_stride = nrows_x;
+    void* args[] = {
+        (void*)&weights, (void*)&vy, (void*)&dst,
+        (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
+        (void*)&dst_stride, (void*)&sum_norm, (void*)&ws, (void*)&counters,
+    };
+    cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+    return QMM_OK;
+}
+
+// The fused-activation dense matmul: `dst [M, N] = silu(proj[:, 0..K]) · Wᵀ` for a Q8_KO
+// weight and an F32 output, the activation quantized by the kernel's own loader
+// (grouped_tc::quantized_matmul_dense_silu_entry_int8). `proj` rows are `proj_stride`
+// floats apart; `mode2` picks the Bm=32 tile exactly as the dense launch's does.
+extern "C" __global__ void q8_ko_int8_f32_dense_silu(
+    const void*, const float*, int, float*, int, int, int, int, int);
+extern "C" __global__ void q8_ko_int8_f32_dense_silu_m2(
+    const void*, const float*, int, float*, int, int, int, int, int);
+
+extern "C" int run_dense_int8_silu_q8ko_f32(
+    const void* weights,
+    const float* proj,
+    int32_t proj_stride,
+    float* dst,
+    int32_t ncols_x,      // K: the activation's width, the weight's columns
+    int32_t nrows_x,      // N
+    int32_t total_batch,  // M
+    int32_t sum_norm,
+    int32_t mode2
+) {
+    // K whole tiles inside each row; N whole 32-row tiles.
+    if (ncols_x <= 0 || ncols_x % 128 != 0 || proj_stride < ncols_x || nrows_x % 32 != 0) {
+        return QMM_NO_KERNEL;
+    }
+    // An empty product has nothing to write — and a zero-sized grid is a launch
+    // error that would otherwise surface at whatever op checks next.
+    if (total_batch <= 0 || nrows_x <= 0) {
+        return QMM_OK;
+    }
+    const int bm = mode2 ? 32 : 16;
+    dim3 grid((total_batch + bm - 1) / bm, (nrows_x + 31) / 32, 1);
+    dim3 block(WARP_SIZE, 4, 1);
+    const int dst_stride = nrows_x;
+    void* args[] = {
+        (void*)&weights, (void*)&proj, (void*)&proj_stride, (void*)&dst,
+        (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
+        (void*)&dst_stride, (void*)&sum_norm,
+    };
+    cudaLaunchKernel(mode2 ? (void*)q8_ko_int8_f32_dense_silu_m2 : (void*)q8_ko_int8_f32_dense_silu,
+                     grid, block, args, 0, nullptr);
+    return QMM_OK;
+}
 
 extern "C" int run_quantized_matmul(
     const vx_segment_t* segments,

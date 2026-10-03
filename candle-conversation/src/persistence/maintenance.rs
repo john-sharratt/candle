@@ -68,7 +68,7 @@ use super::record::{
     DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, SectionTombstonePayload,
     TombstonePayload, TurnCouplingPayload,
 };
-use super::relocation_watch::RelocationWatch;
+use super::relocation_watch::{Reemit, RelocationWatch};
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
 use super::stripes::{stripes, MAX_STRIPE_BYTES};
@@ -309,6 +309,13 @@ pub struct MaintenancePlan {
     op: MaintenanceOp,
     /// The full resident set to re-emit (the drop-safety net, §6 module doc).
     resident: Vec<Resident>,
+    /// The active segment when the plan was made, recorded as the drop-safety
+    /// floor once the resident set is re-emitted (`None` when the plan re-emits
+    /// nothing). Taken at the plan rather than at the first append: a record
+    /// written between the two that supersedes a planned copy — the planned
+    /// copy is then skipped — sits in a segment no older than this, so every
+    /// live metadata record still has a copy at or above the floor.
+    reemit_floor: Option<SegmentId>,
     /// `(stream, chunk_index, source_loc)` chunks to relocate off the targets.
     chunk_relocs: Vec<(StreamId, u64, ChunkLoc)>,
     /// `(stream, source_loc)` `Tokens` records to relocate.
@@ -357,15 +364,17 @@ impl MaintenancePlan {
     }
 }
 
-/// Chunk records one relocation batch moves under a single hold of the
+/// Record bytes one batch re-emits or relocates under a single hold of the
 /// persistence lock. Relocation reads and re-appends at ~100 MB/s (a 3.6 GB
 /// segment took 37 s), so this bounds what a seal write or cold load waits
 /// behind maintenance to roughly 150 ms.
 pub const RELOCATION_BATCH_BYTES: u64 = 16 * 1024 * 1024;
 
-/// A maintenance op's chunk relocation in progress, carried between the
-/// batches of [`SubstratePersistence::relocate_chunk_batch`].
+/// A maintenance op in progress, carried between the batches of
+/// [`SubstratePersistence::relocate_batch`].
 pub struct MaintenanceRun {
+    /// How many of the plan's `resident` records have been taken.
+    resident_cursor: usize,
     /// How many of the plan's `chunk_relocs` have been taken.
     chunk_cursor: usize,
     /// `(stream, chunk_index, old_loc, new_loc)` of every chunk moved so far.
@@ -785,6 +794,7 @@ impl SubstratePersistence {
         } else {
             Vec::new()
         };
+        let reemit_floor = (!resident.is_empty()).then(|| self.segments.active_id());
         let (
             chunk_relocs,
             token_relocs,
@@ -842,6 +852,7 @@ impl SubstratePersistence {
         Ok(Some(MaintenancePlan {
             op,
             resident,
+            reemit_floor,
             chunk_relocs,
             token_relocs,
             snapshot_relocs,
@@ -908,7 +919,7 @@ impl SubstratePersistence {
     /// read-only handle refuses with [`PersistenceError::ReadOnly`].
     pub fn execute_maintenance(&mut self, plan: &MaintenancePlan) -> Result<MaintenanceResult> {
         let mut run = self.begin_maintenance(plan)?;
-        while self.relocate_chunk_batch(plan, &mut run, u64::MAX)? {}
+        while self.relocate_batch(plan, &mut run, u64::MAX)? {}
         self.complete_maintenance(plan, run)
     }
 
@@ -941,44 +952,115 @@ impl SubstratePersistence {
         self.relocation_watch = None;
     }
 
-    /// The first step of [`Self::execute_maintenance`]: re-emit the resident
-    /// set. One hold of the lock, as the resident records' ordering guards
-    /// assume. Returns the run the chunk batches advance.
+    /// The first step of [`Self::execute_maintenance`]: start the run the
+    /// batches of [`Self::relocate_batch`] advance. Writes nothing.
     pub fn begin_maintenance(&mut self, plan: &MaintenancePlan) -> Result<MaintenanceRun> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
-        // Resident set — re-emitted from in-RAM state (not read from disk), so
-        // the normal encoding append. When re-emitted, record the active segment
-        // it lands into (captured BEFORE the appends, the floor of the segments
-        // the re-emission writes to) as the new drop-safety floor, so subsequent
-        // older-only ops can skip the re-emission (see `need_resident_reemit`). An
-        // empty resident set means the planner chose to skip — leave the floor.
-        if !plan.resident.is_empty() {
-            let reemit_floor = self.segments.active_id();
-            for r in &plan.resident {
-                self.append_record(r.rt, 0, r.stream_id, r.chunk_index, 0, 0, &r.payload)?;
-            }
-            self.resident_reemit_floor = Some(reemit_floor);
-        }
         Ok(MaintenanceRun {
+            resident_cursor: 0,
             chunk_cursor: 0,
             chunk_updates: Vec::with_capacity(plan.chunk_relocs.len()),
         })
     }
 
+    /// Advance the op by one batch — up to `budget_bytes` of records, at least
+    /// one — and commit it. The resident set is re-emitted first, then the
+    /// target segments' chunks are relocated. Answers whether either remains.
+    ///
+    /// This is the unit the caller takes the lock for, so a seal write or a
+    /// cold load waits for one batch instead of the whole op. Both halves are
+    /// large: the chunks are gigabytes for a big segment, and the resident set
+    /// is every live metadata record in the store — ~35,700 of them on the live
+    /// daemon, whose single-hold re-emission held the lock for 44–52 s and
+    /// stalled every finishing turn's token write behind it.
+    pub fn relocate_batch(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget_bytes: u64,
+    ) -> Result<bool> {
+        if run.resident_cursor < plan.resident.len() {
+            self.reemit_resident_batch(plan, run, budget_bytes)?;
+            return Ok(true);
+        }
+        self.relocate_chunk_batch(plan, run, budget_bytes)
+    }
+
+    /// Re-emit the next run of the plan's resident set — up to `budget_bytes`
+    /// of appended records, at least one planned record — and commit it.
+    ///
+    /// Re-emitted from in-RAM state (not read from disk), so the normal
+    /// encoding append. A record written since the plan is followed by its
+    /// newer writes, appended again, the way the watch says (see [`Reemit`]):
+    /// the lock is released between batches, and a planned copy left as the
+    /// last word would roll its record back on the next load.
+    ///
+    /// The batch that finishes the set records the plan's floor as the new
+    /// drop-safety floor, so subsequent older-only ops can skip the
+    /// re-emission (see `need_resident_reemit`). Not before: an op abandoned
+    /// part-way has not duplicated every record above it.
+    ///
+    /// **The watch is set aside while the op appends its own copies.** It is
+    /// there to see other writers; fed the re-emission, it would read a
+    /// section's re-emitted declaration as a revival and skip the same
+    /// section's planned tombstone a few records later.
+    fn reemit_resident_batch(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget_bytes: u64,
+    ) -> Result<()> {
+        let watch = self.relocation_watch.take();
+        let appended = self.reemit_resident_run(plan, run, budget_bytes, watch.as_ref());
+        self.relocation_watch = watch;
+        appended?;
+        if run.resident_cursor == plan.resident.len() {
+            self.resident_reemit_floor = plan.reemit_floor;
+        }
+        self.commit()
+    }
+
+    /// The appends of [`Self::reemit_resident_batch`], judged against `watch`.
+    fn reemit_resident_run(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget_bytes: u64,
+        watch: Option<&RelocationWatch>,
+    ) -> Result<()> {
+        let mut bytes = 0u64;
+        while run.resident_cursor < plan.resident.len() && (bytes == 0 || bytes < budget_bytes) {
+            let r = &plan.resident[run.resident_cursor];
+            run.resident_cursor += 1;
+            let verdict = watch.map_or(Reemit::Carry, |w| w.reemit(r.rt, r.stream_id, &r.payload));
+            let newer = match verdict {
+                Reemit::Skip => continue,
+                Reemit::Carry => Vec::new(),
+                Reemit::CarryThen(newer) => newer,
+            };
+            bytes += self
+                .append_record(r.rt, 0, r.stream_id, r.chunk_index, 0, 0, &r.payload)?
+                .2;
+            for (chunk_index, payload) in &newer {
+                bytes += self
+                    .append_record(r.rt, 0, r.stream_id, *chunk_index, 0, 0, payload)?
+                    .2;
+            }
+        }
+        Ok(())
+    }
+
     /// Relocate the next run of the plan's chunks — up to `budget_bytes` of
     /// records, at least one — and commit them. Answers whether chunks remain.
     ///
-    /// The chunks are the bulk of an op (gigabytes for a large segment), and
-    /// this is the unit the caller takes the lock for, so a seal write or a cold
-    /// load waits for one batch instead of the whole relocation. A chunk
-    /// re-appended since the plan is skipped (see `relocation_watch`).
+    /// A chunk re-appended since the plan is skipped (see `relocation_watch`).
     ///
     /// Grouped by source segment and moved with **coalesced reads + verbatim
     /// staging** (no decode / CRC / re-encode), so the fast block-read path is
     /// used rather than a syscall per record.
-    pub fn relocate_chunk_batch(
+    fn relocate_chunk_batch(
         &mut self,
         plan: &MaintenancePlan,
         run: &mut MaintenanceRun,
@@ -1052,11 +1134,27 @@ impl SubstratePersistence {
     /// each behind its own supersession check, then the commit every relocated
     /// copy is durable under before [`Self::finish_maintenance`] unlinks a
     /// source. One hold of the lock. The watch stays up until that unlink.
+    ///
+    /// # Panics
+    ///
+    /// When [`Self::relocate_batch`] has not run the op to the end: the commit
+    /// below is what licenses unlinking the sources, and a resident record or
+    /// chunk not yet carried would be unlinked with them.
     pub fn complete_maintenance(
         &mut self,
         plan: &MaintenancePlan,
         run: MaintenanceRun,
     ) -> Result<MaintenanceResult> {
+        assert!(
+            run.resident_cursor == plan.resident.len()
+                && run.chunk_cursor == plan.chunk_relocs.len(),
+            "a maintenance op was completed with batches still to run: \
+             {}/{} resident records, {}/{} chunks",
+            run.resident_cursor,
+            plan.resident.len(),
+            run.chunk_cursor,
+            plan.chunk_relocs.len(),
+        );
         let chunk_updates = run.chunk_updates;
 
         // Tokens — same coalesced verbatim path, behind the watch the chunks
@@ -1365,6 +1463,7 @@ impl SubstratePersistence {
         } else {
             Vec::new()
         };
+        let reemit_floor = (!resident.is_empty()).then(|| self.segments.active_id());
         let (
             chunk_relocs,
             token_relocs,
@@ -1375,6 +1474,7 @@ impl SubstratePersistence {
         let plan = MaintenancePlan {
             op: *op,
             resident,
+            reemit_floor,
             chunk_relocs,
             token_relocs,
             snapshot_relocs,
@@ -2999,7 +3099,7 @@ mod tests {
             let mut run = sp.begin_maintenance(&plan).unwrap();
             let mut batches = 0;
             loop {
-                let more = sp.relocate_chunk_batch(&plan, &mut run, 1).unwrap();
+                let more = sp.relocate_batch(&plan, &mut run, 1).unwrap();
                 batches += 1;
                 if batches == 1 {
                     sp.write_chunk(sid, 2, 32, 4, None, &chunk_payload(99))
@@ -3010,7 +3110,11 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(batches, 4, "one chunk per batch at a one-byte budget");
+            assert_eq!(
+                batches,
+                plan.resident.len() + 4,
+                "one resident record, then one chunk, per batch at a one-byte budget"
+            );
             let result = sp.complete_maintenance(&plan, run).unwrap();
             let moved: Vec<u64> = result.chunk_updates.iter().map(|u| u.1).collect();
             assert_eq!(
@@ -3105,7 +3209,7 @@ mod tests {
                 },
             );
             sp.commit().unwrap();
-            while sp.relocate_chunk_batch(&plan, &mut run, 1).unwrap() {}
+            while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
             let result = sp.complete_maintenance(&plan, run).unwrap();
             let moved: Vec<(StreamId, u64)> =
                 result.chunk_updates.iter().map(|u| (u.0, u.1)).collect();
@@ -3138,6 +3242,147 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The resident set is re-emitted a batch at a time, around the writes
+    /// made beside it.** Re-emitting it under one hold of the lock stalled
+    /// every finishing turn's token write for 44–52 s on the live daemon, so
+    /// it is batched like the chunks — and the lock is then released between
+    /// batches, so a metadata record can be written again before its planned
+    /// copy is appended. The newer write is appended again after the planned
+    /// copy: a last-writer-wins record (the debug id) keeps the newer value —
+    /// which, left where it was, would sit before the timeline's re-emitted
+    /// declaration and be dropped on replay — and a merged one (the label)
+    /// keeps the planned fields the newer partial record does not carry, and
+    /// the newer title.
+    #[test]
+    fn the_resident_set_is_re_emitted_in_batches_around_newer_writes() {
+        let dir = tmp_dir("reemit_batched");
+        let decl = turn_decl(606, 0);
+        let sid = decl.stream_id();
+        let label = |conv_id: &str, title: &str| {
+            encode_label_payload(606, conv_id, title, &BTreeMap::new())
+        };
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            sp.append_record(
+                RecordType::Label,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &label("conv-606", "original"),
+            )
+            .unwrap();
+            sp.write_debug_id(606, "first").unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(10))
+                .unwrap();
+            sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(1))
+                .unwrap(); // superseded below: the segment carries dead weight
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let plan = sp.plan_maintenance(&substrate, true).unwrap().unwrap();
+            assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+            assert!(
+                plan.resident.len() >= 3,
+                "the decl, the label and the debug id are planned"
+            );
+            assert_eq!(
+                plan.reemit_floor,
+                Some(sp.segments.active_id()),
+                "the floor is the active segment at the plan"
+            );
+            sp.watch_relocation();
+            let mut run = sp.begin_maintenance(&plan).unwrap();
+            sp.write_debug_id(606, "second").unwrap();
+            sp.append_record(RecordType::Label, 0, 0, 0, 0, 0, &label("", "renamed"))
+                .unwrap();
+            sp.commit().unwrap();
+
+            let mut resident_batches = 0;
+            while run.resident_cursor < plan.resident.len() {
+                assert_eq!(
+                    sp.resident_reemit_floor, None,
+                    "the floor waits for the whole set"
+                );
+                assert!(sp.relocate_batch(&plan, &mut run, 1).unwrap());
+                resident_batches += 1;
+            }
+            assert!(
+                resident_batches >= 2,
+                "the set spans several holds at a one-byte budget, not one"
+            );
+            assert_eq!(sp.resident_reemit_floor, plan.reemit_floor);
+            while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
+            let result = sp.complete_maintenance(&plan, run).unwrap();
+            result.apply_to_substrate(&mut substrate);
+            sp.finish_maintenance(&plan).unwrap();
+            assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let tl = TimelineId::from_raw(606).unwrap();
+            assert_eq!(
+                substrate.debug_id_of(tl),
+                Some("second"),
+                "the newer debug id survives the reload"
+            );
+            assert_eq!(substrate.label_of(tl), Some("renamed"));
+            assert_eq!(
+                substrate.conv_id_of(tl),
+                Some("conv-606"),
+                "the planned label's conversation id survives the merge"
+            );
+            assert_eq!(
+                sp.read_chunk(&substrate, sid, 0).unwrap(),
+                chunk_payload(10)
+            );
+            assert_eq!(sp.read_chunk(&substrate, sid, 1).unwrap(), chunk_payload(2));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A batched op cannot be completed early: the commit it ends with
+    /// licenses unlinking the sources.
+    #[test]
+    #[should_panic(expected = "a maintenance op was completed with batches still to run")]
+    fn completing_an_op_with_batches_left_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let decl = turn_decl(707, 0);
+        let sid = decl.stream_id();
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1))
+                .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        let mut substrate = Substrate::new();
+        let mut sp =
+            SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        let plan = sp.plan_maintenance(&substrate, true).unwrap().unwrap();
+        let run = sp.begin_maintenance(&plan).unwrap();
+        sp.complete_maintenance(&plan, run).ok();
     }
 
     /// **One op at a time.** Planning a second while one is in flight panics:

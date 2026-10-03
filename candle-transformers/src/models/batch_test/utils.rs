@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+use crate::models::batch_test::greedy::greedy_token;
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
 use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
 use crate::models::batch_test::span_report::print_span;
@@ -27,6 +28,7 @@ use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
 use crate::models::dialect::Dialect;
+use crate::models::draft_depth::DraftDepth;
 use crate::models::expert_lre::PipelineStats;
 use crate::models::speculative_choice::GreedyChooser;
 use candle::vram::process_ram::ProcessRam;
@@ -537,8 +539,6 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
     passes: usize,
     label: &str,
 ) -> Result<(bool, Vec<Vec<u32>>)> {
-    use candle::IndexOp;
-
     let n_layers = model.num_layers();
     let mut streams: Vec<Vec<u32>> = Vec::with_capacity(passes);
 
@@ -576,10 +576,7 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
                 None,
             )?;
             session.advance_sequence(seq, prompt_ids.len())?;
-            step.logits_owned()?[0]
-                .i(0)?
-                .argmax(0)?
-                .to_scalar::<u32>()?
+            greedy_token(&step.logits_owned()?[0])?
         };
         let mut gen = vec![next];
         for _ in 1..decode_tokens {
@@ -598,10 +595,7 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
                     None,
                 )?;
                 session.advance_sequence(seq, 1)?;
-                step.logits_owned()?[0]
-                    .i(0)?
-                    .argmax(0)?
-                    .to_scalar::<u32>()?
+                greedy_token(&step.logits_owned()?[0])?
             };
             gen.push(next);
         }
@@ -683,8 +677,6 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
     repeats: usize,
     label: &str,
 ) -> Result<usize> {
-    use candle::IndexOp;
-
     let n_layers = model.num_layers();
     let prompt_len = prompt_ids.len();
     let mut session = model.create_batched_session(BatchedConfig::default())?;
@@ -709,10 +701,7 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
             None,
         )?;
         session.advance_sequence(seq, prompt_len)?;
-        let tok = step.logits_owned()?[0]
-            .i(0)?
-            .argmax(0)?
-            .to_scalar::<u32>()?;
+        let tok = greedy_token(&step.logits_owned()?[0])?;
         Ok((seq, tok))
     };
 
@@ -1630,15 +1619,21 @@ impl TestParams {
             // logits must be bit-identical. Any drift means repeat state leaked
             // (offset/backing divergence) and the throughput numbers are
             // measuring a different workload than reported.
+            //
+            // Every session's row at once: one per-row max|delta| on the device
+            // and one read-back, rather than a synchronising read per session
+            // inside the timed window.
             match &repeat_base_logits {
                 None => repeat_base_logits = Some(logits_vec.clone()),
                 Some(base) => {
-                    for (i, (a, b)) in base.iter().zip(logits_vec.iter()).enumerate() {
-                        let d = (a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
-                            .abs()?
-                            .flatten_all()?
-                            .max(0)?
-                            .to_scalar::<f32>()?;
+                    let a = Tensor::cat(&base.iter().collect::<Vec<_>>(), 0)?;
+                    let b = Tensor::cat(&logits_vec.iter().collect::<Vec<_>>(), 0)?;
+                    let deltas = (a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
+                        .abs()?
+                        .flatten_from(1)?
+                        .max(1)?
+                        .to_vec1::<f32>()?;
+                    for (i, &d) in deltas.iter().enumerate() {
                         if d != 0.0 {
                             candle::bail!(
                                 "prompt repeat {} session {} is not idempotent: \
@@ -1765,6 +1760,14 @@ impl TestParams {
         )?;
         self.device.synchronize()?;
         drop(detector);
+        // **The clock stops here, before the reporting below** — the same rule the
+        // prefill clock keeps. `ProcessRam::capture` walks every page of the address
+        // space (~17M on Flash-Next's 54 GB mapping), and inside the window it was
+        // charged to decode: ~0.9 s a row, which read as a 43–54% decode regression
+        // at one context while the speculative steps themselves ran at the recorded
+        // rate.
+        pipeline_record("bench:decode_total", t_decode_total);
+        let generate_duration = generate_start.elapsed();
         // Every session of the row is still alive here, so KV stands at its
         // high-water for the row and the weight zone at what decode ran against.
         print_span(
@@ -1826,9 +1829,6 @@ impl TestParams {
                 if streaming == 0 { " (whole)" } else { "" }
             );
         }
-        pipeline_record("bench:decode_total", t_decode_total);
-
-        let generate_duration = generate_start.elapsed();
         let generate_tokens = steps_run * config.num_contexts;
         let generate_tokens_per_sec = if generate_tokens == 0 {
             0.0
@@ -2067,18 +2067,29 @@ impl TestParams {
         let max_tokens = self.generate_token_count;
         let stop_on = &self.stop_on_eos;
         // First generated token per session = argmax of its prefill logits, held
-        // OUT of the KV as the driver's `committed` seed.
+        // OUT of the KV as the driver's `committed` seed. One fused greedy launch
+        // over every session's row and one read-back — the sampler the decode
+        // steps use — rather than an argmax and a synchronising read per session.
         let mut committed: Vec<u32> = Vec::with_capacity(sequence_indices.len());
         let mut active: Vec<bool> = Vec::with_capacity(sequence_indices.len());
+        let stacked = Tensor::cat(&runs.iter().map(|r| &r.logits).collect::<Vec<_>>(), 0)?;
+        let seeds = stacked.batched_sample_argmax()?;
+        // The logit each seed was chosen at. Every value of a row being -inf or
+        // NaN is what a corrupted forward looks like from here, and the greedy
+        // pick of such a row is a token the model never scored. Caught at the
+        // seed because a bad seed feeds the drafter and the whole block, so the
+        // failure would otherwise surface as unreadable output several steps
+        // later.
+        let picked = stacked
+            .gather(&seeds.unsqueeze(1)?, 1)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let seeds = seeds.to_vec1::<u32>()?;
         for (i, run) in runs.iter_mut().enumerate() {
-            let row = run.logits.squeeze(0)?;
-            let c = row.argmax(0)?.to_scalar::<u32>()?;
-            // `argmax` yields `u32::MAX` when every value is -inf or NaN, which
-            // is what a corrupted forward looks like from here — a token id that
-            // no vocabulary has. Caught at the seed because a bad seed feeds the
-            // drafter and the whole block, so the failure would otherwise
-            // surface as unreadable output several steps later.
-            if c == u32::MAX {
+            let c = seeds[i];
+            if picked[i].is_nan() || picked[i] == f32::NEG_INFINITY {
+                let row = run.logits.squeeze(0)?;
                 let f = |t: Result<Tensor>| -> f32 {
                     t.and_then(|x| x.to_dtype(DType::F32)?.to_vec0::<f32>())
                         .unwrap_or(f32::NAN)
@@ -2098,7 +2109,10 @@ impl TestParams {
         // one plain wave and yields however many tokens the verify confirmed,
         // so mean accepted/step IS the speedup ceiling. Reported rather than
         // asserted — it is a property of the text, not of the code.
-        let (mut steps, mut emitted) = (0usize, 0usize);
+        let (mut steps, mut emitted, mut drafted) = (0usize, 0usize, 0usize);
+        // Each session drafts one past its own acceptance, clipped at the
+        // model's ladder — the same rule the scheduler applies.
+        let mut depths = vec![DraftDepth::default(); sequence_indices.len()];
         let t_spec = std::time::Instant::now();
         loop {
             let idxs: Vec<usize> = (0..sequence_indices.len()).filter(|&i| active[i]).collect();
@@ -2106,9 +2120,11 @@ impl TestParams {
                 break;
             }
             steps += 1;
-            let before: usize = idxs.iter().map(|&i| runs[i].output.len()).sum();
+            let lens: Vec<usize> = idxs.iter().map(|&i| runs[i].output.len()).collect();
+            let before: usize = lens.iter().sum();
             let seqs: Vec<usize> = idxs.iter().map(|&i| sequence_indices[i]).collect();
             let comms: Vec<u32> = idxs.iter().map(|&i| committed[i]).collect();
+            let budgets: Vec<usize> = idxs.iter().map(|&i| depths[i].budget(max_draft)).collect();
             // Per-session emit sinks over DISJOINT `runs` borrows: each pushes
             // into its own output and applies the budget/EOS policy — the exact
             // per-token loop plain decode uses.
@@ -2128,21 +2144,27 @@ impl TestParams {
             // validates every run against a fixed expected string, so the
             // speculative path must reproduce plain greedy decode token for
             // token.
-            let next = model.speculative_decode_step_batch(
+            let step = model.speculative_decode_step_batch(
                 session,
                 &seqs,
                 &comms,
-                max_draft,
+                &budgets,
                 nl,
                 &mut GreedyChooser,
                 &mut emits,
             )?;
             drop(emits);
+            // What each session actually drafted, not what it asked for: a drafter
+            // that proposes less (or nothing) must not read as rejected drafts.
+            drafted += step.drafted.iter().sum::<usize>();
+            for (k, &i) in idxs.iter().enumerate() {
+                depths[i].record(step.drafted[k], runs[i].output.len() - lens[k]);
+            }
             for (k, &i) in idxs.iter().enumerate() {
                 // `Some(c)` ⇒ the sink accepted `c` under budget/EOS policy (it
                 // is already emitted and becomes the next seed); `None` ⇒ the
                 // sink stopped this session.
-                match next[k] {
+                match step.next[k] {
                     Some(c) => committed[i] = c,
                     None => active[i] = false,
                 }
@@ -2152,7 +2174,7 @@ impl TestParams {
         let secs = t_spec.elapsed().as_secs_f64();
         println!(
             "  speculative: {steps} steps, {emitted} tokens, {:.2} accepted/step \
-             ({:.1} tok/s over the cohort, draft budget {max_draft})",
+             ({:.1} tok/s over the cohort, {drafted} drafted at a ceiling of {max_draft})",
             if steps > 0 {
                 emitted as f64 / steps as f64
             } else {

@@ -89,8 +89,8 @@ in flight *at the same time*.
 From the four subsystem studies:
 
 1. **Post-attention is fully type-agnostic and token-flat.** There is exactly
-   one FFN call site per layer (`batched_layer.rs:390-393`): `ffn_norm →
-   ffn_forward → SparseMoeBlock::forward_dynamic`, which immediately flattens to
+   one FFN call site per layer (`batched_layer.rs`): `ffn_norm →
+   ffn_residual → SparseMoeBlock::forward_dynamic`, which immediately flattens to
    `num_tokens = b_size·seq_len` (`quantized_qwen3_moe.rs:253`) and routes/gathers
    per flat row. The router and experts never see sequence structure or token
    type. All projections (q/k/v/o) and the FFN qmatmul are shared `QMatMul`

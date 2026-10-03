@@ -129,7 +129,8 @@ impl RopeRungs {
         self.host_tables.len()
     }
 
-    /// Each rung's highest reach, ascending.
+    /// Each rung's highest reach, ascending — what a header writer picks a
+    /// sequence's rung by.
     pub fn ceilings(&self) -> &[usize] {
         self.select.ceilings()
     }

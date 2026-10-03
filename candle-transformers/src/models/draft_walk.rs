@@ -33,11 +33,11 @@
 //!   token the caller was already given.
 
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
-use candle::{DType, Result, Tensor};
+use candle::{DType, Result, Tensor, D};
 use candle_nn::kv_cache::{ChunkedKvBacking, KvCache};
 
 use super::batched_inference::BatchedInferenceSession;
-use super::operand_guard::expect_dtype;
+use super::operand_guard::{expect_dense_view, expect_dtype};
 
 /// One position of the walk, for the whole cohort.
 ///
@@ -201,16 +201,23 @@ pub fn draft_walk(
                 out
             };
 
-            // `argmax_keepdim`, not `argmax`: the latter drops the axis, and a
-            // one-row cohort would come back rank-0 rather than `[1, 1]`.
+            // One launch of the fused batched sampler's greedy path over the
+            // cohort's `[n, vocab]` rows — the kernel the scheduler's sampler
+            // runs at temperature zero — not the generic `argmax` reduction,
+            // whose half-precision path addresses every element through the
+            // strided-index walk. The rows are the head's dense output, so the
+            // reshape is a view, and the sampler reads them from their own first
+            // element; it yields `[n]` for any cohort, one row included.
             //
-            // The reduction already emits U32 on both backends, and the next
-            // step's embedding gather requires it — so it is checked rather than
-            // cast. A cast would be a full pass over the ids on any backend that
-            // ever stopped emitting U32, silently, once per drafted token.
-            let next = logits.argmax_keepdim(candle::D::Minus1)?;
+            // The sampler emits U32, and the next step's embedding gather
+            // requires it — so it is checked rather than cast. A cast would be a
+            // full pass over the ids on any backend that ever stopped emitting
+            // U32, silently, once per drafted token.
+            expect_dense_view(&logits, "draft walk logits")?;
+            let vocab = logits.dim(D::Minus1)?;
+            let next = logits.reshape((n, vocab))?.batched_sample_argmax()?;
             expect_dtype(&next, DType::U32, "draft walk argmax")?;
-            ids = next.flatten_all()?;
+            ids = next;
             steps.push(ids.clone());
             h = h_next;
         }

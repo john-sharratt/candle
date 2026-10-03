@@ -14,7 +14,18 @@ use crate::token_buffer::TokenBuffer;
 use candle::cuda_backend::CudaStorageSlice;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
+use candle_transformers::generation::{LogitsProcessor, PendingSample};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+/// A stencil-constrained row's sample with its device work enqueued
+/// ([`BatchedSampler::issue_allow_list`]) and not yet read back: the allowed
+/// tokens its result indexes, and the row's processor, which holds the RNG the
+/// host half draws from.
+struct PendingAllowList {
+    allow: Vec<u32>,
+    processor: LogitsProcessor,
+    pending: PendingSample,
+}
 
 /// Per-sequence sampling state.
 ///
@@ -654,6 +665,11 @@ impl BatchedSampler {
         let mut kernel_idx: Vec<usize> = Vec::new();
         let mut kernel_states: Vec<&mut SequenceSamplingState> = Vec::new();
         let mut kernel_configs: Vec<&SamplingConfig> = Vec::new();
+        // Small allow-lists: every such row's device work is enqueued in this
+        // pass and read back after the kernel rows below, so the rows share one
+        // pipeline drain instead of each draining it for its own handful of
+        // logits.
+        let mut allow_rows: Vec<(usize, PendingAllowList, &mut SequenceSamplingState)> = Vec::new();
         for (i, slot) in states.iter_mut().enumerate() {
             let state: &mut SequenceSamplingState = slot;
             let config = configs[i];
@@ -665,8 +681,12 @@ impl BatchedSampler {
                     state.advance_rng();
                     results[i] = token;
                 }
-                // Small allow-list: a tiny gather + sample, CPU-side.
-                [_, _, ..] => results[i] = self.sample_allow_list(&logits2d, i, config, state)?,
+                // Small allow-list: a tiny gather + sample over just the allowed
+                // logits.
+                [_, _, ..] => {
+                    let pending = self.issue_allow_list(&logits2d, i, config, state)?;
+                    allow_rows.push((i, pending, state));
+                }
                 // Unconstrained: defer to the device kernel below. Collected in
                 // this same pass — a second walk filtering on `kernel_idx` would
                 // re-scan it per row, on a path that runs once per decode step.
@@ -714,6 +734,9 @@ impl BatchedSampler {
             for (k, &i) in kernel_idx.iter().enumerate() {
                 results[i] = tokens[k];
             }
+        }
+        for (i, pending, state) in allow_rows {
+            results[i] = self.finish_allow_list(pending, state)?;
         }
 
         // A row that has just crossed the degenerate bar gets its logits
@@ -774,25 +797,45 @@ impl BatchedSampler {
         }
     }
 
-    /// Sample one row constrained to its stencil allow-list: gather just the
-    /// allowed logits (a handful) and sample among them with the row's strategy.
-    /// `O(allow-list)`, never the full vocab, and CPU-side regardless of device.
-    fn sample_allow_list(
+    /// The device half of a row constrained to its stencil allow-list: gather
+    /// just the allowed logits (a handful) and enqueue the row's strategy over
+    /// them. `O(allow-list)`, never the full vocab. Nothing is read back here
+    /// and the row's state is not advanced — [`Self::finish_allow_list`] does
+    /// both.
+    fn issue_allow_list(
         &self,
         logits2d: &Tensor,
         row: usize,
         config: &SamplingConfig,
-        state: &mut SequenceSamplingState,
-    ) -> candle::Result<u32> {
-        use candle_transformers::generation::LogitsProcessor;
+        state: &SequenceSamplingState,
+    ) -> candle::Result<PendingAllowList> {
         let allow: Vec<u32> = config.stencil.iter().map(|&t| t as u32).collect();
         let idx = Tensor::from_vec(allow.clone(), allow.len(), logits2d.device())?;
-        // Gather the allowed logits (small download), then sample over just them.
         let gathered = logits2d.i(row)?.index_select(&idx, 0)?;
         let gathered = apply_banned_local(&gathered, &allow, config)?;
         let seed = config.seed.wrapping_add(state.rng_offset);
-        let mut processor = LogitsProcessor::from_sampling(seed, config_to_sampling(config));
-        let local = processor.sample(&gathered)? as usize;
+        let processor = LogitsProcessor::from_sampling(seed, config_to_sampling(config));
+        let pending = processor.sample_issue(&gathered)?;
+        Ok(PendingAllowList {
+            allow,
+            processor,
+            pending,
+        })
+    }
+
+    /// The host half: read the row's result back, map it to its allowed token
+    /// and advance the row.
+    fn finish_allow_list(
+        &self,
+        row: PendingAllowList,
+        state: &mut SequenceSamplingState,
+    ) -> candle::Result<u32> {
+        let PendingAllowList {
+            allow,
+            mut processor,
+            pending,
+        } = row;
+        let local = processor.sample_finish(pending)? as usize;
         let token = allow[local];
         state.record_token(token, self.max_recent_len);
         state.advance_rng();
@@ -938,8 +981,6 @@ impl BatchedSampler {
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
     ) -> candle::Result<Vec<u32>> {
-        use candle_transformers::generation::LogitsProcessor;
-
         let batch_size = states.len();
         let mut results = Vec::with_capacity(batch_size);
 
@@ -2612,6 +2653,47 @@ mod tests {
             .sample_batch(&logits, &mut [&mut state], &[&config])
             .expect("sample");
         assert_eq!(tokens[0], 20);
+    }
+
+    /// Constrained rows are issued in the pass over the batch and finished
+    /// after the unconstrained rows' kernel: each must land in its OWN row, and
+    /// advance its own state, with an unconstrained row between them. Every row
+    /// peaks at 50; the two allow-lists exclude it and pick their own best. On
+    /// CUDA when a card is present — the path the deferral is for — and on the
+    /// CPU path always.
+    #[test]
+    fn deferred_allow_list_rows_land_in_their_own_rows() {
+        let mut devices = vec![Device::Cpu];
+        devices.extend(Device::new_cuda(0).ok());
+        let first = SamplingConfig::argmax().with_stencil(vec![10, 20]);
+        let free = SamplingConfig::argmax();
+        let last = SamplingConfig::argmax().with_stencil(vec![30, 40]);
+        for device in devices {
+            let sampler = BatchedSampler::new(
+                device.clone(),
+                VOCAB_SIZE,
+                MAX_RECENT,
+                vec![EOS_TOKEN].into(),
+                None,
+            );
+            let (mut s0, mut s1, mut s2) = (make_state(), make_state(), make_state());
+            let logits = logits_from_rows(&[
+                &[(50, 100.0), (20, 5.0), (10, 1.0)],
+                &[(50, 100.0), (20, 5.0)],
+                &[(50, 100.0), (30, 7.0), (40, 9.0)],
+            ])
+            .to_device(&device)
+            .expect("logits");
+            let tokens = sampler
+                .sample_batch(
+                    &logits,
+                    &mut [&mut s0, &mut s1, &mut s2],
+                    &[&first, &free, &last],
+                )
+                .expect("sample");
+            assert_eq!(tokens, vec![20, 50, 40], "{device:?}");
+            assert_eq!((s0.rng_offset, s2.rng_offset), (1, 1), "{device:?}");
+        }
     }
 
     #[test]

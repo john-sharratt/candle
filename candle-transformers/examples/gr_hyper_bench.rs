@@ -20,6 +20,12 @@
 //!       target/release/examples/gr_hyper_bench 2048 20
 //!
 //! The kernel names are `gr_norm_kernel`, `gr_mix_kernel`, `gr_combine_kernel`.
+//!
+//! The KO low-rank projections, at decode and prefill widths:
+//!   cargo run -p candle-transformers --example gr_hyper_bench \
+//!       --features cuda --release -- ko [iters] [w1,w2,…]
+//!   ncu -k q8_ko_int8_f32_dense --launch-skip 40 --launch-count 4 --set full \
+//!       target/release/examples/gr_hyper_bench ko 20 1
 //! Note that `-k` takes a plain substring or `regex:<expr>`; on Windows the
 //! `.bat` wrapper hands the argument to `cmd`, so a regex containing `(`, `)`
 //! or `|` must be avoided — profile one kernel per invocation instead.
@@ -28,9 +34,20 @@
 fn main() -> candle::Result<()> {
     use candle::Device;
     use candle_transformers::models::qwen4exp::hyper::bench::{run_gr_kernels, GrBenchCfg};
+    use candle_transformers::models::qwen4exp::hyper::bench_ko::run_ko_projections;
 
     let a: Vec<String> = std::env::args().collect();
     let parse = |i: usize, d: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+    if a.get(1).map(String::as_str) == Some("ko") {
+        let dev = Device::new_cuda(0)?;
+        // Decode widths first, then prefill widths the change must not cost.
+        // A comma list in the third argument narrows it — one width under `ncu`.
+        let widths: Vec<usize> = match a.get(3) {
+            Some(list) => list.split(',').filter_map(|w| w.parse().ok()).collect(),
+            None => vec![1, 2, 4, 8, 16, 64, 512, 2048],
+        };
+        return run_ko_projections(&dev, &widths, parse(2, 200));
+    }
     // 2048 tokens puts one pass over the wide residual at 160 MiB, past the
     // card's 96 MiB L2; the bench prints which side of that line it landed on.
     let mut cfg = GrBenchCfg::qwen4exp(parse(1, 2048));

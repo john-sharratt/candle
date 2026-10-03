@@ -1,4 +1,6 @@
-use crate::{shape::Dim, Context, Error, LiveTensor, Result, Shape};
+use crate::op::{BackpropOp, Op};
+use crate::wave_provenance::WaveTicket;
+use crate::{shape::Dim, Context, Error, LiveTensor, Result, Shape, Storage, Tensor};
 
 impl<'w> LiveTensor<'w> {
     /// Concatenates two or more tensors along a particular dimension.
@@ -138,7 +140,7 @@ impl<'w> LiveTensor<'w> {
             offsets.push(next_offset);
         }
         let shape = Shape::from(cat_dims);
-        let op = crate::op::BackpropOp::new(args, |args| crate::op::Op::Cat(args, 0));
+        let op = BackpropOp::new(args, |args| Op::Cat(args, 0));
         // The concatenation lands in the arena its inputs came from — `arg0` is
         // representative because every argument shares one `'w`, so they cannot
         // come from different generations.
@@ -151,6 +153,31 @@ impl<'w> LiveTensor<'w> {
         Ok(crate::tensor::from_storage(storage, shape, op, false))
     }
 
+    /// [`Self::cat`] into an **owned** allocation: a `'static` tensor from the
+    /// pool rather than the arena the arguments came from — what
+    /// [`Self::to_owned_tensor`] is to a single tensor. One copy, with the same
+    /// run merging as `cat`, where `cat` followed by `to_owned_tensor` would
+    /// copy twice and put the intermediate on the very span the result is being
+    /// taken off.
+    pub fn cat_owned<A: AsRef<LiveTensor<'w>>, D: Dim>(args: &[A], dim: D) -> Result<Tensor> {
+        if args.is_empty() {
+            Err(Error::OpRequiresAtLeastOneTensor { op: "cat" }.bt())?
+        }
+        let dim = dim.to_index(args[0].as_ref().shape(), "cat")?;
+        if !args.iter().all(|a| a.as_ref().is_contiguous()) {
+            // A strided argument goes through the general concatenation; the
+            // copy below reads ranges, which only a contiguous layout is.
+            return Self::cat(args, dim)?.to_owned_tensor();
+        }
+        let (storage, shape) = Self::cat_contiguous_storage(args, dim, None)?;
+        Ok(crate::tensor::from_storage(
+            storage,
+            shape,
+            BackpropOp::none(),
+            false,
+        ))
+    }
+
     fn cat_contiguous<A: AsRef<LiveTensor<'w>>>(args: &[A], dim: usize) -> Result<Self> {
         if args.is_empty() {
             Err(Error::OpRequiresAtLeastOneTensor { op: "cat" }.bt())?
@@ -159,6 +186,22 @@ impl<'w> LiveTensor<'w> {
         if args.len() == 1 {
             return Ok(arg0.clone());
         }
+        // The concatenation lands in the arena its inputs came from — `arg0` is
+        // representative because every argument shares one `'w`, so they cannot
+        // come from different generations.
+        let (storage, shape) = Self::cat_contiguous_storage(args, dim, arg0.wave_ticket())?;
+        let op = BackpropOp::new(args, |args| Op::Cat(args, dim));
+        Ok(crate::tensor::from_storage(storage, shape, op, false))
+    }
+
+    /// The contiguous concatenation's validation and copy, into storage
+    /// allocated against `ticket` (`None`: an owned pool allocation).
+    fn cat_contiguous_storage<A: AsRef<LiveTensor<'w>>>(
+        args: &[A],
+        dim: usize,
+        ticket: Option<WaveTicket>,
+    ) -> Result<(Storage, Shape)> {
+        let arg0 = args[0].as_ref();
         let rank = arg0.rank();
         let device = arg0.device();
         let dtype = arg0.dtype();
@@ -215,19 +258,34 @@ impl<'w> LiveTensor<'w> {
         let cat_target_dim_len = cat_dims[dim];
         let block_size: usize = cat_dims.iter().skip(1 + dim).product();
         let shape = Shape::from(cat_dims);
-        let op = crate::op::BackpropOp::new(args, |args| crate::op::Op::Cat(args, dim));
-        // The concatenation lands in the arena its inputs came from — `arg0` is
-        // representative because every argument shares one `'w`, so they cannot
-        // come from different generations.
-        let mut storage = unsafe { device.alloc_uninit_from(&shape, dtype, arg0.wave_ticket())? };
+        let mut storage = unsafe { device.alloc_uninit_from(&shape, dtype, ticket)? };
+        // Every argument shares the dims before `dim`, so this is one value.
+        let d1: usize = first_dims.iter().take(dim).product();
+        let dst_s = block_size * cat_target_dim_len;
         let mut dst_o = 0;
-        for arg in args.iter() {
-            let arg = arg.as_ref();
-            let arg_dims = arg.shape().dims();
-            let d1: usize = arg_dims.iter().take(dim).product();
-            let d2 = block_size * arg_dims[dim];
-            let dst_s = block_size * cat_target_dim_len;
+        let mut i = 0;
+        while i < args.len() {
+            let arg = args[i].as_ref();
             let src_o = arg.layout().start_offset();
+            let mut d2 = block_size * arg.shape().dims()[dim];
+            let mut j = i + 1;
+            // **A run of arguments laid back to back in one storage is one copy.**
+            // With nothing outside `dim` (d1 == 1) every argument is a single
+            // contiguous range and the result is their ranges end to end, so
+            // arguments that already sit end to end in the same buffer — the
+            // per-sequence views of one upload, the rows of one logits block —
+            // are one range of it. One launch per run instead of one per
+            // argument; the result is still a copy, so nothing aliases.
+            if d1 == 1 {
+                while j < args.len() {
+                    let next = args[j].as_ref();
+                    if !next.same_storage(arg) || next.layout().start_offset() != src_o + d2 {
+                        break;
+                    }
+                    d2 += block_size * next.shape().dims()[dim];
+                    j += 1;
+                }
+            }
             arg.storage().copy2d(
                 &mut storage,
                 d1,
@@ -238,8 +296,9 @@ impl<'w> LiveTensor<'w> {
                 dst_o,
             )?;
             dst_o += d2;
+            i = j;
         }
-        Ok(crate::tensor::from_storage(storage, shape, op, false))
+        Ok((storage, shape))
     }
 
     /// Set the values on `self` using values from `src`. The copy starts at the specified

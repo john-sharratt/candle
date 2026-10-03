@@ -19,7 +19,11 @@ pub struct VarBuilder {
 impl VarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
         let mut file = std::fs::File::open(p)?;
-        let content = candle::quantized::gguf_file::Content::read(&mut file)?;
+        // Buffered: the header's tokenizer vocabulary is hundreds of thousands
+        // of fields, each its own syscall when read straight off the file.
+        let content = candle::quantized::gguf_file::Content::read(
+            &mut std::io::BufReader::with_capacity(1 << 19, &mut file),
+        )?;
         let mut data = std::collections::HashMap::new();
         for tensor_name in content.tensor_infos.keys() {
             let tensor = content.tensor(&mut file, tensor_name, device)?;

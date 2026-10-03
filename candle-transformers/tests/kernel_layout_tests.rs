@@ -611,13 +611,19 @@ fn bind_kv_cache(backing: &ChunkedKvBacking, batch_idx: usize) -> Result<KvCache
 }
 
 /// Flatten `make_qkv`'s `[1, n_head, n_tokens, head_dim]` into the FLAT-packed
-/// `[total, n_head, head_dim]` the ragged prefill wants.
+/// `[total, n_head, head_dim]` the ragged prefill wants, at the cache's F16.
+///
+/// The prefill kernel validates its operand widths rather than converting them
+/// (hot-path invariant 1b): a projection hands it the cache's compute dtype, so
+/// the harness — standing in for the projection — must too.
 fn flatten_qkv(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-    Ok((
-        q.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-        k.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-        v.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-    ))
+    let flat = |t: &Tensor| -> Result<Tensor> {
+        t.transpose(1, 2)?
+            .squeeze(0)?
+            .to_dtype(DType::F16)?
+            .contiguous()
+    };
+    Ok((flat(q)?, flat(k)?, flat(v)?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -847,13 +853,18 @@ fn make_qkv(n_tokens: usize, device: &Device, seed: u64) -> Result<(Tensor, Tens
             }
         }
     }
+    // The fixture arenas are F16, so the operands are emitted at that width once, here —
+    // the attention wrappers validate the dtype and never convert it.
     let q = Tensor::from_vec(q, (1, n_tokens, N_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     let k = Tensor::from_vec(k, (1, n_tokens, N_KV_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     let v = Tensor::from_vec(v, (1, n_tokens, N_KV_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     Ok((q, k, v))

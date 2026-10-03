@@ -9,6 +9,8 @@
 /// The checked-in prompt bodies, readable outside `#[cfg(test)]` so a harness in
 /// a crate above this one measures the SAME prompt the gates do.
 pub mod fixtures;
+/// Greedy token picks on the fused batched sampler, one launch per batch.
+pub mod greedy;
 /// This process's host RAM by allocation, printed after load, after each
 /// prefill, and as a table of every config's decode end.
 pub mod host_ram_report;

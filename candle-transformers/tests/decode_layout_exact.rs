@@ -222,10 +222,10 @@ fn run_case(
     };
     for s in 0..STEPS {
         let (q_dec, k_new, v_new) = make_qkv(1, device, seed ^ (0xD3C0DE + s as u64))?;
-        let q_dec = q_dec.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
-        let v_new = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+        let q_dec = q_dec.squeeze(2)?.contiguous()?;
+        let v_new = v_new.squeeze(2)?.contiguous()?;
         let k_new = match step {
-            Step::Random => k_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?,
+            Step::Random => k_new.squeeze(2)?.contiguous()?,
             Step::Peaked => {
                 // One key per KV head, along the group's first query, scaled
                 // so q·k clears every random key's score.
@@ -309,11 +309,10 @@ fn run_case(
             backing.set_len(0, n);
             cache.set_current_seq_len(n)?;
         }
-        // The history is the F32 master; the step's tensors are the F16 the
-        // kernel was handed. Widening them back is exact (the reference
-        // rounds everything to F16 before it computes).
-        k_hist = Tensor::cat(&[&k_hist, &k_new.to_dtype(DType::F32)?.unsqueeze(2)?], 2)?;
-        v_hist = Tensor::cat(&[&v_hist, &v_new.to_dtype(DType::F32)?.unsqueeze(2)?], 2)?;
+        // The history is F16 like the step's tensors: the arena width the
+        // kernel was handed, which the reference computes from.
+        k_hist = Tensor::cat(&[&k_hist, &k_new.unsqueeze(2)?], 2)?;
+        v_hist = Tensor::cat(&[&v_hist, &v_new.unsqueeze(2)?], 2)?;
     }
     Ok(worst)
 }
@@ -522,12 +521,17 @@ fn assert_layout(a: &KvCache, b: &KvCache, total: usize, segments: &[usize], nam
     assert_eq!(ub, segments, "[{name}] slot B layout");
 }
 
+/// Flat-packed `[total, n_head, head_dim]` at the cache's F16: the prefill kernel
+/// validates its operand widths rather than converting them (hot-path invariant
+/// 1b), so the harness hands it what a projection would.
 fn flatten(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-    Ok((
-        q.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-        k.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-        v.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-    ))
+    let flat = |t: &Tensor| -> Result<Tensor> {
+        t.transpose(1, 2)?
+            .squeeze(0)?
+            .to_dtype(DType::F16)?
+            .contiguous()
+    };
+    Ok((flat(q)?, flat(k)?, flat(v)?))
 }
 
 fn run_prefill(
@@ -835,13 +839,18 @@ fn make_qkv(n_tokens: usize, device: &Device, seed: u64) -> Result<(Tensor, Tens
             }
         }
     }
+    // The fixture arenas are F16, so the operands are emitted at that width once, here —
+    // the attention wrappers validate the dtype and never convert it.
     let q = Tensor::from_vec(q, (1, n_tokens, N_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     let k = Tensor::from_vec(k, (1, n_tokens, N_KV_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     let v = Tensor::from_vec(v, (1, n_tokens, N_KV_HEAD, HEAD_DIM), device)?
+        .to_dtype(DType::F16)?
         .transpose(1, 2)?
         .contiguous()?;
     Ok((q, k, v))

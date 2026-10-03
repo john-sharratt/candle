@@ -48,6 +48,7 @@
 //! weight holding exactly one part hands it over untouched, so the unstacked
 //! case pays nothing for the generality and issues no scatter at all.
 
+use candle::quantized::cuda::DynamicActs;
 use candle::{DType, Device, LiveTensor, Result};
 use candle_nn::kv_cache::WaveGeneration;
 
@@ -55,13 +56,16 @@ use crate::models::latent_moe::scatter::{rows_scatter_inline, RowRun};
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::wave_buffers::wave_empty;
 
-/// Project `x` through `weights` and split the result into parts of `widths`.
+/// Project `acts` through `weights` and split the result into parts of `widths`.
 ///
 /// `weights` covers `widths` in order and each weight must end on a part
 /// boundary — one weight per part (unstacked), one weight for all of them
 /// (fully stacked), or any grouping between.
+///
+/// `acts` is the block input as its producer left it: an int8 operand is read
+/// by every weight as it stands, so an unstacked group quantizes nothing.
 pub fn project_grouped<'w>(
-    x: &LiveTensor<'w>,
+    acts: &DynamicActs<'w>,
     weights: &[QMatMul],
     widths: &[usize],
     out_dtype: DType,
@@ -73,7 +77,7 @@ pub fn project_grouped<'w>(
     }
     let mut outs = Vec::with_capacity(weights.len());
     for w in weights {
-        outs.push(w.forward_live_as(x, out_dtype)?);
+        outs.push(w.forward_dynamic(acts.as_dynamic(), out_dtype)?);
     }
     split_group(outs, widths, what, wave)
 }
@@ -216,4 +220,74 @@ pub fn split_group<'w>(
     // mutex, and puts nothing on the bus for the device to read back.
     rows_scatter_inline(&runs)?;
     Ok(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::gpu_test_lock::gpu_serial;
+    use candle::quantized::cuda::to_dynamic;
+    use candle::quantized::{GgmlDType, Int8Mode, QTensor};
+    use candle::Tensor;
+
+    fn lcg(shape: &[usize], seed: u64, scale: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * scale
+            })
+            .collect();
+        Tensor::from_vec(v, shape, dev).unwrap()
+    }
+
+    /// An unstacked group reading ONE shared q8a128 operand projects exactly what
+    /// it projected when each weight quantized its own copy of the float — the
+    /// same quantizer over the same float, so the same bytes and the same
+    /// products. At the activation widths a layer hands over (F16, BF16, F32).
+    #[test]
+    fn a_shared_operand_projects_what_per_weight_quantizes_did() {
+        let _gpu = gpu_serial();
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!()
+        };
+        let mode = Int8Mode::auto(&dev);
+        assert!(mode.is_int8(), "this card must run the int8 path");
+        let hidden = 512usize;
+        let widths = [64usize, 32, 32];
+        let weights: Vec<QMatMul> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| {
+                let t = lcg(&[w, hidden], 80 + i as u64, 0.1, &dev);
+                QMatMul::from_qtensor_with_mode(
+                    QTensor::quantize(&t, GgmlDType::Q8_0).unwrap(),
+                    mode,
+                )
+                .unwrap()
+            })
+            .collect();
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            for rows in [1usize, 5, 40] {
+                let x = lcg(&[rows, hidden], 90 + rows as u64, 2.0, &dev)
+                    .to_dtype(dtype)
+                    .unwrap();
+                let float = DynamicActs::Float(x.clone());
+                let shared = to_dynamic(&x, mode, cuda, weights[0].sum_scale()).unwrap();
+                let want =
+                    project_grouped(&float, &weights, &widths, DType::F32, "t", None).unwrap();
+                let got =
+                    project_grouped(&shared, &weights, &widths, DType::F32, "t", None).unwrap();
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    let bits =
+                        |t: &LiveTensor<'_>| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert_eq!(bits(g), bits(w), "{dtype:?} {rows} rows, part {i}");
+                }
+            }
+        }
+    }
 }

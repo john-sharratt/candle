@@ -46,7 +46,7 @@
 //! driver hands it over as [`SpecRow::prefix`] and walks positions in order, so
 //! a chooser can advance its per-sequence state exactly along the committed path.
 
-use candle::{DType, Result, Tensor};
+use candle::{Result, Tensor};
 
 /// One scored row of a speculative step, as the chooser sees it.
 #[derive(Debug, Clone, Copy)]
@@ -96,6 +96,17 @@ pub trait TokenChooser {
 /// its single row — a plain decode step, by the same rule.
 pub fn continues(block: &[u32], position: usize, token: u32) -> bool {
     position + 1 < block.len() && token == block[position + 1]
+}
+
+/// One cohort speculative step's outcome, per sequence in the order the step was given them.
+pub struct SpeculativeStep {
+    /// The next committed seed (already emitted, held out of the KV), or `None` where the
+    /// sequence's sink asked to stop.
+    pub next: Vec<Option<u32>>,
+    /// The tokens the sequence actually drafted — its requested depth, or fewer where the
+    /// drafter proposed less (none at all takes a plain decode row). An acceptance estimate
+    /// divides by this, never by the depth asked for.
+    pub drafted: Vec<usize>,
 }
 
 /// One speculative step's accept walk, position by position.
@@ -238,14 +249,16 @@ impl<'b> AcceptWalk<'b> {
 /// argmax, and the committed token is the model's greedy continuation. This is
 /// what a correctness gate wants — output bit-identical to plain greedy decode
 /// regardless of draft quality — and what a caller that does not sample wants.
+///
+/// One launch of the fused batched sampler's greedy path over every row — the
+/// kernel the scheduler's sampler runs at temperature zero — not the generic
+/// `argmax` reduction, whose half-precision path addresses every element
+/// through the strided-index walk.
 pub struct GreedyChooser;
 
 impl TokenChooser for GreedyChooser {
     fn choose(&mut self, logits: &Tensor, _rows: &[SpecRow<'_>]) -> Result<Vec<u32>> {
-        logits
-            .argmax(candle::D::Minus1)?
-            .to_dtype(DType::U32)?
-            .to_vec1::<u32>()
+        logits.batched_sample_argmax()?.to_vec1::<u32>()
     }
 }
 

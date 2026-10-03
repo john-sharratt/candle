@@ -22,13 +22,14 @@ use crate::stencil::{
     MAX_TOOL_CALLS_PER_TURN,
 };
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
-// disconnected, so nothing constructs a runner. `Substrate` comes from our side.
+// disconnected, so nothing constructs a runner.
 use crate::substrate::ConvCompression;
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::literal_tokenizer;
 use crate::working_set::{Limits, Refusal, WorkingSet};
 
+use candle::quantized::pinned_staging::release_recycled_wc;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use flume::{Receiver, Sender};
@@ -1612,18 +1613,30 @@ impl ConversationEngine {
         // in `assistant_end` cannot be allowed to ride along.
         let envelope = ToolCallEnvelope::for_assistant_calls(&self.config.dialect);
         let close_turn = ToolCallEnvelope::turn_close(&self.config.dialect);
+        let started = std::time::Instant::now();
         let spec = compile_tool_call_loop(tools, &envelope, MAX_TOOL_CALLS_PER_TURN, &close_turn)
             .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
+        let spec_ms = started.elapsed().as_millis() as u64;
         let vocab = HfVocab::new(
             (*self.tokenizer).clone(),
             &self.config.eos_tokens,
             self.config.vocab_size as u64,
         );
+        let vocab_ms = started.elapsed().as_millis() as u64 - spec_ms;
         let tree = compile(&spec, &vocab).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
+        tracing::info!(
+            tools = tools.len(),
+            spec_nodes = spec.nodes.len(),
+            tree_nodes = tree.len(),
+            spec_ms,
+            vocab_ms,
+            compile_ms = started.elapsed().as_millis() as u64 - spec_ms - vocab_ms,
+            "tool stencil compiled"
+        );
         let mut registry = TriggerRegistry::new();
         registry.register(trigger, Arc::new(tree));
         Ok(Arc::new(registry))
@@ -2381,6 +2394,11 @@ impl ConversationEngine {
         // without this flush, every warm→cold KV / tokens / sig append still in
         // the writer's queue at exit would be silently lost.
         self.conversation.flush_writer();
+        // The scheduler thread owned every sequence, so by its join each
+        // `(layer, slot)` has handed its staging pair to the process-wide
+        // recycler. Nothing of this engine will take them again; unpin them
+        // rather than leave them held for the life of the process.
+        release_recycled_wc();
         Ok(())
     }
 }

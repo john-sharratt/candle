@@ -22,6 +22,7 @@
 // order (order differences are ~100× below the f16 ULP).
 
 #include "../blocks.cuh"
+#include "q8a128_tile.cuh"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -69,34 +70,6 @@ __global__ void quantize_q8a128_kernel(
         const int64_t base = (int64_t)tile * 128 + (int64_t)lane * 4;
         float x0, x1, x2, x3;
         q8a128_load4<T>(act + base, x0, x1, x2, x3);
-
-        float amax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
-        float s = x0 + x1 + x2 + x3;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
-            s += __shfl_xor_sync(0xffffffff, s, off, 32);
-        }
-        const float id = (amax != 0.f) ? 127.f / amax : 0.f;
-
-        // q8a1024 flat-grouped placement: qs and ds de-interleaved into the tile's
-        // super-block slot (see blocks.cuh). Same quant math as the old AoS block.
-        *reinterpret_cast<char4*>(obytes + q8a1024_qs_off(tile) + lane * 4) = make_char4(
-            (int8_t)__float2int_rn(x0 * id),
-            (int8_t)__float2int_rn(x1 * id),
-            (int8_t)__float2int_rn(x2 * id),
-            (int8_t)__float2int_rn(x3 * id));
-        if (lane == 0) {
-            // One (scale, sum) per 128-element tile (per-128). Stored at the tile slot's first half2.
-            half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(tile));
-            // Raw Σx, or Σx normalised by amax when the caller asked: |Σx/amax|
-            // ≤ 128 whatever the activation's magnitude, where the raw Σx
-            // overflows f16 above 65504. `id` already carries the amax==0 guard,
-            // so a dead tile stores {0, 0} either way. `s` is passed through
-            // unmultiplied on the raw arm, so those bytes are unchanged.
-            const float s_store = sum_norm ? (s * id * (1.f / 127.f)) : s;
-            ds[0] = make_half2(__float2half_rn(amax / 127.f),
-                               __float2half_rn(s_store));
-        }
+        emit_q8a128_tile(obytes, tile, lane, x0, x1, x2, x3, sum_norm);
     }
 }

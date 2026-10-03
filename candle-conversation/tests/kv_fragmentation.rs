@@ -104,18 +104,12 @@ fn logging() {
 /// Print the outcome's own summary line — the figures the table cannot carry.
 fn summarise(name: &str, outcome: &candle_conversation::fragmentation_probe::ProbeOutcome) {
     println!(
-        "\n{name}: story {}/{}, worst sustained efficiency {}%, worst single sample {}%, \
-         weight uptake {}%{}",
+        "\n{name}: story {}/{}, worst sustained efficiency {}%, worst single sample {}%, {}",
         outcome.story_pass,
         outcome.story_total,
         outcome.worst_sustained_efficiency,
         outcome.worst_single_efficiency,
-        outcome.weight_uptake_pct,
-        if outcome.weight_at_limit {
-            " (weight side at its limit — every expert resident)"
-        } else {
-            ""
-        },
+        outcome.weight_uptake_label(),
     );
 }
 
@@ -306,7 +300,7 @@ fn print_pipeline_profile(title: &str) {
     // visibly rather than hiding somewhere. Regenerate with:
     //   grep -rhoE 'gpu_span(_if|_phase)?\("[a-z0-9_:]+"' --include=*.rs \
     //     candle-transformers/src candle-conversation/src | grep -oE '"[a-z0-9_:]+"' | sort -u
-    const GPU_SPANS: [&str; 47] = [
+    const GPU_SPANS: [&str; 46] = [
         "decode:kernel",
         "decode:out_proj",
         "decode:qkv_proj",
@@ -352,7 +346,6 @@ fn print_pipeline_profile(title: &str) {
         "q4e:ple",
         "q4e:qsa_select",
         "verify:fwd",
-        "vw:own",
         "wv:sweep",
     ];
     let is_gpu = |name: &str| GPU_SPANS.contains(&name);

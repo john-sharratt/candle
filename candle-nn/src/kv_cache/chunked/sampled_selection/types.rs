@@ -1,9 +1,11 @@
+use super::super::block_round_trip::block_round_trip;
 use super::ops as cpu;
 use super::params::SELECT_BLOCK;
 use crate::kv_cache::{KvFormat, QuantFormat};
+use candle::quantized::GgmlDType;
 
 #[cfg(feature = "cuda")]
-use candle::quantized::{cuda::ggml_to_select_qtype, GgmlDType};
+use candle::quantized::cuda::ggml_to_select_qtype;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SampleSide {
@@ -148,7 +150,6 @@ impl SampleFormat {
         }
     }
 
-    #[cfg(feature = "cuda")]
     pub fn to_ggml_dtype(self) -> GgmlDType {
         match self {
             Self::F16 => GgmlDType::F16,
@@ -367,31 +368,17 @@ impl SampleFormat {
         }
     }
 
-    pub fn apply_quant(self, block: &[f32; SELECT_BLOCK]) -> [f32; SELECT_BLOCK] {
+    /// `block` through this format and back, as the GPU sampler measures it:
+    /// the quantized formats through their host codecs (`block_round_trip`),
+    /// which reproduce the kernels' encoders and decoders bit for bit, on
+    /// side `is_k` (Q0_V's codebook is per side).
+    pub fn apply_quant(self, block: &[f32; SELECT_BLOCK], is_k: bool) -> [f32; SELECT_BLOCK] {
         match self {
             Self::F16 => *block,
             Self::BF16 => cpu::round_trip_bf16(block),
-            Self::Q8KS => cpu::round_trip_q8_ks(block),
-            Self::Q8_1 => cpu::round_trip_q8_1(block),
-            Self::Q8_0 => cpu::round_trip_q8_0(block),
-            Self::Q5_1 => cpu::round_trip_q5_1(block),
-            Self::Q5_0 => cpu::round_trip_q5_0(block),
-            Self::Q4KS => cpu::round_trip_q4_ks(block),
-            Self::Q4_1 => cpu::round_trip_q4_1(block),
-            Self::Q4_0 => cpu::round_trip_q4_0(block),
-            Self::Q3_1 => cpu::round_trip_q3_1(block),
-            Self::Q3_0 => cpu::round_trip_q3_0(block),
-            Self::Q2_1 => cpu::round_trip_q2_1(block),
-            Self::Q2A => cpu::round_trip_q2_a(block),
-            Self::Q2S => cpu::round_trip_q2_s(block),
-            Self::Q2_0 => cpu::round_trip_q2_0(block),
-            Self::Q1S => cpu::round_trip_q1_s(block),
-            Self::Q0 => cpu::round_trip_q0(block),
-            Self::Q0_V => cpu::round_trip_q0_v(block),
-            Self::Q1_A => cpu::round_trip_q1_a(block),
-            Self::Q0_X => cpu::round_trip_q0_x(block),
-            Self::Q0_M2 => cpu::round_trip_q0_m2(block),
-            Self::Q0_M4 => cpu::round_trip_q0_m4(block),
+            _ => block_round_trip(self.to_ggml_dtype(), block, is_k).unwrap_or_else(|| {
+                panic!("{self} is a quantized sample format with a block codec")
+            }),
         }
     }
 }

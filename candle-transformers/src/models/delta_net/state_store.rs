@@ -534,6 +534,75 @@ impl RecurrentStateStore {
         Ok((&slot.live, slot.backup.write_half()))
     }
 
+    /// Every recurrent layer's decode-table addresses, in slot order:
+    /// `[tail in, tail out, state in, state out]` — the entering half's conv tail
+    /// and the advanced half's, then the same pair for `s`. The four rows
+    /// [`build_wave_table`] lays out per layer, without marking any layer
+    /// advanced (the same contract as [`Self::layer_state_pair`]).
+    ///
+    /// **Read off the slots, not the tensors.** Each half is a view built by
+    /// `state_in` at its slot's base — `s` at the base, the conv tail at the
+    /// next [`SLOT_ALIGN`] boundary — and every place that rebuilds a half
+    /// (`new`, `fork_from`, `relocate`) or exchanges the two (`commit_wave`)
+    /// moves `held` with it, so the pair always names the slots `live` and
+    /// `backup` stand on. Resolving a tensor's address takes its storage lock
+    /// and a stream-guarded device pointer; the table needs four per layer per
+    /// decode sequence per forward, which at 256 sequences on an 18-layer
+    /// recurrent stack was 3.6 ms of host time with the device idle.
+    ///
+    /// Debug builds check every address against the tensor it describes, which
+    /// is the one way the slots and the halves could part: a caller rebinding a
+    /// half through `layer_state_mut` rather than writing into it.
+    ///
+    /// [`build_wave_table`]: super::cuda::build_wave_table
+    #[cfg(feature = "cuda")]
+    pub fn decode_table_addresses(&self) -> Result<impl Iterator<Item = [u64; 4]> + '_> {
+        let conv_off = state_block(&self.dims).0 as u64;
+        for slot in &self.slots {
+            if slot.held.is_none() {
+                candle::bail!(
+                    "recurrent store: layer {} has no state-arena slots, so its decode \
+                     addresses are not the slots' — a store built off a CUDA device",
+                    slot.layer_index
+                );
+            }
+            #[cfg(debug_assertions)]
+            if let Some([live, backup]) = slot.held.as_ref() {
+                let Device::Cuda(cuda) = &self.device else {
+                    candle::bail!("recurrent store: arena slots on a non-CUDA device");
+                };
+                let want = [
+                    tensor_device_ptr(cuda, &slot.live.conv_tail)?,
+                    tensor_device_ptr(cuda, &slot.backup.conv_tail)?,
+                    tensor_device_ptr(cuda, &slot.live.s)?,
+                    tensor_device_ptr(cuda, &slot.backup.s)?,
+                ];
+                let got = [
+                    live.ptr() + conv_off,
+                    backup.ptr() + conv_off,
+                    live.ptr(),
+                    backup.ptr(),
+                ];
+                if got != want {
+                    candle::bail!(
+                        "recurrent store: layer {}'s slots name {got:x?} but its halves sit \
+                         at {want:x?} — a half was rebound instead of written into",
+                        slot.layer_index
+                    );
+                }
+            }
+        }
+        Ok(self.slots.iter().map(move |slot| {
+            let [live, backup] = slot.held.as_ref().expect("checked above");
+            [
+                live.ptr() + conv_off,
+                backup.ptr() + conv_off,
+                live.ptr(),
+                backup.ptr(),
+            ]
+        }))
+    }
+
     /// The layer's `(entering, advanced)` buffers — what a wave reads and what
     /// it writes — and the record that this layer advanced.
     ///
@@ -1583,6 +1652,62 @@ mod tests {
         let mut d2 = dims();
         d2.conv_kernel = 4;
         assert_ne!(h, schedule_hash(&kinds(), &d2), "dims change");
+    }
+
+    /// The decode table's addresses are the halves' own — read off the slots,
+    /// they must name exactly the buffers the tensors view — and a commit moves
+    /// them with the halves for the layer that advanced and no other.
+    ///
+    /// The fixture's state block is `(256, 512)`: `s` at the slot's base and
+    /// the conv tail 256 bytes in, so each row's tail sits at its state + 256.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn decode_addresses_are_the_halves_and_follow_a_commit() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!("new_cuda answered a CUDA device")
+        };
+        let halves = |store: &RecurrentStateStore| -> Result<Vec<[u64; 4]>> {
+            store
+                .slots
+                .iter()
+                .map(|s| {
+                    Ok([
+                        tensor_device_ptr(cuda, &s.live.conv_tail)?,
+                        tensor_device_ptr(cuda, &s.backup.conv_tail)?,
+                        tensor_device_ptr(cuda, &s.live.s)?,
+                        tensor_device_ptr(cuda, &s.backup.s)?,
+                    ])
+                })
+                .collect()
+        };
+        let mut store = RecurrentStateStore::new(&kinds(), &dims(), &dev)?;
+        let before: Vec<[u64; 4]> = store.decode_table_addresses()?.collect();
+        assert_eq!(before.len(), 3, "one row per DeltaNet layer: 0, 1 and 3");
+        assert_eq!(before, halves(&store)?);
+        for [tail_in, tail_out, s_in, s_out] in &before {
+            assert_eq!((*tail_in, *tail_out), (s_in + 256, s_out + 256));
+            assert_ne!(s_in, s_out, "the halves are distinct slots");
+        }
+
+        // Advance layer 3 only — the third slot — and commit.
+        store.begin_wave()?;
+        store.layer_state_pair_mut(3)?;
+        store.commit_wave();
+        let after: Vec<[u64; 4]> = store.decode_table_addresses()?.collect();
+        assert_eq!(after, halves(&store)?);
+        assert_eq!(
+            &after[..2],
+            &before[..2],
+            "layers that did not run keep their halves"
+        );
+        let [ti, to, si, so] = before[2];
+        assert_eq!(
+            after[2],
+            [to, ti, so, si],
+            "layer 3's halves exchanged roles"
+        );
+        Ok(())
     }
 
     /// The whole point of the geometry price: it answers the same for a process

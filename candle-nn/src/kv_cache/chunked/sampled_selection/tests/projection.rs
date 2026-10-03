@@ -51,6 +51,8 @@ use crate::kv_cache::arena_table::N_PALETTE;
 
 use super::{candidate_formats, make_synthetic_batch, CHUNK_SIZE};
 #[cfg(feature = "cuda")]
+use super::{dim_major_blocks, token_major_bands};
+#[cfg(feature = "cuda")]
 use crate::kv_cache::chunked::sampled_selection::PagedSelectionGpuInputs;
 #[allow(unused_imports)]
 use crate::kv_cache::chunked::sampled_selection::{
@@ -176,7 +178,12 @@ fn gpu_palette4_reduction_does_not_invent_float_formats_from_uniform_quant_input
     let n_batch = 2;
     let n_head = 2;
     let head_dim = 128;
-    let values = make_synthetic_batch(n_batch, n_head, head_dim);
+    // Staged as the float arenas hold it: palette bands, each token-major.
+    let values = token_major_bands(
+        &make_synthetic_batch(n_batch, n_head, head_dim),
+        n_head,
+        head_dim,
+    );
     let per_chunk_len = n_head * head_dim * CHUNK_SIZE;
     let chunk_refs: Vec<&[f32]> = values.chunks_exact(per_chunk_len).collect();
 
@@ -251,7 +258,12 @@ fn gpu_no_pass_uses_least_error_quant_fallback() {
     let n_batch = 1;
     let n_head = 1;
     let head_dim = 128;
-    let values = make_synthetic_batch(n_batch, n_head, head_dim);
+    // Staged as the float arenas hold it: palette bands, each token-major.
+    let values = token_major_bands(
+        &make_synthetic_batch(n_batch, n_head, head_dim),
+        n_head,
+        head_dim,
+    );
     let per_chunk_len = n_head * head_dim * CHUNK_SIZE;
     let chunk_refs: Vec<&[f32]> = values.chunks_exact(per_chunk_len).collect();
 
@@ -296,7 +308,12 @@ fn gpu_quant_only_selector_never_returns_float_formats() {
     let n_batch = 2;
     let n_head = 2;
     let head_dim = 128;
-    let values = make_synthetic_batch(n_batch, n_head, head_dim);
+    // Staged as the float arenas hold it: palette bands, each token-major.
+    let values = token_major_bands(
+        &make_synthetic_batch(n_batch, n_head, head_dim),
+        n_head,
+        head_dim,
+    );
     let per_chunk_len = n_head * head_dim * CHUNK_SIZE;
     let chunk_refs: Vec<&[f32]> = values.chunks_exact(per_chunk_len).collect();
 
@@ -892,7 +909,7 @@ fn select_best_passing_format(
         let dist = if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
             0.0
         } else {
-            let recon = fmt.apply_quant(block);
+            let recon = fmt.apply_quant(block, is_key);
             if is_key {
                 let recon_adj = apply_error_margin_block(block, &recon, ERROR_MARGIN_ABS);
                 magnitude_weighted_distance(block, &recon_adj)
@@ -987,7 +1004,7 @@ fn select_format(block: &[f32; SELECT_BLOCK], threshold: f32) -> BlockFormat {
 fn select_format_with_error(block: &[f32; SELECT_BLOCK], threshold: f32) -> (BlockFormat, f32) {
     let candidates = candidate_formats();
     for &fmt in &candidates {
-        let recon = fmt.apply_quant(block);
+        let recon = fmt.apply_quant(block, false);
         let dist = normalized_l2_distance(block, &recon);
         if dist <= threshold {
             return (fmt, dist);
@@ -1237,7 +1254,7 @@ fn process_blocks(blocks: &[[f32; SELECT_BLOCK]], threshold: f32) -> ComponentSt
         let fmt = select_format(blk, threshold);
         s.fmt_counts[fmt.table_index()] += 1;
         s.bpe_sum += fmt.bits_per_elem() as f64;
-        let recon = fmt.apply_quant(blk);
+        let recon = fmt.apply_quant(blk, false);
         let cd = cosine_distance(blk, &recon);
         s.cos_sum += cd as f64;
         s.cos_dists.push(cd);
@@ -1583,7 +1600,7 @@ impl CurveStat {
     fn push(&mut self, block: &[f32; SELECT_BLOCK], fmt: BlockFormat) {
         self.counts[fmt.table_index()] += 1;
         self.bpe_sum += fmt.bits_per_elem() as f64;
-        let recon = fmt.apply_quant(block);
+        let recon = fmt.apply_quant(block, false);
         let cd = cosine_distance(block, &recon);
         self.cos_sum += cd as f64;
         self.cos_dists.push(cd);
@@ -1970,6 +1987,10 @@ fn test_cuda_selection_matches_cpu() {
     };
     let total_chunks = loaded_chunks.len();
     let chunks = evenly_sampled_chunks(&loaded_chunks, GPU_MATCH_SAMPLE_CHUNKS);
+    if chunks.is_empty() {
+        println!("SKIP: the dump holds no chunks");
+        return;
+    }
     println!(
         "Loaded dump: {} layers, n_kv_head={}, chunk_size={}, head_dim={}, {} sampled / {} total chunks",
         header.num_layers,
@@ -2149,13 +2170,14 @@ fn test_cuda_selection_matches_cpu() {
 
             let mut cpu_k_fmts: Vec<BlockFormat> = Vec::with_capacity(num_blocks);
             let mut cpu_v_fmts: Vec<BlockFormat> = Vec::with_capacity(num_blocks);
+            // The dump is `[H][P][T][D']`; a selection block is one dim's tokens.
+            let k_dm = dim_major_blocks(&chunk.k, header.n_kv_head, header.head_dim);
+            let v_dm = dim_major_blocks(&chunk.v, header.n_kv_head, header.head_dim);
             for b in 0..num_blocks {
-                let k_block: [f32; SELECT_BLOCK] = chunk.k
-                    [b * SELECT_BLOCK..(b + 1) * SELECT_BLOCK]
+                let k_block: [f32; SELECT_BLOCK] = k_dm[b * SELECT_BLOCK..(b + 1) * SELECT_BLOCK]
                     .try_into()
                     .unwrap();
-                let v_block: [f32; SELECT_BLOCK] = chunk.v
-                    [b * SELECT_BLOCK..(b + 1) * SELECT_BLOCK]
+                let v_block: [f32; SELECT_BLOCK] = v_dm[b * SELECT_BLOCK..(b + 1) * SELECT_BLOCK]
                     .try_into()
                     .unwrap();
                 let kf = select_format_from_candidates_k(&k_block, k_cands, eff_k_threshold);
@@ -2250,7 +2272,7 @@ fn test_cuda_selection_matches_cpu() {
                             if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
                                 return 0.0;
                             }
-                            let recon = fmt.apply_quant(&k_block);
+                            let recon = fmt.apply_quant(&k_block, true);
                             magnitude_weighted_distance(&k_block, &recon)
                         };
                         let cpu_err = err_of(cpu_k_fmts[b]);
@@ -2305,7 +2327,7 @@ fn test_cuda_selection_matches_cpu() {
                             if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
                                 return 0.0;
                             }
-                            let recon = fmt.apply_quant(&v_block);
+                            let recon = fmt.apply_quant(&v_block, false);
                             cosine_distance(&v_block, &recon)
                         };
                         let cpu_cos = cos_of(cpu_v_fmts[b]);
@@ -2565,6 +2587,10 @@ fn test_cuda_per_head_matches_cpu() {
     };
     let total_chunks = loaded_chunks.len();
     let chunks = evenly_sampled_chunks(&loaded_chunks, GPU_MATCH_SAMPLE_CHUNKS);
+    if chunks.is_empty() {
+        println!("SKIP: the dump holds no chunks");
+        return;
+    }
     println!(
         "Loaded dump: {} layers, n_kv_head={}, chunk_size={}, head_dim={}, {} sampled / {} total chunks",
         header.num_layers,
@@ -2718,11 +2744,14 @@ fn test_cuda_per_head_matches_cpu() {
                 .unwrap_or(BlockFormat::Q0);
             let mut k_worst = k_most_aggressive;
             let mut v_worst = v_most_aggressive;
+            // The dump is `[H][P][T][D']`; a selection block is one dim's tokens.
+            let k_dm = dim_major_blocks(&chunk.k, header.n_kv_head, header.head_dim);
+            let v_dm = dim_major_blocks(&chunk.v, header.n_kv_head, header.head_dim);
             for b in 0..num_blocks {
-                let k_blk: [f32; SELECT_BLOCK] = chunk.k[b * SELECT_BLOCK..(b + 1) * SELECT_BLOCK]
+                let k_blk: [f32; SELECT_BLOCK] = k_dm[b * SELECT_BLOCK..(b + 1) * SELECT_BLOCK]
                     .try_into()
                     .unwrap();
-                let v_blk: [f32; SELECT_BLOCK] = chunk.v[b * SELECT_BLOCK..(b + 1) * SELECT_BLOCK]
+                let v_blk: [f32; SELECT_BLOCK] = v_dm[b * SELECT_BLOCK..(b + 1) * SELECT_BLOCK]
                     .try_into()
                     .unwrap();
                 let kf = select_format_from_candidates_k(&k_blk, k_cands, eff_k);
@@ -3063,7 +3092,7 @@ fn cpu_select_k_qproj(
         if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
             continue;
         }
-        let recon = fmt.apply_quant(k_block);
+        let recon = fmt.apply_quant(k_block, true);
         let recon_adj = apply_error_margin_block(k_block, &recon, ERROR_MARGIN_ABS);
         let err = cpu_q_attn_weighted_loss(k_block, &recon_adj, q_block);
         if err <= threshold {
@@ -3179,6 +3208,10 @@ fn test_cuda_r16_qproj_matches_cpu() {
     };
     let total_chunks = loaded_chunks.len();
     let chunks = evenly_sampled_chunks(&loaded_chunks, GPU_MATCH_SAMPLE_CHUNKS);
+    if chunks.is_empty() {
+        println!("SKIP: the dump holds no chunks");
+        return;
+    }
 
     // Check that Q data is available (v4 dump)
     let have_q = chunks.iter().all(|c| c.q.is_some());
@@ -3225,7 +3258,11 @@ fn test_cuda_r16_qproj_matches_cpu() {
         .iter()
         .map(|chunk| {
             let q = chunk.q.as_ref().unwrap();
-            let r16_bytes = pack_r16_blocks(&chunk.k, q);
+            // The dump is `[H][P][T][D']`; an R16 block is one dim's tokens.
+            let r16_bytes = pack_r16_blocks(
+                &dim_major_blocks(&chunk.k, header.n_kv_head, header.head_dim),
+                &dim_major_blocks(q, header.n_kv_head, header.head_dim),
+            );
             let v_f16_bytes = pack_f16(&chunk.v);
             let k_r16_gpu = cuda_dev.memcpy_stod(&r16_bytes).expect("GPU upload K R16");
             let v_f16_gpu = cuda_dev
@@ -3343,6 +3380,10 @@ fn test_cuda_r16_qproj_matches_cpu() {
             let num_blocks = chunk.k.len() / SELECT_BLOCK;
             let eff_k_threshold = base_k_threshold;
             let eff_v_threshold = base_v_threshold;
+            // The dump is `[H][P][T][D']`; a selection block is one dim's tokens.
+            let k_dm = dim_major_blocks(&chunk.k, header.n_kv_head, header.head_dim);
+            let q_dm = dim_major_blocks(q_data, header.n_kv_head, header.head_dim);
+            let v_dm = dim_major_blocks(&chunk.v, header.n_kv_head, header.head_dim);
 
             let mut cpu_k_fmts: Vec<BlockFormat> = Vec::with_capacity(num_blocks);
             let mut cpu_v_fmts: Vec<BlockFormat> = Vec::with_capacity(num_blocks);
@@ -3350,12 +3391,12 @@ fn test_cuda_r16_qproj_matches_cpu() {
                 let start = b * SELECT_BLOCK;
                 // F16-truncate K and Q to match R16 block precision
                 let k_block: [f32; SELECT_BLOCK] =
-                    std::array::from_fn(|i| f32_to_f16_to_f32(chunk.k[start + i]));
+                    std::array::from_fn(|i| f32_to_f16_to_f32(k_dm[start + i]));
                 let q_block: [f32; SELECT_BLOCK] =
-                    std::array::from_fn(|i| f32_to_f16_to_f32(q_data[start + i]));
+                    std::array::from_fn(|i| f32_to_f16_to_f32(q_dm[start + i]));
                 // V is also F16-truncated
                 let v_block: [f32; SELECT_BLOCK] =
-                    std::array::from_fn(|i| f32_to_f16_to_f32(chunk.v[start + i]));
+                    std::array::from_fn(|i| f32_to_f16_to_f32(v_dm[start + i]));
 
                 let kf = cpu_select_k_qproj(
                     &k_block,
@@ -3399,6 +3440,8 @@ fn test_cuda_r16_qproj_matches_cpu() {
             let q_data = chunk.q.as_ref().unwrap();
             let num_blocks = chunk.k.len() / SELECT_BLOCK;
             let eff_k_threshold = base_k_threshold;
+            let k_dm = dim_major_blocks(&chunk.k, header.n_kv_head, header.head_dim);
+            let q_dm = dim_major_blocks(q_data, header.n_kv_head, header.head_dim);
             let cpu_k_fmts = &all_cpu_k_fmts[ci];
             let cpu_v_fmts = &all_cpu_v_fmts[ci];
             let tag_offset = ci * blocks_per_chunk;
@@ -3424,14 +3467,14 @@ fn test_cuda_r16_qproj_matches_cpu() {
                         // Compute margin: Q-weighted error distance from threshold
                         let start = b * SELECT_BLOCK;
                         let k_block: [f32; SELECT_BLOCK] =
-                            std::array::from_fn(|i| f32_to_f16_to_f32(chunk.k[start + i]));
+                            std::array::from_fn(|i| f32_to_f16_to_f32(k_dm[start + i]));
                         let q_block: [f32; SELECT_BLOCK] =
-                            std::array::from_fn(|i| f32_to_f16_to_f32(q_data[start + i]));
+                            std::array::from_fn(|i| f32_to_f16_to_f32(q_dm[start + i]));
                         let err_of = |fmt: BlockFormat| -> f32 {
                             if matches!(fmt, BlockFormat::F16 | BlockFormat::BF16) {
                                 return 0.0;
                             }
-                            let recon = fmt.apply_quant(&k_block);
+                            let recon = fmt.apply_quant(&k_block, true);
                             cpu_q_attn_weighted_loss(&k_block, &recon, &q_block)
                         };
                         let cpu_err = err_of(cpu_k_fmts[b]);
@@ -3566,13 +3609,13 @@ fn attention_output(
     let sqrt_d = (head_dim as f32).sqrt();
 
     // Quantize K and V per 32-element block
-    let quantize_flat = |data: &[f32], fmt: BlockFormat| -> Vec<f32> {
+    let quantize_flat = |data: &[f32], fmt: BlockFormat, is_k: bool| -> Vec<f32> {
         let mut out = vec![0.0f32; data.len()];
         for b in (0..data.len()).step_by(SELECT_BLOCK) {
             let end = (b + SELECT_BLOCK).min(data.len());
             if end - b == SELECT_BLOCK {
                 let blk: [f32; SELECT_BLOCK] = data[b..end].try_into().unwrap();
-                let recon = fmt.apply_quant(&blk);
+                let recon = fmt.apply_quant(&blk, is_k);
                 out[b..end].copy_from_slice(&recon);
             } else {
                 out[b..end].copy_from_slice(&data[b..end]);
@@ -3613,8 +3656,8 @@ fn attention_output(
 
     let ref_output = compute(k_flat, v_flat);
 
-    let k_q = quantize_flat(k_flat, k_fmt);
-    let v_q = quantize_flat(v_flat, v_fmt);
+    let k_q = quantize_flat(k_flat, k_fmt, true);
+    let v_q = quantize_flat(v_flat, v_fmt, false);
     let quant_output = compute(&k_q, &v_q);
 
     (ref_output, quant_output)
@@ -3882,7 +3925,7 @@ fn test_asymmetric_kv_attention_error() {
                     let end = (b + SELECT_BLOCK).min(k_head.len());
                     if end - b == SELECT_BLOCK {
                         let blk: [f32; SELECT_BLOCK] = k_head[b..end].try_into().unwrap();
-                        let recon = BlockFormat::Q8_0.apply_quant(&blk);
+                        let recon = BlockFormat::Q8_0.apply_quant(&blk, true);
                         k_q[b..end].copy_from_slice(&recon);
                     } else {
                         k_q[b..end].copy_from_slice(&k_head[b..end]);
@@ -3897,7 +3940,7 @@ fn test_asymmetric_kv_attention_error() {
                     if end - b == SELECT_BLOCK {
                         let blk: [f32; SELECT_BLOCK] = v_head[b..end].try_into().unwrap();
                         let v_fmt = select_format(&blk, eff_thr);
-                        let recon = v_fmt.apply_quant(&blk);
+                        let recon = v_fmt.apply_quant(&blk, false);
                         v_q[b..end].copy_from_slice(&recon);
                         v_bpe_sum += v_fmt.bits_per_elem() as f64;
                         v_blocks += 1;
@@ -4728,20 +4771,10 @@ fn test_candidate_list_compression_curve() {
     #[cfg(feature = "cuda")]
     let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
     let total_start = Instant::now();
-    // Optional dataset filter: KV_DATASET=qwen3  → skip Llama secondary pass
-    //                          KV_DATASET=llama  → use Llama as primary, skip Qwen3
-    //                          (unset)           → Qwen3 primary + Llama secondary (default)
-    let dataset_filter = std::env::var("KV_DATASET").unwrap_or_default();
-    let qwen3_path = if dataset_filter == "llama" {
-        None
-    } else {
-        dump_path_for(QWEN3_KVQ_DUMP_REL_PATH).or_else(|| dump_path_for(QWEN3_DUMP_REL_PATH))
-    };
-    let llama_path = if dataset_filter == "qwen3" {
-        None
-    } else {
-        dump_path_for(LLAMA_DUMP_REL_PATH)
-    };
+    // Qwen3 primary + Llama secondary, whichever dumps are present.
+    let qwen3_path =
+        dump_path_for(QWEN3_KVQ_DUMP_REL_PATH).or_else(|| dump_path_for(QWEN3_DUMP_REL_PATH));
+    let llama_path = dump_path_for(LLAMA_DUMP_REL_PATH);
     if qwen3_path.is_none() && llama_path.is_none() {
         println!("kv_selection_tests: no dump files found — run test_dump_kv_cache_data first.");
         return;
@@ -5415,9 +5448,6 @@ fn test_candidate_list_compression_curve() {
     let render_start = Instant::now();
     println!("\n{sep}");
     println!("Candidate-List Compression Curve v2 (per-level K/V candidates, sink-aware)");
-    if !dataset_filter.is_empty() {
-        println!("  Dataset filter: KV_DATASET={dataset_filter}");
-    }
     println!("  Data sources: {}", data_sources.join(", "));
     println!(
         "  {} layers  {} chunks  {} K-blocks  {} V-blocks",
@@ -6406,7 +6436,7 @@ fn compute_quality_metrics(
             if elems_per_chunk <= data.len() && blk_idx < effective_fmts.len() {
                 let blk = dim_major_block_from_token_major(data, b, n_kv_head, blocks_per_chunk);
                 let fmt = effective_fmts[blk_idx];
-                let recon = fmt.apply_quant(&blk);
+                let recon = fmt.apply_quant(&blk, is_key);
                 let cd = cosine_distance(&blk, &recon);
                 cos_dists.push(cd);
                 for (&x, &xh) in blk.iter().zip(recon.iter()) {
@@ -6478,7 +6508,7 @@ fn compute_quality_w1_p4(
 
                 // If both reductions give the same format, compute quant once
                 if w1_fmt == p4_fmt {
-                    let recon = w1_fmt.apply_quant(&blk);
+                    let recon = w1_fmt.apply_quant(&blk, is_key);
                     let cd = cosine_distance(&blk, &recon);
                     w1_cos.push(cd);
                     p4_cos.push(cd);
@@ -6490,13 +6520,13 @@ fn compute_quality_w1_p4(
                     p4_noise += n;
                 } else {
                     // Different formats — compute both
-                    let w1_recon = w1_fmt.apply_quant(&blk);
+                    let w1_recon = w1_fmt.apply_quant(&blk, is_key);
                     let w1_cd = cosine_distance(&blk, &w1_recon);
                     w1_cos.push(w1_cd);
                     for (&x, &xh) in blk.iter().zip(w1_recon.iter()) {
                         w1_noise += ((x - xh) as f64) * ((x - xh) as f64);
                     }
-                    let p4_recon = p4_fmt.apply_quant(&blk);
+                    let p4_recon = p4_fmt.apply_quant(&blk, is_key);
                     let p4_cd = cosine_distance(&blk, &p4_recon);
                     p4_cos.push(p4_cd);
                     for (&x, &xh) in blk.iter().zip(p4_recon.iter()) {
@@ -7638,7 +7668,7 @@ fn select_formats_k_qproj_with_errors(
             if fmt == BlockFormat::BF16 {
                 continue;
             }
-            let recon = fmt.apply_quant(&blk);
+            let recon = fmt.apply_quant(&blk, true);
             let err = q_projected_block_error(q_hat, subspace_k, head_dim, &blk, &recon, start);
             let better_least_error = err < least_error
                 || (err == least_error
@@ -7811,7 +7841,7 @@ fn test_qproj_k_format_selection() {
                         k_full[start..start + SELECT_BLOCK].try_into().unwrap();
 
                     for (fi, &fmt) in profile_fmts.iter().enumerate() {
-                        let recon = fmt.apply_quant(&blk);
+                        let recon = fmt.apply_quant(&blk, true);
                         let err = q_projected_block_error(
                             q_hat, subspace_k, head_dim, &blk, &recon, start,
                         );

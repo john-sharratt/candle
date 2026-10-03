@@ -14,7 +14,7 @@ use crate::cuda_backend::INHERIT_ALIGN;
 use crate::quantized::k_quants::GgmlType;
 use crate::quantized::ko_quant::ko_tileable;
 use crate::LiveTensor;
-use crate::{CudaDevice, CudaStorage, Result, Shape};
+use crate::{CudaDevice, CudaStorage, DType, Layout, Result, Shape, Storage};
 use half::{bf16, f16};
 
 use crate::cuda_backend::WrapErr;
@@ -48,7 +48,14 @@ use candle_kernels::quantized::{
 use candle_kernels::quantized::{get_repacked_size_bytes, is_gemx_supported, run_repack_gemx};
 
 use super::int8_matmul_mode::q8a128_dense_use_mode2;
+use super::int8_split_k::q8a128_dense_k_splits;
 use super::table_ring::table_ring;
+
+mod silu_matmul;
+mod split_k;
+pub(crate) use silu_matmul::q8a128_dense_matmul_silu;
+pub use split_k::ensure_split_k_scratch;
+use split_k::q8a128_dense_matmul_split_k;
 
 /// Process-cached SM count for the int8 dense tiling (occupancy) heuristic. SM count is a fixed
 /// device property; querying the driver attribute on every matmul would add an FFI call to the hot
@@ -537,6 +544,7 @@ pub fn quantize_to_dtype(
     dtype: GgmlDType,
     dev: &CudaDevice,
 ) -> Result<()> {
+    require_block_quantize_kernel(dtype)?;
     let qtype = dtype_to_qtype(dtype)?;
     let stream = dev.cuda_stream();
     let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -872,60 +880,6 @@ pub unsafe fn quantize_transposed_batched_typed(
     Ok(())
 }
 
-/// Palette4 KV-cache format conversion.
-///
-/// Converts K or V data between arbitrary arena formats using 4-palette
-/// metadata from KvHead structs. Source and destination may have independent
-/// palette maps; routing is handled by a merged xlat[128] table built on-GPU.
-///
-/// # Arguments
-/// * `src_kvhead_ptrs` - Device pointers to src KvHead structs [num_layers × num_kv_heads]
-/// * `dst_kvhead_ptrs` - Device pointers to dst KvHead structs [num_layers × num_kv_heads]
-/// * `num_kv_heads` - Number of KV heads per layer
-/// * `num_layers` - Number of layers
-/// * `num_chunks` - Number of 32-token chunks per head to convert
-/// * `is_k` - true for K conversion, false for V
-pub fn quantize_palette4_convert(
-    heads_base: &CudaSlice<u8>,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_layers: usize,
-    num_chunks: usize,
-    is_k: bool,
-    head_dim: usize,
-    dev: &CudaDevice,
-) -> Result<()> {
-    if num_kv_heads == 0 || num_layers == 0 || num_chunks == 0 {
-        return Ok(());
-    }
-
-    let stream = dev.cuda_stream();
-    let (base_ptr, _guard) = heads_base.device_ptr(&stream);
-
-    unsafe {
-        crate::set_kernel_breadcrumb(
-            if is_k {
-                "run_quantize_palette4_convert (K, single)"
-            } else {
-                "run_quantize_palette4_convert (V, single)"
-            },
-            file!(),
-            line!(),
-        );
-        run_quantize_palette4_convert(
-            base_ptr as *const u8,
-            num_heads as i32,
-            num_kv_heads as i32,
-            num_layers as i32,
-            num_chunks as i32,
-            if is_k { 1 } else { 0 },
-            head_dim as i32,
-            stream.cu_stream() as *mut _,
-        );
-    }
-    Ok(())
-}
-
 // ============================================================================
 // Palette4 buffered conversion API
 // ============================================================================
@@ -1075,7 +1029,18 @@ pub struct PalHeadDesc {
     pub k_dst_scales: [f32; KVHEAD_N_PAL],
     /// Post-dequant scale written into the dst KvHead for V (f32, default 1.0).
     pub v_dst_scales: [f32; KVHEAD_N_PAL],
+    /// Live token window of the chunk this descriptor converts, packed
+    /// `(offset << 8) | len` with `len >= 1` and `offset + len <= 32`
+    /// ([`FULL_CHUNK_WINDOW`] for a full chunk; it applies to every chunk of
+    /// a multi-chunk job). The kernel reads every token outside it as zero:
+    /// a partial chunk's dead slots hold whatever the recycled ground held,
+    /// and each block's scale is taken over all 32 tokens, so a stale inf
+    /// there would decode the live tokens as NaN.
+    pub valid_range: i32,
 }
+
+/// [`PalHeadDesc::valid_range`] of a full 32-token chunk: offset 0, length 32.
+pub const FULL_CHUNK_WINDOW: i32 = 32;
 
 /// Build the identity 2-bit-packed palette map for `head_dim` (only the first
 /// `head_dim / 4` bytes are live; the rest stay zero).
@@ -1167,12 +1132,13 @@ pub fn build_kvhead_bytes_raw(
     Ok(head)
 }
 
-/// Palette4 KV-cache format conversion with CPU-side buffer construction.
+/// Palette4 KV-cache format conversion.
 ///
-/// Higher-level wrapper around [`quantize_palette4_convert`] that accepts
-/// structured `PalHeadDesc` descriptors, serialises them into 152-byte
-/// KvHead GPU structs, and invokes the kernel for both K and V in a single
-/// call.
+/// Converts K and V between arbitrary arena formats using 4-palette metadata:
+/// serialises the `PalHeadDesc` descriptors into KvHead GPU structs plus one
+/// token window per descriptor, uploads them in one staged buffer, and runs
+/// the kernel for K and then V. Source and destination may have independent
+/// palette maps; routing is a per-dim xlat table the kernel builds on-GPU.
 ///
 /// # Arguments
 /// * `descs` - Row-major `[num_layers][num_kv_heads]` slice of head descriptors.
@@ -1249,24 +1215,35 @@ pub fn quantize_palette4_convert_buffered(
         check_ptrs(&desc.k_dst_arena_ptrs, &desc.k_dst_pal_map, "dst", "K")?;
         check_ptrs(&desc.v_src_arena_ptrs, &desc.v_src_pal_map, "src", "V")?;
         check_ptrs(&desc.v_dst_arena_ptrs, &desc.v_dst_pal_map, "dst", "V")?;
+        let (lo, len) = (desc.valid_range >> 8, desc.valid_range & 0xff);
+        if !(0..32).contains(&lo) || len == 0 || lo + len > 32 {
+            crate::bail!(
+                "quantize_palette4_convert_buffered: desc[{i}] valid_range {:#x} is not a \
+                 token window inside one 32-token chunk",
+                desc.valid_range
+            );
+        }
     }
 
     // Pack everything into one GPU allocation:
     //
     //   [ src KvHead[0..N]    ]   offset 0
     //   [ dst KvHead[0..N]    ]   offset N × KVHEAD_SIZE
+    //   [ valid_range[0..N]   ]   offset 2N × KVHEAD_SIZE (i32 each)
     //
-    // Total = N × 2 × KVHEAD_SIZE bytes.  The kernel computes head pointers
-    // as base + job * KVHEAD_SIZE (src) and base + (N + job) * KVHEAD_SIZE (dst),
-    // so no pointer arrays are needed.
+    // Total = N × (2 × KVHEAD_SIZE + 4) bytes.  The kernel computes head
+    // pointers as base + job * KVHEAD_SIZE (src) and base + (N + job) *
+    // KVHEAD_SIZE (dst), so no pointer arrays are needed. KVHEAD_SIZE is a
+    // multiple of 8 at every supported head_dim, so the window array is
+    // 4-byte aligned.
     let n = expected;
     let src_heads_off: usize = 0;
     let dst_heads_off: usize = n * kvhead_bytes;
-    // Layout: [src KvHeads][dst KvHeads]. Per-palette outer scales live
-    // inside each dst KvHead struct (f32 at HD/2+72 / HD/2+88), so the encoder
-    // (multiply by outer) and decoder (divide by outer) share a single source
-    // of truth.
-    let total_bytes = 2 * n * kvhead_bytes;
+    let ranges_off: usize = 2 * n * kvhead_bytes;
+    // Per-palette outer scales live inside each dst KvHead struct (f32 at
+    // HD/2+72 / HD/2+88), so the encoder (multiply by outer) and decoder
+    // (divide by outer) share a single source of truth.
+    let total_bytes = ranges_off + n * 4;
 
     // Build the CPU image directly in pinned memory (no intermediate Vec).
     let mut buf = generation.alloc(total_bytes)?;
@@ -1299,6 +1276,8 @@ pub fn quantize_palette4_convert_buffered(
         let dst_off = dst_heads_off + i * kvhead_bytes;
         buf[src_off..src_off + kvhead_bytes].copy_from_slice(&src_bytes);
         buf[dst_off..dst_off + kvhead_bytes].copy_from_slice(&dst_bytes);
+        let range_off = ranges_off + i * 4;
+        buf[range_off..range_off + 4].copy_from_slice(&desc.valid_range.to_le_bytes());
     }
 
     // Async H2D upload via stager (deferred cleanup).
@@ -1307,11 +1286,13 @@ pub fn quantize_palette4_convert_buffered(
     // Launch K and V conversion passes.
     // Grid: dim3(num_kv_heads, num_layers) → exactly n blocks per launch.
     let base_ptr = gpu_buf.dev_ptr();
+    let ranges_ptr = (base_ptr + ranges_off as u64) as *const i32;
     let raw_stream = stream.cu_stream() as *mut _;
     unsafe {
         crate::set_kernel_breadcrumb("run_quantize_palette4_convert (K)", file!(), line!());
         run_quantize_palette4_convert(
             base_ptr as *const u8,
+            ranges_ptr,
             n as i32,
             num_kv_heads as i32,
             num_layers as i32,
@@ -1323,6 +1304,7 @@ pub fn quantize_palette4_convert_buffered(
         crate::set_kernel_breadcrumb("run_quantize_palette4_convert (V)", file!(), line!());
         run_quantize_palette4_convert(
             base_ptr as *const u8,
+            ranges_ptr,
             n as i32,
             num_kv_heads as i32,
             num_layers as i32,
@@ -1520,9 +1502,9 @@ pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
     n_kv_head: usize,
     arena_chunks: usize,
     // Per-chunk valid token range, packed (offset << 8) | len, len in
-    // [1, 32]. Partial chunks' dead slots are zero (arena zeroing at
-    // creation/recycle); the range corrects the count-normalized error
-    // metrics and sink statistics for the missing lanes.
+    // [1, 32]. The kernels read every slot outside it as zero, whatever the
+    // slot holds, and correct the count-normalized error metrics and sink
+    // statistics for the missing lanes.
     valid_ranges: &[i32],
     dev: &CudaDevice,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
@@ -2470,6 +2452,92 @@ pub fn quantized_size(elem_count: usize, dtype: GgmlDType) -> usize {
 /// [`QCudaStorage::repack_ko_into`] hold its whole-tensor f32 intermediate off the card — see
 /// its header for why a buffer that exists for one tensor at load was costing VRAM for the
 /// life of the process.
+/// Whether `run_dequantize_block` has an arm for `dtype` — exactly the formats
+/// its switch names (`quantized_dispatcher.cu`).
+///
+/// **That switch has no `default:`.** A format it does not name launches
+/// nothing, and the caller's freshly allocated destination comes back as `Ok`
+/// holding whatever the allocator left there. The KV formats below 2 bits
+/// (Q1_S, Q2_S, Q2_A, Q0 and its siblings, Q2_1, Q3_1) were routed to it
+/// anyway and read back as magnitudes near 1e34, so every device dequant asks
+/// this first: a format it rejects either decodes on the host
+/// ([`QCudaStorage::dequantize`]) or is refused.
+fn has_block_dequant_kernel(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q8_1
+            | GgmlDType::Q2_K
+            | GgmlDType::Q3_K
+            | GgmlDType::Q4_K
+            | GgmlDType::Q5_K
+            | GgmlDType::Q6_K
+            | GgmlDType::Q8_K
+            | GgmlDType::QAWQ
+            | GgmlDType::QAWQ_G64
+            | GgmlDType::Q4_KS
+            | GgmlDType::Q8_KS
+            | GgmlDType::Q2_0
+            | GgmlDType::Q3_0
+            | GgmlDType::R16
+    )
+}
+
+/// Whether `run_quantize_block` has an arm for `dtype` — the formats its first
+/// switch names (`quantized_dispatcher.cu`). Its `default:` returns without
+/// launching, so any other format leaves the destination as it was and
+/// reports nothing. The KV formats below 2 bits and R16 are encoded by the
+/// palette convert kernel or on the host, never here.
+fn has_block_quantize_kernel(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q8_1
+            | GgmlDType::Q4_KS
+            | GgmlDType::Q8_KS
+            | GgmlDType::Q2_0
+            | GgmlDType::Q3_0
+            | GgmlDType::Q2_K
+            | GgmlDType::Q3_K
+            | GgmlDType::Q4_K
+            | GgmlDType::Q5_K
+            | GgmlDType::Q6_K
+            | GgmlDType::Q8_K
+            | GgmlDType::QAWQ
+            | GgmlDType::QAWQ_G64
+    )
+}
+
+/// Refuse a block format `run_quantize_block` would silently skip.
+fn require_block_quantize_kernel(dtype: GgmlDType) -> Result<()> {
+    if !has_block_quantize_kernel(dtype) {
+        crate::bail!(
+            "{dtype:?} has no device block-quantize kernel; run_quantize_block would \
+             leave the destination unwritten"
+        )
+    }
+    Ok(())
+}
+
+/// Refuse a block format `run_dequantize_block` would silently skip.
+fn require_block_dequant_kernel(dtype: GgmlDType) -> Result<()> {
+    if !has_block_dequant_kernel(dtype) {
+        crate::bail!(
+            "{dtype:?} has no device dequant kernel; run_dequantize_block would return \
+             uninitialised memory for it"
+        )
+    }
+    Ok(())
+}
+
 fn dequantize_f32_into(
     data_ptr: u64,
     dtype: GgmlDType,
@@ -2494,7 +2562,10 @@ fn dequantize_f32_into(
     let widen = match dtype {
         GgmlDType::MXFP4 => Widen::Mxfp4,
         GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => Widen::Float(dtype),
-        _ => Widen::Block(dtype_to_qtype(dtype)? as i32),
+        _ => {
+            require_block_dequant_kernel(dtype)?;
+            Widen::Block(dtype_to_qtype(dtype)? as i32)
+        }
     };
 
     // **Banded, so one launch never runs long enough to trip the GPU watchdog.**
@@ -2609,6 +2680,7 @@ fn dequantize_f16(
         }
         return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
     }
+    require_block_dequant_kernel(dtype)?;
     let qtype = dtype_to_qtype(dtype)?;
     let dst = unsafe { dev.alloc::<f16>(elem_count)? };
     {
@@ -2652,6 +2724,7 @@ fn dequantize_bf16(
         }
         return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
     }
+    require_block_dequant_kernel(dtype)?;
     let qtype = dtype_to_qtype(dtype)?;
     let dst = unsafe { dev.alloc::<bf16>(elem_count)? };
     {
@@ -3183,40 +3256,7 @@ impl QCudaStorage {
             T::to_float(&vec, dst)
         }
 
-        let fast_kernel = matches!(
-            self.dtype,
-            GgmlDType::Q4_0
-                | GgmlDType::Q4_1
-                | GgmlDType::Q5_0
-                | GgmlDType::Q5_1
-                | GgmlDType::Q8_0
-                | GgmlDType::Q8_1
-                | GgmlDType::Q2_K
-                | GgmlDType::Q3_K
-                | GgmlDType::Q4_K
-                | GgmlDType::Q5_K
-                | GgmlDType::Q6_K
-                | GgmlDType::Q8_K
-                | GgmlDType::QAWQ
-                | GgmlDType::QAWQ_G64
-                | GgmlDType::Q4_KS
-                | GgmlDType::Q8_KS
-                | GgmlDType::Q2_0
-                | GgmlDType::Q3_0
-                | GgmlDType::R16
-                | GgmlDType::Q0
-                | GgmlDType::Q0_V
-                | GgmlDType::Q1_A
-                | GgmlDType::Q0_X
-                | GgmlDType::Q0_M2
-                | GgmlDType::Q0_M4
-                | GgmlDType::Q1_S
-                | GgmlDType::Q2_S
-                | GgmlDType::Q2_A
-                | GgmlDType::Q2_1
-                | GgmlDType::Q3_1
-                | GgmlDType::MXFP4
-        );
+        let fast_kernel = self.dtype == GgmlDType::MXFP4 || has_block_dequant_kernel(self.dtype);
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
         }
@@ -3447,6 +3487,7 @@ impl QCudaStorage {
         }
 
         // Get pointers and call kernel
+        require_block_quantize_kernel(self.dtype)?;
         let qtype = dtype_to_qtype(self.dtype)?;
         let stream = self.device.cuda_stream();
         let (src_ptr, _src_guard) = src_f32.device_ptr(&stream);
@@ -3657,6 +3698,7 @@ impl QCudaStorage {
             );
         }
 
+        require_block_dequant_kernel(self.dtype)?;
         let qtype = dtype_to_qtype(self.dtype)?;
         let stream = self.device.cuda_stream();
         let (src_ptr, _src_guard) = self.data.inner.device_ptr(&stream);
@@ -5930,6 +5972,38 @@ pub fn quantize_acts_q8a128<'w>(
     .with_sum_scale(sum_scale))
 }
 
+/// A q8a128 operand for `[rows, cols]` written by a caller's own fused producer.
+///
+/// The buffer is carved where `beside` lives — the open wave's span when it is
+/// wave-scoped, the pool otherwise — exactly as [`quantize_acts_q8a128`] carves
+/// its own, so a producer outside this crate (a model's fused norm or activation
+/// kernel) emits the int8 operand with no standalone quantize launch and no
+/// allocation the arena did not plan. `fill` receives the device address and
+/// must launch the kernel that writes all `q8a1024_byte_len(rows, cols)` bytes
+/// in the q8a1024 layout, with the Σx convention `sum_scale` names.
+pub fn produce_q8a128<'w>(
+    beside: &LiveTensor<'w>,
+    rows: usize,
+    cols: usize,
+    sum_scale: SumScale,
+    fill: impl FnOnce(u64) -> Result<()>,
+) -> Result<Q8a128Operand<'w>> {
+    if !cols.is_multiple_of(128) {
+        crate::bail!("produce_q8a128: cols={cols} must be a multiple of 128");
+    }
+    let (storage, _) = beside.storage_and_layout();
+    let Storage::Cuda(cuda) = &*storage else {
+        crate::bail!("produce_q8a128: the producer's tensor must be on CUDA");
+    };
+    let device = cuda.device().clone();
+    let origin = cuda.backing;
+    drop(storage);
+    let bytes = q8a1024_byte_len(rows, cols);
+    let (ptr, owned, backing) = resolve_u8_out(origin, &device, bytes)?;
+    fill(ptr)?;
+    Ok(q8a128_from_out(owned, ptr, backing, bytes, rows, cols, &device)?.with_sum_scale(sum_scale))
+}
+
 /// Fused RMSNorm → q8a128: normalize each row of `xs` `[.. × K]` by `alpha` `[K]` and emit the
 /// q8a128 activation operand directly, in ONE kernel — the producer epilogue for B1/B3/B5. This
 /// replaces the unfused `rms_norm` (FP store) + [`quantize_acts_q8a128`] (re-read) pair, removing
@@ -6058,11 +6132,13 @@ pub fn rms_norm_q8a128<'w>(
 /// operand directly, in ONE kernel — the producer epilogue for B4 (feeds the down projection).
 /// Replaces the unfused `silu_mul` (FP store) + [`quantize_acts_q8a128`] (re-read). `gate`/`up`
 /// must share shape `[.. × K]` and dtype; `K` (and the total element count) must be a multiple of
-/// 128. Tracks the two-call path within float margin (silu uses the same fast-exp path, the
-/// result is rounded through the input dtype before quantization). Leading dims are preserved.
+/// 128. Bit-identical to the two-call path: silu uses the same fast-exp path, the product is
+/// rounded through the input dtype as the eager store rounds it, and the tile goes through the one
+/// q8a128 emitter (`quantized_mlp`'s test asserts it at F32 and BF16, under both `Σx`
+/// conventions). Leading dims are preserved.
 pub fn silu_mul_q8a128<'w>(
-    gate: &crate::Tensor,
-    up: &crate::Tensor,
+    gate: &LiveTensor<'w>,
+    up: &LiveTensor<'w>,
     device: &CudaDevice,
     origin: Backing,
     // The Σx convention this fused producer writes — see [`SumScale`]. **This is
@@ -6098,9 +6174,9 @@ pub fn silu_mul_q8a128<'w>(
     }
     // FusedSiluMul dtype code: 0=f32, 1=f16, 2=bf16.
     let dtype_code: i32 = match gate.dtype() {
-        crate::DType::F32 => 0,
-        crate::DType::F16 => 1,
-        crate::DType::BF16 => 2,
+        DType::F32 => 0,
+        DType::F16 => 1,
+        DType::BF16 => 2,
         d => crate::bail!("silu_mul_q8a128: unsupported dtype {d:?}"),
     };
 
@@ -6108,26 +6184,36 @@ pub fn silu_mul_q8a128<'w>(
     let out_bytes = bytes;
     let (out_ptr_planned, owned, out_backing) = resolve_u8_out(origin, device, out_bytes)?;
 
+    // Rows read in place: a dense operand, or a row-strided view such as one half
+    // of a fused gate|up projection. Both operands must step rows identically.
     let (g_storage, g_layout) = gate.storage_and_layout();
-    let (go1, go2) = g_layout.contiguous_offsets().ok_or_else(|| {
-        crate::Error::RequiresContiguous {
-            op: "silu_mul_q8a128(gate)",
-        }
-        .bt()
-    })?;
+    let (go1, g_stride) = silu_mul_rows(g_layout, "gate")?;
+    let (u_storage, u_layout) = up.storage_and_layout();
+    let (uo1, u_stride) = silu_mul_rows(u_layout, "up")?;
+    // A single row has no second row to step to, whatever stride its view records.
+    let (g_stride, u_stride) = if rows == 1 {
+        (cols, cols)
+    } else {
+        (g_stride, u_stride)
+    };
+    if g_stride != u_stride {
+        crate::bail!("silu_mul_q8a128: gate rows are {g_stride} apart but up rows {u_stride}");
+    }
+    if g_stride != cols && !cols.is_multiple_of(128) {
+        crate::bail!(
+            "silu_mul_q8a128: strided rows need cols ({cols}) to be a multiple of 128, so no \
+             tile straddles two rows"
+        );
+    }
+    // Each operand's extent, from its first element to the last one read.
+    let span = (rows - 1) * g_stride + cols;
+    let (go2, uo2) = (go1 + span, uo1 + span);
     let g_cuda = match &*g_storage {
-        crate::Storage::Cuda(c) => c,
+        Storage::Cuda(c) => c,
         _ => crate::bail!("silu_mul_q8a128: gate must be a CUDA tensor"),
     };
-    let (u_storage, u_layout) = up.storage_and_layout();
-    let (uo1, uo2) = u_layout.contiguous_offsets().ok_or_else(|| {
-        crate::Error::RequiresContiguous {
-            op: "silu_mul_q8a128(up)",
-        }
-        .bt()
-    })?;
     let u_cuda = match &*u_storage {
-        crate::Storage::Cuda(c) => c,
+        Storage::Cuda(c) => c,
         _ => crate::bail!("silu_mul_q8a128: up must be a CUDA tensor"),
     };
 
@@ -6149,6 +6235,7 @@ pub fn silu_mul_q8a128<'w>(
                         rows as i32,
                         cols as i32,
                         sum_scale.as_code(),
+                        g_stride as i32,
                     );
                 }
             }};
@@ -6172,6 +6259,30 @@ pub fn silu_mul_q8a128<'w>(
         device,
     )
     .map(|o| o.with_lead(lead).with_sum_scale(sum_scale))
+}
+
+/// `(start offset, row stride)` of a [`silu_mul_q8a128`] operand: unit column
+/// stride, and every row one stride after the last — a dense tensor, or a row
+/// range of a wider one, at rank 2 or 3 (a rank-3 batch must continue the same
+/// row grid, so its stride is `rows × row stride`).
+fn silu_mul_rows(layout: &Layout, what: &str) -> Result<(usize, usize)> {
+    let dims = layout.dims();
+    let stride = layout.stride();
+    let rank = dims.len();
+    if !(rank == 2 || rank == 3) || stride[rank - 1] != 1 {
+        crate::bail!(
+            "silu_mul_q8a128: {what} is {dims:?} stride {stride:?}; rows must be unit-stride at \
+             rank 2 or 3"
+        );
+    }
+    let row_stride = stride[rank - 2];
+    if rank == 3 && dims[0] > 1 && stride[0] != dims[1] * row_stride {
+        crate::bail!(
+            "silu_mul_q8a128: {what} is {dims:?} stride {stride:?}; its batches do not continue \
+             one row grid"
+        );
+    }
+    Ok((layout.start_offset(), row_stride))
 }
 
 /// Quantize F32 weights `[nrows × ncols]` (row-major) → a GPU buffer in the lane-major KO
@@ -6864,14 +6975,64 @@ pub fn dense_qmatmul<'w>(
     out_dtype: crate::DType,
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
+    dense_qmatmul_with_splits(
+        input,
+        weight_ptr,
+        weight_dtype,
+        nrows,
+        weight_len,
+        out_dtype,
+        None,
+        device,
+    )
+}
+
+/// [`dense_qmatmul`] with the int8 path's K split chosen by the caller: `Some(s)` runs `s`
+/// slices (`1` is the unsplit kernel), `None` takes [`q8a128_dense_k_splits`]'s answer. The
+/// forced form is what the KO projection bench sweeps; production calls [`dense_qmatmul`].
+#[allow(clippy::too_many_arguments)]
+pub fn dense_qmatmul_with_splits<'w>(
+    input: DynamicTensor<'_, 'w>,
+    weight_ptr: u64,
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    weight_len: usize,
+    out_dtype: crate::DType,
+    splits: Option<usize>,
+    device: &CudaDevice,
+) -> Result<crate::LiveTensor<'w>> {
     ensure_qmatmul_pairing(&input, weight_dtype)?;
     let qtype = dtype_to_qtype(weight_dtype)? as i32;
     match input {
         DynamicTensor::Int8(op) => {
+            // A decode-width projection with a narrow N cannot fill the card unsplit — 13 blocks
+            // for the 416-wide hyper-connection `down` on 110 SMs. Split K there; everything the
+            // rule declines (every prefill shape among them) takes the tilings below unchanged.
+            // MXFP4 never splits: its per-sub fold accumulates straight into the running sum,
+            // which per-tile partials cannot reproduce bit for bit.
+            let sm = cached_sm_count(device);
+            let splits = splits.unwrap_or_else(|| {
+                if weight_dtype == GgmlDType::MXFP4_KO {
+                    1
+                } else {
+                    q8a128_dense_k_splits(op.rows, nrows, op.cols, sm)
+                }
+            });
+            if splits > 1 {
+                return q8a128_dense_matmul_split_k(
+                    op,
+                    weight_ptr,
+                    weight_dtype,
+                    nrows,
+                    splits,
+                    out_dtype,
+                    device,
+                );
+            }
             // Tiling choice (mode-1 Bm=16 vs mode-2 Bm=32, N_SUB=2): an occupancy decision driven by
             // M and N (block count vs SM count) plus the [17,32] trap — not weight bytes. The bench
             // reaches the same launch with a forced mode via `q8a128_dense_matmul`.
-            let mode2 = q8a128_dense_use_mode2(op.rows, nrows, op.cols, cached_sm_count(device));
+            let mode2 = q8a128_dense_use_mode2(op.rows, nrows, op.cols, sm);
             q8a128_dense_matmul(
                 op,
                 weight_ptr,
@@ -7429,3 +7590,15 @@ pub fn moe_bucketize(
 #[cfg(test)]
 #[path = "cuda_tests.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "q0_v_decode_oracle_tests.rs"]
+mod q0_v_decode_oracle_tests;
+
+#[cfg(test)]
+#[path = "q0_v_encode_oracle_tests.rs"]
+mod q0_v_encode_oracle_tests;
+
+#[cfg(test)]
+#[path = "kv_block_oracle_tests.rs"]
+mod kv_block_oracle_tests;

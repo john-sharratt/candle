@@ -67,6 +67,9 @@
 // where attention and the MoE would get it too, with its own re-derivation of
 // everything calibrated against it.
 #include "../fast_exp.cuh"
+// The one q8a128 tile emitter: the two q8 producers below write, from the same
+// floats, exactly what `quantize_q8a128_kernel` writes.
+#include "../quantize/q8a128_tile.cuh"
 
 namespace gr_hyper {
 
@@ -158,14 +161,31 @@ __device__ __forceinline__ float block_sum(float v, float* shared) {
 // row), and deliberately left there: capping it at 10 or 12 blocks per SM
 // spills 20–24 bytes a thread, and `ncu` already measures this kernel at 91%
 // of DRAM peak, so the headroom a cap could buy is under a tenth.
-extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_kernel(
+//
+// ── EMIT_Q8: the same pass, also writing `xn`'s q8a128 operand ─────────────────
+// A standalone quantize after the norm would re-read the whole `[n, hc·d]`
+// buffer the norm had just written. It does not need to: in the
+// store pass below the four warps hold `float4`s `[32w, 32w+32)` of chunk `k`,
+// which is 128-element tile `w + 4k` of the stream, lane-major — precisely one
+// q8a128 tile per warp per chunk, in `quantize_q8a128_kernel`'s own mapping. So
+// each warp quantizes the values it is storing, from registers, through the one
+// tile emitter (`q8a128_tile.cuh`), and the bytes are the standalone quantize's.
+//
+// That needs the vector path and `d` a multiple of 128, which makes `i < vec` the
+// same for every lane of a warp — a warp is wholly inside the stream or wholly
+// past it, so the emitter's full-mask shuffle never runs a partial warp. The
+// host refuses anything else; nothing is lost for the released `d` of 2560.
+template <bool EMIT_Q8>
+__device__ __forceinline__ void gr_norm_body(
     const float* __restrict__ x,     // [n, hc, d]
     const float* __restrict__ gain,  // [hc * d]
     float* __restrict__ xn,          // [n, hc * d]
+    uint8_t* __restrict__ q8,        // EMIT_Q8: q8a128 operand for [n, hc * d]
     int d,
     int hc,
     float eps,
-    int vec_ok
+    int vec_ok,
+    int sum_norm
 ) {
     const int row = (int)blockIdx.x / hc;
     const int s = (int)blockIdx.x - row * hc;
@@ -211,33 +231,88 @@ extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_kernel(
 
     const float4* g4 = reinterpret_cast<const float4*>(gs);
     float4* o4 = reinterpret_cast<float4*>(out);
-    #pragma unroll
-    for (int k = 0; k < NORM_CACHE; ++k) {
-        const int i = (int)threadIdx.x + k * THREADS;
-        if (i < vec) {
-            const float4 v = held[k];
-            const float4 g = g4[i];
-            float4 o;
-            o.x = v.x * rs * g.x;
-            o.y = v.y * rs * g.y;
-            o.z = v.z * rs * g.z;
-            o.w = v.w * rs * g.w;
-            o4[i] = o;
-        }
-    }
-    for (int i = (int)threadIdx.x + NORM_CACHE * THREADS; i < vec; i += THREADS) {
-        const float4 v = x4[i];
-        const float4 g = g4[i];
+    // The stream's first q8a128 tile: `base` is a multiple of `d`, and an
+    // emitting `d` a multiple of 128.
+    const int stream_tile0 = (int)(base >> 7);
+    const int lane = (int)threadIdx.x & 31;
+    // One store for both paths; the emit rides it with the values still in
+    // registers, so the q8 variant adds no load.
+    auto store = [&](int i, float4 v, float4 g) {
         float4 o;
         o.x = v.x * rs * g.x;
         o.y = v.y * rs * g.y;
         o.z = v.z * rs * g.z;
         o.w = v.w * rs * g.w;
         o4[i] = o;
+        if constexpr (EMIT_Q8) {
+            emit_q8a128_tile(q8, stream_tile0 + (i >> 5), lane, o.x, o.y, o.z, o.w, sum_norm);
+        }
+    };
+    #pragma unroll
+    for (int k = 0; k < NORM_CACHE; ++k) {
+        const int i = (int)threadIdx.x + k * THREADS;
+        if (i < vec) {
+            store(i, held[k], g4[i]);
+        }
     }
-    for (int i = (vec << 2) + (int)threadIdx.x; i < d; i += THREADS) {
-        out[i] = xs[i] * rs * gs[i];
+    for (int i = (int)threadIdx.x + NORM_CACHE * THREADS; i < vec; i += THREADS) {
+        store(i, x4[i], g4[i]);
     }
+    if constexpr (!EMIT_Q8) {
+        for (int i = (vec << 2) + (int)threadIdx.x; i < d; i += THREADS) {
+            out[i] = xs[i] * rs * gs[i];
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_kernel(
+    const float* __restrict__ x, const float* __restrict__ gain, float* __restrict__ xn,
+    int d, int hc, float eps, int vec_ok
+) {
+    gr_norm_body<false>(x, gain, xn, nullptr, d, hc, eps, vec_ok, 0);
+}
+
+extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_q8_kernel(
+    const float* __restrict__ x, const float* __restrict__ gain, float* __restrict__ xn,
+    uint8_t* __restrict__ q8, int d, int hc, float eps, int sum_norm
+) {
+    gr_norm_body<true>(x, gain, xn, q8, d, hc, eps, 1, sum_norm);
+}
+
+// ── gr_silu_q8 ─────────────────────────────────────────────────────────────
+// The read gate's bottleneck activation, quantized for the up projection:
+//
+//   q8 ← q8a128( silu(proj[t, 0..cols]) )
+//
+// `proj` is the stacked down-projection's output, `[n, rows_stride]` with the
+// gate columns first (the inject columns after them are left alone), read
+// through its row stride. The producer for waves wider than the `up` matmul's
+// fused loader serves (`HC_FUSED_SILU_MAX_ROWS`): there each of `up`'s row tiles would
+// re-quantize its token tile, and one pass here is cheaper than that.
+//
+// One warp per 128-element tile — tile `t` is row `t / (cols/128)`, columns
+// `128·(t mod cols/128) + [0, 128)`. The SiLU is `fast_exp::silu`, the one
+// `usilu_f32` calls and the fused loader calls, so every path's quantized values
+// are the same bit for bit.
+extern "C" __global__ void __launch_bounds__(THREADS) gr_silu_q8_kernel(
+    const float* __restrict__ proj,  // [n, row_stride], gate columns 0..cols
+    uint8_t* __restrict__ q8,        // q8a128 operand for [n, cols]
+    int n,
+    int cols,
+    int row_stride,
+    int sum_norm
+) {
+    const int tiles_per_row = cols >> 7;
+    const long long tile = ((long long)blockIdx.x * THREADS + threadIdx.x) >> 5;
+    if (tile >= (long long)n * tiles_per_row) return;  // whole warps exit together
+    const int row = (int)(tile / tiles_per_row);
+    const int j = (int)(tile - (long long)row * tiles_per_row);
+    const int lane = (int)threadIdx.x & 31;
+    const float4 v = *reinterpret_cast<const float4*>(
+        proj + (long long)row * row_stride + j * 128 + lane * 4);
+    emit_q8a128_tile(q8, (int)tile, lane,
+                     fast_exp::silu<float>(v.x), fast_exp::silu<float>(v.y),
+                     fast_exp::silu<float>(v.z), fast_exp::silu<float>(v.w), sum_norm);
 }
 
 // ── gr_mix ─────────────────────────────────────────────────────────────────
@@ -256,13 +331,22 @@ extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_kernel(
 //
 // The sigmoid is applied here rather than by a separate launch over the wide
 // buffer: `gate_raw` arrives straight from the up-projection GEMM.
-template <int HC>
+//
+// EMIT_Q8: also write `mixed` as the q8a128 operand the block's own projections
+// read. On the vector path the 32 lanes of a warp own 32 consecutive `float4`s of
+// one row — 128 elements, one q8a128 tile in `quantize_q8a128_kernel`'s mapping —
+// so each warp quantizes the values it is storing and the standalone quantize
+// that re-read `mixed` is gone. Needs the vector path and `d` a multiple of 128,
+// which makes the `col >= vec` exit whole-warp; the host refuses anything else.
+template <int HC, bool EMIT_Q8>
 __global__ void __launch_bounds__(THREADS) gr_mix_kernel(
     const float* __restrict__ xn,        // [n, hc * d]
     const float* __restrict__ gate_raw,  // [n, hc * d]
     float* __restrict__ mixed,           // [n, d]
+    uint8_t* __restrict__ q8,            // EMIT_Q8: q8a128 operand for [n, d]
     int d,
-    int vec_ok
+    int vec_ok,
+    int sum_norm
 ) {
     const int row = (int)blockIdx.x;
     const int col = (int)blockIdx.y * THREADS + (int)threadIdx.x;
@@ -298,6 +382,11 @@ __global__ void __launch_bounds__(THREADS) gr_mix_kernel(
         acc.z *= inv_hc;
         acc.w *= inv_hc;
         reinterpret_cast<float4*>(mixed + (long long)row * d)[col] = acc;
+        if constexpr (EMIT_Q8) {
+            // Row-major tiles of the flat [n, d] operand: row `row`, tile `col / 32`.
+            emit_q8a128_tile(q8, row * (d >> 7) + (col >> 5), (int)threadIdx.x & 31,
+                             acc.x, acc.y, acc.z, acc.w, sum_norm);
+        }
     } else {
         if (col >= d) return;
         float acc = 0.f;
@@ -337,13 +426,25 @@ __global__ void __launch_bounds__(THREADS) gr_mix_kernel(
 // register array. Indexed by a runtime stream count they were not: ptxas put
 // them in a 64-byte local-memory stack frame, a round trip per weight per
 // column.
-template <int HC>
+//
+// GATED: the block output arrives in the MoE's three parts and is assembled here —
+//
+//   block_out[t, j] = routed[t, j] + shared[t, j] · sigmoid(gate[t])
+//
+// — the shared expert's per-token sigmoid gate, applied where the residual is
+// already being read, instead of as a sigmoid, a broadcast multiply and an add,
+// three launches per MoE layer that each round-tripped a `[n, d]` buffer. Same
+// operations in the same order as those three, so the same bits.
+template <int HC, bool GATED>
 __global__ void __launch_bounds__(THREADS) gr_combine_kernel(
     float* res,                          // [n, hc, d], read and written
-    const float* __restrict__ block_out, // [n, d]
+    const float* __restrict__ block_out, // [n, d] — GATED: the routed experts' sum
+    const float* __restrict__ shared,    // GATED: [n, d], the shared expert's output
+    const float* __restrict__ gate,      // GATED: [n] raw gate, row stride `gate_stride`
     const float* __restrict__ inject,    // [n, hc], row stride `inject_stride`
     int d,
     int inject_stride,
+    int gate_stride,
     int vec_ok
 ) {
     const int row = (int)blockIdx.x;
@@ -357,10 +458,24 @@ __global__ void __launch_bounds__(THREADS) gr_combine_kernel(
     for (int s = 0; s < HC; ++s) {
         w[s] = 2.0f * gr_sigmoid(inject[(long long)row * inject_stride + s] * inv_hc);
     }
+    // One gate per token, broadcast across its columns.
+    float g = 0.f;
+    if constexpr (GATED) {
+        g = gr_sigmoid(gate[(long long)row * gate_stride]);
+    }
 
     const long long rbase = (long long)row * HC * d;
     if (vec > 0) {
-        const float4 o = reinterpret_cast<const float4*>(block_out + (long long)row * d)[col];
+        float4 o = reinterpret_cast<const float4*>(block_out + (long long)row * d)[col];
+        if constexpr (GATED) {
+            // `__fmul_rn`: the product is rounded before the add, as the separate
+            // multiply and add launches rounded it — a contracted FMA would not be.
+            const float4 sh = reinterpret_cast<const float4*>(shared + (long long)row * d)[col];
+            o.x = o.x + __fmul_rn(sh.x, g);
+            o.y = o.y + __fmul_rn(sh.y, g);
+            o.z = o.z + __fmul_rn(sh.z, g);
+            o.w = o.w + __fmul_rn(sh.w, g);
+        }
         float4 v[HC];
         #pragma unroll
         for (int s = 0; s < HC; ++s) {
@@ -375,7 +490,10 @@ __global__ void __launch_bounds__(THREADS) gr_combine_kernel(
             reinterpret_cast<float4*>(res + rbase + (long long)s * d)[col] = v[s];
         }
     } else {
-        const float o = block_out[(long long)row * d + col];
+        float o = block_out[(long long)row * d + col];
+        if constexpr (GATED) {
+            o = o + __fmul_rn(shared[(long long)row * d + col], g);
+        }
         #pragma unroll
         for (int s = 0; s < HC; ++s) {
             res[rbase + (long long)s * d + col] += o * w[s];
@@ -416,17 +534,71 @@ extern "C" void run_gr_norm(
         x, gain, xn, d, hc, eps, vec_ok);
 }
 
+// The q8a128-emitting launchers return GR_Q8_LAUNCHED, or GR_Q8_REFUSED for a shape
+// they cannot run — a width that is not a multiple of 128 (a partial warp would run
+// the tile emitter's shuffle with lanes missing) or an unsupported `hc`. A refusal
+// writes nothing, so the caller must treat it as an error: the operand is consumed by
+// the next GEMM, and an unwritten one is wrong numbers, not a fault. Alignment is the
+// host's to check (`qwen4exp::hyper::cuda_fused`): a base pointer's offset is not
+// visible from here. `n == 0` launches nothing and is not a refusal.
+#define GR_Q8_LAUNCHED 0
+#define GR_Q8_REFUSED  1
+
+extern "C" int32_t run_gr_norm_q8(
+    const float* x, const float* gain, float* xn, void* q8,
+    int32_t n, int32_t hc, int32_t d, float eps, int32_t sum_norm, void* stream
+) {
+    if (n < 0 || hc <= 0 || d <= 0 || (d % 128) != 0) return GR_Q8_REFUSED;
+    if (n == 0) return GR_Q8_LAUNCHED;
+    gr_hyper::gr_norm_q8_kernel<<<(unsigned)(n * hc), gr_hyper::THREADS, 0, (cudaStream_t)stream>>>(
+        x, gain, xn, reinterpret_cast<uint8_t*>(q8), d, hc, eps, sum_norm);
+    return GR_Q8_LAUNCHED;
+}
+
+// `cols` a multiple of 128; `row_stride` and `proj` 16-byte aligned (the host's check).
+extern "C" int32_t run_gr_silu_q8(
+    const float* proj, void* q8,
+    int32_t n, int32_t cols, int32_t row_stride, int32_t sum_norm, void* stream
+) {
+    if (n < 0 || cols <= 0 || (cols % 128) != 0 || row_stride < cols) return GR_Q8_REFUSED;
+    if (n == 0) return GR_Q8_LAUNCHED;
+    const long long threads = (long long)n * (cols / 128) * 32;
+    const unsigned blocks = (unsigned)((threads + gr_hyper::THREADS - 1) / gr_hyper::THREADS);
+    gr_hyper::gr_silu_q8_kernel<<<blocks, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>(
+        proj, reinterpret_cast<uint8_t*>(q8), n, cols, row_stride, sum_norm);
+    return GR_Q8_LAUNCHED;
+}
+
 extern "C" void run_gr_mix(
     const float* xn, const float* gate_raw, float* mixed,
     int32_t n, int32_t hc, int32_t d, int32_t vec_ok, void* stream
 ) {
     if (n <= 0 || hc <= 0 || d <= 0) return;
     const dim3 grid = gr_row_chunk_grid(n, d, vec_ok);
-#define GR_LAUNCH_MIX(HC)                                                              \
-    gr_hyper::gr_mix_kernel<HC><<<grid, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>( \
-        xn, gate_raw, mixed, d, vec_ok)
+#define GR_LAUNCH_MIX(HC)                                                                     \
+    gr_hyper::gr_mix_kernel<HC, false><<<grid, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>( \
+        xn, gate_raw, mixed, nullptr, d, vec_ok, 0)
     GR_DISPATCH_HC(hc, GR_LAUNCH_MIX)
 #undef GR_LAUNCH_MIX
+}
+
+// `gr_mix` also writing `mixed`'s q8a128 operand. `d` a multiple of 128 and `hc` one
+// the dispatch instantiates; every operand 16-byte aligned (the vector path — the
+// host's check).
+extern "C" int32_t run_gr_mix_q8(
+    const float* xn, const float* gate_raw, float* mixed, void* q8,
+    int32_t n, int32_t hc, int32_t d, int32_t sum_norm, void* stream
+) {
+    const bool hc_ok = hc == 1 || hc == 2 || hc == 4 || hc == 8 || hc == 16;
+    if (n < 0 || !hc_ok || d <= 0 || (d % 128) != 0) return GR_Q8_REFUSED;
+    if (n == 0) return GR_Q8_LAUNCHED;
+    const dim3 grid = gr_row_chunk_grid(n, d, 1);
+#define GR_LAUNCH_MIX_Q8(HC)                                                                 \
+    gr_hyper::gr_mix_kernel<HC, true><<<grid, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>( \
+        xn, gate_raw, mixed, reinterpret_cast<uint8_t*>(q8), d, 1, sum_norm)
+    GR_DISPATCH_HC(hc, GR_LAUNCH_MIX_Q8)
+#undef GR_LAUNCH_MIX_Q8
+    return GR_Q8_LAUNCHED;
 }
 
 extern "C" void run_gr_combine(
@@ -435,9 +607,25 @@ extern "C" void run_gr_combine(
 ) {
     if (n <= 0 || hc <= 0 || d <= 0 || inject_stride < hc) return;
     const dim3 grid = gr_row_chunk_grid(n, d, vec_ok);
-#define GR_LAUNCH_COMBINE(HC)                                                              \
-    gr_hyper::gr_combine_kernel<HC><<<grid, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>( \
-        res, block_out, inject, d, inject_stride, vec_ok)
+#define GR_LAUNCH_COMBINE(HC)                                                                     \
+    gr_hyper::gr_combine_kernel<HC, false><<<grid, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>( \
+        res, block_out, nullptr, nullptr, inject, d, inject_stride, 0, vec_ok)
     GR_DISPATCH_HC(hc, GR_LAUNCH_COMBINE)
 #undef GR_LAUNCH_COMBINE
+}
+
+// The MoE's combine with its block output assembled in place:
+// `res += (routed + shared · sigmoid(gate)) · 2·sigmoid(inject/hc)`.
+extern "C" void run_gr_combine_gated(
+    float* res, const float* routed, const float* shared, const float* gate, const float* inject,
+    int32_t n, int32_t hc, int32_t d, int32_t inject_stride, int32_t gate_stride,
+    int32_t vec_ok, void* stream
+) {
+    if (n <= 0 || hc <= 0 || d <= 0 || inject_stride < hc || gate_stride < 1) return;
+    const dim3 grid = gr_row_chunk_grid(n, d, vec_ok);
+#define GR_LAUNCH_COMBINE_GATED(HC)                                                              \
+    gr_hyper::gr_combine_kernel<HC, true><<<grid, gr_hyper::THREADS, 0, (cudaStream_t)stream>>>( \
+        res, routed, shared, gate, inject, d, inject_stride, gate_stride, vec_ok)
+    GR_DISPATCH_HC(hc, GR_LAUNCH_COMBINE_GATED)
+#undef GR_LAUNCH_COMBINE_GATED
 }

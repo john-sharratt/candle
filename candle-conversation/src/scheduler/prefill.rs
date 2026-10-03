@@ -2339,7 +2339,12 @@ impl Scheduler {
                         // 0.007%→0.135% at 42553ca3, amplified later by longer
                         // quanta). A real copy makes the captured row immutable —
                         // one ~vocab-sized row per completed prefill, negligible.
-                        let owned = l.copy().unwrap_or_else(|_| l.clone());
+                        //
+                        // `to_owned_tensor`, not `copy`: the row is a view of the
+                        // wave's whole logits block, and `copy` clones the
+                        // storage it views — every row of the block — where this
+                        // copies the row alone.
+                        let owned = l.to_owned_tensor().unwrap_or_else(|_| l.clone());
                         self.active_prefills[i].final_logits = Some(owned);
                     }
                 }
@@ -3404,6 +3409,7 @@ impl Scheduler {
                     generated_tokens: TokenBuffer::default(),
                     think_close_at: None,
                     forwarded_generated: 0,
+                    draft_depth: DraftDepth::default(),
                     pending_page_cut: false,
                     pending_page_cut_after: None,
                     max_tokens: work.max_decode_tokens,
@@ -3537,6 +3543,7 @@ impl Scheduler {
             generated_tokens: TokenBuffer::default(),
             think_close_at: None,
             forwarded_generated: 0,
+            draft_depth: DraftDepth::default(),
             pending_page_cut: false,
             pending_page_cut_after: None,
             max_tokens: work.max_decode_tokens,

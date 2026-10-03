@@ -57,5 +57,9 @@ extern "C" {
         // The Σx convention these q8a128 blocks are written in
         // (`SumScale::as_code()`): 0 raw, 1 Σx/amax.
         sum_norm: i32,
+        // Elements between consecutive rows of `gate` and `up`: `cols` when dense,
+        // wider for the two halves of one fused gate|up projection (then `cols`
+        // must be a multiple of 128).
+        row_stride: i32,
     );
 }

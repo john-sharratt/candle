@@ -299,6 +299,8 @@ mod bench {
                     output_ptr as *mut u32,
                     42,
                     rng_ptr as *mut u64,
+                    // No per-row dials: every row samples on the scalars above.
+                    std::ptr::null(),
                 );
             }
             stream.synchronize().expect("sync");

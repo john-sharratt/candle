@@ -19,7 +19,7 @@
 use std::sync::{Arc, RwLock};
 
 #[cfg(feature = "cuda")]
-use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
+use super::batched_layer::{add_ffn_residual, BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::dense_span;
@@ -41,7 +41,6 @@ use candle::quantized::cuda::DynamicActs;
 use candle::quantized::register_mmap_cuda;
 use candle::quantized::QTensor;
 use candle::quantized::{ggml_file, gguf_file, Int8Mode};
-use candle::LiveTensor;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{WaveGeneration, LLAMA2_KV_FACTOR, LLAMA3_KV_FACTOR, LLAMA_KV_FACTORS};
@@ -496,20 +495,21 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B3 consumer: dense MLP over the fused activation; MoE falls back to FP.
     #[cfg(feature = "cuda")]
-    fn ffn_forward<'w>(
+    fn ffn_residual<'w>(
         &self,
+        x: &mut Tensor,
         acts: DynamicActs<'w>,
         work_dtype: DType,
-        out_dtype: DType,
         // A dense MLP has no expert cache to score, so the decode/prefill row
         // split says nothing here.
         _decode_tokens: usize,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
         _wave: Option<&'w WaveGeneration>,
-    ) -> Result<LiveTensor<'w>> {
-        match &self.mlp_or_moe {
-            MlpOrMoe::Mlp(m) => m.forward_dynamic(&acts, work_dtype, out_dtype),
+    ) -> Result<()> {
+        let out_dtype = x.dtype();
+        let h = match &self.mlp_or_moe {
+            MlpOrMoe::Mlp(m) => m.forward_dynamic(&acts, work_dtype, out_dtype)?,
             _ => match acts {
                 // The `Module`-shaped MoE has no store-width parameter, so this
                 // arm narrows the result instead of storing it narrow.
@@ -518,13 +518,14 @@ impl BatchedAttentionLayer for LayerWeights {
                         .mlp_or_moe
                         .forward(&t.to_owned_tensor()?.to_dtype(work_dtype)?)?;
                     out.to_dtype_mut(out_dtype)?;
-                    Ok(out)
+                    out
                 }
                 DynamicActs::Int8(_) => {
-                    candle::bail!("llama MoE ffn_forward received int8 acts")
+                    candle::bail!("llama MoE ffn_residual received int8 acts")
                 }
             },
-        }
+        };
+        add_ffn_residual(x, &h)
     }
 
     /// B1 producer: fuse attention_norm -> q8a128 (int8) or FP rms_norm (Off).

@@ -1400,13 +1400,14 @@ void run_fused_silu_mul(int32_t dtype, size_t numel, size_t num_dims, const size
 }
 
 // Fused SwiGLU → q8a128 (producer epilogue B4): out = quantize(silu(gate)*up).
-extern "C" __global__ void silu_mul_q8a128_f32(const float*, const float*, void*, int, int, int);
-extern "C" __global__ void silu_mul_q8a128_f16(const __half*, const __half*, void*, int, int, int);
-extern "C" __global__ void silu_mul_q8a128_bf16(const __nv_bfloat16*, const __nv_bfloat16*, void*, int, int, int);
+extern "C" __global__ void silu_mul_q8a128_f32(const float*, const float*, void*, int, int, int, int);
+extern "C" __global__ void silu_mul_q8a128_f16(const __half*, const __half*, void*, int, int, int, int);
+extern "C" __global__ void silu_mul_q8a128_bf16(const __nv_bfloat16*, const __nv_bfloat16*, void*, int, int, int, int);
 
 // `sum_norm` is `SumScale::as_code()` — the Σx convention these blocks are
 // written in, which the matmul reading them must be launched with.
-void run_silu_mul_q8a128_op(int32_t dtype, const void* gate, const void* up, void* out, int rows, int cols, int sum_norm) {
+// `row_stride`: elements between consecutive rows of `gate`/`up` — `cols` when dense.
+void run_silu_mul_q8a128_op(int32_t dtype, const void* gate, const void* up, void* out, int rows, int cols, int sum_norm, int row_stride) {
     long long total_tiles = ((long long)rows * cols) / 128;
     if (total_tiles <= 0) return;
     const int threads = 256;
@@ -1416,13 +1417,13 @@ void run_silu_mul_q8a128_op(int32_t dtype, const void* gate, const void* up, voi
     dim3 grid((unsigned)blocks, 1, 1), block(threads, 1, 1);
     switch (dtype) {
         case 0: // f32
-            silu_mul_q8a128_f32<<<grid, block>>>((const float*)gate, (const float*)up, out, rows, cols, sum_norm);
+            silu_mul_q8a128_f32<<<grid, block>>>((const float*)gate, (const float*)up, out, rows, cols, sum_norm, row_stride);
             break;
         case 1: // f16
-            silu_mul_q8a128_f16<<<grid, block>>>((const __half*)gate, (const __half*)up, out, rows, cols, sum_norm);
+            silu_mul_q8a128_f16<<<grid, block>>>((const __half*)gate, (const __half*)up, out, rows, cols, sum_norm, row_stride);
             break;
         case 2: // bf16
-            silu_mul_q8a128_bf16<<<grid, block>>>((const __nv_bfloat16*)gate, (const __nv_bfloat16*)up, out, rows, cols, sum_norm);
+            silu_mul_q8a128_bf16<<<grid, block>>>((const __nv_bfloat16*)gate, (const __nv_bfloat16*)up, out, rows, cols, sum_norm, row_stride);
             break;
     }
 }

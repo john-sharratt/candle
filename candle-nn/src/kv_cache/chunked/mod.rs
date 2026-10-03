@@ -30,6 +30,8 @@
 mod alloc;
 mod arena;
 mod backing;
+mod band_codec;
+mod block_round_trip;
 #[cfg(feature = "cuda")]
 pub(crate) mod bump_arena;
 mod chunk_ops;
@@ -76,8 +78,11 @@ pub mod kv_integrity;
 mod meta_pool;
 pub mod migrate;
 pub mod migrate_flight;
+mod palette_layout;
 #[cfg(feature = "cuda")]
 pub(crate) mod region_pool;
+#[cfg(feature = "tensor-assert")]
+mod release_watch;
 #[cfg(feature = "cuda")]
 pub(crate) mod reservation;
 pub mod sampled_selection;
@@ -105,6 +110,7 @@ pub mod wave_spans;
 /// so its invariants — the ones a mis-set boundary would violate — are provable
 /// on a machine with no GPU.
 pub mod weight_zone;
+mod write_placement;
 
 #[cfg(test)]
 mod tests;
@@ -142,8 +148,8 @@ pub use gpu_chunks::ChunkPin;
 pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
 pub use migrate_flight::{
-    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations, try_migrate_flight,
-    LocationFreeze, MigrateFlight,
+    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations,
+    try_hold_chunk_locations, try_migrate_flight, LocationFreeze, LocationHold, MigrateFlight,
 };
 pub use size_class::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,

@@ -123,6 +123,7 @@ pub enum MatmulStatus {
     BadYType,
     NoKernel,
     BadOutDType,
+    BadSplit,
     Unknown(i32),
 }
 
@@ -135,6 +136,7 @@ impl MatmulStatus {
             3 => Self::BadYType,
             4 => Self::NoKernel,
             5 => Self::BadOutDType,
+            6 => Self::BadSplit,
             other => Self::Unknown(other),
         }
     }
@@ -148,6 +150,7 @@ impl MatmulStatus {
             Self::BadYType => Some("unsupported activation type"),
             Self::NoKernel => Some("no kernel for this (format, output dtype) pair"),
             Self::BadOutDType => Some("unsupported output dtype"),
+            Self::BadSplit => Some("split-K depth out of range, or a format that never splits"),
             Self::Unknown(_) => Some("unrecognised launcher status"),
         }
     }
@@ -191,6 +194,50 @@ extern "C" {
         // The activation operand's `SumScale::as_code()` — 0 raw Σx, 1 Σx/amax.
         // Read by the int8 dense path only; the FP kernels carry no q8a128 header.
         sum_norm: i32,
+    ) -> i32;
+
+    /// Split-K int8 dense matmul: q8a128 activations `[M, K]` × one KO weight `[N, K]` →
+    /// `dst [M, N]` at `out_dtype`, with K cut into `splits` slices so a decode-width
+    /// projection with a narrow N fills the card.
+    /// - `ws`: `K/128 × M × N` F32 partials — one per K tile — device memory.
+    /// - `counters`: one u32 per (16-token tile, 32-row tile), all ZERO on entry; the kernel
+    ///   leaves them zero, so one buffer serves every launch ordered on the same stream.
+    ///
+    /// The sum over K tiles runs in tile order in whichever block finishes last — the chain the
+    /// unsplit kernel folds in for the affine KO formats, so the result is the unsplit kernel's
+    /// bit for bit. MXFP4 is not split (its per-sub fold has no per-tile partial). Returns a
+    /// [`MatmulStatus`] code.
+    pub fn run_dense_int8_splitk(
+        weights: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        total_batch: i32,
+        qtype: i32,
+        out_dtype: i32,
+        sum_norm: i32,
+        splits: i32,
+        ws: *mut f32,
+        counters: *mut u32,
+    ) -> i32;
+
+    /// Fused-activation int8 dense matmul for a Q8_KO weight `[N, K]`:
+    /// `dst [M, N] (F32) = silu(proj[:, 0..K]) · Wᵀ`, the activation quantized to q8a128 by
+    /// the kernel's own tile loader — the bytes `gr_silu_q8` would have written, without its
+    /// launch. `proj` is `[M, proj_stride]` F32 (`proj_stride ≥ K`, rows 16-byte aligned);
+    /// `mode2` picks the Bm=32 tile as the dense launch does. Returns a [`MatmulStatus`] code:
+    /// `NoKernel` for a K that is not whole 128-tiles inside a row, or an N not whole 32-rows.
+    pub fn run_dense_int8_silu_q8ko_f32(
+        weights: *const c_void,
+        proj: *const f32,
+        proj_stride: i32,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        total_batch: i32,
+        sum_norm: i32,
+        mode2: i32,
     ) -> i32;
 
     /// Segmented qkv int8 dense matmul: one launch over a shared q8a128 activation × up to 3 KO

@@ -2,6 +2,7 @@ use super::utils::{
     get_scale_min_k4, group_for_dequantization, group_for_quantization, make_q3_quants,
     make_qkx1_quants, make_qx_quants, nearest_int,
 };
+use super::warp_mirror::{encode_centroid, lane8_sum, rint, warp_sum, INV_127, INV_255};
 use super::GgmlDType;
 use crate::Result;
 use byteorder::{ByteOrder, LittleEndian};
@@ -234,30 +235,33 @@ pub struct BlockQ0 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQ0>() == 1);
 
-/// Q1_S: 1-bit sign + FP8 E4M3 scale
+/// Q1_S: 1-bit sign + INT8 scale (`block_q1_s`: `scale = rint(mean|x| · 127)`,
+/// decode `±scale/127`).
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockQ1S {
-    pub(crate) scale: u8,
+    pub(crate) scale: i8,
     pub(crate) qs: [u8; QK1_S / 8],
 }
 const _: () = assert!(std::mem::size_of::<BlockQ1S>() == 5);
 
-/// Q2_S: 2-bit symmetric + FP8 E4M3 scale
+/// Q2_S: 2-bit symmetric + INT8 scale (`block_q2_s`: `d = scale/127`, decode
+/// `d · (q − 1.5)`).
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockQ2S {
-    pub(crate) scale: u8,
+    pub(crate) scale: i8,
     pub(crate) qs: [u8; QK2_S / 4],
 }
 const _: () = assert!(std::mem::size_of::<BlockQ2S>() == 9);
 
-/// Q2_A: 2-bit asymmetric + FP8 E4M3 scale + FP8 E4M3 min
+/// Q2_A: 2-bit asymmetric + INT8 scale + INT8 bias (`block_q2_a`: decode
+/// `q · scale/127 + bias/127`).
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockQ2A {
-    pub(crate) scale: u8,
-    pub(crate) bias: u8,
+    pub(crate) scale: i8,
+    pub(crate) bias: i8,
     pub(crate) qs: [u8; QK2_A / 4],
 }
 const _: () = assert!(std::mem::size_of::<BlockQ2A>() == 10);
@@ -387,20 +391,22 @@ const _: () = assert!(std::mem::size_of::<BlockQ0X>() == 2);
 /// CUDA kernel header.
 pub const Q0_X_S_OUTLIER: i32 = 32;
 
-/// Q0_M2: Two E4M3 constants + 8-bit quartet mask (3 bytes per 32 elements)
+/// Q0_M2: Two INT8 constants + 8-bit quartet mask (3 bytes per 32 elements;
+/// `block_q0_m2`, decode `centroid/127`)
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockQ0M2 {
-    pub(crate) val_fp8: [u8; 2],
+    pub(crate) centroid: [i8; 2],
     pub(crate) qmask: u8,
 }
 const _: () = assert!(std::mem::size_of::<BlockQ0M2>() == 3);
 
-/// Q0_M4: Four E4M3 constants + 32-bit pair mask (8 bytes per 32 elements)
+/// Q0_M4: Four INT8 constants + 32-bit pair mask (8 bytes per 32 elements;
+/// `block_q0_m4`, decode `centroid/127`)
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockQ0M4 {
-    pub(crate) val_fp8: [u8; 4],
+    pub(crate) centroid: [i8; 4],
     pub(crate) qmask: u32,
 }
 const _: () = assert!(std::mem::size_of::<BlockQ0M4>() == 8);
@@ -1503,8 +1509,12 @@ impl GgmlType for BlockQ8_1 {
         sumf
     }
 
+    /// `d` and `qs` as `quantize_block_q8_1` (`quantize_q8_1.cuh`) writes
+    /// them: `q = rint(x · 127/amax)`, `d = amax · (1/127)`. `s` is `d · Σq`,
+    /// the sum of the quantized values the Q4_1/Q5_1 vec-dot folds its min
+    /// against; the kernel stores `Σx` there instead, and no decoder of a KV
+    /// band reads it.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
-        // quantize_row_q8_1
         debug_assert_eq!(
             ys.len() * Self::BLCK_SIZE,
             xs.len(),
@@ -1514,23 +1524,15 @@ impl GgmlType for BlockQ8_1 {
             Self::BLCK_SIZE
         );
         for (i, ys) in ys.iter_mut().enumerate() {
-            let mut amax = 0f32;
             let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
-            for &x in xs.iter() {
-                amax = amax.max(x.abs())
+            let amax = xs.iter().fold(0f32, |m, x| m.max(x.abs()));
+            let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+            for (q, &x) in ys.qs.iter_mut().zip(xs) {
+                *q = rint(x * id) as i8;
             }
-            let d = amax / ((1 << 7) - 1) as f32;
-            let id = if d != 0f32 { 1. / d } else { 0. };
-            ys.d = f16::from_f32(d);
-            let mut sum = 0i32;
-            for j in 0..Self::BLCK_SIZE / 2 {
-                let v0 = xs[j] * id;
-                let v1 = xs[j + Self::BLCK_SIZE / 2] * id;
-                ys.qs[j] = f32::round(v0) as i8;
-                ys.qs[j + Self::BLCK_SIZE / 2] = f32::round(v1) as i8;
-                sum += ys.qs[j] as i32 + ys.qs[j + Self::BLCK_SIZE / 2] as i32;
-            }
-            ys.s = f16::from_f32(sum as f32) * ys.d;
+            ys.d = f16::from_f32(amax * INV_127);
+            let sum_q: i32 = ys.qs.iter().map(|&q| q as i32).sum();
+            ys.s = f16::from_f32(sum_q as f32) * ys.d;
         }
     }
 
@@ -1552,57 +1554,92 @@ impl GgmlType for BlockQ8_1 {
     }
 }
 
+/// The `_KS` decoders' sub-block scales, as `q4_ks_decode` / `q8_ks_decode`
+/// form them: `d · (s · 1/255)` for sub-block A (elements 0–3) and B.
+fn ks_decode_scales(d: f16, sa: u8, sb: u8) -> (f32, f32) {
+    let cd = d.to_f32();
+    (cd * (sa as f32 * INV_255), cd * (sb as f32 * INV_255))
+}
+
+/// The `_KS` encoders' shared header: a coarse scale over the block and a
+/// fine scale per sub-block — A is elements 0–3 (the attention sinks), B the
+/// rest. The quants divide by the unrounded coarse scale times the fine one,
+/// exactly as the kernels do; `d` is stored rounded to f16 afterwards.
+struct KsHeader {
+    coarse: f32,
+    sa: u8,
+    sb: u8,
+}
+
+impl KsHeader {
+    /// `inv_levels` is the kernel's `1.0f / 7.0f` or `1.0f / 127.0f`.
+    fn of(xs: &[f32], inv_levels: f32) -> Self {
+        let amax_a = xs[..4].iter().fold(0f32, |m, x| m.max(x.abs()));
+        let amax_b = xs[4..].iter().fold(0f32, |m, x| m.max(x.abs()));
+        let amax = amax_a.max(amax_b);
+        if amax == 0.0 {
+            return Self {
+                coarse: 0.0,
+                sa: 255,
+                sb: 255,
+            };
+        }
+        let fine = |a: f32| (a / amax * 255.0).round().clamp(1.0, 255.0) as u8;
+        Self {
+            coarse: amax * inv_levels,
+            sa: fine(amax_a),
+            sb: fine(amax_b),
+        }
+    }
+
+    /// Element `j`'s signed quant, clamped to `±levels`.
+    fn quant(&self, xs: &[f32], j: usize, levels: f32) -> i32 {
+        let s = if j < 4 { self.sa } else { self.sb };
+        let actual_d = self.coarse * s as f32 * INV_255;
+        if actual_d == 0.0 {
+            return 0;
+        }
+        (xs[j] / actual_d).round().clamp(-levels, levels) as i32
+    }
+}
+
 impl GgmlType for BlockQ4_KS {
     const DTYPE: GgmlDType = GgmlDType::Q4_KS;
     const BLCK_SIZE: usize = QK_Q4_KS;
     type VecDotType = BlockQ4_KS;
 
+    /// `q4_ks_decode` (`block_q4_ks.cuh`): sub-block scale `d · (s · 1/255)`.
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         let k = ys.len();
         debug_assert!(k.is_multiple_of(QK_Q4_KS));
         let nb = k / QK_Q4_KS;
         for i in 0..nb {
-            let d = xs[i].d.to_f32();
-            let da = d * xs[i].sa as f32 / 255.0;
-            let db = d * xs[i].sb as f32 / 255.0;
+            let (da, db) = ks_decode_scales(xs[i].d, xs[i].sa, xs[i].sb);
             for j in 0..QK_Q4_KS / 2 {
                 let lo_nibble = (xs[i].qs[j] & 0x0F) as i32 - 8;
                 let hi_nibble = (xs[i].qs[j] >> 4) as i32 - 8;
-                let scale_lo = if j < 2 { da } else { db }; // j<2 covers elems 0-3 (4 elems)
+                let scale_lo = if j < 4 { da } else { db };
                 ys[i * QK_Q4_KS + j] = scale_lo * lo_nibble as f32;
                 ys[i * QK_Q4_KS + j + QK_Q4_KS / 2] = db * hi_nibble as f32;
             }
         }
     }
 
+    /// `quantize_block_q4_ks_vec` (`quantize_q4_ks.cuh`), op for op.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         let k = xs.len();
         debug_assert!(k.is_multiple_of(Self::BLCK_SIZE));
         debug_assert_eq!(ys.len(), k / Self::BLCK_SIZE);
         for (i, ys) in ys.iter_mut().enumerate() {
             let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
-            let amax_a = xs[..4].iter().map(|x| x.abs()).fold(0f32, f32::max);
-            let amax_b = xs[4..].iter().map(|x| x.abs()).fold(0f32, f32::max);
-            let amax = amax_a.max(amax_b);
-            let d = amax / 7.0;
-            ys.d = f16::from_f32(d);
-            if amax == 0.0 {
-                ys.sa = 255;
-                ys.sb = 255;
-            } else {
-                ys.sa = ((amax_a / amax * 255.0).round() as u8).clamp(1, 255);
-                ys.sb = ((amax_b / amax * 255.0).round() as u8).clamp(1, 255);
-            }
-            let da = d * ys.sa as f32 / 255.0;
-            let db = d * ys.sb as f32 / 255.0;
+            let h = KsHeader::of(xs, 1.0 / 7.0);
+            let q = |j: usize| -> u8 { (h.quant(xs, j, 7.0) + 8) as u8 };
             for j in 0..QK_Q4_KS / 2 {
-                let scale_lo = if j < 2 { da } else { db }; // j<2 -> elems 0-3
-                let id_lo = if scale_lo != 0.0 { 1.0 / scale_lo } else { 0.0 };
-                let id_hi = if db != 0.0 { 1.0 / db } else { 0.0 };
-                let lo = (xs[j] * id_lo).round().clamp(-7.0, 7.0) as i8 + 8;
-                let hi = (xs[j + QK_Q4_KS / 2] * id_hi).round().clamp(-7.0, 7.0) as i8 + 8;
-                ys.qs[j] = (lo as u8) | ((hi as u8) << 4);
+                ys.qs[j] = q(j) | (q(j + QK_Q4_KS / 2) << 4);
             }
+            ys.d = f16::from_f32(h.coarse);
+            ys.sa = h.sa;
+            ys.sb = h.sb;
         }
     }
 
@@ -1642,14 +1679,13 @@ impl GgmlType for BlockQ8_KS {
     const BLCK_SIZE: usize = QK_Q8_KS;
     type VecDotType = BlockQ8_KS;
 
+    /// `q8_ks_decode` (`block_q8_ks.cuh`): sub-block scale `d · (s · 1/255)`.
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         let k = ys.len();
         debug_assert!(k.is_multiple_of(QK_Q8_KS));
         let nb = k / QK_Q8_KS;
         for i in 0..nb {
-            let d = xs[i].d.to_f32();
-            let da = d * xs[i].sa as f32 / 255.0;
-            let db = d * xs[i].sb as f32 / 255.0;
+            let (da, db) = ks_decode_scales(xs[i].d, xs[i].sa, xs[i].sb);
             for j in 0..QK_Q8_KS {
                 let scale = if j < 4 { da } else { db };
                 ys[i * QK_Q8_KS + j] = scale * xs[i].qs[j] as f32;
@@ -1657,31 +1693,20 @@ impl GgmlType for BlockQ8_KS {
         }
     }
 
+    /// `quantize_block_q8_ks_vec` (`quantize_q8_ks.cuh`), op for op.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         let k = xs.len();
         debug_assert!(k.is_multiple_of(Self::BLCK_SIZE));
         debug_assert_eq!(ys.len(), k / Self::BLCK_SIZE);
         for (i, ys) in ys.iter_mut().enumerate() {
             let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
-            let amax_a = xs[..4].iter().map(|x| x.abs()).fold(0f32, f32::max);
-            let amax_b = xs[4..].iter().map(|x| x.abs()).fold(0f32, f32::max);
-            let amax = amax_a.max(amax_b);
-            let d = amax / 127.0;
-            ys.d = f16::from_f32(d);
-            if amax == 0.0 {
-                ys.sa = 255;
-                ys.sb = 255;
-            } else {
-                ys.sa = ((amax_a / amax * 255.0).round() as u8).clamp(1, 255);
-                ys.sb = ((amax_b / amax * 255.0).round() as u8).clamp(1, 255);
+            let h = KsHeader::of(xs, 1.0 / 127.0);
+            for (j, q) in ys.qs.iter_mut().enumerate() {
+                *q = h.quant(xs, j, 127.0) as i8;
             }
-            let da = d * ys.sa as f32 / 255.0;
-            let db = d * ys.sb as f32 / 255.0;
-            for (j, (q, &x)) in ys.qs.iter_mut().zip(xs.iter()).enumerate() {
-                let scale = if j < 4 { da } else { db };
-                let id = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-                *q = (x * id).round().clamp(-127.0, 127.0) as i8;
-            }
+            ys.d = f16::from_f32(h.coarse);
+            ys.sa = h.sa;
+            ys.sb = h.sb;
         }
     }
 
@@ -1735,14 +1760,12 @@ impl GgmlType for BlockQ2_0 {
         debug_assert_eq!(ys.len(), k / Self::BLCK_SIZE);
         for (i, ys) in ys.iter_mut().enumerate() {
             let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
+            // `quantize_block_q2_0_vec`: an all-zero block still encodes its
+            // quants (every one the midpoint code 2), as the seal writes it.
             let amax = xs.iter().map(|x| x.abs()).fold(0f32, f32::max);
-            if amax == 0.0 {
-                ys.d = f16::from_f32(0.0);
-                ys.qs.fill(0);
-                continue;
-            }
             ys.d = f16::from_f32(amax / 1.5);
-            let id = 1.5 / amax;
+            let id = if amax != 0.0 { 1.5 / amax } else { 0.0 };
+            ys.qs.fill(0);
             for (j, &x) in xs.iter().enumerate().take(QK2_0) {
                 let q = (x * id + 1.5).round().clamp(0.0, 3.0) as u8;
                 ys.qs[j / 4] |= q << ((j % 4) * 2);
@@ -1798,17 +1821,13 @@ impl GgmlType for BlockQ3_0 {
         debug_assert_eq!(ys.len(), k / Self::BLCK_SIZE);
         for (i, ys) in ys.iter_mut().enumerate() {
             let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
+            // `quantize_block_q3_0`: `d = amax · (1/3.5)`, and an all-zero
+            // block still encodes its quants (every one the midpoint code 4).
             let amax = xs.iter().map(|x| x.abs()).fold(0f32, f32::max);
-            if amax == 0.0 {
-                ys.d = f16::from_f32(0.0);
-                ys.qh.fill(0);
-                ys.qs.fill(0);
-                continue;
-            }
-            ys.d = f16::from_f32(amax / 3.5);
+            ys.d = f16::from_f32(amax * (1.0 / 3.5));
             ys.qh.fill(0);
             ys.qs.fill(0);
-            let id = 3.5 / amax;
+            let id = if amax != 0.0 { 3.5 / amax } else { 0.0 };
             for (j, &x) in xs.iter().enumerate().take(QK3_0) {
                 let q = (x * id + 3.5).round().clamp(0.0, 7.0) as u8;
                 let lo = q & 3;
@@ -1888,55 +1907,13 @@ impl GgmlType for BlockR16 {
     }
 }
 
-// ── FP8 E4M3 helpers for CPU decode/encode ──
-fn decode_e4m3(bits: u8) -> f32 {
-    let sign = (bits >> 7) & 1;
-    let exp = ((bits >> 3) & 0xf) as i32;
-    let mantissa = (bits & 7) as f32;
-    if exp == 0 {
-        let val = mantissa / 8.0 * 2.0f32.powi(-6);
-        if sign == 1 {
-            -val
-        } else {
-            val
-        }
-    } else if exp == 15 && mantissa == 7.0 {
-        // E4M3 encodes NaN with either sign bit; both decode to the same NaN.
-        f32::NAN
-    } else {
-        let val = (1.0 + mantissa / 8.0) * 2.0f32.powi(exp - 7);
-        if sign == 1 {
-            -val
-        } else {
-            val
-        }
-    }
-}
-
-fn encode_e4m3(x: f32) -> u8 {
-    if x == 0.0 {
-        return 0;
-    }
-    let sign = if x < 0.0 { 1u8 } else { 0u8 };
-    let ax = x.abs().min(448.0);
-    let (frac, exp_raw) = {
-        let bits = ax.to_bits();
-        let exp = ((bits >> 23) & 0xff) as i32 - 127;
-        let mantissa = (bits & 0x7fffff) as f32 / (1 << 23) as f32;
-        (1.0 + mantissa, exp)
-    };
-    let biased = (exp_raw + 7).clamp(0, 15) as u8;
-    let m = ((frac - 1.0) * 8.0).round().clamp(0.0, 7.0) as u8;
-    (sign << 7) | (biased << 3) | m
-}
-
 impl GgmlType for BlockQ0 {
     const DTYPE: GgmlDType = GgmlDType::Q0;
     const BLCK_SIZE: usize = QK_Q0;
     type VecDotType = BlockQ8_0;
 
-    /// Decode: every lane in the block expands to the same constant.
-    /// `centroid as f32 / 127.0`. The outer-scale division is applied by
+    /// Decode: every lane in the block expands to the same constant,
+    /// `centroid · (1/127)` as `block_q0.cuh` forms it. The outer-scale division is applied by
     /// the BlockConverter on the GPU side; trait `to_float` returns the
     /// pre-outer-scaled value to match every other format's contract.
     fn to_float(xs: &[Self], ys: &mut [f32]) {
@@ -1947,16 +1924,17 @@ impl GgmlType for BlockQ0 {
         );
         let nb = k / QK_Q0;
         for i in 0..nb {
-            let v = xs[i].centroid as f32 / 127.0;
+            let v = xs[i].centroid as f32 * INV_127;
             for j in 0..QK_Q0 {
                 ys[i * QK_Q0 + j] = v;
             }
         }
     }
 
-    /// Encode: take the block mean, scale to i8 [-127, 127] space.
-    /// The caller is expected to have applied outer scaling so input
-    /// values lie roughly in [-1, +1].
+    /// Encode: take the block mean, scale to i8 [-127, 127] space, as
+    /// `quantize_block_q0` does — the warp's butterfly sum times `1/32`,
+    /// rounded ties-to-even. The caller is expected to have applied outer
+    /// scaling so input values lie roughly in [-1, +1].
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         let k = xs.len();
         debug_assert!(
@@ -1966,9 +1944,7 @@ impl GgmlType for BlockQ0 {
         let nb = k / QK_Q0;
         for i in 0..nb {
             let block = &xs[i * QK_Q0..(i + 1) * QK_Q0];
-            let mean: f32 = block.iter().sum::<f32>() / QK_Q0 as f32;
-            let q = (mean.clamp(-1.0, 1.0) * 127.0).round() as i32;
-            ys[i].centroid = q.clamp(-127, 127) as i8;
+            ys[i].centroid = encode_centroid(warp_sum(block) * (1.0 / 32.0));
         }
     }
 
@@ -1985,10 +1961,11 @@ impl GgmlType for BlockQ1S {
     const BLCK_SIZE: usize = QK1_S;
     type VecDotType = BlockQ8_0;
 
+    /// `block_q1_s.cuh`: `±scale · (1/127)`.
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         let nb = ys.len() / QK1_S;
         for i in 0..nb {
-            let scale = decode_e4m3(xs[i].scale);
+            let scale = xs[i].scale as f32 * INV_127;
             for j in 0..QK1_S {
                 let bit = (xs[i].qs[j / 8] >> (j % 8)) & 1;
                 ys[i * QK1_S + j] = if bit == 1 { scale } else { -scale };
@@ -1996,11 +1973,17 @@ impl GgmlType for BlockQ1S {
         }
     }
 
+    /// `quantize_block_q1_s_vec` (`quantize_q1_s.cuh`): the mean |x| is the
+    /// eight lanes' four-element partials, butterfly-summed, over 32.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         for (i, y) in ys.iter_mut().enumerate() {
             let block = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
-            let amax = block.iter().map(|x| x.abs()).fold(0f32, f32::max);
-            y.scale = encode_e4m3(amax);
+            let partials: [f32; 8] = std::array::from_fn(|l| {
+                let v = &block[4 * l..4 * l + 4];
+                v[0].abs() + v[1].abs() + v[2].abs() + v[3].abs()
+            });
+            let mean_abs = lane8_sum(&partials) / 32.0;
+            y.scale = rint((mean_abs * 127.0).min(127.0)) as i8;
             y.qs.fill(0);
             for (j, &b) in block.iter().enumerate().take(QK1_S) {
                 if b >= 0.0 {
@@ -2023,10 +2006,11 @@ impl GgmlType for BlockQ2S {
     const BLCK_SIZE: usize = QK2_S;
     type VecDotType = BlockQ8_0;
 
+    /// `block_q2_s.cuh`: `d · (q − 1.5)`, `d = scale · (1/127)`.
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         let nb = ys.len() / QK2_S;
         for i in 0..nb {
-            let d = decode_e4m3(xs[i].scale);
+            let d = xs[i].scale as f32 * INV_127;
             for j in 0..QK2_S {
                 let q = ((xs[i].qs[j / 4] >> ((j % 4) * 2)) & 3) as f32;
                 ys[i * QK2_S + j] = d * (q - 1.5);
@@ -2034,19 +2018,16 @@ impl GgmlType for BlockQ2S {
         }
     }
 
+    /// `quantize_block_q2_s_vec` (`quantize_q2_s.cuh`): the INT8 scale is
+    /// encoded first and the quants divide by its decoded value.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         for (i, y) in ys.iter_mut().enumerate() {
             let block = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
             let amax = block.iter().map(|x| x.abs()).fold(0f32, f32::max);
-            if amax == 0.0 {
-                y.scale = 0;
-                y.qs.fill(0);
-                continue;
-            }
-            let d = amax / 1.5;
-            y.scale = encode_e4m3(d);
+            y.scale = rint((amax * (1.0 / 1.5) * 127.0).min(127.0)) as i8;
+            let d = y.scale as f32 * INV_127;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
             y.qs.fill(0);
-            let id = 1.5 / amax;
             for (j, &b) in block.iter().enumerate().take(QK2_S) {
                 let q = (b * id + 1.5).round().clamp(0.0, 3.0) as u8;
                 y.qs[j / 4] |= q << ((j % 4) * 2);
@@ -2067,37 +2048,36 @@ impl GgmlType for BlockQ2A {
     const BLCK_SIZE: usize = QK2_A;
     type VecDotType = BlockQ8_0;
 
+    /// `block_q2_a.cuh`: `d · q + m`, `d = scale · (1/127)`, `m = bias ·
+    /// (1/127)`.
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         let nb = ys.len() / QK2_A;
         for i in 0..nb {
-            let d = decode_e4m3(xs[i].scale);
-            let m = decode_e4m3(xs[i].bias);
+            let d = xs[i].scale as f32 * INV_127;
+            let m = xs[i].bias as f32 * INV_127;
             for j in 0..QK2_A {
                 let q = ((xs[i].qs[j / 4] >> ((j % 4) * 2)) & 3) as f32;
-                ys[i * QK2_A + j] = q * d + m;
+                ys[i * QK2_A + j] = d * q + m;
             }
         }
     }
 
+    /// `quantize_block_q2_a_vec` (`quantize_q2_a.cuh`): scale and bias are
+    /// encoded to INT8 first and the quants are placed against their decoded
+    /// values.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         for (i, y) in ys.iter_mut().enumerate() {
             let block = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
             let vmax = block.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let vmin = block.iter().cloned().fold(f32::INFINITY, f32::min);
-            let range = vmax - vmin;
-            if range == 0.0 {
-                y.scale = 0;
-                y.bias = encode_e4m3(vmin);
-                y.qs.fill(0);
-                continue;
-            }
-            let d = range / 3.0;
-            y.scale = encode_e4m3(d);
-            y.bias = encode_e4m3(vmin);
+            y.scale = rint(((vmax - vmin) * (1.0 / 3.0) * 127.0).min(127.0)) as i8;
+            y.bias = rint((vmin * 127.0).clamp(-127.0, 127.0)) as i8;
+            let d = y.scale as f32 * INV_127;
+            let m = y.bias as f32 * INV_127;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
             y.qs.fill(0);
-            let id = 3.0 / range;
             for (j, &b) in block.iter().enumerate().take(QK2_A) {
-                let q = ((b - vmin) * id).round().clamp(0.0, 3.0) as u8;
+                let q = ((b - m) * id).round().clamp(0.0, 3.0) as u8;
                 y.qs[j / 4] |= q << ((j % 4) * 2);
             }
         }
@@ -2248,6 +2228,16 @@ impl GgmlType for BlockP2 {
 /// `candle-kernels/src/convert/block_q0_v.cuh`.
 #[inline]
 pub fn q0_v_elem<const IS_K: bool>(block: &BlockQ0V, e: usize) -> f32 {
+    q0_v_elem_scaled::<IS_K>(block, e, 1.0)
+}
+
+/// A Q0_V element read at a palette scale, given its reciprocal `r`
+/// (`1.0 / scale`, correctly rounded): `(scale_q · r) · curve[e] + centroid_q · r`
+/// as one FMA, the two products rounded first. This is every GPU read path's
+/// arithmetic (`q0_v_header` in block_q0_v.cuh); at `r = 1` it is the plain
+/// decode.
+#[inline]
+pub fn q0_v_elem_scaled<const IS_K: bool>(block: &BlockQ0V, e: usize, r: f32) -> f32 {
     let curve_idx = block.curve_idx();
     let scale_idx = block.scale_idx();
     let centroid_idx = block.centroid_idx();
@@ -2264,8 +2254,8 @@ pub fn q0_v_elem<const IS_K: bool>(block: &BlockQ0V, e: usize) -> f32 {
             q0_v_tables::CURVE_TABLE_V[curve_idx][e] as f32,
         )
     };
-    let scale = half::f16::from_bits(scale_bits).to_f32();
-    let centroid = half::f16::from_bits(centroid_bits).to_f32();
+    let scale = half::f16::from_bits(scale_bits).to_f32() * r;
+    let centroid = half::f16::from_bits(centroid_bits).to_f32() * r;
     scale.mul_add(curve_e, centroid)
 }
 
@@ -2313,19 +2303,22 @@ impl GgmlType for BlockQ0V {
 /// `outer_scale` (1/head_amax) to the input so values are roughly in [-1, +1].
 /// IS_K selects between K-side and V-side calibrated tables.
 ///
-/// Pipeline matches the CUDA encoder in
-/// `candle-kernels/src/quantize/quantize_q0_v.cuh`:
-///   1. Compute actual (centroid, scale) = (mean(x), max|x − mean(x)|).
-///   2. Pick scale_idx (32 entries) by argmin |actual_scale − scale_table[i]|.
-///   3. Pick centroid_idx (8 entries within chosen scale row).
-///   4. Normalise target[lane] = (x[lane] − chosen_centroid) / scale_baked,
-///      where scale_baked = scale_norm / 127. After this, target is directly
-///      comparable to the i8 curve_table values (no /127 needed).
-///   5. Peak-bin curve search: find the lane of max |target|, then score
-///      only the curves whose own peak lane is in {peak−1, peak, peak+1}
-///      (cyclic). The 256-curve table is pre-sorted by peak lane and
-///      indexed by `PEAK_CURVE_INDICES` / `PEAK_BIN_OFFSETS`.
-///   6. Pack curve_idx (8 bits) + scale_idx (5 bits) + centroid_idx (3 bits).
+/// This is the reference for the CUDA encoder in
+/// `candle-kernels/src/quantize/quantize_q0_v.cuh`, which produces the same
+/// bytes: every operation below is the one the kernel performs, rounded the
+/// same way, in the same order (the encode oracle test compares them).
+///   1. Compute actual (centroid, scale) = (mean(x), max|x − mean(x)|). The
+///      sum is the warp's butterfly: five rounds of `x[i] + x[i ^ off]`.
+///   2. Pick scale_idx (32 entries) by argmin |actual_scale − 127·scale[i]|.
+///   3. Pick centroid_idx (16 entries within the chosen scale row).
+///   4. Normalise target[e] = x[e] · (1/scale_baked) − centroid · (1/scale_baked),
+///      where scale_baked = scale_norm / 127, so target is directly comparable
+///      to the i8 curve_table values.
+///   5. Score all 128 curves by E − 2R (E = Σ curve², R = Σ target · curve as
+///      four FMA chains, element e into chain e mod 4 in element order, summed
+///      (c0 + c1) + (c2 + c3)) — the squared error less the Σ target² every
+///      curve shares — and keep the lowest; ties keep the lower index.
+///   6. Pack curve_idx (7 bits) + scale_idx (5 bits) + centroid_idx (4 bits).
 pub fn encode_block_q0_v<const IS_K: bool>(block: &[f32]) -> BlockQ0V {
     debug_assert_eq!(block.len(), QK_Q0_V);
 
@@ -2347,25 +2340,23 @@ pub fn encode_block_q0_v<const IS_K: bool>(block: &[f32]) -> BlockQ0V {
     };
 
     // ── Step 1: actual (centroid, scale) of the block ──
-    let mean: f32 = block.iter().sum::<f32>() / QK_Q0_V as f32;
-    let mut max_dev = 0.0f32;
-    for &x in block.iter() {
-        let d = (x - mean).abs();
-        if d > max_dev {
-            max_dev = d;
-        }
+    // The kernel's warp sum: each round, lane i adds lane i ^ off's partial.
+    let mut partial: [f32; QK_Q0_V] = std::array::from_fn(|i| block[i]);
+    for off in [16, 8, 4, 2, 1] {
+        partial = std::array::from_fn(|i| partial[i] + partial[i ^ off]);
     }
-    let actual_centroid = mean;
-    let actual_scale = max_dev;
+    let actual_centroid = partial[0] * (1.0 / 32.0);
+    let actual_scale = block
+        .iter()
+        .fold(0.0f32, |m, &x| m.max((x - actual_centroid).abs()));
 
     // ── Step 2: pick scale_idx (32 entries) ──
     // Stored value = scale_norm / 127, so multiply by 127 for comparison.
     let mut best_scale_idx = 0u8;
     let mut best_scale_err = f32::INFINITY;
-    for (i, &raw) in scale_table.iter().enumerate().take(32) {
+    for (i, &raw) in scale_table.iter().enumerate() {
         let scale_baked = half::f16::from_bits(raw).to_f32();
-        let s = scale_baked * 127.0;
-        let err = (actual_scale - s).abs();
+        let err = (actual_scale - scale_baked * 127.0).abs();
         if err < best_scale_err {
             best_scale_err = err;
             best_scale_idx = i as u8;
@@ -2388,49 +2379,39 @@ pub fn encode_block_q0_v<const IS_K: bool>(block: &[f32]) -> BlockQ0V {
         half::f16::from_bits(centroid_table[best_scale_idx as usize][best_centroid_idx as usize])
             .to_f32();
 
-    // ── Step 4: target_scaled = (block − centroid) / scale_baked ──
-    // After this, target_scaled values are in i8 [-127, +127] space and can
-    // be compared directly against raw curve_table i8 values with no
-    // additional /127 normalisation.
+    // ── Step 4: target = (block − centroid) / scale_baked ──
+    // In i8 [-127, +127] space, directly comparable to the raw curve values.
     let inv_scale = 1.0 / chosen_scale_baked;
-    let target: [f32; QK_Q0_V] = std::array::from_fn(|i| (block[i] - chosen_centroid) * inv_scale);
+    let neg_c_inv = -chosen_centroid * inv_scale;
+    let target: [f32; QK_Q0_V] = std::array::from_fn(|i| block[i].mul_add(inv_scale, neg_c_inv));
 
-    // ── Step 5: brute-force scan all 128 curves. The peak-bin shortcut from
-    //           the 256-curve era is dropped — with half the curves the
-    //           saving is small (128 vs ~12 candidates) and removing the
-    //           peak tables simplifies bring-up of the new bit layout. CUDA
-    //           kernel keeps a hierarchical search since GPU per-block cost
-    //           is dominated by uploads/launch, not curve count.
-    let score_curve = |curve: &[i8; 32]| -> f32 {
-        let mut err = 0.0f32;
-        for (k, &t) in target.iter().enumerate() {
-            let cv = curve[k] as f32;
-            let d = t - cv;
-            err += d * d;
-        }
-        err
-    };
-
+    // ── Step 5: every curve, by E − 2R ──
     let mut best_curve_idx = 0u8;
     let mut best_curve_err = f32::INFINITY;
-    for (c, curve) in curve_table.iter().enumerate().take(128) {
-        let err = score_curve(curve);
+    for (c, curve) in curve_table.iter().enumerate() {
+        let mut chain = [0.0f32; 4];
+        let mut energy = 0i32;
+        for (e, (&t, &v)) in target.iter().zip(curve.iter()).enumerate() {
+            chain[e & 3] = t.mul_add(v as f32, chain[e & 3]);
+            energy += v as i32 * v as i32;
+        }
+        let r = (chain[0] + chain[1]) + (chain[2] + chain[3]);
+        let err = (-2.0f32).mul_add(r, energy as f32);
         if err < best_curve_err {
             best_curve_err = err;
             best_curve_idx = c as u8;
         }
     }
 
-    let _ = best_scale_err;
-    let _ = best_centroid_err;
-
     BlockQ0V::pack(best_curve_idx, best_scale_idx, best_centroid_idx)
 }
 
 // ==============================================================================
-// Q0_V constant tables — must match q0_v_tables.cuh byte-for-byte.
+// Q0_V codebook tables — the reference codec's.
 // ==============================================================================
-/// Q0_V codebook tables, generated from q0_v_tables.cuh.
+/// Q0_V codebook tables. The CUDA side (q0_v_tables.cuh) holds the same scale
+/// and centroid tables and, in place of the 128 curves, the four base curves
+/// they are rotations of; the decode and encode oracle tests hold it to these.
 /// K and V are calibrated separately; pick by IS_K at the call site.
 #[allow(clippy::needless_range_loop)]
 pub mod q0_v_tables {
@@ -4536,26 +4517,30 @@ impl GgmlType for BlockQ0X {
                     0
                 };
                 let v = (x.bulk_anchor as i32 + delta_scaled).clamp(-127, 127);
-                ys[i * QK_Q0_X + j] = v as f32 / 127.0;
+                ys[i * QK_Q0_X + j] = v as f32 * INV_127;
             }
         }
     }
 
+    /// `quantize_block_q0_x_core` (`quantize_q0.cuh`), op for op: the mean is
+    /// the warp's butterfly sum times `1/32`, and every float-to-int rounding
+    /// is `__float2int_rn` (ties to even).
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         for (i, y) in ys.iter_mut().enumerate() {
             let block = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
 
             // 1. bulk_anchor = INT8-encoded block mean
-            let mean: f32 = block.iter().sum::<f32>() / Self::BLCK_SIZE as f32;
-            let bulk_int = (mean * 127.0).round().clamp(-127.0, 127.0) as i32;
+            let mean = warp_sum(block) * (1.0 / 32.0);
+            let bulk_int = rint(mean * 127.0).clamp(-127, 127);
             let bulk_anchor = bulk_int as i8;
 
-            // 2. argmax(|x_i_i8 - bulk|) → outlier_idx; track its residual
+            // 2. argmax(|x_i_i8 - bulk|) → outlier_idx (the first on ties);
+            //    track its residual
             let mut outlier_idx: usize = 0;
             let mut outlier_residual: i32 = 0;
             let mut best_abs: i32 = -1;
             for (j, &x) in block.iter().enumerate() {
-                let xi = (x * 127.0).round().clamp(-127.0, 127.0) as i32;
+                let xi = rint(x * 127.0).clamp(-127, 127);
                 let r = xi - bulk_int;
                 let ar = r.abs();
                 if ar > best_abs {
@@ -4566,7 +4551,7 @@ impl GgmlType for BlockQ0X {
             }
 
             // 3. Coarse delta in [-4, 3]
-            let delta_raw = (outlier_residual as f32 / Q0_X_S_OUTLIER as f32).round() as i32;
+            let delta_raw = rint(outlier_residual as f32 / Q0_X_S_OUTLIER as f32);
             let outlier_delta = delta_raw.clamp(-4, 3);
 
             let packed_idx = (outlier_idx as u8) & 0x1F;
@@ -4589,42 +4574,38 @@ impl GgmlType for BlockQ0M2 {
     const BLCK_SIZE: usize = QK_Q0_M2;
     type VecDotType = BlockQ8_0;
 
+    /// `block_q0_m2.cuh`: each quartet's centroid times `1/127`.
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         for (i, x) in xs.iter().enumerate() {
-            let c0 = decode_e4m3(x.val_fp8[0]);
-            let c1 = decode_e4m3(x.val_fp8[1]);
             for j in 0..QK_Q0_M2 {
-                let val = if (x.qmask >> (j / 4)) & 1 == 0 {
-                    c0
-                } else {
-                    c1
-                };
-                ys[i * QK_Q0_M2 + j] = val;
+                let c = x.centroid[((x.qmask >> (j / 4)) & 1) as usize];
+                ys[i * QK_Q0_M2 + j] = c as f32 * INV_127;
             }
         }
     }
 
+    /// `quantize_block_q0_m2_core` (`quantize_q0.cuh`), op for op: quartet
+    /// means as the kernel's two xor rounds form them, four Lloyd iterations
+    /// at quartet granularity whose sums are warp butterflies, ties to c0.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         for (i, y) in ys.iter_mut().enumerate() {
             let block = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
-            let vmin = block.iter().cloned().fold(f32::INFINITY, f32::min);
-            let vmax = block.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut c0 = vmin;
-            let mut c1 = vmax;
+            let qt_mean: [f32; 8] = std::array::from_fn(|q| {
+                let v = &block[4 * q..4 * q + 4];
+                ((v[0] + v[1]) + (v[2] + v[3])) * 0.25
+            });
+            let mut c0 = qt_mean.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mut c1 = qt_mean.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let assign = |m: f32, c0: f32, c1: f32| usize::from((m - c1).abs() < (m - c0).abs());
             for _ in 0..4 {
-                let mut s0 = 0.0f32;
-                let mut n0 = 0.0f32;
-                let mut s1 = 0.0f32;
-                let mut n1 = 0.0f32;
-                for &x in block {
-                    if (x - c1).abs() < (x - c0).abs() {
-                        s1 += x;
-                        n1 += 1.0;
-                    } else {
-                        s0 += x;
-                        n0 += 1.0;
-                    }
-                }
+                let a: [usize; 8] = std::array::from_fn(|q| assign(qt_mean[q], c0, c1));
+                let masked = |k: usize, v: &dyn Fn(usize) -> f32| -> f32 {
+                    let lanes: [f32; 32] =
+                        std::array::from_fn(|l| if a[l / 4] == k { v(l) } else { 0.0 });
+                    warp_sum(&lanes)
+                };
+                let (s0, n0) = (masked(0, &|l| block[l]), masked(0, &|_| 1.0));
+                let (s1, n1) = (masked(1, &|l| block[l]), masked(1, &|_| 1.0));
                 if n0 > 0.0 {
                     c0 = s0 / n0;
                 }
@@ -4632,16 +4613,8 @@ impl GgmlType for BlockQ0M2 {
                     c1 = s1 / n1;
                 }
             }
-            let mut qmask = 0u8;
-            for q in 0..8usize {
-                let mean: f32 = block[q * 4..(q + 1) * 4].iter().sum::<f32>() / 4.0;
-                if (mean - c1).abs() < (mean - c0).abs() {
-                    qmask |= 1 << q;
-                }
-            }
-            y.val_fp8[0] = encode_e4m3(c0);
-            y.val_fp8[1] = encode_e4m3(c1);
-            y.qmask = qmask;
+            y.qmask = (0..8).fold(0u8, |m, q| m | ((assign(qt_mean[q], c0, c1) as u8) << q));
+            y.centroid = [encode_centroid(c0), encode_centroid(c1)];
         }
     }
 
@@ -4658,73 +4631,55 @@ impl GgmlType for BlockQ0M4 {
     const BLCK_SIZE: usize = QK_Q0_M4;
     type VecDotType = BlockQ8_0;
 
+    /// `block_q0_m4.cuh`: each pair's centroid times `1/127`.
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         for (i, x) in xs.iter().enumerate() {
-            let c = [
-                decode_e4m3(x.val_fp8[0]),
-                decode_e4m3(x.val_fp8[1]),
-                decode_e4m3(x.val_fp8[2]),
-                decode_e4m3(x.val_fp8[3]),
-            ];
             for j in 0..QK_Q0_M4 {
                 let k = ((x.qmask >> (2 * (j / 2))) & 3) as usize;
-                ys[i * QK_Q0_M4 + j] = c[k];
+                ys[i * QK_Q0_M4 + j] = x.centroid[k] as f32 * INV_127;
             }
         }
     }
 
+    /// `quantize_block_q0_m4_core` (`quantize_q0.cuh`), op for op: centroids
+    /// start equally spaced over the pair means, five Lloyd iterations at pair
+    /// granularity whose sums are warp butterflies, ties to the lower index.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         for (i, y) in ys.iter_mut().enumerate() {
             let block = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
-
-            // Pair means drive the quantization at the format's actual
-            // reconstruction granularity (2 elements share one centroid).
-            let pair_means: [f32; 16] =
+            let pair_mean: [f32; 16] =
                 std::array::from_fn(|p| (block[p * 2] + block[p * 2 + 1]) * 0.5);
-
-            let vmin = pair_means.iter().cloned().fold(f32::INFINITY, f32::min);
-            let vmax = pair_means.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let step = (vmax - vmin) / 3.0;
+            let vmin = pair_mean.iter().cloned().fold(f32::INFINITY, f32::min);
+            let vmax = pair_mean.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step = (vmax - vmin) * (1.0 / 3.0);
             let mut c = [vmin, vmin + step, vmin + 2.0 * step, vmax];
-
-            // Lloyd at pair granularity. Centroid update uses the underlying
-            // elements (sums all 32 contributions over assigned pairs);
-            // equivalent to the mean of assigned pair_means.
-            for _ in 0..5 {
-                let mut sums = [0.0f32; 4];
-                let mut counts = [0.0f32; 4];
-                for p in 0..16usize {
-                    let mean = pair_means[p];
-                    let k = c
-                        .iter()
-                        .enumerate()
-                        .min_by(|a, b| (mean - a.1).abs().partial_cmp(&(mean - b.1).abs()).unwrap())
-                        .unwrap()
-                        .0;
-                    sums[k] += block[p * 2] + block[p * 2 + 1];
-                    counts[k] += 2.0;
+            let nearest = |m: f32, c: &[f32; 4]| -> usize {
+                let (mut best, mut best_d) = (0, (m - c[0]).abs());
+                for (k, &ck) in c.iter().enumerate().skip(1) {
+                    let d = (m - ck).abs();
+                    if d < best_d {
+                        (best, best_d) = (k, d);
+                    }
                 }
-                for k in 0..4 {
-                    if counts[k] > 0.0 {
-                        c[k] = sums[k] / counts[k];
+                best
+            };
+            for _ in 0..5 {
+                let a: [usize; 16] = std::array::from_fn(|p| nearest(pair_mean[p], &c));
+                for (k, ck) in c.iter_mut().enumerate() {
+                    let sums: [f32; 32] =
+                        std::array::from_fn(|l| if a[l / 2] == k { block[l] } else { 0.0 });
+                    let counts: [f32; 32] =
+                        std::array::from_fn(|l| if a[l / 2] == k { 1.0 } else { 0.0 });
+                    let (sk, nk) = (warp_sum(&sums), warp_sum(&counts));
+                    if nk > 0.0 {
+                        *ck = sk / nk;
                     }
                 }
             }
-
-            let mut qmask = 0u32;
-            for (p, &mean) in pair_means.iter().enumerate().take(16) {
-                let k = c
-                    .iter()
-                    .enumerate()
-                    .min_by(|a, b| (mean - a.1).abs().partial_cmp(&(mean - b.1).abs()).unwrap())
-                    .unwrap()
-                    .0 as u32;
-                qmask |= k << (2 * p);
-            }
-            for (dst, &v) in y.val_fp8.iter_mut().zip(c.iter()) {
-                *dst = encode_e4m3(v);
-            }
-            y.qmask = qmask;
+            y.qmask = (0..16).fold(0u32, |m, p| {
+                m | ((nearest(pair_mean[p], &c) as u32) << (2 * p))
+            });
+            y.centroid = c.map(encode_centroid);
         }
     }
 

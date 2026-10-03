@@ -802,6 +802,34 @@ fn cold_load_partial_extend_then_requantize() {
     backing.write_contiguous(view, 50, &k_ext, &v_ext).unwrap();
     backing.set_len(view, total_after);
 
+    // The extension reads back at its logical positions — from the fresh
+    // chunk, not from slots 18.. of the borrowed partial a flat
+    // `pos / CHUNK_SIZE` grid would have put tokens 50..64 in.
+    let (k_back, _) = backing.read_contiguous(view, 50, extra_tokens).unwrap();
+    let want: Vec<f32> = k_ext
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let got: Vec<f32> = k_back
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(got, want, "extension reads back from where it was written");
+
+    // A write reaching into the borrowed turn-1 chunks is refused: they are
+    // the parent's, below the view's writer boundary.
+    let one = k_ext.narrow(2, 0, 1).unwrap();
+    let err = backing
+        .write_contiguous(view, 40, &one, &one)
+        .expect_err("a write into a borrowed chunk must be refused");
+    assert!(err.to_string().contains("read-only"), "{err}");
+
     // ── Phase 7: seal turn 2 ───────────────────────────────────────
     let sealed_t2 = backing.record_turn(view).unwrap();
     assert_eq!(

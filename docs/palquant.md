@@ -74,6 +74,8 @@ Each (chunk, head) holds 128 blocks (32 elements per block × 128 blocks = one 3
 
 The selection algorithm walks each slot in BPE-ascending order through the candidate format list (defined per operating point in §3.6), returning the first format where 32 blocks pass the per-block error threshold. If no format reaches 32, the slot falls back to the format with lowest worst-case error across the slot's blocks.
 
+Q0 is the one format held to a further condition. It stores a block's mean and nothing else, so it keeps none of the variation between the block's 32 tokens, and an error metric that is normalised by the head's range admits it on any dim whose tokens vary by a small fraction of that range — the variation being, for K, what ranks tokens within the chunk and, for V, the content itself. Q0 is therefore offered only the blocks that are flat: those whose standard deviation across the valid tokens is below one INT8 step (1/127) of the head scale. Flatness is a property of the block, decided once per head, so the search skips Q0's round trip for every other block; a block it skips falls to the next format in the ladder, and a slot whose blocks include one Q0 skipped cannot take Q0 as its fallback.
+
 ### 3.3 K/V Error Metrics
 
 The two attention error paths require structurally distinct metrics.
@@ -85,6 +87,8 @@ where $\text{mean}_4$ is the mean of the four largest values across the 32 lanes
 **V metric — warp-mean squared error.** Across the 32 lanes:
 $$\varepsilon_V(\mathbf{v}, \hat{\mathbf{v}}) = \frac{\text{mean}_{32}[(v_i - \hat{v}_i)^2]}{\text{head amax}^2}$$
 V's contribution to attention output is the linear combination $\sum_t \alpha_t \mathbf{v}_t$, so the output error budget is exactly L2. Top-k metrics would over-penalise outlier elements that don't move the actual L2; MSE gives the exact budget.
+
+**Head scale.** Both metrics divide by the head's scale, which is its amax capped at eight times the 95th-percentile $|x|$ of the head's valid elements. A sink token puts a few elements far above the rest of the head; they set the amax, and an amax-relative threshold then admits errors that are large against everything else in the chunk that holds them. The percentile is not moved by a handful of elements, so it bounds how far they can stretch the scale. A head without such elements has an amax within the cap and keeps it exactly.
 
 The asymmetry — top-4 mean for K, warp-mean MSE for V — is grounded in the AsymKV bound (§2.3). The PalQuant kernel operationalises both metrics in a single reduction per block, with no additional cost over a uniform error metric. An offline-analysis variant of the K metric, used during threshold-curve derivation (Appendix D) but not in the runtime kernel, projects K vectors onto the top-30 PCA components of the per-(layer, head) Q distribution; this Q-subspace-projected error and the resulting two-sided gating analysis are documented in Appendix C.
 
@@ -305,11 +309,11 @@ Block layouts and reconstruction formulas for the 16 codebook formats. All forma
 | Q1_A | 1.50 | INT8 $s_+$ (1 B), INT8 $s_-$ (1 B), 32× sign bit (4 B); **6 B** | $x_i = s_+$ if $\text{sgn}(i){=}{+}$, else $-s_-$ — asymmetric sign-encoded |
 | Q1_S | 1.25 | INT8 scale (1 B), 32× sign bit (4 B); **5 B** | $x_i = s \cdot \text{sgn}(i)$, $\text{sgn}(i) \in \{-1,+1\}$ |
 | Q0_M2 | 0.75 | 2× INT8 centroids (2 B), 8× 1-bit quartet selector (1 B); **3 B** | $x_i = c_{m_{\lfloor i/4 \rfloor}}$ — 2-centroid quartet-mask |
-| Q0_V | 0.50 | 8 b curve idx $u$, 5 b scale idx $v$, 3 b centroid idx $w$; **2 B** | $x_i = c[v][w] + s[v] \cdot \text{curve}[u][i]$ from constant tables |
+| Q0_V | 0.50 | 7 b curve idx $u$, 5 b scale idx $v$, 4 b centroid idx $w$; **2 B** | $x_i = c[v][w] + s[v] \cdot \text{curve}[u][i]$ from calibrated tables |
 | Q0_X | 0.50 | INT8 anchor $a$ (1 B), 5 b outlier position $p$, 3 b signed delta $d$; **2 B** | $x_i = a$ for $i \neq p$; $x_p = a + d \cdot s_{\text{step}}(a)$ |
 | Q0 | 0.25 | INT8 centroid $c$ (1 B); **1 B** | $x_i = c$ for all $i$ — constant block |
 
-Q0_V's tables (256 curves × 32 scales × 8 centroids per arena, 8.5 KB constant-memory per K or V arena) are calibrated once from population statistics of pre-RoPE K/V activations and shipped as constants — the only model-derived component anywhere in the codebook. F16 and BF16 (16 BPE, 64 B per block) are used as quality fallback when no codebook format passes the per-block error threshold; they are not part of the 16-format codebook itself.
+Q0_V's tables (128 curves × 32 scales × 16 centroids per side) are calibrated once. The 128 curves are the 16 even rotations of four base curves and their negations, $\text{curve}[16b + p][i] = \pm\,\text{base}[b \bmod 4][(i + 2p) \bmod 32]$, so a side's whole curve codebook is 256 B, and the encoder scores all 128 exactly as 64 circular correlations — the squared error of a curve is $E_b - 2R$ up to a term every curve shares. The tables are derived from population statistics of pre-RoPE K/V activations and shipped as constants — the only model-derived component anywhere in the codebook. F16 and BF16 (16 BPE, 64 B per block) are used as quality fallback when no codebook format passes the per-block error threshold; they are not part of the 16-format codebook itself.
 
 ### B. Per-Level Candidate Format Lists
 

@@ -17,10 +17,12 @@
 //!    alongside — carrying `(kernel−1)·dilation` = 9 tokens of history per
 //!    sequence, which is the third per-session recurrent state.
 
-use candle::{Result, Tensor};
+use candle::{Result, Tensor, D};
+use candle_nn::ops::sigmoid;
 
 use super::config::PleConfig;
 use super::hyper::hc_grouped_norm;
+use super::model::PleSource;
 
 /// One sequence's carried PLE state: the conv history tail and the hash
 /// window's preceding token ids.
@@ -223,31 +225,11 @@ pub fn ple_apply(
     let (t, hc, n_embd) = res_hc.dims3()?;
     let hc_dim = hc * n_embd;
 
-    let key = emb.matmul(&w.key.t()?)?.reshape((t, hc, n_embd))?;
-    let value = emb.matmul(&w.value.t()?)?; // [T, n_embd]
-
-    let key = hc_grouped_norm(&key, &w.norm_key, eps, None)?;
-    let query = hc_grouped_norm(res_hc, &w.norm_query, eps, None)?;
-
-    // Per-stream dot, then a signed square root before the sigmoid.
-    let s = (key.mul(&query)?.sum_keepdim(candle::D::Minus1)? * (1.0 / (n_embd as f64).sqrt()))?;
-    let mag = s.abs()?.clamp(1e-6, 1e30)?.sqrt()?;
-    // sgn(s) ∈ {−1, 0, 1}, matching ggml_sgn (an exact zero gates at 0.5).
-    let sgn = s
-        .gt(0f64)?
-        .to_dtype(candle::DType::F32)?
-        .sub(&s.lt(0f64)?.to_dtype(candle::DType::F32)?)?;
-    let gate = candle_nn::ops::sigmoid(&sgn.mul(&mag)?)?; // [T, hc, 1]
-
-    let gated = value
-        .reshape((t, 1, n_embd))?
-        .broadcast_mul(&gate)?
-        .contiguous()?; // [T, hc, n_embd]
+    let (gated, normalized) = ple_rows(res_hc, emb, w, eps)?;
 
     // Depthwise causal conv over time, dilated by the n-gram size, over the
     // grouped-normed gated value. History rows prepend so a chunked forward
     // matches a one-shot one.
-    let normalized = hc_grouped_norm(&gated, &w.norm_conv, eps, None)?.reshape((t, hc_dim))?;
     if let Some(out) = capture {
         // **`to_owned_tensor`, not `contiguous`.** These outlive the wave whose
         // arena produced them — `spec.rs`'s rewind reads them after it has
@@ -276,7 +258,7 @@ pub fn ple_apply(
     }
     let conv_out = conv_out.expect("conv_kernel >= 2");
     let conv_out = conv_out
-        .broadcast_mul(&candle_nn::ops::sigmoid(&conv_out)?)? // silu
+        .broadcast_mul(&sigmoid(&conv_out)?)? // silu
         .reshape((t, hc, n_embd))?;
 
     // Keep the last `hist` rows for the next segment.
@@ -296,10 +278,329 @@ pub fn ple_apply(
     res_hc.add(&gated)?.add(&conv_out)
 }
 
+/// The row-wise half of the PLE block — the keyed injection and the conv's
+/// input — over any rows: every op here reads one row and writes that row, so
+/// one sequence's rows and a whole wave's give each row the same value.
+/// Returns `(gated [T, hc, n_embd], normalized [T, hc·n_embd])`.
+fn ple_rows(res_hc: &Tensor, emb: &Tensor, w: &PleWeights, eps: f64) -> Result<(Tensor, Tensor)> {
+    let (t, hc, n_embd) = res_hc.dims3()?;
+    let hc_dim = hc * n_embd;
+
+    let key = emb.matmul(&w.key.t()?)?.reshape((t, hc, n_embd))?;
+    let value = emb.matmul(&w.value.t()?)?; // [T, n_embd]
+
+    let key = hc_grouped_norm(&key, &w.norm_key, eps, None)?;
+    let query = hc_grouped_norm(res_hc, &w.norm_query, eps, None)?;
+
+    // Per-stream dot, then a signed square root before the sigmoid.
+    let s = (key.mul(&query)?.sum_keepdim(D::Minus1)? * (1.0 / (n_embd as f64).sqrt()))?;
+    let mag = s.abs()?.clamp(1e-6, 1e30)?.sqrt()?;
+    // sgn(s) ∈ {−1, 0, 1}, matching ggml_sgn (an exact zero gates at 0.5).
+    let sgn = s
+        .gt(0f64)?
+        .to_dtype(candle::DType::F32)?
+        .sub(&s.lt(0f64)?.to_dtype(candle::DType::F32)?)?;
+    let gate = sigmoid(&sgn.mul(&mag)?)?; // [T, hc, 1]
+
+    let gated = value
+        .reshape((t, 1, n_embd))?
+        .broadcast_mul(&gate)?
+        .contiguous()?; // [T, hc, n_embd]
+    let normalized = hc_grouped_norm(&gated, &w.norm_conv, eps, None)?.reshape((t, hc_dim))?;
+    Ok((gated, normalized))
+}
+
+/// One sequence's rows in a batched [`ple_apply_spans`] call.
+pub struct PleSpan<'a> {
+    /// The sequence's first row in the wave's packed residual.
+    pub start: usize,
+    /// Its row count — the tokens it carries this wave.
+    pub len: usize,
+    /// Its token ids this wave, the hash's input.
+    pub tokens: &'a [u32],
+    /// Its carried state, advanced in place.
+    pub state: &'a mut PleState,
+    /// Whether to hand back the rows this segment appends to the conv history
+    /// (the sequence is verifying a speculative block).
+    pub capture: bool,
+}
+
+/// The PLE block over every sequence of a wave at once — [`ple_apply`]'s
+/// arithmetic, row for row, in one pass over the packed residual rather than
+/// one per sequence.
+///
+/// `res_hc` is the wave's `[ΣT, hc, n_embd]` wide residual, which `spans` tile
+/// in order. The hash stays per sequence on the host (it carries each one's
+/// token window); everything after it is one launch sequence for the wave:
+///
+/// * **one table gather** for every span's hashed rows;
+/// * the keyed injection and the conv input ([`ple_rows`]) over all rows;
+/// * **the causal conv through one index table.** Each sequence's history
+///   rows lead the gather source, and tap `k` of a row reads either its own
+///   sequence's earlier row or, `(kernel − 1 − k)·dilation` rows back past the
+///   segment's start, that sequence's history — never a neighbour's. Taps add
+///   in [`ple_apply`]'s order;
+/// * the residual updated over all rows, where a per-sequence form would
+///   concatenate one result per sequence.
+///
+/// Returns the updated residual and, per span, the captured history rows when
+/// `capture` asked for them.
+pub fn ple_apply_spans(
+    res_hc: &Tensor,
+    spans: &mut [PleSpan<'_>],
+    table: &dyn PleSource,
+    w: &PleWeights,
+    cfg: &PleConfig,
+    eps: f64,
+) -> Result<(Tensor, Vec<Option<Tensor>>)> {
+    let (total, hc, n_embd) = res_hc.dims3()?;
+    let hc_dim = hc * n_embd;
+    let mut next = 0usize;
+    for s in spans.iter() {
+        if s.start != next || s.tokens.len() != s.len {
+            candle::bail!(
+                "ple spans: a span at row {} of {} rows ({} tokens) does not continue row {next}",
+                s.start,
+                s.len,
+                s.tokens.len()
+            );
+        }
+        next += s.len;
+    }
+    if next != total {
+        candle::bail!("ple spans: spans cover {next} of the residual's {total} rows");
+    }
+
+    // The hash, per sequence on the host; one gather for every span's rows.
+    let mut flat: Vec<u32> = Vec::new();
+    for s in spans.iter_mut() {
+        for token_rows in ple_row_ids(cfg, s.tokens, &mut s.state.prev) {
+            flat.extend(token_rows);
+        }
+    }
+    let hidden = w.key.dim(1)?; // `key` is [hc·n_embd, hidden]
+    let emb = table.rows(&flat)?.reshape((total, hidden))?;
+    let (gated, normalized) = ple_rows(res_hc, &emb, w, eps)?;
+
+    // The conv's gather source: every sequence's history, then the wave's rows.
+    let hist = cfg.conv_history();
+    let kern = cfg.conv_kernel;
+    let dil = cfg.ngram_size;
+    let base = spans.len() * hist;
+    let mut parts: Vec<&Tensor> = spans.iter().map(|s| &s.state.conv_hist).collect();
+    parts.push(&normalized);
+    let source = Tensor::cat(&parts, 0)?; // [n·hist + ΣT, hc·n_embd]
+
+    // One index upload: `kern` tap rows of ΣT each, then every sequence's new
+    // history — the last `hist` rows of its `[history ; segment]`.
+    let mut idx: Vec<u32> = Vec::with_capacity(kern * total + base);
+    for k in 0..kern {
+        let back = (kern - 1 - k) * dil;
+        for (si, s) in spans.iter().enumerate() {
+            for p in 0..s.len {
+                let row = if p >= back {
+                    base + s.start + p - back
+                } else {
+                    si * hist + hist + p - back
+                };
+                idx.push(row as u32);
+            }
+        }
+    }
+    for (si, s) in spans.iter().enumerate() {
+        for i in 0..hist {
+            let j = s.len + i; // row j of [history ; segment]
+            let row = if j < hist {
+                si * hist + j
+            } else {
+                base + s.start + j - hist
+            };
+            idx.push(row as u32);
+        }
+    }
+    let idx = Tensor::from_vec(idx, kern * total + base, res_hc.device())?;
+
+    let mut conv_out: Option<Tensor> = None;
+    for k in 0..kern {
+        let shifted = source.index_select(&idx.narrow(0, k * total, total)?, 0)?;
+        let wk = w.conv.narrow(1, k, 1)?.reshape(hc_dim)?; // one weight per channel
+        let term = shifted.broadcast_mul(&wk)?;
+        conv_out = Some(match conv_out {
+            Some(acc) => acc.add(&term)?,
+            None => term,
+        });
+    }
+    let conv_out = conv_out.expect("conv_kernel >= 2");
+    let conv_out = conv_out
+        .broadcast_mul(&sigmoid(&conv_out)?)? // silu
+        .reshape((total, hc, n_embd))?;
+
+    // The new histories, gathered once, each sequence holding its own rows of
+    // them. Carried state must outlive the wave, and the gather already does:
+    // a concatenation allocates where its first argument lives, and `source`
+    // opens with a carried history — pool memory, never the wave's arena — so
+    // `source`, and every gather from it, is owned.
+    let histories = source.index_select(&idx.narrow(0, kern * total, base)?, 0)?;
+    let mut captures = Vec::with_capacity(spans.len());
+    for (si, s) in spans.iter_mut().enumerate() {
+        s.state.conv_hist = histories.narrow(0, si * hist, hist)?;
+        captures.push(if s.capture {
+            Some(normalized.narrow(0, s.start, s.len)?.to_owned_tensor()?)
+        } else {
+            None
+        });
+    }
+
+    Ok((res_hc.add(&gated)?.add(&conv_out)?, captures))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle::Device;
+    use candle::{DType, Device};
+
+    /// A small table: row `i` is row `i` of a fixed tensor.
+    struct TableRows(Tensor);
+
+    impl PleSource for TableRows {
+        fn rows(&self, ids: &[u32]) -> Result<Tensor> {
+            let idx = Tensor::from_vec(ids.to_vec(), ids.len(), self.0.device())?;
+            self.0.index_select(&idx, 0)
+        }
+    }
+
+    fn lcg_t(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let mut s = seed;
+        let vals: Vec<f32> = (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+            })
+            .collect();
+        Tensor::from_vec(vals, shape, dev).unwrap()
+    }
+
+    fn vals(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// Equal to rounding — every element within 1e-5 — or a report of how
+    /// many elements differ, the first one and the largest difference. The
+    /// batched block projects every row in one matmul where the per-sequence
+    /// block runs one per sequence, and a matmul's rounding depends on its row
+    /// count: the two agree to an ulp, and a wrong row would miss by the size
+    /// of the values themselves.
+    fn assert_same(got: &Tensor, want: &Tensor, what: &str) {
+        let (g, w) = (vals(got), vals(want));
+        assert_eq!(g.len(), w.len(), "{what}: length");
+        let diff: Vec<usize> = (0..g.len())
+            .filter(|&i| (g[i] - w[i]).abs() > 1e-5)
+            .collect();
+        let max = (0..g.len())
+            .map(|i| (g[i] - w[i]).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            diff.is_empty(),
+            "{what}: {} of {} elements differ; first at {} ({} vs {}); max |delta| {max:e}",
+            diff.len(),
+            g.len(),
+            diff[0],
+            g[diff[0]],
+            w[diff[0]]
+        );
+    }
+
+    /// The batched block is the per-sequence block, to rounding: three
+    /// sequences of different lengths in one wave — the second entering with
+    /// an earlier segment's history and hash window behind it, and capturing —
+    /// against each run alone through [`ple_apply`], on the output, every
+    /// sequence's advanced state and the captured rows.
+    #[test]
+    fn spans_match_the_per_sequence_block() {
+        let dev = Device::Cpu;
+        let c = cfg();
+        let (hc, n_embd) = (2usize, c.n_heads() * c.head_dim);
+        let hc_dim = hc * n_embd;
+        let w = PleWeights {
+            key: lcg_t(&[hc_dim, n_embd], 1, &dev).affine(0.3, 0.).unwrap(),
+            value: lcg_t(&[n_embd, n_embd], 2, &dev).affine(0.3, 0.).unwrap(),
+            norm_key: lcg_t(&[hc_dim], 3, &dev).affine(0.1, 1.0).unwrap(),
+            norm_query: lcg_t(&[hc_dim], 4, &dev).affine(0.1, 1.0).unwrap(),
+            norm_conv: lcg_t(&[hc_dim], 5, &dev).affine(0.1, 1.0).unwrap(),
+            conv: lcg_t(&[hc_dim, c.conv_kernel], 6, &dev)
+                .affine(0.3, 0.)
+                .unwrap(),
+        };
+        let table = TableRows(lcg_t(&[400, c.head_dim], 9, &dev));
+        let emb_of = |toks: &[u32], prev: &mut Vec<u32>| -> Tensor {
+            let flat: Vec<u32> = ple_row_ids(&c, toks, prev).into_iter().flatten().collect();
+            table
+                .rows(&flat)
+                .unwrap()
+                .reshape((toks.len(), n_embd))
+                .unwrap()
+        };
+
+        let tokens: [Vec<u32>; 3] = [vec![1, 2, 3], vec![7, 99, 8, 9, 10], vec![4]];
+        let mut states: Vec<PleState> = (0..3)
+            .map(|_| PleState::zeros(&c, hc_dim, &dev).unwrap())
+            .collect();
+        let warm = [5u32, 6, 7];
+        let emb = emb_of(&warm, &mut states[1].prev);
+        let warm_res = lcg_t(&[warm.len(), hc, n_embd], 20, &dev);
+        ple_apply(&warm_res, &emb, &w, &c, &mut states[1], 1e-6, None).unwrap();
+
+        let total: usize = tokens.iter().map(Vec::len).sum();
+        let res = lcg_t(&[total, hc, n_embd], 21, &dev);
+
+        // Each sequence alone.
+        let mut ref_states: Vec<PleState> = states.iter().map(PleState::snapshot).collect();
+        let mut ref_out = Vec::new();
+        let mut ref_cap = Tensor::zeros(0, DType::F32, &dev).unwrap();
+        let mut start = 0;
+        for (i, toks) in tokens.iter().enumerate() {
+            let emb = emb_of(toks, &mut ref_states[i].prev);
+            let capture = (i == 1).then_some(&mut ref_cap);
+            let rows = res.narrow(0, start, toks.len()).unwrap();
+            ref_out
+                .push(ple_apply(&rows, &emb, &w, &c, &mut ref_states[i], 1e-6, capture).unwrap());
+            start += toks.len();
+        }
+        let ref_out = Tensor::cat(&ref_out, 0).unwrap();
+
+        // The wave.
+        let mut start = 0;
+        let mut spans: Vec<PleSpan<'_>> = Vec::new();
+        for (i, (state, toks)) in states.iter_mut().zip(tokens.iter()).enumerate() {
+            spans.push(PleSpan {
+                start,
+                len: toks.len(),
+                tokens: toks,
+                state,
+                capture: i == 1,
+            });
+            start += toks.len();
+        }
+        let (out, caps) = ple_apply_spans(&res, &mut spans, &table, &w, &c, 1e-6).unwrap();
+        drop(spans);
+
+        for (i, (got, want)) in states.iter().zip(&ref_states).enumerate() {
+            assert_eq!(got.prev, want.prev, "sequence {i} hash window");
+        }
+        assert!(caps[0].is_none() && caps[2].is_none());
+        assert_same(caps[1].as_ref().unwrap(), &ref_cap, "captured rows");
+        for (i, (got, want)) in states.iter().zip(&ref_states).enumerate() {
+            assert_same(
+                &got.conv_hist,
+                &want.conv_hist,
+                &format!("sequence {i} history"),
+            );
+        }
+        assert_same(&out, &ref_out, "residual");
+    }
 
     fn cfg() -> PleConfig {
         PleConfig {

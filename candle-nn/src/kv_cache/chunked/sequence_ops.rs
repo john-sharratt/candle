@@ -11,16 +11,17 @@ use std::cmp;
 use std::ops::Range;
 use std::sync::Arc;
 
-use candle::Result;
+use candle::{DType, Result, Tensor};
 
 use super::head_gids::GIDS_PER_HEAD;
 use crate::CHUNK_SIZE;
 
+use super::band_codec::encode_band;
 use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
 use super::io::read_band_chunk;
 use super::types::{ChunkWindow, SealedChunk, SealedSequence};
-use super::{BlockTableState, ChunkedKvBacking, SequenceState};
+use super::{ChunkedKvBacking, SequenceState};
 use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 use crate::kv_cache::{active_kv_formats, KvFormat};
 
@@ -1161,19 +1162,15 @@ impl ChunkedKvBacking {
                 // append to the forked tail, while the source is whatever the
                 // boundary block is in — and a sealed partial tail is quantized
                 // like any other chunk, so it can be sitting in the 1088 B
-                // `Q8_0` class. `copy_slot_bytes` refuses that, correctly.
-                //
-                // An earlier comment here claimed size classes made the formats
-                // agree and that the old `Quantized→Float` dequantize arm was
-                // therefore dead. They do not: the class follows the *format*,
-                // and fork deliberately changes the format of the tail. Closing
-                // this needs that arm rebuilt against tag-driven band reads
-                // (`io.rs`), including the dim-major→token-major transpose the
-                // old one did. Until then the mismatch is named where it can be
-                // acted on rather than surfacing as a bare stride error.
+                // `Q8_0` class. `copy_slot_bytes` refuses that, correctly: the
+                // class follows the *format*, and fork deliberately changes the
+                // format of the tail. Such a band is re-encoded instead — read
+                // through its own tag in the kernels' token-oriented layout and
+                // written in the destination's (`band_codec`), its stored
+                // values carried unchanged under the inherited palette map and
+                // outer scale.
                 let arenas = arena_state.arenas_mut();
                 let sub_head_dim = (head_dim / N_PALETTE).max(1);
-                let band_elems = CHUNK_SIZE * sub_head_dim;
                 for (i, src_gid) in source_gids.iter().enumerate() {
                     let dst_gid = &gid_vec[i];
                     let is_v = i % 2 == 1;
@@ -1201,8 +1198,9 @@ impl ChunkedKvBacking {
                     // tag and re-encode into the active format.
                     // `read_band_chunk` yields the canonical
                     // `(CHUNK_SIZE, sub_head_dim)` token-major tensor for a
-                    // float *or* a quantized tag, so the dim-major/token-major
-                    // transpose the deleted arm did by hand is already handled.
+                    // float *or* a quantized tag (a quantized band decoded from
+                    // its token-oriented blocks), and `encode_band` takes the
+                    // same layout back.
                     let src_tag = ArenaFormatTag::from_u8(if is_v {
                         source_v_fmt[band]
                     } else {
@@ -1214,15 +1212,9 @@ impl ChunkedKvBacking {
                     // map. The copy is what lets the two coexist, and it is the
                     // reason this arm is the slow path — a same-class band
                     // takes the verbatim byte copy above instead.
-                    let floats = read_band_chunk(
-                        arenas,
-                        src_gid,
-                        src_tag,
-                        CHUNK_SIZE,
-                        sub_head_dim,
-                        &device,
-                    )?
-                    .to_owned_tensor()?;
+                    let floats =
+                        read_band_chunk(arenas, src_gid, src_tag, !is_v, sub_head_dim, &device)?
+                            .to_owned_tensor()?;
                     let dst_fmt = if is_v { active_v_fmt } else { active_k_fmt };
                     let dst = arenas.get_mut(&dst_gid.arena_idx()).ok_or_else(|| {
                         candle::Error::Msg(format!(
@@ -1235,7 +1227,16 @@ impl ChunkedKvBacking {
                             dst.write_slot_typed(dst_gid.chunk_idx(), 0, &floats.to_dtype(dtype)?)?
                         }
                         KvFormat::Quantized(qf) => {
-                            dst.quantize_into_slot(dst_gid.chunk_idx(), qf, band_elems, 0, &floats)?
+                            let values = floats
+                                .to_dtype(DType::F32)?
+                                .flatten_all()?
+                                .to_vec1::<f32>()?;
+                            let bytes = encode_band(&values, qf, !is_v, sub_head_dim)?;
+                            let len = bytes.len();
+                            dst.write_slot_bytes(
+                                dst_gid.chunk_idx(),
+                                &Tensor::from_vec(bytes, len, &device)?,
+                            )?
                         }
                     }
                     // The tag is the only record of how a band's bytes decode,
@@ -1451,24 +1452,6 @@ impl ChunkedKvBacking {
         // the tail's gids always have strong_count = 1.
 
         Ok(cw.gids.clone())
-    }
-
-    /// Internal: writable-range gate. Under the read-only projection model
-    /// the tail (and any newly-allocated block past it) is unshared by
-    /// construction, so no COW is ever required here. The function remains
-    /// as a hook in case future paths want a writability re-check; today it
-    /// always reports "no COW occurred."
-    pub(super) fn ensure_blocks_writable_locked(
-        &self,
-        state: &mut BlockTableState,
-        batch_idx: usize,
-        _start_block: usize,
-        _end_block: usize,
-    ) -> Result<bool> {
-        if state.sequences[batch_idx].is_none() {
-            return Ok(false);
-        }
-        Ok(false)
     }
 
     /// Create a view sequence that borrows blocks from a parent sequence.

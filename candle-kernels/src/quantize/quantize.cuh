@@ -197,11 +197,13 @@ extern "C" __global__ void quantize_tensor_q0(
     quantize_blocks_q0<1>(src, dst, num_blocks);
 }
 
+// A side-less QTensor encode: the V-side codebook, which the Rust
+// `GgmlType for BlockQ0V` codec decodes it with.
 extern "C" __global__ void quantize_tensor_q0_v(
     const float* __restrict__ src,
     block_q0_v* __restrict__ dst,
     int num_blocks) {
-    quantize_blocks_q0_v<1>(src, dst, num_blocks);
+    quantize_blocks_q0_v<false, 1>(src, dst, num_blocks);
 }
 
 extern "C" __global__ void quantize_tensor_q1_a(

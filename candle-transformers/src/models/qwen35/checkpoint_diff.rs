@@ -130,9 +130,14 @@ pub fn chat_template(c: &Content) -> Option<&str> {
 }
 
 /// Read a checkpoint's header.
+///
+/// Buffered, which is the difference between a syscall per field and a syscall
+/// per 512 KiB: the metadata holds the tokenizer's whole vocabulary — a quarter
+/// of a million strings — so the field count is in the hundreds of thousands,
+/// and read straight off the file each one is its own call.
 pub fn header(path: &Path) -> Result<Content> {
-    let mut f = std::fs::File::open(path)?;
-    Content::read(&mut f)
+    let f = std::fs::File::open(path)?;
+    Content::read(&mut std::io::BufReader::with_capacity(1 << 19, f))
 }
 
 /// Every structural difference between two checkpoints, in a stable order.

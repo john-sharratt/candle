@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::GitError;
+use crate::library::refs;
 use crate::runner::utf8;
 use crate::types::{BranchName, Oid, RefName, RemoteName, Rev};
 use crate::Repo;
@@ -77,6 +78,9 @@ fn parse_snapshot(out: &str) -> Result<BTreeMap<RefName, Oid>, GitError> {
 impl Repo {
     /// The refs under `scope` — a ref name or a namespace ending in `/`.
     fn snapshot(&self, scope: &str) -> Result<BTreeMap<RefName, Oid>, GitError> {
+        if let Some(lib) = self.library() {
+            return refs::snapshot(&lib, scope);
+        }
         let out = self
             .git("for-each-ref")
             .arg("--format=%(refname)%00%(objectname)%00%(symref)")

@@ -62,7 +62,7 @@ pub fn sample_error_surface_cpu(
                 }
                 for (qidx, &fmt) in candidates.iter().enumerate() {
                     let flat = ((b * head_dim + d) * n_q + qidx) * n_head + h;
-                    let recon = fmt.apply_quant(&block);
+                    let recon = fmt.apply_quant(&block, matches!(side, SampleSide::Key));
                     data[flat] = normalised_error(&block, &recon, head_scale);
                 }
             }

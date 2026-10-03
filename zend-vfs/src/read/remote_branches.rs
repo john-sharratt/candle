@@ -1,6 +1,7 @@
 //! The remote-tracking branches the last fetch left locally.
 
 use crate::error::GitError;
+use crate::library::refs;
 use crate::runner::utf8;
 use crate::types::{BranchName, Oid, RefName, RemoteName};
 use crate::Repo;
@@ -47,6 +48,9 @@ impl Repo {
     /// Every remote-tracking branch, as of the last fetch or push. Reads
     /// nothing from the network — [`Repo::ls_remote`] does.
     pub fn remote_branches(&self) -> Result<Vec<RemoteBranch>, GitError> {
+        if let Some(lib) = self.library() {
+            return refs::remote_branches(&lib);
+        }
         let out = self
             .git("for-each-ref")
             .arg("--format=%(refname)%00%(objectname)%00%(symref)")

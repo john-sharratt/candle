@@ -32,7 +32,13 @@ pub const FILE_MAGIC: u32 = 0x474f_4c53;
 /// content halves out of the in-memory `TurnEntryData`.  Old (v1) logs
 /// are rejected on open, forcing a clean rebuild rather than silently
 /// loading pre-split records into the new substrate shape.
-pub const FILE_FORMAT_VERSION: u32 = 2;
+///
+/// Bumped to `3` when Q0_V K blocks moved to the K codebook. Earlier logs
+/// sealed every Q0_V block, K included, with the V codebook, and their
+/// records carry no codebook tag. Decoding those K bytes with the K codebook
+/// gives plausible but wrong keys with no error, so v2 logs are rejected on
+/// open.
+pub const FILE_FORMAT_VERSION: u32 = 3;
 
 /// The file is grown ahead in extents of this size so appends write into
 /// already-allocated space — one `set_len` per extent instead of per record.

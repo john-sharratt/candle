@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use super::encode_cache::EncodeCache;
 use super::error::BuildError;
 use super::spec::{NodeSpec, SpecId, TreeSpec};
 use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
@@ -25,6 +26,8 @@ use super::vocab::{TokenId, Vocab};
 /// Compile a string-space spec against a tokenizer.
 pub fn compile(spec: &TreeSpec, vocab: &dyn Vocab) -> Result<StencilTree, BuildError> {
     validate(spec)?;
+    let encoder = EncodeCache::new(vocab);
+    let vocab: &dyn Vocab = &encoder;
     let mut arena = Arena::default();
     let root = lower(spec, vocab, spec.root, "", &mut arena)?;
     let arena = arena.nodes;

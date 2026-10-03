@@ -1778,14 +1778,21 @@ pub fn sign_pack(x: &Tensor) -> Result<Tensor> {
     };
     let stream = dev.cuda_stream();
     let x = x.contiguous()?;
-    let out = Tensor::zeros((n, sign_words(dim)), DType::U32, x.device())?;
+    // Every word is written by the kernel's grid-stride loop, so the output
+    // is allocated uninitialised (hot-path invariant 6).
+    let out = Tensor::empty((n, sign_words(dim)), DType::U32, x.device())?;
     {
-        let (sx, _) = x.storage_and_layout();
+        // `contiguous()` hands a dense view back unchanged, offset and all, so
+        // the input is addressed from its own first element rather than its
+        // storage's.
+        let (sx, x_layout) = x.storage_and_layout();
+        let x_off = x_layout.start_offset();
         let (so, _) = out.storage_and_layout();
-        let (xp, _g1) = match &*sx {
-            Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.device_ptr(&stream),
+        let x_view = match &*sx {
+            Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.slice(x_off..),
             _ => unreachable!(),
         };
+        let (xp, _g1) = x_view.device_ptr(&stream);
         let (op, _g2) = match &*so {
             Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.device_ptr(&stream),
             _ => unreachable!(),
@@ -2965,6 +2972,30 @@ mod tests {
                 assert_eq!(word, expect, "row {r} word {w}");
             }
         }
+        Ok(())
+    }
+
+    /// A dense row view that starts part-way into its storage packs ITS rows,
+    /// not the storage's first rows: the launch addresses the view's first
+    /// element.
+    #[test]
+    #[ignore]
+    fn sign_pack_of_an_offset_view_packs_the_view() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let mut s = 29u64;
+        let n = 9usize;
+        let vals = rows(n, IH, &mut s);
+        let all = Tensor::from_vec(vals.clone(), (n, IH), &dev)?;
+        let view = all.narrow(0, 4, 3)?;
+        assert!(view.is_contiguous() && view.layout().start_offset() == 4 * IH);
+        let got = sign_pack(&view)?.to_vec2::<u32>()?;
+        let want = sign_pack(&Tensor::from_vec(
+            vals[4 * IH..7 * IH].to_vec(),
+            (3, IH),
+            &dev,
+        )?)?
+        .to_vec2::<u32>()?;
+        assert_eq!(got, want);
         Ok(())
     }
 

@@ -106,12 +106,18 @@ pub struct PathStats {
 
 /// One arm the walk is held to, token by token — see
 /// [`StencilDriver::steer_first_branch`].
+#[derive(Clone)]
 struct ArmSteer {
     tokens: Vec<TokenId>,
     next: usize,
 }
 
 /// A live walk of one tree attached to a decoding sequence.
+///
+/// `Clone` so a speculative step can advance a copy along a drafted block and
+/// learn where the block has to stop, without moving the walk the sequence
+/// commits through.
+#[derive(Clone)]
 pub struct StencilDriver {
     session: StencilSession,
     done: bool,
@@ -161,6 +167,13 @@ impl StencilDriver {
     /// The compiled tree being walked.
     pub fn tree(&self) -> &StencilTree {
         self.session.tree()
+    }
+
+    /// Whether the walk is inside a free-text span that the next decoded token
+    /// continues — see [`StencilSession::mid_free_span`]. While it holds, the
+    /// next [`step`](Self::step) is `Free` and nothing is masked.
+    pub fn mid_free_span(&self) -> bool {
+        !self.done && self.session.mid_free_span()
     }
 
     /// Whether the cursor sits in a terminal free-text span — the only place

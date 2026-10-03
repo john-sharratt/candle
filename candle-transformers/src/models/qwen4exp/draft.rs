@@ -53,7 +53,7 @@ use candle::{DType, Result, Tensor};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::engine::GpuLayerMix;
-use super::hyper::{hc_combine, hc_mix};
+use super::hyper::{hc_combine, hc_combine_gated, hc_mix};
 use super::indexer::{IndexCache, IndexSnapshot};
 use super::mtp::MtpHead;
 use super::spec::SpecCapture;
@@ -63,6 +63,7 @@ use crate::models::batched_layer::{forward_attn_batched, BatchedAttentionParams,
 use crate::models::delta_net::SeqSpan;
 use crate::models::draft_walk::{draft_reserve, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
+use crate::models::lazy_rope::LazyRope;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::gpu_span;
 use crate::models::rope_schedule::FactoredRope;
@@ -459,15 +460,13 @@ impl Qwen4ExpBatched {
             // ceiling.
             candle::quantized::SumScale::Raw,
         )?;
-        let y2 = head
-            .block
-            .moe
-            // A draft head only ever runs behind a decode step — there is no
-            // prefill/prompt traffic through one — so all `n` rows are
-            // decode-attributed.
-            .forward_dynamic(acts, DType::F32, n, None)?
-            .reshape((n, n_embd))?;
-        hc_combine(&mut res, &y2, &inject2)?;
+        // The layer's output in its three parts, assembled by the combine as
+        // the trunk's are. A draft head only ever runs behind a decode step —
+        // there is no prefill/prompt traffic through one — so all `n` rows are
+        // decode-attributed.
+        let parts = head.block.moe.forward_parts(acts, DType::F32, n, None)?;
+        let routed = parts.routed.reshape((n, n_embd))?;
+        hc_combine_gated(&mut res, &routed, &parts.shared, &inject2)?;
         g_moe.end();
 
         // ── The shared head. ──
@@ -634,11 +633,11 @@ impl Qwen4ExpBatched {
                         generation: &Generation|
          -> Result<(Tensor, Tensor)> {
             let pos: Vec<u32> = at.iter().map(|&p| p as u32).collect();
-            let (cos, sin) = m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev, None)?;
+            let model_rope =
+                LazyRope::new(|| m.rotary.rope_cos_sin(&pos, theta, DType::F32, dev, None));
             let pm: RefCell<Option<SharedPm>> = RefCell::new(None);
             let params = BatchedAttentionParams::new(
-                &cos,
-                &sin,
+                &model_rope,
                 false,
                 &self.rope,
                 DecodeHeaders::Decode {

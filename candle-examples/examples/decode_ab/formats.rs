@@ -60,27 +60,6 @@ impl ArenaFmt {
             ArenaFmt::RealQuant { .. } => KvFormat::Float(DType::F16),
         }
     }
-
-    /// Structural-correctness cosine floor for the golden gate. Most formats use
-    /// the caller's default. The extreme **1-bit symmetric** format Q1_S encodes
-    /// V as sign × one per-block magnitude, which legitimately reconstructs at
-    /// ~0.87 cosine vs FP32 (V2 hits the same floor) — well above the ~0.6 a
-    /// structural read/decode bug would crater to. So it gets a relaxed floor
-    /// that still fails on a real bug. (Q1_A keeps two scales and clears 0.93.)
-    pub fn golden_cosine_floor(&self, default: f32) -> f32 {
-        let qf = match self {
-            ArenaFmt::Quant(q) => Some(*q),
-            ArenaFmt::RealQuant {
-                override_fmt: Some(q),
-                ..
-            } => Some(*q),
-            _ => None,
-        };
-        match qf {
-            Some(QuantFormat::Q1_S) => default.min(0.80),
-            _ => default,
-        }
-    }
 }
 
 fn quant_label(q: QuantFormat) -> &'static str {

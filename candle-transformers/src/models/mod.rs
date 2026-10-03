@@ -49,6 +49,7 @@ pub mod debertav2;
 pub mod decode_utils;
 pub mod deepseek2;
 pub mod delta_net;
+pub mod draft_depth;
 pub mod draft_ladder;
 /// The cohort draft walk drives a `BatchedInferenceSession`, so it shares
 /// `batched_inference`'s gate.
@@ -87,6 +88,7 @@ pub mod gpu_backed;
 mod gpu_test_lock;
 pub mod granite;
 pub mod granitemoehybrid;
+pub mod head_rows;
 pub mod helium;
 pub mod hiera;
 #[cfg(feature = "cuda")]
@@ -99,6 +101,7 @@ pub mod kv_collect_utils;
 #[cfg(feature = "cuda")]
 pub mod latent_moe;
 pub mod layer_stream;
+pub mod lazy_rope;
 pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;
@@ -246,6 +249,10 @@ pub mod wave_buffers;
 // Drives the batched wave loop over `batched_inference` / `batched_layer`.
 #[cfg(feature = "cuda")]
 pub mod wave_driver;
+// A wave's token ids on the host in one readback — read by the CUDA batched
+// forwards that need their ids on the CPU.
+#[cfg(feature = "cuda")]
+pub mod wave_token_ids;
 pub mod whisper;
 pub mod with_tracing;
 pub mod wuerstchen;

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use candle::quantized::gguf_file::{Content, TensorInfo, Value};
@@ -41,7 +42,9 @@ impl GgufModel {
         let mut metadata = HashMap::new();
         for (i, p) in paths.iter().enumerate() {
             let mut f = File::open(p)?;
-            let content = Content::read(&mut f)?;
+            // Buffered: the header's tokenizer vocabulary is hundreds of
+            // thousands of fields, each its own syscall off the bare file.
+            let content = Content::read(&mut BufReader::with_capacity(1 << 19, &mut f))?;
             if i == 0 {
                 metadata = content.metadata.clone();
             }

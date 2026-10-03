@@ -119,8 +119,8 @@ pub use chunked::{
     payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
 pub use chunked::{
-    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations, try_migrate_flight,
-    LocationFreeze, MigrateFlight,
+    clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations,
+    try_hold_chunk_locations, try_migrate_flight, LocationFreeze, LocationHold, MigrateFlight,
 };
 /// Arena sparsity — the arenas a perfect KV pack would empty, per pool. The
 /// figure compaction is judged by; see `chunked::compact_plan`. `compaction_tally`
@@ -301,17 +301,17 @@ impl QuantFormat {
             // constant; the cheapest legitimate quant at 1 byte / 32 lanes
             // (0.25 BPE), useful for near-flat blocks.
             Self::Q0 => size_of::<BlockQ0>(),
-            // scale: 1 byte FP8(E4M3) + qs[4] sign bits (1 bit × 32 elems).
+            // scale:i8 (mean |x| · 127) + qs[4] sign bits (1 bit × 32 elems).
             Self::Q1_S => size_of::<BlockQ1S>(),
-            // scale: 1 byte FP8(E4M3) + qs[8] 2-bit symmetric quants.
+            // scale:i8 + qs[8] 2-bit symmetric quants.
             Self::Q2_S => size_of::<BlockQ2S>(),
-            // scale + bias: 2 bytes FP8(E4M3) + qs[8] 2-bit asymmetric.
+            // scale:i8 + bias:i8 + qs[8] 2-bit asymmetric.
             Self::Q2_A => size_of::<BlockQ2A>(),
             // dm: u32 packed (f16 scale | f16 min) + qs[8] 2-bit asymmetric.
             Self::Q2_1 => size_of::<BlockQ2_1>(),
             // dm: u32 packed (f16 scale | f16 min) + qh[4] + qs[8] 3-bit asym.
             Self::Q3_1 => size_of::<BlockQ3_1>(),
-            // lo: u8 curve_idx (0..255) | hi: 5-bit scale_idx + 3-bit
+            // One 16-bit code: 7-bit curve_idx, 5-bit scale_idx, 4-bit
             // centroid_idx — parametric-curve quantization, 0.5 BPE.
             Self::Q0_V => size_of::<BlockQ0V>(),
             // scale_pos:i8 + scale_neg:i8 amplitudes + qs[4] sign bits.
@@ -319,10 +319,10 @@ impl QuantFormat {
             // bulk_anchor:i8 + outlier_packed:u8 (5-bit lane | 3-bit signed
             // delta) — flat block + one outlier escape, 0.5 BPE.
             Self::Q0_X => size_of::<BlockQ0X>(),
-            // val_fp8[2] + qmask:u8 — 2 FP8(E4M3) centroids + per-quartet
+            // centroid:[i8; 2] + qmask:u8 — 2 INT8 centroids + per-quartet
             // mask choosing which centroid each lane uses.
             Self::Q0_M2 => size_of::<BlockQ0M2>(),
-            // val_fp8[4] + qmask:u32 — 4 FP8(E4M3) centroids + 2-bit-per-pair
+            // centroid:[i8; 4] + qmask:u32 — 4 INT8 centroids + 2-bit-per-pair
             // selector mask choosing one centroid per pair of lanes.
             Self::Q0_M4 => size_of::<BlockQ0M4>(),
         }

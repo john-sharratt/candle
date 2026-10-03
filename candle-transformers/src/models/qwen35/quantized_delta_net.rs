@@ -22,9 +22,9 @@ use candle_nn::kv_cache::{begin_wave, LayerPhase};
 #[cfg(feature = "cuda")]
 use super::quantized_weights::{QuantFfn, QuantLayer};
 #[cfg(feature = "cuda")]
-use crate::models::lora::LayerLora;
+use crate::models::batched_layer::add_ffn_residual;
 #[cfg(feature = "cuda")]
-use crate::models::operand_guard::expect_dtype;
+use crate::models::lora::LayerLora;
 #[cfg(feature = "cuda")]
 use crate::models::profile::gpu_span;
 #[cfg(feature = "cuda")]
@@ -61,56 +61,45 @@ pub fn quantized_delta_net_ffn(
         _ => None,
     };
     let g_ffn = gpu_span("dn:ffn", x.as_cat_tensor().device());
-    // The dense MLP's down projection stores `orig_dtype`, so its result needs
-    // no narrowing here — that cast was a full-tensor pass per DeltaNet layer
-    // per wave (18 of them on the 0.8B) undoing a widening only the SwiGLU
-    // intermediates needed. The MoE combine still writes its working width.
-    let h = {
-        // An adapted FFN norms to float, for the reason `Qwen35AttentionLayer`'s
-        // `int8mode` states in full: the fused RMSNorm→quantize kernel emits
-        // q8a128 and the adapter's `A` matmul needs the float that went into it.
-        let mode = if lora.is_empty() {
-            layer.ffn_int8mode()
-        } else {
-            Int8Mode::Off
-        };
-        // The FFN's input, before the norm quantizes it. Everything downstream
-        // in this block is bounded by whether this was already bad.
-        x.as_cat_tensor().assert("ffn.in");
-        let acts = layer.post_attn_norm.forward_dynamic(
-            x.as_cat_tensor(),
-            mode,
-            wave_root(ffn_wave.as_ref()),
-        )?;
-        match &layer.ffn {
-            QuantFfn::Dense(m) => m.forward_dynamic_adapted(&acts, mlp_dtype, orig_dtype, lora)?,
-            QuantFfn::Moe(m) => {
-                let mut out =
-                    m.forward_dynamic(acts, mlp_dtype, decode_tokens, ffn_wave.as_ref())?;
-                // Straddles the narrowing. The FFN computes its intermediates
-                // in a promoted dtype precisely because "MLP intermediates can
-                // exceed F16's range", and whether narrowing back is lossless
-                // is a property of the DATA, not the shapes — nothing in the
-                // type system or the operand guards can catch an out-of-range
-                // value silently becoming `inf`. The pair of asserts can: bad
-                // only on the second side is the narrowing, bad on both is
-                // upstream of it.
-                out.assert("ffn.moe_out.wide");
-                out.to_dtype_mut(orig_dtype)?;
-                out.assert("ffn.moe_out.narrowed");
-                out
-            }
-        }
+    // An adapted FFN norms to float, for the reason `Qwen35AttentionLayer`'s
+    // `int8mode` states in full: the fused RMSNorm→quantize kernel emits q8a128
+    // and the adapter's `A` matmul needs the float that went into it.
+    let mode = if lora.is_empty() {
+        layer.ffn_int8mode()
+    } else {
+        Int8Mode::Off
     };
-    // VALIDATED, not converted: the dense arm's down projection stores
-    // `orig_dtype` and the MoE arm narrows to it above, so the two agree by
-    // construction. Rewriting the residual here would be a full-tensor pass per
-    // DeltaNet layer per wave that also hides a producer emitting the wrong
-    // width (hot-path invariant 1b).
-    expect_dtype(&h, orig_dtype, "delta-net residual: ffn(x) vs the stream")?;
-    x.add_mut(&h)?;
+    // The FFN's input, before the norm quantizes it. Everything downstream in
+    // this block is bounded by whether this was already bad.
+    x.as_cat_tensor().assert("ffn.in");
+    let acts = layer.post_attn_norm.forward_dynamic(
+        x.as_cat_tensor(),
+        mode,
+        wave_root(ffn_wave.as_ref()),
+    )?;
+    match &layer.ffn {
+        // The dense MLP's down projection stores `orig_dtype`, so its result
+        // lands in the residual with no narrowing pass between.
+        QuantFfn::Dense(m) => {
+            let h = m.forward_dynamic_adapted(&acts, mlp_dtype, orig_dtype, lora)?;
+            add_ffn_residual(x.as_cat_tensor_mut(), &h)?;
+        }
+        // The shared+routed combine, its narrowing and the residual add are one
+        // launch. The FFN computes in a promoted dtype because "MLP
+        // intermediates can exceed F16's range", and whether narrowing back is
+        // lossless is a property of the DATA — so the residual is checked after
+        // it, where an out-of-range value that became `inf` lands.
+        QuantFfn::Moe(m) => {
+            m.forward_residual(
+                x.as_cat_tensor_mut(),
+                acts,
+                mlp_dtype,
+                decode_tokens,
+                ffn_wave.as_ref(),
+            )?;
+            x.as_cat_tensor().assert("ffn.moe_residual");
+        }
+    }
     g_ffn.end();
-    // `h` borrows `ffn_wave`, so the compiler already refuses any drop order
-    // but this one; both die at the end of the function.
     Ok(())
 }

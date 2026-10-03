@@ -43,7 +43,7 @@ __device__ __forceinline__ void quantize_block_q8_0_vec(
     float amax = local_max;
     #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xff, amax, offset, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
     }
     // Broadcast from lane 0 to all lanes
     amax = __shfl_sync(0xffffffff, amax, 0, 32);
@@ -138,7 +138,7 @@ __device__ __forceinline__ void quantize_blocks_q8_0(
         float amax = local_max;
         #pragma unroll
         for (int offset = 4; offset > 0; offset >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(0xff, amax, offset, 8));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, 8));
         }
         amax = __shfl_sync(0xffffffff, amax, 0, 32);
         

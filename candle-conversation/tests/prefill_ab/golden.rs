@@ -38,6 +38,14 @@ fn rope_rotate(v: &mut [f32], pos: usize, rope: &RopeRungs) {
 /// concatenated in the same flat `[total_q, N_HEAD, HEAD_DIM]` row order the
 /// kernel produces.
 pub fn golden(case: &BuiltCase) -> Vec<f32> {
+    golden_over(case, &case.prefix_k, &case.prefix_v)
+}
+
+/// [`golden`] over a given prefix per sequence, `[t][N_KV_HEAD][HEAD_DIM]` —
+/// the source values, or the dequantized bytes the kernel actually reads
+/// (`harness::dequantized_prefix`), which takes the compression level's error
+/// out of the comparison and leaves the kernel's own.
+pub fn golden_over(case: &BuiltCase, prefix_k: &[Vec<f32>], prefix_v: &[Vec<f32>]) -> Vec<f32> {
     let scale = 1.0 / (HEAD_DIM as f64).sqrt();
     let hpg = N_HEAD / N_KV_HEAD;
     let mut out = Vec::new();
@@ -53,7 +61,7 @@ pub fn golden(case: &BuiltCase) -> Vec<f32> {
             for h in 0..N_KV_HEAD {
                 let dst = (t * N_KV_HEAD + h) * HEAD_DIM;
                 let (src, src_t) = if t < prefix {
-                    (&case.prefix_k[si], t)
+                    (&prefix_k[si], t)
                 } else {
                     (&case.new_k[si], t - prefix)
                 };
@@ -62,7 +70,7 @@ pub fn golden(case: &BuiltCase) -> Vec<f32> {
                 rope_rotate(&mut k_rot[dst..dst + HEAD_DIM], t, &case.rope);
 
                 let (srcv, srcv_t) = if t < prefix {
-                    (&case.prefix_v[si], t)
+                    (&prefix_v[si], t)
                 } else {
                     (&case.new_v[si], t - prefix)
                 };

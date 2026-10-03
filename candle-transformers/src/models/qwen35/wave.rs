@@ -18,8 +18,8 @@
 //!   several sequences runs the mixer once per sequence over that sequence's
 //!   own row range, and only the FFN sees the whole packed buffer.
 
+use candle::quantized::cuda::to_dynamic;
 use candle::{Device, Result};
-#[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
 use super::quantized_weights::{QuantLayer, QuantLayerMix, QuantModel};
@@ -88,13 +88,10 @@ pub fn delta_net_mix_wave(
     // that consumes the result — the same layer scoping an attention layer's
     // half uses, and the same one [`quantized_delta_net_ffn`] opens for the
     // other half of this layer.
-    #[cfg(feature = "cuda")]
     let mix_wave = match xt.device() {
         Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
         _ => None,
     };
-    #[cfg(not(feature = "cuda"))]
-    let mix_wave: Option<()> = None;
 
     // ln1 over the whole buffer: elementwise per row, so it does not need the
     // per-sequence split the recurrence does.
@@ -104,10 +101,16 @@ pub fn delta_net_mix_wave(
     // inherit; every one of the forty-odd ops downstream of here inherits from
     // its operand instead, so naming the span once — here — puts the whole
     // mixer on it without another mention of the wave.
-    #[cfg(feature = "cuda")]
     let normed = layer.attn_norm.forward_rooted(&flat, mix_wave.as_ref())?;
-    #[cfg(not(feature = "cuda"))]
-    let normed = layer.attn_norm.forward(&flat)?;
+    // Quantized ONCE into the operand all four input projections read, where
+    // each unstacked projection used to quantize its own copy of the same
+    // float. The same quantizer over the same float, so the same bytes: this is
+    // the arithmetic the lineage's KV rows were calibrated on. (The fused
+    // norm→q8 kernel is not — it tracks this pair only to float margin.)
+    let Device::Cuda(cuda) = xt.device() else {
+        candle::bail!("delta_net_mix_wave: the quantized mixer runs on CUDA");
+    };
+    let acts = to_dynamic(&normed, w.input_mode(), cuda, w.input_sum_scale())?;
 
     // **One call for the whole wave, not one per sequence.** The layer is
     // row-wise apart from the conv tail and the recurrence, so handing it every
@@ -139,7 +142,8 @@ pub fn delta_net_mix_wave(
         });
     }
     let mixed = quantized_delta_net_layer_forward_spans(
-        &normed,
+        &acts,
+        xt.dtype(),
         w,
         dims,
         &mut seqs,

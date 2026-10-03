@@ -2708,7 +2708,7 @@ impl PipelineState {
             // *issued*. But end-of-pass on this thread is the middle of a forward
             // on the other one — `post_compute` runs the instant a MoE layer's
             // work is answered, while the forward thread is still inside
-            // `ffn_forward` holding that layer's FFN wave guard. A wave arena is
+            // `ffn_residual` holding that layer's FFN wave guard. A wave arena is
             // live, and moving the boundary under one evicts and relocates slots
             // the wave may be reading.
             //
