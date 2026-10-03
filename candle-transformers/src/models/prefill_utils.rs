@@ -2115,13 +2115,22 @@ impl<'k> PagedDecode<'k> {
                     )
                 },
             )?;
-            if status != 0 {
-                candle::bail!(
+            match status {
+                0 => {}
+                1 => candle::bail!(
                     "paged-decode: the split-KV partial pool could not be allocated \
                      (VRAM exhausted) — the requested split/stripe launch needs it, \
                      so nothing was launched and this wave must fail rather than \
                      read an unwritten context"
-                );
+                ),
+                code => candle::bail!(
+                    "paged-decode: routing fault {code} — head_dim {} with {} query heads \
+                     over {} KV heads reached a kernel route that is not compiled in, so \
+                     nothing was launched",
+                    self.head_dim,
+                    self.n_q_head,
+                    self.n_kv_head
+                ),
             }
         } // all guards dropped here, dst no longer borrowed
 
@@ -2247,13 +2256,22 @@ impl<'k> PagedDecode<'k> {
                     )
                 },
             )?;
-            if status != 0 {
-                candle::bail!(
+            match status {
+                0 => {}
+                1 => candle::bail!(
                     "paged-decode q8: the split-KV partial pool could not be allocated \
                      (VRAM exhausted) — every q8 emit routes through partials + combine, \
                      so nothing was launched and this wave must fail rather than consume \
                      an uninitialized context"
-                );
+                ),
+                code => candle::bail!(
+                    "paged-decode q8: routing fault {code} — head_dim {} with {} query heads \
+                     over {} KV heads reached a kernel route that is not compiled in, so \
+                     nothing was launched",
+                    self.head_dim,
+                    self.n_q_head,
+                    self.n_kv_head
+                ),
             }
         } // all guards dropped here, dst no longer borrowed
 

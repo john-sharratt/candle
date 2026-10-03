@@ -131,7 +131,7 @@ using int8_elem::i8_tag_quad;
 using int8_elem::I8IsDtypeTag;
 using int8_elem::I8DtypeTag;
 using int8_elem::I8BlockQuad;
-using int8_elem::i8_pal_rank_load4;
+using int8_elem::i8_pal_rank_quad4;
 
 constexpr int TILE_WARPS = 8;
 constexpr int TILE_THREADS = TILE_WARPS * WARP_SIZE;
@@ -191,11 +191,17 @@ __device__ __forceinline__ int grp_within(uint32_t d) { return (int)((d >> 4) & 
 __device__ __forceinline__ int grp_slice(uint32_t d) { return (int)(d >> 9); }
 
 /// Per-(group, side, palette) extraction metadata of one tile: the
-/// palette's arena base, palette scale and format. Index [g][0] = K,
-/// [g][1] = V.
+/// palette's arena base, the reciprocal of its palette scale and its format.
+/// Index [g][0] = K, [g][1] = V.
+///
+/// `inv` is `__frcp_rn(scale)`, taken once when the descriptor is staged:
+/// every read divides by the palette scale through this reciprocal, and a
+/// Q0_V block folds it into its header, so all of them must agree on the
+/// correctly rounded value (block_q0_v.cuh) — computing it at each token's
+/// read instead cost the refinement and the slow-path call per token.
 struct TileExt {
     const char* gbase[TILE_SLOTS][2][N_PALETTE];
-    float scl[TILE_SLOTS][2][N_PALETTE];
+    float inv[TILE_SLOTS][2][N_PALETTE];
     uint8_t fmt[TILE_SLOTS][2][N_PALETTE];
 };
 
@@ -236,8 +242,9 @@ struct TileGroups {
 
 /// What a thread carries from staging the NEXT tile to committing it:
 /// its palette-map word (every thread), and for the 64 descriptor
-/// stagers the group descriptor plus the palette's pointer, scale and
-/// format. `stage_commit` writes it all to the tile's descriptor buffer.
+/// stagers the group descriptor plus the palette's pointer, scale
+/// reciprocal (`TileExt::inv`) and format. `stage_commit` writes it all to
+/// the tile's descriptor buffer.
 struct NextTile {
     uint32_t map;
     uint32_t desc;
@@ -245,7 +252,7 @@ struct NextTile {
     int col0;
     int ngroups;
     uint64_t ptr;
-    float scl;
+    float inv;
     int fmt;
 };
 
@@ -557,8 +564,8 @@ __device__ __forceinline__ QuadPair tile_quads_vec_resolve(
     pr.rank[1] = (int)(tbw1 & 63u);
     // Correctly rounded under fast math too: a Q0_V block folds this into its
     // header, and every Q0_V read must agree on it (block_q0_v.cuh).
-    raw.inv[0] = __frcp_rn(ext.scl[g0][side][p0]);
-    raw.inv[1] = __frcp_rn(ext.scl[g1][side][p1]);
+    raw.inv[0] = ext.inv[g0][side][p0];
+    raw.inv[1] = ext.inv[g1][side][p1];
     raw.meta = quad_raw_meta(pr.fmt[0], pr.fmt[1], q[0].live, q[1].live);
     return pr;
 }
@@ -713,7 +720,7 @@ __device__ __forceinline__ void tile_quad_vec_token(
     if (((q.live >> j) & 1u) == 0u) return;
     const int p = (int)(q.tbw >> 6) & (N_PALETTE - 1);
     const int rank = (int)(q.tbw & 63u);
-    const float inv = __frcp_rn(ext.scl[gi][side][p]);
+    const float inv = ext.inv[gi][side][p];
     uint32_t w[W];
     #pragma unroll
     for (int k = 0; k < W; ++k) w[k] = 0u;
@@ -814,8 +821,8 @@ __device__ __forceinline__ void tile_quads_vec(
 // sealed tile pays that on every group.
 // ============================================================================
 
-// A group's tokens are one aligned quad: `i8_pal_rank_load4` (int8_elem.cuh,
-// shared with the INT8 prefill) decodes a slot's four at once.
+// A group's tokens are one aligned quad: `i8_pal_rank_quad4` (int8_elem.cuh)
+// decodes a slot's four at once, with no unaligned decoder compiled in.
 static_assert(GROUP_TOK == 4, "a group is one aligned token quad");
 
 /// Where dim `d` of a K group is staged: 8 bytes per dim (the group's
@@ -849,11 +856,11 @@ __device__ __forceinline__ void tile_k_block_decode_palettes(
     #pragma unroll
     for (int pi = 0; pi < NP; ++pi) {
         const char* base = ext.gbase[g][0][p0 + pi];
-        const float inv = __frcp_rn(ext.scl[g][0][p0 + pi]);
+        const float inv = ext.inv[g][0][p0 + pi];
         #pragma unroll
         for (int s = 0; s < 2; ++s) {
             float o[GROUP_TOK];
-            i8_pal_rank_load4<true>(tag, base, lane + WARP_SIZE * s, SUB, inv, within, o);
+            i8_pal_rank_quad4<true>(tag, base, lane + WARP_SIZE * s, SUB, inv, within, o);
             hw[pi][s] = make_uint2(half2_bits(o[0], o[1]), half2_bits(o[2], o[3]));
         }
     }
@@ -1023,7 +1030,7 @@ __device__ __forceinline__ void tile_v_block_decode(
                     const uint32_t desc = tg.desc[gs];
                     const uint32_t live = grp_mask(desc);
                     float o[GROUP_TOK];
-                    i8_pal_rank_load4<false>(tag, ext.gbase[gs][1][p], rank, SUB, __frcp_rn(ext.scl[gs][1][p]),
+                    i8_pal_rank_quad4<false>(tag, ext.gbase[gs][1][p], rank, SUB, ext.inv[gs][1][p],
                                    grp_within(desc), o);
                     #pragma unroll
                     for (int j = 0; j < GROUP_TOK; ++j)
@@ -1144,7 +1151,7 @@ __device__ __forceinline__ void tile_v_q0v_readthrough(
     __half* s_v_scale, int g0, int p, int lane, int8_t* s_v8t)
 {
     constexpr int SUB = HEAD_DIM / N_PALETTE;
-    const float r = __frcp_rn(ext.scl[g0][1][p]);
+    const float r = ext.inv[g0][1][p];
     #pragma unroll
     for (int s = 0; s < 2; ++s) {
         const int rank = lane + WARP_SIZE * s;
@@ -1930,12 +1937,12 @@ int8_decode_tile_kernel(
     };
     // One descriptor item of a resolved group: (side, palette p).
     auto desc_of = [&](const GroupInfo& g, int side, int p, NextTile& nx) {
-        nx.desc = g.desc; nx.rope0 = 0; nx.col0 = 0; nx.ptr = 0; nx.scl = 1.f; nx.fmt = 0;
+        nx.desc = g.desc; nx.rope0 = 0; nx.col0 = 0; nx.ptr = 0; nx.inv = 1.f; nx.fmt = 0;
         if (grp_mask(g.desc) != 0u) {
             const uint8_t* hd = get_head_at<HEAD_DIM>(g.src.kvheads, kv_head_idx);
             nx.ptr = side ? kvhead_v_ptr<HEAD_DIM>(hd, p) : kvhead_k_ptr<HEAD_DIM>(hd, p);
             nx.fmt = side ? kvhead_v_fmt<HEAD_DIM>(hd, p) : kvhead_k_fmt<HEAD_DIM>(hd, p);
-            nx.scl = side ? kvhead_v_scale<HEAD_DIM>(hd, p) : kvhead_k_scale<HEAD_DIM>(hd, p);
+            nx.inv = __frcp_rn(side ? kvhead_v_scale<HEAD_DIM>(hd, p) : kvhead_k_scale<HEAD_DIM>(hd, p));
             nx.rope0 = g.src.rope_base + grp_within(g.desc);
             nx.col0 = g.col0;
         }
@@ -1945,7 +1952,7 @@ int8_decode_tile_kernel(
     };
     auto commit_desc = [&](int buf, int gi, int side, int p, const NextTile& nx) {
         s_ext[buf].gbase[gi][side][p] = (const char*)(uintptr_t)nx.ptr;
-        s_ext[buf].scl[gi][side][p] = nx.scl;
+        s_ext[buf].inv[gi][side][p] = nx.inv;
         s_ext[buf].fmt[gi][side][p] = (uint8_t)nx.fmt;
         if (side == 0 && p == 0) {
             s_tg[buf].desc[gi] = nx.desc;
@@ -1966,7 +1973,7 @@ int8_decode_tile_kernel(
     auto stage_issue = [&](int t, NextTile& nx, bool ahead) {
         const GroupInfo g = group_info(t, warp, ahead);
         nx.map = map_word_of(g, mw_side, mw_word);
-        nx.desc = 0u; nx.rope0 = 0; nx.col0 = 0; nx.ngroups = 0; nx.ptr = 0; nx.scl = 1.f; nx.fmt = 0;
+        nx.desc = 0u; nx.rope0 = 0; nx.col0 = 0; nx.ngroups = 0; nx.ptr = 0; nx.inv = 1.f; nx.fmt = 0;
         if (stager) desc_of(g, st_side, st_p, nx);
         if (tid == 0) nx.ngroups = (t < n_tiles) ? tile_groups(t, ahead) : 0;
     };

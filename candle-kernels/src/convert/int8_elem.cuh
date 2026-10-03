@@ -745,26 +745,59 @@ __device__ __forceinline__ void i8_block_run4(const B* blk, int t, float r, floa
     }
 }
 
-/// Tokens within..within+3 of rank `rank` of a palette of format `Tag`,
-/// scaled by `inv` (the reciprocal palette scale): a quant palette's
-/// block run (an aligned quad when `within` is a multiple of 4, which the
-/// block layouts read with the fewest word loads), a dtype palette's four
-/// strided elements. `within + 3` must lie in the same 32-token block.
-/// `IS_K` names the side, which Q0_V's codebook depends on.
+/// A dtype palette's tokens within..within+3 of rank `rank`, scaled by `inv`:
+/// four strided elements.
+template <typename Tag>
+__device__ __forceinline__ void i8_dtype_rank_load4(
+    const char* base, int rank, int sub, float inv, int within, float (&o)[4])
+{
+    using E = typename Tag::Elem;
+    const E* p = reinterpret_cast<const E*>(base) + (int64_t)within * sub + rank;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = to_float<E>(i8_arena_ld(p + j * sub)) * inv;
+}
+
+/// The aligned token quad within..within+3 (`within` a multiple of 4) of rank
+/// `rank` of a palette of format `Tag`, scaled by `inv` (the reciprocal
+/// palette scale): a quant palette's block quad, read with the fewest word
+/// loads its layout allows, or a dtype palette's four strided elements.
+///
+/// The decode tile reads only aligned quads (a group is one), so it takes
+/// this and not [`i8_pal_rank_load4`]: that one also carries every format's
+/// unaligned run decoder, code the tile never executes but whose size, over
+/// all the formats at each load site, spreads the tile's hot path across
+/// more of the instruction cache.
 template <bool IS_K, typename Tag>
-__device__ __forceinline__ void i8_pal_rank_load4(
+__device__ __forceinline__ void i8_pal_rank_quad4(
     Tag, const char* base, int rank, int sub, float inv, int within, float (&o)[4])
 {
     if constexpr (I8IsDtypeTag<Tag>::value) {
-        using E = typename Tag::Elem;
-        const E* p = reinterpret_cast<const E*>(base) + (int64_t)within * sub + rank;
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) o[j] = to_float<E>(i8_arena_ld(p + j * sub)) * inv;
+        i8_dtype_rank_load4<Tag>(base, rank, sub, inv, within, o);
     } else {
         using B = typename Tag::Block;
-        const B* blk = reinterpret_cast<const B*>(base + (int64_t)rank * sizeof(B));
-        if ((within & 3) == 0) I8BlockQuad<B, IS_K>::load4(blk, within, inv, o);
-        else i8_block_run4<B, IS_K>(blk, within, inv, o);
+        I8BlockQuad<B, IS_K>::load4(
+            reinterpret_cast<const B*>(base + (int64_t)rank * sizeof(B)), within, inv, o);
+    }
+}
+
+/// Tokens within..within+3 of rank `rank` of a palette of format `Tag`,
+/// scaled by `inv` (the reciprocal palette scale), `within` any position:
+/// a quant palette's block run (an aligned quad when `within` is a multiple
+/// of 4), a dtype palette's four strided elements. `within + 3` must lie in
+/// the same 32-token block. `IS_K` names the side, which Q0_V's codebook
+/// depends on.
+template <bool IS_K, typename Tag>
+__device__ __forceinline__ void i8_pal_rank_load4(
+    Tag tag, const char* base, int rank, int sub, float inv, int within, float (&o)[4])
+{
+    if constexpr (I8IsDtypeTag<Tag>::value) {
+        i8_dtype_rank_load4<Tag>(base, rank, sub, inv, within, o);
+    } else if ((within & 3) == 0) {
+        i8_pal_rank_quad4<IS_K>(tag, base, rank, sub, inv, within, o);
+    } else {
+        using B = typename Tag::Block;
+        i8_block_run4<B, IS_K>(
+            reinterpret_cast<const B*>(base + (int64_t)rank * sizeof(B)), within, inv, o);
     }
 }
 
