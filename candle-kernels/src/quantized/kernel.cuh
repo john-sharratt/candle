@@ -67,6 +67,8 @@ struct YTiles {
 #include "mma_dequant.cuh"
 #include "../dequant/dequant.cuh"
 #include "../mma/mma_wrappers.cuh"  // fused_attn INT8 MMA wrappers + frag loaders (grouped_tc int8 path)
+#include "../fast_exp.cuh"           // the SiLU the fused-activation loader applies
+#include "../quantize/q8a128_tile.cuh" // the one q8a128 quantization, for that loader
 
 // =============================================================================
 // FORWARD DECLARATIONS - Optimized standalone dequant functions
@@ -1873,12 +1875,77 @@ __device__ __forceinline__ void load_q8a128_activations(
     }
 }
 
-// One (expert-tile, row-tile) on the INT8 tensor core. Same single-stage load loop
-// and store as grouped_matmul_impl: load_q8a128_activations + a single per-warp weight
-// slot, in 8-row chunks. Each warp streams its row-group's chunks through ONE slot — the
-// dequant drains the loaded chunk to registers, freeing the slot for the next prefetch, so
-// no ring/ping-pong is needed (the double-buffered activations provide the load/compute
-// overlap). RING_I8 stays at 1 and sizes the single weight slot in shared memory.
+// Activation tile computed in place from F32 rows: `silu(proj[token, k·128 + ·])`, quantized
+// straight into the shared tile — the operand `gr_silu_q8` would have written and
+// load_q8a128_activations copied, with neither the producer's launch nor its round trip.
+// One warp per token row of the tile (4 warps stride over N_SUB·16 tokens), lane `l` owning
+// elements [4l, 4l+4) — `gr_silu_q8`'s mapping, through the same `fast_exp::silu` and the same
+// `quantize_q8a128_tile`, so the bytes are its. `proj` rows are `proj_stride` floats apart
+// (the gate columns of a wider projection) and 16-byte aligned. Synchronous stores, not
+// cp.async: the caller's next barrier publishes them exactly as it publishes the copies.
+// Rows ≥ b_cnt are zero-padded as the copying loader pads them.
+//
+// Every one of a warp's token rows is loaded before the first is quantized: the loads are
+// independent and the quantize is a serial butterfly, so issuing them one token at a time
+// paid a round trip per token where this pays one per tile.
+template <int N_SUB = 1>
+__device__ __forceinline__ void load_silu_f32_activations(
+    const float* __restrict__ proj, int proj_stride, int b_start, int b_cnt, int k_blk,
+    int tid, int sum_norm,
+    int8_t smem_A_i8[N_SUB * 16][KI8_STRIDE],
+    half2 smem_A_ds[N_SUB * 16])
+{
+    constexpr int ROWS_PER_WARP = N_SUB * 16 / 4;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    float4 v[ROWS_PER_WARP];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        const int token = warp + r * 4;
+        if (token < b_cnt) {
+            v[r] = *reinterpret_cast<const float4*>(
+                proj + (int64_t)(b_start + token) * proj_stride + k_blk * K_TILE + lane * 4);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        const int token = warp + r * 4;
+        if (token < b_cnt) {   // warp-uniform: the quantize's butterfly is full-warp
+            const Q8a128Lane t = quantize_q8a128_tile(
+                fast_exp::silu<float>(v[r].x), fast_exp::silu<float>(v[r].y),
+                fast_exp::silu<float>(v[r].z), fast_exp::silu<float>(v[r].w), sum_norm);
+            *reinterpret_cast<char4*>(&smem_A_i8[token][lane * 4]) = t.q;
+            if (lane == 0) smem_A_ds[token] = t.ds;
+        } else {
+            *reinterpret_cast<char4*>(&smem_A_i8[token][lane * 4]) = make_char4(0, 0, 0, 0);
+            if (lane == 0) smem_A_ds[token] = make_half2(__float2half(1.f), __float2half(0.f));
+        }
+    }
+}
+
+// The impl's one activation-tile load, from whichever source the instantiation reads:
+// the q8a128 operand (copied, cp.async) or, with ACT_SILU, F32 rows quantized in place.
+template <int N_SUB, bool ACT_SILU>
+__device__ __forceinline__ void load_act_tile(
+    const block_q8a128* __restrict__ act, const float* __restrict__ act_f32, int act_f32_stride,
+    int b_start, int b_cnt, int k_blk, int tiles_per_row, int tid, int sum_norm,
+    int8_t smem_A_i8[N_SUB * 16][KI8_STRIDE], half2 smem_A_ds[N_SUB * 16])
+{
+    if constexpr (ACT_SILU) {
+        load_silu_f32_activations<N_SUB>(act_f32, act_f32_stride, b_start, b_cnt, k_blk, tid,
+                                         sum_norm, smem_A_i8, smem_A_ds);
+    } else {
+        load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk, tiles_per_row, tid,
+                                       smem_A_i8, smem_A_ds);
+    }
+}
+
+// One (expert-tile, row-tile) on the INT8 tensor core: load_q8a128_activations + a per-warp
+// weight ring, in 8-row chunks. At the two-stage pipeline every unsplit launch runs, each warp
+// streams its row-group's chunks through ONE slot — the dequant drains the loaded chunk to
+// registers, freeing the slot for the next prefetch, and the double-buffered activations
+// provide the load/compute overlap. RING_I8 is that one slot, and sizes the weight smem of the
+// two-stage entries; the deeper split-K pipeline sizes its own ring of STAGES−1 slots.
 constexpr int RING_I8 = 1;
 
 // Load this warp's own k1024 weight chunk for `k_blk` into `slot_ptr` with its 32 lanes.
@@ -1921,7 +1988,31 @@ struct is_mxfp4_persub<block_c_mxfp4_k1024> {
 // load_warp_chunk_int8 weight stage, then the int8 MMA + deferred fold per sub.
 // N_SUB = m16 token sub-tiles per block. Mode-1 = 1 (Bm 16); mode-2 = larger Bm so each
 // weight chunk's dequant is reused across N_SUB token sub-tiles (fewer weight re-reads).
-template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1>
+//
+// STAGES = K tiles the double-buffered (N_SUB ≤ 4) pipeline keeps resident: the one being
+// computed plus STAGES−1 in flight, with a per-warp weight ring of STAGES−1 chunks and STAGES
+// activation buffers. 2 is the ping-pong every unsplit launch runs — one tile in flight during
+// the MMA, which is enough when a block walks the whole of K and the grid fills the card. A
+// split-K block walks only a few tiles, and with one in flight it paid a full DRAM round
+// trip per tile in series (ncu: the cp.async wait was ~45% of its stall samples); deeper stages
+// keep more of a short run in flight. At STAGES = 2 this loop is exactly the ping-pong it
+// generalises — a ring of one, buffers k & 1, `wait_group<0>`.
+//
+// TILE_PARTIALS (split-K only): store each K tile's fold to its own partial slot —
+// `partial + k_blk · partial_stride` — and restart the accumulator from zero, instead of
+// accumulating across tiles. For the affine KO formats every unsplit launch sums K as
+// `((0 + f₀) + f₁) + …`, one tile's fold joining the accumulator in one add; the split-K
+// reducer adds these per-tile partials in tile order from zero, which is that sum bit for
+// bit. So a split launch is the unsplit kernel's bits whatever tiles each block takes, a
+// row's output never depends on how many rows its wave carried, and the unsplit kernel
+// carries nothing for it. (MXFP4's per-sub fold accumulates straight into the sum, which a
+// per-tile partial cannot reproduce; it never splits — see `dense_qmatmul_with_splits`.)
+//
+// ACT_SILU: the activation is `silu` of F32 rows (`act_f32`, `act_f32_stride` apart) and
+// each tile is quantized as it is loaded (`load_silu_f32_activations`) — no q8a128 operand
+// exists; `act` is unread.
+template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1,
+          int STAGES = 2, bool TILE_PARTIALS = false, bool ACT_SILU = false>
 __device__ void grouped_matmul_impl_int8(
     const block_compact_t<block_q_t>* __restrict__ weights,
     const block_q8a128* __restrict__ act,
@@ -1932,7 +2023,18 @@ __device__ void grouped_matmul_impl_int8(
     half2 smem_A_ds[][N_SUB * 16],
     uint8_t* smem_W_flat,
     // `SumScale::as_code()` for the activation operand: 0 raw, 1 Σx/amax.
-    int sum_norm)
+    int sum_norm,
+    // The K range this block reduces, in K_TILE blocks: `[k_lo, k_hi)`, the whole
+    // of K when `k_hi < 0`. A split-K block covers one slice of it.
+    int k_lo = 0,
+    int k_hi = -1,
+    // TILE_PARTIALS: the per-tile F32 partials, tile `k` at `partial + k · partial_stride`,
+    // each laid out like `dst` (`dst_stride` wide). See the split-K dense entry.
+    float* __restrict__ partial = nullptr,
+    size_t partial_stride = 0,
+    // ACT_SILU: the F32 rows the activation is `silu` of, and their stride in floats.
+    const float* __restrict__ act_f32 = nullptr,
+    int act_f32_stride = 0)
 {
     using block_c_t = block_compact_t<block_q_t>;
     // The operand's sum convention, as the two coefficients that rebuild Σx.
@@ -1952,7 +2054,8 @@ __device__ void grouped_matmul_impl_int8(
     // N_SUB m16 token sub-tiles per block: frag_c[t*4 .. t*4+3] = tokens [t*16, t*16+16).
     // The weight (and its dequant) is shared across them — dequanted once per k_blk, reused.
     float frag_c[4 * N_SUB] = {};
-    const int k_blocks = ncols / K_TILE;
+    const int k_begin = k_lo;
+    const int k_blocks = k_hi < 0 ? ncols / K_TILE : k_hi;
 
     const int groupID  = lane >> 2;
     const int threadID = lane & 3;
@@ -1969,21 +2072,39 @@ __device__ void grouped_matmul_impl_int8(
     //     is covered by the extra block-level parallelism. Weight prefetch still overlaps the MMA
     //     (the slot is freed by the dequant); only the activation reload waits on a WAR barrier.
     constexpr int ABUF = (N_SUB >= 8) ? 1 : 2;
+    static_assert(STAGES >= 2, "the pipeline keeps the computed tile plus at least one in flight");
+    static_assert(ABUF == 2 || STAGES == 2, "the single-buffered N_SUB=8 path is not staged");
+    // Tiles in flight ahead of the one being computed, and the weight ring that holds them: the
+    // dequant drains a chunk to registers before the next prefetch, so a ring one short of the
+    // stage count suffices.
+    constexpr int AHEAD = (ABUF == 2) ? STAGES - 1 : 1;
+    constexpr int WRING = AHEAD;
     constexpr int CB = int8_chunk_bytes<block_c_t>::value;   // one 8-row chunk
-    uint8_t* my_slot = smem_W_flat + warp_id * CB;
+    uint8_t* warp_ring = smem_W_flat + warp_id * WRING * CB;
+    // Tile `t`'s weight slot and activation buffer, counted from this block's first tile.
+    auto w_slot = [&](int t) { return warp_ring + ((t - k_begin) % WRING) * CB; };
+    auto a_buf = [&](int t) { return (ABUF == 1) ? 0 : (t - k_begin) % STAGES; };
 
-    // Prologue: tile 0 — weight chunk 0 + activation tile 0 (buffer 0), one cp.async group.
-    if (k_blocks > 0) {
-        load_warp_chunk_int8<block_c_t>(my_slot, weights, 0, warp_row_base, nrows, lane);
-        load_q8a128_activations<N_SUB>(act, b_start, b_cnt, 0, tiles_per_row, tid,
-                                       smem_A_i8[0], smem_A_ds[0]);
-        cp_async_commit();
+    // Prologue: the first AHEAD tiles — weight chunk + activation tile, one cp.async group each.
+    // Deeper pipelines commit an (empty) group past the end too, so `wait_group` counts stay
+    // uniform; the ping-pong commits only what it loads, as it always has.
+    #pragma unroll
+    for (int s = 0; s < AHEAD; ++s) {
+        const int t = k_begin + s;
+        if (t < k_blocks) {
+            load_warp_chunk_int8<block_c_t>(w_slot(t), weights, t, warp_row_base, nrows, lane);
+            load_act_tile<N_SUB, ACT_SILU>(act, act_f32, act_f32_stride, b_start, b_cnt, t,
+                                           tiles_per_row, tid, sum_norm,
+                                           smem_A_i8[a_buf(t)], smem_A_ds[a_buf(t)]);
+            if constexpr (STAGES == 2) cp_async_commit();
+        }
+        if constexpr (STAGES > 2) cp_async_commit();
     }
 
-    for (int k_blk = 0; k_blk < k_blocks; ++k_blk) {
-        const int ab = (ABUF == 1) ? 0 : (k_blk & 1); // this tile's activation buffer
-        const int nb = (ABUF == 1) ? 0 : ((k_blk + 1) & 1); // next tile's buffer
-        cp_async_wait_group<0>();        // tile k_blk (weight + activation) resident
+    for (int k_blk = k_begin; k_blk < k_blocks; ++k_blk) {
+        const int ab = a_buf(k_blk);     // this tile's activation buffer
+        uint8_t* my_slot = w_slot(k_blk);
+        cp_async_wait_group<AHEAD - 1>(); // tile k_blk (weight + activation) resident
 
         // Inline scales + up-front dequant: read this warp's chunk into registers. Intra-warp
         // (no barrier needed); frees the weight slot for the next prefetch. This thread owns
@@ -2012,18 +2133,22 @@ __device__ void grouped_matmul_impl_int8(
         gemx_dequant_traits<block_c_t, half, half>::dequant_all_subs_int8(my_slot, lane, b_frags);
 
         __syncthreads();  // RAW: tile k activation visible to all warps; also guarantees tile
-                          // k-1's MMA (which read buffer nb) finished before we prefetch into nb.
+                          // k-1's MMA (which read the buffer the prefetch below fills) finished.
 
         if constexpr (ABUF == 2) {
-            // Prefetch tile k+1: weight chunk into the freed slot + activation into buffer nb,
-            // ONE cp.async group. Both overlap the MMA below (registers + buffer ab only).
-            // WAR-safe: slot freed by the dequant above; buffer nb consumed before the barrier.
-            if (k_blk + 1 < k_blocks) {
-                load_warp_chunk_int8<block_c_t>(my_slot, weights, k_blk + 1, warp_row_base, nrows, lane);
-                load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk + 1, tiles_per_row, tid,
-                                               smem_A_i8[nb], smem_A_ds[nb]);
-                cp_async_commit();
+            // Prefetch tile k+AHEAD: its weight chunk lands in the slot the dequant above just
+            // drained (the ring is AHEAD long, so tile k+AHEAD maps to tile k's slot) and its
+            // activation in the buffer tile k-1's MMA released, ONE cp.async group. Both overlap
+            // the MMA below, which reads only registers and buffer `ab`.
+            const int next = k_blk + AHEAD;
+            if (next < k_blocks) {
+                load_warp_chunk_int8<block_c_t>(w_slot(next), weights, next, warp_row_base, nrows, lane);
+                load_act_tile<N_SUB, ACT_SILU>(act, act_f32, act_f32_stride, b_start, b_cnt,
+                                               next, tiles_per_row, tid, sum_norm,
+                                               smem_A_i8[a_buf(next)], smem_A_ds[a_buf(next)]);
+                if constexpr (STAGES == 2) cp_async_commit();
             }
+            if constexpr (STAGES > 2) cp_async_commit();
         } else {
             // Single buffer: only the weight prefetch overlaps the MMA (its slot is already
             // free). The activation reload waits for the WAR barrier after the sub-tile loop.
@@ -2092,11 +2217,26 @@ __device__ void grouped_matmul_impl_int8(
             }
         }
 
+        if constexpr (TILE_PARTIALS) {
+            // This tile's fold to its own slot, and the accumulator restarts at zero.
+            float* slot = partial + (size_t)k_blk * partial_stride;
+            #pragma unroll
+            for (int t = 0; t < N_SUB; ++t) {
+                const int rem = b_cnt - t * 16;
+                const int cnt = rem < 0 ? 0 : (rem > 16 ? 16 : rem);
+                store_tile_output<float>(slot, &frag_c[t * 4], dst_stride, warp_row_base,
+                                         b_start + t * 16, cnt, lane);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4 * N_SUB; ++i) frag_c[i] = 0.f;
+        }
+
         if constexpr (ABUF == 1) {
             // WAR: every warp is done reading tile k's activation — safe to reload in place.
             __syncthreads();
             if (k_blk + 1 < k_blocks) {
-                load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk + 1, tiles_per_row, tid,
+                load_act_tile<N_SUB, ACT_SILU>(act, act_f32, act_f32_stride, b_start, b_cnt,
+                                               k_blk + 1, tiles_per_row, tid, sum_norm,
                                                smem_A_i8[0], smem_A_ds[0]);
                 cp_async_commit();
             }
@@ -2104,19 +2244,23 @@ __device__ void grouped_matmul_impl_int8(
     }
 
     // One store per sub-tile: tile t → tokens [b_start+t*16, +16). store_tile_output
-    // clamps via the token count, so partial/empty tiles write nothing.
-    #pragma unroll
-    for (int t = 0; t < N_SUB; ++t) {
-        const int rem = b_cnt - t * 16;
-        const int cnt = rem < 0 ? 0 : (rem > 16 ? 16 : rem);
-        store_tile_output<output_t>(dst, &frag_c[t * 4], dst_stride, warp_row_base,
-                                    b_start + t * 16, cnt, lane);
+    // clamps via the token count, so partial/empty tiles write nothing. A split-K
+    // block has stored its per-tile partials already; the entry finishes the reduction.
+    if constexpr (!TILE_PARTIALS) {
+        #pragma unroll
+        for (int t = 0; t < N_SUB; ++t) {
+            const int rem = b_cnt - t * 16;
+            const int cnt = rem < 0 ? 0 : (rem > 16 ? 16 : rem);
+            store_tile_output<output_t>(dst, &frag_c[t * 4], dst_stride, warp_row_base,
+                                        b_start + t * 16, cnt, lane);
+        }
     }
 }
 
 // INT8 dense entry (regular non-MoE QMatMul): one weight, implicit tile schedule —
 // blockIdx.x → the ≤16-token batch slice, blockIdx.y → the 32-row tile. Launched
-// from run_quantized_matmul on ytype==3.
+// from run_quantized_matmul on ytype==3. Each row folds K tile by tile in order, the
+// same chain whatever the batch width, and the split-K reducer reproduces it bit for bit.
 template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1>
 static __device__ void quantized_matmul_dense_entry_int8(
     const block_compact_t<block_q_t>* __restrict__ weights,
@@ -2142,6 +2286,167 @@ static __device__ void quantized_matmul_dense_entry_int8(
         grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
             weights, act, dst, ncols_x, nrows_x, y_stride, dst_stride,
             b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
+    }
+}
+
+// INT8 dense entry over a FUSED activation: `dst = silu(proj[:, 0..K]) · Wᵀ`, with the
+// activation quantized tile by tile as the impl loads it (ACT_SILU) — the matmul the
+// hyper-connection's `up` projection runs, without the `gr_silu_q8` launch that wrote its
+// operand. `proj` is the bottleneck's `[M, proj_stride]` F32 output, read through its row
+// stride. Same tile schedule as the dense entry, and the same bits as `gr_silu_q8` followed
+// by it.
+template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1>
+static __device__ void quantized_matmul_dense_silu_entry_int8(
+    const block_compact_t<block_q_t>* __restrict__ weights,
+    const float* __restrict__ proj,
+    int proj_stride,
+    output_t* __restrict__ dst,
+    int ncols_x, int nrows_x, int total_batch, int dst_stride,
+    int sum_norm)
+{
+    constexpr int BATCH = N_SUB * 16;
+    const int b_start = blockIdx.x * BATCH;
+    const int b_cnt = min(BATCH, total_batch - b_start);
+    const int row_tile_idx = blockIdx.y;
+
+    __shared__ __align__(16) int8_t smem_A_i8[2][BATCH][KI8_STRIDE];
+    __shared__ __align__(16) half2 smem_A_ds[2][BATCH];
+    __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
+
+    if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
+        grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB, 2, false, true>(
+            weights, nullptr, dst, ncols_x, nrows_x, 0, dst_stride,
+            b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm,
+            0, -1, nullptr, 0, proj, proj_stride);
+    }
+}
+
+// INT8 dense entry, SPLIT-K: the same tiles, K cut into `gridDim.z` slices of
+// ceil(K-tiles / gridDim.z) tiles each. The host picks the depth (q8a128_dense_k_splits)
+// so that no slice is empty; the bits do not depend on it (see TILE_PARTIALS).
+//
+// For a decode-width projection with a narrow N — the hyper-connection `down`
+// (N = 416, K = 10,240) — the unsplit grid is ceil(M/16) × N/32 = 13 blocks on a
+// 110-SM card, each walking 80 K tiles with one chunk in flight: ncu measured
+// 8% achieved occupancy and 7% of DRAM. Cutting K gives every slice its own
+// block, so the grid fills the card and the bytes in flight scale with it.
+//
+// Each block stores one F32 partial per K tile it covers to `ws[k]` (`[M, N]` each),
+// then counts in on `counters[tile]`. The block that counts in LAST reduces the tile: it
+// reads every tile's partial — its own included, from `ws`, not registers — in tile
+// order and stores the result. That is the chain every unsplit dense launch folds in too
+// (`((0 + f₀) + f₁) + …`), so the result is the unsplit kernel's bit for bit, whichever
+// block arrives last, with no float atomics. The last block also
+// returns its counter to zero, which is what lets the counters live in a buffer
+// zeroed once and reused by every launch on the stream.
+//
+// Pipeline depth of a split-K block (see `grouped_matmul_impl_int8`'s STAGES): the computed
+// tile plus two in flight — a short slice is issued whole, a longer one streams.
+constexpr int SPLITK_STAGES = 3;
+
+template <int qk, int qi, typename block_q_t, int vdr, typename output_t>
+static __device__ void quantized_matmul_dense_splitk_entry_int8(
+    const block_compact_t<block_q_t>* __restrict__ weights,
+    const block_q8a128* __restrict__ act,
+    output_t* __restrict__ dst,
+    int ncols_x, int nrows_x, int total_batch, int dst_stride, int sum_norm,
+    float* __restrict__ ws,
+    unsigned int* __restrict__ counters)
+{
+    constexpr int BATCH = 16;
+    const int b_start = blockIdx.x * BATCH;
+    const int b_cnt = min(BATCH, total_batch - b_start);
+    const int row_tile_idx = blockIdx.y;
+    const int splits = gridDim.z;
+    const int k_blocks = ncols_x / K_TILE;
+    // This block's slice.
+    const int slice_tiles = (k_blocks + splits - 1) / splits;
+    const int k_lo = min(k_blocks, (int)blockIdx.z * slice_tiles);
+    const int k_hi = min(k_blocks, k_lo + slice_tiles);
+
+    constexpr int STAGES = SPLITK_STAGES;
+    __shared__ __align__(16) int8_t smem_A_i8[STAGES][BATCH][KI8_STRIDE];
+    __shared__ __align__(16) half2 smem_A_ds[STAGES][BATCH];
+    __shared__ uint8_t smem_W_flat[(N_TILE / 8) * (STAGES - 1) * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
+    __shared__ bool s_last;
+
+    if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
+        const size_t slice = (size_t)total_batch * dst_stride;
+        grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, 1, STAGES, true>(
+            weights, act, dst, ncols_x, nrows_x, 0, dst_stride,
+            b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm,
+            k_lo, k_hi, ws, slice);
+
+        // Publish this slice's partial before counting in, so the last block reads it.
+        __threadfence();
+        __syncthreads();
+        const int tid = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
+        const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+        if (tid == 0) {
+            s_last = atomicAdd(&counters[tile], 1u) == (unsigned int)(splits - 1);
+        }
+        __syncthreads();
+        if (!s_last) {
+            return;
+        }
+        __threadfence();
+
+        // The reduction: 32 output rows × b_cnt tokens, each output summed over every K
+        // tile's partial in tile order from zero — the unsplit chain, so every bit of the
+        // result is the unsplit kernel's. It runs in one block per output tile while the
+        // rest of the card idles, so it is bound by L2 round trips: each thread owns up to
+        // OUTS outputs and walks them TOGETHER, RED_BATCH tiles at a time — OUTS·RED_BATCH
+        // loads in flight per round trip, where walking the outputs one after another pays
+        // a round trip per batch per output — a tail that grows with the rows (ncu, the
+        // hyper-connection `down` split 27 ways: 8 µs at one token, 29 µs at sixteen,
+        // against 12.5 µs at sixteen walking them together). `__ldcg` reads past L1, which
+        // the other blocks' stores never touched. N is a multiple of 32 (the launcher
+        // refuses anything else), so every output row of the tile exists.
+        const int row0 = row_tile_idx * N_TILE;
+        constexpr int THREADS = 4 * WARP_SIZE_TC;
+        constexpr int OUTS = BATCH * N_TILE / THREADS;
+        constexpr int RED_BATCH = 8;
+        const int outs = b_cnt * N_TILE;
+        // Offsets within one tile's `[M, N]` partial — the scratch holds 2²² floats, so
+        // 32 bits index it.
+        unsigned int off[OUTS];
+        float acc[OUTS];
+        #pragma unroll
+        for (int j = 0; j < OUTS; ++j) {
+            const int o = tid + j * THREADS;
+            off[j] = (unsigned int)((b_start + o / N_TILE) * dst_stride + row0 + o % N_TILE);
+            acc[j] = 0.f;
+        }
+        for (int s = 0; s < k_blocks; s += RED_BATCH) {
+            float v[OUTS][RED_BATCH];
+            #pragma unroll
+            for (int j = 0; j < OUTS; ++j) {
+                const bool live = tid + j * THREADS < outs;
+                #pragma unroll
+                for (int i = 0; i < RED_BATCH; ++i) {
+                    v[j][i] = live && s + i < k_blocks
+                                  ? __ldcg(&ws[(size_t)(s + i) * slice + off[j]]) : 0.f;
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < OUTS; ++j) {
+                #pragma unroll
+                for (int i = 0; i < RED_BATCH; ++i) {
+                    if (s + i < k_blocks) acc[j] += v[j][i];
+                }
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < OUTS; ++j) {
+            if (tid + j * THREADS < outs) {
+                if constexpr (std::is_same_v<output_t, float>) dst[off[j]] = acc[j];
+                else if constexpr (std::is_same_v<output_t, half>) dst[off[j]] = __float2half_rn(acc[j]);
+                else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) dst[off[j]] = __float2bfloat16_rn(acc[j]);
+            }
+        }
+        if (tid == 0) {
+            counters[tile] = 0u;
+        }
     }
 }
 

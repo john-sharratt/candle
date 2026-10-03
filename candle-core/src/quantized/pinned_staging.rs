@@ -400,6 +400,12 @@ impl RecyclerState {
         self.by_len.entry(len).or_default().push(buf);
         None
     }
+
+    /// Every idle buffer, emptying the pool.
+    fn drain(&mut self) -> Vec<PinnedBuf> {
+        self.bytes = 0;
+        self.by_len.drain().flat_map(|(_, bufs)| bufs).collect()
+    }
 }
 
 fn recycler() -> &'static std::sync::Mutex<RecyclerState> {
@@ -455,6 +461,23 @@ pub fn give_recycled_wc(buf: PinnedBuf) {
         // A refused buffer comes back and drops here, freeing its pages.
         let _ = pool.give(buf);
     }
+}
+
+/// Free every idle buffer the recycler holds, unpinning its pages.
+///
+/// The pool is process-wide, so it outlives the engine whose slot states filled
+/// it: without this, a shut-down engine leaves up to [`RECYCLER_MAX_BYTES`] of
+/// host-wide pinned pages behind for a taker that may never come. Called once
+/// the engine's sequences — every `(layer, slot)` staging pair — have handed
+/// their buffers back. A buffer taken out at the time is untouched and returns
+/// to the pool as usual.
+pub fn release_recycled_wc() {
+    // Drop outside the lock: each drop is a `cuMemFreeHost`.
+    let idle = match recycler().lock() {
+        Ok(mut pool) => pool.drain(),
+        Err(_) => return,
+    };
+    drop(idle);
 }
 
 /// Idle buffers held, and their total bytes.
@@ -1252,6 +1275,22 @@ mod fallible_alloc_tests {
         let refused = pool.give(stub(4096)).expect("over the cap, handed back");
         assert_eq!(refused.len(), 4096);
         assert_eq!(pool.bytes, big, "a refusal does not count toward the pool");
+    }
+
+    /// **A drain hands back every size and leaves the pool empty**, so nothing it
+    /// held is still counted against the host's pinned pages.
+    #[test]
+    fn a_drain_empties_every_size() {
+        let mut pool = empty_state();
+        pool.give(stub(4096));
+        pool.give(stub(4096));
+        pool.give(stub(8192));
+        let mut lens: Vec<usize> = pool.drain().iter().map(|b| b.len()).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![4096, 4096, 8192]);
+        assert_eq!(pool.bytes, 0);
+        assert!(pool.take(4096).is_none(), "nothing left to hand out");
+        assert!(pool.take(8192).is_none(), "nothing left to hand out");
     }
 
     /// A zero-length buffer is not worth a slot: `alloc_owned(0)` is already a

@@ -20,12 +20,15 @@
 //! call takes ownership last.
 
 use candle::quantized::cuda::DynamicActs;
-use candle::{DType, LiveTensor, Result};
+use candle::{DType, LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
+use candle_nn::ops::sigmoid;
 
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::quantized_mlp::QuantizedMlp;
 use crate::models::quantized_qwen3_moe::SparseMoeBlock;
+
+use super::shared_residual::add_moe_residual;
 
 /// One Qwen3.5 MoE layer.
 ///
@@ -53,6 +56,44 @@ pub fn shared_expert_contribution<'w>(
     acts: &DynamicActs<'w>,
     out_dtype: DType,
 ) -> Result<LiveTensor<'w>> {
+    shared_expert_parts(shared, shared_gate, acts, out_dtype)?.gated()
+}
+
+/// The shared expert's two halves before they are combined: its output and its
+/// raw per-row gate.
+pub struct SharedExpertParts<'w> {
+    /// `shared(x)`, at the activation's leading dims.
+    pub y: LiveTensor<'w>,
+    /// `w_gate · x`, pre-sigmoid, `[rows, 1]` — the first column of the padded
+    /// gate projection, a strided view that is never compacted.
+    pub gate: LiveTensor<'w>,
+}
+
+impl<'w> SharedExpertParts<'w> {
+    /// `sigmoid(gate) · y`, at `y`'s shape. The gate is one scalar per row,
+    /// `[rows, 1]`; `y` is viewed as `[rows, hidden]` for the broadcast — a free
+    /// reshape of the contiguous result, where reshaping the strided gate column
+    /// would copy it — so every leading shape of `y` lines up row for row.
+    pub fn gated(&self) -> Result<LiveTensor<'w>> {
+        let dims = self.y.dims().to_vec();
+        let hidden = dims[dims.len() - 1];
+        let rows = self.y.elem_count() / hidden;
+        self.y
+            .reshape((rows, hidden))?
+            .broadcast_mul(&sigmoid(&self.gate)?)?
+            .reshape(dims)
+    }
+}
+
+/// [`shared_expert_contribution`] stopped short of the gate's sigmoid and the
+/// multiply, for a consumer that applies them where it already reads the result
+/// (Qwen3.8-Flash-Next's hyper-connection combine).
+pub fn shared_expert_parts<'w>(
+    shared: &QuantizedMlp,
+    shared_gate: &QMatMul,
+    acts: &DynamicActs<'w>,
+    out_dtype: DType,
+) -> Result<SharedExpertParts<'w>> {
     // One width for both: the shared expert's result is summed into the MoE
     // combine, which runs at the experts' working dtype, so there is no
     // narrower store to ask for here.
@@ -61,62 +102,100 @@ pub fn shared_expert_contribution<'w>(
     // the projection yields a tile's worth of outputs and only the first is the
     // gate — the rest are the zero rows. Narrowing unconditionally is also
     // correct for an unpadded weight, which keeps this free of any dependence
-    // on the numeric path the weights were built for.
+    // on the numeric path the weights were built for. Viewed as `[rows, width]`
+    // first — a free reshape of the contiguous projection — so the column is a
+    // 2-D strided view a kernel can read through its row stride.
     let gate = shared_gate.forward_dynamic(acts.as_dynamic(), out_dtype)?;
-    let last = gate.rank() - 1;
-    let gate = gate.narrow(last, 0, 1)?;
-    let gate = candle_nn::ops::sigmoid(&gate)?;
-    // The gate is one scalar per token and `y` is `[.., hidden]`; both carry
-    // the same leading dims, so the broadcast is over the last one.
-    y.broadcast_mul(&gate)
+    let width = gate.dim(gate.rank() - 1)?;
+    let gate = gate
+        .reshape((gate.elem_count() / width, width))?
+        .narrow(1, 0, 1)?;
+    Ok(SharedExpertParts { y, gate })
+}
+
+/// One MoE layer's output in the three parts it is summed from:
+/// `routed + shared · sigmoid(gate)`.
+pub struct MoeParts<'w> {
+    /// The routed experts' weighted sum.
+    pub routed: LiveTensor<'w>,
+    /// The shared expert, ungated.
+    pub shared: SharedExpertParts<'w>,
 }
 
 impl Qwen35MoeBlock {
-    /// `routed(x) + sigmoid(w_gate · x) · shared(x)`.
-    ///
-    /// Matches `qwen35moe.cpp`'s combine and the F32 reference in
-    /// [`super::moe`], which is validated against llama.cpp.
-    pub fn forward_dynamic<'w>(
+    /// The layer's three parts, uncombined — see [`MoeParts`]. For a consumer
+    /// that folds the combine into a pass it already makes.
+    pub fn forward_parts<'w>(
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
         decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
-    ) -> Result<LiveTensor<'w>> {
+    ) -> Result<MoeParts<'w>> {
         // Shared expert first — see the module note on ownership.
-        let gated = shared_expert_contribution(&self.shared, &self.shared_gate, &acts, out_dtype)?;
+        let shared = shared_expert_parts(&self.shared, &self.shared_gate, &acts, out_dtype)?;
         let routed = self
             .routed
             .forward_dynamic(acts, out_dtype, decode_tokens, wave)?;
-        // The three values the layer's output is made of, checked where they
-        // are still separable.
-        //
-        // The routed half is instrumented all the way down; the SHARED half was
-        // not instrumented at all, and it is the other half of the sum. Its
-        // `sigmoid` and its per-token broadcast are the only broadcast ops in
-        // the FFN — and a broadcast add is what the fault's kernel breadcrumb
-        // named. Checking `gated` and `routed` apart, then their sum, is what
-        // separates "one of the addends was already bad" from "the combine
-        // produced it".
+        Ok(MoeParts { routed, shared })
+    }
+
+    /// `x += routed(a) + sigmoid(w_gate · a) · shared(a)`, where `a` is the
+    /// layer's normed activation and `x` the residual stream it came from.
+    ///
+    /// Matches `qwen35moe.cpp`'s combine and the F32 reference in
+    /// [`super::moe`], which is validated against llama.cpp. The combine and the
+    /// residual add are one launch ([`add_moe_residual`]): the parts are at
+    /// `work_dtype` and narrow to the stream's type after their sum, exactly
+    /// where the separate launches did.
+    pub fn forward_residual<'w>(
+        &self,
+        x: &mut Tensor,
+        acts: DynamicActs<'w>,
+        work_dtype: DType,
+        decode_tokens: usize,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<()> {
+        let MoeParts { routed, shared } =
+            self.forward_parts(acts, work_dtype, decode_tokens, wave)?;
+        // The values the layer's output is made of, checked where they are
+        // still separable — the routed sum, the shared expert and its gate apart,
+        // then the residual they land in. Bad on an input names the addend; bad
+        // only on the residual names the combine.
         #[cfg(feature = "tensor-assert")]
-        {
+        let cuda = {
             use crate::models::nan_capture::checkpoint;
             use candle::tensor_assert::site;
-            if let candle::Device::Cuda(d) = routed.device() {
-                let li = self.routed.moe_layer_idx;
-                checkpoint(site("moe.shared_gated.L", li), &gated, &[], d)?;
-                checkpoint(site("moe.routed_sum_in.L", li), &routed, &[], d)?;
-                let sum = (&routed + &gated)?;
-                checkpoint(
-                    site("moe.combined.L", li),
-                    &sum,
-                    &[("routed", &routed), ("gated", &gated)],
-                    d,
-                )?;
-                return Ok(sum);
+            use candle::Device;
+            match routed.device() {
+                Device::Cuda(d) => {
+                    let li = self.routed.moe_layer_idx;
+                    checkpoint(site("moe.shared_out.L", li), &shared.y, &[], d)?;
+                    checkpoint(site("moe.shared_gate.L", li), &shared.gate, &[], d)?;
+                    checkpoint(site("moe.routed_sum_in.L", li), &routed, &[], d)?;
+                    checkpoint(site("moe.residual_in.L", li), x, &[], d)?;
+                    Some(d.clone())
+                }
+                _ => None,
             }
+        };
+        add_moe_residual(x, &routed, &shared)?;
+        #[cfg(feature = "tensor-assert")]
+        if let Some(d) = cuda {
+            use crate::models::nan_capture::checkpoint;
+            use candle::tensor_assert::site;
+            checkpoint(
+                site("moe.combined.L", self.routed.moe_layer_idx),
+                x,
+                &[
+                    ("routed", &routed),
+                    ("shared", &shared.y),
+                    ("gate", &shared.gate),
+                ],
+                &d,
+            )?;
         }
-        &routed + &gated
+        Ok(())
     }
 }
 

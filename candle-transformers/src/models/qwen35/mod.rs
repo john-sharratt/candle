@@ -49,6 +49,8 @@ pub mod quantized_loader;
 pub mod quantized_moe;
 pub mod quantized_weights;
 pub mod rope;
+#[cfg(feature = "cuda")]
+pub mod shared_residual;
 pub mod spec;
 pub mod tensor_override;
 

@@ -74,6 +74,10 @@ INSTANTIATE_KERNEL_DENSE_INT8_M2_ALL(
     q4_ko_int8,
     QK4_K_K128, QI4_K_K128, block_c_q4_KO, VDR_Q4_K_K128
 )
+INSTANTIATE_KERNEL_DENSE_INT8_SK_ALL(
+    q4_ko_int8,
+    QK4_K_K128, QI4_K_K128, block_c_q4_KO, VDR_Q4_K_K128
+)
 
 // =============================================================================
 // GEMX TENSOR CORE KERNEL - Q4_K + F32

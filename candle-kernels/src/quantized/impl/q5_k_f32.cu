@@ -60,6 +60,10 @@ INSTANTIATE_KERNEL_DENSE_INT8_M2_ALL(
     q5_ko_int8,
     QK5_K_K128, QI5_K_K128, block_c_q5_KO, VDR_Q5_K_K128
 )
+INSTANTIATE_KERNEL_DENSE_INT8_SK_ALL(
+    q5_ko_int8,
+    QK5_K_K128, QI5_K_K128, block_c_q5_KO, VDR_Q5_K_K128
+)
 
 // DISABLED: dequant_k64 not yet implemented for this quant type
 // MARLIN TENSOR CORE KERNEL

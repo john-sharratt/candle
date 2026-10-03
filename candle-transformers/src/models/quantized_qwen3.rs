@@ -8,7 +8,7 @@
 //!
 // OLD: use super::batched_inference::{BatchedInferenceSession, ManagedBatchedModel as BatchableModel};
 #[cfg(feature = "cuda")]
-use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
+use super::batched_layer::{add_ffn_residual, BatchedAttentionLayer, QkvProjection};
 #[cfg(feature = "cuda")]
 use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::dense_span;
@@ -400,21 +400,19 @@ impl BatchedAttentionLayer for LayerWeights {
         let n_head = self.self_attn.num_heads;
         let n_kv_head = self.self_attn.num_kv_heads;
         let head_dim = self.self_attn.head_dim;
-        let q = q
-            .reshape((b_sz, seq_len, n_head, head_dim))?
-            .transpose(1, 2)?;
-        let q_flat = self.self_attn.q_norm.forward_live(&q.flatten(0, 2)?)?;
-        let q = q_flat
-            .reshape((b_sz, n_head, seq_len, head_dim))?
-            .transpose(1, 2)?
+        // The per-head norm is over the last axis, so it runs on the token-major
+        // rows as they are — `[tokens·heads, head_dim]` is the same rows a
+        // head-major transpose would visit, and the transpose (with its copies
+        // in and out) buys nothing.
+        let q = self
+            .self_attn
+            .q_norm
+            .forward_live(&q.reshape((b_sz * seq_len * n_head, head_dim))?)?
             .reshape((b_sz, seq_len, n_head * head_dim))?;
-        let k = k
-            .reshape((b_sz, seq_len, n_kv_head, head_dim))?
-            .transpose(1, 2)?;
-        let k_flat = self.self_attn.k_norm.forward_live(&k.flatten(0, 2)?)?;
-        let k = k_flat
-            .reshape((b_sz, n_kv_head, seq_len, head_dim))?
-            .transpose(1, 2)?
+        let k = self
+            .self_attn
+            .k_norm
+            .forward_live(&k.reshape((b_sz * seq_len * n_kv_head, head_dim))?)?
             .reshape((b_sz, seq_len, n_kv_head * head_dim))?;
         Ok(QkvProjection {
             q,
@@ -437,19 +435,20 @@ impl BatchedAttentionLayer for LayerWeights {
 
     /// B3 consumer: dense MLP over the fused ln2 activation.
     #[cfg(feature = "cuda")]
-    fn ffn_forward<'w>(
+    fn ffn_residual<'w>(
         &self,
+        x: &mut Tensor,
         acts: DynamicActs<'w>,
         work_dtype: DType,
-        out_dtype: DType,
         // A dense MLP has no expert cache to score, so the decode/prefill row
         // split says nothing here.
         _decode_tokens: usize,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
         _wave: Option<&'w WaveGeneration>,
-    ) -> Result<LiveTensor<'w>> {
-        self.mlp.forward_dynamic(&acts, work_dtype, out_dtype)
+    ) -> Result<()> {
+        let h = self.mlp.forward_dynamic(&acts, work_dtype, x.dtype())?;
+        add_ffn_residual(x, &h)
     }
 }
 

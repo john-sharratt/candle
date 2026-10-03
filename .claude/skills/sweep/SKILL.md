@@ -149,7 +149,9 @@ reasons and only one of them is about numerics:
 - **VRAM efficiency** (`worst sustained efficiency N%`) — how much of the ground below the
   arena frontier is actually holding KV.
 - **weight uptake** — whether the weight side took the ground the frontier gave up, judged
-  against `weight grow: asked=…` in the same block.
+  against `weight grow: asked=…` in the same block. A model whose every expert already
+  fits (the 30B on a 72 GB card) has nothing to take; the probe then prints
+  `weights fully resident` instead of a percentage, and that is a pass.
 
 **The efficiency gate fails by construction while KV compaction is switched off** (see
 `compact_backings`), and must be reported as the standing cost of that, not tuned: the
@@ -208,6 +210,7 @@ ceiling:
 | # | probe | story | worst sustained eff% | weight uptake | result | time |
 |---|---|---:|---:|---:|---|---:|
 
+- **weight uptake** — the percentage, or `weights fully resident` when the probe says so.
 - **result** — PASS only when all three of that probe's gates passed. When the only failure
   is the efficiency gate and KV compaction is switched off, write `FAIL (efficiency —
   compaction disabled)` so the reason is in the table and nobody re-derives it.

@@ -398,6 +398,8 @@ impl ArenaRefcounts {
     fn dec(&self, chunk_idx: usize) {
         let prev = self.counts[chunk_idx].fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
+            #[cfg(feature = "tensor-assert")]
+            super::release_watch::on_release((self.arena_idx * GID_STRIDE + chunk_idx) as i64);
             let prev_live = self.live.fetch_sub(1, Ordering::Relaxed);
             self.pool_total_live.fetch_sub(1, Ordering::Relaxed);
             // Mark the slot free in the occupancy discriminator FIRST, so a

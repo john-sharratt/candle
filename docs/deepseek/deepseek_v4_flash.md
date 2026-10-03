@@ -509,7 +509,7 @@ accessors: layers, embed, `final_norm`, `output_proj`) and `BatchedAttentionLaye
 | Q/K/V projection | `project_qkv` (`:264`) | override (low-rank Q, single latent KV) |
 | ln1 / ln2 | `attention_norm`/`ffn_norm` (`:245`,`:249`) | override |
 | o_proj | `output_projection`/`o_proj` (`:283`,`:269`) | fold DSv4's grouped 8-way de-rotated o-proj here |
-| MoE / FFN | `ffn_forward` (`:254`) → `SparseMoeBlock` + `ExpertCache` | **reuse**; new `SparseMoeBlock`-analog, 4 kernel deltas (§6.3) |
+| MoE / FFN | `ffn_residual` → `SparseMoeBlock` + `ExpertCache` | **reuse**; new `SparseMoeBlock`-analog, 4 kernel deltas (§6.3) |
 | **Attention kernel** | *hard-coded* to paged-GQA in `forward_attn_batched_single/_multi` | **new seam** — the wrongly-hardcoded bit (§6.4) |
 | **Residual / layer body** | *hard-coded* `[tokens,hidden]` add in `forward_layer_batched_mixed` | **new seam** — mHC 4-copy stream (§6.4) |
 | **Session KV creation** | *hard-coded* GQA `ChunkedKvBacking` | **new seam** — session-owned window/compressed/indexer KV (§6.2) |
@@ -620,7 +620,7 @@ byte-for-byte unchanged), and **override only those for DeepSeek**. Three seams 
 
 `hc_pre`/`hc_post`/`hc_head` are one fused kernel each (`hc_split_sinkhorn`: 24-dim linear +
 sigmoid/softmax + 20 Sinkhorn iters on a 4×4 — one warp per token), FP32 as in the reference.
-Cross-session wave batching and the MoE `ffn_forward` seam are reused as-is (MoE input is a flat
+Cross-session wave batching and the MoE `ffn_residual` seam are reused as-is (MoE input is a flat
 `[tokens, 4096]` after `hc_pre`). Int8 activation fusion (q8a128 epilogues) is a later
 optimization; BF16 dynamic acts first. **Net: one set of traits, additive defaulted methods,
 three overrides for DeepSeek, existing models untouched.**

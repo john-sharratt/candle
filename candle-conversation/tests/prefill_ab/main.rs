@@ -1,8 +1,12 @@
 //! Prefill kernel tests — the development harness for the int8
 //! prefix-attention kernel (`docs/archived/prefill_optimization.md` §11).
 //!
-//! Three oracle legs:
+//! Four oracle legs:
 //!
+//! 0. **Exact golden** — the same reference over the prefix as the kernel
+//!    reads it, dequantized out of the arena (`harness::dequantized_prefix`).
+//!    Only the kernel's int8 Q/K/P error is left, so this is the precision
+//!    oracle, asserted on every scenario (`assert_kernel_exact`).
 //! 1. **CPU golden** (`golden.rs`) — FP32/FP64 causal GQA attention with the
 //!    kernel's exact RoPE convention, computed from pre-quantization source
 //!    values. The `f16_identity_*` scenarios (unquantized prefix) validate
@@ -44,6 +48,45 @@ fn single(segments: Vec<Segment>, q_len: usize) -> Vec<SeqSpec> {
     vec![SeqSpec { segments, q_len }]
 }
 
+/// The int8 kernel's own error budget against the exact reference: the golden
+/// over the bytes the kernel read. Int8 Q/K/P quantization is the only error
+/// left once the prefix is the arena's own values, and it grows with the
+/// operands' dynamic range — measured on bring-up of this check at max_rel
+/// ≤ 2.9e-2 / cos ≥ 0.99946 on uniform data, and down to max_rel 1.28e-1 /
+/// cos 0.9744 on the planted 300:1 structured profiles (`ab_fuzz_seeded`
+/// iter 3, whose 17-token prefix is mostly int8-quantized fresh K).
+fn kernel_band(structured: bool) -> (f32, f32) {
+    if structured {
+        (1.6e-1, 0.97)
+    } else {
+        (4e-2, 0.999)
+    }
+}
+
+/// The kernel against the golden over the bytes it actually read — the
+/// prefix dequantized out of the arena — which leaves the kernel's own error
+/// and nothing of the compression level's. This is the kernel's correctness
+/// oracle: a misread slot, a wrong palette route or a gap walked past shows
+/// here at full size instead of hiding inside a quantization budget.
+fn assert_kernel_exact(case: &harness::BuiltCase, out: &[f32]) -> Result<()> {
+    let (pk, pv) = harness::dequantized_prefix(case)?;
+    let m = compare(out, &golden::golden_over(case, &pk, &pv));
+    println!(
+        "[{}] kernel-vs-dequantized: max_rel={:.4e} min_row_cos={:.6}",
+        case.spec.name, m.max_rel, m.min_row_cos
+    );
+    let (band, floor) = kernel_band(case.spec.structured_dims);
+    assert!(
+        m.max_rel < band && m.min_row_cos > floor,
+        "[{}] kernel vs the bytes it read: max_rel {:.4e} (band {band:.1e}), cos {:.6} \
+         (floor {floor})",
+        case.spec.name,
+        m.max_rel,
+        m.min_row_cos
+    );
+    Ok(())
+}
+
 /// Run a scenario against the kernel and the CPU golden; assert the bands
 /// and print the measured metrics (the numbers that size the bands).
 fn run_golden_scenario(spec: Scenario) -> Result<()> {
@@ -51,6 +94,7 @@ fn run_golden_scenario(spec: Scenario) -> Result<()> {
     let dev = device()?;
     let mut case = build_case(&spec, &dev)?;
     let out = harness::out_f32(&run_prefill(&mut case)?)?;
+    assert_kernel_exact(&case, &out)?;
     let gold = golden::golden(&case);
     let m = compare(&out, &gold);
     println!(
@@ -197,12 +241,11 @@ fn tiny_segments_gap_walk() -> Result<()> {
         theta: 1e6,
         seed: 0x222,
         golden_band: 2.5e-1,
-        // Measured 0.9527 when the harness first reached this assertion, then
-        // 0.9485 once the production ladder spent more of V's error budget on
-        // C2–C7 (the Q5 buy-back retune of `params.rs`, whose V thresholds rose
-        // there). The segments sit at C4, C5 and C7, so the drop is that
-        // retune, and it is deterministic: identical on every rerun. 0.94 clears
-        // the measurement by the margin the 0.95 floor had over the first.
+        // A quantization budget, not a kernel check: the kernel matches the
+        // bytes it read to cos 0.99995 (`assert_kernel_exact`), and this row
+        // measures what C4/C5/C7 on five partial segments of uniform-random
+        // data lose against the source. Measured 0.9527 when first reached,
+        // 0.9485 after the level candidate tables were re-derived (2026-09).
         min_cos: 0.94,
         structured_dims: false,
     })
@@ -276,6 +319,7 @@ fn run_kernel_scenario(spec: Scenario) -> Result<()> {
     let dev = device()?;
     let mut case = build_case(&spec, &dev)?;
     let out = harness::out_f32(&run_prefill(&mut case)?)?;
+    assert_kernel_exact(&case, &out)?;
 
     if spec.golden_band.is_finite() {
         let gold = golden::golden(&case);
@@ -816,9 +860,9 @@ fn ab_gap_walk_hostile() -> Result<()> {
         ),
         0xAB60,
         false,
-        // Row cosine measured 0.949077 under the production ladder's V
-        // thresholds on C2–C7 (the segments here sit at C2, C4, C5, C7 and C9),
-        // deterministic across reruns; 0.94 keeps the margin the 0.95 floor had.
+        // A quantization budget: the kernel matches the bytes it read to cos
+        // 0.99997. Against the source, a 1-token C9 segment and the C7/C2
+        // partial tails measure cos 0.9491.
         (4.5e-1, 0.94),
     )
 }

@@ -178,6 +178,19 @@ impl ProbeOutcome {
         }
     }
 
+    /// The weight side's verdict as a reader should see it.
+    ///
+    /// A model whose every expert is already resident has nothing for released ground
+    /// to buy, so its uptake is not a share of anything; printing the arithmetic's 0%
+    /// there reads as a failure of the gate that just passed.
+    pub fn weight_uptake_label(&self) -> String {
+        if self.weight_at_limit {
+            "weights fully resident".to_string()
+        } else {
+            format!("weight uptake {}%", self.weight_uptake_pct)
+        }
+    }
+
     /// Fail with every gate's verdict in the message, so a test's output says what
     /// held as well as what did not.
     pub fn assert_passed(&self) {
@@ -186,6 +199,44 @@ impl ProbeOutcome {
             "{} of 3 probe gates failed:\n  {}",
             self.failures.len(),
             self.failures.join("\n  "),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProbeOutcome;
+
+    fn outcome(weight_uptake_pct: usize, weight_at_limit: bool) -> ProbeOutcome {
+        ProbeOutcome {
+            story_pass: 20,
+            story_total: 20,
+            worst_sustained_efficiency: 99,
+            worst_single_efficiency: 70,
+            weight_uptake_pct,
+            weight_at_limit,
+            prefill_tps: 0.0,
+            decode_tps: 0.0,
+            frontier_regions: 0,
+            efficiency_pct: 0,
+            peak_tokens: 0,
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_fully_resident_weight_side_is_named_not_scored() {
+        assert_eq!(
+            outcome(0, true).weight_uptake_label(),
+            "weights fully resident"
+        );
+    }
+
+    #[test]
+    fn a_weight_side_with_room_reports_its_uptake() {
+        assert_eq!(
+            outcome(93, false).weight_uptake_label(),
+            "weight uptake 93%"
         );
     }
 }

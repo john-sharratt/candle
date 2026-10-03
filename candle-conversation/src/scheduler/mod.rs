@@ -109,6 +109,7 @@ use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked, WINDOW_DIVERGENCE_MARKER,
 };
 use candle_transformers::models::delta_net::ExportedLayerState;
+use candle_transformers::models::draft_depth::DraftDepth;
 
 use self::exported_state::{ExportedState, SharedState};
 use self::norm_warm::NormWarm;
@@ -1336,6 +1337,12 @@ struct DecodeState {
     /// exists to keep; the grid's authority is the K/V, and the seal drops
     /// exactly the trailing unforwarded token instead.
     forwarded_generated: usize,
+    /// How deep this turn drafts: one past its own running acceptance, clipped
+    /// at the model's ladder for the wave's width. A turn writing free prose
+    /// keeps ~2 drafted tokens a step and a turn quoting a file keeps nearly all
+    /// of them, so a depth set once per wave pays for proposals the first
+    /// throws away.
+    draft_depth: DraftDepth,
     /// A page cut this turn has earned but not yet taken.
     ///
     /// **A cut may not land between a speculative wave's snapshot and its
@@ -5512,6 +5519,7 @@ impl Scheduler {
             generated_tokens: TokenBuffer::default(),
             think_close_at: None,
             forwarded_generated: 0,
+            draft_depth: DraftDepth::default(),
             pending_page_cut: false,
             pending_page_cut_after: None,
             max_tokens,
@@ -13101,7 +13109,7 @@ mod tests {
             &mut session,
             &[seq],
             &[1u32],
-            4,
+            &[4],
             model.num_layers(),
             &mut chooser,
             &mut sink,
@@ -13400,6 +13408,7 @@ mod tests {
             generated_tokens: TokenBuffer::default(),
             think_close_at: None,
             forwarded_generated: 0,
+            draft_depth: DraftDepth::default(),
             pending_page_cut: false,
             pending_page_cut_after: None,
             max_tokens: 64,

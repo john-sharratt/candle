@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use candle::quantized::cuda::to_dynamic;
+use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
@@ -44,11 +44,11 @@ use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
-use super::hyper::{hc_combine, hc_mix};
+use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{compact_index_caches, select_layer, IndexCache, IndexSnapshot};
 use super::paged_index;
 use super::paged_index::SealedIndex;
-use super::ple::{ple_apply, ple_row_ids, PleState};
+use super::ple::{ple_apply_spans, PleSpan, PleState};
 use super::qsa::IndexerWeights;
 use super::qsa_select::budget_fits_kernel;
 use super::resident_page::{PageRegistry, PieceKey, ResidentPage};
@@ -61,6 +61,8 @@ use crate::models::batched_layer::{
     forward_attn_batched, BatchedAttentionParams, BatchedPrefillMeta, DecodeHeaders,
 };
 use crate::models::batched_model::{WaveGuard, WavePhase};
+#[cfg(feature = "cuda")]
+use crate::models::delta_net::cuda::build_wave_table;
 use crate::models::delta_net::StashSlot;
 use crate::models::delta_net::{
     compact_stores, quantized_delta_net_layer_forward_spans, seq_spans, DeltaNetSeq,
@@ -68,6 +70,9 @@ use crate::models::delta_net::{
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
 use crate::models::expert_lre::{WeightPlan, WeightPlanning};
+use crate::models::head_rows::select_head_rows;
+use crate::models::lazy_rope::LazyRope;
+use crate::models::operand_guard::expect_dense_view;
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::span;
@@ -75,13 +80,14 @@ use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
-use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
+use crate::models::wave_buffers::wave_from_vec_ticketed;
 
 use super::rope::flash_next_schedule;
 use crate::models::tensor_cat::TensorCat;
-use crate::models::verify_wave::VerifyPlan;
+use crate::models::verify_wave::{upload_plan_rows, VerifyPlan};
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
+use crate::models::wave_token_ids::host_token_ids;
 
 /// Pool ground reserved from the driver and not in use — what an eager transient
 /// can allocate without a fresh driver reservation.
@@ -1254,10 +1260,6 @@ impl Qwen4ExpBatched {
         self.qsa_rows.load(Ordering::Relaxed)
     }
 
-    fn token_ids(t: &Tensor) -> Result<Vec<u32>> {
-        t.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()
-    }
-
     /// Fresh-or-reset per-sequence state, keyed exactly as the oracle keys its
     /// sessions: a member arriving at offset 0 starts over.
     ///
@@ -1895,16 +1897,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             );
         }
         // The model's device, not the host: these rows are cat'd with whatever
-        // else the caller has on the wave.
+        // else the caller has on the wave. One upload per group.
         let dseqs: Vec<usize> = plain.iter().map(|&(s, _)| s).collect();
-        let dinputs: Vec<Tensor> = plain
-            .iter()
-            .map(|&(_, t)| Tensor::from_vec(vec![t], (1, 1), &self.model.device))
-            .collect::<Result<_>>()?;
-        let pinputs: Vec<Tensor> = blocks
-            .iter()
-            .map(|b| Tensor::from_vec(b.clone(), (1, b.len()), &self.model.device))
-            .collect::<Result<_>>()?;
+        let tokens: Vec<u32> = plain.iter().map(|&(_, t)| t).collect();
+        let (dinputs, pinputs) = upload_plan_rows(&tokens, blocks, &self.model.device)?;
 
         // **Size the stash before the forward opens.** A wave's storage is
         // claimed by `admit_wave_kv` and the transient tier placed against that
@@ -2219,6 +2215,7 @@ impl WaveSweep for Qwen4ExpBatched {
         if seq_ids.is_empty() {
             candle::bail!("qwen4exp wave: empty batch");
         }
+        let accept_in_place = session.accept_in_place();
         // Flash-Next runs its layers under the Gated Residual, which carries no
         // adapter plumbing, so `project_qkv_gated` is called with an empty
         // `LayerLora`. Refused rather than ignored: dropping the name here would
@@ -2401,19 +2398,23 @@ impl WaveSweep for Qwen4ExpBatched {
                         }
                     })
                     .sum();
+                let scored_rows = if layer_end == num_layers {
+                    n_decode + scored_prefill
+                } else {
+                    0
+                };
                 let width = WaveWidth {
                     prefill_rows: pre_rows,
                     decode_rows: n_decode,
-                    scored_rows: if layer_end == num_layers {
-                        n_decode + scored_prefill
-                    } else {
-                        0
-                    },
+                    scored_rows,
                     // A one-row prefill group takes the decode kernels, so it
                     // carves no span-table entry and, alone, no scan transient.
                     prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
                     staged_rows: staged.map_or(0, |(rows, _)| rows),
                     staged_spans: staged.map_or(0, |(_, spans)| spans),
+                    // The caller's accept walk selects on the head's span only
+                    // when it reads the logits there.
+                    accept_rows: if accept_in_place { scored_rows } else { 0 },
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),
@@ -2628,6 +2629,19 @@ impl WaveSweep for Qwen4ExpBatched {
                 }
             }
         }
+        // The head's logits are carved from the forward span (`hc_mix` and the
+        // head GEMM run on its ticket), so a wave that reached the head hands
+        // the span's guard back with them: `WaveResult` keeps the span alive
+        // while the caller reads, instead of the head copying the `[R, vocab]`
+        // block off it first.
+        #[cfg(feature = "cuda")]
+        let swept = swept.map(|(phase, guard)| {
+            if matches!(phase, WavePhase::Logits(_)) {
+                (phase, guard.or(fwd_span))
+            } else {
+                (phase, guard)
+            }
+        });
         swept
     }
 }
@@ -2738,11 +2752,11 @@ impl Qwen4ExpBatched {
         } else {
             None
         };
+        // Per-sequence host token ids, read once: the embedding gather below and
+        // the PLE hash side both take them from here.
+        let seq_tokens: Vec<Vec<u32>> = host_token_ids(inputs)?;
         if fresh || head_embeds {
-            let mut flat_ids: Vec<u32> = Vec::with_capacity(total_rows);
-            for t in inputs {
-                flat_ids.extend(Self::token_ids(t)?);
-            }
+            let flat_ids: Vec<u32> = seq_tokens.iter().flatten().copied().collect();
             let ids = wave_from_vec_ticketed(flat_ids, (total_rows,), dev, fwd_ticket)?;
             m.embed
                 .gather_into(&ids, entry.as_ref(), row_embeds.as_ref())?;
@@ -2769,11 +2783,7 @@ impl Qwen4ExpBatched {
             None => entry.expect("allocated whenever the residual is fresh"),
         };
 
-        // Per-sequence host token ids (the PLE hash side) + row spans.
-        let seq_tokens: Vec<Vec<u32>> = inputs
-            .iter()
-            .map(Self::token_ids)
-            .collect::<Result<Vec<_>>>()?;
+        // Row spans, beside the host token ids above (the PLE hash side).
         let spans = seq_spans(seq_ids, &q_lens)?;
 
         // ── Model-side RoPE for the non-paged paths; the paged kernels rotate
@@ -2786,22 +2796,24 @@ impl Qwen4ExpBatched {
                 pre_pos.push((o + i) as u32);
             }
         }
-        let dec_rope = m
-            .rotary
-            .rope_cos_sin(&dec_pos, theta, DType::F32, dev, fwd_ticket)?;
-        let (pre_cos, pre_sin) =
+        let dec_rope = LazyRope::new(|| {
             m.rotary
-                .rope_cos_sin(&pre_pos, theta, DType::F32, dev, fwd_ticket)?;
+                .rope_cos_sin(&dec_pos, theta, DType::F32, dev, fwd_ticket)
+        });
         let half = cfg.attn_head_dim / 2;
-        let pre_rope = (
-            pre_cos.reshape((1, pre_rows, half))?,
-            pre_sin.reshape((1, pre_rows, half))?,
-        );
+        let pre_rope = LazyRope::new(|| {
+            let (cos, sin) = m
+                .rotary
+                .rope_cos_sin(&pre_pos, theta, DType::F32, dev, fwd_ticket)?;
+            Ok((
+                cos.reshape((1, pre_rows, half))?,
+                sin.reshape((1, pre_rows, half))?,
+            ))
+        });
         let dec_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
         let pre_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
         let dec_params = BatchedAttentionParams::new(
-            &dec_rope.0,
-            &dec_rope.1,
+            &dec_rope,
             false,
             &self.rope,
             decode_headers,
@@ -2810,8 +2822,7 @@ impl Qwen4ExpBatched {
             &dec_pm,
         );
         let pre_params = BatchedAttentionParams::new(
-            &pre_rope.0,
-            &pre_rope.1,
+            &pre_rope,
             false,
             &self.rope,
             prefill_headers,
@@ -2849,6 +2860,38 @@ impl Qwen4ExpBatched {
             .map_err(|_| candle::Error::Msg("verify lock poisoned".into()))?;
         let cap_map: &mut Option<SpecCapture> = &mut verify_guard;
 
+        // The decode pointer table for the whole sweep — every DeltaNet layer's
+        // state and tail addresses for every decode sequence, ONE host upload
+        // here, before the first layer's launches, where the queue is still
+        // empty. Each DeltaNet layer takes its slice, so no layer uploads a
+        // table of its own behind the launches already queued. Valid for this
+        // forward only: `commit_wave` exchanges the halves after the sweep.
+        #[cfg(feature = "cuda")]
+        let dn_table = {
+            let at: HashMap<usize, usize> =
+                spans.iter().enumerate().map(|(i, s)| (s.seq, i)).collect();
+            let mut slot: Vec<Option<&mut RecurrentStateStore>> =
+                spans.iter().map(|_| None).collect();
+            for (seq, store) in rec.iter_mut() {
+                if let Some(&i) = at.get(seq) {
+                    slot[i] = Some(store);
+                }
+            }
+            let stores: Vec<&mut RecurrentStateStore> = spans
+                .iter()
+                .zip(slot)
+                .map(|(span, st)| {
+                    st.ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "qwen4exp: sequence {} has no recurrent store in this wave",
+                            span.seq
+                        ))
+                    })
+                })
+                .collect::<Result<_>>()?;
+            build_wave_table(&spans, &stores, None)?
+        };
+
         // Sub-block finiteness probes for the layer bisect — sync readbacks,
         // so they exist only in `tensor-assert` diagnostic builds.
         #[cfg(feature = "tensor-assert")]
@@ -2883,43 +2926,54 @@ impl Qwen4ExpBatched {
                 None
             };
             if li == cfg.ple.layer {
-                let mut parts = Vec::with_capacity(spans.len());
-                for span in &spans {
-                    let st = ple_map.get_mut(&span.seq).expect("ensured");
-                    let row_ids = ple_row_ids(
-                        &cfg.ple,
-                        &seq_tokens_of(&spans, &seq_tokens, span.seq)?,
-                        &mut st.prev,
-                    );
-                    let flat: Vec<u32> = row_ids.into_iter().flatten().collect();
-                    let emb = m
-                        .ple_table
-                        .rows(&flat)?
-                        .reshape((span.len, cfg.hidden_size))?;
-                    let rows_in = res.narrow(0, span.start, span.len)?;
-                    // A verifying span stashes the rows it appends to the conv
-                    // history; every other span captures nothing.
-                    //
-                    // Zero elements, so there is nothing to initialise and
-                    // nothing to copy — but it is still a storage, and asking
-                    // the driver for one per span per layer per wave is a round
-                    // trip for a placeholder. On the mixer's span it is a
-                    // pointer bump.
-                    let mut rows_out = wave_empty_ticketed(0, DType::F32, dev, fwd_ticket)?;
-                    let capture = cap_map
-                        .as_ref()
-                        .is_some_and(|c| c.seqs.contains_key(&span.seq))
-                        .then_some(&mut rows_out);
-                    parts.push(ple_apply(
-                        &rows_in, &emb, &m.ple_w, &cfg.ple, st, eps, capture,
-                    )?);
-                    if let Some(c) = cap_map.as_mut() {
-                        if let Some(s) = c.seqs.get_mut(&span.seq) {
-                            s.ple_rows = Some(rows_out);
+                // Every sequence's rows in one pass — one table gather, the
+                // injection and the conv over the whole wave, the residual
+                // updated in place of a per-sequence concatenation. A verifying
+                // span stashes the rows it appends to the conv history; every
+                // other span captures nothing.
+                let at: HashMap<usize, usize> =
+                    spans.iter().enumerate().map(|(i, s)| (s.seq, i)).collect();
+                let mut slot: Vec<Option<&mut PleState>> = spans.iter().map(|_| None).collect();
+                for (seq, st) in ple_map.iter_mut() {
+                    if let Some(&i) = at.get(seq) {
+                        slot[i] = Some(st);
+                    }
+                }
+                let mut ple_spans = Vec::with_capacity(spans.len());
+                for ((span, toks), st) in spans.iter().zip(&seq_tokens).zip(slot) {
+                    let state = st.ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "qwen4exp: sequence {} has no PLE state in this wave",
+                            span.seq
+                        ))
+                    })?;
+                    ple_spans.push(PleSpan {
+                        start: span.start,
+                        len: span.len,
+                        tokens: toks,
+                        state,
+                        capture: cap_map
+                            .as_ref()
+                            .is_some_and(|c| c.seqs.contains_key(&span.seq)),
+                    });
+                }
+                let (out, captured) = ple_apply_spans(
+                    &res,
+                    &mut ple_spans,
+                    m.ple_table.as_ref(),
+                    &m.ple_w,
+                    &cfg.ple,
+                    eps,
+                )?;
+                drop(ple_spans);
+                res = out;
+                if let Some(c) = cap_map.as_mut() {
+                    for (span, rows) in spans.iter().zip(captured) {
+                        if let (Some(s), Some(rows)) = (c.seqs.get_mut(&span.seq), rows) {
+                            s.ple_rows = Some(rows);
                         }
                     }
                 }
-                res = Tensor::cat(&parts, 0)?;
             }
             if let Some(g) = g_ple {
                 g.end();
@@ -2938,13 +2992,30 @@ impl Qwen4ExpBatched {
                 _ => None,
             };
             let g_pre = crate::models::profile::gpu_span("q4e:gr_pre", dev);
+            // A DeltaNet layer whose four input projections run int8 reads the
+            // mix's own q8a128 operand, written as the collapse stores `h` — the
+            // bytes a quantize of `h` would produce, without the launch, provided
+            // the mix quantizes under the projections' `Σx` convention (checked
+            // where the operand is handed over). Any other layer's projections
+            // take the float: an attention layer quantizes through its own hook.
             #[cfg(feature = "cuda")]
-            let (h, inject) = hc_mix(
-                &res,
-                &layer.hc_attn,
-                eps,
-                mix_wave.as_ref().map(|g| g.ticket()),
-            )?;
+            let (h, inject, h_q8) = match &layer.mix {
+                GpuLayerMix::DeltaNet(w) if w.input_mode().is_int8() => hc_mix_with_operand(
+                    &res,
+                    &layer.hc_attn,
+                    eps,
+                    mix_wave.as_ref().map(|g| g.ticket()),
+                )?,
+                _ => {
+                    let (h, inject) = hc_mix(
+                        &res,
+                        &layer.hc_attn,
+                        eps,
+                        mix_wave.as_ref().map(|g| g.ticket()),
+                    )?;
+                    (h, inject, None)
+                }
+            };
             #[cfg(not(feature = "cuda"))]
             let (h, inject) = hc_mix(&res, &layer.hc_attn, eps, None)?;
             let inject = inject.expect("layer HC modules carry an inject");
@@ -2955,7 +3026,10 @@ impl Qwen4ExpBatched {
                 probe(site("q4e.hc_mix.inject.L", li), &inject);
             }
 
-            let y = match &layer.mix {
+            // The mixer's block output for a combine over every row, or `None`
+            // when the mixer has already combined each of its row groups into
+            // its own rows of the residual.
+            let y: Option<LiveTensor<'_>> = match &layer.mix {
                 GpuLayerMix::DeltaNet(w) => {
                     // This layer's ordinal among the recurrent layers — the
                     // axis the stash is indexed on, and the same order
@@ -2991,13 +3065,34 @@ impl Qwen4ExpBatched {
                             stash,
                         });
                     }
+                    let acts = match h_q8 {
+                        Some(op) if op.sum_scale == w.input_sum_scale() => {
+                            DynamicActs::Int8(op.with_lead(vec![total_rows]))
+                        }
+                        Some(op) => candle::bail!(
+                            "layer {li}: the hyper-connection mix quantized under {:?} but the \
+                             DeltaNet projections read {:?} — the operand would be the wrong \
+                             bytes for them",
+                            op.sum_scale,
+                            w.input_sum_scale()
+                        ),
+                        None => DynamicActs::Float(h.clone()),
+                    };
+                    #[cfg(feature = "cuda")]
+                    let layer_table = match &dn_table {
+                        Some(t) => Some(t.layer_slice(li)?),
+                        None => None,
+                    };
+                    #[cfg(not(feature = "cuda"))]
+                    let layer_table = None;
                     let mixed = quantized_delta_net_layer_forward_spans(
-                        &h.clone(),
+                        &acts,
+                        h.dtype(),
                         w,
                         &cfg.delta_net,
                         &mut seqs,
                         eps,
-                        None,
+                        layer_table.as_ref(),
                         ZGate::Sigmoid,
                         #[cfg(feature = "cuda")]
                         mix_wave.as_ref(),
@@ -3012,7 +3107,7 @@ impl Qwen4ExpBatched {
                     if let Some(c) = cap_map.as_mut() {
                         c.delta.filled[ord] = true;
                     }
-                    mixed
+                    Some(mixed)
                 }
                 GpuLayerMix::Attention {
                     w,
@@ -3084,19 +3179,25 @@ impl Qwen4ExpBatched {
                     // `'static` while the provenance they inherit from `h` puts
                     // them on the span regardless, which is a lifetime the
                     // compiler cannot police.
-                    let mut parts: Vec<LiveTensor<'_>> = Vec::with_capacity(2);
+                    //
+                    // Each group's output is combined straight into its own row
+                    // range of the residual (`hc_combine` takes a row view), so a
+                    // mixed wave never concatenates the two (hot-path invariant
+                    // 2). The groups read `h`, never `res`, so combining the
+                    // decode rows before the prefill group runs changes nothing
+                    // it sees.
                     let mut cache_refs: Vec<&mut KvCache> = contexts
                         .iter_mut()
                         .map(|c| &mut c.kv_caches.caches[kv])
                         .collect();
                     let (dec_c, pre_c) = cache_refs.split_at_mut(n_decode);
                     if n_decode > 0 {
+                        // A row range of `h` is dense, so the group reads it in place.
                         let x_g = TensorCat::from_cat_tensor(
-                            h.narrow(0, 0, n_decode)?
-                                .reshape((n_decode, 1, n_embd))?
-                                .contiguous()?,
+                            h.narrow(0, 0, n_decode)?.reshape((n_decode, 1, n_embd))?,
                             0,
                         )?;
+                        expect_dense_view(x_g.as_cat_tensor(), "q4e decode attention rows")?;
                         // The whole attention block, not just its kernel.
                         // `decode:kernel` and `prefill:kernel` are reported by the
                         // kernel wrappers themselves, so the projections, rope, KV
@@ -3116,15 +3217,26 @@ impl Qwen4ExpBatched {
                             mix_wave.as_ref(),
                         )?;
                         g_attn.end();
-                        parts.push(out.reshape((n_decode, n_embd))?);
+                        combine_rows(
+                            &mut res,
+                            &out.reshape((n_decode, n_embd))?,
+                            &inject,
+                            0,
+                            n_decode,
+                            dev,
+                        )?;
+                        #[cfg(feature = "tensor-assert")]
+                        probe(site("q4e.mix.y.L", li), &out);
                     }
                     if pre_rows > 0 {
                         let x_g = TensorCat::from_cat_tensor(
                             h.narrow(0, n_decode, pre_rows)?
-                                .reshape((1, pre_rows, n_embd))?
-                                .contiguous()?,
+                                .reshape((1, pre_rows, n_embd))?,
                             0,
                         )?;
+                        // Starts at row `n_decode` of `h`; the projections
+                        // address it from its own first element.
+                        expect_dense_view(x_g.as_cat_tensor(), "q4e prefill attention rows")?;
                         let g_attn = crate::models::profile::gpu_span("q4e:attn_prefill", dev);
                         let out = forward_attn_batched(
                             &alayer,
@@ -3137,28 +3249,25 @@ impl Qwen4ExpBatched {
                             mix_wave.as_ref(),
                         )?;
                         g_attn.end();
-                        parts.push(out.reshape((pre_rows, n_embd))?);
+                        combine_rows(
+                            &mut res,
+                            &out.reshape((pre_rows, n_embd))?,
+                            &inject,
+                            n_decode,
+                            pre_rows,
+                            dev,
+                        )?;
+                        #[cfg(feature = "tensor-assert")]
+                        probe(site("q4e.mix.y.L", li), &out);
                     }
-                    if parts.len() == 1 {
-                        parts.pop().unwrap()
-                    } else {
-                        // `LiveTensor::cat`, not `Tensor::cat`. `Tensor` is
-                        // `LiveTensor<'static>`, so spelling it that way makes
-                        // the bound `AsRef<LiveTensor<'static>>` and forces the
-                        // elements to `'static` — the `Vec<LiveTensor<'_>>`
-                        // above becomes an inert annotation, and `cat` then
-                        // allocates the concatenation on the ticket it inherits
-                        // from `parts[0]` under a same-generation premise the
-                        // call site is no longer supplying.
-                        LiveTensor::cat(&parts, 0)?
-                    }
+                    None
                 }
             };
-            #[cfg(feature = "tensor-assert")]
-            probe(site("q4e.mix.y.L", li), &y);
-            let g_comb = crate::models::profile::gpu_span("q4e:gr_combine", dev);
-            hc_combine(&mut res, &y, &inject)?;
-            g_comb.end();
+            if let Some(y) = y {
+                #[cfg(feature = "tensor-assert")]
+                probe(site("q4e.mix.y.L", li), &y);
+                combine_rows(&mut res, &y, &inject, 0, total_rows, dev)?;
+            }
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.post_mix.res.L", li), &res);
             // The mixer's span is done with: `res` is the residual, which lives
@@ -3182,15 +3291,14 @@ impl Qwen4ExpBatched {
                 _ => None,
             };
             let g_pre2 = crate::models::profile::gpu_span("q4e:gr_pre_ffn", dev);
-            #[cfg(feature = "cuda")]
-            let (h2, inject2) = hc_mix(
+            // The FFN's input arrives already quantized when the module runs int8:
+            // the collapse writes the operand as it stores `h2`.
+            let (h2, inject2, h2_q8) = hc_mix_with_operand(
                 &res,
                 &layer.hc_ffn,
                 eps,
                 ffn_wave.as_ref().map(|g| g.ticket()),
             )?;
-            #[cfg(not(feature = "cuda"))]
-            let (h2, inject2) = hc_mix(&res, &layer.hc_ffn, eps, None)?;
             let inject2 = inject2.expect("layer HC modules carry an inject");
             g_pre2.end();
             let candle::Device::Cuda(cuda) = dev else {
@@ -3218,12 +3326,16 @@ impl Qwen4ExpBatched {
             // Raw Σx — a language model's block sums stay far below f16's
             // ceiling.
             let g_acts = crate::models::profile::gpu_span("q4e:moe_acts", dev);
-            let acts = to_dynamic(
-                &h2_3d,
-                m.lm_head.int8mode(),
-                cuda,
-                candle::quantized::SumScale::Raw,
-            )?;
+            let acts = match h2_q8 {
+                // The mix's own operand, at the flat layout's leading dims.
+                Some(op) => DynamicActs::Int8(op.with_lead(vec![1, total_rows])),
+                None => to_dynamic(
+                    &h2_3d,
+                    m.lm_head.int8mode(),
+                    cuda,
+                    candle::quantized::SumScale::Raw,
+                )?,
+            };
             g_acts.end();
             #[cfg(feature = "tensor-assert")]
             {
@@ -3252,15 +3364,18 @@ impl Qwen4ExpBatched {
             // the profile's largest row a measure of the queue rather than of the
             // readback, and left the work that filled the queue unattributed.
             let g_moe = crate::models::profile::gpu_span("q4e:moe_routed", dev);
-            let y2 = layer
+            // The layer's output in its three parts: the shared expert's gate is
+            // applied by the combine below, which reads the block output anyway,
+            // rather than by three launches of its own.
+            let parts = layer
                 .moe
-                .forward_dynamic(acts, DType::F32, n_decode, moe_wave)?
-                .reshape((total_rows, n_embd))?;
+                .forward_parts(acts, DType::F32, n_decode, moe_wave)?;
+            let routed = parts.routed.reshape((total_rows, n_embd))?;
             g_moe.end();
             #[cfg(feature = "tensor-assert")]
-            probe(site("q4e.moe.y2.L", li), &y2);
+            probe(site("q4e.moe.routed.L", li), &routed);
             let g_comb2 = crate::models::profile::gpu_span("q4e:gr_combine_ffn", dev);
-            hc_combine(&mut res, &y2, &inject2)?;
+            hc_combine_gated(&mut res, &routed, &parts.shared, &inject2)?;
             g_comb2.end();
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.post_moe.res.L", li), &res);
@@ -3365,12 +3480,7 @@ impl Qwen4ExpBatched {
         // scored rows (`WaveBuffer::HyperHead*`). The selected residual comes
         // off the pool, as the residual itself does.
         let r_total = sel.len();
-        let scored_res = if r_total == total_rows {
-            res
-        } else {
-            let idx = Tensor::from_vec(sel, r_total, dev)?;
-            res.index_select(&idx, 0)?
-        };
+        let scored_res = select_head_rows(&res, sel, 0)?;
         let (scored, _) = hc_mix(&scored_res, &m.out_hc, eps, fwd_ticket)?;
         let acts = {
             let candle::Device::Cuda(cuda) = dev else {
@@ -3386,7 +3496,6 @@ impl Qwen4ExpBatched {
         let logits = m
             .lm_head
             .forward_dynamic(acts.as_dynamic(), DType::F32)?
-            .to_owned_tensor()?
             .reshape((r_total, cfg.vocab_size))?;
         // Keeping the session's per-layer lengths in step after the head is
         // the DRIVER's job (the default advance hook) — nothing more here.
@@ -3395,6 +3504,28 @@ impl Qwen4ExpBatched {
             None,
         ))
     }
+}
+
+/// `hc_combine` over rows `[start, start + len)` of the residual: the block
+/// output covers exactly those rows, and the combine writes them in place
+/// through a row view, reading the matching rows of `inject`.
+fn combine_rows(
+    res: &mut Tensor,
+    block_out: &LiveTensor<'_>,
+    inject: &Tensor,
+    start: usize,
+    len: usize,
+    dev: &Device,
+) -> Result<()> {
+    let g_comb = crate::models::profile::gpu_span("q4e:gr_combine", dev);
+    if start == 0 && len == res.dim(0)? {
+        hc_combine(res, block_out, inject)?;
+    } else {
+        let mut rows = res.narrow(0, start, len)?;
+        hc_combine(&mut rows, block_out, &inject.narrow(0, start, len)?)?;
+    }
+    g_comb.end();
+    Ok(())
 }
 
 /// The KV-cache index of attention layer `li` (three quarters of the trunk
@@ -3407,18 +3538,4 @@ fn kv_index(kinds: &[LayerKind], li: usize) -> Result<usize> {
         .iter()
         .filter(|k| matches!(k, LayerKind::Attention))
         .count())
-}
-
-/// The token segment of `seq` in this wave.
-fn seq_tokens_of(
-    spans: &[crate::models::delta_net::SeqSpan],
-    seq_tokens: &[Vec<u32>],
-    seq: usize,
-) -> Result<Vec<u32>> {
-    for (span, toks) in spans.iter().zip(seq_tokens) {
-        if span.seq == seq {
-            return Ok(toks.clone());
-        }
-    }
-    candle::bail!("sequence {seq} has no token segment in this wave")
 }

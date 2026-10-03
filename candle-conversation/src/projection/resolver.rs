@@ -4330,28 +4330,44 @@ impl Conversation {
                 //    substrate lock is released, so decode's in-RAM projection
                 //    proceeds during the read + re-append + fsync. The scheduler's
                 //    seal writes and cold loads DO share this persistence lock, so
-                //    the lock is taken per batch: the resident re-emit, then the
-                //    chunks `RELOCATION_BATCH_BYTES` at a time, then the small
-                //    record types — each its own hold. A cold load that arrives
-                //    mid-relocation waits for one batch. Held across the whole
-                //    relocation it waited for all of it: a 3.6 GB segment stalled
-                //    an elevate — and the decode behind it — for 37 s.
+                //    the lock is taken per batch: the resident re-emit and then the
+                //    chunks, `RELOCATION_BATCH_BYTES` at a time, then the small
+                //    record types — each its own hold. A seal write or cold load
+                //    that arrives mid-op waits for one batch. Held across a whole
+                //    phase it waited for all of it: a 3.6 GB segment's chunks
+                //    stalled an elevate — and the decode behind it — for 37 s, and
+                //    a ~35,700-record re-emit held every finishing turn's token
+                //    write for 44–52 s.
                 //
                 //    Only the time the lock is actually held is charged to the
                 //    scheduler's Sync bucket.
                 let t_exec = Instant::now();
                 let mut held = Duration::ZERO;
+                let mut batches = 0u32;
+                let mut longest = Duration::ZERO;
                 let mut run = self.maintenance_hold(&mut held, |p| p.begin_maintenance(&plan))?;
-                while self.maintenance_hold(&mut held, |p| {
-                    p.relocate_chunk_batch(&plan, &mut run, RELOCATION_BATCH_BYTES)
-                })? {}
+                loop {
+                    let before = held;
+                    let more = self.maintenance_hold(&mut held, |p| {
+                        p.relocate_batch(&plan, &mut run, RELOCATION_BATCH_BYTES)
+                    })?;
+                    batches += 1;
+                    longest = longest.max(held - before);
+                    if !more {
+                        break;
+                    }
+                }
                 let result =
                     self.maintenance_hold(&mut held, |p| p.complete_maintenance(&plan, run))?;
                 note_persistence_maint_us(held.as_micros() as u64);
+                // `longest_hold_ms` is what a finishing turn can wait behind
+                // maintenance; it is the figure to watch, not `held_ms`.
                 tracing::debug!(
                     target: "candle_conversation::persistence::maintenance",
                     exec_ms = t_exec.elapsed().as_millis() as u64,
                     held_ms = held.as_millis() as u64,
+                    batches,
+                    longest_hold_ms = longest.as_millis() as u64,
                     "segment-maintenance relocation: the persistence lock was held for \
                      held_ms of exec_ms, one batch at a time"
                 );

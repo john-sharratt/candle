@@ -629,6 +629,10 @@ impl super::backing::ChunkedKvBacking {
         // pass would clip having moved nothing, and the harder the device was working
         // the more completely compaction would stop.
         let started = Instant::now();
+        // From the census to the end of the sweep: a slot freed on another thread
+        // inside this window is what the report's gaps are made of.
+        #[cfg(feature = "tensor-assert")]
+        let window = super::release_watch::PassWindow::open();
 
         let frontier_before = self.frontier_regions().ok_or(CompactionRefused::NoDevice)?;
 
@@ -981,6 +985,19 @@ impl super::backing::ChunkedKvBacking {
         // by hand and a new holder nobody sweeps is otherwise invisible: a rising
         // reading is how one is discovered.
         report.unwitnessed = sweep_state.unwitnessed(&map).len();
+        #[cfg(feature = "tensor-assert")]
+        {
+            let foreign = window.foreign();
+            if foreign != 0 {
+                tracing::warn!(
+                    target: "candle_nn::kv_cache::compact",
+                    foreign,
+                    unwitnessed = report.unwitnessed,
+                    source_collisions = report.source_collisions,
+                    "chunk slots were freed on other threads inside this pass",
+                );
+            }
+        }
         if report.unwitnessed != 0 {
             tracing::error!(
                 target: "candle_nn::kv_cache::compact",

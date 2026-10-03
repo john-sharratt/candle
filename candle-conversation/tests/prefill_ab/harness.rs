@@ -426,6 +426,35 @@ pub fn build_case(spec: &Scenario, device: &Device) -> Result<BuiltCase> {
     })
 }
 
+/// Every sequence's sealed prefix as the kernel reads it — the arena bytes,
+/// dequantized — in the golden's `[t][N_KV_HEAD][HEAD_DIM]` host layout.
+pub fn dequantized_prefix(case: &BuiltCase) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let to_host = |t: Tensor, len: usize| -> Result<Vec<f32>> {
+        // (1, n_kv, len, hd) → (len, n_kv, hd).
+        t.squeeze(0)?
+            .transpose(0, 1)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+            .inspect(|v| {
+                debug_assert_eq!(v.len(), len * N_KV_HEAD * HEAD_DIM);
+            })
+    };
+    let (mut ks, mut vs) = (Vec::new(), Vec::new());
+    for (si, seq) in case.spec.seqs.iter().enumerate() {
+        let len = seq.prefix_len();
+        if len == 0 {
+            ks.push(Vec::new());
+            vs.push(Vec::new());
+            continue;
+        }
+        let (k, v) = case.backing.read_contiguous(si, 0, len)?;
+        ks.push(to_host(k, len)?);
+        vs.push(to_host(v, len)?);
+    }
+    Ok((ks, vs))
+}
+
 /// Rewind every slot to its sealed prefix, discarding the chunks a prior
 /// kernel run appended for its new tokens. Sealed prefix chunks are
 /// immutable (a partial sealed tail is a gap, never a write target), so

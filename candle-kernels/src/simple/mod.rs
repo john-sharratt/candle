@@ -43,6 +43,9 @@ pub mod scatter_op;
 // Fused MoE gather and weighted scatter-add kernels
 pub mod moe_bucketize;
 pub mod moe_scatter;
+// A gated shared expert's MoE output folded into the residual: sigmoid, multiply,
+// add and residual add in one launch
+pub mod moe_shared_residual;
 
 // Fused MoE router epilogue: score → +bias → top-k → normalize in one launch
 pub mod router_topk;

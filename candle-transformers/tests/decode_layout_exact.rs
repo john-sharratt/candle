@@ -521,12 +521,17 @@ fn assert_layout(a: &KvCache, b: &KvCache, total: usize, segments: &[usize], nam
     assert_eq!(ub, segments, "[{name}] slot B layout");
 }
 
+/// Flat-packed `[total, n_head, head_dim]` at the cache's F16: the prefill kernel
+/// validates its operand widths rather than converting them (hot-path invariant
+/// 1b), so the harness hands it what a projection would.
 fn flatten(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-    Ok((
-        q.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-        k.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-        v.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-    ))
+    let flat = |t: &Tensor| -> Result<Tensor> {
+        t.transpose(1, 2)?
+            .squeeze(0)?
+            .to_dtype(DType::F16)?
+            .contiguous()
+    };
+    Ok((flat(q)?, flat(k)?, flat(v)?))
 }
 
 fn run_prefill(

@@ -31,6 +31,7 @@
 use candle::{DType, IndexOp, Result, Tensor, D};
 use tokenizers::Tokenizer;
 
+use super::greedy::{greedy_rows, greedy_token};
 use super::long_context::padding_prose;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult,
@@ -214,7 +215,7 @@ pub fn read_answer<M: ManagedBatchedModel>(
     for (i, &want) in answer.iter().enumerate() {
         let lp = candle_nn::ops::log_softmax(&logits, D::Minus1)?;
         nll -= lp.i(want as usize)?.to_scalar::<f32>()? as f64;
-        greedy.push(logits.argmax(D::Minus1)?.to_scalar::<u32>()?);
+        greedy.push(greedy_token(&logits)?);
         if i + 1 < answer.len() {
             logits = decode_wave(model, session, &[seq], &[want])?.remove(0);
         }
@@ -261,15 +262,15 @@ pub fn greedy_together<M: ManagedBatchedModel>(
         let s = session.create_sequence()?;
         rungs.push(session.rope_rung_for(p.len() + n)?);
         let l = prefill(model, &mut session, s, p)?;
-        next.push(l.argmax(D::Minus1)?.to_scalar::<u32>()?);
+        next.push(greedy_token(&l)?);
         seqs.push(s);
     }
     let mut out: Vec<Vec<u32>> = next.iter().map(|&t| vec![t]).collect();
     for _ in 1..n {
         let logits = decode_wave(model, &mut session, &seqs, &next)?;
-        for (i, l) in logits.iter().enumerate() {
-            next[i] = l.argmax(D::Minus1)?.to_scalar::<u32>()?;
-            out[i].push(next[i]);
+        next = greedy_rows(&logits.iter().collect::<Vec<_>>())?;
+        for (i, &t) in next.iter().enumerate() {
+            out[i].push(t);
         }
     }
     for s in seqs {

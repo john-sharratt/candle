@@ -44,6 +44,7 @@ use candle::{Device, Result, Tensor};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use tokenizers::Tokenizer;
 
+use super::greedy::greedy_rows;
 use crate::models::batched_inference::{BatchedConfig, InferenceMode, ManagedBatchedModel};
 
 /// Where to load samples from for [`run_ruler_benchmark`].
@@ -647,14 +648,14 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
     let mut generated: Vec<Vec<u32>> = vec![Vec::with_capacity(max_gen_tokens); n];
     let mut done: Vec<bool> = vec![false; n];
 
-    let mut current_tokens: Vec<u32> = last_logits
+    let seed_rows: Vec<&Tensor> = last_logits
         .iter()
         .map(|lo| {
             lo.as_ref()
-                .map(|l| argmax(l))
-                .unwrap_or(Err(candle::Error::Msg("no prefill logits".into())))
+                .ok_or_else(|| candle::Error::Msg("no prefill logits".into()))
         })
         .collect::<Result<_>>()?;
+    let mut current_tokens: Vec<u32> = greedy_rows(&seed_rows)?;
 
     for _step in 0..max_gen_tokens {
         // Mark EOS.
@@ -698,8 +699,9 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
         for &seq_idx in &active_seqs {
             session.advance_sequence(seq_idx, 1)?;
         }
-        for (orig_i, logits) in active.iter().zip(logits_vec.iter()) {
-            current_tokens[*orig_i] = argmax(logits)?;
+        let picked = greedy_rows(&logits_vec.iter().collect::<Vec<_>>())?;
+        for (orig_i, token) in active.iter().zip(picked) {
+            current_tokens[*orig_i] = token;
         }
     }
 
@@ -728,11 +730,6 @@ pub fn run_ruler_eval<M: ManagedBatchedModel>(
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
-
-fn argmax(logits: &Tensor) -> Result<u32> {
-    let logits = logits.squeeze(0)?;
-    logits.argmax(candle::D::Minus1)?.to_scalar::<u32>()
-}
 
 /// Find the next valid UTF-8 char boundary at or after `pos` in `s`.
 /// Stable alternative to the unstable `str::ceil_char_boundary`.

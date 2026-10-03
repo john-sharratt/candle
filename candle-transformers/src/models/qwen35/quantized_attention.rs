@@ -20,7 +20,9 @@ use candle::{DType, LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 
 use super::quantized_weights::{QuantFfn, QuantLayer};
-use crate::models::batched_layer::{BatchedAttentionLayer, QkvProjection, WaveRef};
+use crate::models::batched_layer::{
+    add_ffn_residual, BatchedAttentionLayer, QkvProjection, WaveRef,
+};
 use crate::models::lora::{adapt, LayerLora};
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::rotary_layout::RotaryLayout;
@@ -133,25 +135,22 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
     }
 
     #[cfg(feature = "cuda")]
-    fn ffn_forward<'w>(
+    fn ffn_residual<'w>(
         &self,
+        x: &mut Tensor,
         acts: DynamicActs<'w>,
         work_dtype: DType,
-        out_dtype: DType,
         decode_tokens: usize,
         wave: Option<&'w WaveGeneration>,
-    ) -> Result<LiveTensor<'w>> {
+    ) -> Result<()> {
         match &self.layer.ffn {
             QuantFfn::Dense(m) => {
-                m.forward_dynamic_adapted(&acts, work_dtype, out_dtype, self.lora)
+                let h = m.forward_dynamic_adapted(&acts, work_dtype, x.dtype(), self.lora)?;
+                add_ffn_residual(x, &h)
             }
-            // See the qwen3-MoE arm: the shared+routed combine writes the width
-            // its experts ran in, so this path narrows on return.
-            QuantFfn::Moe(m) => {
-                let mut out = m.forward_dynamic(acts, work_dtype, decode_tokens, wave)?;
-                out.to_dtype_mut(out_dtype)?;
-                Ok(out)
-            }
+            // The shared+routed combine, its narrowing and the residual add are
+            // one launch.
+            QuantFfn::Moe(m) => m.forward_residual(x, acts, work_dtype, decode_tokens, wave),
         }
     }
 

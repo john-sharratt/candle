@@ -490,10 +490,50 @@ impl Scheduler {
         // the accept walk below commits exactly one token each — so there is no
         // second, plain decode path to drift out of step with this one.
         let t_fwd = std::time::Instant::now();
-        // The model's own measured width ladder: how far it is worth drafting
-        // shrinks as the wave widens, and where it stops paying depends on the
-        // checkpoint's shape rather than on anything the scheduler knows.
-        let budget = self.model.draft_budget(seq_ids.len());
+        // Who drafts, and where each block stops — see `BlockGuard`. Free decode
+        // drafts, and so does a grammar inside a free-text span (a think block,
+        // a tool-call value): nothing is masked there, so the proposals are
+        // judged under exactly the rules a plain step applies, and the block
+        // stops at the token that leaves the span. A grammar at a branch, a
+        // static run or its exit takes a plain row: its next token is
+        // constrained or written, and there is nothing to speculate about.
+        //
+        // So does a replayed turn: its next token is its recording's, so there
+        // is nothing to propose.
+        let mut guards: Vec<Option<BlockGuard>> = seq_ids
+            .iter()
+            .map(|id| {
+                // Every id here was read from `active_decodes` above.
+                let s = &self.active_decodes[id];
+                if s.recorded_reply.is_some() {
+                    return None;
+                }
+                BlockGuard::for_step(
+                    s.stencil.as_ref(),
+                    s.pending_mask.as_ref(),
+                    &s.triggers,
+                    s.generated_tokens.last().copied(),
+                )
+            })
+            .collect();
+        // The model's own measured width ladder is the CEILING: how far it is
+        // worth drafting shrinks as the wave widens, and where it stops paying
+        // depends on the checkpoint's shape rather than on anything the
+        // scheduler knows. Each turn drafts one past its own acceptance under
+        // it, and the drafter walks the cohort to the deepest of them. A turn
+        // its guard keeps to a plain row drafts nothing and must not set that
+        // depth, or one such turn keeps the whole wave drafting at the ceiling
+        // for proposals that are all thrown away.
+        let ceiling = self.model.draft_budget(seq_ids.len());
+        let depths: Vec<usize> = seq_ids
+            .iter()
+            .zip(&guards)
+            .map(|(id, guard)| match guard {
+                Some(_) => self.active_decodes[id].draft_depth.budget(ceiling),
+                None => 0,
+            })
+            .collect();
+        let budget = depths.iter().copied().max().unwrap_or(0);
         let draft_span = profile::span("decode:draft");
         let mut drafts = match self.model.speculative_draft(
             &mut self.session,
@@ -518,35 +558,10 @@ impl Scheduler {
             );
             return;
         }
-        // Who drafts, and where each block stops — see `BlockGuard`. Free decode
-        // drafts, and so does a grammar inside a free-text span (a think block,
-        // a tool-call value): nothing is masked there, so the proposals are
-        // judged under exactly the rules a plain step applies, and the block
-        // stops at the token that leaves the span. A grammar at a branch, a
-        // static run or its exit takes a plain row: its next token is
-        // constrained or written, and there is nothing to speculate about.
-        //
-        // So does a replayed turn: its next token is its recording's, so there
-        // is nothing to propose.
-        let mut guards: Vec<Option<BlockGuard>> = seq_ids
-            .iter()
-            .map(|id| {
-                let s = &self.active_decodes[id];
-                if s.recorded_reply.is_some() {
-                    return None;
-                }
-                BlockGuard::for_step(
-                    s.stencil.as_ref(),
-                    s.pending_mask.as_ref(),
-                    &s.triggers,
-                    s.generated_tokens.last().copied(),
-                )
-            })
-            .collect();
-        for (i, guard) in guards.iter().enumerate() {
-            if guard.is_none() {
-                drafts[i].clear();
-            }
+        // The drafter walks the cohort to the deepest turn's depth; each turn
+        // keeps only its own, and one its guard keeps to a plain row keeps none.
+        for (draft, &depth) in drafts.iter_mut().zip(&depths) {
+            draft.truncate(depth);
         }
 
         // A block is the sequence's committed token followed by its proposals.
@@ -801,6 +816,9 @@ impl Scheduler {
             let tokenizer = &self.tokenizer;
             let mut walk = AcceptWalk::new(&blocks);
             let mut failure = None;
+            // Whether each block was stopped by a rule (EOS, the turn's room,
+            // its guard) rather than by a rejected proposal.
+            let mut ruled = vec![false; blocks.len()];
             while !walk.finished() {
                 let rows = walk.rows();
                 let picked: Vec<Tensor> = walk
@@ -828,7 +846,7 @@ impl Scheduler {
                 // position anyway.
                 if let Err(e) = walk.commit(&tokens, |i, t| {
                     emitted[i].push(t);
-                    !eos.contains(&t)
+                    let goes_on = !eos.contains(&t)
                         && emitted[i].len() < room[i]
                         && guards[i].as_mut().is_some_and(|g| {
                             let bytes = || {
@@ -838,7 +856,9 @@ impl Scheduler {
                                     .unwrap_or_default()
                             };
                             g.continues_after(t, bytes, breaks)
-                        })
+                        });
+                    ruled[i] |= !goes_on;
+                    goes_on
                 }) {
                     failure = Some(e);
                     break;
@@ -846,14 +866,29 @@ impl Scheduler {
             }
             match failure {
                 Some(e) => Err(e),
-                None => Ok(walk.finish()),
+                None => Ok((walk.finish(), ruled)),
             }
         };
         let kept = match walked {
             // The walk's next-seed is not read here: the scheduler takes each
             // step's input from `generated_tokens.last()`, which the commit
             // below fills, so a second copy of it could only disagree.
-            Ok((_, kept)) => kept,
+            Ok(((_, kept), ruled)) => {
+                // What the walk kept sets the depth the next step drafts at —
+                // when it measured the drafter. A block a rule cut short (a
+                // span's exit, a trigger, a page break, EOS, the turn's room)
+                // says how far the grammar let it run, not how far the
+                // proposals held, so it is recorded only if it kept everything.
+                for (i, id) in seq_ids.iter().enumerate() {
+                    if ruled[i] && kept[i] < blocks[i].len() {
+                        continue;
+                    }
+                    if let Some(s) = self.active_decodes.get_mut(id) {
+                        s.draft_depth.record(blocks[i].len() - 1, kept[i]);
+                    }
+                }
+                kept
+            }
             Err(e) => {
                 for (id, state) in state_ids.into_iter().zip(chooser.into_states()) {
                     self.sampling_states.insert(id, state);

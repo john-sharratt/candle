@@ -611,13 +611,19 @@ fn bind_kv_cache(backing: &ChunkedKvBacking, batch_idx: usize) -> Result<KvCache
 }
 
 /// Flatten `make_qkv`'s `[1, n_head, n_tokens, head_dim]` into the FLAT-packed
-/// `[total, n_head, head_dim]` the ragged prefill wants.
+/// `[total, n_head, head_dim]` the ragged prefill wants, at the cache's F16.
+///
+/// The prefill kernel validates its operand widths rather than converting them
+/// (hot-path invariant 1b): a projection hands it the cache's compute dtype, so
+/// the harness — standing in for the projection — must too.
 fn flatten_qkv(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-    Ok((
-        q.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-        k.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-        v.transpose(1, 2)?.squeeze(0)?.contiguous()?,
-    ))
+    let flat = |t: &Tensor| -> Result<Tensor> {
+        t.transpose(1, 2)?
+            .squeeze(0)?
+            .to_dtype(DType::F16)?
+            .contiguous()
+    };
+    Ok((flat(q)?, flat(k)?, flat(v)?))
 }
 
 #[allow(clippy::too_many_arguments)]

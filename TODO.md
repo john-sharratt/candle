@@ -9,9 +9,8 @@
   session runs.
 - [ ] **Tune decode performance.** Inference decode runs at about half the speed
   it should.
-- [ ] **Turns don't finish while the substrate is compacting.** A turn finishes
-  decoding but does not complete until compaction ends — probably its persist
-  blocking on a lock compaction holds. Find the lock and stop compaction from
-  holding it across the whole pass.
+- [x] **Turns don't finish while the substrate is compacting.** The resident
+  re-emit held the persistence lock for 44–52 s in one hold; it now runs in
+  `RELOCATION_BATCH_BYTES` batches like the chunk relocation.
 - [ ] **Test from machines other than the one running zend.** Ask the user
   about the setup before writing any code for this.

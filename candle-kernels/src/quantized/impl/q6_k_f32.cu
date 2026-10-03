@@ -66,6 +66,10 @@ INSTANTIATE_KERNEL_DENSE_INT8_M2_ALL(
     q6_ko_int8,
     QK6_K_K128, QI6_K_K128, block_c_q6_KO, VDR_Q6_K_K128
 )
+INSTANTIATE_KERNEL_DENSE_INT8_SK_ALL(
+    q6_ko_int8,
+    QK6_K_K128, QI6_K_K128, block_c_q6_KO, VDR_Q6_K_K128
+)
 
 // =============================================================================
 // MARLIN TENSOR CORE KERNEL - Q6_K + F32
