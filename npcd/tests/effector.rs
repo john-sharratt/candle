@@ -124,8 +124,8 @@ fn place_where(rt: &Arc<Runtime>, npc_id: u64, at: Where) {
 
 /// Drive the assembled `local` router over the socket with any method and an
 /// optional JSON body, as `(status, body)` — what an external client sends, and
-/// the one way to reach `OPTIONS`, which the fast path's `query`/`invoke` do not
-/// spell.
+/// the one way to reach `GET` and `OPTIONS`, which the fast path's `invoke` does
+/// not spell.
 async fn request(
     rt: &Arc<Runtime>,
     tokens: &Arc<Tokens>,
@@ -242,22 +242,6 @@ async fn a_body_at_a_landing_is_offered_the_lift() {
             "http://local/lift/command-shaft",
         ]
     );
-}
-
-/// The fast path answers exactly what the socket does — it is the same service
-/// invoked without a network (effector design §8.1), so a `oneshot` test *is* a
-/// fast-path call minus the decode.
-#[tokio::test]
-async fn the_fast_path_answers_the_same_as_the_socket() {
-    let (rt, tokens) = daemon();
-    place(&rt, 3, "band-one");
-
-    let over_socket = near_you(&rt, &tokens, 3).await.1;
-    let in_process = rt
-        .effector_query(3, "/", None)
-        .await
-        .expect("the fast path answers");
-    assert_eq!(in_process, over_socket);
 }
 
 /// **The device surface never honours the gateway's headers.** A request
@@ -427,17 +411,16 @@ async fn a_body_at_the_command_table_is_offered_its_mission_verb_with_an_empty_b
 }
 
 /// **Every address a body is offered is one the router answers.** A body is stood
-/// at every place in the vault and each `query` address its grammar would let it
-/// name is read through the fast path: none may `404`. Every `invoke` address
-/// must lie under one of those readable resources, so a character can never be
-/// handed an address the router has no route for — the seat, blast door and wall
-/// turret all stand in the vault and afford nothing, so offering them was a `404`
-/// each time.
+/// at every place in the vault and the resource behind each `invoke` address its
+/// grammar would let it name is read over the socket: none may `404`, so a
+/// character can never be handed an address the router has no route for — the
+/// seat, blast door and wall turret all stand in the vault and afford nothing,
+/// so offering them was a `404` each time.
 #[tokio::test]
 async fn every_address_a_body_is_offered_is_served() {
     use npc_map::load::MapSet;
 
-    let (rt, _tokens) = daemon();
+    let (rt, tokens) = daemon();
     let set = MapSet::load_dir(ROOMS).expect("the vault loads");
     let mut offered = 0;
     let mut npc_id = 1000;
@@ -450,20 +433,19 @@ async fn every_address_a_body_is_offered_is_served() {
             npc_id += 1;
             place_where(&rt, npc_id, at.clone());
             let within = rt.within(npc_id);
-            for url in &within.reachable {
-                let path = url.strip_prefix("http://local").expect("a local address");
-                rt.effector_query(npc_id, path, None)
-                    .await
-                    .unwrap_or_else(|e| panic!("{url} offered at {at:?} does not answer: {e}"));
-                offered += 1;
-            }
             for invokable in &within.invokable {
                 let (resource, _) = invokable.url.rsplit_once('/').expect("a verb path");
-                assert!(
-                    within.reachable.iter().any(|u| u == resource),
-                    "{} is offered at {at:?} but {resource} is not a readable resource",
+                let path = resource
+                    .strip_prefix("http://local")
+                    .expect("a local address");
+                let (status, body) = request(&rt, &tokens, npc_id, "GET", path, None).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{} is offered at {at:?} but {resource} does not answer: {body}",
                     invokable.url
                 );
+                offered += 1;
             }
         }
     }
@@ -499,17 +481,15 @@ async fn calling_the_lift_from_a_landing_is_accepted() {
 /// device*: the status that read `here:false` now reads `here:true`, boardable.
 #[tokio::test]
 async fn a_called_lift_arrives_over_ticks_and_the_status_shows_it_boardable() {
-    let (rt, _tokens) = daemon();
+    let (rt, tokens) = daemon();
     let world = rt.hosted.get(WORLD).expect("hosted");
     let landings = shaft(&rt);
     let top = landings.len() - 1;
     place_where(&rt, 7, landings[top].clone());
 
     // The car is elsewhere: the status says it is not boardable here yet.
-    let before = rt
-        .effector_query(7, "/lift/command-shaft", None)
-        .await
-        .expect("the status answers");
+    let (read, before) = request(&rt, &tokens, 7, "GET", "/lift/command-shaft", None).await;
+    assert_eq!(read, StatusCode::OK, "{before}");
     assert_eq!(
         before["here"],
         json!(false),
@@ -538,10 +518,8 @@ async fn a_called_lift_arrives_over_ticks_and_the_status_shows_it_boardable() {
 
     // And the character learns it through the device, not the return value: the
     // near-you status now reports the car boardable at this landing.
-    let after = rt
-        .effector_query(7, "/lift/command-shaft", None)
-        .await
-        .expect("the status answers");
+    let (read, after) = request(&rt, &tokens, 7, "GET", "/lift/command-shaft", None).await;
+    assert_eq!(read, StatusCode::OK, "{after}");
     assert_eq!(
         after["here"],
         json!(true),

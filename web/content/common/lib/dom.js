@@ -42,14 +42,16 @@ export function ago(ms) {
   return Math.floor(s / 86400) + 'd ago';
 }
 
-/* Narrative time reads as day + clock, never as a wall date (§4). */
+/* World time is ms since 1970-01-01 in the world's own calendar, year offset
+   included; it reads as "14 Jun 2187, 14:20", the same form the daemon stamps
+   journals with. */
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 export function worldTime(ms) {
   if (ms == null) return '—';
-  const day = Math.floor(ms / 86400000);
-  const rem = ms % 86400000;
-  const hh = String(Math.floor(rem / 3600000)).padStart(2, '0');
-  const mm = String(Math.floor((rem % 3600000) / 60000)).padStart(2, '0');
-  return `day ${day}, ${hh}:${mm}`;
+  const d = new Date(ms);
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}, ${hh}:${mm}`;
 }
 
 export function truncId(id) {

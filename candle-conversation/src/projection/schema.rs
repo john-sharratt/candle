@@ -1115,7 +1115,7 @@ impl GroupSchema {
         let mut cfg = self.policy.config;
         cfg.budget_min = 0;
         cfg.budget_max = match &self.selection {
-            SelectionRule::TopK { k } => *k,
+            SelectionRule::TopK { k } | SelectionRule::Offered { k, .. } => *k,
             SelectionRule::Single => 1,
             SelectionRule::AlwaysVisible => n_candidates.max(1),
             // Named/Sequence aren't belief-driven, and a working-set group is
@@ -1198,6 +1198,7 @@ impl Default for Budget {
 ///                   ├─ TopK { k }           → k highest-scored above threshold
 ///                   ├─ Single               → 1 highest-scored above threshold
 ///                   ├─ Named { selector }   → the one member named by a runtime selector
+///                   ├─ Offered { selector, k } → k highest-scored of the members a selector names
 ///                   └─ Sequence         → recent-N (inviolate) + top-K historical
 /// ```
 ///
@@ -1236,6 +1237,20 @@ pub enum SelectionRule {
     ///
     /// On a turn group (which has no member names) this selects nothing.
     Named { selector: String },
+
+    /// Collection-only: **what the runtime offers, ranked by provenance.** The
+    /// members the named selector holds are the only candidates — a fact about
+    /// the world, such as the acts a body can take in this room — and the
+    /// belief-driven selection (provenance score, hysteresis, budget) then keeps
+    /// the `k` most relevant of them. A member the selector does not name is
+    /// never shown however well it scores; a named member that scores poorly is
+    /// dropped unless it is `mandatory`, in which case it is shown on every
+    /// projection that offers it.
+    ///
+    /// An unset selector offers nothing, so nothing is shown. The
+    /// forced-member pin ([`FORCE_TOOL_SELECTOR`]) overrides both, as it does
+    /// for `TopK`.
+    Offered { selector: String, k: usize },
 
     /// Composite for the natural shape of an ongoing conversation: the most
     /// recent `recent` turns survive **unconditionally** (no score threshold,

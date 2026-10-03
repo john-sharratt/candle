@@ -46,6 +46,8 @@ use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::engine::event::{Event, EventKind, Salience};
+use crate::engine::journal::section::JournalPrompt;
+use crate::engine::journal::state::{JournalState, Span, Waiting};
 use crate::engine::sleep::{DayAction, DayTracker};
 use crate::engine::window::Window;
 use crate::npcs;
@@ -159,6 +161,10 @@ pub struct Inbox {
     due_at: u64,
     preempted: bool,
     pub window: Window,
+    /// What this character's journal holds and when its next draft is due.
+    /// Shared, because a draft runs on a task of its own, off the character's
+    /// line, and settles its own state when it ends.
+    journal: Arc<Mutex<JournalState>>,
     pub day: DayTracker,
     /// Lifetime counters, for the Pulse view.
     pub ticks: u64,
@@ -206,6 +212,16 @@ pub struct Inbox {
 }
 
 impl Inbox {
+    /// Begin a draft over the turns not yet written about, whether or not one
+    /// is due. `None` while one is running or when nothing is new.
+    fn begin_draft(&mut self) -> Option<Due> {
+        let span = self.journal.lock().unwrap().begin(&self.window)?;
+        Some(Due {
+            state: Arc::clone(&self.journal),
+            span,
+        })
+    }
+
     pub fn new(npc_id: u64) -> Self {
         Self {
             npc_id,
@@ -215,6 +231,7 @@ impl Inbox {
             due_at: 0,
             preempted: false,
             window: Window::with_default_cap(),
+            journal: Arc::new(Mutex::new(JournalState::new(npc_id))),
             day: DayTracker::new(),
             ticks: 0,
             events_seen: 0,
@@ -300,6 +317,7 @@ impl Inbox {
                 | EventKind::Announcement { .. }
                 | EventKind::Entity { .. }
                 | EventKind::Operator { .. }
+                | EventKind::MindControl { .. }
                 | EventKind::Wake { .. }
                 | EventKind::Sleep { .. }
         )
@@ -377,13 +395,15 @@ impl Inbox {
     /// Accept an event. Never refuses: the mind design is explicit that a filter
     /// dropping evidence before it lands makes a delusion permanent.
     ///
-    /// **Every arrival is a wake.** Nothing polls, so an event that does not
-    /// rouse the character's task is an event nobody ever reads — it would sit
-    /// in the queue until something louder happened to arrive behind it. The
-    /// salience still decides how *urgently* the character reads it
-    /// (`readiness` keeps the Pulse feed's "why did it wake" column); a
-    /// character mid-think elsewhere simply finds the wake stored on its waker
-    /// when it comes back.
+    /// **Every arrival that asks something is a wake.** Nothing polls, so an
+    /// event that does not rouse the character's task is an event nobody ever
+    /// reads — it would sit in the queue until something louder happened to
+    /// arrive behind it. The salience still decides how *urgently* the
+    /// character reads it (`readiness` keeps the Pulse feed's "why did it wake"
+    /// column); a character mid-think elsewhere simply finds the wake stored on
+    /// its waker when it comes back. The one exception is information that
+    /// asks nothing ([`Event::wakes`]): queued, read with the next wake, and
+    /// leaving the character's schedule exactly as it was.
     pub fn push(&mut self, event: Event) {
         self.events_seen += 1;
         // Stamped on arrival rather than on drain: the clock the standing task
@@ -412,7 +432,9 @@ impl Inbox {
         // character ticks flat out on an empty queue. Which is precisely the
         // busy-loop the old wait's rousing rule existed to close, arriving by a
         // different door.
-        self.scheduled = false;
+        if event.wakes() {
+            self.scheduled = false;
+        }
         if preempts {
             self.preempted = true;
             // Something happened. Tighten the metabolism — this is the whole of
@@ -441,6 +463,22 @@ impl Inbox {
     pub fn pace(&self) -> Pace {
         self.pace
     }
+}
+
+/// A journal draft that has been started: the character's journal state, which
+/// the draft settles when it ends, and the stretch it is about. See
+/// [`Scheduler::journal_begin`].
+#[derive(Debug)]
+pub struct Due {
+    pub state: Arc<Mutex<JournalState>>,
+    pub span: Span,
+}
+
+/// A day roll-over: the days it crossed.
+#[derive(Debug)]
+pub struct Rollover {
+    pub from: u64,
+    pub to: u64,
 }
 
 /// A tick's first two phases, handed across the decode to [`Scheduler::end_tick`]:
@@ -737,12 +775,16 @@ impl Scheduler {
     pub fn deliver(&self, npc_id: u64, world_ms: u64, salience: Salience, kind: EventKind) -> bool {
         let seq = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
         let event = Event::new(seq, world_ms, salience, kind);
+        let wakes = event.wakes();
         let waker = {
             let mut inboxes = self.inboxes.lock().unwrap();
             let Some(inbox) = inboxes.get_mut(&npc_id) else {
                 return false;
             };
             inbox.push(event);
+            if !wakes {
+                return true;
+            }
             // Due immediately: preempted whatever it planned, or roused out of
             // a wait. The waker coalesces — a burst of twenty arrivals stores
             // one permit, and the one wake drains the whole burst. An arrival
@@ -965,9 +1007,7 @@ impl Scheduler {
             let mut inboxes = self.inboxes.lock().unwrap();
             let inbox = inboxes.get_mut(&npc_id)?;
             for e in &events {
-                inbox
-                    .window
-                    .push_world(e.prose(), e.at_ms, e.kind.replaces());
+                inbox.window.push_event(e);
             }
             inbox.window.clone()
         };
@@ -1029,9 +1069,9 @@ impl Scheduler {
         match inbox.scheduled {
             true => inbox.scheduled = false,
             false => {
-                inbox.due_at = match inbox.queue.is_empty() {
-                    true => NEVER,
-                    false => 0,
+                inbox.due_at = match inbox.queue.iter().any(Event::wakes) {
+                    false => NEVER,
+                    true => 0,
                 }
             }
         }
@@ -1064,16 +1104,88 @@ impl Scheduler {
 
     /// Decide and record a day roll-over. `None` when the character is still in
     /// the day it thinks it is.
-    pub fn roll_day(&self, npc_id: u64, world_ms: u64) -> Option<(u64, u64)> {
+    ///
+    /// **The turns the roll-over clears are kept by the journal, because
+    /// nothing else will ever see them.** The window is the journal's only
+    /// source, and the new day begins with none of yesterday in it; the
+    /// guardian asks about them like any other stretch.
+    pub fn roll_day(&self, npc_id: u64, world_ms: u64) -> Option<Rollover> {
         let mut inboxes = self.inboxes.lock().unwrap();
         let inbox = inboxes.get_mut(&npc_id)?;
         match inbox.day.evaluate(world_ms) {
             DayAction::Continue => None,
             DayAction::RollOver { from, to } => {
+                inbox.journal.lock().unwrap().strand(&inbox.window);
                 inbox.day.rolled_over_to(to);
                 inbox.window.roll_over();
-                Some((from, to))
+                Some(Rollover { from, to })
             }
+        }
+    }
+
+    /// The stretch of this character's life its journal does not cover yet,
+    /// once there is enough of it to be worth asking about. `None` before the
+    /// cadence, while a draft is running, and for a character nobody has woken.
+    pub fn journal_waiting(&self, npc_id: u64) -> Option<Waiting> {
+        let inboxes = self.inboxes.lock().unwrap();
+        let inbox = inboxes.get(&npc_id)?;
+        let waiting = inbox.journal.lock().unwrap().waiting(&inbox.window);
+        waiting
+    }
+
+    /// Start a draft now. `None` for a character nobody has woken, while a draft
+    /// is running, and when nothing is new.
+    ///
+    /// The state is marked as having a draft in flight before this returns, so
+    /// two callers cannot both be handed the stretch.
+    pub fn journal_begin(&self, npc_id: u64) -> Option<Due> {
+        self.inboxes.lock().unwrap().get_mut(&npc_id)?.begin_draft()
+    }
+
+    /// Read a character's journal under its lock, without cloning it out.
+    /// `None` for a character nobody has woken.
+    pub fn journal_of<T, F>(&self, npc_id: u64, f: F) -> Option<T>
+    where
+        F: FnOnce(&JournalState) -> T,
+    {
+        let journal = {
+            let inboxes = self.inboxes.lock().unwrap();
+            Arc::clone(&inboxes.get(&npc_id)?.journal)
+        };
+        let held = journal.lock().unwrap();
+        Some(f(&held))
+    }
+
+    /// Take entries out of a character's journal. Returns the ids that were held
+    /// and the journal as it now reads, or `None` for a character nobody has woken.
+    pub fn journal_forget(
+        &self,
+        npc_id: u64,
+        ids: &[u64],
+    ) -> Option<(Vec<u64>, JournalPrompt)> {
+        self.journal_of_mut(npc_id, |j| {
+            let gone = j.forget(ids);
+            (gone, j.prompt())
+        })
+    }
+
+    fn journal_of_mut<T, F>(&self, npc_id: u64, f: F) -> Option<T>
+    where
+        F: FnOnce(&mut JournalState) -> T,
+    {
+        let journal = {
+            let inboxes = self.inboxes.lock().unwrap();
+            Arc::clone(&inboxes.get(&npc_id)?.journal)
+        };
+        let mut held = journal.lock().unwrap();
+        Some(f(&mut held))
+    }
+
+    /// Give a character the journal it kept before — rebuilt from the
+    /// substrate at start-up — in place of the empty one it woke with.
+    pub fn set_journal(&self, npc_id: u64, state: JournalState) {
+        if let Some(inbox) = self.inboxes.lock().unwrap().get_mut(&npc_id) {
+            inbox.journal = Arc::new(Mutex::new(state));
         }
     }
 
@@ -1103,23 +1215,35 @@ impl Scheduler {
         let inboxes = self.inboxes.lock().unwrap();
         let mut v: Vec<Census> = inboxes
             .values()
-            .map(|i| Census {
-                npc_id: i.npc_id,
-                readiness: i.readiness(),
-                inbox_depth: i.depth(),
-                heartbeat_ms: i.heartbeat.as_millis() as u64,
-                ticks: i.ticks,
-                events_seen: i.events_seen,
-                window_turns: i.window.len(),
-                window_cap: i.window.cap(),
-                faded: i.window.faded(),
-                day: i.day.current(),
-                acted_ms_ago: i
-                    .last_act_at
-                    // `saturating_sub`: a tick that landed between the reading
-                    // above and this line would otherwise be an age in the
-                    // future, which renders as a very large number.
-                    .map(|at| now.saturating_sub(at).as_millis() as u64),
+            .map(|i| {
+                // One guard for all three reads: guards taken in a struct
+                // literal live to the end of the statement, so a second `lock()`
+                // there would wait on the first.
+                let (journal_written, journal_open, journal_drafting) = {
+                    let j = i.journal.lock().unwrap();
+                    (j.written(), j.open().len(), j.pending())
+                };
+                Census {
+                    npc_id: i.npc_id,
+                    readiness: i.readiness(),
+                    inbox_depth: i.depth(),
+                    heartbeat_ms: i.heartbeat.as_millis() as u64,
+                    ticks: i.ticks,
+                    events_seen: i.events_seen,
+                    window_turns: i.window.len(),
+                    window_cap: i.window.cap(),
+                    faded: i.window.faded(),
+                    journal_written,
+                    journal_open,
+                    journal_drafting,
+                    day: i.day.current(),
+                    acted_ms_ago: i
+                        .last_act_at
+                        // `saturating_sub`: a tick that landed between the reading
+                        // above and this line would otherwise be an age in the
+                        // future, which renders as a very large number.
+                        .map(|at| now.saturating_sub(at).as_millis() as u64),
+                }
             })
             .collect();
         v.sort_by_key(|c| c.npc_id);
@@ -1145,6 +1269,12 @@ pub struct Census {
     pub window_turns: usize,
     pub window_cap: usize,
     pub faded: u64,
+    /// Journal entries this character has kept, over every run of the daemon.
+    pub journal_written: u64,
+    /// Items its journal holds open.
+    pub journal_open: usize,
+    /// Whether an entry is being drafted now.
+    pub journal_drafting: bool,
     pub day: Option<u64>,
     /// How long ago this character last **acted**, in milliseconds.
     ///
@@ -1165,6 +1295,8 @@ pub type Shared = Arc<Scheduler>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::journal::entry::{Entry, Item};
+    use crate::engine::journal::state::EVERY_TURNS;
 
     fn sched() -> Scheduler {
         Scheduler::new(8)
@@ -1646,17 +1778,169 @@ mod tests {
 
     #[test]
     fn the_day_rolls_over_once_and_clears_the_window() {
-        use crate::engine::sleep::DAY_MS;
+        use crate::clock::DAY_MS;
         let s = sched();
         s.wake(1, 0, 0);
         s.deliver(1, 0, Salience::NORMAL, say("yesterday"));
         s.tick(1, 0, 0, |_, _| vec![]);
         assert!(s.census()[0].window_turns > 0);
 
-        assert_eq!(s.roll_day(1, DAY_MS + 5), Some((0, 1)));
+        let rolled = s.roll_day(1, DAY_MS + 5).unwrap();
+        assert_eq!((rolled.from, rolled.to), (0, 1));
         assert_eq!(s.census()[0].window_turns, 0, "the tail survived the day");
         assert_eq!(s.census()[0].day, Some(1));
-        assert_eq!(s.roll_day(1, DAY_MS + 6), None, "rolled over twice");
+        assert!(s.roll_day(1, DAY_MS + 6).is_none(), "rolled over twice");
+    }
+
+    /// Deliver `n` descriptions and let the character think over them, so its
+    /// window holds `n` turns.
+    fn lived(s: &Scheduler, id: u64, n: usize) {
+        for i in 0..n {
+            s.deliver(id, 0, Salience::NORMAL, say(&format!("event {i}")));
+        }
+        s.tick(id, 0, 0, |_, _| vec![]);
+    }
+
+    #[test]
+    fn a_stretch_is_waiting_once_the_cadence_is_reached_and_not_while_a_draft_runs() {
+        let s = sched();
+        s.wake(0, 0, 0);
+        lived(&s, 0, EVERY_TURNS as usize);
+        let waiting = s.journal_waiting(0).expect("a stretch is waiting");
+        assert_eq!(waiting.turns, EVERY_TURNS as usize);
+        let due = s.journal_begin(0).unwrap();
+        assert_eq!(due.span.turns.len(), EVERY_TURNS as usize);
+        assert!(s.journal_waiting(0).is_none(), "one draft at a time");
+        due.state.lock().unwrap().abandon();
+        assert!(
+            s.journal_waiting(0).is_none(),
+            "an abandoned draft is not retried until new turns land"
+        );
+        lived(&s, 0, EVERY_TURNS as usize);
+        let waiting = s.journal_waiting(0).expect("a new stretch is waiting");
+        assert_eq!(
+            waiting.turns,
+            2 * EVERY_TURNS as usize,
+            "the abandoned turns are covered again"
+        );
+    }
+
+    #[test]
+    fn a_draft_can_be_forced_before_the_cadence_but_only_over_new_turns() {
+        let s = sched();
+        s.wake(0, 0, 0);
+        assert!(s.journal_begin(0).is_none(), "nothing has happened yet");
+        lived(&s, 0, 3);
+        let due = s.journal_begin(0).expect("three turns are enough to force");
+        assert_eq!(due.span.turns.len(), 3);
+        assert!(s.journal_begin(0).is_none(), "one draft at a time");
+        assert_eq!(s.journal_of(0, |j| j.pending()), Some(true));
+        assert!(s.journal_begin(99).is_none());
+    }
+
+    #[test]
+    fn a_journal_is_read_in_place_and_a_stranger_has_none() {
+        let s = sched();
+        s.wake(0, 0, 0);
+        assert_eq!(s.journal_of(0, |j| j.written()), Some(0));
+        assert_eq!(s.journal_of(99, |j| j.written()), None);
+    }
+
+    #[test]
+    fn nothing_is_waiting_before_the_cadence_or_for_a_stranger() {
+        let s = sched();
+        s.wake(0, 0, 0);
+        lived(&s, 0, 3);
+        assert!(s.journal_waiting(0).is_none());
+        assert!(s.journal_waiting(99).is_none());
+    }
+
+    #[test]
+    fn the_census_reports_the_journal() {
+        let s = sched();
+        s.wake(0, 0, 0);
+        let row = &s.census()[0];
+        assert_eq!(
+            (row.journal_written, row.journal_open, row.journal_drafting),
+            (0, 0, false)
+        );
+
+        lived(&s, 0, EVERY_TURNS as usize);
+        let due = s.journal_begin(0).expect("a draft is due");
+        assert!(s.census()[0].journal_drafting, "a draft in flight shows");
+
+        let mut writing = Entry {
+            id: 0,
+            from_turn: due.span.from_turn,
+            to_turn: due.span.to_turn,
+            from_ms: 0,
+            to_ms: 1,
+            claims: vec![],
+            intend: vec![],
+            opened: vec![Item {
+                id: 0,
+                text: "who holds the shield?".into(),
+            }],
+            resolved: vec![],
+        };
+        writing = due.state.lock().unwrap().stage(writing);
+        due.state.lock().unwrap().kept(writing);
+        let row = &s.census()[0];
+        assert_eq!(
+            (row.journal_written, row.journal_open, row.journal_drafting),
+            (1, 1, false)
+        );
+    }
+
+    #[test]
+    fn a_restored_journal_is_the_one_the_character_drafts_against() {
+        let s = sched();
+        s.wake(0, 0, 0);
+        let mut restored = JournalState::new(0);
+        restored.kept(Entry {
+            id: 0,
+            from_turn: 1,
+            to_turn: 2,
+            from_ms: 0,
+            to_ms: 1,
+            claims: vec![],
+            intend: vec![],
+            opened: vec![],
+            resolved: vec![],
+        });
+        s.set_journal(0, restored);
+        lived(&s, 0, EVERY_TURNS as usize + 2);
+        let due = s.journal_begin(0).expect("a draft is due");
+        assert_eq!(
+            due.span.from_turn, 3,
+            "the span starts after what is already written"
+        );
+        assert_eq!(due.state.lock().unwrap().entries().count(), 1);
+    }
+
+    #[test]
+    fn the_turns_a_day_is_about_to_clear_are_still_waiting_afterwards() {
+        use crate::clock::DAY_MS;
+        let s = sched();
+        s.wake(1, 0, 0);
+        lived(&s, 1, 5);
+        s.roll_day(1, DAY_MS + 5).unwrap();
+        assert_eq!(s.census()[0].window_turns, 0);
+        let waiting = s
+            .journal_waiting(1)
+            .expect("the unwritten turns are asked about before they are lost");
+        assert_eq!(waiting.turns, 5);
+        let due = s.journal_begin(1).unwrap();
+        assert_eq!(due.span.turns.len(), 5);
+    }
+
+    #[test]
+    fn a_day_with_nothing_unwritten_leaves_nothing_waiting() {
+        use crate::clock::DAY_MS;
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.roll_day(1, DAY_MS + 5).unwrap();
+        assert!(s.journal_waiting(1).is_none());
     }
 
     /// **The gap between two turns of a conversation is not idleness.**
@@ -1934,17 +2218,6 @@ mod tests {
                 },
             ),
             (
-                "somebody talking past you",
-                Salience::from(npc_map::Weight::Note),
-                EventKind::Speech {
-                    speaker: "Orion Vance".into(),
-                    text: "to somebody else".into(),
-                    to: crate::engine::event::Addressed::Other {
-                        who: "Maker-03".into(),
-                    },
-                },
-            ),
-            (
                 "the room changing under you",
                 Salience::IDLE,
                 EventKind::Situation {
@@ -1960,6 +2233,80 @@ mod tests {
             s.deliver(1, 0, salience, kind);
             assert!(s.is_due(1, 1), "{what} did not bring it back");
         }
+    }
+
+    fn overheard() -> EventKind {
+        EventKind::Speech {
+            speaker: "Orion Vance".into(),
+            text: "to somebody else".into(),
+            to: crate::engine::event::Addressed::Other {
+                who: "Maker-03".into(),
+            },
+        }
+    }
+
+    /// **Being told something is not being asked something.** Speech aimed past
+    /// a character is information: it is queued for whenever the character next
+    /// thinks, but it does not schedule a turn, and does not cut a pause short.
+    /// A room of three that each answer whatever they overhear sustains a
+    /// conversation nobody was asked to have.
+    #[test]
+    fn overheard_speech_does_not_schedule_a_turn() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("the room is quiet"));
+        s.tick(1, 0, 0, |_, _| vec!["reflect — nothing here".to_string()])
+            .expect("it ticked");
+        assert!(!s.is_due(1, 1), "a quiet character was due");
+
+        s.deliver(1, 1, Salience::from(npc_map::Weight::Note), overheard());
+        assert!(!s.is_due(1, 2), "overhearing scheduled a turn");
+
+        s.pause_for(1, 2, pause_ms());
+        s.deliver(1, 3, Salience::from(npc_map::Weight::Note), overheard());
+        assert!(!s.is_due(1, 4), "overhearing cut a pause short");
+        assert!(s.is_due(1, 2 + pause_ms() + 1), "the pause never ended");
+    }
+
+    /// **What was overheard is read with whatever next wakes the character.**
+    /// Not dropped — the mind design is explicit that evidence never is.
+    #[test]
+    fn overheard_speech_is_read_when_something_else_wakes_the_character() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("the room is quiet"));
+        s.tick(1, 0, 0, |_, _| Vec::new()).expect("it ticked");
+        s.deliver(1, 1, Salience::from(npc_map::Weight::Note), overheard());
+
+        s.deliver(1, 2, Salience::NORMAL, say("the lights flicker"));
+        assert!(s.is_due(1, 2), "a description did not wake it");
+        let record = s.tick(1, 2, 2, |_, _| Vec::new()).expect("it ticked");
+        let read = record.perceived.join(" ");
+        assert!(read.contains("to somebody else"), "{read}");
+        assert!(read.contains("lights flicker"), "{read}");
+    }
+
+    /// **Overhearing during a decode does not buy another turn.** The tick's
+    /// end puts the character back on the schedule only for what wakes it.
+    #[test]
+    fn overhearing_while_thinking_does_not_schedule_the_next_turn() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("something to answer"));
+        s.tick(1, 0, 0, |_, _| {
+            s.deliver(1, 0, Salience::from(npc_map::Weight::Note), overheard());
+            vec!["speak — yes".to_string()]
+        })
+        .expect("it ticked");
+        assert!(!s.is_due(1, 1), "overheard speech re-woke the character");
+
+        s.deliver(1, 1, Salience::NORMAL, say("something else"));
+        s.tick(1, 1, 1, |_, _| {
+            s.deliver(1, 1, Salience::NORMAL, say("a thing that happened"));
+            vec!["speak — yes".to_string()]
+        })
+        .expect("it ticked");
+        assert!(s.is_due(1, 1), "an arrival during a decode lost its wake");
     }
 
     /// **A pause cut short goes back to the ordinary schedule.**

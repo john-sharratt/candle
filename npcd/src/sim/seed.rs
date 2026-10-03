@@ -29,6 +29,18 @@ use crate::sim::record::{Item, Kind as RecordKind, State as RecordState};
 use crate::sim::tower::{Coord, Recipe, Tower};
 use crate::sim::Sim;
 
+/// A part's name as a character names it: with its article, exactly once.
+///
+/// A part authored as "the catalogue" already carries one; "fabricator" does
+/// not. Prefixing blindly gives "the the catalogue", which a character would
+/// then have to name back exactly.
+pub fn with_article(name: &str) -> String {
+    match name.starts_with("the ") {
+        true => name.to_string(),
+        false => format!("the {name}"),
+    }
+}
+
 /// What sort of machine a part is, from what it is called and what it does.
 ///
 /// The kind decides nothing mechanical — the modes do that — so a part whose
@@ -125,11 +137,7 @@ pub fn devices_and_tools(map: &MapSet) -> (Devices, Vec<(String, Vec<String>)>) 
                 // is numbered from one, because "the second terminal" is what a
                 // body would say and "terminal 0" is not.
                 let name = if count == 1 {
-                    if part.name.starts_with("the ") {
-                        part.name.clone()
-                    } else {
-                        format!("the {}", part.name)
-                    }
+                    with_article(&part.name)
                 } else {
                     format!(
                         "{} {}",
@@ -174,11 +182,7 @@ fn postings_from_map(map: &MapSet) -> posting::Postings {
                 // The article the part carries, or one supplied — the same rule
                 // a device's name follows, because a character has to name it
                 // back exactly as it is written.
-                let name = match part.name.starts_with("the ") {
-                    true => part.name.clone(),
-                    false => format!("the {}", part.name),
-                };
-                out.stand_up(&at, &name);
+                out.stand_up(&at, &with_article(&part.name));
             }
         }
     }
@@ -457,8 +461,11 @@ mod tests {
     fn the_vault_has_terminals_to_work_at_and_orders_to_take() {
         let s = vault(Some(&maps()));
         // Six terminals stand in the early range, so six things can be claimed
-        // there — the count is what makes a level able to hold a crew.
-        assert_eq!(s.operable("vault-chronicle/early-range").len(), 6);
+        // there — the count is what makes a level able to hold a crew. The
+        // seventh thing a character can operate is the room's light ring.
+        let operable = s.operable("vault-chronicle/early-range");
+        assert_eq!(operable.len(), 7, "{operable:?}");
+        assert!(operable.contains(&"the light ring".to_string()));
         assert_eq!(
             s.modes_of("vault-chronicle/early-range", "world history terminal 1"),
             vec!["reading", "working", "offered"]
@@ -469,11 +476,16 @@ mod tests {
     #[test]
     fn a_counted_part_becomes_that_many_machines_and_a_lone_one_is_the_only_one() {
         let s = vault(Some(&maps()));
-        let one = s.operable("vault-command/plant");
+        // The plant room holds a breaker panel, a coolant valve and an air
+        // handler; the handler declares no modes, so it is read and not
+        // operated.
+        let plant = s.operable("vault-command/plant");
         assert_eq!(
-            one.len(),
-            0,
-            "the plant panel declares no modes, so it is read"
+            plant,
+            vec![
+                "the breaker panel".to_string(),
+                "the coolant valve".to_string()
+            ]
         );
 
         let many = s.operable("vault-chronicle/catalogue-room");
@@ -576,8 +588,16 @@ mod tests {
     fn the_rampart_holds_four_turrets_and_the_gatehouse_one_door() {
         let s = battle_cities(Some(&maps()));
         assert_eq!(s.operable("tower-redoubt/rampart").len(), 4);
-        assert_eq!(s.operable("tower-redoubt/gatehouse").len(), 1);
-        assert_eq!(s.operable("tower-redoubt/foundry").len(), 8, "eight queues");
+        assert_eq!(
+            s.operable("tower-redoubt/gatehouse").len(),
+            2,
+            "the blast door and the pressure door beside it"
+        );
+        assert_eq!(
+            s.operable("tower-redoubt/foundry").len(),
+            10,
+            "eight queues, the breaker panel and the coolant valve"
+        );
     }
 
     #[test]

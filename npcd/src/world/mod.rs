@@ -36,6 +36,7 @@ use npc_map::world::World;
 use npc_map::{MapEdit, MapSet};
 
 use crate::engine::rooms::Rooms;
+use crate::engine::watch::Watch;
 use crate::sim::{seed, Sim};
 
 /// One world, and everything about who has been told what in it.
@@ -76,6 +77,9 @@ struct State {
     /// written into the world log, so producing one *is* a world mutation and
     /// has to be serialised with every other.
     rooms: Rooms,
+    /// The tower's clock — see [`crate::engine::watch`]. Under the world's lock
+    /// because what it says is stirred into the world log.
+    watch: Watch,
 }
 
 /// What a successful reshape did — who it displaced, and whether it was kept.
@@ -122,6 +126,7 @@ impl Hosted {
                 attention: Attention::new(),
                 sim,
                 rooms: Rooms::new(),
+                watch: Watch::new(),
             }),
             map_dir: Some(dir.to_path_buf()),
             writeback: Mutex::new(()),
@@ -140,6 +145,7 @@ impl Hosted {
                 attention: Attention::new(),
                 sim,
                 rooms: Rooms::new(),
+                watch: Watch::new(),
             }),
             // An in-memory world has no authored directory, so its reshapes are
             // ephemeral: nothing to write them back to.
@@ -297,8 +303,20 @@ impl Hosted {
     /// waits minutes between looks, and this runs twice a second.
     pub fn stir(&self) -> usize {
         let mut state = self.state.lock().expect("world lock");
-        let State { world, rooms, .. } = &mut *state;
-        rooms.stir(world)
+        let State {
+            world, sim, rooms, ..
+        } = &mut *state;
+        rooms.stir(world, sim)
+    }
+
+    /// Let the tower have the time since the last beat, and tell the crew what
+    /// that did to it. Returns how many lines were said.
+    pub fn watch_tower(&self) -> usize {
+        let mut state = self.state.lock().expect("world lock");
+        let State {
+            world, sim, watch, ..
+        } = &mut *state;
+        watch.watch(world, sim)
     }
 
     /// How many rooms have a building running in them. A room is fitted the

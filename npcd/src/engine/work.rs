@@ -28,10 +28,10 @@ use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
 use crate::engine::body::Outcome;
-use crate::engine::mission::bank::Facts;
 use crate::engine::mission::Outcome as Verdict;
 use crate::sim::record::{slug_of, Condition, Item, Kind, State};
 use crate::world::Hosted;
+use npc_map::schema::Where;
 
 /// The acts this module performs.
 pub fn is_mine(tool: &str) -> bool {
@@ -97,25 +97,26 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             // — so without this a character could draw a fresh mission over an
             // open one, discarding the answer it built and never filing it to
             // `done`. Report it first; then the desk has something new to give.
-            if hosted.sim(|s| s.missions.is_on_mission(body)) {
-                return Outcome::Refused(
+            if let Some(carried) =
+                hosted.sim(|s| s.missions.active(body).map(|m| m.standing_text()))
+            {
+                return Outcome::Refused(format!(
                     "You are already carrying a mission. Report how it went at the \
-                     desk — report_done or report_stuck — before taking another."
-                        .into(),
-                );
+                     desk — report_done or report_stuck — before taking another.\n{carried}"
+                ));
             }
             // The character's own name, so a routine that would send it to visit
             // "the makers here" is not built around visiting itself.
             let me = hosted
                 .read(|w| w.actor(body).map(|actor| actor.name.clone()))
                 .unwrap_or_default();
-            hosted.with_sim(|s| {
-                let (makers, records) = s.mission_material(&me);
-                let facts = Facts {
-                    makers: &makers,
-                    records: &records,
+            hosted.with_both(|w, s| {
+                let room_name = |place: &str| {
+                    let (area, node) = place.split_once('/')?;
+                    w.node(&Where::new(area, node)).map(|n| n.name.clone())
                 };
-                let mission = s.missions.collect(body, &facts);
+                let material = s.mission_material(&me, &room_name);
+                let mission = s.missions.collect(body, &material.facts());
                 let brief = mission.standing_text();
                 tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
                 Outcome::Did(format!("You take it up.\n{brief}"))
@@ -2666,10 +2667,17 @@ mod tests {
 
         // A second collect while already carrying one is refused — one at a
         // time, so a mission in progress is never discarded by drawing another.
-        assert!(matches!(
-            perform(&h, "m1", &act("collect_mission", json!({}))),
-            Outcome::Refused(_)
-        ));
+        // The refusal says what the open mission is, so the character is not
+        // left to guess what it is already carrying.
+        let brief = h.sim(|s| s.missions.active("m1").unwrap().mission_text());
+        match perform(&h, "m1", &act("collect_mission", json!({}))) {
+            Outcome::Refused(why) => {
+                assert!(why.contains("already carrying a mission"), "{why}");
+                assert!(why.contains(&brief), "{why}");
+                assert!(why.contains("report_done"), "{why}");
+            }
+            other => panic!("a second collect must be refused, got {other:?}"),
+        }
 
         // Reporting done closes it, frees the character, and files the answer so
         // an operator can still read it.

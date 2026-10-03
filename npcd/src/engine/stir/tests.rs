@@ -17,9 +17,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use crate::engine::event::Salience;
 use crate::engine::stir::{
-    air::AirHandling, ambient::Ambient, boards::Boards, broadcast::Broadcast, chime::Chime,
-    coolant::CoolantLoop, growth::Growth, lights::Lighting, rat::Rat, stores::Stores, Building,
-    Cond, Fixture, Stirring, Watch,
+    air::AirHandling, ambient::Ambient, broadcast::Broadcast, chime::Chime, coolant::CoolantLoop,
+    growth::Growth, lights::Lighting, rat::Rat, stores::Stores, Building, Cond, Fixture, Stirring,
+    Watch,
 };
 
 /// Stand-in recordings, so the tests are not reading the shipped world.
@@ -49,8 +49,22 @@ fn watch(t: u64, conds: &[Cond]) -> Watch {
         // evening, far from any hour boundary.
         wall: UNIX_EPOCH + Duration::from_secs(70_200 + t),
         conds: conds.to_vec(),
+        standing: Vec::new(),
     }
 }
+
+/// Every part a fixture can need, so a test of the whole building has the whole
+/// building. The room-by-room gating is tested in `binding`.
+const WHOLE_BUILDING: &[&str] = &[
+    "breaker-panel",
+    "light-ring",
+    "coolant-valve",
+    "pressure-door",
+    "air-handler",
+    "compute-rack",
+    "status-board",
+    "stores",
+];
 
 /// A thing another fixture did, for feeding to [`Fixture::notice`].
 fn did(from: &'static str, tags: &[Cond], salience: Salience) -> Stirring {
@@ -78,7 +92,7 @@ const ANAPHORA: &[&str] = &[
 fn everything() -> Vec<Stirring> {
     (0..24u64)
         .flat_map(|seed| {
-            Building::new(seed * 7919 + 3, recordings())
+            Building::new(seed * 7919 + 3, recordings(), WHOLE_BUILDING)
                 .run(Duration::ZERO, Duration::from_secs(25), 1200)
                 .into_iter()
                 .map(|(_, s)| s)
@@ -217,7 +231,7 @@ fn the_quiet_notices_the_building_it_is_in() {
 fn every_fixture_gets_a_turn() {
     // A fixture that never speaks is dead weight, and a round-robin cursor that
     // stopped rotating would silently starve the ones at the back.
-    let mut b = Building::new(11, recordings());
+    let mut b = Building::new(11, recordings(), WHOLE_BUILDING);
     let spoke: std::collections::BTreeSet<&str> = b
         .run(Duration::ZERO, Duration::from_secs(20), 3000)
         .into_iter()
@@ -375,41 +389,6 @@ fn what_the_rat_does_in_the_stores_is_found_later() {
 }
 
 #[test]
-fn the_board_only_names_a_gallery_that_something_went_wrong_in() {
-    // The board reads the building's history rather than its state, and there
-    // is no path by which it can name a system that has not actually failed.
-    let mut b = Boards::new(31);
-    let w = watch(0, &[]);
-    b.notice(&did("coolant", &[Cond::Leaking], Salience::NORMAL), &w);
-    let said = drive(&mut b, &[], 120, 30);
-    assert!(
-        said.iter()
-            .any(|l| l.contains("against the coolant gallery")),
-        "the fault never reached the board: {said:?}"
-    );
-    assert!(
-        !said
-            .iter()
-            .any(|l| l.contains("against the main supply bus")),
-        "the board invented a fault in a system that was fine: {said:?}"
-    );
-}
-
-#[test]
-fn a_board_with_nothing_wrong_files_nothing() {
-    let mut b = Boards::new(31);
-    let w = watch(0, &[]);
-    // An idle vent noise is not a fault, and a board that logged it would be as
-    // useless here as it is in a real building.
-    b.notice(&did("air", &[Cond::Quiet], Salience::IDLE), &w);
-    let said = drive(&mut b, &[], 120, 30);
-    assert!(
-        !said.iter().any(|l| l.contains("fault entry has come up")),
-        "the board filed an idle noise as a fault: {said:?}"
-    );
-}
-
-#[test]
 fn a_building_nobody_left_a_message_in_says_nothing() {
     // The engine holds no announcements of its own. Given none, the tannoy is
     // silent — it does not fall back on words that would then be the engine's
@@ -540,6 +519,7 @@ fn the_clock_strikes_each_hour_exactly_once() {
             since_start: Duration::from_secs(m * 60),
             wall: UNIX_EPOCH + Duration::from_secs(secs),
             conds: Vec::new(),
+            standing: Vec::new(),
         };
         if let Some(s) = chime.consider(&w) {
             if s.text.contains("strikes") {
@@ -591,7 +571,7 @@ fn what_the_creator_left_on_the_tannoy() {
         "\n=== the vault's {} standing recordings, over a day ===",
         said.len()
     );
-    let mut b = Building::new(2027, said.clone());
+    let mut b = Building::new(2027, said.clone(), WHOLE_BUILDING);
     let mut heard = 0;
     for (t, s) in b.run(Duration::ZERO, Duration::from_secs(20), 4320) {
         if s.from == "broadcast" {
@@ -610,7 +590,7 @@ fn what_the_creator_left_on_the_tannoy() {
 #[test]
 fn a_shift_in_the_vault() {
     for seed in [1u64, 2, 3] {
-        let mut b = Building::new(seed, recordings());
+        let mut b = Building::new(seed, recordings(), WHOLE_BUILDING);
         let run = b.run(Duration::ZERO, Duration::from_secs(20), 1080);
 
         println!("\n=== seed {seed} — six hours, {} fixtures ===", b.len());
@@ -636,7 +616,7 @@ fn a_shift_in_the_vault() {
 /// prints each with what led into it.
 #[test]
 fn the_incidents() {
-    let mut b = Building::new(1789, recordings());
+    let mut b = Building::new(1789, recordings(), WHOLE_BUILDING);
     let run = b.run(Duration::ZERO, Duration::from_secs(15), 5760);
 
     println!("\n=== incidents found in twenty-four hours ===");

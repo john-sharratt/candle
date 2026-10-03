@@ -2391,36 +2391,14 @@ fn select_collection_indices<R: ContentResolver>(
         SelectionRule::AlwaysVisible | SelectionRule::Sequence { .. } => {
             (0..coll.sections.len()).collect()
         }
-        SelectionRule::TopK { k } => {
-            let mut scored: Vec<(usize, f32, f32)> = coll
-                .sections
-                .iter()
-                .enumerate()
-                .map(|(decl, s)| (decl, score_of(s), s.priority))
-                .filter(|(_, score, _)| !scoring.apply_threshold || *score >= coll.score_threshold)
-                .collect();
-            if tracing::enabled!(tracing::Level::TRACE) {
-                let mut by_score = scored.clone();
-                by_score.sort_by(|(_, a, _), (_, b, _)| b.partial_cmp(a).unwrap_or(Equal));
-                let scores_str = by_score
-                    .iter()
-                    .map(|(i, sc, _)| format!("{}={:.1}", coll.sections[*i].name, sc))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                tracing::trace!(collection = %coll.name, threshold = coll.score_threshold, scores = %scores_str, "projection scores");
-            }
-            // Score desc, then priority desc, then declaration order.
-            scored.sort_by(|(ai, asc, ap), (bi, bsc, bp)| {
-                bsc.partial_cmp(asc)
-                    .unwrap_or(Equal)
-                    .then(bp.partial_cmp(ap).unwrap_or(Equal))
-                    .then(ai.cmp(bi))
-            });
-            scored.truncate(*k);
-            let mut idx: Vec<usize> = scored.into_iter().map(|(i, _, _)| i).collect();
-            idx.sort_unstable(); // re-emit in declaration order
-            idx
-        }
+        SelectionRule::TopK { k } => top_scored_indices(coll, resolver, scoring, *k, None),
+        SelectionRule::Offered { selector, k } => top_scored_indices(
+            coll,
+            resolver,
+            scoring,
+            *k,
+            Some(selection_state.members(selector)),
+        ),
         SelectionRule::Single => coll
             .sections
             .iter()
@@ -2439,6 +2417,47 @@ fn select_collection_indices<R: ContentResolver>(
         // A collection carries no conversations (the YAML loader refuses it).
         SelectionRule::WorkingSet { .. } => Vec::new(),
     }
+}
+
+/// The `k` highest-scored members of `coll`, in declaration order. `offered`
+/// restricts the candidates to the members it names (`None` ranks them all).
+fn top_scored_indices<R: ContentResolver>(
+    coll: &SectionCollection,
+    resolver: &R,
+    scoring: &CollectionScoring,
+    k: usize,
+    offered: Option<&[String]>,
+) -> Vec<usize> {
+    use std::cmp::Ordering::Equal;
+    let mut scored: Vec<(usize, f32, f32)> = coll
+        .sections
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| offered.is_none_or(|named| named.contains(&s.name)))
+        .map(|(decl, s)| (decl, resolver.section_score(s.id), s.priority))
+        .filter(|(_, score, _)| !scoring.apply_threshold || *score >= coll.score_threshold)
+        .collect();
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let mut by_score = scored.clone();
+        by_score.sort_by(|(_, a, _), (_, b, _)| b.partial_cmp(a).unwrap_or(Equal));
+        let scores_str = by_score
+            .iter()
+            .map(|(i, sc, _)| format!("{}={:.1}", coll.sections[*i].name, sc))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::trace!(collection = %coll.name, threshold = coll.score_threshold, scores = %scores_str, "projection scores");
+    }
+    // Score desc, then priority desc, then declaration order.
+    scored.sort_by(|(ai, asc, ap), (bi, bsc, bp)| {
+        bsc.partial_cmp(asc)
+            .unwrap_or(Equal)
+            .then(bp.partial_cmp(ap).unwrap_or(Equal))
+            .then(ai.cmp(bi))
+    });
+    scored.truncate(k);
+    let mut idx: Vec<usize> = scored.into_iter().map(|(i, _, _)| i).collect();
+    idx.sort_unstable(); // re-emit in declaration order
+    idx
 }
 
 /// The declaration indices of the members a [`SelectionRule::Named`] selector
@@ -2507,7 +2526,15 @@ fn select_collection_sections<R: ContentResolver>(
             }
             out
         }
-        SelectionRule::TopK { .. } => {
+        SelectionRule::TopK { .. } | SelectionRule::Offered { .. } => {
+            // `Offered` ranks only the members the runtime selector names: the
+            // rest are neither candidates nor emitted, whatever they score.
+            let offered: Option<&[String]> = match &coll.selection {
+                SelectionRule::Offered { selector, .. } => Some(selection_state.members(selector)),
+                _ => None,
+            };
+            let is_offered =
+                |s: &SectionSchema| offered.is_none_or(|named| named.contains(&s.name));
             // Forced-member pin: when the runtime sets `FORCE_TOOL_SELECTOR`, emit
             // exactly the named members and skip belief selection, so a prefilled
             // tool_call is always backed by a present tool definition. Same by-name
@@ -2543,7 +2570,7 @@ fn select_collection_sections<R: ContentResolver>(
             let candidates: Vec<&SectionSchema> = coll
                 .sections
                 .iter()
-                .filter(|s| !coll.mandatory.contains(&s.id))
+                .filter(|s| !coll.mandatory.contains(&s.id) && is_offered(s))
                 .collect();
             let fresh: Vec<f32> = candidates
                 .iter()
@@ -2555,6 +2582,9 @@ fn select_collection_sections<R: ContentResolver>(
             // lowered and carried picks are floored (see `PolicyConfig::windowed`),
             // so the submit guess and a still-accruing correct tool stay in scope.
             let (mut cfg, floor) = coll.policy.config.windowed(decode_pos);
+            if let SelectionRule::Offered { k, .. } = &coll.selection {
+                cfg.budget_max = *k;
+            }
             // Concept B: the collection's attention mass extends its member
             // budget within the declared rail.
             if let Some(ba) = &coll.budget_adaptive {
@@ -2592,9 +2622,15 @@ fn select_collection_sections<R: ContentResolver>(
             // belief selected them. A mandatory member's score is recorded for
             // the event view, qualified by the same bar as everyone else.
             let min_score = cfg.section_policy(0).min_score;
+            // An offered collection whose provenance has no opinion (every
+            // offered member scores nothing: cold scores, or content that
+            // matches none of them) shows everything offered rather than the
+            // first `k` by declaration order — the room already narrowed it to
+            // acts the body can take.
+            let no_opinion = offered.is_some() && fresh.iter().all(|&f| f <= 0.0);
             let mut beliefs = beliefs.into_iter();
             let mut out = Vec::new();
-            for s in &coll.sections {
+            for s in coll.sections.iter().filter(|s| is_offered(s)) {
                 let emit = if coll.mandatory.contains(&s.id) {
                     let score = resolver.section_score(s.id);
                     scores.set_section(s.id, score, score >= min_score);
@@ -2604,7 +2640,7 @@ fn select_collection_sections<R: ContentResolver>(
                         .next()
                         .expect("one belief per non-mandatory member, in catalog order");
                     scores.set_section(s.id, b.score, b.qualified);
-                    b.selected
+                    b.selected || no_opinion
                 };
                 if emit {
                     push_member_glue(&mut out, coll);
@@ -2617,7 +2653,11 @@ fn select_collection_sections<R: ContentResolver>(
             // there is nothing for glue to separate it from.
             if out.is_empty() {
                 if let Some(def) = &coll.default {
-                    if let Some(s) = coll.sections.iter().find(|s| s.name == def.tag) {
+                    if let Some(s) = coll
+                        .sections
+                        .iter()
+                        .find(|s| s.name == def.tag && is_offered(s))
+                    {
                         push_section_segment(&mut out, s);
                     }
                 }

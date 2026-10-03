@@ -34,13 +34,13 @@ nodes:
     kind: work
     name: band one
     off: [ring-north]
-    parts: [{ part: character-terminal, count: 6 }]
+    parts: [{ part: character-terminal, count: 6 }, light-ring, air-handler]
 
   - id: band-two
     kind: work
     name: band two
     off: [cross-upper]
-    parts: [{ part: character-terminal, count: 6 }]
+    parts: [{ part: character-terminal, count: 6 }, breaker-panel, coolant-valve]
 
   - id: band-three
     kind: work
@@ -52,7 +52,7 @@ nodes:
     kind: work
     name: the watch
     off: [cross-lower]
-    parts: [watch-desk]
+    parts: [watch-desk, compute-rack, status-board]
 
   - id: roster-room
     kind: store
@@ -64,7 +64,7 @@ nodes:
     kind: social
     name: the green room
     off: [ring-south]
-    parts: [{ part: seat, count: 12 }]
+    parts: [pressure-door, { part: seat, count: 12 }]
     habit: rarely empty
     character: >
       A Maker who held a character last week knows things about them that were

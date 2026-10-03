@@ -68,6 +68,10 @@ impl Fixture for Stores {
         "stores"
     }
 
+    fn needs(&self) -> &'static [&'static str] {
+        &["stores"]
+    }
+
     fn signals(&self, out: &mut Vec<Cond>) {
         // Once enough has been found, the room itself is the evidence — and the
         // address system will start reading the containment log out at people.

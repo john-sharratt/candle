@@ -517,6 +517,17 @@ export async function render(params, q) {
       h('div', { class: 'row wrap', style: 'gap:26px' },
         h('div', {}, h('div', { class: 'tiny dim' }, 'now'), now),
         h('div', {}, h('div', { class: 'tiny dim' }, 'scale'), scale),
+        only('admin', () => {
+          const years = h('input', { class: 'input', type: 'number', step: 1, style: 'width:90px',
+            value: t.year_offset ?? 0 });
+          return h('div', {}, h('div', { class: 'tiny dim' }, 'years ahead'),
+            h('div', { class: 'row', style: 'gap:6px' }, years,
+              h('button', { class: 'btn', onClick: () => {
+                const n = Number(years.value);
+                if (!Number.isInteger(n)) return toast('years ahead is a whole number', 'err');
+                settle({ year_offset: n }, `the world reads ${n} year${Math.abs(n) === 1 ? '' : 's'} ahead`);
+              } }, 'Set')));
+        }),
         // Jumping the clock moves narrative time for every character in the
         // world, so it belongs with the other world edits: admin.
         only('admin', () => {

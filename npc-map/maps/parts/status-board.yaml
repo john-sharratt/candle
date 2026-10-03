@@ -1,0 +1,12 @@
+id: status-board
+kind: fixture
+name: status board
+short: >
+  A status board lists the faults the building has recorded, and each entry
+  names the system, the object and the room it came from.
+long: >
+  A wall panel with a column of entries on it, one line to a fault. An entry is
+  filed when a fault stands somewhere in the vault and comes down when whatever
+  was wrong has been put right. The board lags by a minute or two, so what it
+  shows is what was true a little while ago; the object it names is the thing to
+  go and look at.

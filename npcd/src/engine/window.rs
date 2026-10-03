@@ -31,6 +31,8 @@ use std::collections::VecDeque;
 
 use serde::Serialize;
 
+use crate::engine::event::{Event, EventKind, Salience};
+
 /// Turns of verbatim tail carried into the next decode.
 ///
 /// Counts *turns*, not exchanges: an event and the act it produced are two.
@@ -65,10 +67,75 @@ pub enum Speaker {
     Npc,
 }
 
+/// What produced a turn, kept beside its text so a later reader can tell a
+/// thing that happened from a line of scenery without parsing prose.
+///
+/// The journal cites turns by id and decides what a claim rests on from this
+/// tag alone. It never reads the wording: the wording is the model's own, or
+/// the narrator's, and neither is a reliable witness to what kind of thing it
+/// was.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// A world event, by its [`EventKind::tag`]. `ambient` is the room idling:
+    /// a description arriving at idle salience, which is the stir's own flavour
+    /// and says nothing happened.
+    Event { tag: &'static str, ambient: bool },
+    /// The character's own act, by tool name. Empty when the line is the world's
+    /// refusal of a call that never parsed, which names no tool.
+    Act { verb: String },
+}
+
+/// Event kinds that are standing state or machinery rather than something
+/// that happened, and so are never a thing a claim can be said to rest on.
+const UNCITABLE_EVENTS: &[&str] = &["nudge", "heartbeat", "sleep", "wake"];
+
+impl Origin {
+    pub fn of_event(e: &Event) -> Self {
+        Origin::Event {
+            tag: e.kind.tag(),
+            ambient: matches!(e.kind, EventKind::Description { .. })
+                && e.salience.get() <= Salience::IDLE.get(),
+        }
+    }
+
+    /// The tool an act line names. Every act line is `tool` or `tool — what was
+    /// asked …`, so the verb is whatever precedes the first separator; anything
+    /// that is not a bare tool name there is a refusal's sentence, not a verb.
+    pub fn of_act(line: &str) -> Self {
+        let head = line.split(" — ").next().unwrap_or_default().trim();
+        let verb = match !head.is_empty()
+            && head
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            true => head.to_string(),
+            false => String::new(),
+        };
+        Origin::Act { verb }
+    }
+
+    /// Whether a claim may rest on a turn from here. Scenery, standing
+    /// instructions, machinery, a character's own reflection and a refusal
+    /// that named no tool are all things a journal entry may sit beside and may
+    /// not cite.
+    pub fn citable(&self) -> bool {
+        match self {
+            Origin::Event { tag, ambient } => !ambient && !UNCITABLE_EVENTS.contains(tag),
+            Origin::Act { verb } => !verb.is_empty() && verb != "reflect",
+        }
+    }
+}
+
 /// One turn in the tail.
 #[derive(Clone, Debug, Serialize)]
 pub struct Turn {
+    /// Stable for the life of the window: assigned once, never reused, and not
+    /// reset at the day boundary, so a journal entry's citation of it can never
+    /// come to mean a different turn.
+    pub id: u64,
     pub speaker: Speaker,
+    pub origin: Origin,
     pub text: String,
     /// World-clock milliseconds when this landed.
     pub at_ms: u64,
@@ -94,18 +161,22 @@ pub struct Window {
     /// whether a character's continuity is coming from the gather or from the
     /// tail.
     faded: u64,
+    /// The id the next turn takes. Starts at 1 so 0 is never a turn, and is not
+    /// reset by [`Window::roll_over`].
+    next_id: u64,
 }
 
 impl Window {
     pub fn new(cap: usize) -> Self {
         Self {
-            // A zero cap would make `push` drop everything it was just handed,
+            // A zero cap would make `land` drop everything it was just handed,
             // producing a character with no present tense at all and no error to
             // explain it. One turn is the smallest thing that is still a
             // conversation.
             cap: cap.max(1),
             turns: VecDeque::with_capacity(cap.max(1)),
             faded: 0,
+            next_id: 1,
         }
     }
 
@@ -135,38 +206,76 @@ impl Window {
     /// window with the same band — wherever it sits, not just at the tail. A
     /// superseded map three turns back is exactly as misleading as one at the
     /// end.
-    pub fn push(&mut self, turn: Turn) {
-        if let Some(band) = &turn.replaces {
-            let before = self.turns.len();
-            self.turns.retain(|t| t.replaces.as_ref() != Some(band));
+    ///
+    /// Returns the id the turn took.
+    fn land(
+        &mut self,
+        speaker: Speaker,
+        origin: Origin,
+        text: String,
+        at_ms: u64,
+        replaces: Option<String>,
+    ) -> u64 {
+        if let Some(band) = &replaces {
             // Superseded, not faded: it was replaced by better information about
             // the same thing, which is a different event from falling out of the
             // window, and conflating them would make `faded` unreadable.
-            let _ = before;
+            self.turns.retain(|t| t.replaces.as_ref() != Some(band));
         }
-        self.turns.push_back(turn);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.turns.push_back(Turn {
+            id,
+            speaker,
+            origin,
+            text,
+            at_ms,
+            replaces,
+        });
         while self.turns.len() > self.cap {
             self.turns.pop_front();
             self.faded += 1;
         }
+        id
     }
 
-    pub fn push_world(&mut self, text: impl Into<String>, at_ms: u64, replaces: Option<String>) {
-        self.push(Turn {
-            speaker: Speaker::World,
-            text: text.into(),
-            at_ms,
-            replaces,
-        });
+    /// Land a world event: its prose, its band, and what kind of thing it was.
+    pub fn push_event(&mut self, e: &Event) -> u64 {
+        self.land(
+            Speaker::World,
+            Origin::of_event(e),
+            e.prose(),
+            e.at_ms,
+            e.kind.replaces(),
+        )
     }
 
-    pub fn push_npc(&mut self, text: impl Into<String>, at_ms: u64) {
-        self.push(Turn {
-            speaker: Speaker::Npc,
-            text: text.into(),
-            at_ms,
-            replaces: None,
-        });
+    /// Land one of the character's own act lines. The origin is read off the
+    /// line, which is built in one place and always leads with the tool name.
+    pub fn push_npc(&mut self, text: impl Into<String>, at_ms: u64) -> u64 {
+        let text = text.into();
+        let origin = Origin::of_act(&text);
+        self.land(Speaker::Npc, origin, text, at_ms, None)
+    }
+
+    /// The turn with this id, if it is still in the window.
+    pub fn get(&self, id: u64) -> Option<&Turn> {
+        self.turns.iter().find(|t| t.id == id)
+    }
+
+    /// Every turn after `id`, oldest first. `after(0)` is the whole window.
+    pub fn after(&self, id: u64) -> impl Iterator<Item = &Turn> {
+        self.turns.iter().filter(move |t| t.id > id)
+    }
+
+    /// The id of the newest turn, or 0 when nothing has landed yet.
+    pub fn newest_id(&self) -> u64 {
+        self.next_id - 1
+    }
+
+    /// The id of the oldest turn still held, if any.
+    pub fn oldest_id(&self) -> Option<u64> {
+        self.turns.front().map(|t| t.id)
     }
 
     /// Rewrite the most recent of the character's own turns reading `from`.
@@ -215,8 +324,30 @@ impl Default for Window {
 mod tests {
     use super::*;
 
+    fn put(w: &mut Window, text: &str, band: Option<&str>) -> u64 {
+        let origin = Origin::Event {
+            tag: "description",
+            ambient: false,
+        };
+        w.land(
+            Speaker::World,
+            origin,
+            text.to_string(),
+            0,
+            band.map(str::to_string),
+        )
+    }
+
     fn world(w: &mut Window, text: &str) {
-        w.push_world(text, 0, None);
+        put(w, text, None);
+    }
+
+    fn event(kind: EventKind, salience: Salience) -> Event {
+        Event::new(1, 0, salience, kind)
+    }
+
+    fn describe(text: &str) -> EventKind {
+        EventKind::Description { text: text.into() }
     }
 
     #[test]
@@ -255,10 +386,10 @@ mod tests {
     #[test]
     fn a_replacing_turn_retires_its_band_anywhere_in_the_window() {
         let mut w = Window::new(10);
-        w.push_world("in band one", 0, Some("situation".into()));
+        put(&mut w, "in band one", Some("situation"));
         world(&mut w, "something happened");
         world(&mut w, "something else happened");
-        w.push_world("in the green room", 0, Some("situation".into()));
+        put(&mut w, "in the green room", Some("situation"));
 
         let texts: Vec<&str> = w.turns().map(|t| t.text.as_str()).collect();
         assert_eq!(
@@ -277,9 +408,9 @@ mod tests {
     #[test]
     fn replacement_is_per_band() {
         let mut w = Window::new(10);
-        w.push_world("in band one", 0, Some("situation".into()));
-        w.push_world("finish the redoubt", 0, Some("task".into()));
-        w.push_world("in the green room", 0, Some("situation".into()));
+        put(&mut w, "in band one", Some("situation"));
+        put(&mut w, "finish the redoubt", Some("task"));
+        put(&mut w, "in the green room", Some("situation"));
         let texts: Vec<&str> = w.turns().map(|t| t.text.as_str()).collect();
         assert_eq!(texts, vec!["finish the redoubt", "in the green room"]);
     }
@@ -289,13 +420,13 @@ mod tests {
     #[test]
     fn superseding_a_turn_does_not_count_as_a_fade() {
         let mut w = Window::new(10);
-        w.push_world("in band one", 0, Some("situation".into()));
-        w.push_world("in the green room", 0, Some("situation".into()));
+        put(&mut w, "in band one", Some("situation"));
+        put(&mut w, "in the green room", Some("situation"));
         assert_eq!(w.faded(), 0);
         assert_eq!(w.len(), 1);
     }
 
-    /// **The join.** `replaces()` and `push_world` are each tested at their own
+    /// **The join.** `replaces()` and `push_event` are each tested at their own
     /// end; this is the only place the chain the scheduler actually runs is
     /// exercised whole — an event, through its own band, into a real window.
     ///
@@ -304,19 +435,15 @@ mod tests {
     /// current if the newest has faded out of the cap.
     #[test]
     fn a_situation_event_leaves_exactly_one_of_itself_in_a_real_window() {
-        use crate::engine::event::{Event, EventKind, Salience};
-
         let mut w = Window::new(10);
         for room in ["band one", "the north run", "the green room"] {
-            let e = Event::new(
-                1,
-                0,
-                Salience::IDLE,
+            let e = event(
                 EventKind::Situation {
                     text: format!("You are in {room}."),
                 },
+                Salience::IDLE,
             );
-            w.push_world(e.prose(), e.at_ms, e.kind.replaces());
+            w.push_event(&e);
             // Something happens between them, so the retirement has to scan
             // past it rather than only checking the tail.
             world(&mut w, "somebody came in");
@@ -342,7 +469,7 @@ mod tests {
     #[test]
     fn both_speakers_are_kept_in_order() {
         let mut w = Window::new(4);
-        w.push_world("the gate opens", 10, None);
+        w.push_event(&event(describe("the gate opens"), Salience::NORMAL));
         w.push_npc("you step back", 11);
         let t: Vec<(Speaker, &str)> = w.turns().map(|t| (t.speaker, t.text.as_str())).collect();
         assert_eq!(
@@ -362,6 +489,186 @@ mod tests {
         world(&mut w, "yesterday");
         w.roll_over();
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn ids_start_at_one_and_rise_by_one() {
+        let mut w = Window::new(8);
+        assert_eq!(w.newest_id(), 0);
+        let a = put(&mut w, "a", None);
+        let b = put(&mut w, "b", None);
+        let c = w.push_npc("speak — hello", 0);
+        assert_eq!((a, b, c), (1, 2, 3));
+        assert_eq!(w.newest_id(), 3);
+    }
+
+    /// A citation of an id that has since faded must find nothing, never a
+    /// different turn that happened to take the slot.
+    #[test]
+    fn an_id_is_never_reused_after_it_fades() {
+        let mut w = Window::new(2);
+        let first = put(&mut w, "first", None);
+        world(&mut w, "second");
+        world(&mut w, "third");
+        assert!(w.get(first).is_none());
+        assert_eq!(w.oldest_id(), Some(2));
+        assert_eq!(w.get(3).map(|t| t.text.as_str()), Some("third"));
+    }
+
+    /// Superseding retires a turn without renumbering its neighbours.
+    #[test]
+    fn a_superseded_turn_leaves_its_neighbours_ids_alone() {
+        let mut w = Window::new(8);
+        put(&mut w, "old room", Some("situation"));
+        let between = put(&mut w, "a thing happened", None);
+        let new = put(&mut w, "new room", Some("situation"));
+        assert_eq!(between, 2);
+        assert_eq!(new, 3);
+        assert!(w.get(1).is_none());
+        assert_eq!(w.get(2).map(|t| t.text.as_str()), Some("a thing happened"));
+    }
+
+    /// The day boundary clears the tail but the ids carry on, so yesterday's
+    /// citations cannot alias today's turns.
+    #[test]
+    fn ids_survive_the_day_rollover() {
+        let mut w = Window::new(8);
+        world(&mut w, "yesterday");
+        w.roll_over();
+        assert_eq!(put(&mut w, "today", None), 2);
+        assert!(w.get(1).is_none());
+    }
+
+    #[test]
+    fn after_returns_the_turns_past_an_id_oldest_first() {
+        let mut w = Window::new(8);
+        for t in ["a", "b", "c", "d"] {
+            world(&mut w, t);
+        }
+        let texts: Vec<&str> = w.after(2).map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, vec!["c", "d"]);
+        assert_eq!(w.after(0).count(), 4);
+        assert_eq!(w.after(4).count(), 0);
+    }
+
+    #[test]
+    fn amending_an_act_keeps_its_id_and_origin() {
+        let mut w = Window::new(8);
+        let id = w.push_npc("reflect — the quiet", 0);
+        assert!(w.amend_npc(
+            "reflect — the quiet",
+            "reflect — the quiet → I feel calm".into()
+        ));
+        let t = w.get(id).unwrap();
+        assert_eq!(t.text, "reflect — the quiet → I feel calm");
+        assert_eq!(
+            t.origin,
+            Origin::Act {
+                verb: "reflect".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_event_is_tagged_with_its_kind() {
+        let mut w = Window::new(8);
+        let said = event(
+            EventKind::Speech {
+                speaker: "Pax".into(),
+                text: "the fabricator is gone".into(),
+                to: crate::engine::event::Addressed::You,
+            },
+            Salience::NORMAL,
+        );
+        let id = w.push_event(&said);
+        assert_eq!(
+            w.get(id).unwrap().origin,
+            Origin::Event {
+                tag: "speech",
+                ambient: false
+            }
+        );
+    }
+
+    /// The stir's idle flavour arrives as a description at idle salience. That is
+    /// the one shape that is scenery, and a real description at ordinary
+    /// salience is not.
+    #[test]
+    fn only_an_idle_description_is_ambient() {
+        let idle = Origin::of_event(&event(describe("A pipe ticks."), Salience::IDLE));
+        let real = Origin::of_event(&event(describe("The door slides open."), Salience::NORMAL));
+        let nudge = Origin::of_event(&event(
+            EventKind::Nudge { text: "x".into() },
+            Salience::IDLE,
+        ));
+        assert_eq!(
+            idle,
+            Origin::Event {
+                tag: "description",
+                ambient: true
+            }
+        );
+        assert_eq!(
+            real,
+            Origin::Event {
+                tag: "description",
+                ambient: false
+            }
+        );
+        assert_eq!(
+            nudge,
+            Origin::Event {
+                tag: "nudge",
+                ambient: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_verb_is_whatever_precedes_the_first_separator() {
+        let verb = |s: &str| match Origin::of_act(s) {
+            Origin::Act { verb } => verb,
+            other => panic!("not an act: {other:?}"),
+        };
+        assert_eq!(
+            verb("speak — Pax; that it is done → You tell Pax."),
+            "speak"
+        );
+        assert_eq!(verb("pause"), "pause");
+        assert_eq!(verb("invoke — the fabricator ✗ out of reach"), "invoke");
+        assert_eq!(verb("move_to — the command room"), "move_to");
+        // A refusal's sentence names no tool.
+        assert_eq!(verb("Nothing in the world answers that."), "");
+        assert_eq!(verb(""), "");
+    }
+
+    #[test]
+    fn what_a_claim_may_rest_on() {
+        let ev = |tag: &'static str, ambient: bool| Origin::Event { tag, ambient };
+        let act = |verb: &str| Origin::Act { verb: verb.into() };
+        for cites in [
+            ev("speech", false),
+            ev("message", false),
+            ev("description", false),
+            ev("situation", false),
+            ev("announcement", false),
+            ev("entity", false),
+            act("invoke"),
+            act("speak"),
+        ] {
+            assert!(cites.citable(), "{cites:?} should be citable");
+        }
+        for refuses in [
+            ev("description", true),
+            ev("nudge", false),
+            ev("heartbeat", false),
+            ev("sleep", false),
+            ev("wake", false),
+            act("reflect"),
+            act(""),
+        ] {
+            assert!(!refuses.citable(), "{refuses:?} should not be citable");
+        }
     }
 
     /// A default-capped window is the shape every character actually gets — the

@@ -78,6 +78,12 @@ export async function render(params) {
     // question anybody has about a character and there was previously nowhere on
     // this page to answer it — the loop was only visible from the global view.
     railItem('pulse', 'Pulse', npc.tick?.ticks),
+    // What the character has chosen to remember, in its own words.
+    railItem('journal', 'Journal'),
+    // What its `scan` tells it, so the scan can be checked from here.
+    railItem('scan', 'Scan'),
+    // What it has been asked to do, how far it has got, and how it ended.
+    railItem('mission', 'Mission'),
     /* The two ways to be present to a character, side by side, because the
      * choice between them is one question: are you standing with them, or
      * reaching them from somewhere else. Both used to sit behind an "Open
@@ -141,7 +147,7 @@ export async function render(params) {
   if (vp.narrow) {
     el.appendChild(h('nav', { class: 'npc-tabs' },
       [
-        ['overview', 'Summary'], ['pulse', 'Pulse'], ['messages', 'Messages'],
+        ['overview', 'Summary'], ['pulse', 'Pulse'], ['journal', 'Journal'], ['scan', 'Scan'], ['mission', 'Mission'], ['messages', 'Messages'],
         ['presence', 'In the room'],
         ...declared.map((l) => [l, l[0].toUpperCase() + l.slice(1)]),
         ['projection', 'Projection'], ['monitor', 'Monitor'], ['manage', 'Manage'],
@@ -167,6 +173,9 @@ export async function render(params) {
     overview, messages, presence, beliefs, relationships, agency, projection, monitor, manage,
     environment: environmentTab,
     pulse: pulseTab,
+    journal: journalTab,
+    scan: scanTab,
+    mission: missionTab,
   };
   const fn = TABS[tab] || (declared.includes(tab) ? () => streamLayer(tab) : overview);
   // Any tab other than Messages stops its poll — otherwise the timer runs
@@ -292,6 +301,352 @@ export async function render(params) {
     /* The rail persists across tabs, so leaving this one has to stop the poll —
      * otherwise every visit leaves an interval running against a detached DOM
      * for the life of the session. */
+    teardowns.push(() => { stop = true; clearInterval(t); });
+  }
+
+  // ── scan ──────────────────────────────────────────────────────────────────
+
+  /* What this character's `scan` tells it, right now: the text it would read, and
+   * below it the data that text was written from. Hovering a station, a verb or a
+   * parameter says what it is; nothing here is the page's own reckoning, so a
+   * scan that reads wrong is wrong at the daemon. */
+  async function scanTab() {
+    const host = h('div', { class: 'sc' });
+    let stop = false;
+
+    /* One overlay the page draws itself, shown the instant the pointer is over
+     * anything carrying `data-tip` and anchored to that element, not to the
+     * cursor. The browser's own `title` waits about a second and follows the
+     * mouse. Delegated from the host, so the five-second repaint loses nothing. */
+    const tipEl = h('div', { class: 'sc-tip', hidden: true });
+    document.body.appendChild(tipEl);
+    const hideTip = () => { tipEl.hidden = true; };
+    host.addEventListener('mouseover', (e) => {
+      const t = e.target.closest('[data-tip]');
+      if (!t) return hideTip();
+      tipEl.textContent = t.getAttribute('data-tip');
+      tipEl.hidden = false;
+      const r = t.getBoundingClientRect();
+      const w = tipEl.offsetWidth, ht = tipEl.offsetHeight;
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+      const top = r.bottom + 6 + ht > window.innerHeight ? r.top - ht - 6 : r.bottom + 6;
+      tipEl.style.left = left + 'px';
+      tipEl.style.top = Math.max(8, top) + 'px';
+    });
+    host.addEventListener('mouseleave', hideTip);
+    teardowns.push(() => { tipEl.remove(); });
+
+    const need = (n) => h('span', {
+      class: 'sc-need' + (n.required ? ' is-required' : ''),
+      'data-tip': `${n.name} (${n.ty}, ${n.required ? 'required' : 'optional'}) — ${n.about || 'no description'}`,
+    }, n.name);
+
+    const station = (s) => h('article', { class: 'sc-station' },
+      h('header', { class: 'sc-hd' },
+        h('span', { class: 'sc-name', 'data-tip': 'Raw reading: ' + JSON.stringify(s.reading) }, s.name),
+        h('span', { class: 'sc-addr mono tiny dim' }, s.address)),
+      s.state.length
+        ? h('div', { class: 'sc-state' }, s.state.map((b) => h('span', { class: 'chip' }, b)))
+        : null,
+      h('ul', { class: 'sc-verbs' }, s.verbs.map((v) => h('li', {},
+        h('span', {
+          class: 'sc-verb mono',
+          'data-tip': 'The address the character passes to `invoke`',
+        }, v.address),
+        h('span', { class: 'sc-needs' }, v.needs.map(need))))),
+      s.can.length
+        ? h('div', { class: 'tiny dim' }, 'the tower can ' + s.can.join(', '))
+        : null);
+
+    function paint(v) {
+      const sv = v.survey;
+      hideTip();
+      mount(host,
+        h('section', {},
+          h('h4', {}, 'What the character reads'),
+          h('pre', { class: 'sc-prose' }, v.prose)),
+        h('section', {},
+          h('h4', {}, `In the room · ${sv.stations.length} station${sv.stations.length === 1 ? '' : 's'}`),
+          sv.stations.length
+            ? sv.stations.map(station)
+            : h('p', { class: 'tiny dim' }, 'Nothing here answers to this character.')),
+        h('section', {},
+          h('h4', {}, 'On the phone'),
+          sv.threads.length
+            ? h('ul', { class: 'sc-list' }, sv.threads.map((t) => h('li', {}, t)))
+            : h('p', { class: 'tiny dim' }, 'No conversations, or no handset.')),
+        h('section', {},
+          h('h4', {}, 'Lately'),
+          sv.lately
+            ? h('p', { class: 'sc-lately' }, sv.lately)
+            : h('p', { class: 'tiny dim' }, 'Nothing new since it last looked.')));
+    }
+
+    async function refresh() {
+      if (stop) return;
+      try {
+        paint(await API.npcScan(id));
+      } catch (e) {
+        mount(host, h('p', { class: 'tiny dim' },
+          e.error === 'not_placed'
+            ? 'This character has no body in a running world, so there is nothing to scan.'
+            : 'Could not scan — ' + (e.detail || e.message)));
+      }
+    }
+
+    mount(bodyHost,
+      h('div', { class: 'page' },
+        h('div', { class: 'row', style: 'gap:9px;margin-bottom:18px' },
+          h('button', { class: 'btn', onClick: refresh }, '↻ Scan again')),
+        host));
+    await refresh();
+    const t = setInterval(refresh, 5000);
+    teardowns.push(() => { stop = true; clearInterval(t); });
+  }
+
+  // ── mission ───────────────────────────────────────────────────────────────
+
+  /* What this character has been asked to do, read from the daemon's mission
+   * store: the ask, each step with its tick, the answer it is building and, once
+   * it has filed one, the report. The report step stays open until the character
+   * files the report itself — nothing ticks it for it. */
+  async function missionTab() {
+    const host = h('div', { class: 'ms' });
+    let stop = false;
+
+    const stepState = (s) => (!s.done ? 'open' : s.outcome === 'thwarted' ? 'thwarted' : 'achieved');
+    const stepMark = { open: '○', achieved: '✓', thwarted: '✗' };
+    const stepTitle = { open: 'Not signed off yet', achieved: 'Achieved', thwarted: 'Thwarted: tried and could not do it' };
+    const step = (s) => h('li', { class: 'ms-step is-' + stepState(s) },
+      h('span', { class: 'ms-mark', title: stepTitle[stepState(s)] }, stepMark[stepState(s)]),
+      h('span', { class: 'ms-text' }, s.text),
+      s.reports ? h('span', { class: 'chip' }, 'filed by the report') : null);
+
+    const origin = (o) => (o.kind === 'lodged' ? `lodged by ${o.by}` : `routine · ${o.routine}`);
+
+    function paint(v) {
+      const m = v.mission;
+      if (!m) {
+        mount(host, h('p', { class: 'tiny dim' }, 'This character has no mission.'));
+        return;
+      }
+      const done = m.todo.filter((s) => s.done).length;
+      mount(host,
+        h('section', {},
+          h('h4', {}, 'Asked of it'),
+          h('div', { class: 'row', style: 'gap:6px;margin-bottom:8px' },
+            h('span', { class: 'chip' }, m.open ? 'open' : 'closed'),
+            h('span', { class: 'chip' }, origin(m.origin)),
+            m.todo.length ? h('span', { class: 'chip' }, `${done}/${m.todo.length} steps`) : null),
+          h('pre', { class: 'sc-prose' }, m.prompt)),
+        h('section', {},
+          h('h4', {}, 'Steps'),
+          m.todo.length
+            ? h('ul', { class: 'ms-steps' }, m.todo.map(step))
+            : h('p', { class: 'tiny dim' }, 'No steps; it carries the ask alone.')),
+        m.answer
+          ? h('section', {}, h('h4', {}, 'Answer so far'), h('pre', { class: 'sc-prose' }, m.answer))
+          : null,
+        h('section', {},
+          h('h4', {}, 'Report'),
+          m.report
+            ? h('div', {},
+              h('div', { class: 'row', style: 'gap:6px;margin-bottom:8px' },
+                h('span', { class: 'chip' }, m.report.outcome)),
+              h('pre', { class: 'sc-prose' }, m.report.notes))
+            : h('p', { class: 'tiny dim' }, 'Not filed yet.')));
+    }
+
+    async function refresh() {
+      if (stop) return;
+      try {
+        paint(await API.npcMission(id));
+      } catch (e) {
+        mount(host, h('p', { class: 'tiny dim' }, 'Could not read the mission — ' + (e.detail || e.message)));
+      }
+    }
+
+    mount(bodyHost,
+      h('div', { class: 'page' }, host));
+    await refresh();
+    const t = setInterval(refresh, 3000);
+    teardowns.push(() => { stop = true; clearInterval(t); });
+  }
+
+  // ── journal ───────────────────────────────────────────────────────────────
+
+  /* The character's journal, laid out as a book: the newest entry on top, each
+   * on a page of its own.
+   *
+   * Everything shown is what the daemon returned. An entry's claims are grouped
+   * by how the character came to know them (`kind`), which the daemon derives
+   * from the turns each one cites — the page never decides that. A page carries
+   * a ribbon when its entry is one of those the character's next prompt holds,
+   * which is the answer to "does it actually remember this". */
+  function journalPage(e, held, onForget) {
+    // Local, not a module-level `const`: the tab runs before this point in the
+    // file does, and a `const` here would still be in its temporal dead zone.
+    const KIND_HEADINGS = [
+      ['observed', 'I saw'], ['heard', 'I was told'], ['did', 'I did'],
+      ['inferred', 'I concluded, without seeing or hearing it'],
+    ];
+    const claims = e.claims || [];
+    const group = ([kind, heading]) => {
+      const mine = claims.filter((c) => c.kind === kind);
+      return mine.length
+        ? h('section', { class: 'jr-sec jr-' + kind },
+          h('h4', {}, heading),
+          h('ul', {}, mine.map((c) => h('li', {},
+            h('span', { class: 'jr-claim' }, c.text),
+            c.corrected
+              ? h('span', { class: 'jr-mark', title: 'The world read differently than the character first wrote' },
+                'corrected by the world')
+              : null,
+            h('span', { class: 'jr-cite', title: 'the turns this rests on' },
+              (c.cite || []).map((n) => '·' + n).join(' '))))))
+        : null;
+    };
+    const intend = e.intend || [];
+    const opened = e.opened || [];
+    const resolved = e.resolved || [];
+    return h('article', { class: 'jr-page' + (held ? ' is-held' : '') },
+      held ? h('div', { class: 'jr-ribbon', title: 'The next prompt carries this entry' }, 'in memory') : null,
+      h('header', { class: 'jr-page-hd' },
+        h('span', { class: 'jr-no' }, 'No. ' + e.id),
+        h('span', { class: 'jr-date' }, (e.span || '').replace(/^\[|\]$/g, '')),
+        h('span', { class: 'jr-turns' }, `turns ${e.from_turn}–${e.to_turn}`),
+        h('button', {
+          class: 'jr-forget', title: 'Forget this entry: the character will no longer remember it',
+          onClick: () => onForget(e),
+        }, 'Forget')),
+      KIND_HEADINGS.map(group),
+      intend.length
+        ? h('section', { class: 'jr-sec jr-intend' },
+          h('h4', {}, 'Meaning to'),
+          h('ul', {}, intend.map((t) => h('li', {}, h('span', { class: 'jr-claim' }, t)))))
+        : null,
+      opened.length
+        ? h('section', { class: 'jr-sec jr-opened' },
+          h('h4', {}, 'Left open'),
+          h('ul', {}, opened.map((i) => h('li', {},
+            h('span', { class: 'jr-claim' }, i.text),
+            h('span', { class: 'jr-cite' }, '#' + i.id)))))
+        : null,
+      resolved.length
+        ? h('section', { class: 'jr-sec jr-settled' },
+          h('h4', {}, 'Settled'),
+          h('ul', {}, resolved.map((n) => h('li', {}, h('span', { class: 'jr-claim' }, 'Open item #' + n)))))
+        : null);
+  }
+
+  function draftLog(drafts) {
+    if (!drafts.length) return null;
+    const words = {
+      wrote: 'written', nothing: 'nothing worth writing',
+      abandoned: 'given up', not_started: 'could not start',
+    };
+    return h('details', { class: 'jr-log' },
+      h('summary', {}, `Drafting log · last ${drafts.length}`),
+      drafts.slice().reverse().map((d) => h('div', { class: 'jr-log-row is-' + d.result },
+        h('span', { class: 'mono' }, `turns ${d.from_turn}–${d.to_turn}`),
+        h('span', { class: 'jr-log-result' }, words[d.result] || d.result),
+        d.entry ? h('span', { class: 'mono dim' }, 'No. ' + d.entry) : null,
+        h('span', { class: 'jr-log-detail' }, d.detail || ''),
+        h('span', { class: 'mono dim' }, (d.took_ms / 1000).toFixed(1) + 's'))));
+  }
+
+  async function journalTab() {
+    const host = h('div', { class: 'jr' });
+    let stop = false;
+    let shown = '';
+
+    async function draftNow() {
+      try {
+        const r = await API.draftJournal(id);
+        toast(`Drafting over ${r.turns} turns`, 'ok');
+        refresh();
+      } catch (e) {
+        toast(e.error === 'nothing_to_draft'
+          ? 'Nothing new to write up, or a draft is already running'
+          : (e.detail || e.message || 'could not start a draft'), 'err');
+      }
+    }
+
+    function forget(e) {
+      confirmDialog({
+        title: 'Forget entry No. ' + e.id,
+        danger: true,
+        confirmText: 'Forget it',
+        message: `${npc.name} will no longer remember this entry. It is removed from the journal, the `
+          + 'conversation and the record a restart rebuilds from, and cannot be brought back.',
+        onConfirm: async () => {
+          try {
+            const v = await API.forgetJournalEntry(id, e.id);
+            shown = JSON.stringify(v);
+            paint(v);
+            toast('entry forgotten', 'ok');
+          } catch (err) {
+            toast(err.detail || err.message || 'could not forget the entry', 'err');
+          }
+        },
+      });
+    }
+
+    function paint(v) {
+      const held = new Set(v.in_prompt || []);
+      const entries = (v.entries || []).slice().reverse();
+      const open = v.open || [];
+      mount(host,
+        h('div', { class: 'jr-cover' },
+          h('div', { class: 'jr-cover-title' },
+            h('span', { class: 'jr-cover-kicker' }, 'the private journal of'),
+            h('span', { class: 'jr-cover-name' }, npc.name)),
+          h('div', { class: 'jr-cover-meta' },
+            h('span', {}, `${fmtNum(v.written)} written`),
+            h('span', {}, `${held.size} in memory`),
+            h('span', {}, v.drafting ? 'writing now…' : 'resting')),
+          h('button', { class: 'btn sm', onClick: draftNow, disabled: !!v.drafting }, '✎ Write now')),
+        open.length
+          ? h('aside', { class: 'jr-open' },
+            h('h4', {}, 'Still on its mind'),
+            h('ul', {}, open.map((i) => h('li', {},
+              h('span', { class: 'jr-claim' }, i.text),
+              h('span', { class: 'jr-cite' }, '#' + i.id)))))
+          : null,
+        entries.length
+          ? entries.map((e) => journalPage(e, held.has(e.id), forget))
+          : h('div', { class: 'jr-blank' },
+            h('p', {}, 'The first page is still blank.'),
+            h('p', { class: 'tiny' },
+              'A character writes after every sixteen turns or so, and only if there is something it ' +
+              'would want to know later.')),
+        entries.length < (v.written || 0)
+          ? h('div', { class: 'jr-older tiny dim' },
+            `${fmtNum(v.written - entries.length)} older ${v.written - entries.length === 1 ? 'entry is' : 'entries are'} kept in the substrate and no longer shown here.`)
+          : null,
+        draftLog(v.drafts || []));
+    }
+
+    async function refresh() {
+      if (stop) return;
+      try {
+        const v = await API.getJournal(id);
+        const sig = JSON.stringify(v);
+        if (sig === shown) return;
+        shown = sig;
+        paint(v);
+      } catch (e) {
+        mount(host, empty('✎',
+          e.error === 'not_awake' || e.status === 503
+            ? 'This character is not awake yet'
+            : 'Could not read the journal',
+          e.detail || e.message || ''));
+      }
+    }
+
+    mount(bodyHost, host);
+    await refresh();
+    const t = setInterval(refresh, 5000);
     teardowns.push(() => { stop = true; clearInterval(t); });
   }
 
@@ -587,6 +942,10 @@ export async function render(params) {
   async function monitor() {
     const m = await API.getMonitor(id, 120).catch(() => null);
     if (!m) return mount(bodyHost, empty('◌', 'No monitor data'));
+    if (!Array.isArray(m.overlap) || !m.thresholds) {
+      return mount(bodyHost, empty('◌', 'Not measured',
+        'The engine has not scored this character\'s overlap, so there is no trace to draw.'));
+    }
     mount(bodyHost,
       h('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:11px' },
         h('div', { class: 'tiny dim', style: 'max-width:660px' },

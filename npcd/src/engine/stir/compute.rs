@@ -44,6 +44,10 @@ impl Fixture for ComputeFloor {
         "compute"
     }
 
+    fn needs(&self) -> &'static [&'static str] {
+        &["compute-rack"]
+    }
+
     fn signals(&self, out: &mut Vec<Cond>) {
         if self.running > 0 {
             out.push(Cond::Working);

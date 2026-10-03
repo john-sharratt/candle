@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use crate::engine::event::Salience;
-use crate::engine::stir::{Cond, Due, Fixture, Rng, Stirring, Watch};
+use crate::engine::stir::{Bound, Cond, Due, Fixture, Rng, Stirring, Watch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -57,6 +57,48 @@ impl Fixture for Lighting {
             // Enough gone to matter is dark enough for what lives in the walls.
             State::Down if self.failed >= 3 => out.push(Cond::Dark),
             _ => {}
+        }
+    }
+
+    fn needs(&self) -> &'static [&'static str] {
+        &["light-ring"]
+    }
+
+    fn bound(&self) -> Option<Bound> {
+        Some(Bound {
+            part: "light-ring",
+            ok: "steady",
+            fault: "failing",
+            system: "the lighting ring",
+            trouble: "tubes have failed",
+            object: "the light ring",
+        })
+    }
+
+    fn faulted(&self) -> bool {
+        self.state != State::Full
+    }
+
+    fn set_fault(&mut self, on: bool) -> Option<Stirring> {
+        match on {
+            true => {
+                self.state = State::Down;
+                self.failed = self.failed.max(1);
+                Some(Stirring::new(
+                    "lights",
+                    "The light ring gutters and settles into a weak, uneven light.",
+                    Salience::NORMAL,
+                ))
+            }
+            false => {
+                self.state = State::Full;
+                self.failed = 0;
+                Some(Stirring::new(
+                    "lights",
+                    "The light ring steadies and comes up to full, and the room is honest again.",
+                    Salience::NORMAL,
+                ))
+            }
         }
     }
 
@@ -111,7 +153,7 @@ impl Fixture for Lighting {
                 Salience::IDLE,
                 &[],
             ),
-            4 if self.failed > 0 => {
+            4 if self.state != State::Full => {
                 self.failed = self.failed.saturating_sub(1);
                 self.state = match self.failed {
                     0 => State::Full,

@@ -18,8 +18,32 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::mission::bank::{self, Facts};
-use crate::engine::mission::{Mission, Outcome};
+use crate::engine::mission::bank::{self, Duty, Facts};
+use crate::engine::mission::{Mission, Outcome, StepOutcome};
+
+/// What the world offers a routine, owned: [`Sim::mission_material`]'s answer,
+/// which a caller borrows as [`Facts`] while it draws.
+///
+/// [`Sim::mission_material`]: crate::sim::Sim::mission_material
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MissionMaterial {
+    pub makers: Vec<String>,
+    pub records: Vec<String>,
+    pub duties: Vec<Duty>,
+    pub table: Option<String>,
+}
+
+impl MissionMaterial {
+    /// The same material, borrowed for [`Missions::collect`].
+    pub fn facts(&self) -> Facts<'_> {
+        Facts {
+            makers: &self.makers,
+            records: &self.records,
+            duties: &self.duties,
+            table: self.table.as_deref(),
+        }
+    }
+}
 
 /// Every character's mission, and the ones lodged for characters yet to collect.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,10 +134,12 @@ impl Missions {
         Some(mission)
     }
 
-    /// Check a step off the body's open mission. `false` when it has no open
+    /// Sign a step off on the body's open mission. `false` when it has no open
     /// mission or nothing matched — see [`Mission::check_off`].
-    pub fn check_off(&mut self, body: &str, step: &str) -> bool {
-        self.active.get_mut(body).is_some_and(|m| m.check_off(step))
+    pub fn check_off(&mut self, body: &str, step: &str, outcome: StepOutcome) -> bool {
+        self.active
+            .get_mut(body)
+            .is_some_and(|m| m.check_off(step, outcome))
     }
 
     /// Add a step to the body's open mission. `false` when it has no open
@@ -149,7 +175,7 @@ impl Missions {
 mod tests {
     use super::Missions;
     use crate::engine::mission::bank::Facts;
-    use crate::engine::mission::{Mission, Origin, Outcome, Todo};
+    use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome, Todo};
 
     fn a_mission(prompt: &str) -> Mission {
         Mission::new(
@@ -191,12 +217,18 @@ mod tests {
     fn steps_are_checked_off_and_added_only_on_an_open_mission() {
         let mut m = Missions::default();
         // No mission: nothing to act on.
-        assert!(!m.check_off("pax", "step one"));
+        assert!(!m.check_off("pax", "step one", StepOutcome::Achieved));
         assert!(!m.add_todo("pax", "a new step"));
 
         m.assign("pax", a_mission("do the thing"));
-        assert!(m.check_off("pax", "STEP one"), "trim + case-insensitive");
-        assert!(!m.check_off("pax", "step one"), "already done");
+        assert!(
+            m.check_off("pax", "STEP one", StepOutcome::Achieved),
+            "trim + case-insensitive"
+        );
+        assert!(
+            !m.check_off("pax", "step one", StepOutcome::Thwarted),
+            "already done"
+        );
         assert!(m.add_todo("pax", "a discovered step"));
         assert!(
             !m.add_todo("pax", "  a discovered step  "),
@@ -241,6 +273,7 @@ mod tests {
         let facts = Facts {
             makers: &makers,
             records: &records,
+            ..Facts::default()
         };
 
         // A lodged mission is taken first, verbatim, and becomes active.
@@ -268,6 +301,27 @@ mod tests {
             "a cancelled mission is not a finished one"
         );
         assert!(!m.cancel("bram"), "nothing to cancel twice");
+    }
+
+    #[test]
+    fn missions_survive_a_round_trip_through_json() {
+        let mut m = Missions::default();
+        m.assign("bram", a_mission("do the thing"));
+        m.add_todo("bram", "look twice");
+        m.lodge("bram", a_mission("then this"));
+        m.assign("yen", a_mission("first task"));
+        m.report("yen", Outcome::Pass, "done", Some("it holds".to_string()));
+        let blob = serde_json::to_value(&m).unwrap();
+        let back: Missions = serde_json::from_value(blob).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(
+            back.active("bram").unwrap().todo.last().unwrap().text,
+            "look twice"
+        );
+        assert_eq!(
+            back.done("yen").unwrap().answer.as_deref(),
+            Some("it holds")
+        );
     }
 
     #[test]

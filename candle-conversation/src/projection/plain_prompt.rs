@@ -78,7 +78,7 @@ const FLOOR: u32 = CEILING - 2 * SLOTS;
 const TRANSIENT_SLOTS: u32 = 1 << 20;
 
 /// The lowest id a transient frame can take.
-const TRANSIENT_FLOOR: u32 = FLOOR - 2 * TRANSIENT_SLOTS;
+pub(super) const TRANSIENT_FLOOR: u32 = FLOOR - 2 * TRANSIENT_SLOTS;
 
 // The partitions' bounds, checked where they are declared: a change that walks
 // them into the reserved band or down into schema-allocated ids fails the build.

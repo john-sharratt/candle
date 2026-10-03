@@ -44,7 +44,9 @@
 //! model reads; a tool with none has not been thought through, so an
 //! example-less tool is a build failure here rather than a quiet regression.
 
-use candle_conversation::projection::{Builder, SelectionRule, SelectionState};
+use candle_conversation::projection::{
+    Builder, SelectionRule, SelectionState, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR,
+};
 use candle_conversation::stencil::{Param as StencilParam, ParamType, ToolSpec};
 use serde::Serialize;
 
@@ -311,6 +313,16 @@ const SHOUT: Tool = Tool {
     ],
 };
 
+/// # Peers do not give each other orders
+///
+/// Three characters of equal standing, each handed the same finding and told to
+/// say what they mean, converged on commanding one another: "that Pax should
+/// check the seal", "that we should move somewhere", "that there is no need to
+/// keep asking". Every line was an instruction, so every listener heard a
+/// superior, each tried the same in return, and the room became a ring of
+/// people closing each other's questions. The `intent` parameters of the speech
+/// acts therefore say what an utterance is *for* — what you found, believe or
+/// want — and that nobody here answers to you.
 const TELL: Tool = Tool {
     name: "tell",
     at: &[],
@@ -340,9 +352,12 @@ const TELL: Tool = Tool {
             name: "intent",
             ty: "string",
             required: true,
-            description: "What you mean to convey. Substance, not wording: \"that I will not \
-                          hand over the ledger, and that pressing me will cost him\" — never a \
-                          finished line of dialogue.",
+            description: "What you mean to convey: what you found, saw, believe or want. \
+                          Substance, not wording: \"that I will not hand over the ledger, and \
+                          that pressing me will cost him\" — never a finished line of dialogue. \
+                          Nobody here answers to you and you answer to nobody here, so give \
+                          them what you know or would like and let them decide; do not tell \
+                          them what they should do, or that a matter is closed.",
         },
         Param {
             name: "manner",
@@ -366,6 +381,15 @@ const TELL: Tool = Tool {
             call: r#"{"to":"Maker-02","intent":"that they are not interrupting and I would rather have the company","manner":"warmly"}"#,
             because: "A reply is addressed. Shouting it to everybody would leave the person \
                       who spoke to you unsure it was meant for them.",
+        },
+        Example {
+            situation: "The strip along the door has worked loose again, and Maker-04, who is \
+                        handier with the tools than you, is standing by it.",
+            call: r#"{"to":"Maker-04","intent":"that the strip along the door has worked loose again, and that I would be glad of a hand with it if they have the time","manner":"easily"}"#,
+            because: "A finding and a request leave them free to take it up or not. Saying they \
+                      should fix it would be an order from somebody who has no standing to \
+                      give one, and orders between equals are how everyone ends up waiting on \
+                      everyone.",
         },
         Example {
             situation: "Maker-04 and Maker-02 are both in the green room with you, and you \
@@ -411,7 +435,8 @@ const WHISPER: Tool = Tool {
             name: "intent",
             ty: "string",
             required: true,
-            description: "What you mean to convey. Substance, not wording — never a finished \
+            description: "What you mean to convey: what you know or want, not an instruction — \
+                          nobody here answers to you. Substance, not wording — never a finished \
                           line of dialogue.",
         },
         Param {
@@ -823,57 +848,20 @@ const REFLECT: Tool = Tool {
     ],
 };
 
-/// The effector device's two verbs — the fixed surface over a world that can
+/// The effector device's one verb — the fixed surface over a world that can
 /// grow without bound (effector design §5).
 ///
-/// **Two tools, and they never change while the world behind them does.** A new
+/// **One tool, and it never changes while the world behind it does.** A new
 /// place, machine or whole subsystem shows up as new addresses under
-/// `http://local/...`, discovered and acted on through exactly these two, with no
-/// new `Tool` static and no recompile. That is the whole escape from the tool
-/// surface that could not scale: the body keeps its hands, and gains a device
-/// whose *verbs* are fixed over a *dynamic* set of addressable things.
+/// `http://local/...`, acted on through exactly this, with no new `Tool` static
+/// and no recompile. That is the whole escape from the tool surface that could
+/// not scale: the body keeps its hands, and gains a device whose *verb* is fixed
+/// over a *dynamic* set of addressable things. Finding the addresses is the body
+/// act `scan`.
 ///
-/// `query` reads and `invoke` acts — the GET/OPTIONS versus everything-else line
-/// the model already draws between finding out and doing. Handled on the async
-/// effector fast path (`Runtime::enact_device`, effector design §6, §8.1), not
-/// through `body::perform`: they are body/meta tools, always offered, never world
-/// acts. See [`crate::engine::body::is_device`].
-const QUERY: Tool = Tool {
-    name: "query",
-    at: &[],
-    category: "Device",
-    // Not a world act: it commits through no arbiter and takes no world-version,
-    // because looking changes nothing. Enacted in the loop, not by `body::perform`.
-    plane: Plane::Meta,
-    availability: Availability::Always,
-    description: "Read an address on your effector device — what lives beneath it, or what a \
-                  thing will accept. Looking never changes anything, so you may look as often as \
-                  you like. Addresses look like `http://local/...`; read `http://local/` for \
-                  what is reachable from where you stand.",
-    params: &[Param {
-        name: "url",
-        ty: "string",
-        required: true,
-        description: "The address to read, exactly as it appears on your device — \
-                      \"http://local/\" for what is near you, or one of the addresses it lists.",
-    }],
-    examples: &[
-        Example {
-            situation: "You have just picked the device up and want to know what is around you.",
-            call: r#"{"url":"http://local/"}"#,
-            because: "The bare host is the near-you index — everything reachable from where you \
-                      stand. It is where you look before you know what any one thing is.",
-        },
-        Example {
-            situation: "The index showed a lift within reach and you want to know whether the \
-                        car is here and where it can take you.",
-            call: r#"{"url":"http://local/lift/command-shaft"}"#,
-            because: "Reading the thing itself tells you its state and what it will accept, and \
-                      looking costs nothing — so you find out before you `invoke` it.",
-        },
-    ],
-};
-
+/// Handled on the async effector fast path (`Runtime::enact_device`, effector
+/// design §6, §8.1), not through `body::perform`: it is a body/meta tool, always
+/// offered, never a world act. See [`crate::engine::body::is_device`].
 const INVOKE: Tool = Tool {
     name: "invoke",
     at: &[],
@@ -885,8 +873,8 @@ const INVOKE: Tool = Tool {
     availability: Availability::Always,
     description: "Act at an address on your effector device, giving it the fields it asked for \
                   as a JSON object. The world does the thing and answers, or tells you plainly \
-                  what was wrong so you can fix it and try again. Look with `query` first if you \
-                  are not sure what an address will take.",
+                  what was wrong so you can fix it and try again. `scan` with no place named \
+                  lists what you can work here, with the address and fields for each.",
     params: &[
         Param {
             name: "url",
@@ -982,11 +970,11 @@ const BODY_ACTS: &[Tool] = &[
     // Speech, attention, movement — what a body does with other bodies and
     // with rooms.
     TELL, WHISPER, SHOUT, ASK, GESTURE, MOVE_TO, FOLLOW, REFLECT, SEND_IMAGE,
-    // The effector device — the fixed two-verb surface onto the world. Always
-    // offered, like the body's own acts, and for the same reason: what it can
-    // reach is a fact about where the body stands, not about whether the tool
-    // exists. See [`QUERY`] / [`INVOKE`].
-    QUERY, INVOKE,
+    // The effector device — the fixed verb onto the world. Always offered, like
+    // the body's own acts, and for the same reason: what it can reach is a fact
+    // about where the body stands, not about whether the tool exists. See
+    // [`INVOKE`].
+    INVOKE,
 ];
 
 /// The interaction modes a character can be in. Decides which tools are offered.
@@ -1135,7 +1123,7 @@ pub fn by_name(name: &str) -> Option<&'static Tool> {
 }
 
 /// Whether an act has **migrated to the effector device** — reached only through
-/// `query`/`invoke` on its resource, and therefore no longer offered in the
+/// `invoke` on its resource, and therefore no longer offered in the
 /// compiled grammar (effector design Step 6, "deleting each corresponding `Tool`
 /// … as it moves").
 ///
@@ -1145,7 +1133,7 @@ pub fn by_name(name: &str) -> Option<&'static Tool> {
 /// a route invokes it — but [`specs_within`] filters it out, so a character can
 /// no longer emit it as a plain call. It has to find the resource on its
 /// effector device and act there, which is the whole point of the migration: the
-/// tool surface stays fixed (`query`/`invoke`) while the world's affordances move
+/// tool surface stays fixed (`invoke`) while the world's affordances move
 /// behind it.
 ///
 /// The migration is incremental, one namespace at a time so the pulse can prove
@@ -1207,6 +1195,13 @@ pub fn one_line(t: &Tool) -> String {
 /// rule. No trailing newline — the collection's glue separates entries.
 pub fn entry(t: &Tool) -> String {
     let mut s = one_line(t);
+    if routed(t.name) {
+        s.push_str(&format!(
+            "\n  reached with `invoke`: use the address offered for `{}`, and put the arguments \
+             below in its body",
+            t.name
+        ));
+    }
     for p in t.params {
         let optional = if p.required { "" } else { " (optional)" };
         s.push_str(&format!("\n  {}{optional}: {}", p.name, p.description));
@@ -1214,19 +1209,29 @@ pub fn entry(t: &Tool) -> String {
     s
 }
 
+/// How many of the acts a room offers one turn's prompt describes, ranked by
+/// provenance. Routed acts are not counted: they are shown whenever offered.
+pub const SHOWN_ACTS: usize = 10;
+
 /// Install `tools` into the schema's [`COLLECTION`], one member each, and make
-/// it selected by name — so nothing shows until a turn names it.
+/// it chosen by both the room and provenance — so nothing shows until a turn
+/// offers it, and of what it offers the most relevant are shown.
 ///
 /// **Every tool, whatever it needs.** What a body can do changes every tick
 /// with who is here, what it carries and where it stands, and the system prompt
-/// is sealed once; so the prompt holds all of them and each turn chooses. A
-/// collection scored by provenance would show whichever acts looked relevant,
-/// which is not the same set as the acts that are possible — see
-/// [`show_within`] for the one that is.
+/// is sealed once; so the prompt holds all of them and each turn chooses. The
+/// room decides which acts are *possible* ([`show_within`] offers exactly the
+/// ones the grammar allows), and provenance scoring then ranks those by how
+/// well each fits what the character is meant to be doing — so a collection
+/// scored alone can no longer show an act the room refuses, and a room can no
+/// longer bury the relevant act under every other one it allows. A routed act
+/// is mandatory: it is shown whenever its table is in reach, because the
+/// address in the mask is useless to a character never told what the verb means.
 ///
-/// Forced to [`SelectionRule::Named`] whatever the schema declared, because the
-/// selector is this module's to name: a collection authored `always_visible`
-/// would offer a character alone in a corridor someone to `tell` something to.
+/// Forced to [`SelectionRule::Offered`] whatever the schema declared, because
+/// the selector is this module's to name: a collection authored
+/// `always_visible` would offer a character alone in a corridor someone to
+/// `tell` something to.
 ///
 /// `installed` is called after each one, with how many are in so far.
 pub fn install<'a>(
@@ -1243,34 +1248,66 @@ pub fn install<'a>(
     builder
         .set_collection_selection(
             COLLECTION,
-            SelectionRule::Named {
+            SelectionRule::Offered {
                 selector: COLLECTION.to_string(),
+                k: SHOWN_ACTS,
             },
         )
-        .map_err(|e| anyhow::anyhow!("selecting `{COLLECTION}` by name: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("selecting `{COLLECTION}` by room and provenance: {e}"))?;
     let mut n = 0;
     for t in tools {
-        builder
+        let id = builder
             .add_section_to_collection(cid, member(t.name), entry(t), 100.0)
             .map_err(|e| anyhow::anyhow!("installing `{}` into `{COLLECTION}`: {e}", t.name))?;
+        if routed(t.name) {
+            builder
+                .set_collection_member_mandatory(cid, id)
+                .map_err(|e| anyhow::anyhow!("routed act `{}` mandatory: {e}", t.name))?;
+        }
         n += 1;
         installed(n, t);
     }
     Ok(n)
 }
 
-/// Show exactly these tools on a turn, replacing whatever it showed before.
-/// A name that was never installed shows nothing.
-pub fn show<'a>(selection: &mut SelectionState, tools: impl IntoIterator<Item = &'a str>) {
+/// Offer these tools on a turn, replacing whatever it offered before; the
+/// collection shows the most relevant of them. A name that was never installed
+/// offers nothing.
+fn offer<'a>(selection: &mut SelectionState, tools: impl IntoIterator<Item = &'a str>) {
     selection.select_all(COLLECTION, tools.into_iter().map(member));
 }
 
-/// Show the tools a character standing *here* can take — exactly the acts
-/// [`specs_within`] builds the turn's grammar from, so the prompt can neither
-/// offer an act the mask refuses nor leave out one it allows.
+/// Show exactly these tools on a turn, replacing whatever it showed before,
+/// whatever they score. A reflection or a journal entry is forced into one
+/// answer, so the prompt must hold precisely that answer's definition.
+pub fn show<'a>(selection: &mut SelectionState, tools: impl IntoIterator<Item = &'a str>) {
+    let members: Vec<String> = tools.into_iter().map(member).collect();
+    selection.select(
+        FORCE_TOOL_SELECTOR,
+        members.join(&FORCE_TOOL_SEPARATOR.to_string()),
+    );
+    selection.select_all(COLLECTION, members);
+}
+
+/// Offer the tools a character standing *here* can take — exactly the acts
+/// [`specs_within`] builds the turn's grammar from, so the prompt can never
+/// describe an act the mask refuses; provenance then ranks them, and shows
+/// the most relevant (see [`install`]).
+///
+/// **Plus the acts only `invoke` reaches.** A routed act is not in the grammar
+/// ([`routed`]), so [`specs_within`] never names it — and a character at the
+/// command table then read `invoke` and nothing about `report_done`, with an
+/// address in the mask for a verb it had never been told the meaning of. Every
+/// act behind an address the turn offers is shown with the rest.
 pub fn show_within(selection: &mut SelectionState, mode: Mode, within: &Within) {
     let specs = specs_within(mode, within);
-    show(selection, specs.iter().map(|s| s.name.as_str()));
+    let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    for act in invoke_body::acts(within) {
+        if !names.contains(&act) {
+            names.push(act);
+        }
+    }
+    offer(selection, names);
 }
 
 /// How many acts one turn may contain.
@@ -1519,26 +1556,13 @@ pub enum Choices {
 
     // ---- the effector device ----
     //
-    /// **Every address reachable from here** — what the effector `query` may
-    /// name. The near-you index as a grammar enum: the personal routes, the lift
-    /// at a landing, and every placed instance's url ([`Within::reachable`]).
-    ///
-    /// **This is the anti-hallucination fix.** With `query`'s `url` bound here,
-    /// the decoder is forced through a real address the device actually lists — a
-    /// character cannot `query http://local/command-table` (a plausible guess
-    /// that 404s) because that string is not an arm of the tree. It reads what is
-    /// on its device, and nothing else, which is the whole point of the near-you
-    /// index being live (§6, §13).
-    QueryUrl,
-
     /// **Every verb-path an `invoke` may act on** ([`Within::invokable`]) — each
     /// reachable resource's `<url>/<verb>` for the verbs it affords, and only the
     /// ones the world would take from this body now ([`invoke_body`]). Bound to
     /// `invoke`'s `url`, so the decoder is forced through a whole verb-path the
     /// world actually serves: a character cannot `invoke` a bare resource
-    /// (a `405`), nor a verb the resource does not have. The complement of
-    /// [`Choices::QueryUrl`] — query reads a resource, invoke acts on a verb of
-    /// one. Each address brings the typed `body` of the act behind it.
+    /// (a `405`), nor a plausible guess that 404s, nor a verb the resource does
+    /// not have. Each address brings the typed `body` of the act behind it.
     InvokeUrl,
 }
 
@@ -1719,10 +1743,9 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("produce", "what", Choices::Makeable),
     ("produce", "queue", Choices::Queues),
     // ---- the effector device ----
-    // Both device addresses are grammar-forced sets, so the decoder can only name
-    // an address the device actually lists — `query` a real resource, `invoke` a
-    // real verb-path of one — never a hallucinated url and never a bare resource.
-    ("query", "url", Choices::QueryUrl),
+    // The device address is a grammar-forced set, so the decoder can only name a
+    // real verb-path of a resource the device lists — never a hallucinated url
+    // and never a bare resource.
     ("invoke", "url", Choices::InvokeUrl),
 ];
 
@@ -1811,13 +1834,6 @@ pub struct Within {
     pub contacts: Vec<String>,
     /// The acts the parts standing here carry, straight off the map.
     pub station: Vec<String>,
-    /// **Every address reachable from here, for the effector `query`.** The
-    /// near-you index as a live set: the personal routes, the lift when at a
-    /// landing, and every placed instance's url. Bound to `query`'s `url` so the
-    /// grammar forces it to a real address — a character can `query` only what is
-    /// actually on its device, never a hallucinated `http://local/command-table`.
-    /// See [`Choices::QueryUrl`].
-    pub reachable: Vec<String>,
     /// **Every address an `invoke` may act on** — each reachable resource's
     /// verb-paths (`<resource-url>/<verb>`), with the act each one runs. Bound to
     /// `invoke`'s `url` so the grammar forces a whole verb-path a resource
@@ -1968,7 +1984,7 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
     CATALOG
         .iter()
         // **An act that has migrated to the effector device is not in the
-        // grammar** — it is reached by `query`/`invoke` on its resource, not
+        // grammar** — it is reached by `invoke` on its resource, not
         // offered as a compiled call (effector design Step 6). The `Tool` stays
         // in the catalogue because the device route builds its schema from it;
         // this is the one place it leaves the *grammar*. See [`routed`].
@@ -2164,7 +2180,6 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Invitable => within.invitable.clone(),
         Choices::Invitees => within.invitees.clone(),
         Choices::Contacts => within.contacts.clone(),
-        Choices::QueryUrl => within.reachable.clone(),
         Choices::InvokeUrl => invoke_body::urls(within),
     }
 }
@@ -2456,44 +2471,36 @@ mod tests {
         }
     }
 
-    /// **The effector device is the fixed two-verb surface, always offered.**
+    /// **The effector device is the fixed surface, always offered.**
     ///
-    /// `query` and `invoke` are body acts (in `BODY_ACTS`), `Availability::Always`
-    /// so they are reachable wherever the body stands, carry calibration examples,
-    /// and take string parameters the grammar can bound. See [`QUERY`] / [`INVOKE`].
+    /// `invoke` is a body act (in `BODY_ACTS`), `Availability::Always` so it is
+    /// reachable wherever the body stands, carries calibration examples, and takes
+    /// string parameters the grammar can bound. See [`INVOKE`].
     #[test]
-    fn the_effector_device_offers_query_and_invoke_always() {
-        for name in ["query", "invoke"] {
-            let t = by_name(name).unwrap_or_else(|| panic!("`{name}` is not in the catalog"));
-            assert!(
-                BODY_ACTS.iter().any(|b| b.name == name),
-                "`{name}` is not a body act — it must be in BODY_ACTS"
-            );
+    fn the_effector_device_offers_invoke_always() {
+        let invoke = by_name("invoke").unwrap_or_else(|| panic!("`invoke` is not in the catalog"));
+        assert!(
+            BODY_ACTS.iter().any(|b| b.name == "invoke"),
+            "`invoke` is not a body act — it must be in BODY_ACTS"
+        );
+        assert_eq!(
+            invoke.availability,
+            Availability::Always,
+            "`invoke` must be offered wherever the body stands"
+        );
+        assert!(
+            !invoke.examples.is_empty(),
+            "`invoke` carries no calibration example"
+        );
+        for p in invoke.params {
             assert_eq!(
-                t.availability,
-                Availability::Always,
-                "`{name}` must be offered wherever the body stands"
+                p.ty, "string",
+                "`invoke`.{} is `{}` — the device body is a string until the stencil shapes it",
+                p.name, p.ty
             );
-            assert!(
-                !t.examples.is_empty(),
-                "`{name}` carries no calibration example"
-            );
-            for p in t.params {
-                assert_eq!(
-                    p.ty, "string",
-                    "`{name}`.{} is `{}` — the device body is a string until the stencil shapes it",
-                    p.name, p.ty
-                );
-            }
         }
 
-        // `query` reads one address; `invoke` acts at one, with an optional body.
-        let query = by_name("query").unwrap();
-        assert_eq!(query.params.len(), 1);
-        assert_eq!(query.params[0].name, "url");
-        assert!(query.params[0].required, "an address to read is required");
-
-        let invoke = by_name("invoke").unwrap();
+        // `invoke` acts at one address, with an optional body.
         let url = invoke.params.iter().find(|p| p.name == "url").expect("url");
         assert!(url.required, "an address to act at is required");
         let body = invoke
@@ -3665,8 +3672,43 @@ mod tests {
             _ => None,
         });
         assert!(
-            matches!(rule, Some(SelectionRule::Named { ref selector }) if selector == COLLECTION),
+            matches!(
+                rule,
+                Some(SelectionRule::Offered { ref selector, k }) if selector == COLLECTION && k == SHOWN_ACTS
+            ),
             "{rule:?}"
+        );
+        let mandatory: Vec<_> = b
+            .schema()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|i| match i {
+                SystemPromptItem::Collection(c) if c.name == COLLECTION => Some(c.mandatory.len()),
+                _ => None,
+            })
+            .into_iter()
+            .collect();
+        let routed_count = all.iter().filter(|t| routed(t.name)).count();
+        assert_eq!(mandatory, [routed_count], "the routed acts, and only they");
+    }
+
+    /// A turn that forces one answer pins exactly that definition, whatever the
+    /// room offers.
+    #[test]
+    fn showing_pins_the_definitions_it_names() {
+        let mut sel = SelectionState::new();
+        show(&mut sel, ["reflection", "dream"]);
+        assert_eq!(
+            sel.get(FORCE_TOOL_SELECTOR),
+            Some(format!("{},{}", member("reflection"), member("dream")).as_str())
+        );
+        let mut room = SelectionState::new();
+        show_within(&mut room, Mode::Physical, &Within::nowhere());
+        assert_eq!(
+            room.get(FORCE_TOOL_SELECTOR),
+            None,
+            "the room offers, it does not pin"
         );
     }
 
@@ -3745,7 +3787,7 @@ mod tests {
     /// **A migrated act leaves the grammar even where its station stands.**
     /// `collect_mission` is `routed` to the effector device, so a body standing
     /// at the command table — `within.station` naming it — is still not offered
-    /// it as a compiled call. It reaches missions through `query`/`invoke` on the
+    /// it as a compiled call. It reaches missions through `invoke` on the
     /// command table now, which is the whole of the Step 6 cut.
     #[test]
     fn a_routed_act_is_absent_from_the_grammar_at_its_station() {
@@ -3757,14 +3799,8 @@ mod tests {
             "report_done".to_string(),
             "report_stuck".to_string(),
         ];
-        // `query`/`invoke` are offered only when there is an address to name —
-        // the near-you set is `query`'s enum and the verb-paths are `invoke`'s.
-        // Give both, as the device would list the command table, so the two device
-        // verbs are in the grammar to check against.
-        at_table.reachable = vec![
-            "http://local/here".to_string(),
-            "http://local/command/order-table~0".to_string(),
-        ];
+        // `invoke` is offered only when there is an address to name, so give it
+        // the one the device would list for the command table.
         at_table.invokable = vec![Invokable::new(
             "http://local/command/order-table~0/collect_mission",
             "collect_mission",
@@ -3780,8 +3816,50 @@ mod tests {
             );
             assert!(routed(migrated), "`{migrated}` should be marked routed");
         }
-        // And `query`/`invoke` — the fixed device surface — are always there.
-        assert!(offered.iter().any(|n| n == "query"));
+        // And `invoke` — the fixed device surface — is there.
         assert!(offered.iter().any(|n| n == "invoke"));
+    }
+
+    /// **An act only `invoke` reaches is still read about.** At the command table
+    /// the grammar offers the addresses of `report_done` and `report_stuck`, so
+    /// the turn's prompt must carry their entries — and must not, away from the
+    /// table, where no address is offered.
+    #[test]
+    fn a_turn_describes_the_routed_acts_whose_addresses_it_offers() {
+        let shown = |within: &Within| {
+            let mut sel = SelectionState::new();
+            show_within(&mut sel, Mode::Physical, within);
+            sel.members(COLLECTION).to_vec()
+        };
+        let mut at_table = Within::nowhere();
+        at_table.invokable = vec![
+            Invokable::new(
+                "http://local/command/order-table~0/report_done",
+                "report_done",
+            ),
+            Invokable::new(
+                "http://local/command/order-table~0/report_stuck",
+                "report_stuck",
+            ),
+        ];
+        let here = shown(&at_table);
+        assert!(here.contains(&member("report_done")), "{here:?}");
+        assert!(here.contains(&member("report_stuck")), "{here:?}");
+        assert!(!here.contains(&member("collect_mission")), "{here:?}");
+        let away = shown(&Within::nowhere());
+        assert!(!away.contains(&member("report_done")), "{away:?}");
+    }
+
+    /// A routed act's entry says how it is reached, because its name is not a
+    /// call the grammar will take.
+    #[test]
+    fn a_routed_acts_entry_says_it_is_reached_with_invoke() {
+        let e = entry(by_name("report_done").unwrap());
+        assert!(
+            e.starts_with(&one_line(by_name("report_done").unwrap())),
+            "{e}"
+        );
+        assert!(e.contains("reached with `invoke`"), "{e}");
+        assert!(!entry(by_name("tell").unwrap()).contains("reached with `invoke`"));
     }
 }

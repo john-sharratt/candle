@@ -35,13 +35,13 @@ nodes:
     kind: work
     name: the north studio
     off: [ring-north]
-    parts: [{ part: easel, count: 6 }]
+    parts: [{ part: easel, count: 6 }, light-ring, air-handler]
 
   - id: middle-studio
     kind: work
     name: the middle studio
     off: [cross-upper]
-    parts: [{ part: easel, count: 6 }]
+    parts: [{ part: easel, count: 6 }, breaker-panel, coolant-valve]
 
   - id: south-studio
     kind: work
@@ -59,14 +59,14 @@ nodes:
     kind: store
     name: the palette room
     off: [cross-lower]
-    parts: [house-palette]
+    parts: [house-palette, compute-rack, status-board]
     habit: consulted more than it is visited
 
   - id: gallery
     kind: social
     name: the gallery
     off: [ring-south]
-    parts: [hung-faces, { part: seat, count: 8 }]
+    parts: [hung-faces, pressure-door, { part: seat, count: 8 }]
     habit: busy whenever a plate is filed
 
   - id: likeness

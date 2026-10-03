@@ -26,7 +26,123 @@
 //! world should remember the speed it was going, so resuming does not silently
 //! land on 1×.
 
+//! # Years ahead
+//!
+//! A world may sit in the future: `year_offset` moves the calendar that many
+//! years on from the anchor's, and everything that reads the world's time —
+//! journal stamps, the console, the day a character wakes into — reads it
+//! shifted. The offset is **not** part of the anchor, so changing the pace or
+//! jumping to a time does not disturb it, and a jump names the time as the world
+//! reads it, offset included.
+//!
+//! # One place to ask
+//!
+//! World time is a number of milliseconds since 1970-01-01T00:00 in the world,
+//! and [`WorldTime`] is the calendar read off it — the only place in the daemon
+//! that turns that number into a year, a date or a clock face. Prose that names
+//! a moment goes through [`stamp`], [`WorldTime::date`] or [`WorldTime::clock`];
+//! nothing else divides by a day.
+
 use serde_json::{json, Map, Value};
+
+/// World-clock milliseconds in one narrative day.
+pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Which day a world-clock instant falls in, counted from 1970-01-01.
+pub fn day_of(world_ms: u64) -> u64 {
+    world_ms / DAY_MS
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Days from 1970-01-01 to a proleptic-Gregorian civil date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The civil date of a day number counted from 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// The calendar a world-clock instant reads as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldTime {
+    pub year: i64,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+}
+
+impl WorldTime {
+    /// The calendar for `world_ms`.
+    pub fn of(world_ms: u64) -> Self {
+        let days = (world_ms / DAY_MS) as i64;
+        let into = world_ms % DAY_MS / 1000;
+        let (year, month, day) = civil_from_days(days);
+        Self {
+            year,
+            month: month as u32,
+            day: day as u32,
+            hour: (into / 3600) as u32,
+            minute: (into % 3600 / 60) as u32,
+            second: (into % 60) as u32,
+        }
+    }
+
+    /// `14 Jun 2187`.
+    pub fn date(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.day,
+            MONTHS[self.month as usize - 1],
+            self.year
+        )
+    }
+
+    /// `14:20`.
+    pub fn clock(&self) -> String {
+        format!("{:02}:{:02}", self.hour, self.minute)
+    }
+
+    /// `14 Jun 2187, 14:20`.
+    pub fn stamp(&self) -> String {
+        format!("{}, {}", self.date(), self.clock())
+    }
+}
+
+/// `14 Jun 2187, 14:20` for a world instant.
+pub fn stamp(world_ms: u64) -> String {
+    WorldTime::of(world_ms).stamp()
+}
+
+/// Milliseconds a calendar moves by when it is put `years` on from 1970.
+///
+/// Whole years from the epoch's own date, so a multiple of 400 years is exact
+/// and any other lands within a day of the same calendar date. A fixed amount,
+/// so the clock stays monotonic whichever way the leap days fall.
+fn years_ms(years: i32) -> i64 {
+    days_from_civil(1970 + i64::from(years), 1, 1).saturating_mul(DAY_MS as i64)
+}
 
 /// The default pace of a world that has never said: one world-second per real
 /// second. A world with no clock in its document reads as though it were
@@ -46,6 +162,9 @@ pub struct Clock {
     /// Whether the clock is stopped. Held separately from `scale` so a paused
     /// world remembers what speed to resume at.
     pub paused: bool,
+    /// Whole years the world's calendar is set ahead of its anchor; negative
+    /// for the past.
+    pub year_offset: i32,
 }
 
 impl Clock {
@@ -56,6 +175,7 @@ impl Clock {
             at_ms: now_ms,
             scale: DEFAULT_SCALE,
             paused: false,
+            year_offset: 0,
         }
     }
 
@@ -82,15 +202,24 @@ impl Clock {
                 .filter(|s| s.is_finite() && *s >= 0.0)
                 .unwrap_or(DEFAULT_SCALE),
             paused: t.get("paused").and_then(Value::as_bool).unwrap_or(false),
+            year_offset: num("year_offset")
+                .and_then(|y| i32::try_from(y).ok())
+                .unwrap_or(0),
         }
     }
 
-    /// What time it is in the world now.
+    /// What time it is in the world now, the year offset included.
+    pub fn now(&self, now_ms: i64) -> i64 {
+        self.anchored_now(now_ms)
+            .saturating_add(years_ms(self.year_offset))
+    }
+
+    /// The time the anchor and pace give, before the calendar is moved.
     ///
     /// Saturating, because the arithmetic is a scaled elapsed time and a world
     /// left running at 1440× for long enough would otherwise overflow into a
     /// date before it started.
-    pub fn now(&self, now_ms: i64) -> i64 {
+    fn anchored_now(&self, now_ms: i64) -> i64 {
         if self.paused || self.scale == 0.0 {
             return self.world_ms;
         }
@@ -101,11 +230,24 @@ impl Clock {
             .saturating_add(elapsed.min(i64::MAX as f64) as i64)
     }
 
-    /// Re-anchor so the world reads `world_ms` as of now, keeping the pace.
+    /// Re-anchor so the world reads `world_ms` as of now, keeping the pace and
+    /// the offset. `world_ms` is the time as the world reads it, which is what
+    /// the console shows.
     pub fn jump_to(self, world_ms: i64, now_ms: i64) -> Self {
         Self {
-            world_ms,
+            world_ms: world_ms.saturating_sub(years_ms(self.year_offset)),
             at_ms: now_ms,
+            ..self
+        }
+    }
+
+    /// Put the calendar `years` ahead of the anchor, without moving the anchor.
+    /// The world reads that much later at once.
+    pub fn with_year_offset(self, years: i32, now_ms: i64) -> Self {
+        Self {
+            world_ms: self.anchored_now(now_ms),
+            at_ms: now_ms,
+            year_offset: years,
             ..self
         }
     }
@@ -118,7 +260,7 @@ impl Clock {
     /// every hour the world had already run.
     pub fn set_pace(self, scale: f64, paused: bool, now_ms: i64) -> Self {
         Self {
-            world_ms: self.now(now_ms),
+            world_ms: self.anchored_now(now_ms),
             at_ms: now_ms,
             scale: if scale.is_finite() && scale >= 0.0 {
                 scale
@@ -126,15 +268,18 @@ impl Clock {
                 self.scale
             },
             paused,
+            year_offset: self.year_offset,
         }
     }
 
-    /// What the console reads: the time now, and the pace it is running at.
+    /// What the console reads: the time now, the pace it is running at, and how
+    /// many years ahead the calendar is set.
     pub fn wire(&self, now_ms: i64) -> Value {
         json!({
             "world_ms": self.now(now_ms),
             "scale": self.scale,
             "paused": self.paused,
+            "year_offset": self.year_offset,
         })
     }
 
@@ -145,6 +290,7 @@ impl Clock {
             "at_ms": self.at_ms,
             "scale": self.scale,
             "paused": self.paused,
+            "year_offset": self.year_offset,
         })
     }
 }
@@ -185,11 +331,89 @@ pub fn world_ms_for(
         .unwrap_or(0)
 }
 
+/// The calendar for one character's world, by the same route as
+/// [`world_ms_for`].
+pub fn world_time_for(
+    npcs: &crate::npcs::Npcs,
+    worlds: &crate::registry::Registry,
+    npc_id: u64,
+    now_ms: i64,
+) -> WorldTime {
+    WorldTime::of(world_ms_for(npcs, worlds, npc_id, now_ms))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const T0: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn the_calendar_is_read_off_the_milliseconds() {
+        assert_eq!(stamp(0), "1 Jan 1970, 00:00");
+        // 2023-11-14T22:13:20Z.
+        assert_eq!(stamp(T0 as u64), "14 Nov 2023, 22:13");
+        assert_eq!(stamp(T0 as u64 + 59_000), "14 Nov 2023, 22:14");
+        assert_eq!(stamp(DAY_MS - 1), "1 Jan 1970, 23:59");
+        // A leap day, and the day after it.
+        assert_eq!(stamp(951_782_400_000), "29 Feb 2000, 00:00");
+        assert_eq!(stamp(951_868_800_000), "1 Mar 2000, 00:00");
+        assert_eq!(WorldTime::of(T0 as u64).second, 20);
+    }
+
+    #[test]
+    fn a_date_and_a_clock_face_are_the_halves_of_a_stamp() {
+        let t = WorldTime::of(T0 as u64);
+        assert_eq!(t.date(), "14 Nov 2023");
+        assert_eq!(t.clock(), "22:13");
+    }
+
+    /// 217 years past 1970 with 53 leap days between, then 164 days into 2187.
+    #[test]
+    fn a_far_future_date_reads_as_itself() {
+        let days = days_from_civil(2187, 6, 14);
+        assert_eq!(days, 217 * 365 + 53 + 164);
+        let at = days as u64 * DAY_MS + 9 * 3_600_000 + 5 * 60_000;
+        assert_eq!(stamp(at), "14 Jun 2187, 09:05");
+    }
+
+    #[test]
+    fn a_year_offset_moves_the_calendar_and_nothing_else() {
+        let base = Clock::of_world(
+            &json!({ "time": { "world_ms": 0, "at_ms": T0, "scale": 1 } }),
+            T0,
+        );
+        let ahead = base.with_year_offset(400, T0);
+        // 400 Gregorian years is exact: 146 097 days.
+        assert_eq!(ahead.now(T0), 146_097 * DAY_MS as i64);
+        assert_eq!(stamp(ahead.now(T0) as u64), "1 Jan 2370, 00:00");
+        // It keeps running at the same pace.
+        assert_eq!(ahead.now(T0 + 60_000) - ahead.now(T0), 60_000);
+        assert_eq!(base.now(T0), 0);
+    }
+
+    #[test]
+    fn a_pace_change_or_a_jump_keeps_the_offset() {
+        let c = Clock::started_now(T0).with_year_offset(100, T0);
+        let faster = c.set_pace(60.0, false, T0 + 1_000);
+        assert_eq!(faster.year_offset, 100);
+        assert_eq!(faster.now(T0 + 1_000), c.now(T0 + 1_000));
+
+        // A jump names the time as the world reads it.
+        let target = 2_000_000_000_000;
+        assert_eq!(c.jump_to(target, T0).now(T0), target);
+    }
+
+    #[test]
+    fn the_offset_is_stored_in_the_document_and_read_back() {
+        let c = Clock::started_now(T0).with_year_offset(-3, T0);
+        let body = Value::Object(with_clock(&json!({}), c));
+        assert_eq!(body["time"]["year_offset"], -3);
+        assert_eq!(Clock::of_world(&body, T0).year_offset, -3);
+        // A document that never said has none.
+        assert_eq!(Clock::of_world(&json!({ "time": {} }), T0).year_offset, 0);
+        assert_eq!(c.wire(T0)["year_offset"], -3);
+    }
 
     #[test]
     fn a_world_with_no_clock_starts_now_at_real_time() {

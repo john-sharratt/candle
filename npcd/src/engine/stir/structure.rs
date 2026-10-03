@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use crate::engine::event::Salience;
-use crate::engine::stir::{Cond, Due, Fixture, Rng, Stirring, Watch};
+use crate::engine::stir::{Bound, Cond, Due, Fixture, Rng, Stirring, Watch};
 
 pub struct Structure {
     due: Due,
@@ -62,6 +62,34 @@ impl Fixture for Structure {
         }
     }
 
+    fn needs(&self) -> &'static [&'static str] {
+        &["pressure-door"]
+    }
+
+    fn bound(&self) -> Option<Bound> {
+        Some(Bound {
+            part: "pressure-door",
+            ok: "seated",
+            fault: "hissing",
+            system: "the outer seal line",
+            trouble: "a door seal is not seating",
+            object: "the pressure door",
+        })
+    }
+
+    fn faulted(&self) -> bool {
+        self.weak_seal
+    }
+
+    fn set_fault(&mut self, on: bool) -> Option<Stirring> {
+        self.weak_seal = on;
+        let line = match on {
+            true => "The pressure door is knocked off its seat, and begins to hiss at the seal.",
+            false => "The pressure door is reseated, and the hiss at its seal stops.",
+        };
+        Some(Stirring::new("structure", line, Salience::NORMAL))
+    }
+
     fn consider(&mut self, w: &Watch) -> Option<Stirring> {
         if !self.due.ready(w) {
             return None;
@@ -85,8 +113,8 @@ impl Fixture for Structure {
             return Some(
                 Stirring::new(
                     "structure",
-                    "A door seal lets go all at once, with a bang and a shove of cold air across \
-                     the floor.",
+                    "The pressure door's seal lets go all at once, with a bang and a shove of cold \
+                     air across the floor.",
                     Salience::URGENT,
                 )
                 .tagged(&[Cond::Gusting, Cond::Loud, Cond::Cold]),
@@ -110,13 +138,14 @@ impl Fixture for Structure {
             2 => {
                 self.weak_seal = true;
                 (
-                    "A door seal hisses where it is not sitting properly, and keeps hissing.",
+                    "The pressure door's seal hisses where it is not sitting properly, and keeps \
+                     hissing.",
                     Salience::IDLE,
                     &[],
                 )
             }
             3 => (
-                "A pressure door somewhere further in cycles, closes, and locks.",
+                "The pressure door cycles in its frame and seats again with a heavy thud.",
                 Salience::IDLE,
                 &[],
             ),

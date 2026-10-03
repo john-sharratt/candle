@@ -61,8 +61,9 @@ use crate::persistence::record::{
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{
-    decode_events, CorruptTurnPolicy, GroupId, LayerId, ProjectionTarget, SectionId,
-    TimelineAllocator, TimelineId, TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
+    decode_events, CorruptTurnPolicy, GroupId, LayerId, OwnedSection, OwnedSections,
+    ProjectionTarget, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
+    WorkingSetMembers, WorkingSetShare,
 };
 use crate::provenance::{decode_wide_sigs_for_scoring, WideQSig};
 use crate::summary_tree::exchange::Couplings;
@@ -337,6 +338,13 @@ pub struct Substrate {
     /// tokens, and [`Self::retire_section`] removes them outright. See
     /// [`Self::mark_section_transient`]. In-memory only.
     transient_sections: HashSet<SectionId>,
+    /// Sections each conversation added at runtime, and the id counter they
+    /// draw from. A timeline tombstone releases what its timeline owns.
+    /// The registry is in-memory only: the owner re-submits after a restart and
+    /// the stream is restored by its salted content address. What survives a
+    /// restart is each stream's declaration, which names its owner — see
+    /// [`Self::persisted_owned_streams`].
+    owned_sections: OwnedSections,
     /// Section streams flagged by [`RecordType::SectionTombstone`] as
     /// logically deleted — the section counterpart of
     /// [`Self::tombstoned_timelines`]. Set by the reactive repair that
@@ -4549,6 +4557,105 @@ impl Substrate {
         true
     }
 
+    /// The next unused id for a section a conversation adds at runtime — see
+    /// [`OwnedSections`].
+    pub fn allocate_owned_section(&mut self) -> Option<SectionId> {
+        self.owned_sections.allocate()
+    }
+
+    /// Record that `owner` owns `section` under `name`.
+    pub fn register_owned_section(&mut self, owner: TimelineId, name: &str, section: SectionId) {
+        self.owned_sections.register(owner, name, section);
+    }
+
+    /// The sections `owner` owns, in submission order.
+    pub fn owned_sections_of(&self, owner: TimelineId) -> Vec<OwnedSection> {
+        self.owned_sections.of(owner).to_vec()
+    }
+
+    /// The section `owner` owns under `name`.
+    pub fn owned_section_named(&self, owner: TimelineId, name: &str) -> Option<SectionId> {
+        self.owned_sections.named(owner, name)
+    }
+
+    /// Release one owned section: forget `owner`'s claim, end its stream's
+    /// persisted generation, and drop its entry with its hot and warm K/V.
+    ///
+    /// The persisted counterpart of [`Self::retire_section`]. A section that
+    /// is shared by content address cannot be removed this way, because a
+    /// stream every conversation reads must outlive any one of them; an owned
+    /// section's address is salted with its owner, so its stream is read by no
+    /// one else and ending it is safe.
+    ///
+    /// Returns the stream the caller must tombstone **on disk**, or `None`
+    /// when `owner` does not own `section` or it never sealed (nothing was
+    /// written).
+    pub fn release_owned_section(
+        &mut self,
+        owner: TimelineId,
+        section: SectionId,
+    ) -> Option<StreamId> {
+        if !self.owned_sections.release(owner, section) {
+            return None;
+        }
+        self.drop_owned_entry(section)
+    }
+
+    /// Release everything `owner` owns, returning the streams to tombstone on
+    /// disk — see [`Self::release_owned_section`].
+    pub fn release_owned_sections(&mut self, owner: TimelineId) -> Vec<StreamId> {
+        self.owned_sections
+            .release_all(owner)
+            .into_iter()
+            .filter_map(|o| self.drop_owned_entry(o.section))
+            .collect()
+    }
+
+    /// The `debug_name` an owned section's stream is declared under. The
+    /// declaration is persisted, so it names the owner after a restart, when
+    /// the in-memory ownership registry is empty.
+    pub fn owned_stream_name(owner: TimelineId, name: &str) -> String {
+        format!("conv/{}/{name}", owner.raw())
+    }
+
+    /// The live section streams `owner` has persisted: those declared under
+    /// `name`, or under any name when `name` is `None`. Read from the stream
+    /// declarations, so it holds across a restart; a tombstoned stream is not
+    /// listed.
+    pub fn persisted_owned_streams(&self, owner: TimelineId, name: Option<&str>) -> Vec<StreamId> {
+        let exact = name.map(|n| Self::owned_stream_name(owner, n));
+        let prefix = format!("conv/{}/", owner.raw());
+        let mut found: Vec<StreamId> = self
+            .streams
+            .iter()
+            .filter_map(|(id, stream)| match &stream.decl {
+                Some(StreamDecl::PromptSection(d)) => {
+                    let named = match &exact {
+                        Some(exact) => d.debug_name == *exact,
+                        None => d.debug_name.starts_with(&prefix),
+                    };
+                    named.then_some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort_unstable_by_key(|s| s.0);
+        found
+    }
+
+    /// End `section`'s stream and remove its entry; the stream, if it sealed.
+    fn drop_owned_entry(&mut self, section: SectionId) -> Option<StreamId> {
+        let stream = self.section_stream(section)?;
+        self.tombstone_section(stream);
+        let entry = self.sections.remove(&section)?;
+        self.section_token_total = self.section_token_total.saturating_sub(entry.token_count);
+        let r = entry.residence;
+        if self.residence[r.0].warm.take().is_some() {
+            Self::remove_from_lru(&mut self.warm_lru, r);
+        }
+        Some(stream)
+    }
+
     /// Whether `timeline` has been tombstoned.
     pub fn is_tombstoned(&self, timeline: TimelineId) -> bool {
         self.tombstoned_timelines.contains(&timeline)
@@ -6001,6 +6108,7 @@ impl Substrate {
         self.timelines_by_group.clear();
         self.sections.clear();
         self.transient_sections.clear();
+        self.owned_sections.clear_ownership();
         self.timeline_token_totals.clear();
         self.section_token_total = 0;
         // Drop the whole decoded-signature memo — stream ids may be reused.
@@ -7787,6 +7895,177 @@ mod tests {
         assert!(
             !sub.retire_section(scratch),
             "a second retire finds nothing"
+        );
+    }
+
+    /// Install `section` under its own `stream` with one hot and one warm layer.
+    fn install_owned(
+        sub: &mut Substrate,
+        owner: TimelineId,
+        name: &str,
+        stream: u64,
+    ) -> (SectionId, ResidenceIndex) {
+        let section = sub.allocate_owned_section().unwrap();
+        sub.register_owned_section(owner, name, section);
+        sub.set_section_full(
+            section,
+            StreamId(stream),
+            10,
+            Arc::new(vec![minimal_sealed_layer()]),
+            identity_migrate,
+            Arc::new(vec![1u32]),
+        )
+        .unwrap();
+        let r = sub.section_residence(section).unwrap();
+        sub.install_warm(r, vec![minimal_sealed_layer()]);
+        (section, r)
+    }
+
+    fn owner(n: u64) -> TimelineId {
+        TimelineId::from_raw(n).unwrap()
+    }
+
+    /// **Releasing an owned section ends its stream and removes it** — entry,
+    /// token total, hot and warm K/V — and hands back the stream so the caller
+    /// can write the on-disk tombstone. Another owner's section is untouched.
+    #[test]
+    fn releasing_an_owned_section_ends_its_stream_and_frees_it() {
+        let mut sub = Substrate::new();
+        let (mine, theirs) = (owner(1), owner(2));
+        let (a, ra) = install_owned(&mut sub, mine, "a", 101);
+        let (b, rb) = install_owned(&mut sub, theirs, "b", 102);
+        assert_eq!(sub.section_token_total, 20);
+
+        assert_eq!(sub.release_owned_section(mine, a), Some(StreamId(101)));
+
+        assert!(!sub.section_exists(a));
+        assert!(sub.is_section_tombstoned(StreamId(101)));
+        assert!(sub.residence[ra.0].hot.is_none() && sub.residence[ra.0].warm.is_none());
+        assert!(!sub.warm_lru.contains(&ra) && !sub.hot_lru.contains(&ra));
+        assert_eq!(sub.section_token_total, 10);
+        assert!(sub.owned_sections_of(mine).is_empty());
+
+        assert!(sub.section_exists(b), "another owner's section survives");
+        assert!(!sub.is_section_tombstoned(StreamId(102)));
+        assert!(sub.residence[rb.0].hot.is_some() && sub.residence[rb.0].warm.is_some());
+        assert_eq!(sub.owned_section_named(theirs, "b"), Some(b));
+    }
+
+    /// Only the owner can release: a section is never torn down by a
+    /// conversation that merely knows its id.
+    #[test]
+    fn only_the_owner_releases_an_owned_section() {
+        let mut sub = Substrate::new();
+        let (a, _) = install_owned(&mut sub, owner(1), "a", 101);
+        assert_eq!(sub.release_owned_section(owner(2), a), None);
+        assert!(sub.section_exists(a));
+        assert!(!sub.is_section_tombstoned(StreamId(101)));
+        assert_eq!(sub.release_owned_section(owner(1), a), Some(StreamId(101)));
+        assert_eq!(
+            sub.release_owned_section(owner(1), a),
+            None,
+            "a second release finds nothing"
+        );
+    }
+
+    /// A section that was submitted but never sealed has no stream to end; its
+    /// claim is still dropped.
+    #[test]
+    fn releasing_an_unsealed_owned_section_drops_only_the_claim() {
+        let mut sub = Substrate::new();
+        let section = sub.allocate_owned_section().unwrap();
+        sub.register_owned_section(owner(1), "pending", section);
+        assert_eq!(sub.release_owned_section(owner(1), section), None);
+        assert!(sub.owned_sections_of(owner(1)).is_empty());
+    }
+
+    /// Releasing everything an owner holds returns every stream, in submission
+    /// order, and touches nothing else.
+    #[test]
+    fn releasing_all_of_an_owners_sections_returns_their_streams() {
+        let mut sub = Substrate::new();
+        let (mine, theirs) = (owner(1), owner(2));
+        let (a, _) = install_owned(&mut sub, mine, "a", 101);
+        let (b, _) = install_owned(&mut sub, mine, "b", 102);
+        let (c, _) = install_owned(&mut sub, theirs, "c", 103);
+
+        assert_eq!(
+            sub.release_owned_sections(mine),
+            vec![StreamId(101), StreamId(102)]
+        );
+        assert!(!sub.section_exists(a) && !sub.section_exists(b));
+        assert!(sub.section_exists(c));
+        assert_eq!(sub.section_token_total, 10);
+        assert!(sub.release_owned_sections(mine).is_empty());
+    }
+
+    /// Removing a section and submitting the same name again lands on a new
+    /// generation of the same stream: the tombstone lifts when the stream is
+    /// declared again, so the second section is readable.
+    #[test]
+    fn a_released_owned_section_can_be_sealed_again_under_its_address() {
+        let mut sub = Substrate::new();
+        use crate::persistence::streams::{ContentAddress, SectionDecl};
+
+        let (a, _) = install_owned(&mut sub, owner(1), "a", 101);
+        sub.release_owned_section(owner(1), a);
+        let (again, _) = install_owned(&mut sub, owner(1), "a", 101);
+        assert_ne!(a, again, "an id is never reused");
+        assert!(
+            !sub.section_exists(again),
+            "the stream stays ended until the new generation is declared"
+        );
+        sub.apply_stream_decl(
+            StreamId(101),
+            StreamDecl::PromptSection(SectionDecl {
+                address: ContentAddress::default(),
+                debug_name: "conv/1/a".to_string(),
+            }),
+        );
+        assert!(sub.section_exists(again));
+    }
+
+    /// An owner's persisted streams are found from their declarations alone —
+    /// no ownership registry — by name or all together, and never another
+    /// owner's, including one whose id begins with the same digits.
+    #[test]
+    fn an_owners_persisted_streams_are_found_by_their_declared_name() {
+        use crate::persistence::streams::{ContentAddress, SectionDecl};
+        let mut sub = Substrate::new();
+        for (stream, name) in [
+            (201, "conv/1/mission"),
+            (202, "conv/1/mission"),
+            (203, "conv/1/note"),
+            (204, "conv/12/mission"),
+            (205, "tool_catalog"),
+        ] {
+            sub.apply_stream_decl(
+                StreamId(stream),
+                StreamDecl::PromptSection(SectionDecl {
+                    address: ContentAddress::default(),
+                    debug_name: name.to_string(),
+                }),
+            );
+        }
+        let one = owner(1);
+        assert_eq!(
+            sub.persisted_owned_streams(one, Some("mission")),
+            vec![StreamId(201), StreamId(202)]
+        );
+        assert_eq!(
+            sub.persisted_owned_streams(one, None),
+            vec![StreamId(201), StreamId(202), StreamId(203)]
+        );
+        assert_eq!(
+            sub.persisted_owned_streams(owner(12), None),
+            vec![StreamId(204)]
+        );
+
+        sub.tombstone_section(StreamId(201));
+        assert_eq!(
+            sub.persisted_owned_streams(one, Some("mission")),
+            vec![StreamId(202)],
+            "a tombstoned stream is no longer the owner's"
         );
     }
 

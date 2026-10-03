@@ -98,7 +98,9 @@ pub const CATALOG: &[Command] = &[
         summary: "Speech it catches but is not part of",
         argument: "what is said nearby",
         description: "Speech the character catches but is not part of. Whether silence is rude \
-                      depends on this, so it is its own command.",
+                      depends on this, so it is its own command. It asks nothing of the \
+                      character, so it does not wake one: it is read with whatever next does, \
+                      or with a /wake.",
         emits: "speech",
         salience: 0.4,
         example: "/overhear two guards, quietly: the quartermaster has been selling the grain",

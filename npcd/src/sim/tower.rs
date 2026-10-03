@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::sim::field::Resource;
+use crate::sim::upkeep::{Clock, Contact, SHIELD_DRAW};
 
 /// What the tower is doing with itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +128,13 @@ pub struct Tower {
     pub shields: bool,
     /// What it is besieging, when it is.
     pub besieging: Option<String>,
+    /// What is closing on it, if anything — see [`crate::sim::upkeep`].
+    #[serde(default)]
+    pub contact: Option<Contact>,
+    /// What standing has cost and not yet been charged, and how long it has
+    /// been quiet.
+    #[serde(default)]
+    pub(super) clock: Clock,
     stock: BTreeMap<String, u64>,
     recipes: BTreeMap<String, Recipe>,
     queued: Vec<Batch>,
@@ -141,6 +149,8 @@ impl Tower {
             depth: 0,
             shields: false,
             besieging: None,
+            contact: None,
+            clock: Clock::default(),
             stock: BTreeMap::new(),
             recipes: BTreeMap::new(),
             queued: Vec::new(),
@@ -149,6 +159,16 @@ impl Tower {
 
     pub fn stock_of(&self, r: Resource) -> u64 {
         self.stock.get(r.name()).copied().unwrap_or(0)
+    }
+
+    /// Every resource and how much of it the tower holds, zeros included — a
+    /// reading that left out what is gone would let a character believe it had
+    /// merely not looked.
+    pub fn stockpile(&self) -> Vec<(&'static str, u64)> {
+        Resource::ALL
+            .iter()
+            .map(|r| (r.name(), self.stock_of(*r)))
+            .collect()
     }
 
     pub fn put(&mut self, r: Resource, amount: u64) {
@@ -264,7 +284,9 @@ impl Tower {
     ///   come up first;
     /// - a siege is a commitment, so it is not offered while one stands;
     /// - drilling and surfacing are opposites and exactly one is available;
-    /// - shields are a toggle, so only the half that changes anything shows.
+    /// - shields are a toggle, so only the half that changes anything shows, and
+    ///   they come up only on power to hold them for a minute;
+    /// - a drill is not offered to a tower that cannot pay for a metre of it.
     pub fn actions(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.posture != Posture::DugIn && self.stock_of(Resource::Energy) >= FOLD_COST {
@@ -278,14 +300,14 @@ impl Tower {
         }
         if self.posture == Posture::DugIn {
             out.push("surface".to_string());
-        } else {
+        } else if self.stock_of(Resource::Energy) >= DRILL_COST_PER_METRE {
             out.push("drill down".to_string());
         }
-        out.push(if self.shields {
-            "drop shields".to_string()
-        } else {
-            "raise shields".to_string()
-        });
+        if self.shields {
+            out.push("drop shields".to_string());
+        } else if self.spare_energy() >= SHIELD_DRAW {
+            out.push("raise shields".to_string());
+        }
         out
     }
 }
@@ -293,6 +315,7 @@ impl Tower {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::upkeep::RESERVE;
 
     fn rich() -> Tower {
         let mut t = Tower::new("Redoubt", Coord::new(10, -4));
@@ -360,6 +383,31 @@ mod tests {
         t.shields = true;
         assert!(t.actions().contains(&"drop shields".to_string()));
         assert!(!t.actions().contains(&"raise shields".to_string()));
+    }
+
+    /// **Shields are not offered on power that cannot hold them.** At the reserve
+    /// they would come up and fail on the next beat.
+    #[test]
+    fn shields_are_not_offered_without_power_to_hold_them() {
+        let mut t = rich();
+        t.draw(Resource::Energy, 2_000 - RESERVE);
+        let acts = t.actions();
+        assert!(
+            !acts.contains(&"raise shields".to_string()),
+            "shields offered on a stockpile that cannot hold them: {acts:?}"
+        );
+        t.put(Resource::Energy, SHIELD_DRAW);
+        assert!(t.actions().contains(&"raise shields".to_string()));
+    }
+
+    /// A drill is not offered to a tower that cannot pay for a metre of it.
+    #[test]
+    fn a_drill_is_not_offered_without_energy_to_turn_it() {
+        let mut t = rich();
+        t.draw(Resource::Energy, 2_000);
+        assert!(!t.actions().contains(&"drill down".to_string()));
+        t.put(Resource::Energy, DRILL_COST_PER_METRE);
+        assert!(t.actions().contains(&"drill down".to_string()));
     }
 
     #[test]

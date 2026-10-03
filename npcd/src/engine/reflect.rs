@@ -516,7 +516,9 @@ pub(crate) fn think_off(
         think_close: tok.token_to_id("</think>")?,
         // A span ends on `</think>` or on the turn terminator, and a terminator
         // the tree does not know is one it cannot end on.
-        eos: tok.token_to_id(cfg.dialect.assistant_end).unwrap_or(0),
+        eos: tok
+            .token_to_id(cfg.dialect.assistant_end.trim_end())
+            .unwrap_or(0),
         after_close: "",
     };
     // Every dial yields a tree, `Off` included — suppression is structural, so

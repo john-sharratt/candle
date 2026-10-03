@@ -11,7 +11,9 @@
 //! Three routes, mounted under a namespace prefix (`/chronicle`, `/record`, …):
 //!
 //! - `GET /<ns>/:id` — the resource as a character reads it: the part it is, its
-//!   name, and the short verbs it affords here. `:id` is the map's own instance
+//!   name, the short verbs it affords here, and its live `state` — the machine's
+//!   mode and, where the acts it affords draw on the tower, the stockpile, what
+//!   can be made and which queues are free (`sim::reading`). `:id` is the map's own instance
 //!   id (`<area>~<node>~<part-id>~<ordinal>`, [`npc_map::instance`]); it is
 //!   resolved against the map and reach-checked, so an id that names nothing, or
 //!   a thing not within the caller body's standpoint, is a `404` — the same
@@ -92,7 +94,7 @@ async fn state(
     pinned: Option<Extension<PinnedStandpoint>>,
     Path(id): Path<String>,
 ) -> Response {
-    let Some((_hosted, _body, part)) = resolve(&local, &caller, pinned_at(pinned), &id) else {
+    let Some((hosted, _body, part)) = resolve(&local, &caller, pinned_at(pinned), &id) else {
         return not_here(&id);
     };
     let ns = namespace_of(&part.part_id);
@@ -102,11 +104,26 @@ async fn state(
     let verbs: Vec<String> = acts_at(&part.part_id)
         .map(|t| short_verb(t.name, ns).to_string())
         .collect();
+    let acts: Vec<&str> = acts_at(&part.part_id).map(|t| t.name).collect();
+    let state = hosted.with_both(|world, sim| {
+        let who = |body: &str| {
+            world
+                .actor(body)
+                .map_or_else(|| body.to_string(), |a| a.name.clone())
+        };
+        sim.reading(&id, &part.at, &acts, &who)
+    });
+    let invoke: Vec<String> = verbs
+        .iter()
+        .map(|v| format!("http://local/{ns}/{id}/{v}"))
+        .collect();
     Json(json!({
         "id": format!("{ns}/{id}"),
         "part": part.part_id,
         "name": part.name,
         "verbs": verbs,
+        "invoke": invoke,
+        "state": state,
     }))
     .into_response()
 }
@@ -210,6 +227,8 @@ async fn invoke(
 struct Station {
     /// The catalogue part id — `chronicle-terminal`, `accession-desk`.
     part_id: String,
+    /// The `area/node` room it stands in, the key the sim answers by.
+    at: String,
     /// What the part is called, singular and bare.
     name: String,
     /// What it is and does, for the schema summary ([`Part::long`], the short
@@ -240,12 +259,13 @@ fn resolve(
             false => part.long.clone(),
             true => part.short.clone().unwrap_or_else(|| part.name.clone()),
         };
+        let place = inst.place().clone();
         let station = Station {
             part_id: inst.part_id().to_string(),
+            at: format!("{}/{}", place.area, place.node),
             name: inst.name().to_string(),
             summary,
         };
-        let place = inst.place().clone();
         let standpoint = w.actor(&body).map(|a| a.at.clone());
         Some((station, place, standpoint))
     })?;
@@ -380,24 +400,68 @@ mod tests {
     /// A held-still vault with the device installed and a body standing where the
     /// chronicle terminal is, so it is within reach.
     fn daemon(npc_id: u64) -> (Arc<Runtime>, Arc<Tokens>) {
+        daemon_at(WORLD, Where::new("vault-chronicle", "early-range"), npc_id)
+    }
+
+    /// [`daemon`] for any world, with the body standing at `at`.
+    fn daemon_at(world_id: &str, at: Where, npc_id: u64) -> (Arc<Runtime>, Arc<Tokens>) {
         let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
-        rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
-        rt.hold_world(WORLD, true);
+        rt.host(world_id, Path::new(ROOMS))
+            .expect("the world loads");
+        rt.hold_world(world_id, true);
         let tokens = Arc::new(Tokens::load(tmp()).expect("a fresh token store"));
         rt.set_tokens(tokens.clone());
 
         let body = Runtime::body_id(npc_id);
-        let world = rt.hosted.get(WORLD).expect("hosted");
+        let world = rt.hosted.get(world_id).expect("hosted");
         world.with(|w| {
-            w.enter(
-                &body,
-                format!("Maker-{npc_id:02}"),
-                Where::new("vault-chronicle", "early-range"),
-            )
-            .expect("a real room");
+            w.enter(&body, format!("Maker-{npc_id:02}"), at)
+                .expect("a real room");
         });
-        rt.bodies.bind(npc_id, WORLD, &body).expect("bound");
+        rt.bodies.bind(npc_id, world_id, &body).expect("bound");
         (rt, tokens)
+    }
+
+    /// **A fabricator's read answers what a character was asking its
+    /// neighbours.** The mode it is in and the stockpile behind it come back in
+    /// `state`, so "which of them run, and what is there to make from?" has an
+    /// answer at the machine.
+    #[tokio::test]
+    async fn a_fabricator_reads_the_stockpile_it_draws_on() {
+        use npc_map::load::MapSet;
+        let fabricator = MapSet::load_dir(ROOMS)
+            .expect("the maps load")
+            .instances_at(&Where::new("tower-redoubt", "foundry"))
+            .into_iter()
+            .find(|i| i.part_id() == "fabricator")
+            .expect("a fabricator stands in the foundry")
+            .id();
+        let (rt, tokens) = daemon_at("battle-cities", Where::new("tower-redoubt", "foundry"), 52);
+
+        let (status, read) = send(
+            &rt,
+            &tokens,
+            52,
+            "GET",
+            &format!("/stores/{fabricator}"),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["state"]["mode"], json!("idle"), "{read}");
+        assert_eq!(read["state"]["stockpile"]["nanobots"], json!(12), "{read}");
+        assert!(
+            read["state"]["can_make"]
+                .as_array()
+                .is_some_and(|m| m.contains(&json!("bolt rounds"))),
+            "{read}"
+        );
+        assert_eq!(
+            read["state"]["free_queues"].as_array().map(Vec::len),
+            Some(8),
+            "{read}"
+        );
     }
 
     async fn send(
@@ -531,6 +595,15 @@ mod tests {
             read_verbs.contains(&"add_entry".to_string()),
             "the descriptor did not name add_entry: {read}"
         );
+        assert!(
+            read["invoke"]
+                .as_array()
+                .expect("an invoke array")
+                .contains(&json!(format!(
+                    "http://local/chronicle/{terminal}/add_entry"
+                ))),
+            "the descriptor did not give the full invoke address: {read}"
+        );
 
         // OPTIONS — the schema over the same verb set.
         let (status, schema) = send(&rt, &tokens, 50, "OPTIONS", &path, None).await;
@@ -599,7 +672,7 @@ mod tests {
     /// from.** This is the walk-while-you-think fix ([`PinnedStandpoint`]): a
     /// character's grammar is snapshotted before its decode, but a moving body
     /// covers a leg every metronome tick during the seconds the decode takes, so
-    /// the chosen `query`/`invoke` can land after the body has left the room the
+    /// the chosen `invoke` can land after the body has left the room the
     /// address named. The in-process fast path pins the grammar-time standpoint,
     /// and the reach check honours it — while an external caller, which carries no
     /// pin, is still gated by its live position.

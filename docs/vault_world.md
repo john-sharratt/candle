@@ -413,6 +413,33 @@ written down beside the bench so that whoever comes after can disagree with them
 the parts, so they appear in a Maker's reach and refuse — the same state the
 original 56 were in when the building was first drawn.
 
+## The plant the building's idle events stand on
+
+A room that is quiet is not silent: air moves, a supply dips, a breaker goes, a
+coolant line weeps. Each of those is a real object in a real room, so a
+character can walk to it, read it and operate it, and a status board can only
+report a fault that stands.
+
+| Part | Modes | Where |
+|---|---|---|
+| light ring | steady, failing | the first work room of every level; the command room |
+| breaker panel | closed, tripped | the second work room of every level; the plant room |
+| coolant valve | tight, weeping | beside every breaker panel |
+| pressure door | seated, hissing | the social room of every level; the enquiry room |
+| air handler | — | the first work room of every level; the plant room |
+| compute rack | — | the store or watch room of every level; dispatch |
+| status board | — | beside every compute rack |
+
+The third work room of a level holds none of it, so a level has quiet rooms as
+well as ones with something to go wrong. The coolant valve shares a room with a
+breaker panel because the loop only fails under power strain.
+
+The idle loop (`npcd/src/engine/stir/`) fits a room only with the fixtures it
+has an object for. The objects are the truth: a fixture that fails writes its
+object's fault mode, a character who operates the object is answered by the room,
+and the status board writes up a fault only when an object somewhere stands in
+its fault mode. Rooms with none of an object never speak of its system.
+
 ## What is not in the building
 
 **`responses/` and `moods/` have no level.** They are the craft libraries, and

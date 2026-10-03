@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use super::belief_files::{assemble_file_scans, scan_file_scans};
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
+use super::owned_sections::OwnedSection;
 use super::project::ProjectionTarget;
 use super::schema::{
     CorruptTurnPolicy, GroupSchema, LayerSchema, Schema, SectionCollection, SystemPromptItem,
@@ -3314,7 +3315,10 @@ impl Conversation {
     /// record).  The compactor drops the underlying records on the
     /// next compaction pass; ordinary reads never see them. On a read-only
     /// substrate the in-RAM tombstone is all there is.
+    ///
+    /// Sections the timeline owns ([`Self::release_owned_sections`]) go with it.
     pub fn tombstone_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
+        self.release_owned_sections(timeline)?;
         self.write().tombstone_timeline(timeline);
         if self.read_only {
             return Ok(());
@@ -3468,6 +3472,101 @@ impl Conversation {
     /// [`crate::substrate::Substrate::retire_section`].
     pub fn retire_section(&self, section: SectionId) -> bool {
         self.write().retire_section(section)
+    }
+
+    /// The next unused id for a section a conversation adds at runtime — see
+    /// [`crate::substrate::Substrate::allocate_owned_section`].
+    pub fn allocate_owned_section(&self) -> Option<SectionId> {
+        self.write().allocate_owned_section()
+    }
+
+    /// Record that `owner` owns `section` under `name`.
+    pub fn register_owned_section(&self, owner: TimelineId, name: &str, section: SectionId) {
+        self.write().register_owned_section(owner, name, section);
+    }
+
+    /// The sections `owner` owns, in submission order.
+    pub fn owned_sections_of(&self, owner: TimelineId) -> Vec<OwnedSection> {
+        self.read().owned_sections_of(owner)
+    }
+
+    /// The section `owner` owns under `name`.
+    pub fn owned_section_named(&self, owner: TimelineId, name: &str) -> Option<SectionId> {
+        self.read().owned_section_named(owner, name)
+    }
+
+    /// Release a section `owner` owns: drop it from the substrate and write the
+    /// [`crate::persistence::record::RecordType::SectionTombstone`] for its
+    /// stream, so a restart does not restore it. A section `owner` does not own
+    /// is left alone.
+    pub fn release_owned_section(
+        &self,
+        owner: TimelineId,
+        section: SectionId,
+    ) -> candle::Result<()> {
+        let stream = self.write().release_owned_section(owner, section);
+        self.write_owned_tombstones(stream)
+    }
+
+    /// Release everything `owner` owns — see [`Self::release_owned_section`] —
+    /// returning the ids, so the caller can clear the scheduler's tables keyed
+    /// by them.
+    pub fn release_owned_sections(&self, owner: TimelineId) -> candle::Result<Vec<SectionId>> {
+        let (ids, streams) = {
+            let mut sub = self.write();
+            let ids = sub
+                .owned_sections_of(owner)
+                .into_iter()
+                .map(|o| o.section)
+                .collect();
+            (ids, sub.release_owned_sections(owner))
+        };
+        self.write_owned_tombstones(streams)?;
+        self.release_persisted_owned_sections(owner, None, None)?;
+        Ok(ids)
+    }
+
+    /// Tombstone the streams `owner` has persisted that no live section of its
+    /// holds: those declared under `name`, or under any name when `name` is
+    /// `None`, except `keep`. Returns how many it ended.
+    ///
+    /// The ownership registry is empty after a restart, so a stream sealed
+    /// before it is claimed by nobody until its owner submits the section
+    /// again, and one its owner never submits again — a finished mission, a
+    /// conversation retired since — would stay on disk forever. The stream
+    /// declarations are persisted and name their owner, so this finds them
+    /// there.
+    pub fn release_persisted_owned_sections(
+        &self,
+        owner: TimelineId,
+        name: Option<&str>,
+        keep: Option<StreamId>,
+    ) -> candle::Result<usize> {
+        let stale: Vec<StreamId> = self
+            .read()
+            .persisted_owned_streams(owner, name)
+            .into_iter()
+            .filter(|stream| Some(*stream) != keep)
+            .collect();
+        for stream in &stale {
+            self.tombstone_section(*stream, Some("owner released"))?;
+        }
+        Ok(stale.len())
+    }
+
+    fn write_owned_tombstones(
+        &self,
+        streams: impl IntoIterator<Item = StreamId>,
+    ) -> candle::Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        let mut p = self.persistence.lock().unwrap();
+        for stream in streams {
+            p.write_section_tombstone(stream.0, Some("owner released"))
+                .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Couple `from_turn` to the tool response that follows it — in-RAM (so this

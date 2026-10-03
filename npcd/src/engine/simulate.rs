@@ -251,5 +251,7 @@ fn persona_of<'a>(s: &'a Scenario, world: &'a str, mission: &'a str) -> Persona<
         world,
         place: "",
         building: "",
+        mission: None,
+        journal: None,
     }
 }

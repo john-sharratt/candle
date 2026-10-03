@@ -1,0 +1,15 @@
+id: coolant-valve
+kind: fixture
+name: coolant valve
+short: >
+  A coolant valve is tight while the loop holds and weeping when it has begun to
+  leak.
+long: >
+  A handwheel valve on a lagged pipe, the paint worn off the wheel where
+  hands go. Tight is the ordinary state: the loop holds its pressure and the
+  floor under it is dry. Weeping means the loop is off its mark and leaking at
+  the joint, a bead at a time and then not a bead. Somebody standing here can
+  take it back to tight, and the leak stops.
+modes:
+  - tight
+  - weeping

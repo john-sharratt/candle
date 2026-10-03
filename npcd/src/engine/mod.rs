@@ -48,19 +48,24 @@
 
 pub mod act;
 pub mod acts;
+pub mod ask_api;
 pub mod authoring;
 pub mod bench;
 pub mod body;
+pub mod check;
 pub mod cooldown;
 pub mod dreams;
 pub mod driver;
 pub mod enact;
 pub mod environment;
 pub mod event;
+pub mod guardian;
+pub mod guardian_api;
 pub mod identity;
 pub mod ingest;
 pub mod interaction;
 pub mod invoke_body;
+pub mod journal;
 pub mod layers;
 pub mod life;
 pub mod loading;
@@ -71,6 +76,7 @@ pub mod mission_acts;
 pub mod mission_api;
 pub mod narration;
 pub mod narrator;
+pub mod on_you;
 pub mod perceived;
 pub mod persona;
 pub mod prompt;
@@ -78,6 +84,8 @@ pub mod prose;
 pub mod pulse;
 pub mod reach;
 pub mod reflect;
+pub mod rendered;
+pub mod reported;
 pub mod retention;
 pub mod rooms;
 pub mod runtime;
@@ -87,9 +95,11 @@ pub mod slash;
 pub mod sleep;
 pub mod station;
 pub mod stir;
+pub mod survey;
 pub mod throwaway;
 pub mod tick;
 pub mod tools;
+pub mod watch;
 pub mod watcher;
 pub mod whereabouts;
 pub mod window;
@@ -103,7 +113,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Json;
 use serde_json::{json, Value};
 use web::auth::{Identity, Role};
@@ -156,6 +166,16 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::User,
             get(projection_at),
         )
+        .route(
+            "/v1/npc/:nid/system-prompt",
+            Role::User,
+            get(pulse::system_prompt),
+        )
+        .route(
+            "/v1/npc/:nid/prompt-tokens",
+            Role::User,
+            get(pulse::prompt_tokens),
+        )
         .route("/v1/npc/:nid/monitor", Role::User, get(monitor))
         .route("/v1/npc/:nid/project", Role::User, post(probe))
         .route("/v1/npc/:nid/perceive", Role::User, post(perceive))
@@ -201,6 +221,22 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             Role::User,
             post(mission_api::cancel),
         )
+        // Tick off or add a step on one owned character's open mission.
+        .route(
+            "/v1/npc/:nid/mission/step",
+            Role::User,
+            post(mission_api::step),
+        )
+        // ── looking inside a character, and steering it ─────────────────────
+        //
+        // Ask it a question and force an answer; put a thought in its head. Both
+        // write to one owned character, so `User` plus the ownership check.
+        .route("/v1/npc/:nid/ask", Role::User, post(ask_api::ask))
+        .route(
+            "/v1/npc/:nid/mind_control",
+            Role::User,
+            post(ask_api::mind_control),
+        )
         // ── the world's open channel ────────────────────────────────────────
         //
         // The standing group every character joins on arrival — see
@@ -241,6 +277,22 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // `pulse`: it reaches only a character the caller owns.
         .route("/v1/npc/:nid/direct", Role::User, post(pulse::direct))
         .route("/v1/npc/:nid/window", Role::User, get(pulse::window))
+        // What the character's `scan` tells it, as prose and as the data behind it.
+        .route("/v1/npc/:nid/scan", Role::User, get(pulse::scan))
+        // The character's journal and what its drafts have been doing, and a way
+        // to draft one now. `User` plus the ownership check inside, like `window`.
+        .route("/v1/npc/:nid/journal", Role::User, get(pulse::journal))
+        .route(
+            "/v1/npc/:nid/journal/draft",
+            Role::User,
+            post(pulse::journal_draft),
+        )
+        // Forget one entry: out of the character's memory and its prompt.
+        .route(
+            "/v1/npc/:nid/journal/:eid",
+            Role::User,
+            delete(pulse::journal_forget),
+        )
         // Admin: it reaches characters the caller does not own, which every
         // other route on this daemon refuses to do.
         .route("/v1/pulse/broadcast", Role::Admin, post(pulse::broadcast))
@@ -255,6 +307,13 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             "/v1/pulse/command-table",
             Role::Admin,
             post(mission_api::command_table),
+        )
+        // What the guardian has found and done. Admin: it names every
+        // character, including ones the caller does not own.
+        .route(
+            "/v1/pulse/guardian",
+            Role::Admin,
+            get(guardian_api::records),
         )
         // Clear the whole board's missions at once.
         .route(
@@ -737,7 +796,7 @@ async fn inject(
     let world_ms = s.world_ms(session.npc_id).await;
     let kind = match parsed.kind {
         crate::engine::event::EventKind::Sleep { .. } => crate::engine::event::EventKind::Sleep {
-            day: crate::engine::sleep::day_of(world_ms),
+            day: crate::clock::day_of(world_ms),
         },
         other => other,
     };

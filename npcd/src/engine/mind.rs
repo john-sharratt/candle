@@ -48,18 +48,20 @@
 //! decides what is relevant, and only a bounded tail is carried verbatim. Both
 //! bounds are deliberate and neither is the other's fallback.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use tokio::sync::Mutex as ConversationLock;
 
-use candle_conversation::projection::{Builder, GroupId, LayerId, TimelineId};
+use candle_conversation::projection::{Builder, GroupId, LayerId, SelectionState, TimelineId};
 use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
-    ToolCallEnvelope,
+    ToolCallEnvelope, ToolSpec, TreeSpec,
 };
 use candle_conversation::{
-    ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
+    ConversationEngine, PromptDump, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
+    UnsealedAsker,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -69,17 +71,29 @@ use crate::engine::dreams;
 use crate::engine::event::Event;
 use crate::engine::identity;
 use crate::engine::invoke_body::Invokable;
+use crate::engine::journal::desk::EngineDesk;
+use crate::engine::journal::section::{self, entry_section, JournalPrompt, META_KEPT, META_OF};
+use crate::engine::journal::state::JournalState;
+use crate::engine::journal::verify::World;
+use crate::engine::journal::workflow;
 use crate::engine::layers;
 use crate::engine::narration;
 use crate::engine::narrator;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
+use crate::engine::rendered;
 use crate::engine::retention;
 use crate::engine::schema::ReflectionTurns;
 use crate::engine::sleep::conversation_id;
 use crate::engine::throwaway::Throwaway;
+use crate::engine::tick::Due;
 use crate::engine::tools::{self, for_mode, Mode};
 use crate::engine::window::Speaker;
+
+mod ask;
+mod carried;
+pub use ask::Answer;
+use carried::{Carried, Want};
 
 /// How many completed exchanges the GPU sequence carries per turn.
 ///
@@ -107,9 +121,46 @@ const META_CONVERSATION: &str = "npc_conversation";
 /// opened under — see [`frame_fingerprint`].
 const META_FRAME: &str = "frame_sha256";
 
+/// How long a turn waits for a mission section it just submitted to seal before
+/// it reads the stand-in member instead.
+const SEAL_WAIT: Duration = Duration::from_secs(20);
+
+/// The sections a journal should be carried as.
+fn journal_wants(prompt: Option<&JournalPrompt>) -> Vec<Want<'_>> {
+    prompt
+        .map(|p| {
+            p.sections
+                .iter()
+                .map(|s| Want {
+                    name: &s.name,
+                    text: &s.text,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The journal sections a conversation that did not see them leave may still hold.
+fn journal_sweep(prompt: Option<&JournalPrompt>) -> Vec<&str> {
+    prompt
+        .and_then(|p| p.aged_out.as_deref())
+        .into_iter()
+        .collect()
+}
+
 /// A character's live conversation.
 struct Live {
     sequence: Sequence,
+    /// The mission section this conversation holds, if any. Reconciled against
+    /// the character's mission at the head of every turn — see
+    /// [`Minds::prepare`].
+    mission: Carried,
+    /// The journal sections this conversation holds, reconciled the same way
+    /// and also whenever an entry is kept — see [`Minds::keep_journal`].
+    journal: Carried,
+    /// The journal record last written to this conversation's metadata, so an
+    /// unchanged journal is not written again.
+    journal_record: String,
     /// The day this conversation belongs to. A mismatch against the world's day
     /// is what triggers the roll-over.
     day: u64,
@@ -193,6 +244,13 @@ pub struct Minds {
     /// Each conversation behind its own async lock, so a decode holds only the
     /// character that is thinking — see the module's *Locking* note.
     live: Mutex<HashMap<u64, Arc<ConversationLock<Live>>>>,
+    /// A handle to each live conversation that can put it a question without its
+    /// lock, so asking never waits for the character's turn — see [`Minds::ask_under`].
+    askers: Mutex<HashMap<u64, UnsealedAsker>>,
+    /// The system prompt each character's latest turn was made under, laid out
+    /// from that turn's projection. Held apart from `live` so reading it never
+    /// waits on a decode.
+    system_prompts: Mutex<HashMap<u64, rendered::Rendered>>,
     /// How many turns stay verbatim in the redo log, or `None` to keep them all.
     ///
     /// **Off unless the projection asks for it**, because most conversations are
@@ -293,6 +351,52 @@ fn compile_act_loop(
              cannot be forced into shape"
         );
     };
+
+    // **Where the turn is entered decides what the tree has to cover.**
+    //
+    // Not deliberating, the prefill writes the already-closed block and the
+    // marker, so the tree begins at the call body and the reasoning question
+    // never arises. Deliberating, the prefill stops at `<think>` and the tree
+    // covers the block *and* the calls after it — one grammar, so the join at
+    // `</think>` is a node edge rather than a moment the decoder is free in.
+    let prelude = match thinking {
+        identity::Deliberation::None => None,
+        _ => {
+            let steer = ThinkSteerEnvelope {
+                think_open,
+                think_close,
+                // The turn terminator, by the name the dialect gives it — the
+                // spans end on either `</think>` or EOS, and an EOS the tree
+                // does not know is one it cannot end a span on.
+                eos: tok
+                    .token_to_id(cfg.dialect.assistant_end.trim_end())
+                    .unwrap_or(0),
+                // Empty because this prelude is SPLICED onto the call grammar
+                // below (`compile_action_loop(…, Some(&prelude))`), so the join
+                // at `</think>` is already a node edge rather than a moment the
+                // decoder is free in. Injecting the marker here as well would
+                // emit it twice.
+                after_close: "",
+            };
+            Some(compile_think_tree(thinking.mode(), &steer))
+        }
+    };
+    let specs = tools::specs_within(Mode::Physical, within);
+    compile_calls(&e, cfg, &specs, tools::ACTS_PER_TURN, prelude.as_ref())
+}
+
+/// A grammar for a turn made of calls to `specs`, at most `max_calls` of them.
+///
+/// The shared tail of every call-forcing grammar: the character's act loop and
+/// the single forced call that answers a question. Entered after the turn's
+/// prefill has written the call marker.
+pub(super) fn compile_calls(
+    e: &ConversationEngine,
+    cfg: &SequenceConfig,
+    specs: &[ToolSpec],
+    max_calls: usize,
+    prelude: Option<&TreeSpec>,
+) -> anyhow::Result<Arc<StencilTree>> {
     // **The call's shape comes from the checkpoint's own dialect.**
     //
     // It was written out here, in Qwen3's JSON form, for every model this
@@ -313,42 +417,11 @@ fn compile_act_loop(
             .to_string(),
         ..base
     };
-
-    // **Where the turn is entered decides what the tree has to cover.**
-    //
-    // Not deliberating, the prefill writes the already-closed block and the
-    // marker, so the tree begins at the call body and the reasoning question
-    // never arises. Deliberating, the prefill stops at `<think>` and the tree
-    // covers the block *and* the calls after it — one grammar, so the join at
-    // `</think>` is a node edge rather than a moment the decoder is free in.
-    let prelude = match thinking {
-        identity::Deliberation::None => None,
-        _ => {
-            let steer = ThinkSteerEnvelope {
-                think_open,
-                think_close,
-                // The turn terminator, by the name the dialect gives it — the
-                // spans end on either `</think>` or EOS, and an EOS the tree
-                // does not know is one it cannot end a span on.
-                eos: tok.token_to_id(cfg.dialect.assistant_end).unwrap_or(0),
-                // Empty because this prelude is SPLICED onto the call grammar
-                // below (`compile_action_loop(…, Some(&prelude))`), so the join
-                // at `</think>` is already a node edge rather than a moment the
-                // decoder is free in. Injecting the marker here as well would
-                // emit it twice.
-                after_close: "",
-            };
-            Some(compile_think_tree(thinking.mode(), &steer))
-        }
-    };
-    let specs = tools::specs_within(Mode::Physical, within);
-    let spec = compile_action_loop(
-        &specs,
-        &env,
-        tools::ACTS_PER_TURN,
-        cfg.dialect.assistant_end,
-        prelude.as_ref(),
-    )?;
+    // The terminator ends the grammar ON the end-of-turn token: ChatML's
+    // `assistant_end` trails a newline, which would bury the EOS one slot from
+    // the end where the decode never sees it and the model writes its next turn.
+    let close_turn = ToolCallEnvelope::turn_close(&cfg.dialect);
+    let spec = compile_action_loop(specs, &env, max_calls, &close_turn, prelude)?;
     Ok(Arc::new(e.compile_stencil(&spec)?))
 }
 
@@ -503,6 +576,8 @@ impl Minds {
             grammar_ok: ok,
             projection: RwLock::new(None),
             live: Mutex::new(HashMap::new()),
+            askers: Mutex::new(HashMap::new()),
+            system_prompts: Mutex::new(HashMap::new()),
             keep_turns: None,
             reflection: None,
         }
@@ -567,6 +642,22 @@ impl Minds {
         self.projection.read().unwrap().as_ref().map(Arc::clone)
     }
 
+    /// The system prompt this character's latest turn was made under, or `None`
+    /// before it has had one.
+    pub fn system_prompt(&self, npc_id: u64) -> Option<rendered::Rendered> {
+        self.system_prompts.lock().unwrap().get(&npc_id).cloned()
+    }
+
+    /// The tokens this character would be given if it decoded this instant —
+    /// the projection recomputed now, piece by piece, with each piece's scores.
+    /// Waits for a decode in progress. `None` for a character with no live
+    /// conversation.
+    pub async fn prompt_dump(&self, npc_id: u64) -> Option<PromptDump> {
+        let live = self.live.lock().unwrap().get(&npc_id).map(Arc::clone)?;
+        let held = live.lock().await;
+        held.sequence.prompt_dump()
+    }
+
     /// Every layer of the mind's projection, with how much of each this
     /// character can read. `None` before the projection is loaded.
     pub fn layer_counts(&self, npc_id: u64) -> Option<Vec<layers::LayerCount>> {
@@ -602,10 +693,13 @@ impl Minds {
     fn as_character(&self, npc_id: u64) -> Option<(Builder, GroupId)> {
         let projection = self.projection.read().unwrap();
         let p = projection.as_ref()?;
-        Some((
-            dreams::scoped(&p.builder, npc_id, dreams::IN_ACTING),
-            p.group,
-        ))
+        Some((self.scoped_for(&p.builder, npc_id), p.group))
+    }
+
+    /// `builder` opened to what this character may read of the layers that are
+    /// its own: its dreams, a few lines deep.
+    fn scoped_for(&self, builder: &Builder, npc_id: u64) -> Builder {
+        dreams::scoped(builder, npc_id, dreams::IN_ACTING)
     }
 
     /// Put every dream already kept on the normalized score band.
@@ -1065,6 +1159,147 @@ impl Minds {
         .await
     }
 
+    /// Write one journal entry, if the stretch in `due` warrants one — see
+    /// [`crate::engine::journal`].
+    ///
+    /// Its write is put to the character's live conversation, as [`Minds::ask`]
+    /// puts a question: on an ephemeral slot that writes nothing back, between
+    /// the character's turns, holding its lock for the length of the decode. An
+    /// entry that is kept reaches the character as a section of its journal — see
+    /// [`Minds::keep_journal`].
+    ///
+    /// Whichever way it ends, `due`'s state has been told how.
+    pub async fn journal(
+        &self,
+        npc_id: u64,
+        persona: &Persona<'_>,
+        within: &tools::Within,
+        due: &Due,
+        world: &(dyn World + Sync),
+    ) -> anyhow::Result<(workflow::Outcome, workflow::Timing)> {
+        if self.projected().is_none() {
+            due.state.lock().unwrap().abandon();
+            anyhow::bail!("no schema, so no journal collection to write to");
+        }
+        let mut desk = EngineDesk::new(self, npc_id, persona, within);
+        Ok(workflow::run(&mut desk, &due.state, &due.span, world).await)
+    }
+
+    /// Hold `prompt` in the character's live conversation as its journal: submit
+    /// the sections that are new, remove the ones that have aged out, and record
+    /// the entries in the conversation's metadata so a restart can rebuild them.
+    ///
+    /// The sections are not waited on. They seal in the background and the next
+    /// turn reads them, or the stand-in member until they have.
+    pub async fn keep_journal(&self, npc_id: u64, prompt: &JournalPrompt) -> anyhow::Result<()> {
+        self.hold_journal(npc_id, prompt, &[]).await
+    }
+
+    /// Hold `prompt` as [`Minds::keep_journal`] does, and also take the sections
+    /// of the entries numbered `removed` out of the conversation, including ones
+    /// an earlier run sealed into it.
+    pub async fn hold_journal(
+        &self,
+        npc_id: u64,
+        prompt: &JournalPrompt,
+        removed: &[u64],
+    ) -> anyhow::Result<()> {
+        let gone: Vec<String> = removed.iter().map(|id| entry_section(*id)).collect();
+        let sweep: Vec<&str> = journal_sweep(Some(prompt))
+            .into_iter()
+            .chain(gone.iter().map(String::as_str))
+            .collect();
+        let conversation = self
+            .live
+            .lock()
+            .unwrap()
+            .get(&npc_id)
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                anyhow::anyhow!("npc {npc_id} has no live conversation to journal in")
+            })?;
+        let mut live = conversation.lock().await;
+        let Live {
+            sequence, journal, ..
+        } = &mut *live;
+        journal
+            .reconcile(
+                sequence,
+                identity::JOURNAL,
+                &journal_wants(Some(prompt)),
+                &sweep,
+                None,
+            )
+            .await;
+        self.record_journal(npc_id, &mut live, prompt.record())
+    }
+
+    /// Write the journal record to the conversation's metadata, unless it is
+    /// already what that holds.
+    fn record_journal(&self, npc_id: u64, live: &mut Live, record: &str) -> anyhow::Result<()> {
+        if live.journal_record == record {
+            return Ok(());
+        }
+        let kept = BTreeMap::from([
+            (META_OF.to_string(), npc_id.to_string()),
+            (META_KEPT.to_string(), record.to_string()),
+        ]);
+        self.engine
+            .lock()
+            .unwrap()
+            .set_conversation_metadata_many(live.sequence.timeline_id(), &kept)
+            .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e:?}"))?;
+        live.journal_record = record.to_string();
+        Ok(())
+    }
+
+    /// Rebuild this character's journal from the conversation that holds it.
+    /// Called as the character wakes, before its conversation is opened.
+    ///
+    /// A character with no such conversation, or none whose record parses, wakes
+    /// with an empty journal. Of several, the one that kept the newest entry wins.
+    pub fn restore_journal(&self, npc_id: u64) -> JournalState {
+        let engine = self.engine.lock().unwrap();
+        let kept = engine
+            .find_conversations_by_metadata(META_OF, &npc_id.to_string())
+            .into_iter()
+            .filter_map(|tl| engine.conversation_metadata(tl)?.remove(META_KEPT))
+            .filter_map(|record| section::restore(&record))
+            .max_by_key(|k| k.newest());
+        drop(engine);
+        match kept {
+            Some(k) => JournalState::restore(npc_id, k.entries, k.open, k.next_item),
+            None => JournalState::new(npc_id),
+        }
+    }
+
+    /// Empty the record this character's journal is restored from, so it wakes
+    /// with none. Returns how many conversations held one.
+    ///
+    /// The conversation is not tombstoned — it is the character's day. The
+    /// sections it holds stay with it and are not read: a character whose journal
+    /// is empty selects none, and an entry written later replaces the section of
+    /// the same name. They are tombstoned with the conversation.
+    pub fn forget_journal(&self, npc_id: u64) -> usize {
+        let empty = JournalPrompt::of(&section::Kept {
+            entries: Vec::new(),
+            open: Vec::new(),
+            next_item: 1,
+        });
+        let engine = self.engine.lock().unwrap();
+        let mut emptied = 0;
+        for timeline in engine.find_conversations_by_metadata(META_OF, &npc_id.to_string()) {
+            match engine.set_conversation_metadata(timeline, META_KEPT, empty.record()) {
+                Ok(()) => emptied += 1,
+                Err(e) => tracing::warn!(
+                    "npc {npc_id}: journal record of conversation {timeline} could not be \
+                     emptied: {e:?} — it is restored at the next start"
+                ),
+            }
+        }
+        emptied
+    }
+
     /// A sample of the axes this character has dreamt along — see
     /// [`dreams::sample_axes`].
     pub fn dreamt_axes(&self, npc_id: u64, n: usize) -> Vec<String> {
@@ -1182,7 +1417,7 @@ impl Minds {
                 Some(p) => engine.resume_conversation_with_projection(
                     timeline,
                     &system,
-                    dreams::scoped(&p.builder, npc_id, dreams::IN_ACTING),
+                    self.scoped_for(&p.builder, npc_id),
                     cfg.clone(),
                 ),
                 None => engine.resume_conversation(timeline, &system, cfg.clone()),
@@ -1232,6 +1467,9 @@ impl Minds {
         if let Some((sequence, watermark)) = rejoined {
             return Ok(Live {
                 sequence,
+                mission: Carried::new(false),
+                journal: Carried::new(false),
+                journal_record: String::new(),
                 day,
                 id,
                 // Not zero: a conversation this deep has already retired its
@@ -1250,7 +1488,7 @@ impl Minds {
                 // in the room is reminded of one when something resonates.
                 Some(p) => engine.new_conversation_with_projection(
                     &system,
-                    dreams::scoped(&p.builder, npc_id, dreams::IN_ACTING),
+                    self.scoped_for(&p.builder, npc_id),
                     p.layer,
                     p.group,
                     cfg,
@@ -1298,6 +1536,9 @@ impl Minds {
         }
         Ok(Live {
             sequence,
+            mission: Carried::new(true),
+            journal: Carried::new(true),
+            journal_record: String::new(),
             day,
             id,
             retired_through: 0,
@@ -1346,30 +1587,15 @@ impl Minds {
                     // Tombstone, not delete. The turns stay in the redo log;
                     // what changes is that they stop being selected by default.
                     let gone = self.live.lock().unwrap().remove(&npc_id);
+                    self.askers.lock().unwrap().remove(&npc_id);
                     if let Some(l) = gone {
                         retire(&self.engine, &*l.lock().await);
                     }
                     thought.rolled_over = Some((from, day));
-                    let opened = Arc::new(ConversationLock::new(
-                        self.open_conversation(npc_id, day, persona, mode)?,
-                    ));
-                    self.live
-                        .lock()
-                        .unwrap()
-                        .insert(npc_id, Arc::clone(&opened));
-                    opened
+                    self.adopt(npc_id, self.open_conversation(npc_id, day, persona, mode)?)
                 }
             }
-            None => {
-                let opened = Arc::new(ConversationLock::new(
-                    self.open_conversation(npc_id, day, persona, mode)?,
-                ));
-                self.live
-                    .lock()
-                    .unwrap()
-                    .insert(npc_id, Arc::clone(&opened));
-                opened
-            }
+            None => self.adopt(npc_id, self.open_conversation(npc_id, day, persona, mode)?),
         };
 
         // **The answers to last turn's acts, then everything that has happened
@@ -1404,42 +1630,15 @@ impl Minds {
         // selection — so a daemon running the rendered prompt needs it just as
         // much. It used to be built only on the projected branch, so the path
         // the daemon actually ran never injected the switch at all.
-        let mut selection = self
-            .projection
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|p| {
-                p.identities
-                    // **How hard to think comes from the work.** A mission
-                    // carries its own [`identity::Deliberation`] — drafting a
-                    // story into a gap in the chronicle is a thinking problem,
-                    // deciding who to talk to is not. No mission exists as data
-                    // yet, so every character is on the standing instruction,
-                    // which is the default: act, do not deliberate.
-                    .selection_for(
-                        npc_id,
-                        persona.personality,
-                        persona.world_id,
-                        persona.building,
-                        identity::Deliberation::default(),
-                    )
-            })
-            .unwrap_or_else(|| identity::deliberation(identity::Deliberation::default()));
-        // **What it can do, shown beside what it is.** Every act is installed in
-        // the schema's `tools` collection and a turn names the ones it can take
-        // — the same set, under the same mode, `grammar_for` compiles the mask
-        // from — so the list a character reads is never wider or narrower than
-        // what it can decode. A character alone reads no `tell`; one standing at
-        // a chronicle terminal reads the terminal's acts until it walks away.
-        tools::show_within(&mut selection, Mode::Physical, within);
+        // The selection is made under the character's lock, after its mission
+        // section has been reconciled, because which member the `mission`
+        // collection pins depends on whether that section has sealed.
         let turn_grammar = self.grammar_for(identity::Deliberation::default(), within);
-        let options = TurnOptions {
+        let mut options = TurnOptions {
             assistant_prefill: self
                 .opening(identity::Deliberation::default(), turn_grammar.is_some()),
             turn_grammar,
             sampling: Some(self.sampling_for(identity::Deliberation::default())),
-            selection,
             // **Inside its own dreams' scope.** A turn teaches the hit levels of
             // the scopes its tags name, and the dream group is scoped to this
             // character's tag — so without it a character's own turns, the only
@@ -1453,6 +1652,7 @@ impl Minds {
             // *Locking* note): it is what makes one turn at a time per
             // character true while the rest of the cast decodes concurrently.
             let mut live = conversation.lock().await;
+            options.selection = self.prepare(&mut live, npc_id, persona, within).await;
             // The answers to last turn's acts, taken here so they die with the
             // conversation on a roll-over rather than being delivered into one
             // that never asked the questions.
@@ -1487,6 +1687,10 @@ impl Minds {
             // comes back by winning the gather rather than by being pasted in —
             // so the only way to see it is to ask the projection what it held.
             if let Some(ev) = live.sequence.projection_event(&response.stats) {
+                self.system_prompts.lock().unwrap().insert(
+                    npc_id,
+                    rendered::render(&ev, &live.sequence.section_contents()),
+                );
                 let recalled: Vec<(u64, f32)> = ev
                     .selection
                     .turns
@@ -1551,6 +1755,103 @@ impl Minds {
         Ok(thought)
     }
 
+    /// What a turn of this character's reads: who it is, what it has been asked
+    /// to do and written down, and what it can do where it stands.
+    ///
+    /// Its mission and journal sections are brought in line with what the
+    /// character holds first, waiting up to [`SEAL_WAIT`] for what was just
+    /// submitted to seal, because which member each collection selects depends on
+    /// what has: the sealed sections, or a stand-in until they have. The journal
+    /// record is written to the conversation's metadata as well, so a journal
+    /// carried into a new day is the one a restart restores.
+    ///
+    /// A mission carries its own [`identity::Deliberation`], but none declares a
+    /// level, so every character is on the default: act, do not deliberate.
+    /// Every act is installed in the schema's `tools` collection and a turn names
+    /// the ones it can take — the same set `grammar_for` compiles the mask from —
+    /// so the list a character reads is never wider or narrower than what it can
+    /// decode. A question put to it reads the same selection, which is what makes
+    /// its answer about the character that acts.
+    async fn prepare(
+        &self,
+        live: &mut Live,
+        npc_id: u64,
+        persona: &Persona<'_>,
+        within: &tools::Within,
+    ) -> SelectionState {
+        let mission = persona.mission.map(|m| Want {
+            name: identity::MISSION_SECTION,
+            text: &m.text,
+        });
+        let mission_sealed = live
+            .mission
+            .reconcile(
+                &mut live.sequence,
+                identity::MISSION,
+                &mission.into_iter().collect::<Vec<_>>(),
+                &[identity::MISSION_SECTION],
+                Some(SEAL_WAIT),
+            )
+            .await;
+        let journal_sealed = live
+            .journal
+            .reconcile(
+                &mut live.sequence,
+                identity::JOURNAL,
+                &journal_wants(persona.journal),
+                &journal_sweep(persona.journal),
+                Some(SEAL_WAIT),
+            )
+            .await;
+        if let Some(journal) = persona.journal {
+            if let Err(e) = self.record_journal(npc_id, live, journal.record()) {
+                tracing::warn!("npc {npc_id}: {e:#}");
+            }
+        }
+        self.selection(
+            npc_id,
+            persona,
+            within,
+            !mission_sealed.is_empty(),
+            &journal_sealed,
+        )
+    }
+
+    /// The selection a turn reads, given which of the character's mission and
+    /// journal sections have sealed.
+    fn selection(
+        &self,
+        npc_id: u64,
+        persona: &Persona<'_>,
+        within: &tools::Within,
+        mission_sealed: bool,
+        journal_sealed: &[String],
+    ) -> SelectionState {
+        let mut selection = self
+            .projection
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|p| {
+                p.identities.selection_for(
+                    npc_id,
+                    persona.personality,
+                    persona.world_id,
+                    persona.building,
+                    identity::Deliberation::default(),
+                )
+            })
+            .unwrap_or_else(|| identity::deliberation(identity::Deliberation::default()));
+        if persona.mission.is_some() {
+            identity::carry_mission(&mut selection, mission_sealed);
+        }
+        if persona.journal.is_some() {
+            identity::carry_journal(&mut selection, journal_sealed);
+        }
+        tools::show_within(&mut selection, Mode::Physical, within);
+        selection
+    }
+
     /// Hand back what became of the acts this character just called for.
     ///
     /// One entry per call it made, in the order it made them, whatever the
@@ -1586,9 +1887,23 @@ impl Minds {
         // awaited rather than tombstoned underneath, and the map is free for
         // everyone else while we wait.
         let gone = self.live.lock().unwrap().remove(&npc_id);
+        self.askers.lock().unwrap().remove(&npc_id);
         if let Some(l) = gone {
             retire(&self.engine, &*l.lock().await);
         }
+    }
+
+    /// Make `live` the character's conversation, and the handle it is asked
+    /// through.
+    fn adopt(&self, npc_id: u64, live: Live) -> Arc<ConversationLock<Live>> {
+        let asker = live.sequence.unsealed_asker();
+        let opened = Arc::new(ConversationLock::new(live));
+        self.askers.lock().unwrap().insert(npc_id, asker);
+        self.live
+            .lock()
+            .unwrap()
+            .insert(npc_id, Arc::clone(&opened));
+        opened
     }
 }
 

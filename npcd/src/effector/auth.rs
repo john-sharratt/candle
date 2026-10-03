@@ -51,7 +51,7 @@ pub struct DeviceCaller {
 /// **The fix for a body that walks while it thinks.** A character's grammar is
 /// snapshotted before the decode ([`crate::engine::runtime::Runtime::within`]),
 /// but the world's metronome advances a walking body a leg every 500 ms while
-/// the decode takes seconds — so by the time the chosen `query`/`invoke` runs,
+/// the decode takes seconds — so by the time the chosen `invoke` runs,
 /// the body has left the room the address named, and the live reach check 404s
 /// an address the grammar had just offered. Pinning the grammar-time standpoint
 /// closes that time-of-check/time-of-use gap.
