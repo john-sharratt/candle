@@ -1248,9 +1248,17 @@ pub const QWEN4EXP_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors
 /// shape above. Both axes take the smallest step. The whole ladder passed in one
 /// gate run: C10×2 2/2 at 5.97×, C10×8 8/8 at 5.96×. The step costs C10 2.8%
 /// (6.14× → 5.97×), C8 1.6% and C5, the level zend runs, 0.3% (3.44× → 3.43×).
+///
+/// **Re-derived 2026-10-04: k 1.40 → 1.35, v 2.0 → 1.9.** At 1.40 / 2.0 the gate
+/// failed C10×8 at 7/8 on three consecutive runs, with every other rung
+/// passing and C10 at the same 5.96× the 2026-10-03 pass recorded — a row on the
+/// edge again, so both axes take the smallest step. The whole ladder passed on
+/// two consecutive gate runs, C10×8 8/8 both times. The step costs C10 2.3%
+/// (5.96× → 5.82× at ×2, 5.80× at ×8), C8 2.0% (4.97× → 4.87×) and C5, the
+/// level zend runs, 1.3% (3.85× → 3.80×).
 pub const QWEN4EXP_Q2KO_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.40,
-    k_low: 1.40,
-    v_hi: 2.0,
-    v_low: 2.0,
+    k_hi: 1.35,
+    k_low: 1.35,
+    v_hi: 1.9,
+    v_low: 1.9,
 };
