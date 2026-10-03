@@ -1933,6 +1933,7 @@ extern "C" {
     /// - `head_dim`: Number of dimensions per head (block size)
     pub fn run_quantize_palette4_convert(
         heads_base: *const u8,
+        valid_ranges: *const c_int,
         num_heads: c_int,
         num_kv_heads: c_int,
         num_layers: c_int,

@@ -872,60 +872,6 @@ pub unsafe fn quantize_transposed_batched_typed(
     Ok(())
 }
 
-/// Palette4 KV-cache format conversion.
-///
-/// Converts K or V data between arbitrary arena formats using 4-palette
-/// metadata from KvHead structs. Source and destination may have independent
-/// palette maps; routing is handled by a merged xlat[128] table built on-GPU.
-///
-/// # Arguments
-/// * `src_kvhead_ptrs` - Device pointers to src KvHead structs [num_layers × num_kv_heads]
-/// * `dst_kvhead_ptrs` - Device pointers to dst KvHead structs [num_layers × num_kv_heads]
-/// * `num_kv_heads` - Number of KV heads per layer
-/// * `num_layers` - Number of layers
-/// * `num_chunks` - Number of 32-token chunks per head to convert
-/// * `is_k` - true for K conversion, false for V
-pub fn quantize_palette4_convert(
-    heads_base: &CudaSlice<u8>,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_layers: usize,
-    num_chunks: usize,
-    is_k: bool,
-    head_dim: usize,
-    dev: &CudaDevice,
-) -> Result<()> {
-    if num_kv_heads == 0 || num_layers == 0 || num_chunks == 0 {
-        return Ok(());
-    }
-
-    let stream = dev.cuda_stream();
-    let (base_ptr, _guard) = heads_base.device_ptr(&stream);
-
-    unsafe {
-        crate::set_kernel_breadcrumb(
-            if is_k {
-                "run_quantize_palette4_convert (K, single)"
-            } else {
-                "run_quantize_palette4_convert (V, single)"
-            },
-            file!(),
-            line!(),
-        );
-        run_quantize_palette4_convert(
-            base_ptr as *const u8,
-            num_heads as i32,
-            num_kv_heads as i32,
-            num_layers as i32,
-            num_chunks as i32,
-            if is_k { 1 } else { 0 },
-            head_dim as i32,
-            stream.cu_stream() as *mut _,
-        );
-    }
-    Ok(())
-}
-
 // ============================================================================
 // Palette4 buffered conversion API
 // ============================================================================
@@ -1075,7 +1021,18 @@ pub struct PalHeadDesc {
     pub k_dst_scales: [f32; KVHEAD_N_PAL],
     /// Post-dequant scale written into the dst KvHead for V (f32, default 1.0).
     pub v_dst_scales: [f32; KVHEAD_N_PAL],
+    /// Live token window of the chunk this descriptor converts, packed
+    /// `(offset << 8) | len` with `len >= 1` and `offset + len <= 32`
+    /// ([`FULL_CHUNK_WINDOW`] for a full chunk; it applies to every chunk of
+    /// a multi-chunk job). The kernel reads every token outside it as zero:
+    /// a partial chunk's dead slots hold whatever the recycled ground held,
+    /// and each block's scale is taken over all 32 tokens, so a stale inf
+    /// there would decode the live tokens as NaN.
+    pub valid_range: i32,
 }
+
+/// [`PalHeadDesc::valid_range`] of a full 32-token chunk: offset 0, length 32.
+pub const FULL_CHUNK_WINDOW: i32 = 32;
 
 /// Build the identity 2-bit-packed palette map for `head_dim` (only the first
 /// `head_dim / 4` bytes are live; the rest stay zero).
@@ -1167,12 +1124,13 @@ pub fn build_kvhead_bytes_raw(
     Ok(head)
 }
 
-/// Palette4 KV-cache format conversion with CPU-side buffer construction.
+/// Palette4 KV-cache format conversion.
 ///
-/// Higher-level wrapper around [`quantize_palette4_convert`] that accepts
-/// structured `PalHeadDesc` descriptors, serialises them into 152-byte
-/// KvHead GPU structs, and invokes the kernel for both K and V in a single
-/// call.
+/// Converts K and V between arbitrary arena formats using 4-palette metadata:
+/// serialises the `PalHeadDesc` descriptors into KvHead GPU structs plus one
+/// token window per descriptor, uploads them in one staged buffer, and runs
+/// the kernel for K and then V. Source and destination may have independent
+/// palette maps; routing is a per-dim xlat table the kernel builds on-GPU.
 ///
 /// # Arguments
 /// * `descs` - Row-major `[num_layers][num_kv_heads]` slice of head descriptors.
@@ -1249,24 +1207,35 @@ pub fn quantize_palette4_convert_buffered(
         check_ptrs(&desc.k_dst_arena_ptrs, &desc.k_dst_pal_map, "dst", "K")?;
         check_ptrs(&desc.v_src_arena_ptrs, &desc.v_src_pal_map, "src", "V")?;
         check_ptrs(&desc.v_dst_arena_ptrs, &desc.v_dst_pal_map, "dst", "V")?;
+        let (lo, len) = (desc.valid_range >> 8, desc.valid_range & 0xff);
+        if !(0..32).contains(&lo) || len == 0 || lo + len > 32 {
+            crate::bail!(
+                "quantize_palette4_convert_buffered: desc[{i}] valid_range {:#x} is not a \
+                 token window inside one 32-token chunk",
+                desc.valid_range
+            );
+        }
     }
 
     // Pack everything into one GPU allocation:
     //
     //   [ src KvHead[0..N]    ]   offset 0
     //   [ dst KvHead[0..N]    ]   offset N × KVHEAD_SIZE
+    //   [ valid_range[0..N]   ]   offset 2N × KVHEAD_SIZE (i32 each)
     //
-    // Total = N × 2 × KVHEAD_SIZE bytes.  The kernel computes head pointers
-    // as base + job * KVHEAD_SIZE (src) and base + (N + job) * KVHEAD_SIZE (dst),
-    // so no pointer arrays are needed.
+    // Total = N × (2 × KVHEAD_SIZE + 4) bytes.  The kernel computes head
+    // pointers as base + job * KVHEAD_SIZE (src) and base + (N + job) *
+    // KVHEAD_SIZE (dst), so no pointer arrays are needed. KVHEAD_SIZE is a
+    // multiple of 8 at every supported head_dim, so the window array is
+    // 4-byte aligned.
     let n = expected;
     let src_heads_off: usize = 0;
     let dst_heads_off: usize = n * kvhead_bytes;
-    // Layout: [src KvHeads][dst KvHeads]. Per-palette outer scales live
-    // inside each dst KvHead struct (f32 at HD/2+72 / HD/2+88), so the encoder
-    // (multiply by outer) and decoder (divide by outer) share a single source
-    // of truth.
-    let total_bytes = 2 * n * kvhead_bytes;
+    let ranges_off: usize = 2 * n * kvhead_bytes;
+    // Per-palette outer scales live inside each dst KvHead struct (f32 at
+    // HD/2+72 / HD/2+88), so the encoder (multiply by outer) and decoder
+    // (divide by outer) share a single source of truth.
+    let total_bytes = ranges_off + n * 4;
 
     // Build the CPU image directly in pinned memory (no intermediate Vec).
     let mut buf = generation.alloc(total_bytes)?;
@@ -1299,6 +1268,8 @@ pub fn quantize_palette4_convert_buffered(
         let dst_off = dst_heads_off + i * kvhead_bytes;
         buf[src_off..src_off + kvhead_bytes].copy_from_slice(&src_bytes);
         buf[dst_off..dst_off + kvhead_bytes].copy_from_slice(&dst_bytes);
+        let range_off = ranges_off + i * 4;
+        buf[range_off..range_off + 4].copy_from_slice(&desc.valid_range.to_le_bytes());
     }
 
     // Async H2D upload via stager (deferred cleanup).
@@ -1307,11 +1278,13 @@ pub fn quantize_palette4_convert_buffered(
     // Launch K and V conversion passes.
     // Grid: dim3(num_kv_heads, num_layers) → exactly n blocks per launch.
     let base_ptr = gpu_buf.dev_ptr();
+    let ranges_ptr = (base_ptr + ranges_off as u64) as *const i32;
     let raw_stream = stream.cu_stream() as *mut _;
     unsafe {
         crate::set_kernel_breadcrumb("run_quantize_palette4_convert (K)", file!(), line!());
         run_quantize_palette4_convert(
             base_ptr as *const u8,
+            ranges_ptr,
             n as i32,
             num_kv_heads as i32,
             num_layers as i32,
@@ -1323,6 +1296,7 @@ pub fn quantize_palette4_convert_buffered(
         crate::set_kernel_breadcrumb("run_quantize_palette4_convert (V)", file!(), line!());
         run_quantize_palette4_convert(
             base_ptr as *const u8,
+            ranges_ptr,
             n as i32,
             num_kv_heads as i32,
             num_layers as i32,
@@ -1520,9 +1494,9 @@ pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
     n_kv_head: usize,
     arena_chunks: usize,
     // Per-chunk valid token range, packed (offset << 8) | len, len in
-    // [1, 32]. Partial chunks' dead slots are zero (arena zeroing at
-    // creation/recycle); the range corrects the count-normalized error
-    // metrics and sink statistics for the missing lanes.
+    // [1, 32]. The kernels read every slot outside it as zero, whatever the
+    // slot holds, and correct the count-normalized error metrics and sink
+    // statistics for the missing lanes.
     valid_ranges: &[i32],
     dev: &CudaDevice,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
