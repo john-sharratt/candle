@@ -274,6 +274,21 @@ export const LiveAPI = {
    * held — and the difference between them is how you tell "it forgot" from "it
    * never perceived that". */
   npcWindow: (id) => j('/v1/npc/' + id + '/window'),
+  /* What the character's `scan` tells it: `prose` word for word, and `survey`,
+   * the data it was written from. */
+  npcScan: (id) => j('/v1/npc/' + id + '/scan'),
+  /* The character's current mission, or the last it finished: the ask, the steps
+   * with their ticks, the answer it is building and the report that closed it. */
+  npcMission: (id) => j('/v1/npc/' + id + '/mission'),
+  /* The character's journal: the entries it has kept, which of them its next
+   * prompt carries, what it has left open, and how each recent draft ended. */
+  getJournal: (id) => j('/v1/npc/' + id + '/journal'),
+  /* Draft now over every turn not yet written up, rather than waiting for the
+   * cadence. The outcome shows up in the journal's `drafts`. */
+  draftJournal: (id) => j('/v1/npc/' + id + '/journal/draft', { method: 'POST' }),
+  /* Forget one entry: out of the character's prompt, its conversation and the
+   * record a restart rebuilds from. Answers the journal as it now reads. */
+  forgetJournalEntry: (id, entry) => j('/v1/npc/' + id + '/journal/' + entry, { method: 'DELETE' }),
 
   /* The authored corpus.
    *

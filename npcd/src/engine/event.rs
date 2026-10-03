@@ -36,6 +36,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::clock::{WorldTime, DAY_MS};
+use crate::engine::reported::third_person;
+
 /// How much this event demands attention, 0.0–1.0.
 ///
 /// A newtype rather than a bare `f32` because the clamping has to happen at
@@ -275,20 +278,6 @@ pub enum EventKind {
     /// own state would be its own reasoning read back as instruction, which is
     /// the runaway loop with extra steps.
     Nudge { text: String },
-    /// The effector device's near-you screen — what is reachable from where the
-    /// body stands right now (effector design §6), already rendered as the
-    /// "YOUR EFFECTOR DEVICE / Reachable from here: …" section by
-    /// [`crate::engine::prompt::near_you_section`].
-    ///
-    /// **Replaces** the previous one — see [`EventKind::replaces`]. It is a
-    /// point-in-time fact, true only where the body stands *now*: a second one
-    /// is the current screen and the first is a reading of a place the character
-    /// has walked away from. Its own band, beside the situation, because the two
-    /// change together as the body moves but read as different things — where you
-    /// are, and what you can reach from there. The `query`/`invoke` calls and
-    /// their responses are acts and outcomes and stay inline in the turn stream;
-    /// only this ambient list supersedes.
-    Reachable { text: String },
     /// The day ended. The character consolidates and its conversation rolls over
     /// — see `engine::sleep`.
     Sleep { day: u64 },
@@ -298,6 +287,25 @@ pub enum EventKind {
     /// console. Marked as its own kind so a debugging poke is never mistaken for
     /// something the world did.
     Operator { text: String },
+    /// A thought that arrives in the character's own mind rather than from the
+    /// world: where it ought to go next, what it is forgetting, what it can't
+    /// leave alone.
+    ///
+    /// It is how a character is steered from outside without it being told
+    /// anything by anyone. It reads as the character's own reasoning, in the
+    /// first person, so it is weighed and acted on the way its own conclusions
+    /// are — and the system prompt says as much: thoughts of this kind are its
+    /// own, and it follows them.
+    ///
+    /// **Replaces** the previous one, and the standing task as well — see
+    /// [`EventKind::replaces`]. A character can only be held to one thing at a
+    /// time; the latest is the current one.
+    MindControl { text: String },
+}
+
+/// How a [`EventKind::MindControl`] thought reads to the character.
+pub fn mind_control_line(text: &str) -> String {
+    format!("A thought you can't shake: {}", text.trim())
 }
 
 impl EventKind {
@@ -310,12 +318,12 @@ impl EventKind {
             EventKind::Message { .. } => "message",
             EventKind::Situation { .. } => "situation",
             EventKind::Nudge { .. } => "nudge",
-            EventKind::Reachable { .. } => "reachable",
             EventKind::Entity { .. } => "entity",
             EventKind::Heartbeat => "heartbeat",
             EventKind::Sleep { .. } => "sleep",
             EventKind::Wake { .. } => "wake",
             EventKind::Operator { .. } => "operator",
+            EventKind::MindControl { .. } => "mind_control",
         }
     }
 
@@ -334,12 +342,11 @@ impl EventKind {
             EventKind::Situation { .. } => Some("situation".to_string()),
             // Its own band, beside the situation. Two standing instructions is
             // a character working to a task it has been taken off, which reads
-            // as one that has forgotten what it was doing.
-            EventKind::Nudge { .. } => Some("nudge".to_string()),
-            // Its own band too: the near-you screen is only ever true now, so a
-            // second one supersedes the first rather than leaving a stale list
-            // of a place the body has left sitting in the window.
-            EventKind::Reachable { .. } => Some("reachable".to_string()),
+            // as one that has forgotten what it was doing. A thought it can't
+            // shake is a standing instruction too, so it shares the band: a new
+            // task retires the old task's restatement, and a restatement
+            // retires the task it restates.
+            EventKind::Nudge { .. } | EventKind::MindControl { .. } => Some("nudge".to_string()),
             _ => None,
         }
     }
@@ -372,6 +379,26 @@ impl Event {
         self.salience.preempts()
     }
 
+    /// Whether this arrival schedules a turn for the character it reaches.
+    ///
+    /// **Being told something is not being asked something.** Speech aimed at
+    /// somebody else is information: it is queued and read with whatever next
+    /// wakes the character, but it asks nothing of them. If it woke them, every
+    /// listener in a room would answer every line, and a conversation between
+    /// two would become one between all of them with nobody having been asked to
+    /// take part. Everything else — being addressed, a message, something done,
+    /// somebody arriving, the room stirring — wakes, because an event nobody
+    /// wakes for is one nobody ever reads.
+    pub fn wakes(&self) -> bool {
+        !matches!(
+            self.kind,
+            EventKind::Speech {
+                to: Addressed::Other { .. },
+                ..
+            }
+        )
+    }
+
     /// How this event reads to the character.
     ///
     /// Second person, present tense, no field names, no punctuation the model has
@@ -387,7 +414,7 @@ impl Event {
                 format!("Word goes out across the world: {}", text.trim())
             }
             EventKind::Speech { speaker, text, to } => {
-                let t = text.trim();
+                let t = third_person(text.trim());
                 // Three readings of one utterance, and the difference between
                 // them is what makes a shared room worth standing in: being
                 // told something, being among those it was said to, and
@@ -418,7 +445,7 @@ impl Event {
             // a phone carries is intent, and quoting it would fabricate wording
             // nobody chose.
             EventKind::Message { thread, from, text } => {
-                let t = text.trim();
+                let t = third_person(text.trim());
                 match thread == from {
                     // A direct thread is named for the other party, so saying
                     // both would read as "Wren, on Wren".
@@ -429,12 +456,7 @@ impl Event {
             // Both arrive already written — a situation is generated from a
             // map, a nudge is authored beside the task it belongs to — so
             // rendering passes them through rather than decorating them.
-            // The near-you screen arrives already rendered by
-            // `prompt::near_you_section`, so it passes through verbatim like the
-            // situation and the nudge.
-            EventKind::Situation { text }
-            | EventKind::Nudge { text }
-            | EventKind::Reachable { text } => text.trim().to_string(),
+            EventKind::Situation { text } | EventKind::Nudge { text } => text.trim().to_string(),
             EventKind::Entity {
                 entity_id,
                 observation,
@@ -447,9 +469,11 @@ impl Event {
                     .to_string()
             }
             EventKind::Wake { day } => {
-                format!("You wake. It is day {day}. Yesterday is behind you, kept as memory.")
+                let date = WorldTime::of(day * DAY_MS).date();
+                format!("You wake. It is {date}. Yesterday is behind you, kept as memory.")
             }
             EventKind::Operator { text } => text.trim().to_string(),
+            EventKind::MindControl { text } => mind_control_line(text),
         }
     }
 }
@@ -544,37 +568,6 @@ mod tests {
         }
     }
 
-    /// The near-you screen supersedes in its own band, beside the situation, and
-    /// reaches the character verbatim — it is already the finished device section
-    /// (effector design §6), so a second reading of a place the body has left
-    /// never sits in the window as current, and the list itself is never
-    /// re-voiced or decorated.
-    #[test]
-    fn the_reachable_screen_supersedes_in_its_own_band_and_reads_verbatim() {
-        let screen = "YOUR EFFECTOR DEVICE\nReachable from here: the lift · your phone";
-        let here = EventKind::Reachable {
-            text: screen.into(),
-        };
-        // Its own band — one current screen, whatever it lists.
-        assert_eq!(here.replaces().as_deref(), Some("reachable"));
-        let later = EventKind::Reachable {
-            text: "YOUR EFFECTOR DEVICE\nReachable from here: your phone".into(),
-        };
-        assert_eq!(here.replaces(), later.replaces());
-        // A band of its own, distinct from the situation and the standing task,
-        // so the three supersede independently.
-        assert_ne!(
-            here.replaces(),
-            EventKind::Situation { text: "x".into() }.replaces()
-        );
-        assert_ne!(
-            here.replaces(),
-            EventKind::Nudge { text: "x".into() }.replaces()
-        );
-        // Verbatim: the finished section is what the character reads.
-        assert_eq!(Event::new(1, 0, Salience::IDLE, here).prose(), screen);
-    }
-
     /// Prose is what the character actually reads, so it must never contain the
     /// wire's field names or its punctuation.
     #[test]
@@ -608,6 +601,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn waking_names_the_date_in_the_world_not_a_day_count() {
+        // Day 79 422 from 1970 is 14 Jun 2187.
+        let p = Event::new(1, 0, Salience::NORMAL, EventKind::Wake { day: 79_422 }).prose();
+        assert_eq!(
+            p,
+            "You wake. It is 14 Jun 2187. Yesterday is behind you, kept as memory."
+        );
     }
 
     /// One utterance, three readings. Being told something, being among those

@@ -100,7 +100,7 @@ pub fn apply_selection(
         // `Named` selects a collection member by name; turn groups have no
         // member names, so nothing survives. (Collections resolve `Named` in
         // `project::select_collection_sections`, not here.)
-        SelectionRule::Named { .. } => Vec::new(),
+        SelectionRule::Named { .. } | SelectionRule::Offered { .. } => Vec::new(),
         // A working-set group is filled from the target's working set, whole
         // conversations sized by its own budget (`project::working_set_picks`);
         // it never reaches a per-turn rule.

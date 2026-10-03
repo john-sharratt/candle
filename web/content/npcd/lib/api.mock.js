@@ -18,7 +18,8 @@ const pad2 = (n) => String(n).padStart(2, '0');
 /** Seconds-since-midnight to the HH:MM:SS the log pane renders. */
 const clock = (s) => `${pad2(Math.floor(s / 3600) % 24)}:${pad2(Math.floor(s / 60) % 60)}:${pad2(s % 60)}`;
 
-const WORLD_EPOCH = 412 * 86400000 + 6 * 3600000 + 14 * 60000;
+const forgottenEntries = new Set();
+const WORLD_EPOCH =Date.UTC(2187, 5, 14, 6, 14);
 const worldMs = () => WORLD_EPOCH + (Date.now() % 3600000) * 60;
 
 /* The refusal a fixture owes for work that genuinely needs a card.
@@ -632,7 +633,7 @@ export const MockAPI = {
   async listWorlds(q) {
     const all = EMPTY ? [] : [{ world_id: 'ardh', name: 'Ardh', public: false,
       setting: 'A kingdom of hill villages on a northern frontier, three years after a war nobody won. Roads are unsafe after dark. The crown is distant and the garrisons are underpaid.',
-      npc_count: NPCS.length, time: { world_ms: worldMs(), scale: 60, paused: false },
+      npc_count: NPCS.length, time: { world_ms: worldMs(), scale: 60, paused: false, year_offset: 217 },
       zoom_bands: ['strategic', 'regional', 'tactical', 'local'],
       templates: { responses: 'override', moods: 'default' } }];
     return { worlds: narrow(all, q, (x) => [x.world_id, x.name]) };
@@ -1158,6 +1159,94 @@ export const MockAPI = {
           text: 'You are hurt: a crossbow bolt through the left shoulder, badly' },
       ],
     };
+  },
+  async npcMission(_id) {
+    return {
+      on_mission: true,
+      mission: {
+        prompt: 'Go to the foundry and scan the breaker panel. Find out what state it is in, then come back to the table in the muster hall and report exactly what you read.',
+        open: true,
+        origin: { kind: 'lodged', by: 'operator' },
+        todo: [
+          { text: 'go to the foundry', done: true, outcome: 'achieved', reports: false },
+          { text: 'scan the breaker panel and read its state', done: true, outcome: 'thwarted', reports: false },
+          { text: 'go back to the table and report it', done: false, outcome: null, reports: true },
+        ],
+        answer: null,
+        report: null,
+      },
+    };
+  },
+  async npcScan(_id) {
+    const address = 'http://local/tower/bridge-console~0';
+    const needs = [
+      { name: 'action', ty: 'string', required: true, about: 'what the tower does' },
+      { name: 'x', ty: 'integer', required: false, about: 'grid column to relocate to' },
+    ];
+    const survey = {
+      stations: [{
+        name: 'bridge console', address,
+        state: ['standing', 'shields down'],
+        verbs: [{ address: address + '/command_tower', verb: 'command_tower', needs }],
+        can: ['relocate', 'raise shields'],
+        reading: { tower: { posture: 'standing', shields: false } },
+      }],
+      threads: ['Pax: 1 unread.'],
+      lately: 'Pax came in.',
+    };
+    return {
+      survey,
+      prose: 'Here you can work:\n- Bridge console: standing, shields down. You can `invoke` `' +
+        address + '/command_tower` (needs action) — the tower can relocate, raise shields.\n' +
+        'To act on one, `invoke` its address.\nOn your phone:\n- ' + survey.threads[0] +
+        '\nTo read them, `read`.\nLately: Pax came in.',
+    };
+  },
+  async getJournal(_id) {
+    const day = 86_400_000;
+    const at = (d, hh, mm) => d * day + (hh * 60 + mm) * 60_000;
+    const entries = [
+      { id: 1, from_turn: 2, to_turn: 17, from_ms: at(3, 9, 5), to_ms: at(3, 9, 40),
+        span: '[14 Jun 2187, 09:05–09:40]',
+        claims: [
+          { text: 'Hess asked me where the ledger is.', cite: [4], kind: 'heard', perishable: true, typed: null, corrected: false },
+          { text: 'I refused and kept the ledger.', cite: [5], kind: 'did', perishable: false, typed: null, corrected: false },
+        ],
+        intend: ['Hide the ledger before Hess comes back'],
+        opened: [{ id: 1, text: 'Hess knows the ledger exists' }], resolved: [] },
+      { id: 2, from_turn: 18, to_turn: 33, from_ms: at(3, 10, 2), to_ms: at(3, 10, 31),
+        span: '[14 Jun 2187, 10:02–10:31]',
+        claims: [
+          { text: 'A crossbow bolt hit my left shoulder.', cite: [21], kind: 'observed', perishable: true, typed: null, corrected: false },
+          { text: 'Hess is armed and will not stop at asking.', cite: [21], kind: 'inferred', perishable: true, typed: null, corrected: false },
+          { text: 'I am in the anteroom.', cite: [24], kind: 'observed', perishable: true,
+            typed: { subject: 'me', attribute: 'location', value: 'anteroom' }, corrected: true },
+        ],
+        intend: ['Get to the infirmary', 'Tell Wyneth what Hess did'],
+        opened: [{ id: 2, text: 'Who else knows about the ledger?' }], resolved: [1] },
+    ];
+    const kept = entries.filter((e) => !forgottenEntries.has(e.id));
+    return {
+      written: 2, in_prompt: kept.map((e) => e.id), covered_to: 33, looked_to: 33,
+      drafting: false,
+      open: [{ id: 2, text: 'Who else knows about the ledger?' }],
+      entries: kept,
+      drafts: [
+        { from_turn: 18, to_turn: 33, turns: 16, took_ms: 4210, result: 'wrote', detail: null, entry: 2, rounds: 1,
+          checks: [{ claim: 'I am in the anteroom.', verdict: 'corrected', kind: 'observed' }] },
+        { from_turn: 2, to_turn: 17, turns: 16, took_ms: 3120, result: 'wrote', detail: null, entry: 1, rounds: 1, checks: [] },
+      ],
+    };
+  },
+  async forgetJournalEntry(id, entry) {
+    if (![1, 2].includes(Number(entry)) || forgottenEntries.has(Number(entry))) {
+      throw Object.assign(new Error('no such entry'), { error: 'no_such_entry', status: 404 });
+    }
+    forgottenEntries.add(Number(entry));
+    return this.getJournal(id);
+  },
+  async draftJournal(_id) {
+    throw Object.assign(new Error('nothing new to draft'), { error: 'nothing_to_draft', status: 409 });
   },
   async pulseInject(id, line) {
     if (line.startsWith('/') && !/^\/(say|overhear|see|notice|map|hurt|urgent|wake|sleep)\b/.test(line)) {

@@ -49,6 +49,9 @@ use crate::sim::phone;
 use crate::world::binding::Bindings;
 use crate::world::Hosted;
 
+/// A character's world time in milliseconds, by id.
+pub type WorldTimeOf<'a> = dyn Fn(u64) -> u64 + 'a;
+
 /// A delta as the events a mind receives — the situation, then what happened.
 ///
 /// The order is both how it reads and how it caches: the situation leads, so an
@@ -202,12 +205,23 @@ fn company_line(world: &World, body: &str) -> Option<String> {
 /// The delta is spent whether or not the mind exists in the scheduler: a
 /// character retired between the sweep being planned and run must not leave its
 /// body's cursor behind to replay the same minute for ever.
-pub fn push_one(hosted: &Hosted, sched: &Scheduler, npc_id: u64, body: &str) -> bool {
+///
+/// What arrives is stamped with the character's world time, `time(npc_id)`, and
+/// never with the map's own step counter: the stamp is what a journal dates the
+/// turn by and what the news gate compares against the world clock.
+pub fn push_one(
+    hosted: &Hosted,
+    sched: &Scheduler,
+    npc_id: u64,
+    body: &str,
+    time: &WorldTimeOf,
+) -> bool {
     let delta = hosted.delta(body);
     if delta.is_empty() {
         return false;
     }
-    let (events, at_ms) = hosted.with_both(|w, s| (carried(w, s, &delta), w.now()));
+    let events = hosted.with_both(|w, s| carried(w, s, &delta));
+    let at_ms = time(npc_id);
     for Perceived { kind, salience } in events {
         sched.deliver(npc_id, at_ms, salience, kind);
     }
@@ -219,12 +233,16 @@ pub fn push_one(hosted: &Hosted, sched: &Scheduler, npc_id: u64, body: &str) -> 
 /// Returns how many minds got something. Bodies with no mind are swept anyway —
 /// their cursor has to advance, or the day they are finally bound to one they
 /// would be told a week of news at once.
-pub fn push(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
+pub fn push(
+    hosted: &Hosted,
+    bindings: &Bindings,
+    sched: &Scheduler,
+    time: &WorldTimeOf,
+) -> usize {
     let deltas = hosted.sweep();
     if deltas.is_empty() {
         return 0;
     }
-    let at_ms = hosted.read(|w| w.now());
     let mut told = 0;
     for delta in &deltas {
         let Some(npc_id) = bindings.mind_of(hosted.id(), &delta.who) else {
@@ -234,6 +252,7 @@ pub fn push(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
         if events.is_empty() {
             continue;
         }
+        let at_ms = time(npc_id);
         for Perceived { kind, salience } in events {
             sched.deliver(npc_id, at_ms, salience, kind);
         }
@@ -258,14 +277,21 @@ pub fn push(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
 /// only thing that will ever wake anybody. A route that advanced the world
 /// without it would be a route on which characters are inert, and every test
 /// advances the world directly.
-pub fn advance(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> Moment {
+pub fn advance(
+    hosted: &Hosted,
+    bindings: &Bindings,
+    sched: &Scheduler,
+    time: &WorldTimeOf,
+) -> Moment {
     let moved = hosted.tick();
     let stirred = hosted.stir();
-    let told = push(hosted, bindings, sched);
-    let messaged = deliver_messages(hosted, bindings, sched);
+    let sounded = hosted.watch_tower();
+    let told = push(hosted, bindings, sched, time);
+    let messaged = deliver_messages(hosted, bindings, sched, time);
     Moment {
         moved,
         stirred,
+        sounded,
         told,
         messaged,
     }
@@ -287,7 +313,12 @@ pub fn advance(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> Momen
 /// and does not need the scheduler.
 ///
 /// Returns how many minds were handed something.
-fn deliver_messages(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> usize {
+fn deliver_messages(
+    hosted: &Hosted,
+    bindings: &Bindings,
+    sched: &Scheduler,
+    time: &WorldTimeOf,
+) -> usize {
     // Name → body, off the world: threads address people the way a room does,
     // by the name the world writes down, and the bindings key on the body.
     let who_is_where: Vec<(String, String)> =
@@ -295,12 +326,12 @@ fn deliver_messages(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler) -> 
     if who_is_where.is_empty() {
         return 0;
     }
-    let at_ms = hosted.read(|w| w.now());
     let mut told = 0;
     for (name, body) in who_is_where {
         let Some(npc_id) = bindings.mind_of(hosted.id(), &body) else {
             continue;
         };
+        let at_ms = time(npc_id);
         // Taken and marked under one acquisition, so a message cannot be
         // handed out twice by two moments overlapping.
         let waiting = hosted.with_sim(|s| {
@@ -350,6 +381,10 @@ pub struct Moment {
     /// Rooms in which the building did something. Nearly always none: a room
     /// waits minutes between looks and a moment is half a second.
     pub stirred: usize,
+    /// Lines the tower's clock said to the crew — a contact sighted, a hit
+    /// taken. Counted apart from `stirred` because they come off the tower's
+    /// state and not off the building's own doings.
+    pub sounded: usize,
     /// Minds that were told something.
     pub told: usize,
     /// Minds handed something off a handset. Counted apart from `told` because
@@ -371,6 +406,7 @@ impl Moment {
 mod tests {
     use super::*;
     use crate::engine::event::EventKind;
+    use crate::sim::upkeep::CONTACT_EVERY;
     use npc_map::world::Where;
 
     fn vault() -> Hosted {
@@ -401,7 +437,7 @@ mod tests {
             b.bind(npc_id, h.id(), &body).unwrap();
             s.wake(npc_id, 0, 0);
         }
-        push(&h, &b, &s);
+        push(&h, &b, &s, &|_| 0);
         (h, b, s)
     }
 
@@ -436,6 +472,27 @@ mod tests {
         window(s, npc_id)
     }
 
+    /// **What a body perceives is dated by the world's clock, not the map's step
+    /// counter.** A turn stamped with the counter read as a minute past the
+    /// epoch in every journal.
+    #[test]
+    fn perceived_events_are_stamped_with_the_characters_world_time() {
+        let h = vault();
+        let b = Bindings::new();
+        let s = Scheduler::new(64);
+        h.with(|w| w.enter("m1", "Maker-01", at("band-one")).unwrap());
+        b.bind(1, h.id(), "m1").unwrap();
+        s.wake(1, 0, 0);
+
+        push(&h, &b, &s, &|id| 7_000_000 + id);
+        run(&s, 10_000_000);
+        let stamps: Vec<u64> = s
+            .window_of(1, |win| win.turns().map(|t| t.at_ms).collect())
+            .unwrap();
+        assert!(!stamps.is_empty());
+        assert!(stamps.iter().all(|&at| at == 7_000_001), "{stamps:?}");
+    }
+
     #[test]
     fn a_body_is_grounded_the_first_time_and_left_alone_after() {
         let h = vault();
@@ -445,10 +502,10 @@ mod tests {
         b.bind(1, h.id(), "m1").unwrap();
         s.wake(1, 0, 0);
 
-        assert_eq!(push(&h, &b, &s), 1);
+        assert_eq!(push(&h, &b, &s, &|_| 0), 1);
         assert!(read_window(&s, 1).iter().any(|t| t.starts_with("You are")));
         for _ in 0..10 {
-            assert_eq!(push(&h, &b, &s), 0, "an idle body cost something");
+            assert_eq!(push(&h, &b, &s, &|_| 0), 0, "an idle body cost something");
         }
     }
 
@@ -465,9 +522,9 @@ mod tests {
         b.bind(1, h.id(), "m1").unwrap();
         s.wake(1, 0, 0);
 
-        push(&h, &b, &s);
+        push(&h, &b, &s, &|_| 0);
         h.with(|w| w.say("m1", "something").unwrap());
-        assert_eq!(push(&h, &b, &s), 0, "only the extra could have heard it");
+        assert_eq!(push(&h, &b, &s, &|_| 0), 0, "only the extra could have heard it");
         // The extra's cursor moved with everyone else's, so binding it now
         // would start it at the present rather than at the beginning.
         assert!(h.peek("extra").is_empty(), "{:?}", h.peek("extra"));
@@ -481,7 +538,7 @@ mod tests {
             w.set_off("m1", at("band-one")).unwrap();
         });
         h.tick();
-        push(&h, &b, &s);
+        push(&h, &b, &s, &|_| 0);
 
         let turns = read_window(&s, 102);
         let here = turns.iter().position(|t| t.starts_with("You are"));
@@ -496,7 +553,7 @@ mod tests {
         for room in ["band-one", "relations", "watch", "core"] {
             h.with(|w| w.set_off("m1", at(room)).unwrap());
             h.tick();
-            push(&h, &b, &s);
+            push(&h, &b, &s, &|_| 0);
         }
         let standing: Vec<String> = read_window(&s, 101)
             .into_iter()
@@ -512,17 +569,45 @@ mod tests {
         // walks in is genuinely still. That is the common case and is what makes
         // a large cast affordable.
         let (h, b, s) = crew(3);
-        let m = advance(&h, &b, &s);
+        let m = advance(&h, &b, &s, &|_| 0);
         assert_eq!(
             m,
             Moment {
                 moved: 0,
                 stirred: 0,
+                sounded: 0,
                 told: 0,
                 messaged: 0
             }
         );
         assert!(m.is_quiet());
+    }
+
+    /// **A contact reaches a mind standing in the tower, end to end**: the clock
+    /// runs on the daemon's own moment, the klaxon is stirred, and the sweep
+    /// carries it to the mind.
+    #[test]
+    fn a_contact_sighted_by_the_clock_reaches_a_mind_in_the_tower() {
+        let h = Hosted::load(
+            "battle-cities",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
+        )
+        .expect("the shipped battle-cities must load");
+        h.with(|w| {
+            w.enter("c1", "Vael", Where::new("tower-redoubt", "foundry"))
+                .unwrap()
+        });
+        h.with_sim(|s| s.tower.as_mut().unwrap().advance(CONTACT_EVERY));
+
+        let m = advance(&h, &Bindings::new(), &Scheduler::new(64), &|_| 0);
+        assert!(m.sounded > 0, "{m:?}");
+        assert!(
+            h.sim(|s| s
+                .tower_decisions()
+                .iter()
+                .any(|d| d.what.contains("contact"))),
+            "the contact was not put to the crew as a decision"
+        );
     }
 
     /// **The whole point of the building, end to end.**
@@ -544,7 +629,7 @@ mod tests {
             .unwrap()
         });
 
-        assert_eq!(push(&h, &b, &s), 1, "nobody was told");
+        assert_eq!(push(&h, &b, &s, &|_| 0), 1, "nobody was told");
         let woken = run(&s, 1);
         assert!(
             woken.iter().any(|(id, _)| *id == 101),
@@ -565,7 +650,7 @@ mod tests {
         let (h, b, s) = crew(1);
         h.with(|w| w.set_off("m1", at("band-one")).unwrap());
 
-        let m = advance(&h, &b, &s);
+        let m = advance(&h, &b, &s, &|_| 0);
         assert_eq!(m.moved, 1);
         assert_eq!(m.told, 1);
 
@@ -576,39 +661,49 @@ mod tests {
         assert!(here.contains("band one"), "{here}");
     }
 
-    /// **Both hear it; they differ in whether it interrupted them.**
+    /// **Both hear it; only the one asked is woken.**
     ///
-    /// The bystander used to be left unscheduled — its line sat in the queue
-    /// until something else woke it. That only worked while a heartbeat was
-    /// coming along behind to collect it; with idle ticks gone, an arrival
-    /// nobody wakes for is one nobody ever reads, and overhearing would be
-    /// silently discarded.
-    ///
-    /// So the distinction moved from *whether* to *how*: being addressed
-    /// preempts, overhearing is pending. Both get read.
+    /// The mind spoken to has been asked something and takes a turn. The
+    /// bystander has only been told what happened to somebody else: it keeps
+    /// the line and reads it with whatever next wakes it, but takes no turn on
+    /// it. Were it woken, every listener would answer every line and a talk
+    /// between two would become one between the whole room.
     #[test]
-    fn being_addressed_preempts_and_overhearing_merely_pends() {
+    fn being_addressed_wakes_and_overhearing_waits_to_be_read() {
         let (h, b, s) = crew(3);
         run(&s, 0);
         h.with(|w| w.tell("m1", "m2", "get out of here").unwrap());
-        push(&h, &b, &s);
+        push(&h, &b, &s, &|_| 0);
 
         let woken = run(&s, 1);
         let ids: Vec<u64> = woken.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&102), "the addressed mind was not woken");
-        assert!(ids.contains(&103), "the bystander never read what it heard");
+        assert!(!ids.contains(&103), "the bystander took a turn on it");
+        let told = woken
+            .iter()
+            .find(|(who, _)| *who == 102)
+            .map(|(_, lines)| lines.join(" "))
+            .expect("ticked");
+        assert!(told.contains("to you"), "{told}");
 
-        // And they read different sentences: one was told, the other watched it
-        // happen to somebody else.
-        let heard = |id: u64| {
-            woken
-                .iter()
-                .find(|(who, _)| *who == id)
-                .map(|(_, lines)| lines.join(" "))
-                .expect("ticked")
-        };
-        assert!(heard(102).contains("to you"), "{}", heard(102));
-        assert!(!heard(103).contains("to you"), "{}", heard(103));
+        // Not lost: the next thing that wakes the bystander finds it there,
+        // read as something watched happen to somebody else.
+        s.deliver(
+            103,
+            2,
+            Salience::NORMAL,
+            EventKind::Description {
+                text: "The lights flicker.".into(),
+            },
+        );
+        let later = run(&s, 2);
+        let read = later
+            .iter()
+            .find(|(who, _)| *who == 103)
+            .map(|(_, lines)| lines.join(" "))
+            .expect("the bystander was woken by the description");
+        assert!(read.contains("get out of here"), "{read}");
+        assert!(!read.contains("to you"), "{read}");
     }
 
     #[test]
@@ -624,10 +719,10 @@ mod tests {
         b.bind(9, h.id(), "out").unwrap();
         s.wake(1, 0, 0);
         s.wake(9, 0, 0);
-        push(&h, &b, &s);
+        push(&h, &b, &s, &|_| 0);
 
         h.with(|w| w.say("m1", "the redoubt burned twice").unwrap());
-        push(&h, &b, &s);
+        push(&h, &b, &s, &|_| 0);
         assert!(
             !window(&s, 9).iter().any(|t| t.contains("redoubt")),
             "it carried through a wall: {:?}",
@@ -652,10 +747,10 @@ mod tests {
             b.bind(i, h.id(), &body).unwrap();
             s.wake(i, 0, 0);
         }
-        push(&h, &b, &s);
+        push(&h, &b, &s, &|_| 0);
 
         h.with(|w| w.say("m01", "somebody should look at the redoubt").unwrap());
-        let told = push(&h, &b, &s);
+        let told = push(&h, &b, &s, &|_| 0);
         assert!(told > 0, "nobody heard it");
         assert!(told < 8, "one utterance reached {told} of 16 minds");
     }
@@ -664,8 +759,8 @@ mod tests {
     fn a_mind_is_only_told_things_once() {
         let (h, b, s) = crew(2);
         h.with(|w| w.say("m1", "once").unwrap());
-        assert_eq!(push(&h, &b, &s), 1);
-        assert_eq!(push(&h, &b, &s), 0, "told again");
+        assert_eq!(push(&h, &b, &s, &|_| 0), 1);
+        assert_eq!(push(&h, &b, &s, &|_| 0), 0, "told again");
         assert_eq!(
             read_window(&s, 102)
                 .iter()
@@ -682,7 +777,7 @@ mod tests {
         let (h, b, s) = crew(3);
         h.with(|w| w.say("m1", "for the room").unwrap());
 
-        assert!(push_one(&h, &s, 102, "m2"));
+        assert!(push_one(&h, &s, 102, "m2", &|_| 0));
         assert!(read_window(&s, 102)
             .iter()
             .any(|t| t.contains("for the room")));
@@ -691,13 +786,13 @@ mod tests {
             "the third mind was told too"
         );
         // And the rest of the sweep still finds it waiting.
-        assert_eq!(push(&h, &b, &s), 1);
+        assert_eq!(push(&h, &b, &s, &|_| 0), 1);
     }
 
     #[test]
     fn pushing_a_body_with_nothing_to_say_reports_it_rather_than_delivering() {
         let (h, _b, s) = crew(1);
-        assert!(!push_one(&h, &s, 101, "m1"));
+        assert!(!push_one(&h, &s, 101, "m1", &|_| 0));
     }
 
     #[test]
@@ -709,7 +804,7 @@ mod tests {
         s.retire(102);
         h.with(|w| w.say("m1", "into the void").unwrap());
 
-        push(&h, &b, &s);
+        push(&h, &b, &s, &|_| 0);
         assert!(h.peek("m2").is_empty(), "the cursor was left behind");
     }
 
@@ -720,7 +815,7 @@ mod tests {
             w.tell("m1", "m2", "you have the redoubt").unwrap();
             w.set_off("m3", at("band-one")).unwrap();
         });
-        advance(&h, &b, &s);
+        advance(&h, &b, &s, &|_| 0);
 
         for npc_id in [101, 102, 103] {
             for line in window(&s, npc_id) {

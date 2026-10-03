@@ -5136,6 +5136,85 @@ fn a_mandatory_member_adds_to_the_top_k_rather_than_taking_a_slot() {
     );
 }
 
+/// An `Offered` collection ranks only what the runtime selector names: the
+/// belief top-k is drawn from the offered members, an unoffered member never
+/// shows however well it scores, a mandatory offered member rides on top, and a
+/// provenance with no opinion shows everything offered rather than nothing.
+#[test]
+fn an_offered_collection_ranks_only_what_the_room_offers() {
+    use crate::projection::{ProjectionMode, SelectionRule, SelectionState};
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let framing = b.id_for_system_section("framing").unwrap();
+    let tools_intro = b.id_for_system_section("tools_intro").unwrap();
+    let tool_a = b.id_for_system_section("tool_a").unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let tool_c = b.id_for_system_section("tool_c").unwrap();
+    let tool_d = b.id_for_system_section("tool_d").unwrap();
+    let tools_outro = b.id_for_system_section("tools_outro").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    b.set_collection_selection(
+        "tools",
+        SelectionRule::Offered {
+            selector: "room".to_string(),
+            k: 2,
+        },
+    )
+    .unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    let scored = MockResolver::new()
+        .with_section_score(tool_a, 0.3)
+        .with_section_score(tool_b, 0.9)
+        .with_section_score(tool_c, 0.05)
+        .with_section_score(tool_d, 0.8);
+    let project = |b: &Builder, resolver: &MockResolver, offered: &[&str]| -> Vec<SectionId> {
+        let mut sel = SelectionState::new();
+        sel.select_all("room", offered.iter().copied());
+        b.project_with_selection(target, resolver, ProjectionMode::Decode, &sel)
+            .sealed_sections()
+            .map(|s| s.id)
+            .collect()
+    };
+
+    // tool_b scores best but the room does not offer it: the top-2 of what is
+    // offered is tool_d and tool_a.
+    assert_eq!(
+        project(&b, &scored, &["tool_a", "tool_c", "tool_d"]),
+        vec![framing, tools_intro, tool_a, tool_d, tools_outro],
+        "an unoffered member is never shown, and the top-2 is drawn from the offered"
+    );
+
+    // A mandatory offered member adds to the selection; unoffered, it is absent.
+    b.set_collection_member_mandatory(tools, tool_c).unwrap();
+    assert_eq!(
+        project(&b, &scored, &["tool_a", "tool_c", "tool_d"]),
+        vec![framing, tools_intro, tool_a, tool_c, tool_d, tools_outro]
+    );
+    assert_eq!(
+        project(&b, &scored, &["tool_b", "tool_d"]),
+        vec![framing, tools_intro, tool_b, tool_d, tools_outro],
+        "a mandatory member the room does not offer is not shown"
+    );
+
+    // No selector set → nothing offered → nothing shown.
+    assert_eq!(
+        project(&b, &scored, &[]),
+        vec![framing, tools_intro, tools_outro]
+    );
+
+    // Cold scores: provenance has no opinion, so everything offered shows.
+    assert_eq!(
+        project(&b, &MockResolver::new(), &["tool_a", "tool_b", "tool_d"]),
+        vec![framing, tools_intro, tool_a, tool_b, tool_d, tools_outro],
+        "no provenance signal shows the whole offer rather than an empty section"
+    );
+}
+
 /// A filter that drops a mandatory member drops it outright — the mandatory
 /// flag never resurrects a tool the tools mode excluded.
 #[test]
@@ -5570,6 +5649,68 @@ fn add_section_to_unknown_collection_fails() {
     assert!(matches!(
         r,
         Err(super::error::ConstructionError::UnknownCollection(_))
+    ));
+}
+
+#[test]
+fn a_member_added_with_its_own_id_projects_from_that_builder_only() {
+    let mut base = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
+    let dialogue = base.id_for_layer("dialogue").unwrap();
+    let convo = base.id_for_group("convo").unwrap();
+    let cid = base
+        .add_collection("mail", super::schema::SelectionRule::AlwaysVisible, 0.0)
+        .unwrap();
+    let mut mine = base.clone();
+    let own = SectionId::new(0x8000_0001);
+    mine.add_section_to_collection_with_id(cid, own, "inbox", "three new messages", 50.0)
+        .unwrap();
+
+    assert_eq!(mine.id_for_system_section("inbox"), Some(own));
+    assert_eq!(base.id_for_system_section("inbox"), None);
+
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    let resolver = MockResolver::new();
+    let in_mine: Vec<SectionId> = mine
+        .project(target, &resolver)
+        .sealed_sections()
+        .map(|s| s.id)
+        .collect();
+    let in_base: Vec<SectionId> = base
+        .project(target, &resolver)
+        .sealed_sections()
+        .map(|s| s.id)
+        .collect();
+    assert!(in_mine.contains(&own));
+    assert!(!in_base.contains(&own));
+}
+
+#[test]
+fn adding_a_member_with_an_id_rejects_a_taken_name_and_a_bad_collection() {
+    let mut b = Builder::from_yaml(SECTIONS_YAML_FLAT).unwrap();
+    let cid = b
+        .add_collection("mail", super::schema::SelectionRule::AlwaysVisible, 0.0)
+        .unwrap();
+    assert!(matches!(
+        b.add_section_to_collection_with_id(cid, SectionId::new(0x8000_0001), "alpha", "x", 50.0),
+        Err(super::error::ConstructionError::DuplicateSectionName(_))
+    ));
+    assert!(matches!(
+        b.add_section_to_collection_with_id(
+            super::ids::CollectionId::new(9999),
+            SectionId::new(0x8000_0001),
+            "x",
+            "y",
+            50.0
+        ),
+        Err(super::error::ConstructionError::UnknownCollection(_))
+    ));
+    assert!(matches!(
+        b.add_section_to_collection_with_id(cid, SectionId::new(0x8000_0001), "x", "y", 0.0),
+        Err(super::error::ConstructionError::InvalidPriority { .. })
     ));
 }
 

@@ -1,0 +1,11 @@
+id: compute-rack
+kind: fixture
+name: compute rack
+short: >
+  A compute rack runs in the corner with its drive lights flickering and its
+  fans never quite at rest.
+long: >
+  A tall cabinet of servers behind a mesh door, warm to stand beside. Its drive
+  lights blink in no pattern anyone has bothered to learn, and its fans change
+  note whenever the work does. It does what it is given and says nothing about
+  it.

@@ -34,13 +34,13 @@ nodes:
     kind: work
     name: the north survey room
     off: [ring-north]
-    parts: [{ part: survey-desk, count: 6 }]
+    parts: [{ part: survey-desk, count: 6 }, light-ring, air-handler]
 
   - id: middle-survey
     kind: work
     name: the middle survey room
     off: [cross-upper]
-    parts: [{ part: survey-desk, count: 6 }]
+    parts: [{ part: survey-desk, count: 6 }, breaker-panel, coolant-valve]
 
   - id: south-survey
     kind: work
@@ -61,13 +61,13 @@ nodes:
     kind: store
     name: the index room
     off: [cross-lower]
-    parts: [place-index]
+    parts: [place-index, compute-rack, status-board]
 
   - id: gallery
     kind: social
     name: the survey gallery
     off: [ring-south]
-    parts: [gallery-rail, { part: seat, count: 8 }]
+    parts: [gallery-rail, pressure-door, { part: seat, count: 8 }]
 
   - id: road-table
     kind: social

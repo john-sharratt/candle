@@ -2400,6 +2400,22 @@ fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, Cons
                 })?;
             Ok(SelectionRule::Named { selector })
         }
+        "offered" => {
+            let selector = ys
+                .selector
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ConstructionError::EmptyNamedSelector {
+                    name: name.to_string(),
+                })?;
+            let k =
+                ys.k.filter(|k| *k > 0)
+                    .ok_or_else(|| ConstructionError::InvalidTopK {
+                        name: name.to_string(),
+                    })?;
+            Ok(SelectionRule::Offered { selector, k })
+        }
         "conversation" => {
             let recent = ys.recent.unwrap_or(0);
             let historical_top_k = ys.historical_top_k.unwrap_or(0);

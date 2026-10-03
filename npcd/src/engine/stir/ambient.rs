@@ -59,7 +59,7 @@ const IDLE: &[&str] = &[
     "A door two rooms away opens and closes without anybody coming through.",
     "The floor plate by the doorway rocks a fraction when weight comes off it.",
     "A hatch cover settles against its frame with a soft metallic knock.",
-    "The door seal sighs as the pressure on the two sides of it evens out.",
+    "A door somewhere down the corridor sighs as the pressure on the two sides of it evens out.",
     "A wall panel that was never fastened properly taps once against its stud.",
     "The threshold strip at the door has worked loose at one end.",
     "A handrail somewhere takes a knock and rings for a moment.",

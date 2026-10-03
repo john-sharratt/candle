@@ -4,10 +4,12 @@
 //! `POST /v1/npc/:nid/mission` puts a mission on a character — queued for it to
 //! collect at the command desk, or, with `start`, carried and read at once.
 //! `GET /v1/npc/:nid/mission` reads what the character is carrying or last
-//! finished, its outcome and its answer included. The character's own half —
-//! collecting, recording progress, reporting — is the acts in
-//! [`crate::engine::mission_acts`], performed at the desk and out in the world.
+//! finished, its outcome and its answer included. `POST .../mission/step` ticks
+//! off or adds a step on the open one. The character's own half — collecting and
+//! reporting — is the acts in [`crate::engine::mission_acts`], performed at the
+//! desk.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -19,7 +21,7 @@ use serde_json::{json, Value};
 
 use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{EventKind, Salience};
-use crate::engine::mission::{Mission, Origin, Todo};
+use crate::engine::mission::{Mission, Origin, StepOutcome, Todo};
 use crate::engine::{no_engine, owned, owned_by, speaking_as};
 
 #[derive(Debug, Deserialize)]
@@ -70,12 +72,15 @@ pub async fn lodge(
         );
     };
 
-    let todo: Vec<Todo> = body
+    let mut todo: Vec<Todo> = body
         .todo
         .iter()
         .filter(|step| !step.trim().is_empty())
         .map(Todo::new)
         .collect();
+    if !todo.is_empty() {
+        todo.push(Todo::report("go back to the table and report it"));
+    }
     let steps = todo.len();
     let mission = Mission::new(
         &prompt,
@@ -145,6 +150,66 @@ pub async fn status(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct StepBody {
+    /// Sign off the first open step with this text.
+    #[serde(default)]
+    done: Option<String>,
+    /// How the step turned out: `achieved` (the default) or `thwarted`.
+    #[serde(default)]
+    outcome: Option<StepOutcome>,
+    /// Add a step with this text.
+    #[serde(default)]
+    add: Option<String>,
+}
+
+/// `POST /v1/npc/:nid/mission/step` — tick off or add a step on the character's
+/// open mission. Either changes the steps its prompt section lists, so the
+/// section is sealed again before its next turn.
+pub async fn step(
+    State(s): State<Arc<Authored>>,
+    Path(nid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<StepBody>,
+) -> Response {
+    let nid = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("changing a mission's steps");
+    };
+    let Some((hosted, character)) = rt.body_of(nid) else {
+        return err(
+            StatusCode::CONFLICT,
+            "not_in_a_world",
+            "that character has no body in a world to carry a mission",
+        );
+    };
+    if body.done.is_none() && body.add.is_none() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "no_step",
+            "say a step to tick off with `done`, or a step to add with `add`",
+        );
+    }
+    let (ticked, added) = hosted.with_sim(|sim| {
+        let ticked = body
+            .done
+            .as_deref()
+            .map(|step| {
+                let outcome = body.outcome.unwrap_or(StepOutcome::Achieved);
+                sim.missions.check_off(&character, step, outcome)
+            });
+        let added = body
+            .add
+            .as_deref()
+            .map(|step| sim.missions.add_todo(&character, step));
+        (ticked, added)
+    });
+    Json(json!({ "ticked": ticked, "added": added })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
 pub struct TableBody {
     /// Open the command table, or shut it.
     open: bool,
@@ -190,7 +255,7 @@ pub async fn command_table(
     rt.say_to_all_channels("Command", &line);
     // The tannoy — one announcement to the whole cast, loud enough on opening to
     // break a character off what it is doing. Each reads it on its own clock.
-    let mut when: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut when: HashMap<u64, u64> = HashMap::new();
     for c in rt.scheduler.census() {
         when.insert(c.npc_id, s.world_ms(c.npc_id).await);
     }
@@ -215,7 +280,11 @@ pub async fn cancel_all(State(s): State<Arc<Authored>>, headers: HeaderMap) -> R
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("cancelling missions");
     };
-    let cancelled = rt.cancel_all_missions();
+    let mut when: HashMap<u64, u64> = HashMap::new();
+    for c in rt.scheduler.census() {
+        when.insert(c.npc_id, s.world_ms(c.npc_id).await);
+    }
+    let cancelled = rt.cancel_all_missions(|id| when.get(&id).copied().unwrap_or(0));
     Json(json!({ "cancelled": cancelled })).into_response()
 }
 
@@ -232,7 +301,8 @@ pub async fn cancel(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("cancelling a mission");
     };
-    Json(json!({ "cancelled": rt.cancel_mission(nid) })).into_response()
+    let world_ms = s.world_ms(nid).await;
+    Json(json!({ "cancelled": rt.cancel_mission(nid, world_ms) })).into_response()
 }
 
 /// One mission, as an operator reads it back.
@@ -253,7 +323,7 @@ fn mission_view(m: &Mission) -> Value {
 #[cfg(test)]
 mod tests {
     use super::mission_view;
-    use crate::engine::mission::{Mission, Origin, Outcome, Todo};
+    use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome, Todo};
 
     #[test]
     fn the_view_shows_the_ask_the_steps_and_a_filed_report() {
@@ -273,9 +343,11 @@ mod tests {
         assert_eq!(open["todo"].as_array().unwrap().len(), 2);
         assert_eq!(open["todo"][0]["text"], "read it");
         assert_eq!(open["todo"][0]["done"], false);
+        assert_eq!(open["todo"][0]["outcome"], serde_json::Value::Null);
 
         // Closed: the outcome and answer an operator is asking after.
-        m.check_off("read it");
+        m.check_off("read it", StepOutcome::Achieved);
+        m.check_off("compare it", StepOutcome::Thwarted);
         m.complete(
             Outcome::Pass,
             "it holds",
@@ -287,5 +359,8 @@ mod tests {
         assert_eq!(closed["report"]["outcome"], "pass");
         assert_eq!(closed["report"]["notes"], "it holds");
         assert_eq!(closed["todo"][0]["done"], true);
+        assert_eq!(closed["todo"][0]["outcome"], "achieved");
+        assert_eq!(closed["todo"][1]["done"], true);
+        assert_eq!(closed["todo"][1]["outcome"], "thwarted");
     }
 }

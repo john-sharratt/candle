@@ -1,0 +1,14 @@
+id: light-ring
+kind: fixture
+name: light ring
+short: >
+  A light ring is steady while its tubes hold and failing when they begin to go.
+long: >
+  A band of tubes around the ceiling, with a service switch at head height on
+  the nearest wall. Steady is the ordinary state: even light, no flicker, and
+  nobody thinks about it. Failing means tubes have gone dark along the ring and
+  the rest are hunting. Somebody standing here can set it steady again, and the
+  ring relights from the first tube to the last.
+modes:
+  - steady
+  - failing

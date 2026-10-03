@@ -459,6 +459,11 @@ impl Npcs {
             .filter(|n| n.owner_id == owner && !n.is_tombstoned())
     }
 
+    /// Whether this id is a living character, whoever owns it.
+    pub fn is_living(&self, npc_id: u64) -> bool {
+        self.by_id.get(&npc_id).is_some_and(|n| !n.is_tombstoned())
+    }
+
     pub fn get(&self, npc_id: u64, owner: &str) -> Result<Value, NpcError> {
         self.visible_to(npc_id, owner)
             .map(|n| wire(n, owner))

@@ -2128,7 +2128,8 @@ experience never aggregates. `PUT` bumps a version; characters of that personali
 next spawn or fork refresh.
 
 `PUT /v1/world/{wid}/time` is the narrative clock: set an instant, set a scale (`0` pauses,
-`1.0` is real time, `60.0` is a minute per second), or jump. Every NPC in the world sees it.
+`1.0` is real time, `60.0` is a minute per second), set `year_offset` (whole years ahead),
+or jump. Every NPC in the world sees it.
 
 ## 21. Error catalog
 

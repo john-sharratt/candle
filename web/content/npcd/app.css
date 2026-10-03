@@ -1217,6 +1217,172 @@ canvas { width: 100%; display: block; }
    where both sides look alike is one nobody can read. */
 .win-turn.is-npc { border-left-color: var(--accent-line); color: var(--ink-mid); font-style: italic; }
 
+/* ── the scan, on a character's own page ─────────────────────────────────── */
+.sc section { margin-bottom: 22px; }
+.sc h4 {
+  margin: 0 0 9px; font-size: .7rem; text-transform: uppercase;
+  letter-spacing: 1px; font-weight: 700; color: var(--ink-ghost);
+}
+.sc-prose {
+  margin: 0; padding: 11px 13px; white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: .82rem; line-height: 1.6; color: var(--ink-soft);
+  border-left: 2px solid var(--accent-line);
+}
+.sc-station { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.sc-hd { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.sc-name { font-weight: 700; cursor: help; }
+.sc-state { display: flex; flex-wrap: wrap; gap: 5px; margin: 7px 0; }
+.sc-verbs { list-style: none; margin: 6px 0; padding: 0; display: grid; gap: 6px; }
+.sc-verb { font-size: .78rem; overflow-wrap: anywhere; cursor: help; }
+.sc-needs { display: inline-flex; flex-wrap: wrap; gap: 5px; margin-left: 9px; }
+.sc-need {
+  font-size: .72rem; padding: 1px 7px; border-radius: 9px; cursor: help;
+  border: 1px dashed var(--line-2); color: var(--ink-mid);
+}
+.sc-need.is-required { border-style: solid; border-color: var(--accent-line); }
+[data-tip] { cursor: help; }
+.sc-tip {
+  position: fixed; z-index: 1000; max-width: 380px; pointer-events: none;
+  padding: 7px 10px; border-radius: 6px; font-size: .78rem; line-height: 1.45;
+  background: var(--panel, #1c1f26); color: var(--ink, #e8e8e8);
+  border: 1px solid var(--line-2); box-shadow: 0 6px 22px rgba(0, 0, 0, .35);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.ms-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.ms-step { display: flex; gap: 9px; align-items: baseline; font-size: .88rem; line-height: 1.5; }
+.ms-mark { font-family: var(--mono, monospace); color: var(--ink-mid); }
+.ms-mark { min-width: 1.1em; text-align: center; font-weight: 700; }
+.ms-step.is-achieved, .ms-step.is-thwarted { color: var(--ink-mid); }
+.ms-step.is-achieved .ms-text { text-decoration: line-through; }
+.ms-step.is-achieved .ms-mark { color: var(--ok); }
+.ms-step.is-thwarted .ms-mark { color: #d64545; }
+.sc-list { margin: 0; padding-left: 18px; font-size: .85rem; line-height: 1.6; }
+.sc-lately { margin: 0; font-size: .85rem; line-height: 1.6; color: var(--ink-soft); }
+
+/* ── The journal, on a character's own page ─────────────────────────────────
+   A book on a desk. The pages are paper in every theme — a journal is a
+   physical thing, and dark-mode paper would read as a panel — so the page
+   colours are fixed here rather than taken from the theme tokens. Newest on
+   top; a ribbon marks the entries the character's next prompt carries. */
+.jr {
+  --jr-paper: #f4ebd6; --jr-paper-edge: #e6d9b8; --jr-ink: #33291c;
+  --jr-ink-soft: #6b5a42; --jr-rule: rgba(120,96,56,.22); --jr-red: #9b3d2e;
+  --jr-leather: #3b2a1e; --jr-gilt: #d3a95a;
+  max-width: 760px; margin: 0 auto; padding-bottom: 40px;
+  font-family: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+}
+.jr-cover {
+  position: relative; display: flex; align-items: center; gap: 18px;
+  flex-wrap: wrap; justify-content: space-between;
+  padding: 22px 26px; margin-bottom: 18px; border-radius: 6px 12px 12px 6px;
+  color: var(--jr-gilt);
+  background:
+    radial-gradient(120% 140% at 20% 0%, rgba(255,255,255,.07), transparent 55%),
+    linear-gradient(135deg, #4a3526, var(--jr-leather) 60%, #2b1d14);
+  box-shadow: inset 0 0 0 2px rgba(211,169,90,.35), inset 0 0 0 6px rgba(0,0,0,.25),
+    0 8px 22px rgba(0,0,0,.35);
+}
+.jr-cover::before {
+  content: ''; position: absolute; left: 14px; top: 10px; bottom: 10px; width: 3px;
+  background: linear-gradient(var(--jr-gilt), transparent 30%, var(--jr-gilt) 70%, transparent);
+  opacity: .45; border-radius: 2px;
+}
+.jr-cover-title { display: grid; gap: 2px; padding-left: 12px; }
+.jr-cover-kicker { font-size: .72rem; letter-spacing: .22em; text-transform: uppercase; opacity: .75; }
+.jr-cover-name { font-size: 1.7rem; font-style: italic; letter-spacing: .02em; }
+.jr-cover-meta { display: flex; gap: 14px; font-size: .78rem; letter-spacing: .06em; opacity: .85; }
+.jr-cover-meta span + span::before { content: '◆'; font-size: .5rem; margin-right: 14px; vertical-align: middle; }
+
+.jr-open {
+  margin: 0 0 18px 26px; padding: 12px 18px; background: var(--jr-paper-edge);
+  color: var(--jr-ink); border-radius: 3px; transform: rotate(-.4deg);
+  box-shadow: 0 2px 6px rgba(0,0,0,.25); position: relative;
+}
+.jr-open::before {
+  content: ''; position: absolute; top: -7px; left: 50%; width: 54px; height: 15px;
+  margin-left: -27px; background: rgba(211,169,90,.55); transform: rotate(2deg);
+}
+.jr-open h4, .jr-sec h4 {
+  margin: 0 0 5px; font-size: .72rem; font-weight: 700; letter-spacing: .16em;
+  text-transform: uppercase; color: var(--jr-red);
+}
+.jr-open ul, .jr-sec ul { margin: 0; padding: 0; list-style: none; }
+
+.jr-page {
+  position: relative; margin: 0 0 20px; padding: 28px 34px 28px 58px;
+  color: var(--jr-ink); border-radius: 3px 8px 8px 3px;
+  background:
+    linear-gradient(90deg, rgba(155,61,46,.35) 0 1px, transparent 1px) 44px 0 / 100% 100% no-repeat,
+    repeating-linear-gradient(transparent 0 27px, var(--jr-rule) 27px 28px),
+    var(--jr-paper);
+  box-shadow: 0 1px 0 var(--jr-paper-edge), 0 3px 0 -1px var(--jr-paper),
+    0 4px 0 -1px var(--jr-paper-edge), 0 6px 0 -2px var(--jr-paper),
+    0 7px 0 -2px var(--jr-paper-edge), 0 10px 22px rgba(0,0,0,.28);
+}
+.jr-page.is-held { outline: 1px solid rgba(211,169,90,.6); outline-offset: 2px; }
+.jr-ribbon {
+  position: absolute; top: -4px; right: 30px; padding: 8px 8px 13px;
+  font-family: system-ui, sans-serif; font-size: .6rem; font-weight: 700;
+  letter-spacing: .12em; text-transform: uppercase; color: #fff;
+  background: var(--jr-red);
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 82%, 0 100%);
+  writing-mode: vertical-rl; transform: rotate(180deg);
+}
+.jr-page-hd {
+  /* Everything on a page is a whole number of 28px lines, counted from the top
+     edge, so the text sits on the ruled lines the background draws. */
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  box-sizing: border-box; min-height: 56px; line-height: 28px;
+  border-bottom: 3px double var(--jr-ink-soft);
+}
+.jr-page .jr-sec h4 { margin: 0; line-height: 28px; }
+.jr-no { font-size: 1.15rem; font-style: italic; color: var(--jr-red); }
+.jr-date { font-size: 1rem; font-weight: 600; letter-spacing: .02em; }
+.jr-turns { margin-left: auto; font-size: .72rem; color: var(--jr-ink-soft);
+  font-family: ui-monospace, Consolas, monospace; }
+/* Ink on paper, not a console button; clear of the ribbon at the page's edge. */
+.jr-forget {
+  margin-right: 30px; padding: 3px 12px; font: inherit; font-size: .82rem; font-weight: 700;
+  line-height: 1.2; cursor: pointer; color: #fff; background: var(--jr-red);
+  border: 1px solid var(--jr-red); border-radius: 3px;
+}
+.jr-forget:hover { filter: brightness(1.15); }
+.jr-sec { margin: 0; }
+.jr-page .jr-sec { margin-top: 28px; }
+.jr-page .jr-page-hd + .jr-sec { margin-top: 0; }
+.jr-sec li { display: flex; gap: 10px; align-items: baseline; line-height: 28px; font-size: .98rem; }
+.jr-sec li::before { content: '✦'; font-size: .55rem; color: var(--jr-ink-soft); flex: none; }
+.jr-claim { flex: 1; overflow-wrap: anywhere; }
+.jr-cite { font-family: ui-monospace, Consolas, monospace; font-size: .68rem; color: var(--jr-ink-soft); }
+.jr-mark { font-size: .68rem; font-style: italic; color: var(--jr-red); border: 1px solid currentColor;
+  border-radius: 9px; padding: 0 7px; line-height: 17px; white-space: nowrap; }
+.jr-inferred .jr-claim { font-style: italic; color: var(--jr-ink-soft); }
+.jr-intend li::before { content: '➤'; font-size: .7rem; color: var(--jr-red); }
+.jr-opened li::before { content: '○'; font-size: .8rem; }
+.jr-settled li::before { content: '✓'; font-size: .8rem; color: #3f6b3a; }
+.jr-settled .jr-claim { text-decoration: line-through; text-decoration-color: rgba(51,41,28,.45); }
+
+.jr-blank {
+  padding: 60px 30px; text-align: center; color: var(--jr-ink); border-radius: 3px 8px 8px 3px;
+  background: var(--jr-paper); box-shadow: 0 10px 22px rgba(0,0,0,.28);
+  font-style: italic;
+}
+.jr-blank p { margin: 0 0 8px; font-size: 1.1rem; }
+.jr-blank .tiny { font-size: .8rem; font-style: normal; color: var(--jr-ink-soft); }
+.jr-older { text-align: center; margin-bottom: 14px; font-style: italic; }
+.jr-log { margin-top: 10px; font-family: system-ui, sans-serif; font-size: .78rem; color: var(--ink-soft); }
+.jr-log summary { cursor: pointer; padding: 6px 0; }
+.jr-log-row { display: flex; gap: 12px; padding: 4px 0; border-top: 1px solid var(--line); align-items: baseline; }
+.jr-log-result { font-weight: 600; }
+.jr-log-row.is-wrote .jr-log-result { color: var(--ok); }
+.jr-log-row.is-abandoned .jr-log-result, .jr-log-row.is-not_started .jr-log-result { color: var(--warn); }
+.jr-log-detail { flex: 1; color: var(--ink-faint); overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  .jr-page { padding: 20px 16px 18px 40px; }
+  .jr-ribbon { right: 12px; }
+  .jr-turns { display: none; }
+}
+
 /* ── The life editor ─────────────────────────────────────────────────────
    A personality's authored life, written at four resolutions. The page is a
    review tool: the model writes, a person reads and corrects, and the states

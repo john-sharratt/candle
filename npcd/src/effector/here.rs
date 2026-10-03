@@ -122,12 +122,14 @@ async fn index(State(local): State<Local>, Extension(caller): Extension<DeviceCa
             json!({
                 "name": spec.name,
                 "summary": tools::by_name(&spec.name).map(summary).unwrap_or_default(),
+                "choices": live_choices(&spec),
             })
         })
         .collect();
     Json(json!({
         "id": "here",
-        "summary": "What you can do where you stand — with what is around you and what you carry.",
+        "summary": "What you can do where you stand — with what is around you and what you carry. \
+                    Each verb lists the values its arguments take right now under `choices`.",
         "verbs": verbs,
     }))
     .into_response()
@@ -242,6 +244,19 @@ fn body_schema(spec: &ToolSpec) -> Value {
         }
     }
     json!({ "type": "object", "properties": properties, "required": required })
+}
+
+/// The values each enumerated argument of an act may take right now, by
+/// argument name — what stands here, drawn from the live `Choices` rather than
+/// described in prose. Free-text arguments are absent.
+fn live_choices(spec: &ToolSpec) -> Value {
+    let mut choices = Map::new();
+    for p in &spec.params {
+        if let Some(values) = &p.enum_values {
+            choices.insert(p.name.clone(), json!(values));
+        }
+    }
+    Value::Object(choices)
 }
 
 /// A parameter type as it appears on the wire — the lowercase JSON-schema name.

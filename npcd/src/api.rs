@@ -2180,7 +2180,8 @@ async fn get_world(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -> R
 ///
 /// Both operations in one route because the console offers them together and
 /// they are the same write: the body may carry `world_ms` to jump to, `scale`
-/// to change the pace, `paused`, or any combination. What is absent is left
+/// to change the pace, `paused`, `year_offset` to set the calendar that many
+/// years ahead of the anchor, or any combination. What is absent is left
 /// alone rather than defaulted, so a request that only pauses does not silently
 /// reset the speed.
 async fn put_world_time(
@@ -2209,6 +2210,18 @@ async fn put_world_time(
             );
         }
         clock = clock.set_pace(scale, paused.unwrap_or(clock.paused), now);
+    }
+    // The offset before the jump, so a request that sets both names the time
+    // as the world will read it under the new offset.
+    if let Some(years) = body.get("year_offset") {
+        let Some(years) = years.as_i64().and_then(|y| i32::try_from(y).ok()) else {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_field",
+                "`year_offset` is a whole number of years, positive for the future",
+            );
+        };
+        clock = clock.with_year_offset(years, now);
     }
     if let Some(to) = body.get("world_ms").and_then(Value::as_i64) {
         clock = clock.jump_to(to, now);
@@ -3286,6 +3299,8 @@ mod tests {
                 // Instruments over one owned character.
                 ("/v1/npc/:nid/projection", "user"),
                 ("/v1/npc/:nid/projection/:tick", "user"),
+                ("/v1/npc/:nid/system-prompt", "user"),
+                ("/v1/npc/:nid/prompt-tokens", "user"),
                 ("/v1/npc/:nid/monitor", "user"),
                 ("/v1/npc/:nid/project", "user"),
                 ("/v1/npc/:nid/perceive", "user"),
@@ -3300,6 +3315,9 @@ mod tests {
                 // calling one off.
                 ("/v1/npc/:nid/mission", "user"),
                 ("/v1/npc/:nid/mission/cancel", "user"),
+                ("/v1/npc/:nid/mission/step", "user"),
+                ("/v1/npc/:nid/ask", "user"),
+                ("/v1/npc/:nid/mind_control", "user"),
                 // The world's open channel: reading is a user's, speaking on it
                 // is a creator's, because it reaches every character in a world.
                 ("/v1/world/:wid/channel", "user"),
@@ -3319,6 +3337,10 @@ mod tests {
                 // world. `user` plus the ownership check, exactly like `pulse`.
                 ("/v1/npc/:nid/direct", "user"),
                 ("/v1/npc/:nid/window", "user"),
+                ("/v1/npc/:nid/scan", "user"),
+                ("/v1/npc/:nid/journal", "user"),
+                ("/v1/npc/:nid/journal/draft", "user"),
+                ("/v1/npc/:nid/journal/:eid", "user"),
                 // Broadcast and announce reach characters the caller does not
                 // own — the two pulse routes that are admin for exactly that
                 // reason.
@@ -3327,6 +3349,9 @@ mod tests {
                 // The command table and clearing the board — admin, they drive
                 // the whole cast.
                 ("/v1/pulse/command-table", "admin"),
+                // What the guardian has found and done — names every
+                // character, so admin.
+                ("/v1/pulse/guardian", "admin"),
                 ("/v1/pulse/missions/cancel", "admin"),
                 // Generation on the resident model, over the caller's own cast.
                 ("/v1/generate/description", "user"),
@@ -4895,6 +4920,35 @@ layers:
         .await;
         assert_eq!(v["paused"], true);
         assert_eq!(v["scale"], 60.0, "pausing forgot the pace");
+
+        // A world can be set years ahead. Paused at 5 000 000 ms, 400 years on
+        // is exactly 146 097 days later.
+        let (s, v) = call(
+            router(st.clone()),
+            send(
+                "/v1/world/ardh/time",
+                "PUT",
+                ADMIN,
+                json!({ "year_offset": 400 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["year_offset"], 400);
+        assert!(v["world_ms"].as_i64().unwrap() >= 5_000_000 + 146_097 * 86_400_000);
+        let (_, v) = call(router(st.clone()), get("/v1/world/ardh", None)).await;
+        assert_eq!(v["time"]["year_offset"], 400);
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                "/v1/world/ardh/time",
+                "PUT",
+                ADMIN,
+                json!({ "year_offset": "later" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
 
         // Setting the clock is an admin's.
         let (s, _) = call(

@@ -159,12 +159,9 @@ fn a_maker_spoken_to_is_woken_and_reads_that_it_was_spoken_to() {
 fn a_maker_overhearing_the_same_words_is_not_interrupted_by_them() {
     // The other half, and the one that would be invisible if it broke: a
     // third Maker in the room hears it, reads it as somebody else's business,
-    // and is not interrupted.
+    // and is neither interrupted nor woken by it — nobody asked it anything.
     //
-    // It *is* read. Overhearing used to be left unscheduled, which worked only
-    // while an idle heartbeat was coming along behind to collect it; with those
-    // gone, an arrival nobody wakes for is one nobody ever sees. So the
-    // distinction is preempt against pending, not woken against ignored.
+    // It is not lost: it is read with whatever next wakes the Maker.
     let mut w = vault();
     let s = Scheduler::new(64);
     let mut a = Attention::new();
@@ -186,8 +183,20 @@ fn a_maker_overhearing_the_same_words_is_not_interrupted_by_them() {
     let bystander = deliver(&mut w, &mut a, &s, &crew[2]);
 
     assert!(!bystander.preempts(), "overhearing interrupted a Maker");
-    // Scheduled, because nothing else would ever come to collect it.
     let runs = run_due(&s, 1);
+    assert!(
+        !runs.iter().any(|(id, _)| *id == crew[2].npc_id),
+        "overhearing scheduled a turn"
+    );
+    s.deliver(
+        crew[2].npc_id,
+        2,
+        Salience::NORMAL,
+        EventKind::Description {
+            text: "The lights flicker.".into(),
+        },
+    );
+    let runs = run_due(&s, 2);
     let heard = read(&runs, crew[2].npc_id).join("\n");
     assert!(
         heard.contains("Maker-01 says to Maker-02"),
@@ -543,6 +552,16 @@ fn the_addressee_survives_every_hop_between_the_world_and_the_model() {
     for m in &crew[1..] {
         deliver(&mut w, &mut a, &s, m);
     }
+    // The bystander is not woken by what it overheard; something else wakes it
+    // and it reads the line alongside.
+    s.deliver(
+        crew[2].npc_id,
+        400_000,
+        Salience::NORMAL,
+        EventKind::Description {
+            text: "The lights flicker.".into(),
+        },
+    );
     let runs = run_due(&s, 400_000);
     assert!(read(&runs, crew[1].npc_id)
         .join("\n")

@@ -165,9 +165,9 @@ fn refused(o: &Outcome) -> &str {
 ///
 /// The join that neither half can check alone. `specs_within` decides what a
 /// character may call; `body::perform` decides what happens when it does — except
-/// the two device acts (`query`/`invoke`), which are dispatched by the async
-/// `enact_device` to the effector router rather than the synchronous body path, so
-/// they satisfy the join through `is_device` instead. A tool present in one and
+/// the device act (`invoke`), which is dispatched by the async `enact_device` to
+/// the effector router rather than the synchronous body path, so it satisfies the
+/// join through `is_device` instead. A tool present in one and
 /// absent from the other is a character either spending turns on nothing or being
 /// refused for using its own vocabulary — and both look fine from inside the half
 /// that is right.
@@ -530,8 +530,10 @@ fn a_machine_offers_its_own_states_less_the_one_it_is_in() {
 
     stand(&h, "c1", "tower-redoubt", "gatehouse");
     let door = admits(&h, "c1", "operate", "mode").expect("a door stands in the gatehouse");
-    // Open is where it stands, so what is left is what it could be moved to.
-    assert_eq!(door, vec!["closed", "locked"]);
+    // Open is where the blast door stands, so what is left of its modes is what
+    // it could be moved to; the pressure door beside it is seated, so it offers
+    // the one it is not in.
+    assert_eq!(door, vec!["closed", "locked", "hissing"]);
     assert!(
         !door.contains(&"air only".to_string()),
         "a door was offered a turret's firing policy"
@@ -597,12 +599,16 @@ fn the_tower_offers_only_what_it_can_pay_for() {
     h.with_sim(|s| {
         let t = s.tower.as_mut().unwrap();
         let all = t.stock_of(Resource::Energy);
-        t.draw(Resource::Energy, all);
+        t.draw(Resource::Energy, all - 100);
     });
     let poor = admits(&h, "c1", "command_tower", "action").expect("still a tower");
     assert!(
         !poor.contains(&"relocate".to_string()),
         "a tower with no energy was invited to fold"
+    );
+    assert!(
+        !poor.contains(&"raise shields".to_string()),
+        "a tower on its reserve was invited to raise shields it cannot hold"
     );
     assert!(
         poor.contains(&"drill down".to_string()),

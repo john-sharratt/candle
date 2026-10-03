@@ -1496,57 +1496,32 @@ int8_decode_stripe_kernel(
         k_new, v_new, rungs, partial_acc, partial_ml, sel);
 }
 
-// One side's (K or V) Q0_V block headers for this lane, once per tile, with
-// the palette scale folded in (`q0_v_header`); bit p of the result says
-// palette p is Q0_V. A lane's dim of a palette is one block (32 tokens of that
-// dim) and every token of a tile lies in one chunk, so the lane reads the SAME
-// block for all of them. Free functions with explicit operands, not lambdas:
-// a closure this size is outlined into a real call, and every capture then
-// lives in local memory across the whole kernel body.
-template <bool IS_K, int HEAD_DIM>
-__device__ __forceinline__ uint32_t bmma_q0v_headers(
-    const uint8_t* head_ptr, int lane, Q0VHeader (&h)[N_PALETTE])
-{
-    uint32_t mask = 0u;
-    #pragma unroll
-    for (int p = 0; p < N_PALETTE; ++p) {
-        const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
-        const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
-        h[p] = Q0VHeader{ nullptr, 0.f, 0.f };
-        if (ptr != 0 && fmt == ArenaFormat::Q0_V) {
-            const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
-            h[p] = q0_v_header<IS_K>((const block_q0_v*)(uintptr_t)ptr + lane, __frcp_rn(scale));
-            mask |= 1u << p;
-        }
-    }
-    return mask;
-}
-
-// Stage one token's K (IS_K) or V row into `dst` (palette order): a Q0_V
-// palette from its header, any other through the accessor (cp.async for a
-// same-type dtype palette). `within` is the token's slot in the chunk.
+// Stage one token's K (IS_K) or V row into `dst` (palette order), every
+// palette through the accessor (cp.async for a same-type dtype palette).
+// `within` is the token's slot in the chunk.
+//
+// A Q0_V palette decodes through the accessor too, whose read is the folded
+// header's arithmetic (block_q0_v.cuh), so it is bit for bit what caching the
+// palette's header per tile would give. That cache saved re-reading a 2-byte
+// code per token and held four headers live across the token loop on every
+// tile, Q0_V or not — in a loop at the register cap, which put them in local
+// memory. A free function with explicit operands, not a lambda: a closure
+// this size is outlined into a real call, its captures then living in local
+// memory across the whole kernel body.
 template <typename T, bool IS_K, int HEAD_DIM>
-__device__ __forceinline__ void bmma_stage_token(
-    T* dst, const uint8_t* head_ptr, const Q0VHeader (&h)[N_PALETTE], uint32_t q0v_mask,
-    int within, int lane)
+__device__ __forceinline__ void bmma_stage_token(T* dst, const uint8_t* head_ptr, int within, int lane)
 {
     constexpr int SUB_HEAD_DIM = HEAD_DIM / N_PALETTE;
     constexpr int64_t sub_head_stride = (int64_t)SUB_HEAD_DIM * CHUNK_SIZE;
     constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
-    static_assert(BLOCKS_PER_DIM == 1, "a lane's dim of a palette is one block per chunk");
     #pragma unroll
     for (int p = 0; p < N_PALETTE; ++p) {
         const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
         if (ptr == 0) continue;
-        T* pal_dst = dst + p * SUB_HEAD_DIM;
-        if ((q0v_mask >> p) & 1u) {
-            pal_dst[lane] = q0_v_load_dispatch_detail::narrow(T{}, q0_v_header_elem(h[p], within));
-        } else {
-            const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
-            const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
-            ArenaAccessor acc((const char*)(uintptr_t)ptr, fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-            acc.template load_head_scaled<T, SUB_HEAD_DIM, true, IS_K>(pal_dst, 0, 0, within, lane, scale);
-        }
+        const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+        const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
+        ArenaAccessor acc((const char*)(uintptr_t)ptr, fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+        acc.template load_head_scaled<T, SUB_HEAD_DIM, true, IS_K>(dst + p * SUB_HEAD_DIM, 0, 0, within, lane, scale);
     }
 }
 
@@ -1817,18 +1792,12 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // are discarded (their mask bit is clear) below.
         #define TOK_VALID(t) (((tok_mask >> (t)) & 1u) != 0u)
         #define TOK_WITHIN(t) (TOK_VALID(t) ? within_base + (t) : (int)off)
-        // A Q0_V palette's block header is read once per tile
-        // (`bmma_q0v_headers`), so each token below costs one curve byte and
-        // one FMA. Formats are warp-uniform per palette.
-        Q0VHeader q0h[N_PALETTE];
-
         // ── stage the 8 tokens' K → shared_kb, cp.async double-buffered so each
         // token's load overlaps the previous token's gather/RoPE/quant. The
         // prefetch is unconditional when slice_ok (all 8 tokens share the chunk,
         // so every `within` is in-bounds); invalid tokens just zero shared_kb.
-        uint32_t q0v_mask = bmma_q0v_headers<true, HEAD_DIM>(head_ptr, lane, q0h);
         if (slice_ok) {
-            bmma_stage_token<T, true, HEAD_DIM>(skt[0][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(0), lane);
+            bmma_stage_token<T, true, HEAD_DIM>(skt[0][warp], head_ptr, TOK_WITHIN(0), lane);
             cp_async_commit<true>();
         }
         // A real loop over the 8 tokens, not unrolled: each iteration inlines
@@ -1842,7 +1811,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         for (int t = 0; t < 8; ++t) {
             if (slice_ok) {
                 if (t + 1 < 8) {
-                    bmma_stage_token<T, true, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(t + 1), lane);
+                    bmma_stage_token<T, true, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, TOK_WITHIN(t + 1), lane);
                     cp_async_commit<true>();
                     cp_async_wait<1, true>();
                 } else {
@@ -1935,9 +1904,8 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // accumulate, and add it across all heads — no per-tile V smem staging.
         // Prefetch is unconditional when slice_ok (in-bounds); invalid tokens are
         // skipped in the accumulate. ──
-        q0v_mask = bmma_q0v_headers<false, HEAD_DIM>(head_ptr, lane, q0h);
         if (slice_ok) {
-            bmma_stage_token<T, false, HEAD_DIM>(skt[0][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(0), lane);
+            bmma_stage_token<T, false, HEAD_DIM>(skt[0][warp], head_ptr, TOK_WITHIN(0), lane);
             cp_async_commit<true>();
         }
         // A real loop for the same reason as the K stage above.
@@ -1945,7 +1913,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         for (int t = 0; t < 8; ++t) {
             if (slice_ok) {
                 if (t + 1 < 8) {
-                    bmma_stage_token<T, false, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(t + 1), lane);
+                    bmma_stage_token<T, false, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, TOK_WITHIN(t + 1), lane);
                     cp_async_commit<true>();
                     cp_async_wait<1, true>();
                 } else {
@@ -2452,14 +2420,24 @@ int launch_int8_decode_attn(
         }
         }
         if (!launched_stripe) {
-            // Existing INT8-MMA kernel (warp=head). `pa` is non-null exactly
-            // when the route goes through partials + combine (need_pool held
-            // and the alloc succeeded — a failed alloc returned above); null
-            // `pa` is the single-block direct write.
-            int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
-                <<<grid, block, 0, stream>>>(
-                    q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
-                    softmax_scale, k_new, v_new, rungs, pa, pm, sel);
+            // **Not at head_dim >= 128 with 8 warps.** There every group of 1–8
+            // heads takes the batched-M kernel above, and more than 8 selects 16
+            // warps (`use_wide`), so the warp=head kernel at 8 warps cannot be
+            // reached. Gating its instantiation rather than its launch is what
+            // keeps it out of the archive; arriving here anyway is a routing
+            // fault, reported rather than run.
+            if constexpr (HEAD_DIM >= 128 && WARPS_PER_BLOCK <= 8) {
+                return 2;
+            } else {
+                // Existing INT8-MMA kernel (warp=head). `pa` is non-null exactly
+                // when the route goes through partials + combine (need_pool held
+                // and the alloc succeeded — a failed alloc returned above); null
+                // `pa` is the single-block direct write.
+                int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
+                    <<<grid, block, 0, stream>>>(
+                        q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
+                        softmax_scale, k_new, v_new, rungs, pa, pm, sel);
+            }
         }
 
         // The write-slice commit rides in the combine when there is one; the
@@ -2495,10 +2473,21 @@ int launch_int8_decode_attn(
             return launch(std::integral_constant<int, 16>{}, std::false_type{});
         }
     }
-    if (rope_interleaved) {
-        return launch(std::integral_constant<int, 8>{}, std::true_type{});
+    // **No 8-warp launch at head_dim 256.** Up to TILE_M_ROWS heads per group
+    // the tile kernel above has already run and returned, and more than that
+    // is `use_wide` — so the 8-warp half (its stripe kernels for every head
+    // count and its warp=head fallback) is unreachable here, and is not
+    // instantiated. Arriving here anyway is a routing fault, reported rather
+    // than run.
+    static_assert(TILE_M_ROWS >= 8, "the tile kernel covers every 8-warp group at head_dim 256");
+    if constexpr (HEAD_DIM == 256) {
+        return 2;
+    } else {
+        if (rope_interleaved) {
+            return launch(std::integral_constant<int, 8>{}, std::true_type{});
+        }
+        return launch(std::integral_constant<int, 8>{}, std::false_type{});
     }
-    return launch(std::integral_constant<int, 8>{}, std::false_type{});
 }
 
 } // namespace fused_attn

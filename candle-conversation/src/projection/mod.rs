@@ -195,6 +195,8 @@
 //! | [`reconcile`]   | CSS-flexbox-style budget distribution                          |
 //! | [`project`]     | Full projection pipeline orchestrator                          |
 //! | [`plain_prompt`] | Where a plain prompt's frame section is sealed               |
+//! | [`owned_sections`] | Ids and ownership of sections one conversation adds at runtime |
+//! | [`owned_prefix`] | The prefix a collection's late members seal against          |
 
 pub mod adaptive;
 mod belief_files;
@@ -203,6 +205,8 @@ mod error;
 pub(crate) mod event;
 mod ids;
 pub mod layer_toggle;
+mod owned_prefix;
+mod owned_sections;
 mod plain_prompt;
 mod policy;
 mod project;
@@ -240,6 +244,8 @@ pub use ids::{
     CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,
     TurnIndex, TurnKey,
 };
+pub use owned_prefix::prefix_before_collection;
+pub use owned_sections::{OwnedSection, OwnedSections};
 pub use plain_prompt::PlainPromptFrames;
 pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 pub(crate) use project::turn_belief_key;

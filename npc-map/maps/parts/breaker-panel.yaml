@@ -1,0 +1,16 @@
+id: breaker-panel
+kind: fixture
+name: breaker panel
+short: >
+  A breaker panel is closed while the supply runs and tripped when something on
+  it has been overloaded.
+long: >
+  A grey cabinet of switchgear on the wall, a column of breakers behind a hinged
+  cover. Closed is the ordinary state and is the only one that carries power to
+  the machines in earshot; tripped means a breaker has thrown and everything
+  fed through it has stopped at once. A tripped breaker is not a broken one.
+  Somebody standing here can close it again, and the supply comes back, until
+  whatever overloaded it does so again.
+modes:
+  - closed
+  - tripped

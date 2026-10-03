@@ -443,6 +443,12 @@ async function boot() {
    *
    * Only a network failure or a not-yet-ready state is worth another go. */
   let status = null;
+  /* Asked alongside the first status poll, not after it. A refresh against a
+   * daemon that is already up used to pay two round trips in sequence before the
+   * first page could start; the answer is only trusted when the daemon was ready
+   * on that first poll, and is asked again otherwise. */
+  const earlyMe = API.getMe().then((m) => m, () => null);
+  let waited = false;
   /* Long enough to cover a real cold start. The old bound was 40 × 400 ms —
    * sixteen seconds — which was ample when nothing was loaded and is nowhere
    * near a multi-gigabyte checkpoint coming off disk onto the card. Giving up
@@ -452,8 +458,10 @@ async function boot() {
     try {
       status = await API.getStatus();
       if (status.state === 'ready') break;
+      waited = true;
       paintLoading(status.loading, detail);
     } catch (e) {
+      waited = true;
       if (e && (e.status === 401 || e.status === 403)) {
         // Up, and not answering this to us. Carry on to sign-in rather than
         // pretending to wait for something that has already replied.
@@ -468,11 +476,7 @@ async function boot() {
   // A 401 here means signed out, which is the only thing this daemon can say
   // about identity — it does not run sign-in and has no configuration of its
   // own that could be missing.
-  try {
-    ME = await API.getMe();
-  } catch (e) {
-    ME = null;
-  }
+  ME = waited ? await API.getMe().catch(() => null) : await earlyMe;
   // Hand the router the server's answer, once. Everything role-shaped — which
   // nav links appear, which pages open, which controls are writable — reads
   // through this one function, so there is a single place that can be wrong

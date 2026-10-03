@@ -149,29 +149,33 @@ always have — which is everything the world supplies.
 The full migration — every tool that stays and every tool that becomes a route,
 with its proposed path — is **Appendix A**, for your review.
 
-## 5. The verbs: real HTTP methods behind two device tools
+## 5. The verbs: one device tool, and the body act that finds addresses
 
-The effector device adds exactly two tools to the compiled catalogue. They are the
-only new `Tool` statics this design introduces, and they never change as the world
-grows. Behind them are ordinary HTTP methods, so the model's prior applies directly.
+The effector device adds exactly one tool to the compiled catalogue, and it never
+changes as the world grows. Behind it is an ordinary HTTP method, so the model's
+prior applies directly. The model-facing frame is `invoke` plus the body act `scan`:
 
 ```
-query(url: string)
-    Read the address without changing anything. Issues GET for a listing or a
-    readable resource's data, and OPTIONS for a resource's schema (§5.1). Safe and
-    idempotent, so the character — and the engine (§6, §11) — may look freely.
+scan()
+    With no place named, a prose survey of what the body can work where it
+    stands: one line per station, with its state in a few words and the exact
+    address and fields to `invoke` (§6). A body act, not a device call.
 
 invoke(url: string, body: object)
-    Act at the address. Issues the resource's effectful method (POST / PUT /
-    DELETE) with a JSON body. Returns the result, or a prescriptive error (§12).
+    Act at the address. Issues the resource's effectful method (POST) with a
+    JSON body. Returns the result, or a prescriptive error (§12).
 ```
 
-`query` versus `invoke` is GET/OPTIONS versus everything-else — the line the model
-already draws between finding out and acting. Two named tools (rather than a single
-`request(method, url, body)`) match the discover-then-act mental model and keep the
-safe path unmistakably safe. **The model never picks the method:** the resource
-advertises its one effectful method in its schema and `invoke` uses it, so a
-wrong-method 405 is not a mistake available to the model.
+There is no model-facing read tool. Finding out is `scan`, and the survey is built
+from the same source the grammar's `invoke` enum is (`address_of`, `verbs_at`,
+`Sim::reading`), so every address it names is one `invoke` accepts. **The model
+never picks the method:** every address is a single verb, `invoke` uses its
+effectful method, so a wrong-method 405 is not a mistake available to the model.
+
+The router keeps `GET` and `OPTIONS` handlers on every resource. They are internal:
+the engine reads the schema `OPTIONS` returns to compile the stencil (§11), and
+external callers and the tests drive `GET` over the mounted router (§8.2). No tool
+the model can call issues them.
 
 ### 5.1 `OPTIONS` completes the abstraction
 
@@ -198,24 +202,35 @@ OPTIONS http://local/table/<id>
 these are its methods" verb, it can carry a schema *body*, and it maps one-to-one
 onto the discovery step the design needs; `HEAD` (schema in headers) was the
 alternative floated in review, and `OPTIONS` is the decision. The schema it returns is
-what the stencil is compiled from (§11), so `query`-for-schema is not just for the
-character to read.
+what the stencil is compiled from (§11); it is read by the engine, not by the model.
 
 ## 5.2 Verbs are resources
 
 A thing in the world is addressed by its id — `http://local/chronicle/<id>` — and
 **each verb it affords is itself an address beneath it**:
-`http://local/chronicle/<id>/add_entry`. That verb path is a full resource: `query`
-it for *its* schema, `invoke` it to act. The parent (`.../chronicle/<id>`) answers
-what the thing is and lists the verbs beneath it; a verb answers exactly one body.
+`http://local/chronicle/<id>/add_entry`. That verb path is a full resource: `OPTIONS`
+returns *its* schema, `invoke` acts on it. The parent (`.../chronicle/<id>`) answers
+what the thing is and lists the verbs beneath it — as `verbs` and as `invoke`, the
+whole `http://local/<ns>/<id>/<verb>` addresses to act on; a verb answers exactly
+one body.
+
+The parent read also carries the thing's live `state`, drawn from the sim
+(`Sim::reading`): a machine's mode and whether it answers, and — for a station whose
+acts draw on the tower — the stockpile, what it can make from it, which of the eight
+queues are free and what is queued. A question about the world ("which fabricators are
+running, what is there to make from?") therefore has an answer at the machine, rather
+than only a refusal or a neighbour who knows no more. A station that commands the tower
+reads the tower's own state besides: posture, depth and shields, what it draws per
+minute (`energy_per_minute`) and how long the energy lasts at that draw
+(`minutes_of_energy`), any contact closing on it (`contact`: id, kind, `minutes_out`),
+and the open `decisions` with who, by name, is deciding each (`held_by`, or null).
 
 This is the decision that makes typed `invoke` total rather than partial. A resource
 that afforded several verbs could not be typed by a single body — the address could
 not say which verb the `invoke` would pick. Addressing the **verb** removes the
 ambiguity by construction: every invokable address has exactly one body, so the
 grammar can pair each address the `invoke` enum offers with the body it takes
-(§11), and the schema a `query` returns is exactly the schema the following
-`invoke` needs.
+(§11), and the schema `OPTIONS` returns is exactly the schema `invoke` needs.
 
 So the grammar of an address is:
 
@@ -231,12 +246,55 @@ The station router mounts each verb as a sub-path of the thing, and the `invoke`
 grammar types its body from the act's own parameters (§11), so every address the
 character is offered is typed, single-verb or not.
 
-## 6. The near-you index is a route, shown as a superseding device percept
+## 5.3 The tower has a clock, and what it asks has an owner
+
+A stockpile that never moved would give a character no reason to choose anything, and
+a question put to a cast of equals — "what should the tower do next?" — has no answer
+anywhere in the world, so it goes between them and becomes the loop. Two parts fix that
+at the source rather than breaking the loop after it forms.
+
+**The tower's state moves** (`sim/upkeep.rs`, driven by `engine/watch.rs`). While anybody
+is in the world, the tower is drained each beat at a rate per real minute: a base draw,
+more with shields up, a siege or a batch running, half of it when dug in. A contact is
+sighted after a quiet spell, counts down, and on arrival is met by whatever the tower
+is doing: dug in, it passes over; shielded, it costs energy to hold; otherwise it takes
+energy and metal. Folding away leaves it behind. Shields fail when the spendable energy is gone. A beat is
+capped at five seconds, so a stalled daemon is not charged for the gap, and an empty
+world does not run its clock. What happens is stirred into every occupied room of the
+tower's area — outcomes as notes, a sighting or a falling reserve as a wake — so the crew
+learns of it together.
+
+**Strategic decisions have one owner** (`sim/decisions.rs`). What presses on the tower
+(`Tower::pressing`: a contact, the reserve under a floor) is put on the order board as
+an order set by "the tower", once per cause and announced once. A character takes it
+from the order table; `take_order` is exclusive, so a second one is told who has it.
+While somebody holds a decision the tower is theirs to command: `command_tower` by
+anybody else is refused with the holder's name and the decision. Nobody is in the way
+until somebody has taken one. A command that lands settles what its maker holds, and a
+settled cause is not put up again while it stands. A cause that passes — the contact
+folded away from, the reserve restored — comes off the board, held or not, and is a new
+decision if it returns. The klaxon that announces a decision names it and says how to
+take it on (`claim "<the decision>"`); `claim` offers every unheld order from wherever
+the character stands, so hearing the klaxon is enough to act on.
+
+**A tower can recover.** Standing, a held contact and the shields spend only the energy
+above a reserve (`RESERVE`, 200), so a tower run down is not dead: it can still afford to
+dig in. A buried tower is paid by the ground (`TAP_YIELD` a minute) and, with its draw
+halved, gains energy; its reading says what the ground gives and reports
+`minutes_of_energy: null` when the ground out-gives the draw. The cost is what dug-in
+already costs: it cannot fold or lay siege until it surfaces. The grammar keeps this
+honest: `raise shields` is offered only on enough spare energy to hold them a minute,
+`drill down` only to a tower that can pay for a metre of it, and a drill deeper than the
+stockpile covers is refused with how deep it can go.
+
+## 6. The near-you index is an internal route; the character surveys with `scan`
 
 The list of what is reachable from here is a route — `GET http://local/`, served by
 the same handler machinery as everything else, consistent and externally
-inspectable. Its answer is the **top level and only the top level**, recomputed from
-where the body stands, each entry carrying its world item id (§7):
+inspectable. It is not a tool the model calls and it is not placed in the prompt:
+the character's view of the same ground is the `scan` survey. Its answer is the
+**top level and only the top level**, recomputed from where the body stands, each
+entry carrying its world item id (§7):
 
 ```
 GET http://local/
@@ -249,42 +307,46 @@ GET http://local/
   ] }
 ```
 
-**Where this is shown to the model is the point.** It is only ever true *now*, so it
-is delivered each turn as a **superseding percept** — an `EventKind::Reachable` keyed
-so the pending inbox holds exactly one current device screen, never a growing pile of
-lists as the body moves (`replaces()`, the same discipline the situation band already
-follows, `delta.rs:191`). It is rendered verbatim, at `Salience::IDLE` so it never
-preempts.
+**Where the model sees this ground is the point.** It is only ever true *now*, so
+it is not carried in the prompt or as a percept: the character asks for it with
+`scan`, and the survey is recomputed from the room each time. An earlier design
+delivered the list each turn as a superseding percept; the survey replaces it
+because it names the exact addresses `invoke` takes, where the list named bare
+resources `invoke` cannot.
 
-*As-built correction (Appendix D territory): the design first called this "a dynamic
-section of the system prompt, like the mission and task sections." That is how it
-reads to the character, but not how it is built — npcd has no per-turn-fresh
-system-prompt-section mechanism (schema sections are cast-shared and sealed; a
-per-turn re-seal is model-dependent and would mean touching `candle-*`). And the
-mission/task content it was compared to does not live in a projected section either:
-missions reach the character as a **superseding percept** too (the `Nudge`, rendered
-verbatim in `narrator.rs`). So "like the missions and tasks" is honoured literally —
-the near-you list is the same kind of superseding percept. The one honest cost: like
-every point-in-time percept, a turn's line stays in that turn's window history — but it
-is a single top-level line, not schemas (those arrive via `query`, inline), and the
-window is bounded, so the conversation does not carry the world's whole API.*
-
-It reads, in the character's register:
+The survey reads, in the character's register:
 
 ```
-YOUR EFFECTOR DEVICE
-Reachable from here: the lift · the command table · a world-history terminal · world history · your phone
+Here you can work:
+- Bridge console: besieging the eastern ledger, shields down. You can `invoke` `http://local/tower/bridge-console~0/command_tower` (needs action).
+To act on one, `invoke` its address.
+On your phone:
+- Pax: 1 unread.
+To read them, `read`.
+Lately: Pax came in.
 ```
 
-and, for the leaves the body is standing at, it carries their schema inline (§11), so
-the character can act in one turn.
+The survey also carries what the body holds, wherever it stands, each compressed to
+one line that still reads as a sentence (`engine/on_you.rs`): the open phone threads
+(who it is with and how much is unread — never what was said, which is for `read` —
+and no instruction on how to send) and the recent witnessed past as the narrator
+writes it. A station's line never lists what it can make: a fabricator's catalogue is
+long, so the line carries its mode and queues only. Each section is left out when empty, and the
+phone section when the body carries no handset. The character's identity, beliefs and
+plan are in the system prompt, so the survey does not repeat them.
 
-**The queries and interactions stay inline.** Only the *ambient list* is the
-superseding percept. A `query` and its schema response, an `invoke` and its result or
-error, are actions and their outcomes, and they belong in the turn stream as
-`<tool_call>`/`<tool_response>` exactly like any act (§5, §12). The split is the whole
-of it: *what is reachable* is a superseding, point-in-time percept; *what I did about
-it* is the conversation.
+**The survey is also served.** `GET /v1/npc/:nid/scan` (owner or admin) returns
+`{ prose, survey }`: `prose` is the survey word for word, and `survey` is the data it
+is written from (`engine/survey.rs`, `Survey::of`): each station's name, address,
+state, verbs with every parameter's type, whether it is required and what it means,
+the tower's options and the raw reading, plus the threads and the recent past. The
+console's Scan tab on a character renders it, with hover text on stations, addresses
+and parameters, so a scan can be checked without making the character act.
+
+**The interactions stay inline.** An `invoke` and its result or error are actions
+and their outcomes, and they belong in the turn stream as
+`<tool_call>`/`<tool_response>` exactly like any act (§5, §12). *What is here* is
+a survey the character asks for; *what I did about it* is the conversation.
 
 ## 6.1 The system prompt explains the device
 
@@ -295,12 +357,15 @@ character's own register:
 
 - **What it is** — a handheld effector: it senses what is around you and lets you
   act on it. Its screen lists addresses; the world answers at them.
-- **How to look** — `query` an address to see what lives beneath it or what a
-  thing will accept. Looking never changes anything.
+- **How to look** — `scan` with no place named lists what you can work where you
+  stand, one prose line per station: its state in a few words and the exact
+  address and fields to `invoke` (`engine/survey.rs`, built from the same
+  `address_of` / `verbs_at` / `Sim::reading` the grammar's `invoke` set uses).
+  Looking never changes anything.
 - **How to act** — `invoke` an address with the fields it asked for. The world
   answers, or tells you plainly what was wrong so you can fix it.
-- **What the addresses are** — the screen shows what is reachable from where you
-  stand; walking changes it. Each address names one thing in the world.
+- **What the addresses are** — `http://local/...`, each naming one thing in the
+  world; walking changes which ones the survey lists.
 
 It does *not* mention the auth token (§8.3): that is carried for the character, not
 by it. The exact wording is drafting, not architecture; the requirement is that no
@@ -423,7 +488,7 @@ router with two entry paths:**
 - **In-fiction (fast).** The engine builds a real `http::Request`, stamps the auth
   header (§8.3), and invokes the router *in-process* — the `tower::ServiceExt::
   oneshot` path the existing routers are already tested through (`api.rs:448`). No
-  TCP, no serialize-to-socket, no syscall. This is the path every `query`/`invoke`
+  TCP, no serialize-to-socket, no syscall. This is the path every `invoke`
   takes, at the world's cadence (`EVERY = 500ms`, `driver.rs:44`) times the cast.
 - **External (real socket).** The identical routes answer on the bound port
   (§8.2), for an external client.
@@ -451,7 +516,7 @@ for rather than discovered:
 - **The production Router handle.** Today the merged router is handed to `web` and no
   handle is kept; the `oneshot` path is `#[cfg(test)]` (`api.rs:448`, `main.rs:636`).
   **As-built (Step 1):** `Runtime` retains the router (`set_effector_router`) and
-  drives it via `effector_query`, an `async` method — the sync/async seam above is
+  drives it via `effector_invoke`, an `async` method — the sync/async seam above is
   handled by making the effector call at the async layer, never `block_on`.
 
 ### 8.2 The external mount
@@ -590,16 +655,14 @@ fraction of the length. The within-node catalogue-id de-dup is kept as `part_ids
 by this instance id (`sim/seed.rs`, `Sim::station`), while record *custody* stays global
 (an era held anywhere is unavailable everywhere — correctly not per-instance).
 
-**The url is a stencil, not free text (the anti-hallucination cut).** `query`'s `url` and
-`invoke`'s `url` are grammar-forced enums, not free strings: `query.url` is bound to the
-near-you set (`Choices::QueryUrl` ← `Within::reachable`), and `invoke.url` to each
-reachable resource's verb-paths (`Choices::InvokeUrl` ← `Within::invokable`,
-`<resource-url>/<verb>` from `station::verbs_at`). So the decoder is forced through a real
-address the device actually lists — a character can never `query http://local/command-table`
-(a hallucinated guess that 404s) nor `invoke` a bare resource (a 405); it reads and acts
-on exactly what stands within reach. The near-you percept renders each route as
-`- <summary> — <url>` so the address it must name is on the screen to copy
-(`prompt::near_you_section`).
+**The url is a stencil, not free text (the anti-hallucination cut).** `invoke`'s `url`
+is a grammar-forced enum, not a free string: it is bound to each reachable resource's
+verb-paths (`Choices::InvokeUrl` ← `Within::invokable`, `<resource-url>/<verb>` from
+`station::verbs_at`). So the decoder is forced through a real address the device
+actually lists — a character can never `invoke` a hallucinated guess that 404s
+(`http://local/command-table`) nor a bare resource (a 405); it acts on exactly what
+stands within reach. The `scan` survey renders each station with the whole verb-path
+to copy (`engine/survey.rs`).
 
 **Only an address a route answers for is offered.** A station namespace is mounted only
 when some catalogue act attaches to a part under it, and `map` is held back from the
@@ -607,10 +670,10 @@ generic routes, so an instance of a part with no verbs (a seat, a blast door, a 
 turret) or of a `map` part has nothing behind its url: `GET /room/seat~0` is a `404`.
 `router::address_of` is the single place an instance's url is composed, and it returns
 `None` for such a part (`router::serves`: its namespace is mounted, or is `orders`, which
-the plan bridge serves). The near-you index and the grammar's `query` and `invoke` enums
-all read it, so what a character is shown, what it may name and what the router serves
-are one set; `every_address_a_body_is_offered_is_served` stands a body at every place in
-the vault and reads every offered address. A part that later gains a verb is served the
+the plan bridge serves). The near-you index, the `scan` survey and the grammar's `invoke`
+enum all read it, so what a character is shown, what it may name and what the router
+serves are one set; `every_address_a_body_is_offered_is_served` stands a body at every
+place in the vault and reads the resource behind every offered address. A part that later gains a verb is served the
 moment its act names it, with no change here.
 
 Handlers reach the world through the one lock: `Hosted`, a single mutex over
@@ -659,7 +722,7 @@ and it also bounds *how deep* the reach can be: as deep as `Sim`'s, no deeper.
 ### 9.1.1 The `WorldRoutes` trait (Step 7)
 
 The device machinery is world-agnostic: the token auth (§8.3), the near-you framing
-(§6), the `query`/`invoke` verbs (§5), the per-address body stencil (§11), and the
+(§6), the `invoke` verb (§5), the per-address body stencil (§11), and the
 personal roots (`/history`, `/phone`, `/self`, §7.2) are all npcd's and know nothing of
 what world sits behind them. Everything world-specific is one trait:
 
@@ -823,7 +886,7 @@ another writer under the same lock.
 
 # Part D — The stencil (why the model calls it well)
 
-## 11. The query drives the stencil — the mechanism that makes this cheap
+## 11. The schema drives the stencil — the mechanism that makes this cheap
 
 This is the load-bearing idea, and it needs stating precisely, because a review of
 this design found the first draft overclaimed it.
@@ -851,7 +914,7 @@ decoder enforces the strong half it can, the handler enforces the rest.
 The whole-turn grammar is cached on `(Deliberation, Within)` and hits almost always
 *because `Within` is a room fact shared across the cast*. `Within` carries
 `invokable: Vec<Invokable>` — each `(url, act)` the body can reach from where it
-stands (`Runtime::reachable_urls`, the verbs `station::verbs_at` lists under each
+stands (`Runtime::invokable_urls`, the verbs `station::verbs_at` lists under each
 part) — so the address set is part of the key and two characters in the same room
 share one tree. There is no per-character focus, no second cache and no spliced
 tree.
@@ -877,15 +940,11 @@ and everything a body could name in reach compiles in milliseconds, and the
 per-address cost is bounded by test.
 
 **How the character reaches a schema without spending a turn on it.** The naive path
-— discover, `query` for schema, then `invoke` — is three turns to do one thing, and
-at 2 Hz that is slow. Two changes collapse it:
+— discover, read the schema, then `invoke` — is three turns to do one thing, and
+at 2 Hz that is slow. Two things collapse it:
 
-- The near-you index (§6) carries each reachable leaf's schema *inline* — a `GET`
-  returning JSON, still ordinary HTTP — and it is re-projected into the dynamic
-  system-prompt section *this* turn (§6), so the body the character is about to
-  write is already in front of it. A `query` of a resource answers `{state, schema}`
-  in one call (`Runtime::schema_of`), and because it is a point-in-time section it
-  never accumulates in the window.
+- The `scan` survey (§6) names each station's whole verb-path and the fields it needs,
+  so the body the character is about to write is already in front of it.
 - Every address the `invoke` enum offers is already typed, so "operate the thing in
   front of me" is one `invoke` with no preceding `OPTIONS`.
 
@@ -921,8 +980,7 @@ clever** — an invented format would forfeit the whole prior the wager rests on
 The API is a pure function of `(world state, caller token → standpoint, method,
 path, body)`. No session, no handshake, no cursor inside it. The engine calls it for
 three reasons and none may leave residue: to fill the **near-you index** (`GET
-http://local/`), to read a resource's **schema** (`OPTIONS`, bundled with its state
-on a `query`), and to render a **world event** referring to a capability. Because the
+http://local/`), to read a resource's **schema** (`OPTIONS`), and to render a **world event** referring to a capability. Because the
 answer is a function of world state, asking repeatedly and from more than one place
 is safe — two callers get the same answer, the property `perceive.rs` guarantees for
 percepts (`perceive.rs:9`). Any caching is the *engine's*, keyed on
@@ -939,7 +997,7 @@ percepts (`perceive.rs:9`). Any caching is the *engine's*, keyed on
 `character_loop`, `runtime.rs:3443`). Witness, stir, narration. The one-lock world
 model. The per-character `ConversationLock`, projection/window/prompt structure.
 
-**New.** `query` and `invoke` (§5). The `local` router + its external mount (§8).
+**New.** `invoke` (§5). The `local` router + its external mount (§8).
 `OPTIONS` schema responses (§5.1). The near-you index route (§6). The token auth and
 quick-lookup table (§8.3). The in-process fast path (§8.1). The per-address body
 stencil on `invoke` (§11). The world-routes extension point (§9.1). Item
@@ -951,7 +1009,7 @@ ids on placed instances and the per-item state record (§7, §7.1; Q2). Routing 
 `STATION_ACTS`/`bench`/`mission` (handlers in `engine/work.rs`, `work::perform` —
 *shipped*, not the audit's "0-of-79"; Appendix D), and the reused `file_*` stop being
 compiled `Tool` statics reached through the grammar and become routes reached through
-`query`/`invoke`. For most verbs this is **wrapping an existing handler in a route
+`invoke`. For most verbs this is **wrapping an existing handler in a route
 envelope**, not writing it — the audit's "build 115 tools" (`tool_surface_audit.md`
 §6) becomes "declare 152 routes" over handlers that largely exist, at no grammar and
 no `Within` cost. The genuinely-absent handlers (`plan_*`, `roster_*`, `room_sit`,
@@ -1052,7 +1110,7 @@ game's felt responsiveness.
 
 **Port what exists, then go wide.** The world already has unit tests in `npc-map`
 (lift, movement, witness, bumps) and `npcd` (tools, enact). They port onto the
-effector abstraction — drive the world by `query`/`invoke` against the router and
+effector abstraction — drive the world by `invoke` (and `GET` for reads) against the router and
 assert the response *and* the resulting state — which is both a migration check and
 the start of an **extensive** suite: every route, every error, every
 availability-by-condition transition (§7.1), every schema→stencil path (§11). The
@@ -1079,10 +1137,10 @@ Build order, dependency-first, each step green before the next:
 2. Item ids on placed instances (Q2), the per-item state record (§7.1), and
    standpoint-filtered mounting — with the availability model of §7.1 mapped out in
    full (every part, its conditions, the verbs each condition affords).
-3. `query`/`invoke` as the fixed-frame tools; `OPTIONS` schema; the "Your effector
-   device shows:" band and the system-prompt copy (§6.1).
+3. `invoke` as the fixed-frame tool beside the body act `scan`; `OPTIONS` schema;
+   the system-prompt copy (§6.1).
 4. The per-address body stencil: each `invoke` address pairs with its act's body in
-   the `Within`-keyed grammar (§11); inline schema on the near-you index (so the
+   the `Within`-keyed grammar (§11); the `scan` survey naming each address (so the
    common call is one turn); the simulator suite. This rides on Step 6's `Within` shrink (§15), so the two
    proceed together.
 5. The lift, migrated end-to-end (`http://local/lift/<id>/{status,call}`, enum from
@@ -1205,8 +1263,8 @@ changes. Ordered by how load-bearing the contradiction is.
 |---|---|---|
 | [`tool_surface_audit.md`](tool_surface_audit.md) | the whole "build all 115 as compiled tools" plan (§1, §6, §6.4); the `namespace_verb` naming/tokenisation analysis (§5A) is moot for URL path segments; the counts (§6.3); and its "Implemented: 0" claim is itself stale — the handlers ship in `engine/work.rs` (Appendix D) | §2 (what exists), §3 (removals), §4 (the 8 missing clusters), the craft-word naming rule for verbs |
 | [`tool_world_acts.md`](tool_world_acts.md) | world-acting verbs as compiled body tools; the string/boolean workaround (§0) — lifted by per-resource schema (§11); the "seven new live sets" (§4) become handler-computed `OPTIONS` schema | the intent-vs-typed field rule; §6 "to simulate this in the vault" |
-| [`tool_decisions.md`](tool_decisions.md) | "vocabulary moved onto the argument axis" — it moves onto the **route axis**; `read`/`claim`/`release` as body tools (§2, §3) reopen (read → `query`) | §1 belief-write prohibition (reinforced, §9.2); tool-shape/argument-binding sections |
-| [`tool_interaction_reconciliation.md`](tool_interaction_reconciliation.md) | "25 `*_read_*` tools vs one `observe`" (§4.2) — reads are now `query`; the 25-reads open question dissolves | interaction modes (§1, §3), interlocutor resolution; note phone acts' placement is Q5 |
+| [`tool_decisions.md`](tool_decisions.md) | "vocabulary moved onto the argument axis" — it moves onto the **route axis**; `read`/`claim`/`release` as body tools (§2, §3) reopen (read → `scan` and the internal `GET`) | §1 belief-write prohibition (reinforced, §9.2); tool-shape/argument-binding sections |
+| [`tool_interaction_reconciliation.md`](tool_interaction_reconciliation.md) | "25 `*_read_*` tools vs one `observe`" (§4.2) — reads are now `scan` and the internal `GET`; the 25-reads open question dissolves | interaction modes (§1, §3), interlocutor resolution; note phone acts' placement is Q5 |
 | [`tool_world_state.md`](tool_world_state.md) | the "129 tools" framing; `bench_`/`file_` as tools | most of it — the four stores and the namespace→store table become the **route-handler** spec (§9) |
 
 **Tier 2 — engine & wire contract (section rewrites + additions).**
@@ -1217,7 +1275,7 @@ changes. Ordered by how load-bearing the contradiction is.
   extension story is re-scoped to the attachable world-routes provider (§9.1).
   "Tools carry intent, not output" stays.
 - [`npc_api_gui_design.md`](npc_api_gui_design.md) — `/v1/tools` and `ToolInfo`
-  (§9, §10) now describe only the compiled frame (body + `query`/`invoke`); add a
+  (§9, §10) now describe only the compiled frame (body + `invoke`); add a
   new operator route exposing the `local` route map for console inspection; document
   the external effector mount `/v1/local/...` and its **token auth** (§8.2–8.3) as a
   new auth path beside the gateway headers. It already draws "Battle Cities
@@ -1276,7 +1334,7 @@ is flagged **[no handler yet]** — that route is the work Step 6 lands, per Par
 
 Conventions used in every table below:
 
-- **Method** — `GET` = read (issued by `query`; `OPTIONS` is implicit on every route and
+- **Method** — `GET` = read (internal to the router: no model-facing tool issues it; `OPTIONS` is implicit on every route and
   returns the schema, §5.1). `POST` = effect (issued by `invoke`; the model never picks the
   method, §5). RPC-flavoured one-path-per-verb, per the settled decision (§16 "Route paths").
 - **Condition** beyond reachability (§7.1): `always` (reading affords it once within reach),
@@ -1352,6 +1410,13 @@ here just names which node and which ordinal.)*
 | place-index | fixture | — | — | cartography → index-room ×1 | no | `place/index-1` |
 | gallery-rail | fixture | — | — | cartography → gallery ×1 | no | `map/gallery-rail-1` |
 | road-table | fixture | — | — | cartography → road-table ×1 | no | `place/road-1` |
+| light-ring | fixture | — | steady/failing | the first work room of each of the five working levels, command → command-room, tower-redoubt → muster-hall | no | (no route; operated through `operate`) |
+| breaker-panel | fixture | — | closed/tripped | the second work room of each of the five working levels, command → plant, tower-redoubt → foundry | no | (no route; operated through `operate`) |
+| coolant-valve | fixture | — | tight/weeping | beside every breaker-panel | no | (no route; operated through `operate`) |
+| pressure-door | fixture | — | seated/hissing | the social room of each working level, command → enquiry, tower-redoubt → gatehouse | no | (no route; operated through `operate`) |
+| air-handler | fixture | — | — | the first work room of each of the five working levels, command → plant, tower-redoubt → foundry | no | (read only) |
+| compute-rack | fixture | — | — | the store or watch room of each working level, command → dispatch, tower-redoubt → bridge | no | (read only) |
+| status-board | fixture | — | — | beside every vault compute-rack, and tower-redoubt → muster-hall | no | (a posting; `read`) |
 | seat | seat | — | — | every social/work node (counts 2–16) | n/a | `room/<node>-<n>` |
 | muster-board **(war world)** | fixture | — | — | tower-redoubt → muster ×1 | no | `orders/muster-1` |
 | bridge-console **(war world)** | station | the tower | — | tower-redoubt → bridge ×1 | no | `tower/bridge-1` |
@@ -1388,7 +1453,7 @@ level.
 ## C.2 The world-state half of `WORLD_ACTS` — `acts.rs:1311`
 
 These are the sixteen Appendix A names ("world-state acts | ~18", `acts.rs:1311`). `read` and
-`scan` are **reads → GET** (dissolved into `query`, per Tier-1 `tool_world_acts.md`); the rest
+`scan` are **reads → GET** (dissolved into the router's internal `GET`, per Tier-1 `tool_world_acts.md`); the rest
 are `POST` effects. Several are not part-bound (`Availability` other than `AtPart`): their verb
 is mounted on the target thing named by their live-set (`claim`/`release`/`post_notice`/
 `record_verdict` on the room's claimable/postable/judgeable things; `give`/`equip`/`use` on the
@@ -1516,7 +1581,7 @@ Parts: character-terminal (station, `binds: one character`, modes) ×16; relatio
 
 | Route | Method | Condition | Body schema | Store | From |
 |---|---|---|---|---|---|
-| `GET .../character/<id>` (read) | GET | always | — | World | `character_read` audit §2.2 (→ `query`) **[no handler yet]** |
+| `GET .../character/<id>` (read) | GET | always | — | World | `character_read` audit §2.2 (→ `scan`) **[no handler yet]** |
 | `POST .../character/<id>/write_identity` | POST | claimed (working) | `of` free req; `what` free req | World | `CHARACTER_WRITE_IDENTITY` station.rs:393 |
 | `POST .../character/<id>/write_wants` | POST | claimed | `of` free req; `what` free req | World | `CHARACTER_WRITE_WANTS` station.rs:410 |
 | `POST .../character/<id>/write_memories` | POST | claimed | `of` free req; `what` free req | World | `CHARACTER_WRITE_MEMORIES` station.rs:426 |
@@ -1843,8 +1908,8 @@ is `/history`. Each read degrades to an empty layer if the cast is not installed
 
 ## C.28 Decisions & ambiguities
 
-1. **`read` and `scan` → `GET` (`query`), not their own POST routes.** Both are reads; per
-   Tier-1 `tool_world_acts.md` reads dissolve into `query`, so `read` is the `GET` on the target
+1. **`read` and `scan` → `GET`, not their own POST routes.** Both are reads; per
+   Tier-1 `tool_world_acts.md` reads dissolve into the internal `GET`, so `read` is the `GET` on the target
    resource and `scan` is `GET .../scan/<place>`.
 2. **`sign_off` — store and namespace.** Appendix A groups it with *world-state* acts
    (`acts.rs:1311`), but it acts on a conversation thread. **Call:** routed under
@@ -2241,7 +2306,7 @@ build follows Part F's order; this is the decision record it is built against.*
   Character writes use `bench.write_field` on the sheet (persisting through commit). This closes
   D.6 #1 for character and place; `record_*`/`structure_*` verdicts that remain RAM-only get a
   durability pass as their namespaces migrate.
-- **Grammar migration.** `query`/`invoke` join the fixed frame as `Availability::Always` tools
+- **Grammar migration.** `invoke` joins the fixed frame as an `Availability::Always` tool
   with a **free-string `url`** (`FreeText{Balanced}`), coexisting with unmigrated world/station
   tools; migrate namespace-by-namespace, deleting each namespace's `Tool`/`Choices`/`LIVE`/
   `Within` field as it moves (the `Within` shrink trails each move, §15). The `url` enum arrives
@@ -2424,7 +2489,7 @@ disagree:
   room offers nothing to work on refuses itself in the world's own words, the prescriptive
   error a character corrects against (§12).
 
-`read` and `scan` mount as `POST` verbs here rather than as `query`/GET: both route
+`read` and `scan` mount as `POST` verbs here rather than as `GET`: both route
 through `body::perform` and `read` mutates the reader's read-cursor (which is why
 `Choices::Readable` excludes what a body has already read), so they are effectful reads,
 not the pure GETs the earlier draft assumed. `engage` is `Embodied` and joins the set

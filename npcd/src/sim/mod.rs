@@ -33,6 +33,7 @@
 //! than assert that one is plausible.
 
 pub mod bench;
+pub mod decisions;
 pub mod device;
 pub mod field;
 pub mod item;
@@ -40,20 +41,24 @@ pub mod ledger;
 pub mod missions;
 pub mod phone;
 pub mod posting;
+pub mod reading;
 pub mod record;
 pub mod seed;
 pub mod tower;
+pub mod upkeep;
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::mission::bank::Duty;
+use crate::engine::mission_acts::COLLECT_MISSION;
 use bench::Benches;
 use device::Devices;
 use field::{Field, Resource};
 use item::Pack;
 use ledger::Ledger;
-use missions::Missions;
+use missions::{MissionMaterial, Missions};
 use tower::Tower;
 
 /// Everything about a world that is not its map.
@@ -518,11 +523,17 @@ impl Sim {
     }
 
     /// The material a random routine is built around, for a body named `me`: the
-    /// other makers to visit and the records to consult. `me` is left out of the
-    /// makers so a routine never sends a character to visit itself. Shared by the
-    /// desk's `collect_mission` and the engine's idle auto-assignment so the two
-    /// draw from the same world.
-    pub fn mission_material(&self, me: &str) -> (Vec<String>, Vec<String>) {
+    /// other makers to visit, the records to consult, the machines to go and
+    /// read, and the room the order table stands in. `me` is left out of the
+    /// makers so a routine never sends a character to visit itself. `room_name`
+    /// turns an `area/node` place into the name a character knows the room by;
+    /// a machine in a room it cannot name is left out, and so is every machine
+    /// in the table's own room, where there would be nowhere to go.
+    pub fn mission_material(
+        &self,
+        me: &str,
+        room_name: &dyn Fn(&str) -> Option<String>,
+    ) -> MissionMaterial {
         let makers = self
             .contacts_roster()
             .into_iter()
@@ -530,7 +541,29 @@ impl Sim {
             .collect();
         let mut records = self.record.names_of(record::Kind::Era);
         records.extend(self.record.names_of(record::Kind::Story));
-        (makers, records)
+        let table_place = self
+            .part_tools
+            .iter()
+            .find(|(_, tools)| tools.iter().any(|t| t == COLLECT_MISSION.name))
+            .map(|(place, _)| place.clone());
+        let table = table_place.as_deref().and_then(room_name);
+        let duties = self
+            .devices
+            .iter()
+            .filter(|d| Some(d.at.as_str()) != table_place.as_deref())
+            .filter_map(|d| {
+                Some(Duty {
+                    room: room_name(&d.at)?,
+                    device: d.name.clone(),
+                })
+            })
+            .collect();
+        MissionMaterial {
+            makers,
+            records,
+            duties,
+            table,
+        }
     }
 
     /// How many messages are waiting for somebody across every thread.
@@ -664,6 +697,43 @@ mod tests {
         let s = Sim::new();
         assert!(s.pack("nobody").is_empty());
         assert!(s.carried("nobody").is_empty());
+    }
+
+    /// **A mission's material is the machines to read and the table's room.**
+    /// Machines in the table's own room, and in rooms with no name, are left out.
+    #[test]
+    fn mission_material_names_the_machines_to_read_and_the_table_room() {
+        let mut s = Sim::new();
+        s.set_part_tools("hall/muster", vec![COLLECT_MISSION.name.to_string()]);
+        for (id, name, at) in [
+            ("valve", "the coolant valve", "hall/foundry"),
+            ("clock", "the wall clock", "hall/muster"),
+            ("ghost", "the lost panel", "hall/void"),
+        ] {
+            s.devices.install(device::Device::new(
+                id,
+                name,
+                device::Kind::Panel,
+                at,
+                &["ok"],
+            ));
+        }
+        let rooms = |place: &str| match place {
+            "hall/muster" => Some("the muster hall".to_string()),
+            "hall/foundry" => Some("the foundry".to_string()),
+            _ => None,
+        };
+
+        let material = s.mission_material("someone", &rooms);
+
+        assert_eq!(material.table.as_deref(), Some("the muster hall"));
+        assert_eq!(
+            material.duties,
+            vec![Duty {
+                room: "the foundry".to_string(),
+                device: "the coolant valve".to_string(),
+            }]
+        );
     }
 
     /// A cast whose phones are on the channel and nothing else.

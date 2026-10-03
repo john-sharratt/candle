@@ -68,22 +68,30 @@ use crate::engine::body::{self, Outcome};
 use crate::engine::driver::{self, Metronome};
 use crate::engine::environment;
 use crate::engine::event::{Event, EventKind, Salience};
+use crate::engine::guardian::view::Reply;
+use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::ingest;
 use crate::engine::invoke_body::Invokable;
+use crate::engine::journal::record::DraftRecord;
+use crate::engine::journal::section::JournalPrompt;
+use crate::engine::journal::workflow::{Outcome as Drafted, Timing};
+use crate::engine::journal::world::Snapshot;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
-use crate::engine::mind::{frame_fingerprint, Minds, Projected};
+use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
+use crate::engine::mission::MissionPrompt;
 use crate::engine::mission_acts;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
 use crate::engine::schema;
-use crate::engine::tick::{Pace, Scheduler, Shared as SharedScheduler};
+use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::Ledger;
 use crate::mind::Mind;
 use crate::model;
 use crate::npcs::{Casting, Npcs};
+use crate::sim::missions::Missions;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use npc_map::world::Where;
@@ -225,6 +233,12 @@ pub struct OwnedPersona {
     pub place: String,
     /// Which part of the world `place` describes — see [`Persona::building`].
     pub building: String,
+    /// The body's open mission — see [`Persona::mission`]. Filled in by the
+    /// runtime, which owns the missions.
+    pub mission: Option<MissionPrompt>,
+    /// What the character has written down — see [`Persona::journal`]. Filled in
+    /// by the runtime, which owns the journals.
+    pub journal: Option<JournalPrompt>,
     pub mode: Mode,
 }
 
@@ -244,6 +258,8 @@ impl OwnedPersona {
             world: &self.world,
             place: &self.place,
             building: &self.building,
+            mission: self.mission.as_ref(),
+            journal: self.journal.as_ref(),
         }
     }
 }
@@ -303,6 +319,9 @@ pub struct Runtime {
     /// the authored state — which needs this runtime to answer its own routes.
     /// One of the two has to exist first, and it is this one.
     clock: RwLock<Option<WorldClock>>,
+    /// What the guardian has done, for the operator route to read. `None` when
+    /// no guardian is configured.
+    guardian_log: RwLock<Option<Arc<GuardianLog>>>,
     /// **The daemon's one handle to `data/substrate/`**, opened by the
     /// character registry and adopted here rather than opened a second time.
     ///
@@ -357,7 +376,7 @@ pub struct Runtime {
     /// an `Arc` so the `local` router's auth layer and the in-process fast path
     /// resolve and mint through one handle rather than two.
     tokens: RwLock<Option<Arc<Tokens>>>,
-    /// The `local` effector router, retained so a character's `query`/`invoke`
+    /// The `local` effector router, retained so a character's `invoke`
     /// takes the in-process fast path (effector design §8.1) — the same service
     /// the external mount answers on, driven through `oneshot` with no socket.
     ///
@@ -387,6 +406,9 @@ pub struct Runtime {
     /// [`npc_map::describe::places`] order. The same text for every character
     /// standing in one, and it never changes.
     places: Mutex<BTreeMap<String, Vec<(String, String)>>>,
+    /// Each world's missions as last written to the substrate, so a beat that
+    /// changed nothing writes nothing.
+    missions_saved: Mutex<BTreeMap<String, Missions>>,
     /// The characters with a dream being written — from the moment their
     /// reflection's first question is answered to the moment the dream is kept.
     /// §7: *"At most one dream in flight per character."*
@@ -521,11 +543,15 @@ pub const MAPS: &str = "map";
 /// **Points at the work, not at the map.** The first version sent a character
 /// off to see a room it had not been in, and it did exactly that — three of
 /// them toured a seventy-eight room building for hours and came back with
-/// nothing to say, because a room is not a subject. What a Maker is for is in
-/// front of it: the ledgers, the filed stories, the wall of dates. Naming the
-/// thing within reach gives the next conversation something to be *about*,
-/// which is the difference between two characters talking and two characters
-/// exchanging weather.
+/// nothing to say, because a room is not a subject. What a character is for is
+/// in front of it, and the instruction says so without naming a thing.
+///
+/// **It names no particular object.** Every example it once carried — a ledger,
+/// a filed story, a date on the wall — belonged to one world, and it was read by
+/// the characters of all of them: one with no such thing in reach invented one,
+/// described it to a colleague, and the colleague asked after it in turn. A
+/// named thing in a standing instruction is a thing the whole cast is told to
+/// have, so what to take up is left to what the character can actually see.
 /// **One instruction, and no verb of motion in it.**
 ///
 /// This has now been wrong in three ways. It began as *go and see a room you
@@ -541,8 +567,17 @@ pub const MAPS: &str = "map";
 /// its own when the character has something worth carrying.
 pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your own. That is \
                               not nothing to do: the work is in front of you. Take up one thing \
-                              within reach — a ledger, a filed story, a date on the wall — and \
-                              carry it far enough to have a view about it you could defend.";
+                              you can actually see or read here, and carry it far enough to have \
+                              a view about it you could defend. If nothing here has anything for \
+                              you, say so.";
+
+/// What a character is told when its mission is called off: the errand is
+/// withdrawn, nothing of it is still owed, and what it said about it earlier is
+/// no longer a commitment.
+pub const MISSION_WITHDRAWN: &str = "The errand you were on has been withdrawn. It is no longer \
+                                     yours to finish and there is nothing to report on it. Put it \
+                                     down, and do not carry its subject into what you do next \
+                                     unless somebody raises it again.";
 
 /// Substrate key for the durable command-table open flag — see
 /// [`Runtime::set_table_open`], which writes it, and [`Runtime::host`], which
@@ -550,6 +585,11 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
 /// drives every loaded world identically, so the flag is a single daemon-wide
 /// state rather than per-world.
 pub const TABLE_OPEN_KEY: &str = "command-table";
+
+/// Substrate key for one world's missions — see [`Runtime::checkpoint_missions`].
+fn missions_key(world: &str) -> String {
+    format!("missions/{world}")
+}
 
 /// What a character with no mission is set on **while the command table is
 /// open**: go to it and take one up.
@@ -570,10 +610,10 @@ pub const TO_THE_TABLE: &str =
      lift, call it with `lift_call`, ride it to the command level with \
      `lift_use`, and then `move_to` the command room — you cannot walk between \
      floors. This comes before talk — do not answer the room, go. Once you are \
-     there, the table is on your effector device: `query` its address (your \
-     device lists it) to see what it offers, then take up a mission by `invoke` \
-     on its `collect_mission`. Carry it out, and when it is done come back and \
-     report it at the table the same way, then take up the next.";
+     there, the table is on your effector device: `scan` to see what it offers, \
+     then take up a mission by `invoke` on its `collect_mission`. Carry it out, \
+     and when it is done come back and report it at the table the same way, then \
+     take up the next.";
 
 /// [`TO_THE_TABLE`] for a character whose table is **on its own level**: no lift,
 /// no floors, just a room to walk to. `{room}` is the room the table stands in.
@@ -581,10 +621,10 @@ pub const TO_THE_TABLE_ON_FOOT: &str =
     "The command table is open and there is work waiting for you. Leave off \
      whatever you are doing or saying and go to it now. The table is in {room}: \
      `move_to` it. This comes before talk — do not answer the room, go. Once you \
-     are there, the table is on your effector device: `query` its address (your \
-     device lists it) to see what it offers, then take up a mission by `invoke` \
-     on its `collect_mission`. Carry it out, and when it is done come back and \
-     report it at the table the same way, then take up the next.";
+     are there, the table is on your effector device: `scan` to see what it \
+     offers, then take up a mission by `invoke` on its `collect_mission`. Carry \
+     it out, and when it is done come back and report it at the table the same \
+     way, then take up the next.";
 
 /// The summons for a character that is **already at the table** with no mission.
 ///
@@ -596,11 +636,10 @@ pub const TO_THE_TABLE_ON_FOOT: &str =
 pub const AT_THE_TABLE: &str =
     "You are at the command table, where the work is handed out, and you are \
      carrying nothing. Do not walk away and do not stand here talking. The table \
-     is on your effector device: `query` its address (your device lists it — \
-     \"the table\") to see what it offers, then take up a mission now by `invoke` \
-     on its `collect_mission`. Once it is yours, carry it out, and when it is \
-     done come back and `invoke` the table's `report_done` — or `report_stuck` if \
-     it will not finish — then take up the next.";
+     is on your effector device: `scan` to see what it offers, then take up a \
+     mission now by `invoke` on its `collect_mission`. Once it is yours, carry it \
+     out, and when it is done come back and `invoke` the table's `report_done` — \
+     or `report_stuck` if it will not finish — then take up the next.";
 
 /// How long a character must go without news before the standing task is
 /// restated to it.
@@ -656,14 +695,14 @@ const SUMMONS_AFTER_MS: u64 = 30_000;
 /// answers.** "Say what you have been looking at" produced characters agreeing
 /// with each other about silence and gaps for a hundred turns — three of them
 /// converging on one abstraction because none had named a thing. A conversation
-/// about work needs a *piece* of work in it: a page, a date, a disagreement
-/// with a colleague's entry.
+/// about work needs a *piece* of work in it, and it has to be one the character
+/// has: something it actually read or saw, which is why no example is given —
+/// a given example is the thing every character then reports having read.
 pub const IN_COMPANY: &str = "Nothing has been asked of you, and you are not alone. {who} \
                               here with you. `tell` or `ask` something about the work, now, and \
-                              name a particular thing — a page you read, a date that will not \
-                              reconcile, an entry of theirs you doubt. Ask them something they \
-                              have to answer, or answer what they asked you. Address them \
-                              exactly as written.";
+                              name a particular thing you have actually seen or read here — or \
+                              ask them what they have. Ask them something they have to answer, \
+                              or answer what they asked you. Address them exactly as written.";
 
 /// What came of saying something to a character on its handset.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -699,6 +738,7 @@ impl Runtime {
             // between a twelve-second boot and half an hour of one.
             ledger: Arc::new(Ledger::open(data)),
             clock: RwLock::new(None),
+            guardian_log: RwLock::new(None),
             substrate: RwLock::new(None),
             npcs: RwLock::new(None),
             minds: RwLock::new(None),
@@ -712,6 +752,7 @@ impl Runtime {
             bodies: Bindings::new(),
             metronomes: Mutex::new(BTreeMap::new()),
             places: Mutex::new(BTreeMap::new()),
+            missions_saved: Mutex::new(BTreeMap::new()),
             dreaming: Mutex::new(HashSet::new()),
             reflect_domain: AtomicUsize::new(0),
             feelings: RwLock::new(Vec::new()),
@@ -776,7 +817,22 @@ impl Runtime {
                     .and_then(|obj| obj.blob.get("open").and_then(|v| v.as_bool()))
             })
             .unwrap_or(true);
-        world.with_sim(|s| s.table_open = open);
+        let restored = self.substrate.read().unwrap().clone().and_then(|shared| {
+            let obj = shared.custom_object(&missions_key(id))?;
+            serde_json::from_value::<Missions>(obj.blob).ok()
+        });
+        if let Some(missions) = &restored {
+            self.missions_saved
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), missions.clone());
+        }
+        world.with_sim(|s| {
+            s.table_open = open;
+            if let Some(missions) = restored {
+                s.missions = missions;
+            }
+        });
         let back = Arc::downgrade(self);
         let name = id.to_string();
         let moving = world.clone();
@@ -794,6 +850,7 @@ impl Runtime {
             if rt.moment(&moving).moved > 0 {
                 rt.checkpoint_places(&moving);
             }
+            rt.checkpoint_missions(&moving);
         });
         self.metronomes.lock().unwrap().insert(name, beat);
         Ok(world)
@@ -828,7 +885,9 @@ impl Runtime {
         }
         self.bodies.bind(npc_id, world, body)?;
         self.scheduler.set_pace(npc_id, Pace::WORKING, now_ms);
-        environment::push_one(&hosted, &self.scheduler, npc_id, body);
+        environment::push_one(&hosted, &self.scheduler, npc_id, body, &|id| {
+            self.world_ms(id)
+        });
         Ok(())
     }
 
@@ -917,8 +976,9 @@ impl Runtime {
     /// What a character is set on, as the turn that keeps it on course.
     ///
     /// One standing instruction, restated whenever nothing else is happening.
-    /// A character with a mission gets that mission; a character with none gets
-    /// [`NO_MISSION`] — which is not a placeholder for one. A person with
+    /// A character with a mission gets nothing, because its mission is in its
+    /// prompt; a character with none gets [`NO_MISSION`] — which is not a
+    /// placeholder for one. A person with
     /// nothing assigned does not stand still, and neither should a character:
     /// looking around and talking to people is what there is to do.
     pub fn nudge_for(&self, npc_id: u64) -> Option<String> {
@@ -926,22 +986,17 @@ impl Runtime {
         // explore and nobody to talk to, and telling it otherwise would be
         // instructing it to do something it cannot.
         let (hosted, body) = self.body_of(npc_id)?;
-        // A carried mission *is* the standing task, so it replaces the "nothing
-        // has been asked of you" default outright — it does not fill a hole that
-        // default was leaving (see [`NO_MISSION`]). The mission's own text names
-        // the next step and, when the steps run out, points at reporting it.
+        // A carried mission is already in the character's system prompt (see
+        // [`Persona::mission`]), so there is no standing task to restate: saying
+        // its wording again on a clock is what reads as a loop.
         //
         // With no mission but the command table open, the standing task is to go
         // and take one up — so an idle character makes its way there rather than
         // settling where it stands. See [`TO_THE_TABLE`].
-        let (on_mission, table_open) = hosted.sim(|s| {
-            (
-                s.missions.active(&body).map(|m| m.standing_text()),
-                s.table_open,
-            )
-        });
-        if let Some(text) = on_mission {
-            return Some(text);
+        let (on_mission, table_open) =
+            hosted.sim(|s| (s.missions.is_on_mission(&body), s.table_open));
+        if on_mission {
+            return None;
         }
         if let Some(way) = self.command_table_way(npc_id).filter(|_| table_open) {
             // Location-aware, the same split the active summons makes (see
@@ -1118,19 +1173,35 @@ impl Runtime {
         }
     }
 
-    /// Cancel a character's open mission, if it has one. Returns whether one was
-    /// cancelled — it is called off, not reported, so it is not kept.
-    pub fn cancel_mission(&self, npc_id: u64) -> bool {
-        self.body_of(npc_id)
-            .is_some_and(|(hosted, body)| hosted.with_sim(|s| s.missions.cancel(&body)))
+    /// Cancel a character's open mission, if it has one, and tell it so
+    /// ([`MISSION_WITHDRAWN`]) at `world_ms`. Returns whether one was cancelled —
+    /// it is called off, not reported, so it is not kept. Without the notice the
+    /// character keeps working from its history and its own thread what the
+    /// mission was, long after the mission is gone.
+    pub fn cancel_mission(&self, npc_id: u64, world_ms: u64) -> bool {
+        let cancelled = self
+            .body_of(npc_id)
+            .is_some_and(|(hosted, body)| hosted.with_sim(|s| s.missions.cancel(&body)));
+        if cancelled {
+            self.scheduler.deliver(
+                npc_id,
+                world_ms,
+                Salience::URGENT,
+                EventKind::Nudge {
+                    text: MISSION_WITHDRAWN.to_string(),
+                },
+            );
+        }
+        cancelled
     }
 
-    /// Cancel every character's open mission. Returns how many were cancelled.
-    pub fn cancel_all_missions(&self) -> usize {
+    /// Cancel every character's open mission, each noticed at the world time
+    /// `world_ms` gives for it. Returns how many were cancelled.
+    pub fn cancel_all_missions(&self, world_ms: impl Fn(u64) -> u64) -> usize {
         self.scheduler
             .census()
             .into_iter()
-            .filter(|c| self.cancel_mission(c.npc_id))
+            .filter(|c| self.cancel_mission(c.npc_id, world_ms(c.npc_id)))
             .count()
     }
 
@@ -1179,18 +1250,16 @@ impl Runtime {
         // read, from [`World::lift_within`], so the situation and the grammar
         // cannot disagree about it.
         let (at_lift, lift_here, floors) = hosted.read(|w| w.lift_within(&body));
-        // The addresses reachable from here, as the near-you index lists them —
-        // the live enums `query`'s and `invoke`'s `url` are bound to, so the
-        // grammar forces a real address the device actually shows and a character
-        // can never `query` a hallucinated one nor `invoke` a bare resource
-        // (effector design §6; `Choices::QueryUrl` / `Choices::InvokeUrl`).
-        let (reachable, invokable) = self.reachable_urls(&hosted, &body, at_lift);
+        // The verb-paths reachable from here — the live enum `invoke`'s `url` is
+        // bound to, so the grammar forces a real address the device serves and a
+        // character can never `invoke` a hallucinated one or a bare resource
+        // (effector design §6; `Choices::InvokeUrl`).
+        let invokable = self.invokable_urls(&hosted, &body);
         let base = tools::Within {
             company,
             at_lift,
             lift_here,
             floors,
-            reachable,
             invokable,
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
@@ -1248,42 +1317,16 @@ impl Runtime {
         }
     }
 
-    /// The addresses reachable from where `body` stands — the near-you index as
-    /// two flat lists of urls, for the grammar's `query` and `invoke` enums
-    /// ([`tools::Choices::QueryUrl`] / [`tools::Choices::InvokeUrl`]).
+    /// The verb-paths an `invoke` may act on from where `body` stands, for the
+    /// grammar's `invoke` enum ([`tools::Choices::InvokeUrl`]).
     ///
-    /// The **sync twin** of the async near-you index (`GET http://local/`, see
-    /// [`crate::effector::router`]): the same personal routes, the lift at a
-    /// landing, and every placed instance's url — computed straight off the map so
-    /// the device screen a character reads and the addresses its grammar will let
-    /// it name are one set. Returns `(query, invoke)`:
-    ///
-    /// - **query** — a resource per line: the personal routes, the lift, the url
-    ///   of each instance a route serves ([`address_of`]), and the bare
-    ///   `http://local/` so the whole index can be re-read. A part no route
-    ///   answers for (a seat, a blast door) is not listed, so `query` can only
-    ///   ever name an address that answers.
-    /// - **invoke** — a whole verb-path per line: `<instance-url>/<verb>` for
-    ///   every verb a served instance affords ([`station::verbs_at`]), with the
-    ///   act each one runs. `invoke` can only ever name a verb the world will
-    ///   actually serve — not a bare resource, not a missing verb.
-    fn reachable_urls(
-        &self,
-        hosted: &Arc<Hosted>,
-        body: &str,
-        at_landing: bool,
-    ) -> (Vec<String>, Vec<Invokable>) {
-        let mut query = vec![
-            "http://local/".to_string(),
-            "http://local/here".to_string(),
-            "http://local/history".to_string(),
-            "http://local/phone".to_string(),
-            "http://local/self".to_string(),
-        ];
+    /// One per verb a served instance affords: `<instance-url>/<verb>`
+    /// ([`address_of`], [`station::verbs_at`]), with the act each one runs,
+    /// computed straight off the map. A part no route answers for (a seat, a
+    /// blast door) is not listed, so `invoke` can only ever name a verb the world
+    /// will actually serve — not a bare resource, not a missing verb.
+    fn invokable_urls(&self, hosted: &Arc<Hosted>, body: &str) -> Vec<Invokable> {
         let mut invoke = Vec::new();
-        if at_landing {
-            query.push("http://local/lift/command-shaft".to_string());
-        }
         hosted.read(|w| {
             if let Some(at) = w.actor(body).map(|a| a.at.clone()) {
                 for inst in w.map().instances_at(&at) {
@@ -1293,11 +1336,10 @@ impl Runtime {
                     for (verb, tool) in station::verbs_at(inst.part_id()) {
                         invoke.push(Invokable::new(format!("{url}/{verb}"), tool.name));
                     }
-                    query.push(url);
                 }
             }
         });
-        (query, invoke)
+        invoke
     }
 
     /// Walk a person into the world, beside the character they came to see.
@@ -1399,7 +1441,9 @@ impl Runtime {
     /// The order matters: journeys first, so a visitor follows to where the
     /// character ended up rather than where it set out from.
     pub fn moment(&self, hosted: &Hosted) -> environment::Moment {
-        let moment = environment::advance(hosted, &self.bodies, &self.scheduler);
+        let moment = environment::advance(hosted, &self.bodies, &self.scheduler, &|id| {
+            self.world_ms(id)
+        });
         self.keep_visitors_with_their_hosts(hosted);
         self.show_out_the_expired();
         moment
@@ -1760,6 +1804,16 @@ impl Runtime {
         *self.clock.write().unwrap() = Some(clock);
     }
 
+    /// Install the log of the guardian that is running.
+    pub fn set_guardian_log(&self, log: Arc<GuardianLog>) {
+        *self.guardian_log.write().unwrap() = Some(log);
+    }
+
+    /// The running guardian's log; `None` when there is no guardian.
+    pub fn guardian_log(&self) -> Option<Arc<GuardianLog>> {
+        self.guardian_log.read().unwrap().clone()
+    }
+
     /// Supply the character-state resolver. Called once at startup, before the
     /// driver runs.
     pub fn set_persona_source(&self, src: PersonaSource) {
@@ -1812,114 +1866,28 @@ impl Runtime {
         *self.effector.write().unwrap() = Some(router);
     }
 
-    /// Drive the effector device in-process for a character (effector design
-    /// §8.1) and return the JSON it answers.
-    ///
-    /// This is the fast path every in-fiction `query` takes: it skips the
-    /// socket, not the API. It builds a real `http::Request`, stamps the
-    /// character's bearer token — and **never** an `x-tokera-*`, or the operator
-    /// middleware would read the character as a human — and invokes the retained
-    /// `local` router through `oneshot`, the identical service the external mount
-    /// answers on. The in-fiction call always acts as the character's own body,
-    /// so it carries the as-npc scope and can never reach past its standpoint.
-    ///
-    /// **Never call this while holding the world lock.** A handler behind the
-    /// router acquires that lock itself, so re-entering here from inside a
-    /// `hosted.with(...)`/`read(...)` closure would deadlock the non-reentrant
-    /// world mutex silently (effector design §8.1). Acquire, act, release, then
-    /// query — as the lift handlers already do.
-    pub async fn effector_query(
-        &self,
-        npc_id: u64,
-        path: &str,
-        pinned: Option<&npc_map::world::Where>,
-    ) -> anyhow::Result<Value> {
-        let (status, value) = self
-            .effector_call(npc_id, "GET", path, None, pinned)
-            .await?;
-        // A `query` is a read that is expected to answer — a non-2xx is a bug in
-        // the caller's path, not a normal outcome — so it is surfaced as an
-        // error rather than handed back. (`invoke` keeps the status, because a
-        // 409 refusal there is an ordinary answer the caller maps.)
-        anyhow::ensure!(
-            status.is_success(),
-            "effector {path} answered {status}: {value}"
-        );
-        Ok(value)
-    }
-
-    /// The near-you index, fetched for this turn and rendered as the character's
-    /// dynamic **YOUR EFFECTOR DEVICE** system-prompt section (effector design
-    /// §6).
-    ///
-    /// This is the async fetch-and-render seam: [`Self::effector_query`] is
-    /// async, so the index is fetched here, on the engine's async path, and the
-    /// rendered section is handed down to the turn's prompt assembly
-    /// ([`crate::engine::mind::Minds::think`]) — never fetched from inside the
-    /// synchronous prompt-building code. It is recomputed every turn from the
-    /// body's current standpoint, so the section supersedes rather than
-    /// accumulates.
-    ///
-    /// **It never fails the turn.** A device that is not installed (a test path
-    /// with no router or token store), a fetch that errored, or an index that is
-    /// empty or shapeless all degrade to `None` — no section this turn — rather
-    /// than an error propagated up the tick. Only the ambient list moves to the
-    /// prompt; the `query`/`invoke` calls and their `<tool_response>`s stay
-    /// inline (§6).
-    ///
-    /// **Never holds the world lock across the await.** `effector_query`
-    /// acquires and releases the non-reentrant world lock inside the router
-    /// (§8.1); this method holds nothing while it awaits.
-    ///
-    /// Driven each turn from [`character_loop`], which delivers the rendered
-    /// section as a superseding [`crate::engine::event::EventKind::Reachable`]
-    /// percept.
-    pub(crate) async fn near_you_section(&self, npc_id: u64) -> Option<String> {
-        // No pin: this is fetched at the head of the tick, before the decode, so
-        // the live standpoint already is the grammar-time one.
-        let index = self.effector_query(npc_id, "/", None).await.ok()?;
-        prompt::near_you_section(&index)
-    }
-
     /// Act at an effector address in-process — the `invoke` fast path (effector
-    /// design §8.1), the counterpart to [`Self::effector_query`].
+    /// design §8.1).
     ///
-    /// Same machinery as a query — the as-npc bearer token stamped on the
-    /// request ([`Tokens::ensure`], **never** an `x-tokera-*`), the retained
-    /// `local` router driven through `oneshot`, no socket — but a `POST` carrying
-    /// a JSON body. It returns the status alongside the value rather than erroring
-    /// on a non-2xx, because a refusal (`409`, §12) is a legitimate answer to an
-    /// act: the world would not have it, and the caller reads the status and the
-    /// body the way an external client would.
+    /// It skips the socket, not the API: it builds a real `http::Request`, stamps
+    /// the character's as-npc bearer token ([`Tokens::ensure`], **never** an
+    /// `x-tokera-*`, or the operator middleware would read the character as a
+    /// human) and drives the retained `local` router through `oneshot`, the
+    /// identical service the external mount answers on — a `POST` carrying a JSON
+    /// body. It returns the status alongside the value rather than erroring on a
+    /// non-2xx, because a refusal (`409`, §12) is a legitimate answer to an act:
+    /// the world would not have it, and the caller reads the status and the body
+    /// the way an external client would.
     ///
     /// **Never call this while holding the world lock** — the handler behind the
     /// router takes that lock itself, so re-entering from inside a
     /// `hosted.with(...)`/`read(...)` closure deadlocks the non-reentrant world
-    /// mutex silently. Acquire, act, release, then invoke.
+    /// mutex silently (effector design §8.1). Acquire, act, release, then invoke.
     pub async fn effector_invoke(
         &self,
         npc_id: u64,
         path: &str,
         body: Value,
-        pinned: Option<&npc_map::world::Where>,
-    ) -> anyhow::Result<(StatusCode, Value)> {
-        self.effector_call(npc_id, "POST", path, Some(body), pinned)
-            .await
-    }
-
-    /// Drive the retained `local` router in-process for a character, the shared
-    /// core of [`Self::effector_query`] and [`Self::effector_invoke`].
-    ///
-    /// Stamps the character's own as-npc bearer token and no gateway header, so
-    /// the device middleware resolves it as the body and never as a human, and
-    /// returns the status and parsed JSON so each caller applies its own rule to
-    /// a non-2xx.
-    async fn effector_call(
-        &self,
-        npc_id: u64,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
         pinned: Option<&npc_map::world::Where>,
     ) -> anyhow::Result<(StatusCode, Value)> {
         let router = self
@@ -1937,7 +1905,7 @@ impl Runtime {
         // scope must never become the in-fiction identity (§8.3).
         let token = tokens.as_npc(npc_id)?;
         let mut builder = HttpRequest::builder()
-            .method(method)
+            .method("POST")
             .uri(path)
             .header(AUTHORIZATION, format!("Bearer {token}"));
         // Pin the reach check to where the body stood when this turn's grammar
@@ -1947,12 +1915,9 @@ impl Runtime {
         if let Some(at) = pinned {
             builder = builder.extension(PinnedStandpoint(at.clone()));
         }
-        let request = match body {
-            Some(value) => builder
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(to_vec(&value)?))?,
-            None => builder.body(Body::empty())?,
-        };
+        let request = builder
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(to_vec(&body)?))?;
 
         // The router's error type is `Infallible`, so this cannot fail; the
         // `expect` documents that rather than papering over a real error.
@@ -1966,46 +1931,21 @@ impl Runtime {
         Ok((status, value))
     }
 
-    /// The `OPTIONS` schema of a resource address, or `None` for the GET-only
-    /// addresses (the index, `/history`, `/self`) and for any address that does
-    /// not answer `OPTIONS`.
-    async fn schema_of(
-        &self,
-        npc_id: u64,
-        path: &str,
-        pinned: Option<&npc_map::world::Where>,
-    ) -> Option<Value> {
-        let bare = path.split('?').next().unwrap_or(path);
-        let get_only = bare == "/" || bare.starts_with("/history") || bare.starts_with("/self");
-        if get_only {
-            return None;
-        }
-        match self
-            .effector_call(npc_id, "OPTIONS", path, None, pinned)
-            .await
-        {
-            Ok((status, options)) if status.is_success() => Some(options),
-            _ => None,
-        }
-    }
-
-    /// Enact one effector-device call — `query` or `invoke` — on the async fast
-    /// path and build the same [`Recorded`] a body act produces through
+    /// Enact one effector-device call — `invoke` — on the async fast path and
+    /// build the same [`Recorded`] a body act produces through
     /// [`Self::record_act`], so the character reads a device call's outcome back
     /// exactly as it reads any other act's (effector design §5, §6, §12).
     ///
-    /// **The two verbs, and what comes back.** `query` reads and its `answer` is
-    /// the value the address returned — the `<tool_response>` the character reads
-    /// next turn. `invoke` acts and its `answer` is the status and value together:
-    /// the receipt the world hands back *this* turn (§10), a `200` acknowledgement
-    /// or a `409` refusal in the world's own words (§12). The lasting effect of an
-    /// `invoke` arrives later through perception, not through this return value.
+    /// **What comes back.** `invoke` acts and its `answer` is the world's own
+    /// line: the receipt the world hands back *this* turn (§10), a `200`
+    /// acknowledgement or a `409` refusal in the world's own words (§12). The
+    /// lasting effect arrives later through perception, not through this return
+    /// value.
     ///
     /// **The url becomes a router path** via [`device_path`]: a leading
     /// `http://local` — the only host the device can reach in-fiction (§7) — is
     /// stripped, so `http://local/lift/command-shaft/call` and the bare
-    /// `/lift/command-shaft/call` address the same route, and `http://local/`
-    /// reaches the near-you index at `/`.
+    /// `/lift/command-shaft/call` address the same route.
     ///
     /// **The `invoke` body is a JSON object** (§11), and the grammar writes it as
     /// one, typed by the address it was sent to ([`crate::engine::invoke_body`]).
@@ -2017,9 +1957,8 @@ impl Runtime {
     /// A cooldown is charged only when the call landed, mirroring `record_act`.
     ///
     /// **Never holds the world lock across the await.** It calls
-    /// [`Self::effector_query`] / [`Self::effector_invoke`], whose handlers take
-    /// the non-reentrant world lock themselves; this method holds nothing, so the
-    /// lock is never re-entered (§8.1).
+    /// [`Self::effector_invoke`], whose handler takes the non-reentrant world lock
+    /// itself; this method holds nothing, so the lock is never re-entered (§8.1).
     pub(crate) async fn enact_device(
         &self,
         npc_id: u64,
@@ -2036,38 +1975,6 @@ impl Runtime {
         let path = device_path(&url);
 
         match act.tool {
-            "query" => match self.effector_query(npc_id, &path, pinned).await {
-                Ok(value) => {
-                    // A resource query also fetches the `OPTIONS` schema, which
-                    // rides back inline so the character can read what the
-                    // resource accepts. The index and personal readables are
-                    // GET-only and carry none. The feed line just names what was
-                    // looked at.
-                    let schema = self.schema_of(npc_id, &path, pinned).await;
-                    let answer = match schema {
-                        Some(schema) => {
-                            let bundled = json!({ "state": value, "schema": schema });
-                            to_string(&bundled).unwrap_or_else(|_| bundled.to_string())
-                        }
-                        None => to_string(&value).unwrap_or_else(|_| value.to_string()),
-                    };
-                    self.cooldowns.took_act(npc_id, act);
-                    Recorded {
-                        feed: format!("query {url}"),
-                        answer,
-                        landed: true,
-                        departing: false,
-                    }
-                }
-                // A read that did not answer — no such address here, or out of
-                // reach. The character is told plainly and nothing is charged.
-                Err(why) => Recorded {
-                    feed: format!("query {url} {REFUSED} {why}"),
-                    answer: format!("The device could not read {url}: {why}"),
-                    landed: false,
-                    departing: false,
-                },
-            },
             "invoke" => {
                 let body = match act.args.get("body") {
                     None => json!({}),
@@ -2143,9 +2050,9 @@ impl Runtime {
                     },
                 }
             }
-            // Only `query`/`invoke` are device acts (`body::is_device`), and the
-            // loop routes nothing else here — this arm is the honest answer if it
-            // ever does, rather than a silent success.
+            // Only `invoke` is a device act (`body::is_device`), and the loop
+            // routes nothing else here — this arm is the honest answer if it ever
+            // does, rather than a silent success.
             other => Recorded {
                 feed: other.to_string(),
                 answer: format!("Nothing on your device answers `{other}`."),
@@ -2202,6 +2109,33 @@ impl Runtime {
         });
         for (npc_id, at) in standing {
             sink(npc_id, &at);
+        }
+    }
+
+    /// Write a world's missions to the substrate when they differ from what was
+    /// last written, so a reboot finds every character's mission, its steps and
+    /// the queue behind it as they stood.
+    fn checkpoint_missions(&self, hosted: &Hosted) {
+        let Some(shared) = self.substrate.read().unwrap().clone() else {
+            return;
+        };
+        let now = hosted.with_sim(|s| s.missions.clone());
+        let mut saved = self.missions_saved.lock().unwrap();
+        if saved.get(hosted.id()) == Some(&now) {
+            return;
+        }
+        let blob = match serde_json::to_value(&now) {
+            Ok(blob) => blob,
+            Err(e) => {
+                tracing::warn!("encoding missions failed: {e}");
+                return;
+            }
+        };
+        match shared.put_custom_object(CustomObjectPayload::new(missions_key(hosted.id()), blob)) {
+            Ok(()) => {
+                saved.insert(hosted.id().to_string(), now);
+            }
+            Err(e) => tracing::warn!("persisting missions failed: {e}"),
         }
     }
 
@@ -2404,6 +2338,128 @@ impl Runtime {
         minds
             .dream(npc_id, &who.as_persona(), brief, assumption)
             .await
+    }
+
+    /// What a journal draft checks its claims against: the tower's state when the
+    /// character has a body in a world that has one, nothing otherwise.
+    fn journal_world(&self, npc_id: u64) -> Snapshot {
+        self.body_of(npc_id)
+            .and_then(|(hosted, _)| {
+                hosted.with_both(|_, sim| sim.tower.as_ref().map(Snapshot::of_tower))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Act on the guardian's answer to whether the stretch waiting is worth a
+    /// journal entry. `false` when there is no stretch to act on: another draft
+    /// is running, or the stretch was taken since the question was put.
+    ///
+    /// A no covers the stretch, so it is not asked about again; a yes drafts it,
+    /// as a task of its own. The time the answer took is carried into the record
+    /// of the draft either way.
+    pub fn decide_journal(self: &Arc<Self>, npc_id: u64, worth: bool, reply: &Reply) -> bool {
+        let Some(due) = self.scheduler.journal_begin(npc_id) else {
+            return false;
+        };
+        if worth {
+            self.spawn_journal(npc_id, due, reply.ms);
+        } else {
+            let mut state = due.state.lock().unwrap();
+            state.nothing_to_write(&due.span);
+            let why = if reply.reason.trim().is_empty() {
+                "the character judged the stretch not worth an entry".to_string()
+            } else {
+                reply.reason.trim().to_string()
+            };
+            state.record(
+                DraftRecord::of(&due.span, Duration::ZERO, &Drafted::Nothing { why }).timed(
+                    Timing {
+                        gate_ms: reply.ms,
+                        write_ms: 0,
+                    },
+                ),
+            );
+        }
+        true
+    }
+
+    /// Write a journal entry for the stretch in `due`, as a task of its own.
+    /// `gate_ms` is how long the question that asked for it took.
+    ///
+    /// Nobody waits on it: the character carries on turn by turn while the draft
+    /// runs in conversations of its own. A runtime with no executor to spawn on
+    /// cannot draft, and says so, handing the stretch back to be covered later.
+    pub fn spawn_journal(self: &Arc<Self>, npc_id: u64, due: Due, gate_ms: u64) {
+        match &self.spawner {
+            Some(handle) => {
+                let rt = Arc::clone(self);
+                handle.spawn(async move { rt.journal_now(npc_id, due, gate_ms).await });
+            }
+            None => {
+                due.state.lock().unwrap().abandon();
+                tracing::warn!("npc {npc_id}: no executor to write a journal entry on");
+            }
+        }
+    }
+
+    /// Draft one journal entry and log how it ended. Logged, never returned: an
+    /// entry that did not land costs an entry, and the same turns are covered
+    /// again at the next draft.
+    async fn journal_now(&self, npc_id: u64, due: Due, gate_ms: u64) {
+        let started = Instant::now();
+        let not_started = |why: String| {
+            let mut state = due.state.lock().unwrap();
+            state.abandon();
+            state.record(DraftRecord::not_started(&due.span, started.elapsed(), why));
+        };
+        let Some(minds) = self.minds.read().unwrap().clone() else {
+            not_started("no mind to ask".into());
+            return;
+        };
+        let Some(who) = self.persona_of_async(npc_id).await else {
+            not_started("no persona for this character".into());
+            return;
+        };
+        let world = self.journal_world(npc_id);
+        let within = self.within(npc_id);
+        let drafted = minds
+            .journal(npc_id, &who.as_persona(), &within, &due, &world)
+            .await;
+        match &drafted {
+            Ok((outcome, timing)) => due.state.lock().unwrap().record(
+                DraftRecord::of(&due.span, started.elapsed(), outcome)
+                    .timed(Timing { gate_ms, ..*timing }),
+            ),
+            Err(e) => {
+                tracing::warn!("npc {npc_id}: the journal entry could not start — {e:#}");
+                not_started(format!("{e:#}"));
+                return;
+            }
+        }
+        match drafted {
+            Ok((
+                Drafted::Wrote {
+                    entry,
+                    notes,
+                    rounds,
+                },
+                _,
+            )) => tracing::info!(
+                "npc {npc_id}: journal entry {} kept in {:?} after {rounds} round(s), {} check note(s)",
+                entry.id,
+                started.elapsed(),
+                notes.len(),
+            ),
+            Ok((Drafted::Nothing { why }, _)) => tracing::info!(
+                "npc {npc_id}: nothing worth a journal entry in turns {}–{} — {why}",
+                due.span.from_turn,
+                due.span.to_turn,
+            ),
+            Ok((Drafted::Abandoned(why), _)) => {
+                tracing::warn!("npc {npc_id}: the journal entry was not written — {why:?}")
+            }
+            Err(_) => {}
+        }
     }
 
     /// Claim this character's one reflection slot, if a reflection can run.
@@ -2614,6 +2670,32 @@ impl Runtime {
         Some(self.place_persona(npc_id, who))
     }
 
+    /// Put `question` to a character and force an answer — see [`Minds::ask`].
+    ///
+    /// Waits for the character's own turn boundary, then reads it as it stands
+    /// now: its persona, the room it is in, the mission it is carrying.
+    pub async fn ask(
+        &self,
+        npc_id: u64,
+        question: &str,
+        choices: &[String],
+    ) -> anyhow::Result<Answer> {
+        let minds = self
+            .minds
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the engine is not loaded"))?;
+        let persona = self
+            .persona_of_async(npc_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("npc {npc_id} has no persona"))?;
+        let within = self.within(npc_id);
+        minds
+            .ask(npc_id, &persona.as_persona(), &within, question, choices)
+            .await
+    }
+
     /// Put the resolved persona in the building its body stands in — which the
     /// authored record knows nothing about, because it comes from the map and
     /// the body. Only that one building: a world holds more than one, and a
@@ -2627,7 +2709,12 @@ impl Runtime {
                 who.building = key;
                 who.place = text;
             }
+            who.mission = hosted.sim(|s| s.missions.active(&body).map(|m| m.prompt()));
         }
+        who.journal = self
+            .scheduler
+            .journal_of(npc_id, |j| j.prompt())
+            .filter(|p| !p.is_empty());
         who
     }
 
@@ -2739,8 +2826,6 @@ pub struct LoadPlan {
     /// identity collections. Read in `main` where the registries live and
     /// installed on the loader thread — see [`crate::engine::identity`].
     pub authored: identity::Authored,
-    /// The world clock at startup.
-    pub world_ms: u64,
     /// Retire every character's conversation before the cast wakes, so each
     /// opens a fresh one — `--forget-conversations`. See
     /// [`Minds::forget_conversations`].
@@ -2748,6 +2833,9 @@ pub struct LoadPlan {
     /// Retire every dream every character has kept before the cast wakes —
     /// `--forget-dreams`. See [`Minds::forget_dreams`].
     pub forget_dreams: bool,
+    /// Retire every journal entry every character has kept before the cast
+    /// wakes — `--forget-journal`. See [`Minds::forget_journal`].
+    pub forget_journal: bool,
     /// Retire every conversation in the substrate and clear the ingest ledger
     /// before the layers load — `--wipe-conversations`. See
     /// [`wipe_conversations`].
@@ -3188,6 +3276,20 @@ fn load(
             );
         }
     }
+    if plan.forget_journal {
+        if let Some(minds) = rt.minds.read().unwrap().as_ref() {
+            let retired: usize = plan
+                .cast
+                .iter()
+                .map(|c| minds.forget_journal(c.npc_id))
+                .sum();
+            tracing::info!(
+                "journal: {retired} conversation record(s) emptied across {} character(s) — \
+                 every character starts with an empty journal",
+                plan.cast.len()
+            );
+        }
+    }
 
     // ── the cast ───────────────────────────────────────────────────────────
     p.set_step(LoadStep::Waking);
@@ -3199,7 +3301,8 @@ fn load(
     for (i, casting) in plan.cast.iter().enumerate() {
         let id = casting.npc_id;
         let world = &casting.world_id;
-        rt.scheduler.wake(id, now, plan.world_ms);
+        let world_ms = rt.world_ms(id);
+        rt.scheduler.wake(id, now, world_ms);
         // Back into the body it had. Entering one that is already there is not
         // an error, so this is the same call the create path makes and the two
         // do not have to agree about anything beyond the id.
@@ -3236,7 +3339,7 @@ fn load(
             felt += 1;
             rt.scheduler.deliver(
                 id,
-                plan.world_ms,
+                world_ms,
                 Salience::IDLE,
                 EventKind::Description {
                     text: format!(
@@ -4045,14 +4148,10 @@ fn device_path(url: &str) -> String {
 }
 
 async fn character_loop(rt: Arc<Runtime>, id: u64) {
-    // The last effector near-you screen delivered to this character, so the
-    // section is re-delivered only when it changes — a body that has not moved
-    // reads the same screen it was already handed. Delivering every tick would
-    // make `Scheduler::deliver`'s `due_at = 0` a tight re-tick loop (the hazard
-    // `at_table_summons` documents); on-change is the same discipline the
-    // situation band follows, one seam up. Local to this per-character task, so
-    // no lock and no shared map; a respawn re-delivers the current screen once.
-    let mut last_near_you: Option<String> = None;
+    // Whether this character's kept entries have been read back from the
+    // substrate. Done once, on the first turn the engine is there to ask, and
+    // before that turn's conversation opens so it opens scoped to them.
+    let mut journal_restored = false;
     loop {
         if rt.stopping() {
             return;
@@ -4064,6 +4163,18 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
         if rt.stopping() {
             return;
         }
+        if !journal_restored {
+            let minds = rt.minds.read().unwrap().clone();
+            if let Some(minds) = minds {
+                let kept = minds.restore_journal(id);
+                tracing::info!(
+                    "npc {id}: journal restored, {} entr(ies)",
+                    kept.entries().count()
+                );
+                rt.scheduler.set_journal(id, kept);
+                journal_restored = true;
+            }
+        }
         let now_ms = rt.scheduler.now_ms();
         {
             // Per character, not once per pass: two characters in
@@ -4074,7 +4185,13 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // The day boundary is checked before the tick, so a
             // character that has crossed midnight wakes into its new
             // conversation rather than acting once more in yesterday's.
-            if let Some((from, to)) = rt.scheduler.roll_day(id, world_ms) {
+            //
+            // The turns the roll clears are kept by the journal state —
+            // `roll_day` took them before it cleared the window — and the
+            // guardian asks about them like any other stretch, so a day's
+            // last stretch is not lost with it.
+            if let Some(rolled) = rt.scheduler.roll_day(id, world_ms) {
+                let (from, to) = (rolled.from, rolled.to);
                 tracing::info!("npc {id}: day {from} → {to}, conversation rolled over");
                 rt.scheduler
                     .deliver(id, world_ms, Salience::NORMAL, EventKind::Wake { day: to });
@@ -4164,34 +4281,9 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 }
             }
 
-            // The effector device's near-you screen — what is reachable from
-            // where the body stands right now (effector design §6). Fetched on
-            // the async fast path (`near_you_section` never holds the world lock
-            // across its await) and delivered as a superseding percept so the
-            // character reads the current screen and never a stale list: it
-            // rides its own "reachable" band and supersedes each turn, the same
-            // point-in-time discipline as the situation band. Delivered only on
-            // change — an unmoved body would otherwise be re-woken every tick by
-            // `deliver`'s `due_at = 0`. `None` (empty index, or no device
-            // installed on this path) delivers nothing. The `query`/`invoke`
-            // calls and their outcomes stay inline in the turn stream; only this
-            // ambient list moves here.
-            let near_you = rt.near_you_section(id).await;
-            if near_you != last_near_you {
-                if let Some(text) = near_you.clone() {
-                    rt.scheduler.deliver(
-                        id,
-                        world_ms,
-                        Salience::IDLE,
-                        EventKind::Reachable { text },
-                    );
-                }
-                last_near_you = near_you;
-            }
-
             let minds = rt.minds.read().unwrap().clone();
             let persona = rt.persona_of_async(id).await;
-            let day = crate::engine::sleep::day_of(world_ms);
+            let day = crate::clock::day_of(world_ms);
             // What the grammar is built from this turn: the acts that
             // are reachable from where this character stands, and the
             // names it may address. Read here, once, before the decode —
@@ -4207,7 +4299,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // The standpoint the grammar above was built from, captured at the
             // same pre-decode instant. A device act the character then chooses is
             // reach-checked against this position rather than wherever the
-            // metronome has since walked a moving body — so `query`/`invoke` on an
+            // metronome has since walked a moving body — so `invoke` on an
             // address the grammar just offered cannot 404 because a leg passed
             // during the decode. See [`crate::effector::auth::PinnedStandpoint`].
             let pinned_at = rt
@@ -4301,7 +4393,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             // reflection answers.
                             let mut reflecting: Option<(Owed, [String; 3])> = None;
                             for a in &t.parsed.acts {
-                                // A device call (`query`/`invoke`) is enacted on
+                                // A device call (`invoke`) is enacted on
                                 // the async effector fast path rather than through
                                 // the synchronous `record_act`/`body::perform`
                                 // path — the effector router is an async tower
@@ -4544,11 +4636,10 @@ mod tests {
     /// **`enact_device` really reaches the effector.** Standing on the shaft's top
     /// landing, an `invoke` of the lift's `call` runs the world's own `lift_call`
     /// and reads back the world's own line (the success `detail`, not the HTTP
-    /// envelope); a `query` of the bare host returns the near-you index; and a
-    /// malformed `body` is answered prescriptively rather than panicking (effector
-    /// design §5, §6, §12).
+    /// envelope); a malformed `body` is answered prescriptively rather than
+    /// panicking (effector design §5, §6, §12).
     #[tokio::test]
-    async fn enact_device_reaches_the_effector_and_reads_and_acts() {
+    async fn enact_device_reaches_the_effector_and_acts() {
         const WORLD: &str = "creators-vault";
         let rt = device_daemon();
 
@@ -4597,21 +4688,6 @@ mod tests {
             inv.feed
         );
 
-        // query — the bare host returns the near-you index.
-        let q = rt
-            .enact_device(
-                npc_id,
-                &device_act("query", json!({ "url": "http://local/" })),
-                None,
-            )
-            .await;
-        assert!(q.landed, "the query did not land: {q:?}");
-        let idx: Value = serde_json::from_str(&q.answer).expect("the query answer is JSON");
-        assert!(
-            idx["routes"].is_array(),
-            "the near-you index did not come back: {idx}"
-        );
-
         // A malformed body — a prescriptive `bad_json` answer, and no panic.
         let bad = rt
             .enact_device(
@@ -4658,150 +4734,6 @@ mod tests {
             refused.feed,
             refused.answer
         );
-    }
-
-    /// **The near-you index becomes the character's YOUR EFFECTOR DEVICE screen.**
-    ///
-    /// Standing at a workstation, the async fetch-and-render seam
-    /// ([`Runtime::near_you_section`]) fetches the same near-you index the device
-    /// answers and renders it into the dynamic system-prompt section the
-    /// character reads this turn (effector design §6): the heading, then every
-    /// reachable summary in the index's order, joined by the doc's middle dot.
-    /// One layer up from the raw index, on the effector daemon setup.
-    #[tokio::test]
-    async fn near_you_section_renders_a_bodys_reachable_screen() {
-        const WORLD: &str = "creators-vault";
-        let rt = device_daemon();
-
-        // Band one places character terminals beside the always-present personal
-        // routes — a screen with several distinct summaries on it.
-        let npc_id = 1;
-        let body = Runtime::body_id(npc_id);
-        let world = rt.hosted.get(WORLD).expect("hosted");
-        world.with(|w| {
-            w.enter(
-                &body,
-                "Maker-01".to_string(),
-                Where::new("vault-casting", "band-one"),
-            )
-            .expect("a real room")
-        });
-        rt.bodies.bind(npc_id, WORLD, &body).expect("bound");
-
-        // The index the section is built from, so the assertion tracks the
-        // device rather than hardcoding the vault's terminal names: every
-        // summary the device lists must reach the section.
-        let index = rt
-            .effector_query(npc_id, "/", None)
-            .await
-            .expect("the index answers");
-        let summaries: Vec<String> = index["routes"]
-            .as_array()
-            .expect("routes is an array")
-            .iter()
-            .map(|r| r["summary"].as_str().expect("a summary").to_string())
-            .collect();
-        assert!(
-            summaries.len() >= 4,
-            "band one places terminals beside the personal routes: {summaries:?}"
-        );
-
-        let section = rt
-            .near_you_section(npc_id)
-            .await
-            .expect("a body that can reach things gets a section");
-        assert!(
-            section.starts_with("YOUR EFFECTOR DEVICE\nReachable from here"),
-            "{section}"
-        );
-        for summary in &summaries {
-            assert!(
-                section.contains(summary.as_str()),
-                "the section dropped `{summary}`:\n{section}"
-            );
-        }
-        // The personal routes are always reachable and always named.
-        assert!(section.contains("your phone"), "{section}");
-        assert!(section.contains("what you have done and seen"), "{section}");
-        // A real list — one route per line, each carrying its address so the
-        // character can `query`/`invoke` it rather than guess.
-        assert!(section.contains("\n- "), "{section}");
-        assert!(section.contains("http://local/"), "{section}");
-    }
-
-    /// The section degrades to nothing — never an error up the tick — when the
-    /// device is not installed: with no router and no token store,
-    /// `effector_query` errors and the seam returns `None` rather than a stub or
-    /// a failed turn (effector design §6).
-    #[tokio::test]
-    async fn near_you_section_degrades_to_none_without_the_device() {
-        let rt = rt();
-        assert_eq!(rt.near_you_section(1).await, None);
-    }
-
-    /// **A placed body's turn carries the near-you screen, superseded to one.**
-    ///
-    /// The async seam renders the device's near-you index
-    /// ([`Runtime::near_you_section`]); delivered as an [`EventKind::Reachable`]
-    /// percept it rides its own band, so the window keeps exactly one current
-    /// screen (two deliveries leave one) and the turn the character reads carries
-    /// the reachable list (effector design §6). One seam up from the raw index,
-    /// on the effector daemon setup.
-    #[tokio::test]
-    async fn a_placed_bodys_turn_carries_the_superseding_near_you_screen() {
-        use crate::engine::event::{EventKind, Salience};
-
-        let rt = device_daemon();
-        // Band one places character terminals beside the personal routes, and
-        // `embody` enters the body, wakes its inbox and binds it — so the near-you
-        // index resolves and the scheduler has somewhere to deliver.
-        embody(&rt, 1, "m1", "band-one");
-
-        let screen = rt
-            .near_you_section(1)
-            .await
-            .expect("a placed body has a near-you screen");
-        assert!(
-            screen.starts_with("YOUR EFFECTOR DEVICE\nReachable from here"),
-            "{screen}"
-        );
-
-        // Delivered twice, as the character loop would across two turns of an
-        // unmoved body: the "reachable" band keeps exactly one current screen.
-        for _ in 0..2 {
-            rt.scheduler.deliver(
-                1,
-                0,
-                Salience::IDLE,
-                EventKind::Reachable {
-                    text: screen.clone(),
-                },
-            );
-        }
-        let start = rt
-            .scheduler
-            .begin_tick(1)
-            .expect("a tick carrying the delivered screen");
-
-        // The turn the character reads carries the reachable list.
-        let perceived: String = start
-            .events
-            .iter()
-            .map(|e| e.prose())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            perceived.contains("Reachable from here"),
-            "the turn dropped the near-you screen:\n{perceived}"
-        );
-
-        // Two deliveries leave exactly one current screen in the window — a body
-        // that has not moved never reads a stale list stacked beside the current.
-        let screens = window(&rt, 1)
-            .into_iter()
-            .filter(|t| t.contains("YOUR EFFECTOR DEVICE"))
-            .count();
-        assert_eq!(screens, 1, "the near-you band must supersede to one screen");
     }
 
     // ── the cast, supervised ────────────────────────────────────────────────
@@ -5053,7 +4985,7 @@ mod tests {
         rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
         assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "not drained");
 
-        let moment = environment::advance(&hosted, &rt.bodies, &rt.scheduler);
+        let moment = environment::advance(&hosted, &rt.bodies, &rt.scheduler, &|_| 0);
         assert_eq!(moment.messaged, 1, "the moment carried nothing to anybody");
 
         assert_eq!(
@@ -5075,11 +5007,11 @@ mod tests {
         rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
 
         assert_eq!(
-            environment::advance(&hosted, &rt.bodies, &rt.scheduler).messaged,
+            environment::advance(&hosted, &rt.bodies, &rt.scheduler, &|_| 0).messaged,
             1
         );
         assert_eq!(
-            environment::advance(&hosted, &rt.bodies, &rt.scheduler).messaged,
+            environment::advance(&hosted, &rt.bodies, &rt.scheduler, &|_| 0).messaged,
             0,
             "the same message was handed over twice"
         );
@@ -5307,7 +5239,7 @@ mod tests {
         assert!(!window(&rt, 2).join("\n").contains("redoubt"));
 
         let world = rt.hosted.get(WORLD).unwrap();
-        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
         run(&rt, 3);
 
         let heard = window(&rt, 2).join("\n");
@@ -5342,7 +5274,7 @@ mod tests {
 
         // Perrin is told nothing about it.
         let world = rt.hosted.get(WORLD).unwrap();
-        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
         run(&rt, 2);
         let seen = window(&rt, 2).join("\n");
         assert!(!seen.contains("lets the moment pass"), "{seen}");
@@ -5352,7 +5284,7 @@ mod tests {
         assert!(rt
             .act_on_world(2, &act("shout", json!({"intent": "that I am here"})))
             .happened());
-        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
         assert!(rt.scheduler.due_now(1).contains(&1), "she was not woken");
     }
 
@@ -5417,7 +5349,7 @@ mod tests {
         // And the world did take the speech: the shape of the record is not
         // the act being quietly dropped.
         let world = rt.hosted.get(WORLD).unwrap();
-        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
         run(&rt, 10_000);
         let heard = window(&rt, 2).join("\n");
         assert!(heard.contains("redoubt"), "{heard}");
@@ -5520,7 +5452,7 @@ mod tests {
             landed.answer
         );
 
-        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
         run(&rt, 10_000);
         let heard = window(&rt, 2).join("\n");
         assert!(heard.contains("redoubt"), "{heard}");
@@ -5652,7 +5584,7 @@ mod tests {
             world.read(|w| w.actor("m1").unwrap().at.clone()),
             at("green-room")
         );
-        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
         assert_eq!(
             world.read(|w| w.actor("m1").unwrap().at.clone()),
             at("band-one")
@@ -5672,7 +5604,7 @@ mod tests {
         embody(&rt, 2, "m2", "green-room");
         let _ = rt.act_on_world(1, &act("move_to", json!({"destination": "band one"})));
         let world = rt.hosted.get(WORLD).unwrap();
-        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
 
         run(&rt, 10_000);
         let read = window(&rt, 1).join("\n");
@@ -5722,7 +5654,7 @@ mod tests {
         run(&rt, 2);
         let before = window(&rt, 2).len();
 
-        environment::advance(&world, &rt.bodies, &rt.scheduler);
+        environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
         // Past its heartbeat: speech to the room is worth a turn but does not
         // interrupt one, so it waits rather than preempting.
         run(&rt, 10_000);
@@ -5878,7 +5810,7 @@ mod tests {
 
         let nudge = rt.nudge_for(1).expect("something to be getting on with");
         assert_eq!(nudge, NO_MISSION);
-        assert!(nudge.contains("within reach"), "{nudge}");
+        assert!(nudge.contains("the work is in front of you"), "{nudge}");
         // **No verb of motion.** The standing task is the most recent thing in
         // the window, so whatever it tells a character to *do* is what the
         // character does — and every version of this that ended with somewhere
@@ -5968,13 +5900,12 @@ mod tests {
         assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
     }
 
-    /// **A carried mission is the standing task.** Given a mission, the
-    /// quiet-turn instruction a character reads *is* that mission — the ask, its
-    /// steps, and the next thing to do — not the "nothing has been asked of you"
-    /// default. This is the live path that makes a character follow a mission at
-    /// all: `nudge_for` → `EventKind::Nudge` → the perception the model reads.
+    /// **A carried mission is in the system prompt, not restated.** Given a
+    /// mission, the persona a turn reads carries its ask, its steps and where it
+    /// ends, and the quiet-turn nudge says nothing — neither the "nothing has
+    /// been asked of you" default nor the mission's wording again.
     #[tokio::test]
-    async fn a_character_on_a_mission_reads_the_mission_as_its_standing_task() {
+    async fn a_character_on_a_mission_carries_it_in_its_prompt_and_is_not_nudged() {
         use crate::engine::mission::{Mission, Origin, Todo};
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
@@ -6000,22 +5931,132 @@ mod tests {
             .unwrap()
             .with_sim(|s| s.missions.assign("m1", mission));
 
-        let nudge = rt.nudge_for(1).expect("bound");
-        assert!(nudge.starts_with("What has been asked of you:"), "{nudge}");
-        assert!(nudge.contains("the-charge"), "{nudge}");
+        assert_eq!(rt.nudge_for(1), None, "the mission is not restated");
+        let carried = rt
+            .place_persona(1, OwnedPersona::default())
+            .mission
+            .expect("the persona carries the mission");
+        let text = carried.text;
+        assert!(text.starts_with("Read the record 'the-charge'"), "{text}");
         assert!(
-            nudge.contains("go to the archives"),
-            "the steps are shown: {nudge}"
+            text.contains("[ ] go to the archives"),
+            "the steps are shown: {text}"
         );
         assert!(
-            nudge.contains("go back to the command table and report it on your effector device")
-                && nudge.contains("`report_done`"),
-            "the mission points back to the table's device: {nudge}"
+            text.contains("go back to the table where work is handed out, `scan` it")
+                && text.contains("`report_done`"),
+            "the mission points back to the table's device: {text}"
         );
-        assert_ne!(
-            nudge, NO_MISSION,
-            "the default must give way to the mission"
+        assert!(
+            !text.contains("What has been asked of you"),
+            "the prompt's own heading supplies the lead-in: {text}"
         );
+    }
+
+    /// **Calling a mission off tells the character.** The notice is queued only
+    /// when there was a mission to withdraw, and the mission is gone either way.
+    #[tokio::test]
+    async fn cancelling_a_mission_tells_the_character_it_is_withdrawn() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let before = rt.scheduler.inbox_depth(1).unwrap();
+        assert!(
+            !rt.cancel_mission(1, 0),
+            "nothing to cancel on a character with no mission"
+        );
+        assert_eq!(rt.scheduler.inbox_depth(1).unwrap(), before, "no notice");
+
+        let mission = Mission::new(
+            "Read the record.",
+            vec![Todo::new("go to the archives")],
+            Origin::Lodged {
+                by: "u_op".to_string(),
+            },
+        );
+        rt.hosted
+            .get(WORLD)
+            .unwrap()
+            .with_sim(|s| s.missions.assign("m1", mission));
+        assert!(rt.cancel_mission(1, 0));
+        assert_eq!(
+            rt.scheduler.inbox_depth(1).unwrap(),
+            before + 1,
+            "the withdrawal is queued"
+        );
+        assert!(!rt
+            .hosted
+            .get(WORLD)
+            .unwrap()
+            .sim(|s| s.missions.is_on_mission("m1")));
+        assert!(
+            !MISSION_WITHDRAWN.is_empty() && !MISSION_WITHDRAWN.contains("ledger"),
+            "the notice names no subject"
+        );
+    }
+
+    /// **A mission outlives a restart.** Checkpointed to the substrate, a world
+    /// hosted by a fresh runtime over the same substrate comes up carrying the
+    /// same open mission, its steps and the queue behind it.
+    #[tokio::test]
+    async fn missions_are_checkpointed_and_restored_on_the_next_boot() {
+        use crate::engine::mission::bank::Facts;
+        use crate::engine::mission::{Mission, Origin, Outcome, Todo};
+        use crate::npcs::Npcs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "npcd-missions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let npcs = Npcs::load(&dir).unwrap();
+        let ask = |text: &str| {
+            Mission::new(
+                text,
+                vec![Todo::new("go to the archives")],
+                Origin::Random {
+                    routine: "x".into(),
+                },
+            )
+        };
+
+        let first = rt();
+        first.set_substrate(npcs.substrate());
+        let hosted = first
+            .host(WORLD, Path::new(ROOMS))
+            .expect("the vault loads");
+        hosted.with_sim(|s| {
+            s.missions.assign("m1", ask("Read the record."));
+            s.missions.lodge("m1", ask("Then the ledger."));
+        });
+        first.checkpoint_missions(&hosted);
+
+        let second = rt();
+        second.set_substrate(npcs.substrate());
+        let revived = second
+            .host(WORLD, Path::new(ROOMS))
+            .expect("the vault loads");
+        let open = revived.with_sim(|s| s.missions.active("m1").map(|m| m.prompt_text()));
+        assert!(
+            open.as_deref()
+                .unwrap_or_default()
+                .starts_with("Read the record."),
+            "{open:?}"
+        );
+        let facts = Facts::default();
+        let queued = revived.with_sim(|s| {
+            s.missions.report("m1", Outcome::Pass, "ok", None);
+            s.missions.collect("m1", &facts).mission_text()
+        });
+        assert_eq!(
+            queued, "Then the ledger.",
+            "the queue behind it came back too"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── the command table summons ───────────────────────────────────────────
@@ -6354,6 +6395,19 @@ mod tests {
         assert!(!words.contains("maker-"), "it names somebody");
     }
 
+    /// A standing instruction read by every world's cast may not hand them a
+    /// thing to have found: the example a character is given is the thing it
+    /// then reports reading.
+    #[test]
+    fn the_standing_instructions_offer_no_example_object() {
+        for text in [NO_MISSION, IN_COMPANY] {
+            let words = text.to_lowercase();
+            for thing in ["ledger", "story", "wall", "date", "page", "entry"] {
+                assert!(!words.contains(thing), "`{thing}` in: {text}");
+            }
+        }
+    }
+
     #[test]
     fn a_standing_instruction_replaces_the_one_before_it() {
         use crate::engine::event::EventKind;
@@ -6367,6 +6421,18 @@ mod tests {
             a.replaces(),
             EventKind::Situation { text: "x".into() }.replaces()
         );
+    }
+
+    #[test]
+    fn a_thought_it_cannot_shake_and_the_standing_task_share_a_band() {
+        use crate::engine::event::EventKind;
+        let task = EventKind::Nudge {
+            text: "new errand".into(),
+        };
+        let thought = EventKind::MindControl {
+            text: "old errand".into(),
+        };
+        assert_eq!(task.replaces(), thought.replaces(), "two tasks at once");
     }
 
     #[test]

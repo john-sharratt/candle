@@ -1,6 +1,5 @@
-//! The acts a mission is lived through: take one up at the command desk, record
-//! progress on it wherever the work happens, and report how it went back at the
-//! desk.
+//! The acts a mission is lived through: take one up at the command desk, and
+//! report how it went back at the desk.
 //!
 //! # One place: the command table
 //!
@@ -91,7 +90,7 @@ pub const REPORT_DONE: Tool = desk_on!(
     "account",
     "What you found, made, or concluded — the answer the mission was for.",
     "You have carried out your mission and come back to the table to say what came of it.",
-    r#"{"account":"the record holds, except the eastern date, which cannot be reconciled with the charge"}"#,
+    r#"{"account":"I read the coolant valve and the breaker panel: the valve is open and the breaker is tripped"}"#,
     "Work nobody reported is work nobody can build on, and the answer is the point of having gone."
 );
 
@@ -104,7 +103,7 @@ pub const REPORT_STUCK: Tool = desk_on!(
     "What stopped you — what you tried, and where it would not go.",
     "You have carried a mission as far as it will go, and come back to the table to say it will \
      not finish.",
-    r#"{"why":"the record it asked me to read is not filed anywhere I could find, and nobody here has seen it"}"#,
+    r#"{"why":"I could not get the reading: the panel is locked and nobody here has the key"}"#,
     "A mission that cannot be done is worth knowing about; a character that abandons one silently \
      leaves it believed to be still in hand."
 );

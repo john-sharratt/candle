@@ -607,9 +607,8 @@ pub const OPERATE: Tool = Tool {
     category: "Work",
     plane: Plane::World,
     availability: Availability::Always,
-    description: "Put something here into a different state — open or lock a door, set what a \
-                  turret is allowed to shoot at, start or stop a bay, open a working copy at a \
-                  terminal. Each thing has its own states and takes no others.",
+    description: "Put something here into a different state. Each thing has its own states and \
+                  takes no others.",
     params: &[
         Param {
             name: "what",
@@ -737,30 +736,30 @@ pub const SCAN: Tool = Tool {
     category: "Attention",
     plane: Plane::Internal,
     availability: Availability::Always,
-    description: "Look at somewhere you are not, through instruments. Name the place you want \
-                  looked at. It tells you nothing about the room you are standing in — you are \
-                  told that already.",
-    // **`at` is required, and it was the whole bug that it was not.**
+    description: "Look through your instruments. Name a place you are not in to see who is there \
+                  and what moves. Name nothing to see what in your own room you can work, with \
+                  its state and the address to `invoke` for each.",
+    // **`at` is optional because naming nothing is a real act: the survey.**
     //
-    // This act takes a place *or* a pair of coordinates, and every one of the
-    // three was optional — a disjunction the flat grammar has no way to state,
-    // so what it actually said was "all three may be absent". A character
-    // emitted `scan` with nothing in it and `enact::scan` refused it, every
-    // time, unavoidably: measured live, twelve of one character's sixteen acts
-    // were that refusal.
-    //
-    // So the grammar offers the shape that cannot be wrong — a place, from the
-    // live set of places there are — and the coordinate form stays reachable
-    // through the API and the harness, which are not grammar-constrained. That
-    // is the same split `operate` already makes for a mode a device does not
-    // admit.
+    // The grammar offers a place from the live set of places there are, or no
+    // place at all, which surveys the room's stations (`engine::survey`). The
+    // coordinate form stays reachable through the API and the harness, which are
+    // not grammar-constrained — the same split `operate` makes for a mode a
+    // device does not admit.
     params: &[Param {
         name: "at",
         ty: "string",
-        required: true,
-        description: "The place you want looked at, named exactly as it is written.",
+        required: false,
+        description: "The place you want looked at, named exactly as it is written. Leave it out \
+                      to survey what you can work where you stand.",
     }],
     examples: &[
+        Example {
+            situation: "You stand in a room with a console and are not sure what it will take.",
+            call: r#"{}"#,
+            because: "Naming nothing lists what here answers to you and the exact address to \
+                      `invoke` for each — read it, then act on it.",
+        },
         Example {
             situation: "You want to know whether the ridge is clear before anybody walks it.",
             call: r#"{"at":"the east ridge"}"#,

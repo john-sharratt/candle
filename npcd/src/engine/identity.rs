@@ -25,14 +25,28 @@
 //! one thing: several characters run the same personality, and the personality
 //! is the part worth sharing.
 //!
-//! # Missions are deliberately not installed here
+//! # A mission is a per-conversation section
 //!
-//! `mission` and `task` are declared in the schema and left **empty**, so the
-//! `mission_none` section fires and a character with nothing assigned reads the
-//! standing instruction instead. That is not a gap waiting to be filled with a
-//! placeholder — an empty heading is what makes a model invent a mission to put
-//! under it. When missions exist as data they become members here and the
-//! gating switches over on its own.
+//! A member is sealed once at load, and a mission's wording is made at the table,
+//! so the wording is not one of them. The mind submits it to the character's own
+//! conversation under [`MISSION_SECTION`] whenever the mission's text changes
+//! (`Minds::prepare`), and [`carry_mission`] selects it, so it sits in
+//! the system prompt under `mission_intro`'s "What has been asked of you:" and is
+//! sealed, persisted and restored like any other section. `mission_none`
+//! ("nothing has been asked of you") shows exactly when the `mission` collection
+//! materialises no member, so a character with nothing assigned selects nothing,
+//! which also keeps the heading from standing over an empty field. The
+//! collection holds one fixed member, [`CARRYING`], that stands in while the
+//! submitted section is not sealed. `task` stays empty.
+//!
+//! # A journal is a per-conversation collection too
+//!
+//! What a character has written down is held the same way: one section per kept
+//! entry (the newest five) and one for the open items, submitted to its own
+//! conversation as `journal/<entry id>` and `journal/open`, and selected by
+//! [`carry_journal`] under `journal_intro`. `journal_none` shows when it holds
+//! none. The collection's fixed member stands in until the sections have sealed.
+//! See [`crate::engine::journal::section`].
 //!
 //! # The generic member
 //!
@@ -56,8 +70,31 @@ pub const SETTING: &str = "world";
 /// The building a character works in, as it knows it.
 pub const BUILDING: &str = "place";
 
+/// What has been asked of a character. Selected only while one is carried.
+pub const MISSION: &str = "mission";
+
+/// What a character has written down. Selected only while it holds an entry.
+pub const JOURNAL: &str = "journal";
+
 /// The member every collection carries for the case nothing else resolves.
 pub const GENERIC: &str = "generic";
+
+const CARRYING_ID: &str = "carrying";
+
+/// The fixed member of the `journal` collection, read under `journal_intro`'s
+/// heading while the entries submitted to the conversation are still sealing.
+const JOURNAL_STAND_IN: &str = "\
+Entries you wrote down earlier, which are being brought back to you.";
+
+/// The name a character's mission wording is submitted under, in the `mission`
+/// collection of its own conversation.
+pub const MISSION_SECTION: &str = "mission/standing";
+
+/// The fixed member of the `mission` collection, read under `mission_intro`'s
+/// "What has been asked of you:" while the submitted wording is still sealing.
+const CARRYING: &str = "\
+A mission you took up at the command table. It is not finished until you have \
+reported it at the table.";
 
 /// The schema's composer selectors, which npcd sets rather than an HTTP caller.
 ///
@@ -256,6 +293,32 @@ impl Installed {
     }
 }
 
+/// Select what the turn reads under "What has been asked of you:" and hide
+/// `mission_none`: the conversation's own [`MISSION_SECTION`] once it is
+/// `sealed`, the fixed [`CARRYING`] member until then. Not called for a
+/// character with no open mission: an unpinned `mission` collection emits
+/// nothing, which is what shows `mission_none`.
+pub fn carry_mission(selection: &mut SelectionState, sealed: bool) {
+    let name = match sealed {
+        true => MISSION_SECTION.to_string(),
+        false => member(MISSION, CARRYING_ID),
+    };
+    selection.select(MISSION, name);
+}
+
+/// Select what the turn reads under `journal_intro`'s heading and hide
+/// `journal_none`: the sections of the journal that have `sealed`, or the fixed
+/// [`JOURNAL_STAND_IN`] member while none has. Not called for a character that has
+/// written nothing: an unpinned `journal` collection emits nothing, which is what
+/// shows `journal_none`.
+pub fn carry_journal(selection: &mut SelectionState, sealed: &[String]) {
+    if sealed.is_empty() {
+        selection.select(JOURNAL, member(JOURNAL, CARRYING_ID));
+    } else {
+        selection.select_all(JOURNAL, sealed.iter().map(String::as_str));
+    }
+}
+
 /// The name one part of a world is installed and selected under.
 ///
 /// Qualified by the world because part ids are authored per map, and two
@@ -316,6 +379,34 @@ pub fn install(
                 },
             )
             .map_err(|e| anyhow::anyhow!("scoping `{collection}` to one member: {e}"))?;
+    }
+
+    // Optional, unlike the four above: a schema with no `mission` gating has no
+    // `mission_none` to hide, so there is nothing for the member to switch off.
+    if builder.id_for_system_collection(MISSION).is_some() {
+        builder
+            .set_collection_selection(
+                MISSION,
+                SelectionRule::Named {
+                    selector: MISSION.to_string(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("scoping `{MISSION}` to its member: {e}"))?;
+        add(builder, MISSION, CARRYING_ID, CARRYING)?;
+    }
+
+    // Optional for the same reason: a schema with no `journal` has no
+    // `journal_none` to hide.
+    if builder.id_for_system_collection(JOURNAL).is_some() {
+        builder
+            .set_collection_selection(
+                JOURNAL,
+                SelectionRule::Named {
+                    selector: JOURNAL.to_string(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("scoping `{JOURNAL}` to its members: {e}"))?;
+        add(builder, JOURNAL, CARRYING_ID, JOURNAL_STAND_IN)?;
     }
 
     let mut out = Installed::default();
@@ -536,6 +627,95 @@ mod tests {
         let n = names.len();
         names.dedup();
         assert_eq!(names.len(), n, "two collections share a selector");
+    }
+
+    fn schema(collections: &[&str]) -> Builder {
+        let mut yaml = String::from(
+            "system_prompt:\n  items:\n    - kind: section\n      id: frame\n      content: hi\n",
+        );
+        for name in collections {
+            yaml.push_str(&format!(
+                "    - kind: collection\n      name: {name}\n      \
+                 selection: {{ kind: always_visible }}\n      sections: []\n"
+            ));
+        }
+        yaml.push_str("layers: []\n");
+        Builder::from_yaml(&yaml).unwrap()
+    }
+
+    const FOUR: [&str; 4] = [ANCHOR, WHO, SETTING, BUILDING];
+
+    /// **A carried mission has something to select, and a free character does
+    /// not.** Selecting nothing is what lets `mission_none` show; selecting the
+    /// one member is what hides it.
+    #[test]
+    fn a_carried_mission_selects_the_one_member_and_a_free_character_selects_none() {
+        use candle_conversation::projection::SystemPromptItem;
+        let mut b = schema(&[ANCHOR, WHO, SETTING, BUILDING, MISSION]);
+        install(&mut b, &Authored::default(), &BTreeMap::new()).unwrap();
+        assert!(b.id_for_system_section("mission/carrying").is_some());
+        let rule = b.schema().system_prompt.items.iter().find_map(|i| match i {
+            SystemPromptItem::Collection(c) if c.name == MISSION => Some(c.selection.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(rule, Some(SelectionRule::Named { ref selector }) if selector == MISSION),
+            "{rule:?}"
+        );
+
+        let mut sel =
+            installed().selection_for(7, "maker", "battle-cities", VAULT, Deliberation::None);
+        assert_eq!(sel.get(MISSION), None, "a free character pins no mission");
+        carry_mission(&mut sel, false);
+        assert_eq!(sel.get(MISSION), Some("mission/carrying"));
+        carry_mission(&mut sel, true);
+        assert_eq!(sel.get(MISSION), Some(MISSION_SECTION));
+    }
+
+    /// **A journal selects the sections that have sealed, or its stand-in until one
+    /// has; a character with nothing written pins nothing.** Pinning nothing is
+    /// what lets `journal_none` show.
+    #[test]
+    fn a_journal_selects_what_has_sealed_and_stands_in_until_then() {
+        let mut b = schema(&[ANCHOR, WHO, SETTING, BUILDING, JOURNAL]);
+        install(&mut b, &Authored::default(), &BTreeMap::new()).unwrap();
+        assert!(b.id_for_system_section("journal/carrying").is_some());
+
+        let mut sel =
+            installed().selection_for(7, "maker", "battle-cities", VAULT, Deliberation::None);
+        assert!(
+            sel.members(JOURNAL).is_empty(),
+            "nothing written pins nothing"
+        );
+        carry_journal(&mut sel, &[]);
+        assert_eq!(sel.members(JOURNAL), ["journal/carrying"]);
+        carry_journal(
+            &mut sel,
+            &["journal/3".to_string(), "journal/open".to_string()],
+        );
+        assert_eq!(sel.members(JOURNAL), ["journal/3", "journal/open"]);
+    }
+
+    #[test]
+    fn a_schema_with_no_journal_collection_still_installs() {
+        let mut b = schema(&FOUR);
+        install(&mut b, &Authored::default(), &BTreeMap::new()).unwrap();
+        assert!(b.id_for_system_section("journal/carrying").is_none());
+    }
+
+    #[test]
+    fn a_schema_with_no_mission_collection_still_installs() {
+        let mut b = schema(&FOUR);
+        install(&mut b, &Authored::default(), &BTreeMap::new()).unwrap();
+        assert!(b.id_for_system_section("mission/carrying").is_none());
+    }
+
+    /// The stand-in is read under "What has been asked of you:" and must not
+    /// pretend to be the wording, which only the submitted section carries.
+    #[test]
+    fn the_carrying_member_points_at_the_table_and_does_not_invent_a_brief() {
+        assert!(CARRYING.contains("command table"));
+        assert!(CARRYING.contains("reported"));
     }
 
     /// A generic member must read as somebody with less written about them,

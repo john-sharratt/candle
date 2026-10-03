@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::load::MapSet;
-use crate::part::PartKind;
+use crate::part::{Part, PartKind};
 use crate::schema::{Area, AreaKind, Node, NodeKind};
 use crate::text::{cap, list, plural, spell, tidy};
 
@@ -501,7 +501,7 @@ fn grouped_entries(set: &MapSet, area: &Area, kind: NodeKind) -> Vec<String> {
     let mut groups: BTreeMap<Vec<String>, Vec<&Node>> = BTreeMap::new();
     let mut order: Vec<Vec<String>> = Vec::new();
     for node in area.of_kind(kind) {
-        let mut key: Vec<String> = node.parts.iter().map(|p| p.part().to_string()).collect();
+        let mut key = job_key(set, node);
         key.sort();
         if !groups.contains_key(&key) {
             order.push(key.clone());
@@ -516,6 +516,26 @@ fn grouped_entries(set: &MapSet, area: &Area, kind: NodeKind) -> Vec<String> {
             Some(entry(&list(&names), &room_body(set, rooms)))
         })
         .collect()
+}
+
+/// What a work room is for, as the key rooms are grouped by.
+///
+/// The parts a character works at, not the building's own fixtures: a light
+/// ring or a breaker panel is something a room has, and two rooms with the same
+/// terminals but different plant are still the same job. A room with nothing to
+/// work at is keyed by everything in it, so rooms that hold only fixtures group
+/// only when they hold the same ones.
+fn job_key(set: &MapSet, node: &Node) -> Vec<String> {
+    let all: Vec<&Part> = set.parts_at(node).map(|(part, _)| part).collect();
+    let worked: Vec<String> = all
+        .iter()
+        .filter(|part| part.kind != PartKind::Fixture)
+        .map(|part| part.id.clone())
+        .collect();
+    match worked.is_empty() {
+        true => all.iter().map(|part| part.id.clone()).collect(),
+        false => worked,
+    }
 }
 
 /// Everything worth saying about one room, or about several that hold the

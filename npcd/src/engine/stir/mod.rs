@@ -38,6 +38,29 @@
 //! happened. Coupling is therefore a property of the *fixtures*, not of a table
 //! somewhere — a new one wires itself in by reading the flags it cares about.
 //!
+//! # Fixtures stand on real objects
+//!
+//! A line about a breaker panel is only honest in a room that has one, and a
+//! character told about a fault should be able to walk to it. So:
+//!
+//!   * **Gating.** [`Building::new`] keeps a fixture only when every part named
+//!     by [`Fixture::needs`] stands in the room. The ungated fixtures — ambient,
+//!     broadcast, rat, growth, announce, chime — run everywhere.
+//!   * **Binding.** A fixture that is [`Fixture::bound`] to a part has a fault
+//!     mode on that part's device. The device is the source of truth:
+//!     [`Building::tend`] reads each device's mode before every look and, where
+//!     a character has changed it, tells the fixture through
+//!     [`Fixture::set_fault`] and returns what the room notices. When the
+//!     fixture's own state moves, [`Building::take_sets`] hands the world the
+//!     mode to write back.
+//!   * **Boards.** [`Building::standing`] reports the faults standing in a room,
+//!     [`Building::hear_of`] gives the building every room's, and the
+//!     status-board fixture files an entry only for a fault that stands, written
+//!     on the board itself through [`Stirring::posted_on`] where a character can
+//!     `read` it.
+//!
+//! The world side of all three is `crate::engine::rooms`.
+//!
 //! # A stirring names its own subject
 //!
 //! Every line is a whole sentence saying what it is about: *"The lights in the
@@ -53,9 +76,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::engine::event::Salience;
 
+pub use binding::{Bound, Report, Set};
+
 pub mod air;
 pub mod ambient;
 pub mod announce;
+pub mod binding;
 pub mod boards;
 pub mod broadcast;
 pub mod chime;
@@ -120,6 +146,9 @@ pub struct Stirring {
     /// a *moment* is not a state: a gust is over by the time anybody polls, and
     /// the rat has to hear it happen rather than find it still happening.
     pub tags: Vec<Cond>,
+    /// A line this stirring also writes on one of the room's objects, as
+    /// `(part id, text)` — what a character reads there afterwards.
+    pub posted: Option<(&'static str, String)>,
 }
 
 impl Stirring {
@@ -129,11 +158,18 @@ impl Stirring {
             text: text.into(),
             salience,
             tags: Vec::new(),
+            posted: None,
         }
     }
 
     pub fn tagged(mut self, tags: &[Cond]) -> Stirring {
         self.tags.extend_from_slice(tags);
+        self
+    }
+
+    /// Also write `text` on the room's `part`, so it can be read there.
+    pub fn posted_on(mut self, part: &'static str, text: impl Into<String>) -> Stirring {
+        self.posted = Some((part, text.into()));
         self
     }
 }
@@ -148,6 +184,10 @@ pub struct Watch {
     pub wall: SystemTime,
     /// Everything every fixture is currently publishing about itself.
     pub conds: Vec<Cond>,
+    /// Faults standing on real objects in the world, as the world has told this
+    /// building. Only the status board reads it: a board is where a fault that
+    /// is not in front of you is written down.
+    pub standing: Vec<Report>,
 }
 
 impl Watch {
@@ -174,6 +214,31 @@ impl Watch {
 pub trait Fixture: Send {
     /// What it is, for the feed and for a sibling naming a source.
     fn id(&self) -> &'static str;
+
+    /// The parts that must stand in a room for this fixture to run there. A
+    /// building is fitted only with the fixtures whose objects are in the room,
+    /// so nothing it says names a thing the room does not hold.
+    fn needs(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The object whose state this fixture's fault is, when it has one a
+    /// character can operate. See [`binding`].
+    fn bound(&self) -> Option<Bound> {
+        None
+    }
+
+    /// Whether the fixture is in the fault its [`Bound`] object shows.
+    fn faulted(&self) -> bool {
+        false
+    }
+
+    /// A character set the object to its fault (`true`) or its resting
+    /// (`false`) mode: bring the fixture's own state into line, and say what
+    /// the room notices of it.
+    fn set_fault(&mut self, _on: bool) -> Option<Stirring> {
+        None
+    }
 
     /// What is true of it right now. Read by every sibling before it decides.
     fn signals(&self, _out: &mut Vec<Cond>) {}
@@ -324,6 +389,13 @@ const AT_REST: usize = 4;
 /// Everything in the building that can act on its own.
 pub struct Building {
     fixtures: Vec<Box<dyn Fixture>>,
+    /// Per fixture, the fault state last written to its object. See
+    /// [`binding`].
+    synced: Vec<bool>,
+    /// Object modes the fixtures have changed and the world has not yet applied.
+    outbox: Vec<Set>,
+    /// Faults standing in the world, handed to the board.
+    standing: Vec<Report>,
     started: SystemTime,
     /// Where [`ambient::Ambient`] sits, found by id rather than assumed, so
     /// reordering the list above cannot silently turn the dial off.
@@ -340,10 +412,13 @@ impl Building {
     /// own prose; this is the one thing that is a fact about *this* building,
     /// so it comes in from outside and the engine never authors it. An empty
     /// list is a building nobody left a message in, and it says nothing.
-    pub fn new(seed: u64, said: Vec<String>) -> Building {
+    ///
+    /// `parts` is the part ids standing in the room. A fixture that needs an
+    /// object the room does not have is not fitted.
+    pub fn new(seed: u64, said: Vec<String>, parts: &[&str]) -> Building {
         let mut rng = Rng::new(seed);
         let mut seed_for = || rng.roll();
-        let fixtures: Vec<Box<dyn Fixture>> = vec![
+        let mut fixtures: Vec<Box<dyn Fixture>> = vec![
             Box::new(ambient::Ambient::new(seed_for())),
             Box::new(broadcast::Broadcast::new(seed_for(), said)),
             Box::new(air::AirHandling::new(seed_for())),
@@ -359,11 +434,15 @@ impl Building {
             Box::new(boards::Boards::new(seed_for())),
             Box::new(stores::Stores::new(seed_for())),
         ];
+        fixtures.retain(|f| f.needs().iter().all(|p| parts.contains(p)));
         let at_rest = fixtures
             .iter()
             .position(|f| f.id() == "ambient")
             .expect("the building is always fitted with its quiet");
         Building {
+            synced: vec![false; fixtures.len()],
+            outbox: Vec::new(),
+            standing: Vec::new(),
             fixtures,
             started: SystemTime::now(),
             at_rest,
@@ -392,6 +471,7 @@ impl Building {
             since_start,
             wall: self.started + since_start,
             conds,
+            standing: self.standing.clone(),
         }
     }
 
@@ -447,6 +527,7 @@ impl Building {
         for f in &mut self.fixtures {
             f.notice(&s, &w);
         }
+        self.sync_out();
         Some(s)
     }
 

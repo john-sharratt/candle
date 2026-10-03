@@ -26,10 +26,13 @@ use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
 use crate::engine::body::{destinations, refusal, Outcome};
+use crate::engine::survey;
 use crate::engine::tools::SELF;
 use crate::engine::whereabouts;
-use crate::sim::field::Stance;
+use crate::sim::field::{Resource, Stance};
 use crate::sim::item::{Item, Kind as ItemKind};
+use crate::sim::tower::{on_map, Coord, Posture, DRILL_COST_PER_METRE, EDGE, SIEGE_COST};
+use crate::sim::Sim;
 use crate::world::Hosted;
 
 /// The acts this module performs.
@@ -85,7 +88,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         "lift_call" => lift_call(hosted, body),
         "lift_use" => lift_use(hosted, body, a),
         "scan" => scan(hosted, body, a),
-        "command_tower" => command_tower(hosted, a),
+        "command_tower" => command_tower(hosted, body, a),
         "produce" => produce(hosted, a),
         "promise" => promise(hosted, body, a),
         "remind" => remind(hosted, body, a),
@@ -660,9 +663,9 @@ fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         return Outcome::Did(said);
     }
     let (Some(x), Some(y)) = (text(args, "x"), text(args, "y")) else {
-        return Outcome::Refused(
-            "You meant to look somewhere, but gave neither a place nor a reference.".into(),
-        );
+        // Naming nothing is the other half of the act: look at what this room
+        // lets you work, and where to `invoke` it.
+        return survey::here(hosted, body);
     };
     let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) else {
         return Outcome::Refused("A grid reference is two numbers.".into());
@@ -670,10 +673,9 @@ fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     // A coordinate is the one argument a character can get well-formed and
     // still wrong, because it is a number rather than a name — so the edge of
     // the map is checked here rather than assumed.
-    if !crate::sim::tower::on_map(crate::sim::tower::Coord::new(x, y)) {
+    if !on_map(Coord::new(x, y)) {
         return Outcome::Refused(format!(
-            "{x},{y} is off the map. Nothing reaches past {}.",
-            crate::sim::tower::EDGE
+            "{x},{y} is off the map. Nothing reaches past {EDGE}."
         ));
     }
     let _ = body;
@@ -682,23 +684,43 @@ fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     ))
 }
 
-fn command_tower(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
+/// Command the tower. While somebody else is deciding what it does about
+/// something ([`crate::sim::decisions`]) it is theirs to command, and a body
+/// reaching for it is told whose it is. An act that lands settles whatever
+/// decisions the body was holding.
+fn command_tower(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let Some(action) = text(args, "action") else {
         return Outcome::Refused("You meant to tell the tower something, but not what.".into());
     };
-    hosted.with_sim(|s| {
+    hosted.with_both(|world, s| {
+        if let Some((decision, holder)) = s.tower_held_against(body) {
+            let name = world
+                .actor(&holder)
+                .map_or(holder.clone(), |a| a.name.clone());
+            return Outcome::Refused(format!(
+                "{name} is deciding this: {decision}. The tower is theirs to command until it is settled."
+            ));
+        }
+        let outcome = command_the_tower(s, &action, args);
+        if matches!(outcome, Outcome::Did(_)) {
+            s.settle_tower_decisions(body);
+        }
+        outcome
+    })
+}
+
+fn command_the_tower(s: &mut Sim, action: &str, args: &Map<String, Value>) -> Outcome {
+    {
         let Some(tower) = s.tower.as_mut() else {
             return Outcome::Refused("There is no tower here to command.".into());
         };
-        if !tower.actions().contains(&action) {
+        if !tower.actions().contains(&action.to_string()) {
             return Outcome::Refused(format!(
                 "The tower cannot {action} just now. It can: {}.",
                 tower.actions().join(", ")
             ));
         }
-        use crate::sim::field::Resource;
-        use crate::sim::tower::{Coord, Posture, FOLD_COST, SIEGE_COST};
-        match action.as_str() {
+        match action {
             "relocate" => {
                 let (Some(x), Some(y)) = (whole(args, "x"), whole(args, "y")) else {
                     return Outcome::Refused("A fold needs somewhere to fold to.".into());
@@ -706,11 +728,10 @@ fn command_tower(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
                 let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y)) else {
                     return Outcome::Refused("That is off the map.".into());
                 };
-                if !crate::sim::tower::on_map(Coord::new(x, y)) {
+                if !on_map(Coord::new(x, y)) {
                     return Outcome::Refused("That is off the map.".into());
                 }
-                tower.draw(Resource::Energy, FOLD_COST);
-                tower.at = Coord::new(x, y);
+                tower.fold_to(Coord::new(x, y));
                 Outcome::Did(format!("The tower folds. It stands at {x},{y}."))
             }
             "siege" => {
@@ -739,10 +760,12 @@ fn command_tower(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
                 let Ok(depth) = u32::try_from(depth) else {
                     return Outcome::Refused("That is deeper than the ground goes.".into());
                 };
-                tower.draw(
-                    Resource::Energy,
-                    crate::sim::tower::DRILL_COST_PER_METRE * depth as u64,
-                );
+                if !tower.draw(Resource::Energy, DRILL_COST_PER_METRE * depth as u64) {
+                    let afford = tower.stock_of(Resource::Energy) / DRILL_COST_PER_METRE;
+                    return Outcome::Refused(format!(
+                        "The stockpile turns the drill {afford} metres, not {depth}."
+                    ));
+                }
                 tower.depth = depth;
                 tower.posture = Posture::DugIn;
                 Outcome::Did(format!("The tower drills in, {depth} metres down."))
@@ -762,7 +785,7 @@ fn command_tower(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
             }
             other => Outcome::Refused(format!("Nothing here knows how to {other}.")),
         }
-    })
+    }
 }
 
 fn produce(hosted: &Hosted, args: &Map<String, Value>) -> Outcome {
@@ -884,7 +907,8 @@ fn message(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                 }
             });
             Outcome::Did(format!(
-                "You send it to {to}: {intent}. {} will see it when they next look.",
+                "You send it to {to}: {}. {} will see it when they next look.",
+                intent.trim_end_matches('.'),
                 npc_map::text::list(&reached)
             ))
         }
@@ -988,9 +1012,10 @@ fn reach_out(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome 
 mod tests {
     use super::*;
     use crate::engine::act::Act;
-    use crate::sim::field::Resource;
+    use crate::sim::upkeep::{CONTACT_EVERY, RESERVE};
     use npc_map::world::Where;
     use serde_json::json;
+    use std::time::Duration;
 
     fn act(tool: &'static str, args: Value) -> Act {
         Act {
@@ -1378,6 +1403,68 @@ mod tests {
         assert!(out.line().unwrap().contains("off the map"), "{out:?}");
     }
 
+    /// **A scan that names nothing surveys the room**: one line per station, with
+    /// the exact address to `invoke` and the tower's own state in a few words.
+    #[test]
+    fn a_scan_naming_nothing_surveys_the_stations_in_the_room() {
+        let h = tower_with(&[("c1", "Wren Weaver", "bridge")]);
+        let out = perform(&h, "c1", &act("scan", json!({})));
+        assert!(out.happened(), "{out:?}");
+        let line = out.line().unwrap();
+        assert!(line.starts_with("Here you can work:\n- "), "{line}");
+        assert!(line.contains("Bridge console:"), "{line}");
+        assert!(line.contains("shields down"), "{line}");
+        assert!(
+            line.contains("/command_tower` (needs action)"),
+            "the survey did not name the invoke address: {line}"
+        );
+        assert!(line.contains("`invoke` its address"), "{line}");
+    }
+
+    /// **The survey carries what the character holds as well as what the room
+    /// offers**: its conversations, whatever the room.
+    #[test]
+    fn a_survey_lists_the_characters_conversations() {
+        let h = waste();
+        h.with_sim(|s| {
+            crate::sim::seed::issue_handset(s, "c1", "Wren");
+            s.threads.reach("Wren", "Soren");
+            s.threads
+                .send("Soren", "Wren", "asks for the ore count")
+                .unwrap();
+        });
+        let out = perform(&h, "c1", &act("scan", json!({})));
+        let line = out.line().unwrap();
+        assert!(line.contains("On your phone:\n"), "{line}");
+        assert!(line.contains("- Soren: 1 unread.\n"), "{line}");
+        assert!(
+            !line.contains("ore count"),
+            "the content stays in `read`: {line}"
+        );
+    }
+
+    /// **A character with no handset is not told about one.**
+    #[test]
+    fn a_survey_leaves_out_a_phone_the_character_does_not_carry() {
+        let h = tower_with(&[("c1", "Wren Weaver", "rampart")]);
+        h.with_sim(|s| {
+            s.threads.reach("Wren Weaver", "Soren");
+        });
+        let out = perform(&h, "c1", &act("scan", json!({})));
+        assert!(!out.line().unwrap().contains("On your phone"), "{out:?}");
+    }
+
+    /// **A room with nothing to work says so rather than listing nothing.**
+    #[test]
+    fn a_survey_of_an_empty_room_points_elsewhere() {
+        let h = tower_with(&[("c1", "Wren Weaver", "rampart")]);
+        let out = perform(&h, "c1", &act("scan", json!({})));
+        assert_eq!(
+            out.line().unwrap(),
+            "Nothing in this room answers to you. To see somewhere else, name a place."
+        );
+    }
+
     #[test]
     fn the_tower_refuses_what_it_cannot_afford_and_names_what_it_can() {
         let h = waste();
@@ -1411,6 +1498,175 @@ mod tests {
             let t = s.tower.as_ref().unwrap();
             assert_eq!((t.at.x, t.at.y), (-300, 180));
             assert!(t.stock_of(Resource::Energy) < before);
+        });
+    }
+
+    /// The tower with a contact sighted and its decision on the board.
+    fn under_contact() -> Hosted {
+        let h = waste();
+        h.with_sim(|s| {
+            s.tower.as_mut().unwrap().advance(CONTACT_EVERY);
+            s.watch_tower();
+        });
+        h
+    }
+
+    fn the_decision(h: &Hosted) -> String {
+        h.sim(|s| s.tower_decisions().remove(0).what)
+    }
+
+    /// **Somebody holding the decision is the tower's one voice**: a bystander
+    /// is told who, by name, and the tower is left as it was.
+    #[test]
+    fn the_tower_is_not_commanded_over_whoever_is_deciding_it() {
+        let h = under_contact();
+        let what = the_decision(&h);
+        h.with_sim(|s| s.ledger.take_order(&what, "c1").unwrap());
+
+        let out = perform(
+            &h,
+            "c2",
+            &act("command_tower", json!({"action":"raise shields"})),
+        );
+
+        assert!(!out.happened(), "{out:?}");
+        let line = out.line().unwrap();
+        assert!(line.contains("Wren"), "the holder was not named: {line}");
+        assert!(
+            line.contains("contact 1"),
+            "the decision was not named: {line}"
+        );
+        assert!(!h.sim(|s| s.tower.as_ref().unwrap().shields));
+    }
+
+    /// **Nobody is in the way until somebody has taken it.**
+    #[test]
+    fn an_unheld_decision_does_not_stop_the_tower_being_commanded() {
+        let h = under_contact();
+        let out = perform(
+            &h,
+            "c2",
+            &act("command_tower", json!({"action":"raise shields"})),
+        );
+        assert!(out.happened(), "{out:?}");
+        assert!(h.sim(|s| s.tower.as_ref().unwrap().shields));
+    }
+
+    /// **The holder commands the tower, and that settles the decision**, so it
+    /// is not put to the crew again while the contact stands.
+    #[test]
+    fn the_holder_commands_the_tower_and_settles_the_decision() {
+        let h = under_contact();
+        let what = the_decision(&h);
+        h.with_sim(|s| s.ledger.take_order(&what, "c1").unwrap());
+
+        let out = perform(
+            &h,
+            "c1",
+            &act("command_tower", json!({"action":"raise shields"})),
+        );
+
+        assert!(out.happened(), "{out:?}");
+        h.with_sim(|s| {
+            assert!(s.tower_decisions().is_empty(), "the decision stayed open");
+            assert!(
+                s.watch_tower().is_empty(),
+                "a settled decision was raised again"
+            );
+        });
+        let free = perform(
+            &h,
+            "c2",
+            &act("command_tower", json!({"action":"drop shields"})),
+        );
+        assert!(
+            free.happened(),
+            "the tower stayed locked after it was decided: {free:?}"
+        );
+    }
+
+    /// **Folding away is the answer to a contact**: what was closing on the
+    /// tower is left behind, and so is the decision about it.
+    #[test]
+    fn folding_the_tower_leaves_the_contact_behind() {
+        let h = under_contact();
+        let out = perform(
+            &h,
+            "c1",
+            &act("command_tower", json!({"action":"relocate","x":10,"y":10})),
+        );
+        assert!(out.happened(), "{out:?}");
+        h.with_sim(|s| {
+            assert!(s.tower.as_ref().unwrap().contact.is_none());
+            s.watch_tower();
+            assert!(s.tower_decisions().is_empty());
+        });
+    }
+
+    /// **Shields are refused on a stockpile that cannot hold them**, not raised
+    /// to fail on the next beat.
+    #[test]
+    fn shields_are_refused_when_there_is_no_energy_to_hold_them() {
+        let h = waste();
+        h.with_sim(|s| {
+            let t = s.tower.as_mut().unwrap();
+            t.draw(Resource::Energy, t.stock_of(Resource::Energy));
+        });
+        let out = perform(
+            &h,
+            "c1",
+            &act("command_tower", json!({"action":"raise shields"})),
+        );
+        assert!(!out.happened(), "{out:?}");
+        assert!(!h.sim(|s| s.tower.as_ref().unwrap().shields));
+    }
+
+    /// **A drill is paid for or it does not turn**: a tower that cannot afford the
+    /// depth is told how deep it can go, and is not dug in for nothing.
+    #[test]
+    fn a_drill_the_stockpile_cannot_pay_for_is_refused_and_says_how_deep_it_can_go() {
+        let h = waste();
+        h.with_sim(|s| {
+            let t = s.tower.as_mut().unwrap();
+            t.draw(Resource::Energy, t.stock_of(Resource::Energy) - 50);
+        });
+        let out = perform(
+            &h,
+            "c1",
+            &act("command_tower", json!({"action":"drill down","depth":100})),
+        );
+        assert!(!out.happened(), "{out:?}");
+        assert!(out.line().unwrap().contains("25 metres"), "{out:?}");
+        h.sim(|s| {
+            let t = s.tower.as_ref().unwrap();
+            assert_eq!(t.depth, 0);
+            assert_eq!(t.stock_of(Resource::Energy), 50);
+        });
+    }
+
+    /// **A tower run down to its reserve can dig in, and the ground brings it
+    /// back.**
+    #[test]
+    fn a_run_down_tower_digs_in_and_recovers() {
+        let h = waste();
+        h.with_sim(|s| {
+            let t = s.tower.as_mut().unwrap();
+            t.draw(Resource::Energy, t.stock_of(Resource::Energy) - RESERVE);
+        });
+        let out = perform(
+            &h,
+            "c1",
+            &act("command_tower", json!({"action":"drill down","depth":50})),
+        );
+        assert!(out.happened(), "{out:?}");
+        h.with_sim(|s| {
+            let t = s.tower.as_mut().unwrap();
+            let low = t.stock_of(Resource::Energy);
+            t.advance(Duration::from_secs(60 * 30));
+            assert!(
+                t.stock_of(Resource::Energy) > low,
+                "the ground gave nothing"
+            );
         });
     }
 

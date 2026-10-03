@@ -138,6 +138,8 @@ pub fn of(n: &NpcPayload, world: &str, anchor: &str) -> OwnedPersona {
         // authored record carries no map.
         place: String::new(),
         building: String::new(),
+        mission: None,
+        journal: None,
         mode: Mode::Physical,
     }
 }

@@ -19,9 +19,14 @@ extern "C" {
     // Takes a single `headers_ptr` pointing to SlotHeader[num_active_slots] on GPU.
     // ========================================================================
 
-    /// Returns 0 on success, nonzero when the launch needed the split-KV
-    /// partial pool and its allocation failed (VRAM exhausted) — nothing was
-    /// launched and the output holds no result.
+    /// Returns 0 on success; nothing was launched and the output holds no
+    /// result on any other value:
+    /// - 1 — the launch needed the split-KV partial pool and its allocation
+    ///   failed (VRAM exhausted);
+    /// - 2 — the dispatch reached a route its head geometry excludes (an
+    ///   8-warp launch at head_dim 256, or the warp=head kernel at 8 warps
+    ///   and head_dim >= 128), whose kernel is not compiled in: a routing
+    ///   fault, never a resource condition.
     pub fn run_paged_decode_fp16(
         q_ptr: *const c_void,
         headers_ptr: *const u8,

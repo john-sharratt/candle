@@ -42,6 +42,25 @@ use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
 use candle_transformers::models::dialect::Dialect;
 
+/// Allocate a scratch slot on `scheduler_tx` — see
+/// [`Sequence::alloc_scratch_slot`].
+fn alloc_scratch_slot_on(
+    scheduler_tx: &Sender<SchedulerRequest>,
+    substrate: &Conversation,
+) -> crate::Result<SequenceId> {
+    let (tx, rx) = flume::bounded(1);
+    scheduler_tx
+        .send(SchedulerRequest::NewSequence {
+            conversation: substrate.clone(),
+            target: None,
+            // Scratch: a GPU resource, not a continuation of anything.
+            parent: None,
+            response_tx: tx,
+        })
+        .map_err(|_| ConversationError::SchedulerGone)?;
+    rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+}
+
 /// Slice a per-layer sealing down to the chunk range `[from..to)`.
 ///
 /// Each layer's `SealedSequence` is replaced with one whose `chunks`
@@ -195,7 +214,16 @@ pub(crate) fn window_sealed_tokens(
 use crate::stencil::{StencilDriver, StencilTree, ThinkMode, TriggerRegistry};
 use crate::turn_text::{encode_pieces, TurnText};
 use flume::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+mod ephemeral_turn;
+pub use ephemeral_turn::UnsealedAsker;
+mod prompt_dump;
+mod submitted_sections;
+
+pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};
+use submitted_sections::SubmittedSections;
+pub use submitted_sections::{SectionRef, SectionState};
 
 /// One code scope to ingest in parallel — the `(user, assistant)` pair a single
 /// A client-side conversation handle.
@@ -326,9 +354,50 @@ impl Drop for CancelClearsInFlight<'_> {
     }
 }
 
-pub struct Sequence {
+/// What it takes to lay out a turn's grid and hand it to the scheduler: the
+/// channel, the tokenizers and the config, none of which a conversation changes
+/// after it opens. Split out of [`Sequence`] so a handle that outlives any one
+/// borrow of the conversation ([`UnsealedAsker`]) can submit a turn without it.
+/// A `Sequence` reaches these fields and methods through `Deref`.
+#[derive(Clone)]
+pub struct TurnSubmitter {
     /// Channel to submit GPU work to the scheduler.
-    scheduler_tx: Sender<SchedulerRequest>,
+    pub(crate) scheduler_tx: Sender<SchedulerRequest>,
+
+    /// Shared tokenizer.
+    pub(crate) tokenizer: Arc<tokenizers::Tokenizer>,
+
+    /// The tokenizer for literal text, which reads every chat tag as plain
+    /// characters — see [`crate::turn_text`].
+    pub(crate) literal_tokenizer: Arc<tokenizers::Tokenizer>,
+
+    /// Per-conversation config.
+    pub(crate) config: SequenceConfig,
+}
+
+/// The two things a conversation changes between turns that an
+/// [`UnsealedAsker`] must see current: the projection schema (its submitted
+/// sections come and go) and the selection the last turn ran under.
+pub(crate) struct AskState {
+    pub(crate) projection: Arc<Builder>,
+    pub(crate) selection: SelectionState,
+}
+
+impl std::ops::Deref for Sequence {
+    type Target = TurnSubmitter;
+
+    fn deref(&self) -> &TurnSubmitter {
+        &self.submitter
+    }
+}
+
+pub struct Sequence {
+    /// How this conversation lays out and submits a turn.
+    submitter: TurnSubmitter,
+
+    /// The projection and selection as of the last change, shared with every
+    /// [`UnsealedAsker`] taken from this conversation.
+    ask_state: Arc<Mutex<AskState>>,
 
     /// The sequence slot allocated by the scheduler.  This is the
     /// sequence's identifier — there is no separate logical id,
@@ -336,13 +405,6 @@ pub struct Sequence {
     /// every other use of "which sequence" is in-memory addressing
     /// that this `SequenceId` covers.
     id: SequenceId,
-
-    /// Shared tokenizer.
-    tokenizer: Arc<tokenizers::Tokenizer>,
-
-    /// The tokenizer for literal text, which reads every chat tag as plain
-    /// characters — see [`crate::turn_text`].
-    literal_tokenizer: Arc<tokenizers::Tokenizer>,
 
     /// Sequence tree — the canonical turn history for this conversation.
     /// Holds system prompt (with token ids), paired user↔assistant exchanges
@@ -359,9 +421,6 @@ pub struct Sequence {
 
     /// Monotonic turn counter.
     turn_counter: u64,
-
-    /// Per-conversation config.
-    config: SequenceConfig,
 
     /// Current section-tree selection (e.g. the composer dials).  Set from each
     /// turn's [`TurnOptions::selection`] and used by every projection until the
@@ -391,7 +450,14 @@ pub struct Sequence {
     /// Held as an `Arc` so the scheduler can hold a reference for
     /// continuous re-projection without repeatedly deep-cloning the
     /// underlying `Schema`.
+    ///
+    /// This is `base_projection` plus the sections this conversation has
+    /// submitted and sealed — see [`SubmittedSections`].
     pub(crate) projection: Arc<Builder>,
+    /// The schema as the caller supplied it, without the submitted sections.
+    base_projection: Arc<Builder>,
+    /// Sections submitted to this conversation after it opened.
+    submitted: SubmittedSections,
     /// Workspace-shared substrate handle (Arc-cloneable).  Holds per-turn
     /// metadata (token counts, scores, sig entries, restoration sources)
     /// for every conversation in the engine.  Read-locked during projection,
@@ -761,22 +827,31 @@ impl Sequence {
         };
 
         let tree_config = config.tree.clone();
+        let projection = Arc::new(projection);
         let conv = Self {
-            scheduler_tx,
+            submitter: TurnSubmitter {
+                scheduler_tx,
+                tokenizer,
+                literal_tokenizer,
+                config,
+            },
+            ask_state: Arc::new(Mutex::new(AskState {
+                projection: Arc::clone(&projection),
+                selection: SelectionState::default(),
+            })),
             id: sequence_id,
-            tokenizer,
-            literal_tokenizer,
             tree: ConversationTree::with_config(system_prompt, tree_config),
             selection: SelectionState::default(),
             pending_user: None,
             turn_counter: initial_turn_counter,
-            config,
             turn_in_flight: false,
             freed: false,
             current_blocks: BlockCount(0),
             chunk_size,
             model_core,
-            projection: Arc::new(projection),
+            base_projection: Arc::clone(&projection),
+            projection,
+            submitted: SubmittedSections::default(),
             substrate,
             target,
             primed_prefix: Arc::new(Vec::new()),
@@ -1906,17 +1981,7 @@ impl Sequence {
     /// section ingestion produces context-independent KV that doesn't
     /// belong to any conversation timeline.
     fn alloc_scratch_slot(&self) -> crate::Result<SequenceId> {
-        let (tx, rx) = flume::bounded(1);
-        self.scheduler_tx
-            .send(SchedulerRequest::NewSequence {
-                conversation: self.substrate.clone(),
-                target: None,
-                // Scratch: a GPU resource, not a continuation of anything.
-                parent: None,
-                response_tx: tx,
-            })
-            .map_err(|_| ConversationError::SchedulerGone)?;
-        rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+        alloc_scratch_slot_on(&self.scheduler_tx, &self.substrate)
     }
 
     /// Submit a user turn for processing.
@@ -1946,6 +2011,7 @@ impl Sequence {
                 sequence_id: self.id,
             });
         }
+        self.sync_submitted_sections();
 
         // Adopt this turn's section-tree selection (the composer dials).  It
         // becomes the conversation's current selection and drives every
@@ -1953,6 +2019,7 @@ impl Sequence {
         // turn changes it.
         let selection_changed = self.selection != options.selection;
         self.selection = options.selection.clone();
+        self.publish_ask_state();
 
         // A FIRST turn whose dials select a different prompt branch: the
         // checkpoint installed at create is the default branch's, because
@@ -1990,6 +2057,56 @@ impl Sequence {
         // state past the prompt — the swap window closes.
         self.state_is_prompt_only = false;
 
+        let (handle, user_tokens) = self.submit_turn_on(
+            self.id,
+            self.projection_inputs(),
+            &user_message,
+            user_text.clone(),
+            options,
+            self.build_reprojection_policy(),
+        )?;
+        // Record the pending user turn (text + raw tokens for the tree).
+        self.pending_user = Some(TokenizedText::new(user_text.as_str(), user_tokens));
+        self.turn_in_flight = true;
+        Ok(handle)
+    }
+
+    /// Record the projection and selection an [`UnsealedAsker`] reads.
+    pub(super) fn publish_ask_state(&self) {
+        let mut state = self.ask_state.lock().unwrap();
+        state.projection = Arc::clone(&self.projection);
+        state.selection = self.selection.clone();
+    }
+
+    /// A handle that can put a question to this conversation without borrowing it.
+    pub fn unsealed_asker(&self) -> UnsealedAsker {
+        UnsealedAsker {
+            submitter: self.submitter.clone(),
+            id: self.id,
+            state: Arc::clone(&self.ask_state),
+        }
+    }
+}
+
+impl TurnSubmitter {
+    /// Compose a user turn's prefill and submit it for decode on `sequence_id`.
+    ///
+    /// The one place a turn's grid is laid out, shared by the sealing path
+    /// ([`Sequence::submit_turn_with_options`], on the conversation's own slot)
+    /// and the unsealed one ([`UnsealedAsker::ask`], on an ephemeral slot).
+    /// Touches no conversation state — the caller owns the in-flight guard and the
+    /// pending user turn — and returns the encoded user half so the sealing caller
+    /// can record it. `reprojection` enables mid-decode re-projection, which only
+    /// a turn that is going to be sealed has any use for.
+    fn submit_turn_on(
+        &self,
+        sequence_id: SequenceId,
+        projection_inputs: ProjectionInputs,
+        user_message: &TurnText,
+        user_text: String,
+        options: TurnOptions,
+        reprojection: Option<ReprojectionPolicy>,
+    ) -> crate::Result<(TurnHandle, TokenBuffer)> {
         // Pin the system prompt into the substrate (idempotent).
         // Subsequent SubmitTurn calls re-inject it onto the slot via
         // `apply_projection`; the upload cache amortises after the
@@ -2054,7 +2171,7 @@ impl Sequence {
         // follow as one string, exactly as they always have. The half meets the
         // markers on `user_end`, a registered tag the tokenizer splits at anyway,
         // so the concatenation is the whole grid's encoding.
-        let user_tokens = self.encode_text(&user_message)?;
+        let user_tokens = self.encode_text(user_message)?;
         let markers = format!("{}{}", self.config.dialect.user_end, assistant_start_marker);
         let assistant_head = format!("{user_text}{markers}");
         let lead = assistant_lead(closed_think, assistant_prefill);
@@ -2097,9 +2214,6 @@ impl Sequence {
         // after the sealed turn on every future projection.
         let post_decode_tokens = TokenBuffer::new();
 
-        // Record the pending user turn (text + raw tokens for the tree).
-        self.pending_user = Some(TokenizedText::new(user_text.as_str(), user_tokens.clone()));
-
         let sampling = options
             .sampling
             .unwrap_or_else(|| self.config.sampling.clone());
@@ -2115,7 +2229,10 @@ impl Sequence {
             "turn submitted"
         );
 
-        let reprojection = self.build_reprojection_policy();
+        let free_tool_calls_from_penalties = projection_inputs
+            .projection
+            .schema()
+            .free_tool_calls_from_penalties;
         // Content boundaries inside the sealed grid.  The prefill grid is
         // `[user_msg][user_end][assistant_start]` — the leading `user_start` (and,
         // when suppressing, `/no_think`) are live `Generated` glue segments emitted
@@ -2161,8 +2278,8 @@ impl Sequence {
             .min(total)
             .max(user_content_end as usize)) as u32;
         let handle = self.submit_prefill_unit(
-            self.id,
-            Some(self.projection_inputs()),
+            sequence_id,
+            Some(projection_inputs),
             formatted,
             prefill_tokens,
             user_text,
@@ -2188,13 +2305,14 @@ impl Sequence {
             // Read off the schema, not the turn: whether tool arguments are
             // quotations or prose is a property of what this conversation *is*,
             // and a per-turn switch would be a way to get it wrong on one turn.
-            self.projection.schema().free_tool_calls_from_penalties,
+            free_tool_calls_from_penalties,
             options.recorded_turn,
         )?;
-        self.turn_in_flight = true;
-        Ok(handle)
+        Ok((handle, user_tokens))
     }
+}
 
+impl Sequence {
     /// Submit a calibration turn whose assistant trajectory is **supplied
     /// verbatim** and prefilled in a single batched forward pass instead of
     /// decoded — the fast path that reproduces a decode-built calibration turn's
@@ -2229,7 +2347,9 @@ impl Sequence {
                 sequence_id: self.id,
             });
         }
+        self.sync_submitted_sections();
         self.selection = selection;
+        self.publish_ask_state();
 
         // **No suppression block here, unlike `submit_turn_with_options`.** That
         // path prefills the dialect's closed block because the model is about to
@@ -2385,7 +2505,9 @@ impl Sequence {
                 sequence_id: self.id,
             });
         }
+        self.sync_submitted_sections();
         self.selection = selection;
+        self.publish_ask_state();
 
         // Each case's grid is the whole turn a lone prefill would lay down —
         // opener, user body, the user/assistant join, and the closing marker —
@@ -2507,7 +2629,9 @@ impl Sequence {
         self.turn_in_flight = true;
         Ok((TurnHandle::new(event_rx), sources))
     }
+}
 
+impl TurnSubmitter {
     /// Send a `SubmitTurn` request to the scheduler, returning the
     /// streaming handle.
     ///
@@ -2694,6 +2818,27 @@ impl Sequence {
         self.tokenize(&self.turn_head_text(no_think))
     }
 
+    /// The canonical token sequence for `text`.
+    ///
+    /// The format is: `[no_think] user_text user_end asst_start asst_text turn_end user_start`
+    /// This matches what is prefilled during a normal `submit_turn` / `finish_turn` cycle and
+    /// is used to reconstruct the context window during the pre-submit phase.
+    fn tokenize(&self, text: &str) -> crate::Result<TokenBuffer> {
+        self.tokenizer
+            .encode(text, false)
+            .map(|enc| TokenBuffer::from(enc.get_ids()))
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))
+    }
+
+    /// Encode a user half piece by piece, its literal pieces spelled out — see
+    /// [`crate::turn_text`].
+    fn encode_text(&self, text: &TurnText) -> crate::Result<TokenBuffer> {
+        encode_pieces(&self.tokenizer, &self.literal_tokenizer, text)
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))
+    }
+}
+
+impl Sequence {
     /// Build the projection inputs the scheduler needs to run
     /// `Builder::project()` for this conversation's `target`.  The
     /// target itself is pinned on the slot (via the scheduler's
@@ -4042,7 +4187,7 @@ impl Sequence {
             assistant_tt,
             TurnType::Reality,
             vec![],
-            Some((&self.scheduler_tx, &self.tokenizer)),
+            Some((&self.submitter.scheduler_tx, &self.submitter.tokenizer)),
         );
 
         // Apply any cognitive task that has finished. Tasks still running —
@@ -4228,18 +4373,24 @@ impl Sequence {
     /// with one collection's selection overridden) — its sealed-section KV is
     /// reused as-is. Takes effect on the next submitted turn (the prefill
     /// projection and the reprojection policy both read this on submit).
+    ///
+    /// Sections submitted to this conversation stay in its collections: they
+    /// are merged into the new schema, so the builder passed in never carries
+    /// them.
     pub fn set_projection(&mut self, projection: Arc<Builder>) {
-        self.projection = projection;
+        self.base_projection = projection;
+        self.rebuild_projection();
     }
 
-    /// The projection schema this sequence currently projects with — the getter
-    /// paired with [`Self::set_projection`].
+    /// The projection schema this sequence was last given — the getter paired
+    /// with [`Self::set_projection`]. It does not include submitted sections,
+    /// which [`Self::set_projection`] merges back in.
     ///
     /// Handing it back and setting it again is how a caller asks for a
     /// reprojection without changing what is projected, which is otherwise not
     /// expressible: reprojection is policy-driven from inside the decode loop.
     pub fn projection(&self) -> Arc<Builder> {
-        Arc::clone(&self.projection)
+        Arc::clone(&self.base_projection)
     }
 
     /// Shared body of [`Self::fork`] / [`Self::fork_resuming`] /
@@ -4312,21 +4463,26 @@ impl Sequence {
         let new_seq_id = rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
 
         let fork_conv = Sequence {
-            scheduler_tx: self.scheduler_tx.clone(),
+            submitter: self.submitter.clone(),
+            ask_state: Arc::new(Mutex::new(AskState {
+                projection: Arc::clone(&self.base_projection),
+                selection: self.selection.clone(),
+            })),
             id: new_seq_id,
-            tokenizer: Arc::clone(&self.tokenizer),
-            literal_tokenizer: Arc::clone(&self.literal_tokenizer),
             tree: self.tree.clone(),
             selection: self.selection.clone(),
             pending_user: None,
             turn_counter: self.turn_counter,
-            config: self.config.clone(),
             turn_in_flight: false,
             freed: false,
             current_blocks: self.current_blocks,
             chunk_size: self.chunk_size,
             model_core: self.model_core,
-            projection: self.projection.clone(),
+            // A fork starts from the schema its parent was given: the parent's
+            // submitted sections belong to the parent and go when it does.
+            base_projection: Arc::clone(&self.base_projection),
+            projection: Arc::clone(&self.base_projection),
+            submitted: SubmittedSections::default(),
             // Forks share the same substrate (Arc clone) so cross-fork
             // history aggregation continues to work.
             substrate: self.substrate.clone(),
@@ -5005,32 +5161,15 @@ impl Sequence {
     /// boundary, and is public so a caller that wants a result sooner — or a
     /// test waiting for one — can poll between turns.
     pub fn poll_cognitive_tasks(&mut self) -> usize {
-        self.tree
-            .poll_tasks(Some((&self.scheduler_tx, &self.tokenizer)))
+        self.tree.poll_tasks(Some((
+            &self.submitter.scheduler_tx,
+            &self.submitter.tokenizer,
+        )))
     }
 
     /// Number of cognitive tasks still running in the background.
     pub fn pending_cognitive_tasks(&self) -> usize {
         self.tree.pending_task_count()
-    }
-
-    /// Build the canonical token sequence for one completed turn.
-    ///
-    /// The format is: `[no_think] user_text user_end asst_start asst_text turn_end user_start`
-    /// This matches what is prefilled during a normal `submit_turn` / `finish_turn` cycle and
-    /// is used to reconstruct the context window during the pre-submit phase.
-    fn tokenize(&self, text: &str) -> crate::Result<TokenBuffer> {
-        self.tokenizer
-            .encode(text, false)
-            .map(|enc| TokenBuffer::from(enc.get_ids()))
-            .map_err(|e| ConversationError::Tokenizer(e.to_string()))
-    }
-
-    /// Encode a user half piece by piece, its literal pieces spelled out — see
-    /// [`crate::turn_text`].
-    fn encode_text(&self, text: &TurnText) -> crate::Result<TokenBuffer> {
-        encode_pieces(&self.tokenizer, &self.literal_tokenizer, text)
-            .map_err(|e| ConversationError::Tokenizer(e.to_string()))
     }
 
     // ── Turn-lifecycle helpers ────────────────────────────────────────────────
