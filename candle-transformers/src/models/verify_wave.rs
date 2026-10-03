@@ -43,9 +43,55 @@
 
 use std::ops::Range;
 
-use candle::{Result, Tensor};
+use candle::{Device, Result, Tensor};
 
-use super::batched_inference::{BatchedInferenceSession, ManagedBatchedModel};
+use super::batched_inference::{BatchedInferenceSession, ManagedBatchedModel, WaveResult};
+
+/// A verify plan's token rows, uploaded **once per group**: the plain cohort's
+/// tokens as one `[n, 1]` tensor with each sequence's input a `[1, 1]` view of
+/// its row, and the blocks as one `[1, Σ len]` tensor with each block a
+/// `[1, len]` view of its run. Returned as `(plain inputs, block inputs)`, in
+/// the order given.
+///
+/// One host→device copy per group, however many sequences the wave carries —
+/// and it lands ahead of a forward whose queue is empty and waiting, so a copy
+/// per row would be a stall per row. The views also sit back to back in their
+/// buffer, so the forward's concatenation of a group's ids is one copy rather
+/// than one per sequence (`Tensor::cat` copies runs of adjacent views as one
+/// range).
+///
+/// On `device` because the rows join the wave's other inputs there — the
+/// scheduler's creep and glue rows are device tensors, and a concatenation
+/// across devices is refused.
+pub fn upload_plan_rows(
+    plain: &[u32],
+    blocks: &[Vec<u32>],
+    device: &Device,
+) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+    let plain_inputs = if plain.is_empty() {
+        Vec::new()
+    } else {
+        let all = Tensor::from_vec(plain.to_vec(), (plain.len(), 1), device)?;
+        (0..plain.len())
+            .map(|i| all.narrow(0, i, 1))
+            .collect::<Result<_>>()?
+    };
+    let block_inputs = if blocks.is_empty() {
+        Vec::new()
+    } else {
+        let flat: Vec<u32> = blocks.iter().flatten().copied().collect();
+        let total = flat.len();
+        let all = Tensor::from_vec(flat, (1, total), device)?;
+        let mut start = 0;
+        let mut out = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            out.push(all.narrow(1, start, b.len())?);
+            start += b.len();
+        }
+        out
+    };
+    Ok((plain_inputs, block_inputs))
+}
 
 /// The work riding the verify wave besides the verify blocks themselves.
 ///
@@ -95,10 +141,18 @@ pub struct VerifyWaveOutput {
     /// Per-row logits in caller order, truncated to `[decode | verify]` — the
     /// only rows the accept walk reads. Creep rows promote through the
     /// scheduler's own path and glue rows carry no logits at all.
+    ///
+    /// **Views on the head's span, not copies.** They are valid while
+    /// [`Self::head`] is held; a caller reads them — the accept walk — and
+    /// drops both before the next forward opens, so a decode step allocates and
+    /// copies nothing to hand its scored rows to the walk.
     pub logits: Vec<Tensor>,
     /// The creep's residual after this wave, to hold for the next one. `None`
     /// when no creep rode along.
     pub creep_residual: Option<Tensor>,
+    /// The forward that reached the head — the guard keeping [`Self::logits`]
+    /// valid. Dropped once they have been read.
+    pub head: WaveResult,
 }
 
 /// The rows a verify step feeds its wave, and which group slot each goes in.
@@ -259,20 +313,14 @@ where
             layer_end,
             None,
         )?;
-        // Taking the scored rows off the wave arena, which is the one thing
-        // between the sweep and this function's return that costs anything at
-        // width — one allocation and one copy per row. See `verify:fwd`.
-        let g_own = crate::models::profile::gpu_span("vw:own", session.device());
-        let mut logits = step.logits_owned()?;
+        // The scored rows stay on the head's span, read through the result
+        // that holds it.
+        let mut logits = step.logits_on_span();
         logits.truncate(want);
-        // Explicitly, inside the span: dropping the result releases the head's
-        // forward-span guard, and that reclaim is the only other thing between
-        // the sweep and this function's return.
-        drop(step);
-        g_own.end();
         return Ok(VerifyWaveOutput {
             logits,
             creep_residual: co.creep_residual.clone(),
+            head: step,
         });
     }
 
@@ -333,17 +381,19 @@ where
     // The head runs at the end of the sweep, so whichever segment finishes at
     // `layer_end` is the one carrying logits.
     if win_end >= layer_end {
-        let mut logits = seg2.logits_owned()?;
+        let mut seg2 = seg2;
+        let mut logits = seg2.logits_on_span();
         logits.truncate(want);
         // The creep did not finish its own sweep, so its residual is held even
         // though this wave reached the head for everyone else.
         let creep_residual = seg2
-            .into_residual()
+            .take_residual()
             .map(|r| r.narrow(1, rows.before_creep(), rows.creep))
             .transpose()?;
         return Ok(VerifyWaveOutput {
             logits,
             creep_residual,
+            head: seg2,
         });
     }
 
@@ -381,11 +431,12 @@ where
         layer_end,
         seg3_in,
     )?;
-    let mut logits = seg3.logits_owned()?;
+    let mut logits = seg3.logits_on_span();
     logits.truncate(want);
     Ok(VerifyWaveOutput {
         logits,
         creep_residual,
+        head: seg3,
     })
 }
 

@@ -249,6 +249,10 @@ pub mod wave_buffers;
 // Drives the batched wave loop over `batched_inference` / `batched_layer`.
 #[cfg(feature = "cuda")]
 pub mod wave_driver;
+// A wave's token ids on the host in one readback — read by the CUDA batched
+// forwards that need their ids on the CPU.
+#[cfg(feature = "cuda")]
+pub mod wave_token_ids;
 pub mod whisper;
 pub mod with_tracing;
 pub mod wuerstchen;

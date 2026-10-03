@@ -51,7 +51,7 @@ use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::{RecurrentCompaction, RecurrentStateStore, StashSlot};
 use crate::models::profile::pipeline_record_duration;
-use crate::models::verify_wave::VerifyPlan;
+use crate::models::verify_wave::{upload_plan_rows, VerifyPlan};
 use candle_nn::kv_cache::ModelGeometry;
 
 use crate::models::batched_inference::{
@@ -261,16 +261,10 @@ impl ManagedBatchedModel for HybridBatched {
         }
         // The model's device, not the host: these rows are cat'd with whatever
         // else the caller has on the wave, and the scheduler's creep group and
-        // glue are device-side.
+        // glue are device-side. One upload per group.
         let dseqs: Vec<usize> = plain.iter().map(|&(s, _)| s).collect();
-        let dinputs: Vec<Tensor> = plain
-            .iter()
-            .map(|&(_, t)| Tensor::from_vec(vec![t], (1, 1), self.device()))
-            .collect::<Result<_>>()?;
-        let pinputs: Vec<Tensor> = blocks
-            .iter()
-            .map(|b| Tensor::from_vec(b.clone(), (1, b.len()), self.device()))
-            .collect::<Result<_>>()?;
+        let tokens: Vec<u32> = plain.iter().map(|&(_, t)| t).collect();
+        let (dinputs, pinputs) = upload_plan_rows(&tokens, blocks, self.device())?;
 
         // **Size every verifying sequence's stash before the forward opens.**
         // A wave's storage is claimed by `admit_wave_kv` and the transient tier
@@ -360,8 +354,9 @@ impl ManagedBatchedModel for HybridBatched {
         for (i, &seq) in seqs.iter().enumerate() {
             session.advance_sequence(seq, blocks[i].len())?;
         }
-        // Already copied off the wave's span by the caller: the accept walk
-        // reads these position by position and may run another forward first.
+        // Owned rows from the scheduler, or views on the verify wave's head span
+        // from the step driver, which holds that wave until its accept walk has
+        // read them and drops both before the rewind.
         let lens: Vec<usize> = blocks.iter().map(|b| b.len()).collect();
         split_block_rows(&logits, plain.len(), &lens)
     }
@@ -889,6 +884,7 @@ fn sweep_layers(
     // Spanned because it is the widest-scaling piece of the sweep's setup: one
     // slot header per decode sequence, so it is ~1 ms at a handful of slots and
     // ~20 ms at 128.
+    let accept_in_place = session.accept_in_place();
     let g_meta = crate::models::profile::gpu_span("fwd:meta", model.device());
     #[cfg(feature = "cuda")]
     let decode_headers = if n_decode > 0 {
@@ -971,14 +967,18 @@ fn sweep_layers(
                     }
                 })
                 .sum();
+            let scored_rows = if layer_end == num_layers {
+                n_decode + scored_prefill
+            } else {
+                0
+            };
             let width = WaveWidth {
                 prefill_rows: pre_rows,
                 decode_rows: n_decode,
-                scored_rows: if layer_end == num_layers {
-                    n_decode + scored_prefill
-                } else {
-                    0
-                },
+                scored_rows,
+                // The caller's accept walk selects on the head's span only when
+                // it reads the logits there.
+                accept_rows: if accept_in_place { scored_rows } else { 0 },
                 // A one-row prefill group takes the decode kernels, so it carves
                 // no span-table entry and, alone, no scan transient.
                 prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),

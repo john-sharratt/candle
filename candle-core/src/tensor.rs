@@ -4053,6 +4053,58 @@ impl<'w> LiveTensor<'w> {
         std::ptr::eq(lhs, rhs)
     }
 
+    /// The tensor [`Self::cat`] would build from `parts` along `dim`, as a
+    /// **view** — no allocation, no copy — when the parts already are that
+    /// tensor: contiguous ranges of one storage, each starting where the one
+    /// before it ends, with nothing ahead of `dim` but unit dims (so the
+    /// concatenation is one range). `None` when they are not, and the caller
+    /// concatenates.
+    ///
+    /// For data cut into per-sequence views and wanted whole again — the rows
+    /// of one logits block handed out per sequence, then read as a block. The
+    /// view aliases the parts' storage, which is what makes it free and what
+    /// the caller must want: a write through it is a write to them.
+    pub fn cat_view<A: AsRef<LiveTensor<'w>>, D: Dim>(parts: &[A], dim: D) -> Option<Self> {
+        let first = parts.first()?.as_ref();
+        let dim = dim.to_index(first.shape(), "cat_view").ok()?;
+        let dims0 = first.dims();
+        if dims0[..dim].iter().any(|&d| d != 1) {
+            return None;
+        }
+        let mut cat_dims = dims0.to_vec();
+        cat_dims[dim] = 0;
+        let mut next = first.layout.start_offset();
+        for part in parts {
+            let part = part.as_ref();
+            let dims = part.dims();
+            if !part.is_contiguous()
+                || !part.same_storage(first)
+                || dims.len() != dims0.len()
+                || part.layout.start_offset() != next
+                || dims
+                    .iter()
+                    .zip(dims0)
+                    .enumerate()
+                    .any(|(i, (a, b))| i != dim && a != b)
+            {
+                return None;
+            }
+            cat_dims[dim] += dims[dim];
+            next += part.elem_count();
+        }
+        let op = BackpropOp::new(parts, |args| Op::Cat(args, dim));
+        Some(LiveTensor(Arc::new(TensorInner {
+            lease: PhantomData,
+            id: TensorId::new(),
+            storage: first.storage.clone(),
+            layout: Layout::contiguous_with_offset(cat_dims, first.layout.start_offset()),
+            op,
+            is_variable: false,
+            dtype: first.dtype,
+            device: first.device.clone(),
+        })))
+    }
+
     /// Normalize a 'relative' axis value: positive values are kept, negative
     /// values means counting the dimensions from the back.
     pub fn normalize_axis(&self, axis: i64) -> Result<usize> {

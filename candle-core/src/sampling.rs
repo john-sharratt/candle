@@ -382,7 +382,21 @@ impl CustomOp1 for BatchedSampling {
         }
         let batch_size = dims[0];
         let vocab_size = dims[1];
-        let logits = f32::cpu_storage_as_slice(storage)?;
+        // The dtypes the CUDA kernel takes; half precision widens to f32
+        // exactly, so every comparison below is the one the narrow value makes.
+        let widened: Vec<f32>;
+        let logits: &[f32] = match storage {
+            CpuStorage::F32(v) => v,
+            CpuStorage::F16(v) => {
+                widened = v.iter().map(|x| x.to_f32()).collect();
+                &widened
+            }
+            CpuStorage::BF16(v) => {
+                widened = v.iter().map(|x| x.to_f32()).collect();
+                &widened
+            }
+            _ => crate::bail!("BatchedSampling: unsupported dtype, expected F32/F16/BF16"),
+        };
 
         let mut tokens = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
@@ -468,18 +482,26 @@ impl CustomOp1 for BatchedSampling {
         // Allocate output buffer [batch_size] u32
         let output_slice = unsafe { device.alloc::<u32>(batch_size)? };
 
-        // Allocate RNG offsets [batch_size] u64
-        let rng_data: Vec<u64> = if self.rng_offsets.len() == batch_size {
-            self.rng_offsets.clone()
+        // RNG offsets [batch_size] u64 — for a draw only. An argmax
+        // (`temperature <= 0`) reads no RNG and the kernel takes a null pointer
+        // there, so a greedy pick uploads nothing: it runs once per accept-walk
+        // position and once per drafted token.
+        let rng_slice = if self.temperature <= 0.0 && self.rng_offsets.is_empty() {
+            None
         } else {
-            vec![0u64; batch_size]
+            let rng_data: Vec<u64> = if self.rng_offsets.len() == batch_size {
+                self.rng_offsets.clone()
+            } else {
+                vec![0u64; batch_size]
+            };
+            Some(device.memcpy_stod(&rng_data)?)
         };
-        let rng_slice = device.memcpy_stod(&rng_data)?;
 
         // All guards must live until after the FFI call
         {
             let (output_ptr, _out_guard) = output_slice.device_ptr(&stream);
-            let (rng_ptr, _rng_guard) = rng_slice.device_ptr(&stream);
+            let rng = rng_slice.as_ref().map(|s| s.device_ptr(&stream));
+            let rng_ptr = rng.as_ref().map_or(0, |(p, _)| *p);
 
             // Helper closure to invoke the kernel with a logits pointer
             let call_kernel = |logits_ptr: u64| unsafe {

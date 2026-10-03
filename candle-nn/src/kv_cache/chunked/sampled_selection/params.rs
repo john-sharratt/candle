@@ -966,10 +966,16 @@ pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
     //
     // Every other rung and width is green at both factors. The cost is about
     // 1.6% of ratio at ×64 on each gate.
-    k_hi: 0.95,
-    k_low: 0.95,
-    v_hi: 2.0,
-    v_low: 2.0,
+    //
+    // **Re-set 2026-10-03, k 0.95 → 0.90 and v 2.0 → 1.9**, after the decode
+    // work of that day (warp-per-row DeltaNet decode step, batched greedy picks)
+    // moved the hybrid on `Int8Mode::Performance` one session past the edge
+    // again: C10×64 at 63/64, every other gate and rung green, ratio 5.97×.
+    // Both axes one notch down together.
+    k_hi: 0.90,
+    k_low: 0.90,
+    v_hi: 1.9,
+    v_low: 1.9,
 };
 
 /// Qwen3.8-27B (dense flagship hybrid).
@@ -1173,11 +1179,25 @@ pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
 ///
 /// Ratio lands in line with the lineage (3.5 at 7.13×, 3.6 at 6.8×) despite
 /// only a quarter of the stack holding K/V at all.
+///
+/// **Re-set 2026-10-03: k 1.8 → 1.7, v 3.0 → 2.8.** The PLE block now runs
+/// over the whole wave, so its `key`/`value` projections are one matmul at
+/// M = the wave's rows where they were one per sequence (M = 1 in decode).
+/// That is a different F32 summation order inside cuBLAS — about two ulps on
+/// the layer-1 projections, not a loss of accuracy — but it moves every later
+/// layer's K/V by rounding, and C10, calibrated just under the edge, carries
+/// sessions on a near-tie that the perturbation tips. C10×8 failed 6/8 at
+/// 1.8 / 3.0 after passing in every run that day, and 7/8 at 1.7 / 3.0 in two
+/// runs out of two (6.63×). At 1.7 / 2.8 it passed 8/8 at 6.45× (C10×2) /
+/// 6.43× (C10×8), against 6.75× before — the price of keeping the wave-wide
+/// projection, which reads the 131 MB of PLE weights once per wave instead of
+/// once per sequence. V at 2.8 is the value the lineage's earlier retightening
+/// measured.
 pub const QWEN4EXP_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
-    k_hi: 1.8,
-    k_low: 1.8,
-    v_hi: 3.0,
-    v_low: 3.0,
+    k_hi: 1.7,
+    k_low: 1.7,
+    v_hi: 2.8,
+    v_low: 2.8,
 };
 
 /// **Qwen3.8-Flash-Next at `Q2_KO` experts** — the 16 GB card's rung

@@ -915,6 +915,121 @@ fn cat(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Views that sit back to back in one storage are copied as one run; every
+/// other argument keeps its own copy. The values must be what a per-argument
+/// copy gives, whichever way the arguments group.
+fn cat_runs_of_adjacent_views(device: &Device) -> Result<()> {
+    let root = Tensor::new(&[10u32, 11, 12, 13, 14, 15], device)?;
+    let other = Tensor::new(&[90u32, 91], device)?;
+    let v = |o: usize, n: usize| root.narrow(0, o, n);
+
+    // One run: the whole root, three abutting views.
+    let got = Tensor::cat(&[&v(0, 2)?, &v(2, 1)?, &v(3, 3)?], 0)?;
+    assert_eq!(got.to_vec1::<u32>()?, [10, 11, 12, 13, 14, 15]);
+
+    // Two runs broken by a gap, another storage between them, and a view
+    // that re-reads earlier bytes (not adjacent, so its own copy).
+    let got = Tensor::cat(
+        &[
+            &v(0, 1)?,
+            &v(1, 1)?,
+            &other,
+            &v(3, 2)?,
+            &v(5, 1)?,
+            &v(1, 2)?,
+        ],
+        0,
+    )?;
+    assert_eq!(got.to_vec1::<u32>()?, [10, 11, 90, 91, 13, 14, 15, 11, 12]);
+
+    // The token-id shape: `[1, 1]` views of one `[n, 1]` upload, packed along
+    // dim 1. Nothing precedes dim 1 but a unit dim, so they form one run.
+    let ids = Tensor::new(&[[7u32], [8], [9]], device)?;
+    let rows: Vec<Tensor> = (0..3).map(|i| ids.narrow(0, i, 1)).collect::<Result<_>>()?;
+    let got = Tensor::cat(&rows, 1)?;
+    assert_eq!(got.to_vec2::<u32>()?, [[7, 8, 9]]);
+
+    // Along an inner axis with two outer rows, the second view starting where
+    // the first one's FIRST ROW ends is not adjacency: each argument is two
+    // rows, interleaved in the result. These two `[2, 2]` views of one storage
+    // sit at offsets 0 and 2 — exactly `src_o + d2` for the first — and must
+    // still be copied apart.
+    let flat = Tensor::new(&[0u32, 1, 2, 3, 4, 5], device)?;
+    let a = flat.narrow(0, 0, 4)?.reshape((2, 2))?;
+    let b = flat.narrow(0, 2, 4)?.reshape((2, 2))?;
+    let got = Tensor::cat(&[&a, &b], 1)?;
+    assert_eq!(got.to_vec2::<u32>()?, [[0, 1, 2, 3], [2, 3, 4, 5]]);
+    Ok(())
+}
+
+/// `cat_view` is `cat` without the copy exactly when the parts are one range
+/// of one storage in order, and refuses every other arrangement.
+fn cat_view_of_adjacent_parts(device: &Device) -> Result<()> {
+    let block = Tensor::new(&[[1f32, 2.], [3., 4.], [5., 6.]], device)?;
+    let rows: Vec<Tensor> = (0..3)
+        .map(|i| block.narrow(0, i, 1))
+        .collect::<Result<_>>()?;
+    let joined = Tensor::cat_view(&rows, 0).expect("the block's rows in order");
+    assert_eq!(joined.to_vec2::<f32>()?, [[1., 2.], [3., 4.], [5., 6.]]);
+    assert!(joined.same_storage(&block), "a view, not a copy");
+
+    // A suffix of the rows starts mid-block and still joins.
+    let tail = Tensor::cat_view(&rows[1..], 0).expect("rows 1 and 2");
+    assert_eq!(tail.to_vec2::<f32>()?, [[3., 4.], [5., 6.]]);
+
+    // Out of order, a gap, and another storage are each refused.
+    assert!(Tensor::cat_view(&[&rows[1], &rows[0]], 0).is_none());
+    assert!(Tensor::cat_view(&[&rows[0], &rows[2]], 0).is_none());
+    let other = Tensor::new(&[[7f32, 8.]], device)?;
+    assert!(Tensor::cat_view(&[&rows[2], &other], 0).is_none());
+
+    // `[1, n, v]` parts along dim 1: only a unit dim ahead, so one range.
+    let wide = Tensor::arange(0u32, 12, device)?.reshape((1, 6, 2))?;
+    let parts = [wide.narrow(1, 0, 2)?, wide.narrow(1, 2, 4)?];
+    let got = Tensor::cat_view(&parts, 1).expect("adjacent along dim 1");
+    assert_eq!(got.dims(), &[1, 6, 2]);
+    assert_eq!(
+        got.flatten_all()?.to_vec1::<u32>()?,
+        (0u32..12).collect::<Vec<_>>()
+    );
+
+    // Two outer rows ahead of the axis: the parts interleave, never one range.
+    let m = Tensor::new(&[0u32, 1, 2, 3, 4, 5], device)?;
+    let a = m.narrow(0, 0, 4)?.reshape((2, 2))?;
+    let b = m.narrow(0, 2, 4)?.reshape((2, 2))?;
+    assert!(Tensor::cat_view(&[&a, &b], 1).is_none());
+    Ok(())
+}
+
+/// `cat_owned` gives `cat`'s values in its own storage — a copy even for one
+/// argument, and for a strided one — so writing the result leaves the sources
+/// as they were.
+fn cat_owned_copies(device: &Device) -> Result<()> {
+    let root = Tensor::new(&[[1f32, 2.], [3., 4.], [5., 6.]], device)?;
+    let rows: Vec<Tensor> = (0..3)
+        .map(|i| root.narrow(0, i, 1))
+        .collect::<Result<_>>()?;
+    let got = Tensor::cat_owned(&rows, 0)?;
+    assert_eq!(got.to_vec2::<f32>()?, [[1., 2.], [3., 4.], [5., 6.]]);
+    assert!(!got.same_storage(&root), "owned, not a view of the source");
+
+    let one = Tensor::cat_owned(&[&rows[1]], 0)?;
+    assert_eq!(one.to_vec2::<f32>()?, [[3., 4.]]);
+    assert!(!one.same_storage(&root));
+
+    // A transposed (strided) argument takes the general path.
+    let got = Tensor::cat_owned(&[&root.t()?, &root.t()?], 1)?;
+    assert_eq!(
+        got.to_vec2::<f32>()?,
+        [[1., 3., 5., 1., 3., 5.], [2., 4., 6., 2., 4., 6.]]
+    );
+
+    // Writing the result does not reach the source.
+    got.slice_set(&Tensor::zeros((2, 6), DType::F32, device)?, 0, 0)?;
+    assert_eq!(root.to_vec2::<f32>()?, [[1., 2.], [3., 4.], [5., 6.]]);
+    Ok(())
+}
+
 fn embeddings(device: &Device) -> Result<()> {
     let ids = Tensor::new(&[0u32, 2u32, 1u32], device)?;
     let t = Tensor::new(&[[0f32, 1f32], [2f32, 3f32], [4f32, 5f32]], device)?;
@@ -2169,6 +2284,24 @@ test_device!(narrow, narrow_cpu, narrow_gpu, narrow_metal);
 test_device!(broadcast, broadcast_cpu, broadcast_gpu, broadcast_metal);
 test_device!(slice_set, ss_cpu, ss_gpu, ss_metal);
 test_device!(cat, cat_cpu, cat_gpu, cat_metal);
+test_device!(
+    cat_runs_of_adjacent_views,
+    cat_runs_of_adjacent_views_cpu,
+    cat_runs_of_adjacent_views_gpu,
+    cat_runs_of_adjacent_views_metal
+);
+test_device!(
+    cat_view_of_adjacent_parts,
+    cat_view_of_adjacent_parts_cpu,
+    cat_view_of_adjacent_parts_gpu,
+    cat_view_of_adjacent_parts_metal
+);
+test_device!(
+    cat_owned_copies,
+    cat_owned_copies_cpu,
+    cat_owned_copies_gpu,
+    cat_owned_copies_metal
+);
 test_device!(sum, sum_cpu, sum_gpu, sum_metal);
 test_device!(min, min_cpu, min_gpu, min_metal);
 test_device!(max, max_cpu, max_gpu, max_metal);

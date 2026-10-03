@@ -24,9 +24,11 @@
 //   dt_bias, a      : [h_v] constants
 //   o     : one token's row of the wave output, [h_v, d_v]
 //
-// One block per V head; threads stripe the d_v state rows. k and q are staged
-// in shared memory once per block. d_k and d_v are runtime arguments bounded
-// by DELTA_NET_MAX_HEAD_DIM (shared-memory budget: 2 * 256 * 4 B = 2 KB).
+// One block per (V head, sequence); warps stripe the d_v state rows and the
+// lanes of a warp stripe one row. k and q are staged in shared memory once per
+// block. d_k and d_v are runtime arguments bounded by DELTA_NET_MAX_HEAD_DIM
+// (shared-memory budget: 2 * 256 * 4 B = 2 KB); d_k is a multiple of 4, so a
+// row is whole float4s.
 //
 // Concrete (non-template) kernels: this header is compiled by the single
 // translation unit delta_net_api_f32.cu; `static` keeps the definitions
@@ -37,6 +39,16 @@
 #define DELTA_NET_MAX_HEAD_DIM 256
 
 namespace delta_net {
+
+// float4 chunks of a state row each lane holds: a chunk is 32 lanes × 4
+// floats = 128 elements of the row.
+constexpr int DN_ROW_CHUNKS = DELTA_NET_MAX_HEAD_DIM / 128;
+
+__device__ __forceinline__ float dn_warp_sum(float x) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) x += __shfl_xor_sync(0xffffffffu, x, off);
+    return x;
+}
 
 // Batched over the wave's decode sequences: grid (n_v_heads, n_decode). Each
 // sequence's state lives in its own allocation, so the kernel takes a device
@@ -71,8 +83,8 @@ static __global__ void delta_net_decode_step_f32_kernel(
     const float* gates_b = beta_lin + (size_t)row * n_v_heads;
     float* orow = o + (size_t)row * n_v_heads * d_v;
 
-    __shared__ float sh_k[DELTA_NET_MAX_HEAD_DIM];
-    __shared__ float sh_q[DELTA_NET_MAX_HEAD_DIM];
+    __shared__ __align__(16) float sh_k[DELTA_NET_MAX_HEAD_DIM];
+    __shared__ __align__(16) float sh_q[DELTA_NET_MAX_HEAD_DIM];
 
     for (int j = threadIdx.x; j < d_k; j += blockDim.x) {
         sh_q[j] = qk[(size_t)kh * d_k + j] * q_scale;
@@ -91,24 +103,64 @@ static __global__ void delta_net_decode_step_f32_kernel(
     // That is what lets a failed wave roll back by simply not swapping the two
     // buffers, instead of copying the entering state aside before every wave.
     // The two may also be the same pointer (the reference path passes one buffer
-    // twice): each `j` is read before it is written, so in-place stays correct.
-    for (int i = threadIdx.x; i < d_v; i += blockDim.x) {
-        const float* srow_in = state_in + ((size_t)h * d_v + i) * d_k;
-        float* srow_out = state_out + ((size_t)h * d_v + i) * d_k;
+    // twice): a row is read whole into registers before any of it is written,
+    // so in-place stays correct.
+    //
+    // A warp per row: lane l holds elements 4l..4l+3 of each 128-wide chunk, so
+    // the warp reads the row as one coalesced float4 sweep, keeps it in
+    // registers through the prediction, the update and the output read, and
+    // writes the advanced row back once — one read and one write of the state.
+    // A chunk past d_k is dead for every lane at once when d_k is a multiple of
+    // 128, and its registers are written on both paths.
+    const int lane = (int)threadIdx.x & 31;
+    const int n_warps = (int)blockDim.x >> 5;
+    const float4* k4 = reinterpret_cast<const float4*>(sh_k);
+    const float4* q4 = reinterpret_cast<const float4*>(sh_q);
+    for (int i = (int)threadIdx.x >> 5; i < d_v; i += n_warps) {
+        const float4* srow_in =
+            reinterpret_cast<const float4*>(state_in + ((size_t)h * d_v + i) * d_k);
+        float4* srow_out = reinterpret_cast<float4*>(state_out + ((size_t)h * d_v + i) * d_k);
+        float4 s[DN_ROW_CHUNKS];
         // Decayed prediction the state makes for k.
         float pred = 0.f;
-        for (int j = 0; j < d_k; ++j) {
-            pred += srow_in[j] * decay * sh_k[j];
+        #pragma unroll
+        for (int c = 0; c < DN_ROW_CHUNKS; ++c) {
+            const int j4 = c * 32 + lane;
+            if (4 * j4 < d_k) {
+                s[c] = srow_in[j4];
+                const float4 kk = k4[j4];
+                pred += s[c].x * decay * kk.x;
+                pred += s[c].y * decay * kk.y;
+                pred += s[c].z * decay * kk.z;
+                pred += s[c].w * decay * kk.w;
+            } else {
+                s[c] = make_float4(0.f, 0.f, 0.f, 0.f);
+            }
         }
+        pred = dn_warp_sum(pred);
         const float err = b * (v[(size_t)h * d_v + i] - pred);
         // Update the row and read the output with the post-update state.
         float out = 0.f;
-        for (int j = 0; j < d_k; ++j) {
-            const float s_new = srow_in[j] * decay + err * sh_k[j];
-            srow_out[j] = s_new;
-            out += s_new * sh_q[j];
+        #pragma unroll
+        for (int c = 0; c < DN_ROW_CHUNKS; ++c) {
+            const int j4 = c * 32 + lane;
+            if (4 * j4 < d_k) {
+                const float4 kk = k4[j4];
+                const float4 qq = q4[j4];
+                float4 sn;
+                sn.x = s[c].x * decay + err * kk.x;
+                sn.y = s[c].y * decay + err * kk.y;
+                sn.z = s[c].z * decay + err * kk.z;
+                sn.w = s[c].w * decay + err * kk.w;
+                srow_out[j4] = sn;
+                out += sn.x * qq.x;
+                out += sn.y * qq.y;
+                out += sn.z * qq.z;
+                out += sn.w * qq.w;
+            }
         }
-        orow[(size_t)h * d_v + i] = out;
+        out = dn_warp_sum(out);
+        if (lane == 0) orow[(size_t)h * d_v + i] = out;
     }
 }
 
@@ -208,7 +260,8 @@ static inline void launch_decode_step_f32(
         cudaStream_t stream) {
     if (n_decode <= 0 || n_v_heads <= 0 || n_k_heads <= 0 || d_k <= 0 || d_v <= 0) return;
     if (d_k > DELTA_NET_MAX_HEAD_DIM || d_v > DELTA_NET_MAX_HEAD_DIM) return;
-    const int threads = d_v < 128 ? ((d_v + 31) / 32) * 32 : 128;
+    if (d_k % 4 != 0) return;
+    const int threads = 128;
     dim3 grid(n_v_heads, n_decode);
     delta_net_decode_step_f32_kernel<<<grid, threads, 0, stream>>>(
         states, states_out, conved, rows, alpha, beta_lin, dt_bias, a_neg, o,

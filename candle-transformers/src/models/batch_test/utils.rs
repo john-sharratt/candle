@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+use crate::models::batch_test::greedy::greedy_token;
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
 use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
 use crate::models::batch_test::span_report::print_span;
@@ -538,8 +539,6 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
     passes: usize,
     label: &str,
 ) -> Result<(bool, Vec<Vec<u32>>)> {
-    use candle::IndexOp;
-
     let n_layers = model.num_layers();
     let mut streams: Vec<Vec<u32>> = Vec::with_capacity(passes);
 
@@ -577,10 +576,7 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
                 None,
             )?;
             session.advance_sequence(seq, prompt_ids.len())?;
-            step.logits_owned()?[0]
-                .i(0)?
-                .argmax(0)?
-                .to_scalar::<u32>()?
+            greedy_token(&step.logits_owned()?[0])?
         };
         let mut gen = vec![next];
         for _ in 1..decode_tokens {
@@ -599,10 +595,7 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
                     None,
                 )?;
                 session.advance_sequence(seq, 1)?;
-                step.logits_owned()?[0]
-                    .i(0)?
-                    .argmax(0)?
-                    .to_scalar::<u32>()?
+                greedy_token(&step.logits_owned()?[0])?
             };
             gen.push(next);
         }
@@ -684,8 +677,6 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
     repeats: usize,
     label: &str,
 ) -> Result<usize> {
-    use candle::IndexOp;
-
     let n_layers = model.num_layers();
     let prompt_len = prompt_ids.len();
     let mut session = model.create_batched_session(BatchedConfig::default())?;
@@ -710,10 +701,7 @@ pub fn decode_replay_probe<M: ManagedBatchedModel>(
             None,
         )?;
         session.advance_sequence(seq, prompt_len)?;
-        let tok = step.logits_owned()?[0]
-            .i(0)?
-            .argmax(0)?
-            .to_scalar::<u32>()?;
+        let tok = greedy_token(&step.logits_owned()?[0])?;
         Ok((seq, tok))
     };
 
@@ -1631,15 +1619,21 @@ impl TestParams {
             // logits must be bit-identical. Any drift means repeat state leaked
             // (offset/backing divergence) and the throughput numbers are
             // measuring a different workload than reported.
+            //
+            // Every session's row at once: one per-row max|delta| on the device
+            // and one read-back, rather than a synchronising read per session
+            // inside the timed window.
             match &repeat_base_logits {
                 None => repeat_base_logits = Some(logits_vec.clone()),
                 Some(base) => {
-                    for (i, (a, b)) in base.iter().zip(logits_vec.iter()).enumerate() {
-                        let d = (a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
-                            .abs()?
-                            .flatten_all()?
-                            .max(0)?
-                            .to_scalar::<f32>()?;
+                    let a = Tensor::cat(&base.iter().collect::<Vec<_>>(), 0)?;
+                    let b = Tensor::cat(&logits_vec.iter().collect::<Vec<_>>(), 0)?;
+                    let deltas = (a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
+                        .abs()?
+                        .flatten_from(1)?
+                        .max(1)?
+                        .to_vec1::<f32>()?;
+                    for (i, &d) in deltas.iter().enumerate() {
                         if d != 0.0 {
                             candle::bail!(
                                 "prompt repeat {} session {} is not idempotent: \
@@ -2073,18 +2067,29 @@ impl TestParams {
         let max_tokens = self.generate_token_count;
         let stop_on = &self.stop_on_eos;
         // First generated token per session = argmax of its prefill logits, held
-        // OUT of the KV as the driver's `committed` seed.
+        // OUT of the KV as the driver's `committed` seed. One fused greedy launch
+        // over every session's row and one read-back — the sampler the decode
+        // steps use — rather than an argmax and a synchronising read per session.
         let mut committed: Vec<u32> = Vec::with_capacity(sequence_indices.len());
         let mut active: Vec<bool> = Vec::with_capacity(sequence_indices.len());
+        let stacked = Tensor::cat(&runs.iter().map(|r| &r.logits).collect::<Vec<_>>(), 0)?;
+        let seeds = stacked.batched_sample_argmax()?;
+        // The logit each seed was chosen at. Every value of a row being -inf or
+        // NaN is what a corrupted forward looks like from here, and the greedy
+        // pick of such a row is a token the model never scored. Caught at the
+        // seed because a bad seed feeds the drafter and the whole block, so the
+        // failure would otherwise surface as unreadable output several steps
+        // later.
+        let picked = stacked
+            .gather(&seeds.unsqueeze(1)?, 1)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let seeds = seeds.to_vec1::<u32>()?;
         for (i, run) in runs.iter_mut().enumerate() {
-            let row = run.logits.squeeze(0)?;
-            let c = row.argmax(0)?.to_scalar::<u32>()?;
-            // `argmax` yields `u32::MAX` when every value is -inf or NaN, which
-            // is what a corrupted forward looks like from here — a token id that
-            // no vocabulary has. Caught at the seed because a bad seed feeds the
-            // drafter and the whole block, so the failure would otherwise
-            // surface as unreadable output several steps later.
-            if c == u32::MAX {
+            let c = seeds[i];
+            if picked[i].is_nan() || picked[i] == f32::NEG_INFINITY {
+                let row = run.logits.squeeze(0)?;
                 let f = |t: Result<Tensor>| -> f32 {
                     t.and_then(|x| x.to_dtype(DType::F32)?.to_vec0::<f32>())
                         .unwrap_or(f32::NAN)

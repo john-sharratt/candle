@@ -22,6 +22,19 @@ pub struct LogitsProcessor {
     sampling: Sampling,
 }
 
+/// A sample's device work, enqueued and not yet read back
+/// ([`LogitsProcessor::sample_issue`]).
+///
+/// Holding it lets a caller enqueue many rows' device work before reading any
+/// of them, so the reads find their results already computed — one pipeline
+/// drain for the batch rather than one per row.
+pub enum PendingSample {
+    /// The token itself, computed on the device (argmax, Gumbel-softmax).
+    Token(Tensor),
+    /// The probability vector the host-side sampling draws from.
+    Probs(Tensor),
+}
+
 impl LogitsProcessor {
     pub fn from_sampling(seed: u64, sampling: Sampling) -> Self {
         let rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -51,10 +64,9 @@ impl LogitsProcessor {
         Self::from_sampling(seed, sampling)
     }
 
-    fn sample_argmax(&mut self, logits: &Tensor) -> Result<u32> {
-        // Use Candle's argmax reduction so this can stay on-device (e.g. CUDA) and
-        // avoids full-vocab dtype casts + host transfers.
-        let idx = logits.argmax(candle::D::Minus1)?;
+    /// Read back a device-computed token: an argmax index (rank 0 or 1) or a
+    /// Gumbel-softmax draw.
+    fn read_token(idx: &Tensor) -> Result<u32> {
         match idx.rank() {
             0 => idx.to_vec0::<u32>(),
             1 => idx
@@ -64,11 +76,6 @@ impl LogitsProcessor {
                 .context("empty logits"),
             r => candle::bail!("unexpected argmax rank {r} for logits"),
         }
-    }
-
-    fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {
-        let sampled = candle_nn::sampling::gumbel_softmax(logits, temperature, candle::D::Minus1)?;
-        sampled.to_vec0::<u32>()
     }
 
     fn sample_multinomial(&mut self, prs: &Vec<f32>) -> Result<u32> {
@@ -138,68 +145,68 @@ impl LogitsProcessor {
     }
 
     pub fn sample_f(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
-        let next_token = match &self.sampling {
-            Sampling::ArgMax => self.sample_argmax(logits)?,
+        let pending = self.sample_issue(logits)?;
+        self.sample_finish_f(pending, f)
+    }
+
+    /// The device half of a sample: every device op the strategy runs, enqueued
+    /// and not read back. Argmax stays on the device (Candle's reduction, no
+    /// full-vocab cast or transfer); the Gumbel draw and the probabilities are
+    /// taken in F32 — doing them in bf16/f16 can be unstable.
+    pub fn sample_issue(&self, logits: &Tensor) -> Result<PendingSample> {
+        Ok(match &self.sampling {
+            Sampling::ArgMax => PendingSample::Token(logits.argmax(candle::D::Minus1)?),
             Sampling::GumbelSoftmax { temperature } => {
-                // Cast to f32, doing the Gumbel softmax in bf16/f16 can be unstable.
                 let logits = logits.to_dtype(DType::F32)?;
-                self.sample_gumbel_softmax(&logits, *temperature)?
+                PendingSample::Token(candle_nn::sampling::gumbel_softmax(
+                    &logits,
+                    *temperature,
+                    candle::D::Minus1,
+                )?)
             }
-            Sampling::All { temperature } => {
-                let logits = logits.to_dtype(DType::F32)?;
-                let prs = |temperature: f64| -> Result<Vec<f32>> {
-                    let logits = (&logits / temperature)?;
-                    let prs = candle_nn::ops::softmax_last_dim(&logits)?;
-                    let mut prs = prs.to_vec1()?;
-                    f(&mut prs);
-                    Ok(prs)
-                };
-                let prs = prs(*temperature)?;
-                self.sample_multinomial(&prs)?
+            Sampling::All { temperature }
+            | Sampling::TopP { temperature, .. }
+            | Sampling::TopK { temperature, .. }
+            | Sampling::TopKThenTopP { temperature, .. } => {
+                let logits = (logits.to_dtype(DType::F32)? / *temperature)?;
+                PendingSample::Probs(candle_nn::ops::softmax_last_dim(&logits)?)
             }
-            Sampling::TopP { p, temperature } => {
-                let logits = logits.to_dtype(DType::F32)?;
-                let prs = |temperature: f64| -> Result<Vec<f32>> {
-                    let logits = (&logits / temperature)?;
-                    let prs = candle_nn::ops::softmax_last_dim(&logits)?;
-                    let mut prs = prs.to_vec1()?;
-                    f(&mut prs);
-                    Ok(prs)
-                };
-                let mut prs = prs(*temperature)?;
+        })
+    }
+
+    /// The host half of a sample: read back what [`Self::sample_issue`]
+    /// enqueued and draw the token.
+    pub fn sample_finish(&mut self, pending: PendingSample) -> Result<u32> {
+        self.sample_finish_f(pending, |_| {})
+    }
+
+    fn sample_finish_f(
+        &mut self,
+        pending: PendingSample,
+        f: impl FnOnce(&mut [f32]),
+    ) -> Result<u32> {
+        let prs = match pending {
+            PendingSample::Token(t) => return Self::read_token(&t),
+            PendingSample::Probs(p) => p,
+        };
+        let mut prs: Vec<f32> = prs.to_vec1()?;
+        f(&mut prs);
+        match &self.sampling {
+            Sampling::All { .. } => self.sample_multinomial(&prs),
+            Sampling::TopP { p, .. } => {
                 if *p <= 0.0 || *p >= 1.0 {
                     // simply sample from the predicted probability distribution
-                    self.sample_multinomial(&prs)?
+                    self.sample_multinomial(&prs)
                 } else {
                     // top-p (nucleus) sampling, clamping the least likely tokens to zero
-                    self.sample_topp(&mut prs, *p as f32)?
+                    self.sample_topp(&mut prs, *p as f32)
                 }
             }
-            Sampling::TopK { k, temperature } => {
-                let logits = logits.to_dtype(DType::F32)?;
-                let prs = |temperature: f64| -> Result<Vec<f32>> {
-                    let logits = (&logits / temperature)?;
-                    let prs = candle_nn::ops::softmax_last_dim(&logits)?;
-                    let mut prs = prs.to_vec1()?;
-                    f(&mut prs);
-                    Ok(prs)
-                };
-                let mut prs = prs(*temperature)?;
-                self.sample_topk(&mut prs, *k)?
+            Sampling::TopK { k, .. } => self.sample_topk(&mut prs, *k),
+            Sampling::TopKThenTopP { k, p, .. } => self.sample_topk_topp(&mut prs, *k, *p as f32),
+            Sampling::ArgMax | Sampling::GumbelSoftmax { .. } => {
+                candle::bail!("logits processor: a probability vector for a strategy that draws on the device")
             }
-            Sampling::TopKThenTopP { k, p, temperature } => {
-                let logits = logits.to_dtype(DType::F32)?;
-                let prs = |temperature: f64| -> Result<Vec<f32>> {
-                    let logits = (&logits / temperature)?;
-                    let prs = candle_nn::ops::softmax_last_dim(&logits)?;
-                    let mut prs = prs.to_vec1()?;
-                    f(&mut prs);
-                    Ok(prs)
-                };
-                let mut prs = prs(*temperature)?;
-                self.sample_topk_topp(&mut prs, *k, *p as f32)?
-            }
-        };
-        Ok(next_token)
+        }
     }
 }

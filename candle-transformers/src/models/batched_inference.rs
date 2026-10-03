@@ -53,7 +53,7 @@ use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::{gpu_span, pipeline_record_duration, span};
 use crate::models::speculative_choice::{AcceptWalk, SpeculativeStep, TokenChooser};
-use crate::models::verify_wave::{issue_verify_wave, VerifyPlan, WaveCoBatch};
+use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan, WaveCoBatch};
 
 /// One R16 chunk's unpacked contents: `(block_idx, k_flat, v_flat, q_flat)`.
 ///
@@ -630,6 +630,14 @@ pub struct BatchedInferenceSession {
     /// (`docs/progressive_yarn.md` §8). One unbounded rung until the model sets
     /// its own: the latent kernels read no rung.
     rope: RungSelect,
+    /// Whether the wave being issued hands its logits to a caller that reads
+    /// them **in place** on the head's span — the accept walk of
+    /// [`ManagedBatchedModel::speculative_decode_step_batch`], which selects
+    /// rows there. A forward prices `WaveBuffer::AcceptRows` for its scored
+    /// rows only when this is set; a caller that owns the logits
+    /// first (the scheduler) never sets it, so its waves reserve nothing for a
+    /// walk that does not happen on the span.
+    accept_in_place: bool,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -708,6 +716,7 @@ impl BatchedInferenceSession {
             device: device.clone(),
             pending_glue: None,
             rope: RungSelect::unbounded(),
+            accept_in_place: false,
         })
     }
 
@@ -815,6 +824,7 @@ impl BatchedInferenceSession {
             device: device.clone(),
             pending_glue: None,
             rope: RungSelect::unbounded(),
+            accept_in_place: false,
         }
     }
 
@@ -828,6 +838,18 @@ impl BatchedInferenceSession {
     /// Take + clear the staged glue descriptors (one forward's worth).
     pub fn take_pending_glue(&mut self) -> Option<Vec<PendingGlue>> {
         self.pending_glue.take()
+    }
+
+    /// Mark whether the waves issued from here hand their logits to an
+    /// in-place reader — see the field.
+    pub fn set_accept_in_place(&mut self, on: bool) {
+        self.accept_in_place = on;
+    }
+
+    /// Whether the wave being issued hands its logits to an in-place reader,
+    /// which decides whether the forward reserves the accept walk's rows.
+    pub fn accept_in_place(&self) -> bool {
+        self.accept_in_place
     }
 
     /// Get the configuration used for this session.
@@ -3901,6 +3923,19 @@ pub struct WaveStep {
     pub logits: Option<Vec<Tensor>>,
 }
 
+/// The scored rows a verify step hands its accept walk: the plain cohort's row
+/// each, then every block's rows by position.
+///
+/// When one wave produced them they are views on its head's span and `head` is
+/// that wave, held so the views stay valid — the walk reads them in place and
+/// drops this before the rewind opens anything. `None` when they are owned
+/// copies (a path that ran several forwards).
+pub struct VerifiedRows {
+    pub plain: Vec<Tensor>,
+    pub blocks: Vec<Vec<Tensor>>,
+    pub head: Option<WaveResult>,
+}
+
 /// A [`WaveStep`] together with what keeps it valid.
 ///
 /// The head's outputs are carved from the forward-scoped span, which is
@@ -3956,11 +3991,31 @@ impl WaveResult {
     /// propagates — the two used to collapse into the same empty `Vec`, which the
     /// scheduler reads as "this wave produced nothing" and turns into a silently
     /// token-less turn.
+    ///
+    /// **One copy for every row, not one per row.** The rows are the head's
+    /// logits block, so they are joined along their leading axis straight into
+    /// one owned allocation (`Tensor::cat_owned`, which copies a run of adjacent
+    /// views as one range — one launch when they are that block's rows in order)
+    /// and handed back as views of it in the same shapes: one allocation and one
+    /// copy however many rows the wave scored. A caller that keeps one row past
+    /// the others takes it with `to_owned_tensor`, which copies the row alone;
+    /// `copy` would clone the whole block it views.
     pub fn logits_owned(&self) -> Result<Vec<Tensor>> {
-        match self.step.logits.as_ref() {
-            None => Ok(Vec::new()),
-            Some(ls) => ls.iter().map(|t| t.to_owned_tensor()).collect(),
+        let Some(ls) = self.step.logits.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if ls.is_empty() {
+            return Ok(Vec::new());
         }
+        let block = Tensor::cat_owned(ls, 0)?;
+        let mut start = 0;
+        let mut out = Vec::with_capacity(ls.len());
+        for t in ls {
+            let n = t.dim(0)?;
+            out.push(block.narrow(0, start, n)?);
+            start += n;
+        }
+        Ok(out)
     }
 
     /// Take the residual stream, which is pool-backed and outlives the span.
@@ -3970,6 +4025,23 @@ impl WaveResult {
     /// on a span that resets at the end of this one — and does not.
     pub fn into_residual(mut self) -> Option<Tensor> {
         self.step.residual.take()
+    }
+
+    /// [`Self::into_residual`] without giving up the result — for a caller that
+    /// takes the residual and still reads the logits through the guard.
+    pub fn take_residual(&mut self) -> Option<Tensor> {
+        self.step.residual.take()
+    }
+
+    /// The scored rows as views on the head's span, for reading **while this
+    /// result is held** — the counterpart of [`Self::logits_owned`] that copies
+    /// nothing. The views name memory the span reclaims when this result drops,
+    /// so the caller keeps the result alive for as long as it reads them; the
+    /// verify path does exactly that, carrying it beside the rows
+    /// ([`crate::models::verify_wave::VerifyWaveOutput`]) until the accept walk
+    /// is done.
+    pub fn logits_on_span(&self) -> Vec<Tensor> {
+        self.step.logits.clone().unwrap_or_default()
     }
 }
 
@@ -4771,17 +4843,15 @@ pub trait ManagedBatchedModel {
         if !seqs.is_empty() {
             return Ok(None);
         }
+        // **The model's own device, not the host.** A plan's rows are cat'd with
+        // whatever else the caller has on the wave — the scheduler's creep group
+        // and glue live on the device — so a host-side row makes the wave's own
+        // concatenation fail on a device mismatch. One upload for the cohort.
+        let tokens: Vec<u32> = plain.iter().map(|&(_, t)| t).collect();
+        let (decode_inputs, _) = upload_plan_rows(&tokens, &[], self.device())?;
         Ok(Some(VerifyPlan {
             decode_seqs: plain.iter().map(|&(s, _)| s).collect(),
-            // **The model's own device, not the host.** A plan's rows are cat'd
-            // with whatever else the caller has on the wave — the scheduler's
-            // creep group and glue live on the device — so a host-side row makes
-            // the wave's own concatenation fail on a device mismatch. It only
-            // looked safe while a verify wave carried nothing but its own rows.
-            decode_inputs: plain
-                .iter()
-                .map(|&(_, t)| Tensor::from_vec(vec![t], (1, 1), self.device()))
-                .collect::<Result<_>>()?,
+            decode_inputs,
             verify_seqs: Vec::new(),
             verify_inputs: Vec::new(),
             rows: plain.len(),
@@ -4841,7 +4911,7 @@ pub trait ManagedBatchedModel {
         blocks: &[Vec<u32>],
         layer_end: usize,
         budget: usize,
-    ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+    ) -> Result<VerifiedRows> {
         // The standalone shape: one wave carrying nothing but this step's own
         // rows. The scheduler does not come through here — it runs the same
         // three phases around its own co-batched wave.
@@ -4866,7 +4936,13 @@ pub trait ManagedBatchedModel {
                             plan.rows
                         );
                     }
-                    self.end_verify(session, plain, seqs, blocks, out.logits)
+                    let (plain_rows, block_rows) =
+                        self.end_verify(session, plain, seqs, blocks, out.logits)?;
+                    Ok(VerifiedRows {
+                        plain: plain_rows,
+                        blocks: block_rows,
+                        head: Some(out.head),
+                    })
                 }
                 Err(e) => {
                     self.abort_verify(seqs);
@@ -4909,7 +4985,12 @@ pub trait ManagedBatchedModel {
         for (i, &seq) in seqs.iter().enumerate() {
             out.push(self.verify_block(session, seq, &blocks[i], layer_end)?);
         }
-        Ok((plain_out, out))
+        // Several forwards, so these rows were owned as each one returned.
+        Ok(VerifiedRows {
+            plain: plain_out,
+            blocks: out,
+            head: None,
+        })
     }
 
     /// One lossless speculative-decode step for `seq` (model-agnostic). `committed` is the last
@@ -5102,51 +5183,67 @@ pub trait ManagedBatchedModel {
         // execution plus any starvation gap *inside* the forward.
         //
         // **Read it against `wv:sweep`**, which is the layer sweep plus the
-        // head. The difference is everything this step does around the model,
-        // and it is not small by construction: at 128 slots it once held 881 ms
-        // of a 1,152 ms forward, all of it `vw:own` copying the scored rows off
-        // the wave arena a row at a time. Whenever the accept walk waits far
-        // longer than the `decode:*` / `dn:*` spans account for, this pair says
-        // whether the missing time is inside the model or around it.
+        // head. The difference is everything this step does around the model.
+        // Whenever the accept walk waits far longer than the `decode:*` /
+        // `dn:*` spans account for, this pair says whether the missing time is
+        // inside the model or around it.
         let g_fwd = gpu_span("verify:fwd", session.device());
         let t_verify = std::time::Instant::now();
         let plain_pairs: Vec<(usize, u32)> =
             plain.iter().map(|&i| (seqs[i], committed[i])).collect();
         let spec_seqs: Vec<usize> = spec.iter().map(|&i| seqs[i]).collect();
         let spec_blocks: Vec<Vec<u32>> = spec.iter().map(|&i| blocks[i].clone()).collect();
-        let (mut plain_rows, spec_logits) = self.verify_blocks(
+        // The scored rows, and — when one wave produced them — that wave, held
+        // so the rows (views on its head's span) stay valid through the walk.
+        // The walk below reads the verify wave's logits on its head span, so
+        // that wave reserves the walk's selections beside them.
+        session.set_accept_in_place(true);
+        let verified = self.verify_blocks(
             session,
             &plain_pairs,
             &spec_seqs,
             &spec_blocks,
             layer_end,
             max_draft,
-        )?;
+        );
+        session.set_accept_in_place(false);
+        let VerifiedRows {
+            plain: mut plain_rows,
+            blocks: spec_logits,
+            head,
+        } = verified?;
         pipeline_record_duration("spec:verify", t_verify.elapsed(), 1);
         g_fwd.end();
-        // The row gather between the forward and the accept walk: one `squeeze`
-        // per scored row, a `Tensor::stack` over all of them, and the `row_of`
-        // bookkeeping. Spanned because it is the only part of the step that was
-        // neither `spec:verify` nor `spec:walk`, and at width it is the whole of
-        // the gap between them — `stack` costs one launch per row (hot-path
-        // invariant 2) and the tensor it builds is `[rows, vocab]`.
+        // The row gather between the forward and the accept walk, and the
+        // `row_of` bookkeeping. Spanned because it is the only part of the step
+        // that is neither `spec:verify` nor `spec:walk`.
         let t_gather = std::time::Instant::now();
         let mut plain_logits: Vec<Option<Tensor>> = vec![None; seqs.len()];
         for &i in plain.iter().rev() {
             plain_logits[i] = plain_rows.pop();
         }
 
-        // Every scored row of BOTH waves, stacked once: plain rows lead (in
-        // `plain` order), then each verify block's rows. `row_of[i]` locates
-        // sequence `i`'s run inside it, so the accept walk lifts one block
-        // position across the whole cohort with a single `index_select` rather
-        // than slicing per sequence.
+        // Every scored row of BOTH waves as one `[R, vocab]` block: plain rows
+        // lead (in `plain` order), then each verify block's rows. `row_of[i]`
+        // locates sequence `i`'s run inside it, so the accept walk lifts one
+        // block position across the whole cohort with a single `index_select`
+        // rather than slicing per sequence.
+        //
+        // The head scored exactly these rows in exactly this order, so they are
+        // already one block — the head's — and `cat_view` names it without a
+        // copy. A wave whose driver reordered its rows (a one-token prefill
+        // folded into the decode group) leaves them apart, and they are
+        // concatenated instead.
         let rows: Vec<Tensor> = plain
             .iter()
-            .map(|&i| plain_logits[i].as_ref().expect("filled above").squeeze(0))
-            .chain(spec_logits.iter().flatten().map(|t| t.squeeze(0)))
+            .map(|&i| plain_logits[i].as_ref().expect("filled above"))
+            .chain(spec_logits.iter().flatten())
+            .map(|t| t.flatten_all()?.unsqueeze(0))
             .collect::<Result<_>>()?;
-        let stacked = Tensor::stack(&rows, 0)?; // [R, vocab]
+        let stacked = match Tensor::cat_view(&rows, 0) {
+            Some(block) => block,
+            None => Tensor::cat(&rows, 0)?,
+        }; // [R, vocab]
         let mut row_of: Vec<(usize, usize)> = vec![(0, 0); seqs.len()];
         for (k, &i) in plain.iter().enumerate() {
             row_of[i] = (k, 1);
@@ -5209,6 +5306,14 @@ pub trait ManagedBatchedModel {
         // narrowing cohort, the other visits every layer's chunk list. A single
         // span over both reads as "accept got slower with depth" and hides which.
         pipeline_record_duration("spec:walk", t_accept.elapsed(), 1);
+        // Every view on the head's span, then the wave that holds it: the
+        // rollback below may open waves of its own (the recurrent replay), and
+        // the span is reclaimed only once nothing names it.
+        drop(stacked);
+        drop(rows);
+        drop(plain_logits);
+        drop(spec_logits);
+        drop(head);
         let targets: Vec<(usize, usize)> = seqs
             .iter()
             .enumerate()

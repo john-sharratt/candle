@@ -192,6 +192,11 @@ pub struct WaveWidth {
     /// Spans the replay stages — see [`Self::staged_rows`]. The span tables are
     /// per span, not per row.
     pub staged_spans: usize,
+    /// Scored rows an accept walk selects **on the head's span** after this
+    /// wave — [`WaveBuffer::AcceptRows`]. The scored rows when the caller reads
+    /// the logits in place, zero when it owns them first (or runs no walk), so
+    /// a wave reserves the walk's selections only when they will land there.
+    pub accept_rows: usize,
 }
 
 impl WaveWidth {
@@ -214,6 +219,7 @@ impl WaveWidth {
             prefill_spans: if sequences < pairs { sequences } else { pairs },
             staged_rows: 0,
             staged_spans: 0,
+            accept_rows: 0,
         }
     }
 
@@ -227,6 +233,7 @@ impl WaveWidth {
             prefill_spans: 0,
             staged_rows: 0,
             staged_spans: 0,
+            accept_rows: 0,
         }
     }
 
@@ -245,6 +252,7 @@ impl WaveWidth {
             prefill_spans: 0,
             staged_rows: rows,
             staged_spans: spans,
+            accept_rows: 0,
         }
     }
 
@@ -986,6 +994,18 @@ pub enum WaveBuffer {
     /// guards — which is why this follows the session's mode and not the
     /// lifetime.
     HeadLogits,
+    /// The accept walk's row selections: at each block position, the rows of
+    /// the sequences still standing, gathered out of [`Self::HeadLogits`] for
+    /// the chooser.
+    ///
+    /// The walk reads the head's logits **in place**, behind the forward's
+    /// guard, rather than copying them off the span first — so what it gathers
+    /// lands on the span beside them. A row is selected at most once across the
+    /// walk (each sequence's row at each position), so the selections together
+    /// are at most the scored rows: this is the logits' second buffer, the same
+    /// width. Int8 sessions only, for the reason `HeadLogits` is — a float
+    /// head's logits come off the pool, and so do selections taken from them.
+    AcceptRows,
 
     /// The MoE result **narrowed to the residual's dtype**, when the experts ran
     /// in a different one. Both paths.
@@ -1152,7 +1172,9 @@ impl WaveBuffer {
             Self::DenseFfnNorm | Self::DenseGateUp | Self::DenseSilu | Self::DenseSwiglu => {
                 Chain::DenseFfn
             }
-            Self::HeadNorm | Self::HeadNormF32 | Self::HeadLogits => Chain::Forward,
+            Self::HeadNorm | Self::HeadNormF32 | Self::HeadLogits | Self::AcceptRows => {
+                Chain::Forward
+            }
             other => match other.phase() {
                 LayerPhase::Attention => Chain::Attention,
                 LayerPhase::Ffn => Chain::Ffn,
@@ -1263,7 +1285,8 @@ impl WaveBuffer {
             | Self::HyperHeadMixed
             | Self::HeadNorm
             | Self::HeadNormF32
-            | Self::HeadLogits => LayerPhase::Forward,
+            | Self::HeadLogits
+            | Self::AcceptRows => LayerPhase::Forward,
         }
     }
 
@@ -1656,7 +1679,8 @@ impl WaveBuffer {
             Self::HeadNorm => dense(w.scored_rows, g.hidden, g.act_dtype),
             Self::HeadNormF32 if !g.packed_head => dense(w.scored_rows, g.hidden, DType::F32),
             Self::HeadLogits if g.packed_head => dense(w.scored_rows, g.vocab, g.act_dtype),
-            Self::HeadNormF32 | Self::HeadLogits => dense(0, 0, g.act_dtype),
+            Self::AcceptRows if g.packed_head => dense(w.accept_rows, g.vocab, g.act_dtype),
+            Self::HeadNormF32 | Self::HeadLogits | Self::AcceptRows => dense(0, 0, g.act_dtype),
         }
     }
 
@@ -2441,7 +2465,8 @@ mod tests {
                         // its logits on the span, a float one carries an F32
                         // working copy of the norm instead.
                         || (matches!(b, WaveBuffer::HeadNormF32) && g.packed_head)
-                        || (matches!(b, WaveBuffer::HeadLogits) && !g.packed_head)
+                        || (matches!(b, WaveBuffer::HeadLogits | WaveBuffer::AcceptRows)
+                            && !g.packed_head)
                         || ((b.chain() == Chain::DeltaNet
                             || b.chain() == Chain::DeltaNetReplay)
                             && g.delta_net.is_none())
@@ -2495,6 +2520,7 @@ mod tests {
                         prefill_spans: rows,
                         staged_rows: rows,
                         staged_spans: rows,
+                        accept_rows: rows,
                     };
                     let s = b.shape(&g, width);
                     if conditional {
@@ -2912,7 +2938,9 @@ mod tests {
     ///
     /// Two carves on the 0.8B, `0 B lost to alignment`: the packed head norm at
     /// 1,152 B a scored row and the logits at 496,640 B (248,320 vocab × BF16).
-    /// 1,991,168 B at four scored rows, and 497,920 B at one.
+    /// 1,991,168 B at four scored rows, and 497,920 B at one. A wave whose caller
+    /// reads those logits in place also holds the accept walk's selections from
+    /// them — at most the scored rows again, 496,640 B a row.
     ///
     /// The second half is the reason this matters beyond slack.
     /// `WAVE_FORWARD_BYTES` is 16 MiB, which covers 33 scored rows — and this
@@ -2923,8 +2951,9 @@ mod tests {
     fn the_forward_phase_prices_its_measured_generation_and_outgrows_the_old_constant() {
         let g = gated_partial_rotary();
         let plan = WavePlan::new(g);
+        let w4 = WaveWidth::prefill(2100, 4);
         assert_eq!(
-            plan.chain_bytes(Chain::Forward, WaveWidth::prefill(2100, 4)),
+            plan.chain_bytes(Chain::Forward, w4),
             1_991_168,
             "the measured generation at four scored rows, to the byte"
         );
@@ -2932,6 +2961,18 @@ mod tests {
             plan.chain_bytes(Chain::Forward, WaveWidth::prefill(2100, 1)),
             497_920,
             "and at one"
+        );
+        // A caller walking the logits in place adds its selections, one logits
+        // row per scored row.
+        let walked = WaveWidth {
+            accept_rows: 4,
+            ..w4
+        };
+        assert_eq!(WaveBuffer::AcceptRows.bytes(&g, walked), 4 * 496_640);
+        assert_eq!(
+            plan.chain_bytes(Chain::Forward, walked),
+            1_991_168 + 4 * 496_640,
+            "the head and the walk, to the byte"
         );
         // It scales with scored rows and not with tokens — the whole reason the
         // forward phase is sized separately from the layer phases.
@@ -2973,6 +3014,14 @@ mod tests {
         assert_eq!(WaveBuffer::HeadNormF32.bytes(&int8, w), 0);
         assert_eq!(WaveBuffer::HeadLogits.bytes(&int8, w), 4 * 248_320 * 2);
         assert_eq!(plan.chain_bytes(Chain::Forward, w), 1_991_168);
+        // An in-place accept walk's selections sit beside the logits, the same
+        // width again — only for a caller that reads them there.
+        assert_eq!(WaveBuffer::AcceptRows.bytes(&int8, w), 0);
+        let walked = WaveWidth {
+            accept_rows: 4,
+            ..w
+        };
+        assert_eq!(WaveBuffer::AcceptRows.bytes(&int8, walked), 4 * 248_320 * 2);
 
         // Qwen2's shapes, on the float path its gate actually runs — and note
         // `packed_norm` stays **true**. That is the measured case: its layers
@@ -2991,6 +3040,17 @@ mod tests {
             WaveBuffer::HeadLogits.bytes(&float, w60),
             0,
             "a float session's logits leave the span"
+        );
+        assert_eq!(
+            WaveBuffer::AcceptRows.bytes(
+                &float,
+                WaveWidth {
+                    accept_rows: 60,
+                    ..w60
+                }
+            ),
+            0,
+            "and so do the walk's selections from them"
         );
         assert_eq!(WaveBuffer::HeadNorm.bytes(&float, w60), 60 * 896 * 2);
         assert_eq!(WaveBuffer::HeadNormF32.bytes(&float, w60), 60 * 896 * 4);

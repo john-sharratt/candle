@@ -31,7 +31,8 @@ use crate::models::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 use candle_nn::kv_cache::ModelGeometry;
 use candle_nn::kv_cache::CHUNK_SIZE;
 
-use crate::models::verify_wave::VerifyPlan;
+use crate::models::verify_wave::{upload_plan_rows, VerifyPlan};
+use crate::models::wave_token_ids::host_token_ids;
 
 use super::attention::rms_norm;
 use super::engine::Engine;
@@ -851,16 +852,6 @@ impl BatchedEngine {
         Ok(())
     }
 
-    /// Extract host token ids from an input tensor (`[1, s]` or `[s]`).
-    /// Inputs are scheduler-built host tensors; when one arrives on the GPU
-    /// this is a transfer — counted by the readback instrumentation.
-    fn token_ids(t: &Tensor) -> Result<Vec<u32>> {
-        if t.device().is_cuda() {
-            super::readback::note_readback();
-        }
-        t.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()
-    }
-
     /// Embed a list of token ids: host-resident gather, one upload.
     fn embed_rows(&self, ids: &[u32]) -> Result<Tensor> {
         let dim = self.engine.cfg().dim;
@@ -1130,18 +1121,8 @@ impl ManagedBatchedModel for BatchedEngine {
         // truncation alone cannot see it.
         let s_snap = span("verify:snapshot");
         let n_rows: usize = plain.len() + blocks.iter().map(|b| b.len()).sum::<usize>();
-        let mut decode_seqs: Vec<usize> = Vec::with_capacity(plain.len());
-        let mut decode_inputs: Vec<Tensor> = Vec::with_capacity(plain.len());
-        for &(seq, tok) in plain {
-            decode_seqs.push(seq);
-            decode_inputs.push(Tensor::from_vec(
-                vec![tok],
-                (1, 1),
-                self.engine.engine_device(),
-            )?);
-        }
+        let decode_seqs: Vec<usize> = plain.iter().map(|&(seq, _)| seq).collect();
         let mut verify_seqs: Vec<usize> = Vec::with_capacity(seqs.len());
-        let mut verify_inputs: Vec<Tensor> = Vec::with_capacity(seqs.len());
         for (i, &seq) in seqs.iter().enumerate() {
             if blocks[i].is_empty() {
                 candle::bail!("verify_blocks: empty block for seq {seq}");
@@ -1149,12 +1130,11 @@ impl ManagedBatchedModel for BatchedEngine {
             let q_start = session.sequence_offset(seq).unwrap_or(0);
             self.snapshot_verify_state(seq, q_start, blocks[i].len())?;
             verify_seqs.push(seq);
-            verify_inputs.push(Tensor::from_vec(
-                blocks[i].clone(),
-                (1, blocks[i].len()),
-                self.engine.engine_device(),
-            )?);
         }
+        // One upload per group, each row a view of it.
+        let tokens: Vec<u32> = plain.iter().map(|&(_, tok)| tok).collect();
+        let (decode_inputs, verify_inputs) =
+            upload_plan_rows(&tokens, blocks, self.engine.engine_device())?;
         s_snap.end();
         *self
             .verify_all_rows
@@ -1190,10 +1170,11 @@ impl ManagedBatchedModel for BatchedEngine {
         for (i, &seq) in seqs.iter().enumerate() {
             session.advance_sequence(seq, blocks[i].len())?;
         }
-        // Already copied off the wave's span by the caller: the accept walk
-        // reads these after the forward returns — position by position, and on
-        // partial accept a rollback + a NEXT forward — so span-lifetime views
-        // would dangle by then.
+        // Either owned rows (the scheduler owns them before handing them over)
+        // or views on the verify wave's head span, valid while the step driver
+        // holds that wave — which drops every row and the wave itself before
+        // the rollback, since a rollback may run a NEXT forward on partial
+        // accept. Read here and split, nothing more.
         if logits.len() != n_rows {
             candle::bail!(
                 "end_verify: expected {} scored rows, got {}",
@@ -1438,13 +1419,37 @@ impl BatchedEngine {
         // model is unchanged from the private-loop era — `decode_seqs` may name
         // the same sequence on consecutive rows (a verify block), and every
         // consumer below already handles that.
+        // Every member's ids in one readback, then split by group.
+        if dec_member_inputs.iter().any(|t| t.device().is_cuda())
+            || pre_member_inputs.iter().any(|t| t.device().is_cuda())
+            || glue_member_inputs.iter().any(|t| t.device().is_cuda())
+        {
+            super::readback::note_readback();
+        }
+        let mut ids = host_token_ids(
+            dec_member_inputs
+                .iter()
+                .chain(pre_member_inputs.iter())
+                .chain(glue_member_inputs.iter()),
+        )?
+        .into_iter();
+        let dec_member_ids: Vec<Vec<u32>> = ids.by_ref().take(dec_member_inputs.len()).collect();
+        let pre_member_ids: Vec<Vec<u32>> = ids.by_ref().take(pre_member_inputs.len()).collect();
+        let glue_ids: Vec<Vec<u32>> = ids.collect();
+
         let mut dec_class_seqs: Vec<usize> = dec_member_seqs.to_vec();
-        let mut decode_ids: Vec<u32> = dec_member_inputs
-            .iter()
-            .map(|t| Ok(Self::token_ids(t)?[0]))
-            .collect::<Result<Vec<_>>>()?;
+        let mut decode_ids: Vec<u32> = Vec::with_capacity(dec_member_ids.len());
+        for (seq, toks) in dec_member_seqs.iter().zip(&dec_member_ids) {
+            let [tok] = toks.as_slice() else {
+                candle::bail!(
+                    "decode member {seq} carries {} tokens; a decode row is one",
+                    toks.len()
+                );
+            };
+            decode_ids.push(*tok);
+        }
         for m in 0..n_verify_members {
-            for tok in Self::token_ids(&pre_member_inputs[m])? {
+            for &tok in &pre_member_ids[m] {
                 dec_class_seqs.push(pre_member_seqs[m]);
                 decode_ids.push(tok);
             }
@@ -1453,16 +1458,9 @@ impl BatchedEngine {
 
         // The remaining prefill members are ordinary (creep) prompts.
         let prefill_seqs: &[usize] = &pre_member_seqs[n_verify_members..];
-        let prefill_ids: Vec<Vec<u32>> = pre_member_inputs[n_verify_members..]
-            .iter()
-            .map(Self::token_ids)
-            .collect::<Result<Vec<_>>>()?;
+        let prefill_ids: Vec<Vec<u32>> = pre_member_ids[n_verify_members..].to_vec();
         let prefill_lens: Vec<usize> = prefill_ids.iter().map(|v| v.len()).collect();
         let glue_seqs: &[usize] = glue_member_seqs;
-        let glue_ids: Vec<Vec<u32>> = glue_member_inputs
-            .iter()
-            .map(Self::token_ids)
-            .collect::<Result<Vec<_>>>()?;
         let glue_lens: Vec<usize> = glue_ids.iter().map(|v| v.len()).collect();
 
         // Glue descriptors: taken off the session by the driver, one per glue

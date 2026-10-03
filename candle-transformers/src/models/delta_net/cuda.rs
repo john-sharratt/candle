@@ -261,27 +261,28 @@ pub fn build_wave_table<'w>(
     // reads one half and writes the other, and `commit_wave` exchanges them —
     // so the kernels need both addresses of both buffers.
     //
-    // Resolved through the NON-marking accessor: this table covers every
-    // recurrent layer, but a sweep may run only part of the stack, and a layer
-    // that never ran must not be swapped at commit (its write buffer still holds
-    // an older wave's output). Each layer records itself when it actually runs.
-    let mut ptrs: Vec<i64> = Vec::with_capacity(layers.len() * 4 * n);
-    for &li in &layers {
-        for &i in &decode {
-            let (live, _) = stores[i].layer_state_pair(li)?;
-            ptrs.push(f32_ptr(&live.conv_tail, "conv tail in")? as i64);
+    // Read off each store's slots (`decode_table_addresses`), which marks
+    // nothing: this table covers every recurrent layer, but a sweep may run
+    // only part of the stack, and a layer that never ran must not be swapped
+    // at commit (its write buffer still holds an older wave's output). Each
+    // layer records itself when it actually runs.
+    //
+    // A store answers its layers in slot order, so every store must carry the
+    // same schedule as the first for its rows to land under the right layer.
+    let schedule = first.schedule_hash();
+    let mut ptrs: Vec<i64> = vec![0; layers.len() * 4 * n];
+    for (k, &i) in decode.iter().enumerate() {
+        if stores[i].schedule_hash() != schedule {
+            candle::bail!(
+                "delta_net cuda: span {i}'s recurrent store has schedule {:#x}, the \
+                 wave's first has {schedule:#x} — its rows would land under other layers",
+                stores[i].schedule_hash()
+            );
         }
-        for &i in &decode {
-            let (_, out) = stores[i].layer_state_pair(li)?;
-            ptrs.push(f32_ptr(&out.conv_tail, "conv tail out")? as i64);
-        }
-        for &i in &decode {
-            let (live, _) = stores[i].layer_state_pair(li)?;
-            ptrs.push(f32_ptr(&live.s, "state in")? as i64);
-        }
-        for &i in &decode {
-            let (_, out) = stores[i].layer_state_pair(li)?;
-            ptrs.push(f32_ptr(&out.s, "state out")? as i64);
+        for (ord, addrs) in stores[i].decode_table_addresses()?.enumerate() {
+            for (row, addr) in addrs.into_iter().enumerate() {
+                ptrs[(ord * 4 + row) * n + k] = addr as i64;
+            }
         }
     }
     let rows: Vec<u32> = decode.iter().map(|&i| spans[i].start as u32).collect();
@@ -469,6 +470,10 @@ pub fn delta_net_decode_batch(
     let d = cols / h_v;
     if d > MAX_HEAD_DIM {
         candle::bail!("delta_net cuda: head dim {d} exceeds the {MAX_HEAD_DIM} cap");
+    }
+    // The step kernel reads a state row as whole float4s.
+    if !d.is_multiple_of(4) {
+        candle::bail!("delta_net cuda: head dim {d} is not a multiple of 4");
     }
     if !conv_dim.is_multiple_of(d) || conv_dim <= h_v * d {
         candle::bail!("delta_net cuda: conv row {conv_dim} is not [Q|K|V] at d = {d}");
