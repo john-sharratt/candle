@@ -34,13 +34,13 @@ nodes:
     kind: work
     name: the early range
     off: [ring-north]
-    parts: [{ part: chronicle-terminal, count: 6 }]
+    parts: [{ part: chronicle-terminal, count: 6 }, light-ring, air-handler]
 
   - id: middle-range
     kind: work
     name: the middle range
     off: [cross-upper]
-    parts: [{ part: chronicle-terminal, count: 6 }]
+    parts: [{ part: chronicle-terminal, count: 6 }, breaker-panel, coolant-valve]
 
   - id: late-range
     kind: work
@@ -70,7 +70,7 @@ nodes:
     kind: work
     name: the catalogue
     off: [cross-lower]
-    parts: [catalogue, { part: chronicle-terminal, count: 2 }]
+    parts: [catalogue, { part: chronicle-terminal, count: 2 }, compute-rack, status-board]
     character: >
       The stacks answer nothing on their own. Whoever is in here is writing for
       a reader who does not yet know what they are looking for.
@@ -89,7 +89,7 @@ nodes:
     kind: social
     name: the reading room
     off: [ring-south]
-    parts: [{ part: seat, count: 8 }]
+    parts: [pressure-door, { part: seat, count: 8 }]
     character: >
       Its armchairs stand among the shelves, which is where an argument about
       a date usually ends up.

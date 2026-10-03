@@ -44,7 +44,6 @@
 //!   the change back to the authored map (§8.3, Appendix F).
 //!
 //! The engine drives the router in-process through
-//! [`crate::engine::runtime::Runtime::effector_query`] and
 //! [`crate::engine::runtime::Runtime::effector_invoke`] (the fast path, §8.1),
 //! and the same router is mounted externally under `/v1/local` (§8.2).
 

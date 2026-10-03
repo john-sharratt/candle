@@ -32,17 +32,7 @@
 
 use serde::Serialize;
 
-/// World-clock milliseconds in one narrative day.
-///
-/// Twenty-four hours of world time. A world that wants shorter days changes its
-/// pace rather than this constant — the day is a day, and how fast it passes is
-/// the clock's business.
-pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-
-/// Which day a world-clock instant falls in. Day 0 is the world's first.
-pub fn day_of(world_ms: u64) -> u64 {
-    world_ms / DAY_MS
-}
+use crate::clock::{day_of, DAY_MS};
 
 /// How far into its day an instant is: 0.0 at dawn, approaching but never
 /// reaching 1.0.

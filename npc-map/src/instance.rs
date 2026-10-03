@@ -258,7 +258,11 @@ mod tests {
         let set = vault();
         // Band one places `character-terminal` with count 6.
         let at = Where::new("vault-casting", "band-one");
-        let instances = set.instances_at(&at);
+        let instances: Vec<_> = set
+            .instances_at(&at)
+            .into_iter()
+            .filter(|i| i.part_id() == "character-terminal")
+            .collect();
         assert_eq!(instances.len(), 6, "band one holds six character terminals");
 
         let ids: Vec<String> = instances.iter().map(|i| i.id()).collect();
@@ -284,14 +288,19 @@ mod tests {
     fn every_instance_round_trips_through_its_id_to_the_same_place_and_part() {
         let set = vault();
         let at = Where::new("vault-casting", "band-one");
-        for inst in set.instances_at(&at) {
+        let instances = set.instances_at(&at);
+        assert!(
+            instances.iter().any(|i| i.part_id() == "light-ring"),
+            "band one should hold a part besides its terminals"
+        );
+        for inst in instances {
             let id = inst.id();
             let back = set
                 .resolve_instance(&id)
                 .unwrap_or_else(|| panic!("`{id}` did not resolve"));
             assert_eq!(back.id(), id, "the id did not round-trip");
             assert_eq!(back.place(), &at);
-            assert_eq!(back.part_id(), "character-terminal");
+            assert_eq!(back.part_id(), inst.part_id());
             assert_eq!(back.ordinal(), inst.ordinal());
         }
     }

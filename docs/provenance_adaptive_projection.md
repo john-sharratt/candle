@@ -142,10 +142,21 @@ another.
 ### 2.3 What the YAML can express today
 
 `layer.budget {priority, min_percent, max_percent}`; group `selection`
-(`always_visible | top_k | single | named | conversation`); `policy` blocks
+(`always_visible | top_k | single | named | offered | conversation`); `policy` blocks
 (preset, β, min/evict, early-window, budget min/max, tags, layer_weights);
 collection `default {name}` (empty-selection fallback — collections only; turn
 groups have none, see F19).
+
+`offered {selector, k}` is collection-only and combines the two selection sources: the
+members the runtime selector names are the *only candidates* (what the world makes
+possible), and the belief-driven selection (score, hysteresis, `k` budget) keeps the most
+relevant of them. A member the selector does not name is never shown however it scores; a
+`mandatory` member rides on top of the budget whenever it is offered; the forced-member pin
+still overrides; and when every offered member scores zero (cold provenance) the whole
+offer shows rather than the first `k`. npcd installs its `tools` collection this way: the
+room offers the acts the turn's grammar allows, provenance ranks them, and the routed acts
+(`collect_mission`, `report_done`, `report_stuck`) are mandatory.
+
 Nothing expresses: normalization applicability, adaptive budgets, locality, anchors,
 momentum, probe composition, or fusion mode. All seven get YAML surface in §10.
 

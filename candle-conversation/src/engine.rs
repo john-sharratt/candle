@@ -1224,10 +1224,30 @@ impl ConversationEngine {
 
     /// Tombstone `timeline` — see
     /// [`crate::projection::Conversation::tombstone_timeline`].
+    ///
+    /// Sections the timeline owns are released with it, and the scheduler's
+    /// tables keyed by them are cleared on the wave thread.
     pub fn tombstone_timeline(&self, timeline: TimelineId) -> crate::Result<()> {
+        let owned = self
+            .conversation
+            .release_owned_sections(timeline)
+            .map_err(ConversationError::Model)?;
+        self.retire_scheduler_sections(owned);
         self.conversation
             .tombstone_timeline(timeline)
             .map_err(ConversationError::Model)
+    }
+
+    /// Clear the scheduler's per-section tables for `sections` — see
+    /// [`SchedulerRequest::RetireSections`].
+    pub(crate) fn retire_scheduler_sections(&self, sections: Vec<SectionId>) {
+        if sections.is_empty() {
+            return;
+        }
+        let _ = self.scheduler_tx.send(SchedulerRequest::RetireSections {
+            conversation: self.conversation.clone(),
+            sections,
+        });
     }
 
     /// Tombstone one turn of a live timeline — see

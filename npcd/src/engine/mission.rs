@@ -2,15 +2,16 @@
 //! and the report it files when it is done.
 //!
 //! `docs/npcd_worlds_and_layers.md` describes the projection a character reads;
-//! the schema (`D:/prog/mind/projection.yaml`) already declares empty `mission`
-//! and `task` collections with the gating that shows a mission when one exists
-//! and the "nothing has been asked of you" standing instruction when none does
-//! (see `engine::identity`'s module doc). This module is the *data* those
-//! collections carry once a mission exists — deliberately pure, so the shape of
-//! a mission, the steps under it, and the text it renders into the prompt can be
-//! tested without a running engine. Storage (conversation metadata) and the
-//! sealing of the rendered text into KV live with the code that owns the
-//! substrate; this file owns only the mission itself.
+//! the schema (`D:/prog/mind/projection.yaml`) declares `mission` and `task`
+//! collections with the gating that shows `mission_intro` when a mission is
+//! carried and the "nothing has been asked of you" standing instruction when
+//! none is. The wording is carried in the system prompt as a per-conversation
+//! section the mind reconciles against [`Mission::prompt`] each turn
+//! (`engine::mind`), so the character reads it as part of who it is rather than
+//! as a restated instruction; [`Mission::standing_text`] is the same words as the
+//! brief handed back at the desk. This module is the mission itself — deliberately
+//! pure, so its shape, its steps and the text it renders can be tested without a
+//! running engine.
 //!
 //! A mission is **collected** at the command desk (a lodged one if any is
 //! waiting for this character, otherwise a random routine from [`bank`]),
@@ -28,8 +29,36 @@ use serde::{Deserialize, Serialize};
 pub struct Todo {
     /// What the step is, in the character's own second person ("find X").
     pub text: String,
-    /// Whether it has been ticked off.
+    /// Whether it has been signed off, one way or the other.
     pub done: bool,
+    /// How the step turned out once signed off; `None` while it is open. A step
+    /// signed off before outcomes were recorded reads as achieved.
+    #[serde(default)]
+    pub outcome: Option<StepOutcome>,
+    /// Whether the step is the report itself. Nothing but filing the report
+    /// closes it, so no observer ticks it on the character's word.
+    #[serde(default)]
+    pub reports: bool,
+}
+
+/// How a signed-off step turned out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOutcome {
+    /// The step was carried out.
+    Achieved,
+    /// The character tried and could not carry it out.
+    Thwarted,
+}
+
+impl StepOutcome {
+    /// The word the API and the guardian's log carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StepOutcome::Achieved => "achieved",
+            StepOutcome::Thwarted => "thwarted",
+        }
+    }
 }
 
 impl Todo {
@@ -38,6 +67,16 @@ impl Todo {
         Self {
             text: text.into(),
             done: false,
+            outcome: None,
+            reports: false,
+        }
+    }
+
+    /// A fresh, un-ticked step that is the report back.
+    pub fn report(text: impl Into<String>) -> Self {
+        Self {
+            reports: true,
+            ..Self::new(text)
         }
     }
 }
@@ -83,6 +122,14 @@ pub enum Origin {
     Random { routine: String },
 }
 
+/// What a character's system prompt carries of its mission: the section text and
+/// the fingerprint of what produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionPrompt {
+    pub text: String,
+    pub fingerprint: u64,
+}
+
 /// A mission held on a character: the ask, the steps, the answer it is building,
 /// and the report that closes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,15 +171,17 @@ impl Mission {
         !self.todo.is_empty() && self.todo.iter().all(|t| t.done)
     }
 
-    /// Tick off the first un-ticked step whose text matches `which` (trimmed,
-    /// case-insensitive). Returns whether a step was ticked — `false` when
-    /// nothing matched or every match was already done, so the caller can tell
-    /// the character its instruction landed on nothing.
-    pub fn check_off(&mut self, which: &str) -> bool {
+    /// Sign off the first open step whose text matches `which` (trimmed,
+    /// case-insensitive) with how it turned out. Returns whether a step was
+    /// signed off — `false` when nothing matched or every match was already
+    /// done, so the caller can tell the character its instruction landed on
+    /// nothing.
+    pub fn check_off(&mut self, which: &str, outcome: StepOutcome) -> bool {
         let want = which.trim().to_lowercase();
         for step in &mut self.todo {
             if !step.done && step.text.trim().to_lowercase() == want {
                 step.done = true;
+                step.outcome = Some(outcome);
                 return true;
             }
         }
@@ -173,10 +222,8 @@ impl Mission {
         });
     }
 
-    /// The text the `mission` collection member carries — the ask itself, read
-    /// under the schema's `mission_intro` heading ("What has been asked of
-    /// you:"). Empty missions never reach here; the schema shows `mission_none`
-    /// instead.
+    /// The ask itself, as [`Self::standing_text`] states it after "What has been
+    /// asked of you:".
     pub fn mission_text(&self) -> String {
         self.prompt.trim().to_string()
     }
@@ -192,7 +239,11 @@ impl Mission {
         }
         let mut lines = Vec::with_capacity(self.todo.len());
         for step in &self.todo {
-            let mark = if step.done { "[done]" } else { "[ ]" };
+            let mark = match (step.done, step.outcome) {
+                (false, _) => "[ ]",
+                (true, Some(StepOutcome::Thwarted)) => "[could not be done]",
+                (true, _) => "[done]",
+            };
             lines.push(format!("{mark} {}", step.text.trim()));
         }
         Some(lines.join("\n"))
@@ -205,17 +256,34 @@ impl Mission {
     /// rather than trailing off. A character judges for itself when the work is
     /// done; the steps are the shape of it, not a checklist it ticks.
     pub fn standing_text(&self) -> String {
-        let mut out = format!("What has been asked of you: {}", self.mission_text());
+        format!("What has been asked of you: {}", self.prompt_text())
+    }
+
+    /// The mission as the section a character's system prompt carries under
+    /// "What has been asked of you:" — the same words as [`Self::standing_text`]
+    /// without the lead-in, which the prompt's own heading supplies.
+    pub fn prompt_text(&self) -> String {
+        let mut out = self.mission_text();
         if let Some(tasks) = self.task_text() {
             out.push_str("\nThe steps that see it through:\n");
             out.push_str(&tasks);
         }
         out.push_str(
-            "\nCarry it out. When it is done, go back to the command table and report it on your \
-             effector device — `invoke` its `report_done`, or `report_stuck` if it cannot be \
+            "\nCarry it out. When it is done, go back to the table where work is handed out, \
+             `scan` it, and report on your effector device — `invoke` its `report_done` with \
+             what you found, or its `report_stuck` with what stopped you if it cannot be \
              finished — and take up the next.",
         );
         out
+    }
+
+    /// [`Self::prompt_text`] with the fingerprint that says whether the section
+    /// already sealed for a conversation still matches it.
+    pub fn prompt(&self) -> MissionPrompt {
+        MissionPrompt {
+            text: self.prompt_text(),
+            fingerprint: self.content_fingerprint(),
+        }
     }
 
     /// A stable content fingerprint of what the character reads — the ask plus
@@ -228,6 +296,7 @@ impl Mission {
         for step in &self.todo {
             step.text.trim().hash(&mut h);
             step.done.hash(&mut h);
+            step.outcome.map(StepOutcome::as_str).hash(&mut h);
         }
         h.finish()
     }
@@ -246,17 +315,33 @@ pub mod bank {
     /// What the world offers a routine to be built around: who else is here to
     /// visit, and which archived records exist to consult. A routine picks from
     /// these so two characters rarely draw the identical mission.
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Default)]
     pub struct Facts<'a> {
         /// Other characters' names, to contact or ask about.
         pub makers: &'a [String],
         /// Archived record ids, to read and check against the storyline.
         pub records: &'a [String],
+        /// Machines standing in the world, to go and read. When there are any, a
+        /// mission is built on one of them, because a reading is something a
+        /// character can go and get and bring back as evidence.
+        pub duties: &'a [Duty],
+        /// The room the table where work is reported stands in, when the world
+        /// has one. Every mission ends with a step that goes back to it.
+        pub table: Option<&'a str>,
+    }
+
+    /// One machine to go and read: what it is called and the room it stands in,
+    /// both as a character knows them.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Duty {
+        pub room: String,
+        pub device: String,
     }
 
     /// Every routine's name, in a fixed order. `random` picks one of these by
     /// seed; the name becomes the mission's [`Origin::Random`] routine tag.
     pub const ROUTINES: &[&str] = &[
+        "read-a-station",
         "visit-and-review",
         "hear-them-out",
         "check-a-record",
@@ -283,15 +368,20 @@ pub mod bank {
             (seed, ROUTINES[i]).hash(&mut h);
             h.finish()
         });
-        // The first routine whose material is present, in shuffled order. The
-        // rotation carries routines that need nobody and nothing (`take-stock`,
-        // `walk-the-halls`), so a world with no other makers and no archive
-        // still yields one; `walk_the_halls` is the default should every arm one
-        // day become conditional and a barren world leave the loop empty-handed.
-        order
-            .iter()
-            .find_map(|&i| build(ROUTINES[i], facts, seed))
-            .unwrap_or_else(|| walk_the_halls(facts))
+        // A machine to read comes first when the world has one: a reading is
+        // evidence that can be brought back, where a conversation is not. After
+        // that, the first routine whose material is present, in shuffled order.
+        // The rotation carries routines that need nobody and nothing
+        // (`take-stock`, `walk-the-halls`), so a world with no other makers, no
+        // archive and no machines still yields one.
+        let mut mission = build("read-a-station", facts, seed)
+            .or_else(|| order.iter().find_map(|&i| build(ROUTINES[i], facts, seed)))
+            .unwrap_or_else(|| walk_the_halls(facts));
+        mission.todo.push(Todo::report(match facts.table {
+            Some(room) => format!("go back to the table in {room} and report it"),
+            None => "go back to the table and report it".to_string(),
+        }));
+        mission
     }
 
     /// A pseudo-random pick from `items` by `seed`, or `None` when empty.
@@ -310,6 +400,25 @@ pub mod bank {
             routine: r.to_string(),
         };
         match routine {
+            "read-a-station" => {
+                let mut h = DefaultHasher::new();
+                (seed, "station").hash(&mut h);
+                let duty = facts
+                    .duties
+                    .get((h.finish() % facts.duties.len().max(1) as u64) as usize)?;
+                let Duty { room, device } = duty;
+                Some(Mission::new(
+                    format!(
+                        "Go to {room} and read {device}: scan it, and find out what state it \
+                         is in. Then come back and report exactly what you read."
+                    ),
+                    vec![
+                        Todo::new(format!("go to {room}")),
+                        Todo::new(format!("scan {device} and read what state it is in")),
+                    ],
+                    origin("read-a-station"),
+                ))
+            }
             "visit-and-review" => {
                 let who = pick(facts.makers, seed, "visit")?;
                 Some(Mission::new(
@@ -477,8 +586,8 @@ pub mod bank {
 
 #[cfg(test)]
 mod tests {
-    use super::bank::{random, Facts, ROUTINES};
-    use super::{Mission, Origin, Outcome, Todo};
+    use super::bank::{random, Duty, Facts, ROUTINES};
+    use super::{Mission, Origin, Outcome, StepOutcome, Todo};
 
     fn makers() -> Vec<String> {
         vec!["Wren".to_string(), "Pax".to_string(), "Soren".to_string()]
@@ -509,22 +618,56 @@ mod tests {
     #[test]
     fn check_off_ticks_the_named_step_case_insensitively_and_reports_the_hit() {
         let mut m = a_mission();
-        assert!(m.check_off("  STEP one "), "trim + case-insensitive match");
+        assert!(
+            m.check_off("  STEP one ", StepOutcome::Achieved),
+            "trim + case-insensitive match"
+        );
         assert!(m.todo[0].done);
+        assert_eq!(m.todo[0].outcome, Some(StepOutcome::Achieved));
         assert!(!m.todo[1].done);
+        assert_eq!(m.todo[1].outcome, None);
         // A second tick of the same step finds nothing left to tick.
-        assert!(!m.check_off("step one"));
+        assert!(!m.check_off("step one", StepOutcome::Thwarted));
+        assert_eq!(m.todo[0].outcome, Some(StepOutcome::Achieved));
         // A step that is not on the list ticks nothing.
-        assert!(!m.check_off("step three"));
+        assert!(!m.check_off("step three", StepOutcome::Achieved));
+    }
+
+    #[test]
+    fn a_thwarted_step_is_done_and_reads_to_the_character_as_one_it_could_not_do() {
+        let mut m = a_mission();
+        assert!(m.check_off("step one", StepOutcome::Thwarted));
+        assert!(m.todo[0].done);
+        assert_eq!(m.todo[0].outcome, Some(StepOutcome::Thwarted));
+        assert_eq!(StepOutcome::Achieved.as_str(), "achieved");
+        assert_eq!(StepOutcome::Thwarted.as_str(), "thwarted");
+        assert_eq!(
+            m.task_text().as_deref(),
+            Some("[could not be done] step one\n[ ] step two")
+        );
+        let mut achieved = a_mission();
+        achieved.check_off("step one", StepOutcome::Achieved);
+        assert_ne!(m.content_fingerprint(), achieved.content_fingerprint());
+    }
+
+    #[test]
+    fn a_step_signed_off_before_outcomes_were_recorded_loads_with_none() {
+        let t: Todo = serde_json::from_str(r#"{"text":"old","done":true}"#).unwrap();
+        assert!(t.done);
+        assert_eq!(t.outcome, None);
+        assert_eq!(
+            serde_json::to_string(&Todo::new("x")).unwrap(),
+            r#"{"text":"x","done":false,"outcome":null,"reports":false}"#
+        );
     }
 
     #[test]
     fn all_todos_done_only_once_every_step_is_ticked() {
         let mut m = a_mission();
         assert!(!m.all_todos_done());
-        assert!(m.check_off("step one"));
+        assert!(m.check_off("step one", StepOutcome::Achieved));
         assert!(!m.all_todos_done());
-        assert!(m.check_off("step two"));
+        assert!(m.check_off("step two", StepOutcome::Thwarted));
         assert!(m.all_todos_done());
     }
 
@@ -537,7 +680,7 @@ mod tests {
         assert!(!m.add_todo(" STEP three "), "open duplicate refused");
         assert_eq!(m.todo.len(), 3);
         // Once a step is done, the same text may be added again as new work.
-        assert!(m.check_off("step three"));
+        assert!(m.check_off("step three", StepOutcome::Achieved));
         assert!(m.add_todo("step three"));
         assert_eq!(m.todo.len(), 4);
     }
@@ -557,7 +700,7 @@ mod tests {
     #[test]
     fn mission_and_task_text_render_the_ask_and_the_ticked_steps() {
         let mut m = a_mission();
-        m.check_off("step one");
+        m.check_off("step one", StepOutcome::Achieved);
         assert_eq!(m.mission_text(), "Do the thing.");
         assert_eq!(
             m.task_text().as_deref(),
@@ -581,11 +724,13 @@ mod tests {
         assert!(text.starts_with("What has been asked of you: Do the thing."));
         assert!(text.contains("The steps that see it through:"));
         assert!(text.contains("step one") && text.contains("step two"));
-        // It ends by pointing back to the command table to report and take the
-        // next — the loop closes there, not out in the world.
+        // It ends by pointing back to the table to report and take the next — the
+        // loop closes there, not out in the world — by scanning it and invoking
+        // its report verbs.
         assert!(
-            text.contains("go back to the command table and report it on your effector device")
+            text.contains("go back to the table where work is handed out, `scan` it")
                 && text.contains("`report_done`")
+                && text.contains("`report_stuck`")
         );
         // A mission carried on its ask alone still ends at the table.
         let bare = Mission::new(
@@ -597,7 +742,19 @@ mod tests {
         );
         assert!(bare
             .standing_text()
-            .contains("go back to the command table"));
+            .contains("go back to the table where work is handed out"));
+    }
+
+    #[test]
+    fn the_prompt_is_the_standing_text_under_its_own_heading_and_carries_the_fingerprint() {
+        let m = a_mission();
+        let prompt = m.prompt();
+        assert!(!prompt.text.starts_with("What has been asked of you"));
+        assert_eq!(
+            m.standing_text(),
+            format!("What has been asked of you: {}", prompt.text)
+        );
+        assert_eq!(prompt.fingerprint, m.content_fingerprint());
     }
 
     #[test]
@@ -614,7 +771,7 @@ mod tests {
         assert_eq!(m1.content_fingerprint(), m2.content_fingerprint());
         // Ticking a step does change the rendered task text, so it re-fingerprints.
         let mut m3 = a_mission();
-        m3.check_off("step one");
+        m3.check_off("step one", StepOutcome::Achieved);
         assert_ne!(m1.content_fingerprint(), m3.content_fingerprint());
     }
 
@@ -625,6 +782,7 @@ mod tests {
         let facts = Facts {
             makers: &mk,
             records: &rc,
+            ..Facts::default()
         };
         for seed in 0..50u64 {
             let m = random(&facts, seed);
@@ -650,6 +808,7 @@ mod tests {
         let facts = Facts {
             makers: &mk,
             records: &rc,
+            ..Facts::default()
         };
         let prompts: std::collections::HashSet<String> =
             (0..30u64).map(|s| random(&facts, s).prompt).collect();
@@ -663,10 +822,7 @@ mod tests {
     fn a_lone_character_with_no_records_still_gets_an_actionable_mission() {
         // No other makers, no archive: routines needing them are skipped and the
         // always-available "walk the halls" fallback fires.
-        let facts = Facts {
-            makers: &[],
-            records: &[],
-        };
+        let facts = Facts::default();
         // The only routines needing no other maker and no record.
         let no_material = ["take-stock", "walk-the-halls"];
         for seed in 0..20u64 {
@@ -679,6 +835,67 @@ mod tests {
                 ),
                 Origin::Lodged { .. } => panic!("bank produces Random origins"),
             }
+        }
+    }
+
+    #[test]
+    fn a_world_with_machines_gets_a_mission_to_go_and_read_one() {
+        let mk = makers();
+        let duties = vec![
+            Duty {
+                room: "the foundry".to_string(),
+                device: "the coolant valve".to_string(),
+            },
+            Duty {
+                room: "the armoury".to_string(),
+                device: "the breaker panel".to_string(),
+            },
+        ];
+        let facts = Facts {
+            makers: &mk,
+            duties: &duties,
+            table: Some("the muster hall"),
+            ..Facts::default()
+        };
+        for seed in 0..20u64 {
+            let m = random(&facts, seed);
+            assert_eq!(
+                m.origin,
+                Origin::Random {
+                    routine: "read-a-station".to_string()
+                }
+            );
+            let duty = duties
+                .iter()
+                .find(|d| m.prompt.contains(&d.device))
+                .expect("the mission names one of the machines");
+            assert!(m.prompt.contains(&duty.room), "{}", m.prompt);
+            assert_eq!(m.todo[0].text, format!("go to {}", duty.room));
+            assert_eq!(
+                m.todo.last().unwrap().text,
+                "go back to the table in the muster hall and report it",
+                "it ends at the table, by the room's name"
+            );
+        }
+    }
+
+    #[test]
+    fn every_routine_ends_with_a_step_that_reports_at_the_table() {
+        let mk = makers();
+        let rc = records();
+        let facts = Facts {
+            makers: &mk,
+            records: &rc,
+            ..Facts::default()
+        };
+        for seed in 0..30u64 {
+            let m = random(&facts, seed);
+            assert_eq!(
+                m.todo.last().unwrap().text,
+                "go back to the table and report it"
+            );
+            assert!(m.todo.last().unwrap().reports);
+            assert_eq!(m.todo.iter().filter(|t| t.reports).count(), 1);
         }
     }
 }

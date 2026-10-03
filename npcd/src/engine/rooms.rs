@@ -42,7 +42,9 @@ use npc_map::salience::Weight;
 use npc_map::world::{Where, World};
 
 use crate::engine::event::Salience;
-use crate::engine::stir::{Building, Stirring};
+use crate::engine::stir::{Building, Report, Stirring};
+use crate::sim::seed::with_article;
+use crate::sim::Sim;
 
 /// How long a room waits between looks. Drawn afresh after every one.
 ///
@@ -100,6 +102,14 @@ impl Rooms {
         self.fitted.is_empty()
     }
 
+    /// The ids of the fixtures running in a room, empty when none is fitted.
+    pub fn fitted_ids(&self, at: &Where) -> Vec<&'static str> {
+        self.fitted
+            .get(at)
+            .map(|room| room.building.fitted_ids())
+            .unwrap_or_default()
+    }
+
     /// Ask every occupied room whether anything happened, and write what did
     /// into the world.
     ///
@@ -107,8 +117,8 @@ impl Rooms {
     /// the world's own lock, **before perception is taken** — a stirring that
     /// landed after the sweep would be read a moment late by everybody, and the
     /// character that walked in during that moment would never read it at all.
-    pub fn stir(&mut self, world: &mut World) -> usize {
-        self.stir_at(world, self.started.elapsed())
+    pub fn stir(&mut self, world: &mut World, sim: &mut Sim) -> usize {
+        self.stir_at(world, sim, self.started.elapsed())
     }
 
     /// The same, at a stated point in the run rather than at the real one.
@@ -118,54 +128,92 @@ impl Rooms {
     /// way to see a coolant loop reach its fourth stage is to be able to say
     /// when it is. A test that had to wait out `WAIT` in real seconds would not
     /// be written.
-    pub fn stir_at(&mut self, world: &mut World, since: Duration) -> usize {
+    pub fn stir_at(&mut self, world: &mut World, sim: &mut Sim, since: Duration) -> usize {
         let mut occupied: Vec<Where> = world.actors().map(|a| a.at.clone()).collect();
         occupied.sort();
         occupied.dedup();
 
         let mut spoke = 0;
         for at in occupied {
-            let room = self.fit(world, &at, since);
-            if since < room.due {
-                continue;
+            self.fit(world, &at, since);
+            let standing = self.standing(world);
+            let objects = objects_at(world, &at);
+            let place = format!("{}/{}", at.area, at.node);
+            let room = self.fitted.get_mut(&at).expect("fitted above");
+
+            // **The objects are the truth.** Whatever a character did to one
+            // since the last look is read off the device before the building
+            // decides anything, so a fault somebody just mended is not spoken
+            // of again as though it stood.
+            room.building.hear_of(standing);
+            let seen: Vec<(&str, &str)> = objects
+                .iter()
+                .filter_map(|o| Some((o.part.as_str(), sim.devices.get(&o.id)?.mode.as_str())))
+                .collect();
+            let mut said = room.building.tend(since, &seen);
+
+            if since >= room.due {
+                // Drawn before the event rather than after, so a room whose
+                // fixtures were all quiet still waits its turn — otherwise an
+                // unlucky room is asked every 500ms until something answers.
+                room.due = since + room.building.jitter(WAIT.start, WAIT.end);
+                said.extend(room.building.next_event(since));
             }
-            // Drawn before the event rather than after, so a room whose
-            // fixtures were all quiet still waits its turn — otherwise an
-            // unlucky room is asked every 500ms until something answers.
-            room.due = since + room.building.jitter(WAIT.start, WAIT.end);
-            let Some(s) = room.building.next_event(since) else {
-                continue;
-            };
-            let rung = rung(&s);
-            // A place the map does not hold is the one way this can fail, and it
-            // is worth saying so: the room was fitted from an actor standing
-            // there, so a refusal means a body is somewhere the map does not
-            // have, which is a fault well upstream of here.
-            match world.stir(&at, &s.text, rung) {
-                Ok(()) => {
-                    // **Debug, because Pulse already shows it.** A stirring that
-                    // reaches anybody appears in that character's tick as what
-                    // it perceived, beside what it did about it, which is both
-                    // more use than a log line and where somebody would look.
-                    // This says the same thing one step earlier, which is only
-                    // worth reading when the two disagree — a room that spoke
-                    // and nobody heard.
-                    tracing::debug!(
-                        room = %format!("{}/{}", at.area, at.node),
-                        from = s.from,
-                        weight = ?rung,
-                        "{}",
-                        s.text
-                    );
-                    spoke += 1;
+
+            for set in room.building.take_sets() {
+                for o in objects.iter().filter(|o| o.part == set.part) {
+                    if let Some(device) = sim.devices.get_mut(&o.id) {
+                        device.set(set.mode);
+                    }
                 }
-                Err(e) => tracing::warn!(
-                    room = %format!("{}/{}", at.area, at.node),
-                    "the building could not speak: {e:?}"
-                ),
+            }
+
+            for s in said {
+                if let Some((part, text)) = &s.posted {
+                    if let Some(o) = objects.iter().find(|o| o.part == *part) {
+                        sim.post(&place, &o.name, POSTED_BY, text);
+                    }
+                }
+                let rung = rung(&s);
+                // A place the map does not hold is the one way this can fail, and
+                // it is worth saying so: the room was fitted from an actor
+                // standing there, so a refusal means a body is somewhere the map
+                // does not have, which is a fault well upstream of here.
+                match world.stir(&at, &s.text, rung) {
+                    Ok(()) => {
+                        // **Debug, because Pulse already shows it.** A stirring
+                        // that reaches anybody appears in that character's tick
+                        // as what it perceived, beside what it did about it,
+                        // which is both more use than a log line and where
+                        // somebody would look. This says the same thing one step
+                        // earlier, which is only worth reading when the two
+                        // disagree — a room that spoke and nobody heard.
+                        tracing::debug!(
+                            room = %place,
+                            from = s.from,
+                            weight = ?rung,
+                            "{}",
+                            s.text
+                        );
+                        spoke += 1;
+                    }
+                    Err(e) => tracing::warn!(
+                        room = %place,
+                        "the building could not speak: {e:?}"
+                    ),
+                }
             }
         }
         spoke
+    }
+
+    /// The faults standing on objects in every room that has a building, each
+    /// filed against the room it is in. What a status board is told.
+    fn standing(&self, world: &World) -> Vec<Report> {
+        self.fitted
+            .iter()
+            .flat_map(|(at, room)| room.building.standing(&room_name(world, at)))
+            .collect()
     }
 
     /// The room's building, fitting one if this is the first time anybody has
@@ -176,7 +224,11 @@ impl Rooms {
             // see `stir::broadcast`.
             let said = world.map().announcements_for(&at.area).to_vec();
             let recordings = said.len();
-            let mut building = Building::new(self.next_seed, said);
+            // What stands in the room decides which fixtures run in it: a
+            // building is fitted only with what the room has an object for.
+            let parts: Vec<String> = objects_at(world, at).into_iter().map(|o| o.part).collect();
+            let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+            let mut building = Building::new(self.next_seed, said, &parts);
             // Advanced whether or not this room ever speaks, so no two rooms
             // fitted in one pass run identically.
             self.next_seed = self
@@ -197,6 +249,41 @@ impl Rooms {
             self.fitted.insert(at.clone(), Room { building, due });
         }
         self.fitted.get_mut(at).expect("fitted above")
+    }
+}
+
+/// Who a line written on an object says wrote it.
+const POSTED_BY: &str = "the building";
+
+/// One object standing in a room, as the building sees it.
+struct Object {
+    /// The catalogue part it is an instance of.
+    part: String,
+    /// Its instance id, which is what the world's device is keyed by.
+    id: String,
+    /// What a character names it, as a surface or a device.
+    name: String,
+}
+
+/// What stands in a room.
+fn objects_at(world: &World, at: &Where) -> Vec<Object> {
+    world
+        .map()
+        .instances_at(at)
+        .into_iter()
+        .map(|i| Object {
+            part: i.part_id().to_string(),
+            id: i.id(),
+            name: with_article(i.name()),
+        })
+        .collect()
+}
+
+/// A room as a board names it.
+fn room_name(world: &World, at: &Where) -> String {
+    match world.map().node_at(at) {
+        Some(node) => with_article(&node.name),
+        None => at.node.clone(),
     }
 }
 

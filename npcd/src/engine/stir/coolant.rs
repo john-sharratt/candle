@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use crate::engine::event::Salience;
-use crate::engine::stir::{Cond, Due, Fixture, Rng, Stirring, Watch};
+use crate::engine::stir::{Bound, Cond, Due, Fixture, Rng, Stirring, Watch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Stage {
@@ -69,6 +69,51 @@ impl Fixture for CoolantLoop {
         }
         if self.stage >= Stage::Hammering {
             out.push(Cond::Loud);
+        }
+    }
+
+    fn needs(&self) -> &'static [&'static str] {
+        &["coolant-valve"]
+    }
+
+    fn bound(&self) -> Option<Bound> {
+        Some(Bound {
+            part: "coolant-valve",
+            ok: "tight",
+            fault: "weeping",
+            system: "the coolant gallery",
+            trouble: "the coolant loop is off its mark and leaking",
+            object: "the coolant valve",
+        })
+    }
+
+    fn faulted(&self) -> bool {
+        self.stage > Stage::Sound
+    }
+
+    fn set_fault(&mut self, on: bool) -> Option<Stirring> {
+        match on {
+            true => {
+                self.stage = Stage::Weeping;
+                self.neglected = 0;
+                Some(
+                    Stirring::new(
+                        "coolant",
+                        "The coolant valve is cracked open, and a joint beside it begins to weep.",
+                        Salience::NORMAL,
+                    )
+                    .tagged(&[Cond::Damp, Cond::Leaking]),
+                )
+            }
+            false => {
+                self.stage = Stage::Sound;
+                self.neglected = 0;
+                Some(Stirring::new(
+                    "coolant",
+                    "The coolant valve is wound tight, and the knocking and the drip both stop.",
+                    Salience::NORMAL,
+                ))
+            }
         }
     }
 

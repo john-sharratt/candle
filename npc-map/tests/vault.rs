@@ -351,9 +351,12 @@ fn a_level_memory_groups_its_rooms_by_what_they_are_for() {
 fn identical_work_rooms_are_described_once_between_them() {
     let set = vault();
     let text = flat(&describe::level(&set, "vault-casting"));
+    // The rooms differ in their plant and not in their job, so they are still
+    // one entry, and the plant is listed with it.
     assert!(
         text.contains(
-            "band one, band two and band three — sixteen character terminals between them."
+            "band one, band two and band three — sixteen character terminals, light ring, \
+             air handler, breaker panel and coolant valve between them."
         ),
         "{text}"
     );

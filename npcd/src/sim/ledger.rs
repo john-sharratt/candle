@@ -376,6 +376,47 @@ impl Ledger {
         }
     }
 
+    /// The orders `setter` has put up that are still open, held or not.
+    pub fn open_set_by(&self, setter: &str) -> Vec<&Order> {
+        self.orders
+            .iter()
+            .filter(|o| !o.done && o.by == setter)
+            .collect()
+    }
+
+    /// Whether `setter` has ever put this order up, finished or not — so a
+    /// cause that stands for a long time is put up once, and not again each
+    /// time somebody settles it.
+    pub fn set_by(&self, setter: &str, what: &str) -> bool {
+        self.orders.iter().any(|o| o.by == setter && o.what == what)
+    }
+
+    /// Take down every order `setter` put up that is not in `keep`, held or
+    /// not, finished or not, so that a cause which comes back is a new decision
+    /// rather than one already made. Returns how many open ones came down.
+    pub fn withdraw_unless(&mut self, setter: &str, keep: &[&str]) -> usize {
+        let open = |o: &Order| !o.done && o.by == setter && !keep.contains(&o.what.as_str());
+        let gone = self.orders.iter().filter(|o| open(o)).count();
+        self.orders
+            .retain(|o| o.by != setter || keep.contains(&o.what.as_str()));
+        gone
+    }
+
+    /// Finish every order of `setter`'s that `who` is holding. Returns how many.
+    pub fn finish_held_set_by(&mut self, who: &str, setter: &str) -> usize {
+        let mut finished = 0;
+        for o in self
+            .orders
+            .iter_mut()
+            .filter(|o| !o.done && o.by == setter && o.held_by.as_deref() == Some(who))
+        {
+            o.done = true;
+            o.held_by = None;
+            finished += 1;
+        }
+        finished
+    }
+
     // ---- verdicts ----
 
     pub fn record_verdict(
@@ -642,6 +683,80 @@ mod tests {
         let mut l = Ledger::new();
         assert!(l.take_order("invent a reason", "c1").is_err());
         assert!(l.hand_to("invent a reason", "c1").is_err());
+    }
+
+    /// **Whatever a setter has put up, done or not, is remembered as theirs.**
+    /// What stops a standing cause from being put up again the moment its first
+    /// decision is made.
+    #[test]
+    fn a_setter_remembers_an_order_after_it_is_finished() {
+        let mut l = Ledger::new();
+        assert!(!l.set_by("the tower", "answer the contact"));
+        l.set_order("answer the contact", "the tower", None);
+        l.take_order("answer the contact", "c1").unwrap();
+        l.finish("c1", "answer the contact");
+        assert!(l.set_by("the tower", "answer the contact"));
+        assert!(
+            !l.set_by("keeper", "answer the contact"),
+            "somebody else's order counted as the tower's"
+        );
+    }
+
+    /// **A cause that has passed takes its decision with it** — held or not —
+    /// and leaves every other setter's orders and every cause still standing.
+    #[test]
+    fn a_setter_withdraws_what_no_longer_stands_and_nothing_else() {
+        let mut l = Ledger::new();
+        l.set_order("answer the contact", "the tower", None);
+        l.set_order("live on less energy", "the tower", None);
+        l.set_order("hold the gate", "keeper", None);
+        l.take_order("answer the contact", "c1").unwrap();
+
+        let gone = l.withdraw_unless("the tower", &["live on less energy"]);
+
+        assert_eq!(gone, 1);
+        assert!(l.held_by("c1").is_empty(), "a withdrawn order stayed held");
+        let open: Vec<&str> = l
+            .open_set_by("the tower")
+            .iter()
+            .map(|o| o.what.as_str())
+            .collect();
+        assert_eq!(open, vec!["live on less energy"]);
+        assert!(l.unheld().contains(&"hold the gate".to_string()));
+    }
+
+    /// **A cause that lapses and returns is a new decision**, so what was
+    /// decided about it the first time is forgotten with it.
+    #[test]
+    fn a_withdrawn_cause_that_comes_back_is_not_already_decided() {
+        let mut l = Ledger::new();
+        l.set_order("live on less energy", "the tower", None);
+        l.take_order("live on less energy", "c1").unwrap();
+        l.finish("c1", "live on less energy");
+        assert!(l.set_by("the tower", "live on less energy"));
+
+        assert_eq!(l.withdraw_unless("the tower", &[]), 0);
+        assert!(!l.set_by("the tower", "live on less energy"));
+    }
+
+    /// **Deciding closes what you were holding, and only that.**
+    #[test]
+    fn a_holder_finishes_the_setters_orders_it_holds() {
+        let mut l = Ledger::new();
+        l.set_order("answer the contact", "the tower", None);
+        l.set_order("live on less energy", "the tower", None);
+        l.set_order("hold the gate", "keeper", None);
+        l.take_order("answer the contact", "c1").unwrap();
+        l.take_order("hold the gate", "c1").unwrap();
+
+        assert_eq!(l.finish_held_set_by("c1", "the tower"), 1);
+
+        assert_eq!(
+            l.held_by("c1").len(),
+            1,
+            "another setter's order was closed"
+        );
+        assert_eq!(l.open_set_by("the tower").len(), 1);
     }
 
     #[test]

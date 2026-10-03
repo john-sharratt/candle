@@ -6794,6 +6794,7 @@ fn fmt_selection(rule: &SelectionRule) -> String {
         SelectionRule::TopK { k } => format!("top {k}"),
         SelectionRule::Single => "single".to_string(),
         SelectionRule::Named { selector } => format!("named({selector})"),
+        SelectionRule::Offered { selector, k } => format!("offered({selector}, k={k})"),
         SelectionRule::Sequence {
             recent,
             historical_top_k,

@@ -438,6 +438,41 @@ fn function_blocks_to_lines(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// Every well-formed call in a decode, by whatever name it uses.
+///
+/// [`parse`] without the catalog: a call to a tool this engine does not list
+/// still comes back, which is what the answer to a question needs — that one is
+/// forced through a tool of its own, outside the character's acts.
+pub fn raw_calls(output: &str) -> Vec<(String, Map<String, Value>)> {
+    normalize(output)
+        .lines()
+        .map(str::trim)
+        .filter(|line| looks_like_call(line))
+        .filter_map(|line| match serde_json::from_str::<Value>(line) {
+            Ok(Value::Object(obj)) => {
+                let mut obj = flatten(obj);
+                match obj.remove("tool") {
+                    Some(Value::String(name)) => Some((name, obj)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A decode with its call envelope and function blocks reduced to one JSON
+/// object per line, the shape the line walk reads.
+fn normalize(output: &str) -> String {
+    let output = match function_blocks_to_lines(output) {
+        Some(translated) => translated,
+        None => output.to_string(),
+    };
+    escape_control_in_strings(&output)
+        .replace(CALL_OPEN, "\n")
+        .replace(CALL_CLOSE, "\n")
+}
+
 /// Parse a decode into acts.
 pub fn parse(output: &str) -> Parsed {
     let mut out = Parsed::default();
@@ -453,17 +488,12 @@ pub fn parse(output: &str) -> Parsed {
     // over them would be working on fragments of a value. Translated here, the
     // rest of this function sees the one shape it has always seen. See
     // [`function_blocks_to_lines`].
-    let output = match function_blocks_to_lines(output) {
-        Some(translated) => translated,
-        None => output.to_string(),
-    };
-    let output = escape_control_in_strings(&output);
-
+    //
     // The envelope is stripped before the line walk rather than inside it,
     // because a `<tool_call>` block spans lines: the markers and the object sit
     // on three lines of their own. Removing just the markers leaves the object
     // on its own line, which is what the walk below already understands.
-    let output = &output.replace(CALL_OPEN, "\n").replace(CALL_CLOSE, "\n");
+    let output = &normalize(output);
 
     for raw in output.lines() {
         let line = raw.trim();
@@ -1145,21 +1175,12 @@ mod tests {
         assert!(p.narration.is_empty());
     }
 
-    /// **The effector device's two verbs parse as acts.** `query` and `invoke`
-    /// are ordinary catalog tools as far as the parser is concerned — a
-    /// `<tool_call>` naming either, with its arguments, yields the matching
-    /// [`Act`] the async loop routes to the effector fast path.
+    /// **The effector device's `invoke` parses as an act.** It is an ordinary
+    /// catalog tool as far as the parser is concerned — a `<tool_call>` naming
+    /// it, with its arguments, yields the matching [`Act`] the async loop routes
+    /// to the effector fast path.
     #[test]
-    fn a_device_call_parses_as_a_query_or_invoke_act() {
-        let q = parse(
-            "<tool_call>\n{\"name\": \"query\", \"arguments\": {\"url\": \"http://local/\"}}\n\
-             </tool_call>",
-        );
-        assert_eq!(q.rejected, Vec::new(), "{:?}", q.rejected);
-        assert_eq!(q.acts.len(), 1);
-        assert_eq!(q.acts[0].tool, "query");
-        assert_eq!(q.acts[0].args["url"], "http://local/");
-
+    fn a_device_call_parses_as_an_invoke_act() {
         let i = parse(
             "<tool_call>\n{\"name\": \"invoke\", \"arguments\": \
              {\"url\": \"http://local/lift/command-shaft/call\", \"body\": \"{}\"}}\n</tool_call>",
@@ -1183,15 +1204,15 @@ mod tests {
         assert_eq!(typed.rejected, Vec::new(), "{:?}", typed.rejected);
         assert_eq!(typed.acts[0].args["body"], serde_json::json!({}));
 
-        // The url is required on both, so a call without it is refused, not
+        // The url is required, so a call without it is refused, not
         // half-performed.
-        let short = parse(r#"{"tool":"query"}"#);
+        let short = parse(r#"{"tool":"invoke"}"#);
         assert!(short.acts.is_empty());
         assert!(
             matches!(
                 short.rejected.first(),
                 Some(Rejected::MissingParam {
-                    tool: "query",
+                    tool: "invoke",
                     param: "url"
                 })
             ),

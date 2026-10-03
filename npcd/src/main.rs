@@ -36,6 +36,7 @@ use web::{Builder, Config, Roots};
 
 // The whole core is the library beside this file; the binary is a shim that
 // binds a port over it. See `lib.rs` for why the split exists.
+use npcd::engine::guardian::{GuardianBuilder, GuardianConfig, RuntimeProbe};
 use npcd::{
     accounts, api, clock, collections, effector, engine, guard, identity, images, logs, mind, npcs,
     ops, personality_portrait, projection, registry,
@@ -136,6 +137,15 @@ struct Cli {
     /// are untouched.
     #[arg(long)]
     forget_dreams: bool,
+
+    /// Empty the journal every character has kept, at startup.
+    ///
+    /// Each character wakes with an empty journal and writes its first entry
+    /// from what it lives after waking. Only the journal goes — the record its
+    /// conversation holds it by: each character's conversation, dreams, memory,
+    /// beliefs and place in the world are untouched.
+    #[arg(long)]
+    forget_journal: bool,
 
     /// Retire every conversation in the substrate at startup, and re-ingest the
     /// mind.
@@ -479,20 +489,26 @@ async fn main() -> anyhow::Result<()> {
     // The clock resolver closes over the state rather than reading a single
     // daemon-wide clock: worlds run at their own pace and can be paused
     // independently, and a character has to see its own world's time.
-    // `blocking_read`, because the tick driver is a plain OS thread with no
-    // async context. **This closure must never be called from inside the
-    // runtime** — `blocking_read` there panics rather than waiting, and the
-    // route that did it answered every request with a closed connection while
-    // the loop it was showing ran perfectly underneath. The async side uses
-    // `Authored::world_ms`, which reaches the same lookup by the other route.
+    // `blocking_read` panics rather than waits when called on a runtime worker,
+    // and a route that did it answered every request with a closed connection
+    // while the loop it was showing ran perfectly underneath. So a call from
+    // inside the runtime — a world's moment is a task there — steps off the
+    // worker with `block_in_place` first; one from a plain thread reads
+    // directly. Handlers use `Authored::world_ms`, which awaits instead.
     let clock_state = authored.clone();
     runtime.set_clock(Arc::new(move |npc_id: u64| {
-        clock::world_ms_for(
-            &clock_state.npcs.blocking_read(),
-            &clock_state.worlds.blocking_read(),
-            npc_id,
-            now_ms_i64(),
-        )
+        let read = || {
+            clock::world_ms_for(
+                &clock_state.npcs.blocking_read(),
+                &clock_state.worlds.blocking_read(),
+                npc_id,
+                now_ms_i64(),
+            )
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(read),
+            Err(_) => read(),
+        }
     }));
 
     runtime.set_feelings(feelings);
@@ -720,9 +736,9 @@ async fn main() -> anyhow::Result<()> {
     engine::runtime::start(
         runtime.clone(),
         engine::runtime::LoadPlan {
-            world_ms: 0,
             forget_conversations: cli.forget_conversations,
             forget_dreams: cli.forget_dreams,
+            forget_journal: cli.forget_journal,
             wipe_conversations: cli.wipe_conversations,
             cast,
             // Personalities, not the cast. A layer directory is named after a
@@ -810,6 +826,15 @@ async fn main() -> anyhow::Result<()> {
         },
         None => None,
     };
+
+    // The guardian, when `guardian.yaml` asks for one: it watches the cast
+    // against the missions they carry and presses on the ones that wander.
+    if let Some(config) = GuardianConfig::load(&data)?.filter(|c| c.enabled) {
+        let guardian = GuardianBuilder::from_config(&config).build()?;
+        runtime.set_guardian_log(guardian.log());
+        tokio::spawn(guardian.run(Arc::new(RuntimeProbe(runtime.clone()))));
+        tracing::info!("guardian on: {} modules", config.modules.len());
+    }
 
     // Stop the cast on Ctrl-C, before the process goes.
     //
@@ -925,6 +950,24 @@ mod tests {
         assert!(both.forget_conversations && both.forget_dreams);
         let dreams_only = Cli::parse_from(["npcd", "--forget-dreams"]);
         assert!(dreams_only.forget_dreams && !dreams_only.forget_conversations);
+    }
+
+    /// **A journal is kept unless asked.** It is a character's long-term memory
+    /// of what it lived through, so a restart that dropped it would leave every
+    /// character remembering only the window it woke with. The flag is its own,
+    /// so a test run can start the journals over with or without the rest.
+    #[test]
+    fn journals_are_forgotten_only_when_asked() {
+        assert!(!Cli::parse_from(["npcd"]).forget_journal);
+        let alone = Cli::parse_from(["npcd", "--forget-journal"]);
+        assert!(alone.forget_journal && !alone.forget_conversations && !alone.forget_dreams);
+        let all = Cli::parse_from([
+            "npcd",
+            "--forget-conversations",
+            "--forget-dreams",
+            "--forget-journal",
+        ]);
+        assert!(all.forget_conversations && all.forget_dreams && all.forget_journal);
     }
 
     /// **A wipe is its own flag and never implied.** It re-ingests the whole

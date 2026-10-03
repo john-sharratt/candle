@@ -34,8 +34,10 @@ use web::auth::{Identity, Role};
 
 use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{Addressed, Event, EventKind, Salience};
+use crate::engine::journal::record;
 use crate::engine::runtime::Runtime;
 use crate::engine::slash;
+use crate::engine::survey::Survey;
 use crate::engine::{owned, owned_by};
 use crate::npcs;
 
@@ -388,6 +390,8 @@ pub async fn window(
             .turns()
             .map(|t| {
                 json!({
+                    "id": t.id,
+                    "origin": t.origin,
                     "speaker": t.speaker,
                     "text": crate::engine::mind::render_turn(t.speaker, &t.text),
                     "at_ms": t.at_ms,
@@ -412,6 +416,286 @@ pub async fn window(
         );
     };
     Json(w).into_response()
+}
+
+/// `GET /v1/npc/:nid/scan` — what the character's `scan` with no place named
+/// tells it right now.
+///
+/// `prose` is the text the character would read, word for word; `survey` is the
+/// data it was written from — each station with its address, state, verbs and
+/// every parameter's meaning, plus the conversations and recent past — so an
+/// operator can check the scan without making the character act.
+pub async fn scan(
+    State(s): State<Arc<Authored>>,
+    Path(nid): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let nid = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+    let Some((hosted, body)) = rt.body_of(nid) else {
+        return err(
+            StatusCode::CONFLICT,
+            "not_placed",
+            "the character has no body in a running world, so there is nothing to scan",
+        );
+    };
+    let survey = Survey::of(&hosted, &body);
+    Json(json!({ "prose": survey.prose(), "survey": survey })).into_response()
+}
+
+/// The query of the per-character read routes that let an admin look past
+/// ownership: `GET /v1/npc/:nid/journal` and `GET /v1/npc/:nid/system-prompt`.
+#[derive(Debug, Default, Deserialize)]
+pub struct AllQuery {
+    /// Admin only: read a character the caller does not own.
+    #[serde(default)]
+    all: bool,
+}
+
+/// The character's id when the caller owns it, or when the caller is an admin.
+///
+/// An id that is not a character is 404 either way, so an admin asking about
+/// nothing is told so rather than getting a 503 from an empty scheduler slot.
+async fn owned_or_admin(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    nid: &str,
+) -> Result<u64, Box<Response>> {
+    let (id, _) = owner_of(s, headers).await?;
+    if !s.roles.of(Some(&id)).at_least(Role::Admin) {
+        return owned(s, headers, nid).await;
+    }
+    let not_found = || {
+        Box::new(err(
+            StatusCode::NOT_FOUND,
+            "npc_not_found",
+            "no such character",
+        ))
+    };
+    let npc_id = npcs::npc_id_of_wire(nid).ok_or_else(not_found)?;
+    if !s.npcs.read().await.is_living(npc_id) {
+        return Err(not_found());
+    }
+    Ok(npc_id)
+}
+
+/// The character a read route may look at: the caller's own, or — for an admin
+/// who asked with `?all=true` — any living one.
+async fn readable(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    nid: &str,
+    q: &AllQuery,
+) -> Result<u64, Box<Response>> {
+    if q.all {
+        owned_or_admin(s, headers, nid).await
+    } else {
+        owned(s, headers, nid).await
+    }
+}
+
+/// `GET /v1/npc/:nid/system-prompt` — the system prompt the character's latest
+/// turn was made under, as `{pieces, text}`.
+///
+/// Laid out from that turn's own projection, so the identity, place, tool and
+/// mission members shown are the ones the engine selected for it. 404
+/// `no_system_prompt` until the character has had a turn since the daemon
+/// started. Owner-scoped, with `?all=true` for an admin, like the journal.
+pub async fn system_prompt(
+    State(s): State<Arc<Authored>>,
+    Path(nid): Path<String>,
+    Query(q): Query<AllQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let nid = match readable(&s, &headers, &nid, &q).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+    let rendered = rt
+        .minds
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.system_prompt(nid));
+    match rendered {
+        Some(r) => Json(r).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            "no_system_prompt",
+            "this character has not had a turn since the daemon started",
+        ),
+    }
+}
+
+/// `GET /v1/npc/:nid/prompt-tokens` — the tokens the character would be given if
+/// it decoded this instant, as `{pieces, token_count, token_ids, text}`.
+///
+/// The projection is recomputed at the moment of the call, so it is what the
+/// next turn would start from rather than what the last one used. Each piece is
+/// a section, a sealed turn, live template glue or the pending user message,
+/// with its token ids, decoded text, and the belief score that selected it —
+/// the way to check that a mission, a tool or a turn is really in the context.
+/// 404 `no_conversation` for a character with no live conversation. Owner-scoped,
+/// with `?all=true` for an admin, like `system-prompt`.
+pub async fn prompt_tokens(
+    State(s): State<Arc<Authored>>,
+    Path(nid): Path<String>,
+    Query(q): Query<AllQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let nid = match readable(&s, &headers, &nid, &q).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+    let minds = rt.minds.read().unwrap().as_ref().map(Arc::clone);
+    let dump = match minds {
+        Some(m) => m.prompt_dump(nid).await,
+        None => None,
+    };
+    match dump {
+        Some(d) => Json(d).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            "no_conversation",
+            "this character has no live conversation to read a prompt from",
+        ),
+    }
+}
+
+/// `GET /v1/npc/:nid/journal` — the character's journal and what its drafts have
+/// been doing.
+///
+/// The entries held in memory as the prompt reads them, which of them the next
+/// prompt carries, the open items, where the drafting stands, and the last
+/// drafts with how each ended and how its claims were checked.
+///
+/// Owner-scoped like every route about one character. An admin may add
+/// `?all=true` to read a journal they do not own, as the pulse feed does; the
+/// flag is a request, honoured only for a caller who is one.
+pub async fn journal(
+    State(s): State<Arc<Authored>>,
+    Path(nid): Path<String>,
+    Query(q): Query<AllQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let nid = match readable(&s, &headers, &nid, &q).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+    match rt.scheduler.journal_of(nid, record::view) {
+        Some(view) => Json(view).into_response(),
+        None => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_awake",
+            "the character exists but is not in the scheduler",
+        ),
+    }
+}
+
+/// `POST /v1/npc/:nid/journal/draft` — draft an entry now, without waiting for
+/// the cadence or for the guardian to ask whether one is needed.
+///
+/// Answers 202 with the turns the draft covers; how it ends shows in the
+/// journal's `drafts`. 409 while a draft is already running or when nothing has
+/// happened since the last entry.
+pub async fn journal_draft(
+    State(s): State<Arc<Authored>>,
+    Path(nid): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let nid = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+    let Some(due) = rt.scheduler.journal_begin(nid) else {
+        return err(
+            StatusCode::CONFLICT,
+            "nothing_to_draft",
+            "a draft is already running, or nothing has happened since the last entry",
+        );
+    };
+    let covers = json!({
+        "from_turn": due.span.from_turn,
+        "to_turn": due.span.to_turn,
+        "turns": due.span.turns.len(),
+    });
+    rt.spawn_journal(nid, due, 0);
+    (StatusCode::ACCEPTED, Json(covers)).into_response()
+}
+
+/// `DELETE /v1/npc/:nid/journal/:eid` — forget one journal entry.
+///
+/// The entry leaves the journal the character's next prompt is built from, its
+/// section is removed from the character's conversation, and the record a
+/// restart rebuilds the journal from is rewritten without it. Entry ids are not
+/// reused. Answers the journal as it now reads; 404 `no_such_entry` when the
+/// character holds no entry by that number (only the newest few are held).
+pub async fn journal_forget(
+    State(s): State<Arc<Authored>>,
+    Path((nid, eid)): Path<(String, u64)>,
+    headers: HeaderMap,
+) -> Response {
+    let nid = match owned(&s, &headers, &nid).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_scheduler();
+    };
+    let Some((gone, prompt)) = rt.scheduler.journal_forget(nid, &[eid]) else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_awake",
+            "the character exists but is not in the scheduler",
+        );
+    };
+    if gone.is_empty() {
+        return err(
+            StatusCode::NOT_FOUND,
+            "no_such_entry",
+            "this character holds no journal entry by that number",
+        );
+    }
+    let minds = rt.minds.read().unwrap().as_ref().map(Arc::clone);
+    let Some(minds) = minds else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_mind",
+            "the entry is forgotten, but the mind is not loaded to drop its section",
+        );
+    };
+    if let Err(e) = minds.hold_journal(nid, &prompt, &gone).await {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "journal_not_kept",
+            &e.to_string(),
+        );
+    }
+    match rt.scheduler.journal_of(nid, record::view) {
+        Some(view) => Json(view).into_response(),
+        None => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_awake",
+            "the character exists but is not in the scheduler",
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,7 +854,7 @@ pub async fn inject(
     // the only thing that can fill it in.
     let kind = match parsed.kind {
         EventKind::Sleep { .. } => EventKind::Sleep {
-            day: crate::engine::sleep::day_of(world_ms),
+            day: crate::clock::day_of(world_ms),
         },
         other => other,
     };
@@ -1005,6 +1289,15 @@ mod tests {
     fn a_malformed_npc_id_is_reported_rather_than_ignored() {
         assert_eq!(parse_npc_id_filter(Some("abc123!")), Err("abc123!"));
         assert_eq!(parse_npc_id_filter(Some("")), Err(""));
+    }
+
+    /// A read that does not ask for everything is the owner-scoped one.
+    #[test]
+    fn a_read_request_defaults_to_owner_scope() {
+        let q: AllQuery = serde_json::from_str("{}").expect("empty query parses");
+        assert!(!q.all);
+        let q: AllQuery = serde_json::from_str(r#"{"all":true}"#).expect("all parses");
+        assert!(q.all);
     }
 
     /// A body with a speaker: `serde` fills the `Option` fields we do not send.

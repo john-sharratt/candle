@@ -1179,7 +1179,7 @@ async fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
     let read = context(&rt, 1);
     // Alone, so the task is to take up something in front of it and form a
     // view worth putting to somebody.
-    assert!(read.contains("within reach"), "{read}");
+    assert!(read.contains("the work is in front of you"), "{read}");
     assert!(
         read.contains("You are"),
         "it was told what to do and not where it is"
@@ -1409,7 +1409,7 @@ async fn a_quiet_building_costs_nothing_to_run() {
 
     for _ in 0..20 {
         let world = rt.hosted.get(WORLD).unwrap();
-        let m = environment::advance(&world, &rt.bodies, &rt.scheduler);
+        let m = environment::advance(&world, &rt.bodies, &rt.scheduler, &|_| 0);
         assert!(m.is_quiet(), "an idle building cost something: {m:?}");
     }
 }

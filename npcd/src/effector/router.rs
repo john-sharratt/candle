@@ -4,13 +4,13 @@
 //! router that answers it, behind the device-auth layer ([`crate::effector::
 //! auth`]) rather than the operator roles. It is driven two ways from one build:
 //! in-process by the engine's fast path ([`crate::engine::runtime::Runtime::
-//! effector_query`]) and, mounted externally, over a real socket — the identical
-//! service either way (effector design §8.1).
+//! effector_invoke`]) and, mounted externally, over a real socket — the
+//! identical service either way (effector design §8.1).
 //!
 //! # The near-you index, `GET http://local/`
 //!
-//! The only route in this first slice, and the one that makes the surface
-//! discoverable: it returns *what is reachable from where the caller's body
+//! An internal read for external callers and the docs, not a model-facing tool
+//! (a character surveys with `scan`): it returns *what is reachable from where the caller's body
 //! stands*, recomputed each call from world state. It is a **pure function of
 //! that state** (effector design §13) — no session, no cursor — so it is
 //! `oneshot`-testable on the CPU with no model, which is exactly how it is
@@ -325,7 +325,7 @@ pub fn serves(part_id: &str) -> bool {
 /// instance id is the map's own stable id (effector design §7, §9), so two
 /// same-kind stations in one room get two distinct URLs. This is the one place
 /// an instance's address is composed: the near-you index and the grammar's
-/// `query` and `invoke` enums all read it, so what a character is shown, what it
+/// survey and `invoke`'s enum both read it, so what a character is shown, what it
 /// may name and what the router serves are one set.
 pub fn address_of(inst: &PartInstance) -> Option<String> {
     serves(inst.part_id()).then(|| {
@@ -408,7 +408,11 @@ mod tests {
         let set = MapSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"))
             .expect("the vault loads");
         let at = Where::new("vault-casting", "band-one");
-        let instances = set.instances_at(&at);
+        let instances: Vec<_> = set
+            .instances_at(&at)
+            .into_iter()
+            .filter(|i| i.part_id() == "character-terminal")
+            .collect();
         assert_eq!(instances.len(), 6, "band one holds six character terminals");
         // The url is the namespace then the instance's short id (`<part>~<n>`),
         // derived from the map so the test does not hard-code an ordinal the map

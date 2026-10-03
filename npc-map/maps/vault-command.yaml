@@ -34,14 +34,14 @@ nodes:
     kind: work
     name: the command room
     off: [ring-north]
-    parts: [order-table, creators-chair, { part: seat, count: 16 }]
+    parts: [order-table, creators-chair, light-ring, { part: seat, count: 16 }]
     habit: busy whenever orders have changed
 
   - id: dispatch
     kind: store
     name: the dispatch room
     off: [cross-run]
-    parts: [dispatch-board]
+    parts: [dispatch-board, compute-rack, status-board]
 
   - id: receiving
     kind: store
@@ -57,7 +57,7 @@ nodes:
     kind: social
     name: the enquiry room
     off: [ring-south]
-    parts: [enquiry-desk, { part: seat, count: 4 }]
+    parts: [enquiry-desk, pressure-door, { part: seat, count: 4 }]
     habit: busy in bursts
     character: >
       The only room in the vault that faces outward. Questions arrive in
@@ -68,7 +68,7 @@ nodes:
     kind: store
     name: the plant room
     off: [ring-west]
-    parts: [plant-panel]
+    parts: [plant-panel, breaker-panel, coolant-valve, air-handler]
     habit: quiet
     character: >
       The vault runs itself from in here and asks nothing of anybody, which is

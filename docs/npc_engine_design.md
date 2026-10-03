@@ -223,7 +223,10 @@ already implements the three selection disciplines:
 
 `SelectionRule::Named` is explicitly score-independent — it selects exactly the member the
 caller names, ignoring provenance relevance and the score threshold. That is the correct
-primitive for both a mood spike and a locked template, and it already exists.
+primitive for both a mood spike and a locked template, and it already exists. The `tools`
+collection is the exception that wants both sources: it uses `SelectionRule::Offered`, where
+the room names the acts the body can take and provenance ranks them (see
+`provenance_adaptive_projection.md` §2.3).
 
 ### The situation, and the standing task
 
@@ -326,6 +329,12 @@ parallax property of the mind document's Part VII, obtained for free.
 
 It also orders salience without anyone having to choose numbers: **addressed to you >
 spoken to the room > overheard.** That ordering is the preempt classification.
+
+Overhearing also does not *schedule* a turn. A character is woken by what asks something of
+it; speech aimed past it asks nothing, so it is queued and read with whatever next wakes the
+character, and leaves its schedule (and any pause it is in) exactly as it was. Were it
+otherwise, every listener in a room would answer every line and a talk between two would
+become one between all of them (`Event::wakes`).
 
 ### Mode is a projection input, not a branch
 
@@ -912,6 +921,8 @@ unparseable id and somebody else's id are the same 404.
     GET    /v1/npc/{id}/window              the verbatim tail it is carrying into its next decode
     POST   /v1/npc/{id}/mission             lodge a mission (start: carry it at once)
     GET    /v1/npc/{id}/mission             the open mission, or the last one finished
+                                            (the console's Mission tab polls it: the ask, the
+                                            steps with their ticks, the answer and the report)
     POST   /v1/npc/{id}/mission/cancel      call it off
 
   Environment
@@ -993,6 +1004,14 @@ Two amendments to the mind document's version of it, both from Part V:
   it; a world driver advances it on a regular interval, and journeys advance there rather
   than on any mind's tick. A body deep in a tool sequence keeps moving — you do not stop
   walking because you are thinking.
+  World time is milliseconds since 1970-01-01 in the world's own calendar. The
+  world's `time:` block carries an anchor, a scale, a pause flag and a
+  `year_offset` (whole years added to the reading, so a world can sit in the
+  year its setting requires — the offset is a constant, so the clock stays
+  monotonic). Everything that needs the time asks `clock::world_ms_for`
+  (installed on the runtime as `Runtime::world_ms`) and formats it through
+  `clock::WorldTime`; journal stamps, wake and day-roll prose, and the stamps
+  on perceived events all come from there, never from a step counter.
 - **"Blocked costs nothing" becomes "a body nothing happened to costs nothing."** A high-pace
   NPC never blocks, so the saving cannot come from the inbox being empty. It comes from the
   percept being deterministic: an unchanged situation re-renders to identical tokens, so

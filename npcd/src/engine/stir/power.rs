@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use crate::engine::event::Salience;
-use crate::engine::stir::{Cond, Due, Fixture, Rng, Stirring, Watch};
+use crate::engine::stir::{Bound, Cond, Due, Fixture, Rng, Stirring, Watch};
 
 pub struct PowerBus {
     due: Due,
@@ -53,8 +53,54 @@ impl Fixture for PowerBus {
     }
 
     fn signals(&self, out: &mut Vec<Cond>) {
-        if self.wobbling || self.strain >= 4 {
+        if self.faulted() {
             out.push(Cond::Unstable);
+        }
+    }
+
+    fn needs(&self) -> &'static [&'static str] {
+        &["breaker-panel"]
+    }
+
+    fn bound(&self) -> Option<Bound> {
+        Some(Bound {
+            part: "breaker-panel",
+            ok: "closed",
+            fault: "tripped",
+            system: "the main supply bus",
+            trouble: "a breaker has tripped",
+            object: "the breaker panel",
+        })
+    }
+
+    fn faulted(&self) -> bool {
+        self.wobbling || self.strain >= 4
+    }
+
+    fn set_fault(&mut self, on: bool) -> Option<Stirring> {
+        match on {
+            true => {
+                self.wobbling = true;
+                Some(
+                    Stirring::new(
+                        "power",
+                        "The breaker panel clunks over, and every machine in the room loses its \
+                         supply for a long second.",
+                        Salience::URGENT,
+                    )
+                    .tagged(&[Cond::Unstable, Cond::Loud]),
+                )
+            }
+            false => {
+                self.wobbling = false;
+                self.strain = 0;
+                Some(Stirring::new(
+                    "power",
+                    "The breaker panel clunks as the breaker is thrown back in, and the supply \
+                     steadies under the room.",
+                    Salience::NORMAL,
+                ))
+            }
         }
     }
 
@@ -97,8 +143,8 @@ impl Fixture for PowerBus {
             return Some(
                 Stirring::new(
                     "power",
-                    "A breaker goes somewhere else in the vault, and you hear what it cost — \
-                     half the machines in earshot stopping at once.",
+                    "A breaker on the breaker panel trips, and half the machines in earshot stop \
+                     at once.",
                     Salience::URGENT,
                 )
                 .tagged(&[Cond::Unstable, Cond::Loud]),
@@ -137,7 +183,7 @@ impl Fixture for PowerBus {
                 &[],
             ),
             6 => (
-                "The load-shed warning comes up on the supply panel and clears itself.",
+                "The load-shed warning comes up on the breaker panel and clears itself.",
                 Salience::IDLE,
                 &[],
             ),
@@ -147,12 +193,12 @@ impl Fixture for PowerBus {
                 &[Cond::Unstable],
             ),
             8 => (
-                "A cabinet fan on the supply panel starts up and runs for a few seconds.",
+                "A cabinet fan on the breaker panel starts up and runs for a few seconds.",
                 Salience::IDLE,
                 &[],
             ),
             9 => (
-                "The supply panel logs something to itself and shows no sign of what.",
+                "The breaker panel logs something to itself and shows no sign of what.",
                 Salience::IDLE,
                 &[],
             ),

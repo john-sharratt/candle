@@ -1,0 +1,15 @@
+id: pressure-door
+kind: fixture
+name: pressure door
+short: >
+  A pressure door is seated while its seal holds and hissing when the seal has
+  stopped seating.
+long: >
+  A round hatch in a thick frame, ringed with a black rubber seal and dogged
+  shut by a wheel at its centre. Seated is the ordinary state: the seal is
+  flat to the frame and the air on both sides is its own. Hissing means the
+  seal has stopped seating and something is getting past it. Somebody standing
+  here can reseat it, and the hiss stops.
+modes:
+  - seated
+  - hissing

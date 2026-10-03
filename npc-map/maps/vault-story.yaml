@@ -34,13 +34,13 @@ nodes:
     kind: work
     name: the first writing room
     off: [ring-north]
-    parts: [{ part: story-desk, count: 6 }]
+    parts: [{ part: story-desk, count: 6 }, light-ring, air-handler]
 
   - id: second-room
     kind: work
     name: the second writing room
     off: [cross-upper]
-    parts: [{ part: story-desk, count: 6 }]
+    parts: [{ part: story-desk, count: 6 }, breaker-panel, coolant-valve]
 
   - id: third-room
     kind: work
@@ -52,7 +52,7 @@ nodes:
     kind: store
     name: the ledger room
     off: [cross-lower]
-    parts: [gap-ledger, filed-stories]
+    parts: [gap-ledger, filed-stories, compute-rack, status-board]
 
   - id: board-room
     kind: work
@@ -77,7 +77,7 @@ nodes:
     kind: social
     name: the quiet room
     off: [ring-south]
-    parts: [{ part: seat, count: 6 }]
+    parts: [pressure-door, { part: seat, count: 6 }]
     habit: quiet by agreement rather than by rule
     character: >
       With sixteen Makers on one level, somewhere uninterrupted has to be

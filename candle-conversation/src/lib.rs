@@ -115,7 +115,10 @@ pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, ModeSampling, SamplingConfig,
     SchedulerConfig, SequenceConfig,
 };
-pub use conversation::{ChainRound, GlueMarkers, Sequence};
+pub use conversation::{
+    ChainRound, GlueMarkers, PieceKind, PromptDump, PromptPiece, SectionRef, SectionState,
+    Sequence, UnsealedAsker,
+};
 pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};

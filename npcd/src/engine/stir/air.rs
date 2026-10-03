@@ -62,6 +62,10 @@ impl Fixture for AirHandling {
         "air"
     }
 
+    fn needs(&self) -> &'static [&'static str] {
+        &["air-handler"]
+    }
+
     fn signals(&self, out: &mut Vec<Cond>) {
         match self.level {
             Level::Purging => {

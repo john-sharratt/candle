@@ -127,6 +127,21 @@ impl PlacedPiece {
 }
 
 impl SlotState {
+    /// What a fork of this slot starts its projections from: the record of the
+    /// pieces placed and the glue cache, so the fork's rebuild keeps the shared
+    /// prefix. The in-flight user part belongs to the parent's own turn and stays
+    /// with it.
+    pub(super) fn fork(&self) -> Self {
+        Self {
+            pending_user_part: None,
+            working_set: self.working_set.clone(),
+            glue_islands: self.glue_islands.clone(),
+            glue_generation: self.glue_generation,
+            placed: self.placed,
+            placed_pieces: self.placed_pieces.clone(),
+        }
+    }
+
     /// Rewrite every sealed chunk this slot's caches hold through a compaction
     /// sweep, returning the captured spans that moved.
     ///

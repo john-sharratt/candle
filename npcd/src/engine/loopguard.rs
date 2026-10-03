@@ -59,6 +59,14 @@
 //!      itself: that reflect is struck by (b) instead, so the redirect cannot
 //!      become a reflect loop.
 //!
+//!    **Speech is judged as a family.** `tell`, `ask`, `whisper` and `shout` are
+//!    compared against each other, not each against its own name, and at the
+//!    looser [`SPEECH_CLOSE`]. A settled piece of news is retold in fresh words
+//!    and through a different act each time, which the per-act verbatim test
+//!    never sees; a character that says again what it said within its last four
+//!    utterances trips the breaker, and every way of speaking is struck together
+//!    so the same news cannot be found again in another one.
+//!
 //!    Per-act opt-out: acts the game *wants* repeated (`act` — a fight needs
 //!    repetition) skip the whole guard, paced only by `cooldown`'s fight rate.
 //!
@@ -87,6 +95,7 @@
 //! trajectory.
 
 use std::collections::HashMap;
+use std::slice::from_ref;
 use std::sync::Mutex;
 
 use serde_json::Value;
@@ -116,6 +125,15 @@ const NEVER_STRUCK: &str = "move_to";
 /// The redirect a forced reflect must always be able to reach.
 const ALWAYS_REFLECT: &str = "reflect";
 
+/// Every way a character speaks. A restatement is judged across all of them and
+/// strikes all of them — see design note 2.
+const SPEECH: &[&str] = &["tell", "ask", "whisper", "shout"];
+/// Jaccard overlap between two things said that counts as the same news. Looser
+/// than [`CLOSE_THRESHOLD`], because a settled fact is retold in new words each
+/// time and lands near 0.5.
+const SPEECH_CLOSE: f32 = 0.45;
+/// How many of the character's last utterances a new one is compared against.
+const SPEECH_LOOKBACK: usize = 4;
 /// The sliding window, in history entries, the exponential use-count looks over.
 const WINDOW: usize = 6;
 /// The ceiling on any single cooldown, in turns.
@@ -136,8 +154,9 @@ const HISTORY_CAP: usize = WINDOW * 2;
 /// `<tool_response>` through the ordinary outcome channel — see
 /// [`crate::engine::mind::Minds::deliver_outcomes`].
 pub const NUDGE: &str =
-    "You seem to be repeating yourself; nothing new is happening here. Try something different — \
-     do something new, or turn to someone or something else.";
+    "You seem to be repeating yourself; nothing new is happening here, and what you have already \
+     said has been heard. Try something different — do something new, or turn to someone or \
+     something else.";
 
 /// The text of an act that the closeness test compares — what the character
 /// *meant*, pulled from whichever argument carries the substance.
@@ -204,6 +223,17 @@ struct Guard {
 }
 
 impl Guard {
+    /// Whether `intent` says again what the character recently said, in any way
+    /// of speaking and at any wording close enough to be the same news.
+    fn restates(&self, intent: &str) -> bool {
+        self.history
+            .iter()
+            .rev()
+            .filter(|(act, _)| SPEECH.contains(&act.as_str()))
+            .take(SPEECH_LOOKBACK)
+            .any(|(_, said)| similarity(said, intent) >= SPEECH_CLOSE)
+    }
+
     /// Acts to strike from this turn's grammar.
     fn cooling(&self) -> Vec<String> {
         if self.force_reflect {
@@ -263,24 +293,42 @@ impl Guard {
             }
 
             // ── closeness circuit-breaker (design note 2) ─────────────────────
-            let recent_same: Vec<&String> = self
-                .history
-                .iter()
-                .rev()
-                .filter(|(a, _)| a == act)
-                .map(|(_, i)| i)
-                .take(BREAKER_LOOKBACK)
-                .collect();
-            let looping = !recent_same.is_empty()
-                && recent_same
-                    .iter()
-                    .all(|prev| similarity(prev, intent) >= CLOSE_THRESHOLD);
+            let spoken = SPEECH.contains(&act);
+            let looping = match spoken {
+                true => self.restates(intent),
+                false => {
+                    let recent_same: Vec<&String> = self
+                        .history
+                        .iter()
+                        .rev()
+                        .filter(|(a, _)| a == act)
+                        .map(|(_, i)| i)
+                        .take(BREAKER_LOOKBACK)
+                        .collect();
+                    !recent_same.is_empty()
+                        && recent_same
+                            .iter()
+                            .all(|prev| similarity(prev, intent) >= CLOSE_THRESHOLD)
+                }
+            };
+            // Speech escalates and is struck as one family, so the same words
+            // cannot be found again in another way of speaking.
+            let family = match spoken {
+                true => SPEECH[0],
+                false => act,
+            };
             if looping {
-                let reps = self.loop_reps.entry(act.to_string()).or_insert(0);
+                let reps = self.loop_reps.entry(family.to_string()).or_insert(0);
                 *reps += 1;
                 let cool = (1usize << (*reps).min(LOOP_ESCALATION_CAP)).min(COOL_CAP);
-                let until = self.cool_until.entry(act.to_string()).or_insert(0);
-                *until = (*until).max(turn + 1 + cool);
+                let struck: &[&str] = match spoken {
+                    true => SPEECH,
+                    false => from_ref(&act),
+                };
+                for name in struck {
+                    let until = self.cool_until.entry(name.to_string()).or_insert(0);
+                    *until = (*until).max(turn + 1 + cool);
+                }
                 // A looping reflect is the redirect itself; forcing another
                 // reflect would feed the loop it is meant to break.
                 if act != ALWAYS_REFLECT {
@@ -288,7 +336,7 @@ impl Guard {
                 }
                 fired = true;
             } else {
-                self.loop_reps.remove(act);
+                self.loop_reps.remove(family);
             }
         }
 
@@ -479,6 +527,76 @@ mod tests {
             cooling.contains(&"gesture".to_string()),
             "other acts are struck too"
         );
+    }
+
+    const STRIP_DONE: &str = "that Pax has re-secured the threshold strip and that it's done, so \
+                              we don't need to keep asking about it";
+    const STRIP_RESOLVED: &str = "that Pax has re-secured the threshold strip and that we can \
+                                  consider this matter resolved, so there's no need to keep \
+                                  asking or repeating";
+
+    /// **Speech drifts in wording while the content stands still.** The live loop
+    /// was one settled piece of news told again and again, each time phrased a
+    /// little differently — too different for the verbatim test, which compares an
+    /// act only to its last three of the same name. A restatement is caught
+    /// against anything the character recently said, at a looser closeness.
+    #[test]
+    fn a_reworded_restatement_trips_the_breaker() {
+        let g = LoopGuards::new();
+        assert!(!took(&g, 1, "tell", STRIP_DONE));
+        assert!(
+            took(&g, 1, "tell", STRIP_RESOLVED),
+            "the same news in other words is a repeat"
+        );
+    }
+
+    /// Switching to another way of speaking does not make it new: a question
+    /// about what was just stated is the same news asked for.
+    #[test]
+    fn a_restatement_is_caught_across_speech_acts() {
+        let g = LoopGuards::new();
+        took(&g, 1, "tell", STRIP_DONE);
+        assert!(took(
+            &g,
+            1,
+            "ask",
+            "whether the threshold strip that Pax has re-secured is done"
+        ));
+    }
+
+    /// The speaking voice is struck as a whole, so a character told it cannot say
+    /// this cannot find the same words in another act.
+    #[test]
+    fn a_restatement_strikes_every_way_of_speaking() {
+        let g = LoopGuards::new();
+        took(&g, 1, "tell", STRIP_DONE);
+        took(&g, 1, "tell", STRIP_RESOLVED);
+        let cooling = g.cooling(1);
+        for speech in SPEECH {
+            assert!(
+                cooling.contains(&speech.to_string()),
+                "{speech} is still on offer after a restatement"
+            );
+        }
+        assert!(
+            !cooling.contains(&"reflect".to_string()),
+            "reflect stays reachable"
+        );
+    }
+
+    /// Saying something new is not a repeat, however recently the character
+    /// spoke.
+    #[test]
+    fn saying_something_new_is_not_a_restatement() {
+        let g = LoopGuards::new();
+        assert!(!took(&g, 1, "tell", STRIP_DONE));
+        assert!(!took(
+            &g,
+            1,
+            "tell",
+            "that the lift is stuck between floors and somebody should look at the cable"
+        ));
+        assert!(!took(&g, 1, "ask", "who has the key to the lower stores"));
     }
 
     /// The forced reflect is single-shot: it clears the turn after, so it cannot

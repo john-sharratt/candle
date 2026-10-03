@@ -78,6 +78,21 @@ pub fn urls(within: &Within) -> Vec<String> {
         .collect()
 }
 
+/// The acts behind the addresses a body here could act at, each named once.
+///
+/// What the turn's prompt must describe: a character is told what an address
+/// does by reading its act's entry, so an act reachable only through `invoke`
+/// has to be shown whenever one of its addresses is offered.
+pub fn acts(within: &Within) -> Vec<&'static str> {
+    let mut named: Vec<&'static str> = Vec::new();
+    for (_, tool) in performable_here(within) {
+        if !named.contains(&tool.name) {
+            named.push(tool.name);
+        }
+    }
+    named
+}
+
 /// What each address brings with it: a required `body` object holding the fields
 /// of the act behind it.
 pub fn shapes(within: &Within) -> Vec<(String, Vec<StencilParam>)> {

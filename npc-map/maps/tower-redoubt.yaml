@@ -36,20 +36,18 @@ nodes:
     kind: work
     name: the muster hall
     off: [spine-lower]
-    parts: [muster-board, order-table, { part: seat, count: 12 }]
+    parts: [muster-board, order-table, light-ring, status-board, { part: seat, count: 12 }]
     habit: busy before a sortie and empty during one
     character: >
-      Where orders are given and where a body comes back to. Everything that
-      goes out of the tower is standing in here first.
+      A wide hall where orders are given and where a body comes back to.
 
   - id: gatehouse
     kind: work
     name: the gatehouse
     off: [spine-lower]
-    parts: [blast-door]
+    parts: [blast-door, pressure-door]
     character: >
-      The only way in and out on foot, and one slab of plate deciding whether
-      there is a way at all.
+      The only way in and out on foot, closed by one slab of plate.
 
   - id: rampart
     kind: work
@@ -58,28 +56,24 @@ nodes:
     parts: [{ part: wall-turret, count: 4 }]
     habit: manned whenever anything is moving on the ground
     character: >
-      Four emplacements looking out over open ground. Nobody aims them; what a
-      body does up here is decide what they are allowed to do without being
-      asked.
+      Four emplacements looking out over open ground.
 
   - id: foundry
     kind: work
     name: the foundry
     off: [spine-lower]
-    parts: [{ part: fabricator, count: 8 }]
+    parts: [{ part: fabricator, count: 8 }, breaker-panel, coolant-valve, air-handler]
     habit: never idle for long
     character: >
-      Eight bays and eight queues, and the stockpile is what decides which of
-      them can run.
+      Eight production bays, each with its own queue, drawing on a shared stockpile.
 
   - id: bridge
     kind: work
     name: the bridge
     off: [spine-upper]
-    parts: [bridge-console, sensor-panel, { part: seat, count: 4 }]
+    parts: [bridge-console, sensor-panel, compute-rack, { part: seat, count: 4 }]
     character: >
-      Where the tower is spoken to as one thing. What it will do from here
-      depends entirely on what it can currently afford to do.
+      The control room, where the tower as a whole is commanded.
 
   - id: motor-pool
     kind: store
@@ -95,5 +89,4 @@ nodes:
     parts: [{ part: seat, count: 16 }]
     habit: full at night
     character: >
-      The one room in the tower with nothing in it that does a job, which is
-      why more is said here than anywhere else.
+      A common room with nothing in it that does a job; people talk here.

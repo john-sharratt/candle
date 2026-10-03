@@ -260,9 +260,52 @@ pub fn branch_checkpoint_stream_id(prefix: ContentHash) -> StreamId {
     StreamId(if raw == 0 { 1 } else { raw })
 }
 
+/// The prefix hash an **owned section** is addressed under: the pre-collection
+/// content prefix salted with the owning timeline and the section's name.
+///
+/// A prompt section's address is `(prefix, content)`, so two conversations that
+/// submit the same text over the same prefix would share one stream — and then
+/// one conversation's removal would tombstone the other's K/V. Salting the
+/// prefix makes the stream unique to `(owner, name)`: it is never shared, so
+/// tombstoning it can only ever affect its owner. The name is length-framed so
+/// `("ab", "c")` and `("a", "bc")` style splits cannot alias.
+pub fn owned_section_prefix(owner_timeline: u64, name: &str, prefix: ContentHash) -> ContentHash {
+    let mut h = ContentHasher::new();
+    h.update(b"owned-section");
+    h.update(&owner_timeline.to_le_bytes());
+    h.update(&(name.len() as u32).to_le_bytes());
+    h.update(name.as_bytes());
+    h.update(&prefix.to_bytes());
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The salted prefix is the hash of exactly these bytes, in this order.
+    #[test]
+    fn owned_section_prefix_hashes_the_documented_bytes() {
+        let prefix = hash_tokens(&[1, 2, 3]);
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(b"owned-section");
+        raw.extend_from_slice(&7u64.to_le_bytes());
+        raw.extend_from_slice(&5u32.to_le_bytes());
+        raw.extend_from_slice(b"mails");
+        raw.extend_from_slice(&prefix.to_bytes());
+        assert_eq!(owned_section_prefix(7, "mails", prefix), hash_bytes(&raw));
+    }
+
+    #[test]
+    fn owned_section_prefix_is_unique_per_owner_name_and_prefix() {
+        let p = hash_tokens(&[1, 2, 3]);
+        let base = owned_section_prefix(7, "a", p);
+        assert_eq!(base, owned_section_prefix(7, "a", p));
+        assert_ne!(base, owned_section_prefix(8, "a", p));
+        assert_ne!(base, owned_section_prefix(7, "b", p));
+        assert_ne!(base, owned_section_prefix(7, "a", hash_tokens(&[1, 2, 4])));
+        assert_ne!(base, p, "the salt must move the address off the shared one");
+    }
 
     #[test]
     fn hash_is_deterministic() {

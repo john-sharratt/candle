@@ -193,9 +193,16 @@ fn substitute_template(template: &str, vars: &[(&str, &str)]) -> Result<String, 
 fn validate_selection(name: &str, rule: &SelectionRule) -> Result<(), ConstructionError> {
     use SelectionRule;
     match rule {
-        SelectionRule::TopK { k } if *k == 0 => Err(ConstructionError::InvalidTopK {
-            name: name.to_string(),
-        }),
+        SelectionRule::TopK { k } | SelectionRule::Offered { k, .. } if *k == 0 => {
+            Err(ConstructionError::InvalidTopK {
+                name: name.to_string(),
+            })
+        }
+        SelectionRule::Offered { selector, .. } if selector.trim().is_empty() => {
+            Err(ConstructionError::EmptyNamedSelector {
+                name: name.to_string(),
+            })
+        }
         SelectionRule::Sequence {
             recent,
             historical_top_k,
@@ -887,6 +894,58 @@ impl Builder {
             .section_names
             .insert((LayerId::system_prompt(), name), new_id);
         Ok(new_id)
+    }
+
+    /// Append a section with a caller-chosen id to a top-level collection.
+    ///
+    /// Unlike [`Self::add_section_to_collection`] this does not draw from the
+    /// builder's own id counter. Sections owned by one conversation are merged
+    /// into a clone of its builder this way, with ids from the substrate's
+    /// owned partition; because later builder-allocated ids start above the
+    /// highest id present, nothing further is added to such a clone. Errors for
+    /// a section-tree collection, whose members seal once per branch and need
+    /// builder-allocated ids.
+    pub fn add_section_to_collection_with_id(
+        &mut self,
+        collection: CollectionId,
+        id: SectionId,
+        name: impl Into<String>,
+        content: impl Into<String>,
+        priority: f32,
+    ) -> Result<(), ConstructionError> {
+        let name: String = name.into();
+        if priority <= 0.0 {
+            return Err(ConstructionError::InvalidPriority {
+                name: name.clone(),
+                value: priority,
+            });
+        }
+        self.assert_section_name_free(&name)?;
+        let items = &mut self.schema.system_prompt.items;
+        let Some(CollLoc::TopLevel(ii)) = locate_collection(items, |c| c.id == collection) else {
+            return Err(ConstructionError::UnknownCollection(format!(
+                "CollectionId({collection:?}) is not a top-level collection"
+            )));
+        };
+        let SystemPromptItem::Collection(coll) = &mut items[ii] else {
+            unreachable!("located a top-level collection")
+        };
+        coll.sections.push(SectionSchema {
+            id,
+            name: name.clone(),
+            content: content.into(),
+            priority,
+            depends_on: None,
+            depends_on_absent: None,
+            depends_on_configured: None,
+            depends_on_unconfigured: None,
+            is_template: false,
+            template_tokens: None,
+        });
+        self.name_maps
+            .section_names
+            .insert((LayerId::system_prompt(), name), id);
+        Ok(())
     }
 
     /// Associate a runtime-sealed summary section with a collection. Once set,

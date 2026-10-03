@@ -31,6 +31,7 @@ mod admit;
 mod admit_ground;
 mod block_guard;
 mod decode;
+mod ephemeral_fork;
 pub mod exported_state;
 mod guest_room;
 mod interleave;
@@ -172,6 +173,20 @@ pub(crate) enum SchedulerRequest {
     NewEphemeralSequence {
         conversation: Conversation,
         target: ProjectionTarget,
+        response_tx: Sender<Result<SequenceId, ConversationError>>,
+    },
+
+    /// Fork the live slot `parent` into an ephemeral one, between its turns.
+    ///
+    /// The fork borrows the parent's K/V zero-copy, copies its per-sequence
+    /// model state and clones its projection caches, so a turn run on it
+    /// projects over the prefix the parent already placed instead of rebuilding
+    /// it. Like [`Self::NewEphemeralSequence`] it is marked ephemeral: its turn
+    /// seals nothing. While a turn runs on `parent` the request is parked and
+    /// answered at the turn boundary; it fails if `parent` is freed first.
+    /// Used by `Sequence::ask_unsealed`.
+    ForkEphemeralSequence {
+        parent: SequenceId,
         response_tx: Sender<Result<SequenceId, ConversationError>>,
     },
 
@@ -3292,6 +3307,9 @@ pub(crate) struct Scheduler {
     /// drain). See [`projection_assembler::apply_segments`].
     batch_drain_gap_fills: bool,
     deferred_glue_fires: Vec<projection_assembler::GapFillPlan>,
+    /// Ephemeral-fork requests whose parent had a turn in flight when they
+    /// arrived, answered at the turn boundary. See [`ephemeral_fork`].
+    parked_forks: Vec<ephemeral_fork::ParkedFork>,
 
     /// Continuous-fair-wave prefill cohort (`docs/continuous_fair_waves.md`): the
     /// packed inter-layer residual stream of the in-flight prefill batch, the next
@@ -3571,6 +3589,7 @@ impl Scheduler {
             ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
+            parked_forks: Vec::new(),
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
@@ -3634,6 +3653,9 @@ impl Scheduler {
     }
 
     fn drain_submissions(&mut self) -> bool {
+        // Before any queued request: a turn submitted on a parent right after its
+        // last one finished must not start ahead of the forks waiting on that gap.
+        self.drain_parked_forks();
         loop {
             match self.rx.try_recv() {
                 Ok(req) => {
@@ -3701,6 +3723,14 @@ impl Scheduler {
                     self.ephemeral_slots.insert(*slot);
                 }
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::ForkEphemeralSequence {
+                parent,
+                response_tx,
+            } => {
+                self.request_ephemeral_fork(parent, response_tx);
                 true
             }
 
@@ -4509,12 +4539,14 @@ impl Scheduler {
                 conversation,
                 sections,
             } => {
+                // A transient section leaves the substrate here; an owned
+                // section already left it when its owner released it, and only
+                // the scheduler's tables keyed by its id remain.
                 for id in sections {
-                    if conversation.retire_section(id) {
-                        self.section_positional.remove(&id);
-                        self.section_name_cache.remove(&id);
-                        self.pending_section_quantize.retain(|p| p.section_id != id);
-                    }
+                    conversation.retire_section(id);
+                    self.section_positional.remove(&id);
+                    self.section_name_cache.remove(&id);
+                    self.pending_section_quantize.retain(|p| p.section_id != id);
                 }
                 true
             }
@@ -7537,6 +7569,7 @@ impl Scheduler {
                 }));
             }
         }
+        self.drain_parked_forks();
     }
 
     /// Install a persisted section as a **cold-marker** — `cold = Some`,
@@ -14535,5 +14568,301 @@ mod tests {
             "freeing a non-member slot must leave the in-flight cohort intact"
         );
         assert_eq!(scheduler.wave_prefill_cursor, 3);
+    }
+
+    fn fork_request(
+        scheduler: &mut Scheduler,
+        parent: SequenceId,
+    ) -> Result<SequenceId, ConversationError> {
+        let (tx, rx) = flume::bounded(1);
+        scheduler.handle_request(SchedulerRequest::ForkEphemeralSequence {
+            parent,
+            response_tx: tx,
+        });
+        rx.recv().expect("scheduler reply")
+    }
+
+    /// **An ephemeral fork starts from the live slot's caches and its model
+    /// state, and is registered ephemeral.** The projection the question runs
+    /// under then keeps the prefix the parent placed, instead of rebuilding it.
+    #[test]
+    fn an_ephemeral_fork_inherits_the_parents_projection_caches_and_model_state() {
+        use projection_assembler::PlacedPiece;
+
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let state = scheduler.slot_projection_state.entry(parent).or_default();
+        state.placed_pieces.push(PlacedPiece::ending_at(2));
+        state.glue_generation = 7;
+        let marked: ToyState = [[1.0; 4]; 2];
+        probe.set(parent.0, marked);
+
+        let child = fork_request(&mut scheduler, parent).expect("fork");
+
+        assert_ne!(child, parent);
+        assert!(
+            scheduler.ephemeral_slots.contains(&child),
+            "the fork is ephemeral"
+        );
+        assert!(
+            !scheduler.ephemeral_slots.contains(&parent),
+            "the parent is not"
+        );
+        assert!(scheduler.slot_conversations.contains_key(&child));
+        assert!(
+            !scheduler.turn_views.contains_key(&child),
+            "a fork is a slot, not a turn view"
+        );
+        let forked = &scheduler.slot_projection_state[&child];
+        assert_eq!(
+            forked.placed_pieces.len(),
+            1,
+            "the placed record carries over"
+        );
+        assert_eq!(forked.glue_generation, 7);
+        assert_eq!(
+            probe.get(child.0),
+            Some(marked),
+            "recurrent state is forked"
+        );
+    }
+
+    /// **The parent's in-flight user part stays with the parent.**
+    #[test]
+    fn an_ephemeral_fork_does_not_take_the_parents_pending_user_part() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        scheduler.slot_projection_state.entry(parent).or_default();
+
+        let child = fork_request(&mut scheduler, parent).expect("fork");
+        assert!(scheduler.slot_projection_state[&child]
+            .pending_user_part
+            .is_none());
+    }
+
+    /// **Freeing the fork leaves the parent as it was**, and the fork's own
+    /// bookkeeping goes with it.
+    #[test]
+    fn freeing_an_ephemeral_fork_leaves_the_parent_intact() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let marked: ToyState = [[2.0; 4]; 2];
+        probe.set(parent.0, marked);
+        let child = fork_request(&mut scheduler, parent).expect("fork");
+
+        scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: child });
+
+        assert!(!scheduler.ephemeral_slots.contains(&child));
+        assert!(!scheduler.slot_conversations.contains_key(&child));
+        assert!(!scheduler.slot_projection_state.contains_key(&child));
+        assert_eq!(
+            probe.get(parent.0),
+            Some(marked),
+            "the parent's state survives"
+        );
+        assert!(scheduler.slot_conversations.contains_key(&parent));
+    }
+
+    /// A parent with a turn in flight: a view carved from it is registered.
+    fn start_turn_on(scheduler: &mut Scheduler, parent: SequenceId) -> SequenceId {
+        let conversation = crate::projection::Conversation::new();
+        let view = create_scratch_slot(scheduler, &conversation);
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: BlockCount(0),
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+                applied_identity: None,
+            },
+        );
+        view
+    }
+
+    fn park_fork(
+        scheduler: &mut Scheduler,
+        parent: SequenceId,
+    ) -> flume::Receiver<Result<SequenceId, ConversationError>> {
+        let (tx, rx) = flume::bounded(1);
+        scheduler.handle_request(SchedulerRequest::ForkEphemeralSequence {
+            parent,
+            response_tx: tx,
+        });
+        rx
+    }
+
+    /// **The fork itself is refused while a turn runs on the parent**: its view
+    /// is borrowing the blocks the fork would carve.
+    #[test]
+    fn an_ephemeral_fork_is_never_taken_while_a_turn_runs_on_the_parent() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        start_turn_on(&mut scheduler, parent);
+
+        let err = scheduler
+            .fork_ephemeral_sequence(parent)
+            .expect_err("refused");
+        assert!(
+            matches!(err, ConversationError::TurnInFlight { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// **A request that arrives mid-turn waits for the turn boundary**, then is
+    /// answered with a fork of the finished state, with nothing for the caller to
+    /// lock.
+    #[test]
+    fn a_fork_requested_mid_turn_is_answered_when_the_turn_ends() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = start_turn_on(&mut scheduler, parent);
+
+        let rx = park_fork(&mut scheduler, parent);
+        assert!(rx.try_recv().is_err(), "no answer while the turn runs");
+        scheduler.drain_parked_forks();
+        assert!(rx.try_recv().is_err(), "still parked while the turn runs");
+
+        scheduler.turn_views.remove(&view);
+        scheduler.drain_parked_forks();
+        let child = rx
+            .try_recv()
+            .expect("answered at the boundary")
+            .expect("fork");
+        assert!(scheduler.ephemeral_slots.contains(&child));
+        assert!(scheduler.parked_forks.is_empty());
+    }
+
+    /// **Two requests parked on one parent get a fork each.**
+    #[test]
+    fn requests_parked_on_one_parent_each_get_their_own_fork() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = start_turn_on(&mut scheduler, parent);
+        let (a, b) = (
+            park_fork(&mut scheduler, parent),
+            park_fork(&mut scheduler, parent),
+        );
+
+        scheduler.turn_views.remove(&view);
+        scheduler.drain_parked_forks();
+        let (a, b) = (
+            a.try_recv().unwrap().unwrap(),
+            b.try_recv().unwrap().unwrap(),
+        );
+        assert_ne!(a, b);
+    }
+
+    /// **A parent freed while a request waits fails it**, so the caller does not
+    /// hang.
+    #[test]
+    fn a_parked_fork_fails_when_its_parent_is_freed() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        start_turn_on(&mut scheduler, parent);
+        let rx = park_fork(&mut scheduler, parent);
+
+        scheduler.handle_request(SchedulerRequest::FreeSequence {
+            sequence_id: parent,
+        });
+        scheduler.drain_parked_forks();
+        assert!(rx.try_recv().expect("answered").is_err());
+    }
+
+    /// **A requester that gave up costs no slot.**
+    #[test]
+    fn a_parked_fork_whose_requester_left_takes_no_slot() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let view = start_turn_on(&mut scheduler, parent);
+        let rx = park_fork(&mut scheduler, parent);
+        drop(rx);
+
+        scheduler.turn_views.remove(&view);
+        let slots = scheduler.slot_conversations.len();
+        scheduler.drain_parked_forks();
+        assert_eq!(scheduler.slot_conversations.len(), slots);
+        assert!(scheduler.parked_forks.is_empty());
+    }
+
+    /// **The fork shares no write target with its parent.** It borrows the
+    /// parent's blocks read-only and writes into chunks of its own: cutting the
+    /// fork back to nothing, then freeing it, leaves the parent's blocks and
+    /// offset exactly as they were.
+    #[test]
+    fn an_ephemeral_fork_shares_no_write_target_with_its_parent() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let tokens = [1u32, 2, 3, 4];
+        let input = Tensor::new(&tokens[..], &scheduler.device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        scheduler
+            .session
+            .ensure_capacity(&[parent.0], tokens.len())
+            .unwrap();
+        let nl = scheduler.model.num_layers().max(1);
+        scheduler
+            .model
+            .forward_wave(
+                &mut scheduler.session,
+                &[],
+                &[],
+                &[parent.0],
+                &[input],
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )
+            .unwrap();
+        scheduler
+            .session
+            .advance_sequence(parent.0, tokens.len())
+            .unwrap();
+        let blocks = scheduler.session.sequence_block_count(parent.0).unwrap();
+        let offset = scheduler.session.sequence_offset(parent.0).unwrap();
+        assert!(blocks > 0, "the parent owns KV");
+
+        let child = fork_request(&mut scheduler, parent).expect("fork");
+        assert_eq!(
+            scheduler.session.sequence_block_count(child.0),
+            Some(blocks + 1),
+            "the fork sees the parent's prefix, plus a writer chunk of its own"
+        );
+
+        scheduler
+            .session
+            .truncate_sequence_to_blocks(child.0, 0)
+            .unwrap();
+        assert_eq!(
+            scheduler.session.sequence_block_count(parent.0),
+            Some(blocks)
+        );
+
+        scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: child });
+        assert_eq!(
+            scheduler.session.sequence_block_count(parent.0),
+            Some(blocks)
+        );
+        assert_eq!(scheduler.session.sequence_offset(parent.0), Some(offset));
+    }
+
+    /// **A parent with no registered conversation cannot be forked.**
+    #[test]
+    fn an_ephemeral_fork_of_an_unknown_slot_is_refused() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        assert!(fork_request(&mut scheduler, SequenceId(99)).is_err());
     }
 }

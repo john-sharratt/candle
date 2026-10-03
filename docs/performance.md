@@ -1676,6 +1676,7 @@ quantized_pct, compress, peak_tokens`, scraped from the run logs:
 | `performance_rtx_pro_5000_72gb_rows_2026-09-15_run2.tsv` | 72 GB · 2026-09-15 — width only, build `23623c6b`, run 2 | 171 |
 | `performance_rtx_4090_mobile_16gb_rows.tsv` | RTX 4090 Mobile · 2026-09-30 — width gate sweep, build `bf291341c` | 187 |
 | `performance_rtx_3090_24gb_rows_2026-09-30.tsv` | RTX 3090 · 2026-09-30 — Flash-Next gate only, build `e596fad8d` | 10 |
+| `performance_rtx_3090_24gb_rows_2026-10-04.tsv` | RTX 3090 · 2026-10-04 — width gate sweep, build `8d061e4fc` (baseline: `baseline_rtx_3090_24gb_2026-10-04.md`) | 188 |
 
 A † cell in §3.6 *Width* or §3.7 is the 72 GB 2026-09-13 file's value, a ◆ cell
 the higher of the two 2026-09-15 files' values; every other 72 GB width cell is

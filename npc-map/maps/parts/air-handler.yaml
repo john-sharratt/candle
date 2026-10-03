@@ -1,0 +1,11 @@
+id: air-handler
+kind: fixture
+name: air handler
+short: >
+  An air handler runs behind a louvred grille and is heard in the room long
+  before it is noticed.
+long: >
+  A steel box in the ceiling void with a louvred grille on the room side. It
+  draws the room's air through a filter bank and gives it back a little cooler,
+  and its fan is the sound the room makes when nothing else is. It is not
+  operated from here; it is listened to.
