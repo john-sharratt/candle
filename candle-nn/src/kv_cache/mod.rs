@@ -129,7 +129,7 @@ pub use chunked::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,
-    CompactionTally,
+    CompactionTally, TopArena,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

@@ -74,7 +74,7 @@
 //! barrier at between-forwards cadence and it removes the whole overlap failure
 //! domain, including side streams this module does not know about.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use candle::Result;
@@ -82,7 +82,7 @@ use candle::Result;
 use super::arena::{ArenaKey, ArenaKind};
 use super::backing::ChunkedKvBacking;
 use super::compact_map::{CompactionMap, Sweep};
-use super::compact_plan::{plan_pool, ArenaSlots, ChunkMove};
+use super::compact_plan::{by_source_rank, plan_pool, ArenaSlots, ChunkMove, CompactPlan};
 use super::fresh_arenas::FreshArenas;
 use super::size_class::SizeClass;
 use crate::kv_cache::ArenaLocation;
@@ -157,6 +157,12 @@ pub struct CompactionReport {
     /// everything below the cursor is packed and nothing moved upward, so the next
     /// pass resumes closer.
     pub clipped: bool,
+    /// The arena standing highest in the span once the pass is done, across every pool
+    /// it packs — band and record. When its region is the frontier it is what holds the
+    /// frontier up, and its live count says whether a later pass can move it; when it
+    /// stands below the frontier, the region above it belongs to something no pool
+    /// owns. A pass whose frontier did not fall reads as nothing without this.
+    pub top_arena: Option<TopArena>,
     /// Where the pass spent its wall clock, by phase.
     ///
     /// **Reported rather than recorded here, because this crate sits below the
@@ -166,6 +172,16 @@ pub struct CompactionReport {
     /// measures itself and the caller — which can reach the profiler — files the
     /// numbers under its own span names.
     pub timings: CompactionTimings,
+}
+
+/// The highest arena of any packed pool — see [`CompactionReport::top_arena`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TopArena {
+    pub key: ArenaKey,
+    /// Its region's rank: one below the frontier when it is what holds it.
+    pub rank: usize,
+    /// Slots live in it.
+    pub live: usize,
 }
 
 /// Wall clock per phase of one compaction pass. See [`CompactionReport::timings`].
@@ -709,14 +725,20 @@ impl super::backing::ChunkedKvBacking {
         // landed in itself — see [`FreshArenas`].
         let mut fresh = FreshArenas::new(&*self.inner);
         self.provision_low_arenas(&mut census_by_pool, &mut fresh);
-        for (key, census) in &census_by_pool {
-            let Some(plan) = plan_pool(census, *key, 0) else {
-                continue;
-            };
-            for m in plan.moves {
-                pending.push(m);
-                pool_of.push(*key);
-            }
+        // **One list over every pool, highest source region first** — see
+        // [`by_source_rank`]. The budget clips this list, so its order decides which
+        // regions a clipped pass empties.
+        let rank_of: HashMap<usize, usize> = census_by_pool
+            .iter()
+            .flat_map(|(_, census)| census.iter().map(|a| (a.arena_idx, a.rank)))
+            .collect();
+        let plans: Vec<CompactPlan> = census_by_pool
+            .iter()
+            .filter_map(|(key, census)| plan_pool(census, *key, 0))
+            .collect();
+        for (m, key) in by_source_rank(&plans, |idx| rank_of.get(&idx).copied().unwrap_or(0)) {
+            pending.push(m);
+            pool_of.push(key);
         }
         if pending.is_empty() {
             return Err(CompactionRefused::AlreadyPacked);
@@ -1169,13 +1191,30 @@ impl super::backing::ChunkedKvBacking {
         let fresh_released = fresh.finish();
         report.arenas_released = fresh_released + self.release_empty_arenas().unwrap_or(0);
         report.frontier_after = self.frontier_regions().unwrap_or(frontier_before);
+        report.top_arena = SizeClass::all()
+            .map(|class| ArenaKey::new(class, ArenaLocation::Gpu))
+            .chain(record_key)
+            .filter_map(|key| {
+                self.pool_top_rank(key)
+                    .map(|(rank, live)| TopArena { key, rank, live })
+            })
+            .max_by_key(|t| t.rank);
         report.timings.publish = phase.elapsed();
         Ok(report)
     }
 
-    /// Give every censused pool one fresh arena as low in the span as the free list can
-    /// place it, **the pool highest on the frontier first**, and add each to its pool's
+    /// Give every censused pool fresh arenas as low in the span as the free list can
+    /// place them, **the pool highest on the frontier first**, and add each to its pool's
     /// census so the walk plans into it.
+    ///
+    /// **As many as the pool has arenas' worth of live chunks above them, not one.** A
+    /// full arena moves down only into free slots of its own pool, so one fresh arena a
+    /// pass let each pool lower by at most one arena however many holes stood below it.
+    /// Measured on Qwen3-30B-A3B through a burst: passes moving 170,000–210,000 chunks
+    /// and releasing 25–42 arenas each lowered the frontier by 1–3 regions, the released
+    /// arenas becoming holes under a frontier the full arenas above them still held. The
+    /// pools take turns, highest first, so the lowest holes still go to the pools
+    /// standing highest; `MAX_FRESH` bounds the claims one pass makes.
     ///
     /// **Why every pool, not just the top one.** Packing is per pool, so each pool
     /// converges onto *its own* lowest arenas — and a pool whose lowest arena sits high
@@ -1205,27 +1244,54 @@ impl super::backing::ChunkedKvBacking {
         census_by_pool: &mut [(ArenaKey, Vec<ArenaSlots>)],
         fresh: &mut FreshArenas<'_>,
     ) {
-        for (key, census) in census_by_pool.iter_mut() {
-            if census.is_empty() {
-                continue;
-            }
-            if !self.has_region_hole() {
-                break;
-            }
-            let arena_idx = match fresh.claim(&self.inner, *key) {
-                Ok(idx) => idx,
-                // No region for this pool is no region for any pool below it either.
-                Err(e) => {
-                    tracing::debug!(
-                        target: "candle_nn::kv_cache::compact",
-                        ?key,
-                        "no fresh low arena, packing the remaining pools without one: {e}",
-                    );
-                    break;
+        /// Fresh arenas one pass may claim across every pool.
+        const MAX_FRESH: usize = 64;
+        // Per pool, how many more fresh arenas its live chunks above the holes could
+        // fill. Unknown until its first arena lands, then refined as each one does.
+        let mut wanted: Vec<usize> = vec![usize::MAX; census_by_pool.len()];
+        let mut made = 0usize;
+        loop {
+            let mut claimed_any = false;
+            for (i, (key, census)) in census_by_pool.iter_mut().enumerate() {
+                if census.is_empty() || wanted[i] == 0 {
+                    continue;
                 }
-            };
-            if let Some(slots) = self.fresh_arena_slots(*key, arena_idx) {
+                if made >= MAX_FRESH || !self.has_region_hole() {
+                    return;
+                }
+                let arena_idx = match fresh.claim(&self.inner, *key) {
+                    Ok(idx) => idx,
+                    // No region for this pool is no region for any pool below it either.
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "candle_nn::kv_cache::compact",
+                            ?key,
+                            "no fresh low arena, packing the remaining pools without one: {e}",
+                        );
+                        return;
+                    }
+                };
+                made += 1;
+                claimed_any = true;
+                let Some(slots) = self.fresh_arena_slots(*key, arena_idx) else {
+                    wanted[i] = 0;
+                    continue;
+                };
+                // The live chunks standing above where this arena landed, in arenas'
+                // worth: this one takes the first, and the rest are still wanted. One
+                // that landed above all of them is wanted by nothing, and goes back
+                // unused with the rest.
+                let live_above: usize = census
+                    .iter()
+                    .filter(|a| a.rank > slots.rank)
+                    .map(|a| a.occupied.len())
+                    .sum();
+                let need = live_above.div_ceil(slots.capacity.max(1));
+                wanted[i] = need.saturating_sub(1).min(wanted[i].saturating_sub(1));
                 census.push(slots);
+            }
+            if !claimed_any {
+                return;
             }
         }
     }

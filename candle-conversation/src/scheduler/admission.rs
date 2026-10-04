@@ -239,6 +239,59 @@ pub(super) fn admit_within(lens: impl IntoIterator<Item = usize>, budget: usize)
     admitted
 }
 
+/// The rows each of `remaining` advances in one forward of `budget` rows, in
+/// order: the budget **shared** across every member it can carry.
+///
+/// Each member takes `min(remaining, level)` with the level as high as the budget
+/// allows, so short members finish and long ones take the rest. Members are
+/// carried in order while each can have at least `least` rows (or its whole
+/// remainder, if smaller); those past that get `0` and ride a later forward. The
+/// first member always advances, so a prompt wider than the whole budget still
+/// makes progress.
+///
+/// **Why shared rather than whole turns in order.** A forward that takes whole
+/// turns until the next one does not fit leaves the remainder for a later forward
+/// — and once the carried turns finish prefilling they decode, and the later
+/// forward creeps behind that decode a layer per step. Measured on the
+/// Qwen3.6-35B-A3B: eight ~645-row prompts against a 3,691-row budget went seven
+/// and one, and the eighth's first token waited out the other seven's whole
+/// decode. Shared, the eight advance together, finish together, and decode as one
+/// cohort — the shape the forward gate runs. The rows per forward are the same.
+pub(super) fn share_within(remaining: &[usize], budget: usize, least: usize) -> Vec<usize> {
+    let mut out = vec![0; remaining.len()];
+    // Members carried: in order, while each can have its least share.
+    let mut carried = 0usize;
+    let mut floor_rows = 0usize;
+    for &r in remaining {
+        let need = r.min(least);
+        if carried > 0 && floor_rows + need > budget {
+            break;
+        }
+        floor_rows += need;
+        carried += 1;
+    }
+    let members = &remaining[..carried];
+    // The highest level whose shares fit: `Σ min(r, level)` only grows with the
+    // level, so the largest fitting one is a binary search over `[1, max]`.
+    let fits = |level: usize| members.iter().map(|&r| r.min(level)).sum::<usize>() <= budget;
+    let max = members.iter().copied().max().unwrap_or(0);
+    let (mut lo, mut hi) = (1usize, max);
+    let mut level = 1usize;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            level = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    for (o, &r) in out.iter_mut().zip(members) {
+        *o = r.min(level);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     // Expected byte counts are written as the product they represent
@@ -250,6 +303,46 @@ mod tests {
     use candle_nn::kv_cache::QuantFormat;
 
     const MIB: u64 = 1 << 20;
+
+    /// **Eight equal prompts share the forward and finish together** — 461 rows
+    /// each against 3,691 (8 × 462 would be 3,696), then their last 184 each.
+    #[test]
+    fn equal_prompts_share_the_budget_and_finish_together() {
+        assert_eq!(share_within(&[645; 8], 3691, 32), vec![461; 8]);
+        assert_eq!(share_within(&[184; 8], 3691, 32), vec![184; 8]);
+    }
+
+    /// A short member finishes whole and the long ones split what it left.
+    #[test]
+    fn a_short_member_finishes_and_the_rest_take_what_it_left() {
+        assert_eq!(
+            share_within(&[100, 2000, 2000], 1000, 32),
+            vec![100, 450, 450]
+        );
+    }
+
+    /// Everything fits: everyone advances by all it has.
+    #[test]
+    fn members_that_fit_whole_advance_whole() {
+        assert_eq!(share_within(&[300, 500], 4096, 32), vec![300, 500]);
+    }
+
+    /// More members than the budget can give each its least share: carried in
+    /// order up to that, and the rest wait.
+    #[test]
+    fn a_crowd_is_carried_in_order_up_to_the_least_share() {
+        let got = share_within(&[645; 200], 3691, 32);
+        assert_eq!(got[..115], [32; 115]);
+        assert!(got[115..].iter().all(|&a| a == 0));
+        assert!(got.iter().sum::<usize>() <= 3691);
+    }
+
+    /// One member wider than the whole budget still advances by the budget.
+    #[test]
+    fn a_member_wider_than_the_budget_still_advances() {
+        assert_eq!(share_within(&[10_000], 3691, 32), vec![3691]);
+        assert_eq!(share_within(&[], 3691, 32), Vec::<usize>::new());
+    }
 
     /// **In order, up to the budget, and always at least one.**
     #[test]

@@ -22,6 +22,8 @@
 //!   recover               what a recovery walk reconstructs (streams + tail)
 //!   projections [stream]  per-decode projection composition (the GUI panel data)
 //!   tree                  per-timeline summary forest from TreeMetadata records
+//!   liveness              maintenance's live/dead count against what it carries,
+//!                         by record type and segment (directory target)
 //! ```
 //!
 //! `<stream-id>` accepts decimal or `0x`-prefixed hex (as printed by
@@ -37,6 +39,9 @@
     clippy::unnecessary_sort_by,
     clippy::unnecessary_map_or
 )]
+
+#[path = "substrate_inspect/liveness.rs"]
+mod liveness;
 
 use std::path::{Path, PathBuf};
 
@@ -645,6 +650,12 @@ fn fold_conversations_indexed(
 enum Cmd {
     /// File + superblock overview, record histogram, live/dead ratio.
     Summary,
+    /// Audit maintenance's liveness count against what it carries: every
+    /// record of every segment, by record type and by segment. "Carried,
+    /// counted dead" is rewritten by every op and is what makes the store
+    /// churn; "counted, not carried" is lost when its segment is dropped.
+    /// Directory target only.
+    Liveness,
     /// Export a conversation's projection points + candidate/target galleries
     /// as an offline selection-replay fixture
     /// (`docs/provenance_adaptive_projection.md` §11): per dialogue turn the raw
@@ -1183,6 +1194,9 @@ fn main() -> Result<()> {
         if matches!(cli.cmd, Cmd::Summary) {
             return segment_summary(&segs);
         }
+        if matches!(cli.cmd, Cmd::Liveness) {
+            return liveness::liveness(&target);
+        }
         if let Cmd::Conversations { filter, limit } = &cli.cmd {
             return segment_conversations(&segs, filter, *limit);
         }
@@ -1256,6 +1270,9 @@ fn main() -> Result<()> {
         }
         Cmd::Orphans => {
             anyhow::bail!("orphans requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::Liveness => {
+            anyhow::bail!("liveness requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Couplings { .. } => {
             anyhow::bail!("couplings requires the segmented `substrate` DIRECTORY target")

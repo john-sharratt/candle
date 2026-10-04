@@ -127,14 +127,19 @@ __device__ __forceinline__ float load_as_float<__nv_fp8_e4m3>(const __nv_fp8_e4m
 // here must match it exactly. Every field is 4 bytes (f32/i32) so the struct is
 // naturally packed with no padding — keep it that way.
 //
-// `eos_token_id` and `vocab_size` are NOT here: they are a property of the
-// model/tokenizer, identical across the wave, so they stay scalar.
+// `eos_token_id`, `vocab_size` (the row stride) and `live_vocab` (the tokens a
+// row may produce) are NOT here: they are a property of the model/tokenizer,
+// identical across the wave, so they stay scalar.
 //
 // `segment_close_token_id` IS here, per-row: a wave mixes rows that close on
 // different tokens (a deliberating row closes its `</think>` span; a narrator
 // row has no segment, token id -1), and a scalar taken from row 0 would gate
 // the whole wave on one row's token — the exact cross-row bleed this struct
 // exists to remove. -1 keeps a row's segment-close path off.
+//
+// `typical_draft` is the proposal a speculative verify row tests (-1 on a row
+// that tests none), with `typical_eps`/`typical_delta` the Medusa thresholds it
+// is accepted on when the sample did not land on it.
 struct SeqDials {
     float temperature;
     int32_t top_k;
@@ -157,6 +162,9 @@ struct SeqDials {
     int32_t segment_close_ramp_len;
     float segment_close_max_multiplier;
     float segment_temp_boost;
+    int32_t typical_draft;
+    float typical_eps;
+    float typical_delta;
 };
 
 // ============================================================================
@@ -2174,6 +2182,40 @@ __device__ __forceinline__ int sample_from_topk(
     return indices[num_candidates - 1];
 }
 
+// Medusa typical acceptance over the distribution `sample_from_topk` draws
+// from: the first `num_candidates` entries, renormalised. True when `draft`'s
+// probability exceeds `min(eps, delta * exp(-entropy))`. A draft outside the
+// candidate set has probability zero and is never accepted.
+__device__ __forceinline__ bool typical_accepts(
+    const float* __restrict__ probs,
+    const int* __restrict__ indices,
+    int num_candidates,
+    int draft,
+    float eps,
+    float delta
+) {
+    float total = 0.f;
+    for (int i = 0; i < num_candidates; i++) {
+        total += probs[i];
+    }
+    if (!(total > 0.f)) {
+        return false;
+    }
+    const float inv_total = 1.f / total;
+    float entropy = 0.f;
+    float p_draft = 0.f;
+    for (int i = 0; i < num_candidates; i++) {
+        const float p = probs[i] * inv_total;
+        if (p > 0.f) {
+            entropy -= p * logf(p);
+        }
+        if (indices[i] == draft) {
+            p_draft = p;
+        }
+    }
+    return p_draft > fminf(eps, delta * expf(-entropy));
+}
+
 // ============================================================================
 // Stencil Sampling Kernel (Optimized for small constrained vocabularies)
 // ============================================================================
@@ -2644,6 +2686,12 @@ batched_penalty_sampling_kernel(
     // Input logits from LM head matmul
     const T* __restrict__ logits,           // [batch_size, vocab_size]
     int vocab_size,
+    // Tokens a row may produce. A checkpoint pads its output projection past
+    // the tokenizer's last id; those logits come from rows no token was ever
+    // trained through and must carry no probability — not in the argmax, the
+    // sample, or the typical-acceptance entropy. `vocab_size` stays the row
+    // stride; only the walk over candidates stops here.
+    int live_vocab,
     
     // Penalty scalars (passed by value, CUDA copies to constant memory)
     float repeat_penalty,
@@ -2739,8 +2787,17 @@ batched_penalty_sampling_kernel(
     // sampling fix; `eos_token_id` and vocab size stay scalar because they do
     // not vary across the wave, but `segment_close_token_id` does (a narrator
     // row carries -1 beside a deliberating row's `</think>`), so it is per-row.
+    // A bound past the row could only read beyond it.
+    live_vocab = min(live_vocab, vocab_size);
+    // A verify row carries the draft it tests (see `SeqDials`).
+    int32_t typical_draft = -1;
+    float typical_eps = 0.0f;
+    float typical_delta = 0.0f;
     if (seq_dials != nullptr) {
         const SeqDials d = seq_dials[batch_idx];
+        typical_draft = d.typical_draft;
+        typical_eps = d.typical_eps;
+        typical_delta = d.typical_delta;
         temperature = d.temperature;
         top_k = d.top_k;
         top_p = d.top_p;
@@ -2928,11 +2985,11 @@ batched_penalty_sampling_kernel(
     // =========================================================
     if (!(temperature > 0.f)) {  // Handles NaN, <=0, -inf
         int best = branchless_argmax_typed<T, THREADS>(
-            my_logits, vocab_size, batch_idx,
+            my_logits, live_vocab, batch_idx,
             effective_penalties, recent_bitset, dry_cache_ptr,
             smem.reduction_max, smem.reduction_idx
         );
-        
+
         if (tid == 0) {
             output_tokens[batch_idx] = best;
         }
@@ -2969,7 +3026,7 @@ batched_penalty_sampling_kernel(
 
         // Step 1: Radix select on raw (penalized) logits — 4 vocab passes, NO exp()
         float logit_threshold = radix_select_logit_threshold<T, THREADS>(
-            my_logits, vocab_size, batch_idx, k,
+            my_logits, live_vocab, batch_idx, k,
             effective_penalties, recent_bitset, dry_cache_ptr,
             smem.radix_histogram, smem.reduction_max
         );
@@ -2981,7 +3038,7 @@ batched_penalty_sampling_kernel(
 
         // Step 2: Collect + local softmax — 1 vocab pass, probs computed in smem
         num_topk = collect_and_locally_normalize<T, THREADS>(
-            my_logits, vocab_size, batch_idx, logit_threshold, inv_temp,
+            my_logits, live_vocab, batch_idx, logit_threshold, inv_temp,
             effective_penalties, recent_bitset, dry_cache_ptr,
             smem.topk_vals, smem.topk_idxs, k, &smem.topk_count,
             smem.reduction_max
@@ -3013,7 +3070,7 @@ batched_penalty_sampling_kernel(
 
         // Step 1: Radix select on raw logits — 4 vocab passes, NO exp()
         float logit_threshold = radix_select_logit_threshold<T, THREADS>(
-            my_logits, vocab_size, batch_idx, k,
+            my_logits, live_vocab, batch_idx, k,
             nullptr, recent_bitset, nullptr,  // No penalties, no DRY
             smem.radix_histogram, smem.reduction_max
         );
@@ -3025,7 +3082,7 @@ batched_penalty_sampling_kernel(
 
         // Step 2: Collect + local softmax — 1 vocab pass
         num_topk = collect_and_locally_normalize<T, THREADS>(
-            my_logits, vocab_size, batch_idx, logit_threshold, inv_temp,
+            my_logits, live_vocab, batch_idx, logit_threshold, inv_temp,
             nullptr, recent_bitset, nullptr,
             smem.topk_vals, smem.topk_idxs, k, &smem.topk_count,
             smem.reduction_max
@@ -3087,11 +3144,19 @@ batched_penalty_sampling_kernel(
             rng_offsets[batch_idx] = offset + 1;
         }
         
-        output_tokens[batch_idx] = sample_from_topk(
-            smem.topk_vals, smem.topk_idxs, 
-            nucleus_size > 0 ? nucleus_size : 1,
-            seed, offset
+        const int candidates = nucleus_size > 0 ? nucleus_size : 1;
+        uint32_t token = sample_from_topk(
+            smem.topk_vals, smem.topk_idxs, candidates, seed, offset
         );
+        // A verify row commits its draft when the distribution gives it
+        // enough mass, and its sample otherwise. The sample is drawn either
+        // way, so the row's RNG stream advances exactly as a plain row's.
+        if (typical_draft >= 0 && typical_accepts(
+                smem.topk_vals, smem.topk_idxs, candidates,
+                typical_draft, typical_eps, typical_delta)) {
+            token = (uint32_t)typical_draft;
+        }
+        output_tokens[batch_idx] = token;
     }
 }
 
@@ -3186,6 +3251,7 @@ inline void dispatch_batched_sampling(
     const T* logits,
     int batch_size,
     int vocab_size,
+    int live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -3265,7 +3331,7 @@ inline void dispatch_batched_sampling(
     if (use_penalties && use_dry && use_top_p) {
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, true, true>
             <<<grid, block, bitset_bytes, stream>>>(
-                logits, vocab_size,
+                logits, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
@@ -3283,7 +3349,7 @@ inline void dispatch_batched_sampling(
     } else if (use_penalties && use_dry && !use_top_p) {
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, true, false>
             <<<grid, block, bitset_bytes, stream>>>(
-                logits, vocab_size,
+                logits, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
@@ -3301,7 +3367,7 @@ inline void dispatch_batched_sampling(
     } else if (use_penalties && !use_dry && use_top_p) {
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, false, true>
             <<<grid, block, bitset_bytes, stream>>>(
-                logits, vocab_size,
+                logits, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
@@ -3319,7 +3385,7 @@ inline void dispatch_batched_sampling(
     } else if (use_penalties && !use_dry && !use_top_p) {
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, true, false, false>
             <<<grid, block, bitset_bytes, stream>>>(
-                logits, vocab_size,
+                logits, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
@@ -3338,7 +3404,7 @@ inline void dispatch_batched_sampling(
         // No penalties implies no DRY either
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, false, false, true>
             <<<grid, block, bitset_bytes, stream>>>(
-                logits, vocab_size,
+                logits, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
@@ -3357,7 +3423,7 @@ inline void dispatch_batched_sampling(
         // No penalties, no DRY, no top_p - fastest path
         batched_penalty_sampling_kernel<T, MAX_TOP_K, THREADS_PER_BLOCK, false, false, false>
             <<<grid, block, bitset_bytes, stream>>>(
-                logits, vocab_size,
+                logits, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
@@ -3381,6 +3447,9 @@ inline void launch_batched_sampling_typed(
     const T* logits,
     int batch_size,
     int vocab_size,
+    // Tokens a row may produce; see `batched_penalty_sampling_kernel`. The
+    // stencil kernel reads only its allow-list, which names real tokens.
+    int live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -3475,7 +3544,7 @@ inline void launch_batched_sampling_typed(
     } else {
         // Fall back to full vocabulary kernel
         dispatch_batched_sampling<T>(
-            logits, batch_size, vocab_size,
+            logits, batch_size, vocab_size, live_vocab,
             repeat_penalty, frequency_penalty, presence_penalty,
             dry_multiplier, dry_base, dry_allowed_length, dry_range,
             eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,

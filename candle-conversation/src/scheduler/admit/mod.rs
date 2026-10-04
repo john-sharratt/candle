@@ -444,12 +444,16 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     } else {
                         true
                     };
+                    // An offer of no rows joins a forward whose rows are already
+                    // spent: it shares the forwards to come rather than widening
+                    // this one, so there is no prefill gain to judge — only the
+                    // floor, and the decode question asked above.
                     decode_ok
-                        && match rate.try_admit(
-                            Admission::Prefill { tokens: cost.rows },
-                            before,
-                            after,
-                        ) {
+                        && match if cost.rows == 0 {
+                            rate.try_join(after)
+                        } else {
+                            rate.try_admit(Admission::Prefill { tokens: cost.rows }, before, after)
+                        } {
                             rate::Admit::Admitted { .. } => true,
                             rate::Admit::Refused(r) => {
                                 out.note(r);
@@ -539,6 +543,9 @@ mod tests {
         taken: Vec<Kind>,
         decode_prio: DecodePriority,
         prefill_prio: DecodePriority,
+        /// Every prefill after the first offers no rows, as a turn joining a
+        /// forward whose rows are spent does.
+        join_after_head: bool,
     }
 
     impl Fake {
@@ -558,6 +565,7 @@ mod tests {
                 taken: Vec::new(),
                 decode_prio: DecodePriority::Low,
                 prefill_prio: DecodePriority::Low,
+                join_after_head: false,
             }
         }
         fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -622,7 +630,11 @@ mod tests {
             // A decode claims nothing — its lease was bought at admission — and
             // rides as one row; a prefill or section claims its K/V and carries
             // a chunk's rows.
-            let rows = if kind == Kind::Decode { 1 } else { ROWS };
+            let rows = match kind {
+                Kind::Decode => 1,
+                Kind::Prefill if self.join_after_head && !self.taken.is_empty() => 0,
+                _ => ROWS,
+            };
             self.queue(kind).first().map(|&kv| Cost {
                 kv,
                 rows,
@@ -648,6 +660,29 @@ mod tests {
             self.taken.push(kind);
             true
         }
+    }
+
+    /// **An offer of no rows is a join, judged by the floor, not by the prefill
+    /// gain.** Every prefill after the head offers zero rows — the forward's rows
+    /// are spent, the way `AdmitPass::peek` offers a turn once they are. Each
+    /// dislodges a region; all are taken while residency stays above the floor,
+    /// and the fill stops on the weights at the first that would cross it.
+    #[test]
+    fn prefills_offering_no_rows_join_until_the_floor() {
+        let mut f = Fake::new(Vec::new(), vec![REGION; 6], FLOOR + 3 * REGION + REGION / 2);
+        f.join_after_head = true;
+        let got = fill_once(&mut f);
+        // Residency starts three and a half regions above the floor: the head
+        // leaves 2.5, the joins 1.5 and 0.5, and the next would land under it.
+        assert_eq!(got.prefills, 3, "the head and two joins above the floor");
+        assert!(
+            got.stopped_on_weights,
+            "the third join would cross the floor"
+        );
+        assert!(
+            !got.stopped_on_rate,
+            "no join is judged by the prefill gain"
+        );
     }
 
     /// Run one fill with a fresh planner.
@@ -817,7 +852,11 @@ mod tests {
         // minimum gain, not the zero the other tests use: a bus-bound decode
         // wave's rate is *flat* in the number of decodes (the copy grows with
         // the routed set, so the step grows with it), and flat is refused as
-        // `Saturated` rather than as `Worse`.
+        // `Saturated` rather than as `Worse`. A short layer time is what puts the
+        // wave on the bus: a 20 ms step is long enough to be learned as compute
+        // (it outlasts even a fully resident decode's copy), and short enough
+        // that at the residency below the copy a wider wave streams outruns the
+        // layer it hides under — so the decode model is what refuses.
         let mut rate = WaveRate::with_link_rate(
             25e9,
             ExpertGeometry::QWEN36_35B_A3B,
@@ -825,7 +864,7 @@ mod tests {
             DecodeModel::default(),
         );
         for _ in 0..WaveRate::MIN_DECODE_SAMPLES {
-            rate.observe_decode(1, 0, u64::MAX, 0.5);
+            rate.observe_decode(1, 0, u64::MAX, 20e-3);
         }
         assert!(rate.decode_samples() >= WaveRate::MIN_DECODE_SAMPLES);
 
@@ -868,8 +907,11 @@ mod tests {
         }
 
         // Residency far above the floor, so nothing here can be a weight
-        // refusal: whatever stops the band is a rate judgement.
-        let mut f = Fake::new(Vec::new(), vec![REGION; 8], 60 << 30);
+        // refusal: whatever stops the band is a rate judgement. And below the
+        // experts' total, so a decode streams what is not resident — with every
+        // expert on the card a decode copies nothing, its rate climbs with every
+        // row, and the decode model has nothing to refuse.
+        let mut f = Fake::new(Vec::new(), vec![REGION; 8], 12 << 30);
         f.active = 4;
         f.decodes_active = 4;
         f.standing = 0;
@@ -1085,8 +1127,12 @@ mod tests {
     /// is backpressure the producer must act on.
     #[test]
     fn a_saturated_wave_and_a_starved_one_report_differently() {
-        // Saturated: residency to spare, but the wave is as fast as it gets.
-        let mut f = Fake::new(Vec::new(), vec![0; 64], FLOOR + 512 * REGION);
+        // Saturated: residency to spare, but the wave is as fast as it gets for
+        // what each row spends. Each offer dislodges a region the forward then
+        // copies — the spend the minimum gain exists to weigh; an offer that
+        // dislodged nothing would cost only its compute, which the queued prompt
+        // pays whenever it runs, and is never refused as saturated.
+        let mut f = Fake::new(Vec::new(), vec![REGION; 64], FLOOR + 512 * REGION);
         f.active = 1;
         f.decodes_active = 1;
         let got = fill(&mut f, &mut planner().with_min_gain(0.05));

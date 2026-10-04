@@ -6,8 +6,6 @@
 use super::compute::QMatMul;
 use crate::models::profile::{ProfileMark, ProfileSnapshot};
 use candle::quantized::GgmlDType;
-use candle::wave_provenance::WaveTicket;
-use candle::{DType, Device, Result, Tensor};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -18,38 +16,52 @@ use std::sync::{Arc, Mutex};
 /// Lightweight telemetry counters for the expert pipeline.
 ///
 /// Shared between the pipeline thread (writer) and the `ExpertCache` handle
-/// (reader) via `Arc<Mutex<_>>`.  The mutex is uncontended on the write
-/// path (pipeline thread is sole writer); reads happen only between test
-/// configs or at shutdown.
-///
-/// All fields are plain `usize` — atomic increments inside the already
-/// exclusive pipeline thread (`&mut self`).  The `Mutex` only serialises
-/// the cross-thread snapshot/reset from the handle.
+/// (reader) via `Arc<Mutex<_>>`. The pipeline thread is the sole writer of the
+/// tallies; a reader that wants them complete for a forward asks through
+/// [`super::ExpertCache::expert_stats`], which settles the pipeline first.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineStats {
-    /// Expert cache hits (already in VRAM).
+    /// Routed experts that were in VRAM when their layer's routing reached the
+    /// pipeline thread.
     pub expert_hits: usize,
-    /// Expert cache misses (loaded from pinned or mmap).
+    /// Routed experts that were not: computed by the expert GEMMs' workers from
+    /// pinned memory — `worker_pinned` + `worker_cold`.
     pub expert_misses: usize,
-    /// Experts evicted from VRAM (drip + end-of-pass). A drop, not a copy —
-    /// the cold tier already holds every expert, so there is no matching
-    /// device-to-host transfer to count.
+    /// Misses bucketize found in pinned memory (a warm or pad slot).
+    pub worker_pinned: usize,
+    /// Misses bucketize found cold — waited on until the stager published them.
+    pub worker_cold: usize,
+    /// Experts evicted from VRAM. A retarget, not a copy — every expert has a
+    /// copy in the pack, and usually one in pinned memory.
     pub evictions: usize,
-    /// H2D DMA transfers into VRAM, from either host tier.
-    pub dma_loads: usize,
-    /// Loads served by the warm tier (H2D from pinned host memory).
-    pub warm_loads: usize,
-    /// Loads that missed both resident tiers and read the pack file.
-    pub cold_loads: usize,
+    /// Promotions into VRAM that landed by the copy engine, from a pinned slot
+    /// (the speculative ones), and their bytes.
+    pub promotions: usize,
+    pub promotion_bytes: usize,
+    /// Promotions the GEMM workers made: misses whose slices they also wrote
+    /// into a VRAM slot from the promotion ring — no link traffic of their own.
+    pub worker_promotions: usize,
+    /// Cold experts the stager staged for a routed row, of them those copied
+    /// from a pageable warm slot rather than read from the pack, the ones it
+    /// staged ahead on the predictor's request, and the bytes it moved.
+    pub staged_cold: usize,
+    pub staged_paged: usize,
+    pub staged_speculative: usize,
+    pub staged_bytes: usize,
+    /// Reader time summed over the stager's reads, ns — `staged_bytes` over
+    /// this is the per-reader rate.
+    pub stage_read_ns: u64,
+    /// Pad slots the stager took back from a staged expert.
+    pub pad_evictions: usize,
     /// **Gauge**, not a tally: experts the warm tier holds, of the model's
-    /// total. Reported beside the load counts because the two only make sense
-    /// together — a cold-load count is a verdict on this number, and reading
-    /// them in different places is how a warm tier sized at a third of the model
-    /// went unnoticed while it sent two thirds of every miss to disk.
+    /// total. Reported beside the miss counts because the two only make sense
+    /// together — a cold count is a verdict on this number.
     pub warm_slots: usize,
     /// **Gauge**: of `warm_slots`, those in pageable memory beyond the
-    /// page-lock ceiling — uploaded through the pinned staging ring.
+    /// page-lock ceiling — not device-readable, so staged like a pack record.
     pub warm_paged_slots: usize,
+    /// **Gauge**: pad slots.
+    pub pad_slots: usize,
     /// Experts in the model, so `warm_slots` reads as a fraction.
     pub total_experts: usize,
     /// **Gauge**: MoE layers in the model. Published beside `total_experts`
@@ -57,34 +69,27 @@ pub struct PipelineStats {
     /// `moe_layers` layers, and a layer's copy is capped at `total_experts /
     /// moe_layers` experts. Their product alone cannot say either.
     pub moe_layers: usize,
-    /// Speculative prefetch loads that landed in VRAM.
-    pub prefetch_loads: usize,
-    /// Hint-driven speculative loads.
-    pub hint_loads: usize,
-    /// Speculatively loaded experts that the layer actually routed to.
+    /// Speculative promotions (predictor and wide-row lookahead) that landed.
+    pub prefetch_promotions: usize,
+    /// Speculatively promoted experts that the layer actually routed to.
     /// Numerator of prediction precision.
     pub predicted_hits: usize,
-    /// Total speculatively loaded experts evaluated against actual routing.
+    /// Total speculatively promoted experts evaluated against actual routing.
     /// Denominator of prediction precision.
     pub predicted_total: usize,
-    /// Number of times `fence_wait` blocked (non-zero wait).
-    pub fence_stalls: usize,
-    /// In-flight prefetched experts whose DMA fence had not signalled when
-    /// their target layer's request arrived — the prefetch was issued but did
-    /// NOT land in time. The direct latency-bound signal for the dynamic
-    /// load-ahead controller: late > 0 with bandwidth slack means the
-    /// prefetcher should issue earlier (deepen N); late ≈ 0 with falling
-    /// precision means it should shallow back.
+    /// Speculative promotions still in flight when their target layer's
+    /// routing arrived. The latency-bound signal for the dynamic load-ahead
+    /// controller: late > 0 with bandwidth slack means the prefetcher should
+    /// issue earlier (deepen N); late ≈ 0 with falling precision means it
+    /// should shallow back.
     pub late_loads: usize,
     /// **Gauge**: the dynamic load-ahead depth `N` as of the last pass
     /// boundary — how many layers ahead the speculative prefetcher currently
     /// issues for.
     pub prefetch_depth: usize,
-    /// Experts loaded by the off-thread whole-layer streamer (their bytes
-    /// also count in `warm_loads` / `cold_loads` / `dma_loads` by source).
-    pub stream_loads: usize,
-    /// Total MoE work requests processed.
-    pub work_requests: usize,
+    /// Routed layers the pipeline thread has processed — one per MoE layer per
+    /// forward.
+    pub routed_messages: usize,
     /// **Live** VRAM bytes held by resident expert slots — `occupied_slots ×
     /// slot_size`. Unlike the counters above (monotonic tallies), this is a
     /// gauge: it rises as experts load into VRAM and falls as they stream out
@@ -114,21 +119,6 @@ pub struct PipelineStats {
     /// **Gauge**: bytes one expert slot occupies — the unit every figure above
     /// is a multiple of, and the grain the rate model prices a routed expert in.
     pub expert_slot_bytes: usize,
-    /// **Gauge**: whether the MoE dispatches on the device.
-    ///
-    /// `true` when the expert grid is fully VRAM-resident and
-    /// `GpuDispatchTables` captured it, so routing never leaves the card;
-    /// `false` when the cache streams, where each layer reads its routing back
-    /// to the host to schedule that layer's pinned→VRAM uploads by expert id
-    /// (the sanctioned exception (a) of hot-path invariant 3).
-    ///
-    /// Reported because the difference is a multiple on decode latency and
-    /// nothing else says which path a run took: the decline is a `tracing::warn`
-    /// and the gate harnesses install no subscriber, so it has been shouting
-    /// into a void. A run whose hit rate is below 100% is on the host path by
-    /// construction, and now the table says so instead of leaving it to be
-    /// inferred from the miss column.
-    pub device_dispatch: bool,
 }
 
 impl PipelineStats {
@@ -145,9 +135,7 @@ impl PipelineStats {
     }
 
     /// Reset the per-interval tallies. The **gauges** survive it: they describe
-    /// the cache's shape rather than what it did since the last reset, and an
-    /// inline-mode cache (which never re-seeds them via a classify) would
-    /// otherwise read 0 forever.
+    /// the cache's shape rather than what it did since the last reset.
     ///
     /// **The tallies are cleared by name rather than the gauges restored around
     /// a `default()`.** Both spellings zero the same fields today, but they fail
@@ -161,18 +149,23 @@ impl PipelineStats {
         if let Ok(mut s) = shared.lock() {
             s.expert_hits = 0;
             s.expert_misses = 0;
+            s.worker_pinned = 0;
+            s.worker_cold = 0;
             s.evictions = 0;
-            s.dma_loads = 0;
-            s.warm_loads = 0;
-            s.cold_loads = 0;
-            s.prefetch_loads = 0;
-            s.hint_loads = 0;
+            s.promotions = 0;
+            s.promotion_bytes = 0;
+            s.worker_promotions = 0;
+            s.staged_cold = 0;
+            s.staged_paged = 0;
+            s.staged_speculative = 0;
+            s.staged_bytes = 0;
+            s.stage_read_ns = 0;
+            s.pad_evictions = 0;
+            s.prefetch_promotions = 0;
             s.predicted_hits = 0;
             s.predicted_total = 0;
-            s.fence_stalls = 0;
             s.late_loads = 0;
-            s.stream_loads = 0;
-            s.work_requests = 0;
+            s.routed_messages = 0;
         }
     }
 
@@ -212,12 +205,15 @@ mod stats_tests {
             let mut s = shared.lock().unwrap();
             s.warm_slots = 13_508;
             s.warm_paged_slots = 2_138;
-            s.cold_loads = 11_225;
+            s.pad_slots = 256;
+            s.worker_cold = 11_225;
+            s.promotion_bytes = 4096;
+            s.stage_read_ns = 77;
         }
         PipelineStats::reset(&shared);
         let s = PipelineStats::snapshot(&shared);
-        assert_eq!((s.warm_slots, s.warm_paged_slots), (13_508, 2_138));
-        assert_eq!(s.cold_loads, 0);
+        assert_eq!((s.warm_slots, s.warm_paged_slots, s.pad_slots), (13_508, 2_138, 256));
+        assert_eq!((s.worker_cold, s.promotion_bytes, s.stage_read_ns), (0, 0, 0));
     }
 }
 
@@ -251,11 +247,12 @@ pub struct MmapExpertRef {
 
 /// A single VRAM slot holding one expert's three projection matrices.
 ///
-/// Created on-demand with the correct dtype when an expert is loaded.
-/// Stores pre-built `QMatMul` wrappers to avoid reconstruction per dispatch.
+/// The views over a weight-zone slot the pipeline thread keeps for its
+/// bookkeeping. The expert GEMMs do not read them: they read the slot's
+/// addresses out of bucketize's snapshot of the live table (`live_table`),
+/// which the pipeline thread points at the slot once its bytes have landed.
 ///
-/// **Sole ownership**: slots are owned directly by the pipeline thread
-/// (threaded mode) or the Mutex-protected inner (inline mode).
+/// **Sole ownership**: slots are owned directly by the pipeline thread.
 /// No `Arc` wrapping — never cloned, never shared across threads.
 pub struct ExpertSlot {
     pub gate_proj: QMatMul,
@@ -264,201 +261,50 @@ pub struct ExpertSlot {
 }
 
 // ============================================================================
-// DMA fence
+// Pipeline messages
 // ============================================================================
 
-/// Opaque fence representing in-flight DMA work on the copy stream.
+/// One MoE layer's routing, handed to the pipeline thread.
 ///
-/// Returned by internal classify_and_load — waited on before computing
-/// loaded experts.  On non-CUDA or when no copy stream exists this is a no-op.
-pub struct CopyBatchFence {
-    #[cfg(feature = "cuda")]
-    pub(crate) event: Option<cudarc::driver::CudaEvent>,
-}
-
-impl CopyBatchFence {
-    /// Create a no-op fence (nothing to wait on).
-    pub fn noop() -> Self {
-        Self {
-            #[cfg(feature = "cuda")]
-            event: None,
-        }
-    }
-
-    /// Wait for the fence on the given device's main stream.
-    /// This is a GPU-side `cudaStreamWaitEvent` — the CPU does not block.
-    pub(crate) fn wait(&self, _device: &Device) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        if let Some(ref event) = self.event {
-            if let Device::Cuda(cuda_dev) = _device {
-                cuda_dev
-                    .cuda_stream()
-                    .wait(event)
-                    .map_err(candle::Error::wrap)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether the fenced DMA batch has already completed (CPU-side event
-    /// query, non-blocking). A no-op fence is always complete. This is the
-    /// deadline probe behind the late-load counter: queried at the moment a
-    /// layer's request arrives, it answers "did the prefetch land in time?"
-    /// without perturbing the stream.
-    pub(crate) fn is_complete(&self) -> bool {
-        #[cfg(feature = "cuda")]
-        {
-            self.event.as_ref().is_none_or(|e| e.is_complete())
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            true
-        }
-    }
-
-    /// Whether this fence actually covers an in-flight batch (has an event).
-    pub(crate) fn is_real(&self) -> bool {
-        #[cfg(feature = "cuda")]
-        {
-            self.event.is_some()
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            false
-        }
-    }
-}
-
-// ============================================================================
-// Classification result
-// ============================================================================
-
-/// Result of expert classification: which are hits, which were loaded.
-///
-/// Used internally by both threaded and inline paths.
-pub struct ClassifiedExperts {
-    /// Experts that were already resident (cache hits).
-    /// Each entry: (expert_idx, slot_idx).
-    pub hits: Vec<(usize, usize)>,
-    /// Experts that were loaded via DMA (cache misses).
-    /// Each entry: (expert_idx, slot_idx).
-    pub loaded: Vec<(usize, usize)>,
-    /// DMA fence — wait on this before computing loaded experts.
-    pub fence: CopyBatchFence,
-}
-
-// ============================================================================
-// Work request / response for the pipeline thread
-// ============================================================================
-
-/// Work item submitted to the pipeline thread.
-///
-/// Contains everything the thread needs to perform the full MoE dispatch:
-/// routing assignments, input tensor, and routing weights.  The thread
-/// does classify → DMA → compute → return output.
-/// The MoE input activation `[num_tokens, hidden_dim]`, threaded through the pipeline. `Q8` is the
-/// B3 int8 path — the ln2-fused q8a1024 router input that the experts byte-gather directly (no
-/// gather-then-quantize). It's cuda-only (the operand holds a `CudaSlice`); the non-CUDA pipeline
-/// only ever sees `Float`. Defined here (not in candle-core) so the int8 arm can be cfg-gated
-/// without dragging the cuda-only `Q8a128Operand` into the shared, non-cuda-gated pipeline structs.
-pub enum MoeInput {
-    Float(Tensor),
-    #[cfg(feature = "cuda")]
-    Q8(candle::quantized::cuda::Q8a128Operand<'static>),
-}
-
-impl MoeInput {
-    /// `(num_tokens, hidden)` of the activation.
-    pub fn shape(&self) -> Result<(usize, usize)> {
-        match self {
-            MoeInput::Float(t) => t.dims2(),
-            #[cfg(feature = "cuda")]
-            MoeInput::Q8(op) => Ok((op.rows, op.cols)),
-        }
-    }
-}
-
-pub struct MoeWorkRequest {
-    /// Which MoE layer (0..num_moe_layers).
-    pub moe_layer_idx: usize,
-    /// Unique expert IDs selected by the router (sorted, deduplicated).
-    pub expert_ids: Vec<usize>,
-    /// Input hidden states `[num_tokens, hidden_dim]` — `Float` (Off) or the q8a1024 router
-    /// input (int8). The experts gather from it per expert.
-    pub input: MoeInput,
-    /// Compute dtype of the expert output `ys` (a q8a1024 operand carries no dtype).
-    pub out_dtype: DType,
-    /// Flattened routing weights `[num_tokens * k]` (GPU tensor, F32).
-    pub weights_flat: Tensor,
-    /// Flat assignment array sorted by expert ID.
-    /// Each entry: `(expert_id, token_idx, flat_weight_idx)`.
-    pub assignments: Vec<(u32, u32, u32)>,
-    /// Count of leading rows, in this request's token order, that are
-    /// decode-attributed (decode rows plus any single-token prefills folded
-    /// into the decode group). The rest are prefill/glue rows.
-    ///
-    /// Used only to weight cache residency scoring
-    /// (`ExpertCacheInner::record_hit` vs `record_prefill_hit` /
-    /// `record_prefill_elevate`): a decode row's reuse of a specific expert is
-    /// near-certain from one step to the next, while a prefill row's is close
-    /// to zero, so the two must not compete for residency on equal footing.
-    /// `num_tokens` (every row decode-attributed) reproduces undifferentiated
-    /// scoring exactly, which is the right value for a caller that has not
-    /// been taught its own decode/prefill split yet.
-    pub decode_tokens: usize,
-    /// The wave generation the submitting layer has open, if any.
-    ///
-    /// A [`WaveTicket`] is a `Copy` coordinate rather than a borrow, which is
-    /// the whole reason it can be here: the expert chain runs on the pipeline
-    /// thread, and no `&WaveGeneration` could cross this channel. The forward
-    /// thread blocks on the response for the entire request (`submit_moe_work`
-    /// sends and immediately `recv`s), so the generation is open throughout, and
-    /// both threads issue on the same stream — so the arena's stream-ordered
-    /// reclaim still holds. A ticket from a closed generation resolves to
-    /// nothing, so the worst case is a pool allocation, never a stale range.
-    pub wave: Option<WaveTicket>,
-    /// Timestamp captured by the forward thread just before `send` — lets the worker measure the
-    /// inbound handoff latency (`submit_inbound` = pickup − submit). Zero-sized off-`profile`.
+/// Sent by the forward thread after it has enqueued the layer's bucketize. The
+/// forward thread does not wait for an answer: nothing the GPU computes for the
+/// layer depends on the pipeline thread, which keeps VRAM residency in step
+/// with routing off the critical path.
+#[cfg(feature = "cuda")]
+pub struct RoutedLayer {
+    /// The MoE row (layer index in the live table).
+    pub row: usize,
+    /// The forward thread's pass when this layer was routed — a pass is a run
+    /// of invocations with strictly increasing row.
+    pub pass: u64,
+    /// The summary ring slot holding this layer's routing summary.
+    pub slot: usize,
+    /// The word bucketize stores last in the slot. Once the slot reads it,
+    /// every kernel enqueued before this layer's bucketize — including every
+    /// expert GEMM of an earlier layer — has completed, and the summary is
+    /// readable.
+    pub summary_word: u32,
+    /// The invocation's ticket (`reclaim`): observed when the word is.
+    pub ticket: u64,
+    /// A prompt-prefill launch (`dispatch::PREFILL_LAUNCH_TOKENS`): its misses
+    /// are pulled by enough workers to saturate the link, so a speculative copy
+    /// for the next row competes with them.
+    pub prefill_width: bool,
+    /// Timestamp captured just before `send`, so the worker can measure the
+    /// hand-off. Zero-sized off-`profile`.
     pub submitted_at: ProfileMark,
-    /// Channel for the result + the worker's completion timestamp (`worker_done_at`), so the
-    /// forward thread can measure the outbound handoff latency (`submit_outbound` = recv − done).
-    pub response_tx: mpsc::SyncSender<(Result<Tensor>, ProfileMark)>,
 }
 
-// ============================================================================
-// Pipeline message (Work or Hint)
-// ============================================================================
-
-/// Message sent to the pipeline thread: either a full work request or a
-/// speculative prediction hint.
-///
-/// Hints are sent by the forward thread while the async routing DtoH is
-/// in-flight, allowing the pipeline thread to start DMA for predicted
-/// experts before the full work request arrives.
-///
-/// **`Work` is deliberately not boxed**, which `clippy::large_enum_variant`
-/// asks for because it is ~240 B against `Hint`'s ~32. The fix it proposes costs
-/// a heap allocation on the MoE dispatch path — one per layer per wave, 28,511 of
-/// them in a single flagship engine run — to save a few bytes of stack in the
-/// rarer variant, which is the wrong trade on a hot path. The message is moved
-/// straight into a bounded channel whose buffer is already sized for the large
-/// variant, so the padding is never copied anywhere else.
-///
-/// The lint only fires with `--features profile`: `MoeWorkRequest::submitted_at`
-/// is a zero-sized `ProfileMark` without it and a real timestamp with it, which
-/// is what tips the ratio.
-#[allow(clippy::large_enum_variant)]
+/// Message sent to the pipeline thread.
 pub enum PipelineMessage {
-    /// Full MoE dispatch: classify → DMA → compute → return.
-    Work(MoeWorkRequest),
-    /// Speculative prediction hint: start DMA for predicted experts.
-    Hint {
-        /// Which MoE layer the hint predicts for (typically current + 0,
-        /// since the hint is sent before routing indices are available).
-        layer_idx: usize,
-        /// Expert IDs from the *previous* layer — used with the transition
-        /// matrix to predict which experts this layer will need.
-        prev_expert_ids: Vec<usize>,
+    /// A layer's routing: score it, promote, prefetch.
+    #[cfg(feature = "cuda")]
+    Routed(RoutedLayer),
+    /// Answer once every message sent before this one has been processed. What
+    /// a reader of the counters, or of anything else the pipeline thread
+    /// writes, sends first to read them complete.
+    Settle {
+        response_tx: mpsc::SyncSender<()>,
     },
     /// Snapshot and reset the pipeline thread’s profile accumulator.
     SnapshotProfile {
@@ -469,24 +315,14 @@ pub enum PipelineMessage {
     /// or — with `regions` zero — take back whatever the KV side is holding
     /// spare.
     ///
-    /// **Both directions arrive here, and both come from outside a wave.** The
-    /// give-back is what an arena claim that has run out asks for, on the spot;
-    /// the take-back is asked once per forward, from the wave loop's
-    /// inter-forward gap. Neither may run under a live wave generation, and a
-    /// stalled wave is exactly why the give-back cannot wait for a forward to
-    /// complete — the wave that cannot allocate is the one that would have to.
+    /// The eviction happens here, on the pipeline thread, where the cache
+    /// state lives, while the *quantity* comes from the caller that knows it.
+    /// Whether it may happen at all is decided at entry
+    /// (`PipelineState::renegotiate_if_quiet`): never under a live wave, and
+    /// never with an invocation the forward thread has begun still unserved.
     ///
-    /// This is that reader, and it is how an arena claim buys the ground it
-    /// needs: the eviction still happens here, on the pipeline thread, where the
-    /// cache state lives and no expert GEMM of this thread's is in flight, while
-    /// the *quantity* comes from the claim that knows it. The KV side used to
-    /// record demand in a counter for this to drain, and a counter of refused
-    /// attempts is not a count of regions — one drain read 4,436 against a
-    /// twenty-eight-region shortfall.
-    ///
-    /// Answers with the bytes conceded — zero if the boundary could not move,
-    /// which includes the zone already sitting at its floor, and the case where a
-    /// wave generation is still open and `set_weight_floor` refuses.
+    /// Answers with the bytes conceded — zero if the boundary could not or may
+    /// not move.
     RenegotiateBoundary {
         /// Regions the KV side is asking for.
         regions: usize,

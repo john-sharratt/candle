@@ -69,8 +69,23 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use candle::{
     cuda_backend::cudarc::driver::result::{memcpy_dtod_async, memcpy_dtod_sync},
+    quantized::pinned_staging::PinnedBuf,
     CudaDevice, Error, LeaseAnchor, Storage,
 };
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
+
+/// The pinned host buffer every store's seal readback lands in, kept between
+/// seals and grown only when a store needs more than it holds.
+///
+/// One per process rather than one per store: the scheduler seals one turn at a
+/// time on its loop thread, so a single buffer serves them all, where a buffer per
+/// conversation would pin ~65 MB of host memory for every sequence alive. It never
+/// shrinks, and has nothing to shrink from: a store's size is its model's geometry,
+/// identical for every sequence, so the buffer settles at one store's size on the
+/// first seal.
+#[cfg(feature = "cuda")]
+static READBACK: Mutex<Option<PinnedBuf>> = Mutex::new(None);
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
@@ -1031,22 +1046,124 @@ impl RecurrentStateStore {
             candle::bail!("recurrent store: export mid-wave — seal, then snapshot");
         }
         let d = &self.dims;
-        let mut out = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
-            let state_v: Vec<f32> = slot.live.s.flatten_all()?.to_vec1()?;
-            let tail_v: Vec<f32> = slot.live.conv_tail.flatten_all()?.to_vec1()?;
-            out.push(ExportedLayerState {
+        let bytes = self.read_back()?;
+        Ok(self
+            .slots
+            .iter()
+            .zip(bytes)
+            .map(|(slot, (state, conv_tail))| ExportedLayerState {
                 layer_index: slot.layer_index as u32,
                 n_v_heads: d.n_v_heads as u32,
                 d_v: d.head_dim as u32,
                 d_k: d.head_dim as u32,
-                state: state_v.iter().flat_map(|f| f.to_le_bytes()).collect(),
+                state,
                 conv_channels: d.conv_dim() as u32,
                 conv_tail_cols: (d.conv_kernel - 1) as u32,
-                conv_tail: tail_v.iter().flat_map(|f| f.to_le_bytes()).collect(),
-            });
+                conv_tail,
+            })
+            .collect())
+    }
+
+    /// Every layer's live state and conv tail as LE F32 bytes, in slot order.
+    ///
+    /// **On CUDA, one synchronisation for the whole store.** Every tensor's bytes
+    /// are enqueued into one pinned host buffer and the stream is waited on once:
+    /// a readback per tensor was two synchronising copies per recurrent layer into
+    /// freshly allocated pageable memory — 60 of them on the 35B-A3B, ~27 ms a seal
+    /// at ~2.2 GB/s, on the scheduler's loop thread. The buffer is kept between
+    /// seals ([`READBACK`]), so neither its pinning nor its first-touch faults are
+    /// paid per turn.
+    fn read_back(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        #[cfg(feature = "cuda")]
+        if let Some(first) = self.slots.first() {
+            if let Device::Cuda(dev) = first.live.s.device() {
+                return self.read_back_cuda(dev);
+            }
         }
-        Ok(out)
+        self.slots
+            .iter()
+            .map(|slot| {
+                let state: Vec<f32> = slot.live.s.flatten_all()?.to_vec1()?;
+                let tail: Vec<f32> = slot.live.conv_tail.flatten_all()?.to_vec1()?;
+                Ok((f32_le_bytes(&state), f32_le_bytes(&tail)))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_back_cuda(&self, dev: &CudaDevice) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let state_bytes = self.dims.state_elems() * 4;
+        let tail_bytes = self.dims.conv_state_elems() * 4;
+        let total = self.slots.len() * (state_bytes + tail_bytes);
+        let mut held = READBACK.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_ref().is_none_or(|b| b.len() < total) {
+            // Plain pinned memory, not write-combined: the CPU reads it straight
+            // back. Portable, because the buffer is shared by every store in the
+            // process, whichever device holds it. Every copy into the buffer it
+            // replaces has completed — each call below synchronises before it
+            // returns, on success and on error alike.
+            *held = Some(PinnedBuf::alloc_owned_portable(total)?);
+        }
+        let buf = held
+            .as_mut()
+            .expect("the readback buffer was just sized")
+            .as_mut_slice();
+        let stream = dev.cuda_stream();
+        // Every copy enqueued, then one wait. The wait runs even when an enqueue
+        // fails part-way: copies already queued are still writing into `buf`, and
+        // returning before they land would hand the next seal a buffer under DMA.
+        let enqueued = (|| -> Result<()> {
+            let mut at = 0usize;
+            for slot in &self.slots {
+                for (tensor, bytes) in [
+                    (&slot.live.s, state_bytes),
+                    (&slot.live.conv_tail, tail_bytes),
+                ] {
+                    let (storage, layout) = tensor.storage_and_layout();
+                    let Storage::Cuda(cuda) = &*storage else {
+                        candle::bail!(
+                            "recurrent store: a CUDA store holds a non-CUDA state tensor"
+                        );
+                    };
+                    let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
+                        Error::Msg("recurrent store: a state tensor is not contiguous".into())
+                    })?;
+                    if (end - start) * 4 != bytes {
+                        candle::bail!(
+                            "recurrent store: layer {} holds {} bytes of state where its \
+                             geometry says {bytes}",
+                            slot.layer_index,
+                            (end - start) * 4,
+                        );
+                    }
+                    cuda.copy_f32_bytes_to_host_on_stream(
+                        &mut buf[at..at + bytes],
+                        &stream,
+                        start,
+                        end - start,
+                    )?;
+                    at += bytes;
+                }
+            }
+            Ok(())
+        })();
+        let synced = stream
+            .synchronize()
+            .map_err(|e| Error::Msg(format!("recurrent store: readback sync: {e:?}")));
+        enqueued?;
+        synced?;
+        let mut at = 0usize;
+        Ok(self
+            .slots
+            .iter()
+            .map(|_| {
+                let state = buf[at..at + state_bytes].to_vec();
+                at += state_bytes;
+                let tail = buf[at..at + tail_bytes].to_vec();
+                at += tail_bytes;
+                (state, tail)
+            })
+            .collect())
     }
 
     /// Scatter a snapshot back into the store — the resume path. Validates
@@ -1126,9 +1243,33 @@ impl RecurrentStateStore {
     }
 }
 
+/// `v` as little-endian bytes — the snapshot's wire form of a state tensor.
+///
+/// Written into a pre-sized buffer a fixed four bytes at a time, which the compiler
+/// turns into a straight copy. The `flat_map(to_le_bytes).collect()` this replaced
+/// could neither pre-size nor vectorise, and it ran over every float of every layer
+/// on every turn seal — ~16 M floats on the 35B-A3B, on the scheduler's loop thread.
+fn f32_le_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = vec![0u8; v.len() * 4];
+    for (dst, f) in out.chunks_exact_mut(4).zip(v) {
+        dst.copy_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire bytes are each float's IEEE-754 little-endian image, in order.
+    #[test]
+    fn f32_le_bytes_is_each_floats_little_endian_image_in_order() {
+        assert_eq!(
+            f32_le_bytes(&[1.0, -2.5, 0.0]),
+            vec![0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x20, 0xC0, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert!(f32_le_bytes(&[]).is_empty());
+    }
 
     fn dims() -> DeltaNetDims {
         DeltaNetDims {
@@ -1160,7 +1301,11 @@ mod tests {
     }
 
     fn filled_store() -> RecurrentStateStore {
-        let dev = Device::Cpu;
+        filled_store_on(&Device::Cpu)
+    }
+
+    fn filled_store_on(dev: &Device) -> RecurrentStateStore {
+        let dev = dev.clone();
         let d = dims();
         let mut store = RecurrentStateStore::new(&kinds(), &d, &dev).unwrap();
         for (i, li) in [0usize, 1, 3].iter().enumerate() {
@@ -1640,6 +1785,21 @@ mod tests {
         let child = resumed.fork_from().unwrap();
         assert_eq!(child.export().unwrap(), sealed.1);
         assert!(child.is_seeded());
+    }
+
+    /// **The pinned readback is the same bytes the per-tensor one was.** A CUDA
+    /// store filled with the fixture's values exports byte-for-byte what the CPU
+    /// store does — every layer, state and conv tail, in slot order.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_cuda_export_is_byte_identical_to_the_cpu_one() -> Result<()> {
+        let cuda = filled_store_on(&Device::new_cuda(0)?).export()?;
+        let cpu = filled_store().export()?;
+        assert_eq!(cuda, cpu);
+        // Twice, so the second export reads through the buffer the first sized.
+        let again = filled_store_on(&Device::new_cuda(0)?).export()?;
+        assert_eq!(again, cpu);
+        Ok(())
     }
 
     #[test]

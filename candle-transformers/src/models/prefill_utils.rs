@@ -1191,10 +1191,10 @@ impl<'k> PagedPrefillInt8<'k> {
         };
 
         match self.head_dim {
-            64 | 96 | 128 | 256 => {}
-            hd => candle::bail!(
-                "paged-prefill: unsupported head_dim {hd} (must be 64, 96, 128, or 256)"
-            ),
+            64 | 128 | 256 => {}
+            hd => {
+                candle::bail!("paged-prefill: unsupported head_dim {hd} (must be 64, 128, or 256)")
+            }
         }
 
         unsafe {
@@ -1834,7 +1834,7 @@ pub fn paged_glue_attn<'w>(
 /// The kernel self-increments ws.len after scatter, so no write_offsets needed.
 ///
 /// Runs the production INT8 split-KV / warp-stripe / batched-M decode kernel
-/// (`run_paged_decode_*`) for head_dim 64/96/128/256.
+/// (`run_paged_decode_*`) for head_dim 64/128/256.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn paged_decode_attn<'w>(
@@ -2289,10 +2289,10 @@ impl<'k> PagedDecode<'k> {
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match self.head_dim {
-            64 | 96 | 128 | 256 => {}
-            hd => candle::bail!(
-                "paged-decode: unsupported head_dim {hd} (must be 64, 96, 128, or 256)"
-            ),
+            64 | 128 | 256 => {}
+            hd => {
+                candle::bail!("paged-decode: unsupported head_dim {hd} (must be 64, 128, or 256)")
+            }
         }
 
         // B2: emit the attention context as q8a1024 (head_dim 128 or 256 — whole

@@ -53,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::content_hash::ContentHash;
+use super::payload_parts::PayloadParts;
 use super::{PersistenceError, Result};
 
 /// Record / sector alignment. Every encoded record is padded to a
@@ -82,7 +83,7 @@ pub const MAX_HEADER_LINE: usize = ALIGN - 1;
 ///
 /// `Unknown` must never be written: [`encode_record`] panics if it sees
 /// one (it's a programming error to construct a header with `Unknown`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordType {
     ModelSpec = 1,
@@ -186,6 +187,11 @@ pub enum RecordType {
     /// segment maintenance. No explicit tombstone is written for supersede;
     /// the last-writer-wins accounting *is* the tombstone. Binary payload
     /// [`SnapshotPayload`]; the header CRC covers it like any metadata record.
+    ///
+    /// **An empty payload is a retraction** ([`RecordHeader::retracts_snapshot`]):
+    /// the stream has no live snapshot from here on. Written when a seal's
+    /// snapshot append fails, so the previous turn's snapshot — one turn
+    /// behind the K/V that is about to land — cannot read as the tail.
     Snapshot = 20,
     /// A **prompt branch's** recurrent checkpoint — the state after a whole
     /// system prompt for one selector assignment, keyed by the branch's content
@@ -358,6 +364,14 @@ pub struct RecordHeader {
     pub token_count: u64,
 }
 
+impl RecordHeader {
+    /// A `Snapshot` record with no payload: the stream's snapshot is retracted
+    /// and nothing for it is live. See [`RecordType::Snapshot`].
+    pub fn retracts_snapshot(&self) -> bool {
+        self.record_type == RecordType::Snapshot && self.payload_len == 0
+    }
+}
+
 /// A fully decoded record — header and owned payload bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -374,16 +388,20 @@ pub fn padded_record_len(header_line_len: usize, payload_len: u64) -> usize {
     raw.div_ceil(ALIGN) * ALIGN
 }
 
-/// Encode a record into its padded on-disk byte image.
+/// A record's framing around a payload given as `parts`: the header line with
+/// its trailing newline, and the count of zero bytes that pad the record to its
+/// [`ALIGN`]ed span. The on-disk record is `head`, then the parts in order,
+/// then the padding — [`encode_record`] lays exactly that into one buffer, and
+/// a large record is written from the parts directly.
 ///
-/// Panics if `header.payload_len` disagrees with `payload.len()`, if
-/// the resulting JSON header would exceed [`MAX_HEADER_LINE`] bytes,
-/// or if `header.record_type` is [`RecordType::Unknown`].
-pub fn encode_record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
+/// Panics if `header.payload_len` disagrees with the parts' total length, if
+/// the resulting JSON header would exceed [`MAX_HEADER_LINE`] bytes, or if
+/// `header.record_type` is [`RecordType::Unknown`].
+pub fn record_head(header: &RecordHeader, parts: &[&[u8]]) -> (Vec<u8>, usize) {
+    let payload_len: usize = parts.iter().map(|p| p.len()).sum();
     assert_eq!(
-        header.payload_len as usize,
-        payload.len(),
-        "RecordHeader.payload_len must match the payload slice"
+        header.payload_len as usize, payload_len,
+        "RecordHeader.payload_len must match the payload"
     );
     assert!(
         header.record_type != RecordType::Unknown,
@@ -396,31 +414,42 @@ pub fn encode_record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
     // bytes, taken before the device→host copy) in `crc`; the caller has already
     // set it. Recomputing host-side here would checksum the post-copy bytes and
     // reintroduce the very blind spot the golden exists to close, so leave it be.
-    // Every other record type is host-authored — crc32 over the payload.
+    // Every other record type is host-authored — crc32 over the payload, chained
+    // across its parts.
     if header.record_type != RecordType::Chunk {
-        effective.crc = crc32(payload);
+        let crc = parts
+            .iter()
+            .fold(crc32_init(), |crc, part| crc32_update(crc, part));
+        effective.crc = crc32_finish(crc);
     }
 
-    let header_line = serde_json::to_string(&effective)
-        .expect("RecordHeader serialization is infallible for the supported field set");
+    let mut head = serde_json::to_string(&effective)
+        .expect("RecordHeader serialization is infallible for the supported field set")
+        .into_bytes();
     assert!(
-        header_line.len() <= MAX_HEADER_LINE,
+        head.len() <= MAX_HEADER_LINE,
         "JSON record header is {} bytes, exceeds the {}-byte cap",
-        header_line.len(),
+        head.len(),
         MAX_HEADER_LINE,
     );
+    let total = padded_record_len(head.len(), effective.payload_len);
+    head.push(b'\n');
+    let pad = total - head.len() - payload_len;
+    (head, pad)
+}
 
-    let total = padded_record_len(header_line.len(), effective.payload_len);
-    // Built by appending, not by zero-filling and overwriting. `vec![0u8; total]`
-    // memsets the header and payload span too, and both are then written in full
-    // — so a record cost a memset over its whole length plus the copy. Only the
-    // sector padding tail is genuinely zero-valued, and `resize` writes just that.
+/// Encode a record into its padded on-disk byte image.
+///
+/// Panics as [`record_head`] does.
+pub fn encode_record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
+    let (head, pad) = record_head(header, &[payload]);
+    // Built by appending, not by zero-filling and overwriting: only the sector
+    // padding tail is genuinely zero-valued, and `resize` writes just that.
+    let total = head.len() + payload.len() + pad;
     let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(header_line.as_bytes());
-    out.push(b'\n');
+    out.extend_from_slice(&head);
     out.extend_from_slice(payload);
     out.resize(total, 0);
-    debug_assert_eq!(out.len(), total, "encoded record must fill its padded span");
     out
 }
 
@@ -705,39 +734,21 @@ impl ChunkPayload {
 // CRC-32 (IEEE 802.3, reflected, polynomial 0xEDB88320).
 // ---------------------------------------------------------------------------
 
-const fn crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-}
-
-static CRC32_TABLE: [u32; 256] = crc32_table();
-
 /// Initial CRC-32 accumulator.
 pub fn crc32_init() -> u32 {
     0xFFFF_FFFF
 }
 
 /// Fold `data` into a running CRC-32 accumulator.
-pub fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
-    for &b in data {
-        crc = CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc
+///
+/// The accumulator is the raw register (`!` of a finished CRC), which is what
+/// [`crc32_init`] starts and [`crc32_finish`] inverts. `crc32fast` resumes from a
+/// *finished* value, so the register is inverted on the way in and out — the
+/// values are exactly the IEEE CRC-32 the log has always carried.
+pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new_with_initial(!crc);
+    hasher.update(data);
+    !hasher.finalize()
 }
 
 /// Finalize a CRC-32 accumulator.
@@ -1599,18 +1610,42 @@ pub struct SnapshotPayload {
 const SNAPSHOT_PAYLOAD_VERSION: u32 = 2;
 
 impl SnapshotPayload {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = ByteWriter::new();
-        w.put_u32(SNAPSHOT_PAYLOAD_VERSION);
-        w.put_u64(self.timeline_id);
-        w.put_u32(self.turn_index);
-        w.put_u64(self.schedule_hash);
-        w.put_u32(self.layers.len() as u32);
+    /// The exact length [`Self::encode`] produces, counted from the fields
+    /// without encoding anything — what the writer's byte cap charges a queued
+    /// snapshot, and what the seal's snapshot-size counter adds.
+    pub fn encoded_len(&self) -> usize {
+        // version, timeline_id, turn_index, schedule_hash, layer count …
+        let header = 4 + 8 + 4 + 8 + 4;
+        // … each layer: index, dtype tag, three dims, state blob, two conv dims,
+        // conv-tail blob …
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| 4 + 1 + 4 + 4 + 4 + (4 + l.state.len()) + 4 + 4 + (4 + l.conv_tail.len()))
+            .sum();
+        // … and the aux blob.
+        header + layers + 4 + self.aux.len()
+    }
+
+    /// The payload as the slices it is written from: the state blobs are
+    /// borrowed, so a seal writes them to the file without first copying them
+    /// into one buffer. See [`PayloadParts`].
+    pub fn parts(&self) -> PayloadParts<'_> {
+        let mut p = PayloadParts::default();
+        p.u32(SNAPSHOT_PAYLOAD_VERSION);
+        p.u64(self.timeline_id);
+        p.u32(self.turn_index);
+        p.u64(self.schedule_hash);
+        p.u32(self.layers.len() as u32);
         for l in &self.layers {
-            encode_snapshot_layer(&mut w, l);
+            snapshot_layer_parts(&mut p, l);
         }
-        w.put_blob(&self.aux);
-        w.into_bytes()
+        p.blob(&self.aux);
+        p
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.parts().concat()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
@@ -1700,21 +1735,25 @@ const BRANCH_CHECKPOINT_MAGIC: &[u8; 4] = b"BRCK";
 const BRANCH_CHECKPOINT_VERSION: u32 = 2;
 
 impl BranchCheckpointPayload {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = ByteWriter::new();
-        for &b in BRANCH_CHECKPOINT_MAGIC {
-            w.put_u8(b);
-        }
-        w.put_u32(BRANCH_CHECKPOINT_VERSION);
-        w.put_u64(self.prefix_hash.lo);
-        w.put_u64(self.prefix_hash.hi);
-        w.put_u64(self.schedule_hash);
-        w.put_u32(self.layers.len() as u32);
+    /// The payload as the slices it is written from — see
+    /// [`SnapshotPayload::parts`].
+    pub fn parts(&self) -> PayloadParts<'_> {
+        let mut p = PayloadParts::default();
+        p.raw(BRANCH_CHECKPOINT_MAGIC);
+        p.u32(BRANCH_CHECKPOINT_VERSION);
+        p.u64(self.prefix_hash.lo);
+        p.u64(self.prefix_hash.hi);
+        p.u64(self.schedule_hash);
+        p.u32(self.layers.len() as u32);
         for l in &self.layers {
-            encode_snapshot_layer(&mut w, l);
+            snapshot_layer_parts(&mut p, l);
         }
-        w.put_blob(&self.aux);
-        w.into_bytes()
+        p.blob(&self.aux);
+        p
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.parts().concat()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
@@ -1756,16 +1795,16 @@ impl BranchCheckpointPayload {
 }
 
 /// One layer's state, in the shared on-wire form both recurrent payloads use.
-fn encode_snapshot_layer(w: &mut ByteWriter, l: &SnapshotLayer) {
-    w.put_u32(l.layer_index);
-    w.put_u8(0); // dtype tag: 0 = F32 (the only state dtype)
-    w.put_u32(l.n_v_heads);
-    w.put_u32(l.d_v);
-    w.put_u32(l.d_k);
-    w.put_blob(&l.state);
-    w.put_u32(l.conv_channels);
-    w.put_u32(l.conv_tail_cols);
-    w.put_blob(&l.conv_tail);
+fn snapshot_layer_parts<'a>(p: &mut PayloadParts<'a>, l: &'a SnapshotLayer) {
+    p.u32(l.layer_index);
+    p.u8(0); // dtype tag: 0 = F32 (the only state dtype)
+    p.u32(l.n_v_heads);
+    p.u32(l.d_v);
+    p.u32(l.d_k);
+    p.blob(&l.state);
+    p.u32(l.conv_channels);
+    p.u32(l.conv_tail_cols);
+    p.blob(&l.conv_tail);
 }
 
 fn decode_snapshot_layer(r: &mut ByteReader<'_>) -> Result<SnapshotLayer> {
@@ -1807,6 +1846,29 @@ fn decode_snapshot_layer(r: &mut ByteReader<'_>) -> Result<SnapshotLayer> {
         conv_tail_cols,
         conv_tail,
     })
+}
+
+#[cfg(test)]
+mod crc32_tests {
+    use super::{crc32, crc32_finish, crc32_init, crc32_update};
+
+    /// The standard CRC-32 check value — the same function the log has always
+    /// carried, so every existing record still verifies.
+    #[test]
+    fn crc32_is_the_ieee_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    /// A running accumulator fed in pieces lands where one pass does — the form
+    /// the chunked writers use.
+    #[test]
+    fn a_split_update_equals_one_pass() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let (a, b) = data.split_at(3_777);
+        let split = crc32_finish(crc32_update(crc32_update(crc32_init(), a), b));
+        assert_eq!(split, crc32(&data));
+    }
 }
 
 #[cfg(test)]
@@ -1856,6 +1918,53 @@ mod snapshot_payload_tests {
         expect.extend_from_slice(&5u32.to_le_bytes()); // aux blob len
         expect.extend_from_slice(&[9u8; 5]);
         assert_eq!(bytes, expect);
+    }
+
+    /// The parts a seal writes from borrow the state and conv-tail blobs — the
+    /// whole point of writing from parts — and frame to the same record image
+    /// `encode_record` builds from the joined payload, CRC included.
+    #[test]
+    fn the_parts_borrow_the_state_and_frame_to_the_encoded_record() {
+        let p = tiny();
+        let parts = p.parts();
+        let slices = parts.slices();
+        assert!(slices
+            .iter()
+            .any(|s| std::ptr::eq(s.as_ptr(), p.layers[0].state.as_ptr())));
+        assert!(slices
+            .iter()
+            .any(|s| std::ptr::eq(s.as_ptr(), p.layers[0].conv_tail.as_ptr())));
+
+        let header = RecordHeader {
+            record_type: RecordType::Snapshot,
+            format: 0,
+            payload_len: p.encoded_len() as u64,
+            crc: 0,
+            stream_id: 4,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let (head, pad) = record_head(&header, &slices);
+        let mut framed = head;
+        for s in &slices {
+            framed.extend_from_slice(s);
+        }
+        framed.resize(framed.len() + pad, 0);
+        assert_eq!(framed, encode_record(&header, &p.encode()));
+    }
+
+    /// The pre-sized length is exactly what `encode` writes — 98 bytes for
+    /// `tiny`: a 28-byte header, a 61-byte layer and a 9-byte aux blob, counted
+    /// field by field in `encode_is_byte_stable` above.
+    #[test]
+    fn encoded_len_is_exactly_what_encode_writes() {
+        let p = tiny();
+        assert_eq!(p.encoded_len(), 98);
+        assert_eq!(p.encode().len(), p.encoded_len());
+        let mut empty = tiny();
+        empty.layers.clear();
+        empty.aux.clear();
+        assert_eq!(empty.encode().len(), empty.encoded_len());
     }
 
     #[test]

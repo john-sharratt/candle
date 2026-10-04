@@ -363,6 +363,37 @@ impl LogFile {
         offset
     }
 
+    /// Write one record straight to the file from its parts — `head`, the
+    /// payload slices in order, then `pad` zero bytes — and return the offset it
+    /// occupies. Anything staged is flushed first, so records land in append
+    /// order. Like [`Self::flush`], this writes without syncing: the record is
+    /// durable at the next [`Self::commit`].
+    ///
+    /// For a record large enough that copying it into the group-commit buffer
+    /// would cost more than the buffer saves: a ~65 MB recurrent snapshot goes
+    /// from the caller's slices to the file with no intermediate copy.
+    pub fn append_parts(&mut self, head: &[u8], payload: &[&[u8]], pad: usize) -> Result<u64> {
+        assert!(!self.read_only, "append_parts on a read-only LogFile");
+        let total = head.len() + payload.iter().map(|p| p.len()).sum::<usize>() + pad;
+        assert!(
+            total.is_multiple_of(ALIGN),
+            "record bytes must be 4 KB-aligned"
+        );
+        assert!(pad < ALIGN, "padding only fills the record's last sector");
+        self.flush()?;
+        let offset = self.write_offset;
+        self.grow_to(offset + total as u64)?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(head)?;
+        for part in payload {
+            self.file.write_all(part)?;
+        }
+        self.file.write_all(&[0u8; ALIGN][..pad])?;
+        self.write_offset = offset + total as u64;
+        self.unsynced = true;
+        Ok(offset)
+    }
+
     /// Bytes currently staged but not yet flushed.
     pub fn pending_len(&self) -> usize {
         self.pending.len()
@@ -579,7 +610,7 @@ pub fn read_record_at(src: &mut dyn LogSource, offset: u64, record_size: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::record::{encode_record, RecordHeader, RecordType};
+    use crate::persistence::record::{encode_record, record_head, RecordHeader, RecordType};
 
     fn tmp_path(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -679,6 +710,50 @@ mod tests {
         assert!(log.needs_commit(), "flushed, not synced");
         log.commit().unwrap();
         assert!(!log.needs_commit());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **A record written from its parts lands after what was staged, byte for
+    /// byte the record `encode_record` would have built.** The staged record is
+    /// flushed first so the file keeps append order, and the parts record is
+    /// owed a commit like any write-through.
+    #[test]
+    fn a_record_appended_from_parts_follows_the_staged_ones_byte_for_byte() {
+        let path = tmp_path("append_parts");
+        let staged = rec(1, 0, b"first");
+        let header = RecordHeader {
+            record_type: RecordType::Tokens,
+            format: 0,
+            payload_len: 11,
+            crc: 0,
+            stream_id: 2,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let parts: [&[u8]; 3] = [b"abc", b"", b"defghijk"];
+        let joined = encode_record(&header, b"abcdefghijk");
+        {
+            let mut log = LogFile::create(&path).unwrap();
+            log.stage(&staged);
+            let (head, pad) = record_head(&header, &parts);
+            let at = log.append_parts(&head, &parts, pad).unwrap();
+            assert_eq!(at, SUPERBLOCK_SIZE + staged.len() as u64);
+            assert_eq!(log.pending_len(), 0, "the staged record went first");
+            assert_eq!(
+                log.write_offset(),
+                SUPERBLOCK_SIZE + (staged.len() + joined.len()) as u64
+            );
+            assert!(log.needs_commit());
+            log.commit().unwrap();
+        }
+        let mut log = LogFile::open(&path).unwrap();
+        assert_eq!(log.read_at(SUPERBLOCK_SIZE, staged.len()).unwrap(), staged);
+        assert_eq!(
+            log.read_at(SUPERBLOCK_SIZE + staged.len() as u64, joined.len())
+                .unwrap(),
+            joined
+        );
+        drop(log);
         std::fs::remove_file(&path).ok();
     }
 

@@ -109,7 +109,10 @@ macro_rules! cuda_breadcrumb {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
-use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, PushKernelArg, ValidAsZeroBits};
+use cudarc::driver::result::memcpy_dtoh_async;
+use cudarc::driver::{
+    CudaSlice, CudaStream, DevicePtr, DeviceRepr, PushKernelArg, ValidAsZeroBits,
+};
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::any::Any;
@@ -288,7 +291,7 @@ impl CudaStorageSlice {
     /// The read-only twin of [`Self::device_ptr_mut`], and it carries the same
     /// caveat: no guard is returned, so the caller keeps the storage alive for
     /// as long as the address is used.
-    pub fn device_ptr(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> u64 {
+    pub fn device_ptr(&self, stream: &Arc<CudaStream>) -> u64 {
         use cudarc::driver::DevicePtr;
         macro_rules! addr {
             ($s:expr) => {{
@@ -313,10 +316,7 @@ impl CudaStorageSlice {
     /// Returns the raw pointer that can be passed to FFI functions.
     ///
     /// NOTE: This does NOT return a guard - the caller must ensure proper synchronization.
-    pub fn device_ptr_mut(
-        &mut self,
-        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-    ) -> Result<*mut std::ffi::c_void> {
+    pub fn device_ptr_mut(&mut self, stream: &Arc<CudaStream>) -> Result<*mut std::ffi::c_void> {
         use cudarc::driver::DevicePtrMut;
         match self {
             CudaStorageSlice::U8(s) => {
@@ -1290,7 +1290,7 @@ impl Map2InPlace for IndexAdd<'_> {
             let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
 
             // Get ids pointer and call FFI inside match arms to keep temporaries alive
-            match &ids.slice {
+            let status = match &ids.slice {
                 CudaStorageSlice::U32(slice) => {
                     let s = slice.slice(ids_o1..);
                     let (ids_ptr, _guard) = s.device_ptr(&stream);
@@ -1306,7 +1306,7 @@ impl Map2InPlace for IndexAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 CudaStorageSlice::U8(slice) => {
@@ -1324,7 +1324,7 @@ impl Map2InPlace for IndexAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 CudaStorageSlice::I64(slice) => {
@@ -1342,14 +1342,27 @@ impl Map2InPlace for IndexAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 _ => unreachable!(), // Already checked above
             };
+            expect_dispatched(status, "index-add", ids.dtype(), T::DTYPE)?;
         }
         Ok(())
     }
+}
+
+/// Turn a scatter-family dispatcher's status into an error when it found no
+/// kernel for the pair — it launched nothing, so the destination is unwritten.
+fn expect_dispatched(status: i32, op: &'static str, ids: DType, data: DType) -> Result<()> {
+    if status == kernels::simple::indexing::DISPATCHED {
+        return Ok(());
+    }
+    Err(crate::Error::Msg(format!(
+        "{op}: no CUDA kernel for {ids:?} indices over {data:?} data (dispatcher status {status})"
+    ))
+    .bt())
 }
 
 struct Scatter<'a>(&'a CudaStorage, &'a Layout, usize);
@@ -1404,7 +1417,7 @@ impl Map2InPlace for Scatter<'_> {
             let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
 
             // Get ids pointer and call FFI inside match arms to keep temporaries alive
-            match &ids.slice {
+            let status = match &ids.slice {
                 CudaStorageSlice::U32(slice) => {
                     let s = slice.slice(ids_o1..);
                     let (ids_ptr, _guard) = s.device_ptr(&stream);
@@ -1419,7 +1432,7 @@ impl Map2InPlace for Scatter<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 CudaStorageSlice::U8(slice) => {
@@ -1436,7 +1449,7 @@ impl Map2InPlace for Scatter<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 CudaStorageSlice::I64(slice) => {
@@ -1453,11 +1466,12 @@ impl Map2InPlace for Scatter<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 _ => unreachable!(), // Already checked above
             };
+            expect_dispatched(status, "scatter", ids.dtype(), T::DTYPE)?;
         }
         Ok(())
     }
@@ -1515,7 +1529,7 @@ impl Map2InPlace for ScatterAdd<'_> {
             let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
 
             // Get ids pointer and call FFI inside match arms to keep temporaries alive
-            match &ids.slice {
+            let status = match &ids.slice {
                 CudaStorageSlice::U32(slice) => {
                     let s = slice.slice(ids_o1..);
                     let (ids_ptr, _guard) = s.device_ptr(&stream);
@@ -1530,7 +1544,7 @@ impl Map2InPlace for ScatterAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 CudaStorageSlice::U8(slice) => {
@@ -1547,7 +1561,7 @@ impl Map2InPlace for ScatterAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 CudaStorageSlice::I64(slice) => {
@@ -1564,11 +1578,12 @@ impl Map2InPlace for ScatterAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
-                        );
+                        )
                     }
                 }
                 _ => unreachable!(), // Already checked above
             };
+            expect_dispatched(status, "scatter-add", ids.dtype(), T::DTYPE)?;
         }
         Ok(())
     }
@@ -2773,7 +2788,7 @@ impl CudaStorage {
     pub fn copy_u32_to_host_on_stream(
         &self,
         dst: &mut [u32],
-        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        stream: &Arc<CudaStream>,
         offset: usize,
         elem_count: usize,
     ) -> Result<()> {
@@ -2803,6 +2818,54 @@ impl CudaStorage {
             }
             _ => crate::bail!(
                 "copy_u32_to_host_on_stream: expected U32 storage, got {:?}",
+                self.dtype(),
+            ),
+        }
+    }
+
+    /// Enqueue a copy of `elem_count` F32 elements starting at `offset` into
+    /// `dst` as their bytes, on `stream`, without waiting for it.
+    ///
+    /// The bytes are the device's — little-endian IEEE-754, which is every host
+    /// CUDA runs on — so `dst` receives exactly what a `to_le_bytes` walk of the
+    /// values would produce. Into pinned `dst` the copy is asynchronous and the
+    /// caller synchronises `stream` once for however many it enqueued: that is
+    /// the point, against one synchronising readback per tensor.
+    pub fn copy_f32_bytes_to_host_on_stream(
+        &self,
+        dst: &mut [u8],
+        stream: &Arc<CudaStream>,
+        offset: usize,
+        elem_count: usize,
+    ) -> Result<()> {
+        match &self.slice {
+            CudaStorageSlice::F32(slice) => {
+                if offset + elem_count > slice.len() {
+                    crate::bail!(
+                        "copy_f32_bytes_to_host_on_stream: range {}..{} exceeds slice len {}",
+                        offset,
+                        offset + elem_count,
+                        slice.len(),
+                    );
+                }
+                let bytes = elem_count * std::mem::size_of::<f32>();
+                if dst.len() < bytes {
+                    crate::bail!(
+                        "copy_f32_bytes_to_host_on_stream: dst too small ({} < {})",
+                        dst.len(),
+                        bytes,
+                    );
+                }
+                let view = slice.slice(offset..offset + elem_count);
+                let (src, _guard) = view.device_ptr(stream);
+                // SAFETY: `src` is a live device range of exactly `bytes` bytes,
+                // held by `_guard` until the copy is enqueued, and `dst[..bytes]` is
+                // a host range the caller keeps alive until it synchronises `stream`.
+                unsafe { memcpy_dtoh_async(&mut dst[..bytes], src, stream.cu_stream()) }.w()?;
+                Ok(())
+            }
+            _ => crate::bail!(
+                "copy_f32_bytes_to_host_on_stream: expected F32 storage, got {:?}",
                 self.dtype(),
             ),
         }

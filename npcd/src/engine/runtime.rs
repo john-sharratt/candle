@@ -3619,7 +3619,7 @@ async fn ingest_layer(
                         //
                         // Counted at the seal, so it only ever includes work
                         // that reached the substrate.
-                        p.add_prefill_tokens(r.stats.prefill_token_count as u64);
+                        p.add_prefill_tokens(r.stats.turn_prefill_tokens as u64);
                         persist_signatures(&mut conv, &r, &mut events, addr);
                         // **The seal is what earns the ledger entry.** Recorded here, at the
                         // one point the document is provably a turn in the substrate, so a

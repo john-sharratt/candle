@@ -2,11 +2,8 @@
 //!
 //! The decode hot path allows exactly one readback per token — the sampler.
 //! Every other D2H transfer in the wave forward is counted here so tests can
-//! assert the budget: the only remaining intrinsic set is one routing
-//! readback per MoE layer per WAVE (the streaming `ExpertCache` schedules
-//! pinned→VRAM uploads by expert id, which requires host-visible indices —
-//! amortized across every sequence in the wave, and zero under full expert
-//! residency where the gpu-native dispatch engages).
+//! assert the budget, which is zero: the MoE routing reaches the streaming
+//! `ExpertCache` as an async per-expert summary copy, not a blocking read.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

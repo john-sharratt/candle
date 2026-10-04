@@ -3,6 +3,7 @@ use super::named_tool::steer_to_named_tool;
 use super::spec_chooser::SpecChooser;
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
+use crate::stats::streams_committed;
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use candle_transformers::models::speculative_choice::{AcceptWalk, TokenChooser};
 
@@ -74,12 +75,13 @@ impl Scheduler {
             hits,
             misses,
             hit_rate_pct = format!("{:.1}", pct(hits, activations)).as_str(),
-            dma_loads = after.dma_loads.saturating_sub(before.dma_loads),
-            prefetch_loads = after.prefetch_loads.saturating_sub(before.prefetch_loads),
-            hint_loads = after.hint_loads.saturating_sub(before.hint_loads),
+            promotions = after.promotions.saturating_sub(before.promotions),
+            prefetch_promotions =
+                after.prefetch_promotions.saturating_sub(before.prefetch_promotions),
             pred_precision_pct =
                 format!("{:.1}", pct(predicted_hits, predicted_total)).as_str(),
-            fence_stalls = after.fence_stalls.saturating_sub(before.fence_stalls),
+            cold_misses = after.worker_cold.saturating_sub(before.worker_cold),
+            promotion_mb = after.promotion_bytes.saturating_sub(before.promotion_bytes) >> 20,
             resident_mb = after.resident_vram_bytes >> 20,
             "gap-fill wave: expert telemetry",
         );
@@ -323,6 +325,7 @@ impl Scheduler {
                             Self::log_stencil_finish(id.0, d, "completed");
                         }
                         s.stencil = None;
+                        s.wrote_tool_call = true;
                         s.finished = true;
                     }
                     break;
@@ -667,18 +670,19 @@ impl Scheduler {
         // Reads the scored rows back and advances each sequence by what the wave
         // actually wrote — the walk below rolls the rejected tail off again.
         let _accept_span = profile::span("decode:end_verify_and_sample");
-        let (plain_rows, spec_rows) =
-            match self
-                .model
+        let verified = {
+            let _g = profile::span("decode:end_verify");
+            self.model
                 .end_verify(&mut self.session, &plain, &spec_seqs, &spec_blocks, logits)
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    self.model.abort_verify(&spec_seqs);
-                    self.fail_all_decodes(&seq_ids, &format!("verify readback failed: {e}"));
-                    return;
-                }
-            };
+        };
+        let (plain_rows, spec_rows) = match verified {
+            Ok(r) => r,
+            Err(e) => {
+                self.model.abort_verify(&spec_seqs);
+                self.fail_all_decodes(&seq_ids, &format!("verify readback failed: {e}"));
+                return;
+            }
+        };
         // Scored rows per sequence in cohort order: one for a plain row, one per
         // block position for a verify member.
         let mut rows_of: Vec<Vec<Tensor>> = vec![Vec::new(); blocks.len()];
@@ -789,14 +793,22 @@ impl Scheduler {
         //
         // One sampler dispatch per block position over the sequences still
         // alive. Sampling each row — rather than taking its argmax — is what
-        // makes speculation draw from the distribution plain decoding would:
-        // every drafter here proposes greedily, so the textbook accept/reject
-        // rule collapses to "sample the row, accept the proposal iff the sample
-        // agrees" (see `candle_transformers::models::speculative_choice`).
+        // draws each row from the distribution plain decoding would: every
+        // drafter here proposes greedily, so the textbook accept/reject rule
+        // collapses to "sample the row, accept the proposal iff the sample
+        // agrees" (see `candle_transformers::models::speculative_choice`). On
+        // top of that rule the chooser commits a draft the sample missed when
+        // the model's typical-acceptance thresholds pass it, inside the same
+        // dispatch — the one place a sampled step departs from plain decoding.
         let t_sample = std::time::Instant::now();
         let (state_ids, states): (Vec<SequenceId>, Vec<SequenceSamplingState>) =
             removed_states.into_iter().unzip();
-        let mut chooser = SpecChooser::new(&self.sampler, states, configs);
+        let mut chooser = SpecChooser::new(
+            &self.sampler,
+            states,
+            configs,
+            self.model.typical_acceptance(),
+        );
         let mut emitted: Vec<Vec<u32>> = vec![Vec::new(); blocks.len()];
         // How many more tokens each sequence may generate. The sinks apply only
         // this and EOS — the cheap half of the stop policy, which bounds how much
@@ -811,6 +823,7 @@ impl Scheduler {
             })
             .collect();
         let walked = {
+            let _g = profile::span("decode:accept_walk");
             let eos = &self.eos_tokens;
             let breaks = &self.page_break_tokens;
             let tokenizer = &self.tokenizer;
@@ -826,7 +839,10 @@ impl Scheduler {
                     .iter()
                     .map(|&i| rows_of[i][walk.position()].clone())
                     .collect();
-                let stacked = match Tensor::cat(&picked, 0) {
+                let cat_span = profile::span("walk:cat");
+                let stacked = Tensor::cat(&picked, 0);
+                cat_span.end();
+                let stacked = match stacked {
                     Ok(t) => t,
                     Err(e) => {
                         failure = Some(e);
@@ -1758,6 +1774,14 @@ impl Scheduler {
                     }
                 }
 
+                // Emit the raw token ID — the turn's last one included, unless it
+                // is the EOS that ends it. If the caller dropped the handle, stop
+                // generating.
+                if streams_committed(is_eos)
+                    && state.event_tx.send(TurnEvent::Token(next_token)).is_err()
+                {
+                    state.finished = true;
+                }
                 if let Some(finish) = FinishReason::after_token(
                     is_eos,
                     state.generated_tokens.len(),
@@ -1765,12 +1789,6 @@ impl Scheduler {
                 ) {
                     state.finish = finish;
                     state.finished = true;
-                } else {
-                    // Emit the raw token ID. If the caller dropped the handle,
-                    // stop generating.
-                    if state.event_tx.send(TurnEvent::Token(next_token)).is_err() {
-                        state.finished = true;
-                    }
                 }
 
                 // ── Continuous re-projection triggers ─────────────────────────
@@ -1810,6 +1828,7 @@ impl Scheduler {
                             Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
                             state.non_punct_since_reproject = 0;
                             state.in_tool_call = true;
+                            state.wrote_tool_call = true;
                         } else if is_tool_close {
                             // Leaving the call: reprojection re-enables for whatever
                             // follows (further calls, or the seal).

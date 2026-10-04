@@ -2,10 +2,10 @@
 //!
 //! Each file becomes ONE hidden conversation, run exactly the way a live
 //! dialogue turn runs: forked from the same system-prompt prelude, tools ON
-//! (forced to `file_read` alone), thinking at `ThinkMode::Quick` — the lowest
-//! level, not fully off. Off was tried first and measured breaking the
-//! pattern: with no room to reason at all, the model sometimes skipped
-//! `file_read` entirely and guessed a summary from the filename. The opening
+//! (forced to `file_read` alone), thinking OFF — the steering closes any
+//! `<think>` block on the token after it opens and the prompt carries the
+//! no-think switch, as repo_map's folder summaries do. With no room to
+//! reason, a model can answer from the filename without reading; the opening
 //! instruction requires the model to read the whole file — one or more REAL
 //! `file_read` calls, ranged if it's long — before answering; whatever it
 //! says once it stops calling tools IS the file's summary. There is no
@@ -206,12 +206,9 @@ pub const PASS_NAME: &str = "code_read";
 /// never wanders into an unrelated tool.
 const FILE_READ_TOOL: &str = "file_read";
 
-/// Decode budget per turn in a file's hidden conversation. `ThinkMode::Quick`
-/// alone budgets a graceful close at 1024 thinking tokens (`stencil::think`) —
-/// a backstop well above what this turn's actual thinking typically costs, but
-/// the cap still has to clear it plus room for the `<tool_call>` or answer
-/// that follows, or a turn that legitimately uses the think budget would be
-/// cut off before ever reaching its content.
+/// Decode budget per turn in a file's hidden conversation: room for the
+/// `<tool_call>` or the file's description. Thinking is off, so none of it goes
+/// to a reasoning block.
 const FILE_TURN_MAX_TOKENS: usize = 1536;
 
 /// Real `file_read` rounds a single file's conversation may run before being
@@ -960,6 +957,23 @@ fn process_one_file(
     Ok(())
 }
 
+/// The projection selection every turn of a file's conversation runs under:
+/// tools on, forced to `file_read`, and thinking OFF.
+///
+/// Thinking is off in both halves, as `api::chat::dial_selection` sets a
+/// thinking-off turn: the prompt carries the no-think switch and the effort
+/// dial reads `off`, matching the `ThinkMode::Off` steering the turn's triggers
+/// carry (`RefreshContext::think_triggers`). Set explicitly rather than left to
+/// the schema's defaults, which are a dialogue turn's.
+fn file_selection() -> SelectionState {
+    let mut selection = SelectionState::new();
+    selection.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Present);
+    selection.select(FORCE_TOOL_SELECTOR, FILE_READ_TOOL);
+    selection.set_optional(NO_THINK_SELECTOR, OptionalState::Present);
+    selection.select("thinking_effort", "off");
+    selection
+}
+
 /// Drive `conv` as a REAL, hidden tool-using conversation asking it to read and
 /// describe `path` — exactly the machinery a live chat turn uses
 /// (`submit_turn_with_options` → real decode → real tool dispatch → repeat, see
@@ -977,14 +991,7 @@ fn run_file_conversation(
     tool_ctx: &Arc<ToolContext>,
 ) -> anyhow::Result<String> {
     let tags = vec!["code".to_string(), path.to_string()];
-    let mut selection = SelectionState::new();
-    selection.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Present);
-    selection.select(FORCE_TOOL_SELECTOR, FILE_READ_TOOL);
-    // Thinking stays ON, at `ThinkMode::Quick` (see `triggers`'s doc on
-    // `RefreshContext::think_triggers`) — explicit `Absent` rather than
-    // leaving the selector unset, so this isn't quietly riding whatever the
-    // schema's own default happens to be.
-    selection.set_optional(NO_THINK_SELECTOR, OptionalState::Absent);
+    let selection = file_selection();
 
     let mut current_message: TurnText = TurnText::from(opening_prompt(path, lines));
     let mut closing = false;
@@ -1062,6 +1069,22 @@ fn run_file_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A file read runs with thinking off in both halves, and its one tool.**
+    /// The prompt's no-think switch and the effort dial agree with the
+    /// `ThinkMode::Off` steering, so the prompt never invites a block the
+    /// steering closes.
+    #[test]
+    fn a_file_read_runs_with_thinking_off_and_only_file_read() {
+        let s = file_selection();
+        assert_eq!(s.optional(NO_THINK_SELECTOR), Some(OptionalState::Present));
+        assert_eq!(s.get("thinking_effort"), Some("off"));
+        assert_eq!(
+            s.optional(TOOLS_ENABLED_SELECTOR),
+            Some(OptionalState::Present)
+        );
+        assert_eq!(s.get(FORCE_TOOL_SELECTOR), Some(FILE_READ_TOOL));
+    }
 
     /// A file job's key is the branch walk's key for the same file — the one
     /// the pass plans with and the fast path looks up.

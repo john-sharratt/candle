@@ -341,6 +341,11 @@ pub struct BatchedSampling {
     /// Each call increments the offset for the sequence it sampled.
     /// If empty, offsets start at 0 for all sequences.
     pub rng_offsets: Vec<u64>,
+    /// Tokens a row may produce: the tokenizer's last id + 1. A checkpoint
+    /// pads its output projection past it, and the padded tail of each row
+    /// carries no probability. Clamped to the row width, so the row width
+    /// itself means "no padded tail".
+    pub live_vocab: usize,
 }
 
 impl BatchedSampling {
@@ -350,19 +355,22 @@ impl BatchedSampling {
     /// - `top_k`: 0 = disabled, >0 = only consider top-k tokens
     /// - `top_p`: 1.0 = disabled, <1.0 = nucleus sampling
     /// - `seed`: RNG seed for reproducible sampling
-    pub fn new(temperature: f32, top_k: i32, top_p: f32, seed: u64) -> Self {
+    /// - `live_vocab`: tokens a row may produce (see the field)
+    pub fn new(temperature: f32, top_k: i32, top_p: f32, seed: u64, live_vocab: usize) -> Self {
         Self {
             temperature,
             top_k,
             top_p,
             seed,
             rng_offsets: Vec::new(),
+            live_vocab,
         }
     }
 
-    /// Greedy/argmax sampling (temperature=0, no top-k/top-p).
-    pub fn argmax() -> Self {
-        Self::new(0.0, 0, 1.0, 0)
+    /// Greedy/argmax sampling (temperature=0, no top-k/top-p) over the first
+    /// `live_vocab` tokens of each row.
+    pub fn argmax(live_vocab: usize) -> Self {
+        Self::new(0.0, 0, 1.0, 0, live_vocab)
     }
 }
 
@@ -398,10 +406,12 @@ impl CustomOp1 for BatchedSampling {
             _ => crate::bail!("BatchedSampling: unsupported dtype, expected F32/F16/BF16"),
         };
 
+        // The padded tail of a row is not a token.
+        let live = self.live_vocab.min(vocab_size);
         let mut tokens = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
             let offset = layout.start_offset() + b * vocab_size;
-            let seq_logits = &logits[offset..offset + vocab_size];
+            let seq_logits = &logits[offset..offset + live];
 
             if self.temperature <= 0.0 {
                 // Argmax
@@ -438,7 +448,7 @@ impl CustomOp1 for BatchedSampling {
                 }
                 let u: f32 = rng.random();
                 let mut cumsum = 0.0f32;
-                let mut chosen = vocab_size - 1;
+                let mut chosen = live - 1;
                 for (i, &p) in probs.iter().enumerate() {
                     cumsum += p;
                     if u < cumsum {
@@ -509,6 +519,7 @@ impl CustomOp1 for BatchedSampling {
                     logits_ptr as *const std::ffi::c_void,
                     batch_size as i32,
                     vocab_size as i32,
+                    self.live_vocab.min(vocab_size) as i32,
                     dtype_code,
                     self.temperature,
                     self.top_k,
@@ -552,6 +563,7 @@ impl CustomOp1 for BatchedSampling {
                     self.seed,
                     rng_ptr as *mut u64,
                     std::ptr::null(), // seq_dials — this path is uniform-config
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             };
 
@@ -716,8 +728,11 @@ impl<'w> LiveTensor<'w> {
     /// tensor of u32 token IDs. On CUDA, this dispatches to the fused batched sampling
     /// kernel; on CPU, it falls back to per-sequence argmax.
     ///
-    /// This is equivalent to `self.argmax(1)` but uses the fused kernel on GPU.
-    pub fn batched_sample_argmax(&self) -> Result<Self> {
+    /// This is `self.argmax(1)` over the first `live_vocab` columns — the
+    /// tokens the tokenizer can name — using the fused kernel on GPU. A
+    /// checkpoint pads its logits row past them; pass the row width for one
+    /// that does not.
+    pub fn batched_sample_argmax(&self, live_vocab: usize) -> Result<Self> {
         if self.rank() != 2 {
             crate::bail!(
                 "batched_sample_argmax requires 2D [batch, vocab] tensor, got {:?}",
@@ -726,7 +741,7 @@ impl<'w> LiveTensor<'w> {
         }
         // Ensure contiguous layout for the fused kernel
         let logits = self.contiguous()?;
-        let op = BatchedSampling::argmax();
+        let op = BatchedSampling::argmax(live_vocab);
         logits.apply_op1_no_bwd(&op)
     }
 
@@ -741,12 +756,14 @@ impl<'w> LiveTensor<'w> {
     /// * `top_k` - 0 to disable, >0 to keep only the top-k most probable tokens
     /// * `top_p` - 1.0 to disable, <1.0 for nucleus sampling
     /// * `seed` - RNG seed for reproducible sampling
+    /// * `live_vocab` - tokens a row may produce; the row width for no padded tail
     pub fn batched_sample(
         &self,
         temperature: f32,
         top_k: i32,
         top_p: f32,
         seed: u64,
+        live_vocab: usize,
     ) -> Result<Self> {
         if self.rank() != 2 {
             crate::bail!(
@@ -756,7 +773,7 @@ impl<'w> LiveTensor<'w> {
         }
         // Ensure contiguous layout for the fused kernel
         let logits = self.contiguous()?;
-        let op = BatchedSampling::new(temperature, top_k, top_p, seed);
+        let op = BatchedSampling::new(temperature, top_k, top_p, seed, live_vocab);
         logits.apply_op1_no_bwd(&op)
     }
 }

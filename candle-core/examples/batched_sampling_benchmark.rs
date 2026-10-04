@@ -194,6 +194,7 @@ mod bench {
                     logits_ptr as *const c_void,
                     batch_size,
                     vocab_size,
+                    vocab_size, // live_vocab: no padded tail
                     dtype.code,
                     mode.temperature,
                     mode.top_k,
@@ -237,6 +238,7 @@ mod bench {
                     42, // seed
                     rng_ptr as *mut u64,
                     std::ptr::null(),
+                    stream.cu_stream() as *mut c_void,
                 );
             }
             stream.synchronize().expect("sync");
@@ -257,6 +259,7 @@ mod bench {
                     logits_ptr as *const c_void,
                     batch_size,
                     vocab_size,
+                    vocab_size, // live_vocab: no padded tail
                     dtype.code,
                     mode.temperature,
                     mode.top_k,
@@ -301,6 +304,7 @@ mod bench {
                     rng_ptr as *mut u64,
                     // No per-row dials: every row samples on the scalars above.
                     std::ptr::null(),
+                    stream.cu_stream() as *mut c_void,
                 );
             }
             stream.synchronize().expect("sync");
@@ -402,6 +406,7 @@ mod bench {
                     lp as *const c_void,
                     batch_size,
                     vocab_size,
+                    vocab_size, // live_vocab: no padded tail
                     dtype.code,
                     mode.temperature,
                     mode.top_k,
@@ -445,6 +450,7 @@ mod bench {
                     42,
                     rp as *mut u64,
                     std::ptr::null(),
+                    stream.cu_stream() as *mut c_void,
                 );
             }
             stream.synchronize().expect("sync");
@@ -468,6 +474,7 @@ mod bench {
                     lp as *const c_void,
                     batch_size,
                     vocab_size,
+                    vocab_size, // live_vocab: no padded tail
                     dtype.code,
                     mode.temperature,
                     mode.top_k,
@@ -511,6 +518,7 @@ mod bench {
                     42,
                     rp as *mut u64,
                     std::ptr::null(),
+                    stream.cu_stream() as *mut c_void,
                 );
             }
             stream.synchronize().expect("sync");

@@ -1248,7 +1248,9 @@ __device__ __noinline__ void search_scales_for_fmt(
             for (int w = 0; w < FUSED_WARPS_PER_BLOCK; w++)
                 skipped_nonflat = skipped_nonflat || (warp_nonflat[w] != 0);
         }
-        #pragma unroll
+        // tid 0 alone, once per format: serial bookkeeping, so the scales are
+        // a real loop rather than one inlined copy of the merge each.
+        #pragma unroll 1
         for (int si = 0; si < kNumScales; si++) {
             const float outer = preferred_range(si, slot_amax, safe_p95, safe_p80, slot_mean, safe_p25);
             uint64_t mask[AW];

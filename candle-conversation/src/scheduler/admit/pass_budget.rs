@@ -1,6 +1,7 @@
 //! How many tokens one prefill forward may carry.
 
 use candle_nn::kv_cache::CHUNK_SIZE;
+use candle_transformers::models::batched_inference::prefill_slack_cap;
 
 /// Tokens the KV side's free ground can still back, from the bytes it has free
 /// and what one 32-token block costs.
@@ -70,9 +71,43 @@ pub(crate) fn prefill_pass_budget(
         .max(1)
 }
 
+/// Tokens one prefill **group** shares: the pass budget, or — when the model's
+/// cap is what binds and everything queued (`total`) passes it by no more than
+/// the model's own slack — all of it.
+///
+/// **The tail rule the model's slab packer already applies.** A forward's fixed
+/// cost is paid per sweep whatever its width, so a group cut at the bare cap
+/// leaves a straggler forward that pays a whole sweep for a few tokens — on the
+/// Qwen3.6-35B-A3B, eight 515-token prompts went out as ~3,688 tokens and then a
+/// 432-token remainder, where the forward gate's harness runs the same eight as
+/// one wave. The model accepts that wave because `prefill_slack_cap` is its own
+/// ceiling for a single slab (`pack_prefill_slabs`).
+///
+/// Only the model's cap is stretched. The target is the deployment's choice and
+/// the KV side is a correctness bound, so a group past either keeps the plain
+/// pass budget.
+pub(crate) fn prefill_group_budget(
+    total: usize,
+    target: usize,
+    model_cap: usize,
+    kv_cap: Option<usize>,
+    least: usize,
+) -> usize {
+    let pass = prefill_pass_budget(target, model_cap, kv_cap, least);
+    let absorbed = total > pass
+        && total <= prefill_slack_cap(model_cap.max(least))
+        && total <= target
+        && kv_cap.is_none_or(|k| total <= k);
+    if absorbed {
+        total
+    } else {
+        pass
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{kv_token_cap, prefill_pass_budget};
+    use super::{kv_token_cap, prefill_group_budget, prefill_pass_budget};
     use candle_nn::kv_cache::CHUNK_SIZE;
 
     /// **The cap is in tokens, and it is reached from bytes through whole
@@ -165,6 +200,42 @@ mod tests {
             prefill_pass_budget(0, 0, None, 0),
             1,
             "a zero budget would never make progress"
+        );
+    }
+
+    /// **A queue within the model's slack rides one group; anything past a hard
+    /// bound keeps the plain pass.** The model's cap of 3,688 stretches to 4,610.
+    #[test]
+    fn a_group_absorbs_its_tail_only_within_the_models_slack() {
+        let (cap, least) = (3688, 32);
+        assert_eq!(
+            prefill_group_budget(4120, 8192, cap, None, least),
+            4120,
+            "eight 515-token prompts: one group, not 3,688 then 432"
+        );
+        assert_eq!(
+            prefill_group_budget(3000, 8192, cap, None, least),
+            cap,
+            "a queue that fits the pass keeps the pass"
+        );
+        assert_eq!(
+            prefill_group_budget(4611, 8192, cap, None, least),
+            cap,
+            "past the slack the tail is a group of its own"
+        );
+        assert_eq!(
+            prefill_group_budget(4120, 4096, cap, None, least),
+            cap,
+            "the deployment's target is never stretched"
+        );
+        assert_eq!(
+            prefill_group_budget(4120, 8192, cap, Some(4000), least),
+            cap,
+            "nor is what the KV side can back"
+        );
+        assert_eq!(
+            prefill_group_budget(4120, 8192, cap, Some(4120), least),
+            4120
         );
     }
 }

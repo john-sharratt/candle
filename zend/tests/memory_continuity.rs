@@ -1217,10 +1217,17 @@ fn restart_invariants() {
         sealed_memory_at(session.engine(), corrupt_tl, 0);
         // Supersede the record with garbage BYTES (not a wrong hash — undecodable
         // input). The reload must survive it and only this resume comes up empty.
-        session
-            .engine()
-            .conversation()
-            .enqueue_recurrent_snapshot(corrupt_tl, vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
+        // The writer lands the garbage in place of a re-sealed copy of the
+        // conversation's own record.
+        let conv = session.engine().conversation();
+        let sealed = conv
+            .read_recurrent_snapshot(corrupt_tl)
+            .expect("read")
+            .expect("the conversation has sealed memory to corrupt");
+        candle_conversation::persistence::writer::fault::garble_next_snapshot(
+            candle_conversation::persistence::content_hash::snapshot_stream_id(corrupt_tl.raw()),
+        );
+        conv.enqueue_recurrent_snapshot(corrupt_tl, sealed);
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         scenario("D6", "setting up: a conversation to distill");

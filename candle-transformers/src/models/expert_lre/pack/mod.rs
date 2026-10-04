@@ -178,6 +178,7 @@ impl ExpertPack {
     }
 
     /// Where the three projections sit inside `layer`'s records.
+    #[cfg(test)]
     pub(crate) fn layout(&self, layer: usize) -> RecordLayout {
         self.layouts[layer]
     }
@@ -230,12 +231,12 @@ impl ExpertPack {
     ///
     /// It is checked on [`Self::read_many`] — the startup fill, where thousands
     /// of records move at once, the cores are idle waiting on the drive, and the
-    /// work parallelises. It is **not** checked on [`Self::read_into`], the
-    /// per-miss path, and that is a measured decision rather than an oversight:
-    /// a `fletcher32` over 2.9 MB costs about as much as the read it follows, on
-    /// the pipeline thread, in front of a forward that is waiting for it. With
-    /// it there the gate lost **more than half its throughput** — 723 → 299 t/s
-    /// on the narrowest config — for ~850 records per config.
+    /// work parallelises. It is **not** checked on [`Self::read_into_with_handle`],
+    /// the stager's per-miss path, and that is a measured decision rather than
+    /// an oversight: a `fletcher32` over 2.9 MB costs about as much as the read
+    /// it follows, in front of a worker that is waiting for it. On the miss path
+    /// it once cost the gate **more than half its throughput** — 723 → 299 t/s on
+    /// the narrowest config — for ~850 records per config.
     ///
     /// The residual exposure is bounded and small: an unverified cold read is
     /// one expert of 6,144 whose contribution is wrong for as long as it stays
@@ -283,26 +284,39 @@ impl ExpertPack {
             })
     }
 
+    /// [`Self::read_into`] on file handle `handle` of the pool, so concurrent
+    /// readers each keep their own kernel I/O queue — the stager's reader
+    /// threads, one handle each.
+    pub(crate) fn read_into_with_handle(
+        &self,
+        handle: usize,
+        layer: usize,
+        expert: usize,
+        dest: &mut [u8],
+    ) -> Result<()> {
+        if dest.len() != self.stride {
+            candle::bail!(
+                "expert pack read wants a {}-byte destination, got {}",
+                self.stride,
+                dest.len()
+            );
+        }
+        self.reader
+            .read_at_with_handle(handle, self.offset_of(layer, expert)?, dest)
+            .map_err(|e| {
+                candle::Error::Msg(format!(
+                    "expert pack read L{layer}E{expert} from {}: {e}",
+                    self.path.display()
+                ))
+            })
+    }
+
     /// Read many records at once, each into its own stride-long aligned buffer.
     ///
     /// The reads are spread across the file handles so the drive sees a full
     /// queue — this is the startup fill, where thousands of records move and
     /// per-read latency would otherwise dominate.
     pub(crate) fn read_many(&self, targets: Vec<PackRead<'_>>) -> Result<()> {
-        self.read_many_impl(targets, true)
-    }
-
-    /// [`Self::read_many`] without the checksum pass — the RUNTIME miss path,
-    /// which shares [`Self::read_into`]'s contract: hot-loop reads skip
-    /// verification (see [`Self::verify`] for the measurement behind that)
-    /// while the startup fill, which reads every record exactly once with idle
-    /// cores, keeps it. Routing the hot loop through the verifying form put a
-    /// full-record checksum on every cold miss and multiplied its latency.
-    pub(crate) fn read_many_unverified(&self, targets: Vec<PackRead<'_>>) -> Result<()> {
-        self.read_many_impl(targets, false)
-    }
-
-    fn read_many_impl(&self, targets: Vec<PackRead<'_>>, verify: bool) -> Result<()> {
         for t in targets.iter() {
             if t.dest.len() != self.stride {
                 candle::bail!(
@@ -336,9 +350,6 @@ impl ExpertPack {
                     self.path.display()
                 ))
             })?;
-        if !verify {
-            return Ok(());
-        }
         // Verified across the pool: this is the whole warm tier, ~14 GB, and a
         // checksum is memory-bound, so one thread would add seconds to startup
         // where the cores are otherwise idle waiting on the drive.
@@ -1113,21 +1124,16 @@ mod tests {
                 "read_into served a remembered copy"
             );
         }
-        // Batch repeat: the file's current bytes.
+        // A reader thread's handle: the file's current bytes.
         {
             let dest = scratch.as_mut_slice(stride);
             dest.fill(0xEE);
-            pack.read_many_unverified(vec![PackRead {
-                layer: 1,
-                expert: 1,
-                dest,
-            }])
-            .unwrap();
+            pack.read_into_with_handle(3, 1, 1, dest).unwrap();
             let dest = scratch.as_slice(stride);
             assert_eq!(
                 dest,
                 zeroed.as_slice(),
-                "read_many_unverified served a remembered copy"
+                "read_into_with_handle served a remembered copy"
             );
         }
         drop(pack);

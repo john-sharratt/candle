@@ -9,13 +9,18 @@
 use crate::banned_rows::banned_buffer;
 use crate::config::SamplingConfig;
 use crate::line_ends::ends_a_line;
+use crate::penalty_counts::{count_table_ptr, PenaltyTables, SparseCounts};
+use crate::sampler_args::{split_rng_and_outputs, ArgPack};
+use crate::scheduler::profile;
 use crate::stencil::ban;
 use crate::token_buffer::TokenBuffer;
 use candle::cuda_backend::CudaStorageSlice;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
 use candle_transformers::generation::{LogitsProcessor, PendingSample};
+use candle_transformers::models::speculative_choice::TypicalAcceptance;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
+use std::sync::Mutex;
 
 /// A stencil-constrained row's sample with its device work enqueued
 /// ([`BatchedSampler::issue_allow_list`]) and not yet read back: the allowed
@@ -43,8 +48,14 @@ pub const DEGENERATE_TOKEN_RUN: u32 = 8;
 /// **The C twin is `batched_sampling::SeqDials` in `batched_sampling.cuh`.** The
 /// kernel reads these bytes back as that struct, so the field order and types
 /// here must match it exactly — every field is 4 bytes (`f32`/`i32`), packed
-/// with no padding, and `#[repr(C)]` keeps the layout. The token ids and vocab
-/// size are not here (they are the same across the wave and stay scalar).
+/// with no padding, and `#[repr(C)]` keeps the layout. The EOS id, the row
+/// stride and the live vocabulary are not here (they are the same across the
+/// wave and stay scalar).
+///
+/// `typical_draft` is the proposal a
+/// speculative verify row tests (-1 on any other row), accepted on
+/// `typical_eps`/`typical_delta` when the sample did not land on it — see
+/// `candle_transformers::models::speculative_choice::TypicalAcceptance`.
 ///
 /// Before this existed the kernel took these dials as scalars from the first
 /// row's config and applied them to the whole launch, so a wave that mixed
@@ -75,19 +86,23 @@ struct SeqDials {
     segment_close_ramp_len: i32,
     segment_close_max_multiplier: f32,
     segment_temp_boost: f32,
+    typical_draft: i32,
+    typical_eps: f32,
+    typical_delta: f32,
 }
 
 // The kernel reads this struct as a flat run of 4-byte words (all fields are
 // f32/i32), one per row of the batch, and casts back to the identically-laid-out
 // CUDA `SeqDials`. If the size or field count drifts from the CUDA side the
-// kernel reads a row at the wrong stride, so pin it: 21 fields × 4 bytes.
-const _: () = assert!(std::mem::size_of::<SeqDials>() == 84);
+// kernel reads a row at the wrong stride, so pin it: 24 fields × 4 bytes.
+const _: () = assert!(std::mem::size_of::<SeqDials>() == 96);
 
 impl SeqDials {
     /// Read one row's dials from its config, resolving the same Option/gate logic
     /// the scalar path applies (DRY defaults, the dynamic-EOS gate, the
     /// segment-close-active gate) so a per-row wave behaves identically to a
-    /// uniform one row-for-row.
+    /// uniform one row-for-row. The row tests no draft until
+    /// [`Self::with_draft`] gives it one.
     fn from_config(c: &SamplingConfig) -> Self {
         let (dry_multiplier, dry_base, dry_allowed_length, dry_range) = match &c.dry {
             Some(d) => (d.multiplier, d.base, d.allowed_length, d.range),
@@ -139,8 +154,94 @@ impl SeqDials {
             segment_close_ramp_len,
             segment_close_max_multiplier,
             segment_temp_boost: c.segment_temp_boost,
+            typical_draft: -1,
+            typical_eps: 0.0,
+            typical_delta: 0.0,
         }
     }
+
+    /// This row is a speculative verify row testing `draft` on `typical`.
+    /// A `None` draft leaves the row a plain one.
+    fn with_draft(mut self, draft: Option<u32>, typical: TypicalAcceptance) -> Self {
+        if let Some(d) = draft {
+            self.typical_draft = d as i32;
+            self.typical_eps = typical.epsilon;
+            self.typical_delta = typical.delta;
+        }
+        self
+    }
+}
+
+/// The kernel's candidate cap (`batched_sampling::MAX_TOP_K`): with top-k off
+/// it still samples the best this many.
+const KERNEL_MAX_TOP_K: usize = 256;
+/// The kernel's candidate floor (`radix_select_logit_threshold`'s
+/// `DEAD_ZONE`): no candidate sits more than this far below the row's best.
+const KERNEL_DEAD_ZONE: f32 = 50.0;
+
+/// The typical-acceptance rule over one row of logits: true when `draft`'s
+/// probability exceeds `min(ε, δ·e^(−H))`. The CPU twin of the kernel's
+/// `typical_accepts`, measured over the distribution the kernel samples — the
+/// top-k candidates (at most [`KERNEL_MAX_TOP_K`], none more than
+/// [`KERNEL_DEAD_ZONE`] below the best), softmaxed at `temperature`, cut to
+/// the nucleus at `top_p`, renormalised. A draft outside it has probability
+/// zero.
+fn typical_accepts_row(
+    logits: &[f32],
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    draft: u32,
+    typical: TypicalAcceptance,
+) -> bool {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return false;
+    }
+    let mut candidates: Vec<(usize, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, l)| l >= max - KERNEL_DEAD_ZONE)
+        .collect();
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let k = if top_k > 0 {
+        (top_k as usize).min(KERNEL_MAX_TOP_K)
+    } else {
+        KERNEL_MAX_TOP_K
+    };
+    candidates.truncate(k);
+
+    let inv_t = 1.0 / temperature;
+    let weights: Vec<f32> = candidates
+        .iter()
+        .map(|&(_, l)| ((l - max) * inv_t).exp())
+        .collect();
+    let total: f32 = weights.iter().sum();
+    let mut nucleus = candidates.len();
+    if top_p < 1.0 {
+        let mut cumsum = 0.0;
+        for (i, w) in weights.iter().enumerate() {
+            cumsum += w / total;
+            if cumsum >= top_p {
+                nucleus = i + 1;
+                break;
+            }
+        }
+    }
+    let kept: f32 = weights[..nucleus].iter().sum();
+    let mut entropy = 0.0f32;
+    let mut p_draft = 0.0f32;
+    for (&(id, _), w) in candidates[..nucleus].iter().zip(&weights) {
+        let p = w / kept;
+        if p > 0.0 {
+            entropy -= p * p.ln();
+        }
+        if id == draft as usize {
+            p_draft = p;
+        }
+    }
+    p_draft > typical.epsilon.min(typical.delta * (-entropy).exp())
 }
 
 /// This struct persists across turns (owned by the Scheduler) so that
@@ -162,6 +263,14 @@ pub struct SequenceSamplingState {
     /// [`Self::cross_turn_counts`] when it leaves. Empty when the window is
     /// unbounded.
     pub cross_turn_history: Vec<Vec<(u32, i32)>>,
+
+    /// The tokens whose [`Self::token_counts`] entry is nonzero, in the order
+    /// they were first sampled this turn — the index a dispatch stamps the
+    /// device count table from, so it never walks the vocabulary.
+    counted: Vec<u32>,
+
+    /// The tokens whose [`Self::cross_turn_counts`] entry is nonzero.
+    cross_counted: Vec<u32>,
 
     /// Recent token history (for repeat/DRY penalty).
     /// Stored oldest-first; the scheduler copies the tail window to the GPU buffer.
@@ -242,6 +351,8 @@ impl SequenceSamplingState {
             token_counts: vec![0; vocab_size],
             cross_turn_counts: vec![0; vocab_size],
             cross_turn_history: Vec::new(),
+            counted: Vec::new(),
+            cross_counted: Vec::new(),
             recent_tokens: Vec::with_capacity(max_recent_len),
             current_len: 0,
             in_segment: false,
@@ -261,6 +372,9 @@ impl SequenceSamplingState {
     pub fn record_token(&mut self, token: u32, max_recent_len: usize) {
         let token_idx = token as usize;
         if token_idx < self.token_counts.len() {
+            if self.token_counts[token_idx] == 0 {
+                self.counted.push(token);
+            }
             self.token_counts[token_idx] += 1;
         }
 
@@ -317,6 +431,8 @@ impl SequenceSamplingState {
         self.token_counts.fill(0);
         self.cross_turn_counts.fill(0);
         self.cross_turn_history.clear();
+        self.counted.clear();
+        self.cross_counted.clear();
         self.recent_tokens.clear();
         self.current_len = 0;
         self.in_segment = false;
@@ -349,15 +465,17 @@ impl SequenceSamplingState {
         // A turn that sampled nothing is not recorded: this also runs at a
         // conversation's first decode, with nothing said yet, and letting that
         // take a slot would make a window of one forget the only turn it had.
-        let turn: Vec<(u32, i32)> = self
-            .token_counts
+        let mut turn: Vec<(u32, i32)> = self
+            .counted
             .iter()
-            .enumerate()
-            .filter(|&(_, &c)| c > 0)
-            .map(|(t, &c)| (t as u32, c))
+            .map(|&t| (t, self.token_counts[t as usize]))
             .collect();
+        turn.sort_unstable_by_key(|&(t, _)| t);
         for &(t, c) in &turn {
             let cross = &mut self.cross_turn_counts[t as usize];
+            if *cross == 0 {
+                self.cross_counted.push(t);
+            }
             *cross = cross.saturating_add(c);
         }
         if cross_turn_window > 0 && !turn.is_empty() {
@@ -368,9 +486,12 @@ impl SequenceSamplingState {
                     *cross = cross.saturating_sub(c).max(0);
                 }
             }
+            let cross = &self.cross_turn_counts;
+            self.cross_counted.retain(|&t| cross[t as usize] > 0);
         }
         // Reset per-turn state (frequency/presence penalties are per-turn)
         self.token_counts.fill(0);
+        self.counted.clear();
         self.current_len = 0;
         // A new turn starts a fresh DRY span; any tool-call suppression, open
         // segment, or in-flight closer script from the prior turn is cleared.
@@ -594,8 +715,12 @@ pub struct BatchedSampler {
     #[allow(dead_code)]
     device: Device,
 
-    /// Vocabulary size.
+    /// Vocabulary size — the logits row width, which a checkpoint may pad.
     vocab_size: usize,
+
+    /// Tokens a row may produce: the tokenizer's last id + 1. The padded tail
+    /// of each row past it carries no probability.
+    live_vocab: usize,
 
     /// Maximum recent token history length.
     max_recent_len: usize,
@@ -605,13 +730,17 @@ pub struct BatchedSampler {
 
     /// Optional path to write penalty state during decoding.
     penalty_log_path: Option<std::path::PathBuf>,
+
+    /// The kernel's count tables, kept on the device between dispatches.
+    penalty_tables: Mutex<PenaltyTables>,
 }
 
 impl BatchedSampler {
-    /// Create a new batched sampler.
+    /// Create a new batched sampler. `live_vocab` is clamped to `vocab_size`.
     pub fn new(
         device: Device,
         vocab_size: usize,
+        live_vocab: usize,
         max_recent_len: usize,
         eos_tokens: TokenBuffer,
         penalty_log_path: Option<std::path::PathBuf>,
@@ -619,9 +748,11 @@ impl BatchedSampler {
         Self {
             device,
             vocab_size,
+            live_vocab: live_vocab.min(vocab_size),
             max_recent_len,
             eos_tokens,
             penalty_log_path,
+            penalty_tables: Mutex::new(PenaltyTables::new(vocab_size)),
         }
     }
 
@@ -649,6 +780,38 @@ impl BatchedSampler {
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
+    ) -> candle::Result<Vec<u32>> {
+        self.sample_rows(logits, states, configs, None)
+    }
+
+    /// [`Self::sample_batch`] for speculative verify rows: `drafts[i]` is the
+    /// proposal row `i` tests (`None` on a bonus row), committed instead of the
+    /// row's sample when `typical` accepts it. A row under a stencil samples
+    /// its allow-list exactly as a plain row does and tests nothing.
+    pub fn sample_verify_rows(
+        &self,
+        logits: &Tensor,
+        states: &mut [&mut SequenceSamplingState],
+        configs: &[&SamplingConfig],
+        drafts: &[Option<u32>],
+        typical: TypicalAcceptance,
+    ) -> candle::Result<Vec<u32>> {
+        if drafts.len() != states.len() {
+            candle::bail!(
+                "sample_verify_rows: {} drafts for {} rows",
+                drafts.len(),
+                states.len()
+            );
+        }
+        self.sample_rows(logits, states, configs, Some((drafts, typical)))
+    }
+
+    fn sample_rows(
+        &self,
+        logits: &Tensor,
+        states: &mut [&mut SequenceSamplingState],
+        configs: &[&SamplingConfig],
+        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
         let batch_size = states.len();
         if batch_size == 0 {
@@ -729,8 +892,16 @@ impl BatchedSampler {
                 )?;
                 logits2d.index_select(&idx, 0)?
             };
-            let tokens =
-                self.sample_full_vocab(&kernel_logits, &mut kernel_states, &kernel_configs)?;
+            let kernel_verify = verify.map(|(drafts, typical)| {
+                let rows: Vec<Option<u32>> = kernel_idx.iter().map(|&i| drafts[i]).collect();
+                (rows, typical)
+            });
+            let tokens = self.sample_full_vocab(
+                &kernel_logits,
+                &mut kernel_states,
+                &kernel_configs,
+                kernel_verify.as_ref().map(|(r, t)| (r.as_slice(), *t)),
+            )?;
             for (k, &i) in kernel_idx.iter().enumerate() {
                 results[i] = tokens[k];
             }
@@ -789,11 +960,12 @@ impl BatchedSampler {
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
+        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
         if matches!(self.device, Device::Cuda(_)) {
-            self.sample_batch_cuda(logits, states, configs)
+            self.sample_batch_cuda(logits, states, configs, verify)
         } else {
-            self.sample_batch_cpu(logits, states, configs)
+            self.sample_batch_cpu(logits, states, configs, verify)
         }
     }
 
@@ -980,6 +1152,7 @@ impl BatchedSampler {
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
+        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
         let batch_size = states.len();
         let mut results = Vec::with_capacity(batch_size);
@@ -1022,12 +1195,19 @@ impl BatchedSampler {
             } else {
                 seq_logits
             };
+            // The checkpoint's padded tail is not a token.
+            let seq_logits = seq_logits.narrow(0, 0, self.live_vocab)?;
 
             // In-segment steering: while this sequence is inside a segment,
             // sample a touch hotter (temperature + segment_temp_boost).
             // Mirrors the kernel's per-seq gate so tokens outside the segment
             // stay at the base temperature.  DRY is GPU-only — the CPU
             // LogitsProcessor has no DRY path, so there is nothing to gate here for it.
+            let temperature = if state.in_segment {
+                config.temperature + config.segment_temp_boost
+            } else {
+                config.temperature
+            };
             let sampling = if state.in_segment && config.segment_temp_boost != 0.0 {
                 let mut boosted = config.clone();
                 boosted.temperature += config.segment_temp_boost;
@@ -1037,7 +1217,24 @@ impl BatchedSampler {
             };
             let seed = config.seed.wrapping_add(state.rng_offset);
             let mut processor = LogitsProcessor::from_sampling(seed, sampling);
-            let sampled = processor.sample(&seq_logits)?;
+            let mut sampled = processor.sample(&seq_logits)?;
+            // A verify row's draft, accepted on the typical-acceptance rule over
+            // the same top-k/nucleus distribution the kernel measures it on.
+            if let Some((drafts, typical)) = verify {
+                if let Some(draft) = drafts[i].filter(|_| temperature > 0.0) {
+                    let row: Vec<f32> = seq_logits.to_dtype(DType::F32)?.to_vec1()?;
+                    if typical_accepts_row(
+                        &row,
+                        temperature,
+                        config.top_k,
+                        config.top_p,
+                        draft,
+                        typical,
+                    ) {
+                        sampled = draft;
+                    }
+                }
+            }
 
             // Segment close, degenerate-decode abort and the EOS failsafes all
             // resolve in `resolve_final_token`, shared with the CUDA path.
@@ -1064,6 +1261,7 @@ impl BatchedSampler {
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
+        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
         let batch_size = states.len();
 
@@ -1124,12 +1322,17 @@ impl BatchedSampler {
             };
 
         // Build penalty buffers from states
+        let build_span = profile::span("sample:build");
+        // The kernel prices each row on its own dials, so the cross-turn table
+        // is needed when ANY row carries the penalty, not only row 0.
+        let cross_turn = configs.iter().any(|c| c.cross_turn_penalty != 0.0);
         let (token_counts, cross_turn_counts, recent_tokens, recent_lens, current_lens) = self
             .build_penalty_buffers_from_states(
                 states,
                 config.presence_penalty,
                 config.repeat_last_n,
                 dry_range,
+                cross_turn,
             )?;
 
         // Get EOS token
@@ -1223,10 +1426,48 @@ impl BatchedSampler {
         // its dials from this array instead. This is what stops one row's EOS
         // ramp (or temperature, or penalties) bleeding into another in a wave
         // that mixes configs.
-        let seq_dials: Vec<SeqDials> = configs.iter().map(|c| SeqDials::from_config(c)).collect();
+        // A verify row also carries the draft it tests (see `SeqDials`).
+        let seq_dials: Vec<SeqDials> = configs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let dials = SeqDials::from_config(c);
+                match verify {
+                    Some((drafts, typical)) => dials.with_draft(drafts[i], typical),
+                    None => dials,
+                }
+            })
+            .collect();
+        build_span.end();
+
+        let stamp_span = profile::span("sample:stamp");
+        let mut tables = self
+            .penalty_tables
+            .lock()
+            .map_err(|_| candle::Error::Msg("sampler count tables poisoned".into()))?;
+        let token_table = tables
+            .tokens
+            .stamp(&self.device, batch_size, &token_counts)?;
+        let cross_table = if cross_turn {
+            match tables
+                .cross
+                .stamp(&self.device, batch_size, &cross_turn_counts)
+            {
+                Ok(stamped) => Some(stamped),
+                Err(e) => {
+                    // The token table is already stamped; leave it zero.
+                    tables.tokens.clear(token_table)?;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        stamp_span.end();
 
         // Invoke the CUDA kernel
-        self.invoke_cuda_kernel(
+        let launch_span = profile::span("sample:launch_readback");
+        let launched = self.invoke_cuda_kernel(
             &logits_flat,
             batch_size as i32,
             vocab_size,
@@ -1247,7 +1488,7 @@ impl BatchedSampler {
             eos_ramp_len,
             eos_boost_max_multiplier,
             config.cross_turn_penalty,
-            &cross_turn_counts,
+            cross_table.as_ref().map(|t| t.table()),
             &current_lens,
             segment_close_boost,
             segment_close_token_id,
@@ -1260,7 +1501,7 @@ impl BatchedSampler {
             &suppress_tokens,
             &suppress_penalties,
             suppress_active,
-            &token_counts,
+            token_table.table(),
             banned_tokens,
             num_banned,
             banned_per_seq,
@@ -1272,7 +1513,22 @@ impl BatchedSampler {
             config.seed,
             &mut rng_offsets,
             &seq_dials,
-        )?;
+        );
+        launch_span.end();
+        // Both cleared whether or not the launch succeeded, and the second
+        // whether or not the first did: a table left stamped would price the
+        // next dispatch's rows with this one's counts.
+        let clear_span = profile::span("sample:clear");
+        let tokens_cleared = tables.tokens.clear(token_table);
+        let cross_cleared = match cross_table {
+            Some(cross) => tables.cross.clear(cross),
+            None => Ok(()),
+        };
+        clear_span.end();
+        drop(tables);
+        launched?;
+        tokens_cleared?;
+        cross_cleared?;
 
         // Update states with sampled tokens and new RNG offsets.
         // Apply post-sampler EOS failsafe overrides: if the sequence has exceeded
@@ -1324,7 +1580,8 @@ impl BatchedSampler {
         presence_penalty: f32,
         repeat_last_n: i32,
         dry_range: i32,
-    ) -> candle::Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>)> {
+        cross_turn: bool,
+    ) -> candle::Result<(SparseCounts, SparseCounts, Vec<i32>, Vec<i32>, Vec<i32>)> {
         let batch_size = states.len();
 
         // Inside a TOOL CALL, all repetition penalties are suppressed, not just
@@ -1335,29 +1592,26 @@ impl BatchedSampler {
         // would demote exactly those tokens, corrupting the value.  This mirrors
         // the DRY gate but is scoped to tool calls only (`in_tool_call`), so the
         // think block keeps full repetition control.  Presenting empty penalty
-        // state for these rows is the per-row equivalent of turning them off;
-        // `resize` appends the zeros in place (no scratch buffer on this
-        // per-decode-step path).
-
-        // Flatten token counts: [batch_size * vocab_size]
-        let mut token_counts = Vec::with_capacity(batch_size * self.vocab_size);
-        for state in states.iter() {
-            if state.in_tool_call {
-                token_counts.resize(token_counts.len() + self.vocab_size, 0);
-            } else {
-                token_counts.extend_from_slice(&state.token_counts);
-            }
-        }
-
-        // Flatten cross-turn counts: [batch_size * vocab_size]
-        let mut cross_turn_counts = Vec::with_capacity(batch_size * self.vocab_size);
-        for state in states.iter() {
-            if state.in_tool_call {
-                cross_turn_counts.resize(cross_turn_counts.len() + self.vocab_size, 0);
-            } else {
-                cross_turn_counts.extend_from_slice(&state.cross_turn_counts);
-            }
-        }
+        // state for these rows is the per-row equivalent of turning them off:
+        // the row stamps nothing, so its table row reads zero.
+        let token_counts = SparseCounts::gather(
+            self.vocab_size,
+            states
+                .iter()
+                .map(|s| (!s.in_tool_call).then_some((&s.counted[..], &s.token_counts[..]))),
+        );
+        // The cross-turn table is read only when the penalty is on, so it is
+        // only gathered then.
+        let cross_turn_counts = if cross_turn {
+            SparseCounts::gather(
+                self.vocab_size,
+                states.iter().map(|s| {
+                    (!s.in_tool_call).then_some((&s.cross_counted[..], &s.cross_turn_counts[..]))
+                }),
+            )
+        } else {
+            SparseCounts::default()
+        };
 
         // Log penalty state if a log path is configured
         if let Some(ref log_path) = self.penalty_log_path {
@@ -1503,7 +1757,7 @@ impl BatchedSampler {
         eos_ramp_len: i32,
         eos_boost_max_multiplier: f32,
         cross_turn_penalty: f32,
-        cross_turn_counts: &[i32],
+        cross_turn_counts: Option<&Tensor>,
         current_lens: &[i32],
         segment_close_boost: f32,
         segment_close_token_id: i32,
@@ -1516,7 +1770,7 @@ impl BatchedSampler {
         suppress_tokens: &[i32],
         suppress_penalties: &[f32],
         suppress_active: bool,
-        token_counts: &[i32],
+        token_counts: &Tensor,
         banned_tokens: &[i32],
         num_banned: i32,
         banned_per_seq: i32,
@@ -1544,131 +1798,66 @@ impl BatchedSampler {
             _ => return Err(candle::Error::Msg("logits must be on CUDA".into())),
         };
 
-        // Upload buffers to GPU
-        let token_counts_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(token_counts)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload token_counts: {}", e)))?;
+        // The count tables are already on the device; hold their storage for
+        // the launch.
+        let (tc_storage, tc_layout) = token_counts.storage_and_layout();
+        let cross_storage = cross_turn_counts.map(Tensor::storage_and_layout);
 
-        let cross_turn_gpu: cudarc::driver::CudaSlice<i32> = if cross_turn_penalty != 0.0 {
-            stream.memcpy_stod(cross_turn_counts).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload cross_turn_counts: {}", e))
-            })?
-        } else {
-            stream.memcpy_stod(&[-1i32]).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload cross_turn_counts: {}", e))
-            })?
-        };
-
-        let current_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(current_lens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload current_lens: {}", e)))?;
-
-        let segment_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(segment_lens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload segment_lens: {}", e)))?;
-
-        let dry_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(dry_lens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload dry_lens: {}", e)))?;
-
-        let banned_gpu: cudarc::driver::CudaSlice<i32> = if banned_tokens.is_empty() {
-            stream
-                .memcpy_stod(&[-1i32])
-                .map_err(|e| candle::Error::Msg(format!("failed to upload banned: {}", e)))?
-        } else {
-            stream
-                .memcpy_stod(banned_tokens)
-                .map_err(|e| candle::Error::Msg(format!("failed to upload banned: {}", e)))?
-        };
-
-        // Token suppression buffers. Always upload non-empty slices
-        // (cudarc rejects zero-length copies); the kernel pointers are nulled out
-        // below when suppression is inactive so these uploads are never read.
-        let suppress_tokens_gpu: cudarc::driver::CudaSlice<i32> = if suppress_tokens.is_empty() {
-            stream.memcpy_stod(&[-1i32]).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload suppress_tokens: {}", e))
-            })?
-        } else {
-            stream.memcpy_stod(suppress_tokens).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload suppress_tokens: {}", e))
-            })?
-        };
-
-        let suppress_penalties_gpu: cudarc::driver::CudaSlice<f32> =
-            stream.memcpy_stod(suppress_penalties).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload suppress_penalties: {}", e))
-            })?;
-
-        let recent_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(recent_tokens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload recent_tokens: {}", e)))?;
-
-        let recent_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(recent_lens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload recent_lens: {}", e)))?;
-
-        let stencil_gpu: cudarc::driver::CudaSlice<i32> = if stencil.is_empty() {
-            stream
-                .memcpy_stod(&[-1i32])
-                .map_err(|e| candle::Error::Msg(format!("failed to upload stencil: {}", e)))?
-        } else {
-            stream
-                .memcpy_stod(stencil)
-                .map_err(|e| candle::Error::Msg(format!("failed to upload stencil: {}", e)))?
-        };
-
-        let mut output_gpu: cudarc::driver::CudaSlice<u32> = stream
-            .memcpy_stod(output_tokens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload output: {}", e)))?;
-
-        let mut rng_gpu: cudarc::driver::CudaSlice<u64> = stream
-            .memcpy_stod(rng_offsets)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload rng_offsets: {}", e)))?;
-
-        // Per-sequence dials. Uploaded as raw 4-byte words — `SeqDials` is 20
-        // packed `f32`/`i32` fields (its C twin `batched_sampling::SeqDials` has
-        // the identical layout), so the byte image is what the kernel reads back.
-        // Empty only on a zero-row launch, which never reaches this kernel path;
-        // guard anyway so the copy is never zero-length (cudarc rejects that).
+        // Every small per-dispatch array in one upload. Per-sequence dials go
+        // in as raw 4-byte words — `SeqDials` is packed `f32`/`i32` fields (its
+        // C twin `batched_sampling::SeqDials` has the identical layout), so the
+        // byte image is what the kernel reads back. The two arrays the kernel
+        // writes, RNG offsets then outputs, go last so one copy reads both.
         const SEQ_DIALS_WORDS: usize = std::mem::size_of::<SeqDials>() / 4;
-        let seq_dials_words: &[i32] = if seq_dials.is_empty() {
-            &[]
-        } else {
-            // SAFETY: `SeqDials` is `#[repr(C)]` with only 4-byte `f32`/`i32`
-            // fields and no padding, so a contiguous slice of them is a valid
-            // `[i32]` of `len * SEQ_DIALS_WORDS` words.
-            unsafe {
-                std::slice::from_raw_parts(
-                    seq_dials.as_ptr() as *const i32,
-                    seq_dials.len() * SEQ_DIALS_WORDS,
-                )
-            }
+        // SAFETY: `SeqDials` is `#[repr(C)]` with only 4-byte `f32`/`i32`
+        // fields and no padding, so a contiguous slice of them is a valid
+        // `[i32]` of `len * SEQ_DIALS_WORDS` words.
+        let seq_dials_words: &[i32] = unsafe {
+            std::slice::from_raw_parts(
+                seq_dials.as_ptr() as *const i32,
+                seq_dials.len() * SEQ_DIALS_WORDS,
+            )
         };
-        let seq_dials_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(if seq_dials_words.is_empty() {
-                &[0i32][..]
-            } else {
-                seq_dials_words
-            })
-            .map_err(|e| candle::Error::Msg(format!("failed to upload seq_dials: {}", e)))?;
+        let rows = output_tokens.len();
+        let mut pack = ArgPack::new();
+        let cur_lens_at = pack.push_i32(current_lens);
+        let segment_lens_at = pack.push_i32(segment_lens);
+        let dry_lens_at = pack.push_i32(dry_lens);
+        let banned_at = pack.push_i32(banned_tokens);
+        let suppress_tok_at = pack.push_i32(suppress_tokens);
+        let suppress_pen_at = pack.push_f32(suppress_penalties);
+        let recent_at = pack.push_i32(recent_tokens);
+        let recent_lens_at = pack.push_i32(recent_lens);
+        let stencil_at = pack.push_i32(stencil);
+        let seq_dials_at = pack.push_i32(seq_dials_words);
+        let rng_at = pack.push_u64(rng_offsets);
+        let output_at = pack.reserve(rows);
+        let mut packed: cudarc::driver::CudaSlice<u32> = stream
+            .memcpy_stod(pack.words())
+            .map_err(|e| candle::Error::Msg(format!("failed to upload sampling args: {e}")))?;
 
         // Get device pointers and call kernel in a scoped block
         // so guards are dropped before download
         {
-            let (tc_ptr, _g1) = token_counts_gpu.device_ptr(&stream);
-            let (cross_ptr, _g2) = cross_turn_gpu.device_ptr(&stream);
-            let (cur_lens_ptr, _g3) = current_lens_gpu.device_ptr(&stream);
-            let (segment_lens_ptr, _g3b) = segment_lens_gpu.device_ptr(&stream);
-            let (dry_lens_ptr, _g3b2) = dry_lens_gpu.device_ptr(&stream);
-            let (suppress_tok_ptr, _g3c) = suppress_tokens_gpu.device_ptr(&stream);
-            let (suppress_pen_ptr, _g3d) = suppress_penalties_gpu.device_ptr(&stream);
-            let (ban_ptr, _g4) = banned_gpu.device_ptr(&stream);
-            let (recent_ptr, _g5) = recent_gpu.device_ptr(&stream);
-            let (recent_lens_ptr, _g6) = recent_lens_gpu.device_ptr(&stream);
-            let (stencil_ptr, _g7) = stencil_gpu.device_ptr(&stream);
-            let (output_ptr, _g8) = output_gpu.device_ptr_mut(&stream);
-            let (rng_ptr, _g9) = rng_gpu.device_ptr_mut(&stream);
-            let (seq_dials_ptr, _g10) = seq_dials_gpu.device_ptr(&stream);
+            let (tc_ptr, _g1) = count_table_ptr(&tc_storage, tc_layout, &stream)?;
+            let cross = match &cross_storage {
+                Some((storage, layout)) => Some(count_table_ptr(storage, layout, &stream)?),
+                None => None,
+            };
+            let (base, _g2) = packed.device_ptr_mut(&stream);
+            let at = |word: usize| base + (word * 4) as u64;
+            let cur_lens_ptr = at(cur_lens_at);
+            let segment_lens_ptr = at(segment_lens_at);
+            let dry_lens_ptr = at(dry_lens_at);
+            let suppress_tok_ptr = at(suppress_tok_at);
+            let suppress_pen_ptr = at(suppress_pen_at);
+            let ban_ptr = at(banned_at);
+            let recent_ptr = at(recent_at);
+            let recent_lens_ptr = at(recent_lens_at);
+            let stencil_ptr = at(stencil_at);
+            let output_ptr = at(output_at);
+            let rng_ptr = at(rng_at);
+            let seq_dials_ptr = at(seq_dials_at);
 
             // Helper closure to call kernel with logits pointer
             let call_kernel = |logits_ptr: *const std::ffi::c_void| unsafe {
@@ -1676,6 +1865,7 @@ impl BatchedSampler {
                     logits_ptr,
                     batch_size,
                     vocab_size,
+                    self.live_vocab as i32,
                     dtype,
                     temperature,
                     top_k,
@@ -1693,10 +1883,9 @@ impl BatchedSampler {
                     eos_ramp_len,
                     eos_boost_max_multiplier,
                     cross_turn_penalty,
-                    if cross_turn_penalty != 0.0 {
-                        cross_ptr as *const i32
-                    } else {
-                        std::ptr::null()
+                    match &cross {
+                        Some((cross_ptr, _)) => *cross_ptr as *const i32,
+                        None => std::ptr::null(),
                     },
                     cur_lens_ptr as *const i32,
                     segment_close_boost,
@@ -1744,6 +1933,7 @@ impl BatchedSampler {
                     } else {
                         seq_dials_ptr as *const std::ffi::c_void
                     },
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             };
 
@@ -1774,28 +1964,21 @@ impl BatchedSampler {
             }
         } // Guards dropped here
 
-        // Synchronize and download results
-        stream
-            .synchronize()
-            .map_err(|e| candle::Error::Msg(format!("CUDA sync failed: {}", e)))?;
-
-        let output_vec = stream
-            .memcpy_dtov(&output_gpu)
-            .map_err(|e| candle::Error::Msg(format!("failed to download output: {}", e)))?;
-
-        let rng_vec = stream
-            .memcpy_dtov(&rng_gpu)
-            .map_err(|e| candle::Error::Msg(format!("failed to download rng: {}", e)))?;
-
-        output_tokens.copy_from_slice(&output_vec);
-        rng_offsets.copy_from_slice(&rng_vec);
+        // One stream-ordered copy reads the RNG offsets and the outputs back.
+        // It is queued behind the kernel, and a device-to-host copy into
+        // pageable memory returns only once it has completed, so no separate
+        // synchronise is needed.
+        let tail = stream
+            .memcpy_dtov(&packed.slice(rng_at..output_at + rows))
+            .map_err(|e| candle::Error::Msg(format!("failed to download sampling results: {e}")))?;
+        let (rng, outputs) = split_rng_and_outputs(&tail, rows);
+        output_tokens.copy_from_slice(&outputs);
+        rng_offsets.copy_from_slice(&rng);
 
         Ok(())
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Unit tests
 /// Set this row's banned (deny-list) logits to `-inf`.  Modifies only the few
 /// banned *values* (on an F32 host copy of the row), and is a no-op when the list
 /// is empty, so unconstrained rows keep their exact logits.  Preserves the input
@@ -1940,6 +2123,7 @@ mod tests {
     // even though it is constant-valued at any given commit.
     #![allow(clippy::assertions_on_constants)]
 
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use super::*;
@@ -2187,7 +2371,7 @@ mod tests {
             "a call past the same budget keeps its token"
         );
         let (_, _, _, _, current_lens) = sampler
-            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0)
+            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0, false)
             .unwrap();
         assert_eq!(current_lens, vec![0], "the EOS ramp sees no length");
 
@@ -2205,6 +2389,7 @@ mod tests {
     fn make_sampler() -> BatchedSampler {
         BatchedSampler::new(
             candle::Device::Cpu,
+            VOCAB_SIZE,
             VOCAB_SIZE,
             MAX_RECENT,
             vec![EOS_TOKEN].into(),
@@ -2474,20 +2659,95 @@ mod tests {
             thinking.record_token(42, MAX_RECENT);
         }
         in_call.in_tool_call = true;
+        // A prior turn, so the cross-turn table has something to suppress.
+        in_call.end_turn(0);
+        thinking.end_turn(0);
+        for _ in 0..5 {
+            in_call.record_token(42, MAX_RECENT);
+            thinking.record_token(42, MAX_RECENT);
+        }
 
         let (token_counts, cross_turn_counts, _recent, recent_lens, _cur) = sampler
-            .build_penalty_buffers_from_states(&[&mut in_call, &mut thinking], 0.0, 16, 0)
+            .build_penalty_buffers_from_states(&[&mut in_call, &mut thinking], 0.0, 16, 0, true)
             .expect("buffers");
 
-        // Row 0 (tool call): all penalty inputs empty — the model is free to
-        // reproduce the query's tokens verbatim in the arguments.
-        assert!(token_counts[..VOCAB_SIZE].iter().all(|&c| c == 0));
-        assert!(cross_turn_counts[..VOCAB_SIZE].iter().all(|&c| c == 0));
+        // Row 0 (tool call) stamps nothing, so its table rows read zero — the
+        // model is free to reproduce the query's tokens verbatim in the
+        // arguments. Row 1 (think block) keeps full repetition control.
+        let row1_42 = VOCAB_SIZE as u32 + 42;
+        assert_eq!(
+            token_counts,
+            SparseCounts {
+                offsets: vec![row1_42],
+                values: vec![5],
+            }
+        );
+        assert_eq!(
+            cross_turn_counts,
+            SparseCounts {
+                offsets: vec![row1_42],
+                values: vec![5],
+            }
+        );
         assert_eq!(recent_lens[0], 0);
+        assert_eq!(recent_lens[1], 10);
+    }
 
-        // Row 1 (think block): full repetition control retained.
-        assert_eq!(token_counts[VOCAB_SIZE + 42], 5);
-        assert_eq!(recent_lens[1], 5);
+    /// With the cross-turn penalty off, the cross table is never read, so
+    /// nothing is gathered for it.
+    #[test]
+    fn the_cross_turn_table_is_gathered_only_when_its_penalty_is_on() {
+        let sampler = make_sampler();
+        let mut state = make_state();
+        state.record_token(7, MAX_RECENT);
+        state.end_turn(0);
+        let (_, cross, _, _, _) = sampler
+            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0, false)
+            .expect("buffers");
+        assert_eq!(cross, SparseCounts::default());
+    }
+
+    /// The sparse indexes name exactly the nonzero dense entries, through
+    /// recording, a turn end and a windowed cross-turn eviction — they are what
+    /// the device table is stamped from, so a token missing from them is a
+    /// penalty silently not applied.
+    #[test]
+    fn the_sparse_indexes_track_the_nonzero_counts_across_turns() {
+        fn nonzero(counts: &[i32]) -> Vec<u32> {
+            (0..counts.len() as u32)
+                .filter(|&t| counts[t as usize] > 0)
+                .collect()
+        }
+        fn sorted(v: &[u32]) -> Vec<u32> {
+            let mut v = v.to_vec();
+            v.sort_unstable();
+            v
+        }
+        let mut st = make_state();
+        for t in [9, 3, 9, 4] {
+            st.record_token(t, MAX_RECENT);
+        }
+        assert_eq!(st.counted, vec![9, 3, 4]);
+        assert_eq!(sorted(&st.counted), nonzero(&st.token_counts));
+
+        // Window of one: turn A enters the cross counts.
+        st.end_turn(1);
+        assert!(st.counted.is_empty());
+        assert_eq!(nonzero(&st.token_counts), Vec::<u32>::new());
+        assert_eq!(sorted(&st.cross_counted), vec![3, 4, 9]);
+        assert_eq!(sorted(&st.cross_counted), nonzero(&st.cross_turn_counts));
+
+        // Turn B evicts turn A: only B's tokens remain.
+        for t in [4, 5] {
+            st.record_token(t, MAX_RECENT);
+        }
+        st.end_turn(1);
+        assert_eq!(sorted(&st.cross_counted), vec![4, 5]);
+        assert_eq!(sorted(&st.cross_counted), nonzero(&st.cross_turn_counts));
+        assert_eq!(st.cross_turn_counts[4], 1);
+
+        st.clear();
+        assert!(st.counted.is_empty() && st.cross_counted.is_empty());
     }
 
     // ── EOS failsafe override tests ────────────────────────────────────
@@ -2672,6 +2932,7 @@ mod tests {
             let sampler = BatchedSampler::new(
                 device.clone(),
                 VOCAB_SIZE,
+                VOCAB_SIZE,
                 MAX_RECENT,
                 vec![EOS_TOKEN].into(),
                 None,
@@ -2694,6 +2955,190 @@ mod tests {
             assert_eq!(tokens, vec![20, 50, 40], "{device:?}");
             assert_eq!((s0.rng_offset, s2.rng_offset), (1, 1), "{device:?}");
         }
+    }
+
+    /// The typical-acceptance rule on raw probabilities. `[0.5, 0.3, 0.2]` has
+    /// entropy 1.0297, so `δ·e^(−H)` = 0.1071 and the bar is ε = 0.09: the 0.2
+    /// draft clears it. `[0.9, 0.05, 0.05]` has entropy 0.3944, the bar is again
+    /// 0.09, and a 0.05 draft does not.
+    #[test]
+    fn typical_rule_accepts_on_mass_against_the_entropy_bar() {
+        let ln = |ps: &[f32]| ps.iter().map(|p| p.ln()).collect::<Vec<f32>>();
+        let m = TypicalAcceptance::MEDUSA;
+        let accepts =
+            |ps: &[f32], t: f32, draft: u32| typical_accepts_row(&ln(ps), t, 0, 1.0, draft, m);
+        assert!(accepts(&[0.5, 0.3, 0.2], 1.0, 2));
+        assert!(!accepts(&[0.9, 0.05, 0.05], 1.0, 2));
+        // Temperature sharpens the row: at 0.5, [0.5, 0.3, 0.2] becomes
+        // [0.658, 0.237, 0.105] (entropy 0.8533, bar 0.09), and 0.105 still
+        // clears it; [0.9, 0.05, 0.05] becomes [0.994, 0.003, 0.003].
+        assert!(accepts(&[0.5, 0.3, 0.2], 0.5, 2));
+        assert!(!accepts(&[0.9, 0.05, 0.05], 0.5, 1));
+        // A draft past the row is not a token.
+        assert!(!accepts(&[0.5, 0.5], 1.0, 7));
+    }
+
+    /// **The rule is measured over the distribution the kernel samples, not
+    /// the whole row.** `[0.5, 0.3, 0.2]` accepts its 0.2 draft over the whole
+    /// row, but a nucleus at 0.75 keeps `[0.5, 0.3]` (cumulative 0.8) and top-k
+    /// 2 keeps the same two: the draft is outside either, has probability zero,
+    /// and is not accepted — exactly as the kernel decides it.
+    #[test]
+    fn typical_rule_is_measured_over_the_truncated_distribution() {
+        let row: Vec<f32> = [0.5f32, 0.3, 0.2].iter().map(|p| p.ln()).collect();
+        let m = TypicalAcceptance::MEDUSA;
+        assert!(typical_accepts_row(&row, 1.0, 0, 1.0, 2, m));
+        assert!(!typical_accepts_row(&row, 1.0, 0, 0.75, 2, m));
+        assert!(!typical_accepts_row(&row, 1.0, 2, 1.0, 2, m));
+        // Renormalised over the nucleus `[0.625, 0.375]` (entropy 0.6616, bar
+        // 0.09), the 0.375 draft clears it.
+        assert!(typical_accepts_row(&row, 1.0, 0, 0.75, 1, m));
+    }
+
+    /// One logits row with `p(5) = 0.8` and `p(7) = 0.2`; every other token
+    /// sits at logit 0, ~2e-9 each.
+    fn verify_row_logits() -> Tensor {
+        logits_from_rows(&[&[(5, 20.0), (7, 20.0 + 0.25f32.ln())]])
+    }
+
+    fn sampled_config(seed: u64) -> SamplingConfig {
+        let mut c = SamplingConfig::argmax();
+        c.temperature = 1.0;
+        c.top_k = 0;
+        c.top_p = 1.0;
+        c.seed = seed;
+        c
+    }
+
+    fn devices() -> Vec<Device> {
+        let mut devices = vec![Device::Cpu];
+        devices.extend(Device::new_cuda(0).ok());
+        devices
+    }
+
+    /// **A draft the distribution gives enough mass is committed whatever the
+    /// sample.** `p(7) = 0.2` clears the 0.09 bar, so every seed commits 7 —
+    /// including the ~80% whose sample lands on 5. The sample is still drawn,
+    /// so the row's RNG advances exactly as a plain row's.
+    #[test]
+    fn a_draft_over_the_bar_is_committed_whatever_the_sample() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, VOCAB_SIZE);
+            let logits = verify_row_logits().to_device(&device).expect("logits");
+            for seed in 0..16 {
+                let mut state = make_state();
+                let tokens = sampler
+                    .sample_verify_rows(
+                        &logits,
+                        &mut [&mut state],
+                        &[&sampled_config(seed)],
+                        &[Some(7)],
+                        TypicalAcceptance::MEDUSA,
+                    )
+                    .expect("sample");
+                assert_eq!(tokens, vec![7], "{device:?} seed {seed}");
+                assert_eq!(state.rng_offset, 1, "{device:?} seed {seed}");
+            }
+        }
+    }
+
+    /// **A draft under the bar commits the sample.** Token 9 sits at logit 0,
+    /// ~2e-9 of the row, so the row commits what plain sampling draws: 5 or 7.
+    /// Across 32 seeds both turn up, which a correction pinned to the argmax
+    /// could never produce.
+    #[test]
+    fn a_draft_under_the_bar_commits_the_sample() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, VOCAB_SIZE);
+            let logits = verify_row_logits().to_device(&device).expect("logits");
+            let mut seen = HashSet::new();
+            for seed in 0..32 {
+                let mut state = make_state();
+                let tokens = sampler
+                    .sample_verify_rows(
+                        &logits,
+                        &mut [&mut state],
+                        &[&sampled_config(seed)],
+                        &[Some(9)],
+                        TypicalAcceptance::MEDUSA,
+                    )
+                    .expect("sample");
+                assert!(
+                    tokens[0] == 5 || tokens[0] == 7,
+                    "{device:?} seed {seed}: {tokens:?}"
+                );
+                seen.insert(tokens[0]);
+            }
+            assert_eq!(seen.len(), 2, "{device:?}: corrections {seen:?}");
+        }
+    }
+
+    /// **Greedy verification is unchanged.** At temperature zero the row is a
+    /// point mass on its argmax, so a 0.2 draft is not accepted and the row
+    /// commits 5.
+    #[test]
+    fn at_temperature_zero_only_the_argmax_is_committed() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, VOCAB_SIZE);
+            let logits = verify_row_logits().to_device(&device).expect("logits");
+            let mut state = make_state();
+            let tokens = sampler
+                .sample_verify_rows(
+                    &logits,
+                    &mut [&mut state],
+                    &[&SamplingConfig::argmax()],
+                    &[Some(7)],
+                    TypicalAcceptance::MEDUSA,
+                )
+                .expect("sample");
+            assert_eq!(tokens, vec![5], "{device:?}");
+        }
+    }
+
+    /// **The padded tail of a row is never a token.** The sampler's live
+    /// vocabulary ends at 50; token 60, in the padding, carries the row's
+    /// largest logit by far. Neither the argmax nor a sample may produce it,
+    /// and a draft naming it is not accepted.
+    #[test]
+    fn the_padded_tail_of_a_row_is_never_produced() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, 50);
+            let logits = logits_from_rows(&[&[(5, 20.0), (7, 20.0 + 0.25f32.ln()), (60, 90.0)]])
+                .to_device(&device)
+                .expect("logits");
+            let mut state = make_state();
+            let greedy = sampler
+                .sample_batch(&logits, &mut [&mut state], &[&SamplingConfig::argmax()])
+                .expect("sample");
+            assert_eq!(greedy, vec![5], "{device:?}");
+            for seed in 0..16 {
+                let mut state = make_state();
+                let tokens = sampler
+                    .sample_verify_rows(
+                        &logits,
+                        &mut [&mut state],
+                        &[&sampled_config(seed)],
+                        &[Some(60)],
+                        TypicalAcceptance::MEDUSA,
+                    )
+                    .expect("sample");
+                assert!(
+                    tokens[0] == 5 || tokens[0] == 7,
+                    "{device:?} seed {seed}: {tokens:?}"
+                );
+            }
+        }
+    }
+
+    fn make_sampler_on(device: &Device, live_vocab: usize) -> BatchedSampler {
+        BatchedSampler::new(
+            device.clone(),
+            VOCAB_SIZE,
+            live_vocab,
+            MAX_RECENT,
+            vec![EOS_TOKEN].into(),
+            None,
+        )
     }
 
     #[test]
@@ -2726,6 +3171,7 @@ mod tests {
         for device in devices {
             let sampler = BatchedSampler::new(
                 device.clone(),
+                VOCAB_SIZE,
                 VOCAB_SIZE,
                 MAX_RECENT,
                 vec![EOS_TOKEN].into(),
@@ -3060,6 +3506,7 @@ mod tests {
         let sampler = BatchedSampler::new(
             device.clone(),
             VOCAB_SIZE,
+            VOCAB_SIZE,
             MAX_RECENT,
             vec![EOS_TOKEN].into(),
             None,
@@ -3104,5 +3551,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The kernel reads its counts from the device-resident tables: each row
+    /// is priced by its own history, a tool-call row by none, and the next
+    /// dispatch starts from a clean table rather than the last one's counts.
+    ///
+    /// Token 42 leads token 43 by one logit, so a penalty of more than one on
+    /// 42 flips the greedy pick — the pick says whether the count reached the
+    /// kernel.
+    #[test]
+    fn the_kernel_prices_each_row_from_its_own_resident_counts() {
+        let Ok(device) = candle::Device::new_cuda(0) else {
+            return; // No CUDA device on this box.
+        };
+        let sampler = BatchedSampler::new(
+            device.clone(),
+            VOCAB_SIZE,
+            VOCAB_SIZE,
+            MAX_RECENT,
+            vec![EOS_TOKEN].into(),
+            None,
+        );
+        let mut row = vec![0.0f32; VOCAB_SIZE];
+        row[42] = 10.0;
+        row[43] = 9.0;
+        let logits = |rows: usize| {
+            Tensor::from_vec(row.repeat(rows), (rows, VOCAB_SIZE), &device).expect("logits")
+        };
+
+        // Frequency: 42 said three times costs it 3 × 2.0.
+        let freq = SamplingConfig {
+            frequency_penalty: 2.0,
+            ..SamplingConfig::argmax()
+        };
+        let mut repeated = make_state();
+        let mut fresh = make_state();
+        let mut in_call = make_state();
+        for _ in 0..3 {
+            repeated.record_token(42, MAX_RECENT);
+            in_call.record_token(42, MAX_RECENT);
+        }
+        in_call.in_tool_call = true;
+        let tokens = sampler
+            .sample_batch(
+                &logits(3),
+                &mut [&mut repeated, &mut fresh, &mut in_call],
+                &[&freq, &freq, &freq],
+            )
+            .expect("sample_batch");
+        assert_eq!(tokens, vec![43, 42, 42]);
+
+        // The next dispatch puts a fresh row where the repeated one was: it must
+        // read zero there, not the counts the last dispatch stamped.
+        let mut after = make_state();
+        let tokens = sampler
+            .sample_batch(&logits(1), &mut [&mut after], &[&freq])
+            .expect("sample_batch");
+        assert_eq!(tokens, vec![42]);
+
+        // Cross-turn: 42 said in a prior turn costs it 5.0 this turn.
+        let cross = SamplingConfig {
+            cross_turn_penalty: 5.0,
+            ..SamplingConfig::argmax()
+        };
+        let mut said_before = make_state();
+        said_before.record_token(42, MAX_RECENT);
+        said_before.end_turn(0);
+        let mut never = make_state();
+        let tokens = sampler
+            .sample_batch(
+                &logits(2),
+                &mut [&mut said_before, &mut never],
+                &[&cross, &cross],
+            )
+            .expect("sample_batch");
+        assert_eq!(tokens, vec![43, 42]);
     }
 }

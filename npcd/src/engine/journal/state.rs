@@ -570,7 +570,11 @@ mod tests {
         assert_eq!(left, vec![1, 3]);
         assert_eq!(s.open().len(), 1, "the open item is the character's");
         assert_eq!(s.written(), 3, "an id once used is not used again");
-        assert_eq!(s.prompt().sections.len(), 3, "two entries and the open items");
+        assert_eq!(
+            s.prompt().sections.len(),
+            3,
+            "two entries and the open items"
+        );
         assert!(s.forget(&[2]).is_empty(), "forgetting twice finds nothing");
     }
 

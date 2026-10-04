@@ -803,7 +803,7 @@ pub fn poison_memory_record(engine: &ConversationEngine, timeline: TimelineId) {
     // Any hash the model does not report. `import` validates it before touching
     // a tensor, so the refusal is total and the store is untouched.
     payload.schedule_hash ^= 0xFFFF_FFFF_FFFF_FFFF;
-    conv.enqueue_recurrent_snapshot(timeline, payload.encode());
+    conv.enqueue_recurrent_snapshot(timeline, payload);
     // The write is fire-and-forget; give the writer a moment to land it before
     // a resume reads.
     std::thread::sleep(std::time::Duration::from_millis(300));

@@ -2511,11 +2511,9 @@ impl InferenceState {
             proj_builder: self.refresh_builder.clone(),
             config: self.refresh_config.clone(),
             formatted_prompt: &self.formatted_prompt,
-            // `Quick`, not `Off`: a hidden ingest conversation given no room to
-            // reason at all was measured skipping its `file_read` call entirely
-            // and guessing a summary from the filename — see `code_read`'s
-            // `opening_prompt` doc.
-            think_triggers: turn_triggers(self, ThinkMode::Quick),
+            // `Off`, as repo_map's folder summaries run: a file read is a tool
+            // round and a description, with no reasoning block between them.
+            think_triggers: turn_triggers(self, ThinkMode::Off),
             tool_ctx: self
                 .tool_host
                 .context_for(ToolMode::Restricted, &self.tool_host.conversation_files()),

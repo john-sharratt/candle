@@ -967,6 +967,12 @@ pub const QWEN36_MOE_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFacto
     // moved the hybrid on `Int8Mode::Performance` one session past the edge
     // again: C10×64 at 63/64, every other gate and rung green, ratio 5.97×.
     // Both axes one notch down together.
+    //
+    // **The stock gate runs `Int8Mode::auto` from 2026-10-04**, which resolves
+    // to Precision on an int8-MMA card — the mode the engine loads it in, so
+    // gate and engine measure the same numerics. The "stock, Performance" row
+    // above is therefore no longer what that gate measures; the factors were
+    // not changed for it.
     k_hi: 0.90,
     k_low: 0.90,
     v_hi: 1.9,

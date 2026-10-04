@@ -124,7 +124,7 @@ pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 #[cfg(feature = "cuda")]
 pub use compact::{
     compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,
-    CompactionTally,
+    CompactionTally, TopArena,
 };
 pub use compact_map::{rewrite_sealed, CompactionMap, Sweep};
 pub use compact_plan::{

@@ -19,6 +19,11 @@ candle = { workspace = true, features = ["cuda"] }
 candle-kernels = { workspace = true }
 candle-nn = { workspace = true, features = ["cuda"] }
 candle-transformers = { workspace = true, features = ["cuda", "ruler-bench"] }
+# The redo log's CRC-32, computed with the CPU's carry-less multiply. The byte-at-a-
+# time table it replaced ran at ~0.6 GB/s, and a recurrent snapshot is ~65 MB a turn:
+# ~100 ms of the substrate writer's time per seal, which the scheduler's loop thread
+# waits out whenever the writer falls behind. Same polynomial, same values.
+crc32fast = "1.5"
 crossbeam = { workspace = true }
 cudarc = { workspace = true }
 # Caller↔scheduler channels (SchedulerRequest queue, TurnEvent streams, one-shot replies,

@@ -60,7 +60,7 @@ use super::types::{CHUNK_SIZE, TARGET_ARENA_BYTES};
 /// The rungs above were sized for the production palette-4 geometry —
 /// `head_dim 128 / N_PALETTE 4 = 32`, so `CHUNK_SIZE(32) * 32 = 1024` elements
 /// a slot. A slot's payload scales with `head_dim`, so the supported dims
-/// {64, 96, 128, 256, 512} need coverage up to `head_dim 512`, where `R16` and
+/// {64, 128, 256, 512} need coverage up to `head_dim 512`, where `R16` and
 /// `F32` occupy 16384 B. Only the top rungs are added: the intermediate
 /// payloads at those widths round up into existing rungs, which wastes
 /// bandwidth on a non-production geometry rather than adding classes that
@@ -270,11 +270,11 @@ mod tests {
     /// `head_dim / N_PALETTE`, so the ladder has to cover all of them, not just
     /// the one the model in front of us happens to use.
     ///
-    /// Kept in step with the `64 | 96 | 128 | 256` guards in
+    /// Kept in step with the `64 | 128 | 256` guards in
     /// `paged_decode_attn` and `paged_prefill_attn_varlen_chunks`; 512 is the
     /// DeepSeek single-latent width, whose backing passes through the GQA
     /// geometry at construction (see the ladder's head-dim note).
-    const SUPPORTED_HEAD_DIMS: [usize; 5] = [64, 96, 128, 256, 512];
+    const SUPPORTED_HEAD_DIMS: [usize; 4] = [64, 128, 256, 512];
 
     /// Coverage: every format an arena can hold maps to a class, at every head
     /// dim the kernels accept. A `None` here means a chunk of that format has

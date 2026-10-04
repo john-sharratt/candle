@@ -8,6 +8,16 @@
 > §2 is that defect; §3 is the shape that removes it; §12 is what the build
 > settled that the design left open.
 >
+> **Since then — the miss path (`docs/moe_live_dispatch_design.md` §0).** A miss
+> no longer loads anything before it is computed: the expert GEMMs' worker
+> blocks compute a non-VRAM expert straight from pinned host memory, so the
+> warm tier is read by the device as well as copied from. It is no longer the
+> only pinned tier either — the **pad**, a mutable pinned tier the stager reads
+> cold experts into from the pack, sits beside it — and VRAM residency changes
+> only by promotion (the workers writing a missed expert into a ring slot, or
+> the copy engine for prefetch) off the critical path. §7's policy stands;
+> "demand load" in what follows is that promotion.
+>
 > Every number in this document is measured on the RTX 4090 Mobile 16 GB dev
 > machine with Qwen3-30B-A3B unless it says otherwise. §10 listed what had to be
 > measured before building; §12.1 records what the tree already answered.
@@ -522,8 +532,10 @@ regardless.
 
 ## 7. The hot tier — VRAM
 
-Unchanged in policy: the existing frequency-plus-recency scoring, layer-aware
-forced eviction, early-layer pinning and Markov prefetch all stand. The measured
+Unchanged in policy: the existing frequency-plus-recency scoring, early-layer
+pinning and Markov prefetch all stand. Victims are ranked by that scoring and
+then filtered by the live dispatch's reclaim rule — a row with an invocation in
+flight cannot give its slot up at once (`moe_live_dispatch_design.md` §0.5). The measured
 prediction precision is **66–85% (74% typical)**, and that machinery is the
 reason §6.1's argument works.
 

@@ -3963,7 +3963,7 @@ impl Conversation {
     /// single-tail contract). Nothing is mirrored in RAM here — the state that
     /// produced the payload is still live on the device; the record exists for
     /// restart and fork-resume.
-    pub fn enqueue_recurrent_snapshot(&self, timeline: TimelineId, payload: Vec<u8>) {
+    pub fn enqueue_recurrent_snapshot(&self, timeline: TimelineId, payload: SnapshotPayload) {
         // **Ephemeral timelines get no snapshot.** The record exists for restart
         // and fork-resume, and a timeline marked by
         // `Substrate::mark_timeline_transient` is by definition never resumed:
@@ -3994,7 +3994,11 @@ impl Conversation {
     /// superseding any earlier checkpoint for the same branch. Superseding is
     /// the right behaviour here too — a branch has exactly one state, and a
     /// second computation of it can only be a recomputation.
-    pub fn enqueue_branch_checkpoint(&self, prefix: ContentHash, payload: Vec<u8>) {
+    pub fn enqueue_branch_checkpoint(
+        &self,
+        prefix: ContentHash,
+        payload: Arc<BranchCheckpointPayload>,
+    ) {
         let stream_id = branch_checkpoint_stream_id(prefix);
         self.writer
             .enqueue(WriteJob::BranchCheckpoint { stream_id, payload });
@@ -4399,6 +4403,7 @@ impl Conversation {
         //    a second pass — the forced `POST /v1/debug/maintenance` beside the
         //    background thread's — can arrive mid-op. It plans nothing and
         //    leaves the status alone: the op in flight owns `running`.
+        let t_plan = Instant::now();
         let plan = {
             let mut p = self.persistence.lock().unwrap();
             if p.relocation_in_flight() {
@@ -4417,6 +4422,7 @@ impl Conversation {
             }
             plan
         };
+        let plan_ms = t_plan.elapsed().as_millis() as u64;
         let outcome = if let Some(plan) = plan {
             // Signal "in progress" so the GUI shows a live spinner across the I/O.
             self.maintenance.lock().unwrap().2 = true;
@@ -4459,29 +4465,41 @@ impl Conversation {
                 let result =
                     self.maintenance_hold(&mut held, |p| p.complete_maintenance(&plan, run))?;
                 note_persistence_maint_us(held.as_micros() as u64);
-                // `longest_hold_ms` is what a finishing turn can wait behind
-                // maintenance; it is the figure to watch, not `held_ms`.
-                tracing::debug!(
-                    target: "candle_conversation::persistence::maintenance",
-                    exec_ms = t_exec.elapsed().as_millis() as u64,
-                    held_ms = held.as_millis() as u64,
-                    batches,
-                    longest_hold_ms = longest.as_millis() as u64,
-                    "segment-maintenance relocation: the persistence lock was held for \
-                     held_ms of exec_ms, one batch at a time"
-                );
+                let exec_ms = t_exec.elapsed().as_millis() as u64;
                 // 3. Repoint the index at the relocated records under a brief write lock.
+                let t_apply = Instant::now();
                 {
                     let mut substrate = self.write();
                     result.apply_to_substrate(&mut substrate);
                 }
+                let apply_ms = t_apply.elapsed().as_millis() as u64;
                 // 4. Unlink the drained source segments under the persistence lock.
+                let t_finish = Instant::now();
                 {
                     let mut p = self.persistence.lock().unwrap();
                     p.finish_maintenance(&plan).map_err(|e| {
                         candle::Error::Msg(format!("substrate maintenance drop: {e}"))
                     })?;
                 }
+                let finish_ms = t_finish.elapsed().as_millis() as u64;
+                // **Every phase's hold, not only the relocation's.** The plan holds
+                // the persistence lock and a substrate read lock together; the apply
+                // holds the substrate write lock; the finish holds the persistence
+                // lock across the unlinks. Any of them stalls a seal behind it, and
+                // `longest_hold_ms` covers only the relocation batches.
+                tracing::debug!(
+                    target: "candle_conversation::persistence::maintenance",
+                    plan_ms,
+                    exec_ms,
+                    held_ms = held.as_millis() as u64,
+                    batches,
+                    longest_hold_ms = longest.as_millis() as u64,
+                    apply_ms,
+                    finish_ms,
+                    "segment-maintenance: plan under both locks, relocation one batch \
+                     at a time, apply under the substrate write lock, finish under the \
+                     persistence lock"
+                );
                 Ok(true)
             })()
         } else {
@@ -5517,7 +5535,7 @@ mod recurrent_snapshot_read_tests {
         let loc = {
             let mut p = conv.persistence.lock().expect("persistence");
             let loc = p
-                .write_snapshot(stream, &payload(timeline, turn_index).encode())
+                .write_snapshot(stream, &payload(timeline, turn_index).parts().slices())
                 .expect("append");
             p.commit().expect("commit");
             if seal {

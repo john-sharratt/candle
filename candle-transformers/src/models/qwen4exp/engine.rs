@@ -444,6 +444,7 @@ impl Qwen4ExpGpu {
         let experts = build_expert_cache_for(
             &content,
             cfg.moe.n_experts,
+            cfg.moe.n_experts_used,
             // The head's experts join the same grid — which is the whole reason
             // it is merged in as a block: they stream over PCIe and offload
             // through the same three tiers instead of sitting resident, and

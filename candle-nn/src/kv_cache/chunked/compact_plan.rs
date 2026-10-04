@@ -163,6 +163,52 @@ pub fn plan_pool(arenas: &[ArenaSlots], key: ArenaKey, max_moves: usize) -> Opti
     })
 }
 
+/// Every pool's plan as one list, **the highest source region first**, each move
+/// paired with its pool.
+///
+/// A budgeted pass applies a prefix of this list, and what the prefix buys is the
+/// frontier's fall — which is set by the regions at the top of the span, whichever
+/// pools own them. Concatenated pool by pool instead, a clipped pass emptied the top
+/// pool's highest arena and then spent the rest of its budget on that pool's low
+/// arenas while the next pools' arenas held the frontier one region lower: measured on
+/// Qwen3-30B-A3B, passes moving 40,000–115,000 chunks and releasing 13–20 arenas each
+/// lowered the frontier by one region, and the probe sat at 61–69% efficiency.
+///
+/// **Still a prefix of every pool's own plan.** A pool's moves come off its right
+/// cursor, so their sources descend in address — a stable sort on the source's rank
+/// keeps each pool's moves in plan order, and whatever prefix of the merged list a
+/// pass applies is a prefix of each plan, which [`CompactPlan::moves`] guarantees is
+/// safe to apply. `rank_of` maps a source `arena_idx` to its region rank.
+///
+/// **Sorted by source arena, not by move.** A plan's moves come in one run per source
+/// arena, so the runs — a few hundred — are what get ordered, and each is copied out
+/// whole. Sorting the moves themselves, with a rank lookup per comparison, cost a
+/// planning budget of 20 ms on its own at a few hundred thousand moves, and every pass
+/// then claimed only its one guaranteed batch.
+pub fn by_source_rank(
+    plans: &[CompactPlan],
+    rank_of: impl Fn(usize) -> usize,
+) -> Vec<(ChunkMove, ArenaKey)> {
+    // (rank, plan, start, end) for every run of moves out of one source arena.
+    let mut runs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for (p, plan) in plans.iter().enumerate() {
+        let mut start = 0;
+        for end in 1..=plan.moves.len() {
+            if end == plan.moves.len() || plan.moves[end].from.0 != plan.moves[start].from.0 {
+                runs.push((rank_of(plan.moves[start].from.0), p, start, end));
+                start = end;
+            }
+        }
+    }
+    runs.sort_by_key(|&(rank, ..)| std::cmp::Reverse(rank));
+    let mut merged = Vec::with_capacity(plans.iter().map(|p| p.moves.len()).sum());
+    for (_, p, start, end) in runs {
+        let key = plans[p].key;
+        merged.extend(plans[p].moves[start..end].iter().map(|m| (*m, key)));
+    }
+    merged
+}
+
 /// One arena as the two-cursor walk sees it: an id for the moves to name, its slot
 /// count, and its occupied slots in ascending order.
 pub struct SlotRun<'a> {
@@ -179,16 +225,19 @@ pub struct SlotRun<'a> {
 /// both by `(SlotRun::id, slot)`. See [`plan_pool`] for why this is the minimum move
 /// count for a perfect pack, and why a clipped walk is still sound — the pool that
 /// applies a prefix of these moves is strictly better packed than before it.
+///
+/// **O(moves + arenas), not O(slots).** Both cursors walk the ascending `occupied`
+/// lists themselves: the right one steps down through occupied slots and never looks
+/// at a free one, and the left one steps past an occupied slot by advancing its index
+/// into the list, and past an arena whose remaining slots are all occupied in one
+/// comparison. A left cursor that binary-searched every slot it passed walked every
+/// live chunk of every full low arena — millions at the 320 B rung's 52,428 slots an
+/// arena — and at a frontier of ~300 regions the plan alone outran the pass's 80 ms
+/// budget, so each pass claimed only its one guaranteed batch of 512 moves.
 pub fn pack_moves(order: &[SlotRun<'_>], max_moves: usize) -> (Vec<ChunkMove>, bool) {
     if order.is_empty() {
         return (Vec::new(), false);
     }
-    // A flat occupancy view over the class's whole slot sequence. `occupied` is
-    // ascending per arena, so a membership test is a binary search and the walk
-    // below stays O(slots log capacity) rather than materialising a bitmap over
-    // every slot of every arena — which at the 320 B class's 52,428 chunks per
-    // arena would be the largest allocation in the pass.
-    let occupied_at = |arena: &SlotRun<'_>, slot: u32| arena.occupied.binary_search(&slot).is_ok();
 
     // Global slot ordinals, so "left is still below right" is one comparison.
     // Prefix sums over capacity, in rank order.
@@ -202,14 +251,17 @@ pub fn pack_moves(order: &[SlotRun<'_>], max_moves: usize) -> (Vec<ChunkMove>, b
     let mut moves: Vec<ChunkMove> = Vec::new();
     let mut clipped = false;
 
-    // Left cursor: the lowest free slot. Right cursor: the highest occupied one.
+    // Left cursor: the lowest free slot, with `li` the index of the first occupied
+    // slot at or above it. Right cursor: the highest occupied slot, as an index into
+    // its arena's `occupied`. Both cursors read the census as it was taken: a slot the
+    // walk fills or vacates is behind the cursor that did it, and the walk ends when
+    // they meet.
     let mut lp = 0usize; // arena position, left
     let mut ls = 0u32; // slot within it
+    let mut li = 0usize; // index into order[lp].occupied
     let mut rp = order.len() - 1;
-    // Exclusive, and pre-decremented on first use. `u32` to match the left
-    // cursor and the slot indices themselves: the widest class holds 52,428
-    // chunks per arena, so a slot index never needs more.
-    let mut rs: u32 = order[rp].capacity as u32;
+    // Exclusive, and pre-decremented on first use.
+    let mut ri = order[rp].occupied.len();
 
     loop {
         // Advance the left cursor to the next FREE slot.
@@ -217,13 +269,19 @@ pub fn pack_moves(order: &[SlotRun<'_>], max_moves: usize) -> (Vec<ChunkMove>, b
             if lp >= order.len() {
                 break usize::MAX;
             }
-            if ls as usize >= order[lp].capacity {
+            let a = &order[lp];
+            let rest = a.capacity.saturating_sub(ls as usize);
+            // Every remaining slot of this arena is occupied: the list is ascending
+            // and distinct, so a tail as long as the slots left is all of them.
+            if rest == 0 || a.occupied.len() - li == rest {
                 lp += 1;
                 ls = 0;
+                li = 0;
                 continue;
             }
-            if occupied_at(&order[lp], ls) {
+            if li < a.occupied.len() && a.occupied[li] == ls {
                 ls += 1;
+                li += 1;
                 continue;
             }
             break base[lp] + ls as usize;
@@ -234,18 +292,16 @@ pub fn pack_moves(order: &[SlotRun<'_>], max_moves: usize) -> (Vec<ChunkMove>, b
 
         // Retreat the right cursor to the next OCCUPIED slot.
         let right_ord = loop {
-            if rs == 0 {
+            if ri == 0 {
                 if rp == 0 {
                     break usize::MAX;
                 }
                 rp -= 1;
-                rs = order[rp].capacity as u32;
+                ri = order[rp].occupied.len();
                 continue;
             }
-            rs -= 1;
-            if occupied_at(&order[rp], rs) {
-                break base[rp] + rs as usize;
-            }
+            ri -= 1;
+            break base[rp] + order[rp].occupied[ri] as usize;
         };
         if right_ord == usize::MAX {
             break; // Nothing live left to pull down.
@@ -262,7 +318,7 @@ pub fn pack_moves(order: &[SlotRun<'_>], max_moves: usize) -> (Vec<ChunkMove>, b
         }
 
         moves.push(ChunkMove {
-            from: (order[rp].id, rs),
+            from: (order[rp].id, order[rp].occupied[ri]),
             to: (order[lp].id, ls),
         });
         // The destination is now occupied and the source now free; step both past
@@ -984,6 +1040,48 @@ mod tests {
         assert_eq!(g.arena_holes(), 0, "no holes — the allocator refilled them");
         assert_eq!(g.sparsity(), 115);
         assert_eq!(g.total(), 115, "and the loss is real regardless");
+    }
+
+    /// Two pools whose arenas interleave in the span: the merged list drains the
+    /// highest region first whichever pool owns it, and each pool's moves keep their
+    /// plan order, so any prefix of the merge is a prefix of both plans.
+    #[test]
+    fn the_merge_drains_the_top_of_the_span_first_across_pools() {
+        let other = ArenaKey::new(SizeClass::at(6), ArenaLocation::Gpu);
+        // Pool `gpu()`: arena 10 at rank 0 (one live), arena 11 at rank 3 (two live).
+        // Pool `other`: arena 20 at rank 1 (one live), arena 21 at rank 2 (two live).
+        let census = vec![
+            arena(10, 0, 4, &[0]),
+            arena(11, 3, 4, &[1, 2]),
+            keyed(other, 20, 1, 4, &[0]),
+            keyed(other, 21, 2, 4, &[0, 3]),
+        ];
+        let plans: Vec<CompactPlan> = [gpu(), other]
+            .into_iter()
+            .filter_map(|k| plan_pool(&census, k, 0))
+            .collect();
+        let rank_of = |idx: usize| census.iter().find(|a| a.arena_idx == idx).unwrap().rank;
+        let merged = by_source_rank(&plans, rank_of);
+        assert_eq!(
+            merged,
+            vec![
+                (ChunkMove { from: (11, 2), to: (10, 1) }, gpu()),
+                (ChunkMove { from: (11, 1), to: (10, 2) }, gpu()),
+                (ChunkMove { from: (21, 3), to: (20, 1) }, other),
+                (ChunkMove { from: (21, 0), to: (20, 2) }, other),
+            ],
+        );
+    }
+
+    /// Within one arena the plan's own order stands: the sort is stable and keyed on
+    /// the arena's rank alone.
+    #[test]
+    fn the_merge_keeps_a_pools_order_within_an_arena() {
+        let census = vec![arena(0, 0, 8, &[0]), arena(1, 1, 8, &[1, 4, 6])];
+        let plans = vec![plan_pool(&census, gpu(), 0).unwrap()];
+        let merged = by_source_rank(&plans, |idx| idx);
+        let own: Vec<ChunkMove> = merged.iter().map(|(m, _)| *m).collect();
+        assert_eq!(own, plans[0].moves);
     }
 
     /// A pool absent from the census is not an error and not a plan.

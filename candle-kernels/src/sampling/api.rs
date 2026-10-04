@@ -23,7 +23,10 @@ extern "C" {
     /// # Parameters
     /// - `logits`: Input logits tensor (type determined by `dtype`)
     /// - `batch_size`: Number of sequences in the batch
-    /// - `vocab_size`: Vocabulary size
+    /// - `vocab_size`: Vocabulary size — the logits row stride
+    /// - `live_vocab`: Tokens a row may produce (the tokenizer's last id + 1).
+    ///   A checkpoint pads its output projection past it; the padded tail
+    ///   carries no probability. Clamped to `vocab_size`.
     /// - `dtype`: Data type (0=f32, 1=f16, 2=bf16, 3=fp8_e4m3)
     /// - `temperature`: Sampling temperature (0 = argmax/greedy)
     /// - `top_k`: Top-k sampling (0 = disabled)
@@ -74,10 +77,12 @@ extern "C" {
     ///   `seq_dials[row]`, so a batched wave that mixes configs samples each row
     ///   on its own dials instead of the first row's. Null keeps the shared-scalar
     ///   behaviour.
+    /// - `stream`: the `CUstream` every launch is queued on.
     pub fn run_batched_sampling(
         logits: *const c_void,
         batch_size: i32,
         vocab_size: i32,
+        live_vocab: i32,
         dtype: i32,
         temperature: f32,
         top_k: i32,
@@ -121,5 +126,18 @@ extern "C" {
         seed: u64,
         rng_offsets: *mut u64,
         seq_dials: *const c_void,
+        stream: *mut c_void,
+    );
+
+    /// `table[offsets[i]] = values[i]` for `i < n`, or `= 0` when `values` is
+    /// null, queued on `stream`. The offsets must be distinct. Stamps a
+    /// dispatch's nonzero counts into the sampler's resident count table, and
+    /// clears the same offsets back to zero afterwards.
+    pub fn run_stamp_counts(
+        offsets: *const u32,
+        values: *const u32,
+        n: u32,
+        table: *mut u32,
+        stream: *mut c_void,
     );
 }

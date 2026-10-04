@@ -791,6 +791,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 logits_ptr as *const c_void,
                 p.batch_size,
                 p.vocab_size,
+                p.vocab_size, // live_vocab: no padded tail
                 p.dtype,
                 p.temperature,
                 p.top_k,
@@ -834,6 +835,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 p.seed,
                 rng_ptr as *mut u64,
                 std::ptr::null(),
+                stream.cu_stream() as *mut c_void,
             );
         }
     }
@@ -1112,6 +1114,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 logits_ptr as *const c_void,
                 p.batch_size,
                 p.vocab_size,
+                p.vocab_size, // live_vocab: no padded tail
                 dtype_enum,
                 p.temperature,
                 p.top_k,
@@ -1155,6 +1158,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 p.seed,
                 rng_ptr as *mut u64,
                 std::ptr::null(),
+                stream.cu_stream() as *mut c_void,
             );
         }
     }

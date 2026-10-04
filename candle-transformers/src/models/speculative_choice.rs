@@ -45,8 +45,58 @@
 //! is the block's own draft prefix, known before the verify forward runs. The
 //! driver hands it over as [`SpecRow::prefix`] and walks positions in order, so
 //! a chooser can advance its per-sequence state exactly along the committed path.
+//!
+//! # Typical acceptance
+//!
+//! A sampling chooser also accepts a draft the sample did not land on, when the
+//! row's distribution gives it enough mass: `p(draft) > min(ε, δ·e^(−H))`, the
+//! Medusa rule ([`TypicalAcceptance`]). Otherwise it commits the sample. That
+//! keeps every step at least as long as the exact rule's — a sample that lands
+//! on the draft still accepts it — and a row whose draft fails the threshold
+//! commits exactly what plain sampling would have, so the departure from the
+//! target distribution is confined to the drafts the threshold let through.
+//! The rule needs no argmax clause: `e^(−H) ≤ max p`, so with `δ < 1` the
+//! argmax always clears the threshold. At temperature zero the row is a point
+//! mass and the sample is the argmax, so greedy verification is unchanged.
 
 use candle::{Result, Tensor};
+
+/// The Medusa typical-acceptance thresholds: a draft is accepted when its
+/// probability under the row's sampling distribution exceeds
+/// `min(epsilon, delta · exp(−entropy))`.
+///
+/// `epsilon` caps the bar on a peaked distribution; `delta · exp(−entropy)`
+/// lowers it as the distribution flattens, where many tokens are plausible and
+/// demanding a high probability of any one of them would reject good drafts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TypicalAcceptance {
+    pub epsilon: f32,
+    pub delta: f32,
+}
+
+impl TypicalAcceptance {
+    /// The Medusa reference values.
+    pub const MEDUSA: Self = Self {
+        epsilon: 0.09,
+        delta: 0.3,
+    };
+
+    /// Panics unless `0 < epsilon <= 1` and `0 < delta < 1`.
+    ///
+    /// Outside that range the rule stops meaning what it says: a zero bar
+    /// accepts every draft the row gives any mass at all, and `delta >= 1`
+    /// breaks the property that the argmax always clears the bar. Thresholds
+    /// are a model constant, so a value out of range is a bug in that model,
+    /// caught where the engine loads it rather than as quietly worse text.
+    pub fn assert_valid(&self) {
+        let Self { epsilon, delta } = *self;
+        assert!(
+            epsilon > 0.0 && epsilon <= 1.0 && delta > 0.0 && delta < 1.0,
+            "typical acceptance needs 0 < epsilon <= 1 and 0 < delta < 1, got \
+             epsilon = {epsilon}, delta = {delta}"
+        );
+    }
+}
 
 /// One scored row of a speculative step, as the chooser sees it.
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +114,10 @@ pub struct SpecRow<'a> {
     /// generated, or it prices the row against a history one or more tokens
     /// stale.
     pub prefix: &'a [u32],
+    /// The proposal this row tests — `block[position + 1]` — or `None` on the
+    /// block's last row, which scores the bonus token and tests nothing. A
+    /// chooser applying [`TypicalAcceptance`] reads it.
+    pub draft: Option<u32>,
 }
 
 /// Picks the token each scored row commits.
@@ -189,6 +243,7 @@ impl<'b> AcceptWalk<'b> {
                 // Skips the seed at `block[0]` and covers every proposal
                 // accepted to reach here; empty at position 0.
                 prefix: &self.blocks[i][1..=self.position],
+                draft: self.blocks[i].get(self.position + 1).copied(),
             })
             .collect()
     }
@@ -254,11 +309,36 @@ impl<'b> AcceptWalk<'b> {
 /// kernel the scheduler's sampler runs at temperature zero — not the generic
 /// `argmax` reduction, whose half-precision path addresses every element
 /// through the strided-index walk.
-pub struct GreedyChooser;
+///
+/// The argmax runs over the first `live_vocab` columns, the tokens the
+/// tokenizer can name: a checkpoint pads its logits row past them, and the
+/// padded tail is not a token.
+pub struct GreedyChooser {
+    live_vocab: usize,
+}
+
+impl GreedyChooser {
+    /// Greedy over the first `live_vocab` columns of each row; the row width
+    /// for a model whose logits are not padded.
+    pub fn new(live_vocab: usize) -> Self {
+        Self { live_vocab }
+    }
+
+    /// Greedy over every column of each row, whatever its width — for a
+    /// caller that holds no tokenizer and compares against its own whole-row
+    /// greedy decode, which a bound on one side only would make disagree.
+    pub fn whole_row() -> Self {
+        Self {
+            live_vocab: usize::MAX,
+        }
+    }
+}
 
 impl TokenChooser for GreedyChooser {
     fn choose(&mut self, logits: &Tensor, _rows: &[SpecRow<'_>]) -> Result<Vec<u32>> {
-        logits.batched_sample_argmax()?.to_vec1::<u32>()
+        logits
+            .batched_sample_argmax(self.live_vocab)?
+            .to_vec1::<u32>()
     }
 }
 
@@ -284,19 +364,48 @@ mod tests {
                 seq: 0,
                 position: 0,
                 prefix: &[],
+                draft: None,
             },
             SpecRow {
                 seq: 1,
                 position: 0,
                 prefix: &[],
+                draft: Some(7),
             },
             SpecRow {
                 seq: 1,
                 position: 1,
                 prefix: &[7],
+                draft: None,
             },
         ];
-        assert_eq!(GreedyChooser.choose(&logits, &rows)?, vec![1, 0, 2]);
+        assert_eq!(GreedyChooser::new(3).choose(&logits, &rows)?, vec![1, 0, 2]);
+        Ok(())
+    }
+
+    /// The padded tail of a row is never the greedy pick: with two live
+    /// tokens, row 2's 9.0 in the third column is padding, and the row's pick
+    /// is its best live token.
+    #[test]
+    fn greedy_chooser_never_picks_the_padded_tail() -> Result<()> {
+        let logits = Tensor::from_vec(
+            vec![
+                0.0f32, 1.0, 0.5, // row 0 -> 1
+                0.0, 0.5, 9.0, // row 1 -> 1, not the padded 2
+            ],
+            (2, 3),
+            &Device::Cpu,
+        )?;
+        let row = SpecRow {
+            seq: 0,
+            position: 0,
+            prefix: &[],
+            draft: None,
+        };
+        assert_eq!(
+            GreedyChooser::new(2).choose(&logits, &[row, row])?,
+            vec![1, 1]
+        );
         Ok(())
     }
 
@@ -447,6 +556,46 @@ mod tests {
         assert_eq!(walk.rows()[0].prefix, &[22, 33]);
     }
 
+    #[test]
+    fn the_medusa_thresholds_are_valid() {
+        TypicalAcceptance::MEDUSA.assert_valid();
+    }
+
+    /// A zero bar would accept every draft the row gives any mass.
+    #[test]
+    #[should_panic(expected = "typical acceptance needs")]
+    fn a_zero_epsilon_is_refused() {
+        TypicalAcceptance {
+            epsilon: 0.0,
+            delta: 0.3,
+        }
+        .assert_valid();
+    }
+
+    /// `delta >= 1` would let the bar rise above the argmax's probability.
+    #[test]
+    #[should_panic(expected = "typical acceptance needs")]
+    fn a_delta_of_one_is_refused() {
+        TypicalAcceptance {
+            epsilon: 0.09,
+            delta: 1.0,
+        }
+        .assert_valid();
+    }
+
+    /// Each row names the proposal it tests, and the last row — the bonus
+    /// position — names none.
+    #[test]
+    fn rows_carry_the_draft_they_test() {
+        let blocks = vec![vec![7u32, 22, 33]];
+        let mut walk = AcceptWalk::new(&blocks);
+        assert_eq!(walk.rows()[0].draft, Some(22));
+        walk.commit(&[22], |_, _| true).unwrap();
+        assert_eq!(walk.rows()[0].draft, Some(33));
+        walk.commit(&[33], |_, _| true).unwrap();
+        assert_eq!(walk.rows()[0].draft, None);
+    }
+
     /// A token count that disagrees with the live set is a caller bug that
     /// would otherwise commit one sequence's token to another.
     #[test]
@@ -468,6 +617,7 @@ mod tests {
             seq: 0,
             position,
             prefix: &block[1..=position],
+            draft: block.get(position + 1).copied(),
         };
         assert_eq!(at(0).prefix, &[] as &[u32]);
         assert_eq!(at(1).prefix, &[22]);

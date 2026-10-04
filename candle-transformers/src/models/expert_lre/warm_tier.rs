@@ -200,6 +200,16 @@ impl WarmTier {
         i < self.pinned.num_slots()
     }
 
+    /// Where slot `i` is device-readable — its address, when it is pinned.
+    pub(crate) fn pinned_addr(&self, i: usize) -> Option<u64> {
+        self.is_pinned(i).then(|| self.pinned.slot_addr(i))
+    }
+
+    /// The pinned part's addresses, `[lo, hi)`.
+    pub(crate) fn pinned_range(&self) -> (u64, u64) {
+        self.pinned.range()
+    }
+
     pub(crate) fn slot_ref(&self, i: usize, len: usize) -> &[u8] {
         match i.checked_sub(self.pinned.num_slots()) {
             None => self.pinned.slot_ref(i, len),

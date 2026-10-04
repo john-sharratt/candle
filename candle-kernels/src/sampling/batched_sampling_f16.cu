@@ -7,6 +7,7 @@ extern "C" void run_batched_sampling_f16(
     const half* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -55,10 +56,12 @@ extern "C" void run_batched_sampling_f16(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    // The caller's stream; every launch is ordered on it.
+    void* stream
 ) {
     launch_batched_sampling_typed<half>(
-        logits, batch_size, vocab_size,
+        logits, batch_size, vocab_size, live_vocab,
         repeat_penalty, frequency_penalty, presence_penalty,
         dry_multiplier, dry_base, dry_allowed_length, dry_range,
         eos_boost, eos_token_id,
@@ -73,6 +76,7 @@ extern "C" void run_batched_sampling_f16(
         stencil, stencil_size,
         temperature, top_k, top_p,
         output_tokens, seed, rng_offsets,
-        reinterpret_cast<const SeqDials*>(seq_dials)
+        reinterpret_cast<const SeqDials*>(seq_dials),
+        static_cast<cudaStream_t>(stream)
     );
 }

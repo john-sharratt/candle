@@ -43,6 +43,7 @@ use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::interleave;
 use super::{Scheduler, SequenceId};
 use crate::projection::DecodePriority;
+use candle_nn::kv_cache::CHUNK_SIZE;
 
 /// The least advance the engine hands a sequence, and so the width a forward
 /// worth running is priced at. 128 rows.
@@ -165,6 +166,23 @@ impl<'a> AdmitPass<'a> {
             .wave_tier_bytes(rows, 1, self.sched.session.activation_dtype())
             .unwrap_or(0)
     }
+
+    /// The tier a **join** adds: the forward's rows stay where they are, and it
+    /// carries one sequence more. The tier is superlinear in sequences — the span
+    /// tables hold an entry per span — so a join is not free even though it adds
+    /// no row, and pricing it at zero lets a forward widen to the sequence cap on
+    /// a tier admission never charged.
+    fn join_tier(&self, rows: usize) -> u64 {
+        let dtype = self.sched.session.activation_dtype();
+        let seqs = self.sched.running_prefills();
+        let tier = |n: usize| {
+            self.sched
+                .model
+                .wave_tier_bytes(rows, n, dtype)
+                .unwrap_or(0)
+        };
+        tier(seqs + 1).saturating_sub(tier(seqs))
+    }
 }
 
 impl Ground for AdmitPass<'_> {
@@ -269,17 +287,42 @@ impl Ground for AdmitPass<'_> {
         let room = self
             .chunk_rows
             .saturating_sub(self.sched.standing_rows().saturating_add(self.rows_taken));
-        if room == 0 {
+        // **A full forward still takes turns, as members of a shared cohort.**
+        //
+        // Once the rows are spent, a further turn adds none to this forward, but
+        // it is not therefore turned away: the forwards that follow share their
+        // rows across every prefill in flight (`admission::share_within`), so it
+        // prefills beside the others and decodes in their cohort rather than a
+        // whole cohort behind. One forward's rows are not a cap on how many turns
+        // may join: a cohort admitted whole prefills together and decodes at its
+        // full width, where one cut at the rows decodes in halves.
+        //
+        // It joins while every member can still advance at least one chunk a
+        // forward — the rule `share_within` carries members by — so admission and
+        // the wave that forms from it agree on who rides. Every prefill in flight
+        // is counted, paused ones included: a pause lifts, and its turn then
+        // shares the same forwards.
+        if room == 0
+            && (self.sched.prefill_width() + 1).saturating_mul(CHUNK_SIZE) > self.chunk_rows
+        {
             return None;
         }
         let rows = w.tokens.len().min(room);
+        // A join widens the forward by a sequence rather than by rows, and pays
+        // for that; an offer with rows pays for its rows.
+        let rows_in_forward = self.chunk_rows.saturating_sub(room);
+        let activations = if rows == 0 {
+            self.join_tier(rows_in_forward)
+        } else {
+            self.tier_for(rows)
+        };
         Some(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
             // the engine to feeding all of it, and a cost that priced only the
             // first chunk would admit a queue of turns whose tails cannot fit.
             kv: prefill_cost_bytes(w.tokens.len(), self.per_block),
             recurrent: self.recurrent,
-            activations: self.tier_for(rows),
+            activations,
             rows,
             // The turn decodes when this prefill finishes, which is what puts
             // the decode model's judgement in play beside the prefill one.

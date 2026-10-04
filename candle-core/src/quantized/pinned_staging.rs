@@ -289,6 +289,15 @@ impl PinnedBuf {
         Self::alloc_owned_with_flags(len, 0)
     }
 
+    /// Plain pinned memory, as [`Self::alloc_owned_default`], that every CUDA
+    /// context treats as pinned — `CU_MEMHOSTALLOC_PORTABLE` (0x01). For a
+    /// buffer held process-wide and copied into from whichever device a caller
+    /// is on: without the flag, a copy from a second device's context reads it
+    /// as pageable memory and the transfer is staged through the driver.
+    pub fn alloc_owned_portable(len: usize) -> Result<Self> {
+        Self::alloc_owned_with_flags(len, 0x01)
+    }
+
     /// Staging allocation that never aborts the process under memory pressure:
     /// try pinned host memory first, and on failure fall back to a **fallible**
     /// plain host `Vec` via `try_reserve_exact` (NOT `vec![]`, which calls

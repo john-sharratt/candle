@@ -531,10 +531,7 @@ mod tests {
         });
         let mut g = guardian(vec![Box::new(Journal)], vec![Rung::Nudge]);
         g.scan(&cast, secs(0)).await;
-        assert_eq!(
-            *cast.decided.lock().unwrap(),
-            vec![(true, String::new())]
-        );
+        assert_eq!(*cast.decided.lock().unwrap(), vec![(true, String::new())]);
         assert_eq!(kinds(&g), vec!["journal"]);
     }
 

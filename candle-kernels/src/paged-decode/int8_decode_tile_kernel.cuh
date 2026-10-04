@@ -918,7 +918,13 @@ __device__ __forceinline__ void tile_k_block_decode(
             }
         });
     } else {
-        #pragma unroll
+        // A real loop, not unrolled: each palette's body is a dispatch over
+        // every format, so unrolling pasted that whole dispatch once per
+        // palette into the kernel — four copies on a path that runs only for
+        // a group whose palettes differ in format. One palette's loads cannot
+        // move above the previous palette's dispatch either way, so the
+        // unroll bought no overlap.
+        #pragma unroll 1
         for (int p = 0; p < N_PALETTE; ++p)
             i8_with_format((int)((f4 >> (8 * p)) & 0xffu), [&](auto tag) {
                 tile_k_block_decode_palettes<HEAD_DIM, 1>(tag, ext, s_inv_g, g, within, lane,
@@ -1145,7 +1151,9 @@ __device__ __forceinline__ void tile_v_block_path(
 /// centroid comes back in the PV epilogue as C · Σp over the tile's row.
 /// Per dim this writes S into `s_v_scale` and C's bits into the tile's absmax
 /// buffer, which the block path would otherwise use and this one does not.
-template <int HEAD_DIM, int NS>
+/// All nine slots are walked: the ninth's descriptor is dead on an
+/// eight-quad tile, so it is skipped by the same check as any dead group.
+template <int HEAD_DIM>
 __device__ __forceinline__ void tile_v_q0v_readthrough(
     const TileExt& ext, const TileGroups& tg, const uint8_t* s_inv, int* s_vabs,
     __half* s_v_scale, int g0, int p, int lane, int8_t* s_v8t)
@@ -1161,7 +1169,7 @@ __device__ __forceinline__ void tile_v_q0v_readthrough(
         s_v_scale[d] = __float2half(h.s);
         s_vabs[d] = __float_as_int(h.c);
         #pragma unroll
-        for (int g = 0; g < NS; ++g) {
+        for (int g = 0; g < TILE_SLOTS; ++g) {
             const uint32_t lv = grp_mask(tg.desc[g]);
             if (lv == 0u) continue;
             const int within = grp_within(tg.desc[g]);
@@ -2455,48 +2463,54 @@ int8_decode_tile_kernel(
             return __ballot_sync(0xffffffffu, l);
         };
         // Sweep 1: every pass's K rows and V absmax. The K decode's one site.
-        for (int p = 0; p < n_pass; ++p) {
+        //
+        // The ninth quad (slot TILE_GROUPS, live only on a single-pass
+        // nine-quad window) is warp 0's second round of the same loop, through
+        // its own staging span (warp 0's is span 0), from the group's spans —
+        // a dead slot returns at once. A loop rather than a second call: the
+        // K decode is the vector and block paths over every format, and a
+        // second call site was a second inlined copy of all of it.
+        //
+        // Sweep 2 (a multi-pass tile only): the earlier passes' V rows,
+        // quantised against the window's absmax. The last pass is the body's:
+        // its groups are published and go out as the tile's.
+        //
+        // Both sweeps are one loop, `i` running sweep 1's passes and then
+        // sweep 2's, so the V block decode both take has one site — two
+        // sites were two inlined copies of it over every format.
+        const int k_rounds = (warp == 0 && has8) ? 2 : 1;
+        const int n_iter = (n_pass > 1) ? 2 * n_pass : 1;
+        for (int i = 0; i < n_iter; ++i) {
+            const bool sweep2 = i >= n_pass;
+            const int p = sweep2 ? i - n_pass : i;
             if (n_pass > 1) publish(p);
-            tile_k_decode<HEAD_DIM, ROPE_INTERLEAVED>(ext, tg, s_tbl, s_inv, s_arena + OFF_KSTG,
-                                                      warp, s_k8, s_k_scale, rope, warp, lane,
-                                                      k_raw);
-            // The ninth quad (slot TILE_GROUPS, live only on a single-pass
-            // nine-quad window): warp 0's second round, through its own
-            // staging span, from the group's spans — a dead slot returns at
-            // once.
-            if (warp == 0 && n_pass == 1 && has8)
-                tile_k_decode<HEAD_DIM, ROPE_INTERLEAVED>(ext, tg, s_tbl, s_inv, s_arena + OFF_KSTG,
-                                                          0, s_k8, s_k_scale, rope, TILE_GROUPS,
-                                                          lane, nullptr);
+            if (sweep2 && p + 1 == n_pass) break;
+            if (!sweep2) {
+                #pragma unroll 1
+                for (int r = 0; r < (n_pass == 1 ? k_rounds : 1); ++r) {
+                    tile_k_decode<HEAD_DIM, ROPE_INTERLEAVED>(ext, tg, s_tbl, s_inv, s_arena + OFF_KSTG,
+                                                              warp, s_k8, s_k_scale, rope,
+                                                              r == 0 ? warp : TILE_GROUPS, lane,
+                                                              r == 0 ? k_raw : nullptr);
+                }
+            }
             if (n_pass > 1) {
                 if (warp >= TILE_SM_WARPS) {
+                    // Sweep 1 folds the absmax and drops the words; sweep 2
+                    // decodes again and quantises. The two ranks are a real
+                    // loop (this path is a tile wider than a pass, the rare
+                    // case).
                     const int vw = warp - TILE_SM_WARPS;
                     const uint32_t live_g = v_live();
-                    uint32_t wt[TILE_SLOTS][GROUP_TOK / 2];
-                    tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw, lane, wt);
-                    tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw,
-                                                  lane + WARP_SIZE, wt);
-                }
-                __syncthreads();
-            }
-        }
-        if (n_pass > 1) {
-            // Sweep 2: the earlier passes' V rows, quantised against the
-            // window's absmax. The last pass is the body's: its groups are
-            // published and go out as the tile's.
-            for (int p = 0; p < n_pass; ++p) {
-                publish(p);
-                if (p + 1 == n_pass) break;
-                if (warp >= TILE_SM_WARPS) {
-                    const int vw = warp - TILE_SM_WARPS;
-                    const uint32_t live_g = v_live();
-                    uint32_t w0[TILE_SLOTS][GROUP_TOK / 2], w1[TILE_SLOTS][GROUP_TOK / 2];
-                    tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw, lane, w0);
-                    tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw,
-                                                  lane + WARP_SIZE, w1);
-                    tile_v_block_quantise<HEAD_DIM, TILE_GROUPS>(w0, tg, s_inv, vabs_mp, s_v8t, vw, lane);
-                    tile_v_block_quantise<HEAD_DIM, TILE_GROUPS>(w1, tg, s_inv, vabs_mp, s_v8t, vw,
-                                                    lane + WARP_SIZE);
+                    #pragma unroll 1
+                    for (int s = 0; s < 2; ++s) {
+                        uint32_t w[TILE_SLOTS][GROUP_TOK / 2];
+                        tile_v_block_decode<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs_mp, live_g, vw,
+                                                                   lane + WARP_SIZE * s, w);
+                        if (sweep2)
+                            tile_v_block_quantise<HEAD_DIM, TILE_GROUPS>(w, tg, s_inv, vabs_mp, s_v8t, vw,
+                                                                         lane + WARP_SIZE * s);
+                    }
                 }
                 __syncthreads();
             }
@@ -2795,8 +2809,7 @@ int8_decode_tile_kernel(
             if (vt == 0) s_v_affine = q0v ? 1 : 0;
             __syncwarp();
             if (q0v) {
-                if (has8) tile_v_q0v_readthrough<HEAD_DIM, TILE_SLOTS>(ext, tg, s_inv, vabs, s_v_scale, g_first, vw, lane, s_v8t);
-                else      tile_v_q0v_readthrough<HEAD_DIM, TILE_GROUPS>(ext, tg, s_inv, vabs, s_v_scale, g_first, vw, lane, s_v8t);
+                tile_v_q0v_readthrough<HEAD_DIM>(ext, tg, s_inv, vabs, s_v_scale, g_first, vw, lane, s_v8t);
             } else if (vec) {
                 // The windows are software-pipelined one deep: window
                 // h+1's loads go out once window h's words are converted

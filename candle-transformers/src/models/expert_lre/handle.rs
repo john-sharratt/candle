@@ -1,87 +1,66 @@
-//! Public API — the [`ExpertCache`] handle and its two operating modes.
+//! Public API — the [`ExpertCache`] handle.
 //!
-//! [`ExpertCache`] is the main entry point for the expert pipeline.  It
-//! provides two modes:
+//! [`ExpertCache`] is the main entry point for the expert pipeline. It owns the
+//! device-side expert forward ([`ExpertCache::forward_routed`], see `dispatch`)
+//! and the channels to the two host threads: the pipeline thread, which keeps
+//! VRAM residency in step with routing, and the stager, which reads cold
+//! experts into the pad. The forward thread waits on neither: it enqueues each
+//! MoE layer, tells both the layer's routing, and moves on; the GPU waits only
+//! on a cold expert the stager is still reading.
 //!
-//! - **Threaded** (mmap path): a background thread owns all mutable state.
-//!   The forward path submits work via a channel and blocks for the result.
-//! - **Inline** (reader path): all experts are pre-loaded to VRAM.  No
-//!   thread, no DMA.  A Mutex provides interior mutability (uncontended).
+//! There is no host-side expert path, and no CPU one: a build without `cuda`
+//! cannot construct the cache.
 
 use super::cache::{minimum_resident_slots, pinned_layer_count, ExpertCacheInner};
-#[cfg(not(feature = "cuda"))]
-use super::compute::compute_expert_contribution_gpu_weights;
 #[cfg(feature = "cuda")]
-use super::compute::compute_experts_grouped;
+use super::dispatch::Dispatch;
 #[cfg(feature = "cuda")]
-use super::gpu_dispatch::GpuDispatchTables;
+use super::live_table::LiveTable;
 #[cfg(feature = "cuda")]
 use super::pack::{
     open_or_create, repack_fingerprint, LayerSpansInput, PackIdentity, PackSource, PackSpec,
     RecordLayout,
 };
 #[cfg(feature = "cuda")]
-use super::pinned::{stratified_membership, ExpertResidency};
-#[cfg(not(feature = "cuda"))]
-use super::pipeline::prewarm_expert_cache;
+use super::pad::Pad;
 #[cfg(feature = "cuda")]
-use super::pipeline::{
-    slot_bytes_for, slot_offsets, startup_from_pack, startup_pinned_prefix, startup_repack,
-    ColdStaging, StartupTargets, COLD_STAGING_BUFFERS, PACK_TAIL_STEPS,
-};
+use super::pinned::{stratified_membership, ExpertResidency};
+#[cfg(feature = "cuda")]
 use super::pipeline::{spawn_pipeline_thread, PipelineState};
 #[cfg(feature = "cuda")]
-use super::streamer::{spawn_streamer_thread, StreamerCtx, STREAM_STAGING_BUFFERS};
-use super::transition::TransitionMatrix;
-use super::types::{
-    ClassifiedExperts, CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest,
-    PipelineMessage, PipelineStats,
+use super::promo::PromotionRing;
+#[cfg(feature = "cuda")]
+use super::residency::Residency;
+#[cfg(feature = "cuda")]
+use super::slot_image::{row_tile_bytes_for, slot_bytes_for, slot_offsets};
+#[cfg(feature = "cuda")]
+use super::stager::{spawn_stager, StagerCtx, StagerMsg};
+#[cfg(feature = "cuda")]
+use super::startup::{
+    startup_from_pack, startup_pinned_prefix, startup_repack, StartupRing, StartupTargets,
+    PACK_TAIL_STEPS,
 };
+use super::types::{MmapExpertRef, PipelineMessage, PipelineStats};
 #[cfg(feature = "cuda")]
 use super::warm_tier::WarmTier;
-use super::zone_geometry::ZoneGeometry;
-use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
-
-/// Report, once per distinct reason, that a call could not use the device
-/// dispatch tables. Once because the caller is a per-layer hot path — the point
-/// is that the reason is *stated*, not that it is repeated 40 times a token.
+use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
-/// Say once, per *kind* of refusal, why this layer fell off the device path.
-///
-/// **The key is a `&'static str` and the detail is lazy, and both matter.** This
-/// runs per MoE layer per wave. Keying the dedup on the fully formatted message
-/// — which is what it used to do — means any refusal carrying a varying number
-/// re-logs and inserts another `String` every time that number changes: the
-/// zone-retraction refusal interpolates the live capacity and floor, so it would
-/// have logged on every distinct geometry and grown the set without bound, on
-/// the hot path, while claiming in its own comment to speak once. Formatting the
-/// detail behind `FnOnce` also keeps the `format!` off every call that is about
-/// to be deduped away.
-fn log_dispatch_refusal(reason: &'static str, detail: impl FnOnce() -> String) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    if let Ok(mut s) = seen.lock() {
-        if s.insert(reason) {
-            tracing::warn!(
-                reason,
-                detail = %detail(),
-                "expert cache: this MoE layer takes the host path's blocking routing \
-                 readback instead of the device tables"
-            );
-        }
-    }
-}
+use candle::quantized::cuda::Q8a128Operand;
 use candle::quantized::Int8Mode;
-use candle::wave_provenance::WaveTicket;
-use candle::{DType, Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle::{DType, LiveTensor};
+use candle::{Device, Result};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::WaveGeneration;
 use candle_nn::kv_cache::WeightZone;
 #[cfg(feature = "cuda")]
-use cudarc::driver::CudaStream;
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+
+/// Pad slots an all-resident cache takes: nothing is ever cold there, so the
+/// pad serves only as the startup fill's landing ring.
+#[cfg(feature = "cuda")]
+const STARTUP_RING_SLOTS: usize = 64;
 
 // ============================================================================
 // Warm tier sizing
@@ -400,138 +379,42 @@ pub(crate) fn warm_slots_for(stride: usize, total_slots: usize) -> usize {
 }
 
 // ============================================================================
-// Pipeline mode
-// ============================================================================
-
-/// The two operating modes of the expert cache.
-// Exactly one `PipelineMode` exists per `ExpertCache`, and an `ExpertCache` is
-// per-model. Boxing `Inline` to even the variants out would buy back a few
-// hundred bytes once and pay an indirection on every expert dispatch.
-#[allow(clippy::large_enum_variant)]
-enum PipelineMode {
-    /// Background thread owns all mutable state.  Used for the mmap path
-    /// where DMA overlap is active and experts cycle through VRAM.
-    Threaded {
-        /// Channel to submit work/hints to the pipeline thread.
-        tx: mpsc::SyncSender<PipelineMessage>,
-    },
-    /// All experts pre-loaded to VRAM.  No background thread.  Mutex
-    /// protects the inner state (uncontended — layers execute sequentially).
-    Inline {
-        inner: Mutex<ExpertCacheInner>,
-        device: Device,
-    },
-}
-
-// ============================================================================
 // ExpertCache — the public handle
 // ============================================================================
 
 /// Global expert cache / pipeline handle.
 ///
-/// Shared across all `SparseMoeBlock`s via `Arc<ExpertCache>`.
-///
-/// ## Threaded mode (mmap path)
-///
-/// A background thread owns all mutable state (`ExpertCacheInner`, slots,
-/// eviction scores, mmap, copy stream).  The forward path submits a `MoeWorkRequest`
-/// via an MPSC channel and blocks on the oneshot response.  The thread
-/// does the full classify → DMA → compute loop with `&mut self` — no locks.
-///
-/// ## Inline mode (reader path)
-///
-/// All experts are pre-loaded to VRAM.  No DMA, no background thread.
-/// A `Mutex<ExpertCacheInner>` provides interior mutability (uncontended).
-/// The forward path locks, computes all experts by slot index, releases.
+/// Shared across all MoE blocks via `Arc<ExpertCache>`. A background pipeline
+/// thread owns all mutable cache state (`ExpertCacheInner`, slots, eviction
+/// scores, the copy stream) with `&mut self`; the forward thread reaches it
+/// only through the channel and the pass lock (`dispatch::PassState`).
 pub struct ExpertCache {
-    mode: PipelineMode,
-    /// True when all experts fit in VRAM — hint sending is elided.
-    all_resident: bool,
-    /// The weight zone's live shape, shared with whichever thread owns it.
-    ///
-    /// The handle cannot reach `ExpertCacheInner` in threaded mode — it is
-    /// moved into the pipeline thread's state — so a geometry check written
-    /// against `inner` silently does nothing there. This is the same three
-    /// numbers, published lock-free, readable in either mode.
-    geometry: Arc<ZoneGeometry>,
-    /// Dedicated CUDA stream for async routing index DtoH.
-    /// Lives on the forward thread — never crosses to the pipeline thread.
+    /// Channel to the pipeline thread.
     #[cfg(feature = "cuda")]
-    routing_stream: Option<Arc<CudaStream>>,
-    /// Pinned host buffer for routing indices: `[max_tokens × k]` u32.
-    /// Allocated via `cuMemAllocHost` — truly async DtoH destination.
-    /// Reused every MoE layer (only one is active at a time).
+    tx: mpsc::SyncSender<PipelineMessage>,
+    /// Channel to the stager.
     #[cfg(feature = "cuda")]
-    routing_pinned: Option<PinnedRoutingBuffer>,
-    /// Static GPU-native dispatch tables (all-resident cache only): per-expert
-    /// weight pointers indexed on-device by `moe_bucketize`'s tile tables, so
-    /// the expert forward needs no routing readback. `None` ⇒ host path.
+    stager: mpsc::Sender<StagerMsg>,
+    /// The device-side expert forward and everything it shares with the host
+    /// threads: the live table, the summary ring, the abort word.
     #[cfg(feature = "cuda")]
-    gpu_dispatch: Option<GpuDispatchTables>,
-    /// Set when the pipeline thread has exited (normally or by panic). Its
-    /// `PipelineState` drop frees every expert slot, so the dispatch tables'
-    /// captured weight pointers become dangling — the GPU-native gate checks
-    /// this so a dead pipeline degrades to the host path's loud channel error
-    /// instead of silently dereferencing freed VRAM. Never set in inline mode
-    /// (no thread).
+    dispatch: Dispatch,
+    /// Set when the pipeline thread or the stager has exited (normally or by
+    /// panic). Their guards raise the abort word as they go, so every waiting
+    /// worker traps instead of waiting on an expert that will never come.
+    #[cfg(feature = "cuda")]
     pipeline_dead: Arc<AtomicBool>,
-    /// Expert IDs from the most recently completed MoE layer.
-    /// Used by the next layer's hint to predict via transition matrix.
-    prev_layer_experts: Mutex<Vec<usize>>,
+    #[cfg(feature = "cuda")]
+    stager_dead: Arc<AtomicBool>,
+    /// The pinned tiers the live table's entries point into — held here so
+    /// they outlive every reader, whichever thread exits first.
+    #[cfg(feature = "cuda")]
+    _warm: Arc<WarmTier>,
+    #[cfg(feature = "cuda")]
+    _pad: Arc<Pad>,
     /// Shared telemetry counters (always-on).
     stats: Arc<Mutex<PipelineStats>>,
-    /// Timing accumulator for forward-thread spans (routing, submission).
-    /// Only present when profiling is enabled.
-    #[cfg(feature = "profile")]
-    forward_profile: Mutex<ProfileAccumulator>,
 }
-
-/// Pinned host buffer for routing indices (async DtoH destination).
-#[cfg(feature = "cuda")]
-struct PinnedRoutingBuffer {
-    /// Raw pointer from `cuMemAllocHost`.
-    ptr: *mut u32,
-    /// Capacity in u32 elements.
-    capacity: usize,
-}
-
-#[cfg(feature = "cuda")]
-impl PinnedRoutingBuffer {
-    /// Allocate a pinned buffer for `capacity` u32 elements.
-    fn new(capacity: usize) -> Result<Self> {
-        let byte_size = capacity * std::mem::size_of::<u32>();
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let result = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, byte_size) };
-        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            candle::bail!(
-                "cuMemAllocHost for routing buffer failed: {:?} ({} bytes)",
-                result,
-                byte_size,
-            );
-        }
-        Ok(Self {
-            ptr: ptr as *mut u32,
-            capacity,
-        })
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for PinnedRoutingBuffer {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
-            }
-        }
-    }
-}
-
-// SAFETY: The pinned memory is GPU-accessible and not tied to a thread.
-#[cfg(feature = "cuda")]
-unsafe impl Send for PinnedRoutingBuffer {}
-#[cfg(feature = "cuda")]
-unsafe impl Sync for PinnedRoutingBuffer {}
 
 /// Everything [`ExpertCache::new`] needs, gathered rather than passed as nine
 /// positional arguments.
@@ -550,6 +433,9 @@ pub struct ExpertCacheSetup<'a> {
     pub zone: WeightZone,
     pub device: &'a Device,
     pub experts_per_layer: usize,
+    /// Experts each token routes to (top-k) — sizes the bucketize workspace and
+    /// is checked against the router's bound.
+    pub experts_used: usize,
     /// The checkpoint the experts come from — names the pack and identifies it.
     pub gguf_path: &'a std::path::Path,
     /// Where a persistent pack lives, or `None` for a temp file that is
@@ -570,16 +456,25 @@ pub struct ExpertCacheSetup<'a> {
 }
 
 impl ExpertCache {
+    /// A build without `cuda` has no expert path: the experts run only as the
+    /// device-side grouped GEMM over the live pointer table.
+    #[cfg(not(feature = "cuda"))]
+    pub fn new(_setup: ExpertCacheSetup<'_>) -> Result<Self> {
+        candle::bail!(
+            "MoE expert cache: the routed experts run only on the device — build with the \
+             `cuda` feature"
+        )
+    }
+
     /// Create a new expert cache with a background pipeline thread.
     ///
-    /// **CUDA path:** opens the pack file for this checkpoint — building it by
-    /// repacking every expert out of the GGUF if there is not already a matching
-    /// one — then fills the warm and hot tiers from it. After startup the GGUF's
-    /// expert regions are never read again. Requires an actual CUDA device: a
-    /// cuda-feature build handed a CPU device fails here rather than later.
-    ///
-    /// **Non-CUDA builds** (`not(feature = "cuda")`) take a separate path
-    /// entirely, filling from the mmap with no pack and no warm tier.
+    /// Opens the pack file for this checkpoint — building it by repacking every
+    /// expert out of the GGUF if there is not already a matching one — then
+    /// fills the warm and hot tiers from it, and builds the live pointer table
+    /// over the hot tier. After startup the GGUF's expert regions are never read
+    /// again. Requires an actual CUDA device: a cuda-feature build handed a CPU
+    /// device fails here rather than later.
+    #[cfg(feature = "cuda")]
     pub fn new(setup: ExpertCacheSetup<'_>) -> Result<Self> {
         let ExpertCacheSetup {
             mmap,
@@ -587,6 +482,7 @@ impl ExpertCache {
             zone,
             device,
             experts_per_layer,
+            experts_used,
             gguf_path,
             expert_pack_dir,
             progress,
@@ -641,72 +537,20 @@ impl ExpertCache {
         }
         let mut inner = ExpertCacheInner::new(zone, num_moe_layers, experts_per_layer);
 
-        // ── CUDA copy stream (pipeline thread) ──
-        #[cfg(feature = "cuda")]
-        let copy_stream: Option<Arc<CudaStream>> = if let Device::Cuda(cuda_dev) = device {
-            match cuda_dev.cuda_context().new_stream() {
-                Ok(stream) => {
-                    tracing::info!("Expert cache: created copy stream for DMA overlap");
-                    Some(stream)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Expert cache: failed to create copy stream, falling back to single-stream: {e}"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
+        // ── The copy stream: every promotion and relocation, in order ──
+        let Device::Cuda(cuda_dev_ref) = device else {
+            candle::bail!(
+                "MoE expert cache: this build has CUDA compiled in but was given {device:?}. \
+                 The expert tiers are all device-side or DMA-bound, so there is no CPU path."
+            )
         };
+        let copy_stream = cuda_dev_ref
+            .cuda_context()
+            .new_stream()
+            .map_err(candle::Error::wrap)?;
 
-        // ── CUDA routing stream + pinned buffer (forward thread) ──
-        #[cfg(feature = "cuda")]
-        let (routing_stream, routing_pinned): (
-            Option<Arc<CudaStream>>,
-            Option<PinnedRoutingBuffer>,
-        ) = if let Device::Cuda(cuda_dev) = device {
-            let stream = match cuda_dev.cuda_context().new_stream() {
-                Ok(s) => {
-                    tracing::info!("Expert cache: created routing stream for async DtoH");
-                    Some(s)
-                }
-                Err(e) => {
-                    tracing::warn!("Expert cache: failed to create routing stream: {e}");
-                    None
-                }
-            };
-            // 1024 tokens × 8 experts = 8192 u32 elements = 32 KB
-            let buf = match PinnedRoutingBuffer::new(1024 * experts_per_layer) {
-                Ok(b) => {
-                    tracing::info!(
-                        "Expert cache: allocated {} KB pinned routing buffer",
-                        (1024 * experts_per_layer * 4) / 1024,
-                    );
-                    Some(b)
-                }
-                Err(e) => {
-                    tracing::warn!("Expert cache: failed to allocate pinned routing buffer: {e}");
-                    None
-                }
-            };
-            (stream, buf)
-        } else {
-            (None, None)
-        };
-
-        let transition_matrix = TransitionMatrix::new(num_moe_layers, experts_per_layer);
-        if num_moe_layers > 1 {
-            tracing::info!(
-                "Expert cache: transition matrix enabled ({} layer pairs, {} experts/layer)",
-                num_moe_layers - 1,
-                experts_per_layer,
-            );
-        }
-
-        // ── CUDA startup: the pack, then the two resident tiers from it ──
-        #[cfg(feature = "cuda")]
-        let (pack, warm, cold_staging, streamer_staging, residency, layer_geometries, all_resident) =
+        // ── CUDA startup: the pack, then the resident tiers from it ──
+        let (pack, warm, pad, residency, layer_geometries, all_resident) =
             if let Device::Cuda(cuda_dev) = device {
                 let geoms = super::pinned::layer_geometries(&host_refs, int8mode)?;
                 let total_experts = num_moe_layers * experts_per_layer;
@@ -782,34 +626,23 @@ impl ExpertCache {
                 // what residency demands — the cold tier serves every expert at
                 // any warm size, including zero.
                 let stride = candle::direct_io::round_up_sector(slot_bytes);
-                // **Every staging ring before the warm tier, not after.** They
-                // are small and mandatory; the warm tier is ~14 GB and elastic,
-                // and it pins up to the driver's page-lock ceiling. A ring taken
-                // after it lands on an exhausted page-lock budget, falls back to
-                // pageable memory, and the upload out of that fails with
-                // `CUDA_ERROR_OUT_OF_MEMORY` — the driver cannot lock the bounce
-                // buffer a pageable source needs. That killed a load in the
-                // startup fill, whose ring was allocated after the pool. So the
-                // pipeline's ring (which the startup fill reuses) and the
-                // streamer's ring both come first.
-                let mut cold_staging = ColdStaging::new(stride, COLD_STAGING_BUFFERS)?;
-                let streamer_staging = if all_resident {
-                    None
-                } else {
-                    ColdStaging::new(stride, STREAM_STAGING_BUFFERS)
-                        .inspect_err(|e| {
-                            tracing::warn!(
-                                target: "candle_transformers::expert_lre",
-                                "streamer staging ring unavailable ({e}); expert streaming disabled"
-                            )
-                        })
-                        .ok()
-                };
+                // **The pad before the warm tier, not after.** It is mandatory —
+                // it is what makes a cold expert computable — and one layer of
+                // slots; the warm tier is elastic and pins up to the driver's
+                // page-lock ceiling, so anything pinned after it lands on an
+                // exhausted budget. The startup fill borrows the pad as its
+                // landing ring before the stager takes it over.
+                let pad = Pad::new(
+                    if all_resident {
+                        STARTUP_RING_SLOTS
+                    } else {
+                        experts_per_layer.max(STARTUP_RING_SLOTS)
+                    },
+                    stride,
+                )?;
                 // **A cache that holds every expert in VRAM wants no warm tier
-                // at all.** Nothing is ever evicted in that state — `post_compute`
-                // returns before the eviction and boundary passes — so a warm
-                // slot could only ever be read if a load missed, and no load
-                // does. Sizing it anyway would pin the model's size in host RAM
+                // at all.** Nothing is ever evicted in that state, so no routed
+                // expert is ever read from a host tier. Sizing it anyway would pin the model's size in host RAM
                 // to serve nothing, and pay a full-pack read at startup for it.
                 // The warm tier's job is covering **misses**, and the pinned
                 // prefix never generates one, so it is sized against the
@@ -857,6 +690,7 @@ impl ExpertCache {
                 // to know which experts the warm tier holds before the first
                 // victim is chosen.
                 inner.set_warm_backed(membership);
+                let mut ring = StartupRing::new(&pad);
                 let targets = StartupTargets {
                     inner: &mut inner,
                     warm: &mut warm,
@@ -873,7 +707,7 @@ impl ExpertCache {
                         startup_from_pack(
                             targets,
                             &pack,
-                            &mut cold_staging,
+                            &mut ring,
                             num_moe_layers,
                             experts_per_layer,
                             cuda_dev,
@@ -885,7 +719,7 @@ impl ExpertCache {
                         startup_repack(
                             targets,
                             &mut writer,
-                            &mut cold_staging,
+                            &mut ring,
                             cuda_dev,
                             progress,
                         )?;
@@ -916,47 +750,13 @@ impl ExpertCache {
                 // The pack's stride is what the geometry said it would be — the
                 // buffers above were cut to it before the file was opened.
                 debug_assert_eq!(pack.stride(), stride);
-                (
-                    pack,
-                    warm,
-                    cold_staging,
-                    streamer_staging,
-                    residency,
-                    geoms,
-                    all_resident,
-                )
+                drop(ring);
+                (pack, warm, pad, residency, geoms, all_resident)
             } else {
-                // **A cuda-feature build has no expert path for a CPU device,
-                // and never had one.** Every tier is device-side or DMA-bound:
-                // the hot tier is weight-zone slots, the warm tier is pinned
-                // host memory the GPU reads, the pack's records are uploaded
-                // with `cuMemcpyHtoD`. The `not(feature = "cuda")` build has a
-                // separate mmap path (`prewarm_expert_cache`); this build does
-                // not, and cannot borrow it — the zone it would fill has no
-                // device reservation behind it.
-                //
-                // This used to construct an empty pool and empty tables and
-                // return successfully, which meant the load *appeared* to work
-                // and the first MoE layer panicked indexing an empty
-                // per-layer table. Failing here says the same thing at the
-                // point where it can still be acted on.
-                candle::bail!(
-                    "MoE expert cache: this build has CUDA compiled in but was given {device:?}. \
-                     The expert tiers are all device-side or DMA-bound, so there is no CPU path — \
-                     run on a CUDA device, or build without the `cuda` feature for the mmap path."
-                )
+                // Refused above, where the copy stream is created; kept as the
+                // match's other arm so the binding stays a plain `let`.
+                candle::bail!("MoE expert cache: expected a CUDA device, got {device:?}")
             };
-
-        // ── Non-CUDA prewarm path ──
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = progress; // not yet wired into the legacy prewarm path
-            prewarm_expert_cache(&mut inner, &mmap, &host_refs, device, int8mode);
-        }
-
-        // Non-CUDA: all_resident is always false (no VRAM cache to fill).
-        #[cfg(not(feature = "cuda"))]
-        let all_resident = false;
 
         let stats = PipelineStats::new_shared();
         // Seed the resident-expert VRAM gauge with the startup footprint (occupied
@@ -1018,213 +818,109 @@ impl ExpertCache {
                 s.zone_bytes = inner.zone.capacity() * zone_slot_bytes;
                 s.zone_min_bytes = inner.zone.min_capacity() * zone_slot_bytes;
                 s.zone_max_bytes = inner.zone.limit() * zone_slot_bytes;
-                // Which MoE path this cache will take, as a reported gauge.
-                // `all_resident` is the whole of it: a streaming cache's slot
-                // addresses move, so the device tables cannot be captured and
-                // every layer reads its routing back to schedule uploads.
-                s.device_dispatch = all_resident;
             }
         }
 
-        // With every expert staged into a permanent VRAM slot by the
-        // (synchronous) startup above, the weight addresses are static:
-        // capture them into device pointer tables while `inner` is still in
-        // scope, so the expert forward dispatches entirely on-GPU (no per-layer
-        // routing readback, no pipeline-thread handoff). Only meaningful when
-        // all-resident — a paged cache's pointers move with eviction.
-        #[cfg(feature = "cuda")]
-        let gpu_dispatch = if all_resident {
-            if let Device::Cuda(cuda_dev) = device {
-                GpuDispatchTables::build(&inner, cuda_dev)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Arc-share the two source tiers and the geometry table with the
-        // off-thread expert streamer (both are immutable from here on), and
-        // spawn it — it owns the staging ring allocated for it before the warm
-        // tier, and its own CUDA stream, so a whole-layer prefill stream never
-        // runs its reads on the pipeline thread. All-resident caches have
-        // nothing to stream, and were given no ring.
-        #[cfg(feature = "cuda")]
-        let pack = Arc::new(pack);
-        #[cfg(feature = "cuda")]
-        let warm = Arc::new(warm);
-        #[cfg(feature = "cuda")]
-        let layer_geometries = Arc::new(layer_geometries);
-        #[cfg(feature = "cuda")]
-        let streamer = if let (Some(staging), Device::Cuda(cuda_dev)) = (streamer_staging, device) {
-            match cuda_dev.cuda_context().new_stream() {
-                Ok(stream) => spawn_streamer_thread(
-                    StreamerCtx {
-                        pack: pack.clone(),
-                        warm: warm.clone(),
-                        layer_geometries: layer_geometries.clone(),
-                        cuda_dev: cuda_dev.clone(),
-                        stream,
-                        stats: stats.clone(),
-                    },
-                    staging,
-                ),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "candle_transformers::expert_lre",
-                        "streamer stream unavailable ({e}); expert streaming disabled"
-                    );
-                    None
+        // ── The live table, over where the fill just put every expert ──
+        //
+        // Built for every cache, all-resident or not: there is one expert path,
+        // and the table is how the device finds a weight. Every condition that
+        // path depends on is checked here and refused with its reason.
+        let table = Arc::new(LiveTable::new(
+            cuda_dev_ref,
+            &layer_geometries,
+            experts_per_layer,
+            experts_used,
+        )?);
+        let mut places = Residency::new(table.clone());
+        for (row, layer) in residency.iter().enumerate() {
+            for (expert, res) in layer.iter().enumerate() {
+                if let Some(slot) = res.vram {
+                    places.set_vram(row, expert, Some((slot, inner.slot_base(slot))));
+                }
+                if let Some(ws) = res.ram {
+                    places.set_warm(row, expert, Some((ws, warm.pinned_addr(ws))));
                 }
             }
-        } else {
+        }
+        places.publish_all();
+        let places = Arc::new(Mutex::new(places));
+        // Four layers of ring indices: up to two layers' worth stocked with
+        // free slots (a cold layer, with the next one's refill still behind
+        // the GPU), the rest room for the slots the GPU has taken and this
+        // thread has not yet collected. A cache holding every expert misses
+        // nothing.
+        let promo = if all_resident {
             None
+        } else {
+            Some(Arc::new(PromotionRing::new(
+                4 * experts_per_layer,
+                num_moe_layers,
+                experts_per_layer,
+            )?))
         };
+        let dispatch = Dispatch::new(
+            cuda_dev_ref,
+            table,
+            [warm.pinned_range(), pad.range()],
+            row_tile_bytes_for(&layer_geometries),
+            experts_used,
+            promo.clone(),
+        )?;
+        if let Ok(mut s) = stats.lock() {
+            s.pad_slots = pad.num_slots();
+        }
 
-        let state = PipelineState {
+        let pack = Arc::new(pack);
+        let warm = Arc::new(warm);
+        let pad = Arc::new(pad);
+        let stager_dead = Arc::new(AtomicBool::new(false));
+        let stager = spawn_stager(
+            StagerCtx {
+                pack,
+                warm: warm.clone(),
+                pad: pad.clone(),
+                residency: places.clone(),
+                clock: dispatch.clock.clone(),
+                ring: dispatch.ring.clone(),
+                abort: dispatch.abort.clone(),
+                consumed: dispatch.staged.clone(),
+                stats: stats.clone(),
+                rows: num_moe_layers,
+                n_experts: experts_per_layer,
+            },
+            stager_dead.clone(),
+        )?;
+
+        let state = PipelineState::new(
             inner,
-            device: device.clone(),
-            #[cfg(feature = "cuda")]
+            device.clone(),
             copy_stream,
-            #[cfg(feature = "cuda")]
-            pack,
-            #[cfg(feature = "cuda")]
-            warm,
-            #[cfg(feature = "cuda")]
-            cold_staging,
-            #[cfg(feature = "cuda")]
-            residency,
-            #[cfg(feature = "cuda")]
-            layer_geometries,
-            num_moe_layers,
-            #[cfg(feature = "cuda")]
+            places,
+            dispatch.clock.clone(),
+            dispatch.ring.clone(),
+            dispatch.abort.clone(),
+            dispatch.pass.clone(),
+            dispatch.served.clone(),
+            stager.clone(),
+            Arc::new(layer_geometries),
             all_resident,
-            transition_matrix,
-            last_moe_layer_idx: None,
-            speculative_loads: HashSet::new(),
-            #[cfg(feature = "cuda")]
-            streamer,
-            #[cfg(feature = "cuda")]
-            pending_streams: HashMap::new(),
-            #[cfg(feature = "cuda")]
-            stream_loads: HashSet::new(),
-            prefetch_fences: Vec::new(),
-            prefetch_depth: 1,
-            pass_started: None,
-            pass_dma_bytes: 0,
-            pass_late: 0,
-            pass_pred: (0, 0),
-            bw_ceiling_gbps: 0.0,
-            hint_stats: (0, 0),
-            profile: ProfileAccumulator::new(),
-            stats: stats.clone(),
-            #[cfg(not(feature = "cuda"))]
-            mmap,
-            #[cfg(not(feature = "cuda"))]
-            host_refs,
-            #[cfg(not(feature = "cuda"))]
-            int8mode,
-        };
-
-        // Cloned before `state` moves to the pipeline thread — this handle is
-        // the reader that could not otherwise see the zone at all.
-        let geometry = state.inner.geometry.clone();
+            promo,
+            stats.clone(),
+        );
         let pipeline_dead = Arc::new(AtomicBool::new(false));
         let tx = spawn_pipeline_thread(state, pipeline_dead.clone());
 
         Ok(Self {
-            mode: PipelineMode::Threaded { tx },
-            all_resident,
-            geometry,
-            #[cfg(feature = "cuda")]
-            routing_stream,
-            #[cfg(feature = "cuda")]
-            routing_pinned,
-            #[cfg(feature = "cuda")]
-            gpu_dispatch,
+            tx,
+            stager,
+            dispatch,
             pipeline_dead,
-            prev_layer_experts: Mutex::new(Vec::new()),
+            stager_dead,
+            _warm: warm,
+            _pad: pad,
             stats,
-            #[cfg(feature = "profile")]
-            forward_profile: Mutex::new(ProfileAccumulator::new()),
         })
-    }
-
-    /// Construct an `ExpertCache` in inline mode with pre-populated slots.
-    ///
-    /// Used when all experts are already loaded to VRAM (e.g. the non-mmap
-    /// reader path).  No background thread, no copy stream, no DMA.
-    pub fn new_prepopulated(
-        slots: Vec<Option<ExpertSlot>>,
-        key_to_slot: HashMap<(usize, usize), usize>,
-        last_used: Vec<u32>,
-        generation: u32,
-        slot_to_key: Vec<Option<(usize, usize)>>,
-        device: &Device,
-    ) -> Self {
-        // Every slot is occupied and none ever moves, so the zone exists only to
-        // answer "which index is where" — the addresses are the pre-built
-        // storages' own, not the zone's, and nothing here allocates from it. The
-        // floor is the whole capacity for the same reason: nothing may retract a
-        // zone whose slots it does not own.
-        let mut zone = WeightZone::new(0, 0, slots.len(), slots.len(), slots.len());
-        for _ in 0..slots.len() {
-            zone.alloc();
-        }
-        let slot_count = zone.capacity();
-        let zone_frontier = zone.slot_base(slot_count.saturating_sub(1));
-        let inner = ExpertCacheInner {
-            slots,
-            zone,
-            key_to_slot,
-            last_used,
-            generation,
-            // Nothing may retract a zone whose slot addresses it does not own,
-            // so this geometry is fixed for the object's life — published all
-            // the same, so the staleness check reads one shape of thing in both
-            // modes rather than being conditional on which constructor ran.
-            geometry: Arc::new(ZoneGeometry::new(slot_count, zone_frontier)),
-            slot_to_key,
-            expert_scores: vec![],
-            num_moe_layers: 0,
-            experts_per_layer: 0,
-            // Nothing is ever evicted here, so nothing needs protecting from
-            // eviction either.
-            pinned_layers: 0,
-            // Inline mode holds every expert in VRAM and never evicts, so no
-            // reload cost is ever weighed.
-            warm_backed: vec![],
-        };
-        // All experts are VRAM-resident and never move, so their weight
-        // addresses are static: capture them once into device pointer tables
-        // and the expert forward dispatches entirely on-GPU (no per-layer
-        // routing readback). Best-effort — `None` keeps the host path.
-        #[cfg(feature = "cuda")]
-        let gpu_dispatch = if let Device::Cuda(cuda_dev) = device {
-            GpuDispatchTables::build(&inner, cuda_dev)
-        } else {
-            None
-        };
-        let geometry = inner.geometry.clone();
-        Self {
-            mode: PipelineMode::Inline {
-                inner: Mutex::new(inner),
-                device: device.clone(),
-            },
-            all_resident: true, // prepopulated = all in VRAM
-            geometry,
-            #[cfg(feature = "cuda")]
-            routing_stream: None,
-            #[cfg(feature = "cuda")]
-            routing_pinned: None,
-            #[cfg(feature = "cuda")]
-            gpu_dispatch,
-            pipeline_dead: Arc::new(AtomicBool::new(false)),
-            prev_layer_experts: Mutex::new(Vec::new()),
-            stats: PipelineStats::new_shared(),
-            #[cfg(feature = "profile")]
-            forward_profile: Mutex::new(ProfileAccumulator::new()),
-        }
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -1240,494 +936,49 @@ impl ExpertCache {
         PipelineStats::snapshot(&self.stats).resident_vram_bytes
     }
 
-    /// Submit a full MoE dispatch to the pipeline.
+    /// The routed experts of one MoE layer, on the device — see `dispatch`.
     ///
-    /// This is the primary entry point for `SparseMoeBlock::forward()`.
-    /// In threaded mode, sends the work to the background thread and blocks
-    /// until the result arrives.  In inline mode, executes synchronously.
+    /// `acts` is the layer's q8a128 activation `[n_tokens, hidden]`; `weights`
+    /// and `indices` are the router's `[n_tokens, k]` output (f32, u32), still
+    /// on the device. Returns the routed sum `[n_tokens, hidden]` at
+    /// `out_dtype`. Tokens `[0, decode_tokens)` are decode rows, which the
+    /// residency scoring weights apart from prefill rows.
     ///
-    /// # Arguments
-    ///
-    /// * `moe_layer_idx` — which MoE layer (0..num_moe_layers)
-    /// * `expert_ids` — unique expert IDs selected by the router (sorted)
-    /// * `xs` — input hidden states `[num_tokens, hidden_dim]`
-    /// * `weights_flat` — flattened routing weights `[num_tokens * k]`
-    /// * `assignments` — flat sorted `(expert_id, token_idx, weight_idx)` array
-    /// * `decode_tokens` — count of leading rows (in `assignments`' token
-    ///   order) that are decode-attributed; see
-    ///   [`MoeWorkRequest::decode_tokens`]. A caller that does not know its own
-    ///   split passes the row count, which scores every row as decode did
-    ///   before this existed.
-    ///
-    /// # Returns
-    ///
-    /// Output tensor `[num_tokens, hidden_dim]` — the weighted sum of expert outputs.
+    /// Never waits on the host: the layer is enqueued, its routing is handed to
+    /// the pipeline thread and the stager, and the call returns. The GPU waits
+    /// only in an expert GEMM's worker blocks, on a cold expert the stager is
+    /// still reading.
+    #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
-    pub fn submit_moe_work(
+    pub fn forward_routed<'w>(
         &self,
-        moe_layer_idx: usize,
-        expert_ids: Vec<usize>,
-        input: MoeInput,
-        out_dtype: DType,
-        weights_flat: &Tensor,
-        assignments: Vec<(u32, u32, u32)>,
+        acts: Q8a128Operand<'w>,
+        weights: &LiveTensor<'_>,
+        indices: &LiveTensor<'_>,
+        row: usize,
         decode_tokens: usize,
-        wave: Option<WaveTicket>,
-    ) -> Result<Tensor> {
-        match &self.mode {
-            PipelineMode::Threaded { tx } => {
-                let t = profile_now();
-
-                // Create a oneshot response channel.
-                let (resp_tx, resp_rx) = mpsc::sync_channel(1);
-
-                let request = MoeWorkRequest {
-                    moe_layer_idx,
-                    expert_ids,
-                    input,
-                    out_dtype,
-                    weights_flat: weights_flat.clone(),
-                    assignments,
-                    decode_tokens,
-                    // Captured right before `send` so the worker can split the inbound handoff
-                    // (channel wakeup) out of the actual work.
-                    wave,
-                    submitted_at: profile_now(),
-                    response_tx: resp_tx,
-                };
-
-                tx.send(PipelineMessage::Work(request)).map_err(|_| {
-                    candle::Error::Msg("Expert pipeline thread died — channel closed".into())
-                })?;
-
-                // Block until the pipeline thread returns the result + its completion timestamp.
-                let (result, worker_done_at) = resp_rx.recv().map_err(|_| {
-                    candle::Error::Msg(
-                        "Expert pipeline thread died — response channel closed".into(),
-                    )
-                })?;
-
-                // submit_roundtrip = submit_inbound (worker) + pipe_worker_total (worker) +
-                // submit_outbound (here). The two handoffs are the reclaimable threading tax;
-                // pipe_worker_total is the irreducible classify + DMA + compute.
-                self.record_profile("submit_outbound", worker_done_at);
-                self.record_profile("submit_roundtrip", t);
-                result
-            }
-            PipelineMode::Inline { inner, device } => {
-                // Inline mode: no thread, just lock and compute.
-                self.submit_inline(
-                    inner,
-                    device,
-                    moe_layer_idx,
-                    &expert_ids,
-                    input,
-                    out_dtype,
-                    weights_flat,
-                    &assignments,
-                    wave,
-                )
-            }
-        }
-    }
-
-    /// Inline execution path (reader/prepopulated mode).
-    ///
-    /// All experts are already resident — no DMA, no copy stream.
-    /// Lock the Mutex (uncontended), compute all experts by slot index.
-    #[allow(clippy::too_many_arguments)]
-    fn submit_inline(
-        &self,
-        mutex: &Mutex<ExpertCacheInner>,
-        device: &Device,
-        moe_layer_idx: usize,
-        expert_ids: &[usize],
-        input: MoeInput,
         out_dtype: DType,
-        weights_flat: &Tensor,
-        assignments: &[(u32, u32, u32)],
-        wave: Option<WaveTicket>,
-    ) -> Result<Tensor> {
-        let mut inner = mutex
-            .lock()
-            .map_err(|_| candle::Error::Msg("ExpertCache Mutex poisoned".into()))?;
-
-        // In inline mode, all experts are resident — classify as all hits.
-        let mut hits: Vec<(usize, usize)> = Vec::with_capacity(expert_ids.len());
-        for &expert_idx in expert_ids {
-            if let Some(&slot_idx) = inner.key_to_slot.get(&(moe_layer_idx, expert_idx)) {
-                inner.promote(slot_idx);
-                hits.push((expert_idx, slot_idx));
-            } else {
-                return Err(candle::Error::Msg(format!(
-                    "Inline mode: expert ({moe_layer_idx}, {expert_idx}) not found in cache"
-                )));
-            }
-        }
-
-        let expert_group = |eid: usize| -> (Vec<u32>, Vec<u32>) {
-            let eid32 = eid as u32;
-            let lo = assignments.partition_point(|a| a.0 < eid32);
-            let hi = assignments.partition_point(|a| a.0 <= eid32);
-            let toks: Vec<u32> = assignments[lo..hi].iter().map(|a| a.1).collect();
-            let wids: Vec<u32> = assignments[lo..hi].iter().map(|a| a.2).collect();
-            (toks, wids)
-        };
-
-        let (num_tokens, hidden) = input.shape()?;
-        // The inline twin of the threaded pipeline's combine target. It runs on
-        // the caller's thread and stream, so the layer's FFN generation *would*
-        // bound it — but this mode exists only when there is no pipeline thread,
-        // which production never configures, so it stays an ordinary allocation
-        // rather than a second wave consumer for a path nothing takes.
-        //
-        // Uninitialised on CUDA (hot-path invariant 6): the deterministic
-        // scatter stores every `(token, column)` of the target, and the one path
-        // that does not reach it — no expert routed at all — zeros explicitly
-        // below. The non-CUDA arm accumulates through `index_add`, so its zero
-        // is read.
-        #[cfg(feature = "cuda")]
-        let mut ys = Tensor::empty((num_tokens, hidden), out_dtype, device)?;
-        #[cfg(not(feature = "cuda"))]
-        let mut ys = Tensor::zeros((num_tokens, hidden), out_dtype, device)?;
-        let mut _inline_prof = ProfileAccumulator::new();
-        #[cfg(feature = "cuda")]
-        {
-            let experts_data: Vec<(Vec<u32>, Vec<u32>)> =
-                hits.iter().map(|&(eidx, _)| expert_group(eidx)).collect();
-            // A missing slot is a DROPPED expert, not a skippable one: the old
-            // `filter_map(… as_ref()?)` silently omitted it, so its contribution
-            // vanished and the layer returned an answer computed from fewer than
-            // k experts, indistinguishable downstream from a correct one. Same
-            // hazard, same refusal, as the threaded pipeline's copy.
-            let mut experts_vec: Vec<(&ExpertSlot, &[u32], &[u32])> =
-                Vec::with_capacity(hits.len());
-            for (&(eidx, slot_idx), (toks, wids)) in hits.iter().zip(experts_data.iter()) {
-                let Some(slot) = inner.slots[slot_idx].as_ref() else {
-                    candle::bail!(
-                        "expert {eidx} was classified resident in slot {slot_idx}, but that slot \
-                         is empty at compute time: its contribution would be dropped from this \
-                         layer's output"
-                    );
-                };
-                experts_vec.push((slot, toks.as_slice(), wids.as_slice()));
-            }
-            if experts_vec.is_empty() {
-                // Nothing routed, so the scatter never runs and the target it
-                // would have defined is still uninitialised. Zero by definition,
-                // not by omission.
-                ys = Tensor::zeros((num_tokens, hidden), out_dtype, device)?;
-            } else {
-                compute_experts_grouped(
-                    &input,
-                    &mut ys,
-                    &experts_vec,
-                    weights_flat,
-                    &mut _inline_prof,
-                    wave,
-                )?;
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            // Non-CUDA only ever sees `Float` (int8/q8a128 is cuda-only).
-            let MoeInput::Float(xs) = &input;
-            for &(eidx, slot_idx) in &hits {
-                let slot = inner.slots[slot_idx].as_ref().ok_or_else(|| {
-                    candle::Error::Msg(format!("inline slot {slot_idx} unexpectedly empty"))
-                })?;
-                let (toks, w_ids) = expert_group(eidx);
-                compute_expert_contribution_gpu_weights(
-                    xs,
-                    &mut ys,
-                    slot,
-                    &toks,
-                    weights_flat,
-                    &w_ids,
-                )?;
-            }
-        }
-
-        Ok(ys)
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
+        self.dispatch.forward(
+            &self.tx,
+            &self.stager,
+            acts,
+            weights,
+            indices,
+            row,
+            decode_tokens,
+            out_dtype,
+            wave,
+        )
     }
 
-    /// Legacy API: classify and load experts, returning slot indices + fence.
-    ///
-    /// Only available in inline mode.  Panics in threaded mode (use
-    /// `submit_moe_work` instead).
-    pub fn classify_and_load(
-        &self,
-        moe_idx: usize,
-        expert_ids: &[usize],
-    ) -> Result<ClassifiedExperts> {
-        match &self.mode {
-            PipelineMode::Inline { inner, .. } => {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| candle::Error::Msg("ExpertCache Mutex poisoned".into()))?;
-
-                let mut hits: Vec<(usize, usize)> = Vec::new();
-                for &expert_idx in expert_ids {
-                    if let Some(&slot_idx) = guard.key_to_slot.get(&(moe_idx, expert_idx)) {
-                        if guard.slots[slot_idx].is_some() {
-                            guard.promote(slot_idx);
-                            hits.push((expert_idx, slot_idx));
-                        }
-                    }
-                }
-
-                Ok(ClassifiedExperts {
-                    hits,
-                    loaded: vec![],
-                    fence: CopyBatchFence::noop(),
-                })
-            }
-            PipelineMode::Threaded { .. } => Err(candle::Error::Msg(
-                "classify_and_load not available in threaded mode — use submit_moe_work".into(),
-            )),
-        }
-    }
-
-    /// Lock the inner cache state and run a closure with mutable access.
-    ///
-    /// Only available in inline mode.  Panics in threaded mode.
-    pub fn with_inner<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut ExpertCacheInner) -> Result<R>,
-    {
-        match &self.mode {
-            PipelineMode::Inline { inner, .. } => {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| candle::Error::Msg("ExpertCache Mutex poisoned".into()))?;
-                f(&mut guard)
-            }
-            PipelineMode::Threaded { .. } => Err(candle::Error::Msg(
-                "with_inner not available in threaded mode — use submit_moe_work".into(),
-            )),
-        }
-    }
-
-    /// Make the main (compute) stream wait for a batch fence.
-    ///
-    /// Only needed when using the legacy classify_and_load API.
-    /// In threaded mode, fence waiting is handled by the pipeline thread.
-    pub fn wait_for_copies(&self, fence: CopyBatchFence) -> Result<()> {
-        let _fence = fence;
-        #[cfg(feature = "cuda")]
-        if let Some(ref event) = _fence.event {
-            let device = match &self.mode {
-                PipelineMode::Inline { device, .. } => device,
-                PipelineMode::Threaded { .. } => {
-                    return Err(candle::Error::Msg(
-                        "wait_for_copies not available in threaded mode".into(),
-                    ));
-                }
-            };
-            if let Device::Cuda(cuda_dev) = device {
-                cuda_dev
-                    .cuda_stream()
-                    .wait(event)
-                    .map_err(candle::Error::wrap)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns true if this cache uses the background pipeline thread.
-    pub fn is_threaded(&self) -> bool {
-        matches!(self.mode, PipelineMode::Threaded { .. })
-    }
-
-    /// Send a speculative prediction hint to the pipeline thread.
-    ///
-    /// The hint tells the pipeline thread which MoE layer is coming and
-    /// which experts were used in the previous layer.  The pipeline thread
-    /// uses the transition matrix to predict which experts will be needed
-    /// and starts DMA before the full work request arrives.
-    ///
-    /// No-op in inline mode, when all experts are resident, or if the
-    /// channel send fails.
-    pub fn send_hint(&self, layer_idx: usize, prev_expert_ids: Vec<usize>) {
-        if self.all_resident {
-            return;
-        }
-        if let PipelineMode::Threaded { tx } = &self.mode {
-            let _ = tx.send(PipelineMessage::Hint {
-                layer_idx,
-                prev_expert_ids,
-            });
-        }
-    }
-
-    /// Get the routing stream for async DtoH (if available).
+    /// Whether the pipeline thread or the stager has exited. Its guard raised
+    /// the abort word as it went, so any expert layer enqueued since traps on
+    /// the device and the next synchronize reports it.
     #[cfg(feature = "cuda")]
-    pub fn routing_stream(&self) -> Option<&Arc<CudaStream>> {
-        self.routing_stream.as_ref()
-    }
-
-    /// The static GPU-native dispatch tables, when this cache is all-resident
-    /// and they were successfully built at construction. `Some` ⇒ the expert
-    /// forward can run entirely on-device (no routing readback).
-    #[cfg(feature = "cuda")]
-    pub fn gpu_dispatch(&self) -> Option<&GpuDispatchTables> {
-        self.gpu_dispatch.as_ref()
-    }
-
-    /// Whether the pipeline thread has exited — after which the dispatch
-    /// tables' captured weight pointers are dangling and the GPU-native path
-    /// must not run. Always `false` in inline mode.
     pub fn pipeline_dead(&self) -> bool {
-        self.pipeline_dead.load(Ordering::Acquire)
-    }
-
-    /// The dispatch tables IF the GPU-native path is safe for `moe_layer_idx`
-    /// with a router `n_experts` wide — the cache-owned safety conditions in
-    /// one place so no caller can skip part of the chain:
-    /// * tables built (all-resident, KO weights, null-stream compute),
-    /// * the layer inside the covered row range,
-    /// * router width == table row width (a mismatch would index other
-    ///   layers' experts),
-    /// * the pipeline thread alive (its death frees the slot weights the
-    ///   tables point at — dangling-pointer dispatch).
-    ///
-    /// Callers still gate their own model-level conditions (top-k bound,
-    /// routing capture, diagnostic env overrides).
-    #[cfg(feature = "cuda")]
-    pub fn live_gpu_dispatch(
-        &self,
-        moe_layer_idx: usize,
-        n_experts: usize,
-    ) -> Option<&GpuDispatchTables> {
-        // Each refusal names itself, ONCE. `GpuDispatchTables::build` already
-        // reports why the tables could not be made; this is the other half —
-        // tables that exist but are not usable for this call — and it was the
-        // silent half. Costing decode a multiple because a per-layer condition
-        // quietly disagreed is not something to learn from a profiler three
-        // crates away.
-        let Some(gd) = self.gpu_dispatch.as_ref() else {
-            // Deliberately does NOT guess why. A paged cache never builds
-            // tables by design, and an all-resident one that failed to has
-            // already said so with the actual reason — asserting one of those
-            // here would put a confident wrong answer next to the right one.
-            log_dispatch_refusal("no dispatch tables were built for this cache", String::new);
-            return None;
-        };
-        if gd.expert_base(moe_layer_idx).is_none() {
-            log_dispatch_refusal("MoE layer is outside the covered table range", || {
-                format!("layer {moe_layer_idx}")
-            });
-            return None;
-        }
-        if gd.n_experts != n_experts {
-            log_dispatch_refusal("router width disagrees with the tables", || {
-                format!("router {n_experts} vs tables {}", gd.n_experts)
-            });
-            return None;
-        }
-        if self.pipeline_dead() {
-            log_dispatch_refusal("expert pipeline thread is dead", String::new);
-            return None;
-        }
-        // **The tables' addresses are only valid while the zone still owns
-        // them.**
-        //
-        // They are captured once, on the reasoning that an all-resident cache's
-        // weight addresses are static. All-resident at startup is not resident
-        // for ever: `WeightZone::retract_to` concedes slots to the KV side under
-        // pressure, the KV arena allocates that ground and writes to it, and a
-        // table entry pointing there stops naming an expert weight. The GEMM
-        // then reads KV bytes as weights — finite, plausibly-shaped, and wrong,
-        // which is why it surfaces as a NaN several layers downstream rather
-        // than as a fault.
-        //
-        // The host path has always refused a weight pointer below the live
-        // `weight_floor` ("that is KV ground, not an expert slot"). This is the
-        // GPU-native half of the same rule, and its absence is what let a
-        // retraction corrupt a contiguous run of expert slots silently.
-        // Read through the shared `ZoneGeometry`, not through `inner`.
-        //
-        // This check was originally written as
-        // `if let PipelineMode::Inline { inner, .. } = &self.mode`, justified by
-        // "an all-resident cache is `Inline` by construction". It is not:
-        // `ExpertCache::new` builds the dispatch tables when `all_resident` and
-        // then returns `PipelineMode::Threaded`, having moved `inner` into the
-        // pipeline thread's state. The branch never matched, so the guard was
-        // dead code in exactly the configuration it was written for, and a
-        // retraction went undetected. Measured: an expert weight the tables
-        // still named sitting 31 MiB BELOW the live `weight_floor` — KV ground
-        // the arena had already allocated and written — read back by the GEMM as
-        // an expert weight and surfacing as NaN eleven layers later.
-        //
-        // The geometry is published lock-free by whichever thread owns the zone,
-        // so this is mode-independent and costs three relaxed loads per layer.
-        //
-        // **The refusal is permanent, and that is the correct behaviour — do not
-        // "fix" it by re-trusting the tables once the zone grows back.** The
-        // tempting reading is that a concede-then-regrow restores the geometry,
-        // so the cached addresses become valid again. The addresses do; the
-        // MAPPING does not. `ExpertCacheInner::evict` drops the key → slot
-        // entry, and re-admission takes the rightmost free slot
-        // (`allocate_slot`), so an expert comes back at a DIFFERENT address
-        // while the tables still name its old one. Re-taking them is the
-        // corruption this guard was written for, wearing a recovery's clothes.
-        //
-        // Rebuilding the tables against the live mapping would be sound at the
-        // instant of the rebuild, and is the only real recovery — but only
-        // while the cache is all-resident again, because in a paged cache every
-        // admission moves an expert and the tables would need invalidating per
-        // admission. So the cost of a concession is the host path for the rest
-        // of the process (measured elsewhere at roughly 18-19 ms → 26-28 ms per
-        // decode step). That is a real price, and it is the price of being
-        // right: before this check was reachable, the "faster" path was reading
-        // KV bytes as expert weights.
-        if let Some((now_capacity, now_floor)) = gd.zone_moved(&self.geometry) {
-            log_dispatch_refusal(
-                "the weight zone has retracted since the tables were built — their slot \
-                 addresses now name KV ground",
-                || {
-                    format!(
-                        "capacity {} → {now_capacity}, floor {:#x} → {now_floor:#x}",
-                        gd.built_capacity(),
-                        gd.built_floor(),
-                    )
-                },
-            );
-            return None;
-        }
-        Some(gd)
-    }
-
-    /// Base pointer of the pinned routing buffer, if it exists and holds `len`.
-    ///
-    /// A pointer rather than a `&mut [u32]`: the cache lives behind an `Arc`, so
-    /// a `&mut` handed out from `&self` is one the borrow checker cannot police —
-    /// nothing stops a second call from minting an overlapping one. The single
-    /// writer here is the forward thread, and the ordering against the routing
-    /// stream's DtoH is the caller's (it holds the events), so the caller is
-    /// where the slice and its `unsafe` belong.
-    #[cfg(feature = "cuda")]
-    pub fn routing_pinned_ptr(&self, len: usize) -> Option<*mut u32> {
-        let pinned = self.routing_pinned.as_ref()?;
-        if len > pinned.capacity {
-            return None;
-        }
-        Some(pinned.ptr)
-    }
-
-    /// Store the expert IDs from the most recently completed MoE layer.
-    /// Called after routing indices are read and before submitting work.
-    pub fn set_prev_layer_experts(&self, experts: Vec<usize>) {
-        if let Ok(mut prev) = self.prev_layer_experts.lock() {
-            *prev = experts;
-        }
-    }
-
-    /// Get a clone of the previous layer's expert IDs for hint prediction.
-    pub fn get_prev_layer_experts(&self) -> Vec<usize> {
-        self.prev_layer_experts
-            .lock()
-            .map_or_else(|_| vec![], |v| v.clone())
+        self.pipeline_dead.load(Ordering::Acquire) || self.stager_dead.load(Ordering::Acquire)
     }
 
     /// Buy `regions` of weight-side ground for the KV side, and answer with the
@@ -1747,33 +998,50 @@ impl ExpertCache {
     /// arenas a wave needs never reaches the next one. This is the path that
     /// breaks that.
     ///
-    /// Zero is an ordinary answer: the zone may already sit at its floor, or a
-    /// wave generation may still be open, in which case `set_weight_floor`
-    /// refuses and this reports that it did. The caller decides whether to retry
-    /// on that basis rather than spinning on a claim that cannot succeed.
+    /// Zero is an ordinary answer: the zone may already sit at its floor, a
+    /// wave may be live, or an expert layer the forward thread has begun may
+    /// still be unserved — the boundary moves only with none in flight. The
+    /// caller decides whether to retry on that basis rather than spinning on a
+    /// claim that cannot succeed.
     ///
     /// Blocks on the pipeline thread's reply — it owns the cache state and is
     /// the only place a boundary move is safe.
     pub fn request_kv_ground(&self, regions: usize) -> u64 {
-        let PipelineMode::Threaded { tx } = &self.mode else {
-            // Inline mode holds every expert in VRAM and never moves the
-            // boundary; there is no ground to offer.
-            return 0;
-        };
         if regions == 0 {
             return 0;
         }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        if tx
-            .send(PipelineMessage::RenegotiateBoundary {
-                regions,
-                response_tx,
-            })
-            .is_err()
-        {
+        if !self.send(PipelineMessage::RenegotiateBoundary {
+            regions,
+            response_tx,
+        }) {
             return 0;
         }
         response_rx.recv().unwrap_or(0)
+    }
+
+    /// Send to the pipeline thread; `false` if it is gone (or, in a build
+    /// without `cuda`, never existed).
+    fn send(&self, msg: PipelineMessage) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.tx.send(msg).is_ok()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = msg;
+            false
+        }
+    }
+
+    /// Wait until the pipeline thread has processed every message sent before
+    /// this one — every routed layer included — so whatever it writes reads
+    /// complete. Returns at once if the thread is gone.
+    fn settle(&self) {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        if self.send(PipelineMessage::Settle { response_tx }) {
+            let _ = response_rx.recv();
+        }
     }
 
     /// The other direction: take back KV regions that are standing free.
@@ -1796,9 +1064,6 @@ impl ExpertCache {
     /// Answers with the bytes taken — always zero, since this direction concedes
     /// nothing; the value exists so the two directions share a signature.
     pub fn reclaim_spare_ground(&self) -> u64 {
-        let PipelineMode::Threaded { tx } = &self.mode else {
-            return 0;
-        };
         // **Sweep before asking, because the answer is computed from `live`.**
         //
         // `spare_regions` offers the weight side what occupancy says is free, and
@@ -1821,69 +1086,65 @@ impl ExpertCache {
         // Zero regions is the growth question — "how much is the KV side holding
         // that I could take?" — as against a positive count, which is the KV side
         // stating what it needs.
-        if tx
-            .send(PipelineMessage::RenegotiateBoundary {
-                regions: 0,
-                response_tx,
-            })
-            .is_err()
-        {
+        if !self.send(PipelineMessage::RenegotiateBoundary {
+            regions: 0,
+            response_tx,
+        }) {
             return 0;
         }
         response_rx.recv().unwrap_or(0)
     }
 
-    /// Snapshot and reset all profile accumulators (forward + pipeline threads).
-    ///
-    /// Returns a merged [`ProfileSnapshot`] containing both forward-thread
-    /// spans (prefixed `fwd_`) and pipeline-thread spans (`pipe_`, `cl_`,
-    /// `gemm_`, `dma_`).
+    /// Snapshot and reset the pipeline thread's profile accumulator (`pipe_*`
+    /// spans), and — in a profile build — the expert GEMMs' worker counters:
+    /// `moe:worker copy` (summed worker time copying remote experts into
+    /// scratch, one count per item) and `moe:worker cold wait` (summed worker
+    /// time waiting on the stager). The worker sums are block-time across the
+    /// `WORKERS` blocks of a launch, not wall time.
     pub fn snapshot_profiles(&self) -> ProfileSnapshot {
-        // Forward thread profile (lives on this handle behind Mutex).
-        let fwd = {
-            #[cfg(feature = "profile")]
-            {
-                self.forward_profile.lock().map_or_else(
-                    |_| ProfileSnapshot::default(),
-                    |mut prof| {
-                        let snap = prof.snapshot();
-                        prof.reset();
-                        snap
-                    },
-                )
-            }
-            #[cfg(not(feature = "profile"))]
-            {
-                ProfileSnapshot::default()
-            }
+        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        #[allow(unused_mut)]
+        let mut snap = if self.send(PipelineMessage::SnapshotProfile {
+            response_tx: resp_tx,
+        }) {
+            resp_rx.recv().unwrap_or_default()
+        } else {
+            ProfileSnapshot::default()
         };
-
-        // Pipeline thread profile (request via message).
-        let pipe = match &self.mode {
-            PipelineMode::Threaded { tx } => {
-                let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
-                if tx
-                    .send(PipelineMessage::SnapshotProfile {
-                        response_tx: resp_tx,
-                    })
-                    .is_ok()
-                {
-                    resp_rx.recv().unwrap_or_default()
-                } else {
-                    ProfileSnapshot::default()
-                }
+        #[cfg(all(feature = "cuda", feature = "profile"))]
+        match self.dispatch.drain_worker_counters() {
+            Ok(c) => {
+                snap.entries
+                    .push(("moe:worker copy".into(), c.copy_ns as f64 / 1e6, c.items));
+                snap.entries.push((
+                    "moe:worker cold wait".into(),
+                    c.cold_wait_ns as f64 / 1e6,
+                    c.items,
+                ));
+                tracing::info!(
+                    target: "candle_transformers::expert_lre",
+                    items = c.items,
+                    launches = c.launches,
+                    gib = c.bytes as f64 / (1u64 << 30) as f64,
+                    copy_ms = c.copy_ns as f64 / 1e6,
+                    cold_wait_ms = c.cold_wait_ns as f64 / 1e6,
+                    "expert workers since the last snapshot"
+                );
             }
-            PipelineMode::Inline { .. } => ProfileSnapshot::default(),
-        };
-
-        // Merge both into a single snapshot.
-        let mut merged = fwd;
-        merged.merge(&pipe);
-        merged
+            Err(e) => tracing::warn!("expert worker counters unreadable: {e}"),
+        }
+        snap
     }
 
-    /// Snapshot the current pipeline telemetry counters.
+    /// The pipeline telemetry counters, complete for every routed layer sent
+    /// before the call.
+    ///
+    /// The pipeline thread serves routed layers concurrently with the forward,
+    /// so a counter read the moment a forward returns could still be missing
+    /// its last layers; this settles the thread first — one channel round
+    /// trip, which after the sampler's synchronize finds the thread idle.
     pub fn expert_stats(&self) -> PipelineStats {
+        self.settle();
         PipelineStats::snapshot(&self.stats)
     }
 
@@ -1900,45 +1161,8 @@ impl ExpertCache {
 
     /// Reset all pipeline telemetry counters to zero.
     pub fn reset_expert_stats(&self) {
+        self.settle();
         PipelineStats::reset(&self.stats);
-    }
-
-    /// Record a profiling span from external callers (e.g. SparseMoeBlock).
-    ///
-    /// Recorded twice, into two tables that answer two questions. This cache's
-    /// own is per-instance and is what the bench harness snapshots per config;
-    /// the pipeline profiler is process-wide and is what a running daemon serves
-    /// over its API, where an expert-routing cost that appeared in neither the
-    /// scheduler's phases nor the kernel spans would otherwise be a hole in the
-    /// breakdown exactly where the MoE lives.
-    ///
-    /// When profiling is disabled, this is an inline no-op.
-    #[cfg(feature = "profile")]
-    pub fn record_profile(&self, name: &'static str, start: ProfileMark) {
-        if let Ok(mut prof) = self.forward_profile.lock() {
-            prof.record(name, start);
-        }
-        crate::models::profile::pipeline_record(name, start);
-    }
-
-    /// No-op when profiling is disabled.
-    #[cfg(not(feature = "profile"))]
-    #[inline(always)]
-    pub fn record_profile(&self, _name: &'static str, _start: ProfileMark) {}
-}
-
-impl Drop for ExpertCache {
-    fn drop(&mut self) {
-        // Profile report is now collected per-config via snapshot_profiles().
-        // Only print at shutdown if un-collected data remains.
-        #[cfg(feature = "profile")]
-        {
-            if let Ok(prof) = self.forward_profile.lock() {
-                if prof.has_data() {
-                    println!("{}", prof.report("Forward Thread Profile (uncollected)"));
-                }
-            }
-        }
     }
 }
 

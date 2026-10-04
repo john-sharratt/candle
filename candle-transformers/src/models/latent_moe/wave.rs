@@ -3410,18 +3410,12 @@ mod tests {
             "wave path must answer exactly \"Paris\": {text:?}"
         );
 
-        // Readback budget: the wave path's ONLY device→host transfers are the
-        // per-layer MoE routing reads (one per wave per layer — intrinsic to
-        // the streaming expert cache, amortized across the whole wave).
-        // Sampling (`to_scalar` above) is the one-per-token the budget allows
-        // and belongs to the caller.
-        let expected = (1 + decode_waves) * n_layers;
+        // Readback budget: the wave forward makes no device→host transfer at
+        // all — the MoE routing reaches the expert pipeline as an async summary
+        // copy, never a blocking read. Sampling (`to_scalar` above) is the
+        // one-per-token the budget allows and belongs to the caller.
         let got = super::super::readback::readback_count();
-        assert_eq!(
-            got, expected,
-            "wave-path readbacks beyond the documented MoE-routing set: \
-             {got} vs {expected}"
-        );
+        assert_eq!(got, 0, "wave-path readbacks: {got}");
         Ok(())
     }
 
@@ -3823,7 +3817,7 @@ mod tests {
                 committed,
                 4,
                 n_layers,
-                &mut GreedyChooser,
+                &mut GreedyChooser::whole_row(),
                 &mut |t| {
                     gen.push(t);
                     gen.len() < 12 && t != eos
@@ -3959,7 +3953,7 @@ mod tests {
                 committed,
                 max_draft,
                 n_layers,
-                &mut GreedyChooser,
+                &mut GreedyChooser::whole_row(),
                 &mut |t| {
                     gen.push(t);
                     gen.len() < 12 && t != eos
@@ -4143,7 +4137,7 @@ mod tests {
                 committed,
                 4,
                 n_layers,
-                &mut GreedyChooser,
+                &mut GreedyChooser::whole_row(),
                 &mut |t| {
                     spec.push(t);
                     spec.len() < MAX_NEW && t != eos
@@ -4280,7 +4274,7 @@ mod tests {
                 committed,
                 max_draft,
                 n_layers,
-                &mut GreedyChooser,
+                &mut GreedyChooser::whole_row(),
                 &mut |t| {
                     gen.push(t);
                     gen.len() < MAX_NEW && t != eos

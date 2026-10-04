@@ -876,8 +876,62 @@ extern "C" __global__ void sa_u32_f64(const uint32_t*, const double*, double*, c
 extern "C" __global__ void sa_u32_f16(const uint32_t*, const __half*, __half*, const size_t, const size_t, const size_t, const size_t);
 extern "C" __global__ void sa_u32_bf16(const uint32_t*, const __nv_bfloat16*, __nv_bfloat16*, const size_t, const size_t, const size_t, const size_t);
 
+extern "C" __global__ void ia_i64_u8(const int64_t*, const size_t, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_i64_u32(const int64_t*, const size_t, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_i64_i64(const int64_t*, const size_t, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u32_u8(const uint32_t*, const size_t, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u32_u32(const uint32_t*, const size_t, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u32_i64(const uint32_t*, const size_t, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u8_f32(const uint8_t*, const size_t, const float*, float*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u8_f64(const uint8_t*, const size_t, const double*, double*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u8_u8(const uint8_t*, const size_t, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u8_u32(const uint8_t*, const size_t, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u8_i64(const uint8_t*, const size_t, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u8_f16(const uint8_t*, const size_t, const __half*, __half*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u8_bf16(const uint8_t*, const size_t, const __nv_bfloat16*, __nv_bfloat16*, const size_t, const size_t, const size_t, const size_t);
+
+extern "C" __global__ void sa_i64_u8(const int64_t*, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_i64_u32(const int64_t*, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_i64_i64(const int64_t*, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u32_u8(const uint32_t*, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u32_u32(const uint32_t*, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u32_i64(const uint32_t*, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u8_f32(const uint8_t*, const float*, float*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u8_f64(const uint8_t*, const double*, double*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u8_u8(const uint8_t*, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u8_u32(const uint8_t*, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u8_i64(const uint8_t*, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u8_f16(const uint8_t*, const __half*, __half*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u8_bf16(const uint8_t*, const __nv_bfloat16*, __nv_bfloat16*, const size_t, const size_t, const size_t, const size_t);
+
+extern "C" __global__ void ia_i64_f8_e4m3(const int64_t*, const size_t, const __nv_fp8_e4m3*, __nv_fp8_e4m3*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u32_f8_e4m3(const uint32_t*, const size_t, const __nv_fp8_e4m3*, __nv_fp8_e4m3*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void ia_u8_f8_e4m3(const uint8_t*, const size_t, const __nv_fp8_e4m3*, __nv_fp8_e4m3*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_i64_f8_e4m3(const int64_t*, const __nv_fp8_e4m3*, __nv_fp8_e4m3*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u32_f8_e4m3(const uint32_t*, const __nv_fp8_e4m3*, __nv_fp8_e4m3*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void sa_u8_f8_e4m3(const uint8_t*, const __nv_fp8_e4m3*, __nv_fp8_e4m3*, const size_t, const size_t, const size_t, const size_t);
+
 extern "C" __global__ void s_i64_f32(const int64_t*, const float*, float*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_i64_f64(const int64_t*, const double*, double*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_i64_u8(const int64_t*, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_i64_u32(const int64_t*, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_i64_i64(const int64_t*, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_i64_f16(const int64_t*, const __half*, __half*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_i64_bf16(const int64_t*, const __nv_bfloat16*, __nv_bfloat16*, const size_t, const size_t, const size_t, const size_t);
 extern "C" __global__ void s_u32_f32(const uint32_t*, const float*, float*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u32_f64(const uint32_t*, const double*, double*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u32_u8(const uint32_t*, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u32_u32(const uint32_t*, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u32_i64(const uint32_t*, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u32_f16(const uint32_t*, const __half*, __half*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u32_bf16(const uint32_t*, const __nv_bfloat16*, __nv_bfloat16*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u8_f32(const uint8_t*, const float*, float*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u8_f64(const uint8_t*, const double*, double*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u8_u8(const uint8_t*, const uint8_t*, uint8_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u8_u32(const uint8_t*, const uint32_t*, uint32_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u8_i64(const uint8_t*, const int64_t*, int64_t*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u8_f16(const uint8_t*, const __half*, __half*, const size_t, const size_t, const size_t, const size_t);
+extern "C" __global__ void s_u8_bf16(const uint8_t*, const __nv_bfloat16*, __nv_bfloat16*, const size_t, const size_t, const size_t, const size_t);
 
 // --- Additional where kernels ---
 extern "C" __global__ void where_u8_f64(const size_t, const size_t, const size_t*, const uint8_t*, const double*, const double*, double*);
@@ -1241,71 +1295,86 @@ void run_gather(int32_t ids_dtype, int32_t dtype, size_t numel, const void* ids,
     }
 }
 
-// Index add dispatcher
+// The scatter-family dispatchers below return 0 when they launched a kernel
+// and -1 when no kernel exists for the (ids_dtype, dtype) pair. The caller
+// turns -1 into an error: a dispatcher that fell through silently reported a
+// write that never happened as done.
+//
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16, 7=f8_e4m3
-// ids_dtype: 0=i16, 1=i32, 2=i64, 3=u32, 4=u8
-void run_index_add(int32_t ids_dtype, int32_t dtype, const void* ids, size_t ids_dim_size, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
+// ids_dtype: 2=i64, 3=u32, 4=u8
+#define SCATTER_FAMILY_SWITCH(LAUNCH, PREFIX, I)                     \
+    switch (dtype) {                                                 \
+        case 0: LAUNCH(PREFIX##_f32, I, float) return 0;             \
+        case 1: LAUNCH(PREFIX##_f64, I, double) return 0;            \
+        case 2: LAUNCH(PREFIX##_u8, I, uint8_t) return 0;            \
+        case 3: LAUNCH(PREFIX##_u32, I, uint32_t) return 0;          \
+        case 4: LAUNCH(PREFIX##_i64, I, int64_t) return 0;           \
+        case 5: LAUNCH(PREFIX##_f16, I, __half) return 0;            \
+        case 6: LAUNCH(PREFIX##_bf16, I, __nv_bfloat16) return 0;    \
+    }
+
+// The accumulating ops also carry an FP8 kernel per index type; scatter does not.
+#define SCATTER_FAMILY_F8(LAUNCH, PREFIX, I)                         \
+    if (dtype == 7) {                                                \
+        LAUNCH(PREFIX##_f8_e4m3, I, __nv_fp8_e4m3) return 0;         \
+    }
+
+// Index add dispatcher
+int32_t run_index_add(int32_t ids_dtype, int32_t dtype, const void* ids, size_t ids_dim_size, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
     size_t numel = left_size * right_size;
     int grid = grid_size(numel);
-    
-    if (ids_dtype == 2) { // i64
-        switch (dtype) {
-            case 0: ia_i64_f32<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, ids_dim_size, (const float*)src, (float*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 1: ia_i64_f64<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, ids_dim_size, (const double*)src, (double*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 5: ia_i64_f16<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, ids_dim_size, (const __half*)src, (__half*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 6: ia_i64_bf16<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, ids_dim_size, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-        }
-    } else if (ids_dtype == 3) { // u32
-        switch (dtype) {
-            case 0: ia_u32_f32<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, ids_dim_size, (const float*)src, (float*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 1: ia_u32_f64<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, ids_dim_size, (const double*)src, (double*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 5: ia_u32_f16<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, ids_dim_size, (const __half*)src, (__half*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 6: ia_u32_bf16<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, ids_dim_size, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-        }
+#define IA_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE>>>((const I*)ids, ids_dim_size, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
+    if (ids_dtype == 2) {
+        SCATTER_FAMILY_SWITCH(IA_LAUNCH, ia_i64, int64_t)
+        SCATTER_FAMILY_F8(IA_LAUNCH, ia_i64, int64_t)
+    } else if (ids_dtype == 3) {
+        SCATTER_FAMILY_SWITCH(IA_LAUNCH, ia_u32, uint32_t)
+        SCATTER_FAMILY_F8(IA_LAUNCH, ia_u32, uint32_t)
+    } else if (ids_dtype == 4) {
+        SCATTER_FAMILY_SWITCH(IA_LAUNCH, ia_u8, uint8_t)
+        SCATTER_FAMILY_F8(IA_LAUNCH, ia_u8, uint8_t)
     }
+#undef IA_LAUNCH
+    return -1;
 }
 
 // Scatter dispatcher
-// dtype: 0=f32
-// ids_dtype: 0=i16, 1=i32, 2=i64, 3=u32, 4=u8
-void run_scatter(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
+int32_t run_scatter(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
     size_t numel = left_size * right_size;
     int grid = grid_size(numel);
-    
-    if (ids_dtype == 2) { // i64
-        switch (dtype) {
-            case 0: s_i64_f32<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-        }
-    } else if (ids_dtype == 3) { // u32
-        switch (dtype) {
-            case 0: s_u32_f32<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-        }
+#define S_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE>>>((const I*)ids, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
+    if (ids_dtype == 2) {
+        SCATTER_FAMILY_SWITCH(S_LAUNCH, s_i64, int64_t)
+    } else if (ids_dtype == 3) {
+        SCATTER_FAMILY_SWITCH(S_LAUNCH, s_u32, uint32_t)
+    } else if (ids_dtype == 4) {
+        SCATTER_FAMILY_SWITCH(S_LAUNCH, s_u8, uint8_t)
     }
+#undef S_LAUNCH
+    return -1;
 }
 
 // Scatter add dispatcher
-// dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16
-// ids_dtype: 0=i16, 1=i32, 2=i64, 3=u32, 4=u8
-void run_scatter_add(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
+int32_t run_scatter_add(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
     size_t numel = left_size * right_size;
     int grid = grid_size(numel);
-    
-    if (ids_dtype == 2) { // i64
-        switch (dtype) {
-            case 0: sa_i64_f32<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 1: sa_i64_f64<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 5: sa_i64_f16<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 6: sa_i64_bf16<<<grid, BLOCK_SIZE>>>((const int64_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-        }
-    } else if (ids_dtype == 3) { // u32
-        switch (dtype) {
-            case 0: sa_u32_f32<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 1: sa_u32_f64<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 5: sa_u32_f16<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-            case 6: sa_u32_bf16<<<grid, BLOCK_SIZE>>>((const uint32_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, dst_dim_size, right_size); break;
-        }
+#define SA_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE>>>((const I*)ids, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
+    if (ids_dtype == 2) {
+        SCATTER_FAMILY_SWITCH(SA_LAUNCH, sa_i64, int64_t)
+        SCATTER_FAMILY_F8(SA_LAUNCH, sa_i64, int64_t)
+    } else if (ids_dtype == 3) {
+        SCATTER_FAMILY_SWITCH(SA_LAUNCH, sa_u32, uint32_t)
+        SCATTER_FAMILY_F8(SA_LAUNCH, sa_u32, uint32_t)
+    } else if (ids_dtype == 4) {
+        SCATTER_FAMILY_SWITCH(SA_LAUNCH, sa_u8, uint8_t)
+        SCATTER_FAMILY_F8(SA_LAUNCH, sa_u8, uint8_t)
     }
+#undef SA_LAUNCH
+    return -1;
 }
+
+#undef SCATTER_FAMILY_F8
+#undef SCATTER_FAMILY_SWITCH
 
 // Convolution-related run_* functions moved to conv_dispatcher.cu to avoid duplicate symbols
 // Cast dispatcher run_cast moved to cast_dispatcher.cu

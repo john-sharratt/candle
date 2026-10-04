@@ -1,11 +1,11 @@
 // C API wrapper for batched penalty and sampling kernel
 // This provides the extern "C" interface for Rust FFI
-// 
+//
 // Key design: NO cudaMalloc/cudaMemcpy needed!
 // - All scalar parameters are passed directly to the kernel
 // - All GPU pointers (logits, token_counts, etc.) come from Rust Tensors
 //   which are already on the GPU
-// - CUDA kernel launch uses default stream (0), like prefill kernel
+// - Every launch is queued on the caller's stream
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -15,11 +15,11 @@
 #include <stdint.h>
 
 // Forward declarations of typed kernel entry points (defined in separate .cu files)
-// Note: No cudaStream_t parameter - kernels use default stream internally
 extern "C" void run_batched_sampling_f32(
     const float* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -68,13 +68,15 @@ extern "C" void run_batched_sampling_f32(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    void* stream
 );
 
 extern "C" void run_batched_sampling_f16(
     const half* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -123,13 +125,15 @@ extern "C" void run_batched_sampling_f16(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    void* stream
 );
 
 extern "C" void run_batched_sampling_fp8_e4m3(
     const __nv_fp8_e4m3* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -178,13 +182,15 @@ extern "C" void run_batched_sampling_fp8_e4m3(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    void* stream
 );
 
 extern "C" void run_batched_sampling_bf16(
     const __nv_bfloat16* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -233,18 +239,22 @@ extern "C" void run_batched_sampling_bf16(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    void* stream
 );
 
 // ============================================================================
 // Unified Dispatcher
 // ============================================================================
-// dtype: 0 = f32, 1 = f16, 2 = bf16
+// dtype: 0 = f32, 1 = f16, 2 = bf16, 3 = fp8_e4m3
 
 extern "C" void run_batched_sampling(
     const void* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    // Tokens a row may produce: the tokenizer's last id + 1. The padded tail of
+    // each row past it carries no probability; `vocab_size` stays the stride.
+    int32_t live_vocab,
     int32_t dtype,
     // Sampling params
     float temperature,
@@ -298,12 +308,14 @@ extern "C" void run_batched_sampling(
     uint64_t seed,
     uint64_t* rng_offsets,
     // Per-sequence dials ([batch_size] of SeqDials) or null — see SeqDials.
-    const void* seq_dials
+    const void* seq_dials,
+    // The caller's stream; every launch is ordered on it.
+    void* stream
 ) {
     switch (dtype) {
         case 0: // f32
             run_batched_sampling_f32(
-                reinterpret_cast<const float*>(logits), batch_size, vocab_size,
+                reinterpret_cast<const float*>(logits), batch_size, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id,
@@ -318,12 +330,12 @@ extern "C" void run_batched_sampling(
                 stencil, stencil_size,
                 temperature, top_k, top_p,
                 output_tokens, seed, rng_offsets,
-                seq_dials
+                seq_dials, stream
             );
             break;
         case 1: // f16
             run_batched_sampling_f16(
-                reinterpret_cast<const half*>(logits), batch_size, vocab_size,
+                reinterpret_cast<const half*>(logits), batch_size, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id,
@@ -338,12 +350,12 @@ extern "C" void run_batched_sampling(
                 stencil, stencil_size,
                 temperature, top_k, top_p,
                 output_tokens, seed, rng_offsets,
-                seq_dials
+                seq_dials, stream
             );
             break;
         case 2: // bf16
             run_batched_sampling_bf16(
-                reinterpret_cast<const __nv_bfloat16*>(logits), batch_size, vocab_size,
+                reinterpret_cast<const __nv_bfloat16*>(logits), batch_size, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id,
@@ -358,12 +370,12 @@ extern "C" void run_batched_sampling(
                 stencil, stencil_size,
                 temperature, top_k, top_p,
                 output_tokens, seed, rng_offsets,
-                seq_dials
+                seq_dials, stream
             );
             break;
         case 3: // fp8_e4m3
             run_batched_sampling_fp8_e4m3(
-                reinterpret_cast<const __nv_fp8_e4m3*>(logits), batch_size, vocab_size,
+                reinterpret_cast<const __nv_fp8_e4m3*>(logits), batch_size, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id,
@@ -378,7 +390,7 @@ extern "C" void run_batched_sampling(
                 stencil, stencil_size,
                 temperature, top_k, top_p,
                 output_tokens, seed, rng_offsets,
-                seq_dials
+                seq_dials, stream
             );
             break;
     }

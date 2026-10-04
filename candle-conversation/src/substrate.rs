@@ -4037,7 +4037,8 @@ impl Substrate {
         self.recurrent_snapshots.get(&stream_id).copied()
     }
 
-    /// Drop a timeline's snapshot entry (timeline tombstone path).
+    /// Drop a timeline's snapshot entry (timeline tombstone path, and a
+    /// snapshot retraction).
     pub fn drop_snapshot_loc(&mut self, stream_id: StreamId) {
         self.recurrent_snapshots.remove(&stream_id);
     }
@@ -4962,6 +4963,9 @@ impl Substrate {
             }
             RecordType::Commit => {
                 self.apply_commit_through(stream_id, h.chunk_index);
+            }
+            RecordType::Snapshot if h.retracts_snapshot() => {
+                self.drop_snapshot_loc(stream_id);
             }
             RecordType::Snapshot => {
                 self.apply_snapshot_loc(

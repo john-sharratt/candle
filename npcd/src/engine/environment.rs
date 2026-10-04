@@ -233,12 +233,7 @@ pub fn push_one(
 /// Returns how many minds got something. Bodies with no mind are swept anyway —
 /// their cursor has to advance, or the day they are finally bound to one they
 /// would be told a week of news at once.
-pub fn push(
-    hosted: &Hosted,
-    bindings: &Bindings,
-    sched: &Scheduler,
-    time: &WorldTimeOf,
-) -> usize {
+pub fn push(hosted: &Hosted, bindings: &Bindings, sched: &Scheduler, time: &WorldTimeOf) -> usize {
     let deltas = hosted.sweep();
     if deltas.is_empty() {
         return 0;
@@ -524,7 +519,11 @@ mod tests {
 
         push(&h, &b, &s, &|_| 0);
         h.with(|w| w.say("m1", "something").unwrap());
-        assert_eq!(push(&h, &b, &s, &|_| 0), 0, "only the extra could have heard it");
+        assert_eq!(
+            push(&h, &b, &s, &|_| 0),
+            0,
+            "only the extra could have heard it"
+        );
         // The extra's cursor moved with everyone else's, so binding it now
         // would start it at the present rather than at the beginning.
         assert!(h.peek("extra").is_empty(), "{:?}", h.peek("extra"));

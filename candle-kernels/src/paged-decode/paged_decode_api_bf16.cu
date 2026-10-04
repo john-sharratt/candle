@@ -2,14 +2,14 @@
 // paged_decode_api_bf16.cu — default decode dispatch (BF16).
 //
 // The INT8 decode kernel (split-KV / warp-stripe / batched-M) is the production
-// path for head_dim 64/96/128/256. head_dim 256 runs its wide (hpg>8) path
+// path for head_dim 64/128/256. head_dim 256 runs its wide (hpg>8) path
 // single-stage so the tiles fit the 48 KiB static shared-memory cap; the stripe
 // and batched-M paths are unchanged.
 // =============================================================================
 
 // **This file names no head dim.** Each lives in its own translation unit
 // (`paged_decode_bf16_hd*.cu`) so nvcc compiles them concurrently instead of
-// walking four dispatch trees in one process; see `paged_decode_hd_bf16.cuh`.
+// walking every dispatch tree in one process; see `paged_decode_hd_bf16.cuh`.
 // The kernel header stays included because the MMA fragment-loader test kernel
 // at the bottom of this file uses it — a template that is never given arguments
 // costs nothing to declare.
@@ -19,11 +19,6 @@
 
 extern "C" {
 int32_t run_paged_decode_bf16_hd64(const void*, const uint8_t*, void*, int32_t, int32_t,
-                                   int32_t, float, const void*, const void*, const RopeRungs,
-                                   int32_t, void*, void*, const void*, int64_t,
-                                   const uint32_t*, const uint32_t*, const uint2*,
-                                   const uint2*, int32_t, int32_t);
-int32_t run_paged_decode_bf16_hd96(const void*, const uint8_t*, void*, int32_t, int32_t,
                                    int32_t, float, const void*, const void*, const RopeRungs,
                                    int32_t, void*, void*, const void*, int64_t,
                                    const uint32_t*, const uint32_t*, const uint2*,
@@ -71,7 +66,6 @@ extern "C" int32_t run_paged_decode_bf16(
             nullptr, nullptr, 0, sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio)
     switch (head_dim) {
         case 64:  LAUNCH_INT8(64);
-        case 96:  LAUNCH_INT8(96);
         case 128: LAUNCH_INT8(128);
         case 256: LAUNCH_INT8(256);
         default: return 0; // rust dispatch bails before reaching an unsupported width

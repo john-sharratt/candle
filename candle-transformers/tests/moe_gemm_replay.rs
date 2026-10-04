@@ -664,6 +664,8 @@ fn the_captured_moe_gemm_replays_identically() -> Result<()> {
             &tile_b_start,
             &tile_b_cnt,
             launch_tiles,
+            2,
+            None,
             cu,
         )?;
         let (storage, layout) = out.storage_and_layout();
