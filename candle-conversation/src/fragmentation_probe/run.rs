@@ -55,9 +55,11 @@ use std::time::{Duration, Instant};
 use candle::Device;
 use candle_nn::kv_cache::{region_stats, REGION_BYTES};
 use candle_transformers::models::batch_test::fixtures;
+use candle_transformers::models::expert_lre::grow_tally;
 use candle_transformers::models::profile::pipeline_snapshot_and_reset;
 
 use super::batch::{no_think, run_story_batch, BatchTiming};
+use super::grow_window::GrowWindow;
 use super::probe::{BaselineRow, Probe, ProbeOutcome};
 use crate::guest::GuestRegistry;
 use crate::memory_report;
@@ -966,6 +968,7 @@ pub fn run_on_model(
     // gigabyte and `weights` does not budge has freed nothing anyone can use.
     println!("\nphase C — drain, and the weight side's uptake\n");
     let before_drain = sample(&device).unwrap_or_default();
+    let grow_before_drain = grow_tally();
     for c in convs.iter() {
         let _ = engine.evict_ingest_timeline(c.timeline_id());
     }
@@ -1107,12 +1110,15 @@ pub fn run_on_model(
         t.arenas_released,
         t.regions_reclaimed,
     );
-    let g = candle_transformers::models::expert_lre::grow_tally();
-    println!(
-        "weight grow: asked={} no_spare={} spare_offered={} target_unchanged={} \
-         target_backwards={} floor_refused={} at_limit={} slots_gained={}",
-        g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
-    );
+    let grow_since_boot = grow_tally();
+    let drain_window = GrowWindow::between(grow_before_drain, grow_since_boot);
+    for (label, g) in [("", grow_since_boot), (" in drain", drain_window.counts())] {
+        println!(
+            "weight grow{label}: asked={} no_spare={} spare_offered={} target_unchanged={} \
+             target_backwards={} floor_refused={} at_limit={} slots_gained={}",
+            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+        );
+    }
 
     // ── Results ──────────────────────────────────────────────────────────────
     println!("\n=== VRAM efficiency ===\n");
@@ -1247,24 +1253,30 @@ pub fn run_on_model(
             args.profile.min_efficiency, worst_efficiency,
         );
     }
-    // **A weight side that already holds every expert has nothing to take, and that
-    // is not a failure of compaction.** `capacity_for_frontier` clamps to the zone's
-    // limit — the slots the model actually has — so on a card with room for the whole
-    // checkpoint the zone cannot grow however much ground the KV side hands back, and
-    // the engine records that as `at_limit`. Measured here: 1,014 `at_limit` against
-    // 1.3 million regions offered, with a 19,296 MiB zone holding a 19,296 MiB model.
+    // **A weight side at its limit has nothing to take, and that is not a failure of
+    // compaction.** `capacity_for_frontier` clamps to the zone's limit — the slots the
+    // model has, or the most the span lets the zone hold, whichever is smaller — so
+    // past it the zone cannot grow however much ground the KV side hands back, and the
+    // engine records that as `at_limit`. Measured here: 1,014 `at_limit` against 1.3
+    // million regions offered, with a 19,296 MiB zone holding a 19,296 MiB model.
     //
-    // Read from the ledger rather than inferred, and narrow: it excuses nothing when
-    // the zone had room (`target_unchanged`) or when the floor refused the move
-    // (`floor_refused`), which are the two real defects this gate exists to catch.
-    let at_limit = g[6] > 0 && g[3] == 0 && g[5] == 0 && g[7] == 0;
+    // Read from the ledger over the drain — the window the uptake is measured on —
+    // rather than inferred, and narrow: it excuses nothing when the zone had room
+    // (`target_unchanged`), aimed below itself (`target_backwards`) or was refused
+    // by the floor (`floor_refused`), which are the real defects this gate exists to
+    // catch. A zone that grew and then met its limit took every byte it had a slot
+    // for, and is excused for the rest.
+    let at_limit = drain_window.at_limit();
     if at_limit {
         println!(
-            "PASS  the weight side is at its limit ({} at-limit answers): every expert \
-             slot the model has is resident, so there is no residency for the {} MiB \
-             released to buy. On a card that cannot hold the whole checkpoint this is \
-             where the gain would land.",
-            g[6], mib_released,
+            "PASS  the weight side reached its limit ({} at-limit answers in the drain, \
+             {} MiB taken on the way, {}% of the {} MiB released): the zone holds every \
+             slot it may — the whole checkpoint, or the most the span lets it have — so \
+             the rest of the released ground has no residency to buy.",
+            drain_window.counts()[6],
+            weight_growth_mib,
+            uptake_pct,
+            mib_released,
         );
     } else if uptake_pct < args.profile.min_weight_uptake {
         failures.push(format!(

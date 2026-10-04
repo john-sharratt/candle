@@ -204,6 +204,14 @@ fn vram_compress_max() -> u64 {
 /// a wedged persistence thread; it is not the expected path.
 const VRAM_OFFLOAD_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What one KV compaction pass did: the arenas it emptied and handed back, and whether
+/// its budget stopped it with work left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PackPass {
+    pub(super) released: usize,
+    pub(super) clipped: bool,
+}
+
 impl Scheduler {
     /// Pack the KV pools if they are fragmented enough to be worth a pass, then ask
     /// the weight side to take what packing released.
@@ -218,39 +226,100 @@ impl Scheduler {
     /// moves it. Without that call a pass hands back regions nobody claims, decode is
     /// exactly as slow as before, and the work is invisible in every metric except
     /// the one that matters — which is why the two are one method and not two.
-    pub(super) fn compact_kv_if_fragmented(&mut self) {
-        /// Regions recoverable before a pass is worth its sync and its copies.
-        const MIN_FREEABLE_ARENAS: usize = 8;
-        /// Wall-clock a single pass may spend **planning and claiming**. A budget
-        /// rather than a move cap: the ladder spans 320 B to 16 KiB, so the same
-        /// "one move" is fifty times the bandwidth at one rung and a count cannot
-        /// bound a duration.
-        ///
-        /// Generous, because the copies are one launch and the *walks* are what the
-        /// clock bounds — the occupancy census over every arena of every rung, then
-        /// the claims. At 8 ms the pass clipped on every run and handed back a single
-        /// arena with the frontier where it started; at 20 ms the census alone spent
-        /// the budget and 37 of 40 attempts claimed nothing. Both halves are now
-        /// separately bounded (see `compact_backings`), and this is sized so each has
-        /// room: the wave loop's own housekeeping already spends 40–66 ms on the
-        /// promote pass at this point, so a pass of this order is in proportion to
-        /// what the gap already costs.
-        /// Measured at 40 ms: 31 of 42 passes clipped, and the pools held 94–99%
-        /// except through the first mass eviction, where 24 conversations retiring at
-        /// once left one 1.5 s sample at 71%. A clipped pass is not wasted — it packs a
-        /// prefix and the next resumes closer — but through a burst the arrival rate is
-        /// what has to be matched, and clipping every pass means it never is.
-        const BUDGET: std::time::Duration = std::time::Duration::from_millis(80);
-
+    ///
+    /// **Considered every wave, run at most every `MIN_INTERVAL`.** Relief, which runs
+    /// only under pressure and whose alternatives cost a turn or an expert, packs the KV
+    /// pools directly and leaves the span tenants to this path.
+    ///
+    /// Answers the arenas the pass emptied and handed back to the region free list —
+    /// zero when it did not run.
+    pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
         /// Shortest interval between passes.
         ///
-        /// The gate below is cheap, but the pass behind it is not: its census walks
-        /// every arena's occupancy bitmap once per rung of the ladder. Running it on
-        /// every wave-loop iteration would put that walk between every pair of
-        /// forwards. This is what makes "every wave, cheap-signal gated" mean
+        /// The gate in `pack_kv_pools` is cheap, but the pass behind it is not: its
+        /// census walks every arena's occupancy bitmap once per rung of the ladder.
+        /// Running it on every wave-loop iteration would put that walk between every
+        /// pair of forwards. This is what makes "every wave, cheap-signal gated" mean
         /// *considered* every wave rather than *run* every wave.
         const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
+        // **The interval before either counter.** This runs on every iteration of the
+        // wave loop: the interval is two loads, and the gate behind it takes a read
+        // lock per rung of the ladder — cheap next to a census, not cheap next to
+        // nothing, and pointless on an iteration that has already decided not to run.
+        //
+        // Returns without standing down deliberately: the pass it is deferring is
+        // still coming, so a refusal's hold on the persistence thread must survive it.
+        if self
+            .last_kv_compaction
+            .is_some_and(|t| t.elapsed() < MIN_INTERVAL)
+        {
+            return 0;
+        }
+        if self.kv_pass_shape().is_none() {
+            return 0;
+        }
+        self.compact_span_tenants();
+        self.pack_until_settled()
+    }
+
+    /// The pools' shape when the KV side is fragmented enough to be worth a pass —
+    /// holes below the frontier, or arenas a pack would empty — and a pass on that
+    /// shape has not already shown it cannot improve it. `None` otherwise.
+    ///
+    /// **A cheap gate, because this is consulted every wave.** `kv_ground_lost` is not
+    /// cheap — it sums `packed_arenas` across the ladder, which is the census — so it
+    /// cannot be the thing that decides whether to census. The hole count is a handful
+    /// of field reads behind one lock; the sparsity sum takes a read lock per rung of
+    /// the ladder and walks that pool's arena map.
+    ///
+    /// Both halves of the loss, because either alone misses the other's regime. Holes —
+    /// free regions stranded below the frontier — are self-correcting under allocation,
+    /// so a steadily-loaded pool reads zero holes with tens of sparse arenas beneath it;
+    /// gating on holes alone ran 16 passes over 110 s of churn and left the pools at
+    /// 82%. Sparsity alone would miss the burst, where a mass eviction strands the
+    /// frontier over ground that is genuinely free.
+    ///
+    /// **And not again on a shape the last pass could not improve.** The fragmentation
+    /// test can stay open over a pool no pass can pack — a pinned arena holding the
+    /// frontier — and re-running the identical pass every wave stalls decode for
+    /// nothing. See `compaction_stall`.
+    ///
+    /// **A closed gate stands down** the hold a previous refusal put on the persistence
+    /// thread. A refused pass tells migrates to step aside for it; if the gate has since
+    /// closed, that promise has to be withdrawn or hot→warm defers for a pass that is
+    /// never coming.
+    fn kv_pass_shape(&self) -> Option<PoolShape> {
+        /// Regions recoverable before a pass is worth its sync and its copies.
+        const MIN_FREEABLE_ARENAS: usize = 8;
+        let shape = self.session.kv_region_stats().and_then(|stats| {
+            let holes = stats.live_watermark.saturating_sub(stats.live);
+            let sparse = self.session.kv_sparse_arenas();
+            let worth = holes >= MIN_FREEABLE_ARENAS || holes + sparse >= MIN_FREEABLE_ARENAS;
+            let shape = PoolShape {
+                live: stats.live,
+                frontier: stats.live_watermark,
+                sparse,
+            };
+            (worth && !self.kv_compaction_stall.holds(shape)).then_some(shape)
+        });
+        if shape.is_none() {
+            candle_nn::kv_cache::clear_compaction_waiting();
+        }
+        shape
+    }
+
+    /// Pack the span tenants that are not KV pools — the recurrent state store and the
+    /// provenance gallery — in the same gap and for the same holes.
+    ///
+    /// **Once per wave-loop consideration, never in the follow-ups or relief.** Each is
+    /// a batch of device copies of whole blocks (a recurrent state is ~3 MiB) bounded by
+    /// a move count rather than the KV pass's clock, and repeating it does not converge
+    /// faster. Run from every relief episode and every follow-up pass as well, it ran
+    /// twice a second on Qwen3.8-Flash-Next, moving hundreds of states a time for a
+    /// region or none, beside forwards already slowed by streamed experts — and the
+    /// probe's efficiency gate fell from 98–99% to 76–87%.
+    fn compact_span_tenants(&mut self) {
         /// Layer states one recurrent pass may move. Each is one device copy of a few
         /// MiB, so this bounds the pass at a few hundred MiB of copy — well under the
         /// KV pass's budget — while letting a badly scattered arena set converge in a
@@ -263,88 +332,16 @@ impl Scheduler {
         /// budget in the same class of copy — ~24 MiB — while being enough moves
         /// that a badly scattered gallery converges in a handful of passes rather
         /// than hundreds. The gallery's own ceiling is 512 MiB, or ~87k pages, so
-        /// this is deliberately a fraction of the worst case: the pass runs every
-        /// relief episode and must never be the thing that makes one slow.
+        /// this is deliberately a fraction of the worst case.
         const MAX_GALLERY_MOVES: usize = 4096;
 
-        // **A cheap gate, because this is consulted every wave.** `kv_ground_lost`
-        // is not cheap — it sums `packed_arenas` across the ladder, which is the
-        // census — so it cannot be the thing that decides whether to census.
-        //
-        // Both halves of the loss, because either alone misses the other's regime.
-        // Holes — free regions stranded below the frontier — are self-correcting
-        // under allocation, so a steadily-loaded pool reads zero holes with tens of
-        // sparse arenas beneath it; gating on holes alone ran 16 passes over 110 s of
-        // churn and left the pools at 82%. Sparsity alone would miss the burst, where
-        // a mass eviction strands the frontier over ground that is genuinely free.
-        // Standing down releases the hold a previous refusal put on the persistence
-        // thread. A refused pass tells migrates to step aside for it; if the gate has
-        // since closed — the pools packed themselves, nothing is fragmented — that
-        // promise has to be withdrawn or hot→warm defers for a pass that is never
-        // coming.
-        let stand_down = || candle_nn::kv_cache::clear_compaction_waiting();
-
-        // **Cheapest test first, and the interval before either counter.** This runs on
-        // every iteration of the wave loop, so the order of these three is itself a hot
-        // path: the interval is two loads, the hole count is a handful of field reads
-        // behind one lock, and the sparsity sum takes a read lock per rung of the ladder
-        // and walks that pool's arena map — cheap next to a census, not cheap next to
-        // nothing, and pointless on an iteration that has already decided not to run.
-        //
-        // The interval check returns without standing down deliberately: the pass it is
-        // deferring is still coming, so a refusal's hold on the persistence thread must
-        // survive it.
-        if self
-            .last_kv_compaction
-            .is_some_and(|t| t.elapsed() < MIN_INTERVAL)
-        {
-            return;
-        }
-        let Some(stats) = self.session.kv_region_stats() else {
-            stand_down();
-            return;
-        };
-        // Both halves of the loss, because either alone misses the other's regime.
-        // Holes — free regions stranded below the frontier — are self-correcting under
-        // allocation, so a steadily-loaded pool reads zero holes with tens of sparse
-        // arenas beneath it; gating on holes alone ran 16 passes over 110 s of churn and
-        // left the pools at 82%. Sparsity alone would miss the burst, where a mass
-        // eviction strands the frontier over ground that is genuinely free.
-        let holes = stats.live_watermark.saturating_sub(stats.live);
-        let sparse = self.session.kv_sparse_arenas();
-        if holes < MIN_FREEABLE_ARENAS && holes + sparse < MIN_FREEABLE_ARENAS {
-            stand_down();
-            return;
-        }
-        // **And not again on a shape the last pass could not improve.** The gate
-        // above can stay open over a pool no pass can pack — a pinned arena holding
-        // the frontier — and re-running the identical pass every wave stalls decode
-        // for nothing. See `compaction_stall`.
-        let shape = PoolShape {
-            live: stats.live,
-            frontier: stats.live_watermark,
-            sparse,
-        };
-        if self.kv_compaction_stall.holds(shape) {
-            stand_down();
-            return;
-        }
-
-        // **Every registered conversation, not one.** Conversations in a workspace
-        // share a substrate, so sweeping one sweeps all its residences — but the
-        // scheduler can host conversations on more than one substrate, and a
-        // workspace left out keeps residences naming vacated slots. Sweeping them all
-        // is safe because a pass is idempotent under one `Sweep`: after a rewrite the
-        // residence holds NEW gids and the map is keyed on the old ones, so a second
-        // visit matches nothing.
-        // **Recurrent state first, in the same gap and for the same holes.** Its
-        // arenas are regions of the span like the KV side's, and on a hybrid stack
-        // they are most of what stands above the holes — the KV pools can be packed
-        // to a region while the frontier stays pinned by a state arena near the top.
-        // Its pass moves each state block with one device copy and repoints the one
-        // store that holds it, so it needs no holder sweep and no quiesce; a failure
-        // part-way leaves every store consistent (each move is whole) and is reported
-        // loudly rather than retried silently.
+        // **Recurrent state first.** Its arenas are regions of the span like the KV
+        // side's, and on a hybrid stack they are most of what stands above the holes —
+        // the KV pools can be packed to a region while the frontier stays pinned by a
+        // state arena near the top. Its pass moves each state block with one device
+        // copy and repoints the one store that holds it, so it needs no holder sweep
+        // and no quiesce; a failure part-way leaves every store consistent (each move
+        // is whole) and is reported loudly rather than retried silently.
         let recurrent = {
             let _g = super::profile::span("compact:recurrent");
             self.model.compact_recurrent(MAX_STATE_MOVES)
@@ -405,7 +402,78 @@ impl Scheduler {
                 ),
             }
         }
+    }
 
+    /// Pass after pass until one finishes inside its budget — the pass both the wave
+    /// loop and relief run.
+    ///
+    /// **One pass is not enough after a burst.** Relief's compression rewrites a dozen
+    /// or more float turns as quantized chunks in one go, and a mass retirement frees
+    /// chunks across every arena, so 50–80 arenas of air arrive at once on the 30B probe
+    /// and a single budgeted pass clips after 20–50 of them. The next chance to finish
+    /// is the next wave-loop iteration, which spans a decode quantum and its
+    /// housekeeping — 1–3 s there — and the probe measured the remainder standing that
+    /// long, at 70%, while the forwards in between bought ground from the weight side
+    /// against it. Back to back, the passes cost up to ~80 ms each, and only when a
+    /// pass clipped; an iteration with nothing to pack still costs one gate.
+    fn pack_until_settled(&mut self) -> usize {
+        /// Passes one rung may run back to back.
+        const MAX_PASSES: usize = 4;
+        let mut released = 0;
+        for _ in 0..MAX_PASSES {
+            let Some(pass) = self.pack_kv_pools() else {
+                break;
+            };
+            released += pass.released;
+            if !pass.clipped {
+                break;
+            }
+        }
+        released
+    }
+
+    /// One KV compaction pass if the pools are fragmented enough to be worth it, then
+    /// the weight side's reclaim — what [`Self::compact_kv_if_fragmented`] paces and
+    /// relief runs directly. The span tenants are not packed here; see
+    /// [`Self::compact_span_tenants`].
+    ///
+    /// Answers what the pass did — nothing when the pools were not worth a pass — or
+    /// `None` when it was turned away by a holder of the partition or of chunk
+    /// locations (a forward, a hot→warm migrate group, a cold-writer free), which is
+    /// the one answer that changes by asking again shortly.
+    pub(super) fn pack_kv_pools(&mut self) -> Option<PackPass> {
+        /// Wall-clock a single pass may spend **planning and claiming**. A budget
+        /// rather than a move cap: the ladder spans 320 B to 16 KiB, so the same
+        /// "one move" is fifty times the bandwidth at one rung and a count cannot
+        /// bound a duration.
+        ///
+        /// Generous, because the copies are one launch and the *walks* are what the
+        /// clock bounds — the occupancy census over every arena of every rung, then
+        /// the claims. At 8 ms the pass clipped on every run and handed back a single
+        /// arena with the frontier where it started; at 20 ms the census alone spent
+        /// the budget and 37 of 40 attempts claimed nothing. Both halves are now
+        /// separately bounded (see `compact_backings`), and this is sized so each has
+        /// room: the wave loop's own housekeeping already spends 40–66 ms on the
+        /// promote pass at this point, so a pass of this order is in proportion to
+        /// what the gap already costs.
+        /// Measured at 40 ms: 31 of 42 passes clipped, and the pools held 94–99%
+        /// except through the first mass eviction, where 24 conversations retiring at
+        /// once left one 1.5 s sample at 71%. A clipped pass is not wasted — it packs a
+        /// prefix and the next resumes closer — but through a burst the arrival rate is
+        /// what has to be matched, and clipping every pass means it never is.
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(80);
+
+        let Some(shape) = self.kv_pass_shape() else {
+            return Some(PackPass::default());
+        };
+
+        // **Every registered conversation, not one.** Conversations in a workspace
+        // share a substrate, so sweeping one sweeps all its residences — but the
+        // scheduler can host conversations on more than one substrate, and a
+        // workspace left out keeps residences naming vacated slots. Sweeping them all
+        // is safe because a pass is idempotent under one `Sweep`: after a rewrite the
+        // residence holds NEW gids and the map is keyed on the old ones, so a second
+        // visit matches nothing.
         let substrates: Vec<_> = self.slot_conversations.values().cloned().collect();
         let mut swept = 0usize;
         // **The projection caches are holders too.** Taken out for the duration so
@@ -478,6 +546,17 @@ impl Scheduler {
             super::profile::record("compact:invalidate", t.invalidate);
             super::profile::record("compact:publish", t.publish);
         }
+        let pass = match &outcome {
+            Ok(r) => Some(PackPass {
+                released: r.arenas_released,
+                clipped: r.clipped,
+            }),
+            Err(
+                candle_nn::kv_cache::CompactionRefused::WaveInFlight
+                | candle_nn::kv_cache::CompactionRefused::MigrateInFlight,
+            ) => None,
+            Err(_) => Some(PackPass::default()),
+        };
         match outcome {
             Ok(report) if !report.is_empty() => {
                 // The weight side, immediately, while no wave generation is live.
@@ -508,6 +587,9 @@ impl Scheduler {
                     arenas_released = report.arenas_released,
                     frontier_before = report.frontier_before,
                     frontier_after = report.frontier_after,
+                    // What holds the frontier up once the pass is done — a pass that
+                    // moved a lot and lowered nothing is explained here or nowhere.
+                    top_arena = ?report.top_arena,
                     reclaimed_mib =
                         report.regions_reclaimed() * (candle_nn::kv_cache::REGION_BYTES >> 20),
                     substrate_sequences = swept,
@@ -520,6 +602,11 @@ impl Scheduler {
                     // that spent 80 ms working. Only visible through the profile
                     // spans otherwise, and those compile to nothing by default.
                     quiesce_us = report.timings.quiesce.as_micros(),
+                    // The two halves the budget bounds: the census and plan, then the
+                    // claim walk. A pass that clips after one batch spent its budget in
+                    // the first.
+                    plan_us = report.timings.plan.as_micros(),
+                    claim_us = report.timings.claim.as_micros(),
                     // The host walk over every slot's decode-buffer pins, outside the
                     // budget like the quiesce. Named because it scales with slots ×
                     // chunks × layers, not with what the pass moved.
@@ -573,6 +660,7 @@ impl Scheduler {
                 );
             }
         }
+        pass
     }
 
     /// Under VRAM pressure, shed until the free-region setpoint is met again,
@@ -592,11 +680,15 @@ impl Scheduler {
     ///     turn stays resident and attended-over, and only its float working
     ///     set goes. Cheaper than eviction, which has to be reloaded if the
     ///     turn is re-attended.
-    ///  4. **Evacuate.** Flush the pending hot→warm so just-sealed turns have a
+    ///  4. **Pack the pools.** A KV compaction pass: arenas held by a few live
+    ///     chunks are emptied into lower ones and handed back. One budgeted
+    ///     device pass, and nothing resident is lost — which the two rungs after
+    ///     it cannot say.
+    ///  5. **Evacuate.** Flush the pending hot→warm so just-sealed turns have a
     ///     warm copy — only warm-backed turns are evictable — then drop the hot
     ///     copies of the oldest ones. This is §3.8's evict-as-evacuation, and
-    ///     it runs through the demotion path the tiering already owns; there is
-    ///     no GPU→GPU compaction behind it any more.
+    ///     it runs through the demotion path the tiering already owns.
+    ///  6. **Take ground from the weight side**, which costs expert residency.
     ///
     /// This ordering used to be the VRAM governor's relief ladder, each step a
     /// numbered `Criticality` rung with the governor re-measuring driver
@@ -680,6 +772,26 @@ impl Scheduler {
             released += self.session.release_empty_arenas().unwrap_or(0);
         }
 
+        // **Pack the pools before taking anything from anyone.** Ground the KV side
+        // holds as air — arenas kept alive by a handful of live chunks — is ground
+        // a compaction hands back without evicting a turn or an expert, and both
+        // rungs below cost one of those. Without this rung relief reached for them
+        // with the pools a third air: measured on Qwen3-30B-A3B, the weight zone
+        // conceded 193, 240 and 290 MiB in two seconds while 287 arenas held what
+        // 185 would, and the efficiency gate read 51–64% through it. After
+        // compression, because a compressed turn's float working set leaves exactly
+        // that air behind — and **whenever compression ran, relieved or not**: the
+        // air it leaves is the weight side's ground either way, and left for the
+        // wave loop's next pass it stood for seconds (a 30B probe sample at 58%, 244
+        // arenas holding what 142 would, with nothing retired).
+        //
+        // Unpaced: the interval bounds the census on iterations with nothing at stake,
+        // and here the alternative is an eviction.
+        let mut packed = 0usize;
+        if compressed > 0 || self.vram_under_pressure_for(phase) {
+            packed = self.pack_until_settled();
+        }
+
         if self.vram_under_pressure_for(phase) {
             evicted = self.evict_cold_tail(want);
             if evicted.bytes < want {
@@ -695,6 +807,16 @@ impl Scheduler {
                 evicted.bytes += more.bytes;
             }
             released += self.session.release_empty_arenas().unwrap_or(0);
+        }
+
+        // **Pack again before the weight side pays.** The evictions just above left air
+        // of their own, and a pass the first rung could not get in for has had the
+        // flush's wait as well. Measured on the 30B probe before this rung: 1,513 ms of
+        // relief that flushed, evicted two turns and then conceded 160 MiB of expert
+        // residency with `arenas_packed=0`. Whenever eviction ran, for the reason the
+        // first pack runs whenever compression did.
+        if evicted.count > 0 || self.vram_under_pressure_for(phase) {
+            packed += self.pack_until_settled();
         }
 
         // **Last resort, and the only one that adds ground rather than
@@ -731,6 +853,7 @@ impl Scheduler {
         let acted = released > 0
             || gallery_freed > 0
             || compressed > 0
+            || packed > 0
             || evicted.count > 0
             || conceded > 0;
         if acted {
@@ -752,6 +875,7 @@ impl Scheduler {
                     gallery_freed_mib = gallery_freed / (1 << 20),
                     turns_compressed = compressed,
                     compress_refused,
+                    arenas_packed = packed,
                     turns_evicted = evicted.count,
                     evicted_mib = evicted.bytes / (1 << 20),
                     arenas_released = released,

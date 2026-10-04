@@ -39,6 +39,7 @@
 #include "block_compact.cuh"  // qtype_to_matmul_kernel_index + QTYPE_* constants
 #include "dispatch_table.cuh"
 #include "matmul_status.cuh"  // QMM_* launcher status codes
+#include "moe_live.cuh"       // the grouped launch's workers over a live expert table
 
 // =============================================================================
 // L2 CACHE FLUSH UTILITY
@@ -1426,7 +1427,13 @@ extern "C" void run_grouped_quantized_matmul(
     int32_t ytype,
     int32_t n_sub,     // int8 token-tile width / 16: 2 (Bm 32), 4 (Bm 64), 8 (Bm 128)
     int32_t row_fast,  // grid axis order: 1 = row tiles fast (see kernel entry doc)
-    int32_t sum_norm)  // q8a128 Σx convention (`SumScale::as_code()`); ytype==3 only
+    int32_t sum_norm,  // q8a128 Σx convention (`SumScale::as_code()`); ytype==3 only
+    // A launch over a live expert table (see `MoeLive` in kernel.cuh): the grid
+    // gains its worker row. Null for every other launch. ytype==3 only.
+    const MoeLive* live,
+    // The caller's stream — the device handle's own, so the launch is ordered
+    // with every other op the handle issues.
+    void* stream)
 {
     int kernel_row = qtype_to_matmul_kernel_index(qtype);
     if (kernel_row < 0 || ytype < 0 || ytype > 3 || num_tiles <= 0) {
@@ -1468,6 +1475,12 @@ extern "C" void run_grouped_quantized_matmul(
     // activation slab in L2; token-fast is the transpose. Whichever axis carries
     // the token tiles is bounded (≤ a few thousand, far under the 65535 y limit).
     dim3 grid = row_fast ? dim3(row_tiles, num_tiles, 1) : dim3(num_tiles, row_tiles, 1);
+    if (ytype == 3 && live != nullptr) {
+        // Live: row tiles on x, the workers' rows ahead of the tiles (see "A live
+        // expert table" in kernel.cuh).
+        const int worker_rows = (live->workers + row_tiles - 1) / row_tiles;
+        grid = dim3(row_tiles, num_tiles + worker_rows, 1);
+    }
     dim3 block(WARP_SIZE, 4, 1);  // 128 threads (4 warps × 32)
 
     // The int8 grouped kernels take one argument the FP ones do not: the q8a128
@@ -1475,13 +1488,15 @@ extern "C" void run_grouped_quantized_matmul(
     // signature is unchanged and their launch must NOT name it — `args[]` is
     // positional and matched against the kernel's own parameter list.
     if (ytype == 3) {
+        MoeLive live_v = live != nullptr ? *live : MoeLive{};
+        int row_fast_v = live != nullptr ? 1 : row_fast;
         void* args[] = {
             (void*)&weight_ptrs, (void*)&tile_expert, (void*)&tile_b_start, (void*)&tile_b_cnt,
             (void*)&vy, (void*)&dst,
             (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
-            (void*)&row_fast, (void*)&sum_norm,
+            (void*)&row_fast_v, (void*)&sum_norm, (void*)&live_v,
         };
-        cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+        cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream);
     } else {
         void* args[] = {
             (void*)&weight_ptrs, (void*)&tile_expert, (void*)&tile_b_start, (void*)&tile_b_cnt,
@@ -1489,7 +1504,7 @@ extern "C" void run_grouped_quantized_matmul(
             (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
             (void*)&row_fast,
         };
-        cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+        cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream);
     }
 }
 

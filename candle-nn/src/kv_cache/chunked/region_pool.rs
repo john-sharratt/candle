@@ -1831,17 +1831,40 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
 /// purchase any claim makes — and places into what that frees. The KV side keeps
 /// every region up to the boundary in the meantime, and the tier is priced
 /// against what this wave actually needs rather than what the last one did.
+///
+/// # More than one purchase, while purchases keep landing
+///
+/// A purchase runs outside the pool lock and blocks on the expert pipeline — a
+/// quiesce, the relocations, the floor move — and arena creation is not held off
+/// across it, so a region the persistence thread claims in that window raises
+/// `live_end` into the ground just bought. The retry then measured itself short
+/// again and the wave failed: measured on the Qwen3-30B engine probe, a purchase
+/// conceded 41 slots (~113 MiB) and the tier was still one region into live
+/// arenas, in 4 of 12 runs, with an error blaming a weight floor that had just
+/// moved. So the placement buys again for whatever it is still short, for as long
+/// as the weight side keeps conceding.
 pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<u64> {
-    let short = match try_place(stream, bytes)? {
+    /// Purchases one placement may make. Each is a full boundary move on the
+    /// pipeline thread, so this bounds the wait, not the ground.
+    const MAX_PURCHASES: usize = 4;
+    let mut short = match try_place(stream, bytes)? {
         Placed::At(base) => return Ok(base),
         // Not "the KV side is short of regions" — the tier itself does not fit,
-        // and the regions in its way are live. One purchase, for exactly the
+        // and the regions in its way are live. A purchase for exactly the
         // shortfall the placement measured.
         Placed::Short(regions) => regions,
     };
-    buy_ground(stream, short)?;
-    if let Placed::At(base) = try_place(stream, bytes)? {
-        return Ok(base);
+    let mut conceded = 0u64;
+    for _ in 0..MAX_PURCHASES {
+        let got = buy_ground(stream, short)?;
+        conceded += got;
+        match try_place(stream, bytes)? {
+            Placed::At(base) => return Ok(base),
+            Placed::Short(regions) => short = regions,
+        }
+        if got == 0 {
+            break;
+        }
     }
     // **Sweep the empties before declaring the partition dead.** The footprint
     // check above counts *claimed* regions, and a region whose arena went
@@ -1867,10 +1890,12 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
             candle::bail!(
                 "wave transient tier needs {len} B below the weight floor and is \
                  {still_short} regions into ground live KV arenas hold, which cannot \
-                 move. The weight side could not concede them — it is at its own \
-                 floor — so this wave is too wide for a partition that has nothing \
-                 left to trade. (span {span_bytes} B, weight floor at +{floor_off} B, \
-                 arena frontier at +{live_off} B, {live}/{total} regions live)"
+                 move. The weight side conceded {conceded} B to this placement and \
+                 would give no more — at its own floor, or refusing to move while a \
+                 wave or an expert invocation is in flight — so this wave is too wide \
+                 for the partition. (span {span_bytes} B, weight floor at \
+                 +{floor_off} B, arena frontier at +{live_off} B, {live}/{total} \
+                 regions live)"
             )
         }
     }

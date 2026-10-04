@@ -294,15 +294,34 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
   so deciding where to spend the budget does not spend it. Measured before the
   ordering: nine seconds at 52–59% with the frontier pinned and 64 free regions
   under it, every pass running and clipping on the low rungs.
-- **A fresh low arena for every pool, highest pool first.** Packing is per pool, so
+
+  **And the moves themselves, highest source region first, across pools**
+  (`compact_plan::by_source_rank`). The budget clips the move list, so its order decides
+  which regions a clipped pass empties. Concatenated pool by pool, a clipped pass emptied
+  the top pool's highest arena and spent the rest on that pool's low arenas while the next
+  pools' arenas held the frontier one region lower — 40,000–115,000 moves a pass for a
+  frontier fall of one region on the 30B. Each pool's moves already descend by source, so
+  the merge sorts its per-arena runs (a few hundred), keeps each pool's own order, and any
+  prefix of it is a prefix of every pool's plan.
+- **The plan costs O(moves + arenas).** Both cursors of the walk step through the
+  ascending occupied lists, and the left one passes an arena whose remaining slots are
+  all live in one comparison. A left cursor that binary-searched every slot walked every
+  live chunk of every full low arena — millions at the 320 B rung — and at a frontier of
+  ~300 regions the plan alone outran the 80 ms budget, so each pass claimed only its one
+  guaranteed batch.
+- **Fresh low arenas for every pool, highest pool first.** Packing is per pool, so
   each pool converges onto *its own* lowest arenas — and a pool whose lowest arena sits
-  high in the span packs perfectly and stays where it is. Before planning, every
-  censused pool is given one fresh arena, in the census's order (the pool whose top
+  high in the span packs perfectly and stays where it is. Before planning, the censused
+  pools take turns claiming fresh arenas, in the census's order (the pool whose top
   arena is highest first). The region free list is lowest-index-first, so that order
   hands the lowest hole to the pool standing highest, the next hole to the next, and
-  the walk then fills each fresh arena first because it ranks lowest in its pool. Only
-  while a hole exists below the frontier: with none, a claim would land above it and
-  raise it. A fresh arena that lands above its own pool's top receives nothing and is
+  the walk then fills each fresh arena first because it ranks lowest in its pool. A pool
+  keeps taking them while it has arenas' worth of live chunks standing above where they
+  land — a full arena moves down only into free slots of its own pool, and one fresh
+  arena a pass let each pool lower by one arena however many holes stood below it (passes
+  releasing 25–42 arenas lowered the 30B's frontier by 1–3 regions). At most 64 a pass,
+  and only while a hole exists below the frontier: with none, a claim would land above it
+  and raise it. A fresh arena that lands above its own pool's top receives nothing and is
   released as soon as the claims are in — one O(1) claim and one O(1) release, which
   falls to nothing once the pools sit in the lowest regions.
 - **Every empty arena goes back, including the pass's own.** An arena's creation window
@@ -338,7 +357,16 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
   live counters — no bitmap walked. Both halves are needed: holes self-correct under
   allocation, so a steadily-loaded pool reads zero holes with tens of sparse arenas
   beneath it (gating on holes alone: 16 passes over 110 s, pools at 82%), and
-  sparsity alone misses the burst.
+  sparsity alone misses the burst. **A pass that clips is followed at once**, in the
+  same gap, until one finishes inside its budget (at most four): the next chance is the
+  next wave-loop iteration, which spans a decode quantum and its housekeeping, and a
+  burst's remainder stood that long at 70% on the 30B probe.
+- **And a rung of KV pressure relief, ahead of anything that costs a turn or an
+  expert.** `relieve_vram_pressure` packs after compression — whose float→quant rewrite
+  empties float arenas by the tens at once — and again after eviction, before it asks
+  the weight side for ground, the same pass-until-settled. Without it relief conceded expert residency with the pools a third air:
+  193, 240 and 290 MiB in two seconds on the 30B while 287 arenas held what 185 would.
+  Relief runs between forwards, at the same seam as the wave loop's pass.
 - **Lowering the watermark is followed by lowering the floor.** A non-empty pass
   calls `reclaim_spare_ground()` in the same method, while no wave generation is
   live. The two are one method and not two precisely because either alone buys

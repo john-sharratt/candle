@@ -21,6 +21,43 @@ pub struct VxSegment {
 unsafe impl Send for VxSegment {}
 unsafe impl Sync for VxSegment {}
 
+/// A grouped GEMM launched over a **live** expert table — field-for-field the C
+/// `MoeLive` in `quantized/moe_live.cuh`, passed by value to the kernel. The
+/// kernel entry (`kernel.cuh`, "A live expert table") documents the worker
+/// blocks and the counter layout.
+///
+/// Every field is a device address or a plain number:
+/// - `abort` — a mapped host `u32` the host sets non-zero to end every waiting
+///   worker in a trap;
+/// - `live_row` — this projection's row of the live table (mapped host
+///   memory), where a worker waits for a cold expert; every other expert's
+///   address comes from the launch's weight table, `moe_bucketize`'s snapshot;
+/// - `remote`, `header` — `moe_bucketize`'s remote-expert list and header;
+/// - `remote_dst`, `dst_offset` — each remote expert's promotion slot image (or
+///   0), and where this projection sits in one: the workers store every slice
+///   they copy there too;
+/// - `counter` — this launch's work counter (zeroed by `moe_bucketize`);
+/// - `scratch`, `slot_bytes` — the workers' VRAM slots;
+/// - `stall` — the profile build's `u64[5]` per-row counters (0 otherwise);
+/// - `spin_limit_ns` — the backstop on any single wait;
+/// - `workers` — the worker-block count.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeLive {
+    pub abort: u64,
+    pub live_row: u64,
+    pub remote: u64,
+    pub remote_dst: u64,
+    pub header: u64,
+    pub counter: u64,
+    pub scratch: u64,
+    pub slot_bytes: u64,
+    pub dst_offset: u64,
+    pub stall: u64,
+    pub spin_limit_ns: u64,
+    pub workers: i32,
+}
+
 /// Quantization type enum for the matmul dispatcher (`run_quantized_matmul`).
 ///
 /// Integer values MUST match `GgmlDType` (candle-core) — `GgmlDType` is the
@@ -302,6 +339,11 @@ extern "C" {
         // Read on `ytype == 3` (q8a128) only; the FP grouped kernels do not take
         // it, and the launcher builds a shorter argument list for them.
         sum_norm: i32,
+        // A launch over a live expert table ([`MoeLive`]) — the grid gains its
+        // worker row; null for every other launch. Read on `ytype == 3` only.
+        live: *const MoeLive,
+        // The stream to launch on — the device handle's own.
+        stream: *mut c_void,
     );
 
     /// Repack quantized weights to GEMX format (K/128 with embedded scales).

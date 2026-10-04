@@ -32,6 +32,7 @@
 //! and want flags; the tests exist so a model is one line to cover.
 
 mod batch;
+mod grow_window;
 mod probe;
 mod profile;
 mod run;

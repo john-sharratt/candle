@@ -152,6 +152,7 @@ pub fn build_expert_cache(
     build_expert_cache_for(
         content,
         moe.n_experts,
+        moe.n_experts_used,
         cfg.num_layers + cfg.num_mtp_layers,
         device,
         gguf_path,
@@ -180,6 +181,7 @@ pub fn build_expert_cache(
 pub fn build_expert_cache_for(
     content: &Content,
     n_expert: usize,
+    n_expert_used: usize,
     n_layers_total: usize,
     device: &Device,
     gguf_path: &std::path::Path,
@@ -278,6 +280,7 @@ pub fn build_expert_cache_for(
         zone,
         device,
         experts_per_layer: n_expert,
+        experts_used: n_expert_used,
         gguf_path,
         expert_pack_dir,
         progress,

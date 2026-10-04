@@ -608,8 +608,8 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
         // what each run really exercised rather than against an assumption.
         if let Some(s) = model.expert_stats() {
             eprintln!(
-                "[repro:{label}] experts hits={} misses={} evictions={} dma={} cold={}",
-                s.expert_hits, s.expert_misses, s.evictions, s.dma_loads, s.cold_loads
+                "[repro:{label}] experts hits={} misses={} evictions={} promotions={} cold={}",
+                s.expert_hits, s.expert_misses, s.evictions, s.promotions, s.worker_cold
             );
         }
     }
@@ -2807,6 +2807,7 @@ impl TestParams {
         // Determine column width (minimum 12 to fit numbers).
         let col_w = headers.iter().map(|h| h.len()).max().unwrap_or(10).max(12);
 
+        const GIB: f64 = (1u64 << 30) as f64;
         // Metric rows: (label, extractor returning formatted string).
         let metrics: Vec<(&str, Box<dyn Fn(&PipelineStats) -> String>)> = vec![
             (
@@ -2821,15 +2822,28 @@ impl TestParams {
                 "Hit rate",
                 Box::new(|s: &PipelineStats| format!("{:.1}%", s.hit_rate())),
             ),
+            // Misses split by where bucketize found them: pinned (a warm or pad
+            // slot — computed by the GEMM workers at once) or cold (waited on
+            // until the stager staged them).
             (
-                "DMA loads (H2D)",
-                Box::new(|s: &PipelineStats| format!("{}", s.dma_loads)),
+                "  pinned misses",
+                Box::new(|s: &PipelineStats| format!("{}", s.worker_pinned)),
             ),
-            // The two gauges that turn the load counts into a tier decomposition:
+            (
+                "  cold misses",
+                Box::new(|s: &PipelineStats| format!("{}", s.worker_cold)),
+            ),
+            (
+                "Worker promotions",
+                Box::new(|s: &PipelineStats| format!("{}", s.worker_promotions)),
+            ),
+            (
+                "Promotions (H2D)",
+                Box::new(|s: &PipelineStats| format!("{}", s.promotions)),
+            ),
+            // The two gauges that turn the miss counts into a tier decomposition:
             // how much of the model is resident in VRAM, and how much of the KV
-            // side's ground the weight zone is still willing to concede. Without
-            // them a cold-load count says a tier is missing its target without
-            // saying which tier had the room.
+            // side's ground the weight zone is still willing to concede.
             (
                 "Hot VRAM (resident)",
                 Box::new(|s: &PipelineStats| format!("{} MiB", s.resident_vram_bytes >> 20)),
@@ -2856,40 +2870,33 @@ impl TestParams {
                 "  of which pageable",
                 Box::new(|s: &PipelineStats| format!("{}", s.warm_paged_slots)),
             ),
-            // Which path the MoE dispatched on. `device` means the grid is
-            // fully resident and routing never leaves the card; `host (readback)`
-            // means each layer syncs to schedule its uploads — a multiple on
-            // decode latency, and previously visible only as a `tracing::warn`
-            // no harness subscribes to.
             (
-                "MoE dispatch",
-                Box::new(|s: &PipelineStats| {
-                    if s.device_dispatch {
-                        "device".to_string()
-                    } else {
-                        "host (readback)".to_string()
-                    }
-                }),
+                "Pad slots",
+                Box::new(|s: &PipelineStats| format!("{}", s.pad_slots)),
             ),
             (
-                "Warm loads (RAM)",
-                Box::new(|s: &PipelineStats| format!("{}", s.warm_loads)),
+                "Staged (cold)",
+                Box::new(|s: &PipelineStats| format!("{}", s.staged_cold)),
             ),
             (
-                "Cold loads (pack)",
-                Box::new(|s: &PipelineStats| format!("{}", s.cold_loads)),
+                "  from pageable",
+                Box::new(|s: &PipelineStats| format!("{}", s.staged_paged)),
+            ),
+            (
+                "Staged ahead",
+                Box::new(|s: &PipelineStats| format!("{}", s.staged_speculative)),
+            ),
+            (
+                "Pad evictions",
+                Box::new(|s: &PipelineStats| format!("{}", s.pad_evictions)),
             ),
             (
                 "Evictions",
                 Box::new(|s: &PipelineStats| format!("{}", s.evictions)),
             ),
             (
-                "Prefetch loads",
-                Box::new(|s: &PipelineStats| format!("{}", s.prefetch_loads)),
-            ),
-            (
-                "Hint loads",
-                Box::new(|s: &PipelineStats| format!("{}", s.hint_loads)),
+                "Prefetch promotions",
+                Box::new(|s: &PipelineStats| format!("{}", s.prefetch_promotions)),
             ),
             (
                 "Predicted loads",
@@ -2907,17 +2914,29 @@ impl TestParams {
                 "Load-ahead N",
                 Box::new(|s: &PipelineStats| format!("{}", s.prefetch_depth)),
             ),
+            // Bytes each mover put over its link: promotions on the copy engine,
+            // staging off the drive (or out of pageable RAM) into the pad.
             (
-                "Streamed loads",
-                Box::new(|s: &PipelineStats| format!("{}", s.stream_loads)),
+                "Promotion GiB",
+                Box::new(|s: &PipelineStats| format!("{:.2}", s.promotion_bytes as f64 / GIB)),
             ),
             (
-                "Fence stalls",
-                Box::new(|s: &PipelineStats| format!("{}", s.fence_stalls)),
+                "Staged GiB",
+                Box::new(|s: &PipelineStats| format!("{:.2}", s.staged_bytes as f64 / GIB)),
             ),
             (
-                "Work requests",
-                Box::new(|s: &PipelineStats| format!("{}", s.work_requests)),
+                "Stage read GB/s",
+                Box::new(|s: &PipelineStats| {
+                    if s.stage_read_ns == 0 {
+                        "-".to_string()
+                    } else {
+                        format!("{:.2}", s.staged_bytes as f64 / s.stage_read_ns as f64)
+                    }
+                }),
+            ),
+            (
+                "Routed layers",
+                Box::new(|s: &PipelineStats| format!("{}", s.routed_messages)),
             ),
         ];
 

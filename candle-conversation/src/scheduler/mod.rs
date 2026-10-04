@@ -2477,13 +2477,14 @@ impl WaveStats {
             String::new()
         };
         // This window's expert activations and how many were already resident —
-        // a miss is a weight DMA the forward waited on, and the one number
-        // that says whether decode is bound by the card or by the link.
+        // a miss crosses the link inside its layer's GEMMs, and the one number
+        // that says whether decode is bound by the card or by the link; and how
+        // many experts the window promoted into VRAM.
         let experts_str = match (experts, self.experts_prev) {
             (Some((h, m, d)), Some((h0, m0, d0))) if (h + m) > (h0 + m0) => {
                 let (hits, misses) = (h.saturating_sub(h0), m.saturating_sub(m0));
                 format!(
-                    " | experts hit={:.2}% miss={misses} dma={}",
+                    " | experts hit={:.2}% miss={misses} promoted={}",
                     100.0 * hits as f64 / (hits + misses) as f64,
                     d.saturating_sub(d0),
                 )

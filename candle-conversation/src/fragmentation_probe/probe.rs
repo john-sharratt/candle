@@ -188,8 +188,9 @@ pub struct ProbeOutcome {
     pub worst_single_efficiency: usize,
     /// Share of the ground the KV side released that the weight side took.
     pub weight_uptake_pct: usize,
-    /// The weight side already holds every expert slot the model has, so there is no
-    /// residency for released ground to buy. Read from the engine's growth ledger.
+    /// The weight zone reached its limit in the drain — every slot the model has, or
+    /// the most the span lets it hold — so released ground past that has no residency
+    /// to buy. Read from the engine's growth ledger.
     pub weight_at_limit: bool,
     /// Phase-B throughput, for comparison against the forward gate's clean rows.
     pub prefill_tps: f64,
@@ -230,12 +231,12 @@ impl ProbeOutcome {
 
     /// The weight side's verdict as a reader should see it.
     ///
-    /// A model whose every expert is already resident has nothing for released ground
-    /// to buy, so its uptake is not a share of anything; printing the arithmetic's 0%
-    /// there reads as a failure of the gate that just passed.
+    /// A zone that reached its limit had nothing more for released ground to buy, so
+    /// its uptake is the growth it had room for; the label says so rather than leave a
+    /// bare low percentage reading as a failure of the gate that just passed.
     pub fn weight_uptake_label(&self) -> String {
         if self.weight_at_limit {
-            "weights fully resident".to_string()
+            format!("weight zone at its limit (uptake {}%)", self.weight_uptake_pct)
         } else {
             format!("weight uptake {}%", self.weight_uptake_pct)
         }
@@ -308,10 +309,10 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_resident_weight_side_is_named_not_scored() {
+    fn a_weight_side_at_its_limit_is_named_with_its_uptake() {
         assert_eq!(
             outcome(0, true).weight_uptake_label(),
-            "weights fully resident"
+            "weight zone at its limit (uptake 0%)"
         );
     }
 

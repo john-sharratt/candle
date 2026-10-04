@@ -69,6 +69,7 @@ struct YTiles {
 #include "../mma/mma_wrappers.cuh"  // fused_attn INT8 MMA wrappers + frag loaders (grouped_tc int8 path)
 #include "../fast_exp.cuh"           // the SiLU the fused-activation loader applies
 #include "../quantize/q8a128_tile.cuh" // the one q8a128 quantization, for that loader
+#include "moe_live.cuh"                 // the grouped entry's workers over a live expert table
 
 // =============================================================================
 // FORWARD DECLARATIONS - Optimized standalone dequant functions
@@ -1617,6 +1618,111 @@ __device__ void tc16_kernel(
 // row-tile writes a full 32-row block with no partial-row guard, same as the
 // tc16 path. All MoE expert dims (768 / 2048) satisfy this; grouped_matmul_gemx
 // enforces it host-side.
+
+// ── A live expert table: worker blocks ─────────────────────────────────────
+//
+// The routed MoE expert path (`expert_lre`) launches the device-table grouped
+// GEMM over a LIVE pointer table kept in mapped pinned host memory: an entry is
+// an expert's projection in VRAM (a hit), in pinned host memory (a warm-tier or
+// pad slot image), or 0 (cold — the host's stager has not yet read it from the
+// NVMe pack). `moe_bucketize` orders the tiles of every non-VRAM ("remote")
+// expert first, lists those experts, and snapshots the routed experts' entries
+// into VRAM; the launch's `weight_ptrs` is that snapshot. Such a launch carries
+// a `MoeLive`, and its grid is `(row_tiles, worker_rows + tiles)`, where
+// `worker_rows = ⌈workers / row_tiles⌉`:
+//
+// - The first `worker_rows` grid rows are the WORKERS, numbered row by row (the
+//   last row's blocks past `workers` exit). Rows rather than one row as wide as
+//   the worker count, because the grid's width is every tile row's width: a
+//   128-worker row over a 16-row-tile projection gave each tile row 112 blocks
+//   that only exited. Each worker pulls items `(remote expert, 32-row tile)`
+//   off the launch's counter, takes the expert's address — from the snapshot,
+//   or for a cold expert from the live row, spinning gently while it is 0 —
+//   copies the row tile's slice (every K block's 4 chunks) into its
+//   VRAM scratch slot with wide loads, syncs once, and runs the unmodified
+//   int8 impl over the slot as a 32-row matrix for every token tile of the
+//   expert. A remote expert crosses PCIe once per projection, never per tile.
+// - The rows after them are the tiles. A remote expert's tile exits (a worker owns it);
+//   every other tile is a hit and runs as it always has. Hit blocks never wait.
+// - A remote expert bucketize gave a promotion slot (`remote_dst`, a VRAM slot
+//   image) also has each slice the workers copy stored there, at the
+//   projection's offset (`dst_offset`): once the layer's three launches are
+//   done the slot holds the whole expert, and the host points its entry there.
+//
+// Only workers wait, and what they wait on is a host store — never a submitted
+// copy or any other driver call, which a thread blocked in the driver (a lazy
+// kernel load behind this launch) could hold back. `abort` (a mapped host word)
+// and `spin_limit_ns` end a wait in `__trap()`, a sticky error the next
+// synchronising call reports, so no result computed from the layer is returned.
+//
+// `stall` is the profile build's per-row counter block, null otherwise:
+//   stall[0] cold_wait_ns     — workers' time spent waiting for a cold expert
+//   stall[1] items            — worker items (remote expert × row tile) served
+//   stall[2] bytes            — bytes workers copied into scratch
+//   stall[3] copy_ns          — workers' time in the copy (mini loop)
+//   stall[4] launches         — live launches (one per projection per layer)
+//
+// The struct itself is in `moe_live.cuh`, shared with the launcher.
+
+__device__ __forceinline__ unsigned long long moe_live_now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// An entry the host rewrites while kernels run, read with an acquire load at
+// system scope — never through the read-only path a `const __restrict__`
+// pointer may compile to.
+__device__ __forceinline__ unsigned long long moe_live_load(const uint64_t* p) {
+#if __CUDA_ARCH__ >= 700
+    unsigned long long v;
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+#else
+    return *reinterpret_cast<const volatile unsigned long long*>(p);
+#endif
+}
+
+// 16 bytes through L2 only — the worker's copy reads each byte once.
+__device__ __forceinline__ uint4 moe_live_ld16(const uint8_t* p) {
+    uint4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+// Every poll is a PCIe read, and a launch can have every worker waiting: back
+// off to tens of microseconds so the polls never compete with the copies.
+#define MOE_LIVE_MAX_SLEEP_NS 32768u
+
+// Thread 0 of a worker: the live entry of a cold `expert`, waited for while it
+// is 0. Returns the time spent waiting.
+__device__ __forceinline__ unsigned long long moe_live_source(
+    int expert, const MoeLive& live, unsigned long long* src)
+{
+    const uint64_t* entry = reinterpret_cast<const uint64_t*>(live.live_row) + expert;
+    unsigned long long p = moe_live_load(entry);
+    if (p != 0) {
+        *src = p;
+        return 0;
+    }
+    const unsigned long long t0 = moe_live_now();
+    unsigned int ns = 32;
+    while (p == 0) {
+        if (*reinterpret_cast<const volatile unsigned int*>(live.abort) != 0u ||
+            moe_live_now() - t0 > live.spin_limit_ns) {
+            __trap();
+        }
+#if __CUDA_ARCH__ >= 700
+        __nanosleep(ns);
+#endif
+        ns = ns < MOE_LIVE_MAX_SLEEP_NS ? ns * 2u : MOE_LIVE_MAX_SLEEP_NS;
+        p = moe_live_load(entry);
+    }
+    *src = p;
+    return moe_live_now() - t0;
+}
+
 namespace grouped_tc {
 using namespace tc_common;
 
@@ -2432,6 +2538,125 @@ static __device__ void quantized_matmul_dense_splitk_entry_int8(
     }
 }
 
+// A worker of a live launch (see "A live expert table" above): items
+// `(remote expert r, row tile j)` off the launch's counter until none are left.
+// Per item: the expert's entry (waited for while cold); the row tile's slice
+// copied into this worker's scratch slot as a 32-row KO matrix —
+// `[K block][4 row groups]`, piece `k` from chunk `k·(nrows/8) + 4j` of the
+// source; one barrier; then the unmodified impl over the slot (`nrows = 32`,
+// row tile 0) for every token tile of `r`, its output at `dst + 32j`. The impl
+// indexes chunks `k·(nrows/8) + warp` and stores `dst[token·dst_stride + row]`
+// (`store_tile_output`), so each output row gets the arithmetic it gets from
+// VRAM, bit for bit.
+template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB>
+static __device__ void moe_live_worker(
+    const uint64_t* __restrict__ weight_ptrs,
+    const int* __restrict__ tile_b_start,
+    const int* __restrict__ tile_b_cnt,
+    const block_q8a128* __restrict__ vy,
+    output_t* __restrict__ dst,
+    int ncols_x, int nrows_x, int y_stride, int dst_stride, int sum_norm,
+    const MoeLive& live,
+    int worker,
+    int8_t smem_A_i8[][N_SUB * 16][KI8_STRIDE],
+    half2 smem_A_ds[][N_SUB * 16],
+    uint8_t* smem_W_flat)
+{
+    using block_c_t = block_compact_t<block_q_t>;
+    constexpr int CB = int8_chunk_bytes<block_c_t>::value;   // one 8-row chunk
+    constexpr int UNITS_PER_PIECE = 4 * CB / 16;                // 16 B units per K block
+    static_assert((4 * CB) % 16 == 0, "a row tile's K-block piece is whole 16-byte units");
+    __shared__ int s_item;
+    __shared__ unsigned long long s_src;
+    const int tid = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
+    const int row_tiles = nrows_x / N_TILE;
+    const int units = (ncols_x / K_TILE) * UNITS_PER_PIECE;
+    const int n_items = live.header[3] * row_tiles;
+    uint8_t* slot = live.scratch + (size_t)worker * live.slot_bytes;
+    if (live.stall != nullptr && worker == 0 && tid == 0) {
+        atomicAdd(&live.stall[4], 1ull);
+    }
+    for (;;) {
+        if (tid == 0) {
+            s_item = atomicAdd(live.counter, 1);
+        }
+        __syncthreads();
+        const int it = s_item;
+        if (it >= n_items) {
+            return;
+        }
+        const int r = it / row_tiles;
+        const int j = it - r * row_tiles;
+        const int expert = live.remote[4 * r];
+        const int first = live.remote[4 * r + 1];
+        const int n_tiles = live.remote[4 * r + 2];
+        unsigned long long waited = 0;
+        if (tid == 0) {
+            if (live.remote[4 * r + 3] != 0) {
+                waited = moe_live_source(expert, live, &s_src);
+            } else {
+                s_src = weight_ptrs[expert];
+            }
+        }
+        __syncthreads();
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(s_src));
+        // A promotion slot: the same slice also lands at its place in the slot
+        // image, so the expert is in VRAM once the layer is done — promoted for
+        // the price of a VRAM write, with no second crossing of the link.
+        const unsigned long long promo_base = live.remote_dst != nullptr ? live.remote_dst[r] : 0ull;
+        uint8_t* promo = promo_base == 0ull
+                             ? nullptr
+                             : reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(promo_base + live.dst_offset));
+        const unsigned long long t_copy = moe_live_now();
+        // The mini loop: every thread four 16-byte loads in flight, then their stores.
+        for (int b = tid; b < units; b += NUM_THREADS * 4) {
+            uint4 v[4];
+            size_t at[4];
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int idx = b + u * NUM_THREADS;
+                if (idx < units) {
+                    const int k = idx / UNITS_PER_PIECE;
+                    const int o = idx - k * UNITS_PER_PIECE;
+                    at[u] = ((size_t)k * (nrows_x / 8) + 4 * j) * CB + (size_t)o * 16;
+                    v[u] = moe_live_ld16(src + at[u]);
+                }
+            }
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int idx = b + u * NUM_THREADS;
+                if (idx < units) {
+                    reinterpret_cast<uint4*>(slot)[idx] = v[u];
+                    if (promo != nullptr) {
+                        *reinterpret_cast<uint4*>(promo + at[u]) = v[u];
+                    }
+                }
+            }
+        }
+        // The slot's stores are visible to the block's own `cp.async.cg` reads
+        // (both through L2) once every thread has passed this barrier.
+        __syncthreads();
+        if (live.stall != nullptr && tid == 0) {
+            atomicAdd(&live.stall[0], waited);
+            atomicAdd(&live.stall[1], 1ull);
+            atomicAdd(&live.stall[2], (unsigned long long)units * 16ull);
+            atomicAdd(&live.stall[3], moe_live_now() - t_copy);
+        }
+        if constexpr (is_scale_separate<block_c_t>::value) {
+            for (int t = 0; t < n_tiles; ++t) {
+                const int tile = first + t;
+                grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
+                    reinterpret_cast<const block_c_t*>(slot), vy, dst + (size_t)j * N_TILE,
+                    ncols_x, N_TILE, y_stride, dst_stride,
+                    tile_b_start[tile], tile_b_cnt[tile], 0,
+                    smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
+                // The next tile's prologue refills the buffers this one read.
+                __syncthreads();
+            }
+        }
+    }
+}
+
 // Grouped entry: decode (expert, batch-slice) from device tables and run one tile.
 //   block = 128 threads (4 warps × 32); the GRID AXIS ORDER is a runtime choice:
 //   row_fast != 0 → grid = (row_tiles, total_tiles): consecutively-scheduled blocks
@@ -2460,23 +2685,13 @@ static __device__ void quantized_matmul_grouped_entry(
     // entry also serves FLOAT activations, which carry no q8a128 header at all —
     // the `if constexpr` below discards it for them, so the FP instantiations
     // and their launchers do not name a value that has no meaning for them.
-    int sum_norm = 0)
+    int sum_norm = 0,
+    // A launch over a live expert table carries a `MoeLive` and the worker grid
+    // (see "A live expert table" above); every other launch passes
+    // `abort == nullptr`.
+    MoeLive live = MoeLive{})
 {
     using block_c_t = block_compact_t<block_q_t>;
-
-    const int tile = row_fast ? blockIdx.y : blockIdx.x;
-    const int b_cnt = tile_b_cnt[tile];
-    // A zero-count tile is padding: device-built tile tables (moe_bucketize.cu)
-    // are launched at the `n_tokens × k` upper bound so the host never reads a
-    // data-dependent tile count back. Exit before touching the pointer table.
-    if (b_cnt == 0) {
-        return;
-    }
-    const int expert = tile_expert[tile];
-    const block_c_t* weights =
-        reinterpret_cast<const block_c_t*>(static_cast<uintptr_t>(weight_ptrs[expert]));
-    const int b_start = tile_b_start[tile];
-    const int row_tile_idx = row_fast ? blockIdx.x : blockIdx.y;
 
     // Same decode / grid / store for every activation type; only the smem layout and
     // the per-tile compute differ. q8a128 → INT8 m16n8k32; FP → FP16 m16n8k16. N_SUB
@@ -2490,6 +2705,42 @@ static __device__ void quantized_matmul_grouped_entry(
         __shared__ __align__(16) int8_t smem_A_i8[ABUF][BATCH_I8][KI8_STRIDE];
         __shared__ __align__(16) half2 smem_A_ds[ABUF][BATCH_I8];
         __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_c_t>::value];
+        int tile;
+        int row_tile_idx;
+        if (live.abort != nullptr) {
+            // Live grid: row tiles on x; the first `worker_rows` rows are the
+            // workers, laid out row by row, and the rows after them the tiles.
+            const int worker_rows = (live.workers + (int)gridDim.x - 1) / (int)gridDim.x;
+            if ((int)blockIdx.y < worker_rows) {
+                const int worker = (int)(blockIdx.y * gridDim.x + blockIdx.x);
+                if (worker < live.workers) {
+                    moe_live_worker<qk, qi, block_q_t, vdr, output_t, N_SUB>(
+                        weight_ptrs, tile_b_start, tile_b_cnt, vy, dst, ncols_x, nrows_x,
+                        y_stride, dst_stride, sum_norm, live, worker, smem_A_i8, smem_A_ds,
+                        smem_W_flat);
+                }
+                return;
+            }
+            tile = (int)blockIdx.y - worker_rows;
+            // A remote expert's tile: a worker computes it.
+            if (tile < live.header[4]) {
+                return;
+            }
+            row_tile_idx = blockIdx.x;
+        } else {
+            tile = row_fast ? blockIdx.y : blockIdx.x;
+            row_tile_idx = row_fast ? blockIdx.x : blockIdx.y;
+        }
+        // A zero-count tile is padding: device-built tile tables (moe_bucketize.cu)
+        // are launched at the `n_tokens × k` upper bound so the host never reads a
+        // data-dependent tile count back. Exit before touching the pointer table.
+        const int b_cnt = tile_b_cnt[tile];
+        if (b_cnt == 0) {
+            return;
+        }
+        const block_c_t* weights = reinterpret_cast<const block_c_t*>(
+            static_cast<uintptr_t>(weight_ptrs[tile_expert[tile]]));
+        const int b_start = tile_b_start[tile];
         // KO-only int8 impl (inline-scale k1024). Non-KO → discarded (no-op kernel).
         if constexpr (is_scale_separate<block_c_t>::value) {
             grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
@@ -2497,6 +2748,15 @@ static __device__ void quantized_matmul_grouped_entry(
                 b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         }
     } else {
+        const int tile = row_fast ? blockIdx.y : blockIdx.x;
+        const int b_cnt = tile_b_cnt[tile];
+        if (b_cnt == 0) {
+            return;
+        }
+        const block_c_t* weights = reinterpret_cast<const block_c_t*>(
+            static_cast<uintptr_t>(weight_ptrs[tile_expert[tile]]));
+        const int b_start = tile_b_start[tile];
+        const int row_tile_idx = row_fast ? blockIdx.x : blockIdx.y;
         using compute_t = std::conditional_t<
             std::is_same_v<act_t, float>, half,
             std::conditional_t<

@@ -827,10 +827,7 @@ impl Scheduler {
 
             // Flush the wave summary + phase breakdown if its 2 s window
             // elapsed — even when no forward ran this iteration, so stalls still
-            // surface their phase split. (The expert-DMA delta and cumulative
-            // op-profile dumps were removed once measurement ruled the expert
-            // path out — dma_loads stays 0; the prefill cost is the attention
-            // kernel, seen in the per-forward `code-read prefill` breakdown.)
+            // surface their phase split.
             if self.wave_stats.due() {
                 // The 2 s telemetry window: the memory report, the class census, the
                 // fragmentation log. Cheap per wave only because it is rare, which is
@@ -933,7 +930,7 @@ impl Scheduler {
                     slots,
                     self.model
                         .expert_stats()
-                        .map(|s| (s.expert_hits, s.expert_misses, s.dma_loads)),
+                        .map(|s| (s.expert_hits, s.expert_misses, s.promotions)),
                 );
                 // Same cadence: publish the full memory report (global slot for
                 // `GET /v1/memory` + one JSON debug line). See `memory_report`.

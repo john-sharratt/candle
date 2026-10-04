@@ -22,8 +22,8 @@ use candle::{DType, Device, Result, Tensor, D};
 use memmap2::MmapOptions;
 
 use crate::models::expert_lre::{
-    layer_geometries, minimum_resident_slots, slot_bytes_for, sort_assignments_by_expert,
-    ExpertCache, ExpertCacheSetup, MmapExpertRef, MoeInput,
+    layer_geometries, minimum_resident_slots, slot_bytes_for, ExpertCache, ExpertCacheSetup,
+    MmapExpertRef,
 };
 use crate::models::profile::span;
 use candle_nn::kv_cache::WeightZone;
@@ -424,6 +424,7 @@ impl Engine {
             zone,
             device,
             experts_per_layer: n_expert,
+            experts_used: cfg.n_activated_experts,
             gguf_path: merged_path,
             // Persistent pack beside the GGUF: written once on first boot
             // (repacked kernel-layout records), authoritative cold tier after.
@@ -488,17 +489,17 @@ impl Engine {
 
     /// The MoE sub-block for `layer` over the mHC block input `x` `[1, 1, dim]`: route
     /// (`sqrtsoftplus`/`noaux`/hash), run the routed experts through the resident `ExpertCache`
-    /// on the int8-KO path (`MoeInput::Q8`), add the always-on shared expert. Returns
+    /// on the int8-KO path, add the always-on shared expert. Returns
     /// `[1, 1, dim]`. `token_id` drives the hash-layer `tid2eid` routing.
     fn moe_forward(&self, layer: &EngineLayer, x: &Tensor, token_id: u32) -> Result<Tensor> {
         let ids = Tensor::from_vec(vec![token_id], 1, &self.device)?;
         self.moe_forward_batch(layer, x, &ids)
     }
 
-    /// Batched MoE over `nt` rows: ONE routing readback per call (the
-    /// counting-sort's expert ids must be host-visible to schedule the
-    /// streaming cache's pinned→VRAM uploads — intrinsic to a non-resident
-    /// expert set, and amortized across every row of the wave).
+    /// Batched MoE over `nt` rows. The routed experts run through
+    /// [`ExpertCache::forward_routed`], which never waits on the host: the
+    /// routing reaches the pipeline thread as a per-expert summary, and the
+    /// gate GEMM waits on the device for any expert still loading.
     ///
     /// `token_ids` is the rows' `[nt]` U32 ids on the device — uploaded once per
     /// wave by the caller, because every layer routes the same rows.
@@ -534,50 +535,17 @@ impl Engine {
         };
         s_route.end();
 
-        // Counting-sort the (token, expert) assignments by ascending expert id (O(A+E)),
-        // matching the grouped-GEMM dispatch contract (see `SparseMoeBlock::forward_with_indices`).
-        // The ONE intrinsic wave-path readback: the paged expert cache schedules
-        // pinned→VRAM uploads by expert id, so the routing indices must be
-        // host-visible (amortized across every row of the wave). A dedicated-routing-stream async
-        // DtoH into a pinned buffer was measured here and REVERTED: neutral on single-session
-        // speculative but −8% on the cfg8 batched gate (589.9→541.0), because the per-layer
-        // event/side-stream/sync overhead over 44 layers × N sessions outweighs the pinned-copy
-        // saving — the readback is a genuine per-layer GPU-catch-up wait, not a hideable flush.
-        let s_sort = span("moe:sort");
-        super::readback::note_readback();
-        // Split out the readback itself: it is a synchronous D2H, so it does not
-        // just transfer 4 bytes per routed token — it blocks until every kernel
-        // issued this layer has retired. Timing it apart from the counting sort
-        // is what separates "the host sort is slow" (fixable by moving it to the
-        // GPU) from "the pipeline drains 43 times per token" (fixable only by
-        // removing the sync). The sort below is O(A+E) over ~128 assignments, so
-        // any large number here is the drain.
-        let s_rb = span("moe:sort_readback");
-        let idx_cpu: Vec<Vec<u32>> = indices.to_vec2::<u32>()?;
-        s_rb.end();
-        let weights_flat = weights.flatten_all()?; // [nt*k]
-        let (k, ne) = (self.cfg.n_activated_experts, self.cfg.n_routed_experts);
-        let (expert_ids, assignments) = sort_assignments_by_expert(&idx_cpu, k, ne);
-        s_sort.end();
-        let s_submit = span("moe:submit");
-        let routed = self.experts.submit_moe_work(
+        // `nt` decode rows: this family's wave engine does not separate decode
+        // from prefill rows, so every row is scored as decode for residency.
+        let routed = self.experts.forward_routed(
+            q8,
+            &weights,
+            &indices,
             layer.moe_layer_idx,
-            expert_ids,
-            MoeInput::Q8(q8),
-            DType::F32,
-            &weights_flat,
-            assignments,
-            // `nt`: every row counts as decode-attributed, reproducing this
-            // family's scoring exactly as it stood before the decode/prefill
-            // split existed. DeepSeek-V4-Flash doesn't yet thread its own
-            // wave's decode-row count through to this call site — its wave
-            // engine (`latent_moe/wave.rs`) is a separate path from the
-            // `batched_layer.rs` one that derives it for the Qwen3-family
-            // models this change was measured against.
             nt,
+            DType::F32,
             None,
         )?; // [nt, dim] F32
-        s_submit.end();
         let s_shared = span("moe:shared");
         let shared = layer.shared.forward(&normed)?; // [nt, dim] F32
         let out = (routed + shared)?.reshape((1, nt, dim));

@@ -1,59 +1,37 @@
-//! Expert cache with background pipeline thread and DMA / compute overlap.
+//! Expert cache: four tiers and one device-side expert path.
 //!
-//! Provides the core infrastructure for MoE (Mixture-of-Experts) models that
-//! offload expert weights to host memory (mmap) and load them on demand into
-//! a fixed-size VRAM pool managed with score-based eviction.
+//! The infrastructure for MoE (Mixture-of-Experts) models whose experts do not
+//! all fit in VRAM. Every expert is readable by the GPU at all times, from VRAM
+//! (a weight-zone slot), from pinned host memory (a warm-tier or pad slot), or
+//! — cold — from the NVMe pack once the stager has staged it into the pad. The
+//! live table (`live_table`) names where; `docs/moe_live_dispatch_design.md`
+//! §0 is the design.
 //!
 //! ## Architecture
 //!
-//! This implements the pipeline described in `docs/expert_pipeline_dataflow.md`
-//!
-//! - **Background pipeline thread**: a dedicated thread owns all mutable cache
-//!   state (`ExpertCacheInner`) with `&mut self` — no Mutex on the hot path.
-//!   Callers submit work via an MPSC channel and receive results via a oneshot.
-//!   The thread runs the full classify → DMA → compute loop.
-//!
-//! - **Sole ownership**: expert slots are owned directly by the pipeline thread.
-//!   No `Arc<ExpertSlot>`, no `RwLock`, no atomic reference counting.
-//!
-//! - **Score-based eviction**: each expert carries a lightly-decayed access
-//!   frequency (hit: +1.0, prediction hit: +0.3, end-of-pass decay: ×0.85).
-//!   The eviction key multiplies it by how far the expert's layer is from being
-//!   routed again, the policy runs over warm-backed experts before pack-only
-//!   ones, and the victims are chosen by an O(n) partial sort over contiguous
-//!   memory.
-//!
-//! - **Two-phase dispatch**: the pipeline thread partitions routed experts
-//!   into cache hits (WARM/READY) and misses (COLD→LOADING), runs hit compute
-//!   concurrently with miss DMA, then runs miss compute after a single
-//!   fence wait — all on the pipeline thread with `&mut self`.
-//!
-//! - **Flat sorted assignment array**: token→expert mappings are sorted by
-//!   expert ID and sliced via binary search.  No per-expert HashMap or Vec.
+//! - **The forward thread** (`dispatch`) enqueues each MoE layer — bucketize,
+//!   gather, gate / up / down, scatter — and never waits on the host. The expert
+//!   GEMMs' worker blocks copy every non-VRAM expert's row tiles into VRAM
+//!   scratch and compute them; only a cold expert's workers wait, on a host
+//!   store.
+//! - **The stager** (`stager`) is the only reader of the pack: it stages each
+//!   routed row's cold experts into the pad and publishes them, with no CUDA
+//!   call on the way.
+//! - **The pipeline thread** (`pipeline`) owns VRAM residency — scores, the
+//!   Markov transition matrix, promotion into VRAM with the copy engine,
+//!   eviction — off the critical path. It exclusively owns
+//!   `ExpertCacheInner` with `&mut self`; the per-expert places it shares with
+//!   the stager live behind one lock (`residency`), which also writes the
+//!   table, under the reclaim rule (`reclaim`).
 //!
 //! ## Eviction policy
 //!
-//! Eviction is a **pure drop** — the cold pack is authoritative and the warm
-//! tier is immutable, so releasing a slot moves no bytes and can fail in no
-//! way.  That is what shapes the policy: there is no copy to hide, so nothing
-//! is gained by freeing slots ahead of the demand for them, and eviction can
-//! happen at the exact moment the demand is known.
+//! Eviction is a **retarget** — every expert has a copy in the pack, and the
+//! warm tier is immutable — so it moves no bytes. A promotion takes a free
+//! slot, else the best victim [`cache::ExpertCacheInner::rank_victims`] offers
+//! that the reclaim rule lets go now: a row with no invocation in flight.
 //!
-//! ### 1. Exact-demand batch eviction (the primary path)
-//!
-//! `classify_and_load` counts a layer's misses **before** issuing a single
-//! load, and `ExpertCacheInner::demand_eviction` frees precisely
-//! `misses − free` slots in one scan — scored at the wave's real layer, with
-//! that layer's own hits protected.  One partial sort per layer, never a
-//! per-miss scan.
-//!
-//! This replaces an end-of-pass batch eviction that freed a fixed fraction
-//! proactively.  Two things were wrong with that: it over-evicted by its own
-//! estimate error, and it scored mid-pass victims as if the pass were at layer
-//! 0.  Knowing the exact deficit removes both, and the headroom it was
-//! creating bought nothing once eviction stopped copying.
-//!
-//! ### 2. The eviction key: `score × position`, run once per reload tier
+//! ### The eviction key: `score × position`, run once per reload tier
 //!
 //!   - **score** — the lightly-decayed access frequency above; the dominant
 //!     term, so the cache behaves as LFU with a recency decay.
@@ -70,15 +48,7 @@
 //!     host-to-device copy where a pack miss is a page-cache-bypassing NVMe
 //!     read an order of magnitude slower.
 //!
-//! ### 3. Layer-aware forced eviction (the backstop)
-//!
-//! The per-miss path in `ExpertCacheInner::allocate_slot`, reached only when
-//! the batch scan came up short.  It prefers a low-scored expert from a layer
-//! already executed this pass (behind the wave, so evicting it cannot cascade
-//! into a downstream miss), and falls back to the globally lowest-scored
-//! victim.  Both respect pinning and the in-flight protect set.
-//!
-//! ### 4. Early-layer pinning
+//! ### Early-layer pinning
 //!
 //! Experts in the first [`PINNED_LAYERS`] MoE layers are never evicted: they
 //! run first every pass with no compute ahead of them to overlap a DMA
@@ -96,14 +66,13 @@
 //! 3.6-35B it returns 943 MiB of pinned host RAM to the evictable set — the
 //! only set that generates misses — and the same again on disk.
 //!
-//! ### 5. Windowed prefetch eviction
+//! ### Windowed prefetch eviction
 //!
-//! Speculative prefetch takes free slots first, and may make room only from
-//! the **furthest-behind** layers (`cache::PREFETCH_EVICT_WINDOW`, wrapping
-//! from the current layer).  Near-future layers are structurally out of its
+//! Speculative promotion takes free slots first, and may make room only from
+//! the **furthest-behind** layers (`cache::PREFETCH_EVICT_WINDOW`), never the
+//! wrapped tail of the pass. Near-future layers are structurally out of its
 //! reach, so a mispredicted prefetch cannot displace an expert this sweep is
-//! about to need — while still letting prefetch run on a card with no standing
-//! headroom, which a free-slot-only rule could not.
+//! about to need.
 //!
 //! ## Transition matrix and speculative prefetch
 //!
@@ -116,8 +85,8 @@
 //! required, and no extra compute: it consumes routing IDs only, never live
 //! activations, so it is free to evaluate and shared across every token in a
 //! wave that routed to the same expert.  At each layer the predictor ranks the
-//! likely *non-cached* experts for the next layer and their DMA begins while
-//! the current layer computes.
+//! likely *non-cached* experts for the next layer: those with a pinned copy are
+//! promoted while the current layer computes, cold ones are staged into the pad.
 //!
 //! The fan-out is **not** a fixed top-`K`.  Each candidate must clear a
 //! per-source relative confidence floor, ranked by pointwise mutual
@@ -125,65 +94,52 @@
 //! *diversity* rather than demand *width* — see [`transition`] for why the cap
 //! must not scale with the batch.
 //!
-//! Correct predictions convert cold misses into overlapped loads.  Incorrect
-//! ones occupy a slot the windowed eviction above will reclaim, taken from
-//! layers the wave has already left.
+//! Correct predictions turn misses into hits.  Incorrect ones occupy a slot the
+//! windowed eviction above will reclaim, taken from layers the wave has already
+//! left.
 //!
-//! Prediction is worth nothing at prefill width, where the next layer routes
-//! to most of its experts and there is nothing to guess.  That regime is
-//! served by `streamer` instead: bulk whole-layer streaming, off the
-//! pipeline thread.
-//!
-//! ## Two operating modes
-//!
-//! | Mode | When | Thread? | Lock? |
-//! |------|------|---------|-------|
-//! | **Threaded** | mmap path (partial VRAM residency) | Yes — background thread owns all state | No — `&mut self` on thread |
-//! | **Inline** | reader path (full VRAM residency) | No — all experts pre-loaded | Yes — `Mutex` (uncontended) |
-//!
-//! The inline mode is used when all experts fit in VRAM (the reader path).
-//! No DMA ever occurs, so the background thread adds no value.  The Mutex
-//! is uncontended because layers execute sequentially.
-//!
-//! ## Key types
-//!
-//! | Type | Role |
-//! |------|------|
-//! | [`MmapExpertRef`] | Byte-range reference into the mmap for one expert's projections |
-//! | [`ExpertSlot`]     | A single VRAM slot holding one expert's gate/up/down `QMatMul`s |
-//! | [`CopyBatchFence`] | Opaque fence for in-flight DMA on the copy stream |
-//! | [`ExpertCache`]    | Handle to the pipeline — threaded or inline |
-//! | [`MoeWorkRequest`] | Work item sent to the pipeline thread |
-//! | [`TransitionMatrix`] | Online-learned expert→expert routing predictor |
-//! | [`PINNED_LAYERS`]  | Number of early layers exempt from eviction |
+//! Prediction is worth nothing at prefill width, where the next layer routes to
+//! most of its experts and there is nothing to guess: a prefill-width row
+//! promotes the next row's scored experts instead.
 //!
 //! ## Module structure
 //!
 //! | File | Contents |
 //! |------|----------|
-//! | [`types`]      | Shared data types (`MmapExpertRef`, `ExpertSlot`, etc.) |
-//! | [`cache`]      | `ExpertCacheInner` — slot management and eviction policy |
-//! | [`compute`]    | SwiGLU expert computation and `QMatMul` re-export |
+//! | [`types`]      | Shared data types (`MmapExpertRef`, `ExpertSlot`, stats, messages) |
+//! | [`cache`]      | `ExpertCacheInner` — VRAM slots and the eviction policy |
+//! | [`compute`]    | `QMatMul` re-export |
 //! | [`transition`] | `TransitionMatrix` — online-learned routing predictor |
 //! | [`pack`]       | `ExpertPack` — the authoritative cold tier on disk |
 //! | [`pinned`]     | `WarmPool` — pinned host memory slots, and the warm draw |
 //! | [`warm_tier`]  | `WarmTier` — the warm tier: pinned up to the page-lock ceiling, pageable past it |
+//! | `pad`          | `Pad` — the mutable pinned tier cold experts are staged into |
 //! | [`page_pressure`] | make the OS release RAM before a page-lock retry |
-//! | [`pipeline`]   | `PipelineState`, background thread, DMA loading |
-//! | `streamer`     | Off-thread whole-layer streaming for prefill-width waves (cuda) |
-//! | `gpu_dispatch` | Device-resident expert pointer tables for the grouped GEMM (cuda) |
-//! | [`handle`]     | `ExpertCache` public API and `PipelineMode` |
+//! | `live_table`   | the live `[3][rows][E]` table in mapped memory, written by host stores |
+//! | `residency`    | where every expert's copies are; the lock that writes the table |
+//! | `reclaim`      | tickets, and when a slot may be reused or an entry go to 0 |
+//! | `dispatch`     | the device-side expert forward on the forward thread |
+//! | `stager`       | the stager thread: pack and pageable reads into the pad |
+//! | [`pipeline`]   | the pipeline thread: promotion, prefetch, scores |
+//! | `promo`        | the promotion ring the GPU fills missed experts into |
+//! | `boundary`     | the elastic weight/KV boundary move |
+//! | `slot_image`   | one expert's slot image: offsets, views, uploads |
+//! | `startup`      | building or reusing the pack, and the startup fill |
+//! | [`handle`]     | `ExpertCache` public API |
 
-mod assignment_sort;
+#[cfg(feature = "cuda")]
+mod boundary;
 mod cache;
 pub(crate) mod compute;
+#[cfg(feature = "cuda")]
+mod dispatch;
 #[cfg(test)]
 mod eval;
-#[cfg(feature = "cuda")]
-mod gpu_dispatch;
 /// `pub(crate)` so the layer warm tier can size itself through the same three
 /// host-RAM ceilings this one does — see `handle::warm_slots_for`.
 pub(crate) mod handle;
+#[cfg(feature = "cuda")]
+mod live_table;
 #[cfg(all(test, feature = "cuda"))]
 mod matmul_baseline;
 /// `pub(crate)` so the layer pack shares this one's repack fingerprint rather
@@ -192,6 +148,8 @@ mod matmul_baseline;
 /// invalidate the other.
 pub(crate) mod pack;
 #[cfg(feature = "cuda")]
+mod pad;
+#[cfg(feature = "cuda")]
 mod page_pressure;
 /// `pub(crate)` for [`WarmPool`](pinned::WarmPool) alone, which is a generic
 /// pinned-slot allocator with nothing expert-specific in it and is shared with
@@ -199,33 +157,39 @@ mod page_pressure;
 /// `stratified_membership` *is* expert-specific — see
 /// `layer_stream::warm` on why a layer tier draws a contiguous run instead.
 pub(crate) mod pinned;
+#[cfg(feature = "cuda")]
 mod pipeline;
+#[cfg(feature = "cuda")]
+mod promo;
+#[cfg(feature = "cuda")]
+mod reclaim;
+#[cfg(feature = "cuda")]
+mod residency;
 /// Fletcher-32 fingerprints of the resident expert weights, taken once after
 /// the fill so a later corruption can be told from a bad fill.
 #[cfg(feature = "cuda")]
 pub mod slot_integrity;
 #[cfg(feature = "cuda")]
-mod streamer;
+mod slot_image;
+#[cfg(feature = "cuda")]
+mod stager;
+#[cfg(feature = "cuda")]
+mod startup;
 mod transition;
 mod types;
 #[cfg(feature = "cuda")]
 mod warm_tier;
 mod weight_plan;
-mod zone_geometry;
 
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
-pub use assignment_sort::{sort_assignments_by_expert, ExpertAssignment};
 #[cfg(feature = "cuda")]
 pub use cache::minimum_resident_slots;
 /// Shared with the layer cache, which pins the same count for the same reason:
 /// the leading layers are reached first on every forward and have the least
 /// time to be fetched, so they are the ones worth never fetching at all.
 pub use cache::PINNED_LAYERS;
-#[cfg(feature = "cuda")]
-pub use gpu_dispatch::GpuDispatchTables;
 pub use handle::ExpertCache;
-#[cfg(feature = "cuda")]
 pub use handle::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
 pub use handle::{
@@ -240,10 +204,8 @@ pub use handle::{
 #[cfg(feature = "cuda")]
 pub(crate) use pinned::layer_geometries;
 #[cfg(feature = "cuda")]
-pub use pipeline::grow_tally;
+pub use boundary::grow_tally;
 #[cfg(feature = "cuda")]
-pub(crate) use pipeline::slot_bytes_for;
-pub use types::{
-    CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest, PipelineStats,
-};
+pub(crate) use slot_image::slot_bytes_for;
+pub use types::{ExpertSlot, MmapExpertRef, PipelineStats};
 pub use weight_plan::{WeightPlan, WeightPlanning};

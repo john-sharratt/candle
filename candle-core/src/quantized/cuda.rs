@@ -43,6 +43,9 @@ use candle_kernels::quantized::{
     dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_qkv_segmented_matmul,
     run_quantized_matmul, MatmulStatus, OutDType, VxSegment, YType,
 };
+/// The wait state of a grouped GEMM over a live weight table — see
+/// [`grouped_qmatmul_dev_q8a128`].
+pub use candle_kernels::quantized::MoeLive;
 
 // Import GEMX repacking dispatcher
 use candle_kernels::quantized::{get_repacked_size_bytes, is_gemx_supported, run_repack_gemx};
@@ -5260,6 +5263,9 @@ fn grouped_matmul_gemx_impl<'w>(
                             // this is the float activation path, which has no
                             // q8a128 header. The launcher drops it for ytype != 3.
                             SumScale::Raw.as_code(),
+                            // Host-built tables over resident weights: no wait.
+                            std::ptr::null(),
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 })?;
@@ -6385,15 +6391,47 @@ pub fn dequantize_q8a128(
 /// with ytype = Q8A128. The grouped/MoE path has no mode-2 kernel, so it always
 /// runs mode-1 (Q8A128V) regardless of M. Internal building block for the `Int8`
 /// arm of [`grouped_qmatmul`].
-/// Token width of one mode-2 (`Bm=32`, `N_SUB=2`) grouped-GEMM expert tile —
-/// the width the DEVICE-side tile builder (`moe_bucketize`) segments at, and
-/// the mode its consumers launch (`n_sub = 2`; the decode regime, where 32 is
-/// already the full reuse win). The host tile builder
-/// (`grouped_matmul_gemx_q8a128_with_mode`) derives its width from the chosen
-/// mode instead (`16·n_sub`, up to `Bm=128` for prefill-scale rows-per-expert);
-/// a builder/launch width divergence silently mis-strides the kernel's batch
-/// slices, so each launch site pairs its table width with its `n_sub`.
+/// Token width of one mode-2 (`Bm=32`, `N_SUB=2`) grouped-GEMM expert tile — the
+/// decode regime's width, where 32 is already the full reuse win, and the width
+/// device-table callers that do not choose a mode build at. The expert cache's live
+/// dispatch and the host tile builder (`grouped_matmul_gemx_q8a128_with_mode`) choose
+/// per launch instead ([`grouped_int8_n_sub`]: `16·n_sub`, up to `Bm=128` for
+/// prefill-scale rows-per-expert). A builder/launch width divergence silently
+/// mis-strides the kernel's batch slices, so each launch site pairs its table width
+/// with its `n_sub`.
 pub const GROUPED_GEMM_TILE_W: usize = 32;
+
+/// The token-tile mode (`n_sub`; tile width `16·n_sub`) for a grouped int8 launch
+/// whose experts average `avg_rows` rows each — shared by the host tile builder and
+/// every device-table launch, so both pick the same width for the same load.
+///
+/// The grouped int8 kernel loads and dequants each expert weight chunk ONCE per tile
+/// and sweeps the m16n8k32 core across the tile's 16-row sub-tiles, so the tile width
+/// IS the weight-reuse factor: at decode's 1–32 rows/expert the 32-wide mode-2 tile is
+/// already optimal (a partial tile costs the same weight traffic), but at PREFILL's
+/// ~100–300 rows/expert it re-streams and re-dequants every expert 4×+ per launch —
+/// measured as the flat ~0.87 ms/token marginal prefill cost. Wide modes (Bm 64 / 128)
+/// exist for the KO rows only (`wide_ok`); thresholds sit at the widths where the wider
+/// tile's weight-traffic saving is guaranteed even for a final partial tile.
+///
+/// BENCH-derived (`moe_layer_gemm_bench`, real shapes: 256 experts, gate/up
+/// [2048,7168] / down [7168,2048] MXFP4_KO): at ~91 rows/expert Bm-128 wins (29.3 vs
+/// 36.3 ms), but at ~192 rows/expert Bm-64 beats Bm-128 (52.9 vs 60.3 ms) — the
+/// widest tile loses more occupancy than its extra reuse pays back once several tiles
+/// per expert exist. The bands encode those two measured points.
+pub fn grouped_int8_n_sub(avg_rows: usize, wide_ok: bool) -> usize {
+    if !wide_ok {
+        2
+    } else if avg_rows >= 128 {
+        4
+    } else if avg_rows >= 64 {
+        8
+    } else if avg_rows >= 32 {
+        4
+    } else {
+        2
+    }
+}
 
 /// Kernel bounds of the MoE bucketize, re-exported so every gate that decides
 /// "can this routing take the device-table path?" reads the SAME constants the
@@ -6420,38 +6458,11 @@ fn grouped_matmul_gemx_q8a128<'w>(
     if num_experts == 0 {
         crate::bail!("grouped_matmul_gemx_q8a128: no experts provided");
     }
-    // Token-tile mode by rows-per-active-expert. The grouped int8 kernel loads
-    // + dequants each expert weight chunk ONCE per tile and sweeps the
-    // m16n8k32 core across the tile's 16-row sub-tiles, so the tile width IS
-    // the weight-reuse factor: at decode's 1–32 rows/expert the 32-wide
-    // mode-2 tile is already optimal (a partial tile costs the same weight
-    // traffic), but at PREFILL's ~100–300 rows/expert it re-streams and
-    // re-dequants every expert 4×+ per launch — measured as the flat
-    // ~0.87 ms/token marginal prefill cost. Wide modes (Bm 64 / 128) exist
-    // for the KO rows (the only int8 formats); thresholds sit at the widths
-    // where the wider tile's weight-traffic saving is guaranteed even for a
-    // final partial tile.
     let active: usize = (0..num_experts)
         .filter(|&e| expert_offsets[e + 1] > expert_offsets[e])
         .count();
     let avg_rows = total_batch.checked_div(active).unwrap_or(0);
-    // Mode choice is BENCH-derived (`moe_layer_gemm_bench`, real shapes:
-    // 256 experts, gate/up [2048,7168] / down [7168,2048] MXFP4_KO): at
-    // ~91 rows/expert Bm-128 wins (29.3 vs 36.3 ms), but at ~192 rows/expert
-    // Bm-64 beats Bm-128 (52.9 vs 60.3 ms) — the widest tile loses more
-    // occupancy than its extra reuse pays back once several tiles per expert
-    // exist. The bands encode those two measured points.
-    let n_sub: usize = if !weight_dtype.is_ko() {
-        2
-    } else if avg_rows >= 128 {
-        4
-    } else if avg_rows >= 64 {
-        8
-    } else if avg_rows >= 32 {
-        4
-    } else {
-        2
-    };
+    let n_sub = grouped_int8_n_sub(avg_rows, weight_dtype.is_ko());
     // q8a128 activations are ~1 B/elem (int8 qs + per-128 scales).
     let row_fast = grouped_grid_row_fast(total_batch * ncols, device);
     grouped_matmul_gemx_q8a128_with_mode(
@@ -6576,6 +6587,9 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
                     n_sub as i32,
                     row_fast as i32,
                     sum_scale.as_code(),
+                    // Host-built tables over resident weights: no wait.
+                    std::ptr::null(),
+                    device.cuda_stream().cu_stream() as *mut std::ffi::c_void,
                 );
             }
         })?;
@@ -6679,9 +6693,17 @@ pub fn grouped_qmatmul<'w>(
 ///    (`b_cnt == 0`) exit in the kernel without touching the pointer table.
 ///
 /// Output is `[total_batch, nrows]` f32 with padding rows UNWRITTEN — the
-/// deterministic scatter's segment tables never reference them. Bit-identical
-/// to the host path for every valid row: same tables (proven by the bucketize
-/// tests), same ascending-expert tile order, same kernel.
+/// deterministic scatter's segment tables never reference them. Every output
+/// row has exactly one writing block and a fixed K order, so the result does
+/// not depend on the order of the tiles in the tables.
+///
+/// **A live table.** With `live` set, the table is `moe_bucketize`'s snapshot of
+/// the layer's live-table entries, and bucketize has put the remote (non-VRAM)
+/// experts' tiles first and listed them: the launch gains a row of
+/// `live.workers` worker blocks that copy each remote expert's row tiles into
+/// VRAM scratch and compute them — a cold one once `live.live_row` names it —
+/// while the other tiles run as from any resident table (see "A live expert
+/// table" in `kernel.cuh`).
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_qmatmul_dev_q8a128<'w>(
     op: &Q8a128Operand<'w>,
@@ -6694,9 +6716,18 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
     tile_b_start: &CudaSlice<i32>,
     tile_b_cnt: &CudaSlice<i32>,
     launch_tiles: usize,
+    n_sub: usize,
+    live: Option<&MoeLive>,
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
     ensure_qmatmul_pairing(&DynamicTensor::Int8(op), weight_dtype)?;
+    // The tile tables were built `16·n_sub` wide; a launch at another width
+    // mis-strides every batch slice. Wide modes exist for the KO rows only.
+    if !matches!(n_sub, 2 | 4 | 8) || (n_sub > 2 && !weight_dtype.is_ko()) {
+        crate::bail!(
+            "grouped_qmatmul_dev_q8a128: tile mode n_sub={n_sub} unsupported for {weight_dtype:?}"
+        );
+    }
     if !nrows.is_multiple_of(32) {
         crate::bail!("grouped_qmatmul_dev_q8a128: nrows={nrows} must be a multiple of 32");
     }
@@ -6746,8 +6777,11 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
         let (te, _g1) = tile_expert.device_ptr(&stream);
         let (tbs, _g2) = tile_b_start.device_ptr(&stream);
         let (tbc, _g3) = tile_b_cnt.device_ptr(&stream);
-        // q8a128 activations are ~1 B/elem.
+        // A live launch has its grid fixed by the launcher (row tiles on x, the
+        // workers' rows ahead of the tiles); any other launch picks its axis order
+        // for L2 (q8a128 activations are ~1 B/elem).
         let row_fast = grouped_grid_row_fast(total_batch * ncols, device) as i32;
+        let live_ptr = live.map_or(std::ptr::null(), |l| l as *const MoeLive);
         op.with_device_ptr(device, |act_ptr| {
             unsafe {
                 run_grouped_quantized_matmul(
@@ -6764,12 +6798,13 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
                     launch_tiles as i32,
                     qtype,
                     YType::Q8A128 as i32,
-                    // moe_bucketize builds 32-wide tiles (decode regime).
-                    2,
+                    n_sub as i32,
                     row_fast,
                     // Read off the operand, so the matmul interprets the header
                     // the way whoever quantized these blocks wrote it.
                     op.sum_scale.as_code(),
+                    live_ptr,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
             Ok(())
@@ -7448,9 +7483,10 @@ pub struct MoeBucketizeWorkspace {
     pub rw_ids: CudaSlice<u32>,
     /// Per-token scatter segment boundaries, `[n_tokens + 1]`.
     pub token_starts: CudaSlice<i32>,
-    /// Device header `{n_active, total_valid, num_tiles, 0}` — diagnostic only;
-    /// the pipeline launches at the `n_tokens × k` upper bound and never reads
-    /// this on the host.
+    /// Device header `{n_active, total_valid, num_tiles, remote experts,
+    /// remote tiles}`. The live grouped GEMM's blocks read the last two; the
+    /// host never reads it — the pipeline launches at the `n_tokens × k` upper
+    /// bound.
     pub header: CudaSlice<i32>,
     inv: CudaSlice<u32>,
     scan: CudaSlice<i32>,
@@ -7472,7 +7508,7 @@ impl MoeBucketizeWorkspace {
             perm: unsafe { device.alloc::<u32>(cap_assign)? },
             rw_ids: unsafe { device.alloc::<u32>(cap_assign)? },
             token_starts: unsafe { device.alloc::<i32>(cap_starts)? },
-            header: unsafe { device.alloc::<i32>(4)? },
+            header: unsafe { device.alloc::<i32>(5)? },
             inv: unsafe { device.alloc::<u32>(cap_assign)? },
             scan: unsafe { device.alloc::<i32>(cap_assign)? },
         })
@@ -7487,20 +7523,30 @@ impl MoeBucketizeWorkspace {
     }
 }
 
-/// GPU-native expert bucketize: turn `moe_route`'s `[n_tokens, k]` u32 index
+/// GPU-native expert bucketize: turn the router's `[n_tokens, k]` u32 index
 /// tensor into every device table the grouped expert pipeline consumes —
 /// expert-grouped gather lists, grouped-GEMM tile tables (padded to the
 /// `n_tokens × k` launch bound with `b_cnt = 0`), and the deterministic
 /// scatter's token-major segment tables — in ONE launch on the compute stream,
-/// with no GPU→CPU readback. The grouping is stable in (token, slot) order,
-/// bit-identical to the CPU counting-sort it replaces; an index
-/// `≥ n_experts` is the router's empty-slot sentinel and is skipped. See
+/// with no GPU→CPU readback. The row grouping is stable in (token, slot) order
+/// and ascending by expert id; an index `≥ n_experts` is the router's
+/// empty-slot sentinel and is skipped. See
 /// `candle-kernels/src/simple/moe_bucketize.cu` for the padding contract.
+///
+/// - `live` — a layer over a live expert table ([`BucketizeLive`]): its routed
+///   experts are classified VRAM / pinned / cold from their entries, which are
+///   snapshotted into the layer's GEMM weight tables, the remote (pinned, then
+///   cold) experts' tiles come first and are listed, and the routing summary is
+///   written. `None` treats every expert as in VRAM (plain
+///   ascending tile order, no summary, no list).
+/// - `decode_tokens` — tokens `[0, decode_tokens)` are decode rows.
 pub fn moe_bucketize(
     indices: &LiveTensor<'_>,
     n_experts: usize,
     tile_w: usize,
     ws: &mut MoeBucketizeWorkspace,
+    live: Option<&BucketizeLive>,
+    decode_tokens: usize,
 ) -> Result<()> {
     use crate::cuda_backend::CudaStorageSlice;
 
@@ -7531,6 +7577,14 @@ pub fn moe_bucketize(
             "moe_bucketize: indices must be u32, got {:?}",
             indices.dtype()
         );
+    }
+    if live.is_some_and(|l| l.gate_row != 0 && l.snap == 0) {
+        crate::bail!("moe_bucketize: a live layer needs a snapshot buffer");
+    }
+    let promo = live.and_then(|l| l.promo);
+    if live.is_some_and(|l| l.promo.is_some_and(|p| p.cap == 0) || (l.promo.is_some() && l.remote_dst == 0))
+    {
+        crate::bail!("moe_bucketize: a promotion ring needs a capacity and a remote_dst list");
     }
     ws.ensure(&device, n_tokens, k)?;
 
@@ -7581,10 +7635,80 @@ pub fn moe_bucketize(
             hd as *mut std::ffi::c_void,
             iv as *mut std::ffi::c_void,
             sc as *mut std::ffi::c_void,
+            live.map_or(0, |l| l.gate_row) as *const std::ffi::c_void,
+            live.map_or(0, |l| l.table_plane),
+            live.map_or(0, |l| l.snap) as *mut std::ffi::c_void,
+            live.map_or(0, |l| l.pinned[0].0),
+            live.map_or(0, |l| l.pinned[0].1),
+            live.map_or(0, |l| l.pinned[1].0),
+            live.map_or(0, |l| l.pinned[1].1),
+            decode_tokens.min(i32::MAX as usize) as i32,
+            live.map_or(0, |l| l.summary) as *mut std::ffi::c_void,
+            live.map_or(0, |l| l.summary_seq),
+            live.map_or(0, |l| l.remote) as *mut std::ffi::c_void,
+            live.map_or(0, |l| l.counters) as *mut std::ffi::c_void,
+            promo.map_or(0, |p| p.slots) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.log) as *mut std::ffi::c_void,
+            promo.map_or(0, |p| p.head) as *mut std::ffi::c_void,
+            promo.map_or(0, |p| p.tail) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.cap),
+            promo.map_or(0, |p| p.marks) as *mut std::ffi::c_void,
+            live.map_or(0, |l| l.row),
+            live.map_or(0, |l| l.remote_dst) as *mut std::ffi::c_void,
             stream.cu_stream() as *mut std::ffi::c_void,
         );
     }
     Ok(())
+}
+
+/// One routed layer's live-table inputs and outputs for [`moe_bucketize`].
+/// Every address is a device address (mapped host memory where noted).
+#[derive(Debug, Clone, Copy)]
+pub struct BucketizeLive {
+    /// The layer's row of the live gate table (mapped): an entry in VRAM is a
+    /// VRAM expert, one inside a `pinned` range is pinned, 0 is cold. The up
+    /// and down rows are `table_plane` and `2 · table_plane` entries after it,
+    /// and an expert with any of its three entries 0 is cold.
+    pub gate_row: u64,
+    pub table_plane: i64,
+    /// `u64[3][n_experts]` snapshot of the routed experts' entries (gate, up,
+    /// down) — the weight tables of the layer's three grouped GEMMs.
+    pub snap: u64,
+    /// The two pinned host ranges `[lo, hi)` — the warm tier and the pad.
+    pub pinned: [(u64, u64); 2],
+    /// `u32[n_experts + 1]` routing summary (mapped): `count | pinned << 29 |
+    /// cold << 30 | decode << 31` per expert, then `summary_seq`, stored last
+    /// once every count is visible system-wide.
+    pub summary: u64,
+    pub summary_seq: u32,
+    /// `i32[n_experts][4]` remote list, `{expert, first_tile, n_tiles, cold}`.
+    pub remote: u64,
+    /// `i32[3]` work counters of the layer's gate, up and down launches, zeroed.
+    pub counters: u64,
+    /// The layer's row, recorded in the promotion log.
+    pub row: i32,
+    /// The promotion ring, or `None`: each remote expert takes the next free
+    /// VRAM slot image from it into `remote_dst` (see [`PromoRing`]).
+    pub promo: Option<PromoRing>,
+    /// `u64[n_experts]` promotion slot per remote expert (0 = none).
+    pub remote_dst: u64,
+}
+
+/// The promotion ring `moe_bucketize` takes slots from — device addresses into
+/// mapped host memory. The host frees VRAM slot images into `slots[tail % cap]`
+/// (`u64`) and advances `tail` (`u32`); the kernel takes them from `head`
+/// (`u32`), records `summary_seq << 32 | row << 16 | expert` in `log` (`u64`)
+/// at the same index, and advances `head`. `marks` (`u32[rows][n_experts]`) is
+/// set by the kernel for each expert it gives a slot and cleared by the host
+/// once the promotion lands; a marked expert is not given another.
+#[derive(Debug, Clone, Copy)]
+pub struct PromoRing {
+    pub slots: u64,
+    pub log: u64,
+    pub head: u64,
+    pub tail: u64,
+    pub cap: u32,
+    pub marks: u64,
 }
 
 #[cfg(test)]
