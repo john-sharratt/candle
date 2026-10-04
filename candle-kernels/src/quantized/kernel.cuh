@@ -572,9 +572,13 @@ static __device__ void quantized_matmul_iter(
     
     // =========================================================================
     // PHASE 1: Process all iterations, write to per-iteration smem buffers
-    // iter is compile-time constant after #pragma unroll, so all offsets fold
+    //
+    // A real loop. Each iteration is a whole K walk of its own (the tile loop
+    // below is not unrolled), so iterations never overlap one another and
+    // unrolling them bought only folded offsets — while pasting the K walk,
+    // the partial tile and the reduce NUM_ITERS times into the kernel.
     // =========================================================================
-    #pragma unroll
+    #pragma unroll 1
     for (int iter = 0; iter < NUM_ITERS; ++iter) {
         // Batch Y offset for this iteration: base + iter * BATCH_TILE * y_stride_per_row
         const int batch_y_offset = base_y_offset + iter * iter_y_stride;
@@ -633,8 +637,9 @@ static __device__ void quantized_matmul_iter(
     
     // =========================================================================
     // PHASE 2: Finalize all iterations - read smem and write to global memory
+    // (a real loop, as phase 1)
     // =========================================================================
-    #pragma unroll
+    #pragma unroll 1
     for (int iter = 0; iter < NUM_ITERS; ++iter) {
         // batch_start is global batch index: batch_base + iter * BATCH_TILE
         const int batch_start = batch_base + iter * BATCH_TILE;
@@ -1446,32 +1451,9 @@ __device__ __forceinline__ void load_activations(
 // -----------------------------------------------------------------------------
 // TC kernel implementation: takes SMEM as parameters for unified dispatch
 // This avoids SMEM summing when called from dispatch functions
-//
-// **`__noinline__` here buys compile time, not size.** Worth stating precisely,
-// because the obvious reading is wrong.
-//
-// Sixteen `tc16_N` entry points exist, one per `REMAINDER_BATCH`, and this body
-// does not depend on `REMAINDER_BATCH` — only on the four type parameters — so
-// every one of them carries the same instantiation. In `q8_0_bf16.o`, `tc16_0`
-// (the pure path, no remainder tile) is ~14 KB and each `tc16_1..15` is ~26 KB:
-// the shared body plus an N-specific tail.
-//
-// `__noinline__` does **not** remove those copies. ptxas re-inlines a device
-// function reached from a single call site whatever the front end asked for, and
-// the per-kernel sizes are unmoved by it (13,696 → 14,464; 25,472 → 26,112).
-// Anyone adding this expecting a smaller archive will not get one — measured,
-// the archives grew 3.7 MB from the call-boundary ABI.
-//
-// What it does buy is the front end no longer re-inlining and re-optimising this
-// tensor-core loop sixteen times per translation unit: **nvcc time fell 20%**,
-// 4,623s → 3,715s across a full kernel build, with `q8_0_bf16.cu` going 182.8s →
-// 146.7s. On a build where every one of the ten slowest translation units is a
-// `q*` object from this header, that is the axis worth trading 3.7 MB for. No
-// measurable runtime cost: this is the kernel body, entered once per block, and
-// the quantized suite times the same either way (4.88s → 4.74s).
 // -----------------------------------------------------------------------------
 template <typename block_c_t, typename compute_t, typename act_t, typename output_t>
-__device__ __noinline__ void tc16_kernel_impl(
+__device__ void tc16_kernel_impl(
     const block_c_t* __restrict__ weights,
     const act_t* __restrict__ activations,
     output_t* __restrict__ dst,
@@ -2825,20 +2807,19 @@ namespace sN_tc {
 using namespace tc_common;
 
 // -----------------------------------------------------------------------------
-// Load activations with VECTORIZED loads and zero-padding for batch 5-15
-// 
-// OPTIMIZATION: Uses int4 (16-byte) vectorized loads with simple b < batch_size
-// predicate. Since batch_size is 5-15:
-//   - Iteration 0: batches 0-7 × K_TILE - batches 0-4 always valid
-//   - Iteration 1: batches 8-15 × K_TILE - all may need zero-padding
-// BATCH_SIZE is compile-time constant for branch elimination
+// Load activations with VECTORIZED loads and zero-padding for batch 1-15
+//
+// Uses int4 (16-byte) vectorized loads with a simple b < batch_n predicate;
+// rows batch_n..15 of the tile are written as zeros so the MMA sees padding.
+// batch_n is uniform across the block, so the predicate never diverges a warp
+// beyond the row boundary it encodes.
 // batch_offset is applied to get global indices for memory reads
 // -----------------------------------------------------------------------------
-template <typename compute_t, typename act_t, int BATCH_SIZE>
+template <typename compute_t, typename act_t>
 __device__ __forceinline__ void load_activations_padded(
     compute_t smem_A[BATCH_TILE][K_STRIDE],
     const act_t* __restrict__ vy,
-    int k_offset, int y_stride, int tid, int batch_offset = 0)
+    int k_offset, int y_stride, int tid, int batch_n, int batch_offset)
 {
     // === VECTORIZED HALF → HALF PATH (most common) ===
     // 128 threads × 2 iterations × 8 elements = 2048 elements
@@ -2855,19 +2836,11 @@ __device__ __forceinline__ void load_activations_padded(
             const int gk = k_offset + k;
             const int gb = batch_offset + b;   // global batch index
             
-            // Compile-time predicate: valid if b < BATCH_SIZE
             int4 data;
-            if constexpr (BATCH_SIZE >= 16) {
-                // All batches valid, no predicate needed
+            if (b < batch_n) {
                 data = *reinterpret_cast<const int4*>(&vy[gb * y_stride + gk]);
             } else {
-                // Check at compile time which iterations need predicate
-                // For BATCH_SIZE=8: b<8 always valid (iter 0), b>=8 always zero (iter 1)
-                if (b < BATCH_SIZE) {
-                    data = *reinterpret_cast<const int4*>(&vy[gb * y_stride + gk]);
-                } else {
-                    data = ZERO4;  // Zero-padding for unused batches
-                }
+                data = ZERO4;  // Zero-padding for unused batches
             }
             *reinterpret_cast<int4*>(&smem_A[b][k]) = data;
         }
@@ -2886,14 +2859,10 @@ __device__ __forceinline__ void load_activations_padded(
             const int gb = batch_offset + b;   // global batch index
             
             int4 data;
-            if constexpr (BATCH_SIZE >= 16) {
+            if (b < batch_n) {
                 data = *reinterpret_cast<const int4*>(&vy[gb * y_stride + gk]);
             } else {
-                if (b < BATCH_SIZE) {
-                    data = *reinterpret_cast<const int4*>(&vy[gb * y_stride + gk]);
-                } else {
-                    data = ZERO4;
-                }
+                data = ZERO4;
             }
             *reinterpret_cast<int4*>(&smem_A[b][k]) = data;
         }
@@ -2913,19 +2882,13 @@ __device__ __forceinline__ void load_activations_padded(
             const int gb = batch_offset + b;   // global batch index
             
             half2 h0, h1;
-            if constexpr (BATCH_SIZE >= 16) {
+            if (b < batch_n) {
                 float4 f4 = *reinterpret_cast<const float4*>(&vy[gb * y_stride + gk]);
                 h0 = __floats2half2_rn(f4.x, f4.y);
                 h1 = __floats2half2_rn(f4.z, f4.w);
             } else {
-                if (b < BATCH_SIZE) {
-                    float4 f4 = *reinterpret_cast<const float4*>(&vy[gb * y_stride + gk]);
-                    h0 = __floats2half2_rn(f4.x, f4.y);
-                    h1 = __floats2half2_rn(f4.z, f4.w);
-                } else {
-                    h0 = ZERO2;
-                    h1 = ZERO2;
-                }
+                h0 = ZERO2;
+                h1 = ZERO2;
             }
             *reinterpret_cast<half2*>(&smem_A[b][k]) = h0;
             *reinterpret_cast<half2*>(&smem_A[b][k + 2]) = h1;
@@ -2944,19 +2907,13 @@ __device__ __forceinline__ void load_activations_padded(
             const int gb = batch_offset + b;   // global batch index
             
             __nv_bfloat162 h0, h1;
-            if constexpr (BATCH_SIZE >= 16) {
+            if (b < batch_n) {
                 float4 f4 = *reinterpret_cast<const float4*>(&vy[gb * y_stride + gk]);
                 h0 = __floats2bfloat162_rn(f4.x, f4.y);
                 h1 = __floats2bfloat162_rn(f4.z, f4.w);
             } else {
-                if (b < BATCH_SIZE) {
-                    float4 f4 = *reinterpret_cast<const float4*>(&vy[gb * y_stride + gk]);
-                    h0 = __floats2bfloat162_rn(f4.x, f4.y);
-                    h1 = __floats2bfloat162_rn(f4.z, f4.w);
-                } else {
-                    h0 = ZERO2;
-                    h1 = ZERO2;
-                }
+                h0 = ZERO2;
+                h1 = ZERO2;
             }
             *reinterpret_cast<__nv_bfloat162*>(&smem_A[b][k]) = h0;
             *reinterpret_cast<__nv_bfloat162*>(&smem_A[b][k + 2]) = h1;
@@ -2975,14 +2932,10 @@ __device__ __forceinline__ void load_activations_padded(
             const int gb = batch_offset + b;   // global batch index
             
             uint32_t data;
-            if constexpr (BATCH_SIZE >= 16) {
+            if (b < batch_n) {
                 data = *reinterpret_cast<const uint32_t*>(&vy[gb * y_stride + gk]);
             } else {
-                if (b < BATCH_SIZE) {
-                    data = *reinterpret_cast<const uint32_t*>(&vy[gb * y_stride + gk]);
-                } else {
-                    data = 0;
-                }
+                data = 0;
             }
             *reinterpret_cast<uint32_t*>(&smem_A[b][k]) = data;
         }
@@ -3002,7 +2955,7 @@ __device__ __forceinline__ void load_activations_padded(
                 const int gb = batch_offset + b;  // global batch index
                 
                 compute_t val;
-                if (b < BATCH_SIZE) {
+                if (b < batch_n) {
                     float f;
                     if constexpr (std::is_same_v<act_t, half>) {
                         f = __half2float(vy[gb * y_stride + gk]);
@@ -3030,18 +2983,20 @@ __device__ __forceinline__ void load_activations_padded(
 }
 
 // -----------------------------------------------------------------------------
-// Main TC kernel for batch 5-15
-// OPTIMIZATIONS vs s16_tc:
-//   1. No gridDim.y - single batch block handles all batches
-//   2. Vectorized activation loading with simple batch predicate
-//   3. Output writes: b0 (0-4) unconditional, b0 (5-7) + b1 (8-15) conditional
-// BATCH_SIZE is a compile-time constant for optimal branch elimination
+// Remainder TC tile for batch 1-15 (the rows left over after the 16-row tiles)
+//   1. One batch block covers all batch_n rows; the MMA runs on a zero-padded
+//      16-row tile
+//   2. Vectorized activation loading with a simple batch predicate
+//   3. Output writes predicated on b < batch_n
+// batch_n is read at runtime: one body serves every remainder, so the kernel
+// set carries one remainder kernel rather than fifteen. The predicates cost a
+// compare per activation load and per output store — nothing beside the
+// weight stream the tile is bound by.
 //
-// batch_offset: Added for unified dispatch - this segment's batches start at batch_offset
-//               Activations pointer should already be offset, but output needs this
-// row_tile_idx: -1 = use blockIdx.y (legacy), >= 0 = hierarchical decode
+// batch_offset: this segment's batches start at batch_offset (global row index)
+// row_tile_idx: row tile from the hierarchical grid decode
 // -----------------------------------------------------------------------------
-template <typename block_c_t, typename compute_t, typename act_t, typename output_t, int BATCH_SIZE>
+template <typename block_c_t, typename compute_t, typename act_t, typename output_t>
 __device__ void tcN_kernel_impl(
     const block_c_t* __restrict__ weights,
     const act_t* __restrict__ activations,
@@ -3049,13 +3004,11 @@ __device__ void tcN_kernel_impl(
     int ncols, int nrows, int y_stride, int dst_stride,
     compute_t smem_A[][K_STRIDE],
     uint8_t* smem_W_flat,
-    int batch_offset = 0,
-    int row_tile_idx = -1)  // -1 = use blockIdx.y (legacy), >= 0 = hierarchical decode
+    int batch_n,
+    int batch_offset,
+    int row_tile_idx)
 {
-    static_assert(BATCH_SIZE >= 1 && BATCH_SIZE <= 15, "sN_tc kernel requires batch 1-15");
-    
-    // Hierarchical grid decode: use passed row_tile_idx if >= 0, else blockIdx.y
-    const int n_block = (row_tile_idx >= 0) ? row_tile_idx : (int)blockIdx.y;
+    const int n_block = row_tile_idx;
     const int tid = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
     const int warp_id = tid / WARP_SIZE_TC;
     const int lane = tid % WARP_SIZE_TC;
@@ -3074,8 +3027,8 @@ __device__ void tcN_kernel_impl(
     const int k_blocks = ncols / K_TILE;
 
     for (int k_blk = 0; k_blk < k_blocks; ++k_blk) {
-        load_activations_padded<compute_t, act_t, BATCH_SIZE>(smem_A, activations,
-                                                               k_blk * K_TILE, y_stride, tid, batch_offset);
+        load_activations_padded<compute_t, act_t>(smem_A, activations,
+                                                  k_blk * K_TILE, y_stride, tid, batch_n, batch_offset);
 
         // cp.async: SM80+ always has async copy
         load_weights_async_coop<block_c_t>(smem_W_flat, weights, row0,
@@ -3121,7 +3074,7 @@ __device__ void tcN_kernel_impl(
     const int b0 = batch_offset + b0_local;
     const int b1 = batch_offset + b1_local;
 
-    if constexpr (BATCH_SIZE >= 8) {
+    if (b0_local < batch_n) {
         if constexpr (std::is_same_v<output_t, float>) {
             *reinterpret_cast<float2*>(&dst[b0 * dst_stride + out_row]) = make_float2(frag_c[0], frag_c[1]);
         } else if constexpr (std::is_same_v<output_t, half>) {
@@ -3132,56 +3085,20 @@ __device__ void tcN_kernel_impl(
             dst[b0 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[0]);
             dst[b0 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[1]);
         }
-    } else {
-        if (b0_local < BATCH_SIZE) {
-            if constexpr (std::is_same_v<output_t, float>) {
-                *reinterpret_cast<float2*>(&dst[b0 * dst_stride + out_row]) = make_float2(frag_c[0], frag_c[1]);
-            } else if constexpr (std::is_same_v<output_t, half>) {
-                *reinterpret_cast<half2*>(&dst[b0 * dst_stride + out_row]) = __floats2half2_rn(frag_c[0], frag_c[1]);
-            } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
-                *reinterpret_cast<__nv_bfloat162*>(&dst[b0 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[0], frag_c[1]);
-            } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
-                dst[b0 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[0]);
-                dst[b0 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[1]);
-            }
-        }
     }
-    
-    if constexpr (BATCH_SIZE > 8) {
-        if (b1_local < BATCH_SIZE) {
-            if constexpr (std::is_same_v<output_t, float>) {
-                *reinterpret_cast<float2*>(&dst[b1 * dst_stride + out_row]) = make_float2(frag_c[2], frag_c[3]);
-            } else if constexpr (std::is_same_v<output_t, half>) {
-                *reinterpret_cast<half2*>(&dst[b1 * dst_stride + out_row]) = __floats2half2_rn(frag_c[2], frag_c[3]);
-            } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
-                *reinterpret_cast<__nv_bfloat162*>(&dst[b1 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[2], frag_c[3]);
-            } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
-                dst[b1 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[2]);
-                dst[b1 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[3]);
-            }
-        }
-    }
-}
 
-// Standalone wrapper that declares SMEM
-template <typename block_c_t, typename compute_t, typename act_t, typename output_t, int BATCH_SIZE>
-__device__ void tcN_kernel(
-    const block_c_t* __restrict__ weights,
-    const act_t* __restrict__ activations,
-    output_t* __restrict__ dst,
-    int ncols, int nrows, int y_stride, int dst_stride,
-    int batch_offset = 0)
-{
-    assert(nrows % N_TILE == 0 && "TC kernel requires nrows to be a multiple of 32");
-    
-    constexpr int K128_BYTES = sizeof(block_c_t);
-    
-    __shared__ compute_t smem_A[BATCH_TILE][K_STRIDE];
-    __shared__ uint8_t smem_W_flat[N_TILE * K128_BYTES];
-    
-    tcN_kernel_impl<block_c_t, compute_t, act_t, output_t, BATCH_SIZE>(
-        weights, activations, dst, ncols, nrows, y_stride, dst_stride,
-        smem_A, smem_W_flat, batch_offset);
+    if (b1_local < batch_n) {
+        if constexpr (std::is_same_v<output_t, float>) {
+            *reinterpret_cast<float2*>(&dst[b1 * dst_stride + out_row]) = make_float2(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, half>) {
+            *reinterpret_cast<half2*>(&dst[b1 * dst_stride + out_row]) = __floats2half2_rn(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
+            *reinterpret_cast<__nv_bfloat162*>(&dst[b1 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
+            dst[b1 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[2]);
+            dst[b1 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[3]);
+        }
+    }
 }
 
 } // namespace sN_tc
@@ -3211,9 +3128,9 @@ using namespace tc_common;
 // =============================================================================
 // UNIFIED TC KERNEL - Handles all TC for batch 1-31 (and grid.y tiling for 32+)
 // =============================================================================
-// REMAINDER_BATCH: compile-time constant 0-15
-//   - R=0: just tc16 with grid.y tiling (replaces standalone s16_tc)
-//   - R=1-15: tc16 tiles + tcR remainder (replaces tc16+tcN two-launch)
+// HAS_REMAINDER: whether R = batch_size % 16 is nonzero
+//   - false: just tc16 with grid.y tiling
+//   - true: tc16 tiles + one tcR remainder tile (R read from batch_size)
 //
 // HIERARCHICAL GRID (kernel_cache_design.md):
 //   x = batch tiles (L1 scope) - consecutive blocks share weights in L1
@@ -3226,7 +3143,7 @@ using namespace tc_common;
 // SMEM OPTIMIZATION: Declares unified SMEM once and passes to _impl functions
 // to avoid NVCC summing SMEM from multiple __shared__ declarations.
 // =============================================================================
-template <typename block_c_t, typename compute_t, typename act_t, typename output_t, int REMAINDER_BATCH>
+template <typename block_c_t, typename compute_t, typename act_t, typename output_t, bool HAS_REMAINDER>
 __device__ void dispatch_tc16_tcN(
     const block_c_t* __restrict__ weights,
     const act_t* __restrict__ activations,
@@ -3234,9 +3151,6 @@ __device__ void dispatch_tc16_tcN(
     int ncols, int nrows, int y_stride, int dst_stride,
     int batch_size, int row_groups)
 {
-    static_assert(REMAINDER_BATCH >= 0 && REMAINDER_BATCH <= 15, 
-                  "REMAINDER_BATCH must be 0-15");
-    
     // Unified SMEM declaration - tc16 size covers both tc16 and tcN paths
     constexpr int K128_BYTES = sizeof(block_c_t);
     __shared__ compute_t smem_A[BATCH_TILE][K_STRIDE];  // 16 × 136
@@ -3255,16 +3169,16 @@ __device__ void dispatch_tc16_tcN(
     
     // Total batch tiles for bounds checking
     const int tc16_tiles = batch_size / 16;
-    const int total_batch_tiles = tc16_tiles + (REMAINDER_BATCH > 0 ? 1 : 0);
+    const int total_batch_tiles = tc16_tiles + (HAS_REMAINDER ? 1 : 0);
     const int row_tiles = (nrows + N_TILE - 1) / N_TILE;
-    
+
     // Early exit if out of bounds
     if (row_tile_idx >= row_tiles || batch_tile_idx >= total_batch_tiles) return;
-    
+
     // Compute tiling from batch_size
     const int remainder_start = tc16_tiles * 16;
-    
-    if constexpr (REMAINDER_BATCH == 0) {
+
+    if constexpr (!HAS_REMAINDER) {
         // R=0: All tiles are tc16 (grid.y = tc16_tiles)
         s16_tc::tc16_kernel_impl<block_c_t, compute_t, act_t, output_t>(
             weights, activations, dst, ncols, nrows, y_stride, dst_stride, 
@@ -3274,9 +3188,10 @@ __device__ void dispatch_tc16_tcN(
         // R=1-15: tc16 tiles + one tcR remainder tile
         if (batch_tile_idx >= tc16_tiles) {
             // Remainder tile: tcN kernel
-            sN_tc::tcN_kernel_impl<block_c_t, compute_t, act_t, output_t, REMAINDER_BATCH>(
+            sN_tc::tcN_kernel_impl<block_c_t, compute_t, act_t, output_t>(
                 weights, activations, dst, ncols, nrows, y_stride, dst_stride,
-                smem_A, smem_W_flat, remainder_start, row_tile_idx);
+                smem_A, smem_W_flat, batch_size - remainder_start, remainder_start,
+                row_tile_idx);
         } else {
             // TC16 tiles
             s16_tc::tc16_kernel_impl<block_c_t, compute_t, act_t, output_t>(
@@ -3299,9 +3214,9 @@ __device__ void dispatch_tc16_tcN(
 //   - batch 17-31: tc16 + tcR (R = batch_size % 16)
 //   - batch 32+: tc16 with grid.y tiling + optional tcR remainder
 //
-// REMAINDER_BATCH: compile-time constant 0-15 (R = batch_size % 16)
-//   - R=0: Only tc16 tiles (no remainder)
-//   - R=1-15: tc16 tiles + one tcR remainder tile
+// HAS_REMAINDER: whether R = batch_size % 16 is nonzero
+//   - false: Only tc16 tiles (no remainder)
+//   - true: tc16 tiles + one tcR remainder tile
 //
 // HIERARCHICAL GRID (kernel_cache_design.md):
 //   x = batch tiles (L1 scope) - consecutive blocks share weights in L1
@@ -3310,7 +3225,7 @@ __device__ void dispatch_tc16_tcN(
 // row_groups parameter enables decode: row_group = z % row_groups
 // =============================================================================
 template <int qk, int qi, typename block_q_t, int vdr,
-          typename act_t, typename output_t = float, int REMAINDER_BATCH = 0>
+          typename act_t, typename output_t, bool HAS_REMAINDER>
 static __device__ void quantized_matmul_tc16_entry(
     const void * __restrict__ vx,
     const act_t * __restrict__ vy,
@@ -3322,9 +3237,6 @@ static __device__ void quantized_matmul_tc16_entry(
     const int batch_size,
     const int row_groups)
 {
-    static_assert(REMAINDER_BATCH >= 0 && REMAINDER_BATCH <= 15, 
-                  "REMAINDER_BATCH must be 0-15");
-    
     using compute_t = std::conditional_t<
         std::is_same_v<act_t, float>, half,
         std::conditional_t<
@@ -3338,13 +3250,13 @@ static __device__ void quantized_matmul_tc16_entry(
             >
         >
     >;
-    
+
     using block_c_t = block_compact_t<block_q_t>;
-    
+
     const auto* weights = reinterpret_cast<const block_c_t*>(vx);
-    
-    // Compile-time dispatch - hierarchical grid decode computed internally
-    tc16::dispatch_tc16_tcN<block_c_t, compute_t, act_t, output_t, REMAINDER_BATCH>(
+
+    // Hierarchical grid decode computed internally
+    tc16::dispatch_tc16_tcN<block_c_t, compute_t, act_t, output_t, HAS_REMAINDER>(
         weights, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batch_size, row_groups);
 }
 
@@ -3702,14 +3614,9 @@ __device__ __forceinline__ void load_frag_a_64(
 // TC kernel implementation for batch tile = 32 - takes SMEM as parameters
 // batch_tile_idx: Decoded batch tile index (hierarchical or simple grid)
 // row_tile_idx: Decoded row tile index (-1 = use blockIdx.y for legacy)
-//
-// `__noinline__` for the reason `tc16_kernel_impl` gives — a compile-time
-// saving, not a size one: sixteen `tc32_N` entry points share this body, which
-// does not vary with `REMAINDER_BATCH`, and the front end was re-optimising it
-// once per entry point.
 // -----------------------------------------------------------------------------
 template <typename block_c_t, typename compute_t, typename act_t, typename output_t>
-__device__ __noinline__ void tc32_kernel_impl(
+__device__ void tc32_kernel_impl(
     const block_c_t* __restrict__ weights,
     const act_t* __restrict__ activations,
     output_t* __restrict__ dst,
@@ -3905,9 +3812,9 @@ __device__ void tc32_kernel(
 //   y = row tiles (L2 scope) - wave fills all SMs sharing activations
 //   z = wave index: row_group + batch_group × num_row_groups
 //
-// REMAINDER_BATCH: compile-time constant 0-15 (R = batch_size % 16)
-//   - R=0: Only tc32+tc16 tiles (no tcR remainder)
-//   - R=1-15: tc32+tc16 tiles + one tcR remainder tile
+// HAS_REMAINDER: whether R = batch_size % 16 is nonzero
+//   - false: Only tc32+tc16 tiles (no tcR remainder)
+//   - true: tc32+tc16 tiles + one tcR remainder tile
 //
 // SMEM OPTIMIZATION: Declares unified SMEM once (tc32 size = 32×136) and passes
 // to _impl functions to avoid NVCC summing SMEM from multiple __shared__ declarations.
@@ -3918,9 +3825,10 @@ namespace tc32 {
 
 using namespace s32_tc;
 
-// Compile-time dispatch: each unified kernel has tc32 + optional tc16 + one specific tcN (0-15)
+// Each unified kernel has tc32 + optional tc16 + (when HAS_REMAINDER) one tcR
+// tile whose R = batch_size % 16 is read at runtime.
 // HIERARCHICAL GRID: z = row_group + batch_group × num_row_groups (rows inner, batches outer)
-template <typename block_c_t, typename compute_t, typename act_t, typename output_t, int REMAINDER_BATCH>
+template <typename block_c_t, typename compute_t, typename act_t, typename output_t, bool HAS_REMAINDER>
 __device__ void dispatch_tc32_tc16_tcN(
     const block_c_t* __restrict__ weights,
     const act_t* __restrict__ activations,
@@ -3928,9 +3836,6 @@ __device__ void dispatch_tc32_tc16_tcN(
     int ncols, int nrows, int y_stride, int dst_stride,
     int batch_size, int row_groups)
 {
-    static_assert(REMAINDER_BATCH >= 0 && REMAINDER_BATCH <= 15, 
-                  "REMAINDER_BATCH must be 0-15");
-    
     // Unified SMEM declaration - tc32 size covers tc32, tc16, and tcN paths
     constexpr int K128_BYTES = sizeof(block_c_t);
     __shared__ compute_t smem_A[BATCH_TILE_32][K_STRIDE];  // 32 × 136 (tc32 size)
@@ -3951,7 +3856,7 @@ __device__ void dispatch_tc32_tc16_tcN(
     const int tc32_tiles = batch_size / 32;
     const int remainder_32 = batch_size % 32;
     const int has_tc16 = (remainder_32 >= 16) ? 1 : 0;
-    const int total_batch_tiles = tc32_tiles + has_tc16 + (REMAINDER_BATCH > 0 ? 1 : 0);
+    const int total_batch_tiles = tc32_tiles + has_tc16 + (HAS_REMAINDER ? 1 : 0);
     const int row_tiles = (nrows + N_TILE - 1) / N_TILE;
     
     // Early exit if out of bounds
@@ -3974,12 +3879,13 @@ __device__ void dispatch_tc32_tc16_tcN(
             batch_size, smem_A, smem_W_flat, batch_start, batch_tile_idx, 1,
             row_tile_idx);
     } else {
-        // tcR remainder tile (only if REMAINDER_BATCH > 0)
-        if constexpr (REMAINDER_BATCH > 0) {
+        // tcR remainder tile (only with a remainder)
+        if constexpr (HAS_REMAINDER) {
             const int batch_start = tc32_tiles * 32 + has_tc16 * 16;
-            sN_tc::tcN_kernel_impl<block_c_t, compute_t, act_t, output_t, REMAINDER_BATCH>(
+            sN_tc::tcN_kernel_impl<block_c_t, compute_t, act_t, output_t>(
                 weights, activations, dst, ncols, nrows, y_stride, dst_stride,
-                smem_A, smem_W_flat, batch_start, row_tile_idx);
+                smem_A, smem_W_flat, batch_size - batch_start, batch_start,
+                row_tile_idx);
         }
     }
 }
@@ -3995,9 +3901,9 @@ __device__ void dispatch_tc32_tc16_tcN(
 //   - tc16 tile handles remainder >= 16 (decomposes to 16 + final_remainder)
 //   - tcR handles final remainder 0-15
 //
-// REMAINDER_BATCH: compile-time constant 0-15 (R = batch_size % 16)
-//   - R=0: Only tc32+tc16 tiles (e.g., batch 48 = tc32 + tc16)
-//   - R=1-15: tc32+tc16 tiles + tcR (e.g., batch 49 = tc32 + tc16 + tc1)
+// HAS_REMAINDER: whether R = batch_size % 16 is nonzero
+//   - false: Only tc32+tc16 tiles (e.g., batch 48 = tc32 + tc16)
+//   - true: tc32+tc16 tiles + tcR (e.g., batch 49 = tc32 + tc16 + tc1)
 //
 // HIERARCHICAL GRID (kernel_cache_design.md):
 //   x = batch tiles (L1 scope) - consecutive blocks share weights in L1
@@ -4006,7 +3912,7 @@ __device__ void dispatch_tc32_tc16_tcN(
 // row_groups parameter enables decode: row_group = z % row_groups
 // =============================================================================
 template <int qk, int qi, typename block_q_t, int vdr,
-          typename act_t, typename output_t = float, int REMAINDER_BATCH = 0>
+          typename act_t, typename output_t, bool HAS_REMAINDER>
 static __device__ void quantized_matmul_tc32_entry(
     const void * __restrict__ vx,
     const act_t * __restrict__ vy,
@@ -4014,13 +3920,10 @@ static __device__ void quantized_matmul_tc32_entry(
     const int ncols_x,
     const int nrows_x,
     const int nrows_y,
-    const int nrows_dst, 
+    const int nrows_dst,
     const int batch_size,
     const int row_groups)
 {
-    static_assert(REMAINDER_BATCH >= 0 && REMAINDER_BATCH <= 15, 
-                  "REMAINDER_BATCH must be 0-15");
-    
     using compute_t = std::conditional_t<
         std::is_same_v<act_t, float>, half,
         std::conditional_t<
@@ -4039,8 +3942,8 @@ static __device__ void quantized_matmul_tc32_entry(
     
     const auto* weights = reinterpret_cast<const block_c_t*>(vx);
     
-    // Compile-time dispatch - hierarchical grid decode computed internally
-    tc32::dispatch_tc32_tc16_tcN<block_c_t, compute_t, act_t, output_t, REMAINDER_BATCH>(
+    // Hierarchical grid decode computed internally
+    tc32::dispatch_tc32_tc16_tcN<block_c_t, compute_t, act_t, output_t, HAS_REMAINDER>(
         weights, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batch_size, row_groups);
 }
 

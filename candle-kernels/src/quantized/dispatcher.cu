@@ -12,8 +12,8 @@
 //   - SM80+ (Ampere/Ada): TC enabled for F16/BF16/F32
 //
 // Dispatch paths (SM80+):
-//   - TC16 path (batch 1-31): tc16_N kernels with internal tiling
-//   - TC32 path (batch 32+):  tc32_N kernels with greedy decomposition
+//   - TC16 path (batch 1-31): tc16_0 / tc16_r kernels with internal tiling
+//   - TC32 path (batch 32+):  tc32_0 / tc32_r kernels with greedy decomposition
 //
 // Tensor cores are used for ALL batch sizes >= 1, including batch 1-2.
 // Benchmarking found the TC kernels faster than the CUDA-core GEMV (s1..s8)
@@ -227,97 +227,13 @@ __host__ inline dim3 compute_grid(int nrows_x, int batch_size, int batch_tile, i
     extern "C" __global__ void name##_tc16_0( \
         const void*, const void*, void*, \
         int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_1( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_2( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_3( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_4( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_5( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_6( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_7( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_8( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_9( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_10( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_11( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_12( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_13( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_14( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc16_15( \
+    extern "C" __global__ void name##_tc16_r( \
         const void*, const void*, void*, \
         int, int, int, int, int, int); \
     extern "C" __global__ void name##_tc32_0( \
         const void*, const void*, void*, \
         int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_1( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_2( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_3( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_4( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_5( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_6( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_7( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_8( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_9( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_10( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_11( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_12( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_13( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_14( \
-        const void*, const void*, void*, \
-        int, int, int, int, int, int); \
-    extern "C" __global__ void name##_tc32_15( \
+    extern "C" __global__ void name##_tc32_r( \
         const void*, const void*, void*, \
         int, int, int, int, int, int); \
     extern "C" __global__ void name##_s2_iter2( \
@@ -437,8 +353,10 @@ DECLARE_KERNEL_VARIANTS(q_awq_g64_f32);
 // Greedy decomposition guarantees full batch utilization for all kernels.
 //
 // Tensor core variant:
-//   - tc16_N: BATCH_TILE=16 with grid.y for batch tiling, TC path for batch 3-31
-//   - tc32_N: BATCH_TILE=32 with greedy decomposition, TC path for batch 32+
+//   - tc16_0 / tc16_r: BATCH_TILE=16 with grid.y for batch tiling, TC path for
+//     batch 1-31 — without / with a remainder tile
+//   - tc32_0 / tc32_r: BATCH_TILE=32 with greedy decomposition, TC path for
+//     batch 32+ — without / with a remainder tile
 //
 // Iterator variants (_iter suffix = internal batch loop for L2 weight reuse):
 //   - s2_iter2-8: BATCH_TILE=2, NUM_ITERS=2-8, processes 4/6/8/10/12/14/16 batches
@@ -453,45 +371,15 @@ struct kernel_set_t {
     void* s6;         // BATCH_TILE=6, hexa batch
     void* s7;         // BATCH_TILE=7, septa batch
     void* s8;         // BATCH_TILE=8, octet batch
-    // TC16 kernels - compile-time dispatch for tc16+tcN (0-15)
-    // R=0: pure tc16 grid.y tiling
-    // R=1-15: tc16 + tcR remainder
+    // TC16 kernels. R = batch_size % 16, taken by the kernel from batch_size.
+    // tc16_0: pure tc16 grid.y tiling (R = 0); tc16_r: tc16 + one tcR
+    // remainder tile (R = 1-15).
     void* tc16_0;
-    void* tc16_1;
-    void* tc16_2;
-    void* tc16_3;
-    void* tc16_4;
-    void* tc16_5;
-    void* tc16_6;
-    void* tc16_7;
-    void* tc16_8;
-    void* tc16_9;
-    void* tc16_10;
-    void* tc16_11;
-    void* tc16_12;
-    void* tc16_13;
-    void* tc16_14;
-    void* tc16_15;
-    // TC32 kernels - greedy dispatch for tc32+tc16+tcN (0-15)
-    // R = batch_size % 16, greedy decomposition computed internally
-    // R=0: tc32 + tc16 (no remainder)
-    // R=1-15: tc32 + tc16 + tcR
+    void* tc16_r;
+    // TC32 kernels - greedy tc32 + tc16 decomposition computed internally.
+    // tc32_0: no remainder (R = 0); tc32_r: plus one tcR tile (R = 1-15).
     void* tc32_0;
-    void* tc32_1;
-    void* tc32_2;
-    void* tc32_3;
-    void* tc32_4;
-    void* tc32_5;
-    void* tc32_6;
-    void* tc32_7;
-    void* tc32_8;
-    void* tc32_9;
-    void* tc32_10;
-    void* tc32_11;
-    void* tc32_12;
-    void* tc32_13;
-    void* tc32_14;
-    void* tc32_15;
+    void* tc32_r;
     // Iterator kernels
     void* s2_iter2;   // BATCH_TILE=2, NUM_ITERS=2 (4 batches)
     void* s2_iter3;   // BATCH_TILE=2, NUM_ITERS=3 (6 batches)
@@ -504,22 +392,12 @@ struct kernel_set_t {
 };
 
 // GEMV kernels (s1-s8 register-only path, all use CUDA cores)
-// TC kernels: tc16_(0-15) + tc32_(0-15)
+// TC kernels: tc16_0 / tc16_r + tc32_0 / tc32_r
 #define KERNEL_SET(name) { \
     (void*)name##_s1, (void*)name##_s2, (void*)name##_s3, (void*)name##_s4, \
     (void*)name##_s5, (void*)name##_s6, (void*)name##_s7, (void*)name##_s8, \
-    (void*)name##_tc16_0, (void*)name##_tc16_1, (void*)name##_tc16_2, \
-    (void*)name##_tc16_3, (void*)name##_tc16_4, (void*)name##_tc16_5, \
-    (void*)name##_tc16_6, (void*)name##_tc16_7, (void*)name##_tc16_8, \
-    (void*)name##_tc16_9, (void*)name##_tc16_10, (void*)name##_tc16_11, \
-    (void*)name##_tc16_12, (void*)name##_tc16_13, (void*)name##_tc16_14, \
-    (void*)name##_tc16_15, \
-    (void*)name##_tc32_0, (void*)name##_tc32_1, (void*)name##_tc32_2, \
-    (void*)name##_tc32_3, (void*)name##_tc32_4, (void*)name##_tc32_5, \
-    (void*)name##_tc32_6, (void*)name##_tc32_7, (void*)name##_tc32_8, \
-    (void*)name##_tc32_9, (void*)name##_tc32_10, (void*)name##_tc32_11, \
-    (void*)name##_tc32_12, (void*)name##_tc32_13, (void*)name##_tc32_14, \
-    (void*)name##_tc32_15, \
+    (void*)name##_tc16_0, (void*)name##_tc16_r, \
+    (void*)name##_tc32_0, (void*)name##_tc32_r, \
     (void*)name##_s2_iter2, \
     (void*)name##_s2_iter3, (void*)name##_s2_iter4, \
     (void*)name##_s2_iter5, (void*)name##_s2_iter6, \
@@ -634,39 +512,20 @@ inline void launch_kernel_tc(
 //   Ensures activation working set fits in L2 for maximum reuse
 //
 // Parameters:
-//   remainder: 0-15, selects which tc16 kernel (R = batch_size % 16)
+//   has_remainder: batch_size % 16 != 0 — picks tc16_r over tc16_0; the
+//     kernel derives R itself from batch_size
 //   batch_size: total batches to process
 inline void launch_tc16(
     const kernel_set_t& kset,
-    int remainder,  // 0-15, selects tc16_0..tc16_15
+    bool has_remainder,
     const void* vx, const void* vy, void* dst,
     int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size
 ) {
-    // Select the appropriate tc16 kernel based on remainder
-    void* kernel_fn = nullptr;
-    switch (remainder) {
-        case 0:  kernel_fn = kset.tc16_0; break;
-        case 1:  kernel_fn = kset.tc16_1; break;
-        case 2:  kernel_fn = kset.tc16_2; break;
-        case 3:  kernel_fn = kset.tc16_3; break;
-        case 4:  kernel_fn = kset.tc16_4; break;
-        case 5:  kernel_fn = kset.tc16_5; break;
-        case 6:  kernel_fn = kset.tc16_6; break;
-        case 7:  kernel_fn = kset.tc16_7; break;
-        case 8:  kernel_fn = kset.tc16_8; break;
-        case 9:  kernel_fn = kset.tc16_9; break;
-        case 10: kernel_fn = kset.tc16_10; break;
-        case 11: kernel_fn = kset.tc16_11; break;
-        case 12: kernel_fn = kset.tc16_12; break;
-        case 13: kernel_fn = kset.tc16_13; break;
-        case 14: kernel_fn = kset.tc16_14; break;
-        case 15: kernel_fn = kset.tc16_15; break;
-        default: return;  // Invalid remainder, should never happen
-    }
-    
+    void* kernel_fn = has_remainder ? kset.tc16_r : kset.tc16_0;
+
     // Compute total batch tiles
     const int tc16_tiles = batch_size / 16;
-    const int total_batch_tiles = tc16_tiles + (remainder > 0 ? 1 : 0);
+    const int total_batch_tiles = tc16_tiles + (has_remainder ? 1 : 0);
     const int row_tiles = (nrows_x + TC_ROWS_PER_BLOCK - 1) / TC_ROWS_PER_BLOCK;
     
     // =========================================================================
@@ -711,37 +570,17 @@ inline void launch_tc16(
 
 inline void launch_tc32(
     const kernel_set_t& kset,
-    int remainder,  // 0-15, selects tc32_0..tc32_15
+    bool has_remainder,  // batch_size % 16 != 0 — picks tc32_r over tc32_0
     const void* vx, const void* vy, void* dst,
     int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size
 ) {
-    // Select the appropriate tc32 kernel based on remainder
-    void* kernel_fn = nullptr;
-    switch (remainder) {
-        case 0:  kernel_fn = kset.tc32_0; break;
-        case 1:  kernel_fn = kset.tc32_1; break;
-        case 2:  kernel_fn = kset.tc32_2; break;
-        case 3:  kernel_fn = kset.tc32_3; break;
-        case 4:  kernel_fn = kset.tc32_4; break;
-        case 5:  kernel_fn = kset.tc32_5; break;
-        case 6:  kernel_fn = kset.tc32_6; break;
-        case 7:  kernel_fn = kset.tc32_7; break;
-        case 8:  kernel_fn = kset.tc32_8; break;
-        case 9:  kernel_fn = kset.tc32_9; break;
-        case 10: kernel_fn = kset.tc32_10; break;
-        case 11: kernel_fn = kset.tc32_11; break;
-        case 12: kernel_fn = kset.tc32_12; break;
-        case 13: kernel_fn = kset.tc32_13; break;
-        case 14: kernel_fn = kset.tc32_14; break;
-        case 15: kernel_fn = kset.tc32_15; break;
-        default: return;  // Invalid remainder, should never happen
-    }
-    
+    void* kernel_fn = has_remainder ? kset.tc32_r : kset.tc32_0;
+
     // Compute total batch tiles (greedy decomposition)
     const int tc32_tiles = batch_size / 32;
     const int remainder_32 = batch_size % 32;
     const int has_tc16 = (remainder_32 >= 16) ? 1 : 0;
-    const int has_tcR = (remainder > 0) ? 1 : 0;
+    const int has_tcR = has_remainder ? 1 : 0;
     const int total_batch_tiles = tc32_tiles + has_tc16 + has_tcR;
     
     const int row_tiles = (nrows_x + TC_ROWS_PER_BLOCK - 1) / TC_ROWS_PER_BLOCK;
@@ -1307,13 +1146,11 @@ extern "C" int run_quantized_matmul(
         dispatch_plan_t plan = get_dispatch_plan(remaining, use_l2_path, use_tc);
         
         if (is_tc32_kernel(plan.tc_kernel) && plan.tc_batch > 0) {
-            int remainder = get_tc32_remainder(plan.tc_kernel);
-            launch_tc32(kset, remainder, vx, vy_slice, dst_slice,
+            launch_tc32(kset, plan.tc_kernel == K_TC32_R, vx, vy_slice, dst_slice,
                        ncols_x, nrows_x, nrows_y, nrows_dst, plan.tc_batch);
             remaining = 0;
         } else if (is_tc16_kernel(plan.tc_kernel) && plan.tc_batch > 0) {
-            int remainder = get_tc16_remainder(plan.tc_kernel);
-            launch_tc16(kset, remainder, vx, vy_slice, dst_slice,
+            launch_tc16(kset, plan.tc_kernel == K_TC16_R, vx, vy_slice, dst_slice,
                        ncols_x, nrows_x, nrows_y, nrows_dst, plan.tc_batch);
             remaining = 0;
         }

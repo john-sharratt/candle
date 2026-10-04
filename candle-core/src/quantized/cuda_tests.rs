@@ -130,6 +130,122 @@ fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
     Ok(())
 }
 
+/// Every tensor-core matmul batch from 1 to 64 — each remainder 1-15 under the
+/// tc16 kernels (batch 1-31) and the tc32 kernels (batch 32-64), plus the
+/// remainder-free batches 16, 32, 48, 64 — must give each activation row exactly
+/// the output that row gets alone. An MMA output row reads only its own A row, so
+/// a row's result does not depend on which tile (tc32, tc16 or the remainder
+/// tile) carries it, and the comparison is bit-exact. The remainder tile reads
+/// its row count at runtime: a wrong count either drops real rows (they keep the
+/// sentinel) or stores padding rows past the batch (the row after the batch loses
+/// its sentinel), and both fail here.
+#[test]
+fn cuda_mm_gemx_every_batch_matches_rows_alone() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let ncols = 256usize; // K
+    let nrows = 64usize; // N: two 32-row tiles
+    let max_batch = 64usize;
+    let device = crate::Device::Cuda(dev.clone());
+
+    let rows = crate::Tensor::arange(0f32, nrows as f32, &device)?.reshape((nrows, 1))?;
+    let cols = crate::Tensor::arange(0f32, ncols as f32, &device)?.reshape((1, ncols))?;
+    let w = rows
+        .affine(0.37, 0.0)?
+        .broadcast_add(&cols.affine(0.11, 0.0)?)?
+        .sin()?;
+    let wq = crate::quantized::QTensor::quantize(&w, GgmlDType::Q8_0)?;
+    let w_shape = wq.shape().clone();
+    let w_repacked = match wq.storage() {
+        crate::quantized::QStorage::Cuda(s) => s.repack_gemx(&w_shape)?,
+        _ => unreachable!(),
+    };
+    let qtype = dtype_to_qtype(GgmlDType::Q8_0)? as i32;
+
+    // Activation row b is a distinct ramp, so a row stored in the wrong slot
+    // is caught as well as a row left unwritten.
+    let y_data: Vec<f16> = (0..max_batch * ncols)
+        .map(|i| {
+            let (b, k) = (i / ncols, i % ncols);
+            f16::from_f32((((b * 7 + k * 3) % 61) as f32 - 30.0) / 16.0)
+        })
+        .collect();
+    let y = dev.memcpy_stod(&y_data)?;
+    let sentinel = f16::from_bits(0x7E01);
+
+    // Runs one matmul of `batch` rows starting at activation row `first`, into a
+    // destination one row longer than the batch and pre-filled with the sentinel.
+    let run = |first: usize, batch: usize| -> Result<Vec<f16>> {
+        let dst = dev.memcpy_stod(&vec![sentinel; (batch + 1) * nrows])?;
+        {
+            let stream = dev.cuda_stream();
+            let (w_ptr, _gw) = w_repacked.data.inner.device_ptr(&stream);
+            let segment = VxSegment {
+                weights: w_ptr as *const c_void,
+                batch_count: batch as i32,
+            };
+            let (y_ptr, _gy) = y.device_ptr(&stream);
+            let (dst_ptr, _gd) = dst.device_ptr(&stream);
+            let y_first =
+                (y_ptr as usize + first * ncols * std::mem::size_of::<f16>()) as *const c_void;
+            let status = unsafe {
+                run_quantized_matmul(
+                    &segment as *const VxSegment,
+                    1,
+                    y_first,
+                    dst_ptr as *mut c_void,
+                    ncols as i32,
+                    nrows as i32,
+                    ncols as i32,
+                    nrows as i32,
+                    qtype,
+                    YType::F16 as i32,
+                    w_repacked.data.len,
+                    0,
+                    OutDType::F16 as i32,
+                    SumScale::Raw.as_code(),
+                )
+            };
+            assert_eq!(status, 0, "matmul launcher rejected batch {batch}");
+        }
+        dev.synchronize()?;
+        Ok(dev.memcpy_dtov(&dst.slice(..))?)
+    };
+
+    let alone: Vec<Vec<u16>> = (0..max_batch)
+        .map(|b| {
+            let out = run(b, 1)?;
+            Ok(out[..nrows].iter().map(|v| v.to_bits()).collect())
+        })
+        .collect::<Result<_>>()?;
+    for row in &alone {
+        assert!(
+            row.iter().all(|&bits| bits != sentinel.to_bits()),
+            "batch 1 left an output unwritten"
+        );
+    }
+
+    for batch in 1..=max_batch {
+        let out = run(0, batch)?;
+        for b in 0..batch {
+            let got: Vec<u16> = out[b * nrows..(b + 1) * nrows]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(
+                got, alone[b],
+                "batch {batch}: row {b} differs from the row alone"
+            );
+        }
+        assert!(
+            out[batch * nrows..]
+                .iter()
+                .all(|v| v.to_bits() == sentinel.to_bits()),
+            "batch {batch}: wrote past the last row"
+        );
+    }
+    Ok(())
+}
+
 /// Regression: `to_dtype_mut` on a *contiguous view with a non-zero start offset*
 /// (e.g. the second half of a last-dim `narrow`) must cast the offset slice, not
 /// the buffer start. The fused ffn_gate+ffn_up MLP hit this: at decode M=1 the

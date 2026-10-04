@@ -24,18 +24,12 @@ enum kernel_type_t {
     K_S2_ITER2, K_S2_ITER3, K_S2_ITER4,
     K_S2_ITER5, K_S2_ITER6, K_S2_ITER7, K_S2_ITER8,
     K_S3_ITER3,  // Only s3_iter3 is used (for batch=9, 18, 25, 41, 57)
-    // TC16 kernels (0-15) - handles batch 1-31 with internal tiling
-    // R = batch_size % 16: tc16_0 for pure tc16, tc16_1-15 for tc16+tcR
-    K_TC16_0, K_TC16_1, K_TC16_2, K_TC16_3,
-    K_TC16_4, K_TC16_5, K_TC16_6, K_TC16_7,
-    K_TC16_8, K_TC16_9, K_TC16_10, K_TC16_11,
-    K_TC16_12, K_TC16_13, K_TC16_14, K_TC16_15,
-    // TC32 kernels (0-15) - handles batch 32+ with greedy internal decomposition
-    // R = batch_size % 16: tc32 + optional tc16 + tcR
-    K_TC32_0, K_TC32_1, K_TC32_2, K_TC32_3,
-    K_TC32_4, K_TC32_5, K_TC32_6, K_TC32_7,
-    K_TC32_8, K_TC32_9, K_TC32_10, K_TC32_11,
-    K_TC32_12, K_TC32_13, K_TC32_14, K_TC32_15,
+    // TC16 kernels - handle batch 1-31 with internal tiling. R = batch_size % 16:
+    // tc16_0 for pure tc16 (R = 0), tc16_r for tc16 + one tcR tile (R = 1-15)
+    K_TC16_0, K_TC16_R,
+    // TC32 kernels - handle batch 32+ with greedy internal decomposition
+    // (tc32 + optional tc16 + tcR); tc32_0 for R = 0, tc32_r for R = 1-15
+    K_TC32_0, K_TC32_R,
 };
 
 // Dispatch entry: up to 2 kernels per batch size
@@ -63,43 +57,6 @@ struct dispatch_plan_t {
     int           b2;         // Batches handled by k2
     kernel_type_t k3;         // Tertiary GEMV kernel (K_NONE if not needed)
     int           b3;         // Batches handled by k3 (for L2 3-kernel cases)
-};
-
-// =============================================================================
-// UNIFIED TC DISPATCH PLAN: Enables single kernel launch for multiple TC kernels
-// =============================================================================
-// Problem: Batch 17 = tc12(12) + tc5(5) currently needs 2 kernel launches,
-//          causing L2 cache thrashing (weights read twice → 2x performance cliff)
-//
-// Solution: Single unified TC kernel launch with a plan that specifies
-//           which kernel to run for each batch tile range based on blockIdx.y
-//
-// Example: Batch 17 → single launch with grid.y=2
-//   - blockIdx.y=0: tc12 (batches 0-11, 4 lanes zeroed)
-//   - blockIdx.y=1: tc5  (batches 12-16, 11 lanes zeroed)
-//
-// All TC kernels share the same grid layout: (row_blocks, batch_tiles)
-// Each tile = 32 rows × 16 batches (with zero-padding for partial batches)
-// =============================================================================
-
-// Maximum number of TC segments in a unified launch
-// (2 is sufficient: one tc16 + one tcN remainder, or two tcN kernels)
-constexpr int MAX_TC_SEGMENTS = 2;
-
-// Describes one segment of TC work (range of batch tiles)
-struct tc_segment_t {
-    kernel_type_t kernel;      // K_TC16_*, K_TC32_*, or K_NONE if unused
-    int           batch_start; // First batch index this segment handles
-    int           batch_count; // Number of batches in this segment (for bounds)
-    int           tile_start;  // First blockIdx.y value for this segment
-    int           tile_count;  // Number of batch tiles in this segment
-};
-
-// Complete unified TC plan
-struct tc_unified_plan_t {
-    int           total_tiles;                  // Total gridDim.y for the launch
-    int           num_segments;                 // Number of active segments (1 or 2)
-    tc_segment_t  segments[MAX_TC_SEGMENTS];    // Segment descriptors
 };
 
 // =============================================================================
@@ -339,185 +296,22 @@ inline int get_batch_tile(kernel_type_t kt) {
     }
 }
 
-// Check if kernel type is a TC16 kernel (0-15)
+// Check if kernel type is a TC16 kernel
 inline bool is_tc16_kernel(kernel_type_t kt) {
-    return kt >= K_TC16_0 && kt <= K_TC16_15;
+    return kt == K_TC16_0 || kt == K_TC16_R;
 }
 
-// Check if kernel type is a TC32 kernel (0-15)
+// Check if kernel type is a TC32 kernel
 inline bool is_tc32_kernel(kernel_type_t kt) {
-    return kt >= K_TC32_0 && kt <= K_TC32_15;
+    return kt == K_TC32_0 || kt == K_TC32_R;
 }
-
-// Get remainder number for TC16 dispatch (0-15)
-// Returns -1 for non-TC16 kernels
-inline int get_tc16_remainder(kernel_type_t kt) {
-    if (kt >= K_TC16_0 && kt <= K_TC16_15) {
-        return kt - K_TC16_0;
-    }
-    return -1;
-}
-
-// Get remainder number for TC32 dispatch (0-15)
-// Returns -1 for non-TC32 kernels
-inline int get_tc32_remainder(kernel_type_t kt) {
-    if (kt >= K_TC32_0 && kt <= K_TC32_15) {
-        return kt - K_TC32_0;
-    }
-    return -1;
-}
-
-// =============================================================================
-// TC PATH: Tensor core dispatch for batch 1-31 (uses tc16 kernels)
-// =============================================================================
-// Strategy: tc16 for ALL batch 1-31. Benchmarking found the TC kernels faster
-// than the CUDA-core GEMV (s1/s2) path in every case, batch 1-2 included, so
-// get_dispatch_plan() routes every batch >= 1 to tc16. This static table is the
-// legacy pre-SM80 mapping and is no longer consulted on the TC path;
-// get_dispatch_plan() is the source of truth. The batch 1-2 K_S1/K_S2 entries
-// below apply only to GPUs without tensor cores.
-//
-// - Batch 3-15: tc16_N where N = batch_size (single kernel)
-// - Batch 16-31: tc16_N where N = batch_size % 16 (single kernel, internal tiling)
-//
-// The tc16 kernels compute tc16_tiles and remainder internally from batch_size.
-// =============================================================================
-static const dispatch_entry_t TC_DISPATCH_TABLE[32] = {
-    // Batch 0: nothing to do
-    /*  0 */ { K_NONE,      0,  K_NONE,  0 },
-
-    // Batch 1-2: GEMV only on pre-SM80 GPUs; TC hardware uses tc16_1/tc16_2.
-    /*  1 */ { K_S1,        1,  K_NONE,  0 },
-    /*  2 */ { K_S2,        2,  K_NONE,  0 },
-    
-    // Batch 3-15: Single tc16 kernel (no tc16 tiles, just remainder)
-    /*  3 */ { K_TC16_3,    3,  K_NONE,  0 },
-    /*  4 */ { K_TC16_4,    4,  K_NONE,  0 },
-    /*  5 */ { K_TC16_5,    5,  K_NONE,  0 },
-    /*  6 */ { K_TC16_6,    6,  K_NONE,  0 },
-    /*  7 */ { K_TC16_7,    7,  K_NONE,  0 },
-    /*  8 */ { K_TC16_8,    8,  K_NONE,  0 },
-    /*  9 */ { K_TC16_9,    9,  K_NONE,  0 },
-    /* 10 */ { K_TC16_10,  10,  K_NONE,  0 },
-    /* 11 */ { K_TC16_11,  11,  K_NONE,  0 },
-    /* 12 */ { K_TC16_12,  12,  K_NONE,  0 },
-    /* 13 */ { K_TC16_13,  13,  K_NONE,  0 },
-    /* 14 */ { K_TC16_14,  14,  K_NONE,  0 },
-    /* 15 */ { K_TC16_15,  15,  K_NONE,  0 },
-    
-    // Batch 16-31: tc16 with internal tc16 + tcR dispatch
-    /* 16 */ { K_TC16_0,   16,  K_NONE,  0 },  // tc16 only (R=0)
-    /* 17 */ { K_TC16_1,   17,  K_NONE,  0 },  // tc16 + tc1
-    /* 18 */ { K_TC16_2,   18,  K_NONE,  0 },  // tc16 + tc2
-    /* 19 */ { K_TC16_3,   19,  K_NONE,  0 },  // tc16 + tc3
-    /* 20 */ { K_TC16_4,   20,  K_NONE,  0 },  // tc16 + tc4
-    /* 21 */ { K_TC16_5,   21,  K_NONE,  0 },  // tc16 + tc5
-    /* 22 */ { K_TC16_6,   22,  K_NONE,  0 },  // tc16 + tc6
-    /* 23 */ { K_TC16_7,   23,  K_NONE,  0 },  // tc16 + tc7
-    /* 24 */ { K_TC16_8,   24,  K_NONE,  0 },  // tc16 + tc8
-    /* 25 */ { K_TC16_9,   25,  K_NONE,  0 },  // tc16 + tc9
-    /* 26 */ { K_TC16_10,  26,  K_NONE,  0 },  // tc16 + tc10
-    /* 27 */ { K_TC16_11,  27,  K_NONE,  0 },  // tc16 + tc11
-    /* 28 */ { K_TC16_12,  28,  K_NONE,  0 },  // tc16 + tc12
-    /* 29 */ { K_TC16_13,  29,  K_NONE,  0 },  // tc16 + tc13
-    /* 30 */ { K_TC16_14,  30,  K_NONE,  0 },  // tc16 + tc14
-    /* 31 */ { K_TC16_15,  31,  K_NONE,  0 },  // tc16 + tc15
-};
-
-// =============================================================================
-// TC32 PATH: Tensor core dispatch for batch 32+ (using tc32 kernels)
-// =============================================================================
-// Strategy: Use tc32 which computes greedy decomposition internally:
-// - tc32 tiles handle multiples of 32
-// - tc16 tile handles remainder >= 16
-// - tcR handles final remainder 0-15
-//
-// Kernel selection: R = batch_size % 16
-// Grid.y computed internally based on batch_size
-// =============================================================================
-static const dispatch_entry_t TC32_DISPATCH_TABLE[64] = {
-    // Batch 0-31: Handled by TC_DISPATCH_TABLE (uses tc16 kernels)
-    /*  0 */ { K_NONE,       0,  K_NONE,  0 },
-    /*  1 */ { K_S1,         1,  K_NONE,  0 },
-    /*  2 */ { K_S2,         2,  K_NONE,  0 },
-    /*  3 */ { K_TC16_3,     3,  K_NONE,  0 },
-    /*  4 */ { K_TC16_4,     4,  K_NONE,  0 },
-    /*  5 */ { K_TC16_5,     5,  K_NONE,  0 },
-    /*  6 */ { K_TC16_6,     6,  K_NONE,  0 },
-    /*  7 */ { K_TC16_7,     7,  K_NONE,  0 },
-    /*  8 */ { K_TC16_8,     8,  K_NONE,  0 },
-    /*  9 */ { K_TC16_9,     9,  K_NONE,  0 },
-    /* 10 */ { K_TC16_10,   10,  K_NONE,  0 },
-    /* 11 */ { K_TC16_11,   11,  K_NONE,  0 },
-    /* 12 */ { K_TC16_12,   12,  K_NONE,  0 },
-    /* 13 */ { K_TC16_13,   13,  K_NONE,  0 },
-    /* 14 */ { K_TC16_14,   14,  K_NONE,  0 },
-    /* 15 */ { K_TC16_15,   15,  K_NONE,  0 },
-    /* 16 */ { K_TC16_0,    16,  K_NONE,  0 },
-    /* 17 */ { K_TC16_1,    17,  K_NONE,  0 },
-    /* 18 */ { K_TC16_2,    18,  K_NONE,  0 },
-    /* 19 */ { K_TC16_3,    19,  K_NONE,  0 },
-    /* 20 */ { K_TC16_4,    20,  K_NONE,  0 },
-    /* 21 */ { K_TC16_5,    21,  K_NONE,  0 },
-    /* 22 */ { K_TC16_6,    22,  K_NONE,  0 },
-    /* 23 */ { K_TC16_7,    23,  K_NONE,  0 },
-    /* 24 */ { K_TC16_8,    24,  K_NONE,  0 },
-    /* 25 */ { K_TC16_9,    25,  K_NONE,  0 },
-    /* 26 */ { K_TC16_10,   26,  K_NONE,  0 },
-    /* 27 */ { K_TC16_11,   27,  K_NONE,  0 },
-    /* 28 */ { K_TC16_12,   28,  K_NONE,  0 },
-    /* 29 */ { K_TC16_13,   29,  K_NONE,  0 },
-    /* 30 */ { K_TC16_14,   30,  K_NONE,  0 },
-    /* 31 */ { K_TC16_15,   31,  K_NONE,  0 },
-    
-    // Batch 32-63: tc32 kernels with greedy internal decomposition
-    // R = batch % 16, kernel computes tc32_tiles, has_tc16, remainder internally
-    /* 32 */ { K_TC32_0,    32,  K_NONE,  0 },  // tc32(32) only
-    /* 33 */ { K_TC32_1,    33,  K_NONE,  0 },  // tc32(32) + tc1(1)
-    /* 34 */ { K_TC32_2,    34,  K_NONE,  0 },  // tc32(32) + tc2(2)
-    /* 35 */ { K_TC32_3,    35,  K_NONE,  0 },  // tc32(32) + tc3(3)
-    /* 36 */ { K_TC32_4,    36,  K_NONE,  0 },  // tc32(32) + tc4(4)
-    /* 37 */ { K_TC32_5,    37,  K_NONE,  0 },  // tc32(32) + tc5(5)
-    /* 38 */ { K_TC32_6,    38,  K_NONE,  0 },  // tc32(32) + tc6(6)
-    /* 39 */ { K_TC32_7,    39,  K_NONE,  0 },  // tc32(32) + tc7(7)
-    /* 40 */ { K_TC32_8,    40,  K_NONE,  0 },  // tc32(32) + tc8(8)
-    /* 41 */ { K_TC32_9,    41,  K_NONE,  0 },  // tc32(32) + tc9(9)
-    /* 42 */ { K_TC32_10,   42,  K_NONE,  0 },  // tc32(32) + tc10(10)
-    /* 43 */ { K_TC32_11,   43,  K_NONE,  0 },  // tc32(32) + tc11(11)
-    /* 44 */ { K_TC32_12,   44,  K_NONE,  0 },  // tc32(32) + tc12(12)
-    /* 45 */ { K_TC32_13,   45,  K_NONE,  0 },  // tc32(32) + tc13(13)
-    /* 46 */ { K_TC32_14,   46,  K_NONE,  0 },  // tc32(32) + tc14(14)
-    /* 47 */ { K_TC32_15,   47,  K_NONE,  0 },  // tc32(32) + tc15(15)
-    /* 48 */ { K_TC32_0,    48,  K_NONE,  0 },  // tc32(32) + tc16(16)
-    /* 49 */ { K_TC32_1,    49,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc1(1)
-    /* 50 */ { K_TC32_2,    50,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc2(2)
-    /* 51 */ { K_TC32_3,    51,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc3(3)
-    /* 52 */ { K_TC32_4,    52,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc4(4)
-    /* 53 */ { K_TC32_5,    53,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc5(5)
-    /* 54 */ { K_TC32_6,    54,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc6(6)
-    /* 55 */ { K_TC32_7,    55,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc7(7)
-    /* 56 */ { K_TC32_8,    56,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc8(8)
-    /* 57 */ { K_TC32_9,    57,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc9(9)
-    /* 58 */ { K_TC32_10,   58,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc10(10)
-    /* 59 */ { K_TC32_11,   59,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc11(11)
-    /* 60 */ { K_TC32_12,   60,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc12(12)
-    /* 61 */ { K_TC32_13,   61,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc13(13)
-    /* 62 */ { K_TC32_14,   62,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc14(14)
-    /* 63 */ { K_TC32_15,   63,  K_NONE,  0 },  // tc32(32) + tc16(16) + tc15(15)
-};
 
 // =============================================================================
 // LOOKUP HELPERS
 // =============================================================================
 
-// Table size constants
+// Table size constant
 constexpr int DISPATCH_TABLE_SIZE = 64;
-constexpr int TC_TABLE_SIZE = 32;
-constexpr int TC32_TABLE_SIZE = 64;
-
-// Thresholds for tensor core kernels
-constexpr int TC16_MIN_BATCH = 16;     // TC16 requires batch >= 16
-constexpr int TC_MIN_BATCH = 1;        // TC kernels available for batch >= 1
 
 // =============================================================================
 // UNIFIED DISPATCH PLAN
@@ -530,28 +324,20 @@ inline dispatch_plan_t get_dispatch_plan(int batch_size, bool use_l2_path, bool 
     
     // TC path: use tc16/tc32 kernels which compute tiling internally.
     // ALL batch >= 1 goes through tensor cores, including batch 1-2: benchmarking
-    // found tc16_1/tc16_2 faster than the CUDA-core s1/s2 GEMV in every case.
+    // found the tensor-core remainder tile faster than the CUDA-core s1/s2 GEMV
+    // in every case. The _r kernel is chosen whenever batch_size % 16 != 0 —
+    // for batch 1-15 that is the whole batch as one remainder tile.
     if (use_tc && batch_size >= 1) {
+        const bool has_remainder = (batch_size % 16) != 0;
         if (batch_size >= 32) {
-            // Use tc32 - kernel computes tc32 + tc16 + tcR internally
-            int remainder = batch_size % 16;
-            plan.tc_kernel = (kernel_type_t)(K_TC32_0 + remainder);
-            plan.tc_batch = batch_size;
-            // No GEMV remainder - tc32 kernel handles everything
-            return plan;
+            // tc32 + optional tc16 + tcR, decomposed in the kernel
+            plan.tc_kernel = has_remainder ? K_TC32_R : K_TC32_0;
         } else {
-            // Use tc16 - kernel computes tc16 + tcR internally
-            int remainder = batch_size % 16;
-            if (batch_size >= 16) {
-                // batch 16-31: uses tc16 + tcR
-                plan.tc_kernel = (kernel_type_t)(K_TC16_0 + remainder);
-            } else {
-                // batch 1-15: uses tcR only (no tc16 tiles)
-                plan.tc_kernel = (kernel_type_t)(K_TC16_0 + batch_size);
-            }
-            plan.tc_batch = batch_size;
-            return plan;
+            // tc16 tiles + tcR, decomposed in the kernel
+            plan.tc_kernel = has_remainder ? K_TC16_R : K_TC16_0;
         }
+        plan.tc_batch = batch_size;
+        return plan;
     }
     
     // Non-TC path or batch < 3: use GEMV tables
@@ -605,37 +391,9 @@ inline const char* kernel_type_name(kernel_type_t kt) {
         case K_S2_ITER8: return "s2i8";
         case K_S3_ITER3: return "s3i3";
         case K_TC16_0: return "tc16_0";
-        case K_TC16_1: return "tc16_1";
-        case K_TC16_2: return "tc16_2";
-        case K_TC16_3: return "tc16_3";
-        case K_TC16_4: return "tc16_4";
-        case K_TC16_5: return "tc16_5";
-        case K_TC16_6: return "tc16_6";
-        case K_TC16_7: return "tc16_7";
-        case K_TC16_8: return "tc16_8";
-        case K_TC16_9: return "tc16_9";
-        case K_TC16_10: return "tc16_10";
-        case K_TC16_11: return "tc16_11";
-        case K_TC16_12: return "tc16_12";
-        case K_TC16_13: return "tc16_13";
-        case K_TC16_14: return "tc16_14";
-        case K_TC16_15: return "tc16_15";
+        case K_TC16_R: return "tc16_r";
         case K_TC32_0: return "tc32_0";
-        case K_TC32_1: return "tc32_1";
-        case K_TC32_2: return "tc32_2";
-        case K_TC32_3: return "tc32_3";
-        case K_TC32_4: return "tc32_4";
-        case K_TC32_5: return "tc32_5";
-        case K_TC32_6: return "tc32_6";
-        case K_TC32_7: return "tc32_7";
-        case K_TC32_8: return "tc32_8";
-        case K_TC32_9: return "tc32_9";
-        case K_TC32_10: return "tc32_10";
-        case K_TC32_11: return "tc32_11";
-        case K_TC32_12: return "tc32_12";
-        case K_TC32_13: return "tc32_13";
-        case K_TC32_14: return "tc32_14";
-        case K_TC32_15: return "tc32_15";
+        case K_TC32_R: return "tc32_r";
         default: return "?";
     }
 }

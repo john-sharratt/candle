@@ -5,8 +5,8 @@
 //
 // `launch_int8_decode_attn<…, HEAD_DIM>` expands to a whole dispatch tree: two
 // warp widths, two rope modes, and eight heads-per-group instantiations of the
-// stripe or batched-M kernel under each. Naming four head dims from one
-// translation unit put four of those trees in front of a single nvcc process,
+// stripe or batched-M kernel under each. Naming every head dim from one
+// translation unit put all of those trees in front of a single nvcc process,
 // which compiles them serially — `--threads` parallelises the *gencode* arches
 // within one kernel, not the kernels within one file. One 6 KB source file took
 // over ten minutes while the build's per-file parallelism (capped at 16 jobs)
@@ -17,7 +17,7 @@
 // generated code is identical — the same kernels with the same template
 // arguments — it is only distributed so the jobs can run at once. It also makes
 // incremental rebuilds proportional: editing something that only affects
-// head_dim 128 stops recompiling 64, 96 and 256.
+// head_dim 128 stops recompiling 64 and 256.
 //
 // # The duplication costs an archive, not a binary
 //

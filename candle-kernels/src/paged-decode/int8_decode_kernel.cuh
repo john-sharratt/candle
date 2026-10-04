@@ -779,11 +779,16 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     // Pipelined main loop (mirrors v2's structure), over this split's tile range.
     const int range = tile_hi - tile_lo;
     if constexpr (NUM_STAGES >= 2 && USE_TC) {
+        // The prologue fills up to NUM_STAGES stages, tile i into stage i, in
+        // order — a real loop, so `load_tile` (every palette's K and V across
+        // every arena format) is one inlined copy here rather than one per
+        // stage.
         int tiles_loaded = 0;
-        if (range > 0) { load_tile(tile_lo + 0, 0); cp_async_commit<USE_TC>(); tiles_loaded = 1; }
-        if (range > 1 && NUM_STAGES >= 2) { load_tile(tile_lo + 1, 1); cp_async_commit<USE_TC>(); tiles_loaded = 2; }
-        if constexpr (NUM_STAGES >= 3) {
-            if (range > 2) { load_tile(tile_lo + 2, 2); cp_async_commit<USE_TC>(); tiles_loaded = 3; }
+        #pragma unroll 1
+        for (int i = 0; i < NUM_STAGES && i < range; ++i) {
+            load_tile(tile_lo + i, i);
+            cp_async_commit<USE_TC>();
+            tiles_loaded = i + 1;
         }
         if (tiles_loaded >= NUM_STAGES) {
             cp_async_wait<NUM_STAGES - 1, USE_TC>();
@@ -1029,8 +1034,12 @@ __device__ __forceinline__ void stripe_process_cell(
     const int buf = cell & 1;
     T* k_stage = c.k_stage[buf];
     T* v_stage = c.v_stage[buf];
+    // Real loops over the palettes: each palette's load sits behind its own
+    // format dispatch, which its loads do not move above, so unrolling bought
+    // no overlap — only four inlined copies of the accessor's every-format
+    // dispatch per side.
     if (c.half == 0) {
-        #pragma unroll
+        #pragma unroll 1
         for (int p = 0; p < N_PALETTE; ++p) {
             uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
             if (k_ptr_p) {
@@ -1041,7 +1050,7 @@ __device__ __forceinline__ void stripe_process_cell(
             }
         }
     } else {
-        #pragma unroll
+        #pragma unroll 1
         for (int p = 0; p < N_PALETTE; ++p) {
             uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
             if (v_ptr_p) {
@@ -1311,115 +1320,45 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
     const int stripe = split_idx * PAIRS + pair;
     const int n_stripes = num_splits * PAIRS;
 
-    if (qsa_on) {
-        // ── Sparse walk: enumerate the selection's ENTRIES ──────────────────
-        //
-        // A QSA row attends `top_k + ratio − 1` positions — 2051 for the
-        // released checkpoint — however deep the cache is, so the walk's trip
-        // count must be the selection's size and nothing in it may scale with
-        // `n_slices`. Entries are striped round-robin over the stripes
-        // (`stripe + n_stripes·i`), which balances them to within one entry.
-        //
-        // Each batch of up to 32 entries is resolved lane-parallel: lane `l`
-        // takes one entry, binary-searches the slice holding its first cell
-        // (rope ranges ascend and do not overlap, so `log2(n_slices)` probes —
-        // 12 at 128K — and 32 such chains are in flight per warp instead of
-        // one), then walks the entry's ≤4 consecutive cells with a forward
-        // cursor and packs each as `(slice << 6) | within`, `CELL_NONE` for a
-        // cell no slice holds. A selected position with no slice to hold it
-        // would be a selection built against a different cache than the one
-        // being read; skipping is the only safe answer — attending a slot
-        // outside the slice would read another token's K/V.
-        //
-        // The pair then sweeps the batch's cells in entry order, each cell's
-        // code shuffle-broadcast from the lane that resolved it, so the two
-        // warps of the pair see an identical cell sequence (both resolve the
-        // same batch — the search is cheap and duplicating it keeps the pair
-        // free of any cross-warp hand-off beyond the K/V staging barrier).
-        constexpr int MAX_CELLS = 1 << QSA_CELL_BITS;
-        constexpr uint32_t CELL_NONE = 0xFFFFFFFFu;
-        const uint32_t* sel_entries = sel.entries + (int64_t)slot_idx * sel.stride;
-        const int sel_cnt = (int)sel.cnt[slot_idx];
-        int cell_no = 0;
-        for (int first = stripe; first < sel_cnt; first += n_stripes * WARP_SIZE) {
-            // Lanes holding a live entry: `l < ceil((sel_cnt - first) / n_stripes)`.
-            const int n_live = min(WARP_SIZE, (sel_cnt - first + n_stripes - 1) / n_stripes);
-            uint32_t code[MAX_CELLS];
-            #pragma unroll
-            for (int c = 0; c < MAX_CELLS; ++c) code[c] = CELL_NONE;
-            const int e = first + lane * n_stripes;
-            if (lane < n_live) {
-                const uint32_t ent = sel_entries[e];
-                // Start and width through the page layout: a projected prefix
-                // is pages whose last blocks are short (see `qsa_block_width_from`).
-                const uint32_t blk = ent >> QSA_CELL_BITS;
-                const int pos0 = qsa_block_start(sel, slot_idx, blk);
-                const int cells = max(0, min((int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1,
-                                             qsa_block_width_from(sel, slot_idx, blk, pos0)));
-                int s = 0;
-                {
-                    int lo_s = 0, hi_s = (int)n_slices - 1;
-                    while (lo_s < hi_s) {
-                        const int mid = (lo_s + hi_s + 1) >> 1;
-                        const uint8_t* s_mid = get_slice<HEAD_DIM>(slices_ptr, mid, n_kv_head);
-                        if ((int)slice_rope(s_mid) <= pos0) lo_s = mid; else hi_s = mid - 1;
-                    }
-                    s = lo_s;
-                }
-                const uint8_t* sp = get_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
-                int s_rope = (int)slice_rope(sp);
-                int s_len = slice_eff_len(s);
-                int s_off = (int)slice_offset(sp);
-                #pragma unroll
-                for (int c = 0; c < MAX_CELLS; ++c) {
-                    if (c < cells) {
-                        const int pos = pos0 + c;
-                        // Forward cursor: a run of consecutive positions can
-                        // cross into the next slice(s).
-                        while (s + 1 < (int)n_slices) {
-                            const uint8_t* sn = get_slice<HEAD_DIM>(slices_ptr, s + 1, n_kv_head);
-                            const int n_rope = (int)slice_rope(sn);
-                            if (n_rope > pos) break;
-                            ++s; sp = sn; s_rope = n_rope;
-                            s_len = slice_eff_len(s);
-                            s_off = (int)slice_offset(sp);
-                        }
-                        const int local = pos - s_rope;
-                        if (local >= 0 && local < s_len) {
-                            code[c] = ((uint32_t)s << 6) | (uint32_t)(s_off + local);
-                        }
-                    }
-                }
-            }
-            // The cell sweep is NOT unrolled: the per-cell body inlines the
-            // K/V arena loaders for four palettes across every arena format,
-            // and four copies of it (measured: ~31K SASS instructions each)
-            // left the register allocator spilling in the hot loop. One copy
-            // per walk; the cell code is picked by a register select.
-            for (int src = 0; src < n_live; ++src) {
-                #pragma unroll 1
-                for (int c = 0; c < MAX_CELLS; ++c) {
-                    uint32_t mine = code[0];
-                    #pragma unroll
-                    for (int k = 1; k < MAX_CELLS; ++k) mine = (c == k) ? code[k] : mine;
-                    const uint32_t cd = __shfl_sync(0xffffffffu, mine, src);
-                    if (cd == CELL_NONE) continue;
-                    const int slice_idx = (int)(cd >> 6);
-                    const int within = (int)(cd & 63u);
-                    const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_idx, n_kv_head);
-                    stripe_process_cell<T, HEAD_DIM, ROPE_INTERLEAVED, HPG, WARP_HEADS>(
-                        ctx, st, out_reg, m_i, l_i, slice_idx, sl, within, cell_no++);
-                }
-            }
-        }
-    } else {
-        // ── Dense walk: every visible token, striped over (split, pair) ─────
-        //
-        // The token total is block-uniform; striding the slices across the
-        // block and reducing through shared memory is the same integer sum
-        // (addition is associative, every term non-negative) for 1/blockDim of
-        // the per-thread work. Only the dense walk needs it — the sparse walk
-        // above never touches the total and stays O(selection) at any depth.
+    // ── Sparse walk: enumerate the selection's ENTRIES ──────────────────────
+    //
+    // A QSA row attends `top_k + ratio − 1` positions — 2051 for the released
+    // checkpoint — however deep the cache is, so the walk's trip count must be
+    // the selection's size and nothing in it may scale with `n_slices`.
+    // Entries are striped round-robin over the stripes (`stripe +
+    // n_stripes·i`), which balances them to within one entry.
+    //
+    // Each batch of up to 32 entries is resolved lane-parallel: lane `l` takes
+    // one entry, binary-searches the slice holding its first cell (rope ranges
+    // ascend and do not overlap, so `log2(n_slices)` probes — 12 at 128K — and
+    // 32 such chains are in flight per warp instead of one), then walks the
+    // entry's ≤4 consecutive cells with a forward cursor and packs each as
+    // `(slice << 6) | within`, `CELL_NONE` for a cell no slice holds. A
+    // selected position with no slice to hold it would be a selection built
+    // against a different cache than the one being read; skipping is the only
+    // safe answer — attending a slot outside the slice would read another
+    // token's K/V.
+    //
+    // The pair then sweeps the batch's cells in entry order, each cell's code
+    // shuffle-broadcast from the lane that resolved it, so the two warps of
+    // the pair see an identical cell sequence (both resolve the same batch —
+    // the search is cheap and duplicating it keeps the pair free of any
+    // cross-warp hand-off beyond the K/V staging barrier). The sweep is a real
+    // loop, not unrolled, and the cell's code is picked by a register select:
+    // four inlined copies of the per-cell body (measured ~31K SASS instructions
+    // each) left the register allocator spilling in the hot loop.
+
+    // ── Dense walk: every visible token, striped over (split, pair) ─────────
+    //
+    // The token total is block-uniform; striding the slices across the block
+    // and reducing through shared memory is the same integer sum (addition is
+    // associative, every term non-negative) for 1/blockDim of the per-thread
+    // work. Only the dense walk needs it — the sparse walk never touches the
+    // total and stays O(selection) at any depth. `qsa_on` is per slot, so
+    // block-uniform, and the barriers below are taken by the whole block or
+    // by none of it.
+    int k = 0, tok_hi = 0;
+    if (!qsa_on) {
         __shared__ int s_total_tok;
         if (tid == 0) s_total_tok = 0;
         __syncthreads();
@@ -1436,26 +1375,121 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
         int n_tiles = (total_tok + PAIRS - 1) / PAIRS;
         int tiles_per_split = (n_tiles + num_splits - 1) / num_splits;
         int tok_lo = (split_idx * tiles_per_split) * PAIRS;
-        int tok_hi = (split_idx * tiles_per_split + tiles_per_split) * PAIRS;
+        tok_hi = (split_idx * tiles_per_split + tiles_per_split) * PAIRS;
         if (tok_hi > total_tok) tok_hi = total_tok;
+        k = tok_lo + pair;
+    }
+    // Forward cursor: k is monotonic within a pair's strided iteration, so the
+    // (slice, base) cursor only advances. `slice_eff_len` already accounts for
+    // the writer's +1, so (k - scan_base) reaches the freshly scattered
+    // token's slot.
+    int scan_s = 0, scan_base = 0;
 
-        // Forward cursor: k is monotonic within a pair's strided iteration, so
-        // the (slice, base) cursor only advances. `slice_eff_len` already
-        // accounts for the writer's +1, so (k - scan_base) reaches the freshly
-        // scattered token's slot.
-        int scan_s = 0, scan_base = 0;
-        int cell_no = 0;
-        for (int k = tok_lo + pair; k < tok_hi; k += PAIRS) {
+    // ── Sparse walk state: the selection's entries (see the note above) ──────
+    constexpr int MAX_CELLS = 1 << QSA_CELL_BITS;
+    constexpr uint32_t CELL_NONE = 0xFFFFFFFFu;
+    const uint32_t* sel_entries = qsa_on ? sel.entries + (int64_t)slot_idx * sel.stride : nullptr;
+    const int sel_cnt = qsa_on ? (int)sel.cnt[slot_idx] : 0;
+    int first = stripe;    // the next batch's first entry
+    int n_live = 0;        // the current batch's resolved lanes
+    int src = 0;           // the lane whose entry is being swept
+    int cell = 0;          // the cell of that entry
+    uint32_t code[MAX_CELLS];
+    #pragma unroll
+    for (int c = 0; c < MAX_CELLS; ++c) code[c] = CELL_NONE;
+
+    // ── One walk, one per-cell body ─────────────────────────────────────────
+    //
+    // Each iteration takes the next cell from whichever walk this slot runs —
+    // a warp-uniform branch — and processes it at a single call site. The
+    // per-cell body inlines the K/V arena loaders for four palettes across
+    // every arena format; a call site per walk was two copies of all of it.
+    int cell_no = 0;
+    for (;;) {
+        int slice_idx;
+        int within;
+        if (qsa_on) {
+            uint32_t cd = CELL_NONE;
+            for (;;) {
+                if (src >= n_live) {
+                    if (first >= sel_cnt) break;
+                    // Lanes holding a live entry: `l < ceil((sel_cnt - first) / n_stripes)`.
+                    n_live = min(WARP_SIZE, (sel_cnt - first + n_stripes - 1) / n_stripes);
+                    #pragma unroll
+                    for (int c = 0; c < MAX_CELLS; ++c) code[c] = CELL_NONE;
+                    const int e = first + lane * n_stripes;
+                    if (lane < n_live) {
+                        const uint32_t ent = sel_entries[e];
+                        // Start and width through the page layout: a projected
+                        // prefix is pages whose last blocks are short (see
+                        // `qsa_block_width_from`).
+                        const uint32_t blk = ent >> QSA_CELL_BITS;
+                        const int pos0 = qsa_block_start(sel, slot_idx, blk);
+                        const int cells = max(0, min((int)(ent & ((1u << QSA_CELL_BITS) - 1u)) + 1,
+                                                     qsa_block_width_from(sel, slot_idx, blk, pos0)));
+                        int s = 0;
+                        {
+                            int lo_s = 0, hi_s = (int)n_slices - 1;
+                            while (lo_s < hi_s) {
+                                const int mid = (lo_s + hi_s + 1) >> 1;
+                                const uint8_t* s_mid = get_slice<HEAD_DIM>(slices_ptr, mid, n_kv_head);
+                                if ((int)slice_rope(s_mid) <= pos0) lo_s = mid; else hi_s = mid - 1;
+                            }
+                            s = lo_s;
+                        }
+                        const uint8_t* sp = get_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+                        int s_rope = (int)slice_rope(sp);
+                        int s_len = slice_eff_len(s);
+                        int s_off = (int)slice_offset(sp);
+                        #pragma unroll
+                        for (int c = 0; c < MAX_CELLS; ++c) {
+                            if (c < cells) {
+                                const int pos = pos0 + c;
+                                // Forward cursor: a run of consecutive positions
+                                // can cross into the next slice(s).
+                                while (s + 1 < (int)n_slices) {
+                                    const uint8_t* sn = get_slice<HEAD_DIM>(slices_ptr, s + 1, n_kv_head);
+                                    const int n_rope = (int)slice_rope(sn);
+                                    if (n_rope > pos) break;
+                                    ++s; sp = sn; s_rope = n_rope;
+                                    s_len = slice_eff_len(s);
+                                    s_off = (int)slice_offset(sp);
+                                }
+                                const int local = pos - s_rope;
+                                if (local >= 0 && local < s_len) {
+                                    code[c] = ((uint32_t)s << 6) | (uint32_t)(s_off + local);
+                                }
+                            }
+                        }
+                    }
+                    first += n_stripes * WARP_SIZE;
+                    src = 0;
+                    cell = 0;
+                }
+                uint32_t mine = code[0];
+                #pragma unroll
+                for (int c = 1; c < MAX_CELLS; ++c) mine = (cell == c) ? code[c] : mine;
+                const uint32_t got = __shfl_sync(0xffffffffu, mine, src);
+                if (++cell == MAX_CELLS) { cell = 0; ++src; }
+                if (got != CELL_NONE) { cd = got; break; }
+            }
+            if (cd == CELL_NONE) break;
+            slice_idx = (int)(cd >> 6);
+            within = (int)(cd & 63u);
+        } else {
+            if (k >= tok_hi) break;
             while (scan_s + 1 < (int)n_slices) {
                 int e = slice_eff_len(scan_s);
                 if (scan_base + e <= k) { scan_base += e; ++scan_s; }
                 else break;
             }
-            const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, scan_s, n_kv_head);
-            const int within = (int)slice_offset(sl) + (k - scan_base);
-            stripe_process_cell<T, HEAD_DIM, ROPE_INTERLEAVED, HPG, WARP_HEADS>(
-                ctx, st, out_reg, m_i, l_i, scan_s, sl, within, cell_no++);
+            slice_idx = scan_s;
+            within = (int)slice_offset(get_slice<HEAD_DIM>(slices_ptr, scan_s, n_kv_head)) + (k - scan_base);
+            k += PAIRS;
         }
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_idx, n_kv_head);
+        stripe_process_cell<T, HEAD_DIM, ROPE_INTERLEAVED, HPG, WARP_HEADS>(
+            ctx, st, out_reg, m_i, l_i, slice_idx, sl, within, cell_no++);
     }
 
     emit_block();
@@ -1496,57 +1530,35 @@ int8_decode_stripe_kernel(
         k_new, v_new, rungs, partial_acc, partial_ml, sel);
 }
 
-// One side's (K or V) Q0_V block headers for this lane, once per tile, with
-// the palette scale folded in (`q0_v_header`); bit p of the result says
-// palette p is Q0_V. A lane's dim of a palette is one block (32 tokens of that
-// dim) and every token of a tile lies in one chunk, so the lane reads the SAME
-// block for all of them. Free functions with explicit operands, not lambdas:
-// a closure this size is outlined into a real call, and every capture then
-// lives in local memory across the whole kernel body.
-template <bool IS_K, int HEAD_DIM>
-__device__ __forceinline__ uint32_t bmma_q0v_headers(
-    const uint8_t* head_ptr, int lane, Q0VHeader (&h)[N_PALETTE])
-{
-    uint32_t mask = 0u;
-    #pragma unroll
-    for (int p = 0; p < N_PALETTE; ++p) {
-        const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
-        const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
-        h[p] = Q0VHeader{ nullptr, 0.f, 0.f };
-        if (ptr != 0 && fmt == ArenaFormat::Q0_V) {
-            const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
-            h[p] = q0_v_header<IS_K>((const block_q0_v*)(uintptr_t)ptr + lane, __frcp_rn(scale));
-            mask |= 1u << p;
-        }
-    }
-    return mask;
-}
-
-// Stage one token's K (IS_K) or V row into `dst` (palette order): a Q0_V
-// palette from its header, any other through the accessor (cp.async for a
-// same-type dtype palette). `within` is the token's slot in the chunk.
+// Stage one token's K (IS_K) or V row into `dst` (palette order), every
+// palette through the accessor (cp.async for a same-type dtype palette).
+// `within` is the token's slot in the chunk.
+//
+// A Q0_V palette decodes through the accessor too, whose read is the folded
+// header's arithmetic (block_q0_v.cuh), so it is bit for bit what caching the
+// palette's header per tile would give. That cache saved re-reading a 2-byte
+// code per token and held four headers live across the token loop on every
+// tile, Q0_V or not — in a loop at the register cap, which put them in local
+// memory. A free function with explicit operands, not a lambda: a closure
+// this size is outlined into a real call, its captures then living in local
+// memory across the whole kernel body.
 template <typename T, bool IS_K, int HEAD_DIM>
-__device__ __forceinline__ void bmma_stage_token(
-    T* dst, const uint8_t* head_ptr, const Q0VHeader (&h)[N_PALETTE], uint32_t q0v_mask,
-    int within, int lane)
+__device__ __forceinline__ void bmma_stage_token(T* dst, const uint8_t* head_ptr, int within, int lane)
 {
     constexpr int SUB_HEAD_DIM = HEAD_DIM / N_PALETTE;
     constexpr int64_t sub_head_stride = (int64_t)SUB_HEAD_DIM * CHUNK_SIZE;
     constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
-    static_assert(BLOCKS_PER_DIM == 1, "a lane's dim of a palette is one block per chunk");
-    #pragma unroll
+    // A real loop: each palette's load sits behind its own format dispatch,
+    // which its loads do not move above, so unrolling bought no overlap — only
+    // four inlined copies of the accessor's every-format dispatch.
+    #pragma unroll 1
     for (int p = 0; p < N_PALETTE; ++p) {
         const uint64_t ptr = IS_K ? kvhead_k_ptr<HEAD_DIM>(head_ptr, p) : kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
         if (ptr == 0) continue;
-        T* pal_dst = dst + p * SUB_HEAD_DIM;
-        if ((q0v_mask >> p) & 1u) {
-            pal_dst[lane] = q0_v_load_dispatch_detail::narrow(T{}, q0_v_header_elem(h[p], within));
-        } else {
-            const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
-            const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
-            ArenaAccessor acc((const char*)(uintptr_t)ptr, fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-            acc.template load_head_scaled<T, SUB_HEAD_DIM, true, IS_K>(pal_dst, 0, 0, within, lane, scale);
-        }
+        const int fmt = IS_K ? kvhead_k_fmt<HEAD_DIM>(head_ptr, p) : kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+        const float scale = IS_K ? kvhead_k_scale<HEAD_DIM>(head_ptr, p) : kvhead_v_scale<HEAD_DIM>(head_ptr, p);
+        ArenaAccessor acc((const char*)(uintptr_t)ptr, fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+        acc.template load_head_scaled<T, SUB_HEAD_DIM, true, IS_K>(dst + p * SUB_HEAD_DIM, 0, 0, within, lane, scale);
     }
 }
 
@@ -1817,20 +1829,11 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // are discarded (their mask bit is clear) below.
         #define TOK_VALID(t) (((tok_mask >> (t)) & 1u) != 0u)
         #define TOK_WITHIN(t) (TOK_VALID(t) ? within_base + (t) : (int)off)
-        // A Q0_V palette's block header is read once per tile
-        // (`bmma_q0v_headers`), so each token below costs one curve byte and
-        // one FMA. Formats are warp-uniform per palette.
-        Q0VHeader q0h[N_PALETTE];
-
         // ── stage the 8 tokens' K → shared_kb, cp.async double-buffered so each
         // token's load overlaps the previous token's gather/RoPE/quant. The
         // prefetch is unconditional when slice_ok (all 8 tokens share the chunk,
         // so every `within` is in-bounds); invalid tokens just zero shared_kb.
-        uint32_t q0v_mask = bmma_q0v_headers<true, HEAD_DIM>(head_ptr, lane, q0h);
-        if (slice_ok) {
-            bmma_stage_token<T, true, HEAD_DIM>(skt[0][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(0), lane);
-            cp_async_commit<true>();
-        }
+        //
         // A real loop over the 8 tokens, not unrolled: each iteration inlines
         // the accessor's per-format load dispatch for 4 palettes, and unrolling
         // pasted that 32 times here (and 32 more in the PV loop), stretching the
@@ -1838,16 +1841,21 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // the 64-register target. Every index below is runtime arithmetic
         // already (`t & 1`, the mask shift), and the cp.async double buffer is
         // what overlaps one token's load with the previous token's work.
+        //
+        // The loop starts one early: iteration −1 only issues token 0's load,
+        // so the staging is ONE inlined dispatch rather than a prologue copy of
+        // it beside the loop's. Every later iteration issues token t+1, then
+        // waits for token t — the same commit/wait order as a prologue.
         #pragma unroll 1
-        for (int t = 0; t < 8; ++t) {
+        for (int t = -1; t < 8; ++t) {
+            if (slice_ok && t + 1 < 8) {
+                bmma_stage_token<T, true, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, TOK_WITHIN(t + 1), lane);
+                cp_async_commit<true>();
+            }
+            if (t < 0) continue;
             if (slice_ok) {
-                if (t + 1 < 8) {
-                    bmma_stage_token<T, true, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(t + 1), lane);
-                    cp_async_commit<true>();
-                    cp_async_wait<1, true>();
-                } else {
-                    cp_async_wait<0, true>();
-                }
+                if (t + 1 < 8) cp_async_wait<1, true>();
+                else           cp_async_wait<0, true>();
             }
             __syncwarp();
             if (!TOK_VALID(t)) {
@@ -1935,22 +1943,18 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         // accumulate, and add it across all heads — no per-tile V smem staging.
         // Prefetch is unconditional when slice_ok (in-bounds); invalid tokens are
         // skipped in the accumulate. ──
-        q0v_mask = bmma_q0v_headers<false, HEAD_DIM>(head_ptr, lane, q0h);
-        if (slice_ok) {
-            bmma_stage_token<T, false, HEAD_DIM>(skt[0][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(0), lane);
-            cp_async_commit<true>();
-        }
-        // A real loop for the same reason as the K stage above.
+        // A real loop starting one early, for the same reasons as the K stage
+        // above.
         #pragma unroll 1
-        for (int t = 0; t < 8; ++t) {
+        for (int t = -1; t < 8; ++t) {
+            if (slice_ok && t + 1 < 8) {
+                bmma_stage_token<T, false, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, TOK_WITHIN(t + 1), lane);
+                cp_async_commit<true>();
+            }
+            if (t < 0) continue;
             if (slice_ok) {
-                if (t + 1 < 8) {
-                    bmma_stage_token<T, false, HEAD_DIM>(skt[(t + 1) & 1][warp], head_ptr, q0h, q0v_mask, TOK_WITHIN(t + 1), lane);
-                    cp_async_commit<true>();
-                    cp_async_wait<1, true>();
-                } else {
-                    cp_async_wait<0, true>();
-                }
+                if (t + 1 < 8) cp_async_wait<1, true>();
+                else           cp_async_wait<0, true>();
             }
             __syncwarp();
             if (!TOK_VALID(t)) continue;
@@ -2452,14 +2456,24 @@ int launch_int8_decode_attn(
         }
         }
         if (!launched_stripe) {
-            // Existing INT8-MMA kernel (warp=head). `pa` is non-null exactly
-            // when the route goes through partials + combine (need_pool held
-            // and the alloc succeeded — a failed alloc returned above); null
-            // `pa` is the single-block direct write.
-            int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
-                <<<grid, block, 0, stream>>>(
-                    q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
-                    softmax_scale, k_new, v_new, rungs, pa, pm, sel);
+            // **Not at head_dim >= 128 with 8 warps.** There every group of 1–8
+            // heads takes the batched-M kernel above, and more than 8 selects 16
+            // warps (`use_wide`), so the warp=head kernel at 8 warps cannot be
+            // reached. Gating its instantiation rather than its launch is what
+            // keeps it out of the archive; arriving here anyway is a routing
+            // fault, reported rather than run.
+            if constexpr (HEAD_DIM >= 128 && WARPS_PER_BLOCK <= 8) {
+                return 2;
+            } else {
+                // Existing INT8-MMA kernel (warp=head). `pa` is non-null exactly
+                // when the route goes through partials + combine (need_pool held
+                // and the alloc succeeded — a failed alloc returned above); null
+                // `pa` is the single-block direct write.
+                int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
+                    <<<grid, block, 0, stream>>>(
+                        q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
+                        softmax_scale, k_new, v_new, rungs, pa, pm, sel);
+            }
         }
 
         // The write-slice commit rides in the combine when there is one; the
@@ -2495,10 +2509,21 @@ int launch_int8_decode_attn(
             return launch(std::integral_constant<int, 16>{}, std::false_type{});
         }
     }
-    if (rope_interleaved) {
-        return launch(std::integral_constant<int, 8>{}, std::true_type{});
+    // **No 8-warp launch at head_dim 256.** Up to TILE_M_ROWS heads per group
+    // the tile kernel above has already run and returned, and more than that
+    // is `use_wide` — so the 8-warp half (its stripe kernels for every head
+    // count and its warp=head fallback) is unreachable here, and is not
+    // instantiated. Arriving here anyway is a routing fault, reported rather
+    // than run.
+    static_assert(TILE_M_ROWS >= 8, "the tile kernel covers every 8-warp group at head_dim 256");
+    if constexpr (HEAD_DIM == 256) {
+        return 2;
+    } else {
+        if (rope_interleaved) {
+            return launch(std::integral_constant<int, 8>{}, std::true_type{});
+        }
+        return launch(std::integral_constant<int, 8>{}, std::false_type{});
     }
-    return launch(std::integral_constant<int, 8>{}, std::false_type{});
 }
 
 } // namespace fused_attn

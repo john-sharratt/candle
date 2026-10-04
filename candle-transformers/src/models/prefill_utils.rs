@@ -1191,10 +1191,10 @@ impl<'k> PagedPrefillInt8<'k> {
         };
 
         match self.head_dim {
-            64 | 96 | 128 | 256 => {}
-            hd => candle::bail!(
-                "paged-prefill: unsupported head_dim {hd} (must be 64, 96, 128, or 256)"
-            ),
+            64 | 128 | 256 => {}
+            hd => {
+                candle::bail!("paged-prefill: unsupported head_dim {hd} (must be 64, 128, or 256)")
+            }
         }
 
         unsafe {
@@ -1834,7 +1834,7 @@ pub fn paged_glue_attn<'w>(
 /// The kernel self-increments ws.len after scatter, so no write_offsets needed.
 ///
 /// Runs the production INT8 split-KV / warp-stripe / batched-M decode kernel
-/// (`run_paged_decode_*`) for head_dim 64/96/128/256.
+/// (`run_paged_decode_*`) for head_dim 64/128/256.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn paged_decode_attn<'w>(
@@ -2115,13 +2115,22 @@ impl<'k> PagedDecode<'k> {
                     )
                 },
             )?;
-            if status != 0 {
-                candle::bail!(
+            match status {
+                0 => {}
+                1 => candle::bail!(
                     "paged-decode: the split-KV partial pool could not be allocated \
                      (VRAM exhausted) — the requested split/stripe launch needs it, \
                      so nothing was launched and this wave must fail rather than \
                      read an unwritten context"
-                );
+                ),
+                code => candle::bail!(
+                    "paged-decode: routing fault {code} — head_dim {} with {} query heads \
+                     over {} KV heads reached a kernel route that is not compiled in, so \
+                     nothing was launched",
+                    self.head_dim,
+                    self.n_q_head,
+                    self.n_kv_head
+                ),
             }
         } // all guards dropped here, dst no longer borrowed
 
@@ -2247,13 +2256,22 @@ impl<'k> PagedDecode<'k> {
                     )
                 },
             )?;
-            if status != 0 {
-                candle::bail!(
+            match status {
+                0 => {}
+                1 => candle::bail!(
                     "paged-decode q8: the split-KV partial pool could not be allocated \
                      (VRAM exhausted) — every q8 emit routes through partials + combine, \
                      so nothing was launched and this wave must fail rather than consume \
                      an uninitialized context"
-                );
+                ),
+                code => candle::bail!(
+                    "paged-decode q8: routing fault {code} — head_dim {} with {} query heads \
+                     over {} KV heads reached a kernel route that is not compiled in, so \
+                     nothing was launched",
+                    self.head_dim,
+                    self.n_q_head,
+                    self.n_kv_head
+                ),
             }
         } // all guards dropped here, dst no longer borrowed
 
@@ -2271,10 +2289,10 @@ impl<'k> PagedDecode<'k> {
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         match self.head_dim {
-            64 | 96 | 128 | 256 => {}
-            hd => candle::bail!(
-                "paged-decode: unsupported head_dim {hd} (must be 64, 96, 128, or 256)"
-            ),
+            64 | 128 | 256 => {}
+            hd => {
+                candle::bail!("paged-decode: unsupported head_dim {hd} (must be 64, 128, or 256)")
+            }
         }
 
         // B2: emit the attention context as q8a1024 (head_dim 128 or 256 — whole
