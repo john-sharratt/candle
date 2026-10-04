@@ -1,6 +1,18 @@
 # Live MoE Dispatch — the expert forward without a host round trip
 
-> **Status — Proposed.** Replaces the host-orchestrated expert path
+> **Status — Revision 2, implemented (§0); measured on the qwen36 gate (§0.7.2).**
+> Implementing revision 1 on the
+> RTX 3090 (WDDM) found that a gate GEMM which waits on a *host-driven* release
+> can deadlock against any driver call that synchronizes with the device (§0.1).
+> Revision 2 takes demand misses off the host and the driver entirely: worker
+> blocks inside each expert launch copy every miss from pinned memory into VRAM
+> scratch and compute it, cold experts are staged from NVMe by a thread that
+> makes no CUDA call, and every host↔GPU signal is a mapped word (§0.2–§0.10).
+> Measured end to end on the 3090 in simulation (§0.10.1–2). §0 is the design;
+> §1–§18 are revision 1, retained where §0 builds on them (see the note before
+> §1).
+>
+> **Status of revision 1 — Superseded in part.** Replaces the host-orchestrated expert path
 > (`route_indices` → `submit_moe_work` → pipeline-thread compute) with one
 > device-side path for every MoE model, paged or all-resident. The pointer table
 > the device path already uses becomes *live*: entries for non-resident experts
@@ -13,6 +25,797 @@
 > miss-service"); this document is the design that was missing from it.
 
 ---
+
+## 0. Revision 2 — demand misses fetched by the expert kernels
+
+### 0.1 What revision 1 met on hardware
+
+Measured on the RTX 3090 box (WDDM, driver 560.94), with unit tests in
+`candle-core/src/quantized/cuda_tests.rs` (`cuda_waiting_gate_*`) and traced
+runs of the qwen36-35B gate:
+
+1. **Any implicitly synchronizing driver call made while a gate block spins
+   blocks until the gate ends.** The one that fired in practice is **lazy kernel
+   loading**: the first launch of a kernel loads it, and the load waits for the
+   device to go idle. Behind a spinning gate it blocks the thread for the full
+   spin limit (1.5 s), and other threads' driver calls stall with it — the
+   pipeline thread's 8-byte table clear sat in `cuMemcpyHtoDAsync` for 1.51 s.
+   The forward thread launches kernels behind every gate (up, SwiGLU, down, the
+   next layer), so any first use of a kernel can deadlock the release.
+2. **Copies are not starved by the driver.** With the successor's kernel loaded
+   beforehand, a copy submitted *after* work was queued behind a spinning gate
+   runs beside it and releases it (67 ms for 32 × 2 MiB out of a 2 GiB pinned
+   tier), on the legacy null stream and on a non-blocking stream alike. An
+   earlier conclusion that copies starve behind a queued successor was this
+   lazy-load effect: the test thread never reached the copies.
+3. **A host store into mapped pinned memory reaches a spinning kernel with no
+   driver call.** A gate spinning on a table in mapped memory, with work queued
+   behind it, was released by plain host stores 0.3 ms after they were made,
+   bit-identical to the launch over the filled table.
+4. **Host waits on device events are unreliable while a gate spins** — a
+   pipeline thread blocked on a compute-stream event that the device had long
+   passed. The summary hand-off now uses a sequence word `bucketize` writes into
+   mapped memory, polled by the host (§0.3), not an event.
+
+The rule revision 2 is built on: **once a gate block can wait, nothing it waits
+for may need the driver.** Lazy loading stays on deliberately — it is the
+sharpest test of that rule, and the acceptance gate runs with it.
+
+### 0.2 The shape
+
+Every expert the router can pick is readable by the GPU at all times, from one
+of three places, and the live table says which:
+
+| Live-table entry (per row × expert, gate / up / down) | Where the weights are | The GPU |
+|---|---|---|
+| a **VRAM** address (weight-zone slot) | hot — cached in VRAM | reads VRAM |
+| a **pinned host** address (warm-tier slot or pad slot) | warm — a slot image in pinned RAM | a worker block copies the slice it needs into VRAM scratch and computes it; nothing waits |
+| **0** | cold — on the NVMe pack only (or in a pageable warm slot) | a worker spins on the entry until the stager publishes a pad address, then as above |
+
+```text
+forward thread (null stream)            stager thread (new)              pipeline thread (off the critical path)
+────────────────────────────            ───────────────────              ───────────────────────────────────────
+router → route
+bucketize ── reads the live gate row,   polls summary word n             polls summary word n
+   classifies VRAM / pinned / cold,     cold experts of row n:           stats, scores, Markov observe
+   orders tiles pinned → VRAM → cold,     pad slot ← pack read           promotion: copy engine pinned → VRAM,
+   writes summary[n] + word n             publish pad address              then retarget entry to VRAM
+gather                                    (host stores: up, down,        speculative prefetch: predicted pinned
+gate GEMM ── W worker blocks copy each    fence, gate)                     experts → VRAM; predicted cold experts
+   miss slice to scratch and compute    then: speculative staging          → stager (pack → pad, ahead)
+   it; hit blocks compute from VRAM       requests from the pipeline     VRAM eviction: retarget entry to its
+up, SwiGLU, down (same), scatter                                            pinned copy (or 0), reclaim slot
+next layer …
+```
+
+- **Nothing the GPU waits on needs the driver.** VRAM and pinned tiles wait for
+  nothing. A cold tile waits for a pack read and a host store, both made by the
+  stager, which issues no CUDA call on that path. A lazy kernel load or any
+  other synchronizing call on any thread can therefore delay a release but
+  never block it (§0.1).
+- **A demand miss never touches the VRAM cache.** No eviction, no slot, no copy
+  on the critical path. Demand misses feed the cache only through the pipeline
+  thread's asynchronous promotion — a later pass hits.
+- **The pipeline thread leaves the critical path entirely.** It owns policy —
+  scores, the Markov transition matrix, which experts live in VRAM — and moves
+  bytes with the copy engine, but no GPU wait depends on any of it.
+- **Bit-identical results.** A warm slot and a pad slot hold the pack record,
+  which is the VRAM slot image (`slot_offsets`, `pipeline.rs:666`): the kernel
+  reads the same bytes whichever address the entry names, and the scatter's
+  canonical order (§4.3) is unchanged.
+
+### 0.3 Memory
+
+| Store | What | Allocation | Size | Mutable |
+|---|---|---|---|---|
+| Weight zone | VRAM cache slots | the span's right side (unchanged) | elastic (§9) | yes — pipeline thread |
+| Warm tier | slot images, pinned + pageable parts | `cuMemAllocHost` once at startup (`pinned.rs:464`), pageable `PagedSlots` beyond it | sized by `warm_sizing_from` (`handle.rs:224`) | **no** — filled once (`pinned.rs:1-15`) |
+| **Pad** (new) | slot images staged from the pack | one `cuMemAllocHost` block at startup | §0.8 | yes — stager |
+| Live table | `[rows × E]` × 3 u64 | `cuMemHostAlloc(DEVICEMAP)` | 240 KiB (35B) | host stores |
+| Summary ring | `[RING × (E + 1)]` u32 | `cuMemHostAlloc(DEVICEMAP)` | 66 KiB | `bucketize` |
+| Abort word | u32 | `cuMemHostAlloc(DEVICEMAP)` | 4 B | host store |
+
+**GPU access to the warm tier and the pad.** Both are `cuMemAllocHost`
+allocations. Under unified addressing (every 64-bit platform CUDA supports,
+WDDM included), memory from `cuMemAllocHost` is mapped into the device address
+space at the same address, so the host pointer of a slot *is* its device
+address; no `DEVICEMAP` flag and no `cuMemHostGetDevicePointer` is needed. This
+is general CUDA behaviour that nothing in the product code exercised before (the
+warm tier was only ever a copy source); it is confirmed on the 3090 — a grouped
+GEMM reading `cuMemAllocHost` copies through their host addresses is
+bit-identical to the VRAM run (§0.10.1, test 1 of §0.15).
+
+**Pageable warm slots are not GPU-readable** (`WarmTier`'s `PagedSlots`,
+`warm_tier.rs:95-116`). An expert whose warm copy is pageable is treated as cold:
+its entry is 0 and the stager stages it into the pad by a host `memcpy` (0.59 ms
+per 13.5 MiB slot, `warm_tier.rs:21-23`) instead of a pack read.
+
+### 0.4 The live table
+
+**Initial state**, written at load before the first forward: VRAM-resident →
+VRAM address; pinned warm slot → its address; everything else → 0. Pinned
+layers (`PINNED_LAYERS`, `cache.rs:73`) are always VRAM.
+
+**Every write is a host store** to the mapped table (`[3][rows][E]`: gate, up,
+down planes). A publish writes up, down, full fence, gate; a clear writes gate,
+full fence, up, down.
+
+**The snapshot.** `bucketize` reads all three entries of every *routed* expert
+and copies them into a per-invocation VRAM snapshot (`u64[3][E]`); the layer's
+gate, up and down GEMMs take the snapshot as their weight table and never read
+the live table — except a cold expert's workers, which wait on its live gate
+entry and then read its live up and down entries. So an entry the host
+retargets after `bucketize` cannot reach a block that was ordered by the old
+value: that block keeps reading the old address, whose slot the reclaim rule
+(§0.5) holds until the invocation is done. An expert with **any** of its three
+entries 0 is classified cold, so a clear caught half-way (gate already 0, or
+up / down already 0) is a cold expert, never an address.
+
+This replaces the revision-1 assumption that a hit block may read the live
+entry: with the entry able to change between `bucketize` and the block — and
+able to become 0 — a hit block reading it could have dereferenced 0.
+
+**One writer at a time per entry: the `Residency` lock.** Two threads change
+entries — the pipeline thread (VRAM promotion and eviction) and the stager (pad
+publish and pad eviction) — and an entry's next value depends on state both
+own (an expert evicted from VRAM falls back to its pad copy, if it has one). A
+single `Mutex<Residency>` serialises every entry transition and holds, per
+`(row, expert)`: VRAM slot (if any), pad slot (if any), warm slot (if pinned),
+and the entry's current value. It is never touched by the forward thread and
+never held across a CUDA call or a pack read. The entry's value is a pure
+function of the three locations: VRAM if present, else pad, else pinned warm,
+else 0.
+
+**Transitions** (all under the lock):
+
+| Event | Who | Entry becomes |
+|---|---|---|
+| promotion copy observed complete | pipeline | VRAM address |
+| VRAM eviction | pipeline | pad address, else warm address, else 0 |
+| stager publishes a staged expert | stager | pad address (only if the entry is not VRAM) |
+| pad eviction | stager | warm address, else 0 (only if the entry is the pad address) |
+
+### 0.5 Reclaim — when a slot's bytes may be overwritten
+
+Retargeting an entry away from a slot does not free the slot: a kernel that read
+the old address may still be reading it. A slot (VRAM or pad) is reclaimable
+once every kernel that could hold its old address has finished. The kernels
+that read row `r`'s entries are row `r`'s `bucketize`, gate, up and down, all
+enqueued before row `r + 1`'s `bucketize`.
+
+**Tickets.** Every invocation gets a ticket (`seq + 1`). The forward thread
+records each row's latest ticket, then a full fence, *before* it enqueues the
+row's `bucketize`; the host threads record the highest ticket whose summary word
+they have seen. A summary word is `bucketize`'s last store and the compute
+stream is in order, so observing ticket `T` means every kernel of every ticket
+below `T` has completed (`expert_lre::reclaim`).
+
+**Rule R.** Two rules, both on tickets:
+
+- **Retargeting an entry to another address is allowed at any time.** The old
+  slot is reused once the row's ticket, read *after* the retarget's stores and a
+  full fence, is below the observed ticket — otherwise it goes on a retire list
+  keyed by that ticket and is freed when a later word arrives. The two fences
+  (forward: store ticket, fence, launch; host: store entry, fence, load ticket)
+  guarantee that either the new invocation's `bucketize` saw the new value or
+  its ticket is in the key.
+- **An entry goes to 0 only while its row is quiet** — no invocation of it in
+  flight (row ticket below the observed one, checked before the store). A cold
+  expert's workers read the live entry, so a 0 written under an invocation that
+  had already classified the expert cold would never be undone. An invocation
+  enqueued between the check and the store is harmless: its `bucketize` reads
+  either the old address (into its snapshot; the slot waits on the retire key)
+  or 0 (cold; the stager stages it).
+
+In practice the pipeline thread evicts only from quiet rows (rows behind the
+GPU in this pass, and rows the forward thread has not yet reached), so its
+victims are reusable at once and the retire list is the rare race.
+
+**Rule R′ — the stager's demand window.** While row `n` has a cold tile the
+stager has not yet released, the GPU is inside row `n`'s gate launch and cannot
+be past it: every row before `n` of this pass has finished, and every row after
+`n` (and every row of an earlier pass) has no kernel running. So during a demand
+row any slot not holding one of row `n`'s routed experts is reclaimable at once —
+including rows ahead of `n`, whose entries are retargeted before any of their
+kernels exists. The window closes when the stager publishes row `n`'s last cold
+expert, so it takes every victim it needs before that publish.
+
+Neither thread ever waits for a reclaim on a path a GPU wait depends on.
+
+### 0.6 The stager thread — NVMe and pageable reads into the pad
+
+One dedicated thread owns the pad and is the **only reader of the pack**. It
+replaces `ColdStaging` and every pack read on the pipeline thread
+(`load_expert`, `load_experts_batched`, `pipeline.rs:1627, 1734`) and the
+streamer's own pack reads (`streamer.rs:195-256`).
+
+**It never calls CUDA on the demand path.** Its work is: poll mapped summary
+words, read the pack (Windows `ReadFile`, Linux `pread` — `direct_io.rs`), copy
+pageable warm slots with `memcpy`, and store to the mapped live table. That is
+what makes a cold tile's wait driver-free.
+
+**Per routed row `n`**, in order:
+
+1. Poll summary word `n` (the same mapped word the pipeline thread polls; two
+   readers are fine).
+2. Read the summary's **cold set**: experts `bucketize` found with a zero gate
+   entry (summary bit 30, §0.9). Ascending expert id — the order `bucketize`
+   gives the cold tiles, so the first staged expert releases the first waiting
+   tile.
+3. For each cold expert: take a pad slot (free, else a reclaimable victim, §0.8);
+   fill it — pack read into the slot (4 KiB-aligned, one stride, the pad's slot
+   stride is the pack stride), or `memcpy` from its pageable warm slot; then
+   publish (under the `Residency` lock): up, down, fence, gate.
+4. **Publish each expert as its read lands**, not after the batch: reads are
+   issued to a small pool of persistent reader threads, one `DirectFile`
+   handle each (`read_at_with_handle`, `direct_io.rs:232`), at a queue depth of
+   `NVME_QD` (8 by default, sized from the drive — "QD8 saturates" the
+   dev-box Gen4, `direct_io.rs:66`). Completions publish in order of
+   completion. `read_stripes_concurrent`'s per-call thread spawn and all-or-
+   nothing return (`direct_io.rs:265`) are not used on this path.
+5. Speculative staging requests (pipeline thread → stager channel) are served
+   only when no demand row is outstanding, and are cancelled if their row has
+   passed.
+
+**Demand before everything.** A demand row is serviced to completion before any
+speculative read is issued; speculative reads already in flight are allowed to
+land (at most `NVME_QD` of them, ~1–2 ms).
+
+**Gate projections first** is a later refinement: the gate launch needs only
+gate projections, so splitting each record into gate / up+down reads would
+release the gate sooner. The record layout allows it (`PROJECTION_ALIGN = 256`
+offsets; a 4 KiB-aligned split needs the up offset rounded to 4 KiB in the pack,
+a format change) — not in this revision.
+
+### 0.7 The pipeline thread in revision 2
+
+Kept: per-row stats and scores, the Markov transition matrix
+(`transition.rs`), prediction-precision accounting, the boundary moves (§9),
+profile snapshots.
+
+Changed:
+
+- **Promotion of misses is done by the workers** (§0.7.1): the expert crossed
+  the link anyway, so the workers write it into a VRAM slot the pipeline thread
+  provided, and the pipeline thread points the entry there once the invocation
+  is done. No copy-engine traffic of its own.
+- **Speculative promotion** (prefetch, below) uses the copy engine: take a
+  VRAM slot (free or a Rule-R victim), copy from the expert's pinned source
+  (warm slot, or pad slot — pinned against pad eviction for the copy's
+  duration, a counter in `Residency`), record an event, and retarget the entry
+  to VRAM **when the event is observed complete**. It polls completion with
+  `cuEventQuery` between messages; a delayed completion (a lazy load holding
+  the driver) only delays the promotion.
+- **Speculative prefetch** keeps its policy (Markov, `PREFETCH_DEPTH_MAX`,
+  precision floor): a predicted expert with a pinned copy is promoted exactly as
+  above; a predicted **cold** expert is sent to the stager as a staging request
+  (pack → pad, ahead of the router), and promoted from the pad if the policy
+  still wants it in VRAM.
+- **Eviction** from VRAM retargets the entry to the expert's pinned or pad copy
+  (or 0) and frees the slot by Rule R. Demand eviction (`demand_eviction`,
+  `cache.rs:839`, Rule D) is deleted: demand never takes a slot.
+- **No host wait on the GPU anywhere**: `ColdStaging::acquire`'s
+  `event.synchronize()` (`pipeline.rs:1118`) goes with `ColdStaging`; the
+  summary wait is the mapped-word poll.
+- **Whole-layer streaming** (`streamer.rs`) is deleted, thread and staging ring.
+  What replaced it — the pipeline thread promoting the next row's scored experts
+  for a wide row — survives only for decode-width launches that route most of a
+  row (many sequences decoding together), where the link has room. A
+  prompt-prefill launch's workers saturate the link and are not given
+  speculation to compete with (§0.7.1).
+
+### 0.7.1 Promotion by the workers
+
+Measured on the qwen36 gate with copy-engine promotion of every miss: the
+cold-start prefill (BF16×1, 3,050 misses) moved each missed expert twice — once
+through the workers (~5.5 GB) and once more as a promotion copy (5.36 GiB),
+both on the one 12 GB/s link — and ran at 787 t/s against the baseline's
+1,287. The workers' copy is the one the layer needs; the promotion is the same
+bytes a second time.
+
+So the workers promote. The pipeline thread keeps a **promotion ring** in
+mapped memory (`expert_lre::promo`) stocked with free VRAM slots — `u64
+slots[cap] | u64 log[cap] | u32 head | u32 tail`, the host writing `tail`, the
+device `head`:
+
+1. The pipeline thread takes free slots (free; else victims of quiet rows; for
+   the shortfall, experts of busy rows with a pinned copy, whose slots wait on
+   the retire list — Rule R) and publishes their addresses at `tail`. The
+   stock is **predicted**: the next two rows' non-resident experts at the share
+   of experts the current row routed, ×1.25, at least 32, at most `2E`; the ring
+   holds `4E` indices, the rest room for slots the device has taken and the host
+   not yet collected. Stock past the prediction is withdrawn (`tail` set back)
+   when no bucketize can be reading the ring — under the pass lock, with every
+   begun invocation observed — and its slots returned to the zone. Every stocked
+   slot is an expert evicted ahead of need: a standing stock of 256 cost C10×16
+   1,692 misses where 32 cost 278. A stock sized from the row just served ran
+   dry where a pass entered the cold layers (the startup fill leaves the early
+   layers resident and the late ones cold): 756 of the cold prefill's misses
+   crossed twice, 1,169 t/s against 1,382 predicted.
+2. `bucketize` gives each remote expert, in list order, the next slot at `head`
+   (`remote_dst[i]`, else 0 when the ring is empty), logs
+   `summary_word << 32 | row << 16 | expert` at its index, and stores `head`
+   before the summary word.
+3. Each worker stores every 16-byte unit it copies into scratch also at the
+   same offset of the slot's projection (`dst_offset` per launch): after the
+   gate, up and down launches the slot holds the whole slot image.
+4. The pipeline thread collects the log up to `head` and lands each slot once
+   its invocation's ticket (from the logged word) is below the observed one —
+   the invocation, all three launches, has completed: install the views, set
+   the entry to VRAM. An expert promoted twice (two invocations, or the copy
+   engine too) keeps one slot; the other goes back to the zone, never having
+   been named by any entry.
+
+5. **One promotion in flight per expert.** `bucketize` sets the expert's mark
+   (`u32 marks[rows][E]`, mapped, after the counters) when it hands out a slot
+   and skips a marked expert; the host clears the mark when the slot lands or
+   is dropped. Without it a prefill that visits a row again before the host
+   has landed the first visit's slots promotes the same experts twice.
+6. **A miss the ring ran out for** is promoted by the copy engine — a second
+   crossing, worth paying: skipping the prefill-only ones left the next configs
+   to miss them again (BF16×4 3,176 misses against 1,262).
+
+A boundary move drains the ring with the device synchronized: lands what was
+taken, frees what was not, and sets `tail = head`.
+
+**Worker count by launch width.** `W` = 8 reaches the link's rate and is all a
+decode launch needs (a token tile per remote expert). A prefill launch's remote
+experts carry several token tiles each, all computed by the workers, so 8 made
+the cold prefill compute-bound: 814 t/s at 8, 1,083 at 32, no better at 64 —
+while every surplus worker is a block launched to exit on every decode launch
+(single-context decode ~123 → ~117 t/s at 64). So launches over more than 64
+tokens take 64 workers, the rest 8 (`dispatch::workers_for`). 64 rather than 32
+for the model whose misses are most of a launch: Qwen3.8-Flash-Next at ×8–×16
+prefill (a working set 3× the zone) ran C10 ×8 at 969 t/s with 32, 1,031 with 64,
+1,044 with 128 — and 128 cost the ×16 decode rows ~4%. The workers take their
+own grid rows ahead of the tiles (`⌈W / row_tiles⌉` of them): a single worker row
+set the grid's width for every tile row, which at 128 workers over a 16-row-tile
+projection launched 112 blocks per tile row only to exit.
+
+**No speculation on a prompt-prefill launch** (over 256 tokens,
+`dispatch::PREFILL_LAUNCH_TOKENS`). Its misses are pulled by enough workers to
+saturate the link, so a speculative copy for the next row takes bandwidth from
+them and saves nothing — late, and the workers moved the same bytes; on time,
+and they would have moved them at the same cost. On Flash-Next ×16 prefill the
+look-ahead issued 40,823 copy-engine promotions, 52.6 GiB, nearly all late:
+845 t/s with it, 1,075 without. A many-sequence decode step leaves the link room
+and keeps it.
+
+### 0.7.2 Measured — the qwen36 gate (RTX 3090, PCIe 3.0, WDDM)
+
+`test_parallel_batched_forwarding_36_35b`, prefill / decode t/s, every session
+matching, against the baseline at `a9889aeca` (host-readback dispatch):
+
+| Config | Baseline | Revision 2 |
+|---|---|---|
+| BF16×1 | 1,287 / 34.4 | 1,384 / 48.3 |
+| BF16×4 | 3,494 / 342.7 | 4,175 / 404.7 |
+| Q8_0×1 | 3,513 / 72.8 | 4,270 / 101.2 |
+| C0–C7 ×1 | 3,397–3,578 / 96–107 | 4,225–4,274 / 99–124 |
+| C8×5 | 4,271 / 410 | 5,128 / 473 |
+| C9×2 | 3,791 / 189 | 4,766 / 229 |
+| C10×8 | 3,771 / 476 | 4,955 / 624 |
+| C10×16 | 3,174 / 738 | 4,044 / 877 |
+
+Two runs, reproducible to within noise (±1 % on the BF16×1 row; single-context
+decode rows occasionally dip ~20 % in one run). The cold-start prefill (BF16×1)
+moves ~3,400 experts over the link — the cache's first contact with the model —
+and is within ~10 % of the link's floor for those bytes.
+
+### 0.8 The pad
+
+**A mutable pinned tier with LRE eviction**, owned by the stager. Slot images,
+one pack stride each, allocated once at startup in one `cuMemAllocHost` block and
+booked as pinned host memory like the warm tier
+(`note_host_pinned_alloc`, `pinned.rs:470`).
+
+**Size: one full layer of experts at least** (`E × stride`): a layer's cold set
+is then always stageable without reusing a slot of the same row, so the demand
+path never needs a "consumed" handshake from the GPU. Above that, the pad is
+cache: every additional slot keeps a cold expert pinned-readable for its next
+use. It comes out of the same pinned budget as the warm tier
+(`warm_sizing_from`, `handle.rs:224`) — the warm tier is sized after the pad.
+
+| Machine / model | One layer | Notes |
+|---|---|---|
+| 3090 (64 GB), Qwen3.6-35B | ~0.6 GB | every evictable expert fits the warm tier already (`docs/performance.md:1037-1040`): the pad sees no demand here |
+| 4090 Mobile (32 GB), Flash-Next | ~E × 14.2 MB | warm tier covers ~30 % (`docs/expert_cache_design.md:822-836`): the pad is the hot set of the other 70 % |
+| any, DeepSeek-V4-Flash | ~3.4 GB | 147 GB of experts: the pad is the main cold-miss cache |
+
+**Eviction (LRE).** The stager keeps the pad's own score table: it reads every
+row's summary anyway, so it credits each pad-resident expert the summary routes
+to (decode rows +1.0, prefill rows +0.1 — `cache.rs`'s weights) and decays the
+table by 0.85 at each pass boundary (`decay_scores`). The pipeline's VRAM score
+table stays private to the pipeline thread, unlocked. Victims: on the demand path, any slot outside the current row's routed set
+(Rule R′); for speculative staging, only a slot whose expert is also in VRAM —
+an eviction that changes no entry — reused under Rule R's retire key. Never a
+slot pinned by an in-flight promotion copy. A slot whose expert is also
+VRAM-resident is the cheapest victim — its entry already names VRAM. A demand
+row's cold set takes free slots first, then victims; with the pad at least one
+layer, Rule R′ always leaves enough (the current row routes at most `E`
+experts, and its cold ones are not in the pad).
+
+### 0.9 The forward thread and `bucketize`
+
+- **`bucketize`** classifies each *routed* expert by its entries: any of the
+  three 0 → **cold**; else its gate entry against the two pinned allocations'
+  fixed address ranges (warm tier, pad — both allocated once at startup, so the
+  ranges never move, unlike the weight zone, whose boundary moves): inside
+  either → **pinned**, anything else → **VRAM**. It snapshots the three entries
+  (§0.4). The summary word per expert becomes `count | pinned << 29 |
+  cold << 30 | decode << 31`; an unrouted expert's word is 0. Its kernel
+  outputs are §0.10.
+- **The token-tile width is chosen per launch, as the host tile builder chooses
+  it** (`grouped_int8_n_sub`): Bm 32 at decode, 64 or 128 at prefill. The tile width
+  is the grouped GEMM's weight-reuse factor, and it has to be decided without the
+  routing readback, so it is read off `n_tokens·k / E` — what uniform routing gives,
+  a lower bound on an active expert's rows and close to it at prefill widths, where
+  nearly every expert is active. Bucketize builds `16·n_sub`-wide tiles and the three
+  projections launch at that mode (one tile table between them, so the wide modes
+  only where both dtypes are KO). Fixed at 32, every prefill re-streamed each expert
+  2–4× per projection, which a model that had run the host path's wide tiles paid
+  for directly: Qwen3-30B-A3B prefill at ×10 −11%, Qwen3.8-Flash-Next at ×8–×16
+  −25–33% (RTX 3090).
+- **No per-row VRAM bounds reach the device**, so a boundary move (§0.13) never
+  races a classification.
+- **Run-ahead bound.** The summary ring slot of invocation `n` is rewritten by
+  invocation `n + RING`. The pipeline channel's bound covers the pipeline thread;
+  the stager publishes a consumed sequence number (an atomic) and the forward
+  thread holds invocation `n` until both readers have consumed `n − RING + 2`.
+  This is a host-side check against counters; it waits on neither the driver nor
+  the GPU's progress on any tile that could be spinning.
+- Nothing else on the forward thread changes: no host wait on the MoE.
+
+### 0.10 Kernel changes
+
+The int8 impl (`grouped_matmul_impl_int8`, `kernel.cuh:2126` — STAGES 2, a
+one-slot per-warp weight ring, static shared memory sized for occupancy) is **not
+changed**. Everything below is in `bucketize` and in the grouped entry
+(`quantized_matmul_grouped_entry`, `kernel.cuh:2569`) that calls the impl.
+
+#### `bucketize`
+
+- **Tile order: remote experts first, then VRAM experts.** A remote expert is a
+  pinned or cold one (§0.9). Within each class, ascending expert id; the row
+  layout (`tok_ids`, `perm`, …) stays ascending by expert id as now, so the
+  scatter's canonical order and every output bit are unchanged (§4.3).
+- **New outputs**: `remote[]` — per remote expert, `{expert, first_tile,
+  n_tiles, cold}`, pinned before cold — and `header[3]` = the number of remote
+  experts, `header[4]` = the number of tiles they own (the first tiles of the
+  tile list). Sized `E` entries; written by thread 0 in phase 2 next to the tile
+  prefix it already builds. And `snap[3][E]`, the routed experts' entries as
+  read (phase 1b, after the histogram, one thread per routed expert).
+- The summary word gains the pinned and cold bits (§0.9).
+
+#### The grouped entry: `W` workers, then hits
+
+The live launch's grid is `(row_tiles, worker_rows + launch_tiles)` with
+`worker_rows = ⌈W / row_tiles⌉` — `row_fast = 1`, the order the live gate already
+uses (`cuda.rs` `grouped_qmatmul_dev_q8a128`); grid rows `y < worker_rows` are the
+**workers**, numbered row by row, and the rest are today's tile blocks with
+`tile = y − worker_rows`. Blocks dispatch in linear order, so the workers lead the
+grid — the order §0.10.1 showed overlaps and the reverse serialises.
+
+- **A tile block** (`y ≥ worker_rows`) whose tile is one of the first `header[4]` (a remote
+  expert's) exits at once — workers own it. Every other tile block is a hit: it
+  reads its address from the snapshot (VRAM, a plain load) and runs the impl
+  exactly as today. **Hit blocks never wait.**
+- **A worker** (`y < worker_rows`, number `y·row_tiles + x < W`; the last worker
+  row's blocks past `W` exit) loops over
+  *items* `(remote expert r, row tile j)`, `n_items = header[3] × row_tiles`,
+  pulled off a per-launch device counter:
+  1. **Source**: thread 0 takes a pinned expert's address from the snapshot. A
+     cold expert's it reads from the projection's **live** row
+     (`MoeLive::live_row`) with a system-scope acquire load, spinning while it
+     is 0: `__nanosleep` backoff to 32 µs, abort word and spin limit checked
+     each poll; only workers ever spin. In the up and down launches the stager
+     published the entry before the gate entry, so it is already there.
+  2. **Mini loop**: all 128 threads copy row tile `j`'s slice — `K/128` pieces of
+     `4 × chunk_bytes` (3,200 B for Q6_KO), piece `k` at chunk `k·(nrows/8) + 4j`
+     of the source — into the worker's VRAM scratch slot, 16-byte loads, four in
+     flight per thread. The slot then holds row tile `j` as a **32-row KO matrix**
+     (`[K block][4 row groups]`).
+  3. **One `__syncthreads()`**: the stores are visible to the block's own
+     `cp.async.cg` reads (both through L2).
+  4. **Compute**: for each of `r`'s `n_tiles` token tiles, call the unmodified
+     impl with `weights = slot`, `nrows = 32`, `row_tile_idx = 0`, and
+     `dst + 32j` — the impl indexes chunks `k·(nrows/8) + warp` (= the slot
+     layout) and stores `dst[token·dst_stride + warp_row_base + …]`
+     (`store_tile_output`, `kernel.cuh:1834`), so the output lands in row tile
+     `j`'s columns with the same per-row arithmetic, bit for bit.
+  5. `__syncthreads()`, next item.
+- **`W` = 8** (§0.10.1–2): 8 workers reach the link's 12.2 GB/s; a ninth adds
+  nothing and holds an SM slot. A launch with no remote expert pays 8 blocks
+  that exit at once (a prefill launch 64 — see §0.7.1).
+- **Scratch**: `W` slots of the largest `(K/128) × 4 × chunk_bytes` over the
+  three projections — 51.2 KB for qwen36's gate/up, so 410 KB in all; one device
+  allocation at load. The gate, up and down launches of a layer reuse it in
+  stream order.
+- **Up and down** use the same snapshot, workers and scratch, each projection
+  copying its own slice: a remote expert crosses PCIe once per projection per
+  layer, never once per token tile. A cold expert's up and down entries were
+  published before its gate entry (§0.4), so they are set before the gate
+  launch could finish, and they cannot go to 0 while the invocation is in
+  flight (§0.5). Up and down launches never spin.
+
+#### `MoeLive` and the gate launch
+
+- `MoeWait` becomes `MoeLive { abort, live_row, remote, header, counter,
+  scratch, slot_bytes, stall, spin_limit_ns, workers }`
+  (`candle-kernels/src/quantized/moe_live.cuh`), read by workers only;
+  `moe_wait_for_weights` (the per-block wait) is deleted.
+- **Gate slicing** (`GATE_SLICE_BYTES`, `tile_offset`) is deleted: it existed so
+  no launch outlived the display watchdog while *every* miss tile could wait. Now
+  a launch waits only on cold experts in its `W` workers, bounded by the
+  stager's disk time — a full DeepSeek layer of gate projections (~1.1 GB) is
+  ~0.4 s at this drive's ~3 GB/s (§0.10.2), inside the 2 s limit with room; the
+  per-wait spin limit (1.5 s) remains the backstop.
+- **`row_fast` is fixed at 1** for every live launch, including up and down,
+  which today pick their axis order for L2 (`grouped_grid_row_fast`). The cost
+  for hit tiles is measured in acceptance (§0.16); the grid needs the tile axis
+  on `y` for the worker rows.
+
+#### Registers and occupancy
+
+The worker branch adds a copy loop (four `uint4` in flight) whose live range does
+not overlap the impl's, so the kernel's register maximum should not move; static
+shared memory is unchanged (the worker reuses the entry's buffers; two shared
+words for the item and the source). Both are checked against the current
+build's `ptxas -v` numbers in acceptance, because occupancy is what the hit path
+is tuned on.
+
+#### 0.10.1 Measured (RTX 3090, PCIe 3.0 ×16, 2026-10-04)
+
+`bench_grouped_gemm_weights_from_pinned_host` (`candle-core/src/quantized/cuda_tests.rs`):
+the **unmodified** grouped GEMM, qwen36-35B gate shape (512 × 2048, Q6_KO,
+819,200 B per expert), with table entries holding the host addresses of
+`cuMemAllocHost` copies.
+
+| Question | Result |
+|---|---|
+| Can the GEMM read `cuMemAllocHost` memory at its host address (`cp.async` from host memory)? | **Yes — bit-identical to the VRAM run** |
+| GEMM read rate from pinned memory, 16 → 1024 blocks | **5.0–5.5 GB/s, flat** |
+| …at 1 / 2 / 4 / 8 / 16 blocks (32-row experts) | 2.17 / 4.30 / 4.99 / 5.28 / 5.42 GB/s — **saturated by 4–8 blocks** |
+| A plain reduction over the same pinned memory | 2.20 GB/s |
+| Copy engine H2D, same memory (bulk / one 0.8 MB copy) | **12.75 GB/s** / 5.2 GB/s |
+| One pinned expert across T token tiles (T = 1, 2, 4, 8) | time × 1.00, 2.01, 4.02, 7.96 — **L2 does not absorb re-reads of host memory** |
+| VRAM tiles (151 µs) + pinned tiles (1217 µs) in one launch, pinned first | 1325 µs (sum 1368, max 1217) — overlapped, ~100 µs not hidden with 128 pinned blocks resident |
+| Same, pinned tiles last | 1338 µs — serial |
+| VRAM GEMM rate, 64 experts | ~770 GB/s |
+
+Then `bench_pinned_host_read_bandwidth` (same file): probe kernels compiled at
+test time (NVRTC) reading a 256 MiB `cuMemAllocHost` buffer.
+
+| Probe | GB/s |
+|---|---|
+| Flat 16 B loads, 256 threads/block, 4 in flight — default / `.nc` / `.cg` / `.L2::128B` / `.L2::256B`, 32 → 1312 blocks | **11.7–12.75** (all variants, from 32 blocks) |
+| Same, base misaligned by 16 / 32 / 64 / 96 B | 11.35–12.09 |
+| One 800 B chunk per warp via `cp.async` (the GEMM's unit), not / 128 B-aligned, any hint | 10.7–11.0 |
+| Same with 896 / 1024 B chunks | 12.2–12.6 |
+| The GEMM's exact address walk (row tile × K block, 800 B per warp), 1 or 4 K blocks in flight | 10.6 |
+| **Wide copy pinned → VRAM, 128 threads/block, 4 loads in flight/thread, `W` = 4 / 8 / 16 / 32 / 82 blocks** | **12.77 / 12.43 / 12.27 / 12.29 / 12.05** |
+| Wide copy of one projection (819,200 B), `W` = 4 … 32 | **~69 µs** (≈ 11.9 GB/s) |
+| Copy engine | 12.81 |
+
+What follows:
+
+- **A kernel pulls pinned memory as fast as the copy engine** (12.3–12.8 GB/s)
+  with as few as 4 blocks of 128 threads. Request size, cache hints and
+  alignment are second-order (≤ 12 %).
+- **The GEMM pulling its own weights reaches only ~5.3 GB/s**, half what the
+  same address walk gets as a bare probe (10.6). The loss is in the GEMM's
+  per-K-block structure, not the access pattern; it is not root-caused, and it
+  does not need to be: the miss path does not pull through the GEMM.
+- **So a miss is a wide copy into VRAM, then the unchanged GEMM from VRAM**:
+  ~69 µs per 819 KB projection, ~200 µs per whole qwen36 expert — the copy
+  engine's rate, with no driver call, no shared memory and no change to the
+  hit path. `W` = 4–8 copy blocks; more only hold SM slots.
+- **A miss spanning T token tiles crosses PCIe once** — the GEMM re-reads VRAM.
+  (Pulled directly it cost T crossings: L2 does not keep host-memory lines.)
+- **Pinned work must lead the grid**; trailing it serialises the launch.
+
+#### 0.10.2 The worker launch, simulated end to end
+
+`bench_moe_worker_launch_simulation` (same file): one kernel with the proposed
+grid — `W` worker blocks first, pulling miss items `(expert, 32-row tile)` off a
+counter; each reads the expert's mapped live-table entry (spinning gently while
+it is 0), copies the item's slice (16 × 3,200 B) into its VRAM scratch slot with
+wide loads, `__syncthreads`, then runs a **fake GEMM** with the real one's
+access structure (per K block: `cp.async` 800 B per warp, wait, block sync; ×
+`reps` token tiles) over the slot as a 32-row matrix. Hit blocks follow, one
+tile each, fake GEMM over VRAM. Every item's checksum is verified against the
+source bytes. Cold experts are read from a real file on NVMe
+(`DirectFile`, unbuffered) by reader threads that make no CUDA call and publish
+with a host store.
+
+| Experiment | Result |
+|---|---|
+| A. Warm misses only, 1 / 2 / 8 / 32 experts, `W` = 8 | 76.8 / 143 / 535 / 2158 µs — **12.2 GB/s, ~67 µs per 819 KB projection** (`W` = 4: 11.0 GB/s; `W` = 16: no better than 8) |
+| B. 32 VRAM experts (hits) + 8 warm misses, 4 token tiles, `W` = 8 | hits alone 121 µs, misses alone 661 µs; **together hits 129 µs (+7 %), misses 738 µs (+12 %), kernel 762 µs** — overlapped |
+| C. + 8 cold misses from NVMe, reader QD 1 / 4 / 8 | published 0.55 → 2.7 ms at every QD (~3 GB/s from this drive at 819 KB reads); hits still 127–128 µs; kernel ~3.0 ms |
+| D. Forward thread, while workers spin: 8 transfers queued behind, then **load + launch a module never loaded before** | the forward thread **blocked 29.2 ms — until the spinning launch ended**; the readers (no CUDA calls) published meanwhile; the launch finished and the late kernel then ran. **No deadlock.** |
+| E. Hits with 8 workers spinning on cold entries for 30 ms | hits 126 µs vs 121 µs alone (+4 %) |
+
+What follows:
+
+- **The design works on this box as a whole**: workers copy misses at the copy
+  engine's rate, hits overlap them at a few percent cost, cold experts flow
+  from NVMe with no driver call, and the lazy-load hazard of §0.1 becomes a
+  stall of the forward thread, never a deadlock.
+- **`W` = 8.**
+- **Disk throughput here is ~3 GB/s at whole-expert reads, independent of
+  queue depth** — one 819 KB read already saturates the drive. `NVME_QD` matters
+  for smaller reads; 8 costs nothing.
+- **A spinning worker costs the hit tiles ~4 %**, at the 32 µs backoff cap.
+- Not yet shown: the real `grouped_matmul_impl_int8` over a scratch slot as a
+  32-row matrix (bit-identity and rate), and the real GEMM's occupancy with the
+  worker branch present.
+
+### 0.11 Profiling — stall versus overlap
+
+The question §16 asked — *is the GPU waiting on bytes, or computing while they
+move?* — is answered by three places, each recording what only it sees.
+
+| Where | Counter (per MoE row, profile build only) | Answers |
+|---|---|---|
+| Workers (device, `MoeWait::stall`) | items, bytes copied, copy ns, compute ns, cold-wait ns, launches with a cold wait | how much of a launch the misses took, and how much of that was the disk |
+| Gate / up / down launch (device clocks, as §0.10.2's `clocks`) | hits-done and misses-done time from launch start | **overlap**: misses-done ≫ hits-done means the misses are the layer's long pole |
+| Stager (host) | cold experts staged, bytes, read µs (issue → land), publish lag behind its summary word | disk rate and latency per machine |
+| Pipeline (host) | promotions, promotion bytes, promotion copy µs, prefetch / promotion hit rate | whether the async side keeps up |
+
+The summary table prints, per config: hits / pinned misses / cold misses per
+layer, worker GB/s, cold-wait share of MoE time, overlap ratio (misses-done ÷
+hits-done), stager GB/s. §16–§17's counters for the waiting gate
+(`stall_ns`, `wait_blocks`, …) are replaced by these; the plumbing they designed
+(per-row device counters folded by the launch's last worker, read at snapshot)
+carries over.
+
+### 0.12 Failure and abort
+
+- **The abort word** (mapped) is raised by the pipeline thread's and the stager's
+  `DeadFlagGuard`s and by any error on either thread; a spinning worker traps on
+  its next poll, the sticky error surfaces at the next synchronize, and no token
+  computed from the layer is returned (as §8).
+- **A pack read that fails** (I/O error, short read) is an abort, not a retry:
+  the worker waiting on that expert cannot be released any other way.
+- **The spin limit** (1.5 s per wait) is the backstop for a stager that is alive
+  but stuck (a drive that stopped answering).
+- **A hit tile whose entry changed under it** (VRAM-evicted between `bucketize`
+  and its block's start) still reads the VRAM address from the snapshot, and
+  Rule R keeps that slot unreclaimed until the invocation is done.
+- **The stager never blocks on CUDA**, so a dead driver context cannot wedge it;
+  it exits on the abort word or when its channels close.
+
+### 0.13 Boundary moves (§9)
+
+The elastic weight/KV boundary moves only when quiet (no wave live, every
+summary consumed — `reserved == served` under the pass lock, as §9). A
+retraction retargets the conceded VRAM slots' entries to their pinned copies or
+0 and frees the slots after a device-wide quiesce (`ctx.synchronize()`, as
+`quiesce_before_handover` does) — allowed there because no gate can be waiting
+on anything but the stager, which needs no driver. A growth adds free slots.
+`bucketize` never sees VRAM bounds (§0.9), so neither move races a
+classification. Relocation copies keep the copy engine and publish on observed
+completion like promotion.
+
+### 0.14 Porting
+
+Every expert-cache MoE path already goes through `ExpertCache::forward_routed`
+→ `Dispatch::forward` (qwen3-MoE / 3.5 / 3.6 via `SparseMoeBlock`, qwen4exp,
+latent_moe / DeepSeek), so revision 2 changes no model file beyond what
+revision 1 did. `dspark_experts` keeps its own all-resident VRAM tables (no live
+table, no workers). The latent_moe readback counter test asserts zero
+readbacks.
+
+### 0.15 Tests (written first)
+
+Kernel side (`candle-core`):
+
+1. **`cuMemAllocHost` memory is device-readable at its host address** — done:
+   `bench_grouped_gemm_weights_from_pinned_host` §1 (bit-identical).
+2. **The impl over a scratch slot as a 32-row matrix** — copy one row tile's
+   slice of a KO projection into a VRAM buffer, run the impl with `nrows = 32` and
+   `dst + 32j`; output bit-identical to the normal launch's row tile `j`, for
+   every KO dtype and for `T = 1, 3` token tiles.
+3. **`bucketize` remote ordering** — raw expected `remote[]`, header, tile order
+   and summary bits for a hand-built case with VRAM / pinned / cold experts
+   (extends `cuda_moe_bucketize_live_table_orders_resident_first`); row tables
+   unchanged against the all-resident reference.
+4. **Worker launch, real impl** — the §0.10.2 simulation with the real entry:
+   warm and cold remote experts, output bit-identical to an all-VRAM launch.
+5. **Cold release with the forward thread in a module load** — §0.10.2 D with the
+   real launch; must finish, bit-identical.
+
+Host side (`candle-transformers`, host-only, raw expected values):
+
+6. **`Residency` transitions** — every row of §0.4's table and the races (pad
+   eviction against a VRAM eviction falling back to the pad; promotion from a
+   pad slot being evicted).
+7. **Rule R / R′** — reclaim behind / ahead of the observed row; the retire list
+   draining on a later word; R′ reclaiming a row ahead during a demand row.
+8. **Stager** against a real pack: a cold set staged and published in completion
+   order, bytes equal to the record; pageable warm slots staged by `memcpy`; a
+   one-layer pad serving a row whose whole routed set is cold.
+9. **Pad scores** — credit, decay, victim order.
+
+### 0.16 Acceptance
+
+- The qwen36-35B gate (`test_parallel_batched_forwarding_36_35b`) passes, **lazy
+  loading on**, plain and `--features profile`, against the baseline captured
+  at `a9889aeca` (`BF16×1` 1287 / 34.4 t/s prefill / decode … `C10×16` 3173.7 /
+  737.6), every session matching.
+- No regression on any row of the baseline beyond noise; the profile shows the
+  overlap ratio and cold-wait share per layer.
+- `ptxas -v` registers and static shared memory of the grouped entry unchanged
+  against `a9889aeca`; hit-tile throughput with `row_fast = 1` forced on up and
+  down within noise of today's choice.
+- The full sweep (`/sweep`) green, including the Flash-Next gate and engine probe
+  on the 16 GB card, where the pad and stager do real work.
+
+### 0.17 Deleted by revision 2
+
+`ColdStaging` and its event waits; the streamer thread and its staging ring;
+pack reads outside the stager; demand loading, `demand_eviction` and Rule D;
+the copy-engine table fills and clears and `PointerConstants`; the routing
+stream, the summary DtoH and `summary_ready`; the `spec_clear` event and Rule
+P's compute-stream wait (clears are host stores, visible at once); the device
+abort word raised by a copy; `moe_wait_for_weights`; gate slicing
+(`GATE_SLICE_BYTES`, `tile_offset`); the per-source prefetch fence ring
+(`CopyBatchFence`, `FenceSource`); the evicting victim scans
+(`allocate_slot`, `demand_eviction`, `evict_for_prefetch_batch`), replaced by
+the non-evicting `rank_victims` the reclaim rule filters; and
+`ExpertPack::read_many_unverified`. The pipeline is split by concern into
+`slot_image.rs`, `startup.rs`, `boundary.rs` and `pipeline.rs`, beside the new
+`reclaim.rs`, `residency.rs`, `pad.rs` and `stager.rs`.
+
+### 0.18 Documentation to update
+
+As §18's audit, plus: `docs/expert_cache_design.md` (warm tier no longer the
+only pinned tier; demand misses no longer load), CLAUDE.md hot-path invariant 3
+(the MoE routing readback is gone — propose the edit, do not commit it),
+`docs/performance.md` (new rows from acceptance), and the module docs of
+`expert_lre` (`pipeline.rs`, `dispatch.rs`, `streamer.rs` — deleted —
+`live_table.rs`).
+
+### 0.19 Decided in this revision (formerly open)
+
+| Question | Decision |
+|---|---|
+| Kernel side | §0.10: workers in the same launch, mini-loop copy + one sync, the unmodified impl over a scratch slot |
+| `W` | 8 for a decode launch, 32 over 64 tokens (§0.7.1) |
+| Promotion of misses | by the workers into ring slots; copy engine only for misses the ring ran out for, and for prefetch (§0.7.1) |
+| Scratch | `W` slots of the largest projection slice — ~410 KB for qwen36 |
+| Pad size | one full layer, the floor that never needs a GPU→host "consumed" signal; anything above it is a pinned-budget split left at zero in this revision |
+| Promotion policy | every miss is a promotion candidate, admitted by the pipeline's existing score policy (today's behaviour minus the critical path) |
+| Pad eviction scores | the stager's own table, from the summaries it reads |
+| VRAM classification | against the pinned allocations' fixed ranges, not the moving zone |
+| `NVME_QD` | 8 (one 819 KB read saturates this drive; 8 covers smaller reads) |
+
+### 0.20 Residual risks
+
+1. **The real GEMM's rate over a scratch slot** has not been measured — only the
+   fake GEMM's (§0.10.2). Test 4 measures it; the impl is the same code that
+   runs from VRAM today, so a large difference would itself be a finding.
+2. **`row_fast = 1` for up and down** may cost hit tiles some L2 reuse; measured
+   in acceptance. If it does, the worker row moves to the tile axis's end of a
+   `row_fast = 0` grid instead — same scheme, different index arithmetic.
+3. **Block dispatch order** is relied on for performance (workers lead), never
+   for correctness: no block waits on another block.
+4. **The disk on other machines**: the 3 GB/s here is one drive; the 16 GB box
+   and DeepSeek will report their own through §0.11's stager counters.
+5. **A display-attached GPU's watchdog** bounds a launch's cold waits at ~2 s
+   total; the largest case (a full DeepSeek layer cold) is ~0.4 s here.
+
+---
+
+> **Sections 1–18 are revision 1.** They are kept because §0 builds on them and
+> refers into them, and they remain correct for: the motivation (§1), the
+> routing summary's content (§5.3), passes (§6.4), tile order not changing
+> numerics (§4.3), the scatter, porting (§10), the boundary rule's quiet
+> condition (§9), failure semantics (§8) and the documentation audit (§18).
+> Everything they say about the demand path — copy-stream fills and clears,
+> the waiting gate, the routing stream, Rule D, gate slicing, demand eviction —
+> is superseded by §0.
 
 ## 1. Why
 

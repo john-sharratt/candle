@@ -81,7 +81,7 @@ pub fn print_span(title: &str, experts: Option<&PipelineStats>) {
     if let Some(s) = experts {
         println!(
             "      experts resident {:>8.1} MiB   ({} slots of {:.2} MiB; zone {:.1}, min {:.1}, \
-             max {:.1}) | hit {:.1}% | warm tier {} of {} experts | loads warm {} cold {}",
+             max {:.1}) | hit {:.1}% | warm tier {} of {} experts | misses pinned {} cold {}",
             mib(s.resident_vram_bytes),
             s.resident_vram_bytes
                 .checked_div(s.expert_slot_bytes)
@@ -93,8 +93,8 @@ pub fn print_span(title: &str, experts: Option<&PipelineStats>) {
             s.hit_rate(),
             s.warm_slots,
             s.total_experts,
-            s.warm_loads,
-            s.cold_loads,
+            s.worker_pinned,
+            s.worker_cold,
         );
     }
     println!(

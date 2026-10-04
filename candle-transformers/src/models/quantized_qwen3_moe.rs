@@ -19,15 +19,11 @@ use super::dense_span;
 #[cfg(feature = "cuda")]
 use super::expert_lre::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
-use super::expert_lre::GpuDispatchTables;
-#[cfg(feature = "cuda")]
 use super::expert_lre::{layer_geometries, minimum_resident_slots, slot_bytes_for};
-use super::expert_lre::{
-    sort_assignments_by_expert, ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats,
-    ProfileSnapshot,
-};
+use super::expert_lre::{ExpertCache, MmapExpertRef, PipelineStats, ProfileSnapshot};
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
-use super::profile::{gpu_span, profile_now, ProfileMark};
+#[cfg(feature = "cuda")]
+use super::profile::{pipeline_record, profile_now};
 use super::quantized_matmul::QMatMul;
 use super::quantized_mlp::QuantizedMlp;
 use super::rope_schedule::DeclaredScaling;
@@ -41,19 +37,13 @@ use crate::models::batch_test::utils::{TestConfig, TestMode};
 use crate::models::batched_inference::InferenceMode;
 use crate::models::batched_layer::WaveRef;
 use crate::models::routing_capture;
-use crate::models::wave_buffers::wave_empty;
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
 #[cfg(feature = "cuda")]
-use candle::quantized::cuda::{
-    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
-    moe_bucketize, moe_route, silu_mul_q8a128, DynamicActs, Q8a128Operand, GROUPED_GEMM_TILE_W,
-    MOE_MAX_TOPK,
-};
+use candle::quantized::cuda::{moe_route, to_dynamic, DynamicActs};
 #[cfg(feature = "cuda")]
 use candle::quantized::get_vram_info;
 use candle::quantized::{gguf_file, Int8Mode, QTensor, SumScale};
-use candle::wave_provenance::WaveTicket;
 use candle::LiveTensor;
 use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -64,6 +54,8 @@ use candle_nn::kv_cache::{
     initial_weight_bytes, set_weight_floor, span_end, weight_capacity_bytes,
 };
 use candle_nn::{kv_cache::KvCache, Embedding, Module};
+#[cfg(feature = "cuda")]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, RwLock};
@@ -75,40 +67,6 @@ pub const MAX_ROPE_SEQ_LEN: usize = 0;
 pub const ROPE_EXTEND_CHUNK: usize = 1024;
 
 type SharedCis = Arc<RwLock<CisPrecomputations>>;
-
-// ============================================================================
-// GGUF Reader Helper
-// ============================================================================
-
-struct Gguf<R: std::io::Read + std::io::Seek> {
-    ct: gguf_file::Content,
-    reader: R,
-    device: Device,
-}
-
-impl<R: std::io::Read + std::io::Seek> Gguf<R> {
-    fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
-        Self { ct, reader, device }
-    }
-
-    fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        QMatMul::from_weights(ws.into())
-    }
-
-    fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        RmsNorm::from_qtensor(ws, eps)
-    }
-
-    fn metadata(&self) -> &HashMap<String, gguf_file::Value> {
-        &self.ct.metadata
-    }
-
-    fn tensor(&mut self, name: &str) -> Result<QTensor> {
-        self.ct.tensor(&mut self.reader, name, &self.device)
-    }
-}
 
 // ============================================================================
 // Rotary Embeddings (copied from quantized_qwen3)
@@ -230,9 +188,14 @@ pub(crate) struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    /// B3 producer-fused MoE entry: `acts` is the ln2 output as a `DynamicActs` (q8a128 for int8,
-    /// Float for Off). The router consumes it via `forward_dynamic`; the experts byte-gather the
-    /// q8a128 directly (no gather-then-quantize). CUDA only.
+    /// The routed half of the layer, on the device: router → `moe_route` →
+    /// the expert cache's device forward ([`ExpertCache::forward_routed`]).
+    ///
+    /// `acts` is the ln2 output as a `DynamicActs`. The experts run only as the
+    /// int8 q8a128 × KO grouped GEMM, so a `Float` activation — what a DeltaNet
+    /// layer carrying a LoRA hands over — is quantized here, per row and per
+    /// 128-tile, exactly as it would be if the gather came first. Nothing on
+    /// this path reads routing back to the host.
     #[cfg(feature = "cuda")]
     pub(crate) fn forward_dynamic<'w>(
         &self,
@@ -257,602 +220,71 @@ impl SparseMoeBlock {
             .gate
             .forward_dynamic(acts.as_dynamic(), out_dtype)?
             .reshape((num_tokens, ()))?;
-        // Logits width = the real expert count; the router kernel writes this
-        // value as a "no expert" sentinel into empty top-k slots, so downstream
-        // must know it to filter them (see `forward_with_indices`).
-        let num_experts = router_logits.dim(1)?;
-
-        // GPU-native expert dispatch (all-resident cache, int8 activations):
-        // route → bucketize → gather → grouped GEMMs → scatter run entirely
-        // on-device against the static resident pointer tables, so the routing
-        // indices never round-trip to the CPU — the per-layer readback stall
-        // this eliminates is the dominant decode cost on WDDM.
-        //
-        // The host path below is the design for a PAGED cache, whose expert
-        // pointers move under eviction, and for a routing-trace capture, which
-        // needs the CPU-side expert sets. It is not a safety net for this one:
-        // an all-resident cache that ends up there has lost the device path to
-        // a defect, and `GpuDispatchTables::build` says so at WARN rather than
-        // letting decode quietly run several times slower.
-        #[cfg(feature = "cuda")]
-        if matches!(&acts, DynamicActs::Int8(_)) {
-            // The cache-owned safety chain (table coverage, router width ==
-            // table width, live pipeline thread) is `live_gpu_dispatch`; the
-            // model-level conditions are k inside the bucketize kernel's
-            // per-token sort bound and routing-trace capture.
-            if let Some(gd) = self
-                .cache
-                .live_gpu_dispatch(self.moe_layer_idx, num_experts)
-                .filter(|_| k <= MOE_MAX_TOPK && !routing_capture::is_enabled())
-            {
-                // Moved, not borrowed: the gather is the activation's last
-                // reader, and a borrow here would be a borrow of a local that
-                // the `'w`-bounded result outlives.
-                let DynamicActs::Int8(op) = acts else {
-                    unreachable!("guarded by the `matches!` above")
-                };
-                return self.forward_gpu_native(
-                    wave,
-                    op,
-                    &router_logits,
-                    num_tokens,
-                    b_size,
-                    seq_len,
-                    hidden_dim,
-                    k,
-                    num_experts,
-                    gd,
-                    out_dtype,
-                    t,
-                );
-            }
-        }
-
-        let (weights_flat, idx_cpu) = self.route_indices(&router_logits, num_tokens, k, t)?;
-        // The expert-pipeline thread takes its work over a channel, so
-        // `MoeWorkRequest` cannot carry a lifetime and the operand must be
-        // `'static`. That is a statement about ownership, not about how long the
-        // bytes live: `submit_moe_work` sends and immediately blocks on the
-        // response, so `acts` — and the FFN span it sits in — is live for the
-        // whole of the worker's use. So these lease rather than copy; owning the
-        // bytes would mean a device copy of the entire ln2 activation per layer.
-        let Device::Cuda(lease_dev) = router_logits.device().clone() else {
-            candle::bail!("SparseMoeBlock::forward_dynamic: expected a CUDA device")
-        };
-        let input = match &acts {
-            DynamicActs::Float(t2) => MoeInput::Float(unsafe {
-                t2.as_foreign_lease()?.reshape((num_tokens, hidden_dim))?
-            }),
-            DynamicActs::Int8(op) => MoeInput::Q8(unsafe { op.as_foreign_lease(&lease_dev)? }),
-        };
-        self.forward_with_indices(
-            input,
-            out_dtype,
-            // Same channel boundary, same reasoning, same lease.
-            unsafe { weights_flat.as_foreign_lease()? },
-            idx_cpu,
-            b_size,
-            seq_len,
-            hidden_dim,
-            k,
-            num_experts,
-            t,
-            decode_tokens,
-            wave.map(|g| g.ticket()),
-        )
-    }
-
-    /// Fully GPU-native expert forward for the all-resident cache: the routing
-    /// indices stay on the device from `moe_route` through the scatter.
-    ///
-    ///   1. `moe_route` — fused softmax + top-k (weights + indices, both GPU);
-    ///   2. `moe_bucketize` — the expert counting-sort, on-device
-    ///      (bit-identical grouping, proven by its unit tests), into this
-    ///      layer's reusable workspace;
-    ///   3. `fused_moe_gather_q8a128` → gate/up/down `grouped_qmatmul_dev_q8a128`
-    ///      (dispatched by the static resident pointer tables, RAW expert ids)
-    ///      → fused SwiGLU;
-    ///   4. `fused_deterministic_scatter` with the bucketize's token-major
-    ///      tables — the same ascending-grouped-row accumulation order as the
-    ///      host path, so the output bits match it exactly.
-    ///
-    /// Every launch bound is data-independent (the `n_tokens × k` assignment
-    /// bound; the GEMM grid additionally tightens to `⌈a_ub/tile_w⌉ +
-    /// n_experts`, the most tiles any bucketing can produce — padding
-    /// tiles/rows are skipped in-kernel), so no data-dependent value ever
-    /// crosses back to the host.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    /// `'a` and `'w` are separate on purpose: `op` is consumed here, while the
-    /// returned combine target comes from `wave`. Unifying them would make the
-    /// result appear to borrow the activation and force the caller's operand to
-    /// outlive its own frame.
-    fn forward_gpu_native<'w>(
-        &self,
-        wave: Option<&'w WaveGeneration>,
-        op: Q8a128Operand<'w>,
-        router_logits: &LiveTensor<'_>,
-        num_tokens: usize,
-        b_size: usize,
-        seq_len: usize,
-        hidden_dim: usize,
-        k: usize,
-        num_experts: usize,
-        gd: &GpuDispatchTables,
-        out_dtype: DType,
-        t: ProfileMark,
-    ) -> Result<LiveTensor<'w>> {
-        let device = router_logits.device().clone();
-        let cuda_dev = match &device {
-            Device::Cuda(d) => d.clone(),
-            _ => candle::bail!("forward_gpu_native: expected a CUDA device"),
-        };
-
-        // 1. Fused GPU routing; the flattened weights feed the scatter directly.
-        //
         // The router's own output is the first thing that can be bad here, and
-        // `moe_route` clamps a `bi = n_experts` sentinel out of `-inf`/NaN
-        // logits — so a NaN arriving in the logits is fixed up into a plausible
-        // route rather than propagating visibly. Assert BEFORE the clamp, or
-        // the evidence is gone.
+        // `moe_route` clamps a sentinel out of `-inf`/NaN logits — so a NaN in
+        // the logits is fixed up into a plausible route rather than propagating
+        // visibly. Assert BEFORE the clamp, or the evidence is gone.
         #[cfg(feature = "tensor-assert")]
         router_logits.assert(candle::tensor_assert::site(
             "moe.router_logits.L",
             self.moe_layer_idx,
         ));
-        let (top_k_weights, top_k_indices) = moe_route(router_logits, k, self.norm_topk_prob)?;
+        let (top_k_weights, top_k_indices) = moe_route(&router_logits, k, self.norm_topk_prob)?;
         #[cfg(feature = "tensor-assert")]
         top_k_weights.assert(candle::tensor_assert::site(
             "moe.route_weights.L",
             self.moe_layer_idx,
         ));
-        let weights_flat = top_k_weights.flatten_all()?.contiguous()?;
-        self.cache.record_profile("fwd_routing", t);
+        if routing_capture::is_enabled() {
+            self.capture_routing(&top_k_weights, &top_k_indices)?;
+        }
+        pipeline_record("moe:route", t);
 
-        // 2. On-device bucketize into the shared reusable workspace.
-        let t = profile_now();
-        let mut ws = gd
-            .workspace
-            .lock()
-            .map_err(|_| candle::Error::Msg("moe bucketize workspace poisoned".into()))?;
-        let g_moe = gpu_span("moe:bucketize", &device);
-        moe_bucketize(&top_k_indices, num_experts, GROUPED_GEMM_TILE_W, &mut ws)?;
-        g_moe.end();
-        let a_ub = num_tokens * k;
-        // Tight data-independent tile bound: full tiles ≤ ⌈a_ub/tile_w⌉ and
-        // each expert adds at most one partial tile, so launching `a_ub` blocks
-        // (~25× too many at large prefill) is never needed.
-        let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + num_experts);
-        let expert_base = gd
-            .expert_base(self.moe_layer_idx)
-            .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
-        // THIS layer's weight dtypes. A dynamically quantized checkpoint varies
-        // the bit-width per layer by sensitivity, and the GEMM takes the dtype
-        // per call, so the right one is fetched here rather than assumed
-        // grid-wide.
-        let (gate_dtype, down_dtype) = gd
-            .gate_dtype(self.moe_layer_idx)
-            .zip(gd.down_dtype(self.moe_layer_idx))
-            .ok_or_else(|| candle::Error::Msg("layer outside dispatch tables".into()))?;
-
-        // 3. Gather → gate/up → fused SwiGLU → down, all device-table dispatched.
-        //
-        // Timed on the DEVICE, not the host: every call below is an enqueue, so a
-        // host timer around them measures the launches and reports the expert
-        // GEMMs as free. The grouped GEMM's cost tracks the number of expert
-        // groups the wave activated rather than its token count, which is the one
-        // thing a per-token rate cannot show you.
-        // The gather's SOURCE, before it is permuted into expert order. The
-        // residual entering this layer is already checked and clean, so if this
-        // is bad the norm/quantize between them produced it; if this is clean
-        // and `stacked` below is not, the gather read rows that were not these
-        // — which makes `tok_ids` the fault, not the data.
-        #[cfg(feature = "tensor-assert")]
-        {
-            use crate::models::nan_capture::checkpoint_q8a128;
-            let (r, c, n) = (op.rows, op.cols, op.byte_len());
-            let nm = candle::tensor_assert::site("moe.norm_out.L", self.moe_layer_idx);
-            op.with_device_ptr(&cuda_dev, |p| unsafe {
-                checkpoint_q8a128(nm, p, r, c, n, &cuda_dev)
-            })?;
-        }
-        let g_moe = gpu_span("moe:gather", &device);
-        let stacked = fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &cuda_dev, wave_root(wave))?;
-        g_moe.end();
-        // The gather's RESULT. Bad here with the source clean isolates the
-        // fault to the gather itself.
-        #[cfg(feature = "tensor-assert")]
-        {
-            use crate::models::nan_capture::checkpoint_q8a128;
-            let (r, c, n) = (stacked.rows, stacked.cols, stacked.byte_len());
-            let nm = candle::tensor_assert::site("moe.gathered.L", self.moe_layer_idx);
-            stacked.with_device_ptr(&cuda_dev, |p| unsafe {
-                checkpoint_q8a128(nm, p, r, c, n, &cuda_dev)
-            })?;
-        }
-        let g_moe = gpu_span("moe:gate_up", &device);
-        let gate_out = grouped_qmatmul_dev_q8a128(
-            &stacked,
-            &gd.gate_ptrs,
-            expert_base,
-            num_experts,
-            gate_dtype,
-            gd.gate_nrows,
-            &ws.tile_expert,
-            &ws.tile_b_start,
-            &ws.tile_b_cnt,
-            launch_tiles,
-            &cuda_dev,
+        let op = match acts {
+            DynamicActs::Int8(op) => op,
+            DynamicActs::Float(xs) => {
+                let Device::Cuda(cuda_dev) = xs.device().clone() else {
+                    candle::bail!("SparseMoeBlock::forward_dynamic: expected a CUDA device")
+                };
+                match to_dynamic(&xs, Int8Mode::Precision, &cuda_dev, SumScale::Raw)? {
+                    DynamicActs::Int8(op) => op,
+                    DynamicActs::Float(_) => candle::bail!(
+                        "SparseMoeBlock::forward_dynamic: an int8 quantize returned float"
+                    ),
+                }
+            }
+        };
+        let ys = self.cache.forward_routed(
+            op,
+            &top_k_weights,
+            &top_k_indices,
+            self.moe_layer_idx,
+            decode_tokens,
+            out_dtype,
+            wave,
         )?;
-        // Between the GEMM and everything that consumes its result, while
-        // `stacked`, the weight table and the tile tables are all still the ones
-        // this call read. Checking here costs a fence; checking anywhere later
-        // costs the operands, because the next pass through this site carries
-        // different ones and would dump a call that did not fail.
-        //
-        // This is the BACKSTOP of the checkpoint chain, not its head. The
-        // checkpoints upstream of it fire first when they fire at all, so
-        // reaching this one means the residual arrived here finite and the MoE
-        // really did produce the fault — which the replay has already shown it
-        // does not do on its own. See `nan_capture`.
-        #[cfg(feature = "tensor-assert")]
-        {
-            use crate::models::nan_capture::{capture_gate_gemm, GemmCall};
-            capture_gate_gemm(
-                &GemmCall {
-                    layer: self.moe_layer_idx,
-                    stacked: &stacked,
-                    weight_ptrs: &gd.gate_ptrs,
-                    expert_base,
-                    num_experts,
-                    weight_dtype: gate_dtype,
-                    weight_nrows: gd.gate_nrows,
-                    tile_expert: &ws.tile_expert,
-                    tile_b_start: &ws.tile_b_start,
-                    tile_b_cnt: &ws.tile_b_cnt,
-                    launch_tiles,
-                    out: &gate_out,
-                },
-                &cuda_dev,
-            )?;
-        }
-        let up_out = grouped_qmatmul_dev_q8a128(
-            &stacked,
-            &gd.up_ptrs,
-            expert_base,
-            num_experts,
-            gate_dtype, // up shares gate's KO dtype
-            gd.gate_nrows,
-            &ws.tile_expert,
-            &ws.tile_b_start,
-            &ws.tile_b_cnt,
-            launch_tiles,
-            &cuda_dev,
-        )?;
-        g_moe.end();
-        // The two halves of the SwiGLU, separately. They read the SAME `stacked`
-        // operand and the same tile tables but different weights, so one bad and
-        // the other clean isolates the fault to that weight set; both bad points
-        // at the shared operand or the tables.
-        #[cfg(feature = "tensor-assert")]
-        {
-            use crate::models::nan_capture::checkpoint;
-            use candle::tensor_assert::site;
-            let li = self.moe_layer_idx;
-            checkpoint(
-                site("moe.up_out.L", li),
-                &up_out,
-                &[("gate_out", &gate_out)],
-                &cuda_dev,
-            )?;
-        }
-        let g_moe = gpu_span("moe:silu", &device);
-        // Raw Σx — a language model's SwiGLU intermediate stays orders of
-        // magnitude below f16's 65504; the down matmul reads this operand's own
-        // `sum_scale`, so the two agree by construction.
-        let inter_acts = silu_mul_q8a128(
-            &gate_out,
-            &up_out,
-            &cuda_dev,
-            gate_out.cuda_backing(),
-            SumScale::Raw,
-        )?;
-        g_moe.end();
-        let g_moe = gpu_span("moe:down", &device);
-        let down_out = grouped_qmatmul_dev_q8a128(
-            &inter_acts,
-            &gd.down_ptrs,
-            expert_base,
-            num_experts,
-            down_dtype,
-            gd.down_nrows,
-            &ws.tile_expert,
-            &ws.tile_b_start,
-            &ws.tile_b_cnt,
-            launch_tiles,
-            &cuda_dev,
-        )?;
-        g_moe.end();
-        // Brackets the three grouped GEMMs and the SwiGLU between them: with
-        // `moe.router_logits` / `moe.route_weights` finite and this not, the
-        // fault is in the expert matmul chain rather than in routing.
-        #[cfg(feature = "tensor-assert")]
-        crate::models::nan_capture::checkpoint(
-            candle::tensor_assert::site("moe.down_out.L", self.moe_layer_idx),
-            &down_out,
-            &[],
-            &cuda_dev,
-        )?;
-        // No cast here. The int8 matmul emits F32 and the scatter reads F32,
-        // narrowing once at its store into `ys`'s dtype — so the down
-        // projection's whole output no longer makes a full-tensor pass per
-        // layer per forward just to change type on the way to a loop that
-        // widens it straight back (hot-path invariant 1).
-
-        // 4. Deterministic scatter — identical accumulation order to the host path.
-        // The combine target is the layer's largest transient, and the scatter
-        // *defines* every one of its elements (one block per token, the column
-        // loop striding the whole row), so it is allocated uninitialised —
-        // hot-path invariant 6. `wave_empty` gives it a range of the wave's half
-        // when the layer has a generation open around `ffn_residual` — which
-        // `forward_layer_batched_mixed` does, spanning this call through the
-        // residual update that consumes the result.
-        let ys = wave_empty((num_tokens, hidden_dim), out_dtype, &device, wave)?;
-        let g_moe = gpu_span("moe:scatter", &device);
-        fused_deterministic_scatter(
-            &ys,
-            &down_out,
-            &ws.perm,
-            &weights_flat,
-            &ws.rw_ids,
-            &ws.token_starts,
-            num_tokens,
-            &cuda_dev,
-        )?;
-        g_moe.end();
-        // The routed block's result. Non-finite here with `down_out` finite
-        // puts the fault in the scatter — its only other float input is
-        // `weights_flat`, which `moe.route_weights` already covers.
-        #[cfg(feature = "tensor-assert")]
-        crate::models::nan_capture::checkpoint(
-            candle::tensor_assert::site("moe.routed_out.L", self.moe_layer_idx),
-            &ys,
-            &[("down_out", &down_out)],
-            &cuda_dev,
-        )?;
-        self.cache.record_profile("fwd_expert_gpu", t);
+        debug_assert_eq!(ys.dim(1)?, hidden_dim);
         ys.reshape((b_size, seq_len, hidden_dim))
     }
 
-    /// Route: GPU softmax + top-k → `(flattened routing weights, per-token expert indices)`.
-    /// Used by both the FP and q8a128 arms of `forward_dynamic` — operates only on the logits.
-    fn route_indices<'a>(
-        &self,
-        router_logits: &LiveTensor<'a>,
-        num_tokens: usize,
-        k: usize,
-        t: ProfileMark,
-    ) -> Result<(LiveTensor<'a>, Vec<Vec<u32>>)> {
-        // `num_tokens` drives the CUDA async routing DtoH only; the non-CUDA path uses `to_vec2`.
-        #[cfg(not(feature = "cuda"))]
-        let _ = num_tokens;
-        // Fused routing: softmax + top-k select + (optional) renormalize in a single kernel,
-        // replacing the `softmax → sort(desc) → narrow(k) → renorm → flatten` op chain (≈6 launches
-        // over a tiny `[num_tokens, 128]` tensor). top-k of softmax == top-k of the logits (softmax
-        // is monotonic) and renorm cancels the global softmax denominator, so the kernel makes one
-        // pass over the experts. Outputs `[num_tokens, k]` weights (f32) and indices (u32) in
-        // descending-logit order — identical to the sort path. We pull only the indices to CPU for
-        // scheduling; weights stay GPU-resident.
-        #[cfg(feature = "cuda")]
-        let (top_k_weights, top_k_indices) = moe_route(router_logits, k, self.norm_topk_prob)?;
-        #[cfg(not(feature = "cuda"))]
-        let (top_k_weights, top_k_indices) = {
-            let routing_weights =
-                candle_nn::ops::softmax_last_dim(router_logits)?.to_dtype(DType::F32)?;
-            let (sorted_w, sorted_idx) = routing_weights.sort_last_dim(false)?;
-            let top_k_weights = sorted_w.narrow(1, 0, k)?; // [num_tokens, k]
-            let top_k_indices = sorted_idx.narrow(1, 0, k)?.contiguous()?; // [num_tokens, k] u32
-            let top_k_weights = if self.norm_topk_prob {
-                let sums = top_k_weights.sum(1)?;
-                top_k_weights.broadcast_div(&sums.unsqueeze(1)?)?
-            } else {
-                top_k_weights
-            };
-            (top_k_weights, top_k_indices)
-        };
-
-        // Flatten weights to 1-D on GPU — stays device-resident.
-        let weights_flat = top_k_weights.flatten_all()?.contiguous()?; // [num_tokens * k]
-
-        // ── 1b. Async DtoH for routing indices ──
-        //
-        // Instead of to_vec2() which drains the compute pipeline, we:
-        //   1. Record event E1 on compute stream (marks sort output ready)
-        //   2. Routing stream waits for E1 (GPU-side, CPU does not block)
-        //   3. Async DtoH on routing stream to pinned buffer
-        //   4. Record event E2 on routing stream (marks DtoH done)
-        //   5. Send speculative hint to pipeline thread
-        //   6. cuEventSynchronize(E2) — CPU blocks only for routing stream
-        //   7. Read indices from pinned buffer
-        //
-        // Fallback: if routing stream or pinned buffer not available,
-        // fall back to synchronous to_vec2().
-        #[cfg(feature = "cuda")]
-        let idx_cpu: Vec<Vec<u32>> = if let Device::Cuda(cuda_dev) = router_logits.device() {
-            let total_indices = num_tokens * k;
-            let routing_stream = self.cache.routing_stream();
-            let pinned_ptr = self.cache.routing_pinned_ptr(total_indices);
-
-            if let (Some(rs), Some(ptr)) = (routing_stream, pinned_ptr) {
-                // One slice for the whole sequence — the DtoH destination in
-                // step 3 and the source read in step 7 are the same bytes, and
-                // minting a second slice for the read would alias this one.
-                //
-                // SAFETY: `routing_pinned_ptr` validated the length against the
-                // buffer's capacity. This forward is the buffer's only writer,
-                // and the DtoH that fills it is ordered against the read below
-                // by `e2`, which step 6 synchronizes on.
-                let buf = unsafe { std::slice::from_raw_parts_mut(ptr, total_indices) };
-
-                // Step 1: Record event on compute stream after sort output
-                let compute_stream = cuda_dev.cuda_stream();
-                let e1 = compute_stream
-                    .record_event(None)
-                    .map_err(candle::Error::wrap)?;
-
-                // Step 2: Routing stream waits for sort to complete (GPU-side)
-                rs.wait(&e1).map_err(candle::Error::wrap)?;
-
-                // Step 3: Async DtoH on routing stream to pinned buffer
-                let (storage, layout) = top_k_indices.storage_and_layout();
-                if let candle::Storage::Cuda(cuda_storage) = &*storage {
-                    // Use contiguous_offsets to get the exact element range.
-                    // narrow() can leave a CudaSlice larger than the logical
-                    // tensor (e.g. [1,8] narrowed from [1,128] — slice is 128
-                    // but only 8 elements are valid).
-                    if let Some((o1, o2)) = layout.contiguous_offsets() {
-                        let elem_count = o2 - o1;
-                        cuda_storage.copy_u32_to_host_on_stream(buf, rs, o1, elem_count)?;
-                    } else {
-                        // Non-contiguous layout: fall back to sync path
-                        drop(storage);
-                        let idx = top_k_indices.to_vec2::<u32>()?;
-                        self.cache.record_profile("fwd_routing", t);
-
-                        // Send hint with previous layer's experts
-                        let prev_experts = self.cache.get_prev_layer_experts();
-                        if !prev_experts.is_empty() {
-                            self.cache.send_hint(self.moe_layer_idx, prev_experts);
-                        }
-
-                        return Ok((weights_flat, idx));
-                    }
-                } else {
-                    drop(storage);
-                    let idx = top_k_indices.to_vec2::<u32>()?;
-                    self.cache.record_profile("fwd_routing", t);
-                    return Ok((weights_flat, idx));
-                }
-                drop(storage);
-
-                // Step 4: Record event on routing stream
-                let e2 = rs.record_event(None).map_err(candle::Error::wrap)?;
-
-                self.cache.record_profile("fwd_routing", t);
-
-                // Step 5: Send speculative hint while DtoH is in-flight
-                let prev_experts = self.cache.get_prev_layer_experts();
-                if !prev_experts.is_empty() {
-                    self.cache.send_hint(self.moe_layer_idx, prev_experts);
-                }
-
-                // Step 6: Wait for routing DtoH to complete
-                let t_wait = profile_now();
-                e2.synchronize().map_err(candle::Error::wrap)?;
-                self.cache.record_profile("fwd_routing_wait", t_wait);
-
-                // Step 7: Read indices from pinned buffer into Vec<Vec<u32>>
-                let mut idx_cpu: Vec<Vec<u32>> = Vec::with_capacity(num_tokens);
-                for tok in 0..num_tokens {
-                    let start = tok * k;
-                    idx_cpu.push(buf[start..start + k].to_vec());
-                }
-                idx_cpu
-            } else {
-                // Fallback: no routing stream or pinned buffer — sync path
-                let idx = top_k_indices.to_vec2::<u32>()?;
-                self.cache.record_profile("fwd_routing", t);
-
-                // Still send hint even on sync path
-                let prev_experts = self.cache.get_prev_layer_experts();
-                if !prev_experts.is_empty() {
-                    self.cache.send_hint(self.moe_layer_idx, prev_experts);
-                }
-                idx
-            }
-        } else {
-            let idx = top_k_indices.to_vec2::<u32>()?;
-            self.cache.record_profile("fwd_routing", t);
-            idx
-        };
-
-        #[cfg(not(feature = "cuda"))]
-        let idx_cpu: Vec<Vec<u32>> = {
-            let idx = top_k_indices.to_vec2::<u32>()?;
-            self.cache.record_profile("fwd_routing", t);
-            idx
-        };
-
-        Ok((weights_flat, idx_cpu))
-    }
-
-    /// Common path after routing indices are available (sync or async).
-    #[allow(clippy::too_many_arguments)]
-    fn forward_with_indices(
-        &self,
-        input: MoeInput,
-        out_dtype: DType,
-        weights_flat: Tensor,
-        idx_cpu: Vec<Vec<u32>>,
-        b_size: usize,
-        seq_len: usize,
-        hidden_dim: usize,
-        k: usize,
-        num_experts: usize,
-        _routing_start: ProfileMark,
-        decode_tokens: usize,
-        wave: Option<WaveTicket>,
-    ) -> Result<Tensor> {
-        // ── 2. Group assignments by expert — the shared grouped-GEMM dispatch
-        // sort (`expert_lre::sort_assignments_by_expert`: O(A+E) counting sort,
-        // stable in token order, router sentinels skipped). ──
-        let t = profile_now();
-        let (expert_ids, assignments) = sort_assignments_by_expert(&idx_cpu, k, num_experts);
-        self.cache.record_profile("fwd_cpu_assign", t);
-
-        // Store this layer's expert set for the next layer's speculative hint
-        self.cache.set_prev_layer_experts(expert_ids.clone());
-
-        // ── Routing-trace capture (inert unless explicitly enabled) ──
-        // Records the active expert set + per-expert routing mass for offline
-        // predictor evaluation.  The mass DtoH only happens while capturing.
-        if crate::models::routing_capture::is_enabled() {
-            if let Ok(w) = weights_flat.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-                let mut mass = vec![0f32; expert_ids.len()];
-                for &(eid, _tok, widx) in &assignments {
-                    if let Ok(pos) = expert_ids.binary_search(&(eid as usize)) {
-                        if let Some(&wv) = w.get(widx as usize) {
-                            mass[pos] += wv;
-                        }
-                    }
-                }
-                crate::models::routing_capture::record(self.moe_layer_idx, &expert_ids, &mass);
+    /// Record this layer's routing for the offline predictor evaluation — a
+    /// test-only observer. It reads the route back to the host, which the
+    /// expert forward itself never does; the forward is identical with it on
+    /// or off.
+    #[cfg(feature = "cuda")]
+    fn capture_routing(&self, weights: &LiveTensor<'_>, indices: &LiveTensor<'_>) -> Result<()> {
+        let idx: Vec<Vec<u32>> = indices.to_vec2()?;
+        let w: Vec<Vec<f32>> = weights.to_vec2()?;
+        let mut mass: BTreeMap<usize, f32> = BTreeMap::new();
+        for (row_i, row_w) in idx.iter().zip(w.iter()) {
+            for (&e, &wv) in row_i.iter().zip(row_w.iter()) {
+                *mass.entry(e as usize).or_insert(0.0) += wv;
             }
         }
-
-        // ── 3. Submit to pipeline (threaded or inline) ──
-        //
-        // `submit_moe_work` handles both modes:
-        //   - Threaded (mmap path): sends work to the background pipeline
-        //     thread, which does classify → DMA → compute with &mut self
-        //     (no locks).  Blocks until the thread returns the result.
-        //   - Inline (reader path): locks the Mutex (uncontended), computes
-        //     all experts by slot index, releases.
-        //
-        // Either way, the caller gets back the output tensor.
-        let ys = self.cache.submit_moe_work(
-            self.moe_layer_idx,
-            expert_ids,
-            input,
-            out_dtype,
-            &weights_flat,
-            assignments,
-            decode_tokens,
-            wave,
-        )?;
-
-        let result = ys.reshape((b_size, seq_len, hidden_dim))?;
-        Ok(result)
+        let expert_ids: Vec<usize> = mass.keys().copied().collect();
+        let mass: Vec<f32> = mass.values().copied().collect();
+        routing_capture::record(self.moe_layer_idx, &expert_ids, &mass);
+        Ok(())
     }
 }
 
@@ -1425,231 +857,6 @@ pub struct GgufLoadOptions {
 }
 
 impl ModelWeights {
-    /// Load model from GGUF via reader (non-mmap path).
-    /// MoE layers load all experts to VRAM (no LRU cache in this path).
-    pub fn from_gguf<R: std::io::Read + std::io::Seek>(
-        ct: gguf_file::Content,
-        reader: &mut R,
-        device: &Device,
-    ) -> Result<Self> {
-        // Before any tensor — see `dense_span`.
-        dense_span::open_for_load(device, &ct)?;
-        let mut gg = Gguf::new(ct, reader, device.clone());
-        let md_get = |s: &str| match gg.metadata().get(s) {
-            None => candle::bail!("cannot find {s} in metadata"),
-            Some(v) => Ok(v),
-        };
-        let md_opt_f32 = |k: &str| gg.metadata().get(k).and_then(|v| v.to_f32().ok());
-        let md_opt_u32 = |k: &str| gg.metadata().get(k).and_then(|v| v.to_u32().ok());
-
-        let p = detect_arch_prefix(gg.metadata());
-
-        let num_attention_heads = md_get(&format!("{p}.attention.head_count"))?.to_u32()? as usize;
-        let num_kv_heads = md_get(&format!("{p}.attention.head_count_kv"))?.to_u32()? as usize;
-        let num_layers = md_get(&format!("{p}.block_count"))?.to_u32()? as usize;
-        let hidden_size = md_get(&format!("{p}.embedding_length"))?.to_u32()? as usize;
-
-        let head_dim = md_opt_u32(&format!("{p}.attention.key_length"))
-            .map(|v| v as usize)
-            .unwrap_or_else(|| hidden_size / num_attention_heads);
-
-        let max_position_embeddings =
-            md_opt_u32(&format!("{p}.context_length")).unwrap_or(32768) as usize;
-
-        let rms_norm_eps =
-            md_get(&format!("{p}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
-
-        let rope_freq_base =
-            md_opt_f32(&format!("{p}.rope.freq_base")).unwrap_or(1_000_000f32) as f64;
-
-        let declared = DeclaredScaling::from_gguf(gg.metadata(), &p)?;
-
-        let n_expert = md_opt_u32(&format!("{p}.expert_count")).unwrap_or(1) as usize;
-        let n_expert_used = md_opt_u32(&format!("{p}.expert_used_count")).unwrap_or(1) as usize;
-        // Per-expert FFN width (moe_intermediate_size), which is what one expert
-        // GEMM produces and therefore what the transient plan prices against.
-        let expert_ffn_size =
-            md_opt_u32(&format!("{p}.expert_feed_forward_length")).unwrap_or(2048) as usize;
-        // Qwen3-MoE always uses norm_topk_prob=true; GGUF often omits this key so default to 1.
-        let norm_topk_prob = md_opt_u32(&format!("{p}.expert_weights_norm")).unwrap_or(1) == 1;
-
-        tracing::debug!("GGUF arch: {p} (reader path, no config.json)  layers={num_layers} hidden={hidden_size} eps={rms_norm_eps:.2e} heads={num_attention_heads}Q/{num_kv_heads}KV head_dim={head_dim} ctx={max_position_embeddings} rope_base={rope_freq_base} experts={n_expert}/{n_expert_used} norm={norm_topk_prob}");
-
-        let dtype = DType::F16;
-
-        let embed_tensor = gg.tensor("token_embd.weight")?;
-        let tok_embed = embed_tensor.dequantize(device)?;
-        let embeddings = Embedding::new(tok_embed, hidden_size)?;
-
-        let rotary = Arc::new(RotaryEmbedding::new(
-            dtype,
-            head_dim,
-            max_position_embeddings,
-            rope_freq_base,
-            declared,
-            device,
-        )?);
-
-        let mut layers = Vec::with_capacity(num_layers);
-        let mut reader_moe_count: usize = 0;
-        for i in 0..num_layers {
-            let prefix = format!("blk.{i}");
-            let ln1 = gg.rms_norm(&format!("{prefix}.attn_norm.weight"), rms_norm_eps)?;
-            let ln2 = gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), rms_norm_eps)?;
-
-            // Attention
-            let q_w = gg.tensor(&format!("{prefix}.attn_q.weight"))?;
-            let k_w = gg.tensor(&format!("{prefix}.attn_k.weight"))?;
-            let v_w = gg.tensor(&format!("{prefix}.attn_v.weight"))?;
-            let o_proj = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
-            let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
-            let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
-
-            // q/k/v kept separate (no concat): the int8 path fuses them at launch via the
-            // segmented kernel, and the FP path runs them as three matmuls.
-            let q_proj = Some(QMatMul::from_weights(q_w.into())?);
-            let k_proj = Some(QMatMul::from_weights(k_w.into())?);
-            let v_proj = Some(QMatMul::from_weights(v_w.into())?);
-
-            let self_attn = AttentionWeights {
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
-                q_norm,
-                k_norm,
-                num_heads: num_attention_heads,
-                num_kv_heads,
-                head_dim,
-                rotary_emb: rotary.clone(),
-            };
-
-            // FFN: detect MoE vs dense by checking for expert tensors
-            let has_moe_tensors = gg
-                .ct
-                .tensor_infos
-                .contains_key(&format!("{prefix}.ffn_gate_inp.weight"))
-                || gg
-                    .ct
-                    .tensor_infos
-                    .contains_key(&format!("{prefix}.ffn_gate_exps.weight"));
-
-            let ffn = if has_moe_tensors && n_expert > 1 {
-                // In the reader path, just load all experts to VRAM (no LRU)
-                let gate = gg.qmatmul(&format!("{prefix}.ffn_gate_inp.weight"))?;
-                // Try per-expert 2D naming
-                let mut experts_data = Vec::new();
-                for j in 0..n_expert {
-                    let gate_proj = gg.qmatmul(&format!("{prefix}.ffn_gate.{j}.weight"))?;
-                    let up_proj = gg.qmatmul(&format!("{prefix}.ffn_up.{j}.weight"))?;
-                    let down_proj = gg.qmatmul(&format!("{prefix}.ffn_down.{j}.weight"))?;
-                    experts_data.push((gate_proj, up_proj, down_proj));
-                }
-
-                // Reader path: all experts already in VRAM — pre-populate the
-                // cache so classify_and_load's hit path finds them immediately.
-                // No mmap needed since nothing will ever miss.
-                //
-                // NOTE: each MoE layer gets its own independent ExpertCache
-                // here, unlike the mmap path (from_gguf_by_path) which shares
-                // a single global cache across all layers with cross-layer LRU
-                // eviction.  This is fine because the reader path keeps every
-                // expert resident — there is no eviction pressure.
-                let moe_layer_idx = reader_moe_count;
-                reader_moe_count += 1;
-
-                let num_experts = experts_data.len();
-                let mut slots: Vec<Option<ExpertSlot>> = Vec::with_capacity(num_experts);
-                let mut key_to_slot = std::collections::HashMap::new();
-                let mut last_used = Vec::with_capacity(num_experts);
-                let mut slot_to_key = Vec::with_capacity(num_experts);
-
-                for (j, (gp, up, dp)) in experts_data.into_iter().enumerate() {
-                    slots.push(Some(ExpertSlot {
-                        gate_proj: gp,
-                        up_proj: up,
-                        down_proj: dp,
-                    }));
-                    key_to_slot.insert((moe_layer_idx, j), j);
-                    last_used.push(j as u32);
-                    slot_to_key.push(Some((moe_layer_idx, j)));
-                }
-                let generation = num_experts as u32;
-
-                FeedForward::MoE(SparseMoeBlock {
-                    gate,
-                    cache: Arc::new(ExpertCache::new_prepopulated(
-                        slots,
-                        key_to_slot,
-                        last_used,
-                        generation,
-                        slot_to_key,
-                        device,
-                    )),
-                    moe_layer_idx,
-                    num_experts_per_tok: n_expert_used,
-                    norm_topk_prob,
-                })
-            } else {
-                FeedForward::Mlp(QuantizedMlp::from_weights(
-                    gg.tensor(&format!("{prefix}.ffn_gate.weight"))?,
-                    gg.tensor(&format!("{prefix}.ffn_up.weight"))?,
-                    gg.tensor(&format!("{prefix}.ffn_down.weight"))?,
-                    Int8Mode::Off,
-                )?)
-            };
-
-            layers.push(LayerWeights {
-                self_attn,
-                ffn,
-                ln1,
-                ln2,
-            });
-        }
-
-        let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
-        let lm_head_tensor = match gg.tensor("output.weight") {
-            Ok(tensor) => tensor,
-            Err(_) => gg.tensor("token_embd.weight")?,
-        };
-        let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
-        // Read before the struct takes ownership: the forward phase holds the
-        // head's logits, one row per scored row and `vocab` wide.
-        let vocab = lm_head.weight_dims().first().copied().unwrap_or(0);
-
-        Ok(Self {
-            embeddings: Some(embeddings),
-            #[cfg(feature = "cuda")]
-            // Reader path has no mmap to gather from, so the table is resident.
-            host_embedding: None,
-            layers,
-            norm,
-            lm_head,
-            // Reader path: each SparseMoeBlock owns its own ExpertCache
-            // with all experts pre-loaded, so no global cache is needed.
-            // (The mmap path sets this to Some(...) for cross-layer LRU.)
-            expert_cache: None,
-            _mmap: None,
-            wave_shapes: WaveShapes {
-                hidden: hidden_size,
-                intermediate: expert_ffn_size,
-                experts_per_tok: n_expert_used,
-                n_experts: n_expert,
-                vocab,
-                head_qk_norm: true,
-                qkv_bias: false,
-            },
-            device: device.clone(),
-            // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
-            // mmap (`from_gguf_by_path`) load path.
-            int8mode: Int8Mode::Off,
-            // Reader path: experts live in per-block caches (not the global
-            // `expert_cache`), so the whole-card weight decomposition can't
-            // attribute them here — left unmeasured.
-            base_weight_bytes: 0,
-        })
-    }
-
     /// Load model from GGUF via mmap with LRU expert cache and VRAM budget management.
     ///
     /// - Non-expert weights: loaded directly to VRAM (small relative to expert weights)
@@ -2315,6 +1522,7 @@ impl ModelWeights {
                 zone,
                 device,
                 experts_per_layer: n_expert,
+                experts_used: n_expert_used,
                 gguf_path: file_path,
                 expert_pack_dir: expert_pack_dir.as_deref(),
                 progress: cache_progress,

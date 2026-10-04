@@ -31,6 +31,7 @@
 //! those ends up duplicated. The example exists because the interesting runs are long
 //! and want flags; the tests exist so a model is one line to cover.
 
+mod grow_window;
 mod probe;
 mod profile;
 mod run;

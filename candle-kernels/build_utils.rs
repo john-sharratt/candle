@@ -593,6 +593,21 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
 // Hashing and caching utilities
 // ============================================================================
 
+/// The path a quoted `#include "…"` line names, or `None` for any other line —
+/// a system `<…>` include included.
+///
+/// The path is everything between the first quote and the next, so a trailing
+/// comment (`#include "moe_live.cuh"  // why`) does not hide the dependency.
+/// Requiring the line to END with the closing quote did exactly that: the
+/// header dropped out of every hash that should have covered it, and a struct
+/// layout change rebuilt the kernels that read the struct but not the launcher
+/// that filled it.
+fn include_target(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("#include")?.trim_start();
+    let (path, _) = rest.strip_prefix('"')?.split_once('"')?;
+    Some(path)
+}
+
 /// Parse #include statements from a file and return list of included paths.
 /// include_dirs: list of -I paths to search (e.g., ["-Isrc", "-Isrc/quantized"])
 fn parse_includes(
@@ -606,59 +621,43 @@ fn parse_includes(
     let mut includes = Vec::new();
 
     for line in content.lines() {
-        let trimmed = line.trim();
+        let Some(quoted) = include_target(line) else {
+            continue;
+        };
 
-        if let Some(rest) = trimmed.strip_prefix("#include") {
-            let rest = rest.trim();
+        let file_dir = file_path.parent().unwrap_or(base_dir);
+        let mut found_path: Option<PathBuf> = None;
 
-            let quoted = if let Some(q) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                q
-            } else if rest
-                .strip_prefix('<')
-                .and_then(|s| s.strip_suffix('>'))
-                .is_some()
-            {
-                continue; // System include
-            } else {
-                continue;
-            };
-
-            let file_dir = file_path.parent().unwrap_or(base_dir);
-            let mut found_path: Option<PathBuf> = None;
-
-            // Try relative to file's directory first
-            let relative_path = file_dir.join(quoted);
-            if relative_path.exists() {
-                found_path = Some(relative_path.canonicalize()?);
-            } else {
-                // Try each include directory
-                for inc_dir in include_dirs {
-                    let dir = inc_dir.strip_prefix("-I").unwrap_or(inc_dir);
-                    let inc_path = base_dir.join(dir).join(quoted);
-                    if inc_path.exists() {
-                        found_path = Some(inc_path.canonicalize()?);
-                        break;
-                    }
+        // Try relative to file's directory first
+        let relative_path = file_dir.join(quoted);
+        if relative_path.exists() {
+            found_path = Some(relative_path.canonicalize()?);
+        } else {
+            // Try each include directory
+            for inc_dir in include_dirs {
+                let dir = inc_dir.strip_prefix("-I").unwrap_or(inc_dir);
+                let inc_path = base_dir.join(dir).join(quoted);
+                if inc_path.exists() {
+                    found_path = Some(inc_path.canonicalize()?);
+                    break;
                 }
             }
+        }
 
-            if let Some(path) = found_path {
-                includes.push(path);
-            } else {
-                if quoted.ends_with(".cu") || quoted.ends_with(".cuh") {
-                    panic!(
-                        "Include file not found: '{}' (referenced from {})\nSearched in:\n  - {}\n{}",
-                        quoted,
-                        file_path.display(),
-                        file_dir.display(),
-                        include_dirs
-                            .iter()
-                            .map(|d| format!("  - {}", d.strip_prefix("-I").unwrap_or(d)))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
-                }
-            }
+        if let Some(path) = found_path {
+            includes.push(path);
+        } else if quoted.ends_with(".cu") || quoted.ends_with(".cuh") {
+            panic!(
+                "Include file not found: '{}' (referenced from {})\nSearched in:\n  - {}\n{}",
+                quoted,
+                file_path.display(),
+                file_dir.display(),
+                include_dirs
+                    .iter()
+                    .map(|d| format!("  - {}", d.strip_prefix("-I").unwrap_or(d)))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
         }
     }
 
@@ -1548,6 +1547,23 @@ mod host_compiler_tests {
 
     /// CUDA 13.1 raises the floor and keeps the ceiling.
     const CUDA_131: &str = "#if _MSC_VER < 1920 || _MSC_VER >= 1950\n";
+
+    /// A quoted include is a dependency whatever follows its closing quote —
+    /// a trailing comment hid `moe_live.cuh` from the launcher's hash, so a
+    /// struct layout change rebuilt the kernels but not the launcher.
+    #[test]
+    fn an_include_with_a_trailing_comment_is_still_a_dependency() {
+        assert_eq!(
+            include_target(r#"#include "moe_live.cuh"       // the grouped launch's workers"#),
+            Some("moe_live.cuh")
+        );
+        assert_eq!(include_target(r#"#include "../kernel.cuh""#), Some("../kernel.cuh"));
+        assert_eq!(include_target(r#"  #include   "a/b.cuh" /* x */"#), Some("a/b.cuh"));
+        assert_eq!(include_target("#include <cuda.h>"), None);
+        assert_eq!(include_target("#include <cuda.h> // \"quoted\""), None);
+        assert_eq!(include_target("// #include \"commented_out.cuh\""), None);
+        assert_eq!(include_target("int x = 0;"), None);
+    }
 
     #[test]
     fn a_toolset_directory_maps_to_the_version_cudas_guard_tests() {

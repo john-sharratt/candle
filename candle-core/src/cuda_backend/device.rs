@@ -587,7 +587,7 @@ impl CudaDevice {
     /// Assemble `ptx` to this device's native SASS with the toolkit's `ptxas`
     /// and load the cubin — the fallback for a driver that refuses to JIT the
     /// toolkit's PTX ISA version (see [`Self::compile`]).
-    fn load_module_via_ptxas(
+    pub(crate) fn load_module_via_ptxas(
         &self,
         func_name: &str,
         ptx: &cudarc::nvrtc::Ptx,

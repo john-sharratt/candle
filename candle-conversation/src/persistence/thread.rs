@@ -1115,77 +1115,99 @@ fn run_pass(
     // wrote gids captured before the relocation back into the substrate. Snapshotted
     // under the guard, a group names exactly what the substrate names at that
     // moment, and no compaction can run until it is installed.
+    //
+    // **And a group is bounded, not a whole compression class.** A class is every
+    // pending residence that shares an override, which on a workload with one
+    // override is the entire backlog — so "per group" was per pass in practice,
+    // and the guard was held across the backlog's migrate, its device-wide fence
+    // and its install exactly when a mass retirement had produced both the backlog
+    // and the fragmentation. Measured on the Qwen3-30B engine probe: compaction
+    // refused 32–63 times a run while the pools sat at 41–64% efficiency through
+    // the bursts. `MAX_GROUP_RESIDENCES` per hold, and a refused pass — which sets
+    // `COMPACTION_WAITING` — gets in before the next one.
+    const MAX_GROUP_RESIDENCES: usize = 8;
     let mut deferred_groups = 0usize;
     let mut hot_to_warm_bytes: u64 = 0;
     let mut hot_to_warm_count: usize = 0;
     let mut install_ms = 0u64;
-    for cc in policies {
-        let Some(group_guard) = candle_nn::kv_cache::try_migrate_flight() else {
-            deferred_groups += 1;
-            continue;
-        };
-        let group: Vec<(ResidenceIndex, Vec<SealedSequence>)> = conversation
-            .read()
-            .snapshot_pending_warm_for(cc)
-            .into_iter()
-            .filter(|(idx, hot)| {
-                let whole = hot.len() == n_layers;
-                if !whole {
-                    tracing::warn!("persist: hot→warm layer-count mismatch for {idx:?} — skipping");
-                }
-                whole
-            })
-            .collect();
-        let effective = if single_latent {
-            None
-        } else {
-            effective_turn_policy(compression_policy, cc)
-        };
-        let mut installs = Vec::new();
-        migrate_group_hot_to_warm(
-            backings,
-            device,
-            copy_stream,
-            effective.as_ref(),
-            &group,
-            pinned_scratch,
-            n_layers,
-            &mut installs,
-            &mut quantize_ms,
-            &mut copy_ms,
-            &mut select_ms,
-            &mut alloc_ms,
-            &mut convert_ms,
-        );
-        // The fence that makes the install and the release safe: the group's
-        // Q-format arenas are written and its captured addresses retired.
-        //
-        // Device-wide (not just primary-stream): the reproject on the scheduler
-        // thread reads these freshly-installed Q-arenas for the NEXT turn's
-        // context, and if any of the convert's V work retires on a stream the
-        // primary-stream sync doesn't cover, the reproject captures incomplete V
-        // (K, whose convert retires earlier, is fine) — the V-only multi-turn
-        // duplication corruption.
-        if let Err(e) = device.synchronize() {
-            tracing::warn!(
-                "cache: device sync after a hot→warm group failed: {e:?} (last CUDA \
-                 kernel on this thread: {})",
-                candle::last_cuda_kernel_launch()
+    'policies: for cc in policies {
+        loop {
+            let Some(group_guard) = candle_nn::kv_cache::try_migrate_flight() else {
+                deferred_groups += 1;
+                continue 'policies;
+            };
+            let mut group: Vec<(ResidenceIndex, Vec<SealedSequence>)> = conversation
+                .read()
+                .snapshot_pending_warm_for(cc)
+                .into_iter()
+                .filter(|(idx, hot)| {
+                    let whole = hot.len() == n_layers;
+                    if !whole {
+                        tracing::warn!(
+                            "persist: hot→warm layer-count mismatch for {idx:?} — skipping"
+                        );
+                    }
+                    whole
+                })
+                .collect();
+            let more = group.len() > MAX_GROUP_RESIDENCES;
+            group.truncate(MAX_GROUP_RESIDENCES);
+            let effective = if single_latent {
+                None
+            } else {
+                effective_turn_policy(compression_policy, cc)
+            };
+            let mut installs = Vec::new();
+            migrate_group_hot_to_warm(
+                backings,
+                device,
+                copy_stream,
+                effective.as_ref(),
+                &group,
+                pinned_scratch,
+                n_layers,
+                &mut installs,
+                &mut quantize_ms,
+                &mut copy_ms,
+                &mut select_ms,
+                &mut alloc_ms,
+                &mut convert_ms,
             );
-            // This group's GPU work is suspect — install none of it, and queue
-            // nothing more behind a device that is not answering.
-            drop(installs);
+            // The fence that makes the install and the release safe: the group's
+            // Q-format arenas are written and its captured addresses retired.
+            //
+            // Device-wide (not just primary-stream): the reproject on the scheduler
+            // thread reads these freshly-installed Q-arenas for the NEXT turn's
+            // context, and if any of the convert's V work retires on a stream the
+            // primary-stream sync doesn't cover, the reproject captures incomplete V
+            // (K, whose convert retires earlier, is fine) — the V-only multi-turn
+            // duplication corruption.
+            if let Err(e) = device.synchronize() {
+                tracing::warn!(
+                    "cache: device sync after a hot→warm group failed: {e:?} (last CUDA \
+                     kernel on this thread: {})",
+                    candle::last_cuda_kernel_launch()
+                );
+                // This group's GPU work is suspect — install none of it, and queue
+                // nothing more behind a device that is not answering.
+                drop(installs);
+                drop(group);
+                drop(group_guard);
+                break 'policies;
+            }
+            let t_install = std::time::Instant::now();
+            let (bytes, count) = install_hot_to_warm(conversation, installs);
+            install_ms += t_install.elapsed().as_millis() as u64;
+            hot_to_warm_bytes = hot_to_warm_bytes.saturating_add(bytes);
+            hot_to_warm_count += count;
             drop(group);
             drop(group_guard);
-            break;
+            // Nothing installed means the group could not move this pass, and
+            // re-snapshotting would hand back the same residences.
+            if !more || count == 0 {
+                break;
+            }
         }
-        let t_install = std::time::Instant::now();
-        let (bytes, count) = install_hot_to_warm(conversation, installs);
-        install_ms += t_install.elapsed().as_millis() as u64;
-        hot_to_warm_bytes = hot_to_warm_bytes.saturating_add(bytes);
-        hot_to_warm_count += count;
-        drop(group);
-        drop(group_guard);
     }
     if deferred_groups > 0 {
         tracing::debug!(

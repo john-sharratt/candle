@@ -578,6 +578,26 @@ impl WarmPool {
         }
     }
 
+    /// Address of slot `slot_idx`'s first byte. Pinned memory from
+    /// `cuMemAllocHost` is mapped into the device's address space at the same
+    /// address (unified addressing), so this is also where a kernel reads it.
+    #[inline]
+    pub(crate) fn slot_addr(&self, slot_idx: usize) -> u64 {
+        assert!(
+            slot_idx < self.num_slots,
+            "warm tier: slot {slot_idx} is past the pool's {} slots",
+            self.num_slots,
+        );
+        self.base as u64 + (slot_idx * self.slot_size) as u64
+    }
+
+    /// The pool's addresses, `[lo, hi)` — what a device-side classifier tests
+    /// an entry against to know it names this pool.
+    #[inline]
+    pub(crate) fn range(&self) -> (u64, u64) {
+        (self.base as u64, self.base as u64 + self.total_size as u64)
+    }
+
     /// Total number of slots.
     #[inline]
     pub(crate) fn num_slots(&self) -> usize {

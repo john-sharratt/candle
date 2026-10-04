@@ -248,7 +248,7 @@ impl DsparkStreamingMoe {
                 .map_err(|_| candle::Error::Msg("dspark bucketize workspace poisoned".into()))?;
             // Routing indices → device tile tables (gather lists, grouped-GEMM tiles, scatter
             // segments) in one launch, no GPU→CPU round-trip.
-            moe_bucketize(&indices, ne, GROUPED_GEMM_TILE_W, &mut ws)?;
+            moe_bucketize(&indices, ne, GROUPED_GEMM_TILE_W, &mut ws, None, t_tok)?;
             let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + ne);
             let stacked =
                 fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &self.cuda_dev, Backing::Owned)?;
@@ -263,6 +263,8 @@ impl DsparkStreamingMoe {
                 &ws.tile_b_start,
                 &ws.tile_b_cnt,
                 launch_tiles,
+                2,
+                None,
                 &self.cuda_dev,
             )?;
             let up_out = grouped_qmatmul_dev_q8a128(
@@ -276,6 +278,8 @@ impl DsparkStreamingMoe {
                 &ws.tile_b_start,
                 &ws.tile_b_cnt,
                 launch_tiles,
+                2,
+                None,
                 &self.cuda_dev,
             )?;
             // Raw Σx — a language model's SwiGLU intermediate stays orders of
@@ -299,6 +303,8 @@ impl DsparkStreamingMoe {
                 &ws.tile_b_start,
                 &ws.tile_b_cnt,
                 launch_tiles,
+                2,
+                None,
                 &self.cuda_dev,
             )?
             .to_dtype(candle::DType::F32)?;

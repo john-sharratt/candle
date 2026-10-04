@@ -472,12 +472,12 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \
     const int* __restrict__ tile_b_cnt, \
     const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
     const int ncols_x, const int nrows_x, const int y_stride, const int dst_stride, \
-    const int row_fast, const int sum_norm) { \
+    const int row_fast, const int sum_norm, const MoeLive live) { \
     /* N_SUB=2: mode-2 Bm=32 weight-reuse. Tiles are built ≤32 tokens/expert (cuda.rs); */ \
     /* a ≤16-token tile runs one sub-tile and writes nothing for the empty one. */ \
     grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 2>( \
         weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
-        vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm); \
+        vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm, live); \
 }
 
 /* Wide-Bm grouped twins for the PREFILL regime (many rows per expert): each
@@ -500,10 +500,10 @@ extern "C" __global__ void LAUNCH_BOUNDS_ITER name##_grouped_m4( \
     const int* __restrict__ tile_b_cnt, \
     const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
     const int ncols_x, const int nrows_x, const int y_stride, const int dst_stride, \
-    const int row_fast, const int sum_norm) { \
+    const int row_fast, const int sum_norm, const MoeLive live) { \
     grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 4>( \
         weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
-        vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm); \
+        vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm, live); \
 }
 
 #define INSTANTIATE_KERNEL_GROUPED_INT8_M8(name, qk, qi, block_type, vdr, dst_t) \
@@ -514,10 +514,10 @@ extern "C" __global__ void LAUNCH_BOUNDS_VSMALL name##_grouped_m8( \
     const int* __restrict__ tile_b_cnt, \
     const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
     const int ncols_x, const int nrows_x, const int y_stride, const int dst_stride, \
-    const int row_fast, const int sum_norm) { \
+    const int row_fast, const int sum_norm, const MoeLive live) { \
     grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 8>( \
         weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
-        vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm); \
+        vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm, live); \
 }
 
 // Generate all 16 TC32 kernels (tc32_0 through tc32_15)

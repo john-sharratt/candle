@@ -62,7 +62,6 @@
 
 use std::marker::PhantomData;
 
-use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
 use candle::cuda_backend::cudarc::driver::{
     CudaSlice, CudaStream, DevicePtr, DeviceRepr, SyncOnDrop,
 };
@@ -204,12 +203,10 @@ pub(crate) fn wave_root(wave: Option<&WaveGeneration>) -> candle::cuda_backend::
 /// provenance, and a root is by definition something whose every byte is about
 /// to be written from somewhere else.
 ///
-/// There is deliberately **no zeroing counterpart taking the guard**. The one
-/// caller that had one was the MoE combine target, on the belief that the
-/// deterministic scatter accumulated into it; the scatter defines every element
-/// it touches, so the memset was writing the exact bytes the kernel was about to
-/// stamp. [`wave_zeros_ticketed`] remains only for the degenerate
-/// nothing-was-routed path, where no kernel writes the target at all.
+/// There is deliberately **no zeroing counterpart**. The one caller that had one
+/// was the MoE combine target, on the belief that the deterministic scatter
+/// accumulated into it; the scatter defines every element it touches, so the
+/// memset was writing the exact bytes the kernel was about to stamp.
 ///
 /// **This is the constructor for a provenance root that has no device operand to
 /// inherit from.** `Tensor::empty` can only produce an `Owned` tensor, and
@@ -378,19 +375,16 @@ pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<S
 
 /// [`wave_empty`] for a holder of a [`WaveTicket`] rather than of the guard.
 ///
-/// The uninitialised twin of [`wave_zeros_ticketed`], and sound for exactly the
-/// reasons given there — the expert-pipeline thread cannot borrow the
-/// generation, but the ticket is a `Copy` coordinate that crosses the channel
-/// and the submitting thread blocks on the response throughout.
-///
-/// It issues **no driver call at all**, which is the whole point: no memset, and
-/// therefore none of `wave_zeros_ticketed`'s context binding either (that exists
-/// only because `memset_d8_async` takes its context from the calling thread).
+/// The ticket is a `Copy` coordinate of an open generation, so a caller that
+/// cannot borrow the generation itself can still carve from its arena. The
+/// result is a `Tensor`, i.e. `'static`; that is sound because it **owns
+/// nothing** — it is a lease, so its drop frees nothing — and the wave's own
+/// reset reclaims the range. A ticket whose generation has already closed
+/// resolves to `None` and this allocates from the pool. It issues no driver
+/// call.
 ///
 /// SAFETY / CONTRACT: as [`candle::Tensor::empty`] — every element must be
-/// written before it is read. The MoE combine target qualifies because the
-/// deterministic scatter stores every `(token, column)` of it; a caller that
-/// might skip that launch must zero the target itself.
+/// written before it is read.
 pub(crate) fn wave_empty_ticketed<S: Into<Shape>>(
     shape: S,
     dtype: DType,
@@ -409,57 +403,5 @@ pub(crate) fn wave_empty_ticketed<S: Into<Shape>>(
     // arena, and no other claimant holds that range within this generation. The
     // lease frees nothing on drop, so the range's only reclaim is the
     // generation's reset.
-    unsafe { Tensor::from_leased_cuda_ptr(ptr, dtype, shape, device, LeaseOrigin::Wave(ticket)) }
-}
-
-/// A **zeroed** wave range for a holder of a [`WaveTicket`] rather than of the
-/// guard.
-///
-/// One caller, and it is a narrow one: the expert pipeline's
-/// nothing-was-routed path, where the deterministic scatter never launches and
-/// so nothing defines the combine target. Every other MoE target takes
-/// [`wave_empty_ticketed`], because the scatter writes all of it.
-///
-/// The expert-pipeline thread is the caller that needs this. It cannot borrow
-/// the generation — a `&WaveGeneration` does not cross a channel — but the
-/// ticket is a `Copy` coordinate and does, and the submitting thread blocks on
-/// the response for the whole request, so the generation is open throughout.
-///
-/// The result is a `Tensor`, i.e. `'static`, because it is handed back over the
-/// same channel. That is sound for the same reason the ticket is: the tensor
-/// **owns nothing** — it is a lease, so its drop frees nothing — and the wave's
-/// own reset reclaims the range. A ticket whose generation has already closed
-/// resolves to `None` and this allocates from the pool, which is a correct
-/// answer rather than a fallback.
-pub(crate) fn wave_zeros_ticketed<S: Into<Shape>>(
-    shape: S,
-    dtype: DType,
-    device: &Device,
-    ticket: Option<WaveTicket>,
-) -> Result<Tensor> {
-    let shape = shape.into();
-    let bytes = shape.elem_count() * dtype.size_in_bytes();
-    let (Device::Cuda(cuda), Some(ticket)) = (device, ticket) else {
-        return Tensor::zeros(shape, dtype, device);
-    };
-    let Some(ptr) = wave_alloc(ticket, bytes, WAVE_ALIGN) else {
-        return Tensor::zeros(shape, dtype, device);
-    };
-    let stream = cuda.cuda_stream();
-    // `memset_d8_async` is a raw driver call, and the driver takes its context
-    // from the calling thread. A caller on the forward thread would get away
-    // without this, since candle has already bound a context there; this runs
-    // on the expert-pipeline thread, which has not, and the call fails with
-    // `CUDA_ERROR_INVALID_CONTEXT`. Binding is idempotent.
-    stream
-        .context()
-        .bind_to_thread()
-        .map_err(|e| candle::Error::Msg(format!("binding the device context: {e}")))?;
-    // SAFETY: `ptr` addresses `bytes` the resolver just carved from the ticket's
-    // arena, and no other claimant holds that range within this generation.
-    unsafe { memset_d8_async(ptr, 0, bytes, stream.cu_stream()) }
-        .map_err(|e| candle::Error::Msg(format!("zeroing a wave buffer: {e}")))?;
-    // SAFETY: as above. The lease frees nothing on drop, so the range's only
-    // reclaim is the generation's reset.
     unsafe { Tensor::from_leased_cuda_ptr(ptr, dtype, shape, device, LeaseOrigin::Wave(ticket)) }
 }
