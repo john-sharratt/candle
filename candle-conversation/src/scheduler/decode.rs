@@ -3,6 +3,7 @@ use super::named_tool::steer_to_named_tool;
 use super::spec_chooser::SpecChooser;
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
+use crate::stats::streams_committed;
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use candle_transformers::models::speculative_choice::{AcceptWalk, TokenChooser};
 
@@ -323,6 +324,7 @@ impl Scheduler {
                             Self::log_stencil_finish(id.0, d, "completed");
                         }
                         s.stencil = None;
+                        s.wrote_tool_call = true;
                         s.finished = true;
                     }
                     break;
@@ -667,18 +669,19 @@ impl Scheduler {
         // Reads the scored rows back and advances each sequence by what the wave
         // actually wrote — the walk below rolls the rejected tail off again.
         let _accept_span = profile::span("decode:end_verify_and_sample");
-        let (plain_rows, spec_rows) =
-            match self
-                .model
+        let verified = {
+            let _g = profile::span("decode:end_verify");
+            self.model
                 .end_verify(&mut self.session, &plain, &spec_seqs, &spec_blocks, logits)
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    self.model.abort_verify(&spec_seqs);
-                    self.fail_all_decodes(&seq_ids, &format!("verify readback failed: {e}"));
-                    return;
-                }
-            };
+        };
+        let (plain_rows, spec_rows) = match verified {
+            Ok(r) => r,
+            Err(e) => {
+                self.model.abort_verify(&spec_seqs);
+                self.fail_all_decodes(&seq_ids, &format!("verify readback failed: {e}"));
+                return;
+            }
+        };
         // Scored rows per sequence in cohort order: one for a plain row, one per
         // block position for a verify member.
         let mut rows_of: Vec<Vec<Tensor>> = vec![Vec::new(); blocks.len()];
@@ -811,6 +814,7 @@ impl Scheduler {
             })
             .collect();
         let walked = {
+            let _g = profile::span("decode:accept_walk");
             let eos = &self.eos_tokens;
             let breaks = &self.page_break_tokens;
             let tokenizer = &self.tokenizer;
@@ -826,7 +830,10 @@ impl Scheduler {
                     .iter()
                     .map(|&i| rows_of[i][walk.position()].clone())
                     .collect();
-                let stacked = match Tensor::cat(&picked, 0) {
+                let cat_span = profile::span("walk:cat");
+                let stacked = Tensor::cat(&picked, 0);
+                cat_span.end();
+                let stacked = match stacked {
                     Ok(t) => t,
                     Err(e) => {
                         failure = Some(e);
@@ -1758,6 +1765,14 @@ impl Scheduler {
                     }
                 }
 
+                // Emit the raw token ID — the turn's last one included, unless it
+                // is the EOS that ends it. If the caller dropped the handle, stop
+                // generating.
+                if streams_committed(is_eos)
+                    && state.event_tx.send(TurnEvent::Token(next_token)).is_err()
+                {
+                    state.finished = true;
+                }
                 if let Some(finish) = FinishReason::after_token(
                     is_eos,
                     state.generated_tokens.len(),
@@ -1765,12 +1780,6 @@ impl Scheduler {
                 ) {
                     state.finish = finish;
                     state.finished = true;
-                } else {
-                    // Emit the raw token ID. If the caller dropped the handle,
-                    // stop generating.
-                    if state.event_tx.send(TurnEvent::Token(next_token)).is_err() {
-                        state.finished = true;
-                    }
                 }
 
                 // ── Continuous re-projection triggers ─────────────────────────
@@ -1810,6 +1819,7 @@ impl Scheduler {
                             Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
                             state.non_punct_since_reproject = 0;
                             state.in_tool_call = true;
+                            state.wrote_tool_call = true;
                         } else if is_tool_close {
                             // Leaving the call: reprojection re-enables for whatever
                             // follows (further calls, or the seal).

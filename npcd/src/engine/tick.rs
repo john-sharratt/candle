@@ -1158,11 +1158,7 @@ impl Scheduler {
 
     /// Take entries out of a character's journal. Returns the ids that were held
     /// and the journal as it now reads, or `None` for a character nobody has woken.
-    pub fn journal_forget(
-        &self,
-        npc_id: u64,
-        ids: &[u64],
-    ) -> Option<(Vec<u64>, JournalPrompt)> {
+    pub fn journal_forget(&self, npc_id: u64, ids: &[u64]) -> Option<(Vec<u64>, JournalPrompt)> {
         self.journal_of_mut(npc_id, |j| {
             let gone = j.forget(ids);
             (gone, j.prompt())

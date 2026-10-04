@@ -56,7 +56,9 @@ extern "C" void run_batched_sampling_f32(
     uint64_t seed,
     uint64_t* rng_offsets,
     // Per-sequence dials ([batch_size] of SeqDials) or null — see SeqDials.
-    const void* seq_dials
+    const void* seq_dials,
+    // The caller's stream; every launch is ordered on it.
+    void* stream
 ) {
     launch_batched_sampling_typed<float>(
         logits, batch_size, vocab_size,
@@ -74,6 +76,7 @@ extern "C" void run_batched_sampling_f32(
         stencil, stencil_size,
         temperature, top_k, top_p,
         output_tokens, seed, rng_offsets,
-        reinterpret_cast<const SeqDials*>(seq_dials)
+        reinterpret_cast<const SeqDials*>(seq_dials),
+        static_cast<cudaStream_t>(stream)
     );
 }

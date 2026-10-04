@@ -5,7 +5,9 @@
 //! that has one converts into this, so a test case and a command line reach the same
 //! function by the same route.
 
+use super::batch::BatchTiming;
 use super::profile::{ModelProfile, StoryGate};
+use candle_transformers::models::batch_test::utils::ExtraRow;
 
 /// One probe run's configuration.
 #[derive(Clone, Debug)]
@@ -44,6 +46,24 @@ pub struct Probe {
     pub drain_secs: u64,
     /// Tokens each phase-B sequence decodes.
     pub batch_decode: usize,
+    /// The engine's KV compression level, `C<n>` — the level every phase runs at.
+    pub compression_level: u8,
+    /// Sessions in the clean baseline batch, run on the fresh engine before any churn.
+    ///
+    /// **The baseline is the forward gate's `C5 ×8` row, through the engine.** Same
+    /// prompts, same names, same compression level, same width, same token count, timed
+    /// with the gate's two windows — so the gap between that gate row and this one is
+    /// what the engine costs, and it is the number to optimise against.
+    pub baseline_width: usize,
+    /// Tokens each baseline session generates, the first included — the generate
+    /// count of the gate row it is compared with (`kv_fragmentation`'s long C5 ×8
+    /// row, run at this same count).
+    ///
+    /// **Long enough for decode to be measured, not sampled.** At the ladder's 10
+    /// tokens the decode window is ~4 speculative steps, ~80 ms, so one compaction
+    /// pass or one scheduling hiccup landing in it moved decode by 20%. At 64 the
+    /// window is long enough that per-step cost is what it reports.
+    pub baseline_decode: usize,
 }
 
 impl Probe {
@@ -64,6 +84,9 @@ impl Probe {
             straggler_hold_secs: 20,
             drain_secs: 40,
             batch_decode: 48,
+            compression_level: 5,
+            baseline_width: 8,
+            baseline_decode: 64,
         }
     }
 
@@ -97,7 +120,8 @@ impl Probe {
             .clone()
             .builder()
             .max_concurrent(self.profile.max_concurrency + self.profile.batch + 4)
-            .max_seq_len(self.profile.max_seq_len);
+            .max_seq_len(self.profile.max_seq_len)
+            .compression_level(self.compression_level);
         // **The expert pack lives beside the checkpoint, and naming it is the difference
         // between a read and a repack.** The pack is derived once from the GGUF's experts
         // and persists; unnamed, the load re-derives it every run — 62 GiB of work on
@@ -113,6 +137,33 @@ impl Probe {
             // Unresolvable here is not this function's to report: the caller resolves
             // again and fails with the real error.
             Err(_) => builder,
+        }
+    }
+}
+
+/// The clean baseline batch: the gate's `C<level> ×width` row, through the engine.
+#[derive(Clone, Copy, Debug)]
+pub struct BaselineRow {
+    pub level: u8,
+    pub width: usize,
+    pub timing: BatchTiming,
+    pub story_pass: usize,
+}
+
+impl BaselineRow {
+    /// This batch as a row for the batched comparison table, labelled with the gate
+    /// row it reproduces.
+    pub fn as_table_row(&self) -> ExtraRow {
+        ExtraRow {
+            label: format!("eng C{}×{}", self.level, self.width),
+            contexts: self.width,
+            prompt_tokens_per_sec: self.timing.prefill_tps(),
+            generate_tokens_per_sec: self.timing.decode_tps(),
+            valid: Some((self.story_pass, self.width)),
+            compression_ratio: None,
+            peak_tokens: self.timing.peak_tokens,
+            frontier_regions: None,
+            efficiency_pct: None,
         }
     }
 }
@@ -148,6 +199,8 @@ pub struct ProbeOutcome {
     pub frontier_regions: usize,
     pub efficiency_pct: usize,
     pub peak_tokens: usize,
+    /// The clean baseline batch, measured on the fresh engine before phase A.
+    pub baseline: BaselineRow,
     /// One line per failed gate, in the order the gates are stated.
     pub failures: Vec<String>,
 }
@@ -161,11 +214,8 @@ impl ProbeOutcome {
     ///
     /// `label` names what produced it — the shape, not the KV mode, since an engine row
     /// is one workload rather than one format.
-    pub fn as_table_row(
-        &self,
-        label: impl Into<String>,
-    ) -> candle_transformers::models::batch_test::utils::ExtraRow {
-        candle_transformers::models::batch_test::utils::ExtraRow {
+    pub fn as_table_row(&self, label: impl Into<String>) -> ExtraRow {
+        ExtraRow {
             label: label.into(),
             contexts: self.story_total,
             prompt_tokens_per_sec: self.prefill_tps,
@@ -196,7 +246,7 @@ impl ProbeOutcome {
     pub fn assert_passed(&self) {
         assert!(
             self.passed(),
-            "{} of 3 probe gates failed:\n  {}",
+            "{} probe gate(s) failed:\n  {}",
             self.failures.len(),
             self.failures.join("\n  "),
         );
@@ -205,7 +255,7 @@ impl ProbeOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::ProbeOutcome;
+    use super::{BaselineRow, BatchTiming, ProbeOutcome};
 
     fn outcome(weight_uptake_pct: usize, weight_at_limit: bool) -> ProbeOutcome {
         ProbeOutcome {
@@ -220,8 +270,41 @@ mod tests {
             frontier_regions: 0,
             efficiency_pct: 0,
             peak_tokens: 0,
+            baseline: BaselineRow {
+                level: 5,
+                width: 8,
+                timing: BatchTiming::from_sessions(&[]),
+                story_pass: 8,
+            },
             failures: Vec::new(),
         }
+    }
+
+    /// The baseline row names the gate row it reproduces and carries its two windows'
+    /// rates, so it reads beside that row in the comparison table.
+    #[test]
+    fn the_baseline_row_is_labelled_with_the_gate_row_it_reproduces() {
+        let row = BaselineRow {
+            level: 5,
+            width: 8,
+            timing: BatchTiming {
+                prefill_tokens: 8000,
+                prefill_s: 2.0,
+                decode_tokens: 72,
+                decode_s: 0.5,
+                complete_s: 0.7,
+                streamed_tokens: 80,
+                peak_tokens: 9123,
+            },
+            story_pass: 7,
+        }
+        .as_table_row();
+        assert_eq!(row.label, "eng C5×8");
+        assert_eq!(row.contexts, 8);
+        assert_eq!(row.prompt_tokens_per_sec, 4000.0);
+        assert_eq!(row.generate_tokens_per_sec, 144.0);
+        assert_eq!(row.valid, Some((7, 8)));
+        assert_eq!(row.peak_tokens, 9123, "every session's whole context");
     }
 
     #[test]

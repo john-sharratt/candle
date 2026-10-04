@@ -55,7 +55,9 @@ extern "C" void run_batched_sampling_f16(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    // The caller's stream; every launch is ordered on it.
+    void* stream
 ) {
     launch_batched_sampling_typed<half>(
         logits, batch_size, vocab_size,
@@ -73,6 +75,7 @@ extern "C" void run_batched_sampling_f16(
         stencil, stencil_size,
         temperature, top_k, top_p,
         output_tokens, seed, rng_offsets,
-        reinterpret_cast<const SeqDials*>(seq_dials)
+        reinterpret_cast<const SeqDials*>(seq_dials),
+        static_cast<cudaStream_t>(stream)
     );
 }

@@ -73,9 +73,9 @@ pub fn writing(span: &Span, refused: Option<(&str, &str)>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::DAY_MS;
     use crate::engine::event::{Event, EventKind, Salience};
     use crate::engine::journal::state::JournalState;
-    use crate::clock::DAY_MS;
     use crate::engine::window::Window;
 
     const MINUTE_MS: u64 = 60_000;

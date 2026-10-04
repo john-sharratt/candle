@@ -74,6 +74,7 @@ extern "C" {
     ///   `seq_dials[row]`, so a batched wave that mixes configs samples each row
     ///   on its own dials instead of the first row's. Null keeps the shared-scalar
     ///   behaviour.
+    /// - `stream`: the `CUstream` every launch is queued on.
     pub fn run_batched_sampling(
         logits: *const c_void,
         batch_size: i32,
@@ -121,5 +122,18 @@ extern "C" {
         seed: u64,
         rng_offsets: *mut u64,
         seq_dials: *const c_void,
+        stream: *mut c_void,
+    );
+
+    /// `table[offsets[i]] = values[i]` for `i < n`, or `= 0` when `values` is
+    /// null, queued on `stream`. The offsets must be distinct. Stamps a
+    /// dispatch's nonzero counts into the sampler's resident count table, and
+    /// clears the same offsets back to zero afterwards.
+    pub fn run_stamp_counts(
+        offsets: *const u32,
+        values: *const u32,
+        n: u32,
+        table: *mut u32,
+        stream: *mut c_void,
     );
 }

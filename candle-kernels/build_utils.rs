@@ -148,13 +148,14 @@ const QUANTIZED_KERNELS: [&str; 46] = [
 ];
 
 // Flash-attention kernels: 12 total
-const FLASH_KERNELS: [&str; 21] = [
-    // Batched sampling (1 api + 4 variants)
+const FLASH_KERNELS: [&str; 22] = [
+    // Batched sampling (1 api + 4 variants) and its count-table stamp
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
     "src/sampling/batched_sampling_f16.cu",
     "src/sampling/batched_sampling_bf16.cu",
     "src/sampling/batched_sampling_fp8_e4m3.cu",
+    "src/sampling/count_table.cu",
     // Paged decode: a thin per-dtype dispatcher, plus one TU per head dim.
     //
     // Separate files because nvcc compiles a translation unit serially and each

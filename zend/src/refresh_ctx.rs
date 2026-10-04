@@ -36,11 +36,10 @@ pub struct RefreshContext<'a> {
     /// identically to a live dialogue turn (`InferenceState::load`'s
     /// `formatted_prompt`).
     pub formatted_prompt: &'a str,
-    /// Tool-call grammar + `<think>` steering for `ThinkMode::Quick` — the
-    /// lowest thinking level, not fully off: a hidden ingest conversation with
-    /// no room to reason at all was measured skipping its `file_read` call
-    /// entirely and guessing a summary from the filename. Compiled from the
-    /// REAL tool catalog (not an empty placeholder) — see `turn_triggers`.
+    /// Tool-call grammar + `<think>` steering for `ThinkMode::Off`, whose tree
+    /// closes a think block on the token after it opens — the same steering
+    /// repo_map's folder summaries run under. Compiled from the REAL tool
+    /// catalog (not an empty placeholder) — see `turn_triggers`.
     pub think_triggers: Arc<TriggerRegistry>,
     /// Tool-execution context a hidden ingest conversation's real `file_read`
     /// calls run against — read-only grants, the daemon's own workspace

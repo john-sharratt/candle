@@ -1004,6 +1004,38 @@ impl WaveRate {
         }
     }
 
+    /// Offer a prefill that **joins a forward whose rows are already spent** —
+    /// a turn admitted to share the coming forwards rather than to widen this
+    /// one.
+    ///
+    /// It adds no row to this forward, so the prefill model has no gain to
+    /// weigh: [`Self::judge_prefill`] would compare the same rows at a lower
+    /// residency and call it `Worse`, though the turn's work runs at that
+    /// residency whenever it is admitted. What joining changes is the cohort —
+    /// its prefill shares the forwards the others are already taking, and its
+    /// decode steps beside theirs instead of a whole cohort later — and that
+    /// judgement is the decode model's, asked by the caller through
+    /// [`Self::decode_would_carry`] before this. What stays here is the line
+    /// every admission respects: residency may not fall under the prefill
+    /// floor. A refusal latches [`Self::is_full`], as any other does.
+    pub fn try_join(&mut self, weights_after: u64) -> Admit {
+        if self.full {
+            return Admit::Refused(Refusal::Full);
+        }
+        if self.admitted_any && weights_after < self.prefill_floor {
+            self.full = true;
+            return Admit::Refused(Refusal::Floor {
+                resident_after: weights_after,
+                floor: self.prefill_floor,
+            });
+        }
+        self.admitted_any = true;
+        self.resident_now = weights_after;
+        Admit::Admitted {
+            projected: self.rate(self.tokens, weights_after),
+        }
+    }
+
     /// Whether the decode a prefill is going to become could be carried at
     /// `resident` — asked **while judging that prefill**, so the turn is priced
     /// by both models at the one moment a refusal is still cheap.
@@ -1189,10 +1221,33 @@ impl WaveRate {
         let projected = self.rate(tokens_after, after);
         if self.tokens > 0 {
             let current = self.rate(self.tokens, before);
-            Self::judge_gain(current, projected, self.min_gain)?;
+            Self::judge_gain(current, projected, self.prefill_min_gain(before, after))?;
         }
         self.tokens = tokens_after;
         Ok(projected)
+    }
+
+    /// The minimum gain a prefill offer must buy: [`Self::min_gain`] when it spends
+    /// residency a forward will then have to copy, and nothing when it does not.
+    ///
+    /// **The minimum exists to protect residency, so it applies only where residency
+    /// is spent.** A prefill row that dislodges nothing the forward must copy costs the
+    /// wave only its own compute — and a queued prompt pays that compute whenever it
+    /// runs. Refusing it does not save the work, it moves it into a later wave that
+    /// pays every per-wave cost again: its own forward, its first-token finalise, and
+    /// its own decode and seal round, queued behind this one's. Measured on the
+    /// Qwen3.6-35B-A3B with every expert resident: eight turns submitted together, the
+    /// fifth refused `Saturated { gain: 0.009 }`, and the second four waited out the
+    /// first four's whole decode and seal before their prefill finished.
+    ///
+    /// The `Worse` rule still holds either way — an offer that lowers the wave's rate
+    /// is refused whatever it costs.
+    fn prefill_min_gain(&self, before: u64, after: u64) -> f64 {
+        if self.non_resident_bytes(after) > self.non_resident_bytes(before) {
+            self.min_gain
+        } else {
+            0.0
+        }
     }
 
     fn judge_decode(
@@ -1597,6 +1652,43 @@ mod tests {
     fn promote(p: &mut WaveRate, draft: usize, held: u64) -> Admit {
         let after = p.resident_now();
         p.judge_promotion(draft, after.saturating_add(held), after)
+    }
+
+    /// **A turn joining a spent forward adds no rows and is judged by the floor
+    /// alone.** The wave's rows are full at the cap; the join keeps them there,
+    /// lowers residency by what it dislodges, and is admitted while that stays
+    /// above the prefill floor — where `try_admit` would have read the same rows
+    /// at lower residency as `Worse`.
+    #[test]
+    fn a_join_adds_no_rows_and_is_refused_only_under_the_floor() {
+        let floor = 4 * GIB;
+        let mut p = planner(LINK_4090_MOBILE);
+        p.reset(8 * GIB, floor, floor, CAP, DECODE_CAP);
+        assert!(matches!(
+            offer(&mut p, prefill(CAP), 0),
+            Admit::Admitted { .. }
+        ));
+        let rows = p.tokens();
+        assert!(matches!(
+            p.try_admit(prefill(0), 8 * GIB, 7 * GIB),
+            Admit::Refused(Refusal::Worse { .. })
+        ));
+
+        let mut p = planner(LINK_4090_MOBILE);
+        p.reset(8 * GIB, floor, floor, CAP, DECODE_CAP);
+        let _ = offer(&mut p, prefill(CAP), 0);
+        assert!(matches!(p.try_join(5 * GIB), Admit::Admitted { .. }));
+        assert_eq!(p.tokens(), rows, "a join adds no rows");
+        assert_eq!(p.resident_now(), 5 * GIB);
+        assert!(matches!(
+            p.try_join(floor - 1),
+            Admit::Refused(Refusal::Floor { resident_after, floor: f })
+                if resident_after == floor - 1 && f == floor
+        ));
+        assert!(
+            matches!(p.try_join(6 * GIB), Admit::Refused(Refusal::Full)),
+            "a refused join latches the wave like any refusal"
+        );
     }
 
     /// **A latched wave must not decide a promotion.** `try_admit` refuses
@@ -2198,6 +2290,29 @@ mod tests {
         assert!(p.resident_now() > 8 * GIB + GIB, "well short of the floor");
         assert!(p.tokens() < 65_536, "well short of the cap");
         assert!(admitted >= 2, "at least the first couple always pay");
+    }
+
+    /// **A prefill that spends no residency a forward must copy is never refused as
+    /// saturated.** Every expert resident with room to spare — the 72 GiB card under
+    /// the 35B-A3B — so each offer's dislodge leaves the copy at zero: the rate is
+    /// flat, the gain is zero, and only the cap ends the wave. Refusing at the second
+    /// offer would defer queued prompts into later waves that pay every per-wave cost
+    /// again.
+    #[test]
+    fn a_prefill_that_spends_no_copied_residency_runs_to_the_cap() {
+        let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
+        let mut p = planner(LINK_BLACKWELL).with_min_gain(0.01);
+        // Far more resident than the experts need: dislodging 256 MiB an offer never
+        // brings a single expert byte back onto the bus.
+        let resident = total + 40 * GIB;
+        p.reset(resident, 8 * GIB, 8 * GIB, 4096, DECODE_CAP);
+        let (admitted, refusal) = fill_with(&mut p, prefill(512), 256 * MIB);
+        assert!(
+            matches!(refusal, Refusal::Cap { max_tokens: 4096 }),
+            "{refusal:?}"
+        );
+        assert_eq!(admitted, 8, "4096 rows at 512 a prompt");
+        assert!(p.non_resident_bytes(p.resident_now()) == 0);
     }
 
     /// With no minimum gain, only the floor or the cap ends a prefill wave

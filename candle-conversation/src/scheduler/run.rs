@@ -70,6 +70,37 @@ const WAVE_SLICE: Duration = Duration::from_millis(2000);
 /// outrun before the deadline check fires.
 const MAX_DECODE_STEPS: usize = 256;
 
+/// Longest a finished turn waits for its seal while other turns are still decoding.
+///
+/// A finished turn's cleanup — its seal and the closing tail it forwards — runs on
+/// the loop thread, so run between decode steps it holds back every turn still
+/// generating. Measured on the Qwen3.6-35B-A3B with eight turns decoding together:
+/// two that accepted more draft tokens finished a step early, and their ~40 ms of
+/// cleanup sat in front of the other six's last step. Deferred, the early finishers
+/// seal with the rest when the cohort drains — sharing its tail forward — and their
+/// tokens have all streamed already, so what waits is only the `Done`. The bound is
+/// what keeps a short turn from waiting out a long one's whole generation.
+///
+/// A turn that wrote a tool call is not deferred at all: its `Done` is what its
+/// caller acts on — it runs the tool and submits the result — so waiting there
+/// stalls an agent loop rather than a status line.
+const CLEANUP_DEFER: Duration = Duration::from_millis(100);
+
+/// Whether finished turns are cleaned up after this decode step: at once when one
+/// of them is `urgent` (it wrote a tool call), once nothing is left decoding, or
+/// once the earliest of them has waited [`CLEANUP_DEFER`].
+fn cleanup_due(
+    first_finished: Option<Instant>,
+    now: Instant,
+    decoding: usize,
+    urgent: bool,
+) -> bool {
+    match first_finished {
+        None => false,
+        Some(at) => urgent || decoding == 0 || now.saturating_duration_since(at) >= CLEANUP_DEFER,
+    }
+}
+
 impl Scheduler {
     /// Number of currently-active decode sequences (including summary probes).
     /// Used as the "is there decode work to run" guard — and by the decode-less
@@ -135,6 +166,9 @@ impl Scheduler {
             .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
         let deadline = Instant::now() + WAVE_SLICE;
         let mut steps = 0usize;
+        // When this quantum first saw a finished turn it has not yet cleaned up —
+        // the clock `CLEANUP_DEFER` runs on.
+        let mut first_finished: Option<Instant> = None;
         loop {
             if self.decode_width() == 0 {
                 // No live decode work, but there may be sequences inserted as
@@ -172,9 +206,18 @@ impl Scheduler {
             }
             self.wave_stats
                 .add_phase(WavePhase::Reproject, t_reproj.elapsed().as_millis() as u64);
-            {
+            if first_finished.is_none() && self.active_decodes.values().any(|s| s.finished) {
+                first_finished = Some(Instant::now());
+            }
+            let urgent = first_finished.is_some()
+                && self
+                    .active_decodes
+                    .values()
+                    .any(|s| s.finished && s.wrote_tool_call);
+            if cleanup_due(first_finished, Instant::now(), self.decode_width(), urgent) {
                 let _g = profile::span("loop:decode:cleanup");
                 self.cleanup_finished();
+                first_finished = None;
             }
             steps += 1;
 
@@ -190,14 +233,24 @@ impl Scheduler {
             };
             if !admitted {
                 self.shutdown_requested = true;
+                if first_finished.is_some() {
+                    let _g = profile::span("loop:decode:cleanup");
+                    self.cleanup_finished();
+                }
                 return;
             }
 
             // Clip to the time slice regardless of remaining decode work; the
             // remaining sequences persist in `active_decodes` and resume next
             // quantum. The step cap is only a backstop if steps ever run far
-            // under the WDDM floor (see `MAX_DECODE_STEPS`).
+            // under the WDDM floor (see `MAX_DECODE_STEPS`). A finished turn whose
+            // cleanup was deferred is cleaned up on the way out, so the deferral
+            // never outlives the quantum.
             if Instant::now() >= deadline || steps >= MAX_DECODE_STEPS {
+                if first_finished.is_some() {
+                    let _g = profile::span("loop:decode:cleanup");
+                    self.cleanup_finished();
+                }
                 return;
             }
         }
@@ -1180,5 +1233,49 @@ impl Scheduler {
                 candle_nn::kv_cache::class_promotion_count(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_deferral_tests {
+    use super::{cleanup_due, CLEANUP_DEFER};
+    use std::time::{Duration, Instant};
+
+    /// Nothing finished, nothing to clean up — however long the quantum has run.
+    #[test]
+    fn nothing_finished_is_never_due() {
+        assert!(!cleanup_due(None, Instant::now(), 0, false));
+        assert!(!cleanup_due(None, Instant::now(), 8, false));
+        assert!(!cleanup_due(None, Instant::now(), 8, true));
+    }
+
+    /// The cohort drained: clean up at once, without waiting out the bound.
+    #[test]
+    fn a_drained_cohort_cleans_up_immediately() {
+        let now = Instant::now();
+        assert!(cleanup_due(Some(now), now, 0, false));
+    }
+
+    /// Others still decoding: the finished turn waits until the bound, and no longer.
+    #[test]
+    fn a_finished_turn_waits_for_the_others_up_to_the_bound() {
+        let at = Instant::now();
+        assert!(!cleanup_due(
+            Some(at),
+            at + Duration::from_millis(40),
+            6,
+            false
+        ));
+        let just_short = at + CLEANUP_DEFER - Duration::from_millis(1);
+        assert!(!cleanup_due(Some(at), just_short, 6, false));
+        assert!(cleanup_due(Some(at), at + CLEANUP_DEFER, 6, false));
+    }
+
+    /// A turn that wrote a tool call is cleaned up the step it finishes, with
+    /// others still decoding: its caller is waiting on the `Done` to run the tool.
+    #[test]
+    fn a_tool_call_turn_is_cleaned_up_without_waiting() {
+        let at = Instant::now();
+        assert!(cleanup_due(Some(at), at, 6, true));
     }
 }

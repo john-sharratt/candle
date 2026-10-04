@@ -71,6 +71,7 @@ mod line_ends;
 pub mod models;
 pub mod narrator;
 pub mod normalization;
+mod penalty_counts;
 pub mod persistence;
 pub mod projection;
 /// The process-wide hot-path span profiler, for a daemon that serves its own
@@ -88,6 +89,7 @@ pub mod prompts;
 pub mod provenance;
 mod recorded_reply;
 mod recovered_message;
+mod sampler_args;
 pub(crate) mod scheduler;
 /// A throwaway substrate directory that removes itself on drop and sweeps the
 /// corpses of crashed runs — so a harness never attaches to the live store.

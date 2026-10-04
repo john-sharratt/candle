@@ -8,9 +8,9 @@
 //! what has happened since. A journal with no entry has no section in the
 //! character's prompt, so nothing is asked: the stretch is written up.
 
+use crate::clock::stamp;
 use crate::engine::guardian::module::Module;
 use crate::engine::guardian::view::{NpcView, Question, Verdict};
-use crate::clock::stamp;
 use crate::engine::journal::state::Waiting;
 
 pub const YES: &str = "yes";
@@ -58,8 +58,8 @@ impl Module for Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::guardian::modules::fixtures::view;
     use crate::clock::DAY_MS;
+    use crate::engine::guardian::modules::fixtures::view;
 
     const MINUTE_MS: u64 = 60_000;
 

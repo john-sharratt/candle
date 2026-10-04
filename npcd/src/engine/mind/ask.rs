@@ -183,7 +183,7 @@ impl Minds {
             ask_ms,
             fork_wait_ms = ask_ms.saturating_sub(stats.total_ms as u128),
             prefill_ms = stats.prefill_ms as u64,
-            prefill_tokens = stats.prefill_token_count,
+            prefill_tokens = stats.turn_prefill_tokens,
             decode_ms = stats.decode_ms as u64,
             tokens = stats.tokens_generated,
             tokens_per_second = stats.tokens_per_second as u64,

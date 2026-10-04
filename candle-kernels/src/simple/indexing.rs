@@ -111,6 +111,9 @@ extern "C" {
     /// - `src_dim_size`: Size of the source dimension
     /// - `dst_dim_size`: Size of the destination dimension
     /// - `right_size`: Size of dimensions to the right of the indexed dimension
+    ///
+    /// Returns [`DISPATCHED`], or [`NO_KERNEL`] when no kernel exists for the
+    /// `(idx_dtype, data_dtype)` pair and nothing was launched.
     pub fn run_index_add(
         idx_dtype: i32,
         data_dtype: i32,
@@ -122,7 +125,7 @@ extern "C" {
         src_dim_size: usize,
         dst_dim_size: usize,
         right_size: usize,
-    );
+    ) -> i32;
 
     /// Dispatches to the appropriate scatter_add kernel.
     ///
@@ -136,6 +139,9 @@ extern "C" {
     /// - `src_dim_size`: Size of the source dimension
     /// - `dst_dim_size`: Size of the destination dimension
     /// - `right_size`: Size of dimensions to the right of the scattered dimension
+    ///
+    /// Returns [`DISPATCHED`], or [`NO_KERNEL`] when no kernel exists for the
+    /// `(idx_dtype, data_dtype)` pair and nothing was launched.
     pub fn run_scatter_add(
         idx_dtype: i32,
         data_dtype: i32,
@@ -146,12 +152,12 @@ extern "C" {
         src_dim_size: usize,
         dst_dim_size: usize,
         right_size: usize,
-    );
+    ) -> i32;
 
     /// Dispatches to the appropriate scatter kernel.
     ///
     /// # Parameters
-    /// - `idx_dtype`: Index data type (0=i16, 1=i32, 2=i64, 3=u32, 4=u8)
+    /// - `idx_dtype`: Index data type (2=i64, 3=u32, 4=u8)
     /// - `data_dtype`: Data type (0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16)
     ///   Note: f8_e4m3 is not supported for scatter
     /// - `ids`: Index tensor (same shape as input)
@@ -161,6 +167,9 @@ extern "C" {
     /// - `src_dim_size`: Size of the source dimension
     /// - `dst_dim_size`: Size of the destination dimension
     /// - `right_size`: Size of dimensions to the right of the scattered dimension
+    ///
+    /// Returns [`DISPATCHED`], or [`NO_KERNEL`] when no kernel exists for the
+    /// `(idx_dtype, data_dtype)` pair and nothing was launched.
     pub fn run_scatter(
         idx_dtype: i32,
         data_dtype: i32,
@@ -171,8 +180,15 @@ extern "C" {
         src_dim_size: usize,
         dst_dim_size: usize,
         right_size: usize,
-    );
+    ) -> i32;
 }
+
+/// What [`run_index_add`], [`run_scatter`] and [`run_scatter_add`] return
+/// when they launched a kernel.
+pub const DISPATCHED: i32 = 0;
+/// What they return when no kernel exists for the `(idx_dtype, data_dtype)`
+/// pair: nothing was launched and the destination is untouched.
+pub const NO_KERNEL: i32 = -1;
 
 // =============================================================================
 // Individual kernel bindings (original API)

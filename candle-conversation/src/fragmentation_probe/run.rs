@@ -55,17 +55,46 @@ use std::time::{Duration, Instant};
 use candle::Device;
 use candle_nn::kv_cache::{region_stats, REGION_BYTES};
 use candle_transformers::models::batch_test::fixtures;
-use candle_transformers::models::batch_test::story_normalize::normalize_story;
+use candle_transformers::models::profile::pipeline_snapshot_and_reset;
 
-use super::probe::{Probe, ProbeOutcome};
-use super::profile::StoryGate;
+use super::batch::{no_think, run_story_batch, BatchTiming};
+use super::probe::{BaselineRow, Probe, ProbeOutcome};
 use crate::guest::GuestRegistry;
 use crate::memory_report;
 use crate::scratch_substrate::ScratchSubstrate;
-use crate::{
-    ConversationEngine, OptionalState, SamplingConfig, SelectionState, SequenceConfig, TurnOptions,
-};
-use crate::{Sequence, NO_THINK_SELECTOR};
+use crate::{ConversationEngine, Sequence, TurnOptions};
+
+/// How long each submit held its caller, in session order — the turns behind a
+/// blocked submit cannot even reach the scheduler until it returns.
+fn print_submit_blocked(blocked: &[Duration]) {
+    let ms: Vec<String> = blocked
+        .iter()
+        .map(|d| format!("{:.1}", d.as_secs_f64() * 1000.0))
+        .collect();
+    println!("  submit blocked (ms, per session): [{}]", ms.join(", "));
+}
+
+/// A batch's two windows, as the gate's table would read them.
+fn print_timing(timing: &BatchTiming, sequences: usize) {
+    println!(
+        "  prefill: {} tok in {:.2}s  = {:.1} t/s",
+        timing.prefill_tokens,
+        timing.prefill_s,
+        timing.prefill_tps(),
+    );
+    println!(
+        "  decode:  {} tok in {:.2}s  = {:.1} t/s   ({sequences} sequences, {} tokens streamed)",
+        timing.decode_tokens,
+        timing.decode_s,
+        timing.decode_tps(),
+        timing.streamed_tokens,
+    );
+    println!(
+        "  complete: last reply {:.2}s after the last first token ({:.2}s past the last token)",
+        timing.complete_s,
+        timing.complete_s - timing.decode_s,
+    );
+}
 
 /// One sample of the pool's geometry.
 #[derive(Clone, Copy, Debug, Default)]
@@ -259,51 +288,6 @@ fn sample(device: &Device) -> Option<Geometry> {
 ///
 /// Phase A varies the fraction so conversations differ in KV size, which is what
 /// spreads occupancy across size classes instead of pouring it all into one.
-/// The reply with a leading reasoning block removed.
-///
-/// A suppressed turn still carries the dialect's *framing* — Qwen3 opens a turn
-/// with a pre-closed `<think> </think>` — and that is engine structure, not model
-/// output: the gate drives the session directly and never sees it. Stripping it is
-/// what makes the two comparable; leaving it in fails every session on a prefix the
-/// model was never asked to produce.
-fn strip_think(reply: &str) -> &str {
-    let t = reply.trim_start();
-    match t.find("</think>") {
-        Some(end) if t.starts_with("<think>") => &t[end + "</think>".len()..],
-        _ => reply,
-    }
-}
-
-/// The conversation's own sampling, made deterministic.
-///
-/// Derived from the model's configured sampling rather than built from scratch, so
-/// every other lever — the penalties, the banned tokens, the segment behaviour —
-/// stays as the model ships it and only the randomness goes. `temperature = 0` is
-/// argmax; `top_k = 1` and `top_p = 1` remove the two ways a nucleus could still
-/// widen the choice.
-fn greedy_sampling(config: SequenceConfig) -> SamplingConfig {
-    SamplingConfig {
-        temperature: 0.0,
-        segment_temp_boost: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        ..config.sampling
-    }
-}
-
-/// The composer's thinking dial, off.
-///
-/// `Present` on [`NO_THINK_SELECTOR`] is what the turn assembler reads to emit the
-/// dialect's suppression — `/no_think` as live glue for the families that carry the
-/// switch in the user turn, a pre-closed block for the rest. Named here because
-/// every turn this harness submits wants it and a missing one is not an error, just
-/// a reply that spends its budget reasoning.
-fn no_think() -> SelectionState {
-    let mut s = SelectionState::default();
-    s.set_optional(NO_THINK_SELECTOR, OptionalState::Present);
-    s
-}
-
 fn story_slice(story: &str, fraction: usize) -> &str {
     let want = story.len() * fraction.clamp(1, 8) / 8;
     // Cut on a char boundary — the story is not ASCII.
@@ -331,8 +315,120 @@ pub fn run(probe: &Probe) -> anyhow::Result<ProbeOutcome> {
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     println!("Loading {model_path:?} …");
-    let model = builder.load_model(&model_path, &device, None)?;
+    let model = builder.load_model(&model_path, &device, None)?.model;
     run_on_model(probe, &device, tokenizer, model)
+}
+
+/// Stand up an engine on `model` over a scratch substrate.
+///
+/// **A scratch substrate, never the workspace's own.** `EngineConfig::workspace_path`
+/// defaults to `None`, which opens the substrate under the *process working directory*
+/// — so run from the repo root this harness would append its conversations to the live
+/// `.substrate` and reload the user's real history on the way in. The returned store
+/// must be held for the engine's whole life; dropping it removes the store, and a
+/// previous run's corpse is swept on creation. See `scratch_substrate` for what that
+/// does and does not promise.
+fn start_engine(
+    probe: &Probe,
+    device: &Device,
+    tokenizer: &tokenizers::Tokenizer,
+    model: Box<dyn crate::ManagedBatchedModel + Send>,
+) -> anyhow::Result<(ScratchSubstrate, Arc<ConversationEngine>)> {
+    let builder = probe.builder();
+    let scratch = ScratchSubstrate::new()?;
+    if scratch.swept() > 0 {
+        println!(
+            "swept {} scratch substrate(s) left by a previous run",
+            scratch.swept(),
+        );
+    }
+    println!("substrate: {:?}", scratch.path());
+    let mut engine_config = builder.engine_config(tokenizer, device);
+    engine_config.workspace_path = Some(scratch.path().to_path_buf());
+
+    let engine = Arc::new(ConversationEngine::new(
+        model,
+        tokenizer.clone(),
+        engine_config,
+        GuestRegistry::new(),
+    )?);
+    println!("Engine up.\n");
+    Ok((scratch, engine))
+}
+
+/// The clean baseline: the gate's `C<level> ×width` row through `engine`, and the
+/// story-gate failures, if any.
+///
+/// **One unmeasured batch of the same shape runs first.** The gate's row sits in the
+/// middle of its ladder, so every path it takes has run before its clock starts; an
+/// engine measured on its very first turn would charge first-use costs — the wave
+/// planner arming, the first arena claims, each kernel's first launch — to a row the
+/// gate measures warm. The warm-up is evicted like the measured batch, so neither leaves
+/// KV behind.
+fn clean_baseline(
+    engine: &ConversationEngine,
+    probe: &Probe,
+) -> anyhow::Result<(BaselineRow, Vec<String>)> {
+    let builder = probe.builder();
+    let batch = |label: &str| -> anyhow::Result<_> {
+        println!(
+            "baseline ({label}) — the gate's C{}×{} row through the engine, clean pool\n",
+            probe.compression_level, probe.baseline_width,
+        );
+        let b = run_story_batch(
+            engine,
+            &builder,
+            probe.baseline_width,
+            probe.baseline_decode,
+            probe.story_gate(),
+        )?;
+        print_timing(&b.timing, probe.baseline_width);
+        print_submit_blocked(&b.submit_blocked);
+        for c in b.conversations.iter() {
+            let _ = engine.evict_ingest_timeline(c.timeline_id());
+        }
+        // A turn that errored, or whose stream differs from what it generated, is a
+        // failure of this row — reported with the story failures rather than
+        // aborting the probe, so the phases after it still run and are judged.
+        let fails = b
+            .story_fail
+            .into_iter()
+            .chain(b.errors)
+            .map(|line| format!("baseline ({label}): {line}"))
+            .collect::<Vec<_>>();
+        Ok((b.timing, b.story_pass, fails))
+    };
+    let (_, _, warm_fails) = batch("warm-up, unmeasured")?;
+    // The pipeline profile accumulates process-wide, so the warm-up, the load and
+    // every conversation opened so far would blend into the measured batch's spans.
+    // Cleared here, a `profile` build's breakdown is this batch's alone; without the
+    // feature it is an empty snapshot and costs nothing.
+    let _ = pipeline_snapshot_and_reset();
+    let (timing, story_pass, measured_fails) = batch("measured")?;
+    Ok((
+        BaselineRow {
+            level: probe.compression_level,
+            width: probe.baseline_width,
+            timing,
+            story_pass,
+        },
+        warm_fails.into_iter().chain(measured_fails).collect(),
+    ))
+}
+
+/// Load the probe's model and run only the clean baseline — the iteration loop for
+/// optimising the engine against the gate's row, without the minutes of churn and
+/// drain the full probe spends answering a different question.
+pub fn run_baseline(probe: &Probe) -> anyhow::Result<(BaselineRow, Vec<String>)> {
+    let device = Device::new_cuda(probe.device)?;
+    let builder = probe.builder();
+    let (model_path, tokenizer_path) = builder.resolve_paths_pub()?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    println!("Loading {model_path:?} …");
+    let model = builder.load_model(&model_path, &device, None)?.model;
+    let (_scratch, engine) = start_engine(probe, &device, &tokenizer, model)?;
+    clean_baseline(&engine, probe)
 }
 
 /// Run the probe against a model the **caller** loaded.
@@ -354,36 +450,18 @@ pub fn run_on_model(
     let args = probe;
     let device = device.clone();
     let builder = probe.builder();
-
-    // **A scratch substrate, never the workspace's own.**
-    //
-    // `EngineConfig::workspace_path` defaults to `None`, which opens the
-    // substrate under the *process working directory* — so run from the repo root
-    // this harness appends its conversations to the live `.substrate` and reloads
-    // the user's real history on the way in. Held for the engine's whole life;
-    // dropping it removes the store, and a previous run's corpse is swept on
-    // creation. See `scratch_substrate` for what that does and does not promise.
-    let scratch = ScratchSubstrate::new()?;
-    if scratch.swept() > 0 {
-        println!(
-            "swept {} scratch substrate(s) left by a previous run",
-            scratch.swept(),
-        );
-    }
-    println!("substrate: {:?}", scratch.path());
-    let mut engine_config = builder.engine_config(&tokenizer);
-    engine_config.workspace_path = Some(scratch.path().to_path_buf());
-
-    let engine = Arc::new(ConversationEngine::new(
-        model,
-        tokenizer.clone(),
-        engine_config,
-        GuestRegistry::new(),
-    )?);
-    println!("Engine up.\n");
+    // Held for the engine's whole life — see `start_engine`.
+    let (_scratch, engine) = start_engine(probe, &device, &tokenizer, model)?;
 
     // The forward gate's own fixture — see `story_slice`.
-    let story = candle_transformers::models::batch_test::fixtures::story_prompt();
+    let story = fixtures::story_prompt();
+
+    // ── Baseline: the gate's C5 ×8 row, through the engine, on a clean pool ──
+    //
+    // Before anything else touches the engine's pool, so it is measured on the state
+    // the gate's row starts from. Its conversations are evicted and dropped straight
+    // after, so phase A begins on the pool it always began on.
+    let (baseline, baseline_fail) = clean_baseline(&engine, probe)?;
 
     let base = sample(&device).unwrap_or_default();
     println!(
@@ -816,86 +894,22 @@ pub fn run_on_model(
     // session's KV. Timings cannot see that. A rewrite can: each session is given a
     // DIFFERENT protagonist name, so cross-contamination shows up as the wrong name
     // or the wrong text, and the per-session names make it detectable rather than
-    // merely likely to look odd.
-    let names = candle_transformers::models::batch_test::fixtures::session_names();
-    let t_prefill = Instant::now();
-    let mut convs: Vec<Sequence> = Vec::with_capacity(args.profile.batch);
-    let mut expected: Vec<String> = Vec::with_capacity(args.profile.batch);
-    let mut prompts: Vec<String> = Vec::with_capacity(args.profile.batch);
-    let mut prefill_tokens = 0usize;
-    for i in 0..args.profile.batch {
-        // Indexed exactly as the gate indexes it, so session identities match.
-        let name = &names[i % names.len()];
-        // **The gate's own system prompt, with the name substituted the way the
-        // gate substitutes it.** The rewrite is entirely a function of this text:
-        // "Output ONLY the story text", "keep the title, punctuation, spelling,
-        // casing … EXACTLY the same". Under the daemon's own system prompt the model
-        // answers helpfully instead — measured, every session replied
-        // `**Title:** …`, which is a correct answer to a different question and
-        // matches no prefix of the expected rewrite.
-        let system = fixtures::system_prompt().replace("{INSERT_NAME}", name);
-        let c = engine.new_conversation(&system, builder.conversation_config())?;
-        let user = fixtures::story_rewrite_prompt(&story, name);
-        expected.push(fixtures::story_rewrite_expected(&story, name));
-        prefill_tokens += tokenizer
-            .encode(user.as_str(), false)
-            .map(|e| e.get_ids().len())
-            .unwrap_or(0);
-        prompts.push(user);
-        convs.push(c);
-    }
-
-    // **One turn, whose user half IS the story prompt.** The gate's `StoryRewrite`
-    // is a single exchange: the fixture carries its own rename instruction, and the
-    // assistant's reply to it is the rewrite. Prefilling the story as its own turn
-    // and then asking a *second* question produces an answer to that question, which
-    // is not a prefix of the expected rewrite and fails every session — measured,
-    // 0/20, and it was this harness's mistake rather than the engine's.
-    let t_decode = Instant::now();
-    let mut handles = Vec::with_capacity(convs.len());
-    for (c, prompt) in convs.iter_mut().zip(prompts.iter()) {
-        let opts = TurnOptions {
-            // Enough of the rewrite to catch a wrong name or wrong text without
-            // paying for the whole story. The comparison is prefix-based.
-            max_tokens: Some(args.batch_decode.max(48)),
-            // **Thinking off, or the answer never starts.** The forward gate drives
-            // the session directly with a raw prompt, so its `StoryRewrite` reply
-            // begins with the rewrite. A turn through the conversation engine opens
-            // a reasoning block first, and the whole token budget goes into
-            // `<think>\nOkay, let me try …` — measured, 0/20 sessions, with the
-            // decode never reaching the story at all.
-            selection: no_think(),
-            // **Greedy, because this check is about KV and not about sampling.** The
-            // rewrite is a verbatim reproduction, so with any temperature at all a
-            // session can diverge honestly: measured, one session of twenty matched 195
-            // characters exactly and then paraphrased the next clause, which is a
-            // sampler result and reads in the report as the corruption this check
-            // exists to find. Greedy makes a divergence mean what the check says it
-            // means.
-            sampling: Some(greedy_sampling(builder.conversation_config())),
-            ..Default::default()
-        };
-        handles.push(c.submit_turn_with_options(prompt.as_str(), opts)?);
-    }
-    let prefill_s = t_prefill.elapsed().as_secs_f64();
-    let mut decoded = 0usize;
-    let mut outputs: Vec<String> = vec![String::new(); convs.len()];
-    for (i, (c, h)) in convs.iter_mut().zip(handles).enumerate() {
-        match h.wait_cancellable() {
-            Ok(resp) => {
-                decoded += resp.token_ids.len();
-                outputs[i] = resp.text.clone();
-                // Seal it the way a live turn does, so the KV this batch created
-                // is recorded rather than abandoned — abandoning would free it
-                // early and quietly flatter the geometry this example reports.
-                if let Err(e) = c.finish_turn(h, &resp) {
-                    errors.lock().unwrap().push(format!("finish_turn: {e}"));
-                }
-            }
-            Err(e) => errors.lock().unwrap().push(format!("decode: {e}")),
-        }
-    }
-    let decode_s = t_decode.elapsed().as_secs_f64();
+    // merely likely to look odd. Timed with the gate's two windows — see `batch`.
+    //
+    // Enough of the rewrite to catch a wrong name or wrong text without paying for
+    // the whole story; the comparison is prefix-based.
+    let batch = run_story_batch(
+        &engine,
+        &builder,
+        args.profile.batch,
+        args.batch_decode.max(48),
+        args.story_gate(),
+    )?;
+    errors.lock().unwrap().extend(batch.errors.iter().cloned());
+    let timing = batch.timing;
+    let story_pass = batch.story_pass;
+    let story_fail = batch.story_fail;
+    let convs = batch.conversations;
     let fragmented = sample(&device).unwrap_or_default();
     // **Read the composition here, beside the geometry it describes.** Taken at the
     // end of the run instead, it reported phase B's frontier against the *drain's*
@@ -907,69 +921,7 @@ pub fn run_on_model(
     // behind minutes later.
     print_tenant_census("after phase B");
 
-    // ── Story validation, by the profile's gate ──────────────────────────────
-    //
-    // `StoryGate::Verbatim` is the forward gate's own rule: `normalize_story`, then a
-    // common-prefix comparison with a 5-char tolerance, read from the same module so
-    // "correct" means here what it means there. The output is short next to the whole
-    // story, so it asks whether the model produced a correct PREFIX of the rewrite —
-    // which is what catches a wrong name, wrong content, or broken attention.
-    //
-    // `StoryGate::OwnName` is the floor for a model that cannot reproduce prose
-    // exactly. It asks only that each session names its own protagonist, which still
-    // catches the failure this check exists for: a session reading another session's KV
-    // renames to *that* session's protagonist, so its own name never appears.
-    let mut story_pass = 0usize;
-    let mut story_fail: Vec<String> = Vec::new();
-    for (i, out) in outputs.iter().enumerate() {
-        let got = normalize_story(strip_think(out).trim());
-        let want = normalize_story(expected[i].trim());
-        let name = &names[i % names.len()];
-        if args.story_gate() == StoryGate::OwnName {
-            if got.contains(name.as_str()) {
-                story_pass += 1;
-            } else {
-                let show = got.chars().take(120).collect::<String>();
-                story_fail.push(format!(
-                    "session {i}: its own protagonist {name:?} is absent from the reply\n      got:  {show:?}",
-                ));
-            }
-            continue;
-        }
-        let g: Vec<char> = got.chars().collect();
-        let w: Vec<char> = want.chars().collect();
-        let common = g.iter().zip(w.iter()).take_while(|(a, b)| a == b).count();
-        let min_len = g.len().min(w.len());
-        const TOLERANCE: usize = 5;
-        // An empty or near-empty decode is a failure, not a vacuous pass: with
-        // `min_len` at zero the tolerance would make `required` zero and anything
-        // would match.
-        let required = min_len.saturating_sub(TOLERANCE);
-        if min_len >= 16 && common >= required {
-            story_pass += 1;
-        } else {
-            let show = min_len.min(common + 24);
-            story_fail.push(format!(
-                "session {i} (name {name}): matched {common}/{min_len} chars\n      got:  {:?}\n      want: {:?}",
-                g[..show.min(g.len())].iter().collect::<String>(),
-                w[..show.min(w.len())].iter().collect::<String>(),
-            ));
-        }
-    }
-
-    println!(
-        "  prefill: {:.0} tok in {:.2}s  = {:.1} t/s",
-        prefill_tokens as f64,
-        prefill_s,
-        prefill_tokens as f64 / prefill_s.max(1e-9),
-    );
-    println!(
-        "  decode:  {:.0} tok in {:.2}s  = {:.1} t/s   ({} sequences)",
-        decoded as f64,
-        decode_s,
-        decoded as f64 / decode_s.max(1e-9),
-        args.profile.batch,
-    );
+    print_timing(&timing, args.profile.batch);
     println!(
         "  geometry before batch: live={} watermark={} holes={}",
         before.live,
@@ -1250,11 +1202,27 @@ pub fn run_on_model(
     // fragmented pool that answers correctly is a performance problem; a packed
     // pool that answers wrongly is a corruption. If a later compaction pass ever
     // trades the second for the first, this is the line that says so.
-    if story_pass == outputs.len() {
+    // The clean baseline is judged by the same rule. It ran before any churn, so a
+    // failure there is not fragmentation — it is the engine answering wrongly on a
+    // pool that never moved, and it outranks everything below as much as phase B does.
+    if baseline.story_pass != baseline.width || !baseline_fail.is_empty() {
+        for f in &baseline_fail {
+            println!("\n  {f}");
+        }
+        failures.push(format!(
+            "the clean C{}×{} baseline: {}/{} sessions rewrote the story correctly, {} \
+             failure line(s) above",
+            baseline.level,
+            baseline.width,
+            baseline.story_pass,
+            baseline.width,
+            baseline_fail.len(),
+        ));
+    }
+    if story_pass == args.profile.batch {
         println!(
             "\nPASS  {}/{} sessions rewrote the story correctly.",
-            story_pass,
-            outputs.len(),
+            story_pass, args.profile.batch,
         );
     } else {
         for f in &story_fail {
@@ -1264,8 +1232,7 @@ pub fn run_on_model(
             "only {}/{} sessions rewrote the story correctly — a session reading \
              another session's KV does not fault, it answers wrongly, so this is \
              the check that sees it",
-            story_pass,
-            outputs.len(),
+            story_pass, args.profile.batch,
         ));
     }
     if worst_efficiency < args.profile.min_efficiency {
@@ -1325,18 +1292,19 @@ pub fn run_on_model(
     // an error carrying only a count would have thrown away.
     Ok(ProbeOutcome {
         story_pass,
-        story_total: outputs.len(),
+        story_total: args.profile.batch,
         worst_sustained_efficiency: worst_efficiency,
         worst_single_efficiency: worst_reported,
         weight_uptake_pct: uptake_pct,
         weight_at_limit: at_limit,
-        prefill_tps: prefill_tokens as f64 / prefill_s.max(1e-9),
-        decode_tps: decoded as f64 / decode_s.max(1e-9),
+        prefill_tps: timing.prefill_tps(),
+        decode_tps: timing.decode_tps(),
         // The geometry phase B was delivered on, so a table row states rate and
         // fragmentation as one observation rather than two.
         frontier_regions: end.frontier,
         efficiency_pct: end.eff,
-        peak_tokens: prefill_tokens,
+        peak_tokens: timing.peak_tokens,
+        baseline,
         failures,
     })
 }

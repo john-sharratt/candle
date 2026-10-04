@@ -193,13 +193,10 @@ pub async fn step(
         );
     }
     let (ticked, added) = hosted.with_sim(|sim| {
-        let ticked = body
-            .done
-            .as_deref()
-            .map(|step| {
-                let outcome = body.outcome.unwrap_or(StepOutcome::Achieved);
-                sim.missions.check_off(&character, step, outcome)
-            });
+        let ticked = body.done.as_deref().map(|step| {
+            let outcome = body.outcome.unwrap_or(StepOutcome::Achieved);
+            sim.missions.check_off(&character, step, outcome)
+        });
         let added = body
             .add
             .as_deref()

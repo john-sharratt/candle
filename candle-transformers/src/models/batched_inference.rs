@@ -5494,7 +5494,7 @@ pub(crate) const MAX_PREFILL_TOKENS: usize = 8192;
 /// straggler slab after an 8192 slab spends a whole fixed sweep on 1.5% of the
 /// tokens (~25% extra wall), where absorbing it into one 8320-token wave costs
 /// per-token rate only.
-pub(crate) fn prefill_slack_cap(width_cap: usize) -> usize {
+pub fn prefill_slack_cap(width_cap: usize) -> usize {
     width_cap + width_cap / 4
 }
 

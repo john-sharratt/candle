@@ -30,6 +30,7 @@ mod admission;
 mod admit;
 mod admit_ground;
 mod block_guard;
+mod compaction_stall;
 mod decode;
 mod ephemeral_fork;
 pub mod exported_state;
@@ -107,7 +108,8 @@ use candle::{Device, Tensor};
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked, WINDOW_DIVERGENCE_MARKER,
+    BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked, SequenceStats,
+    WINDOW_DIVERGENCE_MARKER,
 };
 use candle_transformers::models::delta_net::ExportedLayerState;
 use candle_transformers::models::draft_depth::DraftDepth;
@@ -1292,6 +1294,24 @@ struct ReprojectInFlight {
     identity: u64,
 }
 
+/// A finished turn between its disposition and its seal — what
+/// [`Scheduler::cleanup_finished`] carries across the batched closing-tail forward.
+struct FinishedTurn {
+    state: DecodeState,
+    /// The reply as the caller receives it: the written half, then the decoded one.
+    text: String,
+    decode_ms: f64,
+    total_ms: f64,
+    tokens_generated: usize,
+    tokens_per_second: f64,
+    /// Read before the view was finalized, which drops the view slot's stats.
+    sequence_stats: SequenceStats,
+    context_tokens: usize,
+    /// The slot the turn seals from — the parent, once the view is finalized.
+    seal_slot: SequenceId,
+    seal_block_from: usize,
+}
+
 /// Per-sequence state while actively generating tokens.
 struct DecodeState {
     /// Channel back to the caller.
@@ -1407,9 +1427,9 @@ struct DecodeState {
     decode_busy_us: u64,
     /// Prefill duration (for stats).
     prefill_ms: f64,
-    /// Number of tokens in the prefill prompt for this turn.
-    /// Recorded for the health diagnostic dump so that step depth can be
-    /// interpreted relative to the context window size.
+    /// The sequence's KV depth when the turn's prefill finished — its projected
+    /// context plus this turn's prompt. Recorded for the health diagnostic dump
+    /// so that step depth can be interpreted relative to the context window size.
     prefill_token_count: usize,
     /// Turn start time (for total_ms stat).
     turn_start: Instant,
@@ -1486,6 +1506,11 @@ struct DecodeState {
     /// suppressed so the generic call body can't re-orient the committed tool.
     /// Migrates with the decode state across view swaps.
     in_tool_call: bool,
+    /// Whether this turn has written a tool call — its open tag sampled, or a
+    /// tool-call stencil walked to the turn's end. Its caller acts on the
+    /// `Done` (it runs the tool and submits the result), so the finished turn's
+    /// cleanup is not deferred behind the turns still decoding.
+    wrote_tool_call: bool,
     /// Whether this turn's schema asked for repetition penalties to be lifted
     /// while a tool call runs. Off unless the schema names it — see
     /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
@@ -2970,6 +2995,9 @@ pub(crate) struct Scheduler {
     /// When the last KV compaction pass ran, so the cheap per-wave gate can hold a
     /// floor on the interval. `None` before the first pass.
     pub(super) last_kv_compaction: Option<std::time::Instant>,
+    /// The pool shape the last KV compaction pass failed to improve, which holds
+    /// the gate shut until that shape changes. See [`compaction_stall`].
+    kv_compaction_stall: compaction_stall::CompactionStall,
     /// Forwards this wave iteration has run, of either kind.
     ///
     /// The divisor for the loop's per-forward overhead: a wave's non-forward wall clock
@@ -3540,6 +3568,7 @@ impl Scheduler {
             priority_pause: PriorityPause::default(),
             norm_warm: NormWarm::default(),
             last_kv_compaction: None,
+            kv_compaction_stall: compaction_stall::CompactionStall::default(),
             wave_forwards: 0,
             wave_overhead_us: 0,
             wave_rate: None,
@@ -5581,6 +5610,7 @@ impl Scheduler {
             assistant_content_start: 0,
             no_think: false,
             in_tool_call: false,
+            wrote_tool_call: false,
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,
             pending_mask: None,
@@ -6905,6 +6935,7 @@ impl Scheduler {
         prefill_ms: f64,
         turn_start: Instant,
         prefill_token_count: usize,
+        turn_prefill_tokens: usize,
         finish: FinishReason,
     ) {
         let skip = !self.show_special_tokens;
@@ -6921,6 +6952,7 @@ impl Scheduler {
                 tokens_generated: 1,
                 tokens_per_second: 0.0,
                 prefill_token_count,
+                turn_prefill_tokens,
                 context_tokens: self.session.sequence_offset(seq_id.0).unwrap_or(0),
                 finish,
                 sequence: self.session.get_sequence_stats(seq_id.0),
@@ -7133,6 +7165,10 @@ impl Scheduler {
             .map(|(&id, _)| id)
             .collect();
 
+        // Three phases, so the turns finishing together close together: every
+        // turn's disposition, then one forward of all their closing tails, then
+        // each turn's seal and `Done`.
+        let mut sealing: Vec<FinishedTurn> = Vec::with_capacity(finished_seq_ids.len());
         for seq_id in finished_seq_ids {
             if let Some(state) = self.active_decodes.remove(&seq_id) {
                 // The slot's ground is back, so an admission that did not fit
@@ -7237,6 +7273,7 @@ impl Scheduler {
                 // over. `None` on the non-view path, which has no child state.
                 let mut pending_view_state: Option<(SequenceId, SequenceId)> = None;
                 let (seal_slot, seal_block_from) = if let Some(view_state) = finalized_view {
+                    let _g = profile::span("cleanup:finalize_view");
                     if let Err(e) = self.session.finalize_view(
                         seq_id.0,
                         view_state.parent_id.0,
@@ -7389,6 +7426,7 @@ impl Scheduler {
                 // decoded blocks away any more, so nothing may release the state
                 // that advanced over them.
                 if let Some((view_id, parent_id)) = pending_view_state.take() {
+                    let _g = profile::span("cleanup:move_recurrent");
                     if let Err(e) = self.model.move_recurrent(view_id.0, parent_id.0) {
                         tracing::warn!(
                             "failed to move recurrent state from view {} to parent {}: {}",
@@ -7399,177 +7437,223 @@ impl Scheduler {
                     }
                 }
 
-                // Post-decode forward pass: append the turn's closing
-                // structural tokens into the slot before sealing, so the turn's
-                // pinned K/V closes its own brackets. The model didn't emit
-                // these — we synthesise them as if it did.
-                //
-                // Deliberately AFTER the disposition above (see the note at the
-                // top of this block): the state that absorbs the tail must be
-                // the one being sealed, and on the MOVE path that state only
-                // arrives on the parent a few lines up. The DISCARD path never
-                // reaches here — it `continue`s — and its clean re-prefill
-                // replays `[user][clean answer][post_decode]`, so the tail is
-                // absorbed there exactly once, in order.
-                if !state.post_decode_tokens.is_empty() {
-                    if let Err(e) = self.run_prefill(seal_slot, &state.post_decode_tokens[..]) {
-                        tracing::warn!("post-decode prefill failed for slot {}: {}", seal_slot, e,);
-                    }
-                }
-
-                // Seal-and-write step.  When `seal_action != None`, we
-                // snapshot `seal_slot` and apply the appropriate substrate
-                // write (turn append or section pin).  The resulting
-                // `SealResult` rides along on the Done event so the
-                // conversation-side post-actions (cold store) can run
-                // without a second round trip.
-                let seal_result = match &state.seal_action {
-                    SealAction::None => None,
-                    // A stuffed prefill carries its own per-region content,
-                    // built when the grid was planned — the generic
-                    // `TurnContent` assembled below describes the whole slot and
-                    // would give every region the same text and the same tokens.
-                    SealAction::TurnGroup(turns) => {
-                        let turns = Arc::clone(turns);
-                        // `seal_block_from` is where THIS submission's own region
-                        // starts on the slot — past the projection's materialised
-                        // system prompt. The carve's block offsets are relative to
-                        // the stuffed grid, so they are rebased onto it.
-                        self.perform_carved_turn_seals(seal_slot, seal_block_from, &turns)
-                    }
-                    action => {
-                        // Bundle the per-half display text and the
-                        // combined token sequence the seal pinned
-                        // into the slot.  Text and tokens carry
-                        // distinct shapes here: the substrate stores
-                        // `user_text` / `assistant_text` as the
-                        // human-readable strings the caller supplied,
-                        // while `token_ids` carries the full slot
-                        // token sequence (prefill + decoded body +
-                        // post-decode tail) so cross-process replay
-                        // reconstructs the exact K/V the kernel saw.
-                        let turn_content = if matches!(action, SealAction::Turn) {
-                            // user_text comes through verbatim from
-                            // submit_turn (raw user message, no role
-                            // markers, no /no_think prefix).
-                            // assistant_text is the model's decoded
-                            // body — special tokens skipped, just the
-                            // reply the user sees streamed.  The
-                            // substrate stores both halves verbatim;
-                            // no caller assembles a combined string.
-                            // The last entry in state.generated_tokens
-                            // was sampled from the most recent forward
-                            // pass but never forwarded itself — the
-                            // loop terminated (EOS or max_tokens) before
-                            // another forward could write its K/V into
-                            // the slot.  Drop it so token_ids aligns
-                            // 1:1 with the K/V chunk grid.
-                            //
-                            // **Deliberately NOT `forwarded_generated`.** That
-                            // counter answers "is anything waiting to go out",
-                            // which is all the injection path needs, and it is
-                            // maintained by the paths that forward — so a path
-                            // that forwards without touching it reads low.
-                            // Sealing from it made `token_ids` 2 tokens shorter
-                            // than the chunk grid on a measured turn (287 against
-                            // 289), breaking the 1:1 contract this slice exists
-                            // to keep. The grid's authority is the K/V.
-                            let forwarded_generated: &[u32] = state
-                                .generated_tokens
-                                .split_last()
-                                .map(|(_, rest)| rest)
-                                .unwrap_or(&[]);
-                            let mut full_tokens: Vec<u32> = Vec::with_capacity(
-                                state.prefill_tokens.len()
-                                    + forwarded_generated.len()
-                                    + state.post_decode_tokens.len(),
-                            );
-                            full_tokens.extend_from_slice(&state.prefill_tokens);
-                            full_tokens.extend_from_slice(forwarded_generated);
-                            full_tokens.extend_from_slice(&state.post_decode_tokens);
-
-                            // `text` is already written-then-decoded, so it is the
-                            // whole assistant half either way: a prefill turn
-                            // (repo_map / code_reading) supplies it verbatim and
-                            // never decodes, and a decode turn with a seeded
-                            // prefix carries both parts. Choosing between them —
-                            // which this did — silently dropped the decoded half
-                            // of any turn that had both.
-                            let assistant_text = text.clone();
-                            let total = full_tokens.len() as u32;
-                            let layout = self.build_turn_layout(
-                                state.user_content_start,
-                                state.user_content_end,
-                                state.assistant_content_start,
-                                total,
-                                state.user_text.clone(),
-                                assistant_text,
-                                state.no_think,
-                                state.think_close_at,
-                            );
-                            Some(TurnContent {
-                                role: Role::Assistant,
-                                tags: state.tags.clone(),
-                                layout,
-                                token_ids: TokenBuffer::from(full_tokens),
-                            })
-                        } else {
-                            None
-                        };
-                        self.perform_seal_and_write(
-                            seal_slot,
-                            seal_block_from,
-                            SealEnd::SlotEnd,
-                            action,
-                            turn_content,
-                        )
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("post-Done seal failed for slot {}: {}", seal_slot, e,);
-                            None
-                        })
-                    }
-                };
-
-                // Stateless-slot housekeeping: drop the slot's chunks
-                // now that `perform_seal_and_write` has captured them
-                // into the substrate residence. The next turn's
-                // `apply_projection` rebuilds the slot from substrate
-                // anyway, so holding onto these `Arc<ChunkGid>`s
-                // between turns just pins arena slots that nothing
-                // reads. Truncating to 0 drops the slot's Arc refs;
-                // the residence keeps the chunks alive for the next
-                // projection inject.
-                if let Err(e) = self.session.truncate_sequence_to_blocks(seal_slot.0, 0) {
-                    tracing::warn!(
-                        "post-seal slot truncate failed for slot {}: {}",
-                        seal_slot,
-                        e
-                    );
-                }
-                // The slot no longer holds what its last assembly placed.
-                if let Some(slot_state) = self.slot_projection_state.get_mut(&seal_slot) {
-                    slot_state.placed_pieces.clear();
-                }
-
-                let _ = state.event_tx.send(TurnEvent::Done(TurnResponse {
+                sealing.push(FinishedTurn {
+                    state,
                     text,
-                    token_ids: state.generated_tokens,
-                    stats: TurnStats {
-                        prefill_ms: state.prefill_ms,
-                        decode_ms,
-                        total_ms,
-                        tokens_generated,
-                        tokens_per_second,
-                        prefill_token_count: state.prefill_token_count,
-                        context_tokens,
-                        finish: state.finish,
-                        sequence: sequence_stats,
-                    },
-                    seal: seal_result,
-                }));
+                    decode_ms,
+                    total_ms,
+                    tokens_generated,
+                    tokens_per_second,
+                    sequence_stats,
+                    context_tokens,
+                    seal_slot,
+                    seal_block_from,
+                });
             }
         }
+
+        // Post-decode forward pass: append each turn's closing structural
+        // tokens into its slot before sealing, so the turn's pinned K/V closes
+        // its own brackets. The model didn't emit these — we synthesise them as
+        // if it did.
+        //
+        // Deliberately AFTER every turn's disposition above: the state that
+        // absorbs the tail must be the one being sealed, and on the MOVE path
+        // that state only arrives on the parent there.
+        //
+        // **One wave for every turn finishing here, not one per turn.** Each
+        // tail is a slot's own tokens on its own slot, so forwarding them
+        // together gives each slot exactly what forwarding it alone would — the
+        // same pieces, the same page closes, in the same order — and turns that
+        // finish in the same step share the forward instead of queueing behind
+        // each other's on the loop thread.
+        let tails: Vec<(SequenceId, &[u32])> = sealing
+            .iter()
+            .filter(|t| !t.state.post_decode_tokens.is_empty())
+            .map(|t| (t.seal_slot, &t.state.post_decode_tokens[..]))
+            .collect();
+        if !tails.is_empty() {
+            let _g = profile::span("cleanup:post_decode_prefill");
+            for (slot, e) in self.run_prefill_batch(&tails) {
+                tracing::warn!("post-decode prefill failed for slot {}: {}", slot, e);
+            }
+        }
+
+        for turn in sealing {
+            self.seal_finished_turn(turn);
+        }
         self.drain_parked_forks();
+    }
+
+    /// Seal one finished turn whose disposition and closing tail are done, free
+    /// its slot's chunks, and send the caller its `Done`.
+    fn seal_finished_turn(&mut self, turn: FinishedTurn) {
+        let FinishedTurn {
+            state,
+            text,
+            decode_ms,
+            total_ms,
+            tokens_generated,
+            tokens_per_second,
+            sequence_stats,
+            context_tokens,
+            seal_slot,
+            seal_block_from,
+        } = turn;
+
+        // Seal-and-write step.  When `seal_action != None`, we
+        // snapshot `seal_slot` and apply the appropriate substrate
+        // write (turn append or section pin).  The resulting
+        // `SealResult` rides along on the Done event so the
+        // conversation-side post-actions (cold store) can run
+        // without a second round trip.
+        // To the end of the turn: the seal, then the truncate and the `Done`.
+        let _seal_span = profile::span("cleanup:seal");
+        let seal_result = match &state.seal_action {
+            SealAction::None => None,
+            // A stuffed prefill carries its own per-region content,
+            // built when the grid was planned — the generic
+            // `TurnContent` assembled below describes the whole slot and
+            // would give every region the same text and the same tokens.
+            SealAction::TurnGroup(turns) => {
+                let turns = Arc::clone(turns);
+                // `seal_block_from` is where THIS submission's own region
+                // starts on the slot — past the projection's materialised
+                // system prompt. The carve's block offsets are relative to
+                // the stuffed grid, so they are rebased onto it.
+                self.perform_carved_turn_seals(seal_slot, seal_block_from, &turns)
+            }
+            action => {
+                // Bundle the per-half display text and the
+                // combined token sequence the seal pinned
+                // into the slot.  Text and tokens carry
+                // distinct shapes here: the substrate stores
+                // `user_text` / `assistant_text` as the
+                // human-readable strings the caller supplied,
+                // while `token_ids` carries the full slot
+                // token sequence (prefill + decoded body +
+                // post-decode tail) so cross-process replay
+                // reconstructs the exact K/V the kernel saw.
+                let turn_content = if matches!(action, SealAction::Turn) {
+                    // user_text comes through verbatim from
+                    // submit_turn (raw user message, no role
+                    // markers, no /no_think prefix).
+                    // assistant_text is the model's decoded
+                    // body — special tokens skipped, just the
+                    // reply the user sees streamed.  The
+                    // substrate stores both halves verbatim;
+                    // no caller assembles a combined string.
+                    // The last entry in state.generated_tokens
+                    // was sampled from the most recent forward
+                    // pass but never forwarded itself — the
+                    // loop terminated (EOS or max_tokens) before
+                    // another forward could write its K/V into
+                    // the slot.  Drop it so token_ids aligns
+                    // 1:1 with the K/V chunk grid.
+                    //
+                    // **Deliberately NOT `forwarded_generated`.** That
+                    // counter answers "is anything waiting to go out",
+                    // which is all the injection path needs, and it is
+                    // maintained by the paths that forward — so a path
+                    // that forwards without touching it reads low.
+                    // Sealing from it made `token_ids` 2 tokens shorter
+                    // than the chunk grid on a measured turn (287 against
+                    // 289), breaking the 1:1 contract this slice exists
+                    // to keep. The grid's authority is the K/V.
+                    let forwarded_generated: &[u32] = state
+                        .generated_tokens
+                        .split_last()
+                        .map(|(_, rest)| rest)
+                        .unwrap_or(&[]);
+                    let mut full_tokens: Vec<u32> = Vec::with_capacity(
+                        state.prefill_tokens.len()
+                            + forwarded_generated.len()
+                            + state.post_decode_tokens.len(),
+                    );
+                    full_tokens.extend_from_slice(&state.prefill_tokens);
+                    full_tokens.extend_from_slice(forwarded_generated);
+                    full_tokens.extend_from_slice(&state.post_decode_tokens);
+
+                    // `text` is already written-then-decoded, so it is the
+                    // whole assistant half either way: a prefill turn
+                    // (repo_map / code_reading) supplies it verbatim and
+                    // never decodes, and a decode turn with a seeded
+                    // prefix carries both parts. Choosing between them —
+                    // which this did — silently dropped the decoded half
+                    // of any turn that had both.
+                    let assistant_text = text.clone();
+                    let total = full_tokens.len() as u32;
+                    let layout = self.build_turn_layout(
+                        state.user_content_start,
+                        state.user_content_end,
+                        state.assistant_content_start,
+                        total,
+                        state.user_text.clone(),
+                        assistant_text,
+                        state.no_think,
+                        state.think_close_at,
+                    );
+                    Some(TurnContent {
+                        role: Role::Assistant,
+                        tags: state.tags.clone(),
+                        layout,
+                        token_ids: TokenBuffer::from(full_tokens),
+                    })
+                } else {
+                    None
+                };
+                self.perform_seal_and_write(
+                    seal_slot,
+                    seal_block_from,
+                    SealEnd::SlotEnd,
+                    action,
+                    turn_content,
+                )
+                .unwrap_or_else(|e| {
+                    tracing::warn!("post-Done seal failed for slot {}: {}", seal_slot, e,);
+                    None
+                })
+            }
+        };
+
+        // Stateless-slot housekeeping: drop the slot's chunks
+        // now that `perform_seal_and_write` has captured them
+        // into the substrate residence. The next turn's
+        // `apply_projection` rebuilds the slot from substrate
+        // anyway, so holding onto these `Arc<ChunkGid>`s
+        // between turns just pins arena slots that nothing
+        // reads. Truncating to 0 drops the slot's Arc refs;
+        // the residence keeps the chunks alive for the next
+        // projection inject.
+        if let Err(e) = self.session.truncate_sequence_to_blocks(seal_slot.0, 0) {
+            tracing::warn!(
+                "post-seal slot truncate failed for slot {}: {}",
+                seal_slot,
+                e
+            );
+        }
+        // The slot no longer holds what its last assembly placed.
+        if let Some(slot_state) = self.slot_projection_state.get_mut(&seal_slot) {
+            slot_state.placed_pieces.clear();
+        }
+
+        let _ = state.event_tx.send(TurnEvent::Done(TurnResponse {
+            text,
+            token_ids: state.generated_tokens,
+            stats: TurnStats {
+                prefill_ms: state.prefill_ms,
+                decode_ms,
+                total_ms,
+                tokens_generated,
+                tokens_per_second,
+                prefill_token_count: state.prefill_token_count,
+                turn_prefill_tokens: state.prefill_tokens.len(),
+                context_tokens,
+                finish: state.finish,
+                sequence: sequence_stats,
+            },
+            seal: seal_result,
+        }));
     }
 
     /// Install a persisted section as a **cold-marker** — `cold = Some`,
@@ -8618,7 +8702,10 @@ impl Scheduler {
         // This is the LIVE turn seal (dialogue + code-read roundtrip turns) — count
         // it for the GUI's sealing phase, timing the dominant sig-gather cost.
         let t_sig = Instant::now();
-        let wide_sigs = self.gather_wide_sigs(seal_slot, (block_from, block_to));
+        let wide_sigs = {
+            let _g = profile::span("seal:wide_sigs");
+            self.gather_wide_sigs(seal_slot, (block_from, block_to))
+        };
         // **The signatures describe what is RETRIEVABLE, and the reasoning is
         // not.** A turn's reasoning is attendable from exactly one subsequent
         // projection, by position, and never by recall — every later projection
@@ -8708,9 +8795,12 @@ impl Scheduler {
                     block_end: block_to as u64,
                     sealed_gpu: Some(Arc::new(delta_gpu)),
                 };
-                let idx = conversation
-                    .record_turn(target.timeline, role, write, |seqs| Ok(seqs.to_vec()))
-                    .map_err(ConversationError::Model)?;
+                let idx = {
+                    let _g = profile::span("seal:record_turn");
+                    conversation
+                        .record_turn(target.timeline, role, write, |seqs| Ok(seqs.to_vec()))
+                        .map_err(ConversationError::Model)?
+                };
                 recorded_turn_index = Some(idx.0);
 
                 // Drain pending section quantizations.  Every section in
@@ -8730,6 +8820,7 @@ impl Scheduler {
                 // `tests/section_quantize_real_model.rs` for why earlier
                 // / asynchronous attempts corrupt sysprompt K/V.
                 if !self.pending_section_quantize.is_empty() {
+                    let _g = profile::span("seal:section_quantize");
                     if let Some(turn_policy) = self.session.compression_policy() {
                         let boundary_policy = Self::section_compression_policy_boundary();
                         let member_policy = Self::section_compression_policy_member(&turn_policy);
@@ -8907,6 +8998,7 @@ impl Scheduler {
                 // group seals 24 turns, so that was 24 exports per group and 2,998
                 // across a full build. The state is fixed-size per sequence, so a
                 // 19-token question costs exactly what a full trajectory does.
+                let _export_span = profile::span("seal:export_recurrent");
                 let ephemeral = conversation.read().is_timeline_transient(target.timeline);
                 let t_export = Instant::now();
                 // The model's other recurrence, in its own encoding. Exported at
@@ -8933,11 +9025,13 @@ impl Scheduler {
                         }
                     }
                 };
-                match if ephemeral {
+                let exported = if ephemeral {
                     Ok(None)
                 } else {
+                    let _g = profile::span("seal:export_readback");
                     self.model.export_recurrent(seal_slot.0)
-                } {
+                };
+                match exported {
                     Ok(Some((schedule_hash, layers))) => {
                         let payload = SnapshotPayload {
                             timeline_id: target.timeline.raw(),
@@ -8946,16 +9040,15 @@ impl Scheduler {
                             layers: layers.into_iter().map(SnapshotLayer::from).collect(),
                             aux,
                         };
-                        let bytes = payload.encode();
-                        // Timed around export + encode, which is the whole of
-                        // what the seal pays synchronously: the append itself is
-                        // the off-thread writer's problem.
+                        // Timed around the export, which is the whole of what the
+                        // seal pays synchronously: the encode and the append are
+                        // the off-thread writer's.
                         use std::sync::atomic::Ordering::Relaxed;
                         SNAPSHOT_EXPORT_US
                             .fetch_add(t_export.elapsed().as_micros() as u64, Relaxed);
-                        SNAPSHOT_BYTES.fetch_add(bytes.len() as u64, Relaxed);
+                        SNAPSHOT_BYTES.fetch_add(payload.encoded_len() as u64, Relaxed);
                         SNAPSHOT_COUNT.fetch_add(1, Relaxed);
-                        conversation.enqueue_recurrent_snapshot(target.timeline, bytes);
+                        conversation.enqueue_recurrent_snapshot(target.timeline, payload);
                     }
                     // **`None` from a model that declares recurrent state is a
                     // contradiction, not a fast path.**
@@ -9250,24 +9343,43 @@ impl Scheduler {
             self.max_prefill_pass_tokens,
             self.model
                 .prefill_width_cap(self.session.activation_dtype()),
-            // The KV side's own bound: the admit phase claims every chunk a
-            // forward will write before it computes anything, so a chunk wider
-            // than the free ground can back fails part way through claiming.
-            //
-            // Priced through `kv_token_cap`, which is the only thing here that
-            // knows the units. The KV side counts 16 MiB regions and this budget
-            // is in tokens; `vram_budget_available` is that same free count in
-            // bytes (`(free + blocked) × REGION_BYTES`, so it reads the ground a
-            // standing tier releases before these claims run, exactly as
-            // `kv_region_state` does), and the block price turns bytes into
-            // tokens.
-            self.session
-                .vram_budget_available()
-                .and_then(|free| admit::pass_budget::kv_token_cap(free, self.per_block_kv_bytes())),
+            self.prefill_kv_token_cap(),
             // A tier budget that prices to a single row would make no progress,
             // so the cap never falls below one chunk.
             CHUNK_SIZE,
         )
+    }
+
+    /// Tokens a prefill group of `total` queued tokens shares — the pass
+    /// budget, or all of `total` when it passes the model's cap by no more than
+    /// the model's own slack. See [`admit::pass_budget::prefill_group_budget`].
+    pub(super) fn prefill_group_budget(&self, total: usize) -> usize {
+        admit::pass_budget::prefill_group_budget(
+            total,
+            self.max_prefill_pass_tokens,
+            self.model
+                .prefill_width_cap(self.session.activation_dtype()),
+            self.prefill_kv_token_cap(),
+            CHUNK_SIZE,
+        )
+    }
+
+    /// Tokens the KV side's free ground can still back.
+    ///
+    /// The KV side's own bound: the admit phase claims every chunk a forward
+    /// will write before it computes anything, so a chunk wider than the free
+    /// ground can back fails part way through claiming.
+    ///
+    /// Priced through `kv_token_cap`, which is the only thing here that knows
+    /// the units. The KV side counts 16 MiB regions and this budget is in
+    /// tokens; `vram_budget_available` is that same free count in bytes
+    /// (`(free + blocked) × REGION_BYTES`, so it reads the ground a standing
+    /// tier releases before these claims run, exactly as `kv_region_state`
+    /// does), and the block price turns bytes into tokens.
+    fn prefill_kv_token_cap(&self) -> Option<usize> {
+        self.session
+            .vram_budget_available()
+            .and_then(|free| admit::pass_budget::kv_token_cap(free, self.per_block_kv_bytes()))
     }
 
     /// Run `tokens` through the model on `seq`, in [`Self::prefill_pass_budget`]
@@ -11389,6 +11501,7 @@ mod tests {
         BatchedConfig, BatchedInferenceSession, KvLayers, ManagedBatchedModel, WaveResult,
     };
     use std::str::FromStr;
+    use std::time::Duration;
 
     // —— Dummy model ——————————————————————————————————————————————————————————
 
@@ -12153,6 +12266,168 @@ mod tests {
         fn prune(&self) -> candle::Result<()> {
             Ok(())
         }
+    }
+
+    /// A model that refuses a wave mixing adapters — as the real session does —
+    /// records every prefill wave's sequences, and fails any wave carrying
+    /// `fail_with`.
+    #[derive(Clone)]
+    struct AdapterStrict {
+        inner: DummyModel,
+        waves: Arc<Mutex<Vec<Vec<usize>>>>,
+        fail_with: Option<usize>,
+    }
+
+    impl ManagedBatchedModel for AdapterStrict {
+        fn maybe_change_dtype(&self, dtype: DType) -> candle::Result<()> {
+            self.inner.maybe_change_dtype(dtype)
+        }
+        fn num_layers(&self) -> usize {
+            self.inner.num_layers()
+        }
+        fn n_kv_head(&self) -> usize {
+            self.inner.n_kv_head()
+        }
+        fn head_dim(&self) -> usize {
+            self.inner.head_dim()
+        }
+        fn wave_geometry(&self, act_dtype: DType) -> candle_nn::kv_cache::ModelGeometry {
+            self.inner.wave_geometry(act_dtype)
+        }
+        fn device(&self) -> &candle::Device {
+            self.inner.device()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn forward_wave(
+            &self,
+            session: &mut BatchedInferenceSession,
+            decode_seqs: &[usize],
+            decode_inputs: &[Tensor],
+            prefill_seqs: &[usize],
+            prefill_inputs: &[Tensor],
+            glue_seqs: &[usize],
+            glue_inputs: &[Tensor],
+            layer_start: usize,
+            layer_end: usize,
+            residual_in: Option<Tensor>,
+        ) -> candle::Result<WaveResult> {
+            session.wave_adapter(prefill_seqs)?;
+            if self.fail_with.is_some_and(|s| prefill_seqs.contains(&s)) {
+                candle::bail!("wave forward failed");
+            }
+            self.waves.lock().unwrap().push(prefill_seqs.to_vec());
+            self.inner.forward_wave(
+                session,
+                decode_seqs,
+                decode_inputs,
+                prefill_seqs,
+                prefill_inputs,
+                glue_seqs,
+                glue_inputs,
+                layer_start,
+                layer_end,
+                residual_in,
+            )
+        }
+        fn prune(&self) -> candle::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scheduler_over(model: AdapterStrict) -> Scheduler {
+        let (_tx, rx) = flume::bounded(16);
+        Scheduler::new(
+            rx,
+            Box::new(model),
+            make_test_session(),
+            make_dummy_tokenizer(),
+            vec![0u32].into(),
+            64,
+            8,
+            false,
+            None,
+            DecodeHealthConfig::default(),
+            512,
+            PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
+            Arc::new(crate::guest::Guests::new()),
+        )
+    }
+
+    /// **Closing tails batch by adapter.** One wave cannot carry two adapters, so
+    /// a turn on another adapter rides a wave of its own — and every tail lands.
+    #[test]
+    fn closing_tails_on_different_adapters_ride_separate_waves() {
+        let waves = Arc::new(Mutex::new(Vec::new()));
+        let mut sched = scheduler_over(AdapterStrict {
+            inner: DummyModel::new(),
+            waves: Arc::clone(&waves),
+            fail_with: None,
+        });
+        let a = SequenceId(sched.session.create_sequence().unwrap());
+        let b = SequenceId(sched.session.create_sequence().unwrap());
+        let c = SequenceId(sched.session.create_sequence().unwrap());
+        sched
+            .session
+            .set_sequence_adapter(b.0, Some(Arc::from("tuned")))
+            .unwrap();
+        let failed = sched.run_prefill_batch(&[(a, &[1, 2]), (b, &[3]), (c, &[4])]);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(*waves.lock().unwrap(), vec![vec![a.0, c.0], vec![b.0]]);
+        assert_eq!(sched.session.sequence_offset(a.0), Some(2));
+        assert_eq!(sched.session.sequence_offset(b.0), Some(1));
+        assert_eq!(sched.session.sequence_offset(c.0), Some(1));
+    }
+
+    /// **A failed wave fails the turns it carried and no others.** The adapter
+    /// group whose wave fails reports its turns; the other group's tails still
+    /// land.
+    #[test]
+    fn a_failed_closing_tail_wave_fails_only_the_turns_it_carried() {
+        let waves = Arc::new(Mutex::new(Vec::new()));
+        let mut sched = scheduler_over(AdapterStrict {
+            inner: DummyModel::new(),
+            waves: Arc::clone(&waves),
+            fail_with: None,
+        });
+        let a = SequenceId(sched.session.create_sequence().unwrap());
+        let b = SequenceId(sched.session.create_sequence().unwrap());
+        let c = SequenceId(sched.session.create_sequence().unwrap());
+        sched
+            .session
+            .set_sequence_adapter(b.0, Some(Arc::from("tuned")))
+            .unwrap();
+        // Rebuild over a model that fails the wave carrying `a`.
+        sched.model = Box::new(AdapterStrict {
+            inner: DummyModel::new(),
+            waves: Arc::clone(&waves),
+            fail_with: Some(a.0),
+        });
+        let failed = sched.run_prefill_batch(&[(a, &[1, 2]), (b, &[3]), (c, &[4])]);
+        let failed_ids: Vec<SequenceId> = failed.iter().map(|(s, _)| *s).collect();
+        assert_eq!(failed_ids, vec![a, c], "the wave carrying a also carried c");
+        assert_eq!(*waves.lock().unwrap(), vec![vec![b.0]]);
+        assert_eq!(sched.session.sequence_offset(b.0), Some(1));
+        assert_eq!(sched.session.sequence_offset(a.0), Some(0));
+    }
+
+    /// **A sequence named twice keeps its spans in order.** One wave cannot carry
+    /// it twice, so the repeat forwards after the batch, on its own.
+    #[test]
+    fn a_sequence_named_twice_forwards_its_spans_in_order() {
+        let waves = Arc::new(Mutex::new(Vec::new()));
+        let mut sched = scheduler_over(AdapterStrict {
+            inner: DummyModel::new(),
+            waves: Arc::clone(&waves),
+            fail_with: None,
+        });
+        let a = SequenceId(sched.session.create_sequence().unwrap());
+        let b = SequenceId(sched.session.create_sequence().unwrap());
+        let failed = sched.run_prefill_batch(&[(a, &[1]), (b, &[2]), (a, &[3, 4])]);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(*waves.lock().unwrap(), vec![vec![a.0, b.0], vec![a.0]]);
+        assert_eq!(sched.session.sequence_offset(a.0), Some(3));
     }
 
     /// **A glue fill that fails leaves nothing of its assembly to keep.** The
@@ -13470,6 +13745,7 @@ mod tests {
             assistant_content_start: 0,
             no_think: false,
             in_tool_call: false,
+            wrote_tool_call: false,
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,
             pending_mask: None,
@@ -13571,6 +13847,51 @@ mod tests {
             ),
             "the new turn must not be refused"
         );
+    }
+
+    /// **A turn that runs out of budget streams every token it generated, the
+    /// last included.** Only an end-of-sequence token goes unstreamed; the final
+    /// token of a length-capped turn is an ordinary token, and a caller counting
+    /// what it received must see the same number the turn reports.
+    ///
+    /// Driven through the whole loop — submit, prefill, decode, cleanup — since
+    /// the streaming decision sits on both the prefill's first token and the
+    /// decode commit, and only the loop runs them in the order a caller sees.
+    #[test]
+    fn a_length_capped_turn_streams_every_token_it_generated() {
+        let (mut scheduler, tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let loop_thread = std::thread::spawn(move || scheduler.run());
+
+        let (event_tx, event_rx) = flume::unbounded();
+        let mut submit = raw_submit_turn(parent, event_tx);
+        if let SchedulerRequest::SubmitTurn { sampling, .. } = &mut submit {
+            // The dummy model's logits are flat, so the end-of-sequence token
+            // would otherwise be drawn now and then; banned, the turn can only
+            // end on its budget.
+            sampling.banned_tokens = vec![0];
+        }
+        tx.send(submit).expect("scheduler running");
+        let mut streamed = Vec::new();
+        let done = loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the turn ends within a minute")
+            {
+                TurnEvent::Token(t) => streamed.push(t),
+                TurnEvent::Done(resp) => break resp,
+                TurnEvent::Error(e) => panic!("the turn failed: {e}"),
+                _ => {}
+            }
+        };
+        tx.send(SchedulerRequest::Shutdown)
+            .expect("scheduler running");
+        loop_thread.join().expect("the loop exits cleanly");
+
+        assert_eq!(done.stats.finish, FinishReason::Length);
+        assert_eq!(done.token_ids.len(), 4, "max_decode_tokens is 4");
+        assert_eq!(streamed, done.token_ids.to_vec());
     }
 
     /// The refusal half: a previous turn that is registered but has no decode
@@ -13989,6 +14310,62 @@ mod tests {
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
         }
+    }
+
+    /// **A spent forward still takes turns, as joins, while each member keeps a
+    /// chunk — and every join pays the tier its extra sequence adds.**
+    ///
+    /// Turns of 64 tokens fill the pass's rows; the ones after offer no rows and
+    /// are admitted until `chunk / CHUNK_SIZE` members share the pass, the carry
+    /// rule `share_within` forms the wave by. Each join is priced at the tier one
+    /// more sequence adds at the forward's rows, never at zero.
+    #[test]
+    fn a_spent_forward_takes_joins_while_each_member_keeps_a_chunk() {
+        use super::admit::{Ground, Kind};
+        use super::admit_ground::AdmitPass;
+        use crate::projection::DecodePriority;
+
+        let mut sched = admission_scheduler();
+        let chunk = sched.prefill_pass_budget();
+        let members = chunk / CHUNK_SIZE;
+        for _ in 0..members + 4 {
+            let id = SequenceId(sched.session.create_sequence().unwrap());
+            sched.prefill_queue.push_back(test_prefill_work(id));
+        }
+        let dtype = sched.session.activation_dtype();
+        let tier = |n: usize| sched.model.wave_tier_bytes(chunk, n, dtype).unwrap_or(0);
+        let join_price: Vec<u64> = (0..=members)
+            .map(|n| tier(n + 1).saturating_sub(tier(n)))
+            .collect();
+
+        let mut pass = AdmitPass::new(&mut sched);
+        let mut offers = Vec::new();
+        while let Some(cost) = pass.peek(Kind::Prefill, DecodePriority::High) {
+            offers.push((cost.rows, cost.activations));
+            assert!(pass.admit(Kind::Prefill, DecodePriority::High, cost));
+        }
+        assert_eq!(
+            offers.len(),
+            members,
+            "one chunk per member, and no further"
+        );
+        let rows: usize = offers.iter().map(|(r, _)| *r).sum();
+        assert_eq!(
+            rows, chunk,
+            "the rows go to the first offers until the pass is spent"
+        );
+        for (k, &(rows, activations)) in offers.iter().enumerate() {
+            if rows == 0 {
+                assert_eq!(
+                    activations, join_price[k],
+                    "join {k} pays the tier its sequence adds"
+                );
+            }
+        }
+        assert!(
+            offers.iter().any(|(r, _)| *r == 0),
+            "the pass took joins once its rows were spent"
+        );
     }
 
     /// **Every figure admission compares must be in one currency.**

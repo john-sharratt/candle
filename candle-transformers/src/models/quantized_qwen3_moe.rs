@@ -2578,6 +2578,16 @@ pub fn batched_forward_configs() -> Vec<TestConfig> {
             num_repeats: 1,
             test_mode: Some(TestMode::StoryRewrite),
         },
+        // The engine probe's clean baseline runs eight C5 turns together
+        // (`candle-conversation`'s `Probe::baseline_width`), so the ceiling it is
+        // compared with is this row: the same mode at the same width.
+        TestConfig {
+            mode: InferenceMode::C5,
+            use_batched: true,
+            num_contexts: 8,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
         TestConfig {
             mode: InferenceMode::C6,
             use_batched: true,

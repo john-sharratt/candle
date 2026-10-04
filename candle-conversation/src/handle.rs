@@ -350,6 +350,7 @@ mod tests {
                 tokens_generated: 0,
                 tokens_per_second: 0.0,
                 prefill_token_count: 0,
+                turn_prefill_tokens: 0,
                 context_tokens: 0,
                 finish: Default::default(),
                 sequence: SequenceStats::default(),

@@ -31,10 +31,12 @@
 //! those ends up duplicated. The example exists because the interesting runs are long
 //! and want flags; the tests exist so a model is one line to cover.
 
+mod batch;
 mod probe;
 mod profile;
 mod run;
 
-pub use probe::{Probe, ProbeOutcome};
+pub use batch::{run_story_batch, BatchTiming, SessionClock, StoryBatch};
+pub use probe::{BaselineRow, Probe, ProbeOutcome};
 pub use profile::{names, profile, profiles, ModelProfile, StoryGate};
-pub use run::{run, run_on_model};
+pub use run::{run, run_baseline, run_on_model};

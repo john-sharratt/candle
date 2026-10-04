@@ -34,9 +34,10 @@ use std::thread::JoinHandle;
 
 use crossbeam::channel::{self, Receiver, Sender};
 
-use super::record::RecordType;
+use super::manifest::RecordLoc;
+use super::record::{BranchCheckpointPayload, RecordType, SnapshotPayload};
 use super::resume::{self, TurnChunkGrid};
-use super::{Result, SubstratePersistence};
+use super::{PersistenceError, Result, SubstratePersistence};
 use crate::persistence::streams::StreamId;
 use crate::substrate::{ResidenceIndex, Substrate};
 
@@ -46,8 +47,18 @@ use crate::substrate::{ResidenceIndex, Substrate};
 /// in the common case.
 const MAX_PENDING_EVENTS: usize = 16_384;
 /// Max pending write BYTES before an enqueue blocks — the second cap, so a burst
-/// of large KV-cold payloads can't balloon host RAM even under the event cap.
-const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024;
+/// of large payloads can't balloon host RAM even under the event cap. One cap for
+/// every bulk job ([`WriteJob::is_bulk`]): a KV-cold backlog may hold as much host
+/// memory as a snapshot cohort, which on the smallest dev box (32 GB) is 1.6%.
+///
+/// **Sized to hold a cohort's recurrent snapshots.** A recurrent model seals its
+/// whole state with every turn — ~65 MB on the Qwen3.6-35B-A3B, fixed per sequence
+/// whatever the turn's length — and a decode cohort finishes together, so it seals
+/// together. At 256 MiB the cap held under four of them, and the scheduler's loop
+/// thread, which is the enqueuer, waited on the disk for the rest of an
+/// eight-turn cohort, ~50 ms a turn. 512 MiB holds that cohort; sustained load is
+/// still paced by how fast the writer drains, which is the writer's to keep up.
+const MAX_PENDING_BYTES: u64 = 512 * 1024 * 1024;
 /// Upper bound on jobs drained before a group fsync, so a sustained burst still
 /// yields the persistence lock to the persistence thread's other work regularly.
 const MAX_BATCH: usize = 512;
@@ -94,17 +105,26 @@ pub(crate) enum WriteJob {
     /// newest supersedes all previous for the stream (single tail); the
     /// writer registers the fresh location in the substrate index after the
     /// append, `Tokens`-style.
+    ///
+    /// **Carried decoded and encoded here, on the writer's thread.** The encode is
+    /// a ~65 MB copy per turn on a recurrent model, and its enqueuer is the
+    /// scheduler's loop thread: encoding there put that copy between the decode
+    /// steps of every turn still running. The queue is FIFO, so the record still
+    /// lands before the turn's `Tokens`, exactly as the seal orders them.
     Snapshot {
         stream_id: StreamId,
-        payload: Vec<u8>,
+        payload: SnapshotPayload,
     },
     /// A prompt branch's recurrent checkpoint (`BranchCheckpoint` record).
     /// Same single-tail append as [`Self::Snapshot`] and the same byte-cap
     /// class; a separate job because the record type is what tells compaction
     /// this one is a cache it may reclaim.
+    /// Shared with the substrate's in-RAM memo of the same checkpoint, and
+    /// written from its parts, so neither the queue nor the append copies the
+    /// state.
     BranchCheckpoint {
         stream_id: StreamId,
-        payload: Vec<u8>,
+        payload: Arc<BranchCheckpointPayload>,
     },
     /// A turn's projection-event trajectory (`ProjectionEvents` record,
     /// last-writer-wins per stream). The in-RAM blob is mirrored synchronously
@@ -145,18 +165,19 @@ impl WriteJob {
             WriteJob::ProjectionEvents { payload, .. } => payload.len() as u64,
             WriteJob::ConvMeta { payload, .. } => payload.len() as u64,
             WriteJob::ConvState { payload, .. } => payload.len() as u64,
-            WriteJob::Snapshot { payload, .. } => payload.len() as u64,
-            WriteJob::BranchCheckpoint { payload, .. } => payload.len() as u64,
+            WriteJob::Snapshot { payload, .. } => payload.encoded_len() as u64,
+            WriteJob::BranchCheckpoint { payload, .. } => payload.parts().byte_len() as u64,
             WriteJob::KvCold { grid, .. } => grid.bytes() as u64,
             WriteJob::Shutdown(_) => 0,
         }
     }
 
-    /// Whether this job counts against the BYTE cap. Only the large KV-cold
-    /// payloads do; the small metadata records (stream-decl / tokens / sigs) are
-    /// gated by the EVENT cap alone, so a KV-cold backlog (e.g. the writer stalled
-    /// behind a compaction holding the persistence lock) can never block the
-    /// scheduler's latency-critical seal metadata behind the byte cap.
+    /// Whether this job counts against the BYTE cap. Only the large payloads do —
+    /// KV-cold grids and recurrent snapshots and checkpoints; the small metadata
+    /// records (stream-decl / tokens / sigs) are gated by the EVENT cap alone, so
+    /// a bulk backlog (e.g. the writer stalled behind a compaction holding the
+    /// persistence lock) can never block the scheduler's latency-critical seal
+    /// metadata behind the byte cap.
     fn is_bulk(&self) -> bool {
         // Snapshots are multi-MB state blobs: byte-capped with the KV so a
         // backlog can never crowd out the small seal metadata.
@@ -177,8 +198,9 @@ struct Backpressure {
 
 impl Backpressure {
     /// Reserve queue capacity for one job, blocking under backpressure. `bulk`
-    /// (KV-cold only) additionally honors the byte cap; metadata jobs are gated by
-    /// the event cap alone so they never block behind a KV-cold byte backlog.
+    /// (KV-cold, snapshot and branch-checkpoint jobs — see [`WriteJob::is_bulk`])
+    /// additionally honors the byte cap; metadata jobs are gated by the event cap
+    /// alone so they never block behind a bulk byte backlog.
     fn acquire(&self, bytes: u64, bulk: bool) {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // Block until there's room. The `g.0 > 0` guard guarantees a single
@@ -296,21 +318,37 @@ fn writer_loop(
     bp: Arc<Backpressure>,
 ) {
     while let Ok((first, first_bytes)) = rx.recv() {
+        let t_process = std::time::Instant::now();
         let mut ack = process_one(first, &substrate, &persistence);
         bp.release(first_bytes);
         let mut n = 1;
+        let mut batch_bytes = first_bytes;
         while ack.is_none() && n < MAX_BATCH {
             match rx.try_recv() {
                 Ok((job, bytes)) => {
                     ack = process_one(job, &substrate, &persistence);
                     bp.release(bytes);
                     n += 1;
+                    batch_bytes += bytes;
                 }
                 Err(_) => break,
             }
         }
+        let process_ms = t_process.elapsed().as_secs_f64() * 1e3;
         // Group-commit (fsync) the burst.
+        let t_commit = std::time::Instant::now();
         commit(&persistence);
+        // The writer's throughput is what the byte cap's backpressure waits on, so
+        // the split between preparing records and making them durable is what says
+        // which of the two a stalled enqueuer is actually waiting for.
+        tracing::debug!(
+            target: "candle_conversation::persistence::writer",
+            jobs = n,
+            mib = batch_bytes as f64 / (1 << 20) as f64,
+            process_ms,
+            commit_ms = t_commit.elapsed().as_secs_f64() * 1e3,
+            "writer batch committed"
+        );
         if let Some(ack) = ack {
             let _ = ack.send(());
             return;
@@ -435,29 +473,24 @@ fn process_one(
             // location under the substrate lock — non-nested, persistence
             // first, the `Tokens` discipline. The old location is simply
             // overwritten in the index; its bytes were already credited dead
-            // by the accounting layer inside the append.
-            let loc = {
-                let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-                p.write_snapshot(stream_id, &payload)
-            };
-            match loc {
+            // by the accounting layer inside the append. Written from the
+            // payload's parts: the state blobs go from the conversation's own
+            // buffers to the file with no intermediate copy.
+            match append_snapshot(persistence, stream_id, &payload) {
                 Ok(loc) => substrate
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .apply_snapshot_loc(stream_id, loc),
-                Err(e) => tracing::error!(
-                    target: "candle_conversation::persistence::writer",
-                    stream_id = stream_id.0,
-                    "snapshot append failed: {e}"
-                ),
+                Err(e) => retract_failed_snapshot(substrate, persistence, stream_id, &e),
             }
         }
         WriteJob::BranchCheckpoint { stream_id, payload } => {
             // Same append-then-register discipline as `Snapshot`, into the
-            // branch index.
+            // branch index, and written from the parts the same way.
+            let parts = payload.parts();
             let loc = {
                 let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-                p.write_branch_checkpoint(stream_id, &payload)
+                p.write_branch_checkpoint(stream_id, &parts.slices())
             };
             match loc {
                 Ok(loc) => substrate
@@ -523,6 +556,70 @@ fn write_kv_cold(
     Ok(())
 }
 
+/// Append a snapshot from its parts under the persistence lock.
+fn append_snapshot(
+    persistence: &Arc<Mutex<SubstratePersistence>>,
+    stream_id: StreamId,
+    payload: &SnapshotPayload,
+) -> Result<RecordLoc> {
+    // Fault injection (test-helpers): a stream armed via
+    // [`fault::fail_next_snapshot`] has this append fail, as a full or failing
+    // disk would fail it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    if fault::take_fail_snapshot(stream_id) {
+        return Err(PersistenceError::Corrupt(
+            "fault injection: the snapshot append failed".into(),
+        ));
+    }
+    let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+    // Fault injection (test-helpers): a stream armed via
+    // [`fault::garble_next_snapshot`] lands bytes no decoder accepts in place of
+    // this payload — a record that is present, checksummed and undecodable.
+    #[cfg(any(test, feature = "test-helpers"))]
+    if fault::take_garble_snapshot(stream_id) {
+        return p.write_snapshot(stream_id, &[fault::GARBLED_SNAPSHOT]);
+    }
+    let parts = payload.parts();
+    p.write_snapshot(stream_id, &parts.slices())
+}
+
+/// A seal's snapshot did not land. The stream's previous snapshot is a turn
+/// behind the `Tokens` record queued after this one, and a resume would install
+/// it under K/V it never saw — silent staleness, which the seal's write order
+/// exists to rule out. So the stream is retracted: dropped from the in-RAM
+/// index now, and durably by an empty `Snapshot` record, after which a resume
+/// recomputes instead.
+fn retract_failed_snapshot(
+    substrate: &Arc<RwLock<Substrate>>,
+    persistence: &Arc<Mutex<SubstratePersistence>>,
+    stream_id: StreamId,
+    error: &PersistenceError,
+) {
+    substrate
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .drop_snapshot_loc(stream_id);
+    let retracted = persistence
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retract_snapshot(stream_id);
+    match retracted {
+        Ok(()) => tracing::error!(
+            target: "candle_conversation::persistence::writer",
+            stream_id = stream_id.0,
+            "snapshot append failed: {error} — the stream's snapshot is retracted, \
+             so a resume recomputes its recurrent state"
+        ),
+        Err(retract) => tracing::error!(
+            target: "candle_conversation::persistence::writer",
+            stream_id = stream_id.0,
+            "snapshot append failed: {error}, and so did its retraction: {retract} — \
+             the previous snapshot is still the durable tail, and a reload before \
+             the next successful seal resumes one turn behind its K/V"
+        ),
+    }
+}
+
 fn commit(persistence: &Arc<Mutex<SubstratePersistence>>) {
     if let Ok(mut p) = persistence.lock() {
         if let Err(e) = p.commit() {
@@ -559,7 +656,47 @@ pub mod fault {
 
     /// Consume an armed drop for `stream`, if any.
     pub(super) fn take_drop_tokens(stream: StreamId) -> bool {
-        let mut armed = DROP_TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+        take(&DROP_TOKENS, stream)
+    }
+
+    static FAIL_SNAPSHOT: Mutex<Vec<StreamId>> = Mutex::new(Vec::new());
+
+    /// Arm: the next `Snapshot` append for `stream` fails, as a full or failing
+    /// disk would fail it. One-shot per call, like [`drop_next_tokens`].
+    pub fn fail_next_snapshot(stream: StreamId) {
+        FAIL_SNAPSHOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(stream);
+    }
+
+    /// Consume an armed snapshot failure for `stream`, if any.
+    pub(super) fn take_fail_snapshot(stream: StreamId) -> bool {
+        take(&FAIL_SNAPSHOT, stream)
+    }
+
+    static GARBLE_SNAPSHOT: Mutex<Vec<StreamId>> = Mutex::new(Vec::new());
+
+    /// What a garbled snapshot lands: too short for any version word and field
+    /// that follows it, so every decode refuses it.
+    pub const GARBLED_SNAPSHOT: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+
+    /// Arm: the next `Snapshot` append for `stream` lands [`GARBLED_SNAPSHOT`]
+    /// instead of its payload. One-shot per call, like [`drop_next_tokens`].
+    pub fn garble_next_snapshot(stream: StreamId) {
+        GARBLE_SNAPSHOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(stream);
+    }
+
+    /// Consume an armed garble for `stream`, if any.
+    pub(super) fn take_garble_snapshot(stream: StreamId) -> bool {
+        take(&GARBLE_SNAPSHOT, stream)
+    }
+
+    fn take(armed: &Mutex<Vec<StreamId>>, stream: StreamId) -> bool {
+        let mut armed = armed.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pos) = armed.iter().position(|s| *s == stream) {
             armed.remove(pos);
             true
@@ -573,11 +710,93 @@ pub mod fault {
 mod tests {
     use std::sync::{Arc, Mutex, RwLock};
 
-    use super::{SubstrateWriter, WriteJob};
-    use crate::persistence::record::RecordType;
+    use super::{fault, SubstrateWriter, WriteJob};
+    use crate::persistence::record::{RecordType, SnapshotPayload};
     use crate::persistence::streams::StreamId;
     use crate::persistence::{dir_fingerprint, SubstratePersistence};
     use crate::substrate::Substrate;
+
+    fn snapshot_at(turn_index: u32) -> SnapshotPayload {
+        SnapshotPayload {
+            timeline_id: 7,
+            turn_index,
+            schedule_hash: 0,
+            layers: Vec::new(),
+            aux: vec![turn_index as u8; 64],
+        }
+    }
+
+    /// **A snapshot that fails to land retracts the one before it.** That one
+    /// describes the previous turn, and the turn's `Tokens` record is queued
+    /// right behind the failed append: left as the tail, a reload would
+    /// install a state one turn behind its K/V. The retraction removes it from
+    /// the in-RAM index at once and from every later reload, and leaves other
+    /// conversations' snapshots alone; the stream's next snapshot is live again.
+    #[test]
+    fn a_failed_snapshot_retracts_the_previous_tail_now_and_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let failed = StreamId(0xF00D_0077);
+        let other = StreamId(0xF00D_0078);
+        let mut substrate = Substrate::new();
+        let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        let substrate = Arc::new(RwLock::new(substrate));
+        let persistence = Arc::new(Mutex::new(p));
+        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+
+        for stream_id in [failed, other] {
+            writer.enqueue(WriteJob::Snapshot {
+                stream_id,
+                payload: snapshot_at(0),
+            });
+        }
+        // Both turn-0 snapshots land before the fault is armed, so it can only
+        // fire on the turn-1 append — a second writer over the same handles.
+        writer.shutdown();
+        drop(writer);
+        assert!(substrate
+            .read()
+            .unwrap()
+            .recurrent_snapshot_loc(failed)
+            .is_some());
+        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+        fault::fail_next_snapshot(failed);
+        writer.enqueue(WriteJob::Snapshot {
+            stream_id: failed,
+            payload: snapshot_at(1),
+        });
+        writer.shutdown();
+        drop(writer);
+
+        let kept = substrate.read().unwrap().recurrent_snapshot_loc(other);
+        assert!(kept.is_some());
+        assert_eq!(
+            substrate.read().unwrap().recurrent_snapshot_loc(failed),
+            None
+        );
+        drop(persistence);
+
+        let mut reloaded = Substrate::new();
+        let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reloaded).unwrap();
+        assert_eq!(reloaded.recurrent_snapshot_loc(failed), None);
+        assert_eq!(reloaded.recurrent_snapshot_loc(other), kept);
+
+        // The next seal's snapshot is the stream's tail again, on reload too.
+        let substrate = Arc::new(RwLock::new(reloaded));
+        let persistence = Arc::new(Mutex::new(p));
+        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+        writer.enqueue(WriteJob::Snapshot {
+            stream_id: failed,
+            payload: snapshot_at(2),
+        });
+        writer.shutdown();
+        drop(writer);
+        let fresh = substrate.read().unwrap().recurrent_snapshot_loc(failed);
+        assert!(fresh.is_some());
+        drop(persistence);
+        let mut reloaded = Substrate::new();
+        let _p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reloaded).unwrap();
+        assert_eq!(reloaded.recurrent_snapshot_loc(failed), fresh);
+    }
 
     /// **A read-only writer drops every job and touches no file.** Metadata,
     /// tokens and a bulk snapshot are all dropped before they take a queue
@@ -619,7 +838,13 @@ mod tests {
         });
         writer.enqueue(WriteJob::Snapshot {
             stream_id: stream,
-            payload: vec![0u8; 4096],
+            payload: SnapshotPayload {
+                timeline_id: 7,
+                turn_index: 0,
+                schedule_hash: 0,
+                layers: Vec::new(),
+                aux: vec![0u8; 4096],
+            },
         });
         assert_eq!(*writer.backpressure.state.lock().unwrap(), (0, 0));
         writer.shutdown();

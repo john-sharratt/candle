@@ -488,6 +488,17 @@ pub struct Sequence {
     /// advances the state lands a turn on the timeline and a tracked flag
     /// would have to be cleared by each of them.
     state_is_prompt_only: bool,
+    /// The prompt branch whose checkpoint this conversation's state is — the one
+    /// built at create, or the one a dialed first turn swapped in. `None` when no
+    /// checkpoint was built (a model without recurrent state, an empty prompt, a
+    /// fork). A first turn whose dials name this same branch has nothing to swap.
+    installed_branch: Option<ContentHash>,
+}
+
+/// Whether a dialed first turn has to swap the prompt checkpoint: only when the
+/// branch its selection names is not the one already installed.
+fn needs_branch_swap(installed: Option<ContentHash>, selected: ContentHash) -> bool {
+    installed != Some(selected)
 }
 
 /// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
@@ -857,6 +868,7 @@ impl Sequence {
             primed_prefix: Arc::new(Vec::new()),
             branch_spans: Vec::new(),
             state_is_prompt_only: false,
+            installed_branch: None,
         };
 
         // Set the in-memory tree's system prompt tokens so the tree's
@@ -1195,6 +1207,11 @@ impl Sequence {
         // rebuilds from exactly these inputs.
         conv.primed_prefix = Arc::new(fixed_prefix.clone());
         conv.branch_spans = branch_spans;
+        // Only a checkpoint that exists is installed: a failed pass returns the
+        // prefix without a payload, and a first turn on that branch should try again.
+        conv.installed_branch = branch_checkpoint
+            .as_ref()
+            .and_then(|(prefix, payload)| payload.as_ref().map(|_| *prefix));
 
         // Pre-warm the slot: inject all system-prompt sections now so the
         // first `submit_turn` sees an already-populated slot and skips
@@ -1387,18 +1404,17 @@ impl Sequence {
             .map_err(|_| ConversationError::SchedulerGone)?;
         match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
             Ok(Some(state)) => {
-                let payload = BranchCheckpointPayload {
+                let payload = Arc::new(BranchCheckpointPayload {
                     prefix_hash: prefix,
                     schedule_hash: state.schedule_hash,
                     layers: state.layers.into_iter().map(SnapshotLayer::from).collect(),
                     aux: state.aux,
-                };
+                });
                 self.substrate
-                    .enqueue_branch_checkpoint(prefix, payload.encode());
+                    .enqueue_branch_checkpoint(prefix, payload.clone());
                 // Hold it decoded: the conversations opened next are on this
                 // same branch, and the durable record they would otherwise read
                 // is only just being written.
-                let payload = Arc::new(payload);
                 self.substrate.memo_branch_checkpoint(prefix, &payload);
                 note_branch_checkpoint_computed();
                 tracing::info!("computed the prompt branch checkpoint");
@@ -2046,11 +2062,26 @@ impl Sequence {
         // that had absorbed them: K/V holding the ingest, recurrent layers
         // having forgotten it — the very defect this block exists to remove.
         let timeline_is_empty = self.substrate.read().turn_count(self.target.timeline) == 0;
+        //
+        // **A changed selection is not a changed branch.** Dials that select no
+        // section tree — the thinking switch, a response-length dial on a prompt
+        // without that tree — leave the prompt exactly as it was primed, so the
+        // branch they name is the one already installed, and the swap would read
+        // the ~63 MiB checkpoint back off the log (the memo holds one branch, and
+        // every conversation with its own prompt is its own branch), decode it,
+        // and install the state the slot already holds. Measured on eight
+        // conversations submitted together: 123–300 ms per submit, the whole of
+        // the batch's prefill window. Naming the branch is a walk of the sections
+        // already in the substrate; only a branch that differs is rebuilt.
         if selection_changed && self.state_is_prompt_only && timeline_is_empty {
             let primed = Arc::clone(&self.primed_prefix);
             let spans = self.branch_spans.clone();
-            if let Some((prefix, fresh)) = self.build_branch_checkpoint(&primed, &spans)? {
-                self.restore_branch_checkpoint(prefix, fresh)?;
+            let (selected, _) = self.prompt_branch(&primed, &spans);
+            if needs_branch_swap(self.installed_branch, selected) {
+                if let Some((prefix, fresh)) = self.build_branch_checkpoint(&primed, &spans)? {
+                    self.restore_branch_checkpoint(prefix, fresh)?;
+                    self.installed_branch = Some(prefix);
+                }
             }
         }
         // Whatever branch it started from, this turn's decode advances the
@@ -4493,6 +4524,7 @@ impl Sequence {
             // timeline's snapshot, never exactly the prompt checkpoint — so
             // the branch-swap window is closed.
             state_is_prompt_only: false,
+            installed_branch: None,
             // Forks start with a fresh scanner state — scoring will refresh
             // on the next provenance scan.  No need to clone the parent's scores.
         };
@@ -5494,6 +5526,34 @@ fn cap_probe_window(probe: Vec<WideQSig>, max_tail: usize) -> Vec<WideQSig> {
     out.extend_from_slice(&probe[..HEAD]);
     out.extend_from_slice(&probe[tail_lo..]);
     out
+}
+
+#[cfg(test)]
+mod branch_swap_tests {
+    use super::needs_branch_swap;
+    use crate::persistence::content_hash::ContentHash;
+
+    const A: ContentHash = ContentHash { lo: 1, hi: 2 };
+    const B: ContentHash = ContentHash { lo: 3, hi: 4 };
+
+    /// Dials that name the branch already installed — the thinking switch on a
+    /// prompt without section trees — swap nothing.
+    #[test]
+    fn a_selection_naming_the_installed_branch_swaps_nothing() {
+        assert!(!needs_branch_swap(Some(A), A));
+    }
+
+    /// Dials that name a different branch swap it, which is what the window exists for.
+    #[test]
+    fn a_selection_naming_another_branch_swaps() {
+        assert!(needs_branch_swap(Some(A), B));
+    }
+
+    /// No checkpoint went in at create — a failed pass — so the first turn builds one.
+    #[test]
+    fn a_conversation_with_no_installed_checkpoint_swaps() {
+        assert!(needs_branch_swap(None, A));
+    }
 }
 
 #[cfg(test)]

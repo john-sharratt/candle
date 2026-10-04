@@ -13,6 +13,12 @@ use std::path::Path;
 use candle::{Device, Result};
 use candle_nn::kv_cache::QWEN36_MOE_KV_FACTORS;
 
+// The ladder below is reached from `candle-conversation` too, which depends on this
+// crate with `ruler-bench` on — the same gate `quantized_qwen3_moe`'s ladder carries.
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+use crate::models::batch_test::utils::{TestConfig, TestMode};
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+use crate::models::batched_inference::InferenceMode;
 use crate::models::draft_ladder::QWEN36_35B_A3B_DRAFT;
 
 use super::qwen35::{load_hybrid_gguf, HybridBatched, Qwen35LoadOptions};
@@ -81,12 +87,192 @@ pub fn from_gguf_path(
     HybridBatched::new(model, QWEN36_MOE_KV_FACTORS, QWEN36_35B_A3B_DRAFT)
 }
 
+/// The StoryRewrite ladder every 3.6 forwarding gate runs — BF16, Q8_0 and C0–C10, with
+/// C10 widened on a big card.
+///
+/// **Public, and outside the test module, so the same ladder can be driven from above.**
+/// `candle-conversation`'s combined probe runs these rows on the model the engine loads,
+/// then appends the engine's own rows to the same table; a copy there would drift.
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
+pub fn batched_forward_configs(device: &Device) -> Vec<TestConfig> {
+    let mut configs = vec![
+        TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 4,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // ── Quantized KV — the lineage ladder, with the streaming expert
+        // cache in the picture: sealing runs while experts page, so a
+        // threshold that only holds on the dense siblings breaks here.
+        TestConfig {
+            mode: InferenceMode::Q8_0,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C0,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C1,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C2,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C3,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C4,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C5,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // **The engine baseline's twin.** C5 is the engine's default level, and
+        // `candle-conversation`'s probe runs this exact row — same prompts, names,
+        // width and token count — through the conversation engine on a clean pool.
+        // The gap between the two is what the engine costs over the forward, and it is
+        // the figure prefill and decode are optimised against.
+        TestConfig {
+            mode: InferenceMode::C5,
+            use_batched: true,
+            num_contexts: 8,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C6,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C7,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        // C8 runs wider than the single-context rungs — the deepest rung
+        // that still has to be production-comfortable under expert
+        // streaming.
+        TestConfig {
+            mode: InferenceMode::C8,
+            use_batched: true,
+            num_contexts: 5,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+        TestConfig {
+            mode: InferenceMode::C9,
+            use_batched: true,
+            num_contexts: 2,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        },
+    ];
+
+    // ── The top rung, at the widths worth seeing it at ───────────────────
+    //
+    // C10 is the calibration target: `QWEN36_MOE_KV_FACTORS` is tuned so the
+    // whole range C0–C10 passes with C10 just under the breaking edge. A red
+    // C10 row means the thresholds drifted past it — retighten the factor
+    // row rather than widening tolerances.
+    //
+    // **That row has not been re-derived since this rung moved.** It was
+    // calibrated when C10 ran at ×10; the widths below are ×8 and ×16, and
+    // the 3.5 sibling needed a retune (K 1.5→1.2, V 2.0→2.5) for exactly
+    // that widening, because ×16 lost a session under the old row. If a C10
+    // row here goes red, that is the first thing to suspect, and the fix is
+    // the factor row rather than this gate.
+    //
+    // Run at **8 and 16** rather than one middling width: the pair shows the
+    // top rung holding as the cohort grows, which is where a threshold row
+    // tuned at one width quietly stops covering the next.
+    //
+    // Both sit inside the draft ladder's bracket, so both decode
+    // speculatively — but this gate generates ten tokens, which at budget 2
+    // is about four drafted steps a session. That is enough for the accept
+    // path to be *exercised* and nowhere near enough to measure what it
+    // yields; the throughput answer comes from `cold_speculative_point` at
+    // 256 tokens, one width per process. Read these rows as compression
+    // correctness under speculation, not as a speed-up.
+    configs.extend([8usize, 16].map(|n| TestConfig {
+        mode: InferenceMode::C10,
+        use_batched: true,
+        num_contexts: n,
+        num_repeats: 1,
+        test_mode: Some(TestMode::StoryRewrite),
+    }));
+
+    // **On a big card, keep going — but only on this rung.**
+    //
+    // What bounds concurrency here is per-session state, not the
+    // checkpoint: DeltaNet holds `n_v_heads × head_dim × head_dim` in F32
+    // per recurrent layer per sequence, doubled for the live/backup
+    // ping-pong — about 120 MiB a session on this geometry — and C10 KV adds
+    // only a couple more. So 32 sessions want ~4 GiB of per-session state
+    // and 64 want ~8 GiB, on top of a resident footprint that already fills
+    // a 16 GiB card. Forty is the gate: comfortably past what this laptop
+    // can hold, comfortably inside a workstation card.
+    //
+    // Only C10 is widened. The lower rungs carry uncompressed or lightly
+    // compressed KV, where the same widths would be bounded by KV bytes
+    // instead and would measure the card rather than the engine.
+    let (_, total_vram) = device.mem_get_info().unwrap_or((0, 0));
+    if total_vram >= 40 << 30 {
+        configs.extend([32usize, 64].map(|n| TestConfig {
+            mode: InferenceMode::C10,
+            use_batched: true,
+            num_contexts: n,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        }));
+    }
+    configs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model_overrides::{self, Checkpoint};
     use crate::models::batch_test::test_helpers::hf_get;
-    use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
+    use crate::models::batch_test::utils::TestParams;
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
     use crate::models::quantized_qwen35::tests::cold_speculative_point;
@@ -138,16 +324,17 @@ mod tests {
         let model_path = pinned()?;
         let device = Device::new_cuda(0)?;
 
-        // One value for both the loader and the table's `int8` column, held at
-        // `Performance` — same reasoning as the 3.5 gates.
-        let int8mode = Int8Mode::Performance;
+        // One value for both the loader and the table's `int8` column: the mode the
+        // engine serves this checkpoint at, `Int8Mode::auto` — `Precision` on an
+        // int8-MMA card. The gate benchmarks what a daemon runs.
+        let int8mode = Int8Mode::auto(&device);
         let params = TestParams::new(10, &tokenizer_json()?, Dialect::qwen35())
             .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
             .with_suppress_thinking(true)
             .with_print_outputs(true)
             .with_int8mode(int8mode)
             .with_timeout_secs(3600);
-        let configs = story_rewrite_configs(&device);
+        let configs = batched_forward_configs(&device);
 
         let load = || {
             // Keep the pack beside the checkpoint: the gate reloads once per
@@ -224,7 +411,7 @@ mod tests {
             .with_print_outputs(true)
             .with_int8mode(int8mode)
             .with_timeout_secs(3600);
-        let configs = story_rewrite_configs(&device);
+        let configs = batched_forward_configs(&device);
 
         let load = || {
             let m = from_gguf_path(
@@ -255,169 +442,6 @@ mod tests {
         assert_eq!(cfg.num_layers, 40);
         assert_eq!(cfg.attn_head_dim, 256);
         assert_eq!(moe.n_experts, 256);
-    }
-
-    /// The StoryRewrite ladder both 3.6 forwarding gates run — BF16, Q8_0 and C0–C10, with
-    /// C10 widened on a big card.
-    fn story_rewrite_configs(device: &Device) -> Vec<TestConfig> {
-        let mut configs = vec![
-            TestConfig {
-                mode: InferenceMode::BF16,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::BF16,
-                use_batched: true,
-                num_contexts: 4,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // ── Quantized KV — the lineage ladder, with the streaming expert
-            // cache in the picture: sealing runs while experts page, so a
-            // threshold that only holds on the dense siblings breaks here.
-            TestConfig {
-                mode: InferenceMode::Q8_0,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C0,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C1,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C2,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C3,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C4,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C5,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C6,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C7,
-                use_batched: true,
-                num_contexts: 1,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            // C8 runs wider than the single-context rungs — the deepest rung
-            // that still has to be production-comfortable under expert
-            // streaming.
-            TestConfig {
-                mode: InferenceMode::C8,
-                use_batched: true,
-                num_contexts: 5,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            TestConfig {
-                mode: InferenceMode::C9,
-                use_batched: true,
-                num_contexts: 2,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-        ];
-
-        // ── The top rung, at the widths worth seeing it at ───────────────────
-        //
-        // C10 is the calibration target: `QWEN36_MOE_KV_FACTORS` is tuned so the
-        // whole range C0–C10 passes with C10 just under the breaking edge. A red
-        // C10 row means the thresholds drifted past it — retighten the factor
-        // row rather than widening tolerances.
-        //
-        // **That row has not been re-derived since this rung moved.** It was
-        // calibrated when C10 ran at ×10; the widths below are ×8 and ×16, and
-        // the 3.5 sibling needed a retune (K 1.5→1.2, V 2.0→2.5) for exactly
-        // that widening, because ×16 lost a session under the old row. If a C10
-        // row here goes red, that is the first thing to suspect, and the fix is
-        // the factor row rather than this gate.
-        //
-        // Run at **8 and 16** rather than one middling width: the pair shows the
-        // top rung holding as the cohort grows, which is where a threshold row
-        // tuned at one width quietly stops covering the next.
-        //
-        // Both sit inside the draft ladder's bracket, so both decode
-        // speculatively — but this gate generates ten tokens, which at budget 2
-        // is about four drafted steps a session. That is enough for the accept
-        // path to be *exercised* and nowhere near enough to measure what it
-        // yields; the throughput answer comes from `cold_speculative_point` at
-        // 256 tokens, one width per process. Read these rows as compression
-        // correctness under speculation, not as a speed-up.
-        configs.extend([8usize, 16].map(|n| TestConfig {
-            mode: InferenceMode::C10,
-            use_batched: true,
-            num_contexts: n,
-            num_repeats: 1,
-            test_mode: Some(TestMode::StoryRewrite),
-        }));
-
-        // **On a big card, keep going — but only on this rung.**
-        //
-        // What bounds concurrency here is per-session state, not the
-        // checkpoint: DeltaNet holds `n_v_heads × head_dim × head_dim` in F32
-        // per recurrent layer per sequence, doubled for the live/backup
-        // ping-pong — about 120 MiB a session on this geometry — and C10 KV adds
-        // only a couple more. So 32 sessions want ~4 GiB of per-session state
-        // and 64 want ~8 GiB, on top of a resident footprint that already fills
-        // a 16 GiB card. Forty is the gate: comfortably past what this laptop
-        // can hold, comfortably inside a workstation card.
-        //
-        // Only C10 is widened. The lower rungs carry uncompressed or lightly
-        // compressed KV, where the same widths would be bounded by KV bytes
-        // instead and would measure the card rather than the engine.
-        let (_, total_vram) = device.mem_get_info().unwrap_or((0, 0));
-        if total_vram >= 40 << 30 {
-            configs.extend([32usize, 64].map(|n| TestConfig {
-                mode: InferenceMode::C10,
-                use_batched: true,
-                num_contexts: n,
-                num_repeats: 1,
-                test_mode: Some(TestMode::StoryRewrite),
-            }));
-        }
-        configs
     }
 
     /// **Depth on the 3.6 35B-A3B**: the batched forward at 32K and 128K of KV.

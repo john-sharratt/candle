@@ -32,6 +32,15 @@ impl FinishReason {
     }
 }
 
+/// Whether a committed token reaches the turn's stream: every one but an
+/// end-of-sequence token. EOS is the model ending the turn, not reply content.
+/// The token that spends the length budget is the reply's last word — it is in
+/// the reply's text and token ids, and a client reading the stream must receive
+/// it too, or every length-capped reply arrives one token short.
+pub fn streams_committed(is_eos: bool) -> bool {
+    !is_eos
+}
+
 /// Statistics for a completed turn.
 pub struct TurnStats {
     /// Prefill wall time in milliseconds.
@@ -49,13 +58,17 @@ pub struct TurnStats {
     /// Tokens per second during decode phase.
     pub tokens_per_second: f64,
 
-    /// Number of tokens consumed by the prefill phase for this turn
-    /// (the full formatted prefill — `no_think_prefix` + user message
-    /// + `user_end` + `assistant_start` [+ `/think_block`]).  Combined
-    /// with `chunk_size` this lets calibration consumers partition
-    /// the turn's per-chunk sig entries into prefill vs decode chunks
-    /// without a separate prefill-only capture.
+    /// The sequence's KV depth when this turn's prefill finished: the context
+    /// it was projected onto **plus** its own prompt. The position decode
+    /// starts at — not the size of this turn's prefill, which is
+    /// [`Self::turn_prefill_tokens`].
     pub prefill_token_count: usize,
+
+    /// The tokens this turn's own prefill forwarded — the full formatted prompt
+    /// (`no_think_prefix` + user message + `user_end` + `assistant_start`
+    /// [+ `/think_block`]) and nothing it was projected onto. The figure a
+    /// prefill rate divides by.
+    pub turn_prefill_tokens: usize,
 
     /// Tokens the model attended to by the end of the turn — the projected
     /// context, this turn's prefill and every token it generated: the decoding
@@ -73,7 +86,13 @@ pub struct TurnStats {
 
 #[cfg(test)]
 mod tests {
-    use super::FinishReason;
+    use super::{streams_committed, FinishReason};
+
+    #[test]
+    fn the_token_that_spends_the_budget_is_streamed_and_an_end_of_sequence_is_not() {
+        assert!(streams_committed(false));
+        assert!(!streams_committed(true));
+    }
 
     #[test]
     fn an_end_of_sequence_token_stops_the_turn() {

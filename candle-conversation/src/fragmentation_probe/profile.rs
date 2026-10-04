@@ -109,6 +109,15 @@ pub struct ModelProfile {
     /// result.
     pub min_weight_uptake: usize,
     pub story: StoryGate,
+    /// Whether phase B decodes speculatively: the checkpoint carries a drafter and
+    /// [`Self::batch`] is a width its draft ladder drafts at.
+    ///
+    /// Stated rather than read off the loaded model, because speculation is lossless:
+    /// a checkpoint whose head failed to load answers identically and only the speed
+    /// goes, so a row that took its answer from the model would quietly measure plain
+    /// decode under a speculating model's name. The combined probe checks the loaded
+    /// model against this.
+    pub speculates: bool,
 }
 
 /// Every model the probe has measured thresholds for.
@@ -138,6 +147,35 @@ pub fn profiles() -> Vec<ModelProfile> {
             min_efficiency: 90,
             min_weight_uptake: 50,
             story: StoryGate::Verbatim,
+            // Qwen3 shipped no NextN head, and there is no generic proposer.
+            speculates: false,
+        },
+        // Qwen3.6-35B-A3B UD-Q4_K_M, from the `-MTP-` repo. **The row that carries
+        // speculation.** The 30B above has no drafter, so its engine rows can say nothing
+        // about the verify path; this checkpoint has its NextN head and the lineage's draft
+        // ladder (budget 2 up to width 16), and it is a 3:1 DeltaNet hybrid, so it carries
+        // per-sequence recurrent state too. Speculative rewind over a recurrent store is
+        // exactly what a compaction or a boundary move must not disturb.
+        //
+        // `batch` is 16, the widest wave the draft ladder still speculates at — one more
+        // and phase B decodes plain, which is the 30B's row again.
+        //
+        // **The VRAM thresholds are provisional**, set to the 30B's figures until this
+        // row's own `worst sustained` has been read across a few runs, as the module doc
+        // requires. The checkpoint is 22 GiB and fully resident on a 72 GiB card, so the
+        // KV side has more room than Flash-Next's and the churn widths are the 30B's.
+        ModelProfile {
+            name: "qwen36-35b-a3b-q4",
+            model: Model::Qwen36_35B_A3B_Q4,
+            max_seq_len: 8192,
+            concurrency: 24,
+            max_concurrency: 40,
+            pinned: 6,
+            batch: 16,
+            min_efficiency: 90,
+            min_weight_uptake: 50,
+            story: StoryGate::Verbatim,
+            speculates: true,
         },
         // Qwen3.8-Flash-Next. **The row that matters for correctness, not throughput.**
         //
@@ -174,6 +212,8 @@ pub fn profiles() -> Vec<ModelProfile> {
             min_efficiency: 90,
             min_weight_uptake: 50,
             story: StoryGate::Verbatim,
+            // Its MTP head drafts four deep up to width 8.
+            speculates: true,
         },
     ]
 }
@@ -192,6 +232,7 @@ pub fn names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_transformers::models::draft_ladder::QWEN36_35B_A3B_DRAFT;
 
     /// A name that selects nothing is a typo the caller must hear about, and two rows
     /// sharing a name would make one of them unreachable.
@@ -241,5 +282,16 @@ mod tests {
                 p.name,
             );
         }
+    }
+
+    /// **The Qwen3.6 row exists to drive the verify path, so its phase-B wave must be
+    /// one the checkpoint drafts at.** One sequence past the ladder's bracket and the
+    /// batch decodes plain — the row would still pass, and measure the 30B's question.
+    #[test]
+    fn the_qwen36_batch_is_a_width_its_draft_ladder_speculates_at() {
+        let p = profile("qwen36-35b-a3b-q4").expect("the qwen36 row");
+        assert!(p.speculates);
+        assert_eq!(QWEN36_35B_A3B_DRAFT.budget(p.batch), 2);
+        assert_eq!(QWEN36_35B_A3B_DRAFT.budget(p.batch + 1), 0);
     }
 }

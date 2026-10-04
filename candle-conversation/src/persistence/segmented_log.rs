@@ -550,6 +550,18 @@ impl SegmentedLog {
         (self.active_id, offset)
     }
 
+    /// Write one record from its parts straight into the active segment — see
+    /// [`LogFile::append_parts`].
+    pub fn append_parts(
+        &mut self,
+        head: &[u8],
+        payload: &[&[u8]],
+        pad: usize,
+    ) -> Result<(SegmentId, u64)> {
+        let offset = self.active.append_parts(head, payload, pad)?;
+        Ok((self.active_id, offset))
+    }
+
     /// Bytes staged into the active but not yet flushed.
     pub fn pending_len(&self) -> usize {
         self.active.pending_len()

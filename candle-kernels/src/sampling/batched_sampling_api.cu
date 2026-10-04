@@ -1,11 +1,11 @@
 // C API wrapper for batched penalty and sampling kernel
 // This provides the extern "C" interface for Rust FFI
-// 
+//
 // Key design: NO cudaMalloc/cudaMemcpy needed!
 // - All scalar parameters are passed directly to the kernel
 // - All GPU pointers (logits, token_counts, etc.) come from Rust Tensors
 //   which are already on the GPU
-// - CUDA kernel launch uses default stream (0), like prefill kernel
+// - Every launch is queued on the caller's stream
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -15,7 +15,6 @@
 #include <stdint.h>
 
 // Forward declarations of typed kernel entry points (defined in separate .cu files)
-// Note: No cudaStream_t parameter - kernels use default stream internally
 extern "C" void run_batched_sampling_f32(
     const float* logits,
     int32_t batch_size,
@@ -68,7 +67,8 @@ extern "C" void run_batched_sampling_f32(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    void* stream
 );
 
 extern "C" void run_batched_sampling_f16(
@@ -123,7 +123,8 @@ extern "C" void run_batched_sampling_f16(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    void* stream
 );
 
 extern "C" void run_batched_sampling_fp8_e4m3(
@@ -178,7 +179,8 @@ extern "C" void run_batched_sampling_fp8_e4m3(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    void* stream
 );
 
 extern "C" void run_batched_sampling_bf16(
@@ -233,13 +235,14 @@ extern "C" void run_batched_sampling_bf16(
     uint32_t* output_tokens,
     uint64_t seed,
     uint64_t* rng_offsets,
-    const void* seq_dials
+    const void* seq_dials,
+    void* stream
 );
 
 // ============================================================================
 // Unified Dispatcher
 // ============================================================================
-// dtype: 0 = f32, 1 = f16, 2 = bf16
+// dtype: 0 = f32, 1 = f16, 2 = bf16, 3 = fp8_e4m3
 
 extern "C" void run_batched_sampling(
     const void* logits,
@@ -298,7 +301,9 @@ extern "C" void run_batched_sampling(
     uint64_t seed,
     uint64_t* rng_offsets,
     // Per-sequence dials ([batch_size] of SeqDials) or null — see SeqDials.
-    const void* seq_dials
+    const void* seq_dials,
+    // The caller's stream; every launch is ordered on it.
+    void* stream
 ) {
     switch (dtype) {
         case 0: // f32
@@ -318,7 +323,7 @@ extern "C" void run_batched_sampling(
                 stencil, stencil_size,
                 temperature, top_k, top_p,
                 output_tokens, seed, rng_offsets,
-                seq_dials
+                seq_dials, stream
             );
             break;
         case 1: // f16
@@ -338,7 +343,7 @@ extern "C" void run_batched_sampling(
                 stencil, stencil_size,
                 temperature, top_k, top_p,
                 output_tokens, seed, rng_offsets,
-                seq_dials
+                seq_dials, stream
             );
             break;
         case 2: // bf16
@@ -358,7 +363,7 @@ extern "C" void run_batched_sampling(
                 stencil, stencil_size,
                 temperature, top_k, top_p,
                 output_tokens, seed, rng_offsets,
-                seq_dials
+                seq_dials, stream
             );
             break;
         case 3: // fp8_e4m3
@@ -378,7 +383,7 @@ extern "C" void run_batched_sampling(
                 stencil, stencil_size,
                 temperature, top_k, top_p,
                 output_tokens, seed, rng_offsets,
-                seq_dials
+                seq_dials, stream
             );
             break;
     }

@@ -552,6 +552,7 @@ impl CustomOp1 for BatchedSampling {
                     self.seed,
                     rng_ptr as *mut u64,
                     std::ptr::null(), // seq_dials — this path is uniform-config
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             };
 

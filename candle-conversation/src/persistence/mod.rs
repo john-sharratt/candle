@@ -35,9 +35,11 @@ pub mod elevate;
 pub mod header_index;
 pub mod inherit;
 pub mod integrity;
+pub mod liveness_audit;
 pub mod log_file;
 pub mod maintenance;
 pub mod manifest;
+pub mod payload_parts;
 pub mod pipeline;
 pub mod record;
 pub mod recovery;
@@ -69,6 +71,7 @@ use chunk_plan::ChunkedReadPlan;
 use content_hash::snapshot_stream_id;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
+use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 use record::{
     decode_record, encode_record, ChunkPayload, CustomObjectPayload, DebugIdPayload, NpcPayload,
@@ -360,6 +363,18 @@ pub struct SubstratePersistence {
     /// maintenance pass. Counting them as live via this map is what actually
     /// halts that churn. Populated on every append and rebuilt on load / compact.
     metadata_locs: HashMap<(RecordType, u64), RecordLoc>,
+    /// On-disk location of the CURRENT copy of each resident record keyed by
+    /// its payload rather than its header — `Label`, `ConvState`,
+    /// `TreeMetadata`, `TurnCoupling`, `DebugId`, `Tombstone`, `Distilled` —
+    /// keyed by [`ResidentKey`], last-writer-wins.
+    ///
+    /// The twin of `metadata_locs` for the types it cannot key. Maintenance
+    /// re-emits all of them on every op, and with no location to count they
+    /// read dead wherever they landed: every re-emission left its copies dead
+    /// weight in the segment it wrote, so that segment looked reclaimable and
+    /// the next op re-emitted them again. Populated on every append and rebuilt
+    /// on load / compact, like `metadata_locs`.
+    resident_locs: HashMap<ResidentKey, RecordLoc>,
     /// On-disk location of each conversation's CURRENT recurrent-state
     /// `Snapshot` record, keyed by snapshot stream id — last-writer-wins, the
     /// persistence-side twin of the substrate's `recurrent_snapshots` index.
@@ -420,6 +435,27 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
     )
 }
 
+/// Populate `map` with a walked payload-keyed resident record's location
+/// (LWW). The load / compact walk uses this; the runtime append path uses
+/// [`SubstratePersistence::track_resident_loc`].
+fn record_resident_loc(map: &mut HashMap<ResidentKey, RecordLoc>, entry: &walker::WalkEntry) {
+    let h = &entry.record.header;
+    if !keyed_by_payload(h.record_type) {
+        return;
+    }
+    if let Some(key) = resident_key(h.record_type, h.stream_id, &entry.record.payload) {
+        map.insert(
+            key,
+            RecordLoc {
+                segment: entry.segment,
+                offset: entry.offset,
+                payload_len: h.payload_len,
+                record_size: entry.size,
+            },
+        );
+    }
+}
+
 /// Populate `map` with a walked record's metadata location (LWW). The load /
 /// compact walk uses this before the `SubstratePersistence` exists; the runtime
 /// append path uses [`SubstratePersistence::track_metadata_loc`].
@@ -471,6 +507,9 @@ fn record_npc_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) 
 fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     match h.record_type {
+        RecordType::Snapshot if h.retracts_snapshot() => {
+            map.remove(&h.stream_id);
+        }
         RecordType::Snapshot | RecordType::BranchCheckpoint => {
             map.insert(
                 h.stream_id,
@@ -679,6 +718,7 @@ impl SubstratePersistence {
         // builds the combined singleton manifest.
         let mut accounting = RecordAccounting::new();
         let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
+        let mut resident_locs: HashMap<ResidentKey, RecordLoc> = HashMap::new();
         let mut snapshot_locs: HashMap<u64, RecordLoc> = HashMap::new();
         let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
         let mut vfs_index = VfsIndex::new();
@@ -689,6 +729,7 @@ impl SubstratePersistence {
             accounting.record(&entry.record.header, entry.size);
             census.record(entry.record.header.record_type);
             record_metadata_loc(&mut metadata_locs, entry);
+            record_resident_loc(&mut resident_locs, entry);
             record_snapshot_loc(&mut snapshot_locs, entry);
             record_npc_loc(&mut npc_locs, entry);
             vfs::record_vfs_loc(&mut vfs_index, &mut accounting, entry);
@@ -755,6 +796,7 @@ impl SubstratePersistence {
             resident_reemit_floor: None,
             relocation_watch: None,
             metadata_locs,
+            resident_locs,
             snapshot_locs,
             npc_locs,
             vfs_index,
@@ -889,11 +931,70 @@ impl SubstratePersistence {
         let bytes = encode_record(&header, payload);
         let (segment, offset) = self.segments.stage(&bytes);
         let size = bytes.len() as u64;
+        self.account_appended(&header, payload, segment, offset, size)?;
+        Ok((segment, offset, size))
+    }
+
+    /// Append a recurrent-state record — a [`RecordType::Snapshot`] or a
+    /// [`RecordType::BranchCheckpoint`] — from its payload's parts, written
+    /// straight to the active segment rather than staged. The bookkeeping is
+    /// [`Self::append_record`]'s.
+    ///
+    /// Only these two types come through here: they are the multi-megabyte
+    /// records, and none of the append hooks reads their payload, so the parts
+    /// never need joining. Any other type is refused.
+    fn append_recurrent_parts(
+        &mut self,
+        record_type: RecordType,
+        stream_id: u64,
+        parts: &[&[u8]],
+    ) -> Result<(SegmentId, u64, u64)> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
+        assert!(
+            matches!(
+                record_type,
+                RecordType::Snapshot | RecordType::BranchCheckpoint
+            ),
+            "append_recurrent_parts writes recurrent-state records only, not {record_type:?}"
+        );
+        let header = RecordHeader {
+            record_type,
+            format: 0,
+            payload_len: parts.iter().map(|p| p.len() as u64).sum(),
+            crc: 0,
+            stream_id,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let (head, pad) = record::record_head(&header, parts);
+        let (segment, offset) = self.segments.append_parts(&head, parts, pad)?;
+        let size = (head.len() + header.payload_len as usize + pad) as u64;
+        // The hooks key these types by header alone, so the payload they are
+        // handed is never read.
+        self.account_appended(&header, &[], segment, offset, size)?;
+        Ok((segment, offset, size))
+    }
+
+    /// Everything an append records once its bytes are placed: the relocation
+    /// watch, dead-byte accounting, the singleton and snapshot locations, the
+    /// manifest, the header-index chain and segment rotation.
+    fn account_appended(
+        &mut self,
+        header: &RecordHeader,
+        payload: &[u8],
+        segment: SegmentId,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        let header = *header;
         if let Some(watch) = self.relocation_watch.as_mut() {
             watch.record(&header, payload);
         }
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
+        self.track_resident_loc(&header, payload, segment, offset, size);
         self.track_snapshot_loc(&header, segment, offset, size);
         self.retire_snapshot_on_distill(&header, payload);
         self.track_npc_loc(&header, segment, offset, size);
@@ -915,8 +1016,7 @@ impl SubstratePersistence {
         }
         // Last, once the record is accounted and indexed: a write that fails
         // leaves it staged and known, for the next commit to carry.
-        self.write_through_if_over_stage()?;
-        Ok((segment, offset, size))
+        self.write_through_if_over_stage()
     }
 
     /// Append an **already-encoded** record verbatim to the active segment —
@@ -1029,6 +1129,32 @@ impl SubstratePersistence {
     /// reads as dead. A no-op for every other record type. Called from
     /// [`append_record`](Self::append_record) (runtime writes) and the
     /// load / compact walk so the map covers both.
+    /// The runtime twin of [`record_resident_loc`]: record where a just-appended
+    /// payload-keyed resident record landed.
+    fn track_resident_loc(
+        &mut self,
+        h: &RecordHeader,
+        payload: &[u8],
+        segment: SegmentId,
+        offset: u64,
+        size: u64,
+    ) {
+        if !keyed_by_payload(h.record_type) {
+            return;
+        }
+        if let Some(key) = resident_key(h.record_type, h.stream_id, payload) {
+            self.resident_locs.insert(
+                key,
+                RecordLoc {
+                    segment,
+                    offset,
+                    payload_len: h.payload_len,
+                    record_size: size,
+                },
+            );
+        }
+    }
+
     fn track_metadata_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
         if is_tracked_metadata(h.record_type) {
             self.metadata_locs.insert(
@@ -1052,7 +1178,9 @@ impl SubstratePersistence {
     /// writes AND maintenance relocations keep the map current; the load /
     /// compact walk uses the free-function mirror [`record_snapshot_loc`].
     fn track_snapshot_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
-        if matches!(
+        if h.retracts_snapshot() {
+            self.snapshot_locs.remove(&h.stream_id);
+        } else if matches!(
             h.record_type,
             RecordType::Snapshot | RecordType::BranchCheckpoint
         ) {
@@ -1223,16 +1351,31 @@ impl SubstratePersistence {
     /// snapshot as dead the moment this one lands, and `snapshot_locs` keeps
     /// exactly this copy alive through segment maintenance. Returns the
     /// record's location for the caller's in-RAM index.
-    pub fn write_snapshot(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<RecordLoc> {
+    ///
+    /// The payload comes as its parts ([`record::SnapshotPayload::parts`]) and is
+    /// written from them, so the state reaches the file without being copied
+    /// into one buffer first.
+    pub fn write_snapshot(&mut self, stream_id: StreamId, payload: &[&[u8]]) -> Result<RecordLoc> {
         self.write_recurrent_record(RecordType::Snapshot, stream_id, payload)
     }
 
+    /// Append a snapshot retraction for `stream_id`: an empty `Snapshot`
+    /// record, after which the stream has no live snapshot on this run or any
+    /// reload ([`RecordHeader::retracts_snapshot`]). The writer appends one
+    /// when a seal's snapshot fails to land, because the previous snapshot
+    /// would otherwise stay the tail while the turn's records land behind it.
+    pub fn retract_snapshot(&mut self, stream_id: StreamId) -> Result<()> {
+        self.append_record(RecordType::Snapshot, 0, stream_id.0, 0, 0, 0, &[])?;
+        Ok(())
+    }
+
     /// Append a prompt branch's recurrent checkpoint — the same single-tail
-    /// append under a `BranchCheckpoint` record.
+    /// append under a `BranchCheckpoint` record, from its parts
+    /// ([`record::BranchCheckpointPayload::parts`]).
     pub fn write_branch_checkpoint(
         &mut self,
         stream_id: StreamId,
-        payload: &[u8],
+        payload: &[&[u8]],
     ) -> Result<RecordLoc> {
         self.write_recurrent_record(RecordType::BranchCheckpoint, stream_id, payload)
     }
@@ -1241,14 +1384,14 @@ impl SubstratePersistence {
         &mut self,
         record_type: RecordType,
         stream_id: StreamId,
-        payload: &[u8],
+        payload: &[&[u8]],
     ) -> Result<RecordLoc> {
         let (segment, offset, size) =
-            self.append_record(record_type, 0, stream_id.0, 0, 0, 0, payload)?;
+            self.append_recurrent_parts(record_type, stream_id.0, payload)?;
         Ok(RecordLoc {
             segment,
             offset,
-            payload_len: payload.len() as u64,
+            payload_len: payload.iter().map(|p| p.len() as u64).sum(),
             record_size: size,
         })
     }
@@ -2121,17 +2264,20 @@ impl SubstratePersistence {
         // them from the freshly-compacted segment in the same recovery pass
         // (mirrors the load walk in `from_dir_with_sink`).
         self.metadata_locs.clear();
+        self.resident_locs.clear();
         self.snapshot_locs.clear();
         self.npc_locs.clear();
         self.vfs_index.clear();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
+        let resident_locs = &mut self.resident_locs;
         let snapshot_locs = &mut self.snapshot_locs;
         let npc_locs = &mut self.npc_locs;
         let vfs_index = &mut self.vfs_index;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(metadata_locs, entry);
+            record_resident_loc(resident_locs, entry);
             record_snapshot_loc(snapshot_locs, entry);
             record_npc_loc(npc_locs, entry);
             vfs::record_vfs_loc(vfs_index, accounting, entry);

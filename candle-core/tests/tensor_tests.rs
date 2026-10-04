@@ -1795,6 +1795,81 @@ fn scatter(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// The scatter family over every index and data dtype, not only `f32`.
+///
+/// The CUDA dispatchers once covered `f32` alone for `scatter` and fell
+/// through silently on every other pair, so a `scatter_set` into a `U32` table
+/// wrote nothing and returned `Ok`. Each op here is checked against its raw
+/// result for every pair.
+fn scatter_family_dtypes(device: &Device) -> Result<()> {
+    fn read(t: &Tensor) -> Result<Vec<f32>> {
+        t.to_dtype(DType::F32)?.to_vec1::<f32>()
+    }
+    let data = [
+        DType::F32,
+        DType::F64,
+        DType::U8,
+        DType::U32,
+        DType::I64,
+        DType::F16,
+        DType::BF16,
+    ];
+    for dt in data {
+        if device.is_metal() && dt == DType::F64 {
+            continue;
+        }
+        for it in [DType::U8, DType::U32, DType::I64] {
+            let ids = Tensor::new(&[4u32, 0, 2], device)?.to_dtype(it)?;
+            let src = Tensor::new(&[1f32, 2., 3.], device)?.to_dtype(dt)?;
+            let init = Tensor::new(&[10f32; 5], device)?.to_dtype(dt)?;
+            let pair = format!("{it:?} indices over {dt:?}");
+
+            let written = [2., 10., 3., 10., 1.];
+            let added = [12., 10., 13., 10., 11.];
+            assert_eq!(
+                read(&init.scatter(&ids, &src, 0)?)?,
+                written,
+                "scatter, {pair}"
+            );
+            assert_eq!(
+                read(&init.scatter_add(&ids, &src, 0)?)?,
+                added,
+                "scatter_add, {pair}"
+            );
+            assert_eq!(
+                read(&init.index_add(&ids, &src, 0)?)?,
+                added,
+                "index_add, {pair}"
+            );
+            let target = init.copy()?;
+            target.scatter_set(&ids, &src, 0)?;
+            assert_eq!(read(&target)?, written, "scatter_set, {pair}");
+        }
+    }
+    // The two accumulating ops also carry FP8 kernels on CUDA. Every value here
+    // is exact in E4M3 (three mantissa bits cover 10..13 in steps of one).
+    if device.is_cuda() {
+        for it in [DType::U8, DType::U32, DType::I64] {
+            let ids = Tensor::new(&[4u32, 0, 2], device)?.to_dtype(it)?;
+            let src = Tensor::new(&[1f32, 2., 3.], device)?.to_dtype(DType::F8E4M3)?;
+            let init = Tensor::new(&[10f32; 5], device)?.to_dtype(DType::F8E4M3)?;
+            let pair = format!("{it:?} indices over F8E4M3");
+            let added = [12., 10., 13., 10., 11.];
+            assert_eq!(
+                read(&init.scatter_add(&ids, &src, 0)?)?,
+                added,
+                "scatter_add, {pair}"
+            );
+            assert_eq!(
+                read(&init.index_add(&ids, &src, 0)?)?,
+                added,
+                "index_add, {pair}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn gather(device: &Device) -> Result<()> {
     let ids = Tensor::new(&[[0u32], [2u32], [1u32], [0u32]], device)?;
     let t = Tensor::arange(0f32, 12f32, device)?.reshape((4, 3))?;
@@ -2357,6 +2432,12 @@ test_device!(
 );
 test_device!(gather, gather_cpu, gather_gpu, gather_metal);
 test_device!(scatter, scatter_cpu, scatter_gpu, scatter_metal);
+test_device!(
+    scatter_family_dtypes,
+    scatter_family_dtypes_cpu,
+    scatter_family_dtypes_gpu,
+    scatter_family_dtypes_metal
+);
 test_device!(
     slice_scatter,
     slice_scatter_cpu,

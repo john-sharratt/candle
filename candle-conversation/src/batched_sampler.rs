@@ -9,6 +9,9 @@
 use crate::banned_rows::banned_buffer;
 use crate::config::SamplingConfig;
 use crate::line_ends::ends_a_line;
+use crate::penalty_counts::{count_table_ptr, PenaltyTables, SparseCounts};
+use crate::sampler_args::{split_rng_and_outputs, ArgPack};
+use crate::scheduler::profile;
 use crate::stencil::ban;
 use crate::token_buffer::TokenBuffer;
 use candle::cuda_backend::CudaStorageSlice;
@@ -16,6 +19,7 @@ use candle::{DType, Device, IndexOp, Tensor};
 use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
 use candle_transformers::generation::{LogitsProcessor, PendingSample};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
+use std::sync::Mutex;
 
 /// A stencil-constrained row's sample with its device work enqueued
 /// ([`BatchedSampler::issue_allow_list`]) and not yet read back: the allowed
@@ -163,6 +167,14 @@ pub struct SequenceSamplingState {
     /// unbounded.
     pub cross_turn_history: Vec<Vec<(u32, i32)>>,
 
+    /// The tokens whose [`Self::token_counts`] entry is nonzero, in the order
+    /// they were first sampled this turn — the index a dispatch stamps the
+    /// device count table from, so it never walks the vocabulary.
+    counted: Vec<u32>,
+
+    /// The tokens whose [`Self::cross_turn_counts`] entry is nonzero.
+    cross_counted: Vec<u32>,
+
     /// Recent token history (for repeat/DRY penalty).
     /// Stored oldest-first; the scheduler copies the tail window to the GPU buffer.
     pub recent_tokens: Vec<i32>,
@@ -242,6 +254,8 @@ impl SequenceSamplingState {
             token_counts: vec![0; vocab_size],
             cross_turn_counts: vec![0; vocab_size],
             cross_turn_history: Vec::new(),
+            counted: Vec::new(),
+            cross_counted: Vec::new(),
             recent_tokens: Vec::with_capacity(max_recent_len),
             current_len: 0,
             in_segment: false,
@@ -261,6 +275,9 @@ impl SequenceSamplingState {
     pub fn record_token(&mut self, token: u32, max_recent_len: usize) {
         let token_idx = token as usize;
         if token_idx < self.token_counts.len() {
+            if self.token_counts[token_idx] == 0 {
+                self.counted.push(token);
+            }
             self.token_counts[token_idx] += 1;
         }
 
@@ -317,6 +334,8 @@ impl SequenceSamplingState {
         self.token_counts.fill(0);
         self.cross_turn_counts.fill(0);
         self.cross_turn_history.clear();
+        self.counted.clear();
+        self.cross_counted.clear();
         self.recent_tokens.clear();
         self.current_len = 0;
         self.in_segment = false;
@@ -349,15 +368,17 @@ impl SequenceSamplingState {
         // A turn that sampled nothing is not recorded: this also runs at a
         // conversation's first decode, with nothing said yet, and letting that
         // take a slot would make a window of one forget the only turn it had.
-        let turn: Vec<(u32, i32)> = self
-            .token_counts
+        let mut turn: Vec<(u32, i32)> = self
+            .counted
             .iter()
-            .enumerate()
-            .filter(|&(_, &c)| c > 0)
-            .map(|(t, &c)| (t as u32, c))
+            .map(|&t| (t, self.token_counts[t as usize]))
             .collect();
+        turn.sort_unstable_by_key(|&(t, _)| t);
         for &(t, c) in &turn {
             let cross = &mut self.cross_turn_counts[t as usize];
+            if *cross == 0 {
+                self.cross_counted.push(t);
+            }
             *cross = cross.saturating_add(c);
         }
         if cross_turn_window > 0 && !turn.is_empty() {
@@ -368,9 +389,12 @@ impl SequenceSamplingState {
                     *cross = cross.saturating_sub(c).max(0);
                 }
             }
+            let cross = &self.cross_turn_counts;
+            self.cross_counted.retain(|&t| cross[t as usize] > 0);
         }
         // Reset per-turn state (frequency/presence penalties are per-turn)
         self.token_counts.fill(0);
+        self.counted.clear();
         self.current_len = 0;
         // A new turn starts a fresh DRY span; any tool-call suppression, open
         // segment, or in-flight closer script from the prior turn is cleared.
@@ -605,6 +629,9 @@ pub struct BatchedSampler {
 
     /// Optional path to write penalty state during decoding.
     penalty_log_path: Option<std::path::PathBuf>,
+
+    /// The kernel's count tables, kept on the device between dispatches.
+    penalty_tables: Mutex<PenaltyTables>,
 }
 
 impl BatchedSampler {
@@ -622,6 +649,7 @@ impl BatchedSampler {
             max_recent_len,
             eos_tokens,
             penalty_log_path,
+            penalty_tables: Mutex::new(PenaltyTables::new(vocab_size)),
         }
     }
 
@@ -1124,12 +1152,17 @@ impl BatchedSampler {
             };
 
         // Build penalty buffers from states
+        let build_span = profile::span("sample:build");
+        // The kernel prices each row on its own dials, so the cross-turn table
+        // is needed when ANY row carries the penalty, not only row 0.
+        let cross_turn = configs.iter().any(|c| c.cross_turn_penalty != 0.0);
         let (token_counts, cross_turn_counts, recent_tokens, recent_lens, current_lens) = self
             .build_penalty_buffers_from_states(
                 states,
                 config.presence_penalty,
                 config.repeat_last_n,
                 dry_range,
+                cross_turn,
             )?;
 
         // Get EOS token
@@ -1224,9 +1257,36 @@ impl BatchedSampler {
         // ramp (or temperature, or penalties) bleeding into another in a wave
         // that mixes configs.
         let seq_dials: Vec<SeqDials> = configs.iter().map(|c| SeqDials::from_config(c)).collect();
+        build_span.end();
+
+        let stamp_span = profile::span("sample:stamp");
+        let mut tables = self
+            .penalty_tables
+            .lock()
+            .map_err(|_| candle::Error::Msg("sampler count tables poisoned".into()))?;
+        let token_table = tables
+            .tokens
+            .stamp(&self.device, batch_size, &token_counts)?;
+        let cross_table = if cross_turn {
+            match tables
+                .cross
+                .stamp(&self.device, batch_size, &cross_turn_counts)
+            {
+                Ok(stamped) => Some(stamped),
+                Err(e) => {
+                    // The token table is already stamped; leave it zero.
+                    tables.tokens.clear(token_table)?;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        stamp_span.end();
 
         // Invoke the CUDA kernel
-        self.invoke_cuda_kernel(
+        let launch_span = profile::span("sample:launch_readback");
+        let launched = self.invoke_cuda_kernel(
             &logits_flat,
             batch_size as i32,
             vocab_size,
@@ -1247,7 +1307,7 @@ impl BatchedSampler {
             eos_ramp_len,
             eos_boost_max_multiplier,
             config.cross_turn_penalty,
-            &cross_turn_counts,
+            cross_table.as_ref().map(|t| t.table()),
             &current_lens,
             segment_close_boost,
             segment_close_token_id,
@@ -1260,7 +1320,7 @@ impl BatchedSampler {
             &suppress_tokens,
             &suppress_penalties,
             suppress_active,
-            &token_counts,
+            token_table.table(),
             banned_tokens,
             num_banned,
             banned_per_seq,
@@ -1272,7 +1332,22 @@ impl BatchedSampler {
             config.seed,
             &mut rng_offsets,
             &seq_dials,
-        )?;
+        );
+        launch_span.end();
+        // Both cleared whether or not the launch succeeded, and the second
+        // whether or not the first did: a table left stamped would price the
+        // next dispatch's rows with this one's counts.
+        let clear_span = profile::span("sample:clear");
+        let tokens_cleared = tables.tokens.clear(token_table);
+        let cross_cleared = match cross_table {
+            Some(cross) => tables.cross.clear(cross),
+            None => Ok(()),
+        };
+        clear_span.end();
+        drop(tables);
+        launched?;
+        tokens_cleared?;
+        cross_cleared?;
 
         // Update states with sampled tokens and new RNG offsets.
         // Apply post-sampler EOS failsafe overrides: if the sequence has exceeded
@@ -1324,7 +1399,8 @@ impl BatchedSampler {
         presence_penalty: f32,
         repeat_last_n: i32,
         dry_range: i32,
-    ) -> candle::Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>)> {
+        cross_turn: bool,
+    ) -> candle::Result<(SparseCounts, SparseCounts, Vec<i32>, Vec<i32>, Vec<i32>)> {
         let batch_size = states.len();
 
         // Inside a TOOL CALL, all repetition penalties are suppressed, not just
@@ -1335,29 +1411,26 @@ impl BatchedSampler {
         // would demote exactly those tokens, corrupting the value.  This mirrors
         // the DRY gate but is scoped to tool calls only (`in_tool_call`), so the
         // think block keeps full repetition control.  Presenting empty penalty
-        // state for these rows is the per-row equivalent of turning them off;
-        // `resize` appends the zeros in place (no scratch buffer on this
-        // per-decode-step path).
-
-        // Flatten token counts: [batch_size * vocab_size]
-        let mut token_counts = Vec::with_capacity(batch_size * self.vocab_size);
-        for state in states.iter() {
-            if state.in_tool_call {
-                token_counts.resize(token_counts.len() + self.vocab_size, 0);
-            } else {
-                token_counts.extend_from_slice(&state.token_counts);
-            }
-        }
-
-        // Flatten cross-turn counts: [batch_size * vocab_size]
-        let mut cross_turn_counts = Vec::with_capacity(batch_size * self.vocab_size);
-        for state in states.iter() {
-            if state.in_tool_call {
-                cross_turn_counts.resize(cross_turn_counts.len() + self.vocab_size, 0);
-            } else {
-                cross_turn_counts.extend_from_slice(&state.cross_turn_counts);
-            }
-        }
+        // state for these rows is the per-row equivalent of turning them off:
+        // the row stamps nothing, so its table row reads zero.
+        let token_counts = SparseCounts::gather(
+            self.vocab_size,
+            states
+                .iter()
+                .map(|s| (!s.in_tool_call).then_some((&s.counted[..], &s.token_counts[..]))),
+        );
+        // The cross-turn table is read only when the penalty is on, so it is
+        // only gathered then.
+        let cross_turn_counts = if cross_turn {
+            SparseCounts::gather(
+                self.vocab_size,
+                states.iter().map(|s| {
+                    (!s.in_tool_call).then_some((&s.cross_counted[..], &s.cross_turn_counts[..]))
+                }),
+            )
+        } else {
+            SparseCounts::default()
+        };
 
         // Log penalty state if a log path is configured
         if let Some(ref log_path) = self.penalty_log_path {
@@ -1503,7 +1576,7 @@ impl BatchedSampler {
         eos_ramp_len: i32,
         eos_boost_max_multiplier: f32,
         cross_turn_penalty: f32,
-        cross_turn_counts: &[i32],
+        cross_turn_counts: Option<&Tensor>,
         current_lens: &[i32],
         segment_close_boost: f32,
         segment_close_token_id: i32,
@@ -1516,7 +1589,7 @@ impl BatchedSampler {
         suppress_tokens: &[i32],
         suppress_penalties: &[f32],
         suppress_active: bool,
-        token_counts: &[i32],
+        token_counts: &Tensor,
         banned_tokens: &[i32],
         num_banned: i32,
         banned_per_seq: i32,
@@ -1544,131 +1617,66 @@ impl BatchedSampler {
             _ => return Err(candle::Error::Msg("logits must be on CUDA".into())),
         };
 
-        // Upload buffers to GPU
-        let token_counts_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(token_counts)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload token_counts: {}", e)))?;
+        // The count tables are already on the device; hold their storage for
+        // the launch.
+        let (tc_storage, tc_layout) = token_counts.storage_and_layout();
+        let cross_storage = cross_turn_counts.map(Tensor::storage_and_layout);
 
-        let cross_turn_gpu: cudarc::driver::CudaSlice<i32> = if cross_turn_penalty != 0.0 {
-            stream.memcpy_stod(cross_turn_counts).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload cross_turn_counts: {}", e))
-            })?
-        } else {
-            stream.memcpy_stod(&[-1i32]).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload cross_turn_counts: {}", e))
-            })?
-        };
-
-        let current_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(current_lens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload current_lens: {}", e)))?;
-
-        let segment_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(segment_lens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload segment_lens: {}", e)))?;
-
-        let dry_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(dry_lens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload dry_lens: {}", e)))?;
-
-        let banned_gpu: cudarc::driver::CudaSlice<i32> = if banned_tokens.is_empty() {
-            stream
-                .memcpy_stod(&[-1i32])
-                .map_err(|e| candle::Error::Msg(format!("failed to upload banned: {}", e)))?
-        } else {
-            stream
-                .memcpy_stod(banned_tokens)
-                .map_err(|e| candle::Error::Msg(format!("failed to upload banned: {}", e)))?
-        };
-
-        // Token suppression buffers. Always upload non-empty slices
-        // (cudarc rejects zero-length copies); the kernel pointers are nulled out
-        // below when suppression is inactive so these uploads are never read.
-        let suppress_tokens_gpu: cudarc::driver::CudaSlice<i32> = if suppress_tokens.is_empty() {
-            stream.memcpy_stod(&[-1i32]).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload suppress_tokens: {}", e))
-            })?
-        } else {
-            stream.memcpy_stod(suppress_tokens).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload suppress_tokens: {}", e))
-            })?
-        };
-
-        let suppress_penalties_gpu: cudarc::driver::CudaSlice<f32> =
-            stream.memcpy_stod(suppress_penalties).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload suppress_penalties: {}", e))
-            })?;
-
-        let recent_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(recent_tokens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload recent_tokens: {}", e)))?;
-
-        let recent_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(recent_lens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload recent_lens: {}", e)))?;
-
-        let stencil_gpu: cudarc::driver::CudaSlice<i32> = if stencil.is_empty() {
-            stream
-                .memcpy_stod(&[-1i32])
-                .map_err(|e| candle::Error::Msg(format!("failed to upload stencil: {}", e)))?
-        } else {
-            stream
-                .memcpy_stod(stencil)
-                .map_err(|e| candle::Error::Msg(format!("failed to upload stencil: {}", e)))?
-        };
-
-        let mut output_gpu: cudarc::driver::CudaSlice<u32> = stream
-            .memcpy_stod(output_tokens)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload output: {}", e)))?;
-
-        let mut rng_gpu: cudarc::driver::CudaSlice<u64> = stream
-            .memcpy_stod(rng_offsets)
-            .map_err(|e| candle::Error::Msg(format!("failed to upload rng_offsets: {}", e)))?;
-
-        // Per-sequence dials. Uploaded as raw 4-byte words — `SeqDials` is 20
-        // packed `f32`/`i32` fields (its C twin `batched_sampling::SeqDials` has
-        // the identical layout), so the byte image is what the kernel reads back.
-        // Empty only on a zero-row launch, which never reaches this kernel path;
-        // guard anyway so the copy is never zero-length (cudarc rejects that).
+        // Every small per-dispatch array in one upload. Per-sequence dials go
+        // in as raw 4-byte words — `SeqDials` is packed `f32`/`i32` fields (its
+        // C twin `batched_sampling::SeqDials` has the identical layout), so the
+        // byte image is what the kernel reads back. The two arrays the kernel
+        // writes, RNG offsets then outputs, go last so one copy reads both.
         const SEQ_DIALS_WORDS: usize = std::mem::size_of::<SeqDials>() / 4;
-        let seq_dials_words: &[i32] = if seq_dials.is_empty() {
-            &[]
-        } else {
-            // SAFETY: `SeqDials` is `#[repr(C)]` with only 4-byte `f32`/`i32`
-            // fields and no padding, so a contiguous slice of them is a valid
-            // `[i32]` of `len * SEQ_DIALS_WORDS` words.
-            unsafe {
-                std::slice::from_raw_parts(
-                    seq_dials.as_ptr() as *const i32,
-                    seq_dials.len() * SEQ_DIALS_WORDS,
-                )
-            }
+        // SAFETY: `SeqDials` is `#[repr(C)]` with only 4-byte `f32`/`i32`
+        // fields and no padding, so a contiguous slice of them is a valid
+        // `[i32]` of `len * SEQ_DIALS_WORDS` words.
+        let seq_dials_words: &[i32] = unsafe {
+            std::slice::from_raw_parts(
+                seq_dials.as_ptr() as *const i32,
+                seq_dials.len() * SEQ_DIALS_WORDS,
+            )
         };
-        let seq_dials_gpu: cudarc::driver::CudaSlice<i32> = stream
-            .memcpy_stod(if seq_dials_words.is_empty() {
-                &[0i32][..]
-            } else {
-                seq_dials_words
-            })
-            .map_err(|e| candle::Error::Msg(format!("failed to upload seq_dials: {}", e)))?;
+        let rows = output_tokens.len();
+        let mut pack = ArgPack::new();
+        let cur_lens_at = pack.push_i32(current_lens);
+        let segment_lens_at = pack.push_i32(segment_lens);
+        let dry_lens_at = pack.push_i32(dry_lens);
+        let banned_at = pack.push_i32(banned_tokens);
+        let suppress_tok_at = pack.push_i32(suppress_tokens);
+        let suppress_pen_at = pack.push_f32(suppress_penalties);
+        let recent_at = pack.push_i32(recent_tokens);
+        let recent_lens_at = pack.push_i32(recent_lens);
+        let stencil_at = pack.push_i32(stencil);
+        let seq_dials_at = pack.push_i32(seq_dials_words);
+        let rng_at = pack.push_u64(rng_offsets);
+        let output_at = pack.reserve(rows);
+        let mut packed: cudarc::driver::CudaSlice<u32> = stream
+            .memcpy_stod(pack.words())
+            .map_err(|e| candle::Error::Msg(format!("failed to upload sampling args: {e}")))?;
 
         // Get device pointers and call kernel in a scoped block
         // so guards are dropped before download
         {
-            let (tc_ptr, _g1) = token_counts_gpu.device_ptr(&stream);
-            let (cross_ptr, _g2) = cross_turn_gpu.device_ptr(&stream);
-            let (cur_lens_ptr, _g3) = current_lens_gpu.device_ptr(&stream);
-            let (segment_lens_ptr, _g3b) = segment_lens_gpu.device_ptr(&stream);
-            let (dry_lens_ptr, _g3b2) = dry_lens_gpu.device_ptr(&stream);
-            let (suppress_tok_ptr, _g3c) = suppress_tokens_gpu.device_ptr(&stream);
-            let (suppress_pen_ptr, _g3d) = suppress_penalties_gpu.device_ptr(&stream);
-            let (ban_ptr, _g4) = banned_gpu.device_ptr(&stream);
-            let (recent_ptr, _g5) = recent_gpu.device_ptr(&stream);
-            let (recent_lens_ptr, _g6) = recent_lens_gpu.device_ptr(&stream);
-            let (stencil_ptr, _g7) = stencil_gpu.device_ptr(&stream);
-            let (output_ptr, _g8) = output_gpu.device_ptr_mut(&stream);
-            let (rng_ptr, _g9) = rng_gpu.device_ptr_mut(&stream);
-            let (seq_dials_ptr, _g10) = seq_dials_gpu.device_ptr(&stream);
+            let (tc_ptr, _g1) = count_table_ptr(&tc_storage, tc_layout, &stream)?;
+            let cross = match &cross_storage {
+                Some((storage, layout)) => Some(count_table_ptr(storage, layout, &stream)?),
+                None => None,
+            };
+            let (base, _g2) = packed.device_ptr_mut(&stream);
+            let at = |word: usize| base + (word * 4) as u64;
+            let cur_lens_ptr = at(cur_lens_at);
+            let segment_lens_ptr = at(segment_lens_at);
+            let dry_lens_ptr = at(dry_lens_at);
+            let suppress_tok_ptr = at(suppress_tok_at);
+            let suppress_pen_ptr = at(suppress_pen_at);
+            let ban_ptr = at(banned_at);
+            let recent_ptr = at(recent_at);
+            let recent_lens_ptr = at(recent_lens_at);
+            let stencil_ptr = at(stencil_at);
+            let output_ptr = at(output_at);
+            let rng_ptr = at(rng_at);
+            let seq_dials_ptr = at(seq_dials_at);
 
             // Helper closure to call kernel with logits pointer
             let call_kernel = |logits_ptr: *const std::ffi::c_void| unsafe {
@@ -1693,10 +1701,9 @@ impl BatchedSampler {
                     eos_ramp_len,
                     eos_boost_max_multiplier,
                     cross_turn_penalty,
-                    if cross_turn_penalty != 0.0 {
-                        cross_ptr as *const i32
-                    } else {
-                        std::ptr::null()
+                    match &cross {
+                        Some((cross_ptr, _)) => *cross_ptr as *const i32,
+                        None => std::ptr::null(),
                     },
                     cur_lens_ptr as *const i32,
                     segment_close_boost,
@@ -1744,6 +1751,7 @@ impl BatchedSampler {
                     } else {
                         seq_dials_ptr as *const std::ffi::c_void
                     },
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             };
 
@@ -1774,28 +1782,21 @@ impl BatchedSampler {
             }
         } // Guards dropped here
 
-        // Synchronize and download results
-        stream
-            .synchronize()
-            .map_err(|e| candle::Error::Msg(format!("CUDA sync failed: {}", e)))?;
-
-        let output_vec = stream
-            .memcpy_dtov(&output_gpu)
-            .map_err(|e| candle::Error::Msg(format!("failed to download output: {}", e)))?;
-
-        let rng_vec = stream
-            .memcpy_dtov(&rng_gpu)
-            .map_err(|e| candle::Error::Msg(format!("failed to download rng: {}", e)))?;
-
-        output_tokens.copy_from_slice(&output_vec);
-        rng_offsets.copy_from_slice(&rng_vec);
+        // One stream-ordered copy reads the RNG offsets and the outputs back.
+        // It is queued behind the kernel, and a device-to-host copy into
+        // pageable memory returns only once it has completed, so no separate
+        // synchronise is needed.
+        let tail = stream
+            .memcpy_dtov(&packed.slice(rng_at..output_at + rows))
+            .map_err(|e| candle::Error::Msg(format!("failed to download sampling results: {e}")))?;
+        let (rng, outputs) = split_rng_and_outputs(&tail, rows);
+        output_tokens.copy_from_slice(&outputs);
+        rng_offsets.copy_from_slice(&rng);
 
         Ok(())
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Unit tests
 /// Set this row's banned (deny-list) logits to `-inf`.  Modifies only the few
 /// banned *values* (on an F32 host copy of the row), and is a no-op when the list
 /// is empty, so unconstrained rows keep their exact logits.  Preserves the input
@@ -2187,7 +2188,7 @@ mod tests {
             "a call past the same budget keeps its token"
         );
         let (_, _, _, _, current_lens) = sampler
-            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0)
+            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0, false)
             .unwrap();
         assert_eq!(current_lens, vec![0], "the EOS ramp sees no length");
 
@@ -2474,20 +2475,95 @@ mod tests {
             thinking.record_token(42, MAX_RECENT);
         }
         in_call.in_tool_call = true;
+        // A prior turn, so the cross-turn table has something to suppress.
+        in_call.end_turn(0);
+        thinking.end_turn(0);
+        for _ in 0..5 {
+            in_call.record_token(42, MAX_RECENT);
+            thinking.record_token(42, MAX_RECENT);
+        }
 
         let (token_counts, cross_turn_counts, _recent, recent_lens, _cur) = sampler
-            .build_penalty_buffers_from_states(&[&mut in_call, &mut thinking], 0.0, 16, 0)
+            .build_penalty_buffers_from_states(&[&mut in_call, &mut thinking], 0.0, 16, 0, true)
             .expect("buffers");
 
-        // Row 0 (tool call): all penalty inputs empty — the model is free to
-        // reproduce the query's tokens verbatim in the arguments.
-        assert!(token_counts[..VOCAB_SIZE].iter().all(|&c| c == 0));
-        assert!(cross_turn_counts[..VOCAB_SIZE].iter().all(|&c| c == 0));
+        // Row 0 (tool call) stamps nothing, so its table rows read zero — the
+        // model is free to reproduce the query's tokens verbatim in the
+        // arguments. Row 1 (think block) keeps full repetition control.
+        let row1_42 = VOCAB_SIZE as u32 + 42;
+        assert_eq!(
+            token_counts,
+            SparseCounts {
+                offsets: vec![row1_42],
+                values: vec![5],
+            }
+        );
+        assert_eq!(
+            cross_turn_counts,
+            SparseCounts {
+                offsets: vec![row1_42],
+                values: vec![5],
+            }
+        );
         assert_eq!(recent_lens[0], 0);
+        assert_eq!(recent_lens[1], 10);
+    }
 
-        // Row 1 (think block): full repetition control retained.
-        assert_eq!(token_counts[VOCAB_SIZE + 42], 5);
-        assert_eq!(recent_lens[1], 5);
+    /// With the cross-turn penalty off, the cross table is never read, so
+    /// nothing is gathered for it.
+    #[test]
+    fn the_cross_turn_table_is_gathered_only_when_its_penalty_is_on() {
+        let sampler = make_sampler();
+        let mut state = make_state();
+        state.record_token(7, MAX_RECENT);
+        state.end_turn(0);
+        let (_, cross, _, _, _) = sampler
+            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0, false)
+            .expect("buffers");
+        assert_eq!(cross, SparseCounts::default());
+    }
+
+    /// The sparse indexes name exactly the nonzero dense entries, through
+    /// recording, a turn end and a windowed cross-turn eviction — they are what
+    /// the device table is stamped from, so a token missing from them is a
+    /// penalty silently not applied.
+    #[test]
+    fn the_sparse_indexes_track_the_nonzero_counts_across_turns() {
+        fn nonzero(counts: &[i32]) -> Vec<u32> {
+            (0..counts.len() as u32)
+                .filter(|&t| counts[t as usize] > 0)
+                .collect()
+        }
+        fn sorted(v: &[u32]) -> Vec<u32> {
+            let mut v = v.to_vec();
+            v.sort_unstable();
+            v
+        }
+        let mut st = make_state();
+        for t in [9, 3, 9, 4] {
+            st.record_token(t, MAX_RECENT);
+        }
+        assert_eq!(st.counted, vec![9, 3, 4]);
+        assert_eq!(sorted(&st.counted), nonzero(&st.token_counts));
+
+        // Window of one: turn A enters the cross counts.
+        st.end_turn(1);
+        assert!(st.counted.is_empty());
+        assert_eq!(nonzero(&st.token_counts), Vec::<u32>::new());
+        assert_eq!(sorted(&st.cross_counted), vec![3, 4, 9]);
+        assert_eq!(sorted(&st.cross_counted), nonzero(&st.cross_turn_counts));
+
+        // Turn B evicts turn A: only B's tokens remain.
+        for t in [4, 5] {
+            st.record_token(t, MAX_RECENT);
+        }
+        st.end_turn(1);
+        assert_eq!(sorted(&st.cross_counted), vec![4, 5]);
+        assert_eq!(sorted(&st.cross_counted), nonzero(&st.cross_turn_counts));
+        assert_eq!(st.cross_turn_counts[4], 1);
+
+        st.clear();
+        assert!(st.counted.is_empty() && st.cross_counted.is_empty());
     }
 
     // ── EOS failsafe override tests ────────────────────────────────────
@@ -3104,5 +3180,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The kernel reads its counts from the device-resident tables: each row
+    /// is priced by its own history, a tool-call row by none, and the next
+    /// dispatch starts from a clean table rather than the last one's counts.
+    ///
+    /// Token 42 leads token 43 by one logit, so a penalty of more than one on
+    /// 42 flips the greedy pick — the pick says whether the count reached the
+    /// kernel.
+    #[test]
+    fn the_kernel_prices_each_row_from_its_own_resident_counts() {
+        let Ok(device) = candle::Device::new_cuda(0) else {
+            return; // No CUDA device on this box.
+        };
+        let sampler = BatchedSampler::new(
+            device.clone(),
+            VOCAB_SIZE,
+            MAX_RECENT,
+            vec![EOS_TOKEN].into(),
+            None,
+        );
+        let mut row = vec![0.0f32; VOCAB_SIZE];
+        row[42] = 10.0;
+        row[43] = 9.0;
+        let logits = |rows: usize| {
+            Tensor::from_vec(row.repeat(rows), (rows, VOCAB_SIZE), &device).expect("logits")
+        };
+
+        // Frequency: 42 said three times costs it 3 × 2.0.
+        let freq = SamplingConfig {
+            frequency_penalty: 2.0,
+            ..SamplingConfig::argmax()
+        };
+        let mut repeated = make_state();
+        let mut fresh = make_state();
+        let mut in_call = make_state();
+        for _ in 0..3 {
+            repeated.record_token(42, MAX_RECENT);
+            in_call.record_token(42, MAX_RECENT);
+        }
+        in_call.in_tool_call = true;
+        let tokens = sampler
+            .sample_batch(
+                &logits(3),
+                &mut [&mut repeated, &mut fresh, &mut in_call],
+                &[&freq, &freq, &freq],
+            )
+            .expect("sample_batch");
+        assert_eq!(tokens, vec![43, 42, 42]);
+
+        // The next dispatch puts a fresh row where the repeated one was: it must
+        // read zero there, not the counts the last dispatch stamped.
+        let mut after = make_state();
+        let tokens = sampler
+            .sample_batch(&logits(1), &mut [&mut after], &[&freq])
+            .expect("sample_batch");
+        assert_eq!(tokens, vec![42]);
+
+        // Cross-turn: 42 said in a prior turn costs it 5.0 this turn.
+        let cross = SamplingConfig {
+            cross_turn_penalty: 5.0,
+            ..SamplingConfig::argmax()
+        };
+        let mut said_before = make_state();
+        said_before.record_token(42, MAX_RECENT);
+        said_before.end_turn(0);
+        let mut never = make_state();
+        let tokens = sampler
+            .sample_batch(
+                &logits(2),
+                &mut [&mut said_before, &mut never],
+                &[&cross, &cross],
+            )
+            .expect("sample_batch");
+        assert_eq!(tokens, vec![43, 42]);
     }
 }

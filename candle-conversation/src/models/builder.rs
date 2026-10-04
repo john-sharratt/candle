@@ -13,6 +13,8 @@ use crate::models::DialectType;
 use crate::persistence::SharedSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tree::ConversationTreeConfig;
+use crate::ManagedBatchedModel;
+use candle::quantized::Int8Mode;
 use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
 use candle_nn::CHUNK_SIZE;
@@ -20,6 +22,13 @@ use candle_transformers::models::batched_model::{BatchedInference, BatchedModelC
 use candle_transformers::models::qwen35::TensorOverride;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// A model [`ModelBuilder::load_model`] loaded, with the int8 mode it was
+/// loaded in — the value a report on the model names, never re-derived.
+pub struct LoadedModel {
+    pub model: Box<dyn ManagedBatchedModel + Send>,
+    pub int8_mode: Int8Mode,
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // GGUF metadata extracted from the model file
@@ -760,8 +769,14 @@ impl ModelBuilder {
         }
     }
 
-    /// Build an [`EngineConfig`] from the builder's settings and a tokenizer.
-    pub fn engine_config(&self, tokenizer: &tokenizers::Tokenizer) -> EngineConfig {
+    /// Build an [`EngineConfig`] from the builder's settings, a tokenizer, and the
+    /// device the engine will run on — which sizes the prefill forward to the card
+    /// unless [`Self::prefill_pass_tokens`] chose it.
+    pub fn engine_config(
+        &self,
+        tokenizer: &tokenizers::Tokenizer,
+        device: &Device,
+    ) -> EngineConfig {
         let mut eos_tokens = Vec::new();
         // The spec's dialect is the source of truth for the model family's
         // end-of-turn/document markers (e.g. DeepSeek's `<｜end▁of▁sentence｜>`);
@@ -823,9 +838,31 @@ impl ModelBuilder {
 
         let mut ret = EngineConfig::new(eos_tokens.into());
         ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
-        if let Some(n) = self.prefill_pass_tokens {
-            ret.scheduler.large_prefill_max_tokens = n;
-        }
+        // **Sized to the card here, where every engine config is made**, so an
+        // engine assembled from this config directly — the fragmentation probe,
+        // `ruler_stream` — gets the same pass as one from `build`. The 16 GB
+        // default on the 72 GB RTX PRO 5000 is a 2,048-token forward, which holds
+        // eight submitted turns to three per prefill wave where the card takes
+        // 8,192.
+        ret.scheduler.large_prefill_max_tokens = match self.prefill_pass_tokens {
+            Some(n) => n,
+            None => {
+                let total_vram = match device {
+                    Device::Cuda(d) => d
+                        .mem_get_info()
+                        .map(|(_free, total)| total as u64)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                let n = SchedulerConfig::prefill_pass_tokens_for_vram(total_vram);
+                tracing::info!(
+                    total_vram_gib = total_vram / (1 << 30),
+                    prefill_pass_tokens = n,
+                    "prefill forward sized to the card"
+                );
+                n
+            }
+        };
         ret.batched_config.compression_level = Some(self.kv_compression_level);
         // Stress test: uniform-K pin REMOVED — both K and V now use fully
         // adaptive per-(head,palette) selection with non-identity pal_maps,
@@ -910,18 +947,51 @@ impl ModelBuilder {
         )?)
     }
 
+    /// The int8 numeric mode [`Self::load_model`] loads `model_path` in on
+    /// `device` — the one value every arch's loader is handed, and returned
+    /// with the model as [`LoadedModel::int8_mode`].
+    ///
+    /// - **The routed hybrid and Flash-Next take `auto`**, not the size-weighed
+    ///   default. `auto_sized` asks whether the file fits in 70% of free VRAM,
+    ///   which is a dense model's question: a routed checkpoint pages its
+    ///   experts through the three-tier cache, so its file size is not its
+    ///   resident size — and the question answers `Performance` for a 21.7 GB
+    ///   file on a 24 GB card that runs `Precision` with every gate row valid.
+    /// - **DeepSeek-V4 is pinned to `Performance`**, the mode its engine is
+    ///   measured at.
+    /// - **Llama and Qwen2 take `auto`**, their loaders' own default.
+    /// - **The rest take `auto_sized`**: the stepped-up twin only where the
+    ///   weights leave headroom.
+    fn int8_mode(&self, device: &Device, model_path: &Path) -> Int8Mode {
+        match self.spec.arch {
+            ModelArch::DeepSeekV4 => Int8Mode::Performance,
+            ModelArch::Qwen35Hybrid | ModelArch::Qwen4Exp | ModelArch::Llama | ModelArch::Qwen2 => {
+                Int8Mode::auto(device)
+            }
+            ModelArch::Qwen3 | ModelArch::Qwen3Moe | ModelArch::Qwen35Dense => {
+                let model_bytes = std::fs::metadata(model_path)
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0);
+                Int8Mode::auto_sized(device, model_bytes)
+            }
+        }
+    }
+
     /// Load quantised model weights from a local GGUF file.
     ///
     /// Uses the builder's `max_seq_len` for KV cache sizing, and raises the
     /// model's RoPE floor to the builder's [`Self::min_rope_factor`] before any
-    /// session opens.
+    /// session opens. The int8 mode is chosen once, here, and returned with the
+    /// model: `auto_sized` reads free VRAM, which the load itself changes, so
+    /// asking again afterwards can name a mode the model was not loaded in.
     pub fn load_model(
         &self,
         model_path: &Path,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
-    ) -> crate::Result<Box<dyn crate::ManagedBatchedModel + Send>> {
-        let mut model = self.load_arch(model_path, device, progress)?;
+    ) -> crate::Result<LoadedModel> {
+        let int8_mode = self.int8_mode(device, model_path);
+        let mut model = self.load_arch(model_path, device, int8_mode, progress)?;
         if let Some(min) = self.min_rope_factor {
             model
                 .set_rope_min_factor(min)
@@ -932,17 +1002,18 @@ impl ModelBuilder {
                 "RoPE: no sequence runs below the minimum YaRN factor"
             );
         }
-        Ok(model)
+        Ok(LoadedModel { model, int8_mode })
     }
 
-    /// The model `spec.arch` names, loaded from `model_path` — every
-    /// architecture's own loader.
+    /// The model `spec.arch` names, loaded from `model_path` in `int8mode` —
+    /// every architecture's own loader.
     fn load_arch(
         &self,
         model_path: &Path,
         device: &Device,
+        int8mode: Int8Mode,
         progress: Option<&dyn Fn(usize, usize)>,
-    ) -> crate::Result<Box<dyn crate::ManagedBatchedModel + Send>> {
+    ) -> crate::Result<Box<dyn ManagedBatchedModel + Send>> {
         let max_seq = self.max_seq_len;
         // **Only the qwen35 loader reads a tensor from another checkpoint.** A spec naming one
         // for any other arch would load the primary's own copy and serve a model nobody asked
@@ -987,7 +1058,7 @@ impl ModelBuilder {
                 // callback simply doesn't fire. Add `progress` to the
                 // arch's loader to enable it.
                 let _ = progress;
-                let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
+                let raw = ModelWeights::from_gguf_by_path_with_int8(model_path, device, int8mode)?;
                 let inv = stated_inv_freq(raw.rope_inv_freq())?;
                 Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
@@ -1002,7 +1073,7 @@ impl ModelBuilder {
                     device,
                     progress,
                     GgufLoadOptions {
-                        int8mode: None,
+                        int8mode: Some(int8mode),
                         expert_pack_dir: self.expert_pack_dir.clone(),
                     },
                 )?;
@@ -1013,7 +1084,9 @@ impl ModelBuilder {
                 use candle_transformers::models::quantized_qwen2::ModelWeights;
                 // Per-layer progress not yet wired for this arch.
                 let _ = progress;
-                let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
+                let raw = ModelWeights::from_gguf_by_path_with_options(
+                    model_path, device, None, int8mode,
+                )?;
                 let inv = stated_inv_freq(raw.rope_inv_freq())?;
                 Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
@@ -1025,25 +1098,24 @@ impl ModelBuilder {
                 // v3 KV-factor row applies; a Llama-2 checkpoint needs its own
                 // `ModelArch` split onto `from_gguf_by_path_v2` before it can
                 // load through the daemon.
-                let raw = ModelWeights::from_gguf_by_path_v3(model_path, device)?;
+                let raw =
+                    ModelWeights::from_gguf_by_path_with_int8_v3(model_path, device, int8mode)?;
                 let inv = stated_inv_freq(raw.rope_inv_freq())?;
                 Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
             ModelArch::DeepSeekV4 => {
-                use candle::quantized::Int8Mode;
                 use candle_transformers::models::deepseek4::DEEPSEEK_V4;
                 use candle_transformers::models::latent_moe::{BatchedEngine, Engine};
                 // Per-layer progress not yet wired for this arch.
                 let _ = progress;
                 let _ = max_seq; // window/corpus budgets are model-derived
-                let engine = Engine::load(model_path, &DEEPSEEK_V4, device, Int8Mode::Performance)
+                let engine = Engine::load(model_path, &DEEPSEEK_V4, device, int8mode)
                     .map_err(ConversationError::Model)?;
                 Ok(Box::new(
                     BatchedEngine::new(engine).map_err(ConversationError::Model)?,
                 ))
             }
             ModelArch::Qwen4Exp => {
-                use candle::quantized::Int8Mode;
                 use candle_transformers::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
                 // KV is allocated per ATTENTION layer (12 of 48) and the window
                 // budget is config-derived, exactly as the hybrid's is.
@@ -1053,13 +1125,8 @@ impl ModelBuilder {
                 // expert pack is sized from a live span measurement at load.
                 // `progress` reports the expert repack, which is the bulk of a
                 // cold load's wall time.
-                let gpu = Qwen4ExpGpu::load_with_progress(
-                    model_path,
-                    device,
-                    Int8Mode::auto(device),
-                    progress,
-                )
-                .map_err(ConversationError::Model)?;
+                let gpu = Qwen4ExpGpu::load_with_progress(model_path, device, int8mode, progress)
+                    .map_err(ConversationError::Model)?;
                 let mut model = Qwen4ExpBatched::new(gpu).map_err(ConversationError::Model)?;
                 if let Some(positions) = self.qsa_selection_budget {
                     model
@@ -1069,7 +1136,6 @@ impl ModelBuilder {
                 Ok(Box::new(model))
             }
             ModelArch::Qwen35Hybrid => {
-                use candle::quantized::Int8Mode;
                 use candle_transformers::models::quantized_qwen36_moe;
                 use candle_transformers::models::qwen35::Qwen35LoadOptions;
                 // Per-layer progress not yet wired for this arch.
@@ -1093,13 +1159,7 @@ impl ModelBuilder {
                             .expert_pack_dir
                             .clone()
                             .or_else(|| model_path.parent().map(Path::to_path_buf)),
-                        // `auto`, not the loader's size-weighed default. `auto_sized` asks
-                        // whether the file fits in 70% of free VRAM, which is a dense model's
-                        // question: a routed checkpoint pages its experts through the three-tier
-                        // cache, so its file size is not its resident size — and the question
-                        // answers `Performance` for a 21.7 GB file on a 24 GB card that runs
-                        // `Precision` with every gate row valid.
-                        int8mode: Some(Int8Mode::auto(device)),
+                        int8mode: Some(int8mode),
                         gate_donor_path: self.gate_donor_path(model_path)?,
                         tensor_overrides: self.tensor_overrides()?,
                         ..Default::default()
@@ -1123,6 +1183,7 @@ impl ModelBuilder {
                     model_path,
                     device,
                     Qwen35LoadOptions {
+                        int8mode: Some(int8mode),
                         gate_donor_path: self.gate_donor_path(model_path)?,
                         tensor_overrides: self.tensor_overrides()?,
                         ..Default::default()
@@ -1281,24 +1342,7 @@ impl ModelBuilder {
         }
         self.health_config.resolve_structural_tokens(&tokenizer);
 
-        let mut config = self.engine_config(&tokenizer);
-        // Size the prefill forward to the card unless the caller chose it.
-        if self.prefill_pass_tokens.is_none() {
-            let total_vram = match device {
-                Device::Cuda(d) => d
-                    .mem_get_info()
-                    .map(|(_free, total)| total as u64)
-                    .unwrap_or(0),
-                _ => 0,
-            };
-            config.scheduler.large_prefill_max_tokens =
-                SchedulerConfig::prefill_pass_tokens_for_vram(total_vram);
-            tracing::info!(
-                total_vram_gib = total_vram / (1 << 30),
-                prefill_pass_tokens = config.scheduler.large_prefill_max_tokens,
-                "prefill forward sized to the card"
-            );
-        }
+        let mut config = self.engine_config(&tokenizer, device);
 
         // Embed the raw `tokenizer.json` so the substrate log is a
         // self-contained, offline-detokenizable image. Written once per
@@ -1350,7 +1394,7 @@ impl ModelBuilder {
             tracing::info!("  Max response tokens: {}", self.max_response_tokens);
         }
 
-        let model = self.load_model(&model_path, device, progress)?;
+        let model = self.load_model(&model_path, device, progress)?.model;
 
         // Hand the load's pool high-water back before serving starts — it is
         // several GiB held outside the KV reservation and never used again.

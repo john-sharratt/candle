@@ -4,9 +4,11 @@ use super::admission::{
 };
 use super::admit;
 use super::admit_ground::AdmitPass;
+use super::compaction_stall::{PassOutcome, PoolShape};
 use super::*;
 use crate::persistence::thread::effective_turn_policy;
 use crate::recorded_reply::replayed_step;
+use crate::stats::streams_committed;
 use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
 use candle_nn::kv_cache::{end_wave_transient, is_device_oom};
@@ -309,9 +311,21 @@ impl Scheduler {
         // left the pools at 82%. Sparsity alone would miss the burst, where a mass
         // eviction strands the frontier over ground that is genuinely free.
         let holes = stats.live_watermark.saturating_sub(stats.live);
-        if holes < MIN_FREEABLE_ARENAS
-            && holes + self.session.kv_sparse_arenas() < MIN_FREEABLE_ARENAS
-        {
+        let sparse = self.session.kv_sparse_arenas();
+        if holes < MIN_FREEABLE_ARENAS && holes + sparse < MIN_FREEABLE_ARENAS {
+            stand_down();
+            return;
+        }
+        // **And not again on a shape the last pass could not improve.** The gate
+        // above can stay open over a pool no pass can pack — a pinned arena holding
+        // the frontier — and re-running the identical pass every wave stalls decode
+        // for nothing. See `compaction_stall`.
+        let shape = PoolShape {
+            live: stats.live,
+            frontier: stats.live_watermark,
+            sparse,
+        };
+        if self.kv_compaction_stall.holds(shape) {
             stand_down();
             return;
         }
@@ -331,7 +345,11 @@ impl Scheduler {
         // store that holds it, so it needs no holder sweep and no quiesce; a failure
         // part-way leaves every store consistent (each move is whole) and is reported
         // loudly rather than retried silently.
-        match self.model.compact_recurrent(MAX_STATE_MOVES) {
+        let recurrent = {
+            let _g = super::profile::span("compact:recurrent");
+            self.model.compact_recurrent(MAX_STATE_MOVES)
+        };
+        match recurrent {
             Ok(r) if r.planned > 0 => {
                 tracing::info!(
                     target: "candle_conversation::scheduler::vram_relief",
@@ -361,7 +379,11 @@ impl Scheduler {
         // Pages a scan is reading are skipped, so this cannot move ground out from
         // under an in-flight launch.
         if let Some(arena) = self.gallery_arena.as_ref() {
-            match arena.compact(MAX_GALLERY_MOVES) {
+            let gallery = {
+                let _g = super::profile::span("compact:gallery");
+                arena.compact(MAX_GALLERY_MOVES)
+            };
+            match gallery {
                 Ok(r) if r.planned > 0 => {
                     tracing::info!(
                         target: "candle_conversation::scheduler::vram_relief",
@@ -402,15 +424,18 @@ impl Scheduler {
         // The closure receives the pass's OWN `Sweep`, already carrying whatever the
         // backings rewrote. Sharing it is what makes an allocation held by both a
         // block table and a residence come back as one replacement.
-        let outcome = self.session.compact_kv(BUDGET, &mut |sweep| {
-            for s in &substrates {
-                swept += s.rewrite_for_compaction(sweep)?;
-            }
-            for state in projections.values_mut() {
-                swept += state.rewrite_for_compaction(sweep)?;
-            }
-            Ok(())
-        });
+        let outcome = {
+            let _g = super::profile::span("compact:kv");
+            self.session.compact_kv(BUDGET, &mut |sweep| {
+                for s in &substrates {
+                    swept += s.rewrite_for_compaction(sweep)?;
+                }
+                for state in projections.values_mut() {
+                    swept += state.rewrite_for_compaction(sweep)?;
+                }
+                Ok(())
+            })
+        };
         self.slot_projection_state = projections;
         // **The interval is stamped by a pass that ran, never by one that was
         // refused.** `MIN_INTERVAL` exists to bound the census, and a contended pass
@@ -433,6 +458,15 @@ impl Scheduler {
         // one got far enough to plan, because "the census cost 30 ms and then the claims
         // lost" is a diagnosis and "compaction was refused" is not.
         if let Ok(report) = &outcome {
+            self.kv_compaction_stall.record(
+                shape,
+                PassOutcome {
+                    reclaimed_regions: report.regions_reclaimed(),
+                    frontier_before: report.frontier_before,
+                    frontier_after: report.frontier_after,
+                    clipped: report.clipped,
+                },
+            );
             let t = report.timings;
             super::profile::record("compact:quiesce", t.quiesce);
             super::profile::record("compact:plan", t.plan);
@@ -2087,7 +2121,6 @@ impl Scheduler {
             }
         }
         let mut members: Vec<WaveMember> = Vec::new();
-        let mut prefill_tokens = 0usize;
         // A prefill paused behind higher-priority work sits this group out and
         // keeps its place — see `priority_pause`.
         self.observe_priorities();
@@ -2098,15 +2131,15 @@ impl Scheduler {
             if self.priority_paused(p.work.sequence_id) {
                 continue;
             }
-            let advance = (p.work.tokens.len() - p.offset).min(cap);
-            if prefill_tokens > 0 && prefill_tokens + advance > cap {
-                break;
-            }
+            // Every prompt that can advance is a candidate, each offering at
+            // most a pass. Who rides and how far is decided below, where the
+            // members share the budget — stopping here at the first prompt that
+            // does not fit whole would decide it first, and hold every prompt
+            // behind that one back from a forward it could have shared.
             members.push(WaveMember::Prefill {
                 seq_id: p.work.sequence_id.0,
-                advance,
+                advance: (p.work.tokens.len() - p.offset).min(cap),
             });
-            prefill_tokens += advance;
         }
         // ── One adapter per wave ─────────────────────────────────────────────
         //
@@ -2127,29 +2160,53 @@ impl Scheduler {
             .map(|s| s.to_owned());
         members.retain(|m| self.session.sequence_adapter(m.seq_id()) == group_adapter.as_deref());
 
-        // ── Bounded by what one forward can carry ────────────────────────────
+        // ── Bounded by what one forward can carry, and shared ────────────────
         //
-        // A dialogue prefill rides the group whole — the wave takes a member's full
-        // token set — so the group's rows are the sum of its members' turns, and the
-        // forward prices its transient tier from that sum. Unbounded, a burst of
-        // queued turns became one forward: npcd's world ingest on the routed
+        // The group's rows are the sum of its members' advances, and the forward
+        // prices its transient tier from that sum. Unbounded, a burst of queued
+        // turns became one forward: npcd's world ingest on the routed
         // Qwen3.6-35B-A3B asked for a 3.3 GB tier against a 3.0 GB gap between the
         // KV frontier and the weight floor, and every turn in the wave failed with
-        // it. Admitted in queue order up to the pass budget; the rest stay active
-        // and form the next group.
-        let budget = self.prefill_pass_budget();
-        let lens: Vec<usize> = members
+        // it. So the members share the pass budget — each advances a fair slice of
+        // its prompt and the rest rides the next group — rather than whole turns
+        // being admitted until one does not fit, which held the turns past that
+        // point back behind the others' decode. See `admission::share_within`.
+        let remaining: Vec<usize> = members
             .iter()
-            .map(|m| {
-                self.active_prefills
-                    .iter()
-                    .find(|p| p.work.sequence_id.0 == m.seq_id())
-                    .map_or(0, |p| p.work.tokens.len())
+            .map(|m| match m {
+                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
+                    *advance
+                }
             })
             .collect();
-        let admitted = super::admission::admit_within(lens.iter().copied(), budget);
-        members.truncate(admitted);
-        let mut used: usize = lens[..admitted].iter().sum();
+        // A queue that passes the cap by no more than the model's slack rides
+        // whole, rather than leaving a straggler group a sweep of its own.
+        let budget = self.prefill_group_budget(remaining.iter().sum());
+        let shares = super::admission::share_within(&remaining, budget, CHUNK_SIZE);
+        let members_before = std::mem::take(&mut members);
+        for (m, share) in members_before.into_iter().zip(shares) {
+            if share == 0 {
+                continue;
+            }
+            members.push(match m {
+                WaveMember::Prefill { seq_id, .. } => WaveMember::Prefill {
+                    seq_id,
+                    advance: share,
+                },
+                WaveMember::Section { seq_id, .. } => WaveMember::Section {
+                    seq_id,
+                    advance: share,
+                },
+            });
+        }
+        let mut used: usize = members
+            .iter()
+            .map(|m| match m {
+                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
+                    *advance
+                }
+            })
+            .sum();
 
         if include_sections && !members.is_empty() {
             for i in 0..self.active_section_ingests.len() {
@@ -3080,6 +3137,9 @@ impl Scheduler {
         if !self.active_prefills.is_empty() {
             self.settled_since_admit = true;
         }
+        // Turns whose prefill finished cleanly, finalised together below so their
+        // first tokens are sampled in one dispatch.
+        let mut ready: Vec<FinishedPrefill> = Vec::new();
         // Use swap_remove for efficiency; iterate from the back.
         let mut i = 0;
         while i < self.active_prefills.len() {
@@ -3156,29 +3216,102 @@ impl Scheduler {
             let prefill_ms = prefill_start
                 .map(|s| s.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
-            let turn_start = work.submitted_at;
-            let token_count = work.tokens.len();
+            ready.push(FinishedPrefill {
+                turn_start: work.submitted_at,
+                token_count: work.tokens.len(),
+                work,
+                logits,
+                prefill_ms,
+            });
+            // swap_remove pulled the last element into i; don't increment.
+        }
+        if !ready.is_empty() {
             let t_fin = std::time::Instant::now();
-            self.finalise_prefill(work, logits, prefill_ms, turn_start, token_count);
+            self.finalise_prefills(ready);
             crate::scheduler::run::note_promote_split(
                 crate::scheduler::run::PromoteStep::Finalise,
                 t_fin.elapsed().as_micros() as u64,
             );
-            // swap_remove pulled the last element into i; don't increment.
         }
     }
 
-    /// Post-forward path shared by both single and batched prefill: sample
-    /// the first token, emit it, and either transition to decode or close
-    /// the turn out immediately on EOS / max_decode_tokens == 0.
-    fn finalise_prefill(
+    /// Finalise every turn whose prefill finished together: prepare each, sample
+    /// all their first tokens in one dispatch, then emit each and move it to
+    /// decode (or close it out) exactly as one turn alone would be.
+    ///
+    /// **One sample for the cohort, not one per turn.** Each dispatch is a
+    /// launch and a readback over the whole vocabulary, so eight turns finishing
+    /// the same wave paid eight of them, one after another, before the last
+    /// first token went out — 2.5 ms each on the Qwen3.6-35B-A3B. The sampler
+    /// already samples a mixed batch row by row on each row's own config and
+    /// state, which is what the decode step relies on, so the batch changes no
+    /// row's draw.
+    fn finalise_prefills(&mut self, ready: Vec<FinishedPrefill>) {
+        let mut prepared: Vec<(FinishedPrefill, FirstSample)> = ready
+            .into_iter()
+            .map(|mut f| {
+                let first = self.prepare_first_sample(&mut f.work, f.token_count);
+                (f, first)
+            })
+            .collect();
+        let sampled: Vec<Result<u32, ConversationError>> = {
+            let _g = super::profile::span("finalise:sample");
+            self.sample_first_tokens(&mut prepared)
+        };
+        for ((f, first), sampled) in prepared.into_iter().zip(sampled) {
+            self.finish_first_sample(f, first, sampled);
+        }
+    }
+
+    /// Every prepared turn's first token, in order: one batched dispatch, or for
+    /// a single turn its own logits as they are. A dispatch that fails fails
+    /// every turn it carried.
+    fn sample_first_tokens(
         &mut self,
-        mut work: PrefillWork,
-        logits: Tensor,
-        prefill_ms: f64,
-        turn_start: Instant,
-        token_count: usize,
-    ) {
+        prepared: &mut [(FinishedPrefill, FirstSample)],
+    ) -> Vec<Result<u32, ConversationError>> {
+        let n = prepared.len();
+        let logits = if n == 1 {
+            Ok(prepared[0].0.logits.clone())
+        } else {
+            prepared
+                .iter()
+                .map(|(f, _)| f.logits.flatten_all())
+                .collect::<candle::Result<Vec<Tensor>>>()
+                .and_then(|rows| Tensor::stack(&rows, 0))
+        };
+        // Owned, because the states below borrow the same entries mutably.
+        let configs: Vec<SamplingConfig> =
+            prepared.iter().map(|(_, s)| s.sampling.clone()).collect();
+        let config_refs: Vec<&SamplingConfig> = configs.iter().collect();
+        let mut states: Vec<&mut SequenceSamplingState> = prepared
+            .iter_mut()
+            .map(|(_, s)| &mut s.sampling_state)
+            .collect();
+        let drawn = logits.and_then(|l| self.sampler.sample_batch(&l, &mut states, &config_refs));
+        match drawn {
+            Ok(tokens) if tokens.len() == n => tokens.into_iter().map(Ok).collect(),
+            Ok(tokens) => (0..n)
+                .map(|_| {
+                    Err(ConversationError::Channel(format!(
+                        "first-token sample returned {} tokens for {n} turns",
+                        tokens.len()
+                    )))
+                })
+                .collect(),
+            Err(e) => {
+                let msg = e.to_string();
+                (0..n)
+                    .map(|_| Err(ConversationError::Model(candle::Error::Msg(msg.clone()))))
+                    .collect()
+            }
+        }
+    }
+
+    /// Everything a turn's first sample needs, taken before the sample: the
+    /// turn's budget capped at the RoPE reach, its sampling state brought to the
+    /// new turn, and its sampling config with any turn grammar's opening mask.
+    fn prepare_first_sample(&mut self, work: &mut PrefillWork, token_count: usize) -> FirstSample {
         // Total KV position after this prefill.
         let context_depth = self
             .session
@@ -3282,7 +3415,39 @@ impl Scheduler {
             );
         }
 
-        let sampled = match self.sample_single(&logits, &sampling, &mut sampling_state) {
+        FirstSample {
+            context_depth,
+            sampling_state,
+            sampling,
+            turn_driver,
+        }
+    }
+
+    /// Emit a turn's first token and either move it to decode or close it out
+    /// at once on EOS / `max_decode_tokens == 0` — the half of finalising a
+    /// prefill that follows its sample.
+    fn finish_first_sample(
+        &mut self,
+        finished: FinishedPrefill,
+        first: FirstSample,
+        sampled: Result<u32, ConversationError>,
+    ) {
+        let FinishedPrefill {
+            mut work,
+            logits: _,
+            prefill_ms,
+            turn_start,
+            token_count: _,
+        } = finished;
+        // `sampling` was this turn's config for the sample just taken; the turn
+        // decodes on `work.sampling` from here, as it did before the split.
+        let FirstSample {
+            context_depth,
+            mut sampling_state,
+            sampling: _,
+            turn_driver,
+        } = first;
+        let sampled = match sampled {
             Ok(t) => t,
             Err(e) => {
                 self.sampling_states
@@ -3389,11 +3554,17 @@ impl Scheduler {
         if self.is_eos(first_token) || work.max_decode_tokens == 0 {
             // The first token ended the turn: an end-of-sequence, or a budget of
             // zero decoded tokens.
-            let finish = if self.is_eos(first_token) {
+            let first_is_eos = self.is_eos(first_token);
+            let finish = if first_is_eos {
                 FinishReason::Stop
             } else {
                 FinishReason::Length
             };
+            // A one-token reply is still a reply: its token reaches the stream
+            // on both paths below, which otherwise finish it without decoding.
+            if streams_committed(first_is_eos) {
+                let _ = work.event_tx.send(TurnEvent::Token(first_token));
+            }
             // View sequences (SubmitTurn path): the prefill already wrote KV
             // blocks that must be finalized onto the parent and sealed into
             // the substrate.  Insert as a finished DecodeState so
@@ -3450,6 +3621,7 @@ impl Scheduler {
                     non_punct_since_reproject: 0,
                     last_projection_end: 0,
                     in_tool_call: false,
+                    wrote_tool_call: false,
                     free_tool_calls_from_penalties: work.free_tool_calls_from_penalties,
                     triggers: work.triggers,
                     stencil: None,
@@ -3471,6 +3643,7 @@ impl Scheduler {
                     prefill_ms,
                     turn_start,
                     context_depth,
+                    work.tokens.len(),
                     finish,
                 );
             }
@@ -3584,6 +3757,7 @@ impl Scheduler {
             non_punct_since_reproject: 0,
             last_projection_end: 0,
             in_tool_call: first_token_opens_call,
+            wrote_tool_call: first_token_opens_call,
             free_tool_calls_from_penalties: work.free_tool_calls_from_penalties,
             triggers: work.triggers,
             stencil,
@@ -3636,72 +3810,214 @@ impl Scheduler {
         // multi-turn prefill carries a turn closer as well — splitting once
         // would leave the later markers pooled across their own boundaries,
         // which is not correctable afterwards.
-        let mut rest = tokens;
+        let pieces = break_pieces(tokens, self.prefill_breaks());
         let mut last_logits = None;
-        while let Some(at) = self.reasoning_split(rest) {
-            let (head, tail) = rest.split_at(at);
-            last_logits = Some(self.run_prefill_span(sequence_id, head)?);
-            match self.model.close_positional_page(sequence_id.0) {
-                // The head's own token ids when it is short. A surplus page is
-                // identified by what is IN it, and the pages that do not belong
-                // to any turn are consistently 5 and 7 tokens wide — small
-                // enough to name outright rather than infer from their width.
-                Ok(closed) => tracing::info!(
-                    target: "candle_conversation::scheduler::unit_boundary",
-                    seq_id = sequence_id.0,
-                    site = "prefill-break-token",
-                    closed,
-                    at,
-                    span = rest.len(),
-                    head = ?(head.len() <= 16).then_some(head),
-                    break_token = ?head.last(),
-                    "index: closed a page mid-prefill at a break token"
-                ),
-                Err(e) => tracing::warn!(
-                    seq_id = sequence_id.0,
-                    "closing the index page at a prefilled break token failed ({e}); the \
-                     region it bounds will not occupy whole pages and cannot be windowed \
-                     out of a later projection"
-                ),
+        for (i, piece) in pieces.iter().enumerate() {
+            last_logits = Some(self.run_prefill_span(sequence_id, piece)?);
+            if i + 1 < pieces.len() {
+                self.close_page_at_break(sequence_id, piece);
             }
-            rest = tail;
         }
-        if rest.is_empty() {
-            // Every token was consumed by a split, so the last head's logits are
-            // the span's — `reasoning_split` never returns a split at the end,
-            // so this is only reachable for an empty input.
-            return match last_logits {
-                Some(l) => Ok(l),
-                None => self.run_prefill_span(sequence_id, rest),
-            };
-        }
-        self.run_prefill_span(sequence_id, rest)
+        // `break_pieces` yields at least one piece, so this is only `None` if
+        // that piece's forward was never run — which the loop above rules out.
+        last_logits.ok_or_else(|| ConversationError::Channel("prefill ran no pieces".into()))
     }
 
-    /// Where to cut `tokens` so the reasoning boundary lands on a page edge:
-    /// one past this turn's first `</think>`, or `None` when the span carries no
-    /// boundary that needs one.
+    /// Forward several sequences' spans together: the same pieces, page closes
+    /// and order per sequence as [`Self::run_prefill`] gives each alone, with one
+    /// wave per split round carrying every sequence that has a piece in it.
     ///
-    /// `None` when the marker is absent, when it is the last token (nothing
-    /// follows it in this pass, so the next forward is already the edge), or
-    /// when the turn has recorded a close already — `think_close_at` holds the
-    /// first only, and a later `</think>` in the answer body must not move a
-    /// boundary that is fixed.
-    /// **Reads the token stream, not the decode state.** The previous version
-    /// asked `active_decodes` for the turn's `DecodeState` — which does not exist
-    /// yet while the turn is prefilling, because it is built from the prefill's
-    /// own logits afterwards. So for the case this exists to serve, a
-    /// `<think>…</think>` block baked into the prompt, the lookup returned `None`
-    /// and the pass was never split: 0 splits across 822 turns.
+    /// **This is what lets turns that finish together close together.** Every
+    /// finished turn forwards its dialect's closing marker before it seals, and on
+    /// a dialect whose closer is a page-break token that is two forwards per turn
+    /// — one for the marker, one for what follows — of a single row each. Run one
+    /// turn at a time they cost ~33 ms per turn on the loop thread, measured on
+    /// the Qwen3.6-35B-A3B with eight turns finishing in two groups; batched, a
+    /// group pays two waves.
     ///
-    /// One past the first break token, and `None` when that is the end of the
-    /// span — there is nothing on the far side to separate.
-    fn reasoning_split(&self, tokens: &[u32]) -> Option<usize> {
-        let at = tokens
+    /// A span longer than one forward's budget goes through [`Self::run_prefill`]
+    /// on its own, which knows how to chunk it.
+    ///
+    /// Returns the turns whose span failed, each with its error. **A failure is
+    /// the failing turn's alone**, as it is when each turn forwards by itself: a
+    /// wave that fails stops advancing the members it carried, and every other
+    /// turn's span still completes. Sequences are grouped by adapter, because a
+    /// wave carries one adapter or none (see `form_wave_group`) — mixing them is
+    /// refused by the forward for the whole wave. A sequence named twice keeps
+    /// its spans in order: the repeat forwards after the batch, on its own,
+    /// since one wave cannot carry a sequence twice.
+    pub(super) fn run_prefill_batch(
+        &mut self,
+        spans: &[(SequenceId, &[u32])],
+    ) -> Vec<(SequenceId, ConversationError)> {
+        let pass = self.prefill_pass_budget();
+        let mut failed: Vec<(SequenceId, ConversationError)> = Vec::new();
+        let mut groups: Vec<(Option<String>, Vec<(SequenceId, Vec<&[u32]>)>)> = Vec::new();
+        let mut alone: Vec<(SequenceId, &[u32])> = Vec::new();
+        let mut seen: Vec<SequenceId> = Vec::with_capacity(spans.len());
+        for &(sequence_id, tokens) in spans {
+            let pieces = break_pieces(tokens, self.prefill_breaks());
+            let repeat = seen.contains(&sequence_id);
+            seen.push(sequence_id);
+            if repeat || pieces.iter().any(|p| p.len() > pass) {
+                alone.push((sequence_id, tokens));
+                continue;
+            }
+            let adapter = self
+                .session
+                .sequence_adapter(sequence_id.0)
+                .map(str::to_owned);
+            match groups.iter_mut().find(|(a, _)| *a == adapter) {
+                Some((_, members)) => members.push((sequence_id, pieces)),
+                None => groups.push((adapter, vec![(sequence_id, pieces)])),
+            }
+        }
+        for (_, members) in groups {
+            self.run_prefill_rounds(&members, pass, &mut failed);
+        }
+        for (sequence_id, tokens) in alone {
+            // A turn whose earlier span failed does not forward the next one
+            // over the gap.
+            if failed.iter().any(|(s, _)| *s == sequence_id) {
+                continue;
+            }
+            if let Err(e) = self.run_prefill(sequence_id, tokens) {
+                failed.push((sequence_id, e));
+            }
+        }
+        failed
+    }
+
+    /// One adapter group of [`Self::run_prefill_batch`]: a wave per split round
+    /// and per budget's worth of rows, a failed wave's members left out of every
+    /// round after it and recorded in `failed`.
+    fn run_prefill_rounds(
+        &mut self,
+        members: &[(SequenceId, Vec<&[u32]>)],
+        pass: usize,
+        failed: &mut Vec<(SequenceId, ConversationError)>,
+    ) {
+        let rounds = members.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+        let nl = self.model.num_layers().max(1);
+        let mut dead: Vec<SequenceId> = Vec::new();
+        for round in 0..rounds {
+            let live: Vec<(SequenceId, &[u32], bool)> = members
+                .iter()
+                .filter(|(seq, _)| !dead.contains(seq))
+                .filter_map(|(seq, pieces)| {
+                    pieces
+                        .get(round)
+                        .map(|piece| (*seq, *piece, round + 1 < pieces.len()))
+                })
+                .collect();
+            // One wave per budget's worth of rows: a round carries one piece per
+            // sequence, each within the budget, so only their sum can exceed it.
+            let lens: Vec<usize> = live.iter().map(|(_, p, _)| p.len()).collect();
+            let mut start = 0;
+            while start < live.len() {
+                let take = super::admission::admit_within(lens[start..].iter().copied(), pass);
+                let group = &live[start..start + take];
+                start += take;
+                if let Err(e) = self.forward_tail_wave(group, nl) {
+                    let reason = e.to_string();
+                    for &(sequence_id, _, _) in group {
+                        dead.push(sequence_id);
+                        failed.push((
+                            sequence_id,
+                            ConversationError::Other(format!(
+                                "the closing-tail wave this turn rode failed: {reason}"
+                            )),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forward one wave of closing-tail pieces and advance each member past its
+    /// piece, closing its page where the piece ends at a break.
+    fn forward_tail_wave(
+        &mut self,
+        group: &[(SequenceId, &[u32], bool)],
+        nl: usize,
+    ) -> Result<(), ConversationError> {
+        let seqs: Vec<usize> = group.iter().map(|(s, _, _)| s.0).collect();
+        let inputs = group
             .iter()
-            .position(|t| self.page_break_tokens.contains(t))?
-            + 1;
-        (at < tokens.len()).then_some(at)
+            .map(|(_, piece, _)| Tensor::new(*piece, &self.device).and_then(|t| t.unsqueeze(0)))
+            .collect::<candle::Result<Vec<_>>>()
+            .map_err(ConversationError::Model)?;
+        self.model
+            .forward_wave(
+                &mut self.session,
+                &[],
+                &[],
+                &seqs,
+                &inputs,
+                &[],
+                &[],
+                0,
+                nl,
+                None,
+            )
+            .and_then(|s| s.logits_owned())
+            .map_err(ConversationError::Model)?;
+        for &(sequence_id, piece, closes) in group {
+            self.session
+                .advance_sequence(sequence_id.0, piece.len())
+                .map_err(ConversationError::Model)?;
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, piece);
+            if closes {
+                self.close_page_at_break(sequence_id, piece);
+            }
+        }
+        Ok(())
+    }
+
+    /// The tokens a forwarded span is cut after so each boundary lands on a page
+    /// edge — or none, for a model with no pages to land on.
+    ///
+    /// **The cut exists for the positional index alone.** A span's index rows are
+    /// pooled by the forward that carries them, and only a model that keeps a
+    /// per-position index ([`ManagedBatchedModel::carries_positional_state`]) has
+    /// rows to pool; on every other model the page close at the cut is a no-op and
+    /// the cut is a whole extra forward for nothing. Measured on the Qwen3.6-35B-A3B,
+    /// which keeps none: every finished turn's `<|im_end|>\n` tail took two forwards,
+    /// ~20 ms each, on the loop thread between the decode steps of the turns still
+    /// running.
+    fn prefill_breaks(&self) -> &[u32] {
+        if self.model.carries_positional_state() {
+            &self.page_break_tokens
+        } else {
+            &[]
+        }
+    }
+
+    /// Close `sequence_id`'s index page after `head`, a piece that ended on a
+    /// break token — so the region it bounds occupies whole pages.
+    fn close_page_at_break(&mut self, sequence_id: SequenceId, head: &[u32]) {
+        match self.model.close_positional_page(sequence_id.0) {
+            // The head's own token ids when it is short. A surplus page is
+            // identified by what is IN it, and the pages that do not belong
+            // to any turn are consistently 5 and 7 tokens wide — small
+            // enough to name outright rather than infer from their width.
+            Ok(closed) => tracing::info!(
+                target: "candle_conversation::scheduler::unit_boundary",
+                seq_id = sequence_id.0,
+                site = "prefill-break-token",
+                closed,
+                at = head.len(),
+                head = ?(head.len() <= 16).then_some(head),
+                break_token = ?head.last(),
+                "index: closed a page mid-prefill at a break token"
+            ),
+            Err(e) => tracing::warn!(
+                seq_id = sequence_id.0,
+                "closing the index page at a prefilled break token failed ({e}); the \
+                 region it bounds will not occupy whole pages and cannot be windowed \
+                 out of a later projection"
+            ),
+        }
     }
 
     fn run_prefill_span(
@@ -3788,6 +4104,54 @@ impl Scheduler {
     }
 }
 
+/// A turn whose prefill finished cleanly, waiting for its first token.
+struct FinishedPrefill {
+    work: PrefillWork,
+    logits: Tensor,
+    prefill_ms: f64,
+    turn_start: Instant,
+    token_count: usize,
+}
+
+/// What [`Scheduler::prepare_first_sample`] readies for a turn's first sample.
+struct FirstSample {
+    context_depth: usize,
+    sampling_state: SequenceSamplingState,
+    /// The turn's config, with a turn grammar's opening mask applied.
+    sampling: SamplingConfig,
+    turn_driver: Option<StencilDriver>,
+}
+
+/// `tokens` cut one past every break token that has something after it, so each
+/// reasoning or turn boundary lands on a page edge — the pieces a span is
+/// forwarded in, in order.
+///
+/// A break token at the very end makes no cut: nothing follows it in this pass,
+/// so the next forward is already the edge. Always at least one piece, and an
+/// empty span is one empty piece — a forward of nothing, exactly as an unsplit
+/// span of nothing was.
+///
+/// **Reads the token stream, not the decode state.** A turn's `DecodeState` does
+/// not exist while it prefills — it is built from the prefill's own logits — so
+/// the stream is the only place a `<think>…</think>` block baked into the prompt
+/// can be seen in time to split the pass.
+fn break_pieces<'a>(tokens: &'a [u32], breaks: &[u32]) -> Vec<&'a [u32]> {
+    let mut pieces = Vec::new();
+    let mut rest = tokens;
+    while let Some(at) = rest
+        .iter()
+        .position(|t| breaks.contains(t))
+        .map(|i| i + 1)
+        .filter(|&at| at < rest.len())
+    {
+        let (head, tail) = rest.split_at(at);
+        pieces.push(head);
+        rest = tail;
+    }
+    pieces.push(rest);
+    pieces
+}
+
 /// Whether an assistant prefill leaves a think block **open** at the point
 /// decode takes over.
 ///
@@ -3832,6 +4196,58 @@ fn prefill_leaves_think_open<'a>(
 /// The slice boundary the helper above relies on, which main's own module does
 /// not exercise: a prefill whose USER half quotes `<think>` while its assistant
 /// lead closes its block.
+#[cfg(test)]
+mod break_pieces_tests {
+    use super::break_pieces;
+
+    const CLOSE: u32 = 900;
+    const THINK_END: u32 = 901;
+
+    /// The turn closer the seal forwards — `<|im_end|>\n` — is two pieces: the
+    /// marker, then what follows it, so the page closes between them.
+    #[test]
+    fn a_closer_followed_by_text_is_two_pieces() {
+        assert_eq!(
+            break_pieces(&[CLOSE, 7], &[CLOSE]),
+            vec![&[CLOSE][..], &[7][..]]
+        );
+    }
+
+    /// Every boundary is cut, not just the first.
+    #[test]
+    fn every_break_with_something_after_it_is_cut() {
+        let t = [1, THINK_END, 2, 3, CLOSE, 4];
+        assert_eq!(
+            break_pieces(&t, &[THINK_END, CLOSE]),
+            vec![&[1, THINK_END][..], &[2, 3, CLOSE][..], &[4][..]]
+        );
+    }
+
+    /// A break at the very end cuts nothing — the next forward is the edge.
+    #[test]
+    fn a_trailing_break_is_not_a_cut() {
+        assert_eq!(
+            break_pieces(&[1, 2, CLOSE], &[CLOSE]),
+            vec![&[1, 2, CLOSE][..]]
+        );
+    }
+
+    /// With no break tokens — a model keeping no positional index — the closer is
+    /// not a cut and the tail forwards whole.
+    #[test]
+    fn with_no_break_tokens_a_closer_is_not_a_cut() {
+        assert_eq!(break_pieces(&[CLOSE, 7], &[]), vec![&[CLOSE, 7][..]]);
+    }
+
+    /// No break is one piece, and nothing is one empty piece.
+    #[test]
+    fn an_unbroken_span_is_one_piece() {
+        assert_eq!(break_pieces(&[1, 2, 3], &[CLOSE]), vec![&[1, 2, 3][..]]);
+        let empty: &[u32] = &[];
+        assert_eq!(break_pieces(empty, &[CLOSE]), vec![empty]);
+    }
+}
+
 #[cfg(test)]
 mod think_prefill_slice_tests {
     use super::prefill_leaves_think_open;
@@ -3993,10 +4409,12 @@ mod wave_chunk_tests {
         assert_eq!(rows[0][0], 14_800, "the chunk starts at the offset");
     }
 
-    /// Prefills share one pass budget: small ones pack together, and one that
-    /// would carry the pass past the cap waits for the next group.
+    /// **Prefills share one pass budget.** The two short prompts ride whole and the
+    /// one a whole pass long takes what is left, so all three advance together in
+    /// a forward of exactly one pass — rather than the long one waiting out a
+    /// forward it could have shared.
     #[test]
-    fn dialogue_prefills_pack_under_one_pass_budget() {
+    fn dialogue_prefills_share_one_pass_budget() {
         let (mut scheduler, _tx) = make_test_scheduler();
         let cap = scheduler.max_prefill_pass_tokens;
         let a = SequenceId(scheduler.session.create_sequence().expect("create"));
@@ -4013,15 +4431,19 @@ mod wave_chunk_tests {
             .push(dialogue_prefill(c, vec![1; cap]));
 
         scheduler.form_wave_group(false);
-        let seqs: Vec<usize> = scheduler
+        let budget = scheduler.prefill_pass_budget();
+        let rode: Vec<(usize, usize)> = scheduler
             .wave_prefill_members
             .iter()
-            .map(|m| m.seq_id())
+            .map(|m| match m {
+                WaveMember::Prefill { seq_id, advance } => (*seq_id, *advance),
+                WaveMember::Section { .. } => unreachable!("no sections were offered"),
+            })
             .collect();
         assert_eq!(
-            seqs,
-            vec![a.0, b.0],
-            "the third would carry the pass past the cap"
+            rode,
+            vec![(a.0, 100), (b.0, 100), (c.0, budget - 200)],
+            "all three ride, sharing exactly one pass"
         );
     }
 

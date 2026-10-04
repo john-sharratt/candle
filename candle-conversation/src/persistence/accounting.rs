@@ -59,6 +59,13 @@ impl RecordAccounting {
         if header.record_type == RecordType::SectionTombstone {
             self.retire_stream(header.stream_id);
         }
+        // A snapshot retraction kills the stream's tail and is itself never
+        // carried forward, so both are dead the moment it lands.
+        if header.retracts_snapshot() {
+            self.retire(RecordType::Snapshot, header.stream_id, 0);
+            self.dead_bytes += padded_size;
+            return;
+        }
         let key = match header.record_type {
             RecordType::Chunk => (RecordType::Chunk, header.stream_id, header.chunk_index),
             // A conversation's file events and tombstones are keyed by timeline
@@ -186,6 +193,22 @@ mod tests {
             chunk_index,
             token_count: 0,
         }
+    }
+
+    /// A retraction ends the stream's snapshot tail and is never carried
+    /// itself, so both records are dead the moment it lands.
+    #[test]
+    fn a_snapshot_retraction_kills_the_tail_and_itself() {
+        let mut acc = RecordAccounting::new();
+        let mut snapshot = header(RecordType::Snapshot, 7, 0);
+        snapshot.payload_len = 1000;
+        acc.record(&snapshot, 4096);
+        assert_eq!(acc.dead_bytes(), 0);
+        acc.record(&header(RecordType::Snapshot, 7, 0), 64);
+        assert_eq!(acc.dead_bytes(), 4096 + 64);
+        // The next real snapshot is live again, superseding nothing.
+        acc.record(&snapshot, 4096);
+        assert_eq!(acc.dead_bytes(), 4096 + 64);
     }
 
     #[test]
