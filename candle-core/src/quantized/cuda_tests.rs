@@ -4013,6 +4013,9 @@ fn dense_int8_matches_grouped() -> Result<()> {
         .map(|_| rng.random_range(-0.1f32..0.1))
         .collect();
     let stream = dev.cuda_stream();
+    // The dense launch splits K at narrow widths, and its scratch is built with the weight
+    // (`QMatMul::from_arc`); these weights are raw device buffers, so build it here.
+    ensure_split_k_scratch(&dev)?;
 
     // (KO weight dtype, maxq, crumb_bytes, hi_bytes) — the int8 weight formats the q8a128
     // path actually supports; Q8_KO takes the symmetric requant path.
