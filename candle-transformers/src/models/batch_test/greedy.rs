@@ -15,15 +15,22 @@
 use candle::{Result, Tensor, D};
 use tokenizers::Tokenizer;
 
-/// The tokens `tokenizer` can name — its largest id + 1 — clamped to a logits
-/// row of `row_width` columns. A checkpoint pads its output projection past
-/// the tokenizer, and the padded tail of a row is not a token.
-pub fn live_vocab(tokenizer: &Tokenizer, row_width: usize) -> usize {
+/// The ids `tokenizer` can name — its largest id + 1 — or `None` for an empty
+/// vocabulary. It walks the whole vocabulary, so it is read once per tokenizer,
+/// never inside a timed phase.
+pub fn token_ids(tokenizer: &Tokenizer) -> Option<usize> {
     tokenizer
         .get_vocab(true)
         .values()
         .max()
-        .map_or(row_width, |&id| (id as usize + 1).min(row_width))
+        .map(|&id| id as usize + 1)
+}
+
+/// The columns of a `row_width` logits row that are tokens: [`token_ids`]
+/// clamped to the row. A checkpoint pads its output projection past the
+/// tokenizer, and the padded tail of a row is not a token.
+pub fn live_vocab(token_ids: Option<usize>, row_width: usize) -> usize {
+    token_ids.map_or(row_width, |n| n.min(row_width))
 }
 
 /// The greedy token of each row of `rows`, every row a `[1, vocab]` (or
@@ -63,5 +70,25 @@ mod tests {
         assert_eq!(greedy_token(&a.to_dtype(DType::BF16)?)?, 1);
         assert_eq!(greedy_token(&b.to_dtype(DType::F16)?)?, 3);
         Ok(())
+    }
+
+    /// The bound is the largest id + 1, not the entry count: ids 0, 3 and 7
+    /// name 8 columns.
+    #[test]
+    fn token_ids_is_the_largest_id_plus_one() {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"a":0,"c":3,"b":7},"unk_token":"a"}}"#;
+        let tokenizer = Tokenizer::from_bytes(json.as_bytes()).unwrap();
+        assert_eq!(token_ids(&tokenizer), Some(8));
+    }
+
+    /// A padded row is clamped to the tokenizer; a row narrower than the
+    /// tokenizer, or no tokenizer bound at all, keeps the whole row.
+    #[test]
+    fn live_vocab_clamps_to_the_row() {
+        assert_eq!(live_vocab(Some(248_077), 248_320), 248_077);
+        assert_eq!(live_vocab(Some(10), 8), 8);
+        assert_eq!(live_vocab(None, 8), 8);
     }
 }

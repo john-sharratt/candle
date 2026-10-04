@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
-use crate::models::batch_test::greedy::{greedy_token, live_vocab};
+use crate::models::batch_test::greedy::{greedy_token, live_vocab, token_ids};
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
 use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
 use crate::models::batch_test::span_report::print_span;
@@ -131,6 +131,10 @@ pub struct TestParams {
     pub names: Vec<String>,
     pub generate_token_count: usize, // Number of tokens to generate in generate phase
     pub tokenizer: Tokenizer,        // Tokenizer for text-to-token conversion
+    /// The ids [`Self::tokenizer`] can name ([`token_ids`]), read once here: the
+    /// decode phase clamps every pick to it inside its timed window, and walking
+    /// the vocabulary there was charged to decode.
+    pub token_ids: Option<usize>,
     pub dialect: Dialect,            // Chat format dialect (ChatML, Llama3, etc.)
     pub device: Device,
     pub begin_document_token: Option<u32>,
@@ -179,6 +183,7 @@ impl TestParams {
                 .token_to_id(dialect.document_start)
                 .unwrap_or_default()
         });
+        let token_ids = token_ids(&tokenizer);
         Ok(TestParams {
             print_outputs: false,
             skip_validation: false,
@@ -196,6 +201,7 @@ impl TestParams {
                 .collect(),
             generate_token_count,
             tokenizer,
+            token_ids,
             dialect,
             device,
             begin_document_token,
@@ -2075,7 +2081,7 @@ impl TestParams {
         let stacked = Tensor::cat(&runs.iter().map(|r| &r.logits).collect::<Vec<_>>(), 0)?;
         // Every pick of this decode — the seed here and each accept-walk row —
         // stops at the tokenizer's last id; the padded tail is not a token.
-        let live = live_vocab(&self.tokenizer, stacked.dim(1)?);
+        let live = live_vocab(self.token_ids, stacked.dim(1)?);
         let seeds = stacked.batched_sample_argmax(live)?;
         // The logit each seed was chosen at. Every value of a row being -inf or
         // NaN is what a corrupted forward looks like from here, and the greedy
