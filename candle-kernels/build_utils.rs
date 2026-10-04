@@ -148,7 +148,7 @@ const QUANTIZED_KERNELS: [&str; 46] = [
 ];
 
 // Flash-attention kernels: 12 total
-const FLASH_KERNELS: [&str; 23] = [
+const FLASH_KERNELS: [&str; 21] = [
     // Batched sampling (1 api + 4 variants)
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
@@ -158,17 +158,15 @@ const FLASH_KERNELS: [&str; 23] = [
     // Paged decode: a thin per-dtype dispatcher, plus one TU per head dim.
     //
     // Separate files because nvcc compiles a translation unit serially and each
-    // head dim expands to a whole dispatch tree — naming all four from one file
+    // head dim expands to a whole dispatch tree — naming them all from one file
     // made it a ten-minute job by itself while the parallel slots below sat
     // idle. See `paged_decode_hd_bf16.cuh`.
     "src/paged-decode/paged_decode_api_fp16.cu",
     "src/paged-decode/paged_decode_api_bf16.cu",
     "src/paged-decode/paged_decode_bf16_hd64.cu",
-    "src/paged-decode/paged_decode_bf16_hd96.cu",
     "src/paged-decode/paged_decode_bf16_hd128.cu",
     "src/paged-decode/paged_decode_bf16_hd256.cu",
     "src/paged-decode/paged_decode_fp16_hd64.cu",
-    "src/paged-decode/paged_decode_fp16_hd96.cu",
     "src/paged-decode/paged_decode_fp16_hd128.cu",
     "src/paged-decode/paged_decode_fp16_hd256.cu",
     // INT8 prefix-attention prefill (1 api dispatcher + fp16, bf16)

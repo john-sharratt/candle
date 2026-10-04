@@ -25,7 +25,7 @@
 // =============================================================================
 // REGISTER-ONLY GEMV KERNELS (batch 1-8) — pre-SM80 fallback only
 // These CUDA-core kernels are NOT used on tensor-core hardware: benchmarking
-// found the TC kernels (tc16_N) faster than the GEMV path in every measured
+// found the TC kernels (tc16_0 / tc16_r) faster than the GEMV path in every measured
 // case, even single-token decode. On SM80+ the dispatcher routes all batch
 // sizes to tensor cores; these remain solely for GPUs without tensor cores.
 // =============================================================================
@@ -280,11 +280,10 @@ extern "C" __global__ void LAUNCH_BOUNDS_ITER name##_s3_iter3( \
 // =============================================================================
 // TC16 KERNELS - Batch 3-31 with hierarchical grid tiling
 // =============================================================================
-// 16 separate kernels, one for each REMAINDER_BATCH (0-15).
-// Each kernel contains tc16 + one specific tcN, no runtime switch.
-// Eliminates L2 cache thrashing by keeping weights hot across all batch tiles.
-// R=0: just tc16 with grid.y tiling
-// R=1-15: tc16 + tcR (remainder handlers)
+// Two kernels: tc16_0 (R = batch_size % 16 = 0: tc16 tiles only) and tc16_r
+// (tc16 tiles + one tcR remainder tile, R = 1-15). The remainder tile reads
+// R from batch_size and predicates its rows on it; one remainder body serves
+// every R, so the kernel set does not multiply by sixteen.
 //
 // HIERARCHICAL GRID (kernel_cache_design.md):
 //   x = batch tiles (L1 scope)
@@ -292,39 +291,24 @@ extern "C" __global__ void LAUNCH_BOUNDS_ITER name##_s3_iter3( \
 //   z = wave index: row_group + batch_group × num_row_groups
 // row_groups parameter enables decode: row_group = z % row_groups
 
-#define INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, N) \
-extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_tc16_##N( \
+#define INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, SUFFIX, HAS_REM) \
+extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_tc16_##SUFFIX( \
     const void * __restrict__ vx, const act_t * __restrict__ vy, dst_t * __restrict__ dst, \
     const int ncols_x, const int nrows_x, const int nrows_y, \
     const int nrows_dst, const int batch_size, const int row_groups) { \
-    quantized_matmul_tc16_entry<qk, qi, block_type, vdr, act_t, dst_t, N>( \
+    quantized_matmul_tc16_entry<qk, qi, block_type, vdr, act_t, dst_t, HAS_REM>( \
         vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batch_size, row_groups); \
 }
 
-// Generate all 16 TC16 kernels (tc16_0=pure tc16, tc16_1-15=tc16+tcN)
 #define INSTANTIATE_KERNEL_TC16(name, qk, qi, block_type, vdr, act_t, dst_t) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 0) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 1) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 2) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 3) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 4) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 5) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 6) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 7) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 8) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 9) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 10) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 11) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 12) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 13) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 14) \
-    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 15)
+    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, 0, false) \
+    INSTANTIATE_KERNEL_TC16_N(name, qk, qi, block_type, vdr, act_t, dst_t, r, true)
 
 // =============================================================================
 // TC32 KERNELS - Greedy dispatch for tc32+tc16+tcN combinations
 // =============================================================================
-// 16 separate kernels, one for each REMAINDER_BATCH (0-15).
-// R = batch_size % 16 (greedy decomposition computed internally)
+// Two kernels: tc32_0 (R = batch_size % 16 = 0) and tc32_r (R = 1-15).
+// The greedy decomposition is computed internally:
 // R=0: tc32 tiles + optional tc16 (e.g., batch 48 = tc32 + tc16)
 // R=1-15: tc32 tiles + optional tc16 + tcR (e.g., batch 49 = tc32 + tc16 + tc1)
 //
@@ -334,12 +318,12 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_tc16_##N( \
 //   z = wave index: row_group + batch_group × num_row_groups
 // row_groups parameter enables decode: row_group = z % row_groups
 
-#define INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, N) \
-extern "C" __global__ void LAUNCH_BOUNDS_TC32 name##_tc32_##N( \
+#define INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, SUFFIX, HAS_REM) \
+extern "C" __global__ void LAUNCH_BOUNDS_TC32 name##_tc32_##SUFFIX( \
     const void * __restrict__ vx, const act_t * __restrict__ vy, dst_t * __restrict__ dst, \
     const int ncols_x, const int nrows_x, const int nrows_y, \
     const int nrows_dst, const int batch_size, const int row_groups) { \
-    quantized_matmul_tc32_entry<qk, qi, block_type, vdr, act_t, dst_t, N>( \
+    quantized_matmul_tc32_entry<qk, qi, block_type, vdr, act_t, dst_t, HAS_REM>( \
         vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batch_size, row_groups); \
 }
 
@@ -520,31 +504,16 @@ extern "C" __global__ void LAUNCH_BOUNDS_VSMALL name##_grouped_m8( \
         vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm); \
 }
 
-// Generate all 16 TC32 kernels (tc32_0 through tc32_15)
 #define INSTANTIATE_KERNEL_TC32(name, qk, qi, block_type, vdr, act_t, dst_t) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 0) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 1) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 2) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 3) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 4) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 5) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 6) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 7) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 8) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 9) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 10) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 11) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 12) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 13) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 14) \
-    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 15)
+    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 0, false) \
+    INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, r, true)
 
-// All kernels - consolidated to tc16/tc32 kernels
-// Reduced from 94 to 48 kernels:
+// All kernels per (qtype, ytype):
 //   - 8 GEMV (s1-s8)
 //   - 8 Iterator (s2_iter2-8, s3_iter3)
-//   - 16 tc16 (tc16_0-tc16_15 for batch 3-31)
-//   - 16 tc32 (tc32_0-tc32_15 for batch 32+)
+//   - 2 tc16 (tc16_0 / tc16_r for batch 1-31)
+//   - 2 tc32 (tc32_0 / tc32_r for batch 32+)
+//   - grouped (MoE)
 #define INSTANTIATE_KERNELS_BASE(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_S1(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_S2(name, qk, qi, block_type, vdr, act_t, dst_t) \
@@ -566,12 +535,6 @@ extern "C" __global__ void LAUNCH_BOUNDS_VSMALL name##_grouped_m8( \
     INSTANTIATE_KERNEL_S2_ITER8(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_S3_ITER3(name, qk, qi, block_type, vdr, act_t, dst_t)
 
-// All kernels: 48 kernels per (qtype, ytype):
-//   - 8 GEMV (s1-s8)
-//   - 8 Iterator (s2_iter2-8, s3_iter3)
-//   - 16 tc16 (tc16_0-tc16_15 for batch 3-31)
-//   - 16 tc32 (tc32_0-tc32_15 for batch 32+)
-//
 // MoE grouped dispatch is handled at the dispatcher level by looping over
 // sorted expert groups and calling run_quantized_matmul per expert, giving
 // each expert full greedy decomposition with proper weight reuse.

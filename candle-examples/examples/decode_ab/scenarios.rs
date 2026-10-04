@@ -44,9 +44,9 @@ impl Scenario {
         self.ctx_len + 1
     }
 
-    /// Head dims the kernels support (both V2 and fused Track-A): 64/96/128/256.
+    /// Head dims the kernels support (both V2 and fused Track-A): 64/128/256.
     pub fn head_dim_supported(&self) -> bool {
-        matches!(self.head_dim, 64 | 96 | 128 | 256)
+        matches!(self.head_dim, 64 | 128 | 256)
     }
 }
 
@@ -60,7 +60,7 @@ pub fn default_scenarios() -> Vec<Scenario> {
     s
 }
 
-/// The core scenario universe: the hd64/96/128 shapes across MHA / GQA / MQA,
+/// The core scenario universe: the hd64/128 shapes across MHA / GQA / MQA,
 /// partial tails, both RoPE layouts and both compute dtypes, plus one hd256
 /// MHA row (hpg = 1 on the wide-head tile kernel).
 pub fn all_scenarios() -> Vec<Scenario> {

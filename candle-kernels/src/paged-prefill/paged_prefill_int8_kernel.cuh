@@ -672,6 +672,10 @@ paged_prefill_int8_kernel(
                 int sl_idx, in_blk;
                 resolve_pos(slot_hdr, pos, sl_idx, in_blk);
                 if (sl_idx != bound_slice) bind_slice(sl_idx); // warp-uniform
+                // K is unrolled: its windows stay in registers for RoPE. V goes
+                // to the stash a window at a time, so its loop is rolled — each
+                // window's element read is a dispatch over every format, and
+                // unrolling it put one inlined copy per window in the kernel.
                 #pragma unroll
                 for (int w = 0; w < N_WIN; ++w) {
                     const int d = lane + 32 * w;
@@ -680,6 +684,10 @@ paged_prefill_int8_kernel(
                     x[w] = i8_arena_elem<true>(s_wext_fmt[warp][0][pk], s_wext_bb[warp][0][pk],
                                          s_wext_base[warp][0][pk], tk & 63, in_blk,
                                          s_wext_scl[warp][0][pk], SUB);
+                }
+                #pragma unroll 1
+                for (int w = 0; w < N_WIN; ++w) {
+                    const int d = lane + 32 * w;
                     const int tv = s_wrank[warp][1][d];
                     const int pv = (tv >> 6) & (N_PALETTE - 1);
                     const float v = i8_arena_elem<false>(s_wext_fmt[warp][1][pv], s_wext_bb[warp][1][pv],
