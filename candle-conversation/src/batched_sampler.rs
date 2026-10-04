@@ -18,6 +18,7 @@ use candle::cuda_backend::CudaStorageSlice;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
 use candle_transformers::generation::{LogitsProcessor, PendingSample};
+use candle_transformers::models::speculative_choice::TypicalAcceptance;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 use std::sync::Mutex;
 
@@ -47,8 +48,14 @@ pub const DEGENERATE_TOKEN_RUN: u32 = 8;
 /// **The C twin is `batched_sampling::SeqDials` in `batched_sampling.cuh`.** The
 /// kernel reads these bytes back as that struct, so the field order and types
 /// here must match it exactly — every field is 4 bytes (`f32`/`i32`), packed
-/// with no padding, and `#[repr(C)]` keeps the layout. The token ids and vocab
-/// size are not here (they are the same across the wave and stay scalar).
+/// with no padding, and `#[repr(C)]` keeps the layout. The EOS id, the row
+/// stride and the live vocabulary are not here (they are the same across the
+/// wave and stay scalar).
+///
+/// `typical_draft` is the proposal a
+/// speculative verify row tests (-1 on any other row), accepted on
+/// `typical_eps`/`typical_delta` when the sample did not land on it — see
+/// `candle_transformers::models::speculative_choice::TypicalAcceptance`.
 ///
 /// Before this existed the kernel took these dials as scalars from the first
 /// row's config and applied them to the whole launch, so a wave that mixed
@@ -79,19 +86,23 @@ struct SeqDials {
     segment_close_ramp_len: i32,
     segment_close_max_multiplier: f32,
     segment_temp_boost: f32,
+    typical_draft: i32,
+    typical_eps: f32,
+    typical_delta: f32,
 }
 
 // The kernel reads this struct as a flat run of 4-byte words (all fields are
 // f32/i32), one per row of the batch, and casts back to the identically-laid-out
 // CUDA `SeqDials`. If the size or field count drifts from the CUDA side the
-// kernel reads a row at the wrong stride, so pin it: 21 fields × 4 bytes.
-const _: () = assert!(std::mem::size_of::<SeqDials>() == 84);
+// kernel reads a row at the wrong stride, so pin it: 24 fields × 4 bytes.
+const _: () = assert!(std::mem::size_of::<SeqDials>() == 96);
 
 impl SeqDials {
     /// Read one row's dials from its config, resolving the same Option/gate logic
     /// the scalar path applies (DRY defaults, the dynamic-EOS gate, the
     /// segment-close-active gate) so a per-row wave behaves identically to a
-    /// uniform one row-for-row.
+    /// uniform one row-for-row. The row tests no draft until
+    /// [`Self::with_draft`] gives it one.
     fn from_config(c: &SamplingConfig) -> Self {
         let (dry_multiplier, dry_base, dry_allowed_length, dry_range) = match &c.dry {
             Some(d) => (d.multiplier, d.base, d.allowed_length, d.range),
@@ -143,8 +154,94 @@ impl SeqDials {
             segment_close_ramp_len,
             segment_close_max_multiplier,
             segment_temp_boost: c.segment_temp_boost,
+            typical_draft: -1,
+            typical_eps: 0.0,
+            typical_delta: 0.0,
         }
     }
+
+    /// This row is a speculative verify row testing `draft` on `typical`.
+    /// A `None` draft leaves the row a plain one.
+    fn with_draft(mut self, draft: Option<u32>, typical: TypicalAcceptance) -> Self {
+        if let Some(d) = draft {
+            self.typical_draft = d as i32;
+            self.typical_eps = typical.epsilon;
+            self.typical_delta = typical.delta;
+        }
+        self
+    }
+}
+
+/// The kernel's candidate cap (`batched_sampling::MAX_TOP_K`): with top-k off
+/// it still samples the best this many.
+const KERNEL_MAX_TOP_K: usize = 256;
+/// The kernel's candidate floor (`radix_select_logit_threshold`'s
+/// `DEAD_ZONE`): no candidate sits more than this far below the row's best.
+const KERNEL_DEAD_ZONE: f32 = 50.0;
+
+/// The typical-acceptance rule over one row of logits: true when `draft`'s
+/// probability exceeds `min(ε, δ·e^(−H))`. The CPU twin of the kernel's
+/// `typical_accepts`, measured over the distribution the kernel samples — the
+/// top-k candidates (at most [`KERNEL_MAX_TOP_K`], none more than
+/// [`KERNEL_DEAD_ZONE`] below the best), softmaxed at `temperature`, cut to
+/// the nucleus at `top_p`, renormalised. A draft outside it has probability
+/// zero.
+fn typical_accepts_row(
+    logits: &[f32],
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    draft: u32,
+    typical: TypicalAcceptance,
+) -> bool {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return false;
+    }
+    let mut candidates: Vec<(usize, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, l)| l >= max - KERNEL_DEAD_ZONE)
+        .collect();
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let k = if top_k > 0 {
+        (top_k as usize).min(KERNEL_MAX_TOP_K)
+    } else {
+        KERNEL_MAX_TOP_K
+    };
+    candidates.truncate(k);
+
+    let inv_t = 1.0 / temperature;
+    let weights: Vec<f32> = candidates
+        .iter()
+        .map(|&(_, l)| ((l - max) * inv_t).exp())
+        .collect();
+    let total: f32 = weights.iter().sum();
+    let mut nucleus = candidates.len();
+    if top_p < 1.0 {
+        let mut cumsum = 0.0;
+        for (i, w) in weights.iter().enumerate() {
+            cumsum += w / total;
+            if cumsum >= top_p {
+                nucleus = i + 1;
+                break;
+            }
+        }
+    }
+    let kept: f32 = weights[..nucleus].iter().sum();
+    let mut entropy = 0.0f32;
+    let mut p_draft = 0.0f32;
+    for (&(id, _), w) in candidates[..nucleus].iter().zip(&weights) {
+        let p = w / kept;
+        if p > 0.0 {
+            entropy -= p * p.ln();
+        }
+        if id == draft as usize {
+            p_draft = p;
+        }
+    }
+    p_draft > typical.epsilon.min(typical.delta * (-entropy).exp())
 }
 
 /// This struct persists across turns (owned by the Scheduler) so that
@@ -618,8 +715,12 @@ pub struct BatchedSampler {
     #[allow(dead_code)]
     device: Device,
 
-    /// Vocabulary size.
+    /// Vocabulary size — the logits row width, which a checkpoint may pad.
     vocab_size: usize,
+
+    /// Tokens a row may produce: the tokenizer's last id + 1. The padded tail
+    /// of each row past it carries no probability.
+    live_vocab: usize,
 
     /// Maximum recent token history length.
     max_recent_len: usize,
@@ -635,10 +736,11 @@ pub struct BatchedSampler {
 }
 
 impl BatchedSampler {
-    /// Create a new batched sampler.
+    /// Create a new batched sampler. `live_vocab` is clamped to `vocab_size`.
     pub fn new(
         device: Device,
         vocab_size: usize,
+        live_vocab: usize,
         max_recent_len: usize,
         eos_tokens: TokenBuffer,
         penalty_log_path: Option<std::path::PathBuf>,
@@ -646,6 +748,7 @@ impl BatchedSampler {
         Self {
             device,
             vocab_size,
+            live_vocab: live_vocab.min(vocab_size),
             max_recent_len,
             eos_tokens,
             penalty_log_path,
@@ -677,6 +780,38 @@ impl BatchedSampler {
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
+    ) -> candle::Result<Vec<u32>> {
+        self.sample_rows(logits, states, configs, None)
+    }
+
+    /// [`Self::sample_batch`] for speculative verify rows: `drafts[i]` is the
+    /// proposal row `i` tests (`None` on a bonus row), committed instead of the
+    /// row's sample when `typical` accepts it. A row under a stencil samples
+    /// its allow-list exactly as a plain row does and tests nothing.
+    pub fn sample_verify_rows(
+        &self,
+        logits: &Tensor,
+        states: &mut [&mut SequenceSamplingState],
+        configs: &[&SamplingConfig],
+        drafts: &[Option<u32>],
+        typical: TypicalAcceptance,
+    ) -> candle::Result<Vec<u32>> {
+        if drafts.len() != states.len() {
+            candle::bail!(
+                "sample_verify_rows: {} drafts for {} rows",
+                drafts.len(),
+                states.len()
+            );
+        }
+        self.sample_rows(logits, states, configs, Some((drafts, typical)))
+    }
+
+    fn sample_rows(
+        &self,
+        logits: &Tensor,
+        states: &mut [&mut SequenceSamplingState],
+        configs: &[&SamplingConfig],
+        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
         let batch_size = states.len();
         if batch_size == 0 {
@@ -757,8 +892,16 @@ impl BatchedSampler {
                 )?;
                 logits2d.index_select(&idx, 0)?
             };
-            let tokens =
-                self.sample_full_vocab(&kernel_logits, &mut kernel_states, &kernel_configs)?;
+            let kernel_verify = verify.map(|(drafts, typical)| {
+                let rows: Vec<Option<u32>> = kernel_idx.iter().map(|&i| drafts[i]).collect();
+                (rows, typical)
+            });
+            let tokens = self.sample_full_vocab(
+                &kernel_logits,
+                &mut kernel_states,
+                &kernel_configs,
+                kernel_verify.as_ref().map(|(r, t)| (r.as_slice(), *t)),
+            )?;
             for (k, &i) in kernel_idx.iter().enumerate() {
                 results[i] = tokens[k];
             }
@@ -817,11 +960,12 @@ impl BatchedSampler {
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
+        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
         if matches!(self.device, Device::Cuda(_)) {
-            self.sample_batch_cuda(logits, states, configs)
+            self.sample_batch_cuda(logits, states, configs, verify)
         } else {
-            self.sample_batch_cpu(logits, states, configs)
+            self.sample_batch_cpu(logits, states, configs, verify)
         }
     }
 
@@ -1008,6 +1152,7 @@ impl BatchedSampler {
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
+        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
         let batch_size = states.len();
         let mut results = Vec::with_capacity(batch_size);
@@ -1050,12 +1195,19 @@ impl BatchedSampler {
             } else {
                 seq_logits
             };
+            // The checkpoint's padded tail is not a token.
+            let seq_logits = seq_logits.narrow(0, 0, self.live_vocab)?;
 
             // In-segment steering: while this sequence is inside a segment,
             // sample a touch hotter (temperature + segment_temp_boost).
             // Mirrors the kernel's per-seq gate so tokens outside the segment
             // stay at the base temperature.  DRY is GPU-only — the CPU
             // LogitsProcessor has no DRY path, so there is nothing to gate here for it.
+            let temperature = if state.in_segment {
+                config.temperature + config.segment_temp_boost
+            } else {
+                config.temperature
+            };
             let sampling = if state.in_segment && config.segment_temp_boost != 0.0 {
                 let mut boosted = config.clone();
                 boosted.temperature += config.segment_temp_boost;
@@ -1065,7 +1217,24 @@ impl BatchedSampler {
             };
             let seed = config.seed.wrapping_add(state.rng_offset);
             let mut processor = LogitsProcessor::from_sampling(seed, sampling);
-            let sampled = processor.sample(&seq_logits)?;
+            let mut sampled = processor.sample(&seq_logits)?;
+            // A verify row's draft, accepted on the typical-acceptance rule over
+            // the same top-k/nucleus distribution the kernel measures it on.
+            if let Some((drafts, typical)) = verify {
+                if let Some(draft) = drafts[i].filter(|_| temperature > 0.0) {
+                    let row: Vec<f32> = seq_logits.to_dtype(DType::F32)?.to_vec1()?;
+                    if typical_accepts_row(
+                        &row,
+                        temperature,
+                        config.top_k,
+                        config.top_p,
+                        draft,
+                        typical,
+                    ) {
+                        sampled = draft;
+                    }
+                }
+            }
 
             // Segment close, degenerate-decode abort and the EOS failsafes all
             // resolve in `resolve_final_token`, shared with the CUDA path.
@@ -1092,6 +1261,7 @@ impl BatchedSampler {
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
+        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
         let batch_size = states.len();
 
@@ -1256,7 +1426,18 @@ impl BatchedSampler {
         // its dials from this array instead. This is what stops one row's EOS
         // ramp (or temperature, or penalties) bleeding into another in a wave
         // that mixes configs.
-        let seq_dials: Vec<SeqDials> = configs.iter().map(|c| SeqDials::from_config(c)).collect();
+        // A verify row also carries the draft it tests (see `SeqDials`).
+        let seq_dials: Vec<SeqDials> = configs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let dials = SeqDials::from_config(c);
+                match verify {
+                    Some((drafts, typical)) => dials.with_draft(drafts[i], typical),
+                    None => dials,
+                }
+            })
+            .collect();
         build_span.end();
 
         let stamp_span = profile::span("sample:stamp");
@@ -1684,6 +1865,7 @@ impl BatchedSampler {
                     logits_ptr,
                     batch_size,
                     vocab_size,
+                    self.live_vocab as i32,
                     dtype,
                     temperature,
                     top_k,
@@ -1941,6 +2123,7 @@ mod tests {
     // even though it is constant-valued at any given commit.
     #![allow(clippy::assertions_on_constants)]
 
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use super::*;
@@ -2206,6 +2389,7 @@ mod tests {
     fn make_sampler() -> BatchedSampler {
         BatchedSampler::new(
             candle::Device::Cpu,
+            VOCAB_SIZE,
             VOCAB_SIZE,
             MAX_RECENT,
             vec![EOS_TOKEN].into(),
@@ -2748,6 +2932,7 @@ mod tests {
             let sampler = BatchedSampler::new(
                 device.clone(),
                 VOCAB_SIZE,
+                VOCAB_SIZE,
                 MAX_RECENT,
                 vec![EOS_TOKEN].into(),
                 None,
@@ -2770,6 +2955,190 @@ mod tests {
             assert_eq!(tokens, vec![20, 50, 40], "{device:?}");
             assert_eq!((s0.rng_offset, s2.rng_offset), (1, 1), "{device:?}");
         }
+    }
+
+    /// The typical-acceptance rule on raw probabilities. `[0.5, 0.3, 0.2]` has
+    /// entropy 1.0297, so `δ·e^(−H)` = 0.1071 and the bar is ε = 0.09: the 0.2
+    /// draft clears it. `[0.9, 0.05, 0.05]` has entropy 0.3944, the bar is again
+    /// 0.09, and a 0.05 draft does not.
+    #[test]
+    fn typical_rule_accepts_on_mass_against_the_entropy_bar() {
+        let ln = |ps: &[f32]| ps.iter().map(|p| p.ln()).collect::<Vec<f32>>();
+        let m = TypicalAcceptance::MEDUSA;
+        let accepts =
+            |ps: &[f32], t: f32, draft: u32| typical_accepts_row(&ln(ps), t, 0, 1.0, draft, m);
+        assert!(accepts(&[0.5, 0.3, 0.2], 1.0, 2));
+        assert!(!accepts(&[0.9, 0.05, 0.05], 1.0, 2));
+        // Temperature sharpens the row: at 0.5, [0.5, 0.3, 0.2] becomes
+        // [0.658, 0.237, 0.105] (entropy 0.8533, bar 0.09), and 0.105 still
+        // clears it; [0.9, 0.05, 0.05] becomes [0.994, 0.003, 0.003].
+        assert!(accepts(&[0.5, 0.3, 0.2], 0.5, 2));
+        assert!(!accepts(&[0.9, 0.05, 0.05], 0.5, 1));
+        // A draft past the row is not a token.
+        assert!(!accepts(&[0.5, 0.5], 1.0, 7));
+    }
+
+    /// **The rule is measured over the distribution the kernel samples, not
+    /// the whole row.** `[0.5, 0.3, 0.2]` accepts its 0.2 draft over the whole
+    /// row, but a nucleus at 0.75 keeps `[0.5, 0.3]` (cumulative 0.8) and top-k
+    /// 2 keeps the same two: the draft is outside either, has probability zero,
+    /// and is not accepted — exactly as the kernel decides it.
+    #[test]
+    fn typical_rule_is_measured_over_the_truncated_distribution() {
+        let row: Vec<f32> = [0.5f32, 0.3, 0.2].iter().map(|p| p.ln()).collect();
+        let m = TypicalAcceptance::MEDUSA;
+        assert!(typical_accepts_row(&row, 1.0, 0, 1.0, 2, m));
+        assert!(!typical_accepts_row(&row, 1.0, 0, 0.75, 2, m));
+        assert!(!typical_accepts_row(&row, 1.0, 2, 1.0, 2, m));
+        // Renormalised over the nucleus `[0.625, 0.375]` (entropy 0.6616, bar
+        // 0.09), the 0.375 draft clears it.
+        assert!(typical_accepts_row(&row, 1.0, 0, 0.75, 1, m));
+    }
+
+    /// One logits row with `p(5) = 0.8` and `p(7) = 0.2`; every other token
+    /// sits at logit 0, ~2e-9 each.
+    fn verify_row_logits() -> Tensor {
+        logits_from_rows(&[&[(5, 20.0), (7, 20.0 + 0.25f32.ln())]])
+    }
+
+    fn sampled_config(seed: u64) -> SamplingConfig {
+        let mut c = SamplingConfig::argmax();
+        c.temperature = 1.0;
+        c.top_k = 0;
+        c.top_p = 1.0;
+        c.seed = seed;
+        c
+    }
+
+    fn devices() -> Vec<Device> {
+        let mut devices = vec![Device::Cpu];
+        devices.extend(Device::new_cuda(0).ok());
+        devices
+    }
+
+    /// **A draft the distribution gives enough mass is committed whatever the
+    /// sample.** `p(7) = 0.2` clears the 0.09 bar, so every seed commits 7 —
+    /// including the ~80% whose sample lands on 5. The sample is still drawn,
+    /// so the row's RNG advances exactly as a plain row's.
+    #[test]
+    fn a_draft_over_the_bar_is_committed_whatever_the_sample() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, VOCAB_SIZE);
+            let logits = verify_row_logits().to_device(&device).expect("logits");
+            for seed in 0..16 {
+                let mut state = make_state();
+                let tokens = sampler
+                    .sample_verify_rows(
+                        &logits,
+                        &mut [&mut state],
+                        &[&sampled_config(seed)],
+                        &[Some(7)],
+                        TypicalAcceptance::MEDUSA,
+                    )
+                    .expect("sample");
+                assert_eq!(tokens, vec![7], "{device:?} seed {seed}");
+                assert_eq!(state.rng_offset, 1, "{device:?} seed {seed}");
+            }
+        }
+    }
+
+    /// **A draft under the bar commits the sample.** Token 9 sits at logit 0,
+    /// ~2e-9 of the row, so the row commits what plain sampling draws: 5 or 7.
+    /// Across 32 seeds both turn up, which a correction pinned to the argmax
+    /// could never produce.
+    #[test]
+    fn a_draft_under_the_bar_commits_the_sample() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, VOCAB_SIZE);
+            let logits = verify_row_logits().to_device(&device).expect("logits");
+            let mut seen = HashSet::new();
+            for seed in 0..32 {
+                let mut state = make_state();
+                let tokens = sampler
+                    .sample_verify_rows(
+                        &logits,
+                        &mut [&mut state],
+                        &[&sampled_config(seed)],
+                        &[Some(9)],
+                        TypicalAcceptance::MEDUSA,
+                    )
+                    .expect("sample");
+                assert!(
+                    tokens[0] == 5 || tokens[0] == 7,
+                    "{device:?} seed {seed}: {tokens:?}"
+                );
+                seen.insert(tokens[0]);
+            }
+            assert_eq!(seen.len(), 2, "{device:?}: corrections {seen:?}");
+        }
+    }
+
+    /// **Greedy verification is unchanged.** At temperature zero the row is a
+    /// point mass on its argmax, so a 0.2 draft is not accepted and the row
+    /// commits 5.
+    #[test]
+    fn at_temperature_zero_only_the_argmax_is_committed() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, VOCAB_SIZE);
+            let logits = verify_row_logits().to_device(&device).expect("logits");
+            let mut state = make_state();
+            let tokens = sampler
+                .sample_verify_rows(
+                    &logits,
+                    &mut [&mut state],
+                    &[&SamplingConfig::argmax()],
+                    &[Some(7)],
+                    TypicalAcceptance::MEDUSA,
+                )
+                .expect("sample");
+            assert_eq!(tokens, vec![5], "{device:?}");
+        }
+    }
+
+    /// **The padded tail of a row is never a token.** The sampler's live
+    /// vocabulary ends at 50; token 60, in the padding, carries the row's
+    /// largest logit by far. Neither the argmax nor a sample may produce it,
+    /// and a draft naming it is not accepted.
+    #[test]
+    fn the_padded_tail_of_a_row_is_never_produced() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, 50);
+            let logits = logits_from_rows(&[&[(5, 20.0), (7, 20.0 + 0.25f32.ln()), (60, 90.0)]])
+                .to_device(&device)
+                .expect("logits");
+            let mut state = make_state();
+            let greedy = sampler
+                .sample_batch(&logits, &mut [&mut state], &[&SamplingConfig::argmax()])
+                .expect("sample");
+            assert_eq!(greedy, vec![5], "{device:?}");
+            for seed in 0..16 {
+                let mut state = make_state();
+                let tokens = sampler
+                    .sample_verify_rows(
+                        &logits,
+                        &mut [&mut state],
+                        &[&sampled_config(seed)],
+                        &[Some(60)],
+                        TypicalAcceptance::MEDUSA,
+                    )
+                    .expect("sample");
+                assert!(
+                    tokens[0] == 5 || tokens[0] == 7,
+                    "{device:?} seed {seed}: {tokens:?}"
+                );
+            }
+        }
+    }
+
+    fn make_sampler_on(device: &Device, live_vocab: usize) -> BatchedSampler {
+        BatchedSampler::new(
+            device.clone(),
+            VOCAB_SIZE,
+            live_vocab,
+            MAX_RECENT,
+            vec![EOS_TOKEN].into(),
+            None,
+        )
     }
 
     #[test]
@@ -2802,6 +3171,7 @@ mod tests {
         for device in devices {
             let sampler = BatchedSampler::new(
                 device.clone(),
+                VOCAB_SIZE,
                 VOCAB_SIZE,
                 MAX_RECENT,
                 vec![EOS_TOKEN].into(),
@@ -3136,6 +3506,7 @@ mod tests {
         let sampler = BatchedSampler::new(
             device.clone(),
             VOCAB_SIZE,
+            VOCAB_SIZE,
             MAX_RECENT,
             vec![EOS_TOKEN].into(),
             None,
@@ -3196,6 +3567,7 @@ mod tests {
         };
         let sampler = BatchedSampler::new(
             device.clone(),
+            VOCAB_SIZE,
             VOCAB_SIZE,
             MAX_RECENT,
             vec![EOS_TOKEN].into(),

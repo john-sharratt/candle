@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
-use crate::models::batch_test::greedy::greedy_token;
+use crate::models::batch_test::greedy::{greedy_token, live_vocab};
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
 use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
 use crate::models::batch_test::span_report::print_span;
@@ -2073,7 +2073,10 @@ impl TestParams {
         let mut committed: Vec<u32> = Vec::with_capacity(sequence_indices.len());
         let mut active: Vec<bool> = Vec::with_capacity(sequence_indices.len());
         let stacked = Tensor::cat(&runs.iter().map(|r| &r.logits).collect::<Vec<_>>(), 0)?;
-        let seeds = stacked.batched_sample_argmax()?;
+        // Every pick of this decode — the seed here and each accept-walk row —
+        // stops at the tokenizer's last id; the padded tail is not a token.
+        let live = live_vocab(&self.tokenizer, stacked.dim(1)?);
+        let seeds = stacked.batched_sample_argmax(live)?;
         // The logit each seed was chosen at. Every value of a row being -inf or
         // NaN is what a corrupted forward looks like from here, and the greedy
         // pick of such a row is a token the model never scored. Caught at the
@@ -2150,7 +2153,7 @@ impl TestParams {
                 &comms,
                 &budgets,
                 nl,
-                &mut GreedyChooser,
+                &mut GreedyChooser::new(live),
                 &mut emits,
             )?;
             drop(emits);

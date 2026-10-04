@@ -7,6 +7,7 @@ extern "C" void run_batched_sampling_f32(
     const float* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -61,7 +62,7 @@ extern "C" void run_batched_sampling_f32(
     void* stream
 ) {
     launch_batched_sampling_typed<float>(
-        logits, batch_size, vocab_size,
+        logits, batch_size, vocab_size, live_vocab,
         repeat_penalty, frequency_penalty, presence_penalty,
         dry_multiplier, dry_base, dry_allowed_length, dry_range,
         eos_boost, eos_token_id,

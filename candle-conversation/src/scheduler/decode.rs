@@ -792,14 +792,22 @@ impl Scheduler {
         //
         // One sampler dispatch per block position over the sequences still
         // alive. Sampling each row — rather than taking its argmax — is what
-        // makes speculation draw from the distribution plain decoding would:
-        // every drafter here proposes greedily, so the textbook accept/reject
-        // rule collapses to "sample the row, accept the proposal iff the sample
-        // agrees" (see `candle_transformers::models::speculative_choice`).
+        // draws each row from the distribution plain decoding would: every
+        // drafter here proposes greedily, so the textbook accept/reject rule
+        // collapses to "sample the row, accept the proposal iff the sample
+        // agrees" (see `candle_transformers::models::speculative_choice`). On
+        // top of that rule the chooser commits a draft the sample missed when
+        // the model's typical-acceptance thresholds pass it, inside the same
+        // dispatch — the one place a sampled step departs from plain decoding.
         let t_sample = std::time::Instant::now();
         let (state_ids, states): (Vec<SequenceId>, Vec<SequenceSamplingState>) =
             removed_states.into_iter().unzip();
-        let mut chooser = SpecChooser::new(&self.sampler, states, configs);
+        let mut chooser = SpecChooser::new(
+            &self.sampler,
+            states,
+            configs,
+            self.model.typical_acceptance(),
+        );
         let mut emitted: Vec<Vec<u32>> = vec![Vec::new(); blocks.len()];
         // How many more tokens each sequence may generate. The sinks apply only
         // this and EOS — the cheap half of the stop policy, which bounds how much

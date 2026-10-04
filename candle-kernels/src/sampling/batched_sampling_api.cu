@@ -19,6 +19,7 @@ extern "C" void run_batched_sampling_f32(
     const float* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -75,6 +76,7 @@ extern "C" void run_batched_sampling_f16(
     const half* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -131,6 +133,7 @@ extern "C" void run_batched_sampling_fp8_e4m3(
     const __nv_fp8_e4m3* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -187,6 +190,7 @@ extern "C" void run_batched_sampling_bf16(
     const __nv_bfloat16* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -248,6 +252,9 @@ extern "C" void run_batched_sampling(
     const void* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    // Tokens a row may produce: the tokenizer's last id + 1. The padded tail of
+    // each row past it carries no probability; `vocab_size` stays the stride.
+    int32_t live_vocab,
     int32_t dtype,
     // Sampling params
     float temperature,
@@ -308,7 +315,7 @@ extern "C" void run_batched_sampling(
     switch (dtype) {
         case 0: // f32
             run_batched_sampling_f32(
-                reinterpret_cast<const float*>(logits), batch_size, vocab_size,
+                reinterpret_cast<const float*>(logits), batch_size, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id,
@@ -328,7 +335,7 @@ extern "C" void run_batched_sampling(
             break;
         case 1: // f16
             run_batched_sampling_f16(
-                reinterpret_cast<const half*>(logits), batch_size, vocab_size,
+                reinterpret_cast<const half*>(logits), batch_size, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id,
@@ -348,7 +355,7 @@ extern "C" void run_batched_sampling(
             break;
         case 2: // bf16
             run_batched_sampling_bf16(
-                reinterpret_cast<const __nv_bfloat16*>(logits), batch_size, vocab_size,
+                reinterpret_cast<const __nv_bfloat16*>(logits), batch_size, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id,
@@ -368,7 +375,7 @@ extern "C" void run_batched_sampling(
             break;
         case 3: // fp8_e4m3
             run_batched_sampling_fp8_e4m3(
-                reinterpret_cast<const __nv_fp8_e4m3*>(logits), batch_size, vocab_size,
+                reinterpret_cast<const __nv_fp8_e4m3*>(logits), batch_size, vocab_size, live_vocab,
                 repeat_penalty, frequency_penalty, presence_penalty,
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id,

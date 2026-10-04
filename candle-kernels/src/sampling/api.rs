@@ -23,7 +23,10 @@ extern "C" {
     /// # Parameters
     /// - `logits`: Input logits tensor (type determined by `dtype`)
     /// - `batch_size`: Number of sequences in the batch
-    /// - `vocab_size`: Vocabulary size
+    /// - `vocab_size`: Vocabulary size — the logits row stride
+    /// - `live_vocab`: Tokens a row may produce (the tokenizer's last id + 1).
+    ///   A checkpoint pads its output projection past it; the padded tail
+    ///   carries no probability. Clamped to `vocab_size`.
     /// - `dtype`: Data type (0=f32, 1=f16, 2=bf16, 3=fp8_e4m3)
     /// - `temperature`: Sampling temperature (0 = argmax/greedy)
     /// - `top_k`: Top-k sampling (0 = disabled)
@@ -79,6 +82,7 @@ extern "C" {
         logits: *const c_void,
         batch_size: i32,
         vocab_size: i32,
+        live_vocab: i32,
         dtype: i32,
         temperature: f32,
         top_k: i32,

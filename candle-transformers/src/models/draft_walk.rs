@@ -213,9 +213,13 @@ pub fn draft_walk(
             // requires it — so it is checked rather than cast. A cast would be a
             // full pass over the ids on any backend that ever stopped emitting
             // U32, silently, once per drafted token.
+            //
+            // The head proposes over its whole row. A padded column can win
+            // here, and costs nothing: verification gives it no probability,
+            // so it is never committed.
             expect_dense_view(&logits, "draft walk logits")?;
             let vocab = logits.dim(D::Minus1)?;
-            let next = logits.reshape((n, vocab))?.batched_sample_argmax()?;
+            let next = logits.reshape((n, vocab))?.batched_sample_argmax(vocab)?;
             expect_dtype(&next, DType::U32, "draft walk argmax")?;
             ids = next;
             steps.push(ids.clone());

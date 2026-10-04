@@ -3823,7 +3823,7 @@ mod tests {
                 committed,
                 4,
                 n_layers,
-                &mut GreedyChooser,
+                &mut GreedyChooser::whole_row(),
                 &mut |t| {
                     gen.push(t);
                     gen.len() < 12 && t != eos
@@ -3959,7 +3959,7 @@ mod tests {
                 committed,
                 max_draft,
                 n_layers,
-                &mut GreedyChooser,
+                &mut GreedyChooser::whole_row(),
                 &mut |t| {
                     gen.push(t);
                     gen.len() < 12 && t != eos
@@ -4143,7 +4143,7 @@ mod tests {
                 committed,
                 4,
                 n_layers,
-                &mut GreedyChooser,
+                &mut GreedyChooser::whole_row(),
                 &mut |t| {
                     spec.push(t);
                     spec.len() < MAX_NEW && t != eos
@@ -4280,7 +4280,7 @@ mod tests {
                 committed,
                 max_draft,
                 n_layers,
-                &mut GreedyChooser,
+                &mut GreedyChooser::whole_row(),
                 &mut |t| {
                     gen.push(t);
                     gen.len() < MAX_NEW && t != eos

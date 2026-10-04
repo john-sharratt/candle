@@ -8,6 +8,7 @@ extern "C" void run_batched_sampling_fp8_e4m3(
     const __nv_fp8_e4m3* logits,
     int32_t batch_size,
     int32_t vocab_size,
+    int32_t live_vocab,
     // Penalty scalars
     float repeat_penalty,
     float frequency_penalty,
@@ -61,7 +62,7 @@ extern "C" void run_batched_sampling_fp8_e4m3(
     void* stream
 ) {
     launch_batched_sampling_typed<__nv_fp8_e4m3>(
-        logits, batch_size, vocab_size,
+        logits, batch_size, vocab_size, live_vocab,
         repeat_penalty, frequency_penalty, presence_penalty,
         dry_multiplier, dry_base, dry_allowed_length, dry_range,
         eos_boost, eos_token_id,

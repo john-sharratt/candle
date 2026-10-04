@@ -3479,8 +3479,12 @@ impl Scheduler {
         // clamp is inert here — nothing is resident yet — so a wide wave can run
         // shallower than the wide figure suggests. `w1` is the one to read for
         // "does this checkpoint speculate at all": 0 there means no drafter.
+        let typical = model.typical_acceptance();
+        typical.assert_valid();
         tracing::info!(
             target: "candle_conversation::engine_caps",
+            typical_epsilon = typical.epsilon,
+            typical_delta = typical.delta,
             draft_budget_w1 = model.draft_budget(1),
             draft_budget_w8 = model.draft_budget(8),
             draft_ladder_w64_unclamped = model.draft_budget(64),
@@ -3500,9 +3504,17 @@ impl Scheduler {
         )
         .map(Arc::new)
         .ok();
+        // The tokens the tokenizer can name; a checkpoint pads its logits row
+        // past them, and the padded tail must carry no probability.
+        let live_vocab = tokenizer
+            .get_vocab(true)
+            .values()
+            .max()
+            .map_or(vocab_size, |&id| id as usize + 1);
         let sampler = BatchedSampler::new(
             device.clone(),
             vocab_size,
+            live_vocab,
             max_recent_len,
             eos_tokens.clone(),
             penalty_log_path,
@@ -13411,7 +13423,7 @@ mod tests {
         // (recurrent state it cannot rewind), so it must fire before any row is
         // ever scored. Greedy is the one whose behaviour needs no explanation if
         // that ordering ever regresses and this reaches the sampling step.
-        let mut chooser = GreedyChooser;
+        let mut chooser = GreedyChooser::whole_row();
 
         let err = match model.speculative_decode_step_batch(
             &mut session,

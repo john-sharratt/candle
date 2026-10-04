@@ -194,6 +194,7 @@ mod bench {
                     logits_ptr as *const c_void,
                     batch_size,
                     vocab_size,
+                    vocab_size, // live_vocab: no padded tail
                     dtype.code,
                     mode.temperature,
                     mode.top_k,
@@ -258,6 +259,7 @@ mod bench {
                     logits_ptr as *const c_void,
                     batch_size,
                     vocab_size,
+                    vocab_size, // live_vocab: no padded tail
                     dtype.code,
                     mode.temperature,
                     mode.top_k,
@@ -404,6 +406,7 @@ mod bench {
                     lp as *const c_void,
                     batch_size,
                     vocab_size,
+                    vocab_size, // live_vocab: no padded tail
                     dtype.code,
                     mode.temperature,
                     mode.top_k,
@@ -471,6 +474,7 @@ mod bench {
                     lp as *const c_void,
                     batch_size,
                     vocab_size,
+                    vocab_size, // live_vocab: no padded tail
                     dtype.code,
                     mode.temperature,
                     mode.top_k,

@@ -52,7 +52,9 @@ use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePh
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::{gpu_span, pipeline_record_duration, span};
-use crate::models::speculative_choice::{AcceptWalk, SpeculativeStep, TokenChooser};
+use crate::models::speculative_choice::{
+    AcceptWalk, SpeculativeStep, TokenChooser, TypicalAcceptance,
+};
 use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan, WaveCoBatch};
 
 /// One R16 chunk's unpacked contents: `(block_idx, k_flat, v_flat, q_flat)`.
@@ -4240,9 +4242,10 @@ pub trait ManagedBatchedModel {
     // and `speculative_decode_step` degrades to a single plain decode — so the hook is always
     // safe to call. A model with a drafter overrides `speculative_draft` (and, for the actual
     // speedup, `verify_block`). The accepted tokens are always drawn by the caller's own
-    // `TokenChooser` from this model's own logits, so the output is distributed exactly as plain
-    // decoding through that chooser would be, regardless of draft quality — bit-identical under
-    // `GreedyChooser`, and drawn from the identical distribution under a sampler.
+    // `TokenChooser` from this model's own logits, so the driver adds no departure of its own:
+    // with an exact chooser the output is distributed exactly as plain decoding through it would
+    // be, regardless of draft quality — bit-identical under `GreedyChooser`. A chooser that
+    // applies typical acceptance (the scheduler's) departs only where that rule accepts a draft.
 
     /// Tokens this model wants each sequence to draft on a wave of `width` sequences.
     ///
@@ -4398,6 +4401,16 @@ pub trait ManagedBatchedModel {
     /// refuses a target with no rewind point, at the one place that knows.
     fn can_rewind_speculative_block(&self) -> bool {
         !self.carries_recurrent_state()
+    }
+
+    /// The thresholds a sampling chooser accepts a draft on when its sample
+    /// did not land on it — see [`TypicalAcceptance`].
+    ///
+    /// Default: the Medusa reference values. A model overrides this only when
+    /// its own drafter's acceptance has been measured against other values;
+    /// greedy verification never reads it, so the forward gates do not see it.
+    fn typical_acceptance(&self) -> TypicalAcceptance {
+        TypicalAcceptance::MEDUSA
     }
 
     /// Roll `seq` back to exactly `tokens` tokens after a speculative verify — called by the
@@ -4943,7 +4956,8 @@ pub trait ManagedBatchedModel {
         })
     }
 
-    /// One lossless speculative-decode step for `seq` (model-agnostic). `committed` is the last
+    /// One speculative-decode step for `seq` (model-agnostic), as lossless as `chooser` — see
+    /// [`Self::speculative_decode_step_batch`]. `committed` is the last
     /// accepted token, held OUT of the KV; it is placed at the current sequence offset. Drafts a
     /// block, verifies `[committed, drafts…]`, accepts the longest prefix whose proposals agree
     /// with what `chooser` draws for this model, and **emits each accepted token to `emit`, one at
@@ -4983,7 +4997,7 @@ pub trait ManagedBatchedModel {
         Ok(step.next[0])
     }
 
-    /// One lossless speculative-decode step for MANY sequences — semantics identical to running
+    /// One speculative-decode step for MANY sequences — semantics identical to running
     /// [`Self::speculative_decode_step`] once per sequence, with the expensive parts batched:
     /// every block is verified in ONE `verify_blocks` call (a single wave when the model overrides
     /// it), and every scored row of the step is stacked once so `chooser` pays one dispatch per
@@ -4992,10 +5006,12 @@ pub trait ManagedBatchedModel {
     /// to its own accepted prefix. Returns each sequence's next `committed` seed (`None` where its
     /// emit stopped).
     ///
-    /// `chooser` decides what each scored row commits, which is what makes the step lossless
-    /// under sampling as well as under greedy decode — see [`speculative_choice`] for why a
-    /// greedy drafter reduces the textbook accept/reject rule to "sample the row, accept the
-    /// proposal iff the sample agrees". Pass [`GreedyChooser`] for bit-identical greedy output.
+    /// `chooser` decides what each scored row commits, so the step is exactly as lossless as
+    /// the chooser: an exact sampler makes it lossless under sampling as well as under greedy
+    /// decode — see [`speculative_choice`] for why a greedy drafter reduces the textbook
+    /// accept/reject rule to "sample the row, accept the proposal iff the sample agrees" — and
+    /// one applying [`TypicalAcceptance`] departs where that rule takes a draft. Pass
+    /// [`GreedyChooser`] for bit-identical greedy output.
     ///
     /// `max_drafts` is each sequence's own draft depth (see [`super::draft_depth`]): the drafter
     /// walks the cohort to the deepest of them, once, and each sequence keeps only its own
