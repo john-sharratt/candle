@@ -524,6 +524,7 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     // (`docs/archived/arena_unification.md` §3.6). Halves alternate per layer, so
     // layer N's reads are separated from layer N+2's writes by a whole layer of
     // same-stream work.
+    let t_attn_host = profile_now();
     {
         #[cfg(feature = "cuda")]
         let attn_wave = match xt.device() {
@@ -587,6 +588,10 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
         // No `drop(attn_wave)`: each `h` borrows the guard, so the compiler
         // refuses any order but this one. The guard dies at the brace.
     }
+    // Host time of the layer's attention half, from opening its generation to
+    // closing it: against the stream time of the spans inside, what the host
+    // spends issuing the work rather than the device spends doing it.
+    pipeline_record("layer:attn_host", t_attn_host);
 
     // ── Shared FFN/MoE over the WHOLE combined buffer — one grouped GEMM whose
     // per-layer expert load serves every row-type at once. ──
@@ -618,6 +623,7 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
         .take_while(|g| g.decode_layout)
         .map(|g| g.rows)
         .sum();
+    let t_ffn_host = profile_now();
     let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode(), ffn_wave.as_ref())?;
     layer.ffn_residual(
         x.as_cat_tensor_mut(),
@@ -626,6 +632,7 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
         decode_tokens,
         ffn_wave.as_ref(),
     )?;
+    pipeline_record("layer:ffn_host", t_ffn_host);
     // The guard falls out of scope at the end of the function, after the
     // residual update that consumed everything the FFN put on it, fencing the
     // stream and rewinding the half.

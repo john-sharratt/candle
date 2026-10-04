@@ -116,9 +116,9 @@ mod write_placement;
 mod tests;
 
 // Re-export public types
-pub use backing::ChunkedKvBacking;
 pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
+pub use backing::{ChunkedKvBacking, DecodeGpuChunkSyncStats};
 pub use chunk_ops::BlockAllocSpec;
 pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 #[cfg(feature = "cuda")]

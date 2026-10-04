@@ -135,7 +135,7 @@ pub struct TestParams {
     /// decode phase clamps every pick to it inside its timed window, and walking
     /// the vocabulary there was charged to decode.
     pub token_ids: Option<usize>,
-    pub dialect: Dialect,            // Chat format dialect (ChatML, Llama3, etc.)
+    pub dialect: Dialect, // Chat format dialect (ChatML, Llama3, etc.)
     pub device: Device,
     pub begin_document_token: Option<u32>,
     pub timeout_secs: u64, // Test timeout in seconds (default: 120)
@@ -1239,6 +1239,7 @@ impl TestParams {
             result.expert_stats = model.expert_stats();
             result.row_cache_stats = model.row_cache_stats();
 
+            self.print_row_profiles(&result);
             results.push(result);
 
             // Release GPU logits tensors from completed config — they're not needed
@@ -2574,24 +2575,6 @@ impl TestParams {
         self.print_comparison_table(results);
         self.print_expert_stats_table(results);
 
-        // grab the first 5 results and the last result into a slice
-        let results = results.to_vec();
-        let results = if results.len() > 6 {
-            [&results[0..5], &results[results.len() - 1..results.len()]].concat()
-        } else {
-            results
-        };
-        let results = &results;
-
-        self.print_profile_table(results, "Bulk (Prompt) Profile", |r| &r.bulk_profile);
-        self.print_profile_table(results, "Single (Generate) Profile", |r| &r.single_profile);
-        self.print_profile_table(results, "Pipeline Profile — PREFILL (bulk)", |r| {
-            &r.pipeline_bulk_profile
-        });
-        self.print_profile_table(results, "Pipeline Profile — DECODE (single)", |r| {
-            &r.pipeline_profile
-        });
-
         if failed {
             Err(candle::Error::msg("Some tests failed"))
         } else {
@@ -3161,6 +3144,34 @@ impl TestParams {
 
     #[cfg(not(feature = "cuda"))]
     fn print_pinned_ram_report() {}
+
+    /// Print one finished row's four profile tables — prompt and generate, model
+    /// and pipeline spans — straight after the row, headed by the row's name.
+    ///
+    /// Every span accumulator is reset at the row's phase boundaries, so each
+    /// table holds that row alone: a span that grows with the rows before it
+    /// shows up as the same span read down successive dumps. Prints nothing
+    /// without the `profile` feature, which leaves every snapshot empty.
+    fn print_row_profiles(&self, result: &TestResults) {
+        let row = std::slice::from_ref(result);
+        let name = format!("{:?}×{}", result.config.mode, result.config.num_contexts);
+        self.print_profile_table(row, &format!("{name} — Bulk (Prompt) Profile"), |r| {
+            &r.bulk_profile
+        });
+        self.print_profile_table(row, &format!("{name} — Single (Generate) Profile"), |r| {
+            &r.single_profile
+        });
+        self.print_profile_table(
+            row,
+            &format!("{name} — Pipeline Profile, PREFILL (bulk)"),
+            |r| &r.pipeline_bulk_profile,
+        );
+        self.print_profile_table(
+            row,
+            &format!("{name} — Pipeline Profile, DECODE (single)"),
+            |r| &r.pipeline_profile,
+        );
+    }
 
     /// Print a transposed profile-timing table.
     ///

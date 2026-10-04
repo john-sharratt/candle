@@ -781,6 +781,53 @@ impl GpuChunksGuard<'_> {
     }
 }
 
+/// The byte ranges of the slot buffer an upload must carry, for the dirty chunk
+/// indices `dirty` (ascending, no duplicates) of a slot holding `n_chunks`
+/// entries whose out-of-line records are `rec_bytes` each.
+///
+/// The buffer has two sections — slice headers `[0 .. n*16)`, then records — and
+/// a run of adjacent chunk indices is contiguous in *both*, so each run is two
+/// ranges: its 16-byte headers and its records. Ranges that touch are one range:
+/// a run covering the whole slot ends its headers where its records begin, and
+/// carrying that as one copy rather than two halves a full rebuild's driver
+/// submissions — what a prefill pays for every `(layer, slot)` it brings up to
+/// date, where each submission is a separate trip into the driver and a queue
+/// already deep with kernels makes each of them wait.
+fn upload_ranges(
+    dirty: &[usize],
+    n_chunks: usize,
+    rec_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let Some(&first) = dirty.first() else {
+        return Vec::new();
+    };
+    let records_off = n_chunks * SLICE_HEADER_BYTES;
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut push = |range: std::ops::Range<usize>| match ranges.last_mut() {
+        Some(last) if last.end == range.start => last.end = range.end,
+        _ => ranges.push(range),
+    };
+    let mut push_run = |start: usize, end: usize| {
+        push(start * SLICE_HEADER_BYTES..end * SLICE_HEADER_BYTES);
+        if rec_bytes > 0 {
+            push(records_off + start * rec_bytes..records_off + end * rec_bytes);
+        }
+    };
+    let mut start = first;
+    let mut end = start + 1;
+    for &idx in &dirty[1..] {
+        if idx == end {
+            end += 1;
+        } else {
+            push_run(start, end);
+            start = idx;
+            end = idx + 1;
+        }
+    }
+    push_run(start, end);
+    ranges
+}
+
 impl Drop for GpuChunksGuard<'_> {
     fn drop(&mut self) {
         if self.dirty_chunks.is_empty() {
@@ -805,31 +852,8 @@ impl Drop for GpuChunksGuard<'_> {
             return;
         };
 
-        // Two-section buffer: slice headers [0 .. n*16), then records. A
-        // coalesced run of adjacent chunk indices is contiguous in *both*
-        // sections, so each run is two ranges: the 16-byte headers and the
-        // records.
         let rec_bytes = chunk_byte_size - SLICE_HEADER_BYTES;
-        let records_off = n_chunks * SLICE_HEADER_BYTES;
-        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-        let mut push_run = |start: usize, end: usize| {
-            ranges.push(start * SLICE_HEADER_BYTES..end * SLICE_HEADER_BYTES);
-            if rec_bytes > 0 {
-                ranges.push(records_off + start * rec_bytes..records_off + end * rec_bytes);
-            }
-        };
-        let mut start = self.dirty_chunks[0];
-        let mut end = start + 1;
-        for &idx in &self.dirty_chunks[1..] {
-            if idx == end {
-                end += 1;
-            } else {
-                push_run(start, end);
-                start = idx;
-                end = idx + 1;
-            }
-        }
-        push_run(start, end);
+        let ranges = upload_ranges(&self.dirty_chunks, n_chunks, rec_bytes);
         let total: usize = ranges.iter().map(|r| r.len()).sum();
 
         let inner = &mut *self.inner;
@@ -1200,6 +1224,68 @@ mod snapshot_tests {
         b[3] = 0xff;
         assert_eq!(records_checksum(&a), records_checksum(&a));
         assert_ne!(records_checksum(&a), records_checksum(&b));
+    }
+}
+
+#[cfg(test)]
+mod upload_range_tests {
+    use super::upload_ranges;
+
+    /// A slot of four chunks with 100-byte records: headers fill `[0, 64)`,
+    /// records `[64, 464)`.
+    const N: usize = 4;
+    const REC: usize = 100;
+
+    /// **A full rebuild is one copy.** Its headers end at 64 where its records
+    /// begin, so the two halves are one range — the case a prefill hits for every
+    /// `(layer, slot)` it serialises from nothing.
+    #[test]
+    fn a_whole_slot_is_one_range() {
+        assert_eq!(upload_ranges(&[0, 1, 2, 3], N, REC), vec![0..464]);
+    }
+
+    /// A run in the middle of the slot has headers and records far apart: two
+    /// ranges, each exactly its run's bytes.
+    #[test]
+    fn an_interior_run_is_two_ranges() {
+        assert_eq!(upload_ranges(&[1, 2], N, REC), vec![16..48, 164..364]);
+    }
+
+    /// Runs that do not touch stay separate, in run order: each run's headers,
+    /// then its records.
+    #[test]
+    fn separated_runs_stay_separate() {
+        assert_eq!(
+            upload_ranges(&[0, 2], N, REC),
+            vec![0..16, 64..164, 32..48, 264..364]
+        );
+    }
+
+    /// A run that reaches the end of the slot but starts later does not touch
+    /// its records: the headers end at 64, the records begin at 64 + 3·100.
+    #[test]
+    fn a_tail_run_is_two_ranges() {
+        assert_eq!(upload_ranges(&[3], N, REC), vec![48..64, 364..464]);
+    }
+
+    /// A slot of two chunks, whole: headers `[0, 32)` run into records
+    /// `[32, 232)`.
+    #[test]
+    fn a_two_chunk_slot_is_one_range() {
+        assert_eq!(upload_ranges(&[0, 1], 2, REC), vec![0..232]);
+    }
+
+    /// With no out-of-line record, only the headers travel.
+    #[test]
+    fn a_slot_without_records_carries_headers_alone() {
+        assert_eq!(upload_ranges(&[0, 1, 2, 3], N, 0), vec![0..64]);
+        assert_eq!(upload_ranges(&[1], N, 0), vec![16..32]);
+    }
+
+    /// Nothing dirty, nothing to upload.
+    #[test]
+    fn no_dirty_chunks_is_no_ranges() {
+        assert!(upload_ranges(&[], N, REC).is_empty());
     }
 }
 

@@ -2335,6 +2335,25 @@ mod tests {
     #[test]
     #[ignore] // Slow without CUDA. Run with: cargo test --release --features cuda -- --ignored test_parallel_batched_forwarding_llama2
     fn test_parallel_batched_forwarding_llama2() -> Result<()> {
+        run_llama2_gate(|_| true)
+    }
+
+    /// The wide-batch prefill row alone: one BF16 context to warm the model,
+    /// then BF16 ×48. Built with `--features profile`, the run reports where the
+    /// 48-context prompt phase spends its host time, without the other eleven
+    /// rows of the gate in the way.
+    ///
+    /// Run with: cargo test --release --features cuda,profile --lib --package candle-transformers quantized_llama::tests::wide_prefill_llama2 -- --ignored --nocapture
+    #[test]
+    #[ignore = "downloads the Llama-2-7B-Chat Q4_0 GGUF and fills the card with 48 contexts"]
+    fn wide_prefill_llama2() -> Result<()> {
+        run_llama2_gate(|c| {
+            matches!(c.mode, InferenceMode::BF16) && matches!(c.num_contexts, 1 | 48)
+        })
+    }
+
+    /// Llama 2 7B's gate over the rows `keep` selects from its full ladder.
+    fn run_llama2_gate(keep: impl Fn(&TestConfig) -> bool) -> Result<()> {
         #[cfg(not(all(feature = "cuda")))]
         println!("⚠ WARNING: This test should be run with --features cuda for optimal performance");
         #[cfg(not(all(feature = "cuda")))]
@@ -2484,6 +2503,7 @@ mod tests {
                 test_mode: None,
             },
         ];
+        let configs: Vec<TestConfig> = configs.into_iter().filter(|c| keep(c)).collect();
 
         // Sequential (non-batched) callbacks - access inner model via .model()
         let int8mode = match std::env::var("INT8MODE").ok().as_deref() {

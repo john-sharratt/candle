@@ -17,6 +17,7 @@ mod arena_tests;
 mod backing_tests;
 mod band_codec_tests;
 mod chunk_ops_tests;
+mod claim_cost_tests;
 mod compress_tests;
 mod decode_slot_resync_tests;
 pub mod dump_reader;

@@ -93,6 +93,11 @@ pub(crate) fn band_ptr_offset(
         + (usize::from(is_value) * n_palette + p) * 8
 }
 
+/// The most bands one head's record names: 16 for a single-latent chunk, 4 for
+/// GQA. [`serialize_kv_heads`] keeps a head's pointers and tags in arrays this
+/// wide rather than allocating them per head.
+const MAX_RECORD_BANDS: usize = 16;
+
 /// One chunk's contribution to a `KvHead[n_kv_head]` record, borrowed from the
 /// chunk that owns it.
 ///
@@ -171,6 +176,10 @@ pub(crate) fn serialize_kv_heads(
         chunk_record_bytes(n_kv_head, head_dim, n_palette),
         "record dst must be exactly chunk_record_bytes"
     );
+    assert!(
+        n_palette <= MAX_RECORD_BANDS,
+        "a record names at most {MAX_RECORD_BANDS} bands per head, got {n_palette}"
+    );
     let pal_bytes = head_dim / 4;
     // pal_map identity uses the 2-bit density (N_PALETTE), NOT the band count —
     // the map is unused on the single-latent identity-only path and cannot name
@@ -178,7 +187,24 @@ pub(crate) fn serialize_kv_heads(
     // `n_palette`. GID stride per head is `n_palette*2` (K,V per band).
     let sub_hd = (head_dim / N_PALETTE).max(1);
     let stride = n_palette * 2;
+    let all_gids = gids.as_slice();
     let mut pos = 0usize;
+
+    // The identity routing map — the same bytes for every head — built once per
+    // record, and only when some head has no populated map to copy. Building it
+    // per head cost 2·head_dim iterations a head, which at 32 heads of 128 was
+    // 80% of serialising a float chunk's record.
+    let identity: Vec<u8> =
+        if k_pal.len() < n_kv_head * pal_bytes || v_pal.len() < n_kv_head * pal_bytes {
+            let mut map = vec![0u8; pal_bytes];
+            for d in 0..head_dim {
+                let pal_idx = ((d / sub_hd).min(N_PALETTE - 1)) as u8;
+                map[d / 4] |= pal_idx << ((d % 4) * 2);
+            }
+            map
+        } else {
+            Vec::new()
+        };
 
     macro_rules! put {
         ($b:expr) => {{
@@ -191,36 +217,15 @@ pub(crate) fn serialize_kv_heads(
     for h in 0..n_kv_head {
         // Palette maps: populated slice when present, else identity routing
         // (matches `KvHeadHost::from_gids` / live ChunkWindow identity bytes).
-        let k_pal_head = k_pal.get(h * pal_bytes..(h + 1) * pal_bytes);
-        let v_pal_head = v_pal.get(h * pal_bytes..(h + 1) * pal_bytes);
-        match k_pal_head {
-            Some(s) => put!(s),
-            None => {
-                // Identity routing ORs into dst, so the target bytes must start
-                // clean — `dst` may be a reused buffer (the decode pinned buffer
-                // preserves bytes across forwards).
-                dst[pos..pos + pal_bytes].fill(0);
-                for d in 0..head_dim {
-                    let pal_idx = ((d / sub_hd).min(N_PALETTE - 1)) as u8;
-                    dst[pos + d / 4] |= pal_idx << ((d % 4) * 2);
-                }
-                pos += pal_bytes;
-            }
-        }
-        match v_pal_head {
-            Some(s) => put!(s),
-            None => {
-                dst[pos..pos + pal_bytes].fill(0);
-                for d in 0..head_dim {
-                    let pal_idx = ((d / sub_hd).min(N_PALETTE - 1)) as u8;
-                    dst[pos + d / 4] |= pal_idx << ((d % 4) * 2);
-                }
-                pos += pal_bytes;
-            }
-        }
+        put!(k_pal
+            .get(h * pal_bytes..(h + 1) * pal_bytes)
+            .unwrap_or(&identity));
+        put!(v_pal
+            .get(h * pal_bytes..(h + 1) * pal_bytes)
+            .unwrap_or(&identity));
 
-        let mut k_ptr = vec![0u64; n_palette];
-        let mut v_ptr = vec![0u64; n_palette];
+        let mut k_ptr = [0u64; MAX_RECORD_BANDS];
+        let mut v_ptr = [0u64; MAX_RECORD_BANDS];
         // `Invalid`, never a real format. A band whose tag was not recorded has
         // no known layout, and every other unrecorded-tag path in the cache
         // resolves to `Invalid` precisely so the kernel's format check refuses
@@ -230,15 +235,15 @@ pub(crate) fn serialize_kv_heads(
         // (`n_kv_head * n_palette` entries at every call site), so this is the
         // unreachable branch, which is exactly why it must fail loudly if it
         // ever becomes reachable.
-        let mut k_tag = vec![ArenaFormatTag::Invalid.as_u8(); n_palette];
-        let mut v_tag = vec![ArenaFormatTag::Invalid.as_u8(); n_palette];
+        let mut k_tag = [ArenaFormatTag::Invalid.as_u8(); MAX_RECORD_BANDS];
+        let mut v_tag = [ArenaFormatTag::Invalid.as_u8(); MAX_RECORD_BANDS];
         let tag_base = h * n_palette;
         // Index the flat GID slice at the record's own stride (n_palette*2), so
         // an 8-band single-latent head reads its 16 GIDs correctly regardless of
         // the global GIDS_PER_HEAD (which stays 4-palette for GQA).
         for p in 0..n_palette {
-            let k_gid = &gids.as_slice()[h * stride + p * 2];
-            let v_gid = &gids.as_slice()[h * stride + p * 2 + 1];
+            let k_gid = &all_gids[h * stride + p * 2];
+            let v_gid = &all_gids[h * stride + p * 2 + 1];
             // **A non-resident arena leaves the pointer null, rather than forming one
             // from a zero base.** `resolve_arena_info` reports `base_ptr: 0` with a
             // non-zero stride for a CPU/warm arena, so without this guard a band in one
@@ -263,14 +268,14 @@ pub(crate) fn serialize_kv_heads(
                 v_tag[p] = t;
             }
         }
-        for &ptr in &k_ptr {
+        for &ptr in &k_ptr[..n_palette] {
             put!(&ptr.to_le_bytes());
         }
-        for &ptr in &v_ptr {
+        for &ptr in &v_ptr[..n_palette] {
             put!(&ptr.to_le_bytes());
         }
-        put!(&k_tag);
-        put!(&v_tag);
+        put!(&k_tag[..n_palette]);
+        put!(&v_tag[..n_palette]);
         let scale_base = h * n_palette;
         for p in 0..n_palette {
             let s = k_scale.get(scale_base + p).copied().unwrap_or(1.0);
@@ -670,6 +675,55 @@ mod tests {
         }
         assert_eq!(exp.len(), rec);
         assert_eq!(dst, exp, "record body must match exact KvHead byte layout");
+    }
+
+    /// What serialising one chunk's record costs at Llama-2's geometry — 32 KV
+    /// heads, head_dim 128 — with and without populated palette maps.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn serialize_kv_heads_cost_per_chunk() {
+        let (head_dim, n_kv_head) = (128usize, 32usize);
+        let rec = chunk_record_bytes(n_kv_head, head_dim, N_PALETTE);
+        let gids = HeadGids::uniform(ChunkGid::detached(0), n_kv_head);
+        let arena_info = vec![ResolvedArenaInfo {
+            base_ptr: 0x1000,
+            chunk_byte_stride: 512,
+            chunk_capacity: u32::MAX,
+        }];
+        let fmt = vec![ArenaFormatTag::F16.as_u8(); n_kv_head * N_PALETTE];
+        let pal = vec![0xE4u8; n_kv_head * head_dim / 4];
+        let scale = vec![1.0f32; n_kv_head * N_PALETTE];
+        let mut dst = vec![0u8; rec];
+        for (name, k_pal, v_pal) in [
+            ("empty maps", &[][..], &[][..]),
+            ("populated maps", &pal[..], &pal[..]),
+        ] {
+            let t = std::time::Instant::now();
+            let iters = 2000;
+            for _ in 0..iters {
+                serialize_kv_heads(
+                    &mut dst,
+                    &ChunkRecordSrc {
+                        gids: &gids,
+                        k_pal,
+                        v_pal,
+                        k_scale: &scale,
+                        v_scale: &scale,
+                        k_fmt: &fmt,
+                        v_fmt: &fmt,
+                    },
+                    n_kv_head,
+                    head_dim,
+                    N_PALETTE,
+                    &arena_info,
+                );
+            }
+            let per_chunk = t.elapsed().as_nanos() as f64 / iters as f64;
+            println!(
+                "serialize_kv_heads, {name}: {per_chunk:.0} ns per chunk, {:.0} ns per head",
+                per_chunk / n_kv_head as f64
+            );
+        }
     }
 
     /// Two sub-bands in two different arenas resolve to two different pointers

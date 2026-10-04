@@ -113,6 +113,7 @@ pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 pub use chunked::vram_budget_available;
 pub(crate) use chunked::Arena; // Internal use only
+pub use chunked::DecodeGpuChunkSyncStats;
 pub use chunked::MIGRATION_STAGING_CAP_BYTES;
 pub use chunked::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,

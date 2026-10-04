@@ -393,11 +393,16 @@ pub(super) struct RecordLayout {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecodeGpuChunkSyncStats {
+    /// Slots serialised in full.
     pub rebuilds: u64,
+    /// Slots whose live buffer served as it stood.
     pub reuses: u64,
+    /// Slots whose stale writer region was re-serialised, then served.
+    pub resyncs: u64,
     pub empty: u64,
     pub rebuild_time: std::time::Duration,
     pub reuse_time: std::time::Duration,
+    pub resync_time: std::time::Duration,
 }
 
 impl BackingInner {
@@ -1886,6 +1891,10 @@ impl ChunkedKvBacking {
                     stats.reuses += 1;
                     stats.reuse_time += elapsed;
                 }
+                super::types::DecodeGpuChunksSyncKind::Resync => {
+                    stats.resyncs += 1;
+                    stats.resync_time += elapsed;
+                }
                 super::types::DecodeGpuChunksSyncKind::Empty => {
                     stats.empty += 1;
                 }
@@ -2005,6 +2014,10 @@ impl ChunkedKvBacking {
                 super::types::DecodeGpuChunksSyncKind::Reuse => {
                     stats.reuses += 1;
                     stats.reuse_time += elapsed;
+                }
+                super::types::DecodeGpuChunksSyncKind::Resync => {
+                    stats.resyncs += 1;
+                    stats.resync_time += elapsed;
                 }
                 super::types::DecodeGpuChunksSyncKind::Empty => {
                     stats.empty += 1;
