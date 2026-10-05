@@ -38,6 +38,8 @@
 
 use std::sync::RwLock;
 
+#[cfg(not(feature = "cuda"))]
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
@@ -70,6 +72,7 @@ use super::wave_driver::{assemble_wave_contexts, WaveGroups};
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::wave_buffers::wave_root;
+use crate::models::wave_token_ids::device_token_ids;
 use crate::quantized_nn::RmsNorm;
 use candle_nn::Embedding;
 
@@ -283,6 +286,8 @@ pub trait BatchedModelCore {
             // One residual stream: hyper-connections are the Flash-Next
             // lineage's, and no model on this path carries them.
             hyper: None,
+            // Nor a NextN draft head.
+            mtp_head: false,
         }
     }
 
@@ -672,12 +677,17 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             layer_start,
             layer_end,
             x_in,
+            window,
             act_dtype: _,
             adapter,
         } = wave;
         if seq_ids.is_empty() {
             candle::bail!("forward_wave: empty batch");
         }
+        // Read before the contexts borrow the session: whether the caller's
+        // accept walk will select on this wave's head span.
+        #[cfg(feature = "cuda")]
+        let accept_in_place = session.accept_in_place();
         // Refused rather than ignored. Dropping the name here would serve the
         // BASE model under an adapter's name, which reads as a bad fine-tune
         // rather than as an unsupported architecture.
@@ -736,17 +746,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             stride: 0,
         };
         let dev = self.model.device();
-        let prefill_headers =
-            DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(pre_off, pre_q, dev, None)?);
-        #[allow(unused_mut)]
-        let mut glue_meta = BatchedPrefillMeta::new_ragged(glue_off, glue_q, dev, None)?;
-        #[cfg(feature = "cuda")]
-        if let Some(pending) = pending_glue {
-            glue_meta.glue = build_glue_meta(pending, glue_q, dev)?;
-        }
-        #[cfg(not(feature = "cuda"))]
-        let _ = pending_glue;
-        let glue_headers = DecodeHeaders::Prefill(glue_meta);
 
         let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
         let contexts = contexts.as_mut_slice();
@@ -851,10 +850,35 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             if rows > 0 {
                 if let Device::Cuda(d) = self.model.device() {
                     let plan = WavePlan::new(self.model.wave_geometry(embed_dtype));
-                    // The plan now prices all three phases from the wave's
+                    // The plan prices all three phases from the wave's
                     // composition, the forward one included — it knows what the
                     // head's logits cost because the geometry carries `vocab`.
-                    let width = WaveWidth::prefill(rows, 1);
+                    //
+                    // **Each group at its own width.** The head scores every
+                    // decode row and the last row of each prefill sequence, so
+                    // the forward phase is priced by those — a wave that stops
+                    // short of the head scores none. Priced as one sequence, a
+                    // four-context wave ran out of span four logits rows deep.
+                    let scored_rows = if layer_end == num_layers {
+                        n_decode + n_prefill
+                    } else {
+                        0
+                    };
+                    let width = WaveWidth {
+                        prefill_rows: pre_rows + glue_rows,
+                        decode_rows: n_decode,
+                        scored_rows,
+                        // Every prefill and glue sequence: the ragged tables
+                        // hold an entry for each, whatever its length.
+                        prefill_spans: n_prefill + n_glue,
+                        staged_rows: 0,
+                        staged_spans: 0,
+                        // The caller's accept walk selects on the head's span
+                        // only when it reads the logits there.
+                        accept_rows: if accept_in_place { scored_rows } else { 0 },
+                        // This stack's attention is dense: no sparse selection.
+                        qsa_bytes: 0,
+                    };
                     let per_phase = [
                         plan.phase_bytes(LayerPhase::Attention, width),
                         plan.phase_bytes(LayerPhase::Ffn, width),
@@ -898,13 +922,54 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             _ => None,
         };
 
+        // The forward's span, open from here to the head: the wave's token ids
+        // are laid on it before the embedding reads them, and the head's norm
+        // and logits are carved from it after the last layer. It is reset per
+        // *forward* — the lifetime all three actually have.
+        #[cfg(feature = "cuda")]
+        let head_span = match self.model.device() {
+            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+            _ => None,
+        };
+        #[cfg(feature = "cuda")]
+        let fwd_ticket = head_span.as_ref().map(|g| g.ticket());
+        #[cfg(not(feature = "cuda"))]
+        let (head_span, fwd_ticket): (Option<WaveGuard>, Option<WaveTicket>) = (None, None);
+
+        // The prefill and glue groups' ragged tables, built once and read by
+        // every layer — on the forward span, which is what it holds
+        // (`WaveBuffer::{PrefillCuSeqlens, PrefillQLens, PrefillKvLens,
+        // GlueWriteTables}`). Pure functions of the offsets and the staged glue,
+        // so building them here rather than ahead of the tier reads the same
+        // values.
+        let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
+            pre_off, pre_q, dev, fwd_ticket,
+        )?);
+        #[allow(unused_mut)]
+        let mut glue_meta = BatchedPrefillMeta::new_ragged(glue_off, glue_q, dev, fwd_ticket)?;
+        #[cfg(feature = "cuda")]
+        if let Some(pending) = pending_glue {
+            glue_meta.glue = build_glue_meta(pending, glue_q, dev, fwd_ticket)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = pending_glue;
+        let glue_headers = DecodeHeaders::Prefill(glue_meta);
+
         // Combined residual: embed every row flat `[1, total, hidden]`, or resume
         // a paused wave from its persisted stream.
+        let fresh = x_in.is_none();
         let mut x = match x_in {
             None => {
-                let inputs: Vec<Tensor> = contexts.iter().map(|c| c.input_ids.clone()).collect();
-                let packed = TensorCat::from_tensors(1, inputs)?;
-                let xt = packed.to_tensor();
+                // One buffer of every row's id on the forward span — one upload
+                // for ids handed over on the host, a copy for ids already on the
+                // device (`WaveBuffer::RowTokenIds`). The resident table's gather
+                // inherits the ids' arena, so the residual it produces lands
+                // there too (`WaveBuffer::ForwardResidual`), and every layer adds
+                // into it in place. A window that stops short copies it off the
+                // span when it hands it on (below).
+                let inputs: Vec<&Tensor> = contexts.iter().map(|c| c.input_ids).collect();
+                let ids = device_token_ids(&inputs, self.model.device(), fwd_ticket)?;
+                let xt = ids.reshape((1, ids.elem_count()))?;
                 // Prefer the host-served table when the model has one: the rows
                 // are gathered from the mmap over PCIe, so the embedding never
                 // occupies VRAM. Falls back to the resident lookup otherwise.
@@ -933,6 +998,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                             self.model.device(),
                             wave_root(staging.as_ref()),
                             embed_dtype,
+                            fwd_ticket,
                         )?;
                         rows.reshape((1, n, he.layout().ncols))?
                     }
@@ -1044,8 +1110,21 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             )?;
         }
 
+        // A window that stops short hands its residual to a later forward, past
+        // this span's reset. A resumed one is already the caller's buffer and
+        // was added into in place; a fresh one is on the span, so it is copied
+        // into one of the session's held window buffers.
         if layer_end < num_layers {
-            return Ok((WavePhase::Residual(x), None));
+            if !fresh {
+                return Ok((WavePhase::Residual(x), None));
+            }
+            let on_span = x.to_tensor();
+            let held = window.take(on_span.dims(), on_span.dtype(), on_span.device())?;
+            held.slice_set(&on_span, 0, 0)?;
+            return Ok((
+                WavePhase::Residual(TensorCat::from_cat_tensor(held, 0)?),
+                None,
+            ));
         }
 
         // Head over the rows that need logits: every decode row (one token each,
@@ -1067,13 +1146,12 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // A glue-only wave (no decode/prefill rows) has nothing to head — the K/V
         // scatter already happened in the layer loop. Return the residual buffer;
         // the glue caller discards the `WaveStep` (it only needs the side effect).
+        // It is on the forward span, so the span's guard goes back with it.
         if idx.is_empty() {
-            return Ok((WavePhase::Residual(x), None));
+            return Ok((WavePhase::Residual(x), head_span));
         }
-        let pre_norm = select_head_rows(&x_flat, idx, 0)?;
-        // The head's span. It runs after the last layer, so both phase spans are
-        // idle, and this one is reset per *forward* — the lifetime the norm and
-        // the logits actually have.
+        let pre_norm = select_head_rows(&x_flat, idx, 0, fwd_ticket)?;
+        // The head runs on the forward's span, opened before the embedding.
         //
         // Seeded from `wave_root`, which yields a `Backing` carrying a ticket
         // rather than a borrow of the guard. That distinction is the whole
@@ -1082,11 +1160,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // physically on the span. What makes that sound is handing the guard back
         // with them, so the span cannot be reclaimed while the caller holds the
         // values — see `WaveResult`.
-        #[cfg(feature = "cuda")]
-        let head_span = match self.model.device() {
-            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
-            _ => None,
-        };
         let logits = {
             #[cfg(feature = "cuda")]
             {
@@ -1104,8 +1177,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 self.model.output_proj().forward(&normed)?
             }
         };
-        #[cfg(not(feature = "cuda"))]
-        let head_span: Option<WaveGuard> = None;
         Ok((
             WavePhase::Logits(TensorCat::from_cat_tensor(logits, 0)?),
             head_span,

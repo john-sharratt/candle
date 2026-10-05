@@ -22,8 +22,8 @@ use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
-    self, Builder, GroupSchema, Reserved, SectionId, SectionLoads, SelectionRule, SystemItem,
-    SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex, WorkingSetShare,
+    self, Builder, GroupSchema, LayerId, Reserved, SectionId, SectionLoads, SelectionRule,
+    SystemItem, SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex, WorkingSetShare,
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
@@ -58,7 +58,7 @@ use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
 use crate::code_read::PATH_KEY;
 use crate::coding_sampling;
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
 use crate::conv_file_store::ConvFileStore;
 use crate::conv_order;
@@ -75,7 +75,7 @@ use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repeat_guard::{self, RepeatGuard, Verdict};
 use crate::repo_path::shown as shown_unit;
-use crate::repo_scan::DIR_KEY;
+use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resume;
 use crate::retrieval_scope::RetrievalScope;
 use crate::think_budget;
@@ -1012,6 +1012,7 @@ impl InferenceState {
         ingest_dirs: HashMap<String, String>,
         max_depth: Option<usize>,
         compact_substrate: bool,
+        self_check: SelfCheck,
         read_only_substrate: bool,
         qsa_selection_budget: Option<usize>,
         summarize: bool,
@@ -2303,10 +2304,42 @@ impl InferenceState {
                     proj_builder_refresh.clone(),
                     layer,
                     group,
-                    conv_config.clone(),
+                    // Append-only ingest: no mid-decode reprojection. Each turn
+                    // still assembles its slot from the substrate — slots are
+                    // emptied at every seal — so the priming chain, inherited
+                    // through `forked_from`, is in every turn's context.
+                    utility_config(conv_config.clone()),
                 )
                 .map_err(|e| anyhow::anyhow!("{} ingest base create: {e}", il.name))?;
             ingest_bases.insert(il.name.clone(), Mutex::new(base));
+        }
+
+        // `--self-check`: every stored conversation asked whether it is intact,
+        // before the retire sweep, the priming chain and every ingest — so an
+        // ingest unit it tombstones is simply read again by them. Each is read
+        // through a fork of its own layer's base, which projects its history
+        // under that layer's rules (an ingest unit's lineage and nothing else).
+        if self_check != SelfCheck::Off {
+            progress.set_step(LoadStep::SelfCheck);
+            let mut readers: HashMap<LayerId, &Mutex<Sequence>> = HashMap::new();
+            for il in &ingest_layers {
+                if let (Some(layer), Some(base)) = (
+                    proj_builder_refresh.id_for_layer(&il.name),
+                    ingest_bases.get(&il.name),
+                ) {
+                    readers.insert(layer, base);
+                }
+            }
+            let mut layers: HashSet<LayerId> = readers.keys().copied().collect();
+            layers.insert(dialogue_layer);
+            let fork = |layer: LayerId, timeline: TimelineId| -> anyhow::Result<Sequence> {
+                let conv = match readers.get(&layer) {
+                    Some(base) => base.lock().unwrap().fork_resuming(timeline),
+                    None => base_conv.fork_resuming(timeline),
+                };
+                conv.map_err(|e| anyhow::anyhow!("opening timeline {}: {e}", timeline.raw()))
+            };
+            crate::self_check::run(&engine, &conv_config, &layers, &fork, self_check, &progress)?;
         }
 
         for il in &ingest_layers {
@@ -3822,7 +3855,7 @@ fn run_inference_stream(
             // not be read, which are answered with an error rather than dropped
             // (see `tool_round`), so a broken call is a failed round the model
             // and the GUI both see, not a turn that silently reads as final.
-            let round = tool_round::plan(&resp.text);
+            let round = tool_round::plan(&resp.answer);
             // Force-high-resolution is a capture mode: seal the first turn (the
             // tool invocation) into the substrate as the dataset baseline, but
             // do NOT execute the tools — capture-only, so `code_run` / network
@@ -3843,7 +3876,7 @@ fn run_inference_stream(
             // stream, and the GUI reads everything after an unclosed opener —
             // the rounds that follow included — as that call's JSON. Close it
             // in the stream so its card ends where the call did.
-            if !is_final && tool_round::ends_inside_a_call(&resp.text) {
+            if !is_final && tool_round::ends_inside_a_call(&resp.answer) {
                 let _ = tx
                     .send(Ok(StreamItem::Token("\n</tool_call>".to_string())))
                     .await;
@@ -6050,6 +6083,7 @@ impl ZendSession {
         let ingest_dirs = self.config.ingest_dirs.clone();
         let max_depth = self.config.max_depth;
         let compact_substrate = self.config.compact_substrate;
+        let self_check = self.config.self_check;
         let read_only_substrate = self.config.read_only_substrate;
         let qsa_selection_budget = self.config.qsa_selection_budget;
         let summarize = self.config.summarize;
@@ -6141,6 +6175,7 @@ impl ZendSession {
                     ingest_dirs,
                     max_depth,
                     compact_substrate,
+                    self_check,
                     read_only_substrate,
                     qsa_selection_budget,
                     summarize,

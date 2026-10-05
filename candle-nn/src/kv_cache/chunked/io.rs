@@ -59,6 +59,7 @@ pub(super) fn read_band_chunk<'a>(
 /// for every chunk whose palette-4 map is the identity and whose outer scales
 /// are empty or 1.0 — a writer chunk, and any seal under a unity policy — and
 /// for the single latent, whose bands carry no palette metadata.
+#[cfg(feature = "cuda")]
 fn is_plain_palette4(
     cw: &super::types::ChunkWindow,
     head_dim: usize,

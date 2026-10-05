@@ -65,7 +65,9 @@ use std::marker::PhantomData;
 use candle::cuda_backend::cudarc::driver::{
     CudaSlice, CudaStream, DevicePtr, DeviceRepr, SyncOnDrop,
 };
-use candle::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin, WaveTicket};
+use candle::cuda_backend::wave_provenance::{
+    exhausted, wave_alloc, LeaseOrigin, WaveCarve, WaveTicket,
+};
 use candle::cuda_backend::CudaDType;
 use candle::{CudaDevice, CudaStorage, DType, Device, LiveTensor, Result, Shape, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
@@ -239,84 +241,14 @@ pub(crate) fn wave_empty<'w, S: Into<Shape>>(
     }
 }
 
-/// A host-built table uploaded onto the wave's half.
+/// A host-built table uploaded onto the arena a [`WaveTicket`] names, returning
+/// a plain [`Tensor`].
 ///
-/// The upload counterpart of [`wave_empty`], and the one the per-forward
-/// descriptor tables need: a pointer array, a row map, a rotary layout. They are
-/// built on the host, so there is no device operand whose provenance they could
-/// inherit — `Tensor::from_vec` can only ever produce an `Owned` tensor, i.e. a
-/// driver allocation inside the wave, from the memory the reservation
-/// deliberately does not cover.
-///
-/// Takes the guard rather than a ticket so the result borrows it: the tensor
-/// cannot be named after the generation whose reset reclaims the range. That is
-/// the whole reason this is safe where handing out a `Tensor` would not be.
-///
-/// The copy is issued **on the device's stream**, and is not waited for.
-///
-/// Stream-ordered because the destination is recycled wave memory: the legacy
-/// NULL stream does not order against a `NonBlocking` stream (which is what
-/// cudarc creates), so an unordered copy can land on addresses the previous
-/// generation's kernels are still reading. Every other H2D in this tree is
-/// stream-ordered for the same reason.
-///
-/// **No host wait**, matching `memcpy_stod_leased` and every other upload here.
-/// An earlier version synchronized on the theory that `data` — an ordinary `Vec`
-/// that dies at the end of the caller's statement — could still be read. It
-/// cannot: for a transfer *from pageable host memory* the driver stages through
-/// its own pinned buffer and `cuMemcpyHtoDAsync` returns only once `data` has
-/// been copied into it. The DMA to the device may still be outstanding, which is
-/// what the stream ordering covers. The wait bought nothing and blocked the
-/// forward on the previous wave's in-flight kernels.
-pub(crate) fn wave_from_vec<'w, D: CudaDType + candle::WithDType, S: Into<Shape>>(
-    data: Vec<D>,
-    shape: S,
-    device: &Device,
-    wave: Option<&'w WaveGeneration>,
-) -> Result<LiveTensor<'w>> {
-    let shape = shape.into();
-    if shape.elem_count() != data.len() {
-        candle::bail!(
-            "wave_from_vec: {} elements for a shape of {}",
-            data.len(),
-            shape.elem_count()
-        );
-    }
-    let (Device::Cuda(cuda), Some(wave)) = (device, wave) else {
-        return Tensor::from_vec(data, shape, device);
-    };
-    let bytes = std::mem::size_of_val(data.as_slice());
-    let ticket = wave.ticket();
-    let range = wave.alloc(bytes, WAVE_ALIGN)?;
-    let stream = cuda.cuda_stream();
-    // SAFETY: `range` is `bytes` of the half pinned by `wave`, nothing else
-    // addresses it within this generation, and the call returns only once `data`
-    // has been staged out of the pageable `Vec` (see the doc above).
-    unsafe {
-        candle::cuda_backend::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-            range.ptr,
-            data.as_ptr() as *const std::ffi::c_void,
-            bytes,
-            stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| candle::Error::Msg(format!("uploading a wave table: {e}")))?;
-    }
-    // SAFETY: as above, and the returned tensor borrows `wave`, so it cannot be
-    // named after the guard that reclaims the range has dropped.
-    unsafe {
-        LiveTensor::from_leased_cuda_ptr(
-            range.ptr,
-            D::DTYPE,
-            shape,
-            device,
-            LeaseOrigin::Wave(ticket),
-        )
-    }
-}
-
-/// [`wave_from_vec`] for a holder of a [`WaveTicket`] rather than of the guard,
-/// returning a plain [`Tensor`].
+/// The upload counterpart of [`wave_empty`]: a pointer array, a row map, a
+/// rotary layout are built on the host, so there is no device operand whose
+/// provenance they could inherit — `Tensor::from_vec` can only ever produce an
+/// `Owned` tensor, i.e. a driver allocation inside the wave, from the memory the
+/// reservation deliberately does not cover.
 ///
 /// This is the form the per-wave **metadata** uploads take — ragged prefill
 /// offsets, page and candidate tables, gathered position ids — which is exactly
@@ -329,8 +261,18 @@ pub(crate) fn wave_from_vec<'w, D: CudaDType + candle::WithDType, S: Into<Shape>
 /// Sound for the same reason as [`wave_empty_ticketed`]: the lease frees nothing
 /// on drop and the range's only reclaim is the generation's reset, which cannot
 /// happen while the forward that opened it is still running. A ticket whose
-/// generation has closed resolves to `None` and this falls back to an ordinary
-/// upload, which is a correct answer rather than a silent failure.
+/// generation has closed is an ordinary upload, which is a correct answer
+/// rather than a silent failure; an open generation with no room is an error.
+///
+/// The copy is issued **on the device's stream**, and is not waited for.
+/// Stream-ordered because the destination is recycled wave memory: the legacy
+/// NULL stream does not order against a `NonBlocking` stream (which is what
+/// cudarc creates), so an unordered copy can land on addresses the previous
+/// generation's kernels are still reading. **No host wait**: for a transfer
+/// *from pageable host memory* the driver stages through its own pinned buffer
+/// and `cuMemcpyHtoDAsync` returns only once `data` has been copied into it, so
+/// the `Vec` may drop when this returns. The DMA to the device may still be
+/// outstanding, which is what the stream ordering covers.
 pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<Shape>>(
     data: Vec<D>,
     shape: S,
@@ -349,15 +291,17 @@ pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<S
     let (Device::Cuda(cuda), Some(ticket)) = (device, ticket) else {
         return Tensor::from_vec(data, shape, device);
     };
-    let Some(ptr) = wave_alloc(ticket, bytes, WAVE_ALIGN) else {
-        return Tensor::from_vec(data, shape, device);
+    let ptr = match wave_alloc(ticket, bytes, WAVE_ALIGN) {
+        WaveCarve::Carved(ptr) => ptr,
+        WaveCarve::Closed => return Tensor::from_vec(data, shape, device),
+        WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
     };
     let stream = cuda.cuda_stream();
     // SAFETY: `ptr` addresses `bytes` the resolver just carved from the ticket's
     // arena and nothing else holds that range in this generation. The copy is
     // issued on the device's own stream, and the call returns only once `data`
-    // has been staged out of the pageable `Vec` — the same property
-    // [`wave_from_vec`] relies on — so the `Vec` may drop when this returns.
+    // has been staged out of the pageable `Vec` (see the doc above), so the
+    // `Vec` may drop when this returns.
     unsafe {
         candle::cuda_backend::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
             ptr,
@@ -373,6 +317,54 @@ pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<S
     unsafe { Tensor::from_leased_cuda_ptr(ptr, D::DTYPE, shape, device, LeaseOrigin::Wave(ticket)) }
 }
 
+/// Write `data` from the host into `dst`, a contiguous buffer that already
+/// exists — the upload that allocates nothing.
+///
+/// For state a caller holds across forwards and refills each time: the copy
+/// lands in place, so the only device memory involved is the buffer's own.
+/// Issued on the device's stream and not waited for, for the reasons
+/// [`wave_from_vec_ticketed`] gives — the call returns once `data` is staged.
+pub(crate) fn upload_into<D: CudaDType + candle::WithDType>(
+    dst: &Tensor,
+    data: &[D],
+) -> Result<()> {
+    if dst.dtype() != D::DTYPE || !dst.is_contiguous() || dst.elem_count() != data.len() {
+        candle::bail!(
+            "upload_into: {} {:?} elements into a {:?} {:?} buffer (contiguous: {})",
+            data.len(),
+            D::DTYPE,
+            dst.dtype(),
+            dst.shape(),
+            dst.is_contiguous()
+        );
+    }
+    let Device::Cuda(cuda) = dst.device() else {
+        candle::bail!("upload_into: the buffer must be on CUDA");
+    };
+    let stream = cuda.cuda_stream();
+    let (storage, layout) = dst.storage_and_layout();
+    let candle::Storage::Cuda(c) = &*storage else {
+        candle::bail!("upload_into: the buffer must be on CUDA");
+    };
+    let slice = c.as_cuda_slice::<D>()?;
+    let (base, _guard) = slice.device_ptr(&stream);
+    let at = base + (layout.start_offset() * std::mem::size_of::<D>()) as u64;
+    // SAFETY: `at` addresses `data.len()` elements of `dst`'s own storage (the
+    // length and contiguity are checked above), and the copy is issued on the
+    // stream every reader of `dst` is ordered on.
+    unsafe {
+        candle::cuda_backend::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            at,
+            data.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(data),
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| candle::Error::Msg(format!("upload_into: {e}")))?;
+    }
+    Ok(())
+}
+
 /// [`wave_empty`] for a holder of a [`WaveTicket`] rather than of the guard.
 ///
 /// The ticket is a `Copy` coordinate of an open generation, so a caller that
@@ -380,8 +372,8 @@ pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<S
 /// result is a `Tensor`, i.e. `'static`; that is sound because it **owns
 /// nothing** — it is a lease, so its drop frees nothing — and the wave's own
 /// reset reclaims the range. A ticket whose generation has already closed
-/// resolves to `None` and this allocates from the pool. It issues no driver
-/// call.
+/// allocates from the pool; an open generation with no room is an error. It
+/// issues no driver call.
 ///
 /// SAFETY / CONTRACT: as [`candle::Tensor::empty`] — every element must be
 /// written before it is read.
@@ -396,8 +388,10 @@ pub(crate) fn wave_empty_ticketed<S: Into<Shape>>(
     let (Device::Cuda(_), Some(ticket)) = (device, ticket) else {
         return Tensor::empty(shape, dtype, device);
     };
-    let Some(ptr) = wave_alloc(ticket, bytes, WAVE_ALIGN) else {
-        return Tensor::empty(shape, dtype, device);
+    let ptr = match wave_alloc(ticket, bytes, WAVE_ALIGN) {
+        WaveCarve::Carved(ptr) => ptr,
+        WaveCarve::Closed => return Tensor::empty(shape, dtype, device),
+        WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
     };
     // SAFETY: `ptr` addresses `bytes` the resolver just carved from the ticket's
     // arena, and no other claimant holds that range within this generation. The

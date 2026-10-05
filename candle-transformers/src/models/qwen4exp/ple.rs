@@ -17,12 +17,14 @@
 //!    alongside — carrying `(kernel−1)·dilation` = 9 tokens of history per
 //!    sequence, which is the third per-session recurrent state.
 
+use candle::wave_provenance::WaveTicket;
 use candle::{Result, Tensor, D};
 use candle_nn::ops::sigmoid;
 
 use super::config::PleConfig;
 use super::hyper::hc_grouped_norm;
 use super::model::PleSource;
+use super::state_slots::state_buffer;
 
 /// One sequence's carried PLE state: the conv history tail and the hash
 /// window's preceding token ids.
@@ -31,25 +33,57 @@ pub struct PleState {
     /// `[history, hc_dim]` — the last `(conv_kernel−1)·ngram_size` normed
     /// gated-value rows, zeros at sequence start (causal padding).
     pub conv_hist: Tensor,
+    /// The buffer the fused block writes the next history into, which then
+    /// becomes [`Self::conv_hist`] while the history it read becomes this.
+    /// `None` until [`Self::ensure_spare`] makes one, which admission does
+    /// before every forward — so the fused block never allocates it.
+    ///
+    /// Two buffers so that a wave never writes the history it entered with:
+    /// that is what a failed wave restores and what a verify's rewind starts
+    /// from. Anything that installs a buffer as `conv_hist` that could be this
+    /// one — putting back a history this state already held — must drop it.
+    pub spare_hist: Option<Tensor>,
     /// The last `ngram_size − 1` token ids seen, oldest first. Shorter at
     /// sequence start; a missing predecessor hashes as EOS.
     pub prev: Vec<u32>,
 }
 
 impl PleState {
+    /// A sequence-start state: a zero history (causal padding) in a
+    /// recurrent-state slot on the device. Claimed at admission, never inside
+    /// a forward.
     pub fn zeros(cfg: &PleConfig, hc_dim: usize, dev: &candle::Device) -> Result<Self> {
         Ok(Self {
-            conv_hist: Tensor::zeros((cfg.conv_history(), hc_dim), candle::DType::F32, dev)?,
+            conv_hist: state_buffer(dev, (cfg.conv_history(), hc_dim), true)?,
+            spare_hist: None,
             prev: Vec::new(),
         })
     }
 
-    /// An independent copy (the state is replaced, not written through, so a
-    /// plain clone of the handles suffices — mirrored on [`Self::snapshot`]
-    /// for symmetry with the other carried states).
+    /// Make the spare history when this state has none — at admission, outside
+    /// the forward. A new state has none, and a rewind that puts back a history
+    /// this state may already hold as its spare drops it.
+    pub fn ensure_spare(&mut self) -> Result<()> {
+        if self.spare_hist.is_none() {
+            // Fully written by the fused block before anything reads it
+            // (hot-path invariant 6), in a recurrent-state slot beside the
+            // history.
+            self.spare_hist = Some(state_buffer(
+                self.conv_hist.device(),
+                self.conv_hist.shape(),
+                false,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// An independent copy: the history is replaced, never written through, so
+    /// a clone of the handles suffices — the spare included, which is a buffer
+    /// distinct from the history whichever of the two this copy is restored as.
     pub fn snapshot(&self) -> Self {
         Self {
             conv_hist: self.conv_hist.clone(),
+            spare_hist: self.spare_hist.clone(),
             prev: self.prev.clone(),
         }
     }
@@ -119,6 +153,7 @@ impl PleState {
         }
         Ok(Self {
             conv_hist: Tensor::from_vec(vals, (r, c), dev)?,
+            spare_hist: None,
             prev,
         })
     }
@@ -352,6 +387,7 @@ pub fn ple_apply_spans(
     w: &PleWeights,
     cfg: &PleConfig,
     eps: f64,
+    root: Option<WaveTicket>,
 ) -> Result<(Tensor, Vec<Option<Tensor>>)> {
     let (total, hc, n_embd) = res_hc.dims3()?;
     let hc_dim = hc * n_embd;
@@ -379,7 +415,7 @@ pub fn ple_apply_spans(
         }
     }
     let hidden = w.key.dim(1)?; // `key` is [hc·n_embd, hidden]
-    let emb = table.rows(&flat)?.reshape((total, hidden))?;
+    let emb = table.rows(&flat, root)?.reshape((total, hidden))?;
     let (gated, normalized) = ple_rows(res_hc, &emb, w, eps)?;
 
     // The conv's gather source: every sequence's history, then the wave's rows.
@@ -463,7 +499,7 @@ mod tests {
     struct TableRows(Tensor);
 
     impl PleSource for TableRows {
-        fn rows(&self, ids: &[u32]) -> Result<Tensor> {
+        fn rows(&self, ids: &[u32], _root: Option<WaveTicket>) -> Result<Tensor> {
             let idx = Tensor::from_vec(ids.to_vec(), ids.len(), self.0.device())?;
             self.0.index_select(&idx, 0)
         }
@@ -538,7 +574,7 @@ mod tests {
         let emb_of = |toks: &[u32], prev: &mut Vec<u32>| -> Tensor {
             let flat: Vec<u32> = ple_row_ids(&c, toks, prev).into_iter().flatten().collect();
             table
-                .rows(&flat)
+                .rows(&flat, None)
                 .unwrap()
                 .reshape((toks.len(), n_embd))
                 .unwrap()
@@ -584,7 +620,7 @@ mod tests {
             });
             start += toks.len();
         }
-        let (out, caps) = ple_apply_spans(&res, &mut spans, &table, &w, &c, 1e-6).unwrap();
+        let (out, caps) = ple_apply_spans(&res, &mut spans, &table, &w, &c, 1e-6, None).unwrap();
         drop(spans);
 
         for (i, (got, want)) in states.iter().zip(&ref_states).enumerate() {

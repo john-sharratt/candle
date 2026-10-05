@@ -18,9 +18,8 @@ use candle_kernels::delta_net::{
 
 use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, SeqSpan};
 use super::state_store::RecurrentStateStore;
-use crate::models::wave_buffers::{wave_from_vec, wave_from_vec_ticketed};
+use crate::models::wave_buffers::wave_from_vec_ticketed;
 use candle::wave_provenance::WaveTicket;
-use candle_nn::kv_cache::WaveGeneration;
 
 /// The wave tensors every fused DeltaNet kernel reads through strides, plus
 /// the geometry derived from them — validated once per layer, not once per
@@ -239,13 +238,13 @@ impl DeltaNetWaveTable<'_> {
 /// Build the forward's decode table from the wave's spans and state stores —
 /// `None` when the wave carries no decode span. Called once per forward,
 /// before any launch, so its two small uploads land on an empty queue.
-/// `forward_wave` is the [`LayerPhase::Forward`] generation the two uploads land
+/// `forward` names the [`LayerPhase::Forward`] generation the two uploads land
 /// on — held by the caller across the whole layer sweep, which is exactly as
-/// long as the table is read for.
+/// long as the table is read for (`WaveBuffer::DeltaNetDecodeTable`).
 pub fn build_wave_table<'w>(
     spans: &[SeqSpan],
     stores: &[&mut RecurrentStateStore],
-    forward_wave: Option<&'w WaveGeneration>,
+    forward: Option<WaveTicket>,
 ) -> Result<Option<DeltaNetWaveTable<'w>>> {
     let decode: Vec<usize> = (0..spans.len()).filter(|&i| spans[i].len == 1).collect();
     if decode.is_empty() {
@@ -294,8 +293,8 @@ pub fn build_wave_table<'w>(
     // on it yields a driver allocation while implying otherwise.
     let dev = stores[decode[0]].layer_state(layers[0])?.s.device().clone();
     Ok(Some(DeltaNetWaveTable {
-        ptrs: wave_from_vec(ptrs, (layers.len(), 4, n), &dev, forward_wave)?,
-        rows: wave_from_vec(rows, n, &dev, forward_wave)?,
+        ptrs: wave_from_vec_ticketed(ptrs, (layers.len(), 4, n), &dev, forward)?,
+        rows: wave_from_vec_ticketed(rows, n, &dev, forward)?,
         layers,
     }))
 }

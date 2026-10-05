@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::capture_rows::CaptureRows;
 use super::config::IndexerConfig;
 /// Block keys per live-tail key page — see `index_keys`.
 pub use super::index_keys::PAGE_BLOCKS;
@@ -56,7 +57,7 @@ use crate::models::delta_net::mix::SeqSpan;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::operand_guard::expect_dense;
 use crate::models::qsa_selection::QsaSelection;
-use crate::models::wave_buffers::wave_from_vec_ticketed;
+use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 use candle::wave_provenance::WaveTicket;
 use candle_nn::kv_cache::{arena_regions, plan_slot_moves, relocate_tensor, ArenaSlot, SlotTenant};
 
@@ -316,6 +317,54 @@ impl IndexCache {
         !self.pages.is_empty()
     }
 
+    /// The most bytes [`Self::score_rows`] can carve on its ticket's arena for
+    /// `t` query rows whose deepest sees `cand_max` candidate blocks, after a
+    /// wave appended `appended` more blocks to this cache — each carve rounded
+    /// up to the bump's alignment, so the sum is a bound and never short.
+    ///
+    /// Mirrors the two routes: the paged scorer's page, offset and count
+    /// tables, and — when the live tail goes to cuBLAS — the rotated tail, its
+    /// page table and every tile's scoring product (a bump never rewinds within
+    /// a phase, so the tiles add up).
+    pub fn score_bound(
+        &self,
+        t: usize,
+        cand_max: usize,
+        appended: usize,
+        heads: usize,
+        d: usize,
+        align: usize,
+    ) -> Result<usize> {
+        use candle_kernels::simple::qsa_score_paged::PAGE_WORDS;
+
+        let a = |b: usize| b.div_ceil(align) * align;
+        let page_cols = self.page_row_span();
+        let live_cols = cand_max.saturating_sub(page_cols);
+        let tail_in_paged = live_cols > 0 && TailRoute::for_span(t, live_cols) == TailRoute::Paged;
+        let paged_cols = if tail_in_paged { cand_max } else { page_cols };
+        let mut bytes = 0usize;
+        if paged_cols > 0 {
+            let mut chunks = 0usize;
+            for placed in &self.pages {
+                chunks += placed.page.descriptors()?.len();
+            }
+            if tail_in_paged {
+                chunks += (self.n_blocks + appended).div_ceil(PAGE_BLOCKS);
+            }
+            bytes += a(chunks * PAGE_WORDS * 8) + a((chunks + 1) * 4) + a(t * 4);
+        }
+        if !tail_in_paged && live_cols > 0 {
+            bytes += a(live_cols.div_ceil(PAGE_BLOCKS) * 8) + a(live_cols * d * 4);
+            let per_tile = (SCORE_TILE_BYTES / (heads * live_cols * 4)).clamp(1, t);
+            let (full, rem) = (t / per_tile, t % per_tile);
+            bytes += full * a(per_tile * heads * live_cols * 4);
+            if rem > 0 {
+                bytes += a(rem * heads * live_cols * 4);
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Blocks the live tail has completed.
     pub fn live_blocks(&self) -> usize {
         self.n_blocks
@@ -354,13 +403,7 @@ impl IndexCache {
     /// derives the candidate prefix from it, so a short block is expressible;
     /// a block pooled from another turn's tokens is not correctable at all.
     #[cfg(feature = "cuda")]
-    pub fn flush_open_block(
-        &mut self,
-        w: &IndexerWeights,
-        rms_eps: f64,
-        // The open layer phase, for the flush job table.
-        ticket: Option<WaveTicket>,
-    ) -> Result<Option<usize>> {
+    pub fn flush_open_block(&mut self, w: &IndexerWeights, rms_eps: f64) -> Result<Option<usize>> {
         use candle_kernels::simple::qsa_index_append::{run_qsa_index_flush, FLUSH_WORDS};
 
         if self.n_open == 0 {
@@ -378,18 +421,25 @@ impl IndexCache {
             candle::bail!("qsa index flush runs on CUDA");
         };
         let stream = cuda.cuda_stream();
-        let jobs_t = wave_from_vec_ticketed(jobs, (FLUSH_WORDS,), &device, ticket)?;
-        candle::set_kernel_breadcrumb("run_qsa_index_flush", file!(), line!());
-        unsafe {
-            run_qsa_index_flush(
-                i64_ptr(&jobs_t)? as *const i64,
-                tensor_ptr(&w.k_norm)? as *const f32,
-                d as i32,
-                rms_eps as f32,
-                1,
-                stream.cu_stream() as *mut std::ffi::c_void,
-            );
-        }
+        debug_assert_eq!(jobs.len(), FLUSH_WORDS);
+        let k_norm = tensor_ptr(&w.k_norm)?;
+        // The one job through the device's staging scratch: a flush runs at a
+        // page close between forwards as often as inside one, and allocates
+        // nothing in either.
+        cuda.with_staged_upload(&jobs, |jobs_ptr| {
+            candle::set_kernel_breadcrumb("run_qsa_index_flush", file!(), line!());
+            unsafe {
+                run_qsa_index_flush(
+                    jobs_ptr as *const i64,
+                    k_norm as *const f32,
+                    d as i32,
+                    rms_eps as f32,
+                    1,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                );
+            }
+            Ok(())
+        })?;
         self.n_blocks += 1;
         self.n_open = 0;
         Ok(Some(cells))
@@ -435,7 +485,7 @@ impl IndexCache {
         rms_eps: f64,
     ) -> Result<usize> {
         // Closing a page is index maintenance, not a forward: no phase is open.
-        let cells = self.flush_open_block(w, rms_eps, None)?;
+        let cells = self.flush_open_block(w, rms_eps)?;
         if self.n_blocks == 0 {
             return Ok(0);
         }
@@ -1280,7 +1330,7 @@ pub fn rotate_rows(
     if rows_per_pos == 0 {
         candle::bail!("qsa rope rows: rows_per_pos must be at least 1");
     }
-    let dst = Tensor::empty((n, d), DType::F32, device)?;
+    let dst = wave_empty_ticketed((n, d), DType::F32, device, ticket)?;
     if n == 0 {
         return Ok(dst);
     }
@@ -1403,12 +1453,19 @@ pub struct SelectionTable {
 }
 
 impl SelectionTable {
-    /// An uninitialised table for `rows` queries.
+    /// An uninitialised table for `rows` queries, on `ticket`'s arena when one
+    /// is given — the layer phase the attention that reads it runs in.
     ///
     /// Uninitialised is correct, not sloppy: the kernels read `entries` only
     /// below each row's `cnt`, and every row's `cnt` is written by the
     /// selection kernel (hot-path invariant 6).
-    pub fn new(rows: usize, ratio: usize, top_k: usize, device: &Device) -> Result<Self> {
+    pub fn new(
+        rows: usize,
+        ratio: usize,
+        top_k: usize,
+        device: &Device,
+        ticket: Option<WaveTicket>,
+    ) -> Result<Self> {
         if ratio == 0 || ratio > MAX_RATIO {
             candle::bail!("qsa: compression ratio {ratio} outside 1..={MAX_RATIO}");
         }
@@ -1425,8 +1482,8 @@ impl SelectionTable {
         }
         let stride = max_entries(top_k, ratio);
         Ok(Self {
-            entries: Tensor::empty((rows, stride), DType::U32, device)?,
-            cnt: Tensor::empty((rows,), DType::U32, device)?,
+            entries: wave_empty_ticketed((rows, stride), DType::U32, device, ticket)?,
+            cnt: wave_empty_ticketed((rows,), DType::U32, device, ticket)?,
             stride,
             ratio,
         })
@@ -1486,7 +1543,9 @@ impl SelectionTable {
         packed.extend_from_slice(cand);
         packed.extend(qpos.iter().map(|&p| p as u32));
         packed.extend_from_slice(tail);
-        let packed_t = Tensor::from_slice(&packed, (3, rows), scores.device())?;
+        // Beside the scores, on the layer's span, where the rest of the
+        // selection lives.
+        let packed_t = scores.from_vec_beside(packed, (3, rows))?;
 
         let (s_s, s_l) = scores.storage_and_layout();
         let s_slice = match &*s_s {
@@ -1726,10 +1785,6 @@ pub fn append_wave(
     w: &IndexerWeights,
     ratio: usize,
     rms_eps: f64,
-    // The span the job and carry tables belong to — rebuilt per call and dead
-    // once the launches below are issued, so a per-layer phase is their
-    // lifetime. `None` falls back to an ordinary upload.
-    ticket: Option<WaveTicket>,
 ) -> Result<()> {
     use candle_kernels::simple::qsa_index_append::{
         run_qsa_index_append, run_qsa_index_carry, CARRY_WORDS, JOB_WORDS, MAX_D,
@@ -1806,46 +1861,48 @@ pub fn append_wave(
     }
 
     if !jobs.is_empty() || !carries.is_empty() {
-        let stream = match &device {
-            candle::Device::Cuda(dev) => dev.cuda_stream(),
-            _ => candle::bail!("qsa append runs on CUDA"),
+        let candle::Device::Cuda(dev) = &device else {
+            candle::bail!("qsa append runs on CUDA");
         };
+        let stream = dev.cuda_stream();
         let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
         let n_jobs = jobs.len() / JOB_WORDS;
         let n_carry = carries.len() / CARRY_WORDS;
-        // Kept alive until the launches are issued.
-        let jobs_t = (!jobs.is_empty())
-            .then(|| wave_from_vec_ticketed(jobs, (n_jobs * JOB_WORDS,), &device, ticket))
-            .transpose()?;
-        let carries_t = (!carries.is_empty())
-            .then(|| wave_from_vec_ticketed(carries, (n_carry * CARRY_WORDS,), &device, ticket))
-            .transpose()?;
-        if let Some(t) = jobs_t.as_ref() {
-            let k_norm = tensor_ptr(&w.k_norm)?;
-            candle::set_kernel_breadcrumb("run_qsa_index_append", file!(), line!());
-            unsafe {
-                run_qsa_index_append(
-                    i64_ptr(t)? as *const i64,
-                    k_norm as *const f32,
-                    d as i32,
-                    ratio as i32,
-                    rms_eps as f32,
-                    n_jobs as i32,
-                    raw_stream,
-                );
+        // Both tables in one upload through the device's staging scratch — the
+        // jobs, then the carries — so an append allocates nothing, whether it
+        // runs inside a forward or in a rewind between two.
+        let carries_at = jobs.len();
+        let mut table = jobs;
+        table.extend_from_slice(&carries);
+        let k_norm = tensor_ptr(&w.k_norm)?;
+        dev.with_staged_upload(&table, |base| {
+            if n_jobs > 0 {
+                candle::set_kernel_breadcrumb("run_qsa_index_append", file!(), line!());
+                unsafe {
+                    run_qsa_index_append(
+                        base as *const i64,
+                        k_norm as *const f32,
+                        d as i32,
+                        ratio as i32,
+                        rms_eps as f32,
+                        n_jobs as i32,
+                        raw_stream,
+                    );
+                }
             }
-        }
-        if let Some(t) = carries_t.as_ref() {
-            candle::set_kernel_breadcrumb("run_qsa_index_carry", file!(), line!());
-            unsafe {
-                run_qsa_index_carry(
-                    i64_ptr(t)? as *const i64,
-                    d as i32,
-                    n_carry as i32,
-                    raw_stream,
-                );
+            if n_carry > 0 {
+                candle::set_kernel_breadcrumb("run_qsa_index_carry", file!(), line!());
+                unsafe {
+                    run_qsa_index_carry(
+                        (base as *const i64).add(carries_at),
+                        d as i32,
+                        n_carry as i32,
+                        raw_stream,
+                    );
+                }
             }
-        }
+            Ok(())
+        })?;
     }
 
     for (span, (n_blocks, n_open)) in work.iter_mut().zip(commits) {
@@ -2018,6 +2075,7 @@ pub fn select_layer(
             compress_ratio,
             idx_cfg.top_k,
             device,
+            ticket,
         )?)
     } else {
         None
@@ -2039,18 +2097,28 @@ pub fn select_layer(
     };
     // A verifying span keeps this layer's raw keys, so a partial accept can
     // restore the entering cache and re-append exactly the accepted rows
-    // (`super::spec`). Owned: `k_all` is a wave-arena tensor the generation
-    // reset reclaims, and `contiguous()` cannot leave the arena — it returns
-    // `self.clone()` on an already-contiguous tensor and allocates with
-    // `self.wave_ticket()` when it does copy. The rewind reads this after the
-    // wave.
+    // (`super::spec`). `k_all` is on the layer's arena, which the phase reset
+    // reclaims, and the rewind reads the keys after the wave — so they are
+    // copied into the cohort's kept-row buffer for this layer, at the
+    // sequence's stash row.
     if let Some(c) = capture {
+        let SpecCapture { seqs, rows, .. } = c;
+        let keys_buf = rows.qsa.get(kv).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "qsa capture: KV layer {kv} past the {} the capture was sized for",
+                rows.qsa.len()
+            ))
+        })?;
         for span in spans {
-            if let Some(s) = c.seqs.get_mut(&span.seq) {
+            if let Some(s) = seqs.get_mut(&span.seq) {
                 if s.qsa_keys.len() <= kv {
                     s.qsa_keys.resize_with(kv + 1, || None);
                 }
-                s.qsa_keys[kv] = Some(k_all.narrow(0, span.start, span.len)?.to_owned_tensor()?);
+                s.qsa_keys[kv] = Some(CaptureRows::keep(
+                    keys_buf,
+                    s.row,
+                    &k_all.narrow(0, span.start, span.len)?,
+                )?);
             }
         }
     }
@@ -2082,7 +2150,7 @@ pub fn select_layer(
             work.len()
         );
     }
-    append_wave(&mut work, &k_all, indexer, compress_ratio, eps, ticket)?;
+    append_wave(&mut work, &k_all, indexer, compress_ratio, eps)?;
 
     if let (Some(table), Some(q_all)) = (table.as_mut(), q_all.as_ref()) {
         // The widest row in the wave sets the score buffer's stride, so every
@@ -2109,7 +2177,7 @@ pub fn select_layer(
             .max()
             .unwrap_or(0)
             .max(1);
-        let scores = Tensor::empty((total_rows, widest), DType::F32, device)?;
+        let scores = wave_empty_ticketed((total_rows, widest), DType::F32, device, ticket)?;
         let mut cand: Vec<u32> = vec![0; total_rows];
         let mut tail: Vec<u32> = vec![1; total_rows];
         for (span, &rung) in spans.iter().zip(&span_rungs) {
@@ -2203,7 +2271,9 @@ mod tests {
     use crate::models::qwen4exp::qsa_select::{
         entry_block, entry_cells, selection_entries, RowSelection,
     };
+    use crate::models::qwen4exp::select_bytes::{select_layer_bytes, CARVE_ALIGN};
     use crate::models::rope_schedule::plain_inv_freq;
+    use candle_nn::kv_cache::{begin_wave, LayerPhase};
 
     fn cuda() -> Option<Device> {
         match Device::cuda_if_available(0) {
@@ -2674,7 +2744,7 @@ mod tests {
             }
         }
         let scores = Tensor::from_vec(host.clone(), (rows, blocks), &device)?;
-        let mut table = SelectionTable::new(rows, ratio, top_k, &device)?;
+        let mut table = SelectionTable::new(rows, ratio, top_k, &device, None)?;
         // Uniform blocks here, so the tail is what the kernel used to derive.
         let tail: Vec<u32> = qpos
             .iter()
@@ -2722,7 +2792,7 @@ mod tests {
         let cand: Vec<u32> = qpos.iter().map(|&p| ((p + 1) / ratio) as u32).collect();
         let host = lcg(rows * blocks, 0x53, 4.0);
         let scores = Tensor::from_vec(host.clone(), (rows, blocks), &device)?;
-        let mut table = SelectionTable::new(rows, ratio, top_k, &device)?;
+        let mut table = SelectionTable::new(rows, ratio, top_k, &device, None)?;
         // Uniform blocks here, so the tail is what the kernel used to derive.
         let tail: Vec<u32> = qpos
             .iter()
@@ -2816,7 +2886,7 @@ mod tests {
         fn append(&self, cache: &mut IndexCache, start: usize, rows: usize) -> Result<()> {
             cache.ensure_capacity(start + rows, self.ratio)?;
             let mut work = [AppendSpan { cache, start, rows }];
-            append_wave(&mut work, &self.keys, &self.w, self.ratio, self.eps, None)
+            append_wave(&mut work, &self.keys, &self.w, self.ratio, self.eps)
         }
 
         /// A cache holding the first `tokens` tokens, appended in waves whose
@@ -2873,7 +2943,7 @@ mod tests {
             let cand = cache.score_rows(
                 &q, qpos, &self.cfg, self.ratio, &self.rope, 0, &scores, widest, 0, None,
             )?;
-            let mut table = SelectionTable::new(t, self.ratio, self.cfg.top_k, &self.device)?;
+            let mut table = SelectionTable::new(t, self.ratio, self.cfg.top_k, &self.device, None)?;
             let tail: Vec<u32> = qpos
                 .iter()
                 .map(|&p| cache.tail_len(p, self.ratio))
@@ -2881,6 +2951,70 @@ mod tests {
             table.fill_rows(&scores, &cand, qpos, &tail, self.ratio, self.cfg.top_k, 0)?;
             (0..t).map(|r| table.row_to_host(r)).collect()
         }
+    }
+
+    /// **The stated bound covers what a layer's selection actually carves.**
+    ///
+    /// The wave plan prices a layer's selection at
+    /// [`super::super::select_bytes::select_layer_bytes`], and an open phase
+    /// refuses anything past its price — so a bound short of the real carves
+    /// fails the wave. Measured here by the cursor: a marker carve before
+    /// `select_layer` and one after, at a depth where the selection engages,
+    /// with the block input on the phase as the forward puts it.
+    #[test]
+    fn the_selection_bound_covers_what_a_layer_carves() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let Device::Cuda(cd) = &device else {
+            return Ok(());
+        };
+        let rig = Rig::new(device.clone(), 128)?;
+        let (seq, past, rows) = (7usize, 96usize, 16usize);
+        let mut cache = rig.build(past)?;
+        cache.ensure_capacity(past + rows, rig.ratio)?;
+        let mut idx_map: HashMap<usize, Vec<IndexCache>> = HashMap::new();
+        idx_map.insert(seq, vec![cache]);
+        let spans = [SeqSpan {
+            seq,
+            start: 0,
+            len: rows,
+        }];
+        let offsets = [past];
+        assert!(selection_engages(past + rows, &rig.cfg, rig.ratio));
+        let bound = select_layer_bytes(0, rig.ratio, &spans, &offsets, &idx_map, &rig.cfg)?;
+
+        let hidden = rig.w.q_proj.dim(1)?;
+        let h = Tensor::from_vec(lcg(rows * hidden, 0x77, 1.0), (rows, hidden), &device)?;
+        let wave = begin_wave(&cd.cuda_stream(), LayerPhase::Attention)?;
+        let ticket = Some(wave.ticket());
+        let h_wave = wave_empty_ticketed((rows, hidden), DType::F32, &device, ticket)?;
+        h_wave.slice_set(&h, 0, 0)?;
+        let before = wave.alloc(1, CARVE_ALIGN)?.ptr;
+        let sel = select_layer(
+            0,
+            rig.ratio,
+            &rig.w,
+            &rig.rope,
+            &h_wave,
+            &spans,
+            &offsets,
+            &mut idx_map,
+            None,
+            rows,
+            &rig.cfg,
+            rig.eps,
+            &device,
+            &AtomicU64::new(0),
+            ticket,
+        )?;
+        assert!(sel.is_some(), "the selection engaged");
+        drop(sel);
+        let after = wave.alloc(1, CARVE_ALIGN)?.ptr;
+        let carved = (after - before) as usize - CARVE_ALIGN;
+        assert!(
+            carved <= bound,
+            "select_layer carved {carved} B against a stated bound of {bound} B"
+        );
+        Ok(())
     }
 
     /// **The cache survives the record byte-for-byte, at every ragged width.**
@@ -3463,7 +3597,7 @@ mod tests {
                 start: at,
                 rows,
             }];
-            append_wave(&mut work, &k_all, &w_gpu, ratio, eps, None)?;
+            append_wave(&mut work, &k_all, &w_gpu, ratio, eps)?;
             at += rows;
             assert_eq!(cache.len(ratio), at, "cache length after {at} tokens");
         }
@@ -3479,7 +3613,7 @@ mod tests {
             eps,
             None,
         )?;
-        let mut table = SelectionTable::new(t, ratio, cfg.top_k, &device)?;
+        let mut table = SelectionTable::new(t, ratio, cfg.top_k, &device, None)?;
         let widest = t.div_ceil(ratio).max(1);
         let scores = Tensor::empty((t, widest), DType::F32, &device)?;
         let cand = cache.score_rows(

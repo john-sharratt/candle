@@ -176,6 +176,15 @@ pub(crate) trait Ground {
     /// accounting, and between them took the zone to its floor with nothing
     /// admitted.
     fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool;
+
+    /// The rate model has judged that more prefill rows will not make the
+    /// forward faster: spend no more rows this pass, and offer the rest of the
+    /// band as **joins** — turns that share the forwards to come at the width
+    /// already admitted rather than widening this one. `true` when the ground
+    /// re-offers that way; a ground that cannot ends the band on the refusal.
+    fn close_rows(&mut self) -> bool {
+        false
+    }
 }
 
 /// What one fill pass took.
@@ -448,14 +457,31 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     // spent: it shares the forwards to come rather than widening
                     // this one, so there is no prefill gain to judge — only the
                     // floor, and the decode question asked above.
+                    //
+                    // A prefill whose rows the rate model turns down for the rate
+                    // alone has not been turned away: the forward's rows are spent,
+                    // and the ground re-offers the same turn as a join on the next
+                    // peek (`Ground::close_rows`, `WaveRate::try_widen`).
                     decode_ok
                         && match if cost.rows == 0 {
                             rate.try_join(after)
+                        } else if kind == Kind::Prefill {
+                            rate.try_widen(cost.rows, before, after)
                         } else {
                             rate.try_admit(Admission::Prefill { tokens: cost.rows }, before, after)
                         } {
                             rate::Admit::Admitted { .. } => true,
+                            rate::Admit::Refused(
+                                r @ (rate::Refusal::Saturated { .. } | rate::Refusal::Worse { .. }),
+                            ) if kind == Kind::Prefill && ground.close_rows() => {
+                                log_refusal(kind, prio, &cost, before, after, &budget, r);
+                                continue;
+                            }
                             rate::Admit::Refused(r) => {
+                                // `try_widen` leaves a rate refusal unlatched for
+                                // the join above; with no join to make, it ends
+                                // the wave as `try_admit`'s does.
+                                rate.latch_full();
                                 out.note(r);
                                 log_refusal(kind, prio, &cost, before, after, &budget, r);
                                 false
@@ -546,6 +572,10 @@ mod tests {
         /// Every prefill after the first offers no rows, as a turn joining a
         /// forward whose rows are spent does.
         join_after_head: bool,
+        /// Whether `close_rows` is honoured — `AdmitPass`'s behaviour — and
+        /// whether it has been called: every prefill offered after it is a join.
+        closes_rows: bool,
+        rows_closed: bool,
     }
 
     impl Fake {
@@ -566,6 +596,8 @@ mod tests {
                 decode_prio: DecodePriority::Low,
                 prefill_prio: DecodePriority::Low,
                 join_after_head: false,
+                closes_rows: false,
+                rows_closed: false,
             }
         }
         fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -633,6 +665,7 @@ mod tests {
             let rows = match kind {
                 Kind::Decode => 1,
                 Kind::Prefill if self.join_after_head && !self.taken.is_empty() => 0,
+                Kind::Prefill if self.rows_closed => 0,
                 _ => ROWS,
             };
             self.queue(kind).first().map(|&kv| Cost {
@@ -660,6 +693,35 @@ mod tests {
             self.taken.push(kind);
             true
         }
+        fn close_rows(&mut self) -> bool {
+            self.rows_closed = self.closes_rows;
+            self.closes_rows
+        }
+    }
+
+    /// **A turn whose rows do not pay joins the cohort instead of waiting for
+    /// the next one.** The saturated wave of
+    /// `a_saturated_wave_and_a_starved_one_report_differently`, on a ground
+    /// that re-offers as joins: the rate model still stops the forward's rows
+    /// where they stop paying, and every turn behind that joins — the floor is
+    /// nowhere near — so the whole queue is admitted as one cohort.
+    #[test]
+    fn a_saturated_offer_comes_back_as_a_join() {
+        let mut f = Fake::new(Vec::new(), vec![REGION; 64], FLOOR + 512 * REGION);
+        f.active = 1;
+        f.decodes_active = 1;
+        f.closes_rows = true;
+        let mut rate = planner().with_min_gain(0.05);
+        let got = fill(&mut f, &mut rate);
+        assert!(f.rows_closed, "the rows stopped paying");
+        let widened = rate.tokens() / ROWS;
+        assert!(
+            widened > 0 && widened < 64,
+            "the forward took {widened} turns' rows"
+        );
+        assert_eq!(got.prefills, 64, "and every turn behind them joined");
+        assert!(!got.stopped_on_rate, "nothing was turned away on the rate");
+        assert!(!got.stopped_on_weights);
     }
 
     /// **An offer of no rows is a join, judged by the floor, not by the prefill

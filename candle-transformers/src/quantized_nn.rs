@@ -304,9 +304,10 @@ impl RmsNorm {
     /// The rooted FP norm shared by [`Self::forward_rooted`] and the float arm
     /// of [`Self::forward_dynamic`]: the two entry points differ only in where
     /// the provenance ticket comes from (a wave handle vs. a producer's
-    /// backing), so both resolve it and land here.
+    /// backing), so both resolve it and land here. Public for a caller that
+    /// holds a ticket rather than a generation.
     #[cfg(feature = "cuda")]
-    fn forward_with_ticket<'w>(
+    pub fn forward_with_ticket<'w>(
         &self,
         x: &Tensor,
         root: Option<WaveTicket>,

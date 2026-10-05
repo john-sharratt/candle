@@ -30,6 +30,7 @@ use super::promo::PromotionRing;
 use super::reclaim::ReclaimClock;
 use super::stager::StagerMsg;
 use super::types::{PipelineMessage, RoutedLayer};
+use crate::models::batched_inference::MAX_PREFILL_TOKENS;
 use crate::models::profile::{gpu_span, profile_now};
 use crate::models::wave_buffers::{wave_empty, wave_root};
 use candle::cuda_backend::CudaDevice;
@@ -387,8 +388,12 @@ impl Dispatch {
         let ring = Arc::new(SummaryRing::new(n_experts)?);
         let abort = Arc::new(AbortWord::new()?);
         let clock = Arc::new(ReclaimClock::new(table.n_rows()));
-        // Decode width; prefill grows it once, stream-ordered.
-        let workspace = MoeBucketizeWorkspace::new(device, 64, k)?;
+        // Sized here for the widest wave the engine composes — its prefill
+        // ceiling, and as many decode and verify rows again — so the forward
+        // never grows it. One workspace serves every layer: each layer's
+        // tables are consumed by its own launches before the next layer's
+        // bucketize writes them, in stream order.
+        let workspace = MoeBucketizeWorkspace::new(device, 2 * MAX_PREFILL_TOKENS, k)?;
         // SAFETY (all three): written by bucketize before any reader.
         let snap = unsafe { device.alloc::<u64>(3 * n_experts)? };
         let remote = unsafe { device.alloc::<i32>(4 * n_experts)? };

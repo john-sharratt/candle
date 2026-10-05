@@ -34,10 +34,12 @@
 
 use candle::cuda_backend::Backing;
 use candle::quantized::gguf_file::{Content, TensorInfo};
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::host_embedding::HostEmbedding;
 use crate::models::operand_guard::expect_dtype;
+use crate::models::wave_buffers::{upload_into, wave_empty_ticketed};
 
 /// A token-embedding table, and the residency that decides how a row is read.
 pub enum EmbeddingTable {
@@ -148,12 +150,17 @@ impl EmbeddingTable {
     /// The result is `dtype` with no conversion after the fact: the dequantize
     /// emits it (CLAUDE.md invariant 1), and under `Host` the CPU-side cast
     /// happens before the upload so the narrower type is what crosses the bus.
+    ///
+    /// The rows are the forward's residual, written where `residual` names:
+    /// the forward's span for a wave that reaches the head, an owned buffer
+    /// with `None` — see [`HostEmbedding::embed`].
     pub fn rows(
         &self,
         ids: &Tensor,
         device: &Device,
         staging: Backing,
         dtype: DType,
+        residual: Option<WaveTicket>,
     ) -> Result<Tensor> {
         // Validated, not converted. Token ids are U32 everywhere they are
         // produced — the scheduler's `input_ids`, the draft's argmax — so a cast
@@ -162,16 +169,28 @@ impl EmbeddingTable {
         expect_dtype(ids, DType::U32, "embedding ids")?;
         let flat = ids.flatten_all()?;
         match self {
-            Self::HostMapped(h) => h.embed(&flat.to_device(device)?, device, staging, dtype),
+            Self::HostMapped(h) => {
+                h.embed(&flat.to_device(device)?, device, staging, dtype, residual)
+            }
             Self::Host(table) => {
                 // The readback this residency cannot avoid: the CPU gather needs
                 // the ids where the CPU can see them, and if they are on the
                 // device that means draining the pipeline to fetch them.
                 let host_ids = flat.to_device(&Device::Cpu)?;
-                table
-                    .index_select(&host_ids, 0)?
-                    .to_dtype(dtype)?
-                    .to_device(device)
+                let rows = table.index_select(&host_ids, 0)?.to_dtype(dtype)?;
+                if !device.is_cuda() {
+                    return Ok(rows);
+                }
+                // Fully written by the upload (invariant 6).
+                let dst = wave_empty_ticketed(rows.dims(), dtype, device, residual)?;
+                let flat_rows = rows.flatten_all()?;
+                match dtype {
+                    DType::F32 => upload_into(&dst, &flat_rows.to_vec1::<f32>()?)?,
+                    DType::F16 => upload_into(&dst, &flat_rows.to_vec1::<half::f16>()?)?,
+                    DType::BF16 => upload_into(&dst, &flat_rows.to_vec1::<half::bf16>()?)?,
+                    d => candle::bail!("embedding: {d:?} is not a residual-stream type"),
+                }
+                Ok(dst)
             }
         }
     }
@@ -322,7 +341,7 @@ mod tests {
         let t = table(6, 4)?;
         let ids = Tensor::new([3u32, 0, 3, 5].as_slice(), &Device::Cpu)?;
         let got = t
-            .rows(&ids, &Device::Cpu, Backing::Owned, DType::F32)?
+            .rows(&ids, &Device::Cpu, Backing::Owned, DType::F32, None)?
             .to_vec2::<f32>()?;
         assert_eq!(got.len(), 4);
         assert_eq!(got[0], vec![3.0, 3.5, 4.0, 4.5]);
@@ -339,7 +358,7 @@ mod tests {
     fn ids_are_read_flat_whatever_their_shape() -> Result<()> {
         let t = table(6, 4)?;
         let ids = Tensor::from_vec(vec![3u32, 0, 3, 5], (2, 2), &Device::Cpu)?;
-        let got = t.rows(&ids, &Device::Cpu, Backing::Owned, DType::F32)?;
+        let got = t.rows(&ids, &Device::Cpu, Backing::Owned, DType::F32, None)?;
         assert_eq!(got.dims(), &[4, 4]);
         assert_eq!(got.to_vec2::<f32>()?[3], vec![7.0, 7.5, 8.0, 8.5]);
         Ok(())
@@ -358,7 +377,7 @@ mod tests {
         let t = table(6, 4)?;
         let ids = Tensor::from_vec(vec![3i64, 0], (2,), &Device::Cpu)?;
         let err = t
-            .rows(&ids, &Device::Cpu, Backing::Owned, DType::F32)
+            .rows(&ids, &Device::Cpu, Backing::Owned, DType::F32, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("I64") && err.contains("U32"), "{err}");
@@ -373,7 +392,7 @@ mod tests {
     fn ids_are_placed_for_the_residency() -> Result<()> {
         let t = table(6, 4)?;
         let ids = Tensor::new([5u32, 1].as_slice(), &Device::Cpu)?;
-        let got = t.rows(&ids, &Device::Cpu, Backing::Owned, DType::F32)?;
+        let got = t.rows(&ids, &Device::Cpu, Backing::Owned, DType::F32, None)?;
         assert_eq!(got.to_vec2::<f32>()?[0], vec![7.0, 7.5, 8.0, 8.5]);
         Ok(())
     }
@@ -385,7 +404,7 @@ mod tests {
         let t = table(6, 4)?;
         let ids = Tensor::new([2u32].as_slice(), &Device::Cpu)?;
         for dtype in [DType::F32, DType::F16, DType::BF16] {
-            let got = t.rows(&ids, &Device::Cpu, Backing::Owned, dtype)?;
+            let got = t.rows(&ids, &Device::Cpu, Backing::Owned, dtype, None)?;
             assert_eq!(got.dtype(), dtype);
         }
         Ok(())

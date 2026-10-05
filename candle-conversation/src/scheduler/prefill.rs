@@ -5,6 +5,8 @@ use super::admission::{
 use super::admit;
 use super::admit_ground::AdmitPass;
 use super::compaction_stall::{PassOutcome, PoolShape};
+use super::first_sample::{contiguous_runs, FirstSample, FirstSampled, PrefillEnd};
+use super::wave_logits::WaveLogits;
 use super::*;
 use crate::persistence::thread::effective_turn_policy;
 use crate::recorded_reply::replayed_step;
@@ -13,6 +15,7 @@ use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
 use candle_nn::kv_cache::{end_wave_transient, is_device_oom};
 use candle_transformers::models::batched_inference::PendingGlue;
+use candle_transformers::models::window_residuals::WindowResiduals;
 use std::collections::{HashMap, HashSet};
 
 /// Free KV regions kept in hand before [`Scheduler::vram_under_pressure_for`]
@@ -1150,6 +1153,7 @@ impl Scheduler {
         };
         let mut pass = AdmitPass::new(self);
         let filled = admit::fill(&mut pass, &mut rate);
+        pass.conclude();
         self.wave_rate = Some(rate);
         // **Keep one prefill in flight, whatever the model says.**
         //
@@ -1381,7 +1385,7 @@ impl Scheduler {
             work,
             offset: 0,
             next_projection: 0,
-            final_logits: None,
+            finished: None,
             error,
             prefill_start: None,
         });
@@ -2109,7 +2113,9 @@ impl Scheduler {
                 break;
             }
             let tokens = &s.tokens[off..off + advance];
-            match Tensor::new(tokens, &self.device).and_then(|t| t.unsqueeze(0)) {
+            // On the host: the forward lays every row's id on its own span in
+            // one upload (`wave_token_ids`).
+            match Tensor::new(tokens, &Device::Cpu).and_then(|t| t.unsqueeze(0)) {
                 Ok(t) => {
                     seq_ids.push(s.sequence_id.0);
                     inputs.push(t);
@@ -2229,7 +2235,7 @@ impl Scheduler {
         // member of the forward with it. Refused here instead, before it joins.
         let reach = self.session.rope_reach();
         for p in self.active_prefills.iter_mut() {
-            if p.error.is_some() || p.final_logits.is_some() {
+            if p.error.is_some() || p.finished.is_some() {
                 continue;
             }
             let at = self
@@ -2249,7 +2255,7 @@ impl Scheduler {
         // keeps its place — see `priority_pause`.
         self.observe_priorities();
         for p in &self.active_prefills {
-            if p.error.is_some() || p.final_logits.is_some() || p.offset >= p.work.tokens.len() {
+            if p.error.is_some() || p.finished.is_some() || p.offset >= p.work.tokens.len() {
                 continue;
             }
             if self.priority_paused(p.work.sequence_id) {
@@ -2385,7 +2391,7 @@ impl Scheduler {
                         continue;
                     };
                     if self.active_prefills[i].error.is_some()
-                        || self.active_prefills[i].final_logits.is_some()
+                        || self.active_prefills[i].finished.is_some()
                     {
                         continue;
                     }
@@ -2395,7 +2401,9 @@ impl Scheduler {
                     let off = self.active_prefills[i].offset;
                     let end = (off + advance).min(self.active_prefills[i].work.tokens.len());
                     let toks: Vec<u32> = self.active_prefills[i].work.tokens[off..end].to_vec();
-                    match Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
+                    // On the host: the forward lays every row's id on its own
+                    // span in one upload (`wave_token_ids`).
+                    match Tensor::new(toks.as_slice(), &Device::Cpu).and_then(|t| t.unsqueeze(0)) {
                         Ok(t) => {
                             kept.push(m);
                             seq_ids.push(seq_id);
@@ -2419,7 +2427,7 @@ impl Scheduler {
                     let off = self.active_section_ingests[i].offset;
                     let end = (off + advance).min(self.active_section_ingests[i].tokens.len());
                     let toks: Vec<u32> = self.active_section_ingests[i].tokens[off..end].to_vec();
-                    match Tensor::new(toks.as_slice(), &self.device).and_then(|t| t.unsqueeze(0)) {
+                    match Tensor::new(toks.as_slice(), &Device::Cpu).and_then(|t| t.unsqueeze(0)) {
                         Ok(t) => {
                             kept.push(m);
                             seq_ids.push(seq_id);
@@ -2437,12 +2445,17 @@ impl Scheduler {
 
     /// Finish a wave group that reached the final layer: `members`/`member_logits`
     /// are aligned in caller order. Prefill members commit their chunk and emit a
-    /// progress event; the FINAL chunk also emits the staged events and records
-    /// `final_logits` for promotion to decode, while an earlier one leaves the
-    /// prefill active for the next group. Section members advance their chunk +
-    /// record slot tokens (sealed later by `finalize_done_section_ingests`).
-    /// Clears the group.
+    /// progress event; the FINAL chunk also emits the staged events and samples
+    /// the turn's first token from its row for promotion to decode, while an
+    /// earlier one leaves the prefill active for the next group. Section members
+    /// advance their chunk + record slot tokens (sealed later by
+    /// `finalize_done_section_ingests`). Clears the group.
+    ///
+    /// `member_logits` must be read before the forward that wrote them is
+    /// dropped — the caller holds it across this call.
     fn complete_wave_group(&mut self, members: &[WaveMember], member_logits: &[Tensor]) {
+        // Prefills whose last chunk landed in this group, with their rows.
+        let mut finishing: Vec<(usize, Tensor)> = Vec::new();
         for (k, m) in members.iter().enumerate() {
             match *m {
                 WaveMember::Prefill {
@@ -2506,27 +2519,15 @@ impl Scheduler {
                                 tokens_done: total,
                                 tokens_total: total,
                             });
+                    // The turn's first token comes from this row, and the row
+                    // is only valid while this wave holds its span: the next
+                    // forward reuses it, and a row sampled after that reads a
+                    // LATER step's logits for some other slot (the stored CJK
+                    // drift, 0.007%→0.135% at 42553ca3). So it is sampled below,
+                    // before this returns, rather than copied off the span to be
+                    // sampled at promotion.
                     if let Some(l) = member_logits.get(k) {
-                        // DEEP-copy the final-logits row at capture. `Tensor::clone`
-                        // is shallow (shared storage), and this tensor is HELD until
-                        // the once-per-wave `promote_finished_prefills_to_decodes`
-                        // samples the turn's FIRST token from it — up to a whole
-                        // decode quantum later. The wave's forward path reuses its
-                        // output buffers, so by promotion time the shared storage
-                        // holds a LATER step's logits for some other slot: the first
-                        // token gets sampled from a foreign distribution, and a
-                        // greedy summary anchors on it and coherently continues in
-                        // whatever language that row suggests (the stored CJK drift,
-                        // 0.007%→0.135% at 42553ca3, amplified later by longer
-                        // quanta). A real copy makes the captured row immutable —
-                        // one ~vocab-sized row per completed prefill, negligible.
-                        //
-                        // `to_owned_tensor`, not `copy`: the row is a view of the
-                        // wave's whole logits block, and `copy` clones the
-                        // storage it views — every row of the block — where this
-                        // copies the row alone.
-                        let owned = l.to_owned_tensor().unwrap_or_else(|_| l.clone());
-                        self.active_prefills[i].final_logits = Some(owned);
+                        finishing.push((i, l.clone()));
                     }
                 }
                 WaveMember::Section {
@@ -2557,6 +2558,7 @@ impl Scheduler {
                 }
             }
         }
+        self.sample_first_rows(finishing);
         self.reset_wave_prefill();
     }
 
@@ -2623,7 +2625,7 @@ impl Scheduler {
             if p.glue_tokens.is_empty() {
                 continue;
             }
-            let input = match Tensor::new(p.glue_tokens.as_slice(), &self.device)
+            let input = match Tensor::new(p.glue_tokens.as_slice(), &Device::Cpu)
                 .and_then(|t| t.unsqueeze(0))
             {
                 Ok(t) => t,
@@ -2712,15 +2714,37 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Concatenate the present residual parts along the token dim (1) in the given
-    /// caller order, skipping `None` parts. Returns `None` when all are absent.
-    fn cat_caller_residual(parts: &[Option<&Tensor>]) -> candle::Result<Option<Tensor>> {
+    /// Splice the present residual parts along the token dim (1) in the given
+    /// caller order, skipping `None` parts. Returns `None` when all are absent,
+    /// and a lone part as it stands.
+    ///
+    /// Several parts are copied into one of the session's held window buffers
+    /// (`WindowResiduals`) rather than concatenated into a fresh tensor: this
+    /// runs between the segments of a co-batched wave that carries decode, and
+    /// an allocation here was one per segment.
+    fn cat_caller_residual(
+        window: &WindowResiduals,
+        parts: &[Option<&Tensor>],
+    ) -> candle::Result<Option<Tensor>> {
         let present: Vec<&Tensor> = parts.iter().filter_map(|p| *p).collect();
-        match present.len() {
-            0 => Ok(None),
-            1 => Ok(Some(present[0].clone())),
-            _ => Ok(Some(Tensor::cat(&present, 1)?)),
+        let Some(first) = present.first() else {
+            return Ok(None);
+        };
+        if present.len() == 1 {
+            return Ok(Some((*first).clone()));
         }
+        let mut dims = first.dims().to_vec();
+        dims[1] = present
+            .iter()
+            .map(|p| p.dim(1))
+            .sum::<candle::Result<usize>>()?;
+        let spliced = window.take(dims, first.dtype(), first.device())?;
+        let mut at = 0;
+        for p in present {
+            spliced.slice_set(p, 1, at)?;
+            at += p.dim(1)?;
+        }
+        Ok(Some(spliced))
     }
 
     /// The unified continuous-fair-wave step (`docs/continuous_fair_waves.md`): ONE
@@ -2755,7 +2779,7 @@ impl Scheduler {
         decode_inputs: &[Tensor],
         verify_seqs: &[usize],
         verify_inputs: &[Tensor],
-    ) -> candle::Result<Vec<Tensor>> {
+    ) -> candle::Result<WaveLogits> {
         // Fold this wave's deferred glue in as a full-sweep member co-batched with
         // decode (see `take_wave_glue`). A slot that decodes this wave is never
         // also a glue member — `take_active_decode_batch` excludes slots with a
@@ -2790,7 +2814,7 @@ impl Scheduler {
         verify_seqs: &[usize],
         verify_inputs: &[Tensor],
         glue: Option<(Vec<usize>, Vec<Tensor>, Vec<PendingGlue>)>,
-    ) -> candle::Result<Vec<Tensor>> {
+    ) -> candle::Result<WaveLogits> {
         let n = self.model.num_layers().max(1);
         let n_dec = decode_seqs.len();
         let none_seqs: [usize; 0] = [];
@@ -2871,7 +2895,7 @@ impl Scheduler {
             if sec_seqs.is_empty() && !has_fullsweep && verify_seqs.is_empty() {
                 // Nothing to run: no creep, no section, no decode, no glue, no
                 // verify blocks.
-                return Ok(Vec::new());
+                return Ok(WaveLogits::empty());
             }
             if !sec_seqs.is_empty() {
                 self.wave_section_advanced = true;
@@ -2908,12 +2932,8 @@ impl Scheduler {
                 let _g = super::profile::span("loop:wave:reconcile_offsets");
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
-            let logits = {
-                let _g = super::profile::span("loop:wave:logits_owned");
-                out.logits_owned()?
-            };
-            let d = head_rows.min(logits.len());
-            let dec_logits = logits[..d].to_vec();
+            // Read in place behind the forward's guard — see `WaveLogits`.
+            let dec_logits = WaveLogits::held(out, head_rows);
             if !sec_gidx.is_empty() {
                 // Attended-KV summed before `complete_section_chunk` advances the
                 // sequences. One record per co-batched section chunk.
@@ -3042,8 +3062,10 @@ impl Scheduler {
         // residual caller order `[decode | creep | glue]`; at cursor 0 all embed
         // fresh (None).
         let pf_res = self.wave_prefill_residual.take();
-        let seg2_in =
-            Self::cat_caller_residual(&[seg1_dec.as_ref(), pf_res.as_ref(), seg1_glue.as_ref()])?;
+        let seg2_in = Self::cat_caller_residual(
+            &self.session.window_residuals(),
+            &[seg1_dec.as_ref(), pf_res.as_ref(), seg1_glue.as_ref()],
+        )?;
         if let Some(p) = glue_pending {
             self.session.set_pending_glue(p.clone());
         }
@@ -3148,16 +3170,14 @@ impl Scheduler {
                 let _g = super::profile::span("loop:wave:reconcile_offsets");
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
-            let logits = {
-                let _g = super::profile::span("loop:wave:logits_owned");
-                seg2.logits_owned()?
-            };
+            // Read in place behind the forward's guard — see `WaveLogits`. The
+            // creep's rows are consumed here; `complete_wave_group` copies the
+            // one row a finished prefill keeps past this wave.
+            let logits = seg2.logits_on_span();
             let d = head_rows.min(logits.len());
             let creep_end = (d + members.len()).min(logits.len());
-            let dec_logits = logits[..d].to_vec();
-            let member_logits = logits[d..creep_end].to_vec();
-            self.complete_wave_group(&members, &member_logits);
-            return Ok(dec_logits);
+            self.complete_wave_group(&members, &logits[d..creep_end]);
+            return Ok(WaveLogits::held_rows(seg2, logits[..d].to_vec()));
         }
 
         // Paused: split seg2's `[decode | creep | glue]` residual. Hold the creep
@@ -3184,9 +3204,12 @@ impl Scheduler {
         // `[decode | verify | glue]`. Skipped when there is no full-sweep member
         // (the creep paused at win_end, nothing else to sweep).
         if !has_fullsweep && verify_seqs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(WaveLogits::empty());
         }
-        let seg3_in = Self::cat_caller_residual(&[dec_part.as_ref(), glue_part.as_ref()])?;
+        let seg3_in = Self::cat_caller_residual(
+            &self.session.window_residuals(),
+            &[dec_part.as_ref(), glue_part.as_ref()],
+        )?;
         if let Some(p) = glue_pending {
             self.session.set_pending_glue(p.clone());
         }
@@ -3209,12 +3232,7 @@ impl Scheduler {
             let _g = super::profile::span("loop:wave:reconcile_offsets");
             self.reconcile_wave_offsets(glue_seqs)?;
         }
-        let mut logits = {
-            let _g = super::profile::span("loop:wave:logits_owned");
-            seg3.logits_owned()?
-        };
-        logits.truncate(head_rows);
-        Ok(logits)
+        Ok(WaveLogits::held(seg3, head_rows))
     }
 
     /// Handle a device-OOM from the ragged prefill forward: the batch was too
@@ -3261,15 +3279,15 @@ impl Scheduler {
         if !self.active_prefills.is_empty() {
             self.settled_since_admit = true;
         }
-        // Turns whose prefill finished cleanly, finalised together below so their
-        // first tokens are sampled in one dispatch.
-        let mut ready: Vec<FinishedPrefill> = Vec::new();
+        // Turns whose prefill finished cleanly, with the first token the wave
+        // that finished them sampled (`sample_first_rows`).
+        let mut ready: Vec<(FinishedPrefill, FirstSampled)> = Vec::new();
         // Use swap_remove for efficiency; iterate from the back.
         let mut i = 0;
         while i < self.active_prefills.len() {
             let done = {
                 let p = &self.active_prefills[i];
-                p.error.is_some() || (p.final_logits.is_some() && p.offset >= p.work.tokens.len())
+                p.error.is_some() || (p.finished.is_some() && p.offset >= p.work.tokens.len())
             };
             if !done {
                 i += 1;
@@ -3280,7 +3298,7 @@ impl Scheduler {
                 work,
                 offset: _,
                 next_projection: _,
-                final_logits,
+                finished,
                 error,
                 prefill_start,
             } = p;
@@ -3316,6 +3334,12 @@ impl Scheduler {
             // A turn that will never decode never finalizes its view, so the
             // view is released here or not at all.
             if let Some(e) = error {
+                // A first sample taken before the failure holds the sequence's
+                // sampling state; it goes back where the next turn finds it.
+                if let Some(PrefillEnd::Sampled(s)) = finished {
+                    self.sampling_states
+                        .insert(work.sequence_id, s.first.sampling_state);
+                }
                 let _ = work.event_tx.send(TurnEvent::Error(e));
                 // Reclaim the carved view, or the sequence wedges forever: the
                 // view was registered in `turn_views` before the prefill ran and
@@ -3325,13 +3349,13 @@ impl Scheduler {
                 self.discard_turn_view(work.sequence_id);
                 continue;
             }
-            let logits = match final_logits {
-                Some(l) => l,
-                None => {
+            let sampled = match finished {
+                Some(PrefillEnd::Sampled(s)) => s,
+                Some(PrefillEnd::Sealed) | None => {
                     let _ = work
                         .event_tx
                         .send(TurnEvent::Error(ConversationError::Channel(
-                            "prefill produced no final logits".into(),
+                            "prefill finished without sampling its first token".into(),
                         )));
                     self.discard_turn_view(work.sequence_id);
                     continue;
@@ -3340,18 +3364,21 @@ impl Scheduler {
             let prefill_ms = prefill_start
                 .map(|s| s.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
-            ready.push(FinishedPrefill {
-                turn_start: work.submitted_at,
-                token_count: work.tokens.len(),
-                work,
-                logits,
-                prefill_ms,
-            });
+            ready.push((
+                FinishedPrefill {
+                    turn_start: work.submitted_at,
+                    work,
+                    prefill_ms,
+                },
+                sampled,
+            ));
             // swap_remove pulled the last element into i; don't increment.
         }
         if !ready.is_empty() {
             let t_fin = std::time::Instant::now();
-            self.finalise_prefills(ready);
+            for (f, s) in ready {
+                self.finish_first_sample(f, s.first, s.token);
+            }
             crate::scheduler::run::note_promote_split(
                 crate::scheduler::run::PromoteStep::Finalise,
                 t_fin.elapsed().as_micros() as u64,
@@ -3359,9 +3386,9 @@ impl Scheduler {
         }
     }
 
-    /// Finalise every turn whose prefill finished together: prepare each, sample
-    /// all their first tokens in one dispatch, then emit each and move it to
-    /// decode (or close it out) exactly as one turn alone would be.
+    /// Sample the first token of every prefill whose last chunk this wave group
+    /// delivered, from its row on the forward's span: prepare each, sample all
+    /// in one dispatch, and record the result for promotion.
     ///
     /// **One sample for the cohort, not one per turn.** Each dispatch is a
     /// launch and a readback over the whole vocabulary, so eight turns finishing
@@ -3369,76 +3396,110 @@ impl Scheduler {
     /// first token went out — 2.5 ms each on the Qwen3.6-35B-A3B. The sampler
     /// already samples a mixed batch row by row on each row's own config and
     /// state, which is what the decode step relies on, so the batch changes no
-    /// row's draw.
-    fn finalise_prefills(&mut self, ready: Vec<FinishedPrefill>) {
-        let mut prepared: Vec<(FinishedPrefill, FirstSample)> = ready
-            .into_iter()
-            .map(|mut f| {
-                let first = self.prepare_first_sample(&mut f.work, f.token_count);
-                (f, first)
-            })
-            .collect();
-        let sampled: Vec<Result<u32, ConversationError>> = {
+    /// row's draw. The rows are read where the head wrote them — see
+    /// [`Self::sample_first_tokens`].
+    ///
+    /// A compression re-prefill decodes nothing: it is marked sealed and its row
+    /// is not read.
+    fn sample_first_rows(&mut self, finishing: Vec<(usize, Tensor)>) {
+        let mut rows: Vec<Tensor> = Vec::with_capacity(finishing.len());
+        let mut prepared: Vec<(usize, FirstSample)> = Vec::with_capacity(finishing.len());
+        for (i, row) in finishing {
+            if matches!(
+                self.active_prefills[i].work.seal_action,
+                SealAction::CompressionTurn { .. }
+            ) {
+                self.active_prefills[i].finished = Some(PrefillEnd::Sealed);
+                continue;
+            }
+            // `[1, vocab]`, a view of the head's row, so adjacent rows name
+            // their block whole.
+            let row = match row.flatten_all().and_then(|r| r.unsqueeze(0)) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.active_prefills[i].error = Some(ConversationError::Model(e));
+                    continue;
+                }
+            };
+            prepared.push((i, self.prepare_first_sample(i)));
+            rows.push(row);
+        }
+        if prepared.is_empty() {
+            return;
+        }
+        let tokens: Vec<Result<u32, ConversationError>> = {
             let _g = super::profile::span("finalise:sample");
-            self.sample_first_tokens(&mut prepared)
+            self.sample_first_tokens(&rows, &mut prepared)
         };
-        for ((f, first), sampled) in prepared.into_iter().zip(sampled) {
-            self.finish_first_sample(f, first, sampled);
+        for ((i, first), token) in prepared.into_iter().zip(tokens) {
+            self.active_prefills[i].finished =
+                Some(PrefillEnd::Sampled(FirstSampled { first, token }));
         }
     }
 
-    /// Every prepared turn's first token, in order: one batched dispatch, or for
-    /// a single turn its own logits as they are. A dispatch that fails fails
-    /// every turn it carried.
+    /// Every prepared turn's first token from its row in `rows`, in order.
+    ///
+    /// **Sampled where the rows are.** Rows that sit together in the head's
+    /// block are named as one `[n, vocab]` view and sampled in one dispatch;
+    /// gathering scattered rows into a block of their own would be a
+    /// vocabulary-wide carve per finishing turn. A wave whose finishing rows
+    /// are one run — the common case, and always when one turn finishes — is a
+    /// single dispatch. A dispatch that fails fails every turn it carried.
     fn sample_first_tokens(
-        &mut self,
-        prepared: &mut [(FinishedPrefill, FirstSample)],
+        &self,
+        rows: &[Tensor],
+        prepared: &mut [(usize, FirstSample)],
     ) -> Vec<Result<u32, ConversationError>> {
-        let n = prepared.len();
-        let logits = if n == 1 {
-            Ok(prepared[0].0.logits.clone())
-        } else {
-            prepared
-                .iter()
-                .map(|(f, _)| f.logits.flatten_all())
-                .collect::<candle::Result<Vec<Tensor>>>()
-                .and_then(|rows| Tensor::stack(&rows, 0))
-        };
-        // Owned, because the states below borrow the same entries mutably.
-        let configs: Vec<SamplingConfig> =
-            prepared.iter().map(|(_, s)| s.sampling.clone()).collect();
-        let config_refs: Vec<&SamplingConfig> = configs.iter().collect();
-        let mut states: Vec<&mut SequenceSamplingState> = prepared
-            .iter_mut()
-            .map(|(_, s)| &mut s.sampling_state)
-            .collect();
-        let drawn = logits.and_then(|l| self.sampler.sample_batch(&l, &mut states, &config_refs));
-        match drawn {
-            Ok(tokens) if tokens.len() == n => tokens.into_iter().map(Ok).collect(),
-            Ok(tokens) => (0..n)
-                .map(|_| {
+        let mut out: Vec<Result<u32, ConversationError>> = Vec::with_capacity(prepared.len());
+        for (start, end) in contiguous_runs(rows) {
+            let n = end - start;
+            let run = &mut prepared[start..end];
+            // Owned, because the states below borrow the same entries mutably.
+            let configs: Vec<SamplingConfig> =
+                run.iter().map(|(_, s)| s.sampling.clone()).collect();
+            let config_refs: Vec<&SamplingConfig> = configs.iter().collect();
+            let mut states: Vec<&mut SequenceSamplingState> =
+                run.iter_mut().map(|(_, s)| &mut s.sampling_state).collect();
+            let block = Tensor::cat_view(&rows[start..end], 0)
+                .expect("a run is named as one view by construction");
+            match self.sampler.sample_batch(&block, &mut states, &config_refs) {
+                Ok(tokens) if tokens.len() == n => out.extend(tokens.into_iter().map(Ok)),
+                Ok(tokens) => out.extend((0..n).map(|_| {
                     Err(ConversationError::Channel(format!(
                         "first-token sample returned {} tokens for {n} turns",
                         tokens.len()
                     )))
-                })
-                .collect(),
-            Err(e) => {
-                let msg = e.to_string();
-                (0..n)
-                    .map(|_| Err(ConversationError::Model(candle::Error::Msg(msg.clone()))))
-                    .collect()
+                })),
+                Err(e) => {
+                    let msg = e.to_string();
+                    out.extend(
+                        (0..n).map(|_| {
+                            Err(ConversationError::Model(candle::Error::Msg(msg.clone())))
+                        }),
+                    );
+                }
             }
         }
+        out
     }
 
     /// Everything a turn's first sample needs, taken before the sample: the
     /// turn's budget capped at the RoPE reach, its sampling state brought to the
     /// new turn, and its sampling config with any turn grammar's opening mask.
-    fn prepare_first_sample(&mut self, work: &mut PrefillWork, token_count: usize) -> FirstSample {
+    ///
+    /// `i` indexes `active_prefills`: the turn is readied where it stands.
+    fn prepare_first_sample(&mut self, i: usize) -> FirstSample {
+        let Self {
+            session,
+            sampling_states,
+            sampler,
+            active_prefills,
+            ..
+        } = self;
+        let work = &mut active_prefills[i].work;
+        let token_count = work.tokens.len();
         // Total KV position after this prefill.
-        let context_depth = self
-            .session
+        let context_depth = session
             .sequence_offset(work.sequence_id.0)
             .unwrap_or(token_count);
 
@@ -3448,8 +3509,7 @@ impl Scheduler {
         // the schedule's last ceiling is refused — for the whole wave it rides
         // in. So a turn that would outgrow the reach ends where it runs out, as
         // one that spent its budget, and the rest of the wave never sees it.
-        let room = self
-            .session
+        let room = session
             .rope_reach()
             .saturating_sub(context_depth + work.post_decode_tokens.len());
         if work.max_decode_tokens > room {
@@ -3458,7 +3518,7 @@ impl Scheduler {
                 context_depth,
                 budget = work.max_decode_tokens,
                 room,
-                reach = self.session.rope_reach(),
+                reach = session.rope_reach(),
                 "turn budget capped at the model's RoPE reach",
             );
             work.max_decode_tokens = room;
@@ -3486,12 +3546,11 @@ impl Scheduler {
             "conversation decode start",
         );
 
-        let mut sampling_state = self
-            .sampling_states
+        let mut sampling_state = sampling_states
             .remove(&work.sequence_id)
             .expect("sampling state must exist for active sequence");
         sampling_state.end_turn(work.sampling.cross_turn_window);
-        sampling_state.record_context_tokens(&work.tokens, self.sampler.max_recent_len());
+        sampling_state.record_context_tokens(&work.tokens, sampler.max_recent_len());
 
         // Send prefill progress: complete (single-prefill path needs this;
         // batched path already streams progress per-chunk, but a final
@@ -3558,10 +3617,8 @@ impl Scheduler {
     ) {
         let FinishedPrefill {
             mut work,
-            logits: _,
             prefill_ms,
             turn_start,
-            token_count: _,
         } = finished;
         // `sampling` was this turn's config for the sample just taken; the turn
         // decodes on `work.sampling` from here, as it did before the split.
@@ -3928,23 +3985,49 @@ impl Scheduler {
         &mut self,
         sequence_id: SequenceId,
         tokens: &[u32],
-    ) -> Result<Tensor, ConversationError> {
+    ) -> Result<(), ConversationError> {
+        self.run_prefill_pieces(sequence_id, tokens, None)
+            .map(|_| ())
+    }
+
+    /// [`Self::run_prefill`], then the continuation's first token sampled under
+    /// `config` — **from the logits where the head wrote them**, while the
+    /// forward still holds its span. Copying the row off the span to sample it
+    /// afterwards was a vocabulary-wide device allocation per prefill.
+    pub(super) fn run_prefill_sampled(
+        &mut self,
+        sequence_id: SequenceId,
+        tokens: &[u32],
+        config: &SamplingConfig,
+        state: &mut SequenceSamplingState,
+    ) -> Result<u32, ConversationError> {
+        self.run_prefill_pieces(sequence_id, tokens, Some((config, state)))?
+            .ok_or_else(|| ConversationError::Channel("prefill sampled no token".into()))
+    }
+
+    fn run_prefill_pieces(
+        &mut self,
+        sequence_id: SequenceId,
+        tokens: &[u32],
+        mut sample: Option<(&SamplingConfig, &mut SequenceSamplingState)>,
+    ) -> Result<Option<u32>, ConversationError> {
         // **Every break token in the span, not just the first.** A prefilled
         // assistant head carries `<think>` and `</think>` in one pass, and a
         // multi-turn prefill carries a turn closer as well — splitting once
         // would leave the later markers pooled across their own boundaries,
         // which is not correctable afterwards.
         let pieces = break_pieces(tokens, self.prefill_breaks());
-        let mut last_logits = None;
+        let mut sampled = None;
         for (i, piece) in pieces.iter().enumerate() {
-            last_logits = Some(self.run_prefill_span(sequence_id, piece)?);
-            if i + 1 < pieces.len() {
+            let last = i + 1 == pieces.len();
+            // Only the last piece's row is the span's continuation.
+            let here = if last { sample.take() } else { None };
+            sampled = self.run_prefill_span(sequence_id, piece, here)?;
+            if !last {
                 self.close_page_at_break(sequence_id, piece);
             }
         }
-        // `break_pieces` yields at least one piece, so this is only `None` if
-        // that piece's forward was never run — which the loop above rules out.
-        last_logits.ok_or_else(|| ConversationError::Channel("prefill ran no pieces".into()))
+        Ok(sampled)
     }
 
     /// Forward several sequences' spans together: the same pieces, page closes
@@ -4068,7 +4151,7 @@ impl Scheduler {
         let seqs: Vec<usize> = group.iter().map(|(s, _, _)| s.0).collect();
         let inputs = group
             .iter()
-            .map(|(_, piece, _)| Tensor::new(*piece, &self.device).and_then(|t| t.unsqueeze(0)))
+            .map(|(_, piece, _)| Tensor::new(*piece, &Device::Cpu).and_then(|t| t.unsqueeze(0)))
             .collect::<candle::Result<Vec<_>>>()
             .map_err(ConversationError::Model)?;
         self.model
@@ -4084,7 +4167,6 @@ impl Scheduler {
                 nl,
                 None,
             )
-            .and_then(|s| s.logits_owned())
             .map_err(ConversationError::Model)?;
         for &(sequence_id, piece, closes) in group {
             self.session
@@ -4144,52 +4226,29 @@ impl Scheduler {
         }
     }
 
+    /// Forward `tokens` for one sequence, in chunks of the pass budget so the
+    /// activation buffers stay bounded, and — when `sample` is given — sample
+    /// the last chunk's scored row while its forward still holds the span.
+    ///
+    /// The ids are handed over **on the host**: the model lays every row's id
+    /// on its forward span in one upload, so the scheduler allocates nothing on
+    /// the device for them.
     fn run_prefill_span(
         &mut self,
         sequence_id: SequenceId,
         tokens: &[u32],
-    ) -> Result<Tensor, ConversationError> {
-        // Chunked prefill: split large prompts into bounded chunks to keep
-        // intermediate activation buffers from growing unboundedly.
-        let pass = self.prefill_pass_budget();
-        let logits = if tokens.len() > pass {
-            let mut last_logits: Option<Tensor> = None;
-            for chunk in tokens.chunks(pass) {
-                let input = Tensor::new(chunk, &self.device)
-                    .and_then(|t| t.unsqueeze(0))
-                    .map_err(ConversationError::Model)?;
-                let nl = self.model.num_layers();
-                let logits_vec = self
-                    .model
-                    .forward_wave(
-                        &mut self.session,
-                        &[],
-                        &[],
-                        &[sequence_id.0],
-                        &[input],
-                        &[],
-                        &[],
-                        0,
-                        nl,
-                        None,
-                    )
-                    .and_then(|s| s.logits_owned())
-                    .map_err(ConversationError::Model)?;
-                self.session
-                    .advance_sequence(sequence_id.0, chunk.len())
-                    .map_err(ConversationError::Model)?;
-                super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, chunk);
-                last_logits = logits_vec.into_iter().next();
-            }
-            last_logits.ok_or_else(|| {
-                ConversationError::Channel("no logits returned from chunked prefill".into())
-            })?
-        } else {
-            let input = Tensor::new(tokens, &self.device)
+        mut sample: Option<(&SamplingConfig, &mut SequenceSamplingState)>,
+    ) -> Result<Option<u32>, ConversationError> {
+        let pass = self.prefill_pass_budget().max(1);
+        let nl = self.model.num_layers().max(1);
+        let n_chunks = tokens.len().div_ceil(pass).max(1);
+        let mut sampled = None;
+        for k in 0..n_chunks {
+            let chunk = &tokens[(k * pass).min(tokens.len())..((k + 1) * pass).min(tokens.len())];
+            let input = Tensor::new(chunk, &Device::Cpu)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(ConversationError::Model)?;
-
-            let logits_vec = self
+            let step = self
                 .model
                 .forward_wave(
                     &mut self.session,
@@ -4200,50 +4259,41 @@ impl Scheduler {
                     &[],
                     &[],
                     0,
-                    self.model.num_layers().max(1),
+                    nl,
                     None,
                 )
-                .and_then(|s| s.logits_owned())
                 .map_err(ConversationError::Model)?;
-
+            if k + 1 == n_chunks {
+                if let Some((config, state)) = sample.take() {
+                    let rows = step.logits_on_span();
+                    let row = rows.first().ok_or_else(|| {
+                        ConversationError::Channel("no logits returned from prefill".into())
+                    })?;
+                    sampled = Some(self.sample_single(row, config, state)?);
+                }
+            }
+            drop(step);
             self.session
-                .advance_sequence(sequence_id.0, tokens.len())
+                .advance_sequence(sequence_id.0, chunk.len())
                 .map_err(ConversationError::Model)?;
-
             // Mirror these tokens into the slot's diagnostic log so the
-            // turn-complete dump can reconstruct the exact context the
-            // kernel saw (compiled out without the `context-dump` feature).
-            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, tokens);
-
-            logits_vec.into_iter().next().ok_or_else(|| {
-                ConversationError::Channel("no logits returned from prefill".into())
-            })?
-        };
-
+            // turn-complete dump can reconstruct the exact context the kernel
+            // saw (compiled out without the `context-dump` feature).
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, chunk);
+        }
         // Nothing to bring up to date here: the prefill's own commit
         // (`KvCache::commit_written_tokens`, the one place every write outside
         // the decode kernel goes through) marked the cached decode slot buffer,
         // and the next sync that reads it re-serialises its writer region.
-        Ok(logits)
+        Ok(sampled)
     }
 }
 
-/// A turn whose prefill finished cleanly, waiting for its first token.
+/// A turn whose prefill finished cleanly, its first token already drawn.
 struct FinishedPrefill {
     work: PrefillWork,
-    logits: Tensor,
     prefill_ms: f64,
     turn_start: Instant,
-    token_count: usize,
-}
-
-/// What [`Scheduler::prepare_first_sample`] readies for a turn's first sample.
-struct FirstSample {
-    context_depth: usize,
-    sampling_state: SequenceSamplingState,
-    /// The turn's config, with a turn grammar's opening mask applied.
-    sampling: SamplingConfig,
-    turn_driver: Option<StencilDriver>,
 }
 
 /// `tokens` cut one past every break token that has something after it, so each
@@ -4495,7 +4545,7 @@ mod wave_chunk_tests {
             },
             offset: 0,
             next_projection: 0,
-            final_logits: None,
+            finished: None,
             error: None,
             prefill_start: None,
         }

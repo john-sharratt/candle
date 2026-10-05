@@ -105,10 +105,43 @@ pub(crate) fn prefill_group_budget(
     }
 }
 
+/// The forward width the admission rate model chose for a prefill cohort: the
+/// rows it admitted before judging that more would not make the forward
+/// faster, and how many prefills the cohort held when it judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RateWidth {
+    pub rows: usize,
+    pub members: usize,
+}
+
+impl RateWidth {
+    /// Whether the verdict no longer describes the cohort in flight: fewer
+    /// prefills now share the forward than when it was made, so the trade it
+    /// weighed — rows against the residency they dislodge, with that many
+    /// turns' work to amortise — is no longer the one being made.
+    pub(crate) fn lapsed(&self, running: usize) -> bool {
+        running < self.members
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{kv_token_cap, prefill_group_budget, prefill_pass_budget};
+    use super::{kv_token_cap, prefill_group_budget, prefill_pass_budget, RateWidth};
     use candle_nn::kv_cache::CHUNK_SIZE;
+
+    /// A verdict lapses when the cohort shrinks, and holds while it stands or
+    /// grows: turns that joined after the judgement were admitted under it.
+    #[test]
+    fn a_rate_width_lapses_when_its_cohort_shrinks() {
+        let w = RateWidth {
+            rows: 2_575,
+            members: 5,
+        };
+        assert!(!w.lapsed(5));
+        assert!(!w.lapsed(8), "the joins admitted under it");
+        assert!(w.lapsed(4));
+        assert!(w.lapsed(0));
+    }
 
     /// **The cap is in tokens, and it is reached from bytes through whole
     /// blocks.**

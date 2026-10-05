@@ -38,7 +38,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use zend::access;
 use zend::api;
-use zend::config::{DaemonConfig, ModelChoice};
+use zend::config::{DaemonConfig, ModelChoice, SelfCheck};
 use zend::download;
 use zend::log_broadcast::{BusWriter, LogBus};
 use zend::session::ZendSession;
@@ -139,6 +139,19 @@ struct Cli {
     /// re-reconstructs the substrate. Opt-in; the startup pays the rewrite cost.
     #[arg(long)]
     compact_substrate: bool,
+
+    /// Ask every stored conversation — the dialogue and the `repo_map` /
+    /// `code_reading` layers — four yes/no questions about its own integrity
+    /// during load, after the sections are rebuilt and before anything
+    /// ingests, and tombstone each one that answers no to any of them. An
+    /// ingest conversation tombstoned this way is read again by the ingest
+    /// that follows; a dialogue is gone. Pair with `--dry-run` first.
+    #[arg(long)]
+    self_check: bool,
+
+    /// With `--self-check`: report every verdict and tombstone nothing.
+    #[arg(long, requires = "self_check")]
+    dry_run: bool,
 
     /// DESTRUCTIVE: delete the working dir's `substrate` directory (redo-log
     /// segments, logs — the daemon's entire persistent memory) before loading,
@@ -505,6 +518,11 @@ async fn main() -> anyhow::Result<()> {
         ingest_dirs: ingest_dirs.clone(),
         max_depth: cli.max_depth.map(|d| d as usize),
         compact_substrate: cli.compact_substrate,
+        self_check: match (cli.self_check, cli.dry_run) {
+            (false, _) => SelfCheck::Off,
+            (true, true) => SelfCheck::DryRun,
+            (true, false) => SelfCheck::Tombstone,
+        },
         read_only_substrate: false,
         model: cli.model.clone().map_or(ModelChoice::MeasuredVram, |m| {
             ModelChoice::Preset(Box::new(m))

@@ -134,13 +134,20 @@ pub(super) struct AdmitPass<'a> {
     /// the `Low` band would start from wherever `High` had walked to and skip
     /// every `Low` candidate ahead of it.
     prefill_cursor: [usize; 3],
+    /// Whether this pass admitted prefill rows, and whether it closed them on
+    /// the rate — what [`Self::conclude`] reads to replace the cohort's width.
+    widened: bool,
+    closed: bool,
 }
 
 impl<'a> AdmitPass<'a> {
     pub(super) fn new(sched: &'a mut Scheduler) -> Self {
         let per_block = sched.per_block_kv_bytes();
         let recurrent = sched.recurrent_cost();
-        let chunk_rows = sched.prefill_pass_budget();
+        sched.settle_rate_width();
+        // Offered against the ceiling, not the width the last pass chose: a
+        // pass that finds wider rows paying widens the cohort's forwards.
+        let chunk_rows = sched.prefill_pass_ceiling();
         let standing_tier = sched.standing_tier_bytes();
         let headroom = sched.admit_headroom(standing_tier);
         let budget = sched.admit_budget_terms(&headroom, chunk_rows);
@@ -155,6 +162,19 @@ impl<'a> AdmitPass<'a> {
             chunk_rows,
             standing_tier,
             prefill_cursor: [0; 3],
+            widened: false,
+            closed: false,
+        }
+    }
+
+    /// End the pass: a pass that admitted rows and never stopped on the rate
+    /// found every row it offered paying, so the width an earlier pass chose
+    /// no longer holds and the cohort's forwards may widen to the budget. A
+    /// pass that closed its rows has already recorded its own width
+    /// (`close_rows`); one that admitted no rows judged nothing.
+    pub(super) fn conclude(self) {
+        if self.widened && !self.closed {
+            self.sched.clear_rate_width();
         }
     }
 
@@ -330,6 +350,17 @@ impl Ground for AdmitPass<'_> {
         })
     }
 
+    /// The forward's rows end at what this pass has admitted: every later
+    /// offer has no room and comes back as a join, and the forwards the cohort
+    /// shares are composed at this width (`Scheduler::rate_width`).
+    fn close_rows(&mut self) -> bool {
+        let width = self.sched.standing_rows().saturating_add(self.rows_taken);
+        self.chunk_rows = width.max(CHUNK_SIZE);
+        self.sched.set_rate_width(width);
+        self.closed = true;
+        true
+    }
+
     fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
         if kind != Kind::Prefill {
             return false;
@@ -337,6 +368,7 @@ impl Ground for AdmitPass<'_> {
         // Spend the rows this offer took, so the next offer in this pass is sized
         // to what is left — see `peek`.
         self.rows_taken = self.rows_taken.saturating_add(cost.rows);
+        self.widened |= cost.rows > 0;
         let band = band_index(prio);
         // **Nothing is purchased here, and that is not an omission.**
         //

@@ -318,7 +318,12 @@ mod imp {
     /// so a three-frame label collapsed them into one row and hid which root was
     /// feeding the cascade. The cost is table width, paid once per report, on a
     /// diagnostic that is off by default.
-    const LABEL_FRAMES: usize = 6;
+    ///
+    /// **Twelve rather than six**, for the quantized ops: a q8a128 operand's
+    /// allocation is six frames of `candle_core::quantized` dispatch deep
+    /// (`resolve_u8_out <- … <- Storage::apply_op1`) before the first frame of
+    /// the model code that asked, so a six-frame label named only the dispatch.
+    const LABEL_FRAMES: usize = 12;
 
     /// The innermost few frames that belong to this codebase rather than to the
     /// allocator plumbing, innermost first, joined by ` <- `.

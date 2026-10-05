@@ -52,7 +52,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{current, ThreadId};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
-use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::cuda_backend::wave_provenance::{WaveCarve, WaveTicket};
 use candle::Result;
 
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
@@ -467,28 +467,31 @@ fn bump<'a>(
     })
 }
 
-/// [`bump`] without the borrow, for the ticket resolver.
+/// [`bump`] without the borrow, for the ticket resolver, against a lock the
+/// caller already holds.
 ///
 /// [`BumpRange`] ties its lifetime to the mutex guard, which is exactly right at
 /// a call site holding a [`Generation`] and useless here: the resolver is called
 /// from candle-core, which has no guard to borrow from and gets its bound from
-/// the `'w` already on the operand instead. Returning `None` on exhaustion
-/// rather than erroring, for the reason given on [`resolve_wave_alloc`].
-fn bump_raw(inner: &Mutex<Inner>, name: &'static str, len: usize, align: usize) -> Option<u64> {
-    let mut guard = inner.lock().ok()?;
-    bump_locked(&mut guard, name, len, align)
-}
-
-/// [`bump_raw`] against a lock the caller already holds.
-///
-/// Split out so a caller that must *decide* under the same guard it carves under
-/// can do both without dropping it in between — see the guest branch of
+/// the `'w` already on the operand instead. Under the caller's guard so it can
+/// *decide* and carve without dropping it in between — see
 /// [`resolve_wave_alloc`], where releasing the lock between reading `live` and
 /// bumping would leave a window for the generation to close underneath it.
+/// `None` is an exhausted span, which the resolver reports as such.
 fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) -> Option<u64> {
     let start = aligned_start(inner.base, inner.cursor, align);
     let end = start.checked_add(len)?;
     if end > inner.capacity {
+        // The generation that ran out is the one worth itemising: what it had
+        // carved, and the request that did not fit.
+        if wave_census::enabled() {
+            let mut carves = inner.census.clone();
+            carves.push(Carve {
+                len,
+                label: wave_census::label(),
+            });
+            wave_census::report(name, end, inner.capacity, &carves);
+        }
         return None;
     }
     inner.cursor = end;
@@ -1024,12 +1027,14 @@ fn stage_in(
     cuda: &candle::CudaDevice,
     generation: &Generation,
 ) -> Result<candle::Tensor> {
-    use candle::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin};
+    use candle::cuda_backend::wave_provenance::{exhausted, wave_alloc, LeaseOrigin, WaveCarve};
 
     let ticket = generation.ticket();
     let bytes = x.elem_count() * x.dtype().size_in_bytes();
-    let Some(ptr) = wave_alloc(ticket, bytes, 256) else {
-        return Ok(x.clone());
+    let ptr = match wave_alloc(ticket, bytes, 256) {
+        WaveCarve::Carved(ptr) => ptr,
+        WaveCarve::Closed => return Ok(x.clone()),
+        WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
     };
     let dev = candle::Device::Cuda(cuda.clone());
     // SAFETY: the range was carved from the generation open above, which the
@@ -1815,22 +1820,26 @@ fn stream_of(domain: &WaveDomain) -> Arc<CudaStream> {
 /// Carve `bytes` from the arena a [`WaveTicket`] names — the resolver candle-core
 /// calls when an op inherits its operand's arena.
 ///
-/// `None` rather than an error for every miss, because each one has an
-/// unremarkable meaning and a pool allocation is always a correct answer:
-/// an unknown domain (no wave has run on that stream), a stale epoch (the
-/// generation rewound), or an exhausted span. Only the last is interesting, and
-/// it is already reported by the span-exhausted path the planned allocations
-/// take — turning it into a hard failure here would abort a forward that could
-/// have completed on pool memory.
-fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<u64> {
+/// Three answers, and only one of them goes to the pool. An unknown domain (no
+/// wave has run on that stream) or a stale epoch (the generation rewound) is
+/// [`WaveCarve::Closed`]: the operand's phase is over, and its derived data has
+/// nowhere else to live. An open generation whose span cannot hold the request
+/// is [`WaveCarve::Exhausted`], which the caller turns into an error — a buffer
+/// the wave plan did not price, named where it was asked for.
+fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCarve {
+    let carve = |c: Option<u64>| c.map_or(WaveCarve::Exhausted, WaveCarve::Carved);
     // A guest ticket names no phase, so it is answered from the guest registry
     // rather than the wave domain's three arenas. Checked first because it is
     // the cheaper lookup and because `arenas.get(3)` would otherwise decide it
     // by returning `None` — the right answer for the wrong reason, and one that
     // would silently stop working if a fourth phase were ever added.
     if ticket.arena == GUEST_ARENA {
-        let map = guest_domains().lock().ok()?;
-        let arena = map.get(&(ticket.domain as usize))?;
+        let Ok(map) = guest_domains().lock() else {
+            return WaveCarve::Closed;
+        };
+        let Some(arena) = map.get(&(ticket.domain as usize)) else {
+            return WaveCarve::Closed;
+        };
         let inner = Arc::clone(&arena.inner);
         let name = arena.name;
         drop(map);
@@ -1838,7 +1847,9 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<
             // Decided and carved under one guard. Dropping it between the two
             // would let the generation close in the window and hand this carve a
             // range the arena has already rewound past.
-            let mut guard = inner.lock().ok()?;
+            let Ok(mut guard) = inner.lock() else {
+                return WaveCarve::Closed;
+            };
             // **A guest's weights carry a seed, not a provenance.** They are
             // placed once and read by every stage — the encode, each denoise
             // step, each decode tile — and each stage is its own generation, so
@@ -1853,14 +1864,20 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<
             // rewinds, and only the weights keep the any-epoch licence.
             let epoch_ok = ticket.epoch == GUEST_ANY_EPOCH || guard.epoch == ticket.epoch;
             if !epoch_ok || guard.live == 0 {
-                return None;
+                return WaveCarve::Closed;
             }
-            return bump_locked(&mut guard, name, bytes, align);
+            return carve(bump_locked(&mut guard, name, bytes, align));
         }
     }
-    let map = wave_domains().lock().ok()?;
-    let domain = map.get(&(ticket.domain as usize))?;
-    let arena = domain.arenas.get(ticket.arena as usize)?;
+    let Ok(map) = wave_domains().lock() else {
+        return WaveCarve::Closed;
+    };
+    let Some(arena) = map
+        .get(&(ticket.domain as usize))
+        .and_then(|d| d.arenas.get(ticket.arena as usize))
+    else {
+        return WaveCarve::Closed;
+    };
     let inner = Arc::clone(&arena.inner);
     let name = arena.name;
     // Drop the registry lock before touching the arena: the two are always taken
@@ -1868,13 +1885,16 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<
     // deadlock an allocation path called from arbitrary op code could otherwise
     // introduce.
     drop(map);
-    {
-        let guard = inner.lock().ok()?;
-        if guard.epoch != ticket.epoch || guard.live == 0 {
-            return None;
-        }
+    // Decided and carved under one guard, as the guest branch is: released
+    // between the two, the generation could close in the window and the carve
+    // land in a range the arena has already rewound past.
+    let Ok(mut guard) = inner.lock() else {
+        return WaveCarve::Closed;
+    };
+    if guard.epoch != ticket.epoch || guard.live == 0 {
+        return WaveCarve::Closed;
     }
-    bump_raw(&inner, name, bytes, align)
+    carve(bump_locked(&mut guard, name, bytes, align))
 }
 
 /// Whether any wave generation is open on `ordinal`.
@@ -2543,8 +2563,9 @@ mod provenance_tests {
             let _r = wave.alloc(1024, 256)?;
             t
         };
-        assert!(
-            candle::cuda_backend::wave_provenance::wave_alloc(stale, 1024, 256).is_none(),
+        assert_eq!(
+            candle::cuda_backend::wave_provenance::wave_alloc(stale, 1024, 256),
+            super::WaveCarve::Closed,
             "a ticket outlived its generation and still carved from the span"
         );
         let _ = dev;

@@ -43,9 +43,12 @@
 use candle::cuda_backend::Backing;
 use candle::quantized::cuda::{alloc_host_mapped, HostMappedAlloc};
 use candle::quantized::{cuda::QCudaStorage, GgmlDType, QStorage, QTensor};
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use candle_kernels::simple::gather_rows::run_gather_rows_bytes;
 use cudarc::driver::DevicePtr;
+
+use crate::models::wave_buffers::wave_empty_ticketed;
 
 /// Fraction of the card, in percent, above which an embedding table is served
 /// from host memory rather than kept resident in VRAM.
@@ -237,14 +240,18 @@ impl HostEmbedding {
     /// not anything uses it.
     ///
     /// The **result** is deliberately not carved from it: the dequantized rows
-    /// become `x`, the residual stream, which outlives this call and may be
-    /// persisted and resumed on a later wave.
+    /// become `x`, the residual stream, which outlives the staging. They are
+    /// written where `residual` names — the forward's span for a wave that
+    /// reaches the head, so the residual allocates nothing — or into an owned
+    /// buffer with `None`, for a window whose residual is persisted and resumed
+    /// on a later wave.
     pub fn embed(
         &self,
         ids: &Tensor,
         device: &Device,
         staging: Backing,
         dtype: DType,
+        residual: Option<WaveTicket>,
     ) -> Result<Tensor> {
         let cuda = match device {
             Device::Cuda(d) => d,
@@ -293,17 +300,18 @@ impl HostEmbedding {
         }
 
         // Hand the gathered rows to the ordinary quantized path: these are the
-        // same calls the resident embedding would have made at load, so every
+        // same kernels the resident embedding would have run at load, so every
         // format they support is supported here with identical numerics.
-        let qt = QTensor::new(QStorage::Cuda(staged), (n_ids, self.layout.ncols))?;
-        match dtype {
-            DType::F32 => qt.dequantize(device),
-            DType::F16 => qt.dequantize_f16(device),
-            DType::BF16 => qt.dequantize_bf16(device),
-            other => candle::bail!(
-                "host embedding: {other:?} is not a residual-stream type the dequantize emits"
-            ),
+        if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            candle::bail!(
+                "host embedding: {dtype:?} is not a residual-stream type the dequantize emits"
+            );
         }
+        let qt = QTensor::new(QStorage::Cuda(staged), (n_ids, self.layout.ncols))?;
+        // Fully written by the dequantize (invariant 6).
+        let mut rows = wave_empty_ticketed((n_ids, self.layout.ncols), dtype, device, residual)?;
+        qt.dequantize_into(&mut rows, 0, 0, elem_count)?;
+        Ok(rows)
     }
 }
 
@@ -371,6 +379,7 @@ mod cuda_tests {
             &device,
             Backing::Owned,
             DType::F16,
+            None,
         )?;
         assert_eq!(out.dims(), &[ids.len(), ncols]);
         let got = out.to_vec2::<f16>()?;
@@ -409,12 +418,12 @@ mod cuda_tests {
         let table = HostEmbedding::new(&mmap, 0, GgmlDType::Q8_0, n_rows, ncols)?;
         let ids = Tensor::new([5u32, 2, 0].as_slice(), &device)?;
 
-        let f32_rows = table.embed(&ids, &device, Backing::Owned, DType::F32)?;
+        let f32_rows = table.embed(&ids, &device, Backing::Owned, DType::F32, None)?;
         assert_eq!(f32_rows.dtype(), DType::F32);
         let reference = f32_rows.to_vec2::<f32>()?;
 
         for dtype in [DType::F16, DType::BF16] {
-            let rows = table.embed(&ids, &device, Backing::Owned, dtype)?;
+            let rows = table.embed(&ids, &device, Backing::Owned, dtype, None)?;
             assert_eq!(rows.dtype(), dtype, "embed must emit the type it was asked");
             let narrowed = rows.to_dtype(DType::F32)?.to_vec2::<f32>()?;
             for (r, (got, want)) in narrowed.iter().zip(reference.iter()).enumerate() {
@@ -431,7 +440,7 @@ mod cuda_tests {
 
         // An integer residual stream is a caller mistake, not something to
         // silently widen into.
-        let err = match table.embed(&ids, &device, Backing::Owned, DType::U32) {
+        let err = match table.embed(&ids, &device, Backing::Owned, DType::U32, None) {
             Ok(_) => panic!("U32 is not a residual-stream type"),
             Err(e) => e.to_string(),
         };

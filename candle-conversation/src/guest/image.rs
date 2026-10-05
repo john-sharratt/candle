@@ -201,8 +201,8 @@ const ARENA_HEADROOM_BYTES: usize = 64 << 20;
 /// Below this an arena is not worth opening.
 ///
 /// A tile decode's working set is hundreds of megabytes; an arena that cannot
-/// hold one would decline every carve as `ArenaFull` and fall to the pool
-/// anyway, having first taken the ground the pool might have used.
+/// hold one would refuse the first carve that overran it, having first taken
+/// the ground the pool might have used.
 const MIN_ARENA_BYTES: usize = 512 << 20;
 
 struct Loaded {

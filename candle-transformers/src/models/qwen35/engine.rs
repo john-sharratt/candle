@@ -54,7 +54,14 @@ pub fn priced_intermediate(cfg: &Qwen35Config) -> usize {
 /// `int8mode` is the session's, not the config's: the weights' KO twins are
 /// chosen at load, and whether they were decides the encoding each norm's fused
 /// epilogue emits — a real difference in what the span holds, not a rounding.
-pub fn wave_geometry(cfg: &Qwen35Config, act_dtype: DType, int8mode: Int8Mode) -> ModelGeometry {
+/// `mtp_head` is the same kind of fact: whether a NextN head was loaded, which
+/// the checkpoint's layer count does not settle on its own.
+pub fn wave_geometry(
+    cfg: &Qwen35Config,
+    act_dtype: DType,
+    int8mode: Int8Mode,
+    mtp_head: bool,
+) -> ModelGeometry {
     let (experts_per_tok, n_experts) = match &cfg.moe {
         Some(moe) => (moe.n_experts_used.max(1), moe.n_experts.max(1)),
         None => (1, 1),
@@ -80,6 +87,11 @@ pub fn wave_geometry(cfg: &Qwen35Config, act_dtype: DType, int8mode: Int8Mode) -
                 conv_dim: cfg.delta_net.conv_dim(),
                 value_dim: cfg.delta_net.value_dim(),
                 n_v_heads: cfg.delta_net.n_v_heads,
+                layers: cfg
+                    .layer_kinds
+                    .iter()
+                    .filter(|k| matches!(k, LayerKind::DeltaNet))
+                    .count(),
             }),
         // Every MoE layer in this lineage adds an always-active shared expert
         // to the routed block, and its gate projection is stored padded to one
@@ -130,6 +142,7 @@ pub fn wave_geometry(cfg: &Qwen35Config, act_dtype: DType, int8mode: Int8Mode) -
         // rather than assert this lineage's 64-of-256.
         partial_rotary: cfg.rope_dim < cfg.attn_head_dim,
         hyper: None,
+        mtp_head,
     }
 }
 
@@ -308,7 +321,7 @@ mod tests {
     #[test]
     fn geometry_reports_the_hybrid_shapes() {
         let cfg = nine_b();
-        let g = wave_geometry(&cfg, DType::BF16, Int8Mode::Performance);
+        let g = wave_geometry(&cfg, DType::BF16, Int8Mode::Performance, false);
         assert_eq!(g.hidden, 4096);
         assert_eq!((g.n_head, g.n_kv_head, g.head_dim), (16, 4, 256));
         // Dense: the MoE terms collapse rather than needing a second branch.
@@ -325,7 +338,7 @@ mod tests {
         assert_eq!(g.delta_net.map(|d| d.n_v_heads), Some(32));
         // An int8 session's norms emit q8a128; a float session's do not.
         assert!(g.packed_norm);
-        assert!(!wave_geometry(&cfg, DType::BF16, Int8Mode::Off).packed_norm);
+        assert!(!wave_geometry(&cfg, DType::BF16, Int8Mode::Off, false).packed_norm);
     }
 
     /// **The FFN width is the FFN's, even when the mixer is wider.**
@@ -358,7 +371,7 @@ mod tests {
             shared_expert_ffn_size: 512,
             norm_topk_prob: true,
         });
-        let g = wave_geometry(&cfg, DType::BF16, Int8Mode::Performance);
+        let g = wave_geometry(&cfg, DType::BF16, Int8Mode::Performance, false);
         assert_eq!((g.experts_per_tok, g.n_experts), (8, 256));
         // The per-expert width, and only that: the FFN phase prices the FFN,
         // and `expert_rows` applies the fan-out separately.

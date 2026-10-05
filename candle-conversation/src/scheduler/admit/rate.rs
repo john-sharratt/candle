@@ -1004,6 +1004,50 @@ impl WaveRate {
         }
     }
 
+    /// Offer prefill rows that would **widen** the forward, judged as
+    /// [`Self::try_admit`] judges them — except that a refusal on the rate
+    /// alone does not latch the wave full.
+    ///
+    /// `Saturated` and `Worse` answer one question: whether more rows make this
+    /// forward faster. A "no" means its rows are spent, not that the turn
+    /// offering them must wait for another cohort — it can still join the one
+    /// forming and share the forwards to come ([`Self::try_join`]), which is
+    /// what lets the cohort decode at its full width. Latching here turned the
+    /// width the rate model chose into a cut through the cohort: on
+    /// Qwen3.8-Flash-Next, eight 515-token turns against an 8,192-row budget
+    /// admitted five whole, refused the sixth `Saturated { gain: 0.007 }`, and
+    /// the last three waited out the first five's decode.
+    ///
+    /// The floor and the caps still latch: those are the lines every admission,
+    /// a join included, has to respect.
+    pub fn try_widen(&mut self, tokens: usize, weights_before: u64, weights_after: u64) -> Admit {
+        if self.full {
+            return Admit::Refused(Refusal::Full);
+        }
+        let first = !self.admitted_any;
+        match self.judge_prefill(tokens, weights_before, weights_after, first) {
+            Ok(projected) => {
+                self.admitted_any = true;
+                self.resident_now = weights_after;
+                Admit::Admitted { projected }
+            }
+            Err(refusal @ (Refusal::Saturated { .. } | Refusal::Worse { .. })) => {
+                Admit::Refused(refusal)
+            }
+            Err(refusal) => {
+                self.full = true;
+                Admit::Refused(refusal)
+            }
+        }
+    }
+
+    /// End the wave on a refusal the caller could not turn into a join — what
+    /// [`Self::try_admit`] does on every refusal. Every later offer is refused
+    /// as [`Refusal::Full`].
+    pub fn latch_full(&mut self) {
+        self.full = true;
+    }
+
     /// Offer a prefill that **joins a forward whose rows are already spent** —
     /// a turn admitted to share the coming forwards rather than to widen this
     /// one.

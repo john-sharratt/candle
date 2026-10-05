@@ -13,9 +13,19 @@
 //! an ordinary `{"error", "detail"}` result, so both readers already handle it:
 //! the model reads it as a failed call and can issue the call again, and the
 //! GUI pairs it with the call's card and shows it as an error.
+//!
+//! **A tag is markup only where the model wrote it as one.** The answer comes
+//! as a [`TurnText`]: control tokens markup, ordinary tokens literal. A summary
+//! that quotes `<tool_call>` from the file it describes spells the tag out in
+//! ordinary tokens, and read as a string that quotation opens a call — six
+//! `code_reading` summaries were refused as calls cut off at the opener that
+//! way, and each model, told its summary was a broken call, went on to read and
+//! summarise other files. The scanners read [`scan_text`] instead, in which a
+//! quoted tag can no longer be matched.
 
 use std::sync::OnceLock;
 
+use candle_conversation::TurnText;
 use regex::Regex;
 use serde_json::{json, Value};
 use zend_tools::ToolContext;
@@ -24,6 +34,17 @@ use crate::tools::{answer_text, calls_in_answer, parse_call, run_tool, ToolCall,
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
+
+/// What a quoted `<` becomes in [`scan_text`]: a private-use character no
+/// scanner matches, mapped back to `<` in every argument a planned call
+/// carries ([`unquote`]), so a call quoting a tag in its own value keeps it.
+const QUOTED_LT: char = '\u{E000}';
+
+/// The tags the scanners read. Inside a call's body a quotation of one of
+/// these is the only `<` that has to be hidden: the body's own syntax — a
+/// function block's `<function=…>` and `<parameter=…>` — is ordinary tokens
+/// too, and must stay readable.
+const SCANNED_TAGS: [&str; 4] = [OPEN, CLOSE, "<think>", "</think>"];
 
 /// One call of a round.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,13 +79,16 @@ enum Problem {
     Invalid(String),
 }
 
-/// The calls `response_text` makes, runnable and not, in the order it makes
-/// them. Empty when it makes none — a final answer.
-pub fn plan(response_text: &str) -> Vec<Step> {
-    let answer = answer_text(response_text);
+/// The calls `response` makes, runnable and not, in the order it makes them.
+/// Empty when it makes none — a final answer.
+pub fn plan(response: &TurnText) -> Vec<Step> {
+    let answer = answer_text(&scan_text(response));
     let mut steps: Vec<(usize, Step)> = calls_in_answer(&answer)
         .into_iter()
-        .map(|(at, call)| (at, Step::Run(call)))
+        .map(|(at, mut call)| {
+            unquote(&mut call.arguments);
+            (at, Step::Run(call))
+        })
         .collect();
     for (at, name, problem) in unreadable_blocks(&answer) {
         steps.push((at, Step::Refuse(refusal(name, &problem))));
@@ -76,11 +100,54 @@ pub fn plan(response_text: &str) -> Vec<Step> {
 /// Whether the round has a call whose `</tool_call>` never arrived — the
 /// stream then needs the closer written for it, or the GUI reads everything
 /// after the opener as part of the call.
-pub fn ends_inside_a_call(response_text: &str) -> bool {
-    let answer = answer_text(response_text);
+pub fn ends_inside_a_call(response: &TurnText) -> bool {
+    let answer = answer_text(&scan_text(response));
     answer
         .rfind(OPEN)
         .is_some_and(|open| !answer[open..].contains(CLOSE))
+}
+
+/// `response` as the call scanners read it: markup as written, and literal
+/// text with its `<` written as [`QUOTED_LT`], so a tag the model only quoted
+/// cannot open, close or bound anything.
+///
+/// Outside a call every literal `<` is quoted. Inside one — opened by markup
+/// and not yet closed by it — only the `<` of a [`SCANNED_TAGS`] quotation is,
+/// since the rest of the body is the call's own syntax.
+fn scan_text(response: &TurnText) -> String {
+    let mut out = String::new();
+    let mut in_call = false;
+    for piece in response.pieces() {
+        if !piece.literal {
+            out.push_str(&piece.text);
+            in_call = match (piece.text.rfind(OPEN), piece.text.rfind(CLOSE)) {
+                (Some(open), Some(close)) => open > close,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => in_call,
+            };
+        } else if in_call {
+            let mut body = piece.text.clone();
+            for tag in SCANNED_TAGS {
+                body = body.replace(tag, &format!("{QUOTED_LT}{}", &tag[1..]));
+            }
+            out.push_str(&body);
+        } else {
+            out.push_str(&piece.text.replace('<', &QUOTED_LT.to_string()));
+        }
+    }
+    out
+}
+
+/// Every string in `value` with [`QUOTED_LT`] written back as the `<` it
+/// stands for.
+fn unquote(value: &mut Value) {
+    match value {
+        Value::String(s) if s.contains(QUOTED_LT) => *s = s.replace(QUOTED_LT, "<"),
+        Value::Array(items) => items.iter_mut().for_each(unquote),
+        Value::Object(fields) => fields.values_mut().for_each(unquote),
+        _ => {}
+    }
 }
 
 /// Run a planned round in order. A [`Step::Refuse`] contributes its result
@@ -194,6 +261,12 @@ fn refusal(name: Option<String>, problem: &Problem) -> ToolResult {
 mod tests {
     use super::*;
 
+    /// `text` with every tag in it written as a tag — the shape of a turn whose
+    /// markers were all control tokens.
+    fn tagged(text: &str) -> TurnText {
+        TurnText::markup(text)
+    }
+
     fn runs(steps: &[Step]) -> Vec<&str> {
         steps.iter().map(Step::name).collect()
     }
@@ -214,10 +287,13 @@ mod tests {
     fn a_call_whose_value_never_closes_is_refused_as_cut_off() {
         let text = "<think>plan</think>\n\n<tool_call>\n{\"name\": \"write\", \"arguments\": \
                     {\"path\": \"docs/a.md\", \"content\": \"# A\\n\\n\\\"}}\n</tool_call>";
-        let steps = plan(text);
+        let steps = plan(&tagged(text));
         assert_eq!(runs(&steps), ["write"]);
         assert_eq!(error_of(&steps[0]), "call_cut_off");
-        assert!(!ends_inside_a_call(text), "the block itself is closed");
+        assert!(
+            !ends_inside_a_call(&tagged(text)),
+            "the block itself is closed"
+        );
     }
 
     /// A call the turn stopped writing — no `</tool_call>` at all — is cut off
@@ -225,17 +301,17 @@ mod tests {
     #[test]
     fn a_call_with_no_close_is_refused_and_flagged_open() {
         let text = "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"path\": \"a\", \"content\": \"abc";
-        let steps = plan(text);
+        let steps = plan(&tagged(text));
         assert_eq!(runs(&steps), ["write"]);
         assert_eq!(error_of(&steps[0]), "call_cut_off");
-        assert!(ends_inside_a_call(text));
+        assert!(ends_inside_a_call(&tagged(text)));
     }
 
     /// Complete but not JSON: refused as malformed, with the parser's reason.
     #[test]
     fn a_closed_call_that_is_not_json_is_refused_as_malformed() {
         let text = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {path: x}}\n</tool_call>";
-        let steps = plan(text);
+        let steps = plan(&tagged(text));
         assert_eq!(runs(&steps), ["file_read"]);
         assert_eq!(error_of(&steps[0]), "malformed_call");
     }
@@ -247,7 +323,7 @@ mod tests {
         let text = "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {}}\n</tool_call>\n\
                     <tool_call>\n{\"name\": \"file_read\", \"arguments\": {oops}}\n</tool_call>\n\
                     <tool_call>\n{\"name\": \"datetime\", \"arguments\": {}}\n</tool_call>";
-        let steps = plan(text);
+        let steps = plan(&tagged(text));
         assert_eq!(runs(&steps), ["file_list", "file_read", "datetime"]);
         assert!(matches!(steps[0], Step::Run(_)));
         assert_eq!(error_of(&steps[1]), "malformed_call");
@@ -260,27 +336,112 @@ mod tests {
     fn readable_calls_run_and_an_answer_plans_nothing() {
         let text = "<tool_call>\n{\"name\": \"datetime\", \"arguments\": {}}\n</tool_call>";
         assert_eq!(
-            plan(text),
+            plan(&tagged(text)),
             vec![Step::Run(ToolCall {
                 name: "datetime".into(),
                 arguments: json!({}),
             })]
         );
-        assert!(plan("The answer is 4.").is_empty());
+        assert!(plan(&tagged("The answer is 4.")).is_empty());
     }
 
     /// A call written inside the reasoning is deliberation — not run, and not
     /// refused either.
     #[test]
     fn a_broken_call_inside_the_reasoning_is_not_a_call() {
-        assert!(plan("<think><tool_call>{\"name\": \"write\", \"argu</think>Done.").is_empty());
+        let text = "<think><tool_call>{\"name\": \"write\", \"argu</think>Done.";
+        assert!(plan(&tagged(text)).is_empty());
     }
 
     /// Nothing readable to name: the refusal still answers, as `tool_call`.
     #[test]
     fn a_nameless_cut_off_call_is_still_answered() {
-        let steps = plan("<tool_call>\n{\"na");
+        let steps = plan(&tagged("<tool_call>\n{\"na"));
         assert_eq!(runs(&steps), ["tool_call"]);
         assert_eq!(error_of(&steps[0]), "call_cut_off");
+    }
+
+    /// **The live failure: a summary that quotes the tag.** The file it
+    /// summarised documents `<tool_call>`, and the summary names it the same
+    /// way — spelled out, in ordinary tokens. That is a final answer, not a
+    /// call cut off at its opener.
+    #[test]
+    fn a_quoted_tag_in_the_answer_is_not_a_call() {
+        let summary = TurnText::literal(
+            "a ban that belongs to one session (`<tool_call>` on the answer that \
+             closes a stuck tool loop) would otherwise reach the whole wave.",
+        );
+        assert!(plan(&summary).is_empty());
+        assert!(!ends_inside_a_call(&summary));
+        let both = TurnText::literal("`<tool_call>` and `</tool_call>` frame a call.");
+        assert!(plan(&both).is_empty());
+    }
+
+    /// A real call after a quoted tag runs, and is the only step: the
+    /// quotation neither opens a block of its own nor swallows the call.
+    #[test]
+    fn a_real_call_after_a_quoted_tag_runs_alone() {
+        let text = TurnText::literal("I will read the file that defines `<tool_call>`.\n")
+            .then_markup("<tool_call>")
+            .then_literal("\n{\"name\": \"datetime\", \"arguments\": {}}\n")
+            .then_markup("</tool_call>");
+        assert_eq!(
+            plan(&text),
+            vec![Step::Run(ToolCall {
+                name: "datetime".into(),
+                arguments: json!({}),
+            })]
+        );
+    }
+
+    /// A call's body is read as written, quoted tags and all: a `write` whose
+    /// content documents the tag keeps it in its argument.
+    #[test]
+    fn a_quoted_tag_inside_a_call_stays_in_its_argument() {
+        let text = TurnText::markup("<tool_call>")
+            .then_literal(
+                "\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.md\", \
+                 \"content\": \"calls open with <tool_call>\"}}\n",
+            )
+            .then_markup("</tool_call>");
+        let steps = plan(&text);
+        assert_eq!(runs(&steps), ["write"]);
+        let Step::Run(call) = &steps[0] else {
+            panic!("the write was not planned to run");
+        };
+        assert_eq!(call.arguments["content"], "calls open with <tool_call>");
+    }
+
+    #[test]
+    fn literal_text_outside_a_call_has_its_tags_escaped() {
+        let text = TurnText::literal("a <b> ")
+            .then_markup("<tool_call>")
+            .then_literal("<c>")
+            .then_markup("</tool_call>")
+            .then_literal(" <d>");
+        assert_eq!(
+            scan_text(&text),
+            "a \u{E000}b> <tool_call><c></tool_call> \u{E000}d>"
+        );
+    }
+
+    /// Inside a call only a quoted tag is hidden; the body's own `<` syntax
+    /// stays readable.
+    #[test]
+    fn a_call_body_hides_only_quoted_tags() {
+        let text = TurnText::markup("<tool_call>")
+            .then_literal("<function=write><tool_call></think>")
+            .then_markup("</tool_call>");
+        assert_eq!(
+            scan_text(&text),
+            "<tool_call><function=write>\u{E000}tool_call>\u{E000}/think></tool_call>"
+        );
+    }
+
+    #[test]
+    fn unquoting_restores_every_nested_string() {
+        let mut v = json!({"a": "x\u{E000}y", "b": ["\u{E000}", 3], "c": {"d": "\u{E000}e"}});
+        unquote(&mut v);
+        assert_eq!(v, json!({"a": "x<y", "b": ["<", 3], "c": {"d": "<e"}}));
     }
 }

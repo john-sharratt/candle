@@ -38,6 +38,8 @@ use candle_nn::kv_cache::{ChunkedKvBacking, KvCache};
 
 use super::batched_inference::BatchedInferenceSession;
 use super::operand_guard::{expect_dense_view, expect_dtype};
+#[cfg(feature = "cuda")]
+use super::wave_buffers::upload_into;
 
 /// One position of the walk, for the whole cohort.
 ///
@@ -106,7 +108,6 @@ pub fn draft_walk(
     if n == 0 || max_len == 0 {
         return Ok(vec![Vec::new(); n]);
     }
-    let dev = seeds.device().clone();
 
     // The head ropes on ABSOLUTE sequence positions, like every trunk layer:
     // its history is the sequence's, one row per token, so a drafted position
@@ -147,9 +148,14 @@ pub fn draft_walk(
 
     // Everything that allocates has now run; from here the walk only computes.
     let generation = session.begin_stager_generation();
-    let mut ids = Tensor::from_vec(committed.to_vec(), n, &dev)?;
+    // The walk's tokens, one row each: the committed ones the first step
+    // follows, then every step's pick. One buffer the session holds, so no step
+    // allocates; the picks feed the next step from where they were written, and
+    // the whole block crosses the bus once at the end.
+    let tokens = session.walk_tokens(max_len + 1, n)?;
+    upload_tokens(&tokens.get(0)?, committed)?;
+    let mut ids = tokens.get(0)?;
     let mut h = seeds.clone();
-    let mut steps: Vec<Tensor> = Vec::with_capacity(max_len);
 
     let drafted = (|| -> Result<()> {
         for j in 0..max_len {
@@ -219,10 +225,11 @@ pub fn draft_walk(
             // so it is never committed.
             expect_dense_view(&logits, "draft walk logits")?;
             let vocab = logits.dim(D::Minus1)?;
-            let next = logits.reshape((n, vocab))?.batched_sample_argmax(vocab)?;
-            expect_dtype(&next, DType::U32, "draft walk argmax")?;
+            let next = tokens.get(j + 1)?;
+            logits
+                .reshape((n, vocab))?
+                .batched_sample_argmax_into(vocab, &next)?;
             ids = next;
-            steps.push(ids.clone());
             h = h_next;
         }
         Ok(())
@@ -243,10 +250,23 @@ pub fn draft_walk(
     drafted?;
     rolled_back?;
 
-    // The one readback: `[n, max_len]`, so the whole cohort's whole block
-    // crosses the bus in a single transfer.
-    let refs: Vec<&Tensor> = steps.iter().collect();
-    Tensor::stack(&refs, 1)?.to_vec2::<u32>()
+    // The one readback: the `[max_len, n]` picks, so the whole cohort's whole
+    // block crosses the bus in a single transfer, transposed on the host.
+    let picks = tokens.narrow(0, 1, max_len)?.to_vec2::<u32>()?;
+    Ok((0..n)
+        .map(|i| picks.iter().map(|row| row[i]).collect())
+        .collect())
+}
+
+/// The committed tokens into the walk buffer's first row: an upload into the
+/// buffer itself on CUDA, a write of the host buffer otherwise.
+fn upload_tokens(row: &Tensor, committed: &[u32]) -> Result<()> {
+    expect_dtype(row, DType::U32, "draft walk tokens")?;
+    #[cfg(feature = "cuda")]
+    if row.device().is_cuda() {
+        return upload_into(row, committed);
+    }
+    row.slice_set(&Tensor::new(committed, row.device())?, 0, 0)
 }
 
 /// Pre-allocate the walk's write chunks without walking.

@@ -23,10 +23,14 @@
 
 #[cfg(feature = "cuda")]
 pub mod batched_attention;
+pub mod capture_rows;
+pub mod column_split;
 pub mod config;
 pub mod convert;
 pub mod convert_bench;
 pub mod coverage;
+#[cfg(feature = "cuda")]
+pub mod device_operand;
 pub mod draft;
 #[cfg(feature = "cuda")]
 pub mod engine;
@@ -46,7 +50,13 @@ pub mod paged_index;
 #[cfg(feature = "cuda")]
 pub mod place;
 pub mod ple;
+/// Microbench + `ncu` target for the fused PLE launches, with its own
+/// correctness gate.
+#[cfg(feature = "cuda")]
+pub mod ple_bench;
 pub mod ple_cache;
+#[cfg(feature = "cuda")]
+pub mod ple_fused;
 /// The prepared engine artifact — recipe, sources, requant, build.
 pub mod prepare;
 pub mod qsa;
@@ -54,7 +64,10 @@ pub mod qsa_select;
 #[cfg(feature = "cuda")]
 pub mod resident_page;
 pub mod rope;
+#[cfg(feature = "cuda")]
+pub mod select_bytes;
 pub mod spec;
+pub mod state_slots;
 #[cfg(feature = "cuda")]
 pub mod wave;
 

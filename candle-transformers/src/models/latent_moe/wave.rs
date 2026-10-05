@@ -918,6 +918,8 @@ impl ManagedBatchedModel for BatchedEngine {
             // No hyper-connections: one residual stream, as everything but the
             // Flash-Next lineage.
             hyper: None,
+            // Its drafter is not a NextN head on the wave.
+            mtp_head: false,
         }
     }
 
@@ -1133,8 +1135,7 @@ impl ManagedBatchedModel for BatchedEngine {
         }
         // One upload per group, each row a view of it.
         let tokens: Vec<u32> = plain.iter().map(|&(_, tok)| tok).collect();
-        let (decode_inputs, verify_inputs) =
-            upload_plan_rows(&tokens, blocks, self.engine.engine_device())?;
+        let (decode_inputs, verify_inputs) = upload_plan_rows(&tokens, blocks)?;
         s_snap.end();
         *self
             .verify_all_rows
@@ -1349,6 +1350,7 @@ impl BatchedEngine {
             layer_start,
             layer_end,
             x_in,
+            window: _,
             act_dtype: _,
             adapter,
         } = wave;
@@ -1431,7 +1433,9 @@ impl BatchedEngine {
                 .iter()
                 .chain(pre_member_inputs.iter())
                 .chain(glue_member_inputs.iter()),
+            None,
         )?
+        .per_input
         .into_iter();
         let dec_member_ids: Vec<Vec<u32>> = ids.by_ref().take(dec_member_inputs.len()).collect();
         let pre_member_ids: Vec<Vec<u32>> = ids.by_ref().take(pre_member_inputs.len()).collect();
@@ -3035,7 +3039,7 @@ impl BatchedEngine {
             cursor += s_len;
         }
         let r_total = sel_rows.len();
-        let scored_h = select_head_rows(&h, sel_rows.clone(), 1)?; // [1, R, hc, dim]
+        let scored_h = select_head_rows(&h, sel_rows.clone(), 1, None)?; // [1, R, hc, dim]
         let reduced = hc.head_reduce(&scored_h, e.hc_head())?; // [1, R, dim]
         let scored_hidden = rms_norm(&reduced, e.output_norm(), cfg.norm_eps)?;
         let logits_all = e.lm_head().forward(&scored_hidden)?; // [1,R,vocab]
@@ -3058,7 +3062,7 @@ impl BatchedEngine {
                             .ok_or_else(|| {
                                 candle::Error::msg(format!("target layer {tl} not captured"))
                             })?;
-                    select_head_rows(&captured.1, sel_rows.clone(), 1) // [1, R, dim]
+                    select_head_rows(&captured.1, sel_rows.clone(), 1, None) // [1, R, dim]
                 })
                 .collect::<Result<_>>()?;
             let feats = Tensor::cat(&per_layer, 2)?; // [1, R, m·dim]

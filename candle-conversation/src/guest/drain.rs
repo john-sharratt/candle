@@ -217,9 +217,10 @@ pub fn drain_one<R: EngineRoom>(
     // **What the arena did not serve, and why.** A reading now and a
     // subtraction after, rather than a reset, because the counters are
     // process-wide and the persistence thread can add to them mid-drain — see
-    // [`candle::cuda_backend::wave_provenance::DeclineSnapshot`]. The two
-    // reasons have opposite fixes: `NoTicket` is a provenance break somewhere
-    // upstream, `ArenaFull` is a sizing problem and nothing else.
+    // [`candle::cuda_backend::wave_provenance::DeclineSnapshot`]. `NoTicket` is
+    // a provenance break somewhere upstream; `Closed` is a value read after its
+    // stage's arena rewound. An arena too small for its stage is neither — it
+    // fails the stage outright.
     let before_declines = candle::cuda_backend::wave_provenance::DeclineSnapshot::now();
     let t_run = Instant::now();
     // **The whole backlog in one call, so a guest that can batch does.**
@@ -327,11 +328,11 @@ pub fn drain_one<R: EngineRoom>(
         total_ms = report.total_ms,
         // Bytes that reached the pool through the inheriting path. Not the whole
         // story — a site calling `dev.alloc` directly never asks, so it never
-        // appears here — but it is the difference between "the arena is too
-        // small" and "the provenance broke", which is the question a guest
-        // out-of-memory always turns out to be.
+        // appears here — but it separates a broken provenance from a value read
+        // past its stage, which is the question a guest out-of-memory always
+        // turns out to be.
         no_ticket_mib = declines.0 >> 20,
-        arena_full_mib = declines.1 >> 20,
+        closed_mib = declines.1 >> 20,
         "guest drained"
     );
     report

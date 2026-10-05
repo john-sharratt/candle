@@ -201,6 +201,7 @@ pub mod qwen35;
 pub mod qwen3_moe;
 #[cfg(feature = "cuda")]
 pub mod qwen4exp;
+pub mod residual_order;
 pub mod rope_schedule;
 pub mod rope_tables;
 pub mod rotary_layout;
@@ -254,6 +255,7 @@ pub mod wave_driver;
 #[cfg(feature = "cuda")]
 pub mod wave_token_ids;
 pub mod whisper;
+pub mod window_residuals;
 pub mod with_tracing;
 pub mod wuerstchen;
 pub mod xlm_roberta;

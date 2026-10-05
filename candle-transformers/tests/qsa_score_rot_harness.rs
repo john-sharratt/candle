@@ -688,7 +688,7 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
         start: 0,
         rows: tail_tokens,
     }];
-    append_wave(&mut work, &raw, &w, RATIO, 1e-6, None)?;
+    append_wave(&mut work, &raw, &w, RATIO, 1e-6)?;
 
     // The oracle's view: the pages, then the tail's stored rows where they sit.
     let tail_rows = cache.live_rows_host()?;
@@ -874,7 +874,7 @@ fn bench_tail_routes() -> Result<()> {
             start: 0,
             rows: tokens,
         }];
-        append_wave(&mut work, &raw, &w, RATIO, 1e-6, None)?;
+        append_wave(&mut work, &raw, &w, RATIO, 1e-6)?;
         let n = cache.live_blocks();
         for &t in &[1usize, 8, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
             if t * n * 4 > 2 << 30 {

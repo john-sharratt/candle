@@ -32,6 +32,7 @@ use crate::models::delta_net::RecurrentCompaction;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::rope_schedule::RungSelect;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
+use crate::models::window_residuals::WindowResiduals;
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
@@ -49,6 +50,8 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
 use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePhase};
+#[cfg(feature = "cuda")]
+use super::wave_buffers::wave_from_vec_ticketed;
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::{gpu_span, pipeline_record_duration, span};
@@ -56,6 +59,8 @@ use crate::models::speculative_choice::{
     AcceptWalk, SpeculativeStep, TokenChooser, TypicalAcceptance,
 };
 use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan, WaveCoBatch};
+#[cfg(feature = "cuda")]
+use candle::wave_provenance::WaveTicket;
 
 /// One R16 chunk's unpacked contents: `(block_idx, k_flat, v_flat, q_flat)`.
 ///
@@ -498,6 +503,7 @@ pub(crate) fn build_glue_meta(
     pending: Vec<PendingGlue>,
     input_lens: &[usize],
     device: &Device,
+    ticket: Option<WaveTicket>,
 ) -> Result<Option<GlueMeta>> {
     if pending.len() != input_lens.len() {
         candle::bail!(
@@ -539,10 +545,12 @@ pub(crate) fn build_glue_meta(
         total_glue = total,
         "paged-glue route active"
     );
+    // On the forward span `ticket` names: three per-row tables every layer's
+    // glue scatter reads (`WaveBuffer::GlueWriteTables`).
     Ok(Some(GlueMeta {
-        glue_write_slice: Tensor::from_vec(write_slice, n, device)?,
-        glue_write_in_blk: Tensor::from_vec(write_in_blk, n, device)?,
-        fwd_ahead: Tensor::from_vec(fwd_ahead, n, device)?,
+        glue_write_slice: wave_from_vec_ticketed(write_slice, n, device, ticket)?,
+        glue_write_in_blk: wave_from_vec_ticketed(write_in_blk, n, device, ticket)?,
+        fwd_ahead: wave_from_vec_ticketed(fwd_ahead, n, device, ticket)?,
     }))
 }
 
@@ -640,6 +648,11 @@ pub struct BatchedInferenceSession {
     /// first (the scheduler) never sets it, so its waves reserve nothing for a
     /// walk that does not happen on the span.
     accept_in_place: bool,
+    /// The draft walk's token buffer — see [`Self::walk_tokens`].
+    walk_tokens: Option<Tensor>,
+    /// The residuals layer windows hand on to each other — see
+    /// [`Self::window_residuals`].
+    window_residuals: Arc<WindowResiduals>,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -719,6 +732,8 @@ impl BatchedInferenceSession {
             pending_glue: None,
             rope: RungSelect::unbounded(),
             accept_in_place: false,
+            walk_tokens: None,
+            window_residuals: Arc::default(),
         })
     }
 
@@ -827,6 +842,8 @@ impl BatchedInferenceSession {
             pending_glue: None,
             rope: RungSelect::unbounded(),
             accept_in_place: false,
+            walk_tokens: None,
+            window_residuals: Arc::default(),
         }
     }
 
@@ -852,6 +869,35 @@ impl BatchedInferenceSession {
     /// which decides whether the forward reserves the accept walk's rows.
     pub fn accept_in_place(&self) -> bool {
         self.accept_in_place
+    }
+
+    /// A contiguous `[rows, n]` `u32` buffer for one draft walk: its committed
+    /// tokens and every step's pick, one row each.
+    ///
+    /// Held by the session and grown only when a walk asks for more than any
+    /// walk before it, so a steady speculative decode reuses it and allocates
+    /// nothing per step. The walk reads its picks back once, at the end; the
+    /// next walk on this session's stream is ordered after that readback, so
+    /// it never overwrites a pick still in flight.
+    pub fn walk_tokens(&mut self, rows: usize, n: usize) -> Result<Tensor> {
+        let want = rows * n;
+        let held = self.walk_tokens.as_ref().map_or(0, Tensor::elem_count);
+        if held < want {
+            // By doubling, so a cohort ramping up settles in a few steps.
+            let grown = (held * 2).max(want);
+            self.walk_tokens = Some(Tensor::empty(grown, DType::U32, &self.device)?);
+        }
+        let buf = self.walk_tokens.as_ref().expect("sized above");
+        buf.narrow(0, 0, want)?.reshape((rows, n))
+    }
+
+    /// The pool of residuals that layer windows hand on to each other — a
+    /// window that stops short of the head writes its residual into one, the
+    /// driver reorders through them, and a caller that splices residual parts
+    /// for the next window composes into one. Shared, so a caller can hold it
+    /// across a forward that borrows the session.
+    pub fn window_residuals(&self) -> Arc<WindowResiduals> {
+        self.window_residuals.clone()
     }
 
     /// Get the configuration used for this session.
@@ -4811,7 +4857,7 @@ pub trait ManagedBatchedModel {
         // and glue live on the device — so a host-side row makes the wave's own
         // concatenation fail on a device mismatch. One upload for the cohort.
         let tokens: Vec<u32> = plain.iter().map(|&(_, t)| t).collect();
-        let (decode_inputs, _) = upload_plan_rows(&tokens, &[], self.device())?;
+        let (decode_inputs, _) = upload_plan_rows(&tokens, &[])?;
         Ok(Some(VerifyPlan {
             decode_seqs: plain.iter().map(|&(s, _)| s).collect(),
             decode_inputs,
@@ -5189,27 +5235,16 @@ pub trait ManagedBatchedModel {
             plain_logits[i] = plain_rows.pop();
         }
 
-        // Every scored row of BOTH waves as one `[R, vocab]` block: plain rows
-        // lead (in `plain` order), then each verify block's rows. `row_of[i]`
-        // locates sequence `i`'s run inside it, so the accept walk lifts one
-        // block position across the whole cohort with a single `index_select`
-        // rather than slicing per sequence.
-        //
-        // The head scored exactly these rows in exactly this order, so they are
-        // already one block — the head's — and `cat_view` names it without a
-        // copy. A wave whose driver reordered its rows (a one-token prefill
-        // folded into the decode group) leaves them apart, and they are
-        // concatenated instead.
+        // Every scored row of BOTH waves, each a `[1, vocab]` view where its head
+        // wrote it: plain rows lead (in `plain` order), then each verify block's
+        // rows. `row_of[i]` locates sequence `i`'s run among them, so the accept
+        // walk lifts one block position across the cohort by naming its rows.
         let rows: Vec<Tensor> = plain
             .iter()
             .map(|&i| plain_logits[i].as_ref().expect("filled above"))
             .chain(spec_logits.iter().flatten())
             .map(|t| t.flatten_all()?.unsqueeze(0))
             .collect::<Result<_>>()?;
-        let stacked = match Tensor::cat_view(&rows, 0) {
-            Some(block) => block,
-            None => Tensor::cat(&rows, 0)?,
-        }; // [R, vocab]
         let mut row_of: Vec<(usize, usize)> = vec![(0, 0); seqs.len()];
         for (k, &i) in plain.iter().enumerate() {
             row_of[i] = (k, 1);
@@ -5252,18 +5287,22 @@ pub trait ManagedBatchedModel {
         let t_accept = std::time::Instant::now();
         let mut walk = AcceptWalk::new(&blocks);
         while !walk.finished() {
-            let rows = walk.rows();
-            // One `index_select` lifts this position's rows across the cohort
-            // out of the stack, rather than a slice per sequence.
-            let idx = Tensor::from_vec(
-                walk.alive()
-                    .iter()
-                    .map(|&i| (row_of[i].0 + walk.position()) as u32)
-                    .collect::<Vec<_>>(),
-                walk.alive().len(),
-                stacked.device(),
-            )?;
-            let tokens = chooser.choose(&stacked.index_select(&idx, 0)?, &rows)?;
+            let walked = walk.rows();
+            // This position's rows across the cohort. Rows that sit together in
+            // their head's block are named as one view; others are gathered
+            // beside the logits on the span (`WaveBuffer::AcceptRows` — each
+            // scored row is selected at most once across the walk). No index
+            // is uploaded: the rows are named on the host, where they are known.
+            let picked: Vec<Tensor> = walk
+                .alive()
+                .iter()
+                .map(|&i| rows[row_of[i].0 + walk.position()].clone())
+                .collect();
+            let block = match Tensor::cat_view(&picked, 0) {
+                Some(block) => block,
+                None => Tensor::cat(&picked, 0)?,
+            };
+            let tokens = chooser.choose(&block, &walked)?;
             walk.commit(&tokens, |i, token| (emits[i])(token))?;
         }
         let (next, kept) = walk.finish();
@@ -5275,7 +5314,6 @@ pub trait ManagedBatchedModel {
         // Every view on the head's span, then the wave that holds it: the
         // rollback below may open waves of its own (the recurrent replay), and
         // the span is reclaimed only once nothing names it.
-        drop(stacked);
         drop(rows);
         drop(plain_logits);
         drop(spec_logits);

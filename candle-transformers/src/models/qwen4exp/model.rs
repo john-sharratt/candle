@@ -28,6 +28,7 @@
 
 use std::collections::BTreeMap;
 
+use candle::wave_provenance::WaveTicket;
 use candle::{Result, Tensor};
 
 use super::config::Qwen4ExpConfig;
@@ -52,8 +53,10 @@ pub trait ExpertSource: Send + Sync {
 /// reads 170-byte quantized records through the bounded RAM row cache;
 /// tests hold a small table.
 pub trait PleSource: Send + Sync {
-    /// Gather rows `ids` as one F32 `[ids.len(), head_dim]` tensor.
-    fn rows(&self, ids: &[u32]) -> Result<Tensor>;
+    /// Gather rows `ids` as one F32 `[ids.len(), head_dim]` tensor, on the
+    /// arena of `root` — the open phase the rows are consumed in — when one is
+    /// given.
+    fn rows(&self, ids: &[u32], root: Option<WaveTicket>) -> Result<Tensor>;
 
     /// Cache instrumentation, where a cache exists (§8 item 4). `None` for
     /// sources with nothing between them and their table.
@@ -298,7 +301,7 @@ impl Qwen4ExpModel {
                     let flat: Vec<u32> = row_ids.into_iter().flatten().collect();
                     let emb = self
                         .ple_table
-                        .rows(&flat)?
+                        .rows(&flat, None)?
                         .reshape((len, self.cfg.hidden_size))?;
                     let rows = res_hc.narrow(0, start, len)?;
                     parts.push(ple_apply(
@@ -475,7 +478,7 @@ mod tests {
         table: Tensor,
     }
     impl PleSource for MemPle {
-        fn rows(&self, ids: &[u32]) -> Result<Tensor> {
+        fn rows(&self, ids: &[u32], _root: Option<WaveTicket>) -> Result<Tensor> {
             let idx = Tensor::from_vec(ids.to_vec(), (ids.len(),), self.table.device())?;
             self.table.index_select(&idx, 0)
         }

@@ -197,6 +197,17 @@ pub struct WaveWidth {
     /// the logits in place, zero when it owns them first (or runs no walk), so
     /// a wave reserves the walk's selections only when they will land there.
     pub accept_rows: usize,
+    /// Bytes one attention layer's **sparse selection** carves on its phase:
+    /// the index keys and queries, the score buffer, the scoring products, the
+    /// selection table and the per-span tables — [`WaveBuffer::QsaSelection`].
+    ///
+    /// Not a function of the wave's width alone, which is why the model states
+    /// it rather than the geometry: the score buffer and the scoring products
+    /// are as wide as the candidate blocks the deepest row can see, so they
+    /// grow with *context depth*. A model whose attention selects nothing, or a
+    /// wave whose rows are all within the dense budget, states zero for all of
+    /// it but the index keys every attention layer appends.
+    pub qsa_bytes: usize,
 }
 
 impl WaveWidth {
@@ -220,6 +231,7 @@ impl WaveWidth {
             staged_rows: 0,
             staged_spans: 0,
             accept_rows: 0,
+            qsa_bytes: 0,
         }
     }
 
@@ -234,6 +246,7 @@ impl WaveWidth {
             staged_rows: 0,
             staged_spans: 0,
             accept_rows: 0,
+            qsa_bytes: 0,
         }
     }
 
@@ -253,6 +266,7 @@ impl WaveWidth {
             staged_rows: rows,
             staged_spans: spans,
             accept_rows: 0,
+            qsa_bytes: 0,
         }
     }
 
@@ -325,6 +339,9 @@ pub struct DeltaNetWidths {
     pub value_dim: usize,
     /// V heads. `beta` and `alpha` are one F32 scalar per head per row.
     pub n_v_heads: usize,
+    /// DeltaNet layers in the stack. The forward's decode table carries four
+    /// state addresses per decode row for each of them.
+    pub layers: usize,
 }
 
 /// A MoE layer's always-active **shared expert**, as
@@ -340,9 +357,9 @@ pub struct DeltaNetWidths {
 /// **An uncharged carve here is not slack somewhere else.** The FFN generation
 /// is sized to exactly this chain, and the shared half carves before the routed
 /// one, so a shared buffer the plan omits leaves the routed down projection —
-/// the chain's last large carve — without room. It then declines to the CUDA
-/// pool (`ArenaFull`, silently) on every layer, and the tier reserves bytes
-/// nothing ever carves: both symptoms of one missing declaration.
+/// the chain's last large carve — without room, and the wave fails on it
+/// (`WaveCarve::Exhausted`) while the tier reserves bytes nothing ever carves:
+/// both symptoms of one missing declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SharedExpertWidths {
     /// The shared SwiGLU's intermediate width.
@@ -367,6 +384,13 @@ pub struct HyperWidths {
     pub streams: usize,
     /// The read gate's bottleneck rank.
     pub low_rank: usize,
+    /// Whether a draft head runs over the wave's rows after the trunk: one
+    /// attention block whose input is assembled from the shifted wide residual
+    /// and the rows' embeddings ([`Chain::HeadPass`]).
+    pub draft_head: bool,
+    /// Whether the stack's per-layer n-gram embedding block runs in the
+    /// forward, ahead of its layer's mixer ([`Chain::Ple`]).
+    pub ple: bool,
 }
 
 /// Which generation a buffer lives in.
@@ -548,6 +572,11 @@ pub struct ModelGeometry {
     /// ([`WaveBuffer::AttnNorm`] on a float session, [`WaveBuffer::DeltaNetNorm`],
     /// [`WaveBuffer::FfnNorm`]) carve nothing of their own.
     pub hyper: Option<HyperWidths>,
+    /// Whether a **single-stream** stack carries a NextN draft head, whose pass
+    /// runs over every row of a wave that reaches the head — the `Mtp*`
+    /// buffers. A multi-stream stack states its head in
+    /// [`HyperWidths::draft_head`] instead.
+    pub mtp_head: bool,
 }
 
 impl ModelGeometry {
@@ -711,7 +740,9 @@ pub enum WaveBuffer {
     KBias,
     /// `v + bv`, as [`Self::QBias`].
     VBias,
-    /// The attention context in its **dense** form, which prefill and glue write.
+    /// The attention context in its **dense** form, which prefill and glue
+    /// write — and decode too, on a stack whose decode kernel emits no q8
+    /// context ([`ModelGeometry::decode_q8_context`]).
     AttnOutput,
     /// The attention context in its **packed** form.
     ///
@@ -721,12 +752,21 @@ pub enum WaveBuffer {
     /// allocates both — the decode group's packed context and the prefill
     /// group's dense one — into the same generation.
     DecodeContext,
+    /// The context quantized for an int8 `o_proj`, q8a128 over the attention
+    /// columns.
+    ///
+    /// Prefill's `o_proj` takes a `Float` context, and the int8 matmul
+    /// quantizes it at the call. The quantize inherits the context's arena, so
+    /// the operand — and the projection after it — land on this span. A decode
+    /// row's too, on a stack whose decode kernel emits a float context
+    /// (`decode_q8_context` off — Qwen2's head dim 64). Int8 sessions only: a
+    /// float `o_proj` reads the context as it stands.
+    OProjOperand,
     /// `o_proj`'s result, in the compute dtype.
     ///
-    /// Prefill's `o_proj` takes a `Float` context, the override quantizes it at
-    /// the matmul, and that quantize breaks the provenance chain — the output
-    /// lands on the pool. So this is a decode-chain carve, and a pure-prefill
-    /// wave pays for it as part of the union.
+    /// The decode group's always; the prefill group's too on an int8 session,
+    /// whose quantized operand ([`Self::OProjOperand`]) carries the context's
+    /// arena on to the projection.
     OProjOutput,
 
     // ── The DeltaNet mixer ──────────────────────────────────────────────────
@@ -734,23 +774,27 @@ pub enum WaveBuffer {
     // hybrid stack. Priced as its own chain and compared against attention's
     // with a `max`, not summed into it — see `Chain`.
     //
-    // **Only part of this mixer is on the span, and the list below is that
-    // part.** `QMatMul::forward_live_as` forks on the weight's int8 mode: the
-    // int8 arm reaches the KO kernel through a standalone `to_dynamic`
-    // quantize, and that quantize breaks the operand's provenance, so the
-    // projection's result is allocated from the CUDA pool rather than from the
-    // generation — and everything downstream of it (the causal conv, the
-    // mixer's output, the norm-gate result, `w_out`) inherits the pool from its
-    // operand and follows it off the span. The non-int8 arm has no quantize and
-    // stays on the generation, paying one F32 upcast of its operand.
-    //
-    // So a DeltaNet layer's span cost is: the layer norm, plus one upcast and
-    // one result for each projection whose weight is too small to have been
-    // KO-repacked. Measured on the 0.8B at 2100 rows: five carves totalling
-    // 21,772,800 B, which is what these five variants price to the byte.
+    // **The whole mixer is on the span.** The layer norm seeds the chain on the
+    // phase, the int8 projections' activation quantize inherits the norm's
+    // arena, and every carve after it follows. In carve order on a
+    // single-stream stack — the census of the 0.8B at 134 prefill rows: the
+    // norm, the `[q|k|v]` projection's q8a128 operand and its F32 result, the
+    // `z` projection's operand and result, the F32 upcast and result of each of
+    // `beta` and `alpha` (whose weights are too small to KO-repack), and then
+    // the live chain's span tables, conv, recurrence and its transients,
+    // norm-gate and `w_out` (`DeltaNetLive*` below).
     /// The DeltaNet layer's input norm — `ln1` over the packed buffer, which is
     /// where this chain is seeded on the span.
     DeltaNetNorm,
+    /// The `[q|k|v]` projection's q8a128 operand: the norm quantized for the
+    /// int8 matmul, on a single-stream int8 stack.
+    DeltaNetQkvOperand,
+    /// The `[q|k|v]` projection's result, `conv_dim` wide, F32.
+    DeltaNetQkvProj,
+    /// The `z` projection's q8a128 operand — the norm quantized again for it.
+    DeltaNetZOperand,
+    /// The `z` projection's result, `value_dim` wide, F32.
+    DeltaNetZProj,
     /// `beta`'s operand, upcast to F32 by the float arm of `forward_live_as`.
     DeltaNetBetaOperand,
     /// `beta` itself: one F32 per V head per row.
@@ -768,11 +812,10 @@ pub enum WaveBuffer {
     // stacked `[qkv | z | β | α]` projection and its split, the two span
     // tables, the conv, the recurrence output, the prefill scan's four
     // transients (`u`, `w`, `kq`, `g_cs`), then the norm-gate and `w_out`.
-    // Measured on Qwen3.8-Flash-Next at 2100 rows over four spans. A span
-    // priced without `w` and `kq` fills at `g_cs`, and the rest of the chain
-    // then falls back to the pool without a word — so the census of an
-    // under-priced span reads as a plan with slack, not as an overrun. Priced
-    // zero elsewhere: the qwen35 stack's live chain has not been re-measured.
+    // Measured on Qwen3.8-Flash-Next at 2100 rows over four spans. From the
+    // span tables on, the single-stream stack carves the same chain behind its
+    // separate projections; the operand, stacked projection and split are the
+    // pre-mix stack's alone.
     /// The four projections' q8a128 operand: the mix output quantized once.
     DeltaNetLiveOperand,
     /// The stacked projection, `conv_dim + value_dim + 2 · n_v_heads` wide, F32.
@@ -824,6 +867,20 @@ pub enum WaveBuffer {
     ReplaySpanPtrs,
     /// The span table's extents: two `u32` per span.
     ReplaySpanExtents,
+    /// The replayed causal conv's output, `[staged, conv_dim]` F32, carved
+    /// beside the staged `[Q|K|V]` — the root the scan's carves inherit.
+    ReplayConved,
+    /// The scan's output rows, `[staged, value_dim]` F32. Discarded — a replay
+    /// wants the advanced states — but the kernel writes them.
+    ReplayOut,
+    /// The scan's `u` transient, `[v_heads, staged, head_dim]` F32.
+    ReplayScanU,
+    /// The scan's `w` transient, the same shape as [`Self::ReplayScanU`].
+    ReplayScanW,
+    /// The scan's chunk-local `k·q` block, `[v_heads, staged, chunk]` F32.
+    ReplayScanKq,
+    /// The scan's cumulative decay, one F32 per V head per staged row.
+    ReplayDecay,
 
     /// The FFN phase's Gated Residual pre-mix — the same five carves as
     /// [`Self::HyperAttnNorm`] and its siblings, in the same order.
@@ -982,18 +1039,23 @@ pub enum WaveBuffer {
     /// The head's logits: one row per scored row, `vocab` wide, in the compute
     /// dtype.
     ///
-    /// **Int8 sessions only**, because only there do they land on the span. The
-    /// int8 matmul carves its output from the operand's arena and converts on
-    /// the store; the float arm reaches the dequantized-weight path through
-    /// `to_owned_tensor`, which breaks provenance, so the logits come off the
-    /// CUDA pool. Both were measured: Qwen3.5-0.8B (int8) carves
-    /// `4 × 248,320 × 2` here, and Qwen2 (float) carves no logits at all.
+    /// **Both head modes.** The int8 matmul carves its output from the
+    /// operand's arena and converts on the store; the float arm reaches the
+    /// dequantized-weight path through `to_owned_tensor`, whose copy inherits
+    /// the operand's arena as well. Measured: Qwen3.5-0.8B (int8) carves
+    /// `4 × 248,320 × 2` here, and Qwen2's float head ran out of span exactly
+    /// one `151,936 × 4` row into its logits once the float path stopped
+    /// dropping them on the pool.
     ///
     /// Being *returned* from the forward is not what decides it — the head's
     /// span is reset per forward precisely so the logits may outlive the layer
-    /// guards — which is why this follows the session's mode and not the
-    /// lifetime.
+    /// guards.
     HeadLogits,
+    /// A float head's logits as its matmul writes them, F32, before they are
+    /// narrowed to the compute dtype — `QMatMul::forward_live_as` off the int8
+    /// path. Only where the compute dtype is narrower: an F32 session's matmul
+    /// result *is* its logits.
+    HeadLogitsF32,
     /// The accept walk's row selections: at each block position, the rows of
     /// the sequences still standing, gathered out of [`Self::HeadLogits`] for
     /// the chooser.
@@ -1003,9 +1065,73 @@ pub enum WaveBuffer {
     /// lands on the span beside them. A row is selected at most once across the
     /// walk (each sequence's row at each position), so the selections together
     /// are at most the scored rows: this is the logits' second buffer, the same
-    /// width. Int8 sessions only, for the reason `HeadLogits` is — a float
-    /// head's logits come off the pool, and so do selections taken from them.
+    /// width, in either head mode.
     AcceptRows,
+    /// The wide residual, `[rows, streams · hidden]` F32 — on a multi-stream
+    /// stack, for a wave that reaches the head.
+    ///
+    /// One buffer for the whole sweep, combined into in place by every layer,
+    /// so it lives on the forward span rather than a layer's: it crosses every
+    /// layer phase's reset. A wave that stops short of the head hands its
+    /// residual on to the next window, past this span's reset, and keeps it
+    /// off the span — so it is charged only where the head runs.
+    HyperResidual,
+    /// The rows' bare embeddings, `[rows, hidden]` F32: the draft head's
+    /// `embed(t)` half, gathered with the residual and read after the trunk.
+    /// Only on a stack with a draft head, and only where the head runs.
+    HeadRowEmbeds,
+    /// The scored rows of the wide residual, gathered beside it ahead of the
+    /// head's mix, `[scored, streams · hidden]` F32 — on a multi-stream stack;
+    /// `[scored, hidden]` in the compute dtype on a single-stream one, whose
+    /// residual is on the span as well ([`Self::ForwardResidual`]). A
+    /// selection that is one run of rows is a view and carves nothing; the
+    /// plan charges the gather whenever the head runs, since only the rows
+    /// decide which.
+    HeadScoredResidual,
+    /// That gather's row index, one `u32` per scored row.
+    HeadScoredRows,
+    /// The ragged prefill's cumulative query offsets, one `u32` per prefill
+    /// span plus one — the first of three tables the multi-stream stack builds
+    /// once per forward on its forward span, whether or not the wave reaches
+    /// the head: every layer reads them.
+    PrefillCuSeqlens,
+    /// Each prefill span's query length, one `u32` per span.
+    PrefillQLens,
+    /// Each prefill span's KV length after the wave, one `u32` per span.
+    ///
+    /// A single-stream stack builds the three tables as well — twice, for its
+    /// prefill and its glue group — on its forward span, before the first
+    /// layer reads them.
+    PrefillKvLens,
+    /// A reprojection-glue forward's three per-row scatter tables — write
+    /// slice, offset within the block, forward-ahead count — on the forward
+    /// span every layer's glue scatter reads them from. Single-stream stacks,
+    /// which are the ones that carry glue.
+    GlueWriteTables,
+    /// The residual stream a single-stream stack embeds into, `[rows, hidden]`
+    /// in the compute dtype: the resident table's gather inherits the arena of
+    /// the ids it reads, which are on this span. Every forward that embeds —
+    /// a window that stops short copies it off the span into a held window
+    /// buffer as it hands it on, so it is here for the window's whole sweep
+    /// either way. A multi-stream stack's is [`Self::HyperResidual`].
+    ForwardResidual,
+    /// A hybrid stack's DeltaNet **decode table**: four state addresses (the
+    /// conv tail's entering and advanced buffers, then the state's) per decode
+    /// row per DeltaNet layer, `i64`, and each decode row's position in the
+    /// wave, `u32` — two carves, built once per forward and read by every
+    /// recurrent layer.
+    DeltaNetDecodeTable,
+    /// The wave's token ids, one `u32` per row, laid on the forward span for
+    /// the embedding gather to read. On a multi-stream stack it is also the
+    /// buffer the readback lays the device inputs into — and, for a wave with
+    /// an input already on the host, a second upload of every row: two words a
+    /// row there, the most either takes. A single-stream stack reads nothing
+    /// back and takes one.
+    RowTokenIds,
+    /// One attention layer's sparse selection, as the model states it — see
+    /// [`WaveWidth::qsa_bytes`] for why the width cannot say it alone. Carved
+    /// on the attention phase, after the pre-mix and ahead of the projections.
+    QsaSelection,
 
     /// The MoE result **narrowed to the residual's dtype**, when the experts ran
     /// in a different one. Both paths.
@@ -1031,6 +1157,79 @@ pub enum WaveBuffer {
     /// nothing to widen. So this is the one buffer that needs *both* a float
     /// session and an F16 activation.
     FfnNormOperand,
+
+    // ── The draft head's pass, after the trunk ──────────────────────────────
+    // The head runs one attention block over every row of the wave, in the
+    // attention phase it opens for itself. Its input is assembled first, in
+    // this order: the trunk residual shifted one row right, its grouped norm,
+    // the rows' embedding norm, the two halves of `eh_proj` with their q8a128
+    // operands, and the sum. Then the block runs its pre-mix and its attention
+    // as a trunk attention layer does — see [`Chain::HeadPass`]. Priced zero on
+    // a stack without a head.
+    //
+    // **The embedding half is the forward phase's.** The rows' embeddings live
+    // on the forward span ([`Self::HeadRowEmbeds`]), and a norm whose input
+    // already carries an arena stays in that arena whatever root it is handed —
+    // so the embedding norm, its operand and its projection carve there, beside
+    // the rows they read, and not on the head's attention phase.
+    /// The shifted residual, `[rows, streams · hidden]` F32.
+    HeadShift,
+    /// Its grouped norm, the same width.
+    HeadHiddenNorm,
+    /// The rows' embeddings normed, `[rows, hidden]` F32 — on the forward phase.
+    HeadEmbedNorm,
+    /// That norm quantized for `eh_proj`'s embedding half — int8 sessions only,
+    /// on the forward phase.
+    HeadEmbedOperand,
+    /// The embedding half's projection, `[rows, hidden]` F32 — on the forward
+    /// phase.
+    HeadEmbedProj,
+    /// The hidden norm quantized for `eh_proj`'s hidden half, one row per
+    /// stream — int8 sessions only.
+    HeadHiddenOperand,
+    /// The hidden half's projection, `[rows · streams, hidden]` F32.
+    HeadHiddenProj,
+    /// Their broadcast sum: the block's wide input, `[rows, streams · hidden]`.
+    HeadInput,
+
+    // ── A single-stream draft head's pass (the Qwen3.5 lineage's NextN) ─────
+    // The same pass on a stack with ordinary layer norms: the trunk's final
+    // norm over every row, that shifted one row right, the two input norms,
+    // their concatenation and `eh_proj` — then the head's attention block, as
+    // a trunk attention layer runs it. Every buffer is `[rows, ·]` in the
+    // compute dtype. Priced zero without a head ([`ModelGeometry::mtp_head`])
+    // and on a wave that stops short of it.
+    /// The rows' embeddings, gathered for the head on the **forward** phase —
+    /// beside the ids they are read with, and outside the head's attention
+    /// generation, which the gather's staging would otherwise share.
+    MtpRowEmbeds,
+    /// The trunk's final norm over every row, `[rows, hidden]`.
+    MtpTrunkNorm,
+    /// That norm shifted one row right, `[rows, hidden]`.
+    MtpShift,
+    /// The embeddings normed (`enorm`), `[rows, hidden]`.
+    MtpEmbedNorm,
+    /// The shifted hidden normed (`hnorm`), `[rows, hidden]`.
+    MtpHiddenNorm,
+    /// The two norms side by side, `[rows, 2 · hidden]`.
+    MtpInputCat,
+    /// `eh_proj`'s output: the head block's input, `[rows, hidden]`.
+    MtpInput,
+
+    // ── The PLE block, ahead of its layer's mixer ───────────────────────────
+    // Its own attention generation, opened and closed before the mixer's: the
+    // gathered table rows, the stacked key|value projection, the conv's normed
+    // input and the span table. Everything else the block computes is written
+    // into the residual in place. Priced zero on a stack without one.
+    /// The gathered table rows, `[rows, hidden]` F32.
+    PleRows,
+    /// The key and value projections stacked, `[rows, streams · hidden + hidden]`.
+    PleKeyValue,
+    /// The conv's normed input, `[rows, streams · hidden]` F32.
+    PleNormalized,
+    /// Four 64-bit words per sequence — bounded by the scored rows, which are
+    /// at least one per sequence.
+    PleSpanTable,
 }
 
 /// A run of buffers that one layer can allocate inside one generation.
@@ -1063,6 +1262,11 @@ pub enum Chain {
     HyperAttn,
     /// The FFN phase's Gated Residual pre-mix — a prelude.
     HyperFfn,
+    /// The forward's setup tables — the token ids and the ragged prefill
+    /// tables — carved before the first layer and read by every one, in the
+    /// forward phase. A prelude: the forward carves them whether or not it
+    /// reaches the head.
+    ForwardSetup,
     /// The head's Gated Residual output mix, in the forward phase — a prelude.
     HyperHead,
     /// An attention layer's mixer: norm through `o_proj`.
@@ -1084,6 +1288,15 @@ pub enum Chain {
     /// The **MoE** FFN: the router, the expert gather, the grouped GEMMs and
     /// the combine.
     Ffn,
+    /// The draft head's pass: its input assembly, then — walked on from there,
+    /// see [`WavePlan::phase_bytes`] — the attention prelude and the attention
+    /// chain, which the head's block runs as a trunk attention layer does. An
+    /// alternative to the trunk's mixers, not an addition: the pass opens the
+    /// attention generation after the trunk's last layer has closed it.
+    HeadPass,
+    /// The PLE block: its own attention generation, opened ahead of its layer's
+    /// mixer and closed before it, with no prelude.
+    Ple,
     /// The **dense** FFN: norm, one fused `[gate|up]` GEMM, SiLU, multiply.
     ///
     /// The same `max` relationship the two mixers have, one phase down. A layer
@@ -1104,22 +1317,43 @@ impl Chain {
     /// The generation this chain allocates from.
     pub fn phase(&self) -> LayerPhase {
         match self {
-            Self::HyperAttn | Self::Attention | Self::DeltaNet | Self::DeltaNetReplay => {
-                LayerPhase::Attention
-            }
+            Self::HyperAttn
+            | Self::Attention
+            | Self::DeltaNet
+            | Self::DeltaNetReplay
+            | Self::HeadPass
+            | Self::Ple => LayerPhase::Attention,
             Self::HyperFfn | Self::Ffn | Self::DenseFfn => LayerPhase::Ffn,
-            Self::HyperHead | Self::Forward => LayerPhase::Forward,
+            Self::ForwardSetup | Self::HyperHead | Self::Forward => LayerPhase::Forward,
         }
     }
 
     /// Whether this chain runs ahead of every other chain in its phase rather
     /// than instead of them — see the type's docs.
     pub fn is_prelude(&self) -> bool {
-        matches!(self, Self::HyperAttn | Self::HyperFfn | Self::HyperHead)
+        matches!(
+            self,
+            Self::HyperAttn | Self::HyperFfn | Self::ForwardSetup | Self::HyperHead
+        )
     }
 }
 
 impl WaveBuffer {
+    /// Whether this buffer is a single-stream draft head's — priced only where
+    /// [`ModelGeometry::mtp_head`] is set.
+    pub fn is_mtp(&self) -> bool {
+        matches!(
+            self,
+            Self::MtpRowEmbeds
+                | Self::MtpTrunkNorm
+                | Self::MtpShift
+                | Self::MtpEmbedNorm
+                | Self::MtpHiddenNorm
+                | Self::MtpInputCat
+                | Self::MtpInput
+        )
+    }
+
     /// Which run of buffers this one belongs to.
     pub fn chain(&self) -> Chain {
         match self {
@@ -1145,6 +1379,10 @@ impl WaveBuffer {
             | Self::HyperHeadGateRaw
             | Self::HyperHeadMixed => Chain::HyperHead,
             Self::DeltaNetNorm
+            | Self::DeltaNetQkvOperand
+            | Self::DeltaNetQkvProj
+            | Self::DeltaNetZOperand
+            | Self::DeltaNetZProj
             | Self::DeltaNetBetaOperand
             | Self::DeltaNetBetaProj
             | Self::DeltaNetAlphaOperand
@@ -1168,13 +1406,48 @@ impl WaveBuffer {
             | Self::ReplayBeta
             | Self::ReplayAlpha
             | Self::ReplaySpanPtrs
-            | Self::ReplaySpanExtents => Chain::DeltaNetReplay,
+            | Self::ReplaySpanExtents
+            | Self::ReplayConved
+            | Self::ReplayOut
+            | Self::ReplayScanU
+            | Self::ReplayScanW
+            | Self::ReplayScanKq
+            | Self::ReplayDecay => Chain::DeltaNetReplay,
             Self::DenseFfnNorm | Self::DenseGateUp | Self::DenseSilu | Self::DenseSwiglu => {
                 Chain::DenseFfn
             }
-            Self::HeadNorm | Self::HeadNormF32 | Self::HeadLogits | Self::AcceptRows => {
-                Chain::Forward
+            Self::HeadShift
+            | Self::HeadHiddenNorm
+            | Self::HeadHiddenOperand
+            | Self::HeadHiddenProj
+            | Self::HeadInput
+            | Self::MtpTrunkNorm
+            | Self::MtpShift
+            | Self::MtpEmbedNorm
+            | Self::MtpHiddenNorm
+            | Self::MtpInputCat
+            | Self::MtpInput => Chain::HeadPass,
+            Self::MtpRowEmbeds => Chain::Forward,
+            Self::HeadEmbedNorm | Self::HeadEmbedOperand | Self::HeadEmbedProj => Chain::Forward,
+            Self::PleRows | Self::PleKeyValue | Self::PleNormalized | Self::PleSpanTable => {
+                Chain::Ple
             }
+            Self::HeadNorm
+            | Self::HeadNormF32
+            | Self::HeadLogits
+            | Self::HeadLogitsF32
+            | Self::AcceptRows
+            | Self::HyperResidual
+            | Self::HeadRowEmbeds
+            | Self::HeadScoredResidual
+            | Self::HeadScoredRows => Chain::Forward,
+            Self::PrefillCuSeqlens
+            | Self::PrefillQLens
+            | Self::PrefillKvLens
+            | Self::GlueWriteTables
+            | Self::ForwardResidual
+            | Self::DeltaNetDecodeTable
+            | Self::RowTokenIds => Chain::ForwardSetup,
             other => match other.phase() {
                 LayerPhase::Attention => Chain::Attention,
                 LayerPhase::Ffn => Chain::Ffn,
@@ -1187,6 +1460,10 @@ impl WaveBuffer {
     pub fn phase(&self) -> LayerPhase {
         match self {
             Self::DeltaNetNorm
+            | Self::DeltaNetQkvOperand
+            | Self::DeltaNetQkvProj
+            | Self::DeltaNetZOperand
+            | Self::DeltaNetZProj
             | Self::DeltaNetBetaOperand
             | Self::DeltaNetBetaProj
             | Self::DeltaNetAlphaOperand
@@ -1211,13 +1488,34 @@ impl WaveBuffer {
             | Self::ReplayAlpha
             | Self::ReplaySpanPtrs
             | Self::ReplaySpanExtents
+            | Self::ReplayConved
+            | Self::ReplayOut
+            | Self::ReplayScanU
+            | Self::ReplayScanW
+            | Self::ReplayScanKq
+            | Self::ReplayDecay
             | Self::HyperAttnNorm
             | Self::HyperAttnNormOperand
             | Self::HyperAttnLowRank
             | Self::HyperAttnGateAct
             | Self::HyperAttnGateOperand
             | Self::HyperAttnGateRaw
-            | Self::HyperAttnMixed => LayerPhase::Attention,
+            | Self::HyperAttnMixed
+            | Self::HeadShift
+            | Self::HeadHiddenNorm
+            | Self::HeadHiddenOperand
+            | Self::HeadHiddenProj
+            | Self::HeadInput
+            | Self::MtpTrunkNorm
+            | Self::MtpShift
+            | Self::MtpEmbedNorm
+            | Self::MtpHiddenNorm
+            | Self::MtpInputCat
+            | Self::MtpInput
+            | Self::PleRows
+            | Self::PleKeyValue
+            | Self::PleNormalized
+            | Self::PleSpanTable => LayerPhase::Attention,
             Self::AttnNorm
             | Self::QkvProjection
             | Self::QSplit
@@ -1239,7 +1537,9 @@ impl WaveBuffer {
             | Self::VBias
             | Self::AttnOutput
             | Self::DecodeContext
-            | Self::OProjOutput => LayerPhase::Attention,
+            | Self::OProjOperand
+            | Self::OProjOutput
+            | Self::QsaSelection => LayerPhase::Attention,
             Self::HyperFfnNorm
             | Self::HyperFfnNormOperand
             | Self::HyperFfnLowRank
@@ -1286,7 +1586,23 @@ impl WaveBuffer {
             | Self::HeadNorm
             | Self::HeadNormF32
             | Self::HeadLogits
-            | Self::AcceptRows => LayerPhase::Forward,
+            | Self::HeadLogitsF32
+            | Self::AcceptRows
+            | Self::HyperResidual
+            | Self::HeadRowEmbeds
+            | Self::HeadScoredResidual
+            | Self::HeadScoredRows
+            | Self::HeadEmbedNorm
+            | Self::HeadEmbedOperand
+            | Self::HeadEmbedProj
+            | Self::MtpRowEmbeds
+            | Self::PrefillCuSeqlens
+            | Self::PrefillQLens
+            | Self::PrefillKvLens
+            | Self::GlueWriteTables
+            | Self::ForwardResidual
+            | Self::DeltaNetDecodeTable
+            | Self::RowTokenIds => LayerPhase::Forward,
         }
     }
 
@@ -1337,6 +1653,8 @@ impl WaveBuffer {
         let hyper = g.hyper.unwrap_or(HyperWidths {
             streams: 0,
             low_rank: 0,
+            draft_head: false,
+            ple: false,
         });
         let hyper_rows = if g.hyper.is_some() { rows } else { 0 };
         let hyper_scored = if g.hyper.is_some() { w.scored_rows } else { 0 };
@@ -1459,11 +1777,26 @@ impl WaveBuffer {
             // buffers because a mixed wave carves both into one generation —
             // each at its own group's width, which is what a single row count
             // could not say.
-            Self::AttnOutput => dense(w.prefill_rows, g.attn_cols(), g.act_dtype),
+            // A decode row's context is dense too where the decode kernel does
+            // not emit q8 (`decode_q8_context` off — Qwen2's head dim 64).
+            Self::AttnOutput if g.decode_q8_context => {
+                dense(w.prefill_rows, g.attn_cols(), g.act_dtype)
+            }
+            Self::AttnOutput => dense(w.rows(), g.attn_cols(), g.act_dtype),
             // Only where the decode kernel emits it — see
             // `ModelGeometry::decode_q8_context`.
             Self::DecodeContext if g.decode_q8_context => q8(w.decode_rows, g.attn_cols()),
             Self::DecodeContext => dense(0, 0, g.act_dtype),
+            // A decode row's context is already packed where the decode kernel
+            // emits q8 (`DecodeContext`); elsewhere it is quantized here too.
+            Self::OProjOperand if g.packed_norm && g.decode_q8_context => {
+                q8(w.prefill_rows, g.attn_cols())
+            }
+            Self::OProjOperand if g.packed_norm => q8(w.rows(), g.attn_cols()),
+            Self::OProjOperand => dense(0, 0, g.act_dtype),
+            Self::OProjOutput if g.packed_norm => {
+                dense(w.decode_rows + w.prefill_rows, g.hidden, g.act_dtype)
+            }
             Self::OProjOutput => dense(w.decode_rows, g.hidden, g.act_dtype),
             // The DeltaNet chain prices zero on a stack with no DeltaNet
             // layers, which makes `Chain::DeltaNet` sum to zero and drop out of
@@ -1495,11 +1828,38 @@ impl WaveBuffer {
             Self::DeltaNetBetaProj | Self::DeltaNetAlphaProj => {
                 dense(rows, g.delta_net.map_or(0, |d| d.n_v_heads), DType::F32)
             }
-            // The live chain: only a Gated Residual stack with DeltaNet layers.
-            Self::DeltaNetLiveOperand
-            | Self::DeltaNetLiveProjection
-            | Self::DeltaNetLiveSplit
-            | Self::DeltaNetLiveSpanPtrs
+            // The single-stream stack's separate `[q|k|v]` and `z` projections;
+            // the pre-mix stack stacks them into `DeltaNetLiveProjection`.
+            Self::DeltaNetQkvOperand
+            | Self::DeltaNetQkvProj
+            | Self::DeltaNetZOperand
+            | Self::DeltaNetZProj
+                if g.hyper.is_some() || g.delta_net.is_none() =>
+            {
+                dense(0, 0, DType::F32)
+            }
+            Self::DeltaNetQkvOperand | Self::DeltaNetZOperand if g.packed_norm => {
+                q8(rows, g.hidden)
+            }
+            Self::DeltaNetQkvOperand | Self::DeltaNetZOperand => dense(0, 0, DType::F32),
+            Self::DeltaNetQkvProj => dense(
+                rows,
+                g.delta_net.expect("guarded above").conv_dim,
+                DType::F32,
+            ),
+            Self::DeltaNetZProj => dense(
+                rows,
+                g.delta_net.expect("guarded above").value_dim,
+                DType::F32,
+            ),
+            // The pre-mix stack's stacked projection: only there.
+            Self::DeltaNetLiveOperand | Self::DeltaNetLiveProjection | Self::DeltaNetLiveSplit
+                if g.hyper.is_none() || g.delta_net.is_none() =>
+            {
+                dense(0, 0, DType::F32)
+            }
+            // The rest of the live chain, on either stack with DeltaNet layers.
+            Self::DeltaNetLiveSpanPtrs
             | Self::DeltaNetLiveSpanExtents
             | Self::DeltaNetLiveConv
             | Self::DeltaNetLiveScanOut
@@ -1510,7 +1870,7 @@ impl WaveBuffer {
             | Self::DeltaNetLiveNormGate
             | Self::DeltaNetLiveOutOperand
             | Self::DeltaNetLiveOut
-                if g.hyper.is_none() || g.delta_net.is_none() =>
+                if g.delta_net.is_none() =>
             {
                 dense(0, 0, DType::F32)
             }
@@ -1584,6 +1944,38 @@ impl WaveBuffer {
             }
             Self::ReplaySpanPtrs => dense(w.staged_spans, 4, DType::I64),
             Self::ReplaySpanExtents => dense(w.staged_spans, 2, DType::U32),
+            // The replayed conv and scan, over every staged row: the kernels
+            // run over the stash's whole buffers and touch only the spans.
+            Self::ReplayConved
+            | Self::ReplayOut
+            | Self::ReplayScanU
+            | Self::ReplayScanW
+            | Self::ReplayScanKq
+            | Self::ReplayDecay
+                if g.delta_net.is_none() =>
+            {
+                dense(0, 0, DType::F32)
+            }
+            Self::ReplayConved => dense(
+                w.staged_rows,
+                g.delta_net.expect("guarded above").conv_dim,
+                DType::F32,
+            ),
+            Self::ReplayOut | Self::ReplayScanU | Self::ReplayScanW => dense(
+                w.staged_rows,
+                g.delta_net.expect("guarded above").value_dim,
+                DType::F32,
+            ),
+            Self::ReplayScanKq => dense(
+                w.staged_rows,
+                g.delta_net.expect("guarded above").n_v_heads * DELTA_NET_SCAN_CHUNK,
+                DType::F32,
+            ),
+            Self::ReplayDecay => dense(
+                w.staged_rows,
+                g.delta_net.expect("guarded above").n_v_heads,
+                DType::F32,
+            ),
             // The shared expert's half of the chain, on a stack whose MoE has
             // one — and nothing at all otherwise.
             Self::SharedGateUp
@@ -1678,9 +2070,129 @@ impl WaveBuffer {
             Self::HeadNorm if g.packed_head => q8(w.scored_rows, g.hidden),
             Self::HeadNorm => dense(w.scored_rows, g.hidden, g.act_dtype),
             Self::HeadNormF32 if !g.packed_head => dense(w.scored_rows, g.hidden, DType::F32),
-            Self::HeadLogits if g.packed_head => dense(w.scored_rows, g.vocab, g.act_dtype),
-            Self::AcceptRows if g.packed_head => dense(w.accept_rows, g.vocab, g.act_dtype),
-            Self::HeadNormF32 | Self::HeadLogits | Self::AcceptRows => dense(0, 0, g.act_dtype),
+            Self::HeadLogits => dense(w.scored_rows, g.vocab, g.act_dtype),
+            Self::HeadLogitsF32 if !g.packed_head && g.act_dtype != DType::F32 => {
+                dense(w.scored_rows, g.vocab, DType::F32)
+            }
+            Self::HeadLogitsF32 => dense(0, 0, DType::F32),
+            Self::AcceptRows => dense(w.accept_rows, g.vocab, g.act_dtype),
+            Self::HeadNormF32 => dense(0, 0, g.act_dtype),
+            // Every row of the wave, where the head runs.
+            Self::HyperResidual if w.scored_rows > 0 => dense(hyper_rows, hc_dim, DType::F32),
+            Self::HeadRowEmbeds if w.scored_rows > 0 && hyper.draft_head => {
+                dense(rows, g.hidden, DType::F32)
+            }
+            Self::HyperResidual | Self::HeadRowEmbeds => dense(0, 0, DType::F32),
+            Self::HeadScoredResidual if g.hyper.is_some() => {
+                dense(hyper_scored, hc_dim, DType::F32)
+            }
+            // A single-stream stack's residual is on this span too
+            // (`ForwardResidual`), so the head's gather of its scored rows
+            // lands here in the compute dtype.
+            Self::HeadScoredResidual => dense(w.scored_rows, g.hidden, g.act_dtype),
+            Self::HeadScoredRows => dense(w.scored_rows, 1, DType::U32),
+            Self::QsaSelection => dense(w.qsa_bytes, 1, DType::U8),
+            // The forward's setup tables: only the multi-stream stack builds
+            // them on its forward span — every other stack's are its own.
+            // A wave of no tokens — a speculative replay — is not a forward and
+            // builds no setup.
+            Self::PrefillCuSeqlens
+            | Self::PrefillQLens
+            | Self::PrefillKvLens
+            | Self::GlueWriteTables
+            | Self::RowTokenIds
+                if rows == 0 =>
+            {
+                dense(0, 0, DType::U32)
+            }
+            // A single-stream stack builds two ragged sets — the prefill group's
+            // and the glue group's — so each table is two carves, one bump
+            // alignment apart, over the spans of both.
+            Self::PrefillCuSeqlens if g.hyper.is_none() => {
+                dense(w.prefill_spans + 2 + BUMP_ALIGNMENT / 4, 1, DType::U32)
+            }
+            Self::PrefillQLens | Self::PrefillKvLens if g.hyper.is_none() => {
+                dense(w.prefill_spans + BUMP_ALIGNMENT / 4, 1, DType::U32)
+            }
+            // Three per-row tables; the glue rows are among the prefill rows.
+            Self::GlueWriteTables if g.hyper.is_none() => {
+                dense(3 * w.prefill_rows + 2 * (BUMP_ALIGNMENT / 4), 1, DType::U32)
+            }
+            Self::GlueWriteTables => dense(0, 0, DType::U32),
+            Self::ForwardResidual if g.hyper.is_none() => dense(rows, g.hidden, g.act_dtype),
+            Self::ForwardResidual => dense(0, 0, g.act_dtype),
+            Self::DeltaNetDecodeTable => match g.delta_net {
+                Some(dn) if w.decode_rows > 0 => dense(
+                    dn.layers * 4 * w.decode_rows * 8 + BUMP_ALIGNMENT + w.decode_rows * 4,
+                    1,
+                    DType::U8,
+                ),
+                _ => dense(0, 0, DType::U8),
+            },
+            // One carve on a single-stream stack: the ids laid on the span for
+            // the embedding, nothing read back.
+            Self::RowTokenIds if g.hyper.is_none() => dense(rows, 1, DType::U32),
+            Self::PrefillCuSeqlens => dense(w.prefill_spans + 1, 1, DType::U32),
+            Self::PrefillQLens | Self::PrefillKvLens => dense(w.prefill_spans, 1, DType::U32),
+            // Two carves at most, so one bump alignment between them as well.
+            Self::RowTokenIds => dense(2 * rows + BUMP_ALIGNMENT / 4, 1, DType::U32),
+            // The draft head's input assembly, over every row of the wave.
+            Self::HeadShift
+            | Self::HeadHiddenNorm
+            | Self::HeadEmbedNorm
+            | Self::HeadEmbedOperand
+            | Self::HeadEmbedProj
+            | Self::HeadHiddenOperand
+            | Self::HeadHiddenProj
+            | Self::HeadInput
+                if !hyper.draft_head =>
+            {
+                dense(0, 0, DType::F32)
+            }
+            Self::HeadShift | Self::HeadHiddenNorm | Self::HeadInput => {
+                dense(rows, hc_dim, DType::F32)
+            }
+            // The embedding half rides the forward phase, which only a wave
+            // that reaches the head prices.
+            Self::HeadEmbedNorm | Self::HeadEmbedOperand | Self::HeadEmbedProj
+                if w.scored_rows == 0 =>
+            {
+                dense(0, 0, DType::F32)
+            }
+            Self::HeadEmbedNorm | Self::HeadEmbedProj => dense(rows, g.hidden, DType::F32),
+            Self::HeadEmbedOperand => q8(operand_rows(rows), g.hidden),
+            Self::HeadHiddenOperand => q8(operand_rows(rows * hyper.streams), g.hidden),
+            Self::HeadHiddenProj => dense(rows * hyper.streams, g.hidden, DType::F32),
+            // A single-stream head's pass, over every row of a wave that
+            // reaches it.
+            Self::MtpRowEmbeds
+            | Self::MtpTrunkNorm
+            | Self::MtpShift
+            | Self::MtpEmbedNorm
+            | Self::MtpHiddenNorm
+            | Self::MtpInputCat
+            | Self::MtpInput
+                if !g.mtp_head || w.scored_rows == 0 =>
+            {
+                dense(0, 0, g.act_dtype)
+            }
+            Self::MtpInputCat => dense(rows, 2 * g.hidden, g.act_dtype),
+            Self::MtpRowEmbeds
+            | Self::MtpTrunkNorm
+            | Self::MtpShift
+            | Self::MtpEmbedNorm
+            | Self::MtpHiddenNorm
+            | Self::MtpInput => dense(rows, g.hidden, g.act_dtype),
+            // The PLE block, over every row of the wave.
+            Self::PleRows | Self::PleKeyValue | Self::PleNormalized | Self::PleSpanTable
+                if !hyper.ple =>
+            {
+                dense(0, 0, DType::F32)
+            }
+            Self::PleRows => dense(rows, g.hidden, DType::F32),
+            Self::PleKeyValue => dense(rows, hc_dim + g.hidden, DType::F32),
+            Self::PleNormalized => dense(rows, hc_dim, DType::F32),
+            Self::PleSpanTable => dense(w.scored_rows, 4, DType::I64),
         }
     }
 
@@ -1753,13 +2265,32 @@ impl WavePlan {
     /// the layer opens the phase for, so the cursor walks the preludes and then
     /// each alternative from where they left it; the phase costs the largest of
     /// those walks.
+    ///
+    /// **Two alternatives walk differently.** The draft head's pass carves its
+    /// input assembly, then the pre-mix, then the attention chain — its block
+    /// is a trunk attention layer behind an assembly of its own. The PLE block
+    /// opens its generation alone, with no pre-mix.
     pub fn phase_bytes(&self, phase: LayerPhase, w: WaveWidth) -> usize {
-        let prelude = Chain::iter()
-            .filter(|c| c.phase() == phase && c.is_prelude())
-            .fold(0usize, |cursor, c| self.walk_chain(cursor, c, w));
+        let preludes = |cursor: usize| {
+            Chain::iter()
+                .filter(|c| c.phase() == phase && c.is_prelude())
+                .fold(cursor, |cursor, c| self.walk_chain(cursor, c, w))
+        };
+        let prelude = preludes(0);
         Chain::iter()
             .filter(|c| c.phase() == phase && !c.is_prelude())
-            .map(|c| self.walk_chain(prelude, c, w))
+            .map(|c| match c {
+                Chain::HeadPass => {
+                    let assembled = self.walk_chain(0, Chain::HeadPass, w);
+                    if assembled == 0 {
+                        0
+                    } else {
+                        self.walk_chain(preludes(assembled), Chain::Attention, w)
+                    }
+                }
+                Chain::Ple => self.walk_chain(0, Chain::Ple, w),
+                _ => self.walk_chain(prelude, c, w),
+            })
             .max()
             .unwrap_or(prelude)
     }
@@ -2019,6 +2550,8 @@ mod tests {
             hyper: Some(HyperWidths {
                 streams: 4,
                 low_rank: 320,
+                draft_head: false,
+                ple: false,
             }),
             ..moe()
         }
@@ -2051,6 +2584,232 @@ mod tests {
         assert_eq!(plain.chain_bytes(Chain::HyperFfn, wide), 0);
     }
 
+    /// [`hyper_moe`] with a draft head and a PLE block, as Flash-Next runs.
+    fn hyper_moe_full() -> ModelGeometry {
+        ModelGeometry {
+            hyper: Some(HyperWidths {
+                streams: 4,
+                low_rank: 320,
+                draft_head: true,
+                ple: true,
+            }),
+            ..hyper_moe()
+        }
+    }
+
+    /// The draft head's input assembly at 100 rows on an int8 session, carve by
+    /// carve. On its attention phase: the shift, the hidden norm and the sum
+    /// (each 100 × 10240 × 4 = 4,096,000), the hidden operand (one row per
+    /// stream: 8,000 tiles → 1,000 blocks × 1,152 = 1,152,000) and the hidden
+    /// projection (400 × 2560 × 4 = 4,096,000). On the forward phase, beside
+    /// the embeddings they read: the embedding norm and its projection (each
+    /// 100 × 2560 × 4 = 1,024,000) and the embedding operand (2,000 tiles → 250
+    /// blocks × 1,152 = 288,000). Every carve starts on a 256 boundary, so each
+    /// walk is its sum.
+    #[test]
+    fn the_head_pass_prices_its_assembly() {
+        let g = hyper_moe_full();
+        let p = WavePlan::new(g);
+        let wide = WaveWidth::prefill(100, 1);
+        assert_eq!(p.chain_bytes(Chain::HeadPass, wide), 17_536_000);
+        assert_eq!(
+            WavePlan::new(hyper_moe()).chain_bytes(Chain::HeadPass, wide),
+            0
+        );
+        let embed: usize = [
+            WaveBuffer::HeadEmbedNorm,
+            WaveBuffer::HeadEmbedOperand,
+            WaveBuffer::HeadEmbedProj,
+        ]
+        .iter()
+        .map(|b| b.bytes(&g, wide))
+        .sum();
+        assert_eq!(embed, 2_336_000);
+        // Only where the head runs.
+        let window = WaveWidth {
+            prefill_rows: 100,
+            ..WaveWidth::default()
+        };
+        assert_eq!(WaveBuffer::HeadEmbedNorm.bytes(&g, window), 0);
+    }
+
+    /// The head's block runs behind its assembly: the pass is the assembly,
+    /// then the pre-mix, then the attention chain — an alternative the phase
+    /// takes the max with, never a sum over the trunk's mixers.
+    #[test]
+    fn the_head_pass_walks_its_assembly_then_the_trunk_attention_layer() {
+        let p = WavePlan::new(hyper_moe_full());
+        let wide = WaveWidth::prefill(100, 1);
+        let head = p.walk_chain(
+            p.walk_chain(17_536_000, Chain::HyperAttn, wide),
+            Chain::Attention,
+            wide,
+        );
+        let trunk = p
+            .walk_chain(10_731_776, Chain::Attention, wide)
+            .max(p.walk_chain(10_731_776, Chain::DeltaNet, wide));
+        assert_eq!(p.phase_bytes(LayerPhase::Attention, wide), head.max(trunk));
+        assert!(head > p.walk_chain(10_731_776, Chain::Attention, wide));
+    }
+
+    /// The PLE block at 100 rows over one sequence: the table rows
+    /// (1,024,000), the stacked key|value (100 × 12800 × 4 = 5,120,000), the
+    /// normed conv input (4,096,000) and one span's four words (32).
+    #[test]
+    fn the_ple_block_prices_its_four_carves() {
+        let p = WavePlan::new(hyper_moe_full());
+        let wide = WaveWidth::prefill(100, 1);
+        assert_eq!(p.chain_bytes(Chain::Ple, wide), 10_240_032);
+        assert_eq!(WavePlan::new(hyper_moe()).chain_bytes(Chain::Ple, wide), 0);
+    }
+
+    /// A layer's sparse selection is priced at what the model states, on the
+    /// attention phase, and nothing when it states nothing.
+    #[test]
+    fn the_qsa_selection_is_priced_as_the_model_states_it() {
+        let p = WavePlan::new(hyper_moe());
+        let plain = WaveWidth::decode(4);
+        let deep = WaveWidth {
+            qsa_bytes: 3_000_000,
+            ..plain
+        };
+        assert_eq!(WaveBuffer::QsaSelection.bytes(&hyper_moe(), plain), 0);
+        assert_eq!(
+            WaveBuffer::QsaSelection.bytes(&hyper_moe(), deep),
+            3_000_000
+        );
+        // One more aligned carve at the chain's end: its bytes, plus at most
+        // the alignment its start costs.
+        let grew = p.chain_bytes(Chain::Attention, deep) - p.chain_bytes(Chain::Attention, plain);
+        assert!(
+            (3_000_000..3_000_000 + BUMP_ALIGNMENT).contains(&grew),
+            "grew by {grew}"
+        );
+        assert_eq!(
+            p.phase_bytes(LayerPhase::Ffn, deep),
+            p.phase_bytes(LayerPhase::Ffn, plain),
+            "the selection is the attention phase's alone"
+        );
+    }
+
+    /// The wide residual and the rows' embeddings ride the forward span when
+    /// the head runs: at 100 rows, `100 × 10240 × 4` and `100 × 2560 × 4`. A
+    /// window that stops short of the head hands its residual on, so it is
+    /// charged neither; a stack without a draft head gathers no bare rows.
+    #[test]
+    fn the_forward_span_carries_the_residual_where_the_head_runs() {
+        let g = hyper_moe_full();
+        let wide = WaveWidth::prefill(100, 1);
+        assert_eq!(WaveBuffer::HyperResidual.bytes(&g, wide), 4_096_000);
+        assert_eq!(WaveBuffer::HeadRowEmbeds.bytes(&g, wide), 1_024_000);
+        // One scored row: its gathered residual and its index.
+        assert_eq!(WaveBuffer::HeadScoredResidual.bytes(&g, wide), 40_960);
+        assert_eq!(WaveBuffer::HeadScoredRows.bytes(&g, wide), 4);
+        let window = WaveWidth {
+            prefill_rows: 100,
+            ..WaveWidth::default()
+        };
+        assert_eq!(WaveBuffer::HyperResidual.bytes(&g, window), 0);
+        assert_eq!(WaveBuffer::HeadRowEmbeds.bytes(&g, window), 0);
+        let headless = hyper_moe();
+        assert_eq!(WaveBuffer::HyperResidual.bytes(&headless, wide), 4_096_000);
+        assert_eq!(WaveBuffer::HeadRowEmbeds.bytes(&headless, wide), 0);
+    }
+
+    /// A single-stream NextN head's pass over 100 rows of 1024 BF16: five
+    /// `100 × 1024 × 2` buffers and the `2 · hidden` concatenation on the
+    /// head's attention phase, the row embeddings on the forward phase — and
+    /// none of it on a wave that stops short of the head, or on a stack
+    /// without one.
+    #[test]
+    fn a_single_stream_draft_head_prices_its_pass() {
+        let g = ModelGeometry {
+            mtp_head: true,
+            ..gated_partial_rotary()
+        };
+        let wide = WaveWidth::prefill(100, 1);
+        assert_eq!(WaveBuffer::MtpRowEmbeds.bytes(&g, wide), 204_800);
+        assert_eq!(WaveBuffer::MtpInputCat.bytes(&g, wide), 409_600);
+        let p = WavePlan::new(g);
+        assert_eq!(p.chain_bytes(Chain::HeadPass, wide), 5 * 204_800 + 409_600);
+        let window = WaveWidth {
+            prefill_rows: 100,
+            ..WaveWidth::default()
+        };
+        assert_eq!(p.chain_bytes(Chain::HeadPass, window), 0);
+        assert_eq!(WaveBuffer::MtpRowEmbeds.bytes(&g, window), 0);
+        let headless = WavePlan::new(gated_partial_rotary());
+        assert_eq!(headless.chain_bytes(Chain::HeadPass, wide), 0);
+    }
+
+    /// A single-stream stack embeds onto the forward span in every forward,
+    /// the window that stops short included — it copies the residual off the
+    /// span as it hands it on — so the residual is charged either way: at 100
+    /// rows of 1024 BF16, `100 × 1024 × 2`.
+    #[test]
+    fn a_single_stream_residual_is_on_the_span_with_or_without_the_head() {
+        let g = gated_partial_rotary();
+        let window = WaveWidth {
+            prefill_rows: 100,
+            ..WaveWidth::default()
+        };
+        assert_eq!(WaveBuffer::ForwardResidual.bytes(&g, window), 204_800);
+        assert_eq!(
+            WaveBuffer::ForwardResidual.bytes(&g, WaveWidth::prefill(100, 1)),
+            204_800
+        );
+        assert_eq!(WaveBuffer::ForwardResidual.bytes(&hyper_moe(), window), 0);
+    }
+
+    /// The multi-stream stack's per-forward setup tables are on its forward
+    /// span whether or not the wave reaches the head — every layer reads them —
+    /// so a window that stops short still prices them: one prefill span's three
+    /// offset tables (2, 1 and 1 words) and two words per row of token ids,
+    /// with an alignment between its two carves.
+    #[test]
+    fn the_forward_setup_tables_are_priced_with_or_without_the_head() {
+        let g = hyper_moe_full();
+        let window = WaveWidth {
+            prefill_rows: 100,
+            prefill_spans: 1,
+            ..WaveWidth::default()
+        };
+        for (b, want) in [
+            (WaveBuffer::PrefillCuSeqlens, 8),
+            (WaveBuffer::PrefillQLens, 4),
+            (WaveBuffer::PrefillKvLens, 4),
+        ] {
+            assert_eq!(b.bytes(&g, window), want, "{b:?}");
+        }
+        assert_eq!(WaveBuffer::GlueWriteTables.bytes(&g, window), 0);
+        // A single-stream stack builds the prefill group's set and the glue
+        // group's, each table two carves an alignment apart, and the glue
+        // group's three per-row scatter tables.
+        let single = gated_partial_rotary();
+        for (b, want) in [
+            (WaveBuffer::PrefillCuSeqlens, 12 + BUMP_ALIGNMENT),
+            (WaveBuffer::PrefillQLens, 4 + BUMP_ALIGNMENT),
+            (WaveBuffer::PrefillKvLens, 4 + BUMP_ALIGNMENT),
+            (WaveBuffer::GlueWriteTables, 1200 + 2 * BUMP_ALIGNMENT),
+        ] {
+            assert_eq!(b.bytes(&single, window), want, "{b:?}");
+        }
+        // The ids are every stack's: two words a row where they are read back,
+        // one where the device inputs are only laid on the span.
+        assert_eq!(
+            WaveBuffer::RowTokenIds.bytes(&g, window),
+            800 + BUMP_ALIGNMENT
+        );
+        assert_eq!(
+            WaveBuffer::RowTokenIds.bytes(&gated_partial_rotary(), window),
+            400
+        );
+        assert!(
+            WavePlan::new(g).phase_bytes(LayerPhase::Forward, window)
+                >= 3 * BUMP_ALIGNMENT + 800 + BUMP_ALIGNMENT
+        );
+    }
+
     /// A prelude runs AHEAD of the phase's mixer, not instead of it: the phase
     /// walks the pre-mix and then the largest alternative on from its end.
     #[test]
@@ -2081,6 +2840,7 @@ mod tests {
                 conv_dim: 10240,
                 value_dim: 6144,
                 n_v_heads: 48,
+                layers: 36,
             }),
             ..hyper_moe()
         }
@@ -2294,6 +3054,7 @@ mod tests {
             fused_qkv: true,
             head_qk_norm: true,
             head_norm_reshapes: true,
+            mtp_head: false,
         }
     }
 
@@ -2319,6 +3080,7 @@ mod tests {
                 conv_dim: 6144,
                 value_dim: 2048,
                 n_v_heads: 16,
+                layers: 18,
             }),
             act_dtype: DType::BF16,
             accum_dtype: DType::F32,
@@ -2337,6 +3099,8 @@ mod tests {
             fused_qkv: false,
             head_qk_norm: true,
             head_norm_reshapes: false,
+            // The 0.8B carries no NextN head.
+            mtp_head: false,
         }
     }
 
@@ -2372,6 +3136,7 @@ mod tests {
             fused_qkv: true,
             head_qk_norm: false,
             head_norm_reshapes: true,
+            mtp_head: false,
         }
     }
 
@@ -2432,6 +3197,9 @@ mod tests {
                         || (matches!(b, WaveBuffer::QBias | WaveBuffer::KBias | WaveBuffer::VBias)
                             && !g.qkv_bias)
                         || (matches!(b, WaveBuffer::DecodeContext) && !g.decode_q8_context)
+                        // The prefill context's quantize, which only an int8
+                        // `o_proj` makes.
+                        || (matches!(b, WaveBuffer::OProjOperand) && !g.packed_norm)
                         || (matches!(b, WaveBuffer::QSplit) && !g.fused_qkv && !g.gated_qkv)
                         || (matches!(
                             b,
@@ -2461,12 +3229,11 @@ mod tests {
                                 | WaveBuffer::SharedGatedOut
                                 | WaveBuffer::MoeSharedSum
                         ) && g.shared_expert.is_none())
-                        // The head's two alternatives: a packed session carves
-                        // its logits on the span, a float one carries an F32
-                        // working copy of the norm instead.
+                        // A float head carries F32 working copies of its norm
+                        // and its logits; a packed one does not.
                         || (matches!(b, WaveBuffer::HeadNormF32) && g.packed_head)
-                        || (matches!(b, WaveBuffer::HeadLogits | WaveBuffer::AcceptRows)
-                            && !g.packed_head)
+                        || (matches!(b, WaveBuffer::HeadLogitsF32)
+                            && (g.packed_head || g.act_dtype == DType::F32))
                         || ((b.chain() == Chain::DeltaNet
                             || b.chain() == Chain::DeltaNetReplay)
                             && g.delta_net.is_none())
@@ -2481,26 +3248,25 @@ mod tests {
                         || (matches!(b, WaveBuffer::HeadNorm | WaveBuffer::HeadNormF32)
                             && g.hyper.is_some()
                             && !g.packed_head)
-                        // The live DeltaNet chain: a Gated Residual stack with
-                        // DeltaNet layers only — where β and α ride its stacked
-                        // projection instead of their own.
+                        // The stacked projection: a Gated Residual stack with
+                        // DeltaNet layers only — where β and α ride it instead
+                        // of their own.
                         || (matches!(
                             b,
                             WaveBuffer::DeltaNetLiveOperand
                                 | WaveBuffer::DeltaNetLiveProjection
                                 | WaveBuffer::DeltaNetLiveSplit
-                                | WaveBuffer::DeltaNetLiveSpanPtrs
-                                | WaveBuffer::DeltaNetLiveSpanExtents
-                                | WaveBuffer::DeltaNetLiveConv
-                                | WaveBuffer::DeltaNetLiveScanOut
-                                | WaveBuffer::DeltaNetLiveScanU
-                                | WaveBuffer::DeltaNetLiveScanW
-                                | WaveBuffer::DeltaNetLiveScanKq
-                                | WaveBuffer::DeltaNetLiveDecay
-                                | WaveBuffer::DeltaNetLiveNormGate
-                                | WaveBuffer::DeltaNetLiveOutOperand
-                                | WaveBuffer::DeltaNetLiveOut
                         ) && (g.hyper.is_none() || g.delta_net.is_none()))
+                        // The separate `[q|k|v]` and `z` projections, on a
+                        // single-stream stack; their operands only where int8.
+                        || (matches!(
+                            b,
+                            WaveBuffer::DeltaNetQkvProj | WaveBuffer::DeltaNetZProj
+                        ) && (g.hyper.is_some() || g.delta_net.is_none()))
+                        || (matches!(
+                            b,
+                            WaveBuffer::DeltaNetQkvOperand | WaveBuffer::DeltaNetZOperand
+                        ) && (g.hyper.is_some() || g.delta_net.is_none() || !g.packed_norm))
                         || (matches!(
                             b,
                             WaveBuffer::DeltaNetBetaProj | WaveBuffer::DeltaNetAlphaProj
@@ -2509,7 +3275,33 @@ mod tests {
                         || (matches!(
                             b,
                             WaveBuffer::DeltaNetBetaOperand | WaveBuffer::DeltaNetAlphaOperand
-                        ) && g.act_dtype == DType::F32);
+                        ) && g.act_dtype == DType::F32)
+                        // The draft head's assembly, on a stack without a head:
+                        // the multi-stream head's, and the single-stream one's.
+                        || (((b.chain() == Chain::HeadPass && !b.is_mtp())
+                            || matches!(
+                                b,
+                                WaveBuffer::HeadEmbedNorm
+                                    | WaveBuffer::HeadEmbedOperand
+                                    | WaveBuffer::HeadEmbedProj
+                            ))
+                            && !g.hyper.is_some_and(|h| h.draft_head))
+                        || (b.is_mtp() && !g.mtp_head)
+                        // The PLE block, on a stack without one.
+                        || (b.chain() == Chain::Ple && !g.hyper.is_some_and(|h| h.ple))
+                        // The wide residual, on a single-stream stack; the
+                        // rows' embeddings, on a stack without a draft head.
+                        || (matches!(b, WaveBuffer::HyperResidual) && g.hyper.is_none())
+                        // Glue rides the single-stream stacks only.
+                        || (matches!(b, WaveBuffer::GlueWriteTables) && g.hyper.is_some())
+                        // The decode table, on a stack with DeltaNet layers.
+                        || (matches!(b, WaveBuffer::DeltaNetDecodeTable)
+                            && g.delta_net.is_none())
+                        // The single-stream residual; a multi-stream stack's is
+                        // `HyperResidual`.
+                        || (matches!(b, WaveBuffer::ForwardResidual) && g.hyper.is_some())
+                        || (matches!(b, WaveBuffer::HeadRowEmbeds)
+                            && !g.hyper.is_some_and(|h| h.draft_head));
                     // Every unit non-zero, so a buffer sized by any of the three
                     // is exercised and a zero is a defect rather than a width
                     // this case happened not to supply.
@@ -2521,6 +3313,7 @@ mod tests {
                         staged_rows: rows,
                         staged_spans: rows,
                         accept_rows: rows,
+                        qsa_bytes: rows,
                     };
                     let s = b.shape(&g, width);
                     if conditional {
@@ -2585,27 +3378,40 @@ mod tests {
         ] {
             assert_eq!(b.bytes(&g, rows), 0, "{b:?} is not carved on this chain");
         }
-        // **The whole chain, to the byte**, against the thirteen carves the
-        // census itemises — and this is the assertion the width split exists
-        // for. `DecodeContext` and `OProjOutput` are the decode group's; a wave
-        // with no decode rows carves neither, and priced at one total row count
-        // they cost this span 8.7 MiB it could never spend.
+        // **The whole chain, to the byte**: the thirteen carves the census
+        // itemises, plus the int8 `o_proj`'s quantized operand and result, which
+        // inherit the context's arena (`MEASURED_ATTN_PREFILL_PER_ROW` records
+        // the gate that ran out of span on them). `DecodeContext` is the decode
+        // group's; a wave with no decode rows carves none, and priced at one
+        // total row count it cost this span megabytes it could never spend.
+        assert_eq!(
+            WaveBuffer::OProjOperand.bytes(&g, rows),
+            4_838_400,
+            "q8a128 over the 2,048 attention columns of 2,100 rows"
+        );
+        assert_eq!(WaveBuffer::OProjOutput.bytes(&g, rows), 4_300_800);
         assert_eq!(
             plan.chain_bytes(Chain::Attention, rows),
-            88_435_200,
-            "a pure-prefill wave must price its measured generation exactly"
+            88_435_200 + 4_838_400 + 4_300_800,
+            "a pure-prefill wave must price its generation exactly"
         );
-        for b in [WaveBuffer::DecodeContext, WaveBuffer::OProjOutput] {
-            assert_eq!(
-                b.bytes(&g, rows),
-                0,
-                "{b:?} charged on a wave with no decode rows"
-            );
-            assert!(
-                b.bytes(&g, WaveWidth::decode(2100)) > 0,
-                "{b:?} must still be charged when there ARE decode rows"
-            );
-        }
+        assert_eq!(
+            WaveBuffer::DecodeContext.bytes(&g, rows),
+            0,
+            "DecodeContext charged on a wave with no decode rows"
+        );
+        assert!(
+            WaveBuffer::DecodeContext.bytes(&g, WaveWidth::decode(2100)) > 0,
+            "DecodeContext must still be charged when there ARE decode rows"
+        );
+        // A float session's `o_proj` reads the context as it stands: no operand,
+        // and the prefill group's result is not on the span.
+        let float = ModelGeometry {
+            packed_norm: false,
+            ..g
+        };
+        assert_eq!(WaveBuffer::OProjOperand.bytes(&float, rows), 0);
+        assert_eq!(WaveBuffer::OProjOutput.bytes(&float, rows), 0);
 
         // A geometry with neither flag is charged nothing for the gate chain or
         // the permutes, so no ungated model's span moves.
@@ -2656,37 +3462,52 @@ mod tests {
         }
     }
 
-    /// **The DeltaNet chain against its measured generation, to the byte.**
+    /// **The single-stream DeltaNet chain against its measured carves.**
     ///
-    /// A `wave-census-labels` build on the 0.8B at 2100 rows: five carves,
-    /// 21,772,800 B, `0 B lost to alignment`. That total is the assertion — a chain priced
-    /// from a list of shapes is only as good as the list, and the sum is what
-    /// says nothing was left off it and nothing imagined onto it.
-    ///
-    /// It is five carves and not eleven because `forward_live_as` sends the two
-    /// KO-repacked projections through a standalone quantize that breaks
-    /// provenance, taking them and everything downstream off the span — see the
-    /// note on the DeltaNet variants.
+    /// The `KV_WAVE_CENSUS=labels` itemisation of the 0.8B's DeltaNet layer at
+    /// 134 prefill rows over one span, carve for carve up to the conv: the
+    /// norm, the `[q|k|v]` and `z` projections each behind its q8a128 operand,
+    /// `beta` and `alpha` each behind its F32 upcast, the two span tables, the
+    /// conv. The layer norm roots the chain on the phase and every projection
+    /// inherits it, so the whole mixer is on the span.
     #[test]
     fn the_delta_net_chain_prices_its_measured_generation() {
         let g = gated_partial_rotary();
         let plan = WavePlan::new(g);
-        let rows = WaveWidth::prefill(2100, 4);
+        let rows = WaveWidth::prefill(134, 1);
         for (b, want) in [
-            (WaveBuffer::DeltaNetNorm, 4_300_800),
-            (WaveBuffer::DeltaNetBetaOperand, 8_601_600),
-            (WaveBuffer::DeltaNetBetaProj, 134_400),
-            (WaveBuffer::DeltaNetAlphaOperand, 8_601_600),
-            (WaveBuffer::DeltaNetAlphaProj, 134_400),
+            (WaveBuffer::DeltaNetNorm, 274_432),
+            (WaveBuffer::DeltaNetQkvOperand, 154_368),
+            (WaveBuffer::DeltaNetQkvProj, 3_293_184),
+            (WaveBuffer::DeltaNetZOperand, 154_368),
+            (WaveBuffer::DeltaNetZProj, 1_097_728),
+            (WaveBuffer::DeltaNetBetaOperand, 548_864),
+            (WaveBuffer::DeltaNetBetaProj, 8_576),
+            (WaveBuffer::DeltaNetAlphaOperand, 548_864),
+            (WaveBuffer::DeltaNetAlphaProj, 8_576),
+            (WaveBuffer::DeltaNetLiveSpanPtrs, 32),
+            (WaveBuffer::DeltaNetLiveSpanExtents, 8),
+            (WaveBuffer::DeltaNetLiveConv, 3_293_184),
         ] {
             assert_eq!(b.bytes(&g, rows), want, "{b:?} against its measured carve");
         }
-        assert_eq!(
-            plan.chain_bytes(Chain::DeltaNet, rows),
-            21_772_800,
-            "the whole generation, alignment included — the census measured no \
-             alignment loss at all, so the chain must price the bare sum"
-        );
+        // The pre-mix stack's stacked projection is not this stack's.
+        for b in [
+            WaveBuffer::DeltaNetLiveOperand,
+            WaveBuffer::DeltaNetLiveProjection,
+            WaveBuffer::DeltaNetLiveSplit,
+        ] {
+            assert_eq!(b.bytes(&g, rows), 0, "{b:?}");
+        }
+        // The chain is the walk of every buffer it prices, nothing more.
+        let walked = WaveBuffer::iter()
+            .filter(|b| b.chain() == Chain::DeltaNet)
+            .map(|b| b.bytes(&g, rows))
+            .filter(|&len| len > 0)
+            .fold(0usize, |cursor, len| {
+                cursor.div_ceil(BUMP_ALIGNMENT) * BUMP_ALIGNMENT + len
+            });
+        assert_eq!(plan.chain_bytes(Chain::DeltaNet, rows), walked);
     }
 
     /// **The dense FFN chain against its measured generation, to the byte.**
@@ -2937,13 +3758,15 @@ mod tests {
     /// constant it replaces.**
     ///
     /// Two carves on the 0.8B, `0 B lost to alignment`: the packed head norm at
-    /// 1,152 B a scored row and the logits at 496,640 B (248,320 vocab × BF16).
-    /// 1,991,168 B at four scored rows, and 497,920 B at one. A wave whose caller
-    /// reads those logits in place also holds the accept walk's selections from
-    /// them — at most the scored rows again, 496,640 B a row.
+    /// 1,152 B a scored row and the logits at 496,640 B (248,320 vocab × BF16) —
+    /// 1,991,168 B at four scored rows, and 497,920 B at one. Ahead of them,
+    /// with the residual on the span, the gather of the scored rows: 2,048 B a
+    /// row in BF16 and a `u32` index, 8,208 B at four. A wave whose caller reads
+    /// the logits in place also holds the accept walk's selections from them —
+    /// at most the scored rows again, 496,640 B a row.
     ///
     /// The second half is the reason this matters beyond slack.
-    /// `WAVE_FORWARD_BYTES` is 16 MiB, which covers 33 scored rows — and this
+    /// `WAVE_FORWARD_BYTES` was 16 MiB, which covers 33 scored rows — and this
     /// engine composes waves of 64 sessions. Past that the phase needed more
     /// than its reservation, and the span would have exhausted *after* every
     /// layer had launched, as a refusal with nothing in it naming the head.
@@ -2954,12 +3777,12 @@ mod tests {
         let w4 = WaveWidth::prefill(2100, 4);
         assert_eq!(
             plan.chain_bytes(Chain::Forward, w4),
-            1_991_168,
-            "the measured generation at four scored rows, to the byte"
+            1_991_168 + 8_208,
+            "the measured generation at four scored rows and their gather, to the byte"
         );
         assert_eq!(
             plan.chain_bytes(Chain::Forward, WaveWidth::prefill(2100, 1)),
-            497_920,
+            497_920 + 2_048 + 4,
             "and at one"
         );
         // A caller walking the logits in place adds its selections, one logits
@@ -2971,11 +3794,12 @@ mod tests {
         assert_eq!(WaveBuffer::AcceptRows.bytes(&g, walked), 4 * 496_640);
         assert_eq!(
             plan.chain_bytes(Chain::Forward, walked),
-            1_991_168 + 4 * 496_640,
-            "the head and the walk, to the byte"
+            1_991_168 + 4 * 496_640 + 8_208,
+            "the head, the walk and the gather, to the byte"
         );
         // It scales with scored rows and not with tokens — the whole reason the
-        // forward phase is sized separately from the layer phases.
+        // head is sized separately from the layer phases. (The setup prelude
+        // ahead of it is per row: `a_wave_that_runs_no_head_prices_no_forward_phase`.)
         assert_eq!(
             plan.chain_bytes(Chain::Forward, WaveWidth::prefill(8192, 4)),
             plan.chain_bytes(Chain::Forward, WaveWidth::prefill(2100, 4)),
@@ -2996,15 +3820,11 @@ mod tests {
     ///
     /// Both measured. An **int8** session carves a packed norm and its logits:
     /// Qwen3.5-0.8B at 4 scored rows, `4 × 1,152 + 4 × 248,320 × 2`. A **float**
-    /// session carves a dense norm and its F32 working copy, and no logits at
-    /// all — the dequantized-weight path reaches the matmul through
-    /// `to_owned_tensor`, which breaks provenance and puts the result on the
-    /// pool. Qwen2 at 60 scored rows, hidden 896: `60 × 896 × 2 + 60 × 896 × 4`
-    /// = 322,560 B, which is exactly what its forward arena peaked at.
-    ///
-    /// Charging the int8 shape to a float session was 17.1 MiB of a 17.4 MiB
-    /// span — the phase was 98% slack, and every byte of it logits that were
-    /// never there.
+    /// session carves a dense norm and its F32 working copy — Qwen2 at 60
+    /// scored rows, hidden 896: `60 × 896 × 2 + 60 × 896 × 4` = 322,560 B — and
+    /// its logits beside them: the dequantized-weight path's `to_owned_tensor`
+    /// inherits the operand's arena, and Qwen2's gate ran out of span one
+    /// `151,936 × 4` row into them before they were priced.
     #[test]
     fn the_head_is_priced_for_the_session_it_runs_in() {
         let int8 = gated_partial_rotary();
@@ -3013,7 +3833,9 @@ mod tests {
         let w = WaveWidth::prefill(2100, 4);
         assert_eq!(WaveBuffer::HeadNormF32.bytes(&int8, w), 0);
         assert_eq!(WaveBuffer::HeadLogits.bytes(&int8, w), 4 * 248_320 * 2);
-        assert_eq!(plan.chain_bytes(Chain::Forward, w), 1_991_168);
+        assert_eq!(WaveBuffer::HeadLogitsF32.bytes(&int8, w), 0);
+        // The head's two carves and the gather of its four scored rows.
+        assert_eq!(plan.chain_bytes(Chain::Forward, w), 1_991_168 + 8_208);
         // An in-place accept walk's selections sit beside the logits, the same
         // width again — only for a caller that reads them there.
         assert_eq!(WaveBuffer::AcceptRows.bytes(&int8, w), 0);
@@ -3024,9 +3846,8 @@ mod tests {
         assert_eq!(WaveBuffer::AcceptRows.bytes(&int8, walked), 4 * 248_320 * 2);
 
         // Qwen2's shapes, on the float path its gate actually runs — and note
-        // `packed_norm` stays **true**. That is the measured case: its layers
-        // are packed and its head is not, so the head follows `packed_head`
-        // alone. Pricing it from the layers' flag was the whole 17.1 MiB.
+        // `packed_norm` stays **true**: its layers are packed and its head is
+        // not, so the head follows `packed_head` alone.
         let float = ModelGeometry {
             packed_head: false,
             hidden: 896,
@@ -3038,8 +3859,8 @@ mod tests {
         let w60 = WaveWidth::prefill(4096, 60);
         assert_eq!(
             WaveBuffer::HeadLogits.bytes(&float, w60),
-            0,
-            "a float session's logits leave the span"
+            60 * 151_936 * 2,
+            "a float session's logits are on the span too"
         );
         assert_eq!(
             WaveBuffer::AcceptRows.bytes(
@@ -3049,16 +3870,28 @@ mod tests {
                     ..w60
                 }
             ),
-            0,
-            "and so do the walk's selections from them"
+            60 * 151_936 * 2,
+            "and so are the walk's selections from them"
         );
         assert_eq!(WaveBuffer::HeadNorm.bytes(&float, w60), 60 * 896 * 2);
         assert_eq!(WaveBuffer::HeadNormF32.bytes(&float, w60), 60 * 896 * 4);
+        // The matmul writes F32 and the result is narrowed to F16 after it.
+        assert_eq!(
+            WaveBuffer::HeadLogitsF32.bytes(&float, w60),
+            60 * 151_936 * 4
+        );
         assert_eq!(
             WavePlan::new(float).chain_bytes(Chain::Forward, w60),
-            322_560,
-            "the measured generation, to the byte"
+            322_560 + 60 * 151_936 * (2 + 4) + 60 * 896 * 2 + 60 * 4,
+            "the norm's two carves, the logits in both widths and the scored-row \
+             gather, to the byte"
         );
+        // An F32 session's matmul result is its logits: no second copy.
+        let float32 = ModelGeometry {
+            act_dtype: DType::F32,
+            ..float
+        };
+        assert_eq!(WaveBuffer::HeadLogitsF32.bytes(&float32, w60), 0);
     }
 
     /// **A speculative replay's staged operands, against its measured
@@ -3081,6 +3914,7 @@ mod tests {
                 conv_dim: 8192,
                 value_dim: 4096,
                 n_v_heads: 32,
+                layers: 24,
             }),
             ..gated_partial_rotary()
         };
@@ -3093,6 +3927,12 @@ mod tests {
             (WaveBuffer::ReplayAlpha, 30 * 32 * 4),
             (WaveBuffer::ReplaySpanPtrs, 6 * 4 * 8),
             (WaveBuffer::ReplaySpanExtents, 6 * 2 * 4),
+            (WaveBuffer::ReplayConved, 30 * 8192 * 4),
+            (WaveBuffer::ReplayOut, 30 * 4096 * 4),
+            (WaveBuffer::ReplayScanU, 30 * 4096 * 4),
+            (WaveBuffer::ReplayScanW, 30 * 4096 * 4),
+            (WaveBuffer::ReplayScanKq, 30 * 32 * DELTA_NET_SCAN_CHUNK * 4),
+            (WaveBuffer::ReplayDecay, 30 * 32 * 4),
         ] {
             assert_eq!(
                 b.bytes(&g, replay),
@@ -3113,9 +3953,10 @@ mod tests {
     }
 
     /// **A wave that stops short of the last layer runs no head**, so it
-    /// reserves none of the forward phase. A segmented sweep prices one window
-    /// per layer range, and charging the head's full width to each was 17.4 MiB
-    /// a window on a 60-session Qwen2.
+    /// reserves none of the head's forward phase — only the setup its layers
+    /// read: the token ids the embedding gathers and the ragged prefill tables.
+    /// A segmented sweep prices one window per layer range, and charging the
+    /// head's full width to each was 17.4 MiB a window on a 60-session Qwen2.
     #[test]
     fn a_wave_that_runs_no_head_prices_no_forward_phase() {
         let plan = WavePlan::new(gated_partial_rotary());
@@ -3123,7 +3964,10 @@ mod tests {
             prefill_rows: 2100,
             ..WaveWidth::default()
         };
-        assert_eq!(plan.phase_bytes(LayerPhase::Forward, no_head), 0);
+        assert_eq!(plan.chain_bytes(Chain::Forward, no_head), 0);
+        let setup = plan.chain_bytes(Chain::ForwardSetup, no_head);
+        assert!(setup >= 2100 * 4, "the ids alone are a word a row");
+        assert_eq!(plan.phase_bytes(LayerPhase::Forward, no_head), setup);
         // The layer phases are untouched — the window still runs its layers.
         assert!(plan.phase_bytes(LayerPhase::Attention, no_head) > 0);
         assert!(plan.phase_bytes(LayerPhase::Ffn, no_head) > 0);
@@ -3155,9 +3999,12 @@ mod tests {
         );
     }
 
-    /// Per-row cost of the attention chain a **prefill** group runs, as
-    /// a `wave-census` build measured it on Qwen3-30B-A3B: twelve carves, and every
-    /// one of them a whole number of bytes per row.
+    /// Per-row cost of the attention chain a **prefill** group runs on
+    /// Qwen3-30B-A3B: the twelve carves a `wave-census` build measured, every
+    /// one of them a whole number of bytes per row, and the int8 `o_proj`'s
+    /// two after them. The census predates the quantize inheriting the
+    /// context's arena; Qwen2's gate carved the operand on the span and ran
+    /// out of it, 34,560 B into an unpriced `o_proj` quantize.
     ///
     /// ```text
     /// [ 0]    2304  AttnNorm       q8a128 over hidden
@@ -3172,8 +4019,10 @@ mod tests {
     /// [ 9]    1024  KHeadsPacked
     /// [10]    1024  VContiguous
     /// [11]    8192  AttnOutput     the paged prefill kernel's context
+    /// [12]    4608  OProjOperand   q8a128 over the attention columns
+    /// [13]    4096  OProjOutput
     /// ```
-    const MEASURED_ATTN_PREFILL_PER_ROW: usize = 58624;
+    const MEASURED_ATTN_PREFILL_PER_ROW: usize = 67328;
 
     /// The same for a **decode** group: nine carves, and a different set — the
     /// `seq == 1` reshapes are free, and the context comes back already packed,
@@ -3318,9 +4167,10 @@ mod tests {
         }
         // Qwen2-0.5B's own decode generation, off the gate: 60 decode rows,
         // head dim 64 — so the FP context, not the q8 one — and the three bias
-        // adds. The norm, the fused projection, the adds and one `rows ×
-        // hidden` buffer after them, plus the pad the flat-grouped q8 norm
-        // leaves.
+        // adds. The census (`KV_WAVE_CENSUS=labels`) itemises eight carves: the
+        // norm, the fused projection, the three adds, the decode kernel's FP
+        // context, the `o_proj` quantize of it and the `rows × hidden` result,
+        // plus the pads the flat-grouped q8 buffers leave.
         let qwen2 = ModelGeometry {
             hidden: 896,
             vocab: 151_936,
@@ -3337,7 +4187,7 @@ mod tests {
         };
         assert_eq!(
             WavePlan::new(qwen2).phase_bytes(LayerPhase::Attention, WaveWidth::decode(60)),
-            445_184,
+            613_888,
             "{}",
             WavePlan::new(qwen2).describe(WaveWidth::decode(60))
         );

@@ -39,6 +39,7 @@ use super::loader::{load_headroom_bytes, offloaded_bytes, open_cached_ple};
 use super::model::PleSource;
 use super::mtp::{MtpDense, MtpHead};
 use super::ple::PleWeights;
+use super::ple_fused::PleFusedWeights;
 use super::qsa::IndexerWeights;
 use crate::models::delta_net::{KvLayerMap, QuantDeltaNetWeights};
 use crate::models::dense_span;
@@ -93,7 +94,8 @@ pub struct Qwen4ExpGpu {
     /// 1,212 MiB from the expert zone.
     pub embed: DeviceEmbedding,
     pub layers: Vec<GpuLayer>,
-    pub ple_w: PleWeights,
+    /// The PLE block's weights, stacked and transposed for the fused launches.
+    pub ple_w: PleFusedWeights,
     /// The final hyper-connection mix — the output norm (no inject).
     pub out_hc: HcWeightsKo,
     pub lm_head: QMatMul,
@@ -380,12 +382,12 @@ impl Qwen4ExpGpu {
 
             trunk.push((hc_attn, hc_ffn, mix));
         }
-        let ple_w = ple_w.ok_or_else(|| {
+        let ple_w = PleFusedWeights::from_weights(&ple_w.ok_or_else(|| {
             candle::Error::Msg(format!(
                 "qwen4exp engine: PLE layer {} produced no weights",
                 cfg.ple.layer
             ))
-        })?;
+        })?)?;
 
         let rotary = RotaryLayout::new(cfg.attn_head_dim, cfg.rope_dim, device)?;
         // The TRUNK's layers only. The draft head holds its keys in this same

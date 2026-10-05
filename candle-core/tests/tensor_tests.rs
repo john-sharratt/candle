@@ -2736,3 +2736,21 @@ fn contiguous_aliases_an_already_contiguous_view_but_force_contiguous_copies() -
     );
     Ok(())
 }
+
+/// A handle is the sole owner only while neither a clone of it nor a view of
+/// its buffer is alive — what a pool of held buffers reads to know which it
+/// may hand out again.
+#[test]
+fn a_clone_or_a_view_makes_the_storage_shared_until_dropped() -> Result<()> {
+    let held = Tensor::zeros(6, DType::F32, &Device::Cpu)?;
+    assert!(held.is_sole_owner());
+    let clone = held.clone();
+    assert!(!held.is_sole_owner());
+    drop(clone);
+    assert!(held.is_sole_owner());
+    let view = held.narrow(0, 0, 4)?.reshape((2, 2))?;
+    assert!(!held.is_sole_owner());
+    drop(view);
+    assert!(held.is_sole_owner());
+    Ok(())
+}

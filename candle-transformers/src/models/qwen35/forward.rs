@@ -30,6 +30,7 @@
 
 use std::cell::RefCell;
 
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
@@ -47,6 +48,8 @@ use super::quantized_weights::QuantModel;
 use super::spec::{split_block_rows, StashSpan, VerifyStash};
 use super::wave::delta_net_mix_wave;
 
+#[cfg(feature = "cuda")]
+use crate::models::delta_net::cuda::build_wave_table;
 use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::{RecurrentCompaction, RecurrentStateStore, StashSlot};
@@ -71,6 +74,7 @@ use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_buffers::wave_root;
 use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
+use crate::models::wave_token_ids::device_token_ids;
 
 /// The hybrid as the scheduler drives it.
 ///
@@ -264,7 +268,7 @@ impl ManagedBatchedModel for HybridBatched {
         // glue are device-side. One upload per group.
         let dseqs: Vec<usize> = plain.iter().map(|&(s, _)| s).collect();
         let tokens: Vec<u32> = plain.iter().map(|&(_, t)| t).collect();
-        let (dinputs, pinputs) = upload_plan_rows(&tokens, blocks, self.device())?;
+        let (dinputs, pinputs) = upload_plan_rows(&tokens, blocks)?;
 
         // **Size every verifying sequence's stash before the forward opens.**
         // A wave's storage is claimed by `admit_wave_kv` and the transient tier
@@ -831,6 +835,7 @@ fn sweep_layers(
         layer_start,
         layer_end,
         x_in,
+        window,
         act_dtype,
         adapter,
     } = wave;
@@ -901,14 +906,6 @@ fn sweep_layers(
         buf: None,
         stride: 0,
     };
-    let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
-        pre_off,
-        pre_q,
-        model.device(),
-        // This path builds its headers before the forward's span opens; the
-        // qwen4exp sweep moved the construction down so it could use one.
-        None,
-    )?);
     g_meta.end();
 
     let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
@@ -979,6 +976,8 @@ fn sweep_layers(
                 // The caller's accept walk selects on the head's span only when
                 // it reads the logits there.
                 accept_rows: if accept_in_place { scored_rows } else { 0 },
+                // This lineage's attention is dense: no sparse selection.
+                qsa_bytes: 0,
                 // A one-row prefill group takes the decode kernels, so it carves
                 // no span-table entry and, alone, no scan transient.
                 prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
@@ -1021,16 +1020,43 @@ fn sweep_layers(
         _ => None,
     };
 
+    // The forward's span, open from here to the head: the setup every layer
+    // reads — the token ids and the ragged prefill tables — is laid on it
+    // first, and the head's norm and logits are carved from it after the last
+    // layer. It is reset per *forward*, the lifetime all of them have.
+    #[cfg(feature = "cuda")]
+    let head_span = match dev {
+        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+        _ => None,
+    };
+    #[cfg(feature = "cuda")]
+    let fwd_ticket = head_span.as_ref().map(|g| g.ticket());
+    #[cfg(not(feature = "cuda"))]
+    let (head_span, fwd_ticket): (Option<WaveGuard>, Option<WaveTicket>) = (None, None);
+
+    let g_meta = crate::models::profile::gpu_span("fwd:meta", dev);
+    let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
+        pre_off, pre_q, dev, fwd_ticket,
+    )?);
+    g_meta.end();
+
+    // Every row's id in one buffer on the span — one upload for ids handed over
+    // on the host, a copy for ids already on the device — read by the embedding
+    // and, when the wave reaches it, by the draft head.
+    let ids = {
+        let inputs: Vec<&Tensor> = contexts.iter().map(|c| c.input_ids).collect();
+        device_token_ids(&inputs, dev, fwd_ticket)?
+    };
+
     // Combined residual: embed every row flat `[1, total, hidden]`, or resume a
     // paused wave from its persisted stream.
     let g_embed = crate::models::profile::gpu_span("fwd:embed", dev);
+    // A fresh residual is on the forward span (`WaveBuffer::ForwardResidual`);
+    // a window that stops short copies it off the span when it hands it on.
+    let fresh = x_in.is_none();
     let mut x = match x_in {
         Some(resume) => resume,
-        None => {
-            let ids: Vec<Tensor> = contexts.iter().map(|c| c.input_ids.clone()).collect();
-            let packed = TensorCat::from_tensors(1, ids)?;
-            TensorCat::from_cat_tensor(embed_rows(q, &packed.to_tensor(), embed_dtype)?, 0)?
-        }
+        None => TensorCat::from_cat_tensor(embed_rows(q, &ids, embed_dtype, fwd_ticket)?, 0)?,
     };
     g_embed.end();
 
@@ -1096,27 +1122,19 @@ fn sweep_layers(
     // here where the launch queue is still empty. Each layer takes its slice;
     // a per-layer upload would sync the stream mid-sweep and serialise the
     // pipeline. `None` when the wave carries no decode span.
-    // **Owned, not on the forward span — deliberately.**
     //
-    // The table is built once and read by every DeltaNet layer, which is exactly
-    // what `LayerPhase::Forward` describes, and an earlier version claimed that
-    // generation here and held it across the sweep. That is unsafe for a reason
-    // the phase doc does not mention: the head's own `Forward` guard is handed
-    // back to the caller in the wave result, so it can still be live when the
-    // next wave starts — and `begin_wave` refuses a phase that is already open
-    // rather than waiting. Holding the span for the whole sweep removes the
-    // sweep as slack for that guard to drop in, and an overlapping wave fails
-    // outright instead of merely allocating.
+    // On the forward span (`WaveBuffer::DeltaNetDecodeTable`): built once and
+    // read by every DeltaNet layer, which is what that span holds. The span is
+    // open from before the embedding to the head, so a caller must drop the
+    // previous wave's result — which holds that wave's span — before issuing
+    // the next; `begin_wave` refuses a phase that is still open.
     //
-    // 68 KB + 40 KB per forward is not worth that. Left as a driver allocation
-    // until the head guard's lifetime is pinned down; `wave_from_vec` takes the
-    // generation, so the fix is passing one rather than rewriting this.
     // Spanned for the same reason as `fwd:meta`: one table entry per DeltaNet
     // layer per decode sequence, so it is the other setup cost that grows with
     // the cohort rather than with the model.
     let g_dntab = crate::models::profile::gpu_span("fwd:dntab", dev);
     #[cfg(feature = "cuda")]
-    let dn_table = crate::models::delta_net::cuda::build_wave_table(&spans, stores, None)?;
+    let dn_table = build_wave_table(&spans, stores, fwd_ticket)?;
     g_dntab.end();
 
     // Spans a speculative verify will have to rewind stash each DeltaNet
@@ -1412,8 +1430,21 @@ fn sweep_layers(
         model.put_verify_stash(st)?;
     }
 
+    // A window that stops short hands its residual to a later forward, past
+    // this span's reset. A resumed one is already the caller's buffer and was
+    // added into in place; a fresh one is on the span, so it is copied into one
+    // of the session's held window buffers.
     if layer_end < num_layers {
-        return Ok((WavePhase::Residual(x), None));
+        if !fresh {
+            return Ok((WavePhase::Residual(x), None));
+        }
+        let on_span = x.to_tensor();
+        let held = window.take(on_span.dims(), on_span.dtype(), on_span.device())?;
+        held.slice_set(&on_span, 0, 0)?;
+        return Ok((
+            WavePhase::Residual(TensorCat::from_cat_tensor(held, 0)?),
+            None,
+        ));
     }
 
     let xt = x.to_tensor();
@@ -1426,14 +1457,12 @@ fn sweep_layers(
     // runs here rather than inside the sweep because its input is the trunk's
     // OUTPUT, not the residual stream. See [`super::draft`].
     if let (Some(head), Some(kv_layer)) = (q.mtp.as_ref(), head_kv) {
-        let packed: Vec<Tensor> = contexts.iter().map(|c| c.input_ids.clone()).collect();
-        let ids = TensorCat::from_tensors(1, packed)?;
         head_wave_pass(
             model,
             head,
             contexts,
             &x_flat,
-            &ids.to_tensor(),
+            &ids.reshape((1, ids.elem_count()))?,
             &HeadWave {
                 n_decode,
                 pre_rows,
@@ -1444,6 +1473,7 @@ fn sweep_layers(
                 spans: &spans,
                 kv_layer,
                 act_dtype: embed_dtype,
+                forward: fwd_ticket,
             },
         )?;
     }
@@ -1469,21 +1499,15 @@ fn sweep_layers(
         acc += l as u32;
     }
     if idx.is_empty() {
-        return Ok((WavePhase::Residual(x), None));
+        // On the forward span, so the span's guard goes back with it.
+        return Ok((WavePhase::Residual(x), head_span));
     }
     let g_head = crate::models::profile::gpu_span("fwd:head", dev);
-    let pre_norm = select_head_rows(&x_flat, idx, 0)?;
-    // The head's span, reset per forward — the lifetime the norm and the logits
-    // actually have. Seeded from `wave_root`, which yields a ticket rather than
-    // a borrow, so the logits stay `'static`-typed and physically on the span;
-    // what makes that sound is handing the guard back with them.
-    #[cfg(feature = "cuda")]
-    let head_span = match dev {
-        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
-        _ => None,
-    };
-    #[cfg(not(feature = "cuda"))]
-    let head_span: Option<WaveGuard> = None;
+    let pre_norm = select_head_rows(&x_flat, idx, 0, fwd_ticket)?;
+    // The head runs on the forward's span, opened before the embedding. Seeded
+    // from `wave_root`, which yields a ticket rather than a borrow, so the
+    // logits stay `'static`-typed and physically on the span; what makes that
+    // sound is handing the guard back with them.
     let logits = {
         #[cfg(feature = "cuda")]
         {
@@ -1521,7 +1545,17 @@ fn sweep_layers(
 /// claims the same arena for real work — the bytes are reserved whether or not
 /// anything uses them, so they are free here, and the gathered bytes are dead
 /// the moment the dequantize on the next line has read them.
-fn embed_rows(model: &QuantModel, ids: &Tensor, dtype: DType) -> Result<Tensor> {
+///
+/// The dequantized rows are the residual, written where `residual` names —
+/// the forward's span for a wave that reaches the head
+/// (`WaveBuffer::ForwardResidual`), an owned buffer for a window whose
+/// residual a later wave resumes.
+fn embed_rows(
+    model: &QuantModel,
+    ids: &Tensor,
+    dtype: DType,
+    residual: Option<WaveTicket>,
+) -> Result<Tensor> {
     let n = ids.elem_count();
     #[cfg(feature = "cuda")]
     let staging = match &model.device {
@@ -1530,9 +1564,13 @@ fn embed_rows(model: &QuantModel, ids: &Tensor, dtype: DType) -> Result<Tensor> 
     };
     #[cfg(not(feature = "cuda"))]
     let staging: Option<WaveGuard> = None;
-    let rows = model
-        .embed
-        .rows(ids, &model.device, wave_root(staging.as_ref()), dtype)?;
+    let rows = model.embed.rows(
+        ids,
+        &model.device,
+        wave_root(staging.as_ref()),
+        dtype,
+        residual,
+    )?;
     drop(staging);
     rows.reshape((1, n, model.cfg.hidden_size))
 }

@@ -103,11 +103,27 @@ impl WaveTicket {
     }
 }
 
-/// Carve `bytes` from the arena `ticket` names, or `None` if that generation has
-/// closed or the arena has no room.
+/// What the arena a ticket names did with a request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaveCarve {
+    /// Served, at this device address.
+    Carved(u64),
+    /// The generation the ticket names has closed — or there is no such arena,
+    /// or no resolver at all. The tensor descends from memory a finished phase
+    /// owned, so its new data has no phase to live in and the pool is its home.
+    Closed,
+    /// The generation is open and its span cannot hold the request. Not a
+    /// pool allocation waiting to happen: the wave plan priced this phase
+    /// short of what it carves, and the allocation is refused so the site that
+    /// overran is named here rather than found later as memory the reservation
+    /// never accounted for.
+    Exhausted,
+}
+
+/// Carve `bytes` (aligned to the third argument) from the arena a ticket names.
 ///
 /// Installed by candle-nn, which owns the arenas.
-pub type WaveAllocFn = fn(WaveTicket, usize, usize) -> Option<u64>;
+pub type WaveAllocFn = fn(WaveTicket, usize, usize) -> WaveCarve;
 
 static WAVE_ALLOC: OnceLock<WaveAllocFn> = OnceLock::new();
 
@@ -119,65 +135,104 @@ pub fn install_wave_allocator(f: WaveAllocFn) {
 
 /// Carve `bytes` (aligned to `align`) from the arena `ticket` names.
 ///
-/// `None` means "allocate from the pool instead" and is a normal outcome, not an
-/// error: it is what a closed generation, a full arena, or a process that never
-/// installed a resolver all return. The caller always has the pool to fall back
-/// on, so a miss costs an allocation rather than a failure.
-pub fn wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> Option<u64> {
-    WAVE_ALLOC.get()?(ticket, bytes, align)
+/// A closed generation — or a process that never installed a resolver — is
+/// [`WaveCarve::Closed`], and the caller allocates from the pool. An open one
+/// that cannot hold the request is [`WaveCarve::Exhausted`], which every caller
+/// turns into an error: see [`exhausted`].
+pub fn wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCarve {
+    match WAVE_ALLOC.get() {
+        Some(f) => f(ticket, bytes, align),
+        None => WaveCarve::Closed,
+    }
 }
 
-/// Why an allocation that *could* have been served from a wave arena was not.
+/// The error an open generation's overrun becomes.
 ///
-/// **The two have opposite fixes, and telling them apart is the whole point.**
-/// `NoTicket` is a provenance break: something upstream produced a tensor with
-/// no wave backing, and everything derived from it inherits the pool — so the
-/// fix is at that root, possibly many frames above the site that shows up in a
-/// report. `ArenaFull` is a sizing problem: provenance is intact and the arena
-/// simply had no room, so the fix is the arena's width and nothing about the
-/// call site is wrong.
+/// **There is no fallback for it.** A request that overruns an open phase is a
+/// buffer the wave plan did not price, and serving it from the pool is how the
+/// pool came to hold gigabytes of forward-pass memory the reservation never
+/// accounted for — until the card ran out with nothing pointing at the cause.
 ///
-/// Guessing between them was costing real time. The fallback in
-/// [`crate::cuda_backend::alloc_inheriting`] is silent and both paths land on
-/// `CudaDevice::alloc`, so a forbidden-allocation report shows an identical row
-/// either way — a site that has lost its provenance and a site whose arena
-/// overflowed are the same line of output.
+/// The message carries the stack that asked: the generic op that allocated is
+/// never the answer, the model code above it is. Captured only here, on the
+/// error path, so it costs nothing on any allocation that succeeds.
+#[track_caller]
+pub fn exhausted(ticket: WaveTicket, bytes: usize) -> crate::Error {
+    let at = std::panic::Location::caller();
+    let stack = std::backtrace::Backtrace::force_capture().to_string();
+    let asked_by: Vec<&str> = stack
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.starts_with("at ")
+                && (l.contains("candle_transformers::") || l.contains("candle_conversation::"))
+        })
+        .take(8)
+        .collect();
+    crate::Error::Msg(format!(
+        "wave arena exhausted: {bytes} B asked at {}:{} of arena {} (domain {}, epoch {}), \
+         past what the wave plan priced for this phase — price the buffer, do not \
+         allocate it elsewhere. Asked by: {}",
+        at.file(),
+        at.line(),
+        ticket.arena,
+        ticket.domain,
+        ticket.epoch,
+        asked_by.join(" <- "),
+    ))
+}
+
+/// Why an allocation that inherited from an operand went to the pool.
+///
+/// **Neither is an arena that ran out of room** — that is an error
+/// ([`WaveCarve::Exhausted`]), never a pool allocation. Both of these are the
+/// operand's provenance: `NoTicket` is a tensor with no wave backing at all, and
+/// everything derived from it inherits the pool, so the fix is at that root,
+/// possibly many frames above the site that shows up in a report. `Closed` is a
+/// tensor whose phase has finished — a value read after its generation, whose
+/// derived data has no phase left to live in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum ArenaDecline {
     /// The origin carried no wave ticket — a `Foreign` lease, an owned pool
     /// allocation, or a tensor that never had provenance to begin with.
     NoTicket,
-    /// The origin had a ticket and the arena refused: no room, or a generation
-    /// that has since closed.
+    /// The origin's generation has closed.
     ///
     /// Also covers a process with no resolver installed at all, which in
     /// practice means before candle-nn registers one at startup — a window with
     /// no waves in it, so it contributes nothing to a steady-state reading.
-    ArenaFull,
+    Closed,
 }
 
-/// `[NoTicket, ArenaFull]` — calls, then bytes, indexed by `ArenaDecline as
+/// `[NoTicket, Closed]` — calls, then bytes, indexed by `ArenaDecline as
 /// usize`. Relaxed throughout: these are counters read by a report, never a
 /// value anything orders against.
 static DECLINE_CALLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static DECLINE_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Carve from `from`'s arena, recording why if that is not possible.
+/// Carve from `from`'s arena, recording why if the pool is the home instead.
 ///
 /// The single decision point for "arena or pool", so the accounting cannot drift
 /// from the behaviour: a caller that carves without asking here is a caller that
-/// does not appear in the totals.
-pub fn wave_alloc_attributed(from: Option<WaveTicket>, bytes: usize, align: usize) -> Option<u64> {
+/// does not appear in the totals. `Ok(None)` sends the caller to the pool; an
+/// open generation that cannot hold the request is an error ([`exhausted`]).
+#[track_caller]
+pub fn wave_alloc_attributed(
+    from: Option<WaveTicket>,
+    bytes: usize,
+    align: usize,
+) -> crate::Result<Option<u64>> {
     let Some(ticket) = from else {
         record_decline(ArenaDecline::NoTicket, bytes);
-        return None;
+        return Ok(None);
     };
     match wave_alloc(ticket, bytes, align) {
-        Some(ptr) => Some(ptr),
-        None => {
-            record_decline(ArenaDecline::ArenaFull, bytes);
-            None
+        WaveCarve::Carved(ptr) => Ok(Some(ptr)),
+        WaveCarve::Closed => {
+            record_decline(ArenaDecline::Closed, bytes);
+            Ok(None)
         }
+        WaveCarve::Exhausted => Err(exhausted(ticket, bytes)),
     }
 }
 
@@ -225,7 +280,7 @@ pub fn reset_arena_declines() {
 #[derive(Clone, Copy, Debug)]
 pub struct DeclineSnapshot {
     no_ticket: (u64, u64),
-    arena_full: (u64, u64),
+    closed: (u64, u64),
 }
 
 impl DeclineSnapshot {
@@ -233,27 +288,27 @@ impl DeclineSnapshot {
     pub fn now() -> Self {
         Self {
             no_ticket: arena_declines(ArenaDecline::NoTicket),
-            arena_full: arena_declines(ArenaDecline::ArenaFull),
+            closed: arena_declines(ArenaDecline::Closed),
         }
     }
 
-    /// `(no_ticket_bytes, arena_full_bytes)` accumulated since `self` was taken.
+    /// `(no_ticket_bytes, closed_bytes)` accumulated since `self` was taken.
     pub fn bytes_since(&self) -> (u64, u64) {
         let now = Self::now();
         (
             now.no_ticket.1.saturating_sub(self.no_ticket.1),
-            now.arena_full.1.saturating_sub(self.arena_full.1),
+            now.closed.1.saturating_sub(self.closed.1),
         )
     }
 }
 
-/// The last completed wave's decline bytes, `(no_ticket, arena_full)`.
+/// The last completed wave's decline bytes, `(no_ticket, closed)`.
 static LAST_WAVE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Publish one wave's decline delta. Called by the scheduler at wave end.
-pub fn publish_wave_declines(no_ticket_bytes: u64, arena_full_bytes: u64) {
+pub fn publish_wave_declines(no_ticket_bytes: u64, closed_bytes: u64) {
     LAST_WAVE[0].store(no_ticket_bytes, Ordering::Relaxed);
-    LAST_WAVE[1].store(arena_full_bytes, Ordering::Relaxed);
+    LAST_WAVE[1].store(closed_bytes, Ordering::Relaxed);
 }
 
 /// The last wave's decline bytes — the figure the memory report should show,
@@ -268,7 +323,8 @@ pub fn last_wave_declines() -> (u64, u64) {
 #[cfg(test)]
 mod decline_tests {
     use super::{
-        arena_declines, reset_arena_declines, wave_alloc_attributed, ArenaDecline, WaveTicket,
+        arena_declines, exhausted, reset_arena_declines, wave_alloc_attributed, ArenaDecline,
+        WaveTicket,
     };
 
     /// A ticketless origin is charged to `NoTicket`, with its bytes.
@@ -280,32 +336,49 @@ mod decline_tests {
     #[test]
     fn a_ticketless_origin_is_charged_to_no_ticket() {
         reset_arena_declines();
-        assert_eq!(wave_alloc_attributed(None, 4096, 256), None);
+        assert_eq!(wave_alloc_attributed(None, 4096, 256).unwrap(), None);
         let (calls, bytes) = arena_declines(ArenaDecline::NoTicket);
         assert_eq!((calls, bytes), (1, 4096));
         assert_eq!(
-            arena_declines(ArenaDecline::ArenaFull),
+            arena_declines(ArenaDecline::Closed),
             (0, 0),
-            "a missing ticket is not an arena that refused — the two have \
-             opposite fixes and must not share a counter",
+            "a missing ticket is not a closed generation — the two have \
+             different roots and must not share a counter",
         );
     }
 
-    /// A ticket whose arena will not serve it is charged to `ArenaFull`.
+    /// A ticket whose generation is gone is charged to `Closed`.
     ///
-    /// With no resolver installed every ticket declines, which is exactly the
-    /// path a closed generation or a full arena takes.
+    /// With no resolver installed every ticket reads as closed, which is
+    /// exactly the path a finished generation takes.
     #[test]
-    fn a_refused_ticket_is_charged_to_arena_full() {
+    fn a_closed_ticket_is_charged_to_closed() {
         reset_arena_declines();
         let ticket = WaveTicket {
             domain: 0,
             arena: 0,
             epoch: 0,
         };
-        assert_eq!(wave_alloc_attributed(Some(ticket), 8192, 256), None);
-        assert_eq!(arena_declines(ArenaDecline::ArenaFull), (1, 8192));
+        assert_eq!(
+            wave_alloc_attributed(Some(ticket), 8192, 256).unwrap(),
+            None
+        );
+        assert_eq!(arena_declines(ArenaDecline::Closed), (1, 8192));
         assert_eq!(arena_declines(ArenaDecline::NoTicket), (0, 0));
+    }
+
+    /// An exhausted open generation is an error naming the request, never a
+    /// pool allocation.
+    #[test]
+    fn an_exhausted_generation_is_refused() {
+        let ticket = WaveTicket {
+            domain: 3,
+            arena: 1,
+            epoch: 9,
+        };
+        let msg = exhausted(ticket, 4096).to_string();
+        assert!(msg.contains("wave arena exhausted: 4096 B"), "{msg}");
+        assert!(msg.contains("arena 1 (domain 3, epoch 9)"), "{msg}");
     }
 }
 

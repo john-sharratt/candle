@@ -1194,11 +1194,21 @@ pub const QWEN38_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
 /// projection, which reads the 131 MB of PLE weights once per wave instead of
 /// once per sequence. V at 2.8 is the value the lineage's earlier retightening
 /// measured.
+///
+/// **Re-set 2026-10-05: v 2.8 → 2.6.** The forward gate's prefill slabs
+/// widened: the width cap is now what the card can place
+/// (`Qwen4ExpBatched::prefill_width_cap`), so the C10×8 fleet prefills as one
+/// 4,120-row slab where it was two. A different composition is a different
+/// summation order in the wave-wide projections, and at 1.7 / 2.8 one session
+/// tipped on a near-tie — 7/8 (`watched` → `watch`) in two runs out of two at
+/// 7.33×, every other config passing. At 2.7 the same session still failed,
+/// diverging earlier (7.23×). V, the binding axis on this model, moves two
+/// notches.
 pub const QWEN4EXP_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors {
     k_hi: 1.7,
     k_low: 1.7,
-    v_hi: 2.8,
-    v_low: 2.8,
+    v_hi: 2.6,
+    v_low: 2.6,
 };
 
 /// **Qwen3.8-Flash-Next at `Q2_KO` experts** — the 16 GB card's rung

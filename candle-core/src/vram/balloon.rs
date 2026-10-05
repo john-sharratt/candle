@@ -46,18 +46,30 @@ pub fn capacity_target(total: u64, reserve: u64) -> u64 {
 /// under the startup budget still thrashes (measured: budget − 512 MiB scored
 /// 89.9 t/s on the widest config and hard-OOMed the following run; ~4 GB
 /// under budget ran stable best-ever). A sixteenth of the budget, floored at
-/// the absolute reserve, scales that slack with the card: ~4.4 GiB on the
-/// 73 GiB dev card, under a GiB on a 16 GiB one — where a fixed 4 GiB would
-/// cost a quarter of the card.
+/// the absolute reserve, scales that slack with the card — under a GiB on a
+/// 16 GiB one, where a fixed 4 GiB would cost a quarter of the card — and
+/// capped at [`MAX_WOBBLE_MARGIN`].
+///
+/// **Capped, because the slack was paying for allocations that should not
+/// exist.** Uncapped, a sixteenth is ~4.4 GiB on the 73 GiB card, and that
+/// margin was what the forward's off-span pool allocations lived in: the run
+/// that needed it was one whose decode forward still drew transients from the
+/// CUDA pool. With those on the span, 1 GiB covers the desktop's dips; every
+/// GiB beyond it is a GiB the expert cache and the KV side never get.
 ///
 /// Everywhere else the refusal mechanism is honest and the margin is just the
 /// configured reserve.
 pub fn wobble_margin(reading: &VramReading, config: &GovernorConfig) -> u64 {
     match reading.source {
-        ProbeKind::Dxgi => (reading.headroom / 16).max(config.capacity_reserve),
+        ProbeKind::Dxgi => (reading.headroom / 16)
+            .min(MAX_WOBBLE_MARGIN)
+            .max(config.capacity_reserve),
         _ => config.capacity_reserve,
     }
 }
+
+/// The most [`wobble_margin`] leaves under a WDDM budget, in bytes.
+pub const MAX_WOBBLE_MARGIN: u64 = 1024 * 1024 * 1024;
 
 /// Grow the balloon until it reaches [`capacity_target`], or until the driver
 /// refuses a chunk smaller than [`GovernorConfig::balloon_min_chunk`] — whichever

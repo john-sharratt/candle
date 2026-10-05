@@ -2,15 +2,18 @@ use crate::backend::BackendDevice;
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use cudarc;
 use cudarc::driver::sys::CUresult;
-use cudarc::driver::{CudaFunction, CudaModule};
+use cudarc::driver::{CudaFunction, CudaModule, CudaSlice};
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use super::info_ring::InfoRing;
+use super::staged::pack_segments;
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::cuda_backend::{alloc_inheriting, Backing};
 use crate::forbidden_alloc;
+use crate::wave_provenance::LeaseOrigin;
 use candle_kernels::simple::fill::{run_arange_op, FillDType};
 use cudarc::driver::DevicePtr;
 
@@ -56,20 +59,27 @@ pub struct CudaDevice {
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     /// Memoized device copies of small layout/info tables (dims+strides blobs the
-    /// strided kernels read). Keyed by contents: identical tables share one device
-    /// buffer instead of re-uploading per launch — the per-launch tiny H2D copies
-    /// were a measured WDDM submission storm. See [`Self::info_table`].
+    /// strided kernels read), carved from one ring. See [`Self::info_table`].
     info_tables: InfoTables,
     /// Memoized device copies of the token-major → group-major gather permutation.
     /// Keyed by **shape** `(rows, groups)` rather than contents, because the table is
     /// a pure function of that shape: a hit costs a two-word hash and does no host
     /// build and no upload at all. See [`Self::group_major_ids`].
     perm_tables: PermTables,
+    /// The quantized-matmul path's activation staging — see
+    /// [`Self::with_staging`]. Per stream, like the caches above.
+    staging: Staging,
+    /// Launch tables for work that synchronises its stream before it returns
+    /// — see [`Self::with_synced_upload`]. Separate from `staging` so a launch
+    /// that waits out a long copy never holds the forward's scratch.
+    synced_staging: Staging,
 }
 
-/// Memoized `ArenaTableEntry` uploads, keyed by the shape vector that produced
-/// them.
-type InfoTables = Arc<Mutex<HashMap<Vec<usize>, Arc<Uploaded<usize>>>>>;
+/// One grow-only byte buffer, reused by every call that stages through it.
+type Staging = Arc<Mutex<Option<CudaSlice<u8>>>>;
+
+/// Memoized layout-table uploads, keyed by the table's contents.
+type InfoTables = Arc<Mutex<InfoRing>>;
 
 /// Memoized gather permutations, keyed by `(rows, groups)`.
 type PermTables = Arc<Mutex<HashMap<(usize, usize), Arc<Uploaded<u32>>>>>;
@@ -290,39 +300,137 @@ impl CudaDevice {
         Ok(Uploaded {
             slice: std::mem::ManuallyDrop::new(dst),
             backing,
+            _anchor: None,
         })
     }
 
-    /// Device copy of a small layout/info table (a dims/strides blob a strided kernel
-    /// reads), memoized by contents: the same table returns the same device buffer
-    /// instead of re-uploading. Launch-descriptor tables repeat across launches —
-    /// per-call uploads of them were a measured WDDM submission storm (tens of
-    /// thousands of 24-128 B copies per wave sweep), so steady-state waves must hit
-    /// the cache and perform NO upload at all.
+    /// Run `f` with a staging buffer of at least `bytes`, the scratch a
+    /// quantized matmul quantizes its activation into before the kernel reads
+    /// it.
     ///
-    /// Cache entries are pool-owned (`Backing::Owned`), never arena leases: a cached
-    /// table outlives any single wave, and kernels only read it — the same legality
-    /// as reading pool-resident weights from a wave launch. A cache MISS allocates
-    /// from the pool mid-wave; misses only happen the first time a layout shape is
-    /// seen, so the steady-state wave path stays allocation-free. The map is cleared
-    /// wholesale when it grows past a bound (shape-dependent tables accumulate over
-    /// a long uptime); in-flight users hold their own `Arc`, so clearing is safe and
-    /// a re-upload is trivial.
+    /// **Reused, not allocated per call.** The scratch is written and read by
+    /// launches on this handle's stream, so the next call's quantize is
+    /// ordered after the previous matmul's read and may take the same bytes.
+    /// It grows to the widest request seen — by doubling, so a ramp of widths
+    /// settles in a few steps — and is never handed back, which is what makes a
+    /// steady-state wave allocation-free. The lock is held while `f` runs, so
+    /// two callers on this handle cannot interleave their quantize and read.
+    pub fn with_staging<R>(
+        &self,
+        bytes: usize,
+        f: impl FnOnce(&mut CudaSlice<u8>) -> Result<R>,
+    ) -> Result<R> {
+        let mut slot = self.staging.lock().unwrap();
+        if !slot.as_ref().is_some_and(|s| s.len() >= bytes) {
+            let grown = slot.as_ref().map_or(0, |s| s.len() * 2).max(bytes).max(1);
+            // Dropping the old buffer frees it on this stream, after every
+            // launch already queued against it.
+            *slot = None;
+            // SAFETY: staging is written by the quantize the caller launches
+            // before its kernel reads it.
+            *slot = Some(unsafe { self.alloc::<u8>(grown)? });
+        }
+        f(slot.as_mut().expect("sized above"))
+    }
+
+    /// Upload `data` into the staging scratch ([`Self::with_staging`]) and run
+    /// `f` with its device address — for a launch's small host-built table
+    /// (a job list, a carry list) that lives from the upload to the kernel's
+    /// read and no further.
+    ///
+    /// Allocates nothing in the steady state, inside a forward or between two:
+    /// the copy and the launch `f` queues are ordered on this stream, and the
+    /// scratch is not handed to another caller until `f` returns.
+    pub fn with_staged_upload<T: cudarc::driver::DeviceRepr, R>(
+        &self,
+        data: &[T],
+        f: impl FnOnce(u64) -> Result<R>,
+    ) -> Result<R> {
+        let bytes = std::mem::size_of_val(data);
+        self.with_staging(bytes, |buf| {
+            // SAFETY: `data` is `bytes` of plain device-representable values;
+            // read as bytes, it is exactly what the kernel reads back.
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
+            if bytes > 0 {
+                self.stream
+                    .memcpy_htod(src, &mut buf.slice_mut(..bytes))
+                    .w()?;
+            }
+            let (ptr, _guard) = buf.device_ptr(&self.stream);
+            f(ptr)
+        })
+    }
+
+    /// Upload `segments` as one copy into the staging scratch
+    /// ([`Self::with_staged_upload`]) and run `f` with each segment's device
+    /// address — for a launch fed by several host arrays (a descriptor table
+    /// and the arrays it indexes), which would otherwise take one allocation
+    /// apiece. Build a segment from a typed slice with [`super::staged::segment`].
+    pub fn with_staged_segments<R>(
+        &self,
+        segments: &[&[u8]],
+        f: impl FnOnce(&[u64]) -> Result<R>,
+    ) -> Result<R> {
+        let (bytes, offsets) = pack_segments(segments);
+        self.with_staged_upload(&bytes, |base| {
+            let addrs: Vec<u64> = offsets.iter().map(|&o| base + o as u64).collect();
+            f(&addrs)
+        })
+    }
+
+    /// Upload `segments` on `stream` into a held scratch, run `f` with each
+    /// segment's device address, then synchronise `stream` — for a launch
+    /// table on a stream other than this handle's (the persistence thread's
+    /// copy stream), where the stream-ordered reuse
+    /// [`Self::with_staged_segments`] relies on does not hold.
+    ///
+    /// **Reuse rests on the synchronise, not on stream order.** The scratch is
+    /// locked from the upload until `stream` has drained, so the next caller —
+    /// on any stream — finds every read of it retired. It grows by doubling
+    /// and is never handed back, so a steady stream of launches allocates
+    /// nothing. Its own lock: a caller waiting out a long copy here never
+    /// holds the forward's [`Self::with_staging`].
+    pub fn with_synced_upload<R>(
+        &self,
+        stream: &Arc<cudarc::driver::CudaStream>,
+        segments: &[&[u8]],
+        f: impl FnOnce(&[u64]) -> Result<R>,
+    ) -> Result<R> {
+        let (bytes, offsets) = pack_segments(segments);
+        let mut slot = self.synced_staging.lock().unwrap();
+        if !slot.as_ref().is_some_and(|s| s.len() >= bytes.len()) {
+            let grown = slot
+                .as_ref()
+                .map_or(0, |s| s.len() * 2)
+                .max(bytes.len())
+                .max(1);
+            *slot = None;
+            // SAFETY: every byte a launch reads is written by the upload below.
+            *slot = Some(unsafe { self.alloc::<u8>(grown)? });
+            // The pool hands the bytes out in this handle's stream order, and
+            // `stream` may be another one: wait for the allocation to retire
+            // before a copy on `stream` writes it. Growth only.
+            self.stream.synchronize().w()?;
+        }
+        let buf = slot.as_mut().expect("sized above");
+        if !bytes.is_empty() {
+            stream
+                .memcpy_htod(&bytes, &mut buf.slice_mut(..bytes.len()))
+                .w()?;
+        }
+        let base = buf.device_ptr(stream).0;
+        let addrs: Vec<u64> = offsets.iter().map(|&o| base + o as u64).collect();
+        let out = f(&addrs);
+        stream.synchronize().w()?;
+        out
+    }
+
+    /// Device copy of a small layout table (the dims/strides blob a strided
+    /// kernel reads), memoized by contents and carved from this handle's info
+    /// ring — see [`super::info_ring`]. A steady-state wave hits the memo and
+    /// uploads nothing; a new shape costs one small copy and no allocation.
     pub fn info_table(&self, info: &[usize]) -> Result<Arc<Uploaded<usize>>> {
-        let mut cache = self.info_tables.lock().unwrap();
-        if let Some(t) = cache.get(info) {
-            return Ok(t.clone());
-        }
-        if cache.len() >= 8192 {
-            cache.clear();
-        }
-        let slice = self.memcpy_stod(info)?;
-        let t = Arc::new(Uploaded {
-            slice: std::mem::ManuallyDrop::new(slice),
-            backing: Backing::Owned,
-        });
-        cache.insert(info.to_vec(), t.clone());
-        Ok(t)
+        self.info_tables.lock().unwrap().table(self, info)
     }
 
     /// The token-major → group-major gather permutation, memoized per `(rows, groups)`:
@@ -363,6 +471,7 @@ impl CudaDevice {
         let t = Arc::new(Uploaded {
             slice: std::mem::ManuallyDrop::new(slice),
             backing: Backing::Owned,
+            _anchor: None,
         });
         cache.insert(key, t.clone());
         Ok(t)
@@ -439,6 +548,25 @@ impl CudaDevice {
 pub struct Uploaded<T> {
     slice: std::mem::ManuallyDrop<cudarc::driver::CudaSlice<T>>,
     backing: Backing,
+    /// The allocation a leased `slice` points into, when that allocation is
+    /// not owned by an arena that outlives it — an info-ring entry keeps its
+    /// ring buffer alive this way after the ring has moved on to a fresh one.
+    /// Dropped after `slice` is disposed of, so the view never outlives it.
+    _anchor: Option<Arc<CudaSlice<usize>>>,
+}
+
+impl<T> Uploaded<T> {
+    /// A leased view over memory `anchor` (when given) keeps alive.
+    pub(crate) fn leased(
+        slice: cudarc::driver::CudaSlice<T>,
+        anchor: Option<Arc<CudaSlice<usize>>>,
+    ) -> Self {
+        Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            backing: Backing::Lease(LeaseOrigin::Foreign),
+            _anchor: anchor,
+        }
+    }
 }
 
 impl<T> std::ops::Deref for Uploaded<T> {
@@ -761,8 +889,10 @@ impl CudaDevice {
             stream,
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
-            info_tables: Arc::new(Mutex::new(HashMap::new())),
+            info_tables: Arc::new(Mutex::new(InfoRing::default())),
             perm_tables: Arc::new(Mutex::new(HashMap::new())),
+            staging: Arc::new(Mutex::new(None)),
+            synced_staging: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1036,8 +1166,10 @@ impl BackendDevice for CudaDevice {
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            info_tables: Arc::new(Mutex::new(HashMap::new())),
+            info_tables: Arc::new(Mutex::new(InfoRing::default())),
             perm_tables: Arc::new(Mutex::new(HashMap::new())),
+            staging: Arc::new(Mutex::new(None)),
+            synced_staging: Arc::new(Mutex::new(None)),
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory
@@ -1448,8 +1580,6 @@ impl CudaDevice {
         dtype: DType,
         ticket: Option<crate::wave_provenance::WaveTicket>,
     ) -> Result<CudaStorage> {
-        use crate::cuda_backend::alloc_inheriting;
-        use crate::wave_provenance::LeaseOrigin;
         let from = match ticket {
             Some(t) => Backing::Lease(LeaseOrigin::Wave(t)),
             None => Backing::Owned,

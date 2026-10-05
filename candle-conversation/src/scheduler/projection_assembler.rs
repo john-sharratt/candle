@@ -597,14 +597,13 @@ pub(crate) fn materialize_conversation(
 
 /// Borrowed scheduler state the assembler needs in order to run.
 ///
-/// `model` and `device` are required so cache-miss runs can drive a
-/// synchronous `forward_batched` to compute and capture the missing
-/// K/V; `max_prefill_pass_tokens` caps the per-pass token count to keep
-/// activation buffers bounded.
+/// `model` is required so cache-miss runs can drive a synchronous
+/// `forward_batched` to compute and capture the missing K/V;
+/// `max_prefill_pass_tokens` caps the per-pass token count to keep activation
+/// buffers bounded.
 pub(super) struct ApplyContext<'a> {
     pub(super) session: &'a mut BatchedInferenceSession,
     pub(super) model: &'a mut Box<dyn ManagedBatchedModel + Send>,
-    pub(super) device: &'a Device,
     pub(super) conversation: &'a Conversation,
     pub(super) slot_target: Option<ProjectionTarget>,
     pub(super) parent_id: SequenceId,
@@ -721,7 +720,7 @@ pub(super) fn apply_segments(
         }
     }
     let t_glue = std::time::Instant::now();
-    if let Err(e) = fire_gap_fill_batch(ctx.session, &**ctx.model, ctx.device, &[&plan]) {
+    if let Err(e) = fire_gap_fill_batch(ctx.session, &**ctx.model, &[&plan]) {
         // The walk recorded the glue pieces as placed; unfilled, they are
         // zero chunks no later rebuild may keep.
         state.placed_pieces.clear();
@@ -2035,14 +2034,16 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
     while offset < tokens.len() {
         let chunk_len = (tokens.len() - offset).min(ctx.max_prefill_pass_tokens);
         let slice = &tokens[offset..offset + chunk_len];
-        let input = Tensor::new(slice, ctx.device)
+        // On the host: the forward lays the ids on its own span.
+        let input = Tensor::new(slice, &Device::Cpu)
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
         {
             let _g = profile::span("loop:prefill:forward");
             let nl = ctx.model.num_layers().max(1);
-            let _logits = ctx
-                .model
+            // Only the K/V this writes is wanted; the result drops here, with
+            // the logits still on the span they were carved from.
+            ctx.model
                 .forward_wave(
                     ctx.session,
                     &[],
@@ -2055,7 +2056,6 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
                     nl,
                     None,
                 )
-                .and_then(|s| s.logits_owned())
                 .map_err(ConversationError::Model)?;
         }
         ctx.session
@@ -2191,7 +2191,6 @@ fn drive_prefill_and_capture(
 pub(super) fn fire_gap_fill_batch(
     session: &mut BatchedInferenceSession,
     model: &(dyn ManagedBatchedModel + Send),
-    device: &Device,
     plans: &[&GapFillPlan],
 ) -> Result<(), ConversationError> {
     let active: Vec<&GapFillPlan> = plans
@@ -2207,7 +2206,8 @@ pub(super) fn fire_gap_fill_batch(
     let mut pending: Vec<PendingGlue> = Vec::with_capacity(active.len());
     for p in &active {
         ids.push(p.parent_id.0);
-        let input = Tensor::new(p.glue_tokens.as_slice(), device)
+        // On the host: the forward lays the ids on its own span.
+        let input = Tensor::new(p.glue_tokens.as_slice(), &Device::Cpu)
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
         inputs.push(input);

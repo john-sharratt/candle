@@ -125,6 +125,8 @@ pub struct HybridBatched {
     /// The head's KV is NOT here: it is a layer of the session's paged cache.
     /// See [`super::draft`].
     seed: Mutex<HashMap<usize, Tensor>>,
+    /// The draft walk's two carried-hidden buffers — see [`Self::draft_carry`].
+    draft_carry: Mutex<Option<(Tensor, Tensor)>>,
 }
 
 impl HybridBatched {
@@ -165,6 +167,7 @@ impl HybridBatched {
             verify_hidden: Mutex::new(HashMap::new()),
             capture_rows: Mutex::new(HashMap::new()),
             seed: Mutex::new(HashMap::new()),
+            draft_carry: Mutex::new(None),
         })
     }
 
@@ -268,6 +271,16 @@ impl HybridBatched {
             .verify_stash
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: verify_stash lock poisoned".into()))?;
+        // An empty cohort stashes nothing, so it needs no buffers: building a
+        // zero-row stash for it was one allocator call per recurrent operand,
+        // every step that drafted nothing. Buffers already held are kept, with
+        // no spans.
+        if total == 0 {
+            return match slot.as_mut() {
+                Some(s) => s.begin(blocks),
+                None => Ok(()),
+            };
+        }
         let grow = match slot.as_ref() {
             Some(s) => s.capacity()? < total,
             None => true,
@@ -923,6 +936,38 @@ impl HybridBatched {
             .cloned())
     }
 
+    /// The draft walk's two carried-hidden buffers, `[n, hidden]` each in
+    /// `dtype`.
+    ///
+    /// A step reads the hidden the step before it wrote and writes its own
+    /// beside it, so the walk alternates between two buffers: the seeds are
+    /// laid into the first, and each step writes whichever one the step before
+    /// did not. The step's other transients are on its forward phase, which
+    /// the next step carves over — the carry is what has to outlive it. Held
+    /// here and grown by doubling, so a walk allocates nothing for its carry.
+    pub fn draft_carry(&self, n: usize, dtype: DType) -> Result<(Tensor, Tensor)> {
+        let hidden = self.model.cfg.hidden_size;
+        let mut pair = self
+            .draft_carry
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: draft carry lock poisoned".into()))?;
+        let held = match pair.as_ref() {
+            Some((a, _)) if a.dtype() == dtype => a.dim(0)?,
+            _ => 0,
+        };
+        if held < n {
+            // Fully written before it is read: the seeds go into the first, and
+            // each step writes the buffer it then hands on (invariant 6).
+            let dims = ((held * 2).max(n), hidden);
+            *pair = Some((
+                Tensor::empty(dims, dtype, &self.model.device)?,
+                Tensor::empty(dims, dtype, &self.model.device)?,
+            ));
+        }
+        let (a, b) = pair.as_ref().expect("sized above");
+        Ok((a.narrow(0, 0, n)?, b.narrow(0, 0, n)?))
+    }
+
     /// A sequence's seed hidden — the trunk's post-`final_norm` output at its
     /// last accepted position. `None` before its first wave.
     pub fn draft_seed(&self, seq: usize) -> Result<Option<Tensor>> {
@@ -1203,7 +1248,12 @@ impl HybridBatched {
         // The session's int8 mode, not the config's: the KO twins are chosen at
         // load and decide what each norm's fused epilogue emits, which is a real
         // difference in what the span holds.
-        wave_geometry(&self.model.cfg, act_dtype, self.int8mode())
+        wave_geometry(
+            &self.model.cfg,
+            act_dtype,
+            self.int8mode(),
+            self.model.mtp.is_some(),
+        )
     }
 
     /// Re-materialise every norm weight in the session's activation dtype.

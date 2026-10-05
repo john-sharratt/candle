@@ -38,7 +38,9 @@ use super::batched_inference::{
 use super::batched_model::{WaveGuard, WavePhase};
 use super::kv_cache_utils::SequenceContext;
 use super::profile::gpu_span;
+use super::residual_order::{caller_runs, reorder, Run};
 use super::tensor_cat::TensorCat;
+use super::window_residuals::WindowResiduals;
 use candle::quantized::pinned_staging::Generation;
 
 /// Everything the layer sweep needs that the driver assembled for it.
@@ -81,6 +83,9 @@ pub struct WaveGroups<'a> {
     pub layer_end: usize,
     /// A paused wave's residual stream, already permuted into internal order.
     pub x_in: Option<TensorCat>,
+    /// Where a sweep that stops short of the head puts the residual it hands
+    /// back: off the forward span, which a later window resumes past.
+    pub window: &'a WindowResiduals,
     /// The width every activation in this wave flows in.
     ///
     /// Decided ONCE, here, from the session's declared activation dtype, and
@@ -549,68 +554,40 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     // to give one group's conversations another group's fine-tune.
     let wave_adapter = session.wave_adapter(&all_seqs)?;
 
-    // Residual token order. The sweep packs per-token hidden states in INTERNAL
-    // order `[orig-decode | single-prefills | multi-prefills | glue]` (the
-    // single-token prefills were folded into the decode group). The residual
-    // crosses the API boundary in CALLER order `[decode | prefill (caller
-    // order) | glue]` so a co-batched caller can split it by contiguous group —
-    // decode, section, cohort, glue — which is what lets a creeping cohort be
-    // held whole across a wave while the full-sweep members continue. We
-    // reorder caller→internal on the way in and internal→caller on the way out;
-    // the two permutations are exact inverses, so re-feeding the returned
-    // residual on the next layer window round-trips. When there are no
-    // single-token prefills the two orders coincide (the multis keep caller
-    // order), so the permutation is identity and we skip it.
-    let token_perm: Option<(Tensor, Tensor)> = if single.is_empty() {
+    // Residual token order (`residual_order`). The sweep packs rows in internal
+    // order and the residual crosses the API in caller order, so a co-batched
+    // caller can split it by contiguous group — decode, section, cohort, glue —
+    // and hold a creeping cohort whole across a wave while the full-sweep
+    // members continue. Reordered caller→internal on the way in and
+    // internal→caller on the way out, exact inverses, so re-feeding the
+    // returned residual on the next layer window round-trips. With no
+    // single-token prefill the two orders coincide and nothing is reordered.
+    //
+    // Only where a residual crosses the API — resumed in, or handed back by a
+    // window that stops short of the head. A sweep that starts fresh and
+    // reaches the head reorders its logits on the host below.
+    let residual_crosses = residual_in.is_some() || layer_end < num_layers;
+    let runs: Option<Vec<Run>> = if single.is_empty() || !residual_crosses {
         None
     } else {
-        let mut single_rank = vec![usize::MAX; n_prefill_in];
-        for (r, &i) in single.iter().enumerate() {
-            single_rank[i] = r;
-        }
-        let mut multi_tok_start = vec![0usize; n_prefill_in];
-        let mut acc = n_decode;
-        for &i in &multi {
-            multi_tok_start[i] = acc;
-            acc += pre_lens_in[i];
-        }
-        let glue_internal_base = acc;
-        let glue_tok: usize = glue_lens.iter().sum();
-        let total_tok = glue_internal_base + glue_tok;
-        let mut internal_of_caller: Vec<u32> = Vec::with_capacity(total_tok);
-        for t in 0..n_decode_in {
-            internal_of_caller.push(t as u32);
-        }
-        for j in 0..n_prefill_in {
-            if single_rank[j] != usize::MAX {
-                internal_of_caller.push((n_decode_in + single_rank[j]) as u32);
-            } else {
-                let start = multi_tok_start[j];
-                for t in 0..pre_lens_in[j] {
-                    internal_of_caller.push((start + t) as u32);
-                }
-            }
-        }
-        for t in 0..glue_tok {
-            internal_of_caller.push((glue_internal_base + t) as u32);
-        }
-        let mut caller_of_internal = vec![0u32; total_tok];
-        for (c, &k) in internal_of_caller.iter().enumerate() {
-            caller_of_internal[k as usize] = c as u32;
-        }
-        let i2c = Tensor::from_vec(internal_of_caller, total_tok, dev)?;
-        let c2i = Tensor::from_vec(caller_of_internal, total_tok, dev)?;
-        Some((i2c, c2i))
+        Some(caller_runs(
+            n_decode_in,
+            &pre_lens_in,
+            glue_lens.iter().sum(),
+        ))
     };
+    let window = session.window_residuals();
 
-    let x_in = match (residual_in, token_perm.as_ref()) {
-        (Some(t), Some((_, c2i))) => {
-            // Caller order → internal order for the resume. Tokens are dim 1
-            // (`[batch, tokens, hidden]`).
-            Some(TensorCat::from_cat_tensor(t.index_select(c2i, 1)?, 0)?)
-        }
-        (Some(t), None) => Some(TensorCat::from_cat_tensor(t, 0)?),
-        (None, _) => None,
+    let x_in = match residual_in {
+        // Tokens are dim 1 (`[batch, tokens, hidden]`).
+        Some(t) => Some(TensorCat::from_cat_tensor(
+            match runs.as_deref() {
+                Some(r) => reorder(&t, r, true, &window)?,
+                None => t,
+            },
+            0,
+        )?),
+        None => None,
     };
     // The layer sweep plus the head, so the forward's stream time divides into
     // "the model" and "everything the driver and its caller do around it". The
@@ -630,6 +607,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             layer_start,
             layer_end,
             x_in,
+            window: &window,
             act_dtype,
         },
     );
@@ -674,8 +652,8 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     let step = match phase {
         WavePhase::Residual(x) => {
             // Internal order → caller order. Tokens are dim 1.
-            let res = match token_perm.as_ref() {
-                Some((i2c, _)) => x.to_tensor().index_select(i2c, 1)?,
+            let res = match runs.as_deref() {
+                Some(r) => reorder(&x.to_tensor(), r, false, &window)?,
                 None => x.to_tensor(),
             };
             WaveStep {

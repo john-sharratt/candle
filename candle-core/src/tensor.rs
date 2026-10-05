@@ -4053,6 +4053,14 @@ impl<'w> LiveTensor<'w> {
         std::ptr::eq(lhs, rhs)
     }
 
+    /// Whether this handle is the only thing reaching its storage — no clone
+    /// of the handle and no view (`narrow`, `reshape`, …) of the buffer is
+    /// alive anywhere else. A pool that hands out views of buffers it holds
+    /// asks this to know which of them it may hand out again.
+    pub fn is_sole_owner(&self) -> bool {
+        Arc::strong_count(&self.0) == 1 && Arc::strong_count(&self.storage) == 1
+    }
+
     /// The tensor [`Self::cat`] would build from `parts` along `dim`, as a
     /// **view** — no allocation, no copy — when the parts already are that
     /// tensor: contiguous ranges of one storage, each starting where the one

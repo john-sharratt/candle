@@ -80,6 +80,11 @@ pub(crate) struct DeviceCountTable {
     vocab: usize,
     table: Option<Tensor>,
     narrow_run: usize,
+    /// Where a dispatch's packed entries are uploaded on CUDA: held and grown
+    /// to the widest dispatch seen, so a stamp allocates nothing. The clear
+    /// that ends a dispatch reads it on the same stream before the next
+    /// stamp's upload overwrites it.
+    entries: Option<Tensor>,
 }
 
 /// A table with one dispatch's counts stamped in. Hand it back to
@@ -105,6 +110,7 @@ impl DeviceCountTable {
             vocab,
             table: None,
             narrow_run: 0,
+            entries: None,
         }
     }
 
@@ -124,7 +130,14 @@ impl DeviceCountTable {
             None
         } else {
             let n = counts.offsets.len();
-            let entries = Tensor::from_vec(counts.packed(), 2 * n, device)?;
+            let entries = match device {
+                Device::Cuda(_) => {
+                    let held = self.entries_for(device, 2 * n)?;
+                    upload_words(&held, &counts.packed())?;
+                    held
+                }
+                _ => Tensor::from_vec(counts.packed(), 2 * n, device)?,
+            };
             if let Err(e) = write_entries(&table, &entries, n, true) {
                 self.table = None;
                 return Err(e);
@@ -132,6 +145,28 @@ impl DeviceCountTable {
             Some((entries, n))
         };
         Ok(Stamped { table, entries })
+    }
+
+    /// The held entries buffer as a `[words]` view, grown by doubling when a
+    /// dispatch outgrows it.
+    fn entries_for(&mut self, device: &Device, words: usize) -> Result<Tensor> {
+        if !self
+            .entries
+            .as_ref()
+            .is_some_and(|e| e.elem_count() >= words)
+        {
+            let grown = self
+                .entries
+                .as_ref()
+                .map_or(0, |e| e.elem_count() * 2)
+                .max(words);
+            // Fully written by the upload before any launch reads it.
+            self.entries = Some(Tensor::empty(grown, DType::U32, device)?);
+        }
+        self.entries
+            .as_ref()
+            .expect("sized above")
+            .narrow(0, 0, words)
     }
 
     /// Return the stamped entries to zero, so the next dispatch starts from an
@@ -214,6 +249,38 @@ fn write_entries(table: &Tensor, entries: &Tensor, n: usize, values: bool) -> Re
         Tensor::zeros(n, DType::U32, entries.device())?
     };
     table.scatter_set(&offsets, &written, 0)
+}
+
+/// Upload `words` into `dst`, a held CUDA `U32` buffer of exactly that many
+/// elements, on its stream — the copy lands in place and allocates nothing.
+fn upload_words(dst: &Tensor, words: &[u32]) -> Result<()> {
+    let Device::Cuda(dev) = dst.device() else {
+        candle::bail!("count table entries must be on CUDA");
+    };
+    if dst.elem_count() != words.len() {
+        candle::bail!(
+            "count table entries: {} words into a {}-word view",
+            words.len(),
+            dst.elem_count()
+        );
+    }
+    let stream = dev.cuda_stream();
+    let (storage, layout) = dst.storage_and_layout();
+    let (ptr, _guard) = count_table_ptr(&storage, layout, &stream)?;
+    // SAFETY: `ptr` addresses `words.len()` u32s of `dst`'s own storage (the
+    // length is checked above), and the copy is ordered on the stream every
+    // reader of `dst` runs on. A pageable source is staged before this returns.
+    unsafe {
+        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            ptr,
+            words.as_ptr() as *const c_void,
+            std::mem::size_of_val(words),
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| candle::Error::Msg(format!("count table entries upload: {e}")))?;
+    }
+    Ok(())
 }
 
 /// The device address of a resident `U32` buffer at its view's offset, with
@@ -310,6 +377,41 @@ mod tests {
         let held = stamped.table().clone();
         table.clear(stamped)?;
         assert_eq!(held.to_vec1::<u32>()?, vec![0; 8]);
+        Ok(())
+    }
+
+    /// A dispatch uploads into the held entries buffer: a narrower one after a
+    /// wider one reuses it, and the counts it stamps are still exact.
+    #[test]
+    fn a_cuda_dispatch_reuses_the_held_entries_buffer() -> Result<()> {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return Ok(()); // No CUDA device on this box.
+        };
+        let mut table = DeviceCountTable::new(4);
+        let wide = SparseCounts {
+            offsets: vec![0, 1, 2, 3],
+            values: vec![1, 2, 3, 4],
+        };
+        let stamped = table.stamp(&dev, 1, &wide)?;
+        table.clear(stamped)?;
+        let held = table
+            .entries
+            .clone()
+            .expect("a CUDA stamp holds its entries");
+        let narrow = SparseCounts {
+            offsets: vec![2],
+            values: vec![9],
+        };
+        let stamped = table.stamp(&dev, 1, &narrow)?;
+        assert_eq!(stamped.table().to_vec1::<u32>()?, vec![0, 0, 9, 0]);
+        assert!(
+            table
+                .entries
+                .as_ref()
+                .is_some_and(|e| e.same_storage(&held)),
+            "the narrower dispatch must upload into the same buffer"
+        );
+        table.clear(stamped)?;
         Ok(())
     }
 

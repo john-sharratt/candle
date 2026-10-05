@@ -66,6 +66,10 @@ pub struct DaemonConfig {
     /// the eager whole-store rewrite instead of deferring it. Opt-in
     /// (`--compact-substrate`).
     pub compact_substrate: bool,
+    /// Whether the load asks every stored conversation whether it is intact,
+    /// and what it does with the ones that say no (`--self-check`,
+    /// `--dry-run`). See [`crate::self_check`].
+    pub self_check: SelfCheck,
     /// Open the workspace's substrate READ-ONLY and write nothing to disk
     /// (`ModelBuilder::read_only_substrate`): every turn lives in RAM, and the
     /// boot steps that exist to write — calibration, compaction, the upload
@@ -121,6 +125,7 @@ impl DaemonConfig {
             ingest_dirs: HashMap::new(),
             max_depth: None,
             compact_substrate: false,
+            self_check: SelfCheck::Off,
             read_only_substrate: false,
             model: ModelChoice::default(),
             qsa_selection_budget: None,
@@ -130,6 +135,18 @@ impl DaemonConfig {
             local_signin: None,
         }
     }
+}
+
+/// The load's conversation self-check ([`crate::self_check`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelfCheck {
+    /// Not run.
+    #[default]
+    Off,
+    /// Every conversation asked, every verdict reported, nothing tombstoned.
+    DryRun,
+    /// Every conversation asked, and the corrupt ones tombstoned.
+    Tombstone,
 }
 
 /// Which model a daemon runs.

@@ -52,6 +52,7 @@ use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::{DType, Result, Tensor};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
+use super::capture_rows::CaptureRows;
 use super::engine::GpuLayerMix;
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix};
 use super::indexer::{IndexCache, IndexSnapshot};
@@ -59,17 +60,22 @@ use super::mtp::MtpHead;
 use super::spec::SpecCapture;
 use super::wave::Qwen4ExpBatched;
 use crate::models::batched_inference::BatchedInferenceSession;
+use crate::models::batched_inference::ManagedBatchedModel;
 use crate::models::batched_layer::{forward_attn_batched, BatchedAttentionParams, DecodeHeaders};
 use crate::models::delta_net::SeqSpan;
 use crate::models::draft_walk::{draft_reserve, draft_walk};
 use crate::models::kv_cache_utils::SequenceContext;
+use crate::models::latent_moe::scatter::{rows_scatter, RowRun};
 use crate::models::lazy_rope::LazyRope;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::gpu_span;
 use crate::models::rope_schedule::FactoredRope;
 use crate::models::tensor_cat::TensorCat;
+use crate::models::wave_buffers::wave_empty_ticketed;
 use candle::quantized::cuda::to_dynamic;
-use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
+use candle_nn::kv_cache::{
+    begin_wave, cover_wave_transient, KvCache, LayerPhase, WavePlan, WaveWidth,
+};
 
 /// Each sequence's last wide residual, carried between waves so the head's
 /// first row has the `h(t-1)` the wave before it produced.
@@ -79,6 +85,12 @@ use candle_nn::kv_cache::{begin_wave, KvCache, LayerPhase};
 /// this sequence never had. Cleared through the engine's `release_sequence`
 /// alongside the recurrent and index state, and reset whenever a sequence
 /// starts over at offset 0.
+///
+/// The model holds two of these: the seeds, and each sequence's **spare** — the
+/// buffer the next carry writes before it becomes the seed (see
+/// [`Qwen4ExpBatched::head_wave_pass`]). A spare must never be a buffer the seed
+/// store also holds, so every path that puts a seed back or takes one away
+/// drops the sequence's spare with it.
 pub type SeedStore = HashMap<usize, Tensor>;
 
 /// Everything the head pass needs that the wave already computed — the same
@@ -101,6 +113,9 @@ pub struct HeadWave<'a> {
     /// The head's KV layer, which is also its index into a sequence's index
     /// caches — past every trunk attention layer.
     pub kv_layer: usize,
+    /// The wave's pinned staging generation, which the shift's and the
+    /// carry's row-copy descriptors are staged in.
+    pub generation: &'a Generation,
 }
 
 impl Qwen4ExpBatched {
@@ -118,6 +133,7 @@ impl Qwen4ExpBatched {
         idx_map: &mut HashMap<usize, Vec<IndexCache>>,
         mut capture: Option<&mut SpecCapture>,
         seeds: &mut SeedStore,
+        spares: &mut SeedStore,
         res: &Tensor,
         embeds: &Tensor,
         w: &HeadWave<'_>,
@@ -129,66 +145,63 @@ impl Qwen4ExpBatched {
         let g = gpu_span("q4e:mtp_head", dev);
 
         // **The head's own phase.** It runs one layer's worth of work after the
-        // trunk's loop has closed its phases, and until now it ran with none
-        // open at all — so its projections, its DeltaNet scan buffers and the
-        // split block under `project_qkv` all went to the pool, which is where
-        // the largest remaining allocations were.
+        // trunk's loop has closed its phases, so it opens the attention phase
+        // for itself, and every transient below is rooted on it: the shift, the
+        // input assembly, the pre-mix, the selection tables and the projections.
         //
-        // Safe because the head already escapes the arena where it must: the
-        // seeds it carries forward are taken with `to_owned_tensor`
-        // specifically so a generation reset cannot reclaim what the next wave
-        // reads (see the carry below). Everything else it allocates dies with
-        // the pass.
-        #[cfg(feature = "cuda")]
+        // Safe because what outlives the pass is written outside the arena: the
+        // seeds are each sequence's own buffers (see the carry below) and the
+        // verify's head rows are owned copies. Everything else dies with the
+        // pass.
         let head_wave = match dev {
             candle::Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
             _ => None,
         };
-        #[cfg(not(feature = "cuda"))]
-        let head_wave: Option<()> = None;
+        let head_ticket = head_wave.as_ref().map(|g| g.ticket());
 
-        // ── The shift, as one gather. ──
+        // ── The shift, as one scatter onto the head's phase. ──
         //
         // Row `i` of the head reads the trunk residual of row `i-1`, and the
-        // first row of each span reaches back to the previous wave's seed. Both
-        // sources are addressed by ONE index list over a pool of
-        // `[seeds ; res]`, so the shift costs a single `index_select` rather
-        // than a per-span splice — the rows are not contiguous in either
-        // source, and stitching them per sequence is the copy storm invariant 2
-        // exists to refuse.
-        let mut seed_rows: Vec<Tensor> = Vec::with_capacity(w.spans.len());
+        // first row of each span reaches back to the previous wave's seed. Each
+        // span is therefore two runs — its seed into its first row, and its own
+        // rows but the last into the rows after — and every span's runs go in
+        // one launch. The rows are written where the head reads them, with no
+        // `[seeds ; res]` block assembled first to gather from.
+        //
+        // A sequence the head has never run behind is at position 0, where the
+        // reference takes zeros — which is what admission made its seed.
+        let width = hc * n_embd;
+        let shifted = wave_empty_ticketed((total_rows, hc, n_embd), DType::F32, dev, head_ticket)?;
+        let shifted_rows = shifted.reshape((total_rows, width))?;
+        let res_rows = res.reshape((total_rows, width))?;
+        let mut shift_runs: Vec<RowRun<'_>> = Vec::with_capacity(2 * w.spans.len());
         for span in w.spans {
-            let seed = match seeds.get(&span.seq) {
-                Some(t) => t.clone(),
-                // No previous wave: position 0 of the sequence, where the head
-                // has no carried state and the reference takes zeros.
-                None => Tensor::zeros((1, hc, n_embd), DType::F32, dev)?,
-            };
-            seed_rows.push(seed);
-        }
-        let seed_block = if seed_rows.len() == 1 {
-            seed_rows.pop().expect("one span")
-        } else {
-            Tensor::cat(&seed_rows, 0)?
-        };
-        let pool = Tensor::cat(&[&seed_block, res], 0)?;
-        let n_seed = w.spans.len();
-        let mut shift_idx: Vec<u32> = vec![0; total_rows];
-        for (s, span) in w.spans.iter().enumerate() {
-            for j in 0..span.len {
-                shift_idx[span.start + j] = if j == 0 {
-                    s as u32
-                } else {
-                    (n_seed + span.start + j - 1) as u32
-                };
+            let seed = seeds.get(&span.seq).cloned().ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "qwen4exp head: sequence {} entered the forward with no seed — \
+                     admission makes it, so the forward never allocates one",
+                    span.seq
+                ))
+            })?;
+            shift_runs.push(RowRun::new(
+                seed.reshape((1, width))?,
+                &shifted_rows,
+                span.start,
+            ));
+            if span.len > 1 {
+                shift_runs.push(RowRun::new(
+                    res_rows.narrow(0, span.start, span.len - 1)?,
+                    &shifted_rows,
+                    span.start + 1,
+                ));
             }
         }
-        let shift_idx = Tensor::from_vec(shift_idx, (total_rows,), dev)?;
-        let shifted = pool.index_select(&shift_idx, 0)?;
+        rows_scatter(&shift_runs, w.generation)?;
+        drop(shift_runs);
 
         // ── The head's block input, entering the hyper-connection stream the
         // way a token embedding does. ──
-        let x_head = head.block_input(embeds, &shifted, eps)?;
+        let x_head = head.block_input(embeds, &shifted, eps, head_ticket)?;
 
         let GpuLayerMix::Attention {
             w: aw,
@@ -203,7 +216,7 @@ impl Qwen4ExpBatched {
             );
         };
 
-        let (h, _) = hc_mix(&x_head, &head.block.hc_attn, eps, None)?;
+        let (h, _) = hc_mix(&x_head, &head.block.hc_attn, eps, head_ticket)?;
 
         // QSA over the head's OWN cache. The head selects exactly as a trunk
         // attention layer does — same indexer weights, same budget — because a
@@ -224,9 +237,9 @@ impl Qwen4ExpBatched {
             // and leave the thirteenth holding the rejected tokens' keys.
             capture.as_deref_mut(),
             total_rows,
-            // The draft head runs outside the trunk's forward-scoped span, so
-            // its tables take the ordinary upload.
-            None,
+            // The head's own phase: its tables are read by this pass's
+            // attention and nothing after it.
+            head_ticket,
         )?;
         let dec_sel = match &qsa {
             Some(s) if w.n_decode > 0 => Some(s.rows_slice(0, w.n_decode)?),
@@ -290,17 +303,14 @@ impl Qwen4ExpBatched {
 
         // ── Carry each sequence's rows forward. ──
         //
-        // **`to_owned_tensor`, not `contiguous`.** `res` is a wave-arena tensor
-        // and the generation reset reclaims it, so a seed holding a view into
-        // it reads another wave's activations by the time the next wave reads
-        // the seed.
-        //
-        // `contiguous()` cannot get us out of the arena, in either of its
-        // branches: on an already-contiguous tensor — which a dim-0 `narrow` of
-        // one is — it returns `self.clone()`, sharing the storage outright; and
-        // when it does copy it allocates with `self.wave_ticket()`, so the copy
-        // is arena-leased too. Only `to_owned_tensor` clones the storage into a
-        // fresh `Arc` that no generation owns.
+        // **Into the sequence's spare seed buffer, which then becomes its seed.**
+        // Each sequence holds two `[1, hc, n_embd]` buffers for its whole life
+        // and the carry alternates between them: the seed this wave read stays
+        // exactly as it entered, which is what the failure bracket restores and
+        // what a verify's rewind starts from, while the next wave's seed is
+        // written beside it. Every sequence's row goes in one launch, and no
+        // seed is allocated after the second wave a sequence runs in — where a
+        // fresh owned copy per sequence per wave used to be made.
         //
         // **One row, and the block's rows only where a rewind can reach them.**
         // A verify wave's accept walk may keep just a prefix of its block, so
@@ -314,21 +324,42 @@ impl Qwen4ExpBatched {
         // block rows go to the verify capture, which exists only for the
         // sequences that can be rewound, and `rewind_cohort` reseeds from them.
         //
-        // That saving is only real because `to_owned_tensor` copies the VIEW.
-        // It used to clone the view's whole storage, so the single-row narrow
-        // below bought all of `res` regardless — once per span, which is the
-        // very cost this paragraph claims to avoid. See invariant 2 in
-        // CLAUDE.md; the same bug was 76% of a 128-slot qwen35 decode step.
+        // The capture copies the block's rows into the cohort's kept-row
+        // buffer at the sequence's stash row — buffers sized once for the
+        // cohort and reused across steps, so keeping them allocates nothing.
+        let mut carry_runs: Vec<RowRun<'_>> = Vec::with_capacity(w.spans.len());
+        let mut flips: Vec<(usize, Tensor)> = Vec::with_capacity(w.spans.len());
         for span in w.spans {
             if let Some(cap) = capture.as_deref_mut() {
-                if let Some(stash) = cap.seqs.get_mut(&span.seq) {
-                    stash.head_rows = Some(res.narrow(0, span.start, span.len)?.to_owned_tensor()?);
+                let SpecCapture { seqs, rows, .. } = cap;
+                if let Some(stash) = seqs.get_mut(&span.seq) {
+                    stash.head_rows = Some(CaptureRows::keep(
+                        &rows.head,
+                        stash.row,
+                        &res.narrow(0, span.start, span.len)?,
+                    )?);
                 }
             }
-            let last = res
-                .narrow(0, span.start + span.len - 1, 1)?
-                .to_owned_tensor()?;
-            seeds.insert(span.seq, last);
+            let spare = spares.remove(&span.seq).ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "qwen4exp head: sequence {} entered the forward with no spare seed — \
+                     admission makes it, so the forward never allocates one",
+                    span.seq
+                ))
+            })?;
+            carry_runs.push(RowRun::new(
+                res_rows.narrow(0, span.start + span.len - 1, 1)?,
+                &spare.reshape((1, width))?,
+                0,
+            ));
+            flips.push((span.seq, spare));
+        }
+        rows_scatter(&carry_runs, w.generation)?;
+        drop(carry_runs);
+        for (seq, written) in flips {
+            if let Some(read) = seeds.insert(seq, written) {
+                spares.insert(seq, read);
+            }
         }
         g.end();
         Ok(())
@@ -339,18 +370,33 @@ impl Qwen4ExpBatched {
     ///
     /// Returns `(wide residual out, logits)` — the residual because it is what
     /// the next drafted position reads as its `h(t-1)`, and the logits because
-    /// the walk takes their argmax as the proposal.
+    /// the walk takes their argmax as the proposal. The residual is written into
+    /// `out`, one of the walk's two carry buffers (see [`Self::draft_carry`]);
+    /// `prev_wide` is the other.
     ///
     /// **The whole block, not attention only.** The lockstep pass
     /// ([`Self::head_wave_pass`]) skips the MoE because it owes only K/V; a
     /// proposal is the block's *output*, so here the FFN half runs. Both halves
     /// go through the same `hc_mix`/`hc_combine` pair every trunk layer uses.
+    ///
+    /// **Every transient is on the tier's three spans**, which `mtp_draft`
+    /// covers for the cohort before the walk: the embeddings and the embedding
+    /// half of the input on the forward span, opened for the whole step; the
+    /// hidden half, the pre-mix, the selection and the attention on the
+    /// attention span; the FFN pre-mix and the MoE on the FFN span; and the
+    /// shared head's mix and the logits back on the forward span. The attention
+    /// and FFN phases close in turn, as a trunk layer closes them. The logits
+    /// are returned past the forward phase's close:
+    /// the walk's argmax is the next launch on this stream, so it reads them
+    /// before the next step's forward phase carves over them, and its own
+    /// output — inheriting a closed generation's ticket — lands on the pool.
     #[allow(clippy::too_many_arguments)]
     fn head_draft_step(
         &self,
         head: &MtpHead,
-        embeds: &Tensor,
+        ids: &Tensor,
         prev_wide: &Tensor,
+        out: &Tensor,
         caches: &mut [&mut KvCache],
         seqs: &[usize],
         at: &[usize],
@@ -365,6 +411,10 @@ impl Qwen4ExpBatched {
         let dev = &m.device;
         let n = at.len();
         let n_embd = cfg.hidden_size;
+        let candle::Device::Cuda(cuda) = dev else {
+            candle::bail!("qwen4exp draft runs on CUDA");
+        };
+        let stream = cuda.cuda_stream();
 
         let GpuLayerMix::Attention {
             w: aw,
@@ -375,10 +425,24 @@ impl Qwen4ExpBatched {
             candle::bail!("qwen4exp draft: the head's block is not full-attention");
         };
 
-        let mut res = head.block_input(embeds, prev_wide, eps)?;
+        // The forward phase holds the step's embeddings — and with them the
+        // embedding half of the head's input, which a norm keeps beside the rows
+        // it reads — and, at the end, the shared head's logits.
+        let fwd_wave = begin_wave(&stream, LayerPhase::Forward)?;
+        let fwd_ticket = Some(fwd_wave.ticket());
+        // Fully written by the lookup (invariant 6), in the head's F32.
+        let embeds = wave_empty_ticketed((n, m.embed.ncols()), DType::F32, dev, fwd_ticket)?;
+        m.embed.gather_into(ids, None, Some(&embeds))?;
 
         // ── Attention half. ──
-        let (h, inject) = hc_mix(&res, &head.block.hc_attn, eps, None)?;
+        let attn_wave = begin_wave(&stream, LayerPhase::Attention)?;
+        let attn_ticket = Some(attn_wave.ticket());
+        // Assembled on the span, then laid into the carry buffer the next step
+        // reads: the residual outlives this phase and the walk's step.
+        let assembled = head.block_input(&embeds, prev_wide, eps, attn_ticket)?;
+        out.slice_set(&assembled, 0, 0)?;
+        let mut res = out.clone();
+        let (h, inject) = hc_mix(&res, &head.block.hc_attn, eps, attn_ticket)?;
         let inject = inject.expect("a block's HC modules carry an inject");
         // One decode row per sequence, so the spans are one row each. The span
         // names the SEQUENCE, not the row: `layer_selection` keys each
@@ -407,8 +471,8 @@ impl Qwen4ExpBatched {
             // partially and nothing to capture.
             None,
             n,
-            // As above: no forward-scoped span is open on this path.
-            None,
+            // Read by this step's attention and nothing after it.
+            attn_ticket,
         )?;
         g_sel.end();
         let g_attn = gpu_span("q4e:draft:attn", dev);
@@ -433,22 +497,32 @@ impl Qwen4ExpBatched {
         //
         // [`Self::head_wave_pass`] passes the absolute index for the opposite
         // reason: it rides the wave's own metadata, which covers every layer.
-        // No wave is open on this path, so the projection's output is ordinary
-        // owned memory and owning it again was a straight `[n, n_embd]` copy.
-        // The compiler is what keeps that honest: were a generation passed
-        // above, `'w` would bind and the combine would have to stay inside it.
-        let y = forward_attn_batched(&alayer, caches, &x_g, at, params, 0, sel.as_ref(), None)?
-            .reshape((n, n_embd))?;
+        //
+        // The projection's output borrows the attention phase, so the combine
+        // reads it before the phase closes — the compiler refuses the order
+        // the other way round.
+        let y = forward_attn_batched(
+            &alayer,
+            caches,
+            &x_g,
+            at,
+            params,
+            0,
+            sel.as_ref(),
+            Some(&attn_wave),
+        )?
+        .reshape((n, n_embd))?;
         hc_combine(&mut res, &y, &inject)?;
+        drop(y);
+        drop(sel);
+        drop(attn_wave);
         g_attn.end();
 
         // ── MoE half. ──
         let g_moe = gpu_span("q4e:draft:moe", dev);
-        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps, None)?;
+        let ffn_wave = begin_wave(&stream, LayerPhase::Ffn)?;
+        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps, Some(ffn_wave.ticket()))?;
         let inject2 = inject2.expect("a block's HC modules carry an inject");
-        let candle::Device::Cuda(cuda) = dev else {
-            candle::bail!("qwen4exp draft runs on CUDA");
-        };
         // Quantized once in the session's mode, as the trunk's MoE input is:
         // the router, the shared expert and the routed experts' tile gather all
         // read the one operand.
@@ -464,14 +538,20 @@ impl Qwen4ExpBatched {
         // the trunk's are. A draft head only ever runs behind a decode step —
         // there is no prefill/prompt traffic through one — so all `n` rows are
         // decode-attributed.
-        let parts = head.block.moe.forward_parts(acts, DType::F32, n, None)?;
+        let parts = head
+            .block
+            .moe
+            .forward_parts(acts, DType::F32, n, Some(&ffn_wave))?;
         let routed = parts.routed.reshape((n, n_embd))?;
         hc_combine_gated(&mut res, &routed, &parts.shared, &inject2)?;
+        drop(routed);
+        drop(parts);
+        drop(ffn_wave);
         g_moe.end();
 
         // ── The shared head. ──
         let g_head = gpu_span("q4e:draft:lm_head", dev);
-        let narrow = head.to_shared_head(&res, eps)?;
+        let narrow = head.to_shared_head(&res, eps, fwd_ticket)?;
         let acts = to_dynamic(
             &narrow,
             m.lm_head.int8mode(),
@@ -481,10 +561,43 @@ impl Qwen4ExpBatched {
         let logits = m
             .lm_head
             .forward_dynamic(acts.as_dynamic(), DType::F32)?
-            .to_owned_tensor()?
             .reshape((n, cfg.vocab_size))?;
+        drop(acts);
+        drop(fwd_wave);
         g_head.end();
         Ok((res, logits))
+    }
+
+    /// The draft walk's two carried-residual buffers, `[n, hc, n_embd]` each.
+    ///
+    /// A step reads the residual the step before it wrote and writes its own
+    /// beside it, so the walk alternates between two buffers: the seeds are
+    /// laid into the first, and step `j` writes whichever one step `j − 1` did
+    /// not. Both are held by the engine and grow only when a cohort is wider
+    /// than any before it, so a walk allocates nothing for its carry.
+    fn draft_carry(&self, n: usize) -> Result<(Tensor, Tensor)> {
+        let cfg = &self.model.cfg;
+        let (hc, n_embd) = (cfg.hc.count, cfg.hidden_size);
+        let mut pair = self
+            .draft_carry
+            .lock()
+            .map_err(|_| candle::Error::Msg("draft carry lock poisoned".into()))?;
+        let held = match pair.as_ref() {
+            Some((a, _)) => a.dim(0)?,
+            None => 0,
+        };
+        if held < n {
+            // Fully written before it is read: the seeds go into the first, and
+            // each step writes the buffer it then hands on (invariant 6). Grown
+            // by doubling, so a cohort ramping up settles in a few steps.
+            let dims = ((held * 2).max(n), hc, n_embd);
+            *pair = Some((
+                Tensor::empty(dims, DType::F32, &self.model.device)?,
+                Tensor::empty(dims, DType::F32, &self.model.device)?,
+            ));
+        }
+        let (a, b) = pair.as_ref().expect("sized above");
+        Ok((a.narrow(0, 0, n)?, b.narrow(0, 0, n)?))
     }
 
     /// Draft up to `max_len` proposals for the whole cohort with the head.
@@ -519,7 +632,7 @@ impl Qwen4ExpBatched {
 
         // Every sequence needs a seed. One that has none has not been through a
         // wave yet, so it takes a plain decode row and drafts from the next step.
-        let seed_block = {
+        let seed_rows: Vec<Tensor> = {
             let seeds = self
                 .seeds
                 .read()
@@ -531,12 +644,42 @@ impl Qwen4ExpBatched {
                     None => return Ok(vec![Vec::new(); n]),
                 }
             }
-            if rows.len() == 1 {
-                rows.pop().expect("one row")
-            } else {
-                Tensor::cat(&rows, 0)?
-            }
+            rows
         };
+
+        // **The walk runs on the previous forward's tier, priced for that
+        // forward's width rather than this cohort's.** Each step is one decode
+        // row per sequence through the head's assembly, its attention, its FFN
+        // and the shared head, so the tier must hold the plan for `n` decode
+        // rows; covering it is a no-op when it already does.
+        if let candle::Device::Cuda(d) = dev {
+            let plan = WavePlan::new(self.wave_geometry(DType::F32));
+            // The head's selection at the walk's deepest position, which is the
+            // widest any of its steps scores.
+            let deepest: Vec<usize> = seqs
+                .iter()
+                .map(|&s| session.sequence_offset(s).unwrap_or(0) + max_len - 1)
+                .collect();
+            let num_layers = m.cfg.num_layers;
+            let width = WaveWidth {
+                qsa_bytes: self.wave_qsa_bytes(
+                    seqs,
+                    &vec![1; n],
+                    &deepest,
+                    num_layers,
+                    num_layers,
+                )?,
+                ..WaveWidth::decode(n)
+            };
+            cover_wave_transient(
+                &d.cuda_stream(),
+                [
+                    plan.phase_bytes(LayerPhase::Attention, width),
+                    plan.phase_bytes(LayerPhase::Ffn, width),
+                    plan.phase_bytes(LayerPhase::Forward, width),
+                ],
+            )?;
+        }
 
         // The walk reserves these itself, but the rope depth below has to be
         // read after the reservation — it can grow the backing's block count.
@@ -625,6 +768,25 @@ impl Qwen4ExpBatched {
 
         let index_rope = self.index_rope().clone();
 
+        // The seeds, laid into the first carry buffer in one launch. Taken
+        // under the index lock, which every walk holds for its whole length,
+        // so no other walk can be writing the same pair. The staging
+        // generation stays open across the walk: the last one to close
+        // synchronises the stream, and the walk's own readback does that.
+        let (carry_a, carry_b) = self.draft_carry(n)?;
+        let seed_generation = session.begin_stager_generation();
+        {
+            let width = m.cfg.hc.count * m.cfg.hidden_size;
+            let a_rows = carry_a.reshape((n, width))?;
+            let runs: Vec<RowRun<'_>> = seed_rows
+                .iter()
+                .enumerate()
+                .map(|(i, s)| Ok(RowRun::new(s.reshape((1, width))?, &a_rows, i)))
+                .collect::<Result<_>>()?;
+            rows_scatter(&runs, &seed_generation)?;
+        }
+        drop(seed_rows);
+
         let mut step = |ids: &Tensor,
                         h: &Tensor,
                         caches: &mut [&mut KvCache],
@@ -648,13 +810,17 @@ impl Qwen4ExpBatched {
                 generation,
                 &pm,
             );
-            // Fully written by the lookup (invariant 6), in the head's F32.
-            let embeds = Tensor::empty((ids.elem_count(), m.embed.ncols()), DType::F32, dev)?;
-            m.embed.gather_into(ids, None, Some(&embeds))?;
+            // Whichever carry buffer the previous step did not write.
+            let out = if h.same_storage(&carry_a) {
+                &carry_b
+            } else {
+                &carry_a
+            };
             self.head_draft_step(
                 head,
-                &embeds,
+                ids,
                 h,
+                out,
                 caches,
                 seqs,
                 at,
@@ -666,14 +832,9 @@ impl Qwen4ExpBatched {
             )
         };
         let walked = draft_walk(
-            session,
-            seqs,
-            kv_layer,
-            committed,
-            &seed_block,
-            max_len,
-            &mut step,
+            session, seqs, kv_layer, committed, &carry_a, max_len, &mut step,
         );
+        drop(seed_generation);
         for (&s, snap) in seqs.iter().zip(&snaps) {
             if let Some(cache) = idx_map.get_mut(&s).and_then(|c| c.get_mut(kv_layer)) {
                 cache.restore(snap)?;

@@ -1817,8 +1817,11 @@ pub fn delta_net_advance_spans(
     if replay_ok {
         let spans = super::cuda::build_span_table_all(seqs, &p.qkv)?;
         // Fully kernel-written within the spans and read only within them, so
-        // uninitialised (invariant 6); the gap rows are never touched.
-        let conved = Tensor::empty((t, dims.conv_dim()), DType::F32, p.qkv.device())?;
+        // uninitialised (invariant 6); the gap rows are never touched. Beside
+        // the staged operands, so the whole replay chain — the conv, the scan's
+        // transients and its output — lands on the replay's wave
+        // (`WaveBuffer::Replay*`).
+        let conved = p.qkv.empty_beside((t, dims.conv_dim()), DType::F32)?;
         super::cuda::delta_net_conv_prefill(
             &p.qkv,
             c.conv,
@@ -1827,7 +1830,7 @@ pub fn delta_net_advance_spans(
             rms_eps as f32,
             &conved,
         )?;
-        let o = Tensor::empty((t, dims.value_dim()), DType::F32, p.qkv.device())?;
+        let o = conved.empty_beside((t, dims.value_dim()), DType::F32)?;
         let fused = super::cuda::DeltaNetFused {
             conved: &conved,
             alpha: &p.alpha_lin,

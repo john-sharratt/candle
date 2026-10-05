@@ -116,9 +116,9 @@ pub fn run_folder_conversation(
         // already a sealed turn and has no prefilled half to write.
         seed = &[];
 
-        let steps = tool_round::plan(&got.text);
+        let steps = tool_round::plan(&got.answer);
         if steps.is_empty() || closing {
-            check_summary(&got.text)?;
+            check_summary(&got.answer)?;
             return Ok(FolderSummary {
                 tokens,
                 tool_rounds: round,
@@ -132,7 +132,7 @@ pub fn run_folder_conversation(
         // decoded stands, and since it was a call, `summary_of` refuses it and
         // the unit retries.
         if response.is_blank() {
-            check_summary(&got.text)?;
+            check_summary(&got.answer)?;
             return Ok(FolderSummary {
                 tokens,
                 tool_rounds: round,
@@ -163,11 +163,11 @@ pub fn run_folder_conversation(
 /// whole budget elsewhere). Neither is a summary, and a unit holding one is worse
 /// than a unit holding nothing — its content key would retire it from every
 /// later pass.
-fn check_summary(text: &str) -> anyhow::Result<()> {
-    if !tool_round::plan(text).is_empty() {
+fn check_summary(answer: &TurnText) -> anyhow::Result<()> {
+    if !tool_round::plan(answer).is_empty() {
         anyhow::bail!("folder conversation ended on a tool call, not a summary");
     }
-    if text.trim().is_empty() {
+    if answer.is_blank() {
         anyhow::bail!("folder conversation decoded no summary");
     }
     Ok(())
@@ -180,7 +180,15 @@ mod tests {
     /// A one-sentence answer is a summary.
     #[test]
     fn a_plain_sentence_is_a_summary() {
-        assert!(check_summary("The `a/` folder holds the widget loader.").is_ok());
+        let text = TurnText::literal("The `a/` folder holds the widget loader.");
+        assert!(check_summary(&text).is_ok());
+    }
+
+    /// A summary that quotes the tag names it; it does not make a call.
+    #[test]
+    fn a_summary_quoting_the_tag_is_a_summary() {
+        let text = TurnText::literal("The `tool_round` module plans every `<tool_call>` block.");
+        assert!(check_summary(&text).is_ok());
     }
 
     /// The defect this module exists to fix: a decode that ends on a tool call
@@ -188,7 +196,9 @@ mod tests {
     #[test]
     fn a_tool_call_is_refused_as_a_summary() {
         let text = "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"prefix\": \"a/b/\"}}\n</tool_call>";
-        let err = check_summary(text).unwrap_err().to_string();
+        let err = check_summary(&TurnText::markup(text))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("ended on a tool call"), "{err}");
     }
 
@@ -198,14 +208,16 @@ mod tests {
     fn prose_followed_by_a_call_is_refused() {
         let text = "Let me look inside.\n<tool_call>\n{\"name\": \"file_list\", \
              \"arguments\": {\"prefix\": \"a/b/\"}}\n</tool_call>";
-        assert!(check_summary(text).is_err());
+        assert!(check_summary(&TurnText::markup(text)).is_err());
     }
 
     /// An empty decode is refused too: a blank entry would take the folder's
     /// resume hash and retire it from every later pass.
     #[test]
     fn an_empty_decode_is_refused() {
-        let err = check_summary("   \n").unwrap_err().to_string();
+        let err = check_summary(&TurnText::literal("   \n"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("decoded no summary"), "{err}");
     }
 

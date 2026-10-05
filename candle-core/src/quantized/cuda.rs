@@ -2822,17 +2822,13 @@ fn mul_mat_vec_via_q8_1(
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let row_q8_bytes = ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
     let y_size_in_bytes = b_size * row_q8_bytes;
-    // The staging buffer stays on the pool. It is a bare `CudaSlice` that this
-    // function drops, and dropping a lease means `cuMemFreeAsync` on an address
-    // inside the VMM reservation — which the driver rejects and cudarc records,
-    // once per call. Only `dst` inherits, because only `dst` is wrapped in a
-    // storage that carries its backing.
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
-    quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
-
     let qtype = dtype_to_qtype(dtype)?;
     let (dst, dst_backing) = unsafe { alloc_inheriting::<f32>(dev, nrows * b_size, inherit)? };
-    {
+    // The quantized activation is staged through the device's reused scratch
+    // ([`CudaDevice::with_staging`]): it lives from the quantize to the kernel's
+    // read and no further, so one buffer serves every call on the stream.
+    dev.with_staging(y_size_in_bytes, |y_q8_1| {
+        quantize_q8_1(y, y_q8_1, ncols, b_size, dev)?;
         let stream = dev.cuda_stream();
         let (data_ptr, _data_guard) = data.inner.device_ptr(&stream);
         let (y_q8_1_ptr, _y_guard) = y_q8_1.device_ptr(&stream);
@@ -2858,7 +2854,8 @@ fn mul_mat_vec_via_q8_1(
             }
             off += chunk;
         }
-    }
+        Ok(())
+    })?;
     Ok(CudaStorage::wrap_cuda_slice_backed(
         dst,
         dev.clone(),
@@ -2894,13 +2891,11 @@ fn mul_mat_via_q8_1(
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         k_padded * y_cols * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    // Pool, for the reason given in [`mul_mat_vec_via_q8_1`].
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
-    quantize_q8_1(y, &mut y_q8_1, k, y_cols, dev)?;
-
     let qtype = dtype_to_qtype(dtype)?;
     let (dst, dst_backing) = unsafe { alloc_inheriting::<f32>(dev, x_rows * y_cols, inherit)? };
-    {
+    // Staged as in [`mul_mat_vec_via_q8_1`].
+    dev.with_staging(y_size_in_bytes, |y_q8_1| {
+        quantize_q8_1(y, y_q8_1, k, y_cols, dev)?;
         let stream = dev.cuda_stream();
         let (data_ptr, _data_guard) = data.inner.device_ptr(&stream);
         let (y_q8_1_ptr, _y_guard) = y_q8_1.device_ptr(&stream);
@@ -2918,7 +2913,8 @@ fn mul_mat_via_q8_1(
                 qtype as i32,
             );
         }
-    }
+        Ok(())
+    })?;
     Ok(CudaStorage::wrap_cuda_slice_backed(
         dst,
         dev.clone(),
@@ -5365,7 +5361,7 @@ fn resolve_u8_out(origin: Backing, dev: &CudaDevice, bytes: usize) -> Result<Res
     // other two. A `NoTicket` decline here is always a genuine provenance break:
     // the phase-first buffers described above do not reach it, because they seed
     // a synthesised ticket rather than arriving without one.
-    if let Some(ptr) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN) {
+    if let Some(ptr) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)? {
         let ticket = ticket.expect("a carved range implies a ticket");
         return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
@@ -5394,7 +5390,7 @@ fn resolve_typed_out<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     // Attributed for the same reason as `alloc_inheriting` — this is the other
     // half of the same decision, and a report that cannot tell the two decline
     // reasons apart sends the reader to the wrong fix.
-    if let Some(ptr) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN) {
+    if let Some(ptr) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)? {
         let ticket = ticket.expect("a carved range implies a ticket");
         return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }

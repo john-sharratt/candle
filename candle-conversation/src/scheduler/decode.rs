@@ -623,12 +623,19 @@ impl Scheduler {
         begin_span.end();
         let wave_rows = plan.rows;
         let forward_span = profile::span("decode:forward_cobatched");
-        let logits = match self.decode_forward_cobatched(
+        // The accept walk stacks each block position's rows beside the head's
+        // logits on the forward's span, so the wave prices those stacks.
+        self.session.set_accept_in_place(true);
+        let forwarded = self.decode_forward_cobatched(
             &plan.decode_seqs,
             &plan.decode_inputs,
             &plan.verify_seqs,
             &plan.verify_inputs,
-        ) {
+        );
+        self.session.set_accept_in_place(false);
+        // Held until the rollback: the rows below, the walk's stacks and the
+        // rows the commit checks are all views on the forward's span.
+        let held = match forwarded {
             Ok(l) => l,
             Err(e) => {
                 self.model.abort_verify(&spec_seqs);
@@ -672,8 +679,13 @@ impl Scheduler {
         let _accept_span = profile::span("decode:end_verify_and_sample");
         let verified = {
             let _g = profile::span("decode:end_verify");
-            self.model
-                .end_verify(&mut self.session, &plain, &spec_seqs, &spec_blocks, logits)
+            self.model.end_verify(
+                &mut self.session,
+                &plain,
+                &spec_seqs,
+                &spec_blocks,
+                held.rows.clone(),
+            )
         };
         let (plain_rows, spec_rows) = match verified {
             Ok(r) => r,
@@ -1090,6 +1102,11 @@ impl Scheduler {
             .enumerate()
             .map(|(i, &s)| (s, poss[i] + committed[i]))
             .collect();
+        // Every read of the wave's rows is done; the rollback may run the next
+        // forward, which reclaims their span.
+        drop(captured);
+        drop(rows_of);
+        drop(held);
         if let Err(e) = self.model.truncate_sequences(&mut self.session, &targets) {
             self.fail_all_decodes(&seq_ids, &format!("speculative rollback failed: {e}"));
             return;
@@ -1991,7 +2008,6 @@ impl Scheduler {
         if let Err(e) = super::projection_assembler::fire_gap_fill_batch(
             &mut self.session,
             &*self.model,
-            &self.device,
             &plan_refs,
         ) {
             tracing::warn!(

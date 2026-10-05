@@ -25,22 +25,25 @@
 //! default hooks — this model keeps every [`WaveSweep`] default: its offsets
 //! equal its backing lengths.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
     arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype,
-    plan_wave_transient, DeltaNetWidths, HyperWidths, KvCache, LayerPhase, ModelGeometry,
-    SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth,
+    plan_wave_transient, region_stats, DeltaNetWidths, HyperWidths, KvCache, LayerPhase,
+    ModelGeometry, SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth, REGION_BYTES,
+    WAVE_SPAN_BYTES,
 };
 
 use super::kv_row::kv_factors_for;
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
+use super::capture_rows::CaptureRows;
 use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
@@ -48,11 +51,14 @@ use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{compact_index_caches, select_layer, IndexCache, IndexSnapshot};
 use super::paged_index;
 use super::paged_index::SealedIndex;
-use super::ple::{ple_apply_spans, PleSpan, PleState};
+use super::ple::{PleSpan, PleState};
+use super::ple_fused::ple_apply_spans_fused;
 use super::qsa::IndexerWeights;
 use super::qsa_select::budget_fits_kernel;
 use super::resident_page::{PageRegistry, PieceKey, ResidentPage};
+use super::select_bytes::select_layer_bytes;
 use super::spec::SpecCapture;
+use super::state_slots::state_buffer;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, WaveResult,
     MAX_PREFILL_TOKENS,
@@ -78,9 +84,9 @@ use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::span;
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
-use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows};
+use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows, VerifyStash};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
-use crate::models::wave_buffers::wave_from_vec_ticketed;
+use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
 use super::rope::flash_next_schedule;
 use crate::models::tensor_cat::TensorCat;
@@ -88,28 +94,7 @@ use crate::models::verify_wave::{upload_plan_rows, VerifyPlan};
 use crate::models::wave_admit::admit_wave_kv;
 use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
 use crate::models::wave_token_ids::host_token_ids;
-
-/// Pool ground reserved from the driver and not in use — what an eager transient
-/// can allocate without a fresh driver reservation.
-///
-/// The reserved-but-unused gap, deliberately, not the driver's free memory: the
-/// pool has already taken this ground, so an allocation inside it cannot fail for
-/// want of a reservation, while the driver's free figure is ground the expert zone
-/// and the span reservation are still competing for. `None` off CUDA, or when the
-/// pool declines to report.
-fn pool_cushion_bytes(device: &Device) -> Option<usize> {
-    #[cfg(feature = "cuda")]
-    {
-        if let Device::Cuda(d) = device {
-            if let (Ok(used), Ok(reserved)) = (d.pool_used_bytes(), d.pool_reserved_bytes()) {
-                return Some(reserved.saturating_sub(used));
-            }
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    let _ = device;
-    None
-}
+use crate::models::window_residuals::WindowResiduals;
 
 /// Seal `c`'s live tail into a **position-free** record: its completed rows and
 /// its open block, read back to the host.
@@ -174,6 +159,16 @@ pub struct Qwen4ExpBatched {
     /// checkpoint with no head, and reset with the other carried state when a
     /// sequence starts over. See [`super::draft`].
     pub(super) seeds: RwLock<SeedStore>,
+    /// Each sequence's second seed buffer, which the next carry writes before
+    /// it becomes the seed. Dropped wherever a seed is put back or taken away,
+    /// so it never names a buffer [`Self::seeds`] holds. See [`SeedStore`].
+    pub(super) seed_spares: RwLock<SeedStore>,
+    /// The draft walk's two carried-residual buffers, sized for the widest
+    /// cohort drafted so far. See [`Self::draft_carry`].
+    pub(super) draft_carry: Mutex<Option<(Tensor, Tensor)>>,
+    /// The rewind stash and the kept rows between speculative steps, sized for
+    /// the widest cohort verified so far. See [`Self::verify_stash_for`].
+    pub(super) verify_stash: Mutex<Option<(VerifyStash, CaptureRows)>>,
     /// Sequences whose carried state was put there **deliberately** — by a view
     /// carve or by a resume — and which must therefore survive exactly one
     /// `offset == 0` reset in [`Self::ensure_seq_state`].
@@ -525,7 +520,7 @@ impl Qwen4ExpBatched {
             // Sealing is not a forward: no phase is open to carve from. The
             // flush consumes the carried rows, so the page IS the whole piece
             // and there is no open block to carry with it.
-            let cells = c.flush_open_block(w, cfg.rms_norm_eps, None)?;
+            let cells = c.flush_open_block(w, cfg.rms_norm_eps)?;
             pages.push(seal_live(c, cells.unwrap_or(ratio))?);
         }
         Ok(Some(paged_index::encode_aux(&[], &pages)?))
@@ -621,7 +616,7 @@ impl Qwen4ExpBatched {
                     .saturating_sub(c.page_row_span())
             };
             let mut fork = c.fork()?;
-            let cells = fork.flush_open_block(w, cfg.rms_norm_eps, None)?;
+            let cells = fork.flush_open_block(w, cfg.rms_norm_eps)?;
             let d = fork.head_dim();
             let rows = fork.live_rows_host()?;
             let n = rows.len() / d;
@@ -783,7 +778,7 @@ impl Qwen4ExpBatched {
                     continue;
                 }
                 let mut fork = c.fork()?;
-                let cells = fork.flush_open_block(w, cfg.rms_norm_eps, None)?;
+                let cells = fork.flush_open_block(w, cfg.rms_norm_eps)?;
                 layer_pages.push(seal_live(&fork, cells.unwrap_or(ratio))?);
             }
             blobs.push((tail_tokens, paged_index::encode_aux(&[], &layer_pages)?));
@@ -972,6 +967,18 @@ impl Qwen4ExpBatched {
         {
             let mut map = self
                 .seeds
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: seeds lock poisoned".into()))?;
+            if let Some(s) = map.remove(&child) {
+                map.insert(parent, s);
+            }
+        }
+        {
+            // The spare follows its seed, so the parent's pair stays two
+            // distinct buffers; a parent whose seed was not replaced keeps its
+            // own spare.
+            let mut map = self
+                .seed_spares
                 .write()
                 .map_err(|_| candle::Error::Msg("qwen4exp: seeds lock poisoned".into()))?;
             if let Some(s) = map.remove(&child) {
@@ -1182,18 +1189,26 @@ impl Qwen4ExpBatched {
             &self.model.device,
             max_moves,
         )?;
-        // The stash only exists while a verify is armed, and only a stash with no
-        // outstanding span may move — `compact_verify_stash` enforces that itself
-        // and answers (0, 0) otherwise.
+        // The stash is armed inside a verify's capture or parked between steps —
+        // the same buffers either way, and both are on this thread between
+        // forwards, where a move cannot race a capture or a replay.
         let stash_before = arena_regions(&self.model.device, SlotTenant::RewindStash);
         let stash = {
             let mut g = self
                 .verify
                 .write()
                 .map_err(|_| candle::Error::Msg("verify lock poisoned".into()))?;
-            match g.as_mut() {
-                Some(cap) => compact_verify_stash(
-                    &mut cap.delta,
+            let mut parked = self
+                .verify_stash
+                .lock()
+                .map_err(|_| candle::Error::Msg("verify stash lock poisoned".into()))?;
+            let target = match g.as_mut() {
+                Some(cap) => Some(&mut cap.delta),
+                None => parked.as_mut().map(|(delta, _)| delta),
+            };
+            match target {
+                Some(delta) => compact_verify_stash(
+                    delta,
                     &self.model.cfg.delta_net,
                     &self.model.device,
                     max_moves,
@@ -1239,6 +1254,9 @@ impl Qwen4ExpBatched {
             model,
             recurrent: RwLock::new(HashMap::new()),
             seeds: RwLock::new(SeedStore::new()),
+            seed_spares: RwLock::new(SeedStore::new()),
+            draft_carry: Mutex::new(None),
+            verify_stash: Mutex::new(None),
             seeded: RwLock::new(HashSet::new()),
             verify: RwLock::new(None),
             ple: RwLock::new(HashMap::new()),
@@ -1427,6 +1445,9 @@ impl Qwen4ExpBatched {
             if starting_over || !ple.contains_key(&seq) {
                 ple.insert(seq, PleState::zeros(&cfg.ple, hc_dim, &self.model.device)?);
             }
+            // The fused block's second history buffer, made here rather than in
+            // the forward: a new state has none, and a rewind drops it.
+            ple.get_mut(&seq).expect("inserted above").ensure_spare()?;
         }
         // A sequence starting over has no previous row for the head to read,
         // and a stale seed here is the previous conversation's state feeding
@@ -1437,6 +1458,34 @@ impl Qwen4ExpBatched {
                 .write()
                 .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?
                 .remove(&seq);
+            self.seed_spares
+                .write()
+                .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?
+                .remove(&seq);
+        }
+        // The head's two seed buffers, made here rather than in the forward. A
+        // sequence with no seed is one the head has never run behind, whose
+        // first row reaches back to zeros (see `SeedStore`); its spare is the
+        // buffer the first carry writes. A failed wave drops the spare, and
+        // this replaces it before the next.
+        if self.model.mtp.is_some() {
+            let dims = (1, cfg.hc.count, cfg.hidden_size);
+            let dev = &self.model.device;
+            let mut seeds = self
+                .seeds
+                .write()
+                .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?;
+            if let Entry::Vacant(e) = seeds.entry(seq) {
+                e.insert(state_buffer(dev, dims, true)?);
+            }
+            let mut spares = self
+                .seed_spares
+                .write()
+                .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?;
+            if let Entry::Vacant(e) = spares.entry(seq) {
+                // Written by the carry before it is read (invariant 6).
+                e.insert(state_buffer(dev, dims, false)?);
+            }
         }
         Ok(())
     }
@@ -1463,6 +1512,63 @@ impl Qwen4ExpBatched {
             }
         }
         ratios
+    }
+
+    /// The most any one KV layer a sweep over `[layer_start, layer_end)` runs
+    /// carves for its sparse selection — the trunk's attention layers in the
+    /// window, and the draft head's when the sweep reaches it. What the wave
+    /// plan prices as `WaveBuffer::QsaSelection`; see
+    /// [`super::select_bytes`] for why the model states it.
+    ///
+    /// The rows are the wave's, decode then prefill, `offsets[i]` the first
+    /// position of `seq_ids[i]`'s `q_lens[i]` rows.
+    #[cfg(feature = "cuda")]
+    pub(super) fn wave_qsa_bytes(
+        &self,
+        seq_ids: &[usize],
+        q_lens: &[usize],
+        offsets: &[usize],
+        layer_start: usize,
+        layer_end: usize,
+    ) -> Result<usize> {
+        let spans = seq_spans(seq_ids, q_lens)?;
+        let idx = self
+            .index
+            .read()
+            .map_err(|_| candle::Error::Msg("index lock poisoned".into()))?;
+        let cfg = &self.model.cfg;
+        let mut worst = 0usize;
+        let mut kv = 0usize;
+        for (li, layer) in self.model.layers.iter().enumerate() {
+            if let GpuLayerMix::Attention { compress_ratio, .. } = &layer.mix {
+                if (layer_start..layer_end).contains(&li) {
+                    worst = worst.max(select_layer_bytes(
+                        kv,
+                        *compress_ratio,
+                        &spans,
+                        offsets,
+                        &idx,
+                        &cfg.indexer,
+                    )?);
+                }
+                kv += 1;
+            }
+        }
+        if layer_end == cfg.num_layers {
+            if let Some(head) = &self.model.mtp {
+                if let GpuLayerMix::Attention { compress_ratio, .. } = &head.block.mix {
+                    worst = worst.max(select_layer_bytes(
+                        kv,
+                        *compress_ratio,
+                        &spans,
+                        offsets,
+                        &idx,
+                        &cfg.indexer,
+                    )?);
+                }
+            }
+        }
+        Ok(worst)
     }
 
     /// Each KV layer's indexer weights, in the same KV-layer order as
@@ -1552,6 +1658,11 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
                     conv_dim: cfg.delta_net.conv_dim(),
                     value_dim: cfg.delta_net.value_dim(),
                     n_v_heads: cfg.delta_net.n_v_heads,
+                    layers: cfg
+                        .layer_kinds
+                        .iter()
+                        .filter(|k| matches!(k, LayerKind::DeltaNet))
+                        .count(),
                 }),
             // Every MoE layer adds an always-active shared expert to the routed
             // block, its gate projection stored padded to one KO tile.
@@ -1585,55 +1696,35 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             hyper: Some(HyperWidths {
                 streams: cfg.hc.count,
                 low_rank: cfg.hc.low_rank,
+                draft_head: self.model.mtp.is_some(),
+                ple: true,
             }),
+            // The multi-stream head is the one `HyperWidths` states.
+            mtp_head: false,
         }
     }
 
-    /// This forward takes its transients from the CUDA pool (the eager Gated
-    /// Residual path has not adopted the span's wave arenas), so the default
-    /// cap's FFN-span pricing bounds a tier this model never allocates from —
-    /// the same posture DeepSeek-V4 holds.
+    /// The widest prefill **this card** can place: the rows whose whole tier —
+    /// every phase, priced in [`Self::wave_geometry`] — fits the ground a
+    /// forward can reach ([`Self::placeable_tier_bytes`]), bounded by where
+    /// compute saturates and by what the KV side can hold.
     ///
-    /// What DOES bind is the eager GR chain itself: at its peak it holds ~6
-    /// wide `[rows, hc·n_embd]` F32 intermediates — ~250 KB a row — in the
-    /// pool cushion the weight zone leaves. Bounding one forward's rows keeps the
-    /// peak inside it; the pure-prefill slab slicer turns a wider fleet into
-    /// sequential slabs. Fusing the GR (the §0.4 work the design doc records)
-    /// removes this term.
-    ///
-    /// **Priced against the cushion, not fixed at a row count.** This was a flat
-    /// 2,048 — half a gigabyte of GR peak against a cushion the comment itself
-    /// described as "~2–3 GiB", so it bound the wave at a third of what the pool
-    /// could hold, and it bound it identically whether the weight zone had conceded
-    /// ground or not. On an ingest that is the whole throughput of the engine: the
-    /// wave's head is one repo-map unit of a couple of thousand tokens, it takes
-    /// the cap on the head waiver, and **every** sequence offered behind it is
-    /// refused `Cap` — measured on this daemon at `--max-depth 3`, an 82-row offer
-    /// refused against `max_rows=2048` with the weight floor 14.4 GiB away, waves
-    /// running `seqs max=1` at 260 t/s where the batched gate does ~1,800.
-    ///
-    /// Reading the live cushion makes the cap move the right way on its own: when
-    /// the weight side concedes for prefill the pool gap grows and the wave widens,
-    /// which is the trade this engine wants made at prefill time. Falls back to the
-    /// old constant when the pool cannot be read (a CPU device, a test), so the
-    /// bound is never absent.
+    /// Not the generic single-phase bound (rows that fit a fixed 512 MiB FFN
+    /// span), which cuts a 72 GB card's prefill to a fraction of the width its
+    /// tier can carry; and not unbounded either, which hands a 16 GB card slabs
+    /// whose tier it cannot place. On a card with tens of GB the weight side
+    /// could concede, this opens to the compute ceiling and the admission rate
+    /// model picks the width within it; on a small card it sits near the tier
+    /// the partition always has room for.
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
-        /// The GR chain's peak per prefill row: ~6 wide `[rows, hc·n_embd]` F32
-        /// intermediates live at once. Measured as the ~250 KB a row the eager
-        /// path's own note records.
-        const GR_PEAK_BYTES_PER_ROW: usize = 250 * 1024;
-        /// Fraction of the free pool the GR chain may stand in. The cushion also
-        /// carries the wave's other pool allocations and the next KV claim, so the
-        /// chain takes half and leaves half.
-        const GR_CUSHION_SHARE: usize = 2;
-        /// The bound when the pool cannot be read — the value this cap held before
-        /// it was priced, so an unreadable pool is no worse than it was.
-        const GR_EAGER_ROW_FLOOR: usize = 2048;
-
-        let from_cushion = pool_cushion_bytes(&self.model.device)
-            .map(|cushion| cushion / GR_CUSHION_SHARE / GR_PEAK_BYTES_PER_ROW)
-            .unwrap_or(0);
-        let mut cap = MAX_PREFILL_TOKENS.min(from_cushion.max(GR_EAGER_ROW_FLOOR));
+        let mut cap = MAX_PREFILL_TOKENS;
+        if let Some(ground) = self.placeable_tier_bytes() {
+            let fits = WavePlan::new(self.wave_geometry(act_dtype))
+                .max_prefill_rows_for_tier(ground, WaveWidth::default());
+            if fits > 0 {
+                cap = cap.min(fits);
+            }
+        }
         if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
             cap = cap.min(kv_fits);
         }
@@ -1900,7 +1991,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         // else the caller has on the wave. One upload per group.
         let dseqs: Vec<usize> = plain.iter().map(|&(s, _)| s).collect();
         let tokens: Vec<u32> = plain.iter().map(|&(_, t)| t).collect();
-        let (dinputs, pinputs) = upload_plan_rows(&tokens, blocks, &self.model.device)?;
+        let (dinputs, pinputs) = upload_plan_rows(&tokens, blocks)?;
 
         // **Size the stash before the forward opens.** A wave's storage is
         // claimed by `admit_wave_kv` and the transient tier placed against that
@@ -1912,12 +2003,18 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             .enumerate()
             .map(|(i, &s)| (s, blocks[i].len()))
             .collect();
-        let cap = SpecCapture::new(
-            &cohort,
-            &self.model.cfg.layer_kinds,
-            &self.model.cfg.delta_net,
-            &self.model.device,
-        )?;
+        // A capture still armed from a step that never reached its rewind is
+        // released first, so its stash is the one this step reuses.
+        let stale = self
+            .verify
+            .write()
+            .map_err(|_| candle::Error::Msg("verify lock poisoned".into()))?
+            .take();
+        if let Some(old) = stale {
+            self.park_verify_stash(old);
+        }
+        let rows: usize = cohort.iter().map(|&(_, n)| n).sum();
+        let cap = SpecCapture::new(&cohort, self.verify_stash_for(rows)?)?;
         let mut tokens: Vec<(usize, Vec<u32>)> = Vec::with_capacity(seqs.len());
         for (i, &s) in seqs.iter().enumerate() {
             tokens.push((s, blocks[i].clone()));
@@ -1972,8 +2069,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// from it.
     fn abort_verify(&self, seqs: &[usize]) {
         let _ = seqs;
-        if let Ok(mut g) = self.verify.write() {
-            *g = None;
+        let released = self.verify.write().ok().and_then(|mut g| g.take());
+        if let Some(cap) = released {
+            self.park_verify_stash(cap);
         }
     }
 
@@ -2067,6 +2165,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if let Ok(mut m) = self.seeds.write() {
             m.clear();
         }
+        if let Ok(mut m) = self.seed_spares.write() {
+            m.clear();
+        }
         Ok(())
     }
 
@@ -2078,6 +2179,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     fn release_sequence(&self, seq: usize) -> Result<()> {
         if let Ok(mut m) = self.recurrent.write() {
             m.remove(&seq);
+            // **The parked rewind stash goes with the last sequence.** It is
+            // kept across steps for the next verify, and carved from the
+            // reservation — so with nobody left to verify it would pin its
+            // regions for the life of the process, where no arena sweep can
+            // see them because they are not KV.
+            if m.is_empty() {
+                if let Ok(mut parked) = self.verify_stash.lock() {
+                    *parked = None;
+                }
+            }
         }
         if let Ok(mut m) = self.ple.write() {
             m.remove(&seq);
@@ -2089,6 +2200,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             m.remove(&seq);
         }
         if let Ok(mut m) = self.seeds.write() {
+            m.remove(&seq);
+        }
+        if let Ok(mut m) = self.seed_spares.write() {
             m.remove(&seq);
         }
         // Or the next sequence to be handed this slot id inherits a suppression
@@ -2209,6 +2323,7 @@ impl WaveSweep for Qwen4ExpBatched {
             layer_start,
             layer_end,
             x_in,
+            window,
             act_dtype: _,
             adapter,
         } = wave;
@@ -2415,6 +2530,13 @@ impl WaveSweep for Qwen4ExpBatched {
                     // The caller's accept walk selects on the head's span only
                     // when it reads the logits there.
                     accept_rows: if accept_in_place { scored_rows } else { 0 },
+                    qsa_bytes: self.wave_qsa_bytes(
+                        seq_ids,
+                        &q_lens,
+                        &offsets,
+                        layer_start,
+                        layer_end,
+                    )?,
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),
@@ -2527,6 +2649,7 @@ impl WaveSweep for Qwen4ExpBatched {
             (total_rows, pre_rows),
             (layer_start, layer_end),
             x_in,
+            window,
             (decode_headers, prefill_headers),
             generation,
             eps,
@@ -2582,7 +2705,15 @@ impl WaveSweep for Qwen4ExpBatched {
                 .seeds
                 .write()
                 .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?;
+            let mut spares = self
+                .seed_spares
+                .write()
+                .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?;
             for (s, seed) in seed_snapshot {
+                // The carry may already have flipped: the seed being put back
+                // would then also be the spare, and the next carry would write
+                // the seed it reads.
+                spares.remove(&s);
                 match seed {
                     // Restore what the sequence entered the wave with — which
                     // for a sequence that had none is nothing, so the entry is
@@ -2647,6 +2778,21 @@ impl WaveSweep for Qwen4ExpBatched {
 }
 
 impl Qwen4ExpBatched {
+    /// Bytes a forward's tier can be placed in: the KV side's free ground —
+    /// counting what the standing tier blocks, which the next forward releases
+    /// first — plus what the weight side could still concede above its floor.
+    /// Never less than [`WAVE_SPAN_BYTES`], the tier the partition always
+    /// leaves room for. `None` where there is no span to measure (a CPU
+    /// device, a test).
+    fn placeable_tier_bytes(&self) -> Option<usize> {
+        let stats = region_stats(0)?;
+        let free = (stats.free + stats.blocked).saturating_mul(REGION_BYTES);
+        Some(
+            free.saturating_add(self.model.experts.cedeable_span_bytes())
+                .max(WAVE_SPAN_BYTES),
+        )
+    }
+
     /// One full-attention layer's QSA work: append every sequence's index
     /// keys, then build the wave's selection table if any row is past the
     /// budget.
@@ -2707,6 +2853,7 @@ impl Qwen4ExpBatched {
         rows: (usize, usize),
         range: (usize, usize),
         x_in: Option<TensorCat>,
+        window: &WindowResiduals,
         headers: (DecodeHeaders, DecodeHeaders),
         generation: &candle::quantized::pinned_staging::Generation,
         eps: f64,
@@ -2737,27 +2884,53 @@ impl Qwen4ExpBatched {
         //
         // One launch fills both: the fresh residual is the embedding repeated
         // across the `hc` streams, written by the gather itself, and the head
-        // reads the bare rows. Both destinations are pool allocations, as the
-        // `index_select` + `broadcast_as().contiguous()` pair they replace
-        // were, and both are fully written (invariant 6).
+        // reads the bare rows. Both are fully written (invariant 6), and both
+        // are on the forward span whenever the sweep reaches the head
+        // (`WaveBuffer::HyperResidual`, `WaveBuffer::HeadRowEmbeds`) — see the
+        // residual below for the window that does not.
         let fresh = x_in.is_none();
-        let head_embeds = layer_end == num_layers && m.mtp.is_some();
+        let reaches_head = layer_end == num_layers;
+        let head_embeds = reaches_head && m.mtp.is_some();
+        let res_dims = (total_rows, hc, n_embd);
+        // The residual's home: the forward span for a sweep that reaches the
+        // head, a held window buffer for one that hands it on.
+        let residual_buffer = || -> Result<Tensor> {
+            if reaches_head {
+                wave_empty_ticketed(res_dims, DType::F32, dev, fwd_ticket)
+            } else {
+                window.take(res_dims, DType::F32, dev)
+            }
+        };
         let entry = if fresh {
-            Some(Tensor::empty((total_rows, hc, n_embd), DType::F32, dev)?)
+            Some(residual_buffer()?)
         } else {
             None
         };
         let row_embeds = if head_embeds {
-            Some(Tensor::empty((total_rows, n_embd), DType::F32, dev)?)
+            Some(wave_empty_ticketed(
+                (total_rows, n_embd),
+                DType::F32,
+                dev,
+                fwd_ticket,
+            )?)
         } else {
             None
         };
         // Per-sequence host token ids, read once: the embedding gather below and
-        // the PLE hash side both take them from here.
-        let seq_tokens: Vec<Vec<u32>> = host_token_ids(inputs)?;
+        // the PLE hash side both take them from here. The buffer they were read
+        // through stays on the forward span as every row's id in wave order —
+        // what the gather reads — so only a wave with a host-side input uploads
+        // its ids again (`WaveBuffer::RowTokenIds` prices both).
+        let ids = host_token_ids(inputs, fwd_ticket)?;
+        let seq_tokens: Vec<Vec<u32>> = ids.per_input;
         if fresh || head_embeds {
-            let flat_ids: Vec<u32> = seq_tokens.iter().flatten().copied().collect();
-            let ids = wave_from_vec_ticketed(flat_ids, (total_rows,), dev, fwd_ticket)?;
+            let ids = match ids.device {
+                Some(t) => t,
+                None => {
+                    let flat_ids: Vec<u32> = seq_tokens.iter().flatten().copied().collect();
+                    wave_from_vec_ticketed(flat_ids, (total_rows,), dev, fwd_ticket)?
+                }
+            };
             m.embed
                 .gather_into(&ids, entry.as_ref(), row_embeds.as_ref())?;
         }
@@ -2766,10 +2939,12 @@ impl Qwen4ExpBatched {
         //
         // **One buffer for the whole forward, updated in place.** `hc_combine`
         // adds each block's scatter into `res` where it stands, so the wide
-        // `[rows, hc, hidden]` stream is this one allocation, not one per
-        // combine. It stays on the pool: the residual crosses every phase reset,
-        // and a windowed sweep hands it back as `WavePhase::Residual` for the
-        // next wave to resume from, past the forward span's reset.
+        // `[rows, hc, hidden]` stream is this one buffer, not one per combine.
+        // It crosses every layer phase's reset, so a sweep that reaches the
+        // head carves it from the forward span, which outlives them all. A
+        // window that stops short hands it back as `WavePhase::Residual` for
+        // the next wave to resume from — past this span's reset — so there it
+        // is one of the session's held window buffers.
         //
         // **A resumed residual is copied first.** `x_in` is the caller's tensor:
         // the residual a previous window handed back to be persisted, which the
@@ -2779,7 +2954,12 @@ impl Qwen4ExpBatched {
         // per resumed forward is the price; the fresh path writes its gathered
         // rows straight into a buffer it owns.
         let mut res = match x_in {
-            Some(t) => t.to_tensor().reshape((total_rows, hc, n_embd))?.copy()?,
+            Some(t) => {
+                let src = t.to_tensor().reshape(res_dims)?;
+                let dst = residual_buffer()?;
+                dst.slice_set(&src, 0, 0)?;
+                dst
+            }
             None => entry.expect("allocated whenever the residual is fresh"),
         };
 
@@ -2889,7 +3069,7 @@ impl Qwen4ExpBatched {
                     })
                 })
                 .collect::<Result<_>>()?;
-            build_wave_table(&spans, &stores, None)?
+            build_wave_table(&spans, &stores, fwd_ticket)?
         };
 
         // Sub-block finiteness probes for the layer bisect — sync readbacks,
@@ -2957,23 +3137,38 @@ impl Qwen4ExpBatched {
                             .is_some_and(|c| c.seqs.contains_key(&span.seq)),
                     });
                 }
-                let (out, captured) = ple_apply_spans(
-                    &res,
+                // Its own phase, opened and closed here before the mixer opens
+                // the same generation: every PLE transient is consumed by the
+                // two fused launches, and the residual they write is the
+                // wave's own buffer.
+                let Device::Cuda(cuda) = dev else {
+                    candle::bail!("qwen4exp: the PLE block runs on CUDA");
+                };
+                let ple_wave = begin_wave(&cuda.cuda_stream(), LayerPhase::Attention)?;
+                let captured = ple_apply_spans_fused(
+                    &mut res,
                     &mut ple_spans,
                     m.ple_table.as_ref(),
                     &m.ple_w,
                     &cfg.ple,
                     eps,
+                    Some(ple_wave.ticket()),
                 )?;
                 drop(ple_spans);
-                res = out;
+                // Kept before the phase closes: the captured rows are views on
+                // it, copied into the cohort's kept-row buffer at each
+                // sequence's stash row.
                 if let Some(c) = cap_map.as_mut() {
+                    let SpecCapture {
+                        seqs, rows: kept, ..
+                    } = c;
                     for (span, rows) in spans.iter().zip(captured) {
-                        if let (Some(s), Some(rows)) = (c.seqs.get_mut(&span.seq), rows) {
-                            s.ple_rows = Some(rows);
+                        if let (Some(s), Some(rows)) = (seqs.get_mut(&span.seq), rows) {
+                            s.ple_rows = Some(CaptureRows::keep(&kept.ple, s.row, &rows)?);
                         }
                     }
                 }
+                drop(ple_wave);
             }
             if let Some(g) = g_ple {
                 g.end();
@@ -3398,6 +3593,10 @@ impl Qwen4ExpBatched {
                     .seeds
                     .write()
                     .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?;
+                let mut spares = self
+                    .seed_spares
+                    .write()
+                    .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?;
                 let hw = HeadWave {
                     n_decode,
                     pre_rows,
@@ -3411,6 +3610,7 @@ impl Qwen4ExpBatched {
                     kv_layer: cfg
                         .mtp_kv_layer()
                         .ok_or_else(|| candle::Error::msg("a head means a head KV layer"))?,
+                    generation,
                 };
                 let embeds = row_embeds
                     .as_ref()
@@ -3421,6 +3621,7 @@ impl Qwen4ExpBatched {
                     &mut idx_map,
                     cap_map.as_mut(),
                     &mut seeds,
+                    &mut spares,
                     &res,
                     embeds,
                     &hw,
@@ -3477,10 +3678,11 @@ impl Qwen4ExpBatched {
         // row (all decode) takes the residual as it stands.
         //
         // The mix runs on the forward span, where the plan prices it at the
-        // scored rows (`WaveBuffer::HyperHead*`). The selected residual comes
-        // off the pool, as the residual itself does.
+        // scored rows (`WaveBuffer::HyperHead*`). A scattered selection gathers
+        // beside the residual, which is on that span too, with its index
+        // (`WaveBuffer::HeadScoredResidual`, `WaveBuffer::HeadScoredRows`).
         let r_total = sel.len();
-        let scored_res = select_head_rows(&res, sel, 0)?;
+        let scored_res = select_head_rows(&res, sel, 0, fwd_ticket)?;
         let (scored, _) = hc_mix(&scored_res, &m.out_hc, eps, fwd_ticket)?;
         let acts = {
             let candle::Device::Cuda(cuda) = dev else {

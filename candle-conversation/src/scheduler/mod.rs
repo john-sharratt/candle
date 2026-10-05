@@ -34,6 +34,7 @@ mod compaction_stall;
 mod decode;
 mod ephemeral_fork;
 pub mod exported_state;
+mod first_sample;
 mod guest_room;
 mod interleave;
 #[cfg(feature = "kv-zero-check")]
@@ -55,11 +56,13 @@ mod seal_scan;
 mod spec_chooser;
 #[cfg(test)]
 mod test_substrate;
+mod wave_logits;
 
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
 use crate::conversation::slice_per_layer_sealed;
 use crate::decode_health::DecodeHealthState;
+use crate::decoded_text::{decode_turn_text, TagIds};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
 use crate::index_pages;
@@ -101,7 +104,10 @@ use crate::summary_tree::{
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
+use crate::turn_text::TurnText;
 use crate::{FinishReason, SubstrateReloadStatus, TurnStats};
+use admit::pass_budget::RateWidth;
+use first_sample::PrefillEnd;
 
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, Tensor};
@@ -1298,8 +1304,9 @@ struct ReprojectInFlight {
 /// [`Scheduler::cleanup_finished`] carries across the batched closing-tail forward.
 struct FinishedTurn {
     state: DecodeState,
-    /// The reply as the caller receives it: the written half, then the decoded one.
-    text: String,
+    /// The reply as the caller receives it: the written half, then the decoded
+    /// one, split where the model wrote tags ([`TurnResponse::answer`]).
+    answer: TurnText,
     decode_ms: f64,
     total_ms: f64,
     tokens_generated: usize,
@@ -2015,9 +2022,10 @@ pub(super) struct ActivePrefill {
     /// reach and emit. Advances as the prefill crosses each staged projection
     /// point. Unused (stays 0) for a normal prefill with no offsets.
     pub(super) next_projection: usize,
-    /// Set once `offset >= work.tokens.len()` by the chunk runner.
-    /// Drained by `promote_finished_prefills_to_decodes`.
-    pub(super) final_logits: Option<Tensor>,
+    /// How the last chunk ended — for a turn, its first token sampled in the
+    /// wave that delivered that chunk (`first_sample`). Drained by
+    /// `promote_finished_prefills_to_decodes`.
+    pub(super) finished: Option<PrefillEnd>,
     /// Set if any chunk for this prefill failed.
     pub(super) error: Option<ConversationError>,
     /// Wall-clock when prefill processing actually started (first chunk).
@@ -2928,6 +2936,10 @@ pub(crate) struct Scheduler {
     session: BatchedInferenceSession,
     /// Shared tokenizer for streaming decode.
     tokenizer: tokenizers::Tokenizer,
+    /// The tokenizer's tag ids, which split a finished turn's text into what
+    /// the model wrote as tags and what it wrote as text
+    /// ([`TurnResponse::answer`]).
+    tag_ids: TagIds,
     /// The `</think>` token id, when the tokenizer has a single token for it.
     ///
     /// **The reasoning span's end, measured rather than re-derived.** A turn's
@@ -3078,6 +3090,24 @@ pub(crate) struct Scheduler {
     /// When a submission exceeds this, it is split into multiple forward passes
     /// so intermediate activation buffers stay bounded.
     max_prefill_pass_tokens: usize,
+    /// The forward width the rate model chose for the prefill cohort in flight
+    /// — the rows admitted when it judged that more would not make the forward
+    /// faster — and how many prefills that cohort held when it did.
+    ///
+    /// The turns admitted past that point join the cohort rather than widening
+    /// its forward (`Ground::close_rows`), so the forwards they share are
+    /// composed at this width — [`Self::prefill_pass_budget`] is bounded by it.
+    /// Without it they would be composed against the deployment's whole target,
+    /// which is a width the rate model has just refused.
+    ///
+    /// **A verdict on one cohort, not a setting.** It lapses when that cohort
+    /// shrinks — fewer members share the forward, so the trade it weighed is no
+    /// longer the one being made — and is replaced whenever a later pass offers
+    /// rows: one that stops on the rate sets a new width, one whose rows all pay
+    /// clears it. A busy daemon, where some prefill is always running, would
+    /// otherwise compose every later forward at a width judged for a cohort
+    /// long gone.
+    rate_width: Option<RateWidth>,
     /// Per-turn view ownership: `view_id → ViewState`.
     ///
     /// Populated when [`SchedulerRequest::SubmitTurn`] creates a view
@@ -3568,6 +3598,7 @@ impl Scheduler {
             model,
             session,
             gallery_arena,
+            tag_ids: TagIds::of(&tokenizer),
             tokenizer,
             think_close,
             page_break_tokens,
@@ -3596,6 +3627,7 @@ impl Scheduler {
             health_config,
             chunk_size,
             max_prefill_pass_tokens,
+            rate_width: None,
             slot_conversations: HashMap::new(),
             slot_targets: HashMap::new(),
             ephemeral_slots: std::collections::HashSet::new(),
@@ -5535,24 +5567,20 @@ impl Scheduler {
         // as the summary.
         let mut asst_start = self.boundary_markers.assistant_start.as_ref().clone();
         asst_start.extend_from_slice(&self.boundary_markers.no_think_block);
-        let prefill_logits = self
-            .run_prefill(slot, &asst_start)
-            .map_err(|e| format!("SubmitSummaryProbe: prefill assistant_start: {e}"))?;
-        let prefill_ms = turn_start.elapsed().as_secs_f64() * 1000.0;
-        let prefill_token_count = self.session.sequence_offset(slot.0).unwrap_or(0);
-
         let config = SamplingConfig::compression();
         let mut sstate = self
             .sampling_states
             .remove(&slot)
             .ok_or_else(|| "SubmitSummaryProbe: missing sampling state".to_string())?;
         let first = self
-            .sample_single(&prefill_logits, &config, &mut sstate)
+            .run_prefill_sampled(slot, &asst_start, &config, &mut sstate)
             .map_err(|e| {
                 self.sampling_states.insert(slot, sstate.clone());
-                format!("SubmitSummaryProbe: sample first: {e}")
+                format!("SubmitSummaryProbe: prefill assistant_start and sample first: {e}")
             })?;
         self.sampling_states.insert(slot, sstate);
+        let prefill_ms = turn_start.elapsed().as_secs_f64() * 1000.0;
+        let prefill_token_count = self.session.sequence_offset(slot.0).unwrap_or(0);
 
         if self.is_eos(first) {
             return Err(
@@ -6953,10 +6981,11 @@ impl Scheduler {
     ) {
         let skip = !self.show_special_tokens;
         // Persist verbatim (see the main finish path) — no think-stripping here.
-        let text = self.tokenizer.decode(&[token], skip).unwrap_or_default();
+        let answer = decode_turn_text(&self.tokenizer, &self.tag_ids, "", &[token], skip);
         let total_ms = turn_start.elapsed().as_secs_f64() * 1000.0;
         let _ = event_tx.send(TurnEvent::Done(TurnResponse {
-            text,
+            text: answer.text(),
+            answer,
             token_ids: vec![token].into(),
             stats: TurnStats {
                 prefill_ms,
@@ -7065,7 +7094,6 @@ impl Scheduler {
             projection_assembler::ApplyContext {
                 session: &mut self.session,
                 model: &mut self.model,
-                device: &self.device,
                 conversation: &conversation,
                 slot_target,
                 parent_id,
@@ -7112,7 +7140,6 @@ impl Scheduler {
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
             model: &mut self.model,
-            device: &self.device,
             conversation: &conversation,
             slot_target,
             parent_id,
@@ -7150,7 +7177,6 @@ impl Scheduler {
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
             model: &mut self.model,
-            device: &self.device,
             conversation: &conversation,
             slot_target,
             parent_id,
@@ -7231,12 +7257,12 @@ impl Scheduler {
                 // because the part it supplied is missing. The substrate had the
                 // same hole, storing a turn whose text began in the middle of
                 // its own JSON.
-                let text = format!(
-                    "{}{}",
-                    state.prefill_assistant_text,
-                    self.tokenizer
-                        .decode(&state.generated_tokens, skip)
-                        .unwrap_or_default()
+                let answer = decode_turn_text(
+                    &self.tokenizer,
+                    &self.tag_ids,
+                    &state.prefill_assistant_text,
+                    &state.generated_tokens,
+                    skip,
                 );
                 // Snapshot stats before any view finalize, since the view
                 // slot is dropped during finalize and its sequence stats
@@ -7452,7 +7478,7 @@ impl Scheduler {
 
                 sealing.push(FinishedTurn {
                     state,
-                    text,
+                    answer,
                     decode_ms,
                     total_ms,
                     tokens_generated,
@@ -7503,7 +7529,7 @@ impl Scheduler {
     fn seal_finished_turn(&mut self, turn: FinishedTurn) {
         let FinishedTurn {
             state,
-            text,
+            answer,
             decode_ms,
             total_ms,
             tokens_generated,
@@ -7513,6 +7539,7 @@ impl Scheduler {
             seal_slot,
             seal_block_from,
         } = turn;
+        let text = answer.text();
 
         // Seal-and-write step.  When `seal_action != None`, we
         // snapshot `seal_slot` and apply the appropriate substrate
@@ -7652,6 +7679,7 @@ impl Scheduler {
 
         let _ = state.event_tx.send(TurnEvent::Done(TurnResponse {
             text,
+            answer,
             token_ids: state.generated_tokens,
             stats: TurnStats {
                 prefill_ms: state.prefill_ms,
@@ -9350,10 +9378,55 @@ impl Scheduler {
     /// Tokens one prefill forward may carry — see [`admission::prefill_pass_budget`].
     ///
     /// Read per forward rather than once at construction: the model's cap includes
-    /// what the KV side can still hold, which moves with every claim.
+    /// what the KV side can still hold, which moves with every claim. Bounded by
+    /// the width the rate model chose for the cohort in flight
+    /// ([`Self::rate_width`]).
     pub(super) fn prefill_pass_budget(&self) -> usize {
+        self.pass_budget_under(self.composition_target())
+    }
+
+    /// The pass budget **before** the rate model's choice: what an admission
+    /// pass offers rows against, so that a pass can still find a width wider
+    /// than the last one chose.
+    pub(super) fn prefill_pass_ceiling(&self) -> usize {
+        self.pass_budget_under(self.max_prefill_pass_tokens)
+    }
+
+    /// Record the width the rate model chose — see [`Self::rate_width`].
+    pub(super) fn set_rate_width(&mut self, rows: usize) {
+        self.rate_width = Some(RateWidth {
+            rows: rows.max(CHUNK_SIZE),
+            members: self.running_prefills(),
+        });
+    }
+
+    /// Forget the rate model's width: a pass offered rows and every one paid.
+    pub(super) fn clear_rate_width(&mut self) {
+        self.rate_width = None;
+    }
+
+    /// Forget the rate model's width once the cohort it was judged for has
+    /// shrunk — see [`Self::rate_width`].
+    pub(super) fn settle_rate_width(&mut self) {
+        if self
+            .rate_width
+            .is_some_and(|w| w.lapsed(self.running_prefills()))
+        {
+            self.rate_width = None;
+        }
+    }
+
+    /// The target the forwards are composed against: the deployment's, or the
+    /// rate model's narrower choice for the cohort in flight.
+    fn composition_target(&self) -> usize {
+        self.rate_width.map_or(self.max_prefill_pass_tokens, |w| {
+            w.rows.min(self.max_prefill_pass_tokens)
+        })
+    }
+
+    fn pass_budget_under(&self, target: usize) -> usize {
         admit::pass_budget::prefill_pass_budget(
-            self.max_prefill_pass_tokens,
+            target,
             self.model
                 .prefill_width_cap(self.session.activation_dtype()),
             self.prefill_kv_token_cap(),
@@ -9369,7 +9442,7 @@ impl Scheduler {
     pub(super) fn prefill_group_budget(&self, total: usize) -> usize {
         admit::pass_budget::prefill_group_budget(
             total,
-            self.max_prefill_pass_tokens,
+            self.composition_target(),
             self.model
                 .prefill_width_cap(self.session.activation_dtype()),
             self.prefill_kv_token_cap(),
@@ -9407,7 +9480,8 @@ impl Scheduler {
         let mut off = 0usize;
         while off < tokens.len() {
             let advance = (tokens.len() - off).min(cap);
-            let input = Tensor::new(&tokens[off..off + advance], &self.device)
+            // On the host: the forward lays the ids on its own span.
+            let input = Tensor::new(&tokens[off..off + advance], &Device::Cpu)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(ConversationError::Model)?;
             let step = self
@@ -11583,6 +11657,7 @@ mod tests {
                 partial_rotary: false,
                 decode_q8_context: false,
                 hyper: None,
+                mtp_head: false,
             }
         }
         fn device(&self) -> &candle::Device {

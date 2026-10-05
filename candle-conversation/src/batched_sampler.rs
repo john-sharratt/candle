@@ -19,7 +19,7 @@ use candle::{DType, Device, IndexOp, Tensor};
 use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
 use candle_transformers::generation::{LogitsProcessor, PendingSample};
 use candle_transformers::models::speculative_choice::TypicalAcceptance;
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use std::sync::Mutex;
 
 /// A stencil-constrained row's sample with its device work enqueued
@@ -733,6 +733,13 @@ pub struct BatchedSampler {
 
     /// The kernel's count tables, kept on the device between dispatches.
     penalty_tables: Mutex<PenaltyTables>,
+
+    /// The device half of a dispatch's argument pack: every small per-dispatch
+    /// array, uploaded into this buffer in one copy and read back from it in
+    /// one copy. Held and grown to the widest dispatch seen, so a dispatch
+    /// allocates nothing; the readback that ends each dispatch is what lets the
+    /// next one overwrite it.
+    args: Mutex<Option<CudaSlice<u32>>>,
 }
 
 impl BatchedSampler {
@@ -753,6 +760,7 @@ impl BatchedSampler {
             eos_tokens,
             penalty_log_path,
             penalty_tables: Mutex::new(PenaltyTables::new(vocab_size)),
+            args: Mutex::new(None),
         }
     }
 
@@ -1832,8 +1840,30 @@ impl BatchedSampler {
         let seq_dials_at = pack.push_i32(seq_dials_words);
         let rng_at = pack.push_u64(rng_offsets);
         let output_at = pack.reserve(rows);
-        let mut packed: cudarc::driver::CudaSlice<u32> = stream
-            .memcpy_stod(pack.words())
+        let words = pack.words();
+        let mut args = self
+            .args
+            .lock()
+            .map_err(|_| candle::Error::Msg("sampler argument buffer poisoned".into()))?;
+        if !args.as_ref().is_some_and(|a| a.len() >= words.len()) {
+            let grown = args
+                .as_ref()
+                .map_or(0, |a| a.len() * 2)
+                .max(words.len())
+                .max(1);
+            // The old buffer is freed on this stream, after the readback that
+            // ended the dispatch it served.
+            *args = None;
+            // SAFETY: every word a dispatch reads is uploaded below before the
+            // kernel is queued, and the tail it reads back is written by it.
+            *args = Some(
+                unsafe { stream.alloc::<u32>(grown) }
+                    .map_err(|e| candle::Error::Msg(format!("sampling args buffer: {e}")))?,
+            );
+        }
+        let packed = args.as_mut().expect("sized above");
+        stream
+            .memcpy_htod(words, &mut packed.slice_mut(..words.len()))
             .map_err(|e| candle::Error::Msg(format!("failed to upload sampling args: {e}")))?;
 
         // Get device pointers and call kernel in a scoped block

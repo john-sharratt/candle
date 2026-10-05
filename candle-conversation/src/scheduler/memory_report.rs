@@ -224,15 +224,14 @@ pub struct AccountingSection {
     /// nothing. Scoped to a wave — where every allocation is supposed to inherit
     /// — a non-zero reading is a defect.
     pub decline_no_ticket_bytes: u64,
-    /// Bytes that went to the pool because the arena had no room, over the last
-    /// wave.
+    /// Bytes that went to the pool because their operand's generation had
+    /// closed, over the last wave — a value read after its phase, whose derived
+    /// data has no phase left to live in.
     ///
-    /// **A sizing problem, not a provenance one.** Nothing about the call site is
-    /// wrong; the wave arena was too narrow for the work. Reported beside
-    /// [`Self::decline_no_ticket_bytes`] because the two land on the same
-    /// `CudaDevice::alloc` and are otherwise indistinguishable — and they have
-    /// opposite fixes, so a reader who cannot separate them chases the wrong one.
-    pub decline_arena_full_bytes: u64,
+    /// Reported beside [`Self::decline_no_ticket_bytes`] because the two land on
+    /// the same `CudaDevice::alloc` and are otherwise indistinguishable. An arena
+    /// with no room is neither: it fails the wave, naming the request.
+    pub decline_closed_bytes: u64,
     /// Driver-reported in use across the whole card (`total - free`).
     pub device_in_use_bytes: u64,
     /// The **expert weight zone's extent** inside the span — `span_end −
@@ -716,10 +715,10 @@ impl Scheduler {
         // and deliberately NOT added to the outside set.
         let inside_gallery_bytes = gallery.resident_bytes;
         let inside_recurrent_bytes = self.model.recurrent_reserved_bytes() as u64;
-        // Why the pool was reached at all, split by the two causes that have
-        // opposite fixes — over the last wave, not the run. See the field docs
-        // for why the lifetime totals answer nothing.
-        let (decline_no_ticket_bytes, decline_arena_full_bytes) = last_wave_declines();
+        // Why the pool was reached at all, split by its two causes — over the
+        // last wave, not the run. See the field docs for why the lifetime
+        // totals answer nothing.
+        let (decline_no_ticket_bytes, decline_closed_bytes) = last_wave_declines();
         let span_bytes = match self.device.location() {
             candle::DeviceLocation::Cuda { gpu_id } => candle_nn::kv_cache::span_layout(gpu_id)
                 .map(|l| l.span_end.saturating_sub(l.span_base)),
@@ -760,7 +759,7 @@ impl Scheduler {
             expert_zone_bytes,
             inside_transient_bytes,
             decline_no_ticket_bytes,
-            decline_arena_full_bytes,
+            decline_closed_bytes,
             device_in_use_bytes,
             driver_baseline_bytes,
             unaccounted_bytes: device_in_use_bytes as i64
@@ -915,7 +914,7 @@ mod tests {
                 // One wave's worth: provenance breaks dominating, the arena
                 // itself never refusing — the shape measured on the 3.6-35B.
                 decline_no_ticket_bytes: 205_959_852,
-                decline_arena_full_bytes: 0,
+                decline_closed_bytes: 0,
                 device_in_use_bytes: 71_015_942_144,
                 // The context + driver working set, measured before the span was
                 // reserved. Naming it is what leaves `unaccounted` meaning only
@@ -968,7 +967,7 @@ mod tests {
             "inside_gallery_bytes",
             "inside_recurrent_bytes",
             "decline_no_ticket_bytes",
-            "decline_arena_full_bytes",
+            "decline_closed_bytes",
             "unaccounted_bytes",
             "span_bytes",
         ] {

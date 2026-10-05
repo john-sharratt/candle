@@ -49,8 +49,10 @@
 //! own copies safe to drop at merge.
 
 use candle::quantized::Int8Mode;
+use candle::wave_provenance::WaveTicket;
 use candle::{Device, Result, Tensor};
 
+use super::column_split::split_columns;
 use super::config::Qwen4ExpConfig;
 use super::engine::GpuLayer;
 use super::hyper::ko::HcWeightsKo;
@@ -77,8 +79,12 @@ pub struct MtpInput {
     /// `nextn.hc_head_norm`, and this) is the grouped kind; `enorm` is
     /// `[n_embd]` and is the plain kind.
     pub hnorm: Tensor,
-    /// `[n_embd, 2·n_embd]` over the concat.
-    pub eh_proj: QMatMul,
+    /// `eh_proj`'s embedding half, `[n_embd, n_embd]`: the checkpoint's single
+    /// `[n_embd, 2·n_embd]` weight over `[enorm ; hnorm]`, cut at load where
+    /// its columns change operand ([`super::column_split`]).
+    pub fc_embedding: QMatMul,
+    /// `eh_proj`'s hidden half, `[n_embd, n_embd]`.
+    pub fc_hidden: QMatMul,
 }
 
 /// One NextN draft head.
@@ -143,15 +149,21 @@ impl MtpDense {
         let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
         };
+        // Read on the host so its rows can be cut, then each half uploaded.
+        let eh_proj = g.qtensor(&format!("{p}.nextn.eh_proj.weight"), &Device::Cpu)?;
+        let (fc_embedding, fc_hidden) = split_columns(&eh_proj, cfg.hidden_size, device)?;
         let input = MtpInput {
             enorm: RmsNorm::from_qtensor(
                 g.qtensor(&format!("{p}.nextn.enorm.weight"), device)?,
                 eps,
             )?,
             hnorm: f32t(g, &format!("{p}.nextn.hnorm.weight"))?,
-            eh_proj: QMatMul::from_qtensor(
-                g.qtensor(&format!("{p}.nextn.eh_proj.weight"), device)?,
-            )?,
+            // In the session's mode, as every other projection here is: an int8
+            // session runs them on the KO path, which quantizes each operand
+            // beside the rows it reads — on the phase that prices it — where the
+            // GGML path quantized into a pool scratch on every call.
+            fc_embedding: QMatMul::from_qtensor_with_mode(fc_embedding, int8mode)?,
+            fc_hidden: QMatMul::from_qtensor_with_mode(fc_hidden, int8mode)?,
         };
         let mixer = HcWeightsKo::from_weights(
             &HcWeights::from_checkpoint(
@@ -187,7 +199,16 @@ impl MtpHead {
     /// `hc_mix` reads [`super::hyper::HcProject::inject_col`] off the module, and
     /// the head's mixer has no inject rows, so the same call that returns a
     /// trunk layer's `(mixed, Some(inject))` returns `(mixed, None)` here.
-    pub fn assemble(&self, embed: &Tensor, residual: &Tensor, eps: f64) -> Result<Tensor> {
+    ///
+    /// `root` is the open phase every buffer here belongs to; `None` outside a
+    /// forward.
+    pub fn assemble(
+        &self,
+        embed: &Tensor,
+        residual: &Tensor,
+        eps: f64,
+        root: Option<WaveTicket>,
+    ) -> Result<Tensor> {
         let (n, hc, n_embd) = residual.dims3()?;
         // **Per hyper-connection stream, on the wide hidden — never a mean
         // first.** `eh_proj` is applied once per stream, so its output is
@@ -202,24 +223,39 @@ impl MtpHead {
         // catastrophically" (llama.cpp#27836) — and measured here it did
         // exactly that: plausible tokens that were never the trunk's.
         let hn =
-            hc_grouped_norm(residual, &self.input.hnorm, eps, None)?.reshape((n * hc, n_embd))?;
-        // **Embedding first, hidden second**: `eh_proj` fuses the checkpoint's
-        // `fc_embedding` and `fc_hidden` side by side, so the one matmul
-        // computes `fc_embedding @ e + fc_hidden @ h`. One `[n_embd, 2·n_embd]`
-        // weight spans both halves, so nothing in the shapes can check the
-        // order; measured the other way round the proposals got strictly worse.
-        let en = self
+            hc_grouped_norm(residual, &self.input.hnorm, eps, root)?.reshape((n * hc, n_embd))?;
+        // `fc_embedding @ e + fc_hidden @ h`, the checkpoint's one `eh_proj`
+        // over `[e ; h]` with its halves applied separately. **Embedding first,
+        // hidden second** in the stored weight: the cut at load takes its
+        // leading `n_embd` columns as `fc_embedding`, and measured the other way
+        // round the proposals got strictly worse.
+        //
+        // The embedding's half is the same for every stream of a row, so it is
+        // computed once per row and broadcast in the add, where a concat would
+        // have copied the embedding across the streams and run it `hc` times.
+        let e = self
             .input
-            .enorm
-            .forward_live(embed)?
-            .reshape((n, 1, n_embd))?
-            .broadcast_as((n, hc, n_embd))?
-            .reshape((n * hc, n_embd))?;
-        let cat = Tensor::cat(&[&en, &hn], 1)?;
+            .fc_embedding
+            .forward_live(&self.enorm(embed, root)?)?
+            .reshape((n, 1, n_embd))?;
         self.input
-            .eh_proj
-            .forward_live(&cat)?
-            .reshape((n, hc, n_embd))
+            .fc_hidden
+            .forward_live(&hn)?
+            .reshape((n, hc, n_embd))?
+            .broadcast_add(&e)
+    }
+
+    /// `enorm(embed)`, on `root`'s arena when one is given.
+    fn enorm(&self, embed: &Tensor, root: Option<WaveTicket>) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        {
+            self.input.enorm.forward_with_ticket(embed, root)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = root;
+            self.input.enorm.forward_live(embed)
+        }
     }
 
     /// Collapse the head's block output to the width the **shared** LM head
@@ -228,8 +264,13 @@ impl MtpHead {
     /// The head's mixer is its output norm — `hc_mix` opens with the grouped
     /// norm over `nextn.hc_head_norm` — so nothing precedes it, exactly as
     /// nothing precedes the trunk's `out_hc`.
-    pub fn to_shared_head(&self, block_out: &Tensor, eps: f64) -> Result<Tensor> {
-        let (narrow, _) = hc_mix(block_out, &self.mixer, eps, None)?;
+    pub fn to_shared_head(
+        &self,
+        block_out: &Tensor,
+        eps: f64,
+        root: Option<WaveTicket>,
+    ) -> Result<Tensor> {
+        let (narrow, _) = hc_mix(block_out, &self.mixer, eps, root)?;
         Ok(narrow)
     }
 
@@ -242,7 +283,15 @@ impl MtpHead {
     /// the head folds its embedding into the trunk's carried streams instead of
     /// starting fresh ones, which is what makes its proposals conditional on
     /// the state the trunk actually built.
-    pub fn block_input(&self, embed: &Tensor, residual: &Tensor, eps: f64) -> Result<Tensor> {
-        self.assemble(embed, residual, eps)?.contiguous()
+    ///
+    /// Contiguous as returned: the broadcast add writes a dense result.
+    pub fn block_input(
+        &self,
+        embed: &Tensor,
+        residual: &Tensor,
+        eps: f64,
+        root: Option<WaveTicket>,
+    ) -> Result<Tensor> {
+        self.assemble(embed, residual, eps, root)
     }
 }

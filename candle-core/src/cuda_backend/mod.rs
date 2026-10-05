@@ -123,6 +123,8 @@ use std::sync::Arc;
 pub mod cudnn;
 mod device;
 mod error;
+mod info_ring;
+pub mod staged;
 mod utils;
 pub use device::{CudaDevice, DeviceId, Uploaded};
 pub use error::{CudaError, WrapErr};
@@ -1045,6 +1047,15 @@ impl Map1 for IndexSelect<'_> {
 
         let stream = dev.cuda_stream();
 
+        // The rows belong where the indices are when the table has no arena of
+        // its own: an embedding gather reads a resident table — no wave
+        // provenance — through ids laid on the forward span, and its output is
+        // that forward's residual.
+        let origin = if origin.inherit_ticket().is_some() {
+            origin
+        } else {
+            ids.backing
+        };
         // SAFETY: Set later by running the kernel.
         let (out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
         {
@@ -2673,8 +2684,9 @@ cuda_dtype!(F8E4M3, F8E4M3);
 /// vectorised access a kernel makes.
 pub const INHERIT_ALIGN: usize = 256;
 
-/// Allocate an op's output from the arena its **operand** came from, falling
-/// back to the pool.
+/// Allocate an op's output from the arena its **operand** came from — or the
+/// pool when the operand has no open phase to inherit — and fail when that
+/// phase is open and full ([`wave_provenance::exhausted`]).
 ///
 /// This is the whole operand-provenance rule in one function. The returned
 /// [`Backing`] is what the caller must stamp on the output storage: pairing the
@@ -2695,9 +2707,10 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
     let ticket = from.inherit_ticket();
     let bytes = elem_count * std::mem::size_of::<T>();
     // Attributed, so the fall-through below is not silent: a site that lost its
-    // provenance and a site whose arena overflowed both end up on `dev.alloc`
-    // and are otherwise indistinguishable in any report.
-    if let Some(ptr) = wave_provenance::wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN) {
+    // provenance and a site whose generation closed both end up on `dev.alloc`
+    // and are otherwise indistinguishable in any report. An open phase that
+    // cannot hold the request is an error here, not a pool allocation.
+    if let Some(ptr) = wave_provenance::wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)? {
         // **The arena and the weight zone share one reservation.**
         //
         // Wave arenas are carved upward from `span_base`; the expert weight zone

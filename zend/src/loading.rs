@@ -6,9 +6,11 @@
 //! 2. **Substrate** — replay the redo log into the in-RAM substrate.
 //! 3. **Sections** — prefill the projection schema's pinned sections, then
 //!    calibrate them.
-//! 4. **Priming** — read the priming chain the base conversation descends
+//! 4. **Self-check** — with `--self-check`, ask every stored conversation
+//!    whether it is intact (`crate::self_check`).
+//! 5. **Priming** — read the priming chain the base conversation descends
 //!    from (`crate::branch_ingest::prime`).
-//! 5. **Normalizing** — relearn the tool catalog's score-normalization levels.
+//! 6. **Normalizing** — relearn the tool catalog's score-normalization levels.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
 //! via [`Self::set_step`], reports intra-step progress via
@@ -28,6 +30,10 @@ pub enum LoadStep {
     Compacting,
     Sections,
     CalibratingSections,
+    /// Every stored conversation asked whether it is intact (`--self-check`).
+    /// Skipped unless the flag is set. Before the priming chain and every
+    /// ingest, so a conversation it tombstones is read again by them.
+    SelfCheck,
     /// The priming chain (`BranchIngest::prime`): the workspace listing, then
     /// each repository's root listing and anchor documents, read in order.
     /// Before `ready`, because the base conversation descends from it — the
@@ -50,6 +56,7 @@ impl LoadStep {
         LoadStep::Compacting,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
+        LoadStep::SelfCheck,
         LoadStep::Priming,
         LoadStep::Normalizing,
     ];
@@ -62,6 +69,7 @@ impl LoadStep {
             LoadStep::Compacting => "Compacting substrate",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
+            LoadStep::SelfCheck => "Checking conversations",
             LoadStep::Priming => "Reading the repositories",
             LoadStep::Normalizing => "Normalizing scores",
         }
@@ -84,6 +92,7 @@ impl LoadStep {
             LoadStep::Compacting => "",
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
+            LoadStep::SelfCheck => "conversations",
             LoadStep::Priming => "documents",
             LoadStep::Normalizing => "",
         }

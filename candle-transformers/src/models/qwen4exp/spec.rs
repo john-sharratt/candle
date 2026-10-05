@@ -39,15 +39,14 @@ use std::collections::HashMap;
 
 use candle::{Result, Tensor};
 
+use super::capture_rows::{CaptureRows, CaptureWidths};
 use super::engine::GpuLayerMix;
 use super::indexer::{append_wave, AppendSpan, IndexCache, IndexSnapshot};
 use super::ple::PleState;
 use super::qsa::IndexerWeights;
 use super::wave::Qwen4ExpBatched;
 use crate::models::batched_inference::BatchedInferenceSession;
-use crate::models::delta_net::{
-    DeltaNetConstants, DeltaNetDims, LayerKind, RecurrentStateStore, SpanOperands,
-};
+use crate::models::delta_net::{DeltaNetConstants, LayerKind, RecurrentStateStore, SpanOperands};
 use crate::models::qwen35::spec::{replay_accepted_prefixes, ReplayLayer, StashSpan, VerifyStash};
 use candle_nn::kv_cache::vram_budget_available;
 
@@ -87,18 +86,18 @@ pub struct SpecCapture {
     pub seqs: HashMap<usize, SeqStash>,
     /// The cohort's GDN operands, one buffer set per recurrent layer.
     pub delta: VerifyStash,
+    /// The cohort's kept rows, at the same row layout as `delta`.
+    pub rows: CaptureRows,
 }
 
 impl SpecCapture {
-    /// Arm for `blocks` — `(sequence, block length)`, in wave order.
+    /// Arm for `blocks` — `(sequence, block length)`, in wave order — over
+    /// buffers already sized for the cohort
+    /// ([`Qwen4ExpBatched::verify_stash_for`]).
     pub fn new(
         blocks: &[(usize, usize)],
-        layer_kinds: &[LayerKind],
-        dims: &DeltaNetDims,
-        device: &candle::Device,
+        (mut delta, rows): (VerifyStash, CaptureRows),
     ) -> Result<Self> {
-        let cap: usize = blocks.iter().map(|&(_, n)| n).sum();
-        let mut delta = VerifyStash::new(layer_kinds, dims, cap, device)?;
         delta.begin(blocks)?;
         let mut seqs = HashMap::with_capacity(blocks.len());
         for &(seq, len) in blocks {
@@ -114,7 +113,7 @@ impl SpecCapture {
                 },
             );
         }
-        Ok(Self { seqs, delta })
+        Ok(Self { seqs, delta, rows })
     }
 
     /// The GDN stash rows for `seq`, or `None` when it is not verifying.
@@ -157,6 +156,65 @@ impl SpecCapture {
 }
 
 impl Qwen4ExpBatched {
+    /// The rewind stash for a cohort of `rows` verify rows: the one the last
+    /// step used when it is wide enough, a new one sized for `rows` otherwise.
+    ///
+    /// **Before the forward opens**, never inside it: the stash is claimed from
+    /// rewind-stash arena slots, and a wave's storage is claimed up front. The
+    /// buffers are reused across steps and replaced only when a wider cohort
+    /// arrives — the old one released first, so two cohorts' slots are never
+    /// held at once at the moment the wider one is hardest to satisfy.
+    pub(super) fn verify_stash_for(&self, rows: usize) -> Result<(VerifyStash, CaptureRows)> {
+        let mut slot = self
+            .verify_stash
+            .lock()
+            .map_err(|_| candle::Error::Msg("verify stash lock poisoned".into()))?;
+        let fits = match slot.as_ref() {
+            Some((s, r)) => s.capacity()? >= rows && r.capacity()? >= rows,
+            None => false,
+        };
+        if fits {
+            return Ok(slot.take().expect("checked above"));
+        }
+        drop(slot.take());
+        let cfg = &self.model.cfg;
+        let widths = CaptureWidths {
+            hc: cfg.hc.count,
+            n_embd: cfg.hidden_size,
+            kv_layers: self.kv_layer_count(),
+            index_dim: cfg.indexer.head_dim,
+        };
+        Ok((
+            VerifyStash::new(&cfg.layer_kinds, &cfg.delta_net, rows, &self.model.device)?,
+            CaptureRows::new(rows, widths, &self.model.device)?,
+        ))
+    }
+
+    /// Hand a released capture's buffers back for the next step, the stash
+    /// naming no span: whatever it held was good for the one rewind it was
+    /// armed for.
+    pub(super) fn park_verify_stash(&self, cap: SpecCapture) {
+        let SpecCapture {
+            mut delta, rows, ..
+        } = cap;
+        delta.spans.clear();
+        if let Ok(mut slot) = self.verify_stash.lock() {
+            *slot = Some((delta, rows));
+        }
+    }
+
+    /// The KV layers a sequence holds an index cache for: every trunk
+    /// attention layer, and the draft head's after them.
+    fn kv_layer_count(&self) -> usize {
+        let cfg = &self.model.cfg;
+        let trunk = cfg
+            .layer_kinds
+            .iter()
+            .filter(|k| !matches!(k, LayerKind::DeltaNet))
+            .count();
+        trunk + usize::from(self.model.mtp.is_some())
+    }
+
     /// The deepest budget whose rewind stash the KV side can currently hold.
     ///
     /// `usize::MAX` when the question does not arise — no reservation to
@@ -386,7 +444,8 @@ impl Qwen4ExpBatched {
         // the head's *committed* K/V for the accepted position from a rejected
         // state, with nothing to raise but a decaying accept rate.
         {
-            let mut seeds = self
+            // Held exclusively while the seeds are rewritten on the device.
+            let seeds = self
                 .seeds
                 .write()
                 .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?;
@@ -406,7 +465,12 @@ impl Qwen4ExpBatched {
                         stash.len
                     );
                 }
-                seeds.insert(seq, rows.narrow(0, kept - 1, 1)?.to_owned_tensor()?);
+                // Into the seed the block's carry wrote, which the rewind
+                // replaces: the sequence keeps its two seed buffers.
+                let seed = seeds.get(&seq).ok_or_else(|| {
+                    candle::Error::Msg(format!("qwen4exp seed rewind: sequence {seq} has no seed"))
+                })?;
+                seed.slice_set(&rows.narrow(0, kept - 1, 1)?, 0, 0)?;
             }
         }
 
@@ -416,6 +480,9 @@ impl Qwen4ExpBatched {
                 session.truncate_sequence_to_tokens(seq, tokens)?;
             }
         }
+        // Consumed: its spans named this step's blocks and nothing later. The
+        // buffers go back for the next step to lay its own cohort over.
+        self.park_verify_stash(cap);
         Ok(())
     }
 }
@@ -458,24 +525,33 @@ pub fn rewind_row_state(
     // ── PLE: the window the accepted rows would have left. ──
     //
     // `conv_hist` after `m` rows is the last `hist` rows of
-    // `(entering_hist ++ block_rows)`, so it is `narrow(m, hist)` over that
-    // concatenation — no arithmetic replayed, because the rows are already
-    // computed and stashed.
+    // `(entering_hist ++ block_rows)` — no arithmetic replayed, because the
+    // rows are already computed and stashed. Written into the history the
+    // block's wave left, which the rewind replaces wholesale: it is neither the
+    // entering history (that is the spare now) nor the stashed rows, so the
+    // copies read nothing they write, and the sequence keeps its two buffers.
     let entering = stash
         .ple_entering
         .as_ref()
         .ok_or_else(|| candle::Error::msg("qwen4exp verify rewind: no entering PLE state"))?;
+    let dst = &ple.conv_hist;
+    if dst.same_storage(&entering.conv_hist) {
+        candle::bail!(
+            "qwen4exp verify rewind: the PLE history to rewrite is the entering one — the \
+             rewind would read the rows it writes"
+        );
+    }
     match &stash.ple_rows {
+        Some(rows) if kept >= hist => {
+            dst.slice_set(&rows.narrow(0, kept - hist, hist)?, 0, 0)?;
+        }
         Some(rows) => {
-            let padded = Tensor::cat(&[&entering.conv_hist, rows], 0)?;
-            // Owned for the same reason `ple_apply` owns its own tail: this is
-            // carried state, and a `contiguous()` narrow would alias `padded`
-            // and pin the whole concatenation alive to keep `hist` rows.
-            ple.conv_hist = padded.narrow(0, kept, hist)?.to_owned_tensor()?;
+            dst.slice_set(&entering.conv_hist.narrow(0, kept, hist - kept)?, 0, 0)?;
+            dst.slice_set(&rows.narrow(0, 0, kept)?, 0, hist - kept)?;
         }
         // A wave whose window never reached the PLE layer captured no rows, and
-        // then it advanced no history either.
-        None => ple.conv_hist = entering.conv_hist.clone(),
+        // then it advanced no history either: the entering one stands.
+        None => dst.slice_set(&entering.conv_hist, 0, 0)?,
     }
     // The hash window is a function of token ids alone.
     let mut prev = entering.prev.clone();
@@ -529,7 +605,7 @@ pub fn rewind_row_state(
                 rows: kept,
             }];
             // Replay of a captured span, outside any open layer phase.
-            append_wave(&mut one, keys, w, ratio, eps, None)?;
+            append_wave(&mut one, keys, w, ratio, eps)?;
         }
     }
     Ok(())

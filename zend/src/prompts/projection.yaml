@@ -407,7 +407,7 @@ system_prompt:
         {"name": <function-name>, "arguments": <args-json-object>}
         </tool_call>
 
-        Calls are your whole reply — put no prose beside them. You may make up to four in
+        Calls are your whole reply — put no prose beside them. You may make up to six in
         one reply, and you should: every call you already know you need belongs in this
         turn rather than the next one. Reading three files you have just seen named is one
         reply with three calls, not three replies. Only split them when a call's arguments

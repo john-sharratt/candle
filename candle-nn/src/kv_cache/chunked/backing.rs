@@ -1203,29 +1203,8 @@ impl ChunkedKvBacking {
     ) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            use candle::cuda_backend::cudarc::driver::DevicePtr;
             use candle::cuda_backend::kernels::simple::kv_record_fill as krf;
-
-            /// A derived-only input still needs one byte of device memory so its pointer is
-            /// valid; the kernel never reads it, because every descriptor's offset is -1.
-            fn pad1_u8(mut v: Vec<u8>) -> Vec<u8> {
-                if v.is_empty() {
-                    v.push(0);
-                }
-                v
-            }
-            fn pad1_f32(mut v: Vec<f32>) -> Vec<f32> {
-                if v.is_empty() {
-                    v.push(0.0);
-                }
-                v
-            }
-            fn pad1_i64(mut v: Vec<i64>) -> Vec<i64> {
-                if v.is_empty() {
-                    v.push(0);
-                }
-                v
-            }
+            use candle::cuda_backend::staged::segment;
 
             if handles.is_empty() {
                 return Ok(());
@@ -1362,68 +1341,56 @@ impl ChunkedKvBacking {
                 );
             }
 
-            // `memcpy_stod` on an empty slice is not meaningful, so a derived-only input
-            // still needs one byte of device memory for its pointer to be valid; the kernel
-            // never reads it, because every descriptor's offset is -1.
-            let d_descs = cuda.memcpy_stod(&descs)?;
-            let d_gids = cuda.memcpy_stod(&gids)?;
-            let d_kpal = cuda.memcpy_stod(&pad1_u8(k_pal))?;
-            let d_vpal = cuda.memcpy_stod(&pad1_u8(v_pal))?;
-            let d_kfmt = cuda.memcpy_stod(&pad1_u8(k_fmt))?;
-            let d_vfmt = cuda.memcpy_stod(&pad1_u8(v_fmt))?;
-            let d_kscale = cuda.memcpy_stod(&pad1_f32(k_scale))?;
-            let d_vscale = cuda.memcpy_stod(&pad1_f32(v_scale))?;
-            // Padded like the rest: `arena_info` is legitimately empty when no arena is
-            // resolved, and the kernel bounds every extent lookup against `n_extents`, so
-            // the padding byte is never read — but the pointer still has to be valid.
-            let d_ext = cuda.memcpy_stod(&pad1_i64(extents))?;
+            // All nine arrays go up as one copy into the device's staging scratch, so a
+            // batch of records allocates nothing. A derived-only input (an empty array)
+            // still gets a valid address inside the scratch; the kernel never reads it,
+            // because every descriptor's offset is -1 — and `arena_info` is legitimately
+            // empty when no arena is resolved, with every extent lookup bounded against
+            // `n_extents`.
             let stream = cuda.cuda_stream();
-            {
-                let (p_desc, _g0) = d_descs.device_ptr(&stream);
-                let (p_gid, _g1) = d_gids.device_ptr(&stream);
-                let (p_kp, _g2) = d_kpal.device_ptr(&stream);
-                let (p_vp, _g3) = d_vpal.device_ptr(&stream);
-                let (p_kf, _g4) = d_kfmt.device_ptr(&stream);
-                let (p_vf, _g5) = d_vfmt.device_ptr(&stream);
-                let (p_ks, _g6) = d_kscale.device_ptr(&stream);
-                let (p_vs, _g7) = d_vscale.device_ptr(&stream);
-                let (p_ex, _g8) = d_ext.device_ptr(&stream);
-                candle::set_kernel_breadcrumb("run_kv_record_fill", file!(), line!());
-                // SAFETY: every array is device-resident and at least as long as the
-                // offsets the descriptors name; each `dst` is a record slot this call just
-                // allocated, of exactly `chunk_record_bytes` bytes.
-                //
-                // **The buffers are dropped right after this async launch, and that is
-                // sound because of how `CudaSlice::drop` frees.** It waits on the slice's
-                // recorded events and then either calls `free_async` on the slice's own
-                // stream — the same stream this launches on, so the free is ordered behind
-                // the kernel — or, on a context without async allocation, synchronises the
-                // stream before a synchronous free. Either way the bytes outlive the read.
-                // Worth knowing that the second branch means this call site synchronises
-                // once per buffer on such a context, which is the one place the "no GPU
-                // syncs" property here depends on the driver rather than on this code.
-                unsafe {
-                    krf::run_kv_record_fill(
-                        p_desc as *const std::ffi::c_void,
-                        p_gid as *const i64,
-                        p_kp as *const u8,
-                        p_vp as *const u8,
-                        p_kf as *const u8,
-                        p_vf as *const u8,
-                        p_ks as *const f32,
-                        p_vs as *const f32,
-                        p_ex as *const std::ffi::c_void,
-                        n_extents as i32,
-                        handles.len() as i32,
-                        n_kv_head as i32,
-                        head_dim as i32,
-                        n_palette as i32,
-                        super::size_class::GID_STRIDE as i32,
-                        ArenaFormatTag::Invalid.as_u8() as i32,
-                        stream.cu_stream() as *mut std::ffi::c_void,
-                    );
-                }
-            }
+            cuda.with_staged_segments(
+                &[
+                    segment(&descs),
+                    segment(&gids),
+                    &k_pal,
+                    &v_pal,
+                    &k_fmt,
+                    &v_fmt,
+                    segment(&k_scale),
+                    segment(&v_scale),
+                    segment(&extents),
+                ],
+                |p| {
+                    candle::set_kernel_breadcrumb("run_kv_record_fill", file!(), line!());
+                    // SAFETY: every array is device-resident and at least as long as the
+                    // offsets the descriptors name; each `dst` is a record slot this call
+                    // just allocated, of exactly `chunk_record_bytes` bytes. The scratch
+                    // is next written by a later copy on this stream, ordered after the
+                    // kernel's read.
+                    unsafe {
+                        krf::run_kv_record_fill(
+                            p[0] as *const std::ffi::c_void,
+                            p[1] as *const i64,
+                            p[2] as *const u8,
+                            p[3] as *const u8,
+                            p[4] as *const u8,
+                            p[5] as *const u8,
+                            p[6] as *const f32,
+                            p[7] as *const f32,
+                            p[8] as *const std::ffi::c_void,
+                            n_extents as i32,
+                            handles.len() as i32,
+                            n_kv_head as i32,
+                            head_dim as i32,
+                            n_palette as i32,
+                            super::size_class::GID_STRIDE as i32,
+                            ArenaFormatTag::Invalid.as_u8() as i32,
+                            stream.cu_stream() as *mut std::ffi::c_void,
+                        );
+                    }
+                    Ok(())
+                },
+            )?;
         }
         Ok(())
     }
@@ -3356,21 +3323,19 @@ impl ChunkedKvBacking {
         // Reuse the grow-only device scratch: realloc only when this batch is
         // bigger than any prior one, so the steady-state seal pays no device
         // alloc / pointer memcpy_stod — only one HtoD into the existing buffer.
+        // The batch is the whole scope's chunk count, which rises with every
+        // admission, so growth doubles: sized to the batch exactly, every
+        // admission past the last high-water mark reallocated.
         let mut guard = self
             .inner
             .prov_sign_scratch
             .lock()
             .map_err(|_| candle::Error::Msg("prov_sign_scratch mutex poisoned".into()))?;
-        let grow = guard
-            .as_ref()
-            .is_none_or(|s| s.ptrs.len() < n_warps || s.out.len() < out_len);
-        if grow {
-            let ptrs_cap = guard
-                .as_ref()
-                .map_or(n_warps, |s| s.ptrs.len().max(n_warps));
-            let out_cap = guard.as_ref().map_or(out_len, |s| s.out.len().max(out_len));
+        let held = guard.as_ref().map_or(0, |s| s.ptrs.len());
+        if held < n_warps {
+            let ptrs_cap = (held * 2).max(n_warps);
             let ptrs = unsafe { cuda_dev.alloc::<i64>(ptrs_cap)? };
-            let out = unsafe { cuda_dev.alloc::<u64>(out_cap)? };
+            let out = unsafe { cuda_dev.alloc::<u64>(ptrs_cap * CHUNK_SIZE)? };
             *guard = Some(ProvSignScratch { ptrs, out });
         }
         let scratch = guard.as_mut().unwrap();

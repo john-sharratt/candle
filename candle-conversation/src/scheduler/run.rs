@@ -615,8 +615,8 @@ impl Scheduler {
             // what share of a wave is not the forward at all. Its parts are spanned
             // individually below; this is the total they have to add up to.
             let house_span = super::profile::span("loop:housekeeping");
-            let (no_ticket, arena_full) = declines.bytes_since();
-            publish_wave_declines(no_ticket, arena_full);
+            let (no_ticket, closed) = declines.bytes_since();
+            publish_wave_declines(no_ticket, closed);
             #[cfg(feature = "forbidden_allocations")]
             {
                 drop(alloc_watch);

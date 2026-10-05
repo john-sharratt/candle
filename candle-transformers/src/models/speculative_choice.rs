@@ -59,7 +59,7 @@
 //! argmax always clears the threshold. At temperature zero the row is a point
 //! mass and the sample is the argmax, so greedy verification is unchanged.
 
-use candle::{Result, Tensor};
+use candle::{DType, Result, Tensor};
 
 /// The Medusa typical-acceptance thresholds: a draft is accepted when its
 /// probability under the row's sampling distribution exceeds
@@ -315,30 +315,42 @@ impl<'b> AcceptWalk<'b> {
 /// padded tail is not a token.
 pub struct GreedyChooser {
     live_vocab: usize,
+    /// Where each position's picks are written — grown to the widest cohort
+    /// the chooser has walked and reused, so a walk position allocates nothing.
+    picks: Option<Tensor>,
 }
 
 impl GreedyChooser {
     /// Greedy over the first `live_vocab` columns of each row; the row width
     /// for a model whose logits are not padded.
     pub fn new(live_vocab: usize) -> Self {
-        Self { live_vocab }
+        Self {
+            live_vocab,
+            picks: None,
+        }
     }
 
     /// Greedy over every column of each row, whatever its width — for a
     /// caller that holds no tokenizer and compares against its own whole-row
     /// greedy decode, which a bound on one side only would make disagree.
     pub fn whole_row() -> Self {
-        Self {
-            live_vocab: usize::MAX,
-        }
+        Self::new(usize::MAX)
     }
 }
 
 impl TokenChooser for GreedyChooser {
     fn choose(&mut self, logits: &Tensor, _rows: &[SpecRow<'_>]) -> Result<Vec<u32>> {
-        logits
-            .batched_sample_argmax(self.live_vocab)?
-            .to_vec1::<u32>()
+        let n = logits.dim(0)?;
+        let fits = self
+            .picks
+            .as_ref()
+            .is_some_and(|p| p.elem_count() >= n && p.device().same_device(logits.device()));
+        if !fits {
+            self.picks = Some(Tensor::empty(n, DType::U32, logits.device())?);
+        }
+        let picks = self.picks.as_ref().expect("sized above").narrow(0, 0, n)?;
+        logits.batched_sample_argmax_into(self.live_vocab, &picks)?;
+        picks.to_vec1::<u32>()
     }
 }
 

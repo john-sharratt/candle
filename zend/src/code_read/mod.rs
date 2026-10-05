@@ -38,7 +38,7 @@ use candle_conversation::projection::{
     OptionalState, SelectionState, TimelineId, FORCE_TOOL_SELECTOR, NO_THINK_SELECTOR,
     TOOLS_ENABLED_SELECTOR,
 };
-use candle_conversation::stencil::TriggerRegistry;
+use candle_conversation::stencil::{TriggerRegistry, MAX_TOOL_CALLS_PER_TURN};
 use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
 use zend_tools::ToolContext;
 use zend_vfs::vfs::PAGE_LINES;
@@ -266,12 +266,23 @@ fn opening_prompt(key: &str, lines: usize) -> String {
     let (repo, path) = split(key);
     let pages = lines.div_ceil(PAGE_LINES as usize).max(1);
     let last = pages - 1;
+    // A reply holds at most `MAX_TOOL_CALLS_PER_TURN` calls — the tool grammar
+    // ends the turn after that many — so a longer file is asked for in replies
+    // of that size rather than told to fit in one.
+    let batching = if pages <= MAX_TOOL_CALLS_PER_TURN {
+        format!("issue all {pages} in the SAME reply, one per page from page 0 to page {last}")
+    } else {
+        format!(
+            "issue them {MAX_TOOL_CALLS_PER_TURN} to a reply — the most one reply can \
+             hold — in page order from page 0 to page {last}, putting as many as fit \
+             in the SAME reply each time"
+        )
+    };
     format!(
         "Read the entire contents of `{path}` in the `{repo}` repository — and only \
          this file — using {FILE_READ_TOOL}. The file is {lines} lines long and each \
          call returns one {PAGE_LINES}-line page, so it takes exactly {pages} \
-         {FILE_READ_TOOL} call(s): issue all {pages} in the SAME reply, one per page \
-         from page 0 to page {last}, instead of one call per reply. \
+         {FILE_READ_TOOL} call(s): {batching}, instead of one call per reply. \
          Every call you make in a reply is run together and all of their results \
          come back to you at once. Once you've read the whole thing, summarize what \
          it contains: its purpose, its main structures or functions, and how it fits \
@@ -1035,7 +1046,7 @@ fn run_file_conversation(
         let resp = handle
             .wait_cancellable()
             .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-        let steps = tool_round::plan(&resp.text);
+        let steps = tool_round::plan(&resp.answer);
         let call_idx = resp.seal.as_ref().and_then(|s| s.turn_index);
         conv.finish_turn(handle, &resp)
             .map_err(|e| anyhow::anyhow!("finish_turn: {e}"))?;
@@ -1212,6 +1223,27 @@ mod tests {
             p.contains("instead of one call per reply"),
             "must say what it is asking INSTEAD of — one call per reply is the \
              behaviour this prompt exists to replace: {p:?}",
+        );
+    }
+
+    /// **The prompt never asks for more calls than a reply can hold.** The tool
+    /// grammar ends a turn after `MAX_TOOL_CALLS_PER_TURN` calls, so a file of
+    /// more pages is asked for in replies of that size; one that fits is asked
+    /// for whole.
+    #[test]
+    fn opening_prompt_batches_within_the_per_reply_cap() {
+        let long = opening_prompt("candle/src/big.rs", 2000);
+        assert!(
+            long.contains(&format!(
+                "issue them {MAX_TOOL_CALLS_PER_TURN} to a reply — the most one reply can hold"
+            )),
+            "{long:?}"
+        );
+        assert!(!long.contains("issue all 10"), "{long:?}");
+        let short = opening_prompt("candle/src/small.rs", 300);
+        assert!(
+            short.contains("issue all 2 in the SAME reply, one per page from page 0 to page 1"),
+            "{short:?}"
         );
     }
 }

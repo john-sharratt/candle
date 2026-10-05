@@ -135,7 +135,7 @@ pub struct TestParams {
     /// decode phase clamps every pick to it inside its timed window, and walking
     /// the vocabulary there was charged to decode.
     pub token_ids: Option<usize>,
-    pub dialect: Dialect,            // Chat format dialect (ChatML, Llama3, etc.)
+    pub dialect: Dialect, // Chat format dialect (ChatML, Llama3, etc.)
     pub device: Device,
     pub begin_document_token: Option<u32>,
     pub timeout_secs: u64, // Test timeout in seconds (default: 120)
@@ -2122,6 +2122,12 @@ impl TestParams {
         // Each session drafts one past its own acceptance, clipped at the
         // model's ladder — the same rule the scheduler applies.
         let mut depths = vec![DraftDepth::default(); sequence_indices.len()];
+        // Greedy: this harness seeds from the prefill row's argmax and
+        // validates every run against a fixed expected string, so the
+        // speculative path must reproduce plain greedy decode token for token.
+        // One chooser for the run, so the buffer its picks land in is held
+        // across steps rather than made per step.
+        let mut chooser = GreedyChooser::new(live);
         let t_spec = std::time::Instant::now();
         loop {
             let idxs: Vec<usize> = (0..sequence_indices.len()).filter(|&i| active[i]).collect();
@@ -2149,17 +2155,13 @@ impl TestParams {
                     }) as Box<dyn FnMut(u32) -> bool>
                 })
                 .collect();
-            // Greedy: this harness seeds from the prefill row's argmax and
-            // validates every run against a fixed expected string, so the
-            // speculative path must reproduce plain greedy decode token for
-            // token.
             let step = model.speculative_decode_step_batch(
                 session,
                 &seqs,
                 &comms,
                 &budgets,
                 nl,
-                &mut GreedyChooser::new(live),
+                &mut chooser,
                 &mut emits,
             )?;
             drop(emits);

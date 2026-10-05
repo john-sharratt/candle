@@ -48,6 +48,7 @@ pub mod resume;
 pub mod retrieval_scope;
 pub mod sandbox_programs;
 pub mod secrets;
+pub mod self_check;
 pub mod session;
 pub mod think_budget;
 pub mod think_gate;

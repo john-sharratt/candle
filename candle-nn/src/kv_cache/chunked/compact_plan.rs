@@ -185,6 +185,7 @@ pub fn plan_pool(arenas: &[ArenaSlots], key: ArenaKey, max_moves: usize) -> Opti
 /// whole. Sorting the moves themselves, with a rank lookup per comparison, cost a
 /// planning budget of 20 ms on its own at a few hundred thousand moves, and every pass
 /// then claimed only its one guaranteed batch.
+#[cfg(any(feature = "cuda", test))]
 pub fn by_source_rank(
     plans: &[CompactPlan],
     rank_of: impl Fn(usize) -> usize,

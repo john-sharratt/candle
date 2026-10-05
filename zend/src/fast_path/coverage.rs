@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
-use candle_conversation::ConversationEngine;
+use candle_conversation::{ConversationEngine, TurnText};
 use serde_json::Value;
 use zend_vfs::vfs::PAGE_LINES;
 
@@ -57,7 +57,10 @@ pub fn covers(pages: &BTreeSet<u32>, lines: usize) -> bool {
 pub fn read_pages(turns: &[(String, String)]) -> BTreeSet<u32> {
     let mut pages = BTreeSet::new();
     for pair in turns.windows(2) {
-        let calls = plan(&pair[0].1);
+        // A stored turn keeps its text, not the split of it its ids carried, so
+        // it is read with every tag as markup; a quoted tag can only add a
+        // refused step here, and a refused step reads no page.
+        let calls = plan(&TurnText::markup(pair[0].1.as_str()));
         let responses = response_bodies(&pair[1].0);
         for (step, body) in calls.iter().zip(responses) {
             let Step::Run(call) = step else {

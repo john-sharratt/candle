@@ -531,16 +531,17 @@ fn dir_tags(unit: &DirUnit) -> Vec<String> {
 /// retrieval.
 pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
     config.tree.disable_summarization();
-    // Utility ingests (repo_map, code_reading) are append-only cumulative
-    // trunks — each turn just extends the layer. Skip the per-turn projection
-    // rebuild (reset + re-project the whole trunk, which is O(n²) and serial on
-    // the scheduler thread); turns still seal into the substrate. This lets the
-    // parallel workers' prefills/decodes actually batch instead of serialising
-    // behind reprojection.
+    // Utility ingests (repo_map, code_reading) are append-only: no mid-decode
+    // reprojection, which would re-score and rebuild the context on every
+    // wave and serialise the parallel workers behind the scheduler thread.
+    // Each turn still assembles its slot from the substrate (a slot is emptied
+    // at every seal), which is how a unit's priming chain — inherited through
+    // `forked_from` — reaches its context.
     config.disable_reprojection = true;
     // Utility ingests quantize at C5, fully adaptive for both K and V (the
-    // engine-wide uniform-K pin is off in this config). The code-reading layer
-    // inherits this same C5 level via `code_read_config`.
+    // engine-wide uniform-K pin is off in this config). Both layers' ingest
+    // bases are built from this config (`session.rs`), so every unit forked
+    // from them carries it.
     config.kv_compression_level = Some(5);
     config
 }

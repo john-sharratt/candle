@@ -511,9 +511,10 @@ fn needs_branch_swap(installed: Option<ContentHash>, selected: ContentHash) -> b
 /// the `tokens` to accumulate across the loop into the unit's ingest stat.
 #[derive(Debug, Clone)]
 pub struct ChainRound {
-    /// The decoded assistant text — the unit's summary, or the `<tool_call>` the
-    /// model issued in place of one.
-    pub text: String,
+    /// The decoded assistant half — the unit's summary, or the `<tool_call>` the
+    /// model issued in place of one — split as [`TurnResponse::answer`] splits
+    /// it.
+    pub answer: TurnText,
     /// Sealed index of the decoded turn. Deliberately NOT "the last turn": the
     /// async summariser can append a turn between the seal and the caller's
     /// [`Sequence::couple_turn`].
@@ -3215,7 +3216,7 @@ impl Sequence {
             closing,
         )?;
         let response = handle.wait_cancellable();
-        let (indices, tokens, text) =
+        let (indices, tokens, answer) =
             self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
         // Couple every turn except the last: each prefilled turn belongs with the
         // one that answers it, so the summariser sees the whole exchange rather
@@ -3227,7 +3228,7 @@ impl Sequence {
             ConversationError::Channel("round-trip chain: no turns were sealed".into())
         })?;
         Ok(ChainRound {
-            text,
+            answer,
             turn_index,
             tokens,
         })
@@ -3318,14 +3319,14 @@ impl Sequence {
     /// The tail both chain waits share: propagate the wait's verdict, read the
     /// sealed index off the response, and record the decoded turn with its
     /// staged provenance events. Returns the sealed indices, the tokens, and the
-    /// decoded text.
+    /// decoded answer.
     fn ingest_chain_settle(
         &mut self,
         mut indices: Vec<u32>,
         prefill_tokens: usize,
         handle: TurnHandle,
         response: crate::Result<TurnResponse>,
-    ) -> crate::Result<(Vec<u32>, usize, String)> {
+    ) -> crate::Result<(Vec<u32>, usize, TurnText)> {
         let response = response?;
         let resp_tokens = response.token_ids.len();
         let resp_idx = response
@@ -3340,7 +3341,7 @@ impl Sequence {
         // Records the decoded turn + its staged provenance events.
         self.finish_turn_staged(handle, &response)?;
         indices.push(resp_idx);
-        Ok((indices, prefill_tokens + resp_tokens, response.text))
+        Ok((indices, prefill_tokens + resp_tokens, response.answer))
     }
 
     /// The head both chain waits share: selection framing, the prefilled turns,

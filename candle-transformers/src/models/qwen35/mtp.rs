@@ -61,6 +61,7 @@
 //! embedding axis, this file's last axis. [`MtpInput`]'s test pins it.
 
 use candle::cuda_backend::Backing;
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 
 use super::embedding::EmbeddingTable;
@@ -144,7 +145,16 @@ impl MtpInput {
     /// Both `[n, hidden]`; result `[n, hidden]`. `n` is one per drafting
     /// sequence in a draft step, and the whole wave's row count in the head's
     /// wave pass.
-    pub fn forward(&self, embed: &Tensor, hidden: &Tensor) -> Result<Tensor> {
+    ///
+    /// `root` names the arena the assembly carves from — the norms write there
+    /// whatever arena their operands came from, and the concatenation and the
+    /// projection follow them. `None` leaves each norm in its operand's arena.
+    pub fn forward(
+        &self,
+        embed: &Tensor,
+        hidden: &Tensor,
+        root: Option<WaveTicket>,
+    ) -> Result<Tensor> {
         let (n, d) = embed.dims2()?;
         if hidden.dims2()? != (n, d) {
             candle::bail!(
@@ -155,8 +165,8 @@ impl MtpInput {
         }
         // Embedding first. See the module note: the halves are not
         // interchangeable and the order is llama.cpp's.
-        let e = self.enorm.forward_live(embed)?;
-        let h = self.hnorm.forward_live(hidden)?;
+        let e = self.enorm.forward_with_ticket(embed, root)?;
+        let h = self.hnorm.forward_with_ticket(hidden, root)?;
         let cat = Tensor::cat(&[&e, &h], 1)?;
         self.eh_proj.forward_live(&cat)
     }
@@ -198,9 +208,17 @@ impl MtpContext<'_> {
     /// [`EmbeddingTable::HostMapped`] the GPU reads the ids where they already
     /// are, so an argmax can become the next step's embedding without ever
     /// reaching the host.
-    pub fn embed_ids(&self, ids: &Tensor) -> Result<Tensor> {
+    ///
+    /// `staging` is where the gather stages its quantized rows, and `home` the
+    /// arena the embeddings land in.
+    pub fn embed_ids(
+        &self,
+        ids: &Tensor,
+        staging: Backing,
+        home: Option<WaveTicket>,
+    ) -> Result<Tensor> {
         self.embed
-            .rows(ids, self.device, Backing::Owned, self.act_dtype)
+            .rows(ids, self.device, staging, self.act_dtype, home)
     }
 }
 
@@ -270,6 +288,11 @@ impl MtpHead {
     /// head scores and what seeds the next step, because llama.cpp takes
     /// `t_h_nextn` after the final norm on the trunk and on this block alike,
     /// so the two ends of the recurrence speak the same normalised space.
+    ///
+    /// `root` is the step's forward phase: the input assembly, the block's
+    /// residual and the closing norm carve there, and the block's own phases
+    /// open inside it as a trunk layer's do.
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &self,
         embed: &Tensor,
@@ -278,6 +301,7 @@ impl MtpHead {
         offsets: &[usize],
         params: &BatchedAttentionParams<'_>,
         ctx: &MtpContext<'_>,
+        root: Option<WaveTicket>,
     ) -> Result<Tensor> {
         let rows = embed.dim(0)?;
         if caches.len() != rows || offsets.len() != rows {
@@ -288,7 +312,7 @@ impl MtpHead {
                 offsets.len()
             );
         }
-        let x = self.input.forward(embed, hidden)?;
+        let x = self.input.forward(embed, hidden, root)?;
         let hidden_dim = x.dim(1)?;
         // The decode entry wants `[b, 1, hidden]`; `forward_layer_batched_mixed`
         // reshapes it to the kernel's `[rows, 1, hidden]` itself via
@@ -331,7 +355,7 @@ impl MtpHead {
         // else, so its stride-indexed slot is the buffer's first.
         forward_layer_batched_mixed(&layer, &mut groups, &mut xt, x.dtype(), 0)?;
         let out = xt.to_tensor().reshape((rows, hidden_dim))?;
-        self.head_norm.forward_live(&out)
+        self.head_norm.forward_with_ticket(&out, root)
     }
 
     // `extend` / `extend_cohort` are gone. They existed to catch the head's
@@ -395,14 +419,14 @@ mod tests {
         };
         // Selecting the first half: the hidden is invisible, the embedding is not.
         assert_eq!(
-            vals(&first_half.forward(&e1, &h1).unwrap()),
-            vals(&first_half.forward(&e1, &h2).unwrap()),
+            vals(&first_half.forward(&e1, &h1, None).unwrap()),
+            vals(&first_half.forward(&e1, &h2, None).unwrap()),
             "the first half of the concat responded to the HIDDEN — the two are \
              the wrong way round"
         );
         assert_ne!(
-            vals(&first_half.forward(&e1, &h1).unwrap()),
-            vals(&first_half.forward(&e2, &h1).unwrap()),
+            vals(&first_half.forward(&e1, &h1, None).unwrap()),
+            vals(&first_half.forward(&e2, &h1, None).unwrap()),
             "the first half of the concat ignored the EMBEDDING"
         );
 
@@ -413,13 +437,13 @@ mod tests {
             eh_proj: qmm(&half_selector(d, 1, &dev)),
         };
         assert_eq!(
-            vals(&second_half.forward(&e1, &h1).unwrap()),
-            vals(&second_half.forward(&e2, &h1).unwrap()),
+            vals(&second_half.forward(&e1, &h1, None).unwrap()),
+            vals(&second_half.forward(&e2, &h1, None).unwrap()),
             "the second half of the concat responded to the EMBEDDING"
         );
         assert_ne!(
-            vals(&second_half.forward(&e1, &h1).unwrap()),
-            vals(&second_half.forward(&e1, &h2).unwrap()),
+            vals(&second_half.forward(&e1, &h1, None).unwrap()),
+            vals(&second_half.forward(&e1, &h2, None).unwrap()),
             "the second half of the concat ignored the HIDDEN"
         );
     }
@@ -485,7 +509,7 @@ mod tests {
         // And it runs: one step's input assembly on real weights, finite.
         let e = Tensor::randn(0f32, 1.0, (1, hidden), &device)?;
         let h = Tensor::randn(0f32, 1.0, (1, hidden), &device)?;
-        let x = head.input.forward(&e, &h)?;
+        let x = head.input.forward(&e, &h, None)?;
         assert_eq!(x.dims2()?, (1, hidden));
         let m = x.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
         assert!(m.is_finite() && m > 0.0, "eh_proj produced {m}");
@@ -509,7 +533,7 @@ mod tests {
         };
         let e = Tensor::zeros((2, d), DType::F32, &dev).unwrap();
         let h = Tensor::zeros((1, d), DType::F32, &dev).unwrap();
-        let err = inp.forward(&e, &h).unwrap_err().to_string();
+        let err = inp.forward(&e, &h, None).unwrap_err().to_string();
         assert!(err.contains("one embedding with one hidden"), "{err}");
     }
 }

@@ -7,7 +7,11 @@
 //! residual already is (hot-path invariant 2) after uploading an index the
 //! layout already implies. Only a genuinely scattered selection gathers.
 
+use candle::wave_provenance::WaveTicket;
 use candle::{Result, Tensor};
+
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::wave_from_vec_ticketed;
 
 /// The first row and length of `rows` when they are consecutive, ascending.
 pub fn contiguous_run(rows: &[u32]) -> Option<(usize, usize)> {
@@ -19,13 +23,27 @@ pub fn contiguous_run(rows: &[u32]) -> Option<(usize, usize)> {
 
 /// `x` restricted to `rows` along `dim`: a `narrow` view when the rows are one
 /// consecutive run, otherwise an `index_select` gather.
-pub fn select_head_rows(x: &Tensor, rows: Vec<u32>, dim: usize) -> Result<Tensor> {
+///
+/// The gather lands beside `x`; its index is uploaded onto `index_ticket`'s
+/// arena when one is given, and onto the pool otherwise.
+pub fn select_head_rows(
+    x: &Tensor,
+    rows: Vec<u32>,
+    dim: usize,
+    index_ticket: Option<WaveTicket>,
+) -> Result<Tensor> {
     match contiguous_run(&rows) {
         Some((start, len)) if start == 0 && len == x.dim(dim)? => Ok(x.clone()),
         Some((start, len)) => x.narrow(dim, start, len),
         None => {
             let n = rows.len();
-            let idx = Tensor::from_vec(rows, n, x.device())?;
+            #[cfg(feature = "cuda")]
+            let idx = wave_from_vec_ticketed(rows, (n,), x.device(), index_ticket)?;
+            #[cfg(not(feature = "cuda"))]
+            let idx = {
+                let _ = index_ticket;
+                Tensor::from_vec(rows, n, x.device())?
+            };
             x.index_select(&idx, dim)
         }
     }
@@ -62,7 +80,7 @@ mod tests {
     #[test]
     fn scoring_every_row_returns_the_residual_itself() {
         let x = residual();
-        let got = select_head_rows(&x, (0..6).collect(), 0).unwrap();
+        let got = select_head_rows(&x, (0..6).collect(), 0, None).unwrap();
         assert!(got.same_storage(&x));
         assert_eq!(got.dims(), &[6, 2]);
         assert_eq!(got.to_vec2::<f32>().unwrap(), x.to_vec2::<f32>().unwrap());
@@ -71,7 +89,7 @@ mod tests {
     #[test]
     fn a_run_is_a_view_of_the_residual() {
         let x = residual();
-        let got = select_head_rows(&x, vec![2, 3, 4], 0).unwrap();
+        let got = select_head_rows(&x, vec![2, 3, 4], 0, None).unwrap();
         assert!(got.same_storage(&x));
         assert!(got.is_contiguous());
         assert_eq!(
@@ -83,7 +101,7 @@ mod tests {
     #[test]
     fn a_scattered_selection_gathers_exactly_those_rows() {
         let x = residual();
-        let got = select_head_rows(&x, vec![0, 1, 5], 0).unwrap();
+        let got = select_head_rows(&x, vec![0, 1, 5], 0, None).unwrap();
         assert!(!got.same_storage(&x));
         assert_eq!(
             got.to_vec2::<f32>().unwrap(),
@@ -94,12 +112,12 @@ mod tests {
     #[test]
     fn rows_select_along_the_requested_dim() {
         let x = residual().reshape((1, 6, 2)).unwrap();
-        let run = select_head_rows(&x, vec![4, 5], 1).unwrap();
+        let run = select_head_rows(&x, vec![4, 5], 1, None).unwrap();
         assert_eq!(
             run.to_vec3::<f32>().unwrap(),
             vec![vec![vec![8.0, 9.0], vec![10.0, 11.0]]]
         );
-        let gathered = select_head_rows(&x, vec![5, 0], 1).unwrap();
+        let gathered = select_head_rows(&x, vec![5, 0], 1, None).unwrap();
         assert_eq!(
             gathered.to_vec3::<f32>().unwrap(),
             vec![vec![vec![10.0, 11.0], vec![0.0, 1.0]]]

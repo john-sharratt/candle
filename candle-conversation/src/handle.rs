@@ -1,5 +1,6 @@
 use crate::error::ConversationError;
 use crate::token_buffer::TokenBuffer;
+use crate::turn_text::TurnText;
 use crate::TurnStats;
 use flume::{Receiver, RecvTimeoutError};
 use futures_core::Stream;
@@ -272,6 +273,13 @@ pub struct TurnResponse {
     /// The assistant's generated text.
     pub text: String,
 
+    /// `text`, split where the model wrote tags: the written half and every
+    /// control token as markup, every run of ordinary tokens as literal (see
+    /// [`crate::decoded_text`]). What a reader of the answer's markup — a tool
+    /// call planner — reads, since `text` alone cannot tell a tag from its
+    /// quotation.
+    pub answer: TurnText,
+
     /// Token IDs generated.
     pub token_ids: TokenBuffer,
 
@@ -342,6 +350,7 @@ mod tests {
     fn response(text: &str) -> TurnResponse {
         TurnResponse {
             text: text.to_string(),
+            answer: TurnText::literal(text),
             token_ids: TokenBuffer::new(),
             stats: TurnStats {
                 prefill_ms: 0.0,

@@ -19,13 +19,16 @@ use candle::quantized::ggml_file::qtensor_from_ggml;
 use candle::quantized::gguf_file::{Content, TensorInfo, Value};
 use candle::quantized::ko_quant::dequant_ko;
 use candle::quantized::GgmlDType;
+use candle::wave_provenance::WaveTicket;
 use candle::{Device, Result, Tensor};
 
 use super::config::Qwen4ExpConfig;
 use super::hyper::HcWeights;
 use super::model::{ExpertSource, LayerMix, PleSource, Qwen4ExpLayer, Qwen4ExpModel};
 use super::ple::PleWeights;
-use super::ple_cache::{PleCacheStats, PleRowCache, PleRowFetch};
+#[cfg(feature = "cuda")]
+use super::ple_cache::dequant_rows_on_device;
+use super::ple_cache::{PleCacheStats, PleRowCache, PleRowFetch, RECORD_BYTES, RECORD_ELEMS};
 use super::qsa::IndexerWeights;
 use crate::models::delta_net::{DeltaNetWeights, LayerKind};
 use crate::models::dense_span::peak_load_pool_bytes;
@@ -175,9 +178,18 @@ struct CachedPle {
 }
 
 impl PleSource for CachedPle {
-    fn rows(&self, ids: &[u32]) -> Result<Tensor> {
+    /// On the card the records are uploaded quantized and widened there, both
+    /// on `root`'s arena when one is given, so neither the upload nor the F32
+    /// rows the PLE block reads is a pool allocation per forward. The host
+    /// oracle widens the same records with the CPU Q8_0 codec.
+    fn rows(&self, ids: &[u32], root: Option<WaveTicket>) -> Result<Tensor> {
         let mut buf = Vec::new();
         self.cache.gather(ids, &mut buf)?;
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            return dequant_rows_on_device(&self.device, buf, ids.len(), root);
+        }
+        let _ = root;
         qtensor_from_ggml(
             self.dtype,
             &buf,
@@ -451,6 +463,21 @@ pub(crate) fn open_cached_ple(
             "qwen4exp: PLE table width {} != embedding_length_per_layer_input {}",
             ple_slab.dims[1],
             cfg.ple.head_dim
+        );
+    }
+    // The card widens rows with a kernel built for exactly one record
+    // geometry; anything else would be read as garbage, so refuse it here.
+    if device.is_cuda()
+        && (ple_slab.dtype != GgmlDType::Q8_0
+            || ple_slab.dims[1] != RECORD_ELEMS
+            || ple_slab.outer_bytes != RECORD_BYTES)
+    {
+        candle::bail!(
+            "qwen4exp: the device PLE gather needs a Q8_0 table {RECORD_ELEMS} wide \
+             ({RECORD_BYTES}-byte records), got {:?} × {} ({} bytes)",
+            ple_slab.dtype,
+            ple_slab.dims[1],
+            ple_slab.outer_bytes
         );
     }
     let table_rows = ple_slab.dims[0] as u64;

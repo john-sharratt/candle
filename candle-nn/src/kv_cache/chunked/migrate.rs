@@ -19,6 +19,8 @@ use super::chunk_ops::BlockAllocSpec;
 use crate::kv_cache::KvFormat;
 #[cfg(feature = "cuda")]
 use candle::cuda::cudarc::driver::CudaStream;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 /// Bytes one band occupies, from the band's own format tag.
 ///
@@ -161,10 +163,10 @@ pub fn kv_migrate(device: &candle::Device, plan: &MigrationPlan) -> candle::Resu
 pub fn kv_migrate_on(
     device: &candle::Device,
     plan: &MigrationPlan,
-    stream: Option<&CudaStream>,
+    stream: Option<&Arc<CudaStream>>,
 ) -> candle::Result<()> {
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::cuda_backend::kernels;
+    use candle::cuda_backend::staged::segment;
 
     let dev = match device {
         candle::Device::Cuda(d) => d,
@@ -181,47 +183,28 @@ pub fn kv_migrate_on(
     let src: Vec<i64> = plan.records.iter().map(|r| r.src_ptr).collect();
     let dst: Vec<i64> = plan.records.iter().map(|r| r.dst_ptr).collect();
     let lens: Vec<i64> = plan.records.iter().map(|r| r.byte_len).collect();
-
-    let src_gpu = dev
-        .memcpy_stod(&src)
-        .map_err(|e| candle::Error::Msg(format!("kv_migrate: src plan HtoD: {e}")))?;
-    let dst_gpu = dev
-        .memcpy_stod(&dst)
-        .map_err(|e| candle::Error::Msg(format!("kv_migrate: dst plan HtoD: {e}")))?;
-    let len_gpu = dev
-        .memcpy_stod(&lens)
-        .map_err(|e| candle::Error::Msg(format!("kv_migrate: len plan HtoD: {e}")))?;
-
     // Uploaded only for a strided plan. Every migration plan is contiguous, so
-    // this is `None` there and the kernel takes null — the same three arrays,
+    // these are empty there and the kernel takes null — the same three arrays,
     // the same bytes on the wire, as before strided records existed.
-    let stride_gpu = if plan.strided {
-        let rows: Vec<i64> = plan.records.iter().map(|r| r.rows).collect();
-        let ss: Vec<i64> = plan.records.iter().map(|r| r.src_stride).collect();
-        let ds: Vec<i64> = plan.records.iter().map(|r| r.dst_stride).collect();
-        Some((
-            dev.memcpy_stod(&rows)
-                .map_err(|e| candle::Error::Msg(format!("kv_migrate: rows plan HtoD: {e}")))?,
-            dev.memcpy_stod(&ss)
-                .map_err(|e| candle::Error::Msg(format!("kv_migrate: src stride HtoD: {e}")))?,
-            dev.memcpy_stod(&ds)
-                .map_err(|e| candle::Error::Msg(format!("kv_migrate: dst stride HtoD: {e}")))?,
-        ))
+    let (rows, ss, ds): (Vec<i64>, Vec<i64>, Vec<i64>) = if plan.strided {
+        (
+            plan.records.iter().map(|r| r.rows).collect(),
+            plan.records.iter().map(|r| r.src_stride).collect(),
+            plan.records.iter().map(|r| r.dst_stride).collect(),
+        )
     } else {
-        None
+        Default::default()
     };
 
     let default_stream = dev.cuda_stream();
     let used_stream = stream.unwrap_or(&default_stream);
-    // Cross-stream ordering fence. The three plan uploads above — and the
-    // record sources themselves when they are freshly written (e.g. Q arenas
-    // filled by the primary-stream convert moments earlier) — are allocated
-    // and copied in PRIMARY-stream order (`memcpy_stod` + the async pool's
-    // stream-ordered validity). When the caller passes a dedicated copy
-    // stream, the kernel below consumes them on THAT stream with no recorded
-    // dependency: under load the primary stream queues seconds deep, so the
-    // copy stream reaches the plan/source bytes long before their allocation
-    // and fill retire — CUDA_ERROR_ILLEGAL_ADDRESS inside
+    // Cross-stream ordering fence. The record sources, when they are freshly
+    // written (e.g. Q arenas filled by the primary-stream convert moments
+    // earlier), are written in PRIMARY-stream order. When the caller passes a
+    // dedicated copy stream, the kernel below consumes them on THAT stream
+    // with no recorded dependency: under load the primary stream queues
+    // seconds deep, so the copy stream reaches the source bytes long before
+    // their fill retires — CUDA_ERROR_ILLEGAL_ADDRESS inside
     // `run_kv_migrate_copy` (the bulk-ingest decode-onset crash). Drain the
     // device once before the cross-stream launch; the default-stream path
     // needs no fence (same-stream FIFO).
@@ -230,25 +213,6 @@ pub fn kv_migrate_on(
             .synchronize()
             .map_err(|e| candle::Error::Msg(format!("kv_migrate: pre-launch fence: {e}")))?;
     }
-    let (sp, _sg) = src_gpu.device_ptr(used_stream);
-    let (dp, _dg) = dst_gpu.device_ptr(used_stream);
-    let (lp, _lg) = len_gpu.device_ptr(used_stream);
-    // Guards live to the end of the launch scope, as the three above do.
-    let strided_ptrs = stride_gpu.as_ref().map(|(r, s, d)| {
-        (
-            r.device_ptr(used_stream),
-            s.device_ptr(used_stream),
-            d.device_ptr(used_stream),
-        )
-    });
-    let (rows_p, ss_p, ds_p) = match &strided_ptrs {
-        Some(((r, _), (s, _), (d, _))) => (*r as *const i64, *s as *const i64, *d as *const i64),
-        None => (
-            std::ptr::null::<i64>(),
-            std::ptr::null::<i64>(),
-            std::ptr::null::<i64>(),
-        ),
-    };
     // Every destination this launch will write, checked against memory declared
     // immutable after load.
     //
@@ -267,23 +231,44 @@ pub fn kv_migrate_on(
             r.byte_len.max(0) as usize,
         );
     }
-    unsafe {
-        candle::set_kernel_breadcrumb("run_kv_migrate_copy", file!(), line!());
-        kernels::simple::kv_migrate::run_kv_migrate_copy(
-            sp as *const i64,
-            dp as *const i64,
-            lp as *const i64,
-            rows_p,
-            ss_p,
-            ds_p,
-            plan.records.len() as i32,
-            used_stream.cu_stream() as *mut std::ffi::c_void,
-        );
-    }
-    used_stream
-        .synchronize()
-        .map_err(|e| candle::Error::Msg(format!("kv_migrate: stream sync: {e}")))?;
-    Ok(())
+    // The plan goes up in one copy into the device's synced scratch — held, so
+    // a migration allocates nothing — on the stream that reads it, and the
+    // stream is drained before the scratch is released.
+    dev.with_synced_upload(
+        used_stream,
+        &[
+            segment(&src),
+            segment(&dst),
+            segment(&lens),
+            segment(&rows),
+            segment(&ss),
+            segment(&ds),
+        ],
+        |p| {
+            let strided = |a: u64| {
+                if plan.strided {
+                    a as *const i64
+                } else {
+                    std::ptr::null::<i64>()
+                }
+            };
+            unsafe {
+                candle::set_kernel_breadcrumb("run_kv_migrate_copy", file!(), line!());
+                kernels::simple::kv_migrate::run_kv_migrate_copy(
+                    p[0] as *const i64,
+                    p[1] as *const i64,
+                    p[2] as *const i64,
+                    strided(p[3]),
+                    strided(p[4]),
+                    strided(p[5]),
+                    plan.records.len() as i32,
+                    used_stream.cu_stream() as *mut std::ffi::c_void,
+                );
+            }
+            Ok(())
+        },
+    )
+    .map_err(|e| candle::Error::Msg(format!("kv_migrate: {e}")))
 }
 
 /// Host-side migration plan-builder (`docs/archived/kv_tier_migration.md` §8).

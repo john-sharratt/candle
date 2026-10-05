@@ -45,11 +45,12 @@
 //! not carried over from the draft.
 
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
+use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::draft_walk::{draft_reserve, draft_walk};
 use candle_nn::kv_cache::{
-    begin_wave, cover_wave_transient, KvCache, LayerPhase, WavePlan, WaveWidth,
+    begin_wave, cover_wave_transient, Chain, KvCache, LayerPhase, WavePlan, WaveWidth,
 };
 
 use std::cell::RefCell;
@@ -68,7 +69,7 @@ use crate::models::lora::LayerLora;
 use crate::models::operand_guard::expect_dtype;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::tensor_cat::TensorCat;
-use crate::models::wave_buffers::wave_root;
+use crate::models::wave_buffers::{wave_empty_ticketed, wave_root};
 
 /// Everything the head's wave pass needs from the sweep that just ran.
 ///
@@ -93,6 +94,9 @@ pub struct HeadWave<'a> {
     pub kv_layer: usize,
     /// The wave's activation dtype.
     pub act_dtype: DType,
+    /// The forward span's ticket — where the rows' embeddings are gathered
+    /// (`WaveBuffer::MtpRowEmbeds`). `None` when no tier was placed.
+    pub forward: Option<WaveTicket>,
 }
 
 /// Run the head over this wave's rows, filling its KV layer, and hand back each
@@ -126,17 +130,39 @@ pub fn head_wave_pass(
     let dev = &q.device;
     let capture = model.hidden_capture_seqs()?;
 
+    // The rows' embeddings, on the forward span beside the ids they are read
+    // with (`WaveBuffer::MtpRowEmbeds`). Gathered under an attention
+    // generation of their own for the gather's staging — the head's pass has
+    // not opened its own yet, and the staging is gone before it does.
+    let embed = {
+        let staging = match dev {
+            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
+            _ => None,
+        };
+        q.embed.rows(
+            ids,
+            dev,
+            wave_root(staging.as_ref()),
+            w.act_dtype,
+            w.forward,
+        )?
+    };
+
+    // **The head's pass is one attention generation**, priced as
+    // `Chain::HeadPass`: its input assembly in carve order, then the block's
+    // attention as a trunk layer runs it.
+    let wave = match dev {
+        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
+        _ => None,
+    };
+    let ticket = wave.as_ref().map(|g| g.ticket());
+
     // The trunk's output for EVERY row, not just the scored ones: the head's
     // row `i` is conditioned on the hidden of row `i - 1`, so a wave that
     // normed only the rows the LM head scores would have nothing to feed the
-    // interior of a prefill span.
-    //
-    // Off the pool rather than a wave span, like the residual stream it is
-    // computed from: what consumes it is `forward_attn_batched`, whose input is
-    // a [`TensorCat`], and a `TensorCat` holds an owned tensor. The head's own
-    // transients — its projections, its context — do run on the span the pass
-    // opens below.
-    let h_all = q.final_norm.forward_live(x_flat)?;
+    // interior of a prefill span. Rooted on the pass, not on the residual's
+    // forward span, which prices no such buffer (`WaveBuffer::MtpTrunkNorm`).
+    let h_all = q.final_norm.forward_with_ticket(x_flat, ticket)?;
 
     // Hand the armed sequences their rows before the shift consumes `h_all`.
     for span in w.spans {
@@ -164,53 +190,37 @@ pub fn head_wave_pass(
         dst.narrow(0, 0, span.len)?.slice_set(&src, 0, 0)?;
     }
 
-    // The shift. Row `start` of a span takes the seed the last accept left —
-    // the trunk's hidden at the position before this wave's first — and rows
-    // `start+1 ..` take the row before them, which this wave just produced.
-    //
-    // **This cat is one launch per span** (`cat0` allocates once and issues a
-    // `copy_strided_src` per argument), so a decode wave over `n` sessions
-    // spends `n` launches assembling a buffer — hot-path invariant 2, and the
-    // one place this pass pays it. Removing it needs the seeds to already be
-    // contiguous, which means a slab indexed by slot rather than a tensor per
-    // sequence, or a gather kernel over a descriptor table (invariant 2b).
-    // Neither is worth doing from this comment: the cost is bounded by the
-    // cohort width, not the token count, and it has never been measured against
-    // a wide wave. Instrument the span first — the last two refactors proposed
-    // here from structural reasoning alone were both aimed at the wrong thing.
-    let mut parts: Vec<Tensor> = Vec::with_capacity(w.spans.len() * 2);
-    let mut zero: Option<Tensor> = None;
+    // The shift (`WaveBuffer::MtpShift`). Row `start` of a span takes the seed
+    // the last accept left — the trunk's hidden at the position before this
+    // wave's first — and rows `start+1 ..` take the row before them, which
+    // this wave just produced. Two copies per span into one buffer on the
+    // pass, bounded by the cohort width rather than the token count.
+    let shifted = wave_empty_ticketed((rows, hidden), w.act_dtype, dev, ticket)?;
     for span in w.spans {
-        let seed = match model.draft_seed(span.seq)? {
+        match model.draft_seed(span.seq)? {
             // Already the wave's dtype — it is a row of a capture buffer that
             // was allocated in it.
-            Some(s) => s,
+            Some(seed) => shifted.slice_set(&seed, 0, span.start)?,
             // No seed yet: the sequence's first wave, whose first row is
             // position 0 and has no predecessor. A fork inherits its parent's
             // KV but not its seed and lands here too — one row of the head's
             // history is then conditioned on zeros instead of the true hidden,
             // which costs a little draft quality on that step and nothing else,
             // because a proposal is only ever checked against the target.
-            None => zero
-                .get_or_insert(Tensor::zeros((1, hidden), w.act_dtype, dev)?)
-                .clone(),
-        };
-        parts.push(seed);
+            None => shifted.narrow(0, span.start, 1)?.zero_set()?,
+        }
         if span.len > 1 {
-            parts.push(h_all.narrow(0, span.start, span.len - 1)?);
+            shifted.slice_set(
+                &h_all.narrow(0, span.start, span.len - 1)?,
+                0,
+                span.start + 1,
+            )?;
         }
     }
-    let shifted = Tensor::cat(&parts, 0)?;
-    drop(parts);
 
-    let wave = match dev {
-        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
-        _ => None,
-    };
-    let embed = q
-        .embed
-        .rows(ids, dev, wave_root(wave.as_ref()), w.act_dtype)?;
-    let x = head.input.forward(&embed, &shifted)?;
+    // The two norms, their concatenation and `eh_proj` each inherit the pass
+    // from their operands (`MtpEmbedNorm` … `MtpInput`).
+    let x = head.input.forward(&embed, &shifted, ticket)?;
     let xt = TensorCat::from_cat_tensor(x.reshape((1, rows, hidden))?, 0)?;
 
     let layer = Qwen35AttentionLayer {
@@ -342,6 +352,13 @@ pub fn draft_cohort(
     // sequence through the head's attention and FFN, so the tier must hold the
     // plan for `n` decode rows; a cohort wider than the forward behind it
     // exhausted the span one carve short of its first `DecodeContext`.
+    //
+    // A step's forward phase carries what a wave's head does — its embeddings,
+    // the closing norm, the logits — **plus** the head's input assembly, which
+    // a wave runs on the head pass's attention generation (`Chain::HeadPass`)
+    // and a step runs here; so it is covered for both. The assembly's trunk
+    // norm and shift, which a step does not carve, are the room its two
+    // quantized operands take instead.
     if let Device::Cuda(d) = dev {
         let plan = WavePlan::new(model.wave_geometry(act_dtype));
         let width = WaveWidth::decode(n);
@@ -350,7 +367,8 @@ pub fn draft_cohort(
             [
                 plan.phase_bytes(LayerPhase::Attention, width),
                 plan.phase_bytes(LayerPhase::Ffn, width),
-                plan.phase_bytes(LayerPhase::Forward, width),
+                plan.phase_bytes(LayerPhase::Forward, width)
+                    + plan.chain_bytes(Chain::HeadPass, width),
             ],
         )?;
     }
@@ -379,9 +397,16 @@ pub fn draft_cohort(
     for s in seeds {
         expect_dtype(s, act_dtype, "mtp draft seed")?;
     }
-    let seed_refs: Vec<&Tensor> = seeds.iter().collect();
-    let seed_block = Tensor::cat(&seed_refs, 0)?;
+    // The seeds, laid into the first carry buffer the walk reads.
+    let (carry_a, carry_b) = model.draft_carry(n, act_dtype)?;
+    for (i, s) in seeds.iter().enumerate() {
+        carry_a.slice_set(s, 0, i)?;
+    }
     let q_lens = vec![1usize; n];
+    let Device::Cuda(cuda) = dev else {
+        candle::bail!("qwen35 mtp draft runs on CUDA");
+    };
+    let stream = cuda.cuda_stream();
 
     // One position of the walk. Everything around it — the pre-ensure, the
     // per-step metadata, the cache advance, the rollback, the single readback —
@@ -414,19 +439,34 @@ pub fn draft_cohort(
             generation,
             &pm,
         );
-        let embed = ctx.embed_ids(ids)?;
-        let h_next = head.step(&embed, h, caches, at, &params, &ctx)?;
-        let logits = ctx.lm_head.forward_live(&h_next)?;
-        Ok((h_next, logits))
+        // **The step's forward phase** holds its embeddings, the head's input
+        // assembly and residual, the closing norm and the logits; the block
+        // opens its attention and FFN phases inside it. The logits are returned
+        // past its close: the walk's argmax is the next launch on this stream,
+        // so it reads them before the next step's forward phase carves over
+        // them. The hidden the next step reads is copied into the carry buffer
+        // this step did not read, which outlives the phase.
+        let fwd_wave = begin_wave(&stream, LayerPhase::Forward)?;
+        let fwd_ticket = Some(fwd_wave.ticket());
+        let embed = {
+            // The gather's staging, in an attention generation of its own that
+            // closes before the block opens the phase for real work.
+            let staging = begin_wave(&stream, LayerPhase::Attention)?;
+            ctx.embed_ids(ids, wave_root(Some(&staging)), fwd_ticket)?
+        };
+        let normed = head.step(&embed, h, caches, at, &params, &ctx, fwd_ticket)?;
+        let logits = ctx.lm_head.forward_live(&normed)?;
+        let out = if h.same_storage(&carry_a) {
+            &carry_b
+        } else {
+            &carry_a
+        };
+        out.slice_set(&normed, 0, 0)?;
+        drop(fwd_wave);
+        Ok((out.clone(), logits))
     };
     draft_walk(
-        session,
-        seqs,
-        kv_layer,
-        committed,
-        &seed_block,
-        max_len,
-        &mut step,
+        session, seqs, kv_layer, committed, &carry_a, max_len, &mut step,
     )
 }
 

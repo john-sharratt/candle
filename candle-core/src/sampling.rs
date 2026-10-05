@@ -1,4 +1,6 @@
-use crate::{CpuStorage, CustomOp1, DType, Layout, LiveTensor, Result, Shape, Tensor, WithDType};
+use crate::{
+    CpuStorage, CustomOp1, DType, InplaceOp2, Layout, LiveTensor, Result, Shape, Tensor, WithDType,
+};
 
 #[cfg(feature = "cuda")]
 use crate::CudaStorage;
@@ -476,8 +478,6 @@ impl CustomOp1 for BatchedSampling {
             );
         }
         let batch_size = dims[0];
-        let vocab_size = dims[1];
-
         let device = &storage.device;
         let stream = device.cuda_stream();
 
@@ -491,6 +491,38 @@ impl CustomOp1 for BatchedSampling {
 
         // Allocate output buffer [batch_size] u32
         let output_slice = unsafe { device.alloc::<u32>(batch_size)? };
+        {
+            let (output_ptr, _out_guard) = output_slice.device_ptr(&stream);
+            self.launch_cuda(storage, layout, output_ptr, dtype_code)?;
+        }
+        let result_storage = CudaStorage::wrap_cuda_slice(output_slice, device.clone());
+        Ok((result_storage, Shape::from(batch_size)))
+    }
+
+    fn bwd(&self, _arg: &Tensor, _res: &Tensor, _grad_res: &Tensor) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+}
+
+impl BatchedSampling {
+    /// The fused sampler over `storage`'s `[batch, vocab]` rows, writing one
+    /// `u32` token per row at `output_ptr` — device memory the caller owns.
+    #[cfg(feature = "cuda")]
+    fn launch_cuda(
+        &self,
+        storage: &CudaStorage,
+        layout: &Layout,
+        output_ptr: u64,
+        dtype_code: i32,
+    ) -> Result<()> {
+        use crate::cuda_backend::cudarc::driver::DevicePtr;
+        use crate::cuda_backend::CudaStorageSlice;
+
+        let dims = layout.shape().dims();
+        let batch_size = dims[0];
+        let vocab_size = dims[1];
+        let device = &storage.device;
+        let stream = device.cuda_stream();
 
         // RNG offsets [batch_size] u64 — for a draw only. An argmax
         // (`temperature <= 0`) reads no RNG and the kernel takes a null pointer
@@ -509,7 +541,6 @@ impl CustomOp1 for BatchedSampling {
 
         // All guards must live until after the FFI call
         {
-            let (output_ptr, _out_guard) = output_slice.device_ptr(&stream);
             let rng = rng_slice.as_ref().map(|s| s.device_ptr(&stream));
             let rng_ptr = rng.as_ref().map_or(0, |(p, _)| *p);
 
@@ -586,13 +617,59 @@ impl CustomOp1 for BatchedSampling {
                 _ => unreachable!(),
             }
         }
+        Ok(())
+    }
+}
 
-        let result_storage = CudaStorage::wrap_cuda_slice(output_slice, device.clone());
-        Ok((result_storage, Shape::from(batch_size)))
+/// [`BatchedSampling`] writing its tokens into a `u32` buffer the caller holds
+/// rather than a fresh allocation — see [`LiveTensor::batched_sample_argmax_into`].
+struct SampleInto(BatchedSampling);
+
+impl InplaceOp2 for SampleInto {
+    fn name(&self) -> &'static str {
+        "batched_sampling_into"
     }
 
-    fn bwd(&self, _arg: &Tensor, _res: &Tensor, _grad_res: &Tensor) -> Result<Option<Tensor>> {
-        Ok(None)
+    fn cpu_fwd(
+        &self,
+        out: &mut CpuStorage,
+        out_l: &Layout,
+        s: &CpuStorage,
+        l: &Layout,
+    ) -> Result<()> {
+        let (tokens, _) = self.0.cpu_fwd(s, l)?;
+        let (CpuStorage::U32(tokens), CpuStorage::U32(dst)) = (tokens, out) else {
+            crate::bail!("batched_sample_argmax_into: the output must be U32");
+        };
+        let at = out_l.start_offset();
+        dst[at..at + tokens.len()].copy_from_slice(&tokens);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        out: &mut CudaStorage,
+        out_l: &Layout,
+        s: &CudaStorage,
+        l: &Layout,
+    ) -> Result<()> {
+        use crate::cuda_backend::cudarc::driver::DevicePtr;
+        use crate::cuda_backend::CudaStorageSlice;
+
+        let dtype_code = match &s.slice {
+            CudaStorageSlice::F32(_) => 0i32,
+            CudaStorageSlice::F16(_) => 1i32,
+            CudaStorageSlice::BF16(_) => 2i32,
+            _ => crate::bail!("BatchedSampling: unsupported dtype, expected F32/F16/BF16"),
+        };
+        let CudaStorageSlice::U32(dst) = &out.slice else {
+            crate::bail!("batched_sample_argmax_into: the output must be U32");
+        };
+        let stream = out.device.cuda_stream();
+        let (base, _guard) = dst.device_ptr(&stream);
+        let output_ptr = base + (out_l.start_offset() * std::mem::size_of::<u32>()) as u64;
+        self.0.launch_cuda(s, l, output_ptr, dtype_code)
     }
 }
 
@@ -745,6 +822,36 @@ impl<'w> LiveTensor<'w> {
         logits.apply_op1_no_bwd(&op)
     }
 
+    /// [`Self::batched_sample_argmax`] writing its `[batch]` tokens into `out`,
+    /// a contiguous `u32` buffer of exactly `batch` elements the caller holds,
+    /// rather than into a fresh allocation.
+    ///
+    /// For a loop that picks a token per step and keeps every pick: the steps
+    /// write rows of one buffer the loop sized once, so a step allocates
+    /// nothing. The logits must already be contiguous — they are read in place,
+    /// and a copy to make them so would be an allocation of its own.
+    pub fn batched_sample_argmax_into(&self, live_vocab: usize, out: &Self) -> Result<()> {
+        if self.rank() != 2 {
+            crate::bail!(
+                "batched_sample_argmax_into requires 2D [batch, vocab] logits, got {:?}",
+                self.shape()
+            );
+        }
+        if !self.is_contiguous() {
+            crate::bail!("batched_sample_argmax_into: the logits must be contiguous");
+        }
+        let batch = self.dim(0)?;
+        if out.dtype() != DType::U32 || !out.is_contiguous() || out.elem_count() != batch {
+            crate::bail!(
+                "batched_sample_argmax_into: the output must be a contiguous U32 buffer of \
+                 {batch} elements, got {:?} {:?}",
+                out.dtype(),
+                out.shape()
+            );
+        }
+        out.inplace_op2(self, &SampleInto(BatchedSampling::argmax(live_vocab)))
+    }
+
     /// Batched sampling with full control over temperature, top-k, top-p and seed.
     ///
     /// Takes a 2D [batch_size, vocab_size] logits tensor and returns a 1D [batch_size]
@@ -782,6 +889,33 @@ impl<'w> LiveTensor<'w> {
 mod tests {
     use super::*;
     use crate::Device;
+
+    /// The in-place argmax writes each row's pick into the row of the buffer it
+    /// is handed and nowhere else, on the host and on the device alike.
+    #[test]
+    fn argmax_into_writes_the_row_it_is_given() -> Result<()> {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(cuda) = Device::new_cuda(0) {
+            devices.push(cuda);
+        }
+        for dev in devices {
+            let logits = Tensor::new(&[[0.1f32, 3.0, 0.2], [5.0, 1.0, 0.0]], &dev)?;
+            let buf = Tensor::new(&[[7u32, 7], [7, 7], [7, 7]], &dev)?;
+            logits.batched_sample_argmax_into(3, &buf.get(1)?)?;
+            assert_eq!(
+                buf.to_vec2::<u32>()?,
+                vec![vec![7, 7], vec![1, 0], vec![7, 7]]
+            );
+            // The padded tail carries no probability.
+            logits.batched_sample_argmax_into(1, &buf.get(2)?)?;
+            assert_eq!(buf.get(2)?.to_vec1::<u32>()?, vec![0, 0]);
+            // A buffer of the wrong width is refused, not written past.
+            assert!(logits
+                .batched_sample_argmax_into(3, &buf.flatten_all()?)
+                .is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_multinomial_sampling_cpu() -> Result<()> {

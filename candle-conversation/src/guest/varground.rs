@@ -344,18 +344,23 @@ pub fn guest_origin(device: &Device) -> candle::cuda_backend::wave_provenance::L
 /// derived. One copy at the head of a stage buys the arena for everything that
 /// stage allocates.
 ///
-/// Returns `src` unchanged when no generation is open or the arena is full —
-/// both mean "the pool", which is where all of this came from before.
+/// Returns `src` unchanged when no generation is open — the pool, which is
+/// where all of this came from before. An open generation with no room is an
+/// error: the stage asked for more than its arena was sized for.
 pub fn into_arena(src: &Tensor, device: &Device) -> candle::Result<Tensor> {
-    use candle::cuda_backend::wave_provenance::{wave_alloc, LeaseOrigin, WaveTicket};
+    use candle::cuda_backend::wave_provenance::{
+        exhausted, wave_alloc, LeaseOrigin, WaveCarve, WaveTicket,
+    };
 
     let Ok(cuda) = device.as_cuda_device() else {
         return Ok(src.clone());
     };
     let ticket = WaveTicket::guest(cuda.cuda_stream().context().ordinal() as u32);
     let bytes = src.elem_count() * src.dtype().size_in_bytes();
-    let Some(ptr) = wave_alloc(ticket, bytes, 256) else {
-        return Ok(src.clone());
+    let ptr = match wave_alloc(ticket, bytes, 256) {
+        WaveCarve::Carved(ptr) => ptr,
+        WaveCarve::Closed => return Ok(src.clone()),
+        WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
     };
     // SAFETY: the range was just carved from the open generation, which outlives
     // this tensor — the caller drops it before the generation rewinds — and

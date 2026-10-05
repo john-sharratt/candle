@@ -18,9 +18,22 @@
 //! would cost more than the records. The counters exist to answer §8 item 4
 //! (hit rate against real traffic) — they report, they do not steer.
 
+#[cfg(feature = "cuda")]
+use std::ffi::c_void;
 use std::sync::Mutex;
 
+#[cfg(feature = "cuda")]
+use candle::cuda_backend::cudarc::driver::DevicePtr;
+#[cfg(feature = "cuda")]
+use candle::wave_provenance::WaveTicket;
 use candle::Result;
+#[cfg(feature = "cuda")]
+use candle::{DType, Storage, Tensor};
+#[cfg(feature = "cuda")]
+use candle_kernels::simple::ple_gather_dequant::run_ple_dequant_q8;
+
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
 /// Hit/miss/eviction counters — the §8-item-4 instrument.
 #[derive(Debug, Clone, Copy, Default)]
@@ -166,53 +179,74 @@ impl<F: PleRowFetch> PleRowCache<F> {
     }
 }
 
-/// Upload gathered Q8_0 records and dequantize them **on the card**
-/// (`simple/ple_gather_dequant.cu`), returning the widened rows to the host.
-///
-/// The transfer half of §0.1 as the engine runs it: ~2.7 KB per token crosses
-/// PCIe in quantized form and widens device-side. This helper returns the
-/// result to the host so the parity test can pin the kernel against the CPU
-/// Q8_0 dequant bit-for-bit; the engine's forward keeps the device buffer.
-pub fn gpu_dequant_rows_to_host(
-    device: &candle::Device,
-    records: &[u8],
-    n_rows: usize,
-) -> Result<Vec<f32>> {
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
-    use candle::cuda_backend::WrapErr;
-    use candle_kernels::simple::ple_gather_dequant::run_ple_dequant_q8;
+/// Bytes in one gathered Q8_0 record, and the F32 row it widens to — the one
+/// geometry `simple/ple_gather_dequant.cu` is built for.
+pub const RECORD_BYTES: usize = 170;
+pub const RECORD_ELEMS: usize = 160;
 
-    const ROW_BYTES: usize = 170;
-    const ROW_ELEMS: usize = 160;
-    let candle::Device::Cuda(dev) = device else {
-        candle::bail!("ple gpu dequant: CUDA device required");
-    };
-    if records.len() != n_rows * ROW_BYTES {
+/// Upload gathered Q8_0 records onto `root`'s arena and widen them there
+/// (`simple/ple_gather_dequant.cu`): `[n_rows, 160]` F32 on the device, every
+/// byte of it on the wave.
+///
+/// The engine's receive half of §0.1: ~2.7 KB per token crosses PCIe in
+/// quantized form, into the wave's own memory, and is dequantized beside it.
+#[cfg(feature = "cuda")]
+pub fn dequant_rows_on_device(
+    device: &candle::Device,
+    records: Vec<u8>,
+    n_rows: usize,
+    root: Option<WaveTicket>,
+) -> Result<Tensor> {
+    if records.len() != n_rows * RECORD_BYTES {
         candle::bail!(
-            "ple gpu dequant: {} bytes for {n_rows} rows of {ROW_BYTES}",
+            "ple gpu dequant: {} bytes for {n_rows} rows of {RECORD_BYTES}",
             records.len()
         );
     }
+    let candle::Device::Cuda(dev) = device else {
+        candle::bail!("ple gpu dequant: CUDA device required");
+    };
+    let rec = wave_from_vec_ticketed(records, (n_rows * RECORD_BYTES,), device, root)?;
+    // Fully overwritten by the kernel (hot-path invariant 6).
+    let out = wave_empty_ticketed((n_rows, RECORD_ELEMS), DType::F32, device, root)?;
+    if n_rows == 0 {
+        return Ok(out);
+    }
     let stream = dev.cuda_stream();
-    let rec_gpu = stream.memcpy_stod(records).w()?;
-    // Fully overwritten by the kernel — allocate uninitialised.
-    let out_gpu = unsafe { dev.alloc::<f32>(n_rows * ROW_ELEMS)? };
     {
-        let (rp, _gr) = rec_gpu.device_ptr(&stream);
-        let (op, _go) = out_gpu.device_ptr(&stream);
+        let (rs, rl) = rec.storage_and_layout();
+        let (os, ol) = out.storage_and_layout();
+        let (Storage::Cuda(rc), Storage::Cuda(oc)) = (&*rs, &*os) else {
+            candle::bail!("ple gpu dequant: operands left the device");
+        };
+        let rslice = rc.as_cuda_slice::<u8>()?.slice(rl.start_offset()..);
+        let oslice = oc.as_cuda_slice::<f32>()?.slice(ol.start_offset()..);
+        let (rp, _gr) = rslice.device_ptr(&stream);
+        let (op, _go) = oslice.device_ptr(&stream);
+        candle::set_kernel_breadcrumb("run_ple_dequant_q8", file!(), line!());
         unsafe {
             run_ple_dequant_q8(
                 rp as *const u8,
                 op as *mut f32,
                 n_rows as i32,
-                stream.cu_stream() as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut c_void,
             );
         }
     }
-    let mut out = vec![0f32; n_rows * ROW_ELEMS];
-    stream.memcpy_dtoh(&out_gpu, &mut out[..]).w()?;
-    stream.synchronize().w()?;
     Ok(out)
+}
+
+/// [`dequant_rows_on_device`] with the widened rows read back to the host, so
+/// the parity test can pin the kernel against the CPU Q8_0 dequant bit for bit.
+#[cfg(feature = "cuda")]
+pub fn gpu_dequant_rows_to_host(
+    device: &candle::Device,
+    records: &[u8],
+    n_rows: usize,
+) -> Result<Vec<f32>> {
+    dequant_rows_on_device(device, records.to_vec(), n_rows, None)?
+        .flatten_all()?
+        .to_vec1::<f32>()
 }
 
 #[cfg(test)]

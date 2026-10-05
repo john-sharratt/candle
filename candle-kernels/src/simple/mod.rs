@@ -75,6 +75,8 @@ pub mod fletcher32;
 // one launch replaces the ~120 tiny host-orchestrated ops per sub-block per layer
 pub mod bdp;
 pub mod hyper_mhc;
+/// The PLE block's fused gate and conv (Qwen3.8-Flash-Next).
+pub mod ple_fused;
 /// PLE gathered-row dequant (the qwen4exp n-gram transfer's receive half).
 pub mod ple_gather_dequant;
 // QSA block selection: indexer scores → the per-query packed entry list the

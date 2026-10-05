@@ -47,27 +47,18 @@ use candle::{Device, Result, Tensor};
 
 use super::batched_inference::{BatchedInferenceSession, ManagedBatchedModel, WaveResult};
 
-/// A verify plan's token rows, uploaded **once per group**: the plain cohort's
-/// tokens as one `[n, 1]` tensor with each sequence's input a `[1, 1]` view of
-/// its row, and the blocks as one `[1, Σ len]` tensor with each block a
-/// `[1, len]` view of its run. Returned as `(plain inputs, block inputs)`, in
-/// the order given.
+/// A verify plan's token rows, built **once per group** on the host: the plain
+/// cohort's tokens as one `[n, 1]` tensor with each sequence's input a
+/// `[1, 1]` view of its row, and the blocks as one `[1, Σ len]` tensor with
+/// each block a `[1, len]` view of its run. Returned as `(plain inputs, block
+/// inputs)`, in the order given.
 ///
-/// One host→device copy per group, however many sequences the wave carries —
-/// and it lands ahead of a forward whose queue is empty and waiting, so a copy
-/// per row would be a stall per row. The views also sit back to back in their
-/// buffer, so the forward's concatenation of a group's ids is one copy rather
-/// than one per sequence (`Tensor::cat` copies runs of adjacent views as one
-/// range).
-///
-/// On `device` because the rows join the wave's other inputs there — the
-/// scheduler's creep and glue rows are device tensors, and a concatenation
-/// across devices is refused.
-pub fn upload_plan_rows(
-    plain: &[u32],
-    blocks: &[Vec<u32>],
-    device: &Device,
-) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+/// **On the host, and the forward uploads them.** Every model lays a wave's
+/// ids on its forward span in one copy (`wave_token_ids`), host ids beside any
+/// already on the device, so building them on the device here would be a pool
+/// allocation ahead of the forward for ids the forward copies anyway.
+pub fn upload_plan_rows(plain: &[u32], blocks: &[Vec<u32>]) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+    let device = &Device::Cpu;
     let plain_inputs = if plain.is_empty() {
         Vec::new()
     } else {
