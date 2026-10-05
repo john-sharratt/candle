@@ -106,6 +106,13 @@ impl<T> RetireList<T> {
         self.held.len()
     }
 
+    /// Everything held, in the order it was retired, whatever it waits past.
+    /// For a moment when every reader is known to be done regardless of what
+    /// the host has observed — the device synchronized under the pass lock.
+    pub(crate) fn drain_all(&mut self) -> Vec<T> {
+        self.held.drain(..).map(|(_, item)| item).collect()
+    }
+
     /// Everything now reclaimable under `clock`, in the order it was retired.
     pub(crate) fn drain(&mut self, clock: &ReclaimClock) -> Vec<T> {
         let mut out = Vec::new();
@@ -183,5 +190,19 @@ mod tests {
         c.observe(13);
         assert_eq!(r.drain(&c), vec!['c']);
         assert_eq!(r.len(), 0);
+    }
+
+    /// With the device idle every retiree is releasable, including one whose
+    /// ticket the host has not yet observed, and the list is left empty.
+    #[test]
+    fn draining_all_releases_what_the_observed_ticket_has_not_reached() {
+        let c = ReclaimClock::new(1);
+        let mut r = RetireList::new();
+        r.push(7, 'a');
+        r.push(40, 'b');
+        c.observe(8);
+        assert_eq!(r.drain_all(), vec!['a', 'b']);
+        assert_eq!(r.len(), 0);
+        assert!(r.drain(&c).is_empty());
     }
 }

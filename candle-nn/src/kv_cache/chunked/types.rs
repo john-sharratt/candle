@@ -487,7 +487,11 @@ impl WriterTail {
 pub(crate) enum DecodeGpuChunksSyncKind {
     Empty,
     Rebuild,
+    /// The live buffer served as it stood.
     Reuse,
+    /// A commit outside the decode kernel had marked the writer region stale,
+    /// and it was re-serialised before the live buffer was handed back.
+    Resync,
 }
 
 /// Number of front chunks fully outside the sliding window — the pure
@@ -1432,6 +1436,7 @@ impl SequenceState {
         seq_offset: usize,
         arena_info: &[ResolvedArenaInfo],
     ) -> candle::Result<((u64, u32, u32), DecodeGpuChunksSyncKind)> {
+        let resynced = self.decode_stale_from.is_some();
         if let Some(from) = self.decode_stale_from {
             // Cleared only once the region is current: a resync that fails
             // leaves the mark for the next sync, not a buffer that reads as up
@@ -1474,10 +1479,12 @@ impl SequenceState {
         Self::slot_counts_agree(host_n, self.gpu_chunks.n_chunks())?;
         let wi = self.decode_write_chunk_idx();
         let ptr = self.gpu_chunks.raw_device_ptr();
-        Ok((
-            (ptr, host_n as u32, wi as u32),
-            DecodeGpuChunksSyncKind::Reuse,
-        ))
+        let kind = if resynced {
+            DecodeGpuChunksSyncKind::Resync
+        } else {
+            DecodeGpuChunksSyncKind::Reuse
+        };
+        Ok(((ptr, host_n as u32, wi as u32), kind))
     }
 
     /// Snapshot the current slot-state into the stager `generation`, returning

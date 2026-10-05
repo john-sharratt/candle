@@ -69,6 +69,7 @@ use super::wave_admit::admit_wave_kv;
 use super::wave_driver::{assemble_wave_contexts, WaveGroups};
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
+use crate::models::profile::{pipeline_record, profile_now};
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
 use candle_nn::Embedding;
@@ -748,8 +749,10 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         let _ = pending_glue;
         let glue_headers = DecodeHeaders::Prefill(glue_meta);
 
+        let t_assemble = profile_now();
         let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
         let contexts = contexts.as_mut_slice();
+        pipeline_record("wave:assemble", t_assemble);
 
         let cache_dtype = contexts
             .first()
@@ -766,6 +769,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // that has already finished. Invisible while every wave succeeds, fatal
         // the moment one fails: the failed wave's tier stands, every retry's
         // admit is refused by it, and the engine spins.
+        let t_reclaim = profile_now();
         #[cfg(feature = "cuda")]
         if let Device::Cuda(d) = self.model.device() {
             end_wave_transient(&d.cuda_stream());
@@ -824,13 +828,17 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             }
         }
 
+        pipeline_record("wave:reclaim", t_reclaim);
+
         // **Phase 1: admit.** Claim every KV slot this wave will write, for
         // every layer in the range, before a single byte of it computes — so the
         // arena frontier is final when the transient tier is reserved against it
         // (`docs/archived/elastic_vram_partition.md` §7, `wave_admit`). Decode's claims
         // were made by the caller when it built the position map; this covers
         // the multi-token rows.
+        let t_admit = profile_now();
         admit_wave_kv(contexts, n_decode, n_prefill, layer_start, layer_end)?;
+        pipeline_record("wave:admit", t_admit);
 
         // **Phase 2: price and reserve this wave's transient tier.**
         //
@@ -845,6 +853,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // out inside the reservation on every phase but never chooses its
         // address, which is what keeps layer *N*'s extents and layer *N+1*'s at
         // the same offsets (§13b).
+        let t_plan = profile_now();
         #[cfg(feature = "cuda")]
         {
             let rows = n_decode + pre_rows + glue_rows;
@@ -872,6 +881,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 }
             }
         }
+        pipeline_record("wave:plan", t_plan);
 
         // **From here to the end of this function, the forward owns the
         // partition.**
@@ -900,6 +910,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
 
         // Combined residual: embed every row flat `[1, total, hidden]`, or resume
         // a paused wave from its persisted stream.
+        let t_embed = profile_now();
         let mut x = match x_in {
             None => {
                 let inputs: Vec<Tensor> = contexts.iter().map(|c| c.input_ids.clone()).collect();
@@ -956,6 +967,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             }
             Some(resume) => resume,
         };
+        pipeline_record("wave:embed", t_embed);
 
         // Per-group model-side RoPE (built only if a layer takes the non-paged
         // path) + prefill position-map caches, all alive for the whole layer loop.

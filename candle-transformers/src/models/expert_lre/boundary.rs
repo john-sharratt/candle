@@ -218,6 +218,7 @@ impl PipelineState {
         self.quiesce_before_handover()?;
         self.finish_promotions()?;
         self.drain_ring(self.routed_served.load(Ordering::Acquire))?;
+        self.release_retired();
 
         // The zone decides who moves and who goes; this performs it.
         let plan = self.inner.retract_zone(target);

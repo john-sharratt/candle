@@ -1,5 +1,5 @@
 #[cfg(feature = "cuda")]
-use crate::models::profile::{gpu_span, pipeline_record, profile_now};
+use crate::models::profile::{gpu_span, pipeline_record, pipeline_record_duration, profile_now};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
@@ -221,9 +221,22 @@ fn build_slot_headers(
     // every consumer of that buffer.
     pipeline_record("slot:arena", t_arena);
     let t_sync = profile_now();
-    let (slot_states, pinned_gids, table_changed) =
+    let (slot_states, pinned_gids, sync_stats) =
         KvCache::sync_chunked_slot_states(caches, offsets, &arena_info)?;
     pipeline_record("slot:sync", t_sync);
+    // What `slot:sync` spent, by how each slot was brought up to date.
+    pipeline_record_duration(
+        "slot:sync.rebuild",
+        sync_stats.rebuild_time,
+        sync_stats.rebuilds,
+    );
+    pipeline_record_duration(
+        "slot:sync.resync",
+        sync_stats.resync_time,
+        sync_stats.resyncs,
+    );
+    pipeline_record_duration("slot:sync.reuse", sync_stats.reuse_time, sync_stats.reuses);
+    let table_changed = sync_stats.rebuilds > 0;
 
     // The position_map is layer-invariant (see [`SharedPm`]). The first layer of
     // a forward builds and uploads it from the slots' token layouts; every later
@@ -823,6 +836,7 @@ fn paged_prefill_batched_impl<'w>(
     g_pack.end();
 
     let g_kernel = gpu_span("prefill:kernel", q.device());
+    let t_launch = profile_now();
     let out_packed = paged_prefill_attn_varlen_chunks(
         wave,
         &q_packed,
@@ -843,13 +857,16 @@ fn paged_prefill_batched_impl<'w>(
         qsa,
     )?;
     g_kernel.end();
+    pipeline_record("prefill:launch", t_launch);
     // Per-sequence written length (each sequence advanced by its own q_lens[i],
     // not the over-allocated max_add). Written by this kernel, not the decode
     // kernel, so the cached decode slot buffers are marked for the next sync to
     // bring up to date — a verify block is exactly this commit on a sequence
     // mid-decode. One commit for the layer's whole batch: one state lock, not
     // one per sequence.
+    let t_commit = profile_now();
     KvCache::commit_written_tokens_batch(caches, offsets, q_lens)?;
+    pipeline_record("prefill:commit", t_commit);
 
     // After each prefill layer, eagerly quantize all fully-sealed chunks so that
     // float F16 arenas are freed as we go rather than accumulating to OOM.
@@ -869,7 +886,9 @@ fn paged_prefill_batched_impl<'w>(
     // Quantized paths are left to rebuild lazily on the next decode metadata
     // sync so they always see the final post-reconcile chunk routing.
     if !needs_reconcile {
+        let t_prime = profile_now();
         KvCache::prime_chunked_decode_slots_batch(caches)?;
+        pipeline_record("prefill:prime", t_prime);
     }
 
     // Return the attention output FLAT-packed in cu_seqlens_q token order:
@@ -1799,7 +1818,9 @@ pub fn paged_glue_attn<'w>(
     // the final gap chunk's usage — desyncing the slot and overflowing the next
     // prefill's write region. `header_upload` stays alive until return.
     if !needs_reconcile {
+        let t_prime = profile_now();
         KvCache::prime_chunked_decode_slots_batch(caches)?;
+        pipeline_record("prefill:prime", t_prime);
     }
     drop(header_upload);
     // Returned at the ARENA's compute dtype, which is not always the caller's

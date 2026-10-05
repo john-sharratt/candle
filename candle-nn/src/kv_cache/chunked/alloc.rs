@@ -763,8 +763,8 @@ impl ChunkedKvBacking {
             .inner
             .single_latent
             .load(std::sync::atomic::Ordering::Relaxed);
-        for _h in 0..self.inner.n_kv_head {
-            if single_latent {
+        if single_latent {
+            for _h in 0..self.inner.n_kv_head {
                 // Two-region window: bands [0, LATENT_NOPE_BANDS) back the 448-d
                 // nope span in the writer format (FP8 E4M3 for the reference
                 // config); bands [LATENT_NOPE_BANDS, np) back the 64-d rope tail
@@ -790,9 +790,17 @@ impl ChunkedKvBacking {
                     gids.push(k_gid);
                     gids.push(v_gid);
                 }
-            } else {
-                let k_run = self.inner.alloc_chunk_run_for_key(k_key, np)?;
-                let v_run = self.inner.alloc_chunk_run_for_key(v_key, np)?;
+            }
+        } else {
+            // Every head's K run then its V run, claimed as one ordered batch:
+            // the same slots in the same order as one claim per run, with the
+            // pool's arena checks made once for the chunk rather than 2·n_kv_head
+            // times — at 32 heads that bookkeeping was most of a chunk's claim.
+            let requests: Vec<(ArenaKey, usize)> = (0..self.inner.n_kv_head)
+                .flat_map(|_| [(k_key, np), (v_key, np)])
+                .collect();
+            let mut runs = self.inner.alloc_chunk_runs_for_keys(&requests)?.into_iter();
+            while let (Some(k_run), Some(v_run)) = (runs.next(), runs.next()) {
                 for (k_gid, v_gid) in k_run.into_iter().zip(v_run) {
                     gids.push(k_gid);
                     gids.push(v_gid);
@@ -1163,6 +1171,47 @@ impl BackingInner {
              VRAM exhaustion on arena creation",
             key.slot_stride(),
         )
+    }
+
+    /// Claim a sequence of palette runs, `requests[i] = (key, len)`, in order —
+    /// the slots and the order of one [`Self::alloc_chunk_run_for_key`] per
+    /// request, with that function's per-run bookkeeping done once.
+    ///
+    /// A run that the pool serves from an existing arena needs two follow-ups:
+    /// its arena must exist in storage, and the class must be probed for being
+    /// nearly dry. Both are properties of the arena and the class, not of the
+    /// run, so a batch of runs from one arena asks each question once. A run the
+    /// pool cannot serve falls back to the single-run path, which registers a
+    /// fresh arena and retries exactly as it always did.
+    pub(super) fn alloc_chunk_runs_for_keys(
+        &self,
+        requests: &[(super::arena::ArenaKey, usize)],
+    ) -> Result<Vec<Vec<super::gid_pool::ChunkGid>>> {
+        let mut runs = Vec::with_capacity(requests.len());
+        let mut arenas: Vec<(super::arena::ArenaKey, usize)> = Vec::new();
+        let mut probes: Vec<(super::arena::ArenaKey, usize)> = Vec::new();
+        for &(key, len) in requests {
+            match self.pool.allocate_run_for(key, len) {
+                Some(gids) => {
+                    let arena_idx = gids[0].arena_idx();
+                    if !arenas.contains(&(key, arena_idx)) {
+                        arenas.push((key, arena_idx));
+                    }
+                    if !probes.iter().any(|&(k, _)| k == key) {
+                        probes.push((key, len));
+                    }
+                    runs.push(gids);
+                }
+                None => runs.push(self.alloc_chunk_run_for_key(key, len)?),
+            }
+        }
+        for (key, arena_idx) in arenas {
+            self.ensure_arena_exists(arena_idx, key)?;
+        }
+        for (key, len) in probes {
+            self.replenish_if_nearly_dry(key, len);
+        }
+        Ok(runs)
     }
 
     /// Bulk allocator — mirrors [`Self::alloc_chunk_for_key`]'s
