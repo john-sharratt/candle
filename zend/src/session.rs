@@ -18,7 +18,7 @@ use tokio::sync::{Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle as TaskHandle;
 
 use candle::vram;
-use candle_conversation::models::{Dialect, Model};
+use candle_conversation::models::{Dialect, Model, StrataTokens};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
@@ -1015,6 +1015,7 @@ impl InferenceState {
         self_check: SelfCheck,
         read_only_substrate: bool,
         qsa_selection_budget: Option<usize>,
+        qsa_strata: StrataTokens,
         summarize: bool,
         progress: Arc<LoadProgress>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
@@ -1031,26 +1032,15 @@ impl InferenceState {
         let device = candle::Device::cuda_if_available(0)
             .map_err(|e| anyhow::anyhow!("device init: {e}"))?;
 
-        // VRAM advisory at startup.  The 4090 mobile baseline is
-        // 16 GB; the daemon's model + expert cache + scheduler
-        // buffers leave roughly 3-5 GB for parallel-ingest peak
-        // working set.  When VRAM is constrained we shout a clear
-        // recommendation in the log so a CUDA OOM during code-read
-        // is traceable rather than an opaque exit-1.
+        // The card's headroom at startup, beside the file-ingest pool width
+        // that will spend it, so a CUDA OOM during code_read is traceable to
+        // both figures rather than an opaque exit-1.
         if let Ok((free, total)) = device.mem_get_info() {
             let free_gib = (free as f64) / (1024.0 * 1024.0 * 1024.0);
             let total_gib = (total as f64) / (1024.0 * 1024.0 * 1024.0);
             let n_workers = crate::code_read::CODE_READ_PARALLELISM;
-            let recommended = if total_gib < 24.0 {
-                "<= 8 workers recommended for 16 GB"
-            } else if total_gib < 40.0 {
-                "<= 16 workers recommended for 24-32 GB"
-            } else {
-                "32-64 workers usable on this VRAM budget"
-            };
             tracing::info!(
-                "VRAM {free_gib:.1}/{total_gib:.1} GiB free · code_read workers={n_workers} \
-                 ({recommended}; override ZEND_CODE_READ_PARALLELISM=N)"
+                "VRAM {free_gib:.1}/{total_gib:.1} GiB free · code_read workers={n_workers}"
             );
         }
 
@@ -1217,6 +1207,7 @@ impl InferenceState {
             .workspace_path(root.clone())
             .read_only_substrate(read_only_substrate)
             .qsa_selection_budget(qsa_selection_budget)
+            .qsa_strata(qsa_strata)
             // The schema's `rope: min_yarn_factor:` — engine-wide, so it is
             // read once here rather than per layer.
             .min_rope_factor(proj_builder.schema().min_yarn_factor)
@@ -2316,30 +2307,25 @@ impl InferenceState {
 
         // `--self-check`: every stored conversation asked whether it is intact,
         // before the retire sweep, the priming chain and every ingest — so an
-        // ingest unit it tombstones is simply read again by them. Each is read
-        // through a fork of its own layer's base, which projects its history
-        // under that layer's rules (an ingest unit's lineage and nothing else).
+        // ingest unit it tombstones is simply read again by them. Each is
+        // written out as a record and judged through the dialogue base, which
+        // has no history of its own to mix into the record.
         if self_check != SelfCheck::Off {
             progress.set_step(LoadStep::SelfCheck);
-            let mut readers: HashMap<LayerId, &Mutex<Sequence>> = HashMap::new();
-            for il in &ingest_layers {
-                if let (Some(layer), Some(base)) = (
-                    proj_builder_refresh.id_for_layer(&il.name),
-                    ingest_bases.get(&il.name),
-                ) {
-                    readers.insert(layer, base);
-                }
-            }
-            let mut layers: HashSet<LayerId> = readers.keys().copied().collect();
+            let mut layers: HashSet<LayerId> = ingest_layers
+                .iter()
+                .filter(|il| ingest_bases.contains_key(&il.name))
+                .filter_map(|il| proj_builder_refresh.id_for_layer(&il.name))
+                .collect();
             layers.insert(dialogue_layer);
-            let fork = |layer: LayerId, timeline: TimelineId| -> anyhow::Result<Sequence> {
-                let conv = match readers.get(&layer) {
-                    Some(base) => base.lock().unwrap().fork_resuming(timeline),
-                    None => base_conv.fork_resuming(timeline),
-                };
-                conv.map_err(|e| anyhow::anyhow!("opening timeline {}: {e}", timeline.raw()))
-            };
-            crate::self_check::run(&engine, &conv_config, &layers, &fork, self_check, &progress)?;
+            crate::self_check::run(
+                &engine,
+                &conv_config,
+                &layers,
+                base_conv.unsealed_asker(),
+                self_check,
+                &progress,
+            )?;
         }
 
         for il in &ingest_layers {
@@ -6086,6 +6072,7 @@ impl ZendSession {
         let self_check = self.config.self_check;
         let read_only_substrate = self.config.read_only_substrate;
         let qsa_selection_budget = self.config.qsa_selection_budget;
+        let qsa_strata = self.config.qsa_strata;
         let summarize = self.config.summarize;
         // Resolved once, here, and handed to both the downloader and the engine
         // builder, so the artifact fetched and the model built are the same one.
@@ -6178,6 +6165,7 @@ impl ZendSession {
                     self_check,
                     read_only_substrate,
                     qsa_selection_budget,
+                    qsa_strata,
                     summarize,
                     load_progress_for_blocking,
                 ) {

@@ -1048,6 +1048,39 @@ fn ingest_self_projection_sees_its_own_unscored_turns() {
     );
 }
 
+/// **The window does not trim an ingest conversation's own turns.** Four
+/// zero-scored turns of 4000 tokens each are 16000 against a 9000-token window.
+/// Trimmed by score they lost to the tie-break — newest key first — so a file
+/// conversation several pages in answered its final turn with its own request
+/// and its earlier pages gone, and summarised the priming chain's last document
+/// instead. Every one is the conversation itself, and every one is projected.
+#[test]
+fn ingest_self_projection_keeps_its_own_turns_past_the_window() {
+    let b = Builder::from_yaml(INGEST_GATED_YAML).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let turns: Vec<TurnIndex> = (0..4).map(|_| resolver.append(grp)).collect();
+    let resolver = turns
+        .iter()
+        .fold(resolver, |r, &i| {
+            r.with_score(grp, i, 0.0).with_tokens(grp, i, 4000)
+        })
+        .as_ingest_self();
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert_eq!(indices, [0, 1, 2, 3], "every own turn is projected");
+}
+
 /// The same schema and the same zero-scored turns, but the target is NOT an
 /// ingest layer — retrieval, where a turn must earn its slot. The band applies
 /// exactly as before, so dialogue pulling this content back is untouched.

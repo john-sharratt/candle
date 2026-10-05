@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use candle_conversation::projection::{LayerId, TimelineId};
 
+use super::questions::Subject;
 use crate::code_read::PATH_KEY;
 use crate::passthrough::CONV_ID_PREFIX;
 use crate::repo_scan::DIR_KEY;
@@ -28,10 +29,11 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub timeline: TimelineId,
-    pub layer: LayerId,
     /// How a report names it: its conversation id, its ingested path, or its
     /// folder, whichever it has.
     pub label: String,
+    /// What it was given to do, which decides what it is asked.
+    pub subject: Subject,
 }
 
 /// The entries to check, in timeline order so a report reads the same from
@@ -49,17 +51,20 @@ pub fn select(
                 .is_some_and(|id| id.starts_with(CONV_ID_PREFIX))
         })
         .filter_map(|e| {
-            let layer = e.layer.filter(|l| layers.contains(l))?;
-            let label = e
-                .conv_id
-                .clone()
-                .or_else(|| e.metadata.get(PATH_KEY).cloned())
-                .or_else(|| e.metadata.get(DIR_KEY).cloned())
-                .unwrap_or_else(|| "-".to_string());
+            e.layer.filter(|l| layers.contains(l))?;
+            let (label, subject) = if let Some(id) = &e.conv_id {
+                (id.clone(), Subject::Dialogue)
+            } else if let Some(path) = e.metadata.get(PATH_KEY) {
+                (path.clone(), Subject::file(path))
+            } else if let Some(dir) = e.metadata.get(DIR_KEY) {
+                (dir.clone(), Subject::folder(dir))
+            } else {
+                ("-".to_string(), Subject::Dialogue)
+            };
             Some(Candidate {
                 timeline: e.timeline,
-                layer,
                 label,
+                subject,
             })
         })
         .collect();
@@ -130,5 +135,29 @@ mod tests {
             .map(|c| c.label)
             .collect();
         assert_eq!(labels, ["chat-7", "candle/a.rs", "candle/src", "-"]);
+    }
+
+    #[test]
+    fn the_subject_follows_the_same_order_as_the_label() {
+        let mut a = entry(1, 1, 1);
+        a.conv_id = Some("chat-7".into());
+        a.metadata.insert(PATH_KEY.into(), "x/y.rs".into());
+        let mut b = entry(2, 1, 1);
+        b.metadata.insert(PATH_KEY.into(), "candle/a.rs".into());
+        b.metadata.insert(DIR_KEY.into(), "candle/".into());
+        let mut c = entry(3, 1, 1);
+        c.metadata.insert(DIR_KEY.into(), "candle/src/".into());
+        let subjects: Vec<Subject> = select([a, b, c], &layers(&[1]))
+            .into_iter()
+            .map(|c| c.subject)
+            .collect();
+        assert_eq!(
+            subjects,
+            [
+                Subject::Dialogue,
+                Subject::file("candle/a.rs"),
+                Subject::folder("candle/src/"),
+            ]
+        );
     }
 }

@@ -20,6 +20,7 @@ use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_model::{BatchedInference, BatchedModelCore};
 use candle_transformers::models::qwen35::TensorOverride;
+use candle_transformers::models::selection_strata::StrataTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -175,6 +176,9 @@ pub struct ModelBuilder {
     /// selects. `None` runs the checkpoint's own. See
     /// [`ModelBuilder::qsa_selection_budget`].
     qsa_selection_budget: Option<usize>,
+    /// How a selecting attention divides a query's candidates.
+    /// [`StrataTokens::DEFAULT`] unless set. See [`ModelBuilder::qsa_strata`].
+    qsa_strata: StrataTokens,
     /// The lowest progressive-YaRN factor any sequence runs at. `None` lets a
     /// sequence inside the trained window run the trained RoPE. See
     /// [`ModelBuilder::min_rope_factor`].
@@ -211,6 +215,7 @@ impl ModelBuilder {
             prefill_pass_tokens: None,
             loras: Vec::new(),
             qsa_selection_budget: None,
+            qsa_strata: StrataTokens::DEFAULT,
             min_rope_factor: None,
             spec,
         }
@@ -363,6 +368,22 @@ impl ModelBuilder {
     /// nothing, and refuses a budget its selection kernel cannot run.
     pub fn qsa_selection_budget(mut self, positions: Option<usize>) -> Self {
         self.qsa_selection_budget = positions;
+        self
+    }
+
+    /// How a selecting attention divides a query's candidates
+    /// (`docs/qsa_stratified_selection.md`): cut into windows that each spend
+    /// the whole budget, with the system prompt and the recent span ranked in,
+    /// or forced into, every one, all stated in positions.
+    ///
+    /// [`StrataTokens::DEFAULT`] unless set; [`StrataTokens::WHOLE`] is the
+    /// checkpoint's single ranking over every candidate. Handed to every model
+    /// through `ManagedBatchedModel::set_selection_strata`, after its budget:
+    /// a model whose attention attends every position has nothing to divide,
+    /// and a selecting one refuses a strata whose windows its kernel could not
+    /// hold at the deepest position it reaches.
+    pub fn qsa_strata(mut self, strata: StrataTokens) -> Self {
+        self.qsa_strata = strata;
         self
     }
 
@@ -992,6 +1013,17 @@ impl ModelBuilder {
     ) -> crate::Result<LoadedModel> {
         let int8_mode = self.int8_mode(device, model_path);
         let mut model = self.load_arch(model_path, device, int8_mode, progress)?;
+        // After `load_arch` has applied the budget: a selecting model checks
+        // the strata against its kernel under the budget it will run with.
+        model
+            .set_selection_strata(self.qsa_strata)
+            .map_err(ConversationError::Model)?;
+        tracing::info!(
+            window = self.qsa_strata.window,
+            recent = self.qsa_strata.recent,
+            mode = ?self.qsa_strata.mode,
+            "selection strata (a model whose attention reads every position ignores it)"
+        );
         if let Some(min) = self.min_rope_factor {
             model
                 .set_rope_min_factor(min)
@@ -2168,5 +2200,27 @@ mod selection_budget_tests {
             "Qwen35Dense has no QSA selection, so a selection budget of 1048576 position(s) \
              would change nothing"
         );
+    }
+
+    /// **Every model is built with the stratified selection unless told
+    /// otherwise** — the setting is the engine's, not one architecture's, and a
+    /// caller replaces it whole.
+    #[test]
+    fn every_model_builds_with_the_default_strata_unless_told_otherwise() {
+        use candle_transformers::models::selection_strata::{Recent, StrataTokens};
+        for model in [Model::Qwen35_0_8B_Q8, Model::Qwen3_30B_A3B_Q4] {
+            assert_eq!(
+                model.builder().qsa_strata,
+                StrataTokens {
+                    window: 131_072,
+                    recent: 8192,
+                    mode: Recent::Candidate,
+                }
+            );
+        }
+        let whole = Model::Qwen35_0_8B_Q8
+            .builder()
+            .qsa_strata(StrataTokens::WHOLE);
+        assert_eq!(whole.qsa_strata, StrataTokens::WHOLE);
     }
 }

@@ -262,7 +262,7 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 ///
 /// `key` is workspace-relative; the prompt names the repository and the path
 /// inside it separately, the two arguments the call it asks for takes.
-fn opening_prompt(key: &str, lines: usize) -> String {
+pub(crate) fn opening_prompt(key: &str, lines: usize) -> String {
     let (repo, path) = split(key);
     let pages = lines.div_ceil(PAGE_LINES as usize).max(1);
     let last = pages - 1;
@@ -302,14 +302,16 @@ fn opening_prompt(key: &str, lines: usize) -> String {
 /// non-ingest slots the engine also needs concurrently: the live dialogue
 /// session, the async summariser's compression passes, etc.
 ///
-/// **16, and the ceiling here is VRAM rather than throughput.** Each worker is
+/// **8, and the ceiling here is VRAM rather than throughput.** Each worker is
 /// serialised on its own file's whole turn — a prefill that attends over the
 /// inherited priming chain (~32k KV, ~9.4 s) and then a decode — so the pool
 /// width, not the wave, is what bounds the file phase.
 ///
 /// Measured on the 72 GB card over the same corpus:
 ///
+///    8   0.61 files/min   48 files in 79 min
 ///   12   0.58 files/min   stable for three hours
+///   16   0.41 files/min   16 files in 39 min
 ///   32   1.66 files/min   K/V ran 13.9 GB against a 2.5 GB budget, the weight
 ///                         zone slid to 30.6 GB against a 28.8 GB floor, and the
 ///                         daemon died after ~30 minutes — no panic, no poison,
@@ -317,10 +319,17 @@ fn opening_prompt(key: &str, lines: usize) -> String {
 ///
 /// A file conversation is not a directory conversation: it carries 876k KV per
 /// decode forward against a directory's 25k, so a width that is comfortable for
-/// `repo_map` exhausts the card here. 16 keeps most of the gain over 12 with
-/// margin against the floor, which matters more than rate — a dead daemon
-/// ingests nothing.
-pub const CODE_READ_PARALLELISM: usize = 16;
+/// `repo_map` exhausts the card here.
+///
+/// **The curve is not monotonic, and 16 sits past its turn.** Each worker holds a
+/// ~77k-token context, so at 16 the resident K/V pushes the expert weights out of
+/// the span: the hit rate falls to ~50% mid-sweep, an 8k prefill forward costs
+/// 5–7 s instead of ~1 s, and the wave loop spends ~10 s per pass in KV relief
+/// that returns `reclaimed_mib=0` because nothing in the span is actually free.
+/// Narrowing the pool buys back the weight zone, which is worth more than the
+/// extra concurrency — 8 is 1.5× the rate of 16 on the same corpus. Below 8 the
+/// card is no longer the constraint and the rate falls off with the width.
+pub const CODE_READ_PARALLELISM: usize = 8;
 
 /// Worker count for the parallel ingest — [`CODE_READ_PARALLELISM`].
 fn parallelism() -> usize {

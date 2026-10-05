@@ -236,7 +236,10 @@ impl ProbeOutcome {
     /// bare low percentage reading as a failure of the gate that just passed.
     pub fn weight_uptake_label(&self) -> String {
         if self.weight_at_limit {
-            format!("weight zone at its limit (uptake {}%)", self.weight_uptake_pct)
+            format!(
+                "weight zone at its limit (uptake {}%)",
+                self.weight_uptake_pct
+            )
         } else {
             format!("weight uptake {}%", self.weight_uptake_pct)
         }

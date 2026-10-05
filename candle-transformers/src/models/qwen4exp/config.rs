@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::models::batched_inference::KvLayers;
 pub use crate::models::delta_net::{DeltaNetDims, LayerKind};
 use crate::models::qwen35::config::{value_to_usize, MoeConfig, Qwen35Config};
-use crate::models::qwen4exp::qsa_select::MAX_RATIO;
+use crate::models::qwen4exp::qsa_select::{Strata, MAX_RATIO};
 
 /// The hyper-connection (Gated Residual) geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +43,12 @@ pub struct IndexerConfig {
     pub head_dim: usize,
     /// Selection budget in positions (`attention.indexer.top_k`, 2048). The
     /// selected width is `top_k + ratio − 1` — whole blocks plus the tail.
+    /// Under stratified selection it is each window's budget.
     pub top_k: usize,
+    /// How the candidates are divided before they are ranked. Not part of the
+    /// checkpoint: it loads as [`Strata::WHOLE`], the checkpoint's own
+    /// selection, and the engine sets it from the daemon's configuration.
+    pub strata: Strata,
 }
 
 /// The PLE (per-layer n-gram embedding) configuration. One PLE layer per
@@ -222,6 +227,7 @@ impl Qwen4ExpConfig {
             n_heads: get_usize("attention.indexer.head_count")?,
             head_dim: get_usize("attention.indexer.key_length")?,
             top_k: get_usize("attention.indexer.top_k")?,
+            strata: Strata::WHOLE,
         };
         if indexer.n_heads == 0 || indexer.head_dim == 0 || indexer.top_k == 0 {
             candle::bail!("qwen4exp: indexer geometry must be nonzero");

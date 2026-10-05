@@ -471,10 +471,18 @@ pub struct WriterTail {
 }
 
 impl WriterTail {
-    /// `true` when the snapshot contains no chunks (the common
-    /// turn-boundary case where decode hasn't started yet).
+    /// `true` when the snapshot holds no tokens — the common turn-boundary
+    /// case where decode hasn't started yet.
+    ///
+    /// Tokens, not chunks: a slot can carry an empty writer chunk with nothing
+    /// in it — the one a view is carved with so its first write has somewhere
+    /// unshared to land. That chunk is no part of what the slot forwarded, so
+    /// there is nothing of it to restore, and restoring it after a rebuild that
+    /// placed its own writer leaves a stale empty chunk past the rebuilt
+    /// writer region, which the decode then reads a write slice for that no
+    /// commit ever described.
     pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
+        self.chunks.iter().all(|c| c.usage == 0)
     }
 
     /// Number of chunks in the snapshot.

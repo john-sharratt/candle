@@ -13982,6 +13982,127 @@ mod tests {
         assert_eq!(streamed, done.token_ids.to_vec());
     }
 
+    /// **Consecutive turns on one parent carry its recurrent buffer forward.**
+    ///
+    /// A recurrence cannot be rebuilt from K/V, so between one turn and the next
+    /// the parent's state is the only copy of everything the conversation has
+    /// said — the seal empties the slot's K/V (stateless-slot housekeeping) and
+    /// keeps the state. Three identical turns are driven through the whole loop
+    /// — submit, prefill, view carve, decode, move back, seal — and the parent
+    /// is read after each.
+    ///
+    /// The toy step is affine (`s ← 2s + t·k`), so a turn of `m` forwards is
+    /// `f(s) = 2ᵐ·s + C`, and `C = f(0)` is exactly the state after turn one.
+    /// Carried forward therefore means `state₂ = 2ᵐ·state₁ + state₁` and
+    /// `state₃ = 2ᵐ·state₂ + state₁` for one `m` — an exact identity, no
+    /// tolerance. A state that was reset or not reused comes back as `state₁`;
+    /// one absorbed twice, or out of order, matches no `m` at all.
+    #[test]
+    fn consecutive_turns_carry_the_recurrent_buffer_forward() {
+        let (mut scheduler, tx, probe) = make_test_scheduler_recurrent();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let loop_thread = std::thread::spawn(move || scheduler.run());
+
+        // One turn, run to its end. `Done` is sent from the seal, which runs
+        // after the view's state has moved back onto the parent and the closing
+        // tail has been forwarded, so the parent is settled when this returns.
+        let run_turn = || {
+            let (event_tx, event_rx) = flume::unbounded();
+            let mut submit = raw_submit_turn(parent, event_tx);
+            if let SchedulerRequest::SubmitTurn { sampling, .. } = &mut submit {
+                // Flat dummy logits draw end-of-sequence now and then; banned,
+                // every turn runs its whole budget and the turns are identical.
+                sampling.banned_tokens = vec![0];
+            }
+            tx.send(submit).expect("scheduler running");
+            loop {
+                match event_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the turn ends within a minute")
+                {
+                    TurnEvent::Done(resp) => break resp,
+                    TurnEvent::Error(e) => panic!("the turn failed: {e}"),
+                    _ => {}
+                }
+            }
+        };
+        let read = || {
+            (
+                probe
+                    .get_index(parent.0)
+                    .expect("the parent carries a recurrence after a turn")
+                    .tokens,
+                probe
+                    .get(parent.0)
+                    .expect("the parent carries a recurrent state after a turn"),
+            )
+        };
+
+        let first = run_turn();
+        let (absorbed_1, state_1) = read();
+        let second = run_turn();
+        let (absorbed_2, state_2) = read();
+        let third = run_turn();
+        let (absorbed_3, state_3) = read();
+
+        tx.send(SchedulerRequest::Shutdown)
+            .expect("scheduler running");
+        loop_thread.join().expect("the loop exits cleanly");
+
+        // Each turn's K/V is that turn alone (the seal empties the slot), and the
+        // recurrence absorbs exactly that many tokens per turn.
+        for (turn, held) in [
+            (1, first.stats.context_tokens),
+            (2, second.stats.context_tokens),
+            (3, third.stats.context_tokens),
+        ] {
+            assert_eq!(
+                held, absorbed_1 as usize,
+                "turn {turn}'s K/V holds {held} token(s), turn 1 absorbed {absorbed_1}",
+            );
+        }
+        assert_eq!(
+            (absorbed_2 - absorbed_1, absorbed_3 - absorbed_2),
+            (absorbed_1, absorbed_1),
+            "every identical turn must absorb the same {absorbed_1} token(s); the counts \
+             went {absorbed_1} → {absorbed_2} → {absorbed_3}",
+        );
+
+        // `f(s) = 2ᵐ·s + state₁`: recover `2ᵐ` from one cell and hold every cell
+        // of both later turns to it.
+        let scale = (state_2[0][0] - state_1[0][0]) / state_1[0][0];
+        assert!(
+            scale >= 2.0 && scale.log2().fract() == 0.0,
+            "turn 2 did not continue from turn 1's state: state₂[0][0] = {} against \
+             state₁[0][0] = {} is no 2ᵐ step (scale {scale}). state₁ = {state_1:?}, \
+             state₂ = {state_2:?}",
+            state_2[0][0],
+            state_1[0][0],
+        );
+        let step = |from: &ToyState| -> ToyState {
+            let mut out = *from;
+            for (l, row) in out.iter_mut().enumerate() {
+                for (j, cell) in row.iter_mut().enumerate() {
+                    *cell = *cell * scale + state_1[l][j];
+                }
+            }
+            out
+        };
+        assert_eq!(
+            state_2,
+            step(&state_1),
+            "turn 2 did not continue from turn 1's state — the parent's recurrent \
+             buffer was not carried into the second turn",
+        );
+        assert_eq!(
+            state_3,
+            step(&state_2),
+            "turn 3 did not continue from turn 2's state — the parent's recurrent \
+             buffer was not carried into the third turn",
+        );
+    }
+
     /// The refusal half: a previous turn that is registered but has no decode
     /// to finish (still in prefill) cannot be wound down — the new submit is
     /// refused with `TurnInFlight`, and the in-flight turn is left alone.

@@ -140,6 +140,11 @@ __device__ __forceinline__ float load_as_float<__nv_fp8_e4m3>(const __nv_fp8_e4m
 // `typical_draft` is the proposal a speculative verify row tests (-1 on a row
 // that tests none), with `typical_eps`/`typical_delta` the Medusa thresholds it
 // is accepted on when the sample did not land on it.
+//
+// `logits_row` is the row of the logits block this entry samples. A dispatch
+// whose other rows are resolved elsewhere (a grammar allow-list) hands the
+// kernel the whole block and names each kernel row's source row here, instead
+// of gathering the kernel rows into a compacted copy first.
 struct SeqDials {
     float temperature;
     int32_t top_k;
@@ -165,6 +170,7 @@ struct SeqDials {
     int32_t typical_draft;
     float typical_eps;
     float typical_delta;
+    int32_t logits_row;
 };
 
 // ============================================================================
@@ -2793,8 +2799,12 @@ batched_penalty_sampling_kernel(
     int32_t typical_draft = -1;
     float typical_eps = 0.0f;
     float typical_delta = 0.0f;
+    // The logits row this block samples (see `SeqDials::logits_row`); the
+    // block's own index when no dials are given.
+    int32_t logits_row = batch_idx;
     if (seq_dials != nullptr) {
         const SeqDials d = seq_dials[batch_idx];
+        logits_row = d.logits_row;
         typical_draft = d.typical_draft;
         typical_eps = d.typical_eps;
         typical_delta = d.typical_delta;
@@ -2821,8 +2831,8 @@ batched_penalty_sampling_kernel(
         segment_temp_boost = d.segment_temp_boost;
     }
     
-    const T* my_logits = logits + batch_idx * vocab_size;
-    
+    const T* my_logits = logits + (size_t)logits_row * vocab_size;
+
     // Calculate bitset words needed for this vocab size
     const int bitset_words = (vocab_size + 31) / 32;
     

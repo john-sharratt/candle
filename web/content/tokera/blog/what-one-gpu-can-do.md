@@ -215,9 +215,11 @@ One engine is faster at a single session: [Strata](https://github.com/Niko1221/S
 built for this model alone, keeps the hot experts in VRAM and computes the misses
 on the CPU. On a PCIe 5.0 RTX 5070 with 12 GB, holding 14% of the experts against
 our 36–49% on a PCIe 3.0 3090, it decodes 94 t/s to our 73.3, both on 2-bit
-experts of the same size and both with MTP, so the bus is part of that gap. On the same 3090 card with a PCIe Gen4 link and an EPYC host it decodes 93 t/s on larger 3-bit experts. Its one published batched run, four sessions on the 5070, is 63.1 t/s
-aggregate, below its 70.7 one request at a time. Width is where this engine
-pulls ahead.
+experts of the same size and both with MTP, so the bus is part of that gap. On
+an RTX 3090 of its own, with a PCIe Gen4 link and an EPYC host, it decodes
+93 t/s on larger 3-bit experts. Its one published batched run, four sessions on
+the 5070, is 63.1 t/s aggregate, below its 70.7 one request at a time. Width is
+where this engine pulls ahead.
 
 As far as I can find, this is the first time anyone has published this model
 running on a laptop GPU — or in 32 GB of host memory at all.
@@ -804,25 +806,27 @@ The code is in the public domain. The numbers are in the repository with the
 tests that produced them. Go and try them — and if you beat them, I'd love to
 hear about it.
 
-A shout-out to [Strata](https://github.com/Niko1221/Strata), who are pushing some
-great numbers on this same model. Built for Flash-Next alone, with its benchmarks,
-hardware and method published in the open for anyone to reproduce, it is the
-fastest single-session decoder of Flash-Next I've found. Its RTX 5090 is close
-hardware to our Blackwell workstation card, an RTX PRO 5000, so that's the
-comparison to make:
+One last word, about [Strata](https://github.com/Niko1221/Strata). It was built
+for Flash-Next alone, and it is the fastest single-session decoder of that model
+I've found. A community run on an RTX 5090 — close hardware to our RTX PRO 5000 —
+makes the cleanest comparison:
 
-- **Single-session decode: Strata wins.** 179.4 t/s at 4K on 2-bit experts
-  against our 143.1 t/s on 4-bit experts, twice the bytes per token.
-- **Batched inference: we win.** Our PRO 5000 reaches 704.7 t/s aggregate at
-  eight sessions and 807.9 at sixteen. Strata's one published batched run, on an
-  RTX 5070, is 63.1 t/s aggregate at four sessions, below its 70.7 one request at
-  a time.
-- **Inline compression: we win.** Our cache is compressed 7.33× as it's written
-  while eight sessions still decode 668.2 t/s, 95% of the uncompressed 704.7.
-  Strata's int8 KV is about 2×.
+- **One session:** Strata decodes 179.4 t/s at 4K context (175.7 at 32K), on
+  2-bit experts. We decode 147.5 t/s from a short prompt, on 4-bit experts that
+  are twice the bytes per expert. On one conversation, Strata is faster.
+- **Many sessions:** our eight-session aggregate is 738.2 t/s, 5.0× our single
+  session, and sixteen reach 792.8. Strata's one published batched run, four
+  sessions on an RTX 5070, comes to 63.1 t/s, 0.89× its 70.7 one request at a
+  time. That ratio doesn't depend on the card, and it's where the two designs
+  part ways.
+- **The KV cache:** ours is compressed 7.13× as it's written, while eight
+  sessions still decode 681.5 t/s, 92% of uncompressed. Strata's int8 KV is
+  about 2×.
 
-Strata has never run on our 3090 machine, so that comparison is only indicative.
-Work like theirs moves the whole field, and it's well worth a look.
+Strata has never run on our 3090 machine, so the 3090 comparison earlier is only
+indicative. Its benchmarks, hardware and method are all published in the open
+for anyone to reproduce, and work like that moves the whole field. It's well
+worth a look.
 
 <div class="key">
 <h4>Sources</h4>

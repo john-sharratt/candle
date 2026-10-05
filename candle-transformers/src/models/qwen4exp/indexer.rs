@@ -50,16 +50,26 @@ use super::index_keys::{
     SNAPSHOT_BUFFERS,
 };
 use super::qsa::{rms_norm_last, IndexerWeights};
-use super::qsa_select::{max_entries, max_keep, selected_width, MAX_RATIO};
+use super::qsa_select::{
+    max_entries_for, max_gathered_for, max_keep, selected_width, Strata, MAX_RATIO,
+};
 use super::resident_page::ResidentPage;
 use super::spec::SpecCapture;
 use crate::models::delta_net::mix::SeqSpan;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::operand_guard::expect_dense;
 use crate::models::qsa_selection::QsaSelection;
+use crate::models::selection_strata::Recent;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 use candle::wave_provenance::WaveTicket;
+#[cfg(feature = "cuda")]
+use candle_kernels::simple::qsa_topk::{qsa_topk_split_parts, SPLIT_KEYS};
+use candle_kernels::simple::qsa_topk::{MAX_ENTRIES, MAX_KEEP};
 use candle_nn::kv_cache::{arena_regions, plan_slot_moves, relocate_tensor, ArenaSlot, SlotTenant};
+#[cfg(feature = "cuda")]
+use std::ffi::c_void;
+#[cfg(feature = "cuda")]
+use std::ptr::null_mut;
 
 use crate::models::rope_schedule::FactoredRope;
 
@@ -173,6 +183,15 @@ pub struct IndexCache {
     /// by that span's width; it is now whatever the last placement said, so a
     /// span nothing indexed is a hole and nothing else.
     tail_base: usize,
+    /// Position the conversation's system prompt ends at — `0` when the slot
+    /// holds none.
+    ///
+    /// Set by the projection that placed the prompt, and the reason it lives
+    /// here rather than beside the sequence: a stratified selection ranks the
+    /// prompt's blocks in every window, so it has to describe the same layout
+    /// the pages do, and travel wherever they travel — a view carve, a move, a
+    /// rebuild that keeps the prefix.
+    prompt_end: usize,
 }
 
 /// One injected page and where it sits.
@@ -223,7 +242,28 @@ impl IndexCache {
             pages: Vec::new(),
             page_rows: vec![0],
             tail_base: 0,
+            prompt_end: 0,
         })
+    }
+
+    /// Record where the conversation's system prompt ends.
+    pub fn set_prompt_end(&mut self, pos: usize) {
+        self.prompt_end = pos;
+    }
+
+    /// Where the conversation's system prompt ends — `0` when none was set.
+    pub fn prompt_end(&self) -> usize {
+        self.prompt_end
+    }
+
+    /// The blocks wholly inside the system prompt — the span a stratified
+    /// selection ranks in every window. Through the page layout, so a prompt
+    /// placed as several sealed sections counts its short boundary blocks.
+    pub fn prompt_blocks(&self, ratio: usize) -> usize {
+        match self.prompt_end {
+            0 => 0,
+            end => self.candidates_at(end - 1, ratio),
+        }
     }
 
     /// The indexer head width this cache stores.
@@ -437,7 +477,7 @@ impl IndexCache {
                     d as i32,
                     rms_eps as f32,
                     1,
-                    stream.cu_stream() as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
             Ok(())
@@ -552,6 +592,8 @@ impl IndexCache {
             pages: Vec::new(),
             page_rows: vec![0],
             tail_base: 0,
+            // A restored cache holds no projection; the next one sets it.
+            prompt_end: 0,
         })
     }
 
@@ -779,6 +821,7 @@ impl IndexCache {
             pages: self.pages.clone(),
             page_rows: self.page_rows.clone(),
             tail_base: self.tail_base,
+            prompt_end: self.prompt_end,
         })
     }
 
@@ -831,7 +874,23 @@ impl IndexCache {
         self.n_open = 0;
         self.page_rows.truncate(1);
         self.tail_base = 0;
+        self.prompt_end = 0;
         self.pages.drain(..).map(|p| p.page).collect()
+    }
+
+    /// The largest position at or before `pos` that [`Self::truncate_to`]
+    /// accepts: the start of the page `pos` falls inside, or `pos` itself when
+    /// no page straddles it.
+    ///
+    /// A page can span several pieces — a slot's whole injected prefix is
+    /// closed into one page at a unit boundary — so a rebuild that wants to keep
+    /// a prefix ending inside it must keep less, and re-inject from the page's
+    /// start.
+    pub fn cut_floor(&self, pos: usize) -> usize {
+        self.pages
+            .iter()
+            .find(|p| p.base < pos && pos < p.base + p.tokens)
+            .map_or(pos, |p| p.base)
     }
 
     /// Cut the cache back to position `pos`: keep the injected pages that end at
@@ -840,9 +899,9 @@ impl IndexCache {
     ///
     /// For a rebuild that keeps its slot's prefix up to a piece boundary and
     /// re-injects only what follows. A page is atomic — its last row is ragged —
-    /// so a cut that falls inside one is refused rather than splitting it: the
-    /// caller's piece boundaries are exactly the page boundaries, and a cut
-    /// anywhere else means the two have diverged.
+    /// so a cut that falls inside one is refused rather than splitting it. The
+    /// caller chooses its cut through [`Self::cut_floor`], so a cut anywhere
+    /// else means the two have diverged.
     pub fn truncate_to(&mut self, pos: usize) -> Result<Vec<Arc<ResidentPage>>> {
         let keep = self
             .pages
@@ -862,6 +921,8 @@ impl IndexCache {
         self.n_open = 0;
         self.page_rows.truncate(keep + 1);
         self.tail_base = pos;
+        // A prompt is a prefix: a cut below its end keeps only what it kept.
+        self.prompt_end = self.prompt_end.min(pos);
         Ok(self.pages.drain(keep..).map(|p| p.page).collect())
     }
 
@@ -1213,7 +1274,7 @@ impl IndexCache {
                 ratio as i32,
                 out_stride as i64,
                 row_base as i64,
-                stream.cu_stream() as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut c_void,
             );
         }
         Ok(())
@@ -1436,10 +1497,57 @@ pub fn rotate_rows(
             rung_ptr,
             rung,
             i32::from(side == RotSide::Query),
-            stream.cu_stream() as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut c_void,
         );
     }
     Ok(dst)
+}
+
+/// The row stride of a selection table whose deepest query sees `cand_max`
+/// candidate blocks under `strata` — or why the selection kernel cannot run it.
+///
+/// Two ceilings, both the kernel's own and mirrored from it:
+///
+/// - **Survivors per window.** Each window streams its pool through one
+///   buffer of `MAX_KEEP` survivors, so the budget must keep no more than that
+///   ([`max_keep`]). Windows do not add up here — each starts over.
+/// - **Entries gathered per row.** Every window's choice is gathered, sorted
+///   and de-duplicated in one shared buffer of a power-of-two width, up to
+///   `MAX_ENTRIES`, so the gathered count ([`max_gathered_for`], repeats
+///   included) must round up inside it. More windows at a given depth is what
+///   reaches it.
+///
+/// The stride itself is what survives the union, [`max_entries_for`].
+pub fn selection_stride(
+    ratio: usize,
+    top_k: usize,
+    cand_max: usize,
+    strata: &Strata,
+) -> Result<usize> {
+    if ratio == 0 || ratio > MAX_RATIO {
+        candle::bail!("qsa: compression ratio {ratio} outside 1..={MAX_RATIO}");
+    }
+    // `max_keep`, not a second copy of the arithmetic: this guard advertises
+    // the selection kernel's survivor ceiling, so it has to be the same bound
+    // the kernel actually reaches.
+    let keep_max = max_keep(top_k, ratio);
+    if keep_max > MAX_KEEP {
+        candle::bail!(
+            "qsa: top_k {top_k} at ratio {ratio} needs {keep_max} survivors, past the \
+             selection kernel's {MAX_KEEP} — its streaming buffer could not absorb a chunk"
+        );
+    }
+    let gathered = max_gathered_for(top_k, ratio, cand_max, strata);
+    if gathered.next_power_of_two() > MAX_ENTRIES {
+        candle::bail!(
+            "qsa: {} window(s) of {} blocks at {cand_max} candidate blocks gather up to \
+             {gathered} entries a row, past the selection kernel's {MAX_ENTRIES} — widen the \
+             window",
+            strata.windows(cand_max),
+            strata.window_width(cand_max),
+        );
+    }
+    Ok(max_entries_for(top_k, ratio, cand_max, strata))
 }
 
 /// The wave's selection table for one layer: one row per query, in the wave's
@@ -1451,12 +1559,71 @@ pub struct SelectionTable {
     entries: Tensor,
     cnt: Tensor,
     stride: usize,
+    // The kernel's union buffer, in entries: the gathered bound rounded up to
+    // the power of two its bitonic sort runs over.
+    gather: usize,
+    // The kernel's split scratch (`qsa_topk::SPLIT_KEYS` u64, as u32 pairs):
+    // what a launch too narrow to fill the device ranks each row's slices into.
+    // Uninitialised — every key the merge reads, the same launch wrote. Absent
+    // when this table's launch fills the device and runs the single pass.
+    split_keys: Option<Tensor>,
     ratio: usize,
+    strata: Strata,
+}
+
+/// The split scratch a selection over `rows` rows needs — `None` when the
+/// launch fills the device and runs the single pass, which reads none.
+#[cfg(feature = "cuda")]
+fn split_scratch(
+    rows: usize,
+    ratio: usize,
+    top_k: usize,
+    cand_max: usize,
+    strata: &Strata,
+    device: &Device,
+    ticket: Option<WaveTicket>,
+) -> Result<Option<Tensor>> {
+    if !device.is_cuda() {
+        return Ok(None);
+    }
+    let parts = unsafe {
+        qsa_topk_split_parts(
+            rows as i32,
+            cand_max as i32,
+            strata.window_blocks as i32,
+            top_k as i32,
+            ratio as i32,
+        )
+    };
+    if parts == 0 {
+        return Ok(None);
+    }
+    Ok(Some(wave_empty_ticketed(
+        (SPLIT_KEYS * 2,),
+        DType::U32,
+        device,
+        ticket,
+    )?))
+}
+
+/// No selection kernel runs without CUDA, so nothing splits.
+#[cfg(not(feature = "cuda"))]
+fn split_scratch(
+    _rows: usize,
+    _ratio: usize,
+    _top_k: usize,
+    _cand_max: usize,
+    _strata: &Strata,
+    _device: &Device,
+    _ticket: Option<WaveTicket>,
+) -> Result<Option<Tensor>> {
+    Ok(None)
 }
 
 impl SelectionTable {
-    /// An uninitialised table for `rows` queries, on `ticket`'s arena when one
-    /// is given — the layer phase the attention that reads it runs in.
+    /// An uninitialised table for `rows` queries whose deepest sees `cand_max`
+    /// candidate blocks, selecting under `strata` — on `ticket`'s arena when one
+    /// is given, the layer phase the attention that reads it runs in.
     ///
     /// Uninitialised is correct, not sloppy: the kernels read `entries` only
     /// below each row's `cnt`, and every row's `cnt` is written by the
@@ -1465,29 +1632,20 @@ impl SelectionTable {
         rows: usize,
         ratio: usize,
         top_k: usize,
+        cand_max: usize,
+        strata: &Strata,
         device: &Device,
         ticket: Option<WaveTicket>,
     ) -> Result<Self> {
-        if ratio == 0 || ratio > MAX_RATIO {
-            candle::bail!("qsa: compression ratio {ratio} outside 1..={MAX_RATIO}");
-        }
-        // `max_keep`, not a second copy of the arithmetic: this guard advertises
-        // the selection kernel's survivor ceiling, so it has to be the same
-        // bound the kernel actually reaches.
-        let keep_max = max_keep(top_k, ratio);
-        if keep_max > candle_kernels::simple::qsa_topk::MAX_KEEP {
-            candle::bail!(
-                "qsa: top_k {top_k} at ratio {ratio} needs {keep_max} survivors, past the \
-                 selection kernel's {} — its streaming buffer could not absorb a chunk",
-                candle_kernels::simple::qsa_topk::MAX_KEEP
-            );
-        }
-        let stride = max_entries(top_k, ratio);
+        let stride = selection_stride(ratio, top_k, cand_max, strata)?;
         Ok(Self {
             entries: wave_empty_ticketed((rows, stride), DType::U32, device, ticket)?,
             cnt: wave_empty_ticketed((rows,), DType::U32, device, ticket)?,
             stride,
+            gather: max_gathered_for(top_k, ratio, cand_max, strata).next_power_of_two(),
+            split_keys: split_scratch(rows, ratio, top_k, cand_max, strata, device, ticket)?,
             ratio,
+            strata: *strata,
         })
     }
 
@@ -1514,6 +1672,9 @@ impl SelectionTable {
         // the selection kernel cannot derive from a position once blocks stop
         // being uniformly `ratio` wide. See `IndexCache::tail_len`.
         tail: &[u32],
+        // Blocks wholly inside each query's system prompt — ranked in every
+        // window of a stratified selection. See `IndexCache::prompt_blocks`.
+        prompt: &[u32],
         ratio: usize,
         top_k: usize,
         row_base: usize,
@@ -1529,25 +1690,27 @@ impl SelectionTable {
             candle::bail!("qsa selection runs on CUDA");
         };
         let stream = dev.cuda_stream();
-        if tail.len() != rows {
+        if tail.len() != rows || prompt.len() != rows {
             candle::bail!(
-                "qsa selection: {} tail lengths against {rows} rows",
-                tail.len()
+                "qsa selection: {} tail lengths and {} prompt spans against {rows} rows",
+                tail.len(),
+                prompt.len()
             );
         }
-        // **One upload, not three.** Every one of these is a host→device copy
+        // **One upload, not four.** Every one of these is a host→device copy
         // per layer per wave, and on WDDM a small transfer costs far more in
         // submission than in bytes — three of them measured ~5% of the whole
         // forward-batched ladder. They are the same length and the same dtype,
-        // so they travel as one `[3, rows]` block and the kernel takes three
+        // so they travel as one `[4, rows]` block and the kernel takes four
         // offsets into it.
-        let mut packed: Vec<u32> = Vec::with_capacity(rows * 3);
+        let mut packed: Vec<u32> = Vec::with_capacity(rows * 4);
         packed.extend_from_slice(cand);
         packed.extend(qpos.iter().map(|&p| p as u32));
         packed.extend_from_slice(tail);
+        packed.extend_from_slice(prompt);
         // Beside the scores, on the layer's span, where the rest of the
         // selection lives.
-        let packed_t = scores.from_vec_beside(packed, (3, rows))?;
+        let packed_t = scores.from_vec_beside(packed, (4, rows))?;
 
         let (s_s, s_l) = scores.storage_and_layout();
         let s_slice = match &*s_s {
@@ -1573,18 +1736,38 @@ impl SelectionTable {
             _ => candle::bail!("qsa selection: cnt must be CUDA"),
         }
         .slice(n_l.start_offset()..);
+        let k_store = self.split_keys.as_ref().map(|t| t.storage_and_layout());
+        let k_slice = match &k_store {
+            Some((k_s, k_l)) => Some(
+                match &**k_s {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+                    _ => candle::bail!("qsa selection: split scratch must be CUDA"),
+                }
+                .slice(k_l.start_offset()..),
+            ),
+            None => None,
+        };
 
         let (s_ptr, _sg) = s_slice.device_ptr(&stream);
         let (c_ptr, _cg) = c_slice.device_ptr(&stream);
-        // The three rows of the packed block, in the order they were written.
+        // The four rows of the packed block, in the order they were written.
         let p_ptr = (c_ptr as *const u32).wrapping_add(rows);
         let t_ptr = (c_ptr as *const u32).wrapping_add(rows * 2);
+        let pr_ptr = (c_ptr as *const u32).wrapping_add(rows * 3);
         let (e_ptr, _eg) = e_slice.device_ptr(&stream);
         let (n_ptr, _ng) = n_slice.device_ptr(&stream);
+        // Null when the table holds no scratch: the kernel then runs the single
+        // pass.
+        let k_dev = k_slice.as_ref().map(|k| k.device_ptr(&stream));
+        let k_ptr = k_dev
+            .as_ref()
+            .map_or(null_mut(), |(p, _)| *p as *mut c_void);
+        let cand_max = cand.iter().copied().max().unwrap_or(0);
         // The table is one allocation; a tile writes its own row window, so
         // the offsets go on the pointers rather than through a narrowed view.
         let e_ptr = (e_ptr as *mut u32).wrapping_add(row_base * self.stride);
         let n_ptr = (n_ptr as *mut u32).wrapping_add(row_base);
+        let s = &self.strata;
         candle::set_kernel_breadcrumb("run_qsa_topk_entries", file!(), line!());
         unsafe {
             run_qsa_topk_entries(
@@ -1593,13 +1776,22 @@ impl SelectionTable {
                 c_ptr as *const u32,
                 p_ptr,
                 t_ptr,
+                pr_ptr,
                 e_ptr,
                 self.stride as i32,
                 n_ptr,
                 ratio as i32,
                 top_k as i32,
+                s.window_blocks as i32,
+                s.recent_blocks as i32,
+                i32::from(s.recent == Recent::Forced),
+                // Checked against the kernel's ceiling where the stride was
+                // sized.
+                self.gather as i32,
+                cand_max as i32,
+                k_ptr,
                 rows as i32,
-                stream.cu_stream() as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut c_void,
             );
         }
         Ok(())
@@ -1717,7 +1909,7 @@ fn fold_heads_into(
     .slice(o_l.start_offset() + row_base * out_stride..);
     let (r_ptr, _rg) = r_slice.device_ptr(&stream);
     let (o_ptr, _og) = o_slice.device_ptr(&stream);
-    let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
+    let raw_stream = stream.cu_stream() as *mut c_void;
     candle::set_kernel_breadcrumb("run_indexer_score_reduce", file!(), line!());
     unsafe {
         run_indexer_score_reduce(
@@ -1879,7 +2071,7 @@ pub fn append_wave(
         // upload runs eagerly, so they belong on the stream it names there.
         dev.with_staged_upload(&table, |base| {
             let stream = dev.cuda_stream();
-            let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
+            let raw_stream = stream.cu_stream() as *mut c_void;
             if n_jobs > 0 {
                 candle::set_kernel_breadcrumb("run_qsa_index_append", file!(), line!());
                 unsafe {
@@ -1996,6 +2188,32 @@ pub(super) fn i64_ptr(t: &Tensor) -> Result<u64> {
     Ok(ptr)
 }
 
+/// The most candidate blocks any row of the wave sees on KV layer `kv` — at
+/// least one. What the score buffer and the selection table are sized from;
+/// [`select_layer`] and the admission pricing (`select_bytes`) both ask it here
+/// so they cannot size the same carve two ways.
+pub fn widest_candidates(
+    spans: &[SeqSpan],
+    offsets: &[usize],
+    idx_map: &HashMap<usize, Vec<IndexCache>>,
+    kv: usize,
+    ratio: usize,
+) -> usize {
+    spans
+        .iter()
+        .zip(offsets)
+        .map(|(span, &off)| {
+            let last = off + span.len;
+            match idx_map.get(&span.seq).and_then(|c| c.get(kv)) {
+                Some(cache) => cache.candidates_at(last.saturating_sub(1), ratio),
+                None => last.div_ceil(ratio),
+            }
+        })
+        .max()
+        .unwrap_or(0)
+        .max(1)
+}
+
 /// Whether a layer at this depth selects at all.
 ///
 /// Below the budget every visible cell is attended, so the indexer would
@@ -2072,12 +2290,29 @@ pub fn select_layer(
     // take their own row windows. One GEMM per sequence per layer would be
     // launch-bound on the decode path, where a wave is 16 rows.
     let k_all = project_keys(h, indexer)?;
+    // The widest row in the wave sets the score buffer's stride, so every span
+    // writes into one buffer and the top-k covers all of it in a single launch;
+    // it also sizes the selection table's rows, which a stratified selection
+    // widens with depth. Asked of the caches, not derived from the offsets: a
+    // sequence holding injected pages has MORE rows than `tokens / ratio` — a
+    // page ends wherever its piece did, so its last row is short, and a prefix
+    // of several pieces carries one short row per boundary. Sizing from the
+    // uniform formula under-allocates by exactly that many columns. Read before
+    // this wave's append, which it does not depend on: a cache's candidates at
+    // a position follow from its page layout and where its tail opens.
+    let widest = if engages {
+        widest_candidates(spans, offsets, idx_map, kv, compress_ratio)
+    } else {
+        0
+    };
     let mut table = if engages {
         qsa_rows.fetch_add(total_rows as u64, Ordering::Relaxed);
         Some(SelectionTable::new(
             total_rows,
             compress_ratio,
             idx_cfg.top_k,
+            widest,
+            &idx_cfg.strata,
             device,
             ticket,
         )?)
@@ -2157,33 +2392,13 @@ pub fn select_layer(
     append_wave(&mut work, &k_all, indexer, compress_ratio, eps)?;
 
     if let (Some(table), Some(q_all)) = (table.as_mut(), q_all.as_ref()) {
-        // The widest row in the wave sets the score buffer's stride, so every
-        // span writes into one buffer and the top-k covers all of it in a
-        // single launch. A row's own candidate count still bounds its scan, so
-        // the columns a narrower span leaves untouched are never read — which
-        // is why the buffer is allocated uninitialised (hot-path invariant 6).
-        // Asked of the caches, not derived from the offsets. A sequence holding
-        // injected pages has MORE rows than `tokens / ratio`: a page ends
-        // wherever its piece did, so its last row is short, and a prefix of
-        // several pieces carries one short row per boundary. Sizing this from
-        // the uniform formula under-allocates by exactly that many columns, and
-        // the first span to write past the end fails inside the wave.
-        let widest = spans
-            .iter()
-            .zip(offsets)
-            .map(|(span, &off)| {
-                let last = off + span.len;
-                match idx_map.get(&span.seq).and_then(|c| c.get(kv)) {
-                    Some(cache) => cache.candidates_at(last.saturating_sub(1), compress_ratio),
-                    None => last.div_ceil(compress_ratio),
-                }
-            })
-            .max()
-            .unwrap_or(0)
-            .max(1);
+        // A row's own candidate count still bounds its scan, so the columns a
+        // narrower span leaves untouched are never read — which is why the
+        // buffer is allocated uninitialised (hot-path invariant 6).
         let scores = wave_empty_ticketed((total_rows, widest), DType::F32, device, ticket)?;
         let mut cand: Vec<u32> = vec![0; total_rows];
         let mut tail: Vec<u32> = vec![1; total_rows];
+        let mut prompt: Vec<u32> = vec![0; total_rows];
         for (span, &rung) in spans.iter().zip(&span_rungs) {
             let cache = idx_map
                 .get(&span.seq)
@@ -2218,6 +2433,8 @@ pub fn select_layer(
             {
                 tail[span.start + r] = cache.tail_len(p, compress_ratio);
             }
+            prompt[span.start..span.start + span.len]
+                .fill(cache.prompt_blocks(compress_ratio) as u32);
         }
         expect_dense(&scores, "qsa selection scores")?;
         table.fill_rows(
@@ -2225,6 +2442,7 @@ pub fn select_layer(
             &cand,
             &positions,
             &tail,
+            &prompt,
             compress_ratio,
             idx_cfg.top_k,
             0,
@@ -2346,6 +2564,13 @@ mod tests {
             c.push_page(page, base, 4)?;
         }
         assert_eq!(c.next_base(), 90);
+
+        assert_eq!(c.cut_floor(0), 0);
+        assert_eq!(c.cut_floor(3), 0, "3 is inside the page at 0..30");
+        assert_eq!(c.cut_floor(30), 30);
+        assert_eq!(c.cut_floor(45), 30, "45 is inside the page at 30..60");
+        assert_eq!(c.cut_floor(90), 90);
+        assert_eq!(c.cut_floor(95), 95, "past the pages, in the tail");
 
         let dropped = c.truncate_to(60)?;
         assert_eq!(dropped.len(), 1);
@@ -2722,45 +2947,126 @@ mod tests {
             .collect()
     }
 
-    /// The selection kernel against the shared definition, on scores chosen by
-    /// the test — no model, no GEMM, so any disagreement is the kernel's.
+    /// The prompt end is a declaration about the slot, so it travels with the
+    /// cache: a fork carries it, a truncate below it pulls it back to the cut,
+    /// a truncate above it leaves it, and a reset forgets it. The blocks it
+    /// covers are the whole indexed blocks below it, through the layout.
+    #[test]
+    fn the_prompt_end_travels_with_the_cache() -> Result<()> {
+        let d = 2;
+        // Four complete blocks and one open row at ratio 4: 17 positions.
+        let mut c = IndexCache::from_rows(&[0.0; 8], &[0.0; 2], d, &Device::Cpu)?;
+        assert_eq!((c.prompt_end(), c.prompt_blocks(4)), (0, 0));
+        c.set_prompt_end(10);
+        assert_eq!(c.prompt_blocks(4), 2);
+        c.set_prompt_end(12);
+        assert_eq!(c.prompt_blocks(4), 3);
+
+        let mut fork = c.fork()?;
+        assert_eq!(fork.prompt_end(), 12);
+        fork.truncate_to(16)?;
+        assert_eq!(fork.prompt_end(), 12, "a cut above the prompt keeps it");
+        // A cut restarts the live tail at itself, so with no pages below it no
+        // block is indexed under the clamped end until the rows are re-appended.
+        c.truncate_to(8)?;
+        assert_eq!((c.prompt_end(), c.prompt_blocks(4)), (8, 0));
+        fork.reset();
+        assert_eq!((fork.prompt_end(), fork.prompt_blocks(4)), (0, 0));
+        Ok(())
+    }
+
+    /// The three ceilings the selection kernel imposes, each refused by name,
+    /// and the stride a run that fits is given.
+    #[test]
+    fn selection_stride_refuses_what_the_kernel_cannot_run() {
+        let err = |r: Result<usize>| r.unwrap_err().to_string();
+        assert!(err(selection_stride(0, 2048, 1000, &Strata::WHOLE)).contains("ratio 0"));
+        assert!(
+            err(selection_stride(MAX_RATIO + 1, 2048, 1000, &Strata::WHOLE)).contains("outside")
+        );
+        // 4096 positions at ratio 4 keep 1025 blocks, past the 768 buffer.
+        assert!(err(selection_stride(4, 4096, 100_000, &Strata::WHOLE)).contains("survivors"));
+        // One-block windows over 20,000 candidates gather 20,000 · 513.
+        let tiny = Strata {
+            window_blocks: 1,
+            recent_blocks: 0,
+            recent: Recent::Candidate,
+        };
+        assert!(err(selection_stride(4, 2048, 20_000, &tiny)).contains("gather"));
+        assert_eq!(
+            selection_stride(4, 2048, 73_728, &Strata::WHOLE).unwrap(),
+            514
+        );
+    }
+
+    /// What one kernel-against-definition case runs: the queries, the geometry,
+    /// the scores' grid, and the strata with its prompt span.
+    struct KernelCase {
+        qpos: Vec<usize>,
+        top_k: usize,
+        // `Some(step)` collapses the scores onto a grid of `step`.
+        quantize: Option<f32>,
+        seed: u64,
+        strata: Strata,
+        // Row r's prompt spans `prompt_blocks + r · prompt_spread` blocks.
+        prompt_blocks: u32,
+        prompt_spread: u32,
+    }
+
+    /// The selection kernel against the shared definition, row by row, on
+    /// scores chosen by the test — no model, no GEMM, so any disagreement is
+    /// the kernel's.
     ///
     /// `quantize` collapses the scores onto a coarse grid, which is how the
-    /// tie-breaking rule gets exercised: at 8 distinct values over 300 blocks
-    /// the cut lands inside a run of equal scores on almost every row, and the
-    /// reference resolves those by ascending block.
-    fn kernel_matches_definition(blocks: usize, quantize: Option<f32>, seed: u64) -> Result<()> {
+    /// tie-breaking rule gets exercised: at 8 distinct values over a few
+    /// hundred blocks the cut lands inside a run of equal scores on almost
+    /// every row, and the reference resolves those by ascending block.
+    fn kernel_matches(case: &KernelCase) -> Result<()> {
         let Some(device) = cuda() else { return Ok(()) };
-        let (ratio, top_k) = (4usize, 8usize);
-        let rows = 16usize;
-        // Positions chosen so every row is past the budget and the phases of
-        // `qpos mod ratio` are all represented (the partial-block cut moves
-        // with the phase).
-        let qpos: Vec<usize> = (0..rows).map(|i| 40 + i * 7).collect();
-        let cand: Vec<u32> = qpos.iter().map(|&p| ((p + 1) / ratio) as u32).collect();
-        let cand_max = *cand.iter().max().unwrap() as usize;
-        assert!(cand_max <= blocks, "test needs {cand_max} candidate blocks");
+        let ratio = 4usize;
+        let rows = case.qpos.len();
+        let cand: Vec<u32> = case
+            .qpos
+            .iter()
+            .map(|&p| ((p + 1) / ratio) as u32)
+            .collect();
+        let blocks = *cand.iter().max().unwrap() as usize;
 
-        let mut host = lcg(rows * blocks, seed, 4.0);
-        if let Some(step) = quantize {
+        let mut host = lcg(rows * blocks, case.seed, 4.0);
+        if let Some(step) = case.quantize {
             for v in host.iter_mut() {
                 *v = (*v / step).floor() * step;
             }
         }
         let scores = Tensor::from_vec(host.clone(), (rows, blocks), &device)?;
-        let mut table = SelectionTable::new(rows, ratio, top_k, &device, None)?;
+        let mut table =
+            SelectionTable::new(rows, ratio, case.top_k, blocks, &case.strata, &device, None)?;
         // Uniform blocks here, so the tail is what the kernel used to derive.
-        let tail: Vec<u32> = qpos
+        let tail: Vec<u32> = case
+            .qpos
             .iter()
             .zip(&cand)
             .map(|(&p, &c)| (p + 1 - c as usize * ratio) as u32)
             .collect();
-        table.fill_rows(&scores, &cand, &qpos, &tail, ratio, top_k, 0)?;
+        let prompt: Vec<u32> = (0..rows as u32)
+            .map(|r| case.prompt_blocks + r * case.prompt_spread)
+            .collect();
+        table.fill_rows(
+            &scores, &cand, &case.qpos, &tail, &prompt, ratio, case.top_k, 0,
+        )?;
 
         let mut want = Vec::new();
-        for (r, &p) in qpos.iter().enumerate() {
+        for (r, &p) in case.qpos.iter().enumerate() {
             let row_scores = &host[r * blocks..r * blocks + blocks];
-            let sel = selection_entries(row_scores, p, ratio, top_k, &mut want);
+            let sel = selection_entries(
+                row_scores,
+                p,
+                ratio,
+                case.top_k,
+                &case.strata,
+                prompt[r] as usize,
+                &mut want,
+            );
             let got = table.row_to_host(r)?;
             match sel {
                 RowSelection::Dense => assert!(got.is_none(), "row {r} should be dense"),
@@ -2773,46 +3079,277 @@ mod tests {
         Ok(())
     }
 
+    /// Positions chosen so every row is past the budget and the phases of
+    /// `qpos mod ratio` are all represented (the partial-block cut moves with
+    /// the phase).
+    fn shallow_rows() -> Vec<usize> {
+        (0..16).map(|i| 40 + i * 7).collect()
+    }
+
+    /// Rows deep enough to cut into several small windows: 188 candidate
+    /// blocks at the deepest.
+    fn windowed_rows() -> Vec<usize> {
+        (0..16).map(|i| 200 + i * 37).collect()
+    }
+
+    fn strata(window_blocks: usize, recent_blocks: usize, recent: Recent) -> Strata {
+        Strata {
+            window_blocks,
+            recent_blocks,
+            recent,
+        }
+    }
+
     #[test]
     fn selection_kernel_matches_the_definition() -> Result<()> {
-        kernel_matches_definition(300, None, 0x51)
+        kernel_matches(&KernelCase {
+            qpos: shallow_rows(),
+            top_k: 8,
+            quantize: None,
+            seed: 0x51,
+            strata: Strata::WHOLE,
+            prompt_blocks: 0,
+            prompt_spread: 0,
+        })
     }
 
     #[test]
     fn selection_kernel_breaks_ties_by_ascending_block() -> Result<()> {
-        // A coarse grid forces long runs of equal scores through the cut.
-        kernel_matches_definition(300, Some(0.5), 0x52)
+        // A coarse grid forces long runs of equal scores through the cut: at 8
+        // distinct values the cut lands inside a run on almost every row, and
+        // the reference resolves those by ascending block.
+        kernel_matches(&KernelCase {
+            qpos: shallow_rows(),
+            top_k: 8,
+            quantize: Some(0.5),
+            seed: 0x52,
+            strata: Strata::WHOLE,
+            prompt_blocks: 0,
+            prompt_spread: 0,
+        })
     }
 
     #[test]
     fn selection_kernel_survives_more_blocks_than_the_buffer_holds() -> Result<()> {
-        // Past one streaming trim: 4096 candidate blocks against a 1024-slot
+        // Past one streaming trim: ~4000 candidate blocks against a 1024-slot
         // buffer, so the threshold path runs many times.
-        let Some(device) = cuda() else { return Ok(()) };
-        let (ratio, top_k) = (4usize, 64usize);
-        let rows = 4usize;
-        let blocks = 4096usize;
-        let qpos: Vec<usize> = (0..rows).map(|i| 16000 + i * 3).collect();
-        let cand: Vec<u32> = qpos.iter().map(|&p| ((p + 1) / ratio) as u32).collect();
-        let host = lcg(rows * blocks, 0x53, 4.0);
-        let scores = Tensor::from_vec(host.clone(), (rows, blocks), &device)?;
-        let mut table = SelectionTable::new(rows, ratio, top_k, &device, None)?;
-        // Uniform blocks here, so the tail is what the kernel used to derive.
-        let tail: Vec<u32> = qpos
-            .iter()
-            .zip(&cand)
-            .map(|(&p, &c)| (p + 1 - c as usize * ratio) as u32)
-            .collect();
-        table.fill_rows(&scores, &cand, &qpos, &tail, ratio, top_k, 0)?;
-        let mut want = Vec::new();
-        for (r, &p) in qpos.iter().enumerate() {
-            let row_scores = &host[r * blocks..r * blocks + blocks];
-            selection_entries(row_scores, p, ratio, top_k, &mut want);
-            assert_eq!(
-                table.row_to_host(r)?.expect("selective row"),
-                want,
-                "row {r} differs past the buffer's first trim"
-            );
+        kernel_matches(&KernelCase {
+            qpos: (0..4).map(|i| 16000 + i * 3).collect(),
+            top_k: 64,
+            quantize: None,
+            seed: 0x53,
+            strata: Strata::WHOLE,
+            prompt_blocks: 0,
+            prompt_spread: 0,
+        })
+    }
+
+    /// Several windows, each spending the budget, with the prompt ranked in
+    /// every one — and on a tie grid, so a prompt block two windows both choose
+    /// arrives twice and must leave once, at its widest cut.
+    #[test]
+    fn stratified_selection_kernel_matches_the_definition() -> Result<()> {
+        for (quantize, seed) in [(None, 0x61), (Some(0.5), 0x62)] {
+            kernel_matches(&KernelCase {
+                qpos: windowed_rows(),
+                top_k: 8,
+                quantize,
+                seed,
+                strata: strata(32, 0, Recent::Candidate),
+                prompt_blocks: 5,
+                prompt_spread: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stratified_selection_kernel_ranks_a_recent_candidate_in_every_window() -> Result<()> {
+        for (quantize, seed) in [(None, 0x63), (Some(0.5), 0x64)] {
+            kernel_matches(&KernelCase {
+                qpos: windowed_rows(),
+                top_k: 8,
+                quantize,
+                seed,
+                strata: strata(32, 12, Recent::Candidate),
+                prompt_blocks: 5,
+                prompt_spread: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stratified_selection_kernel_attends_a_forced_span_whole() -> Result<()> {
+        for (quantize, seed) in [(None, 0x65), (Some(0.5), 0x66)] {
+            kernel_matches(&KernelCase {
+                qpos: windowed_rows(),
+                top_k: 8,
+                quantize,
+                seed,
+                strata: strata(32, 12, Recent::Forced),
+                prompt_blocks: 5,
+                prompt_spread: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Windows wider than the buffer, so every window streams through several
+    /// trims of its own, with a forced span past one chunk's width.
+    #[test]
+    fn stratified_selection_kernel_survives_windows_wider_than_the_buffer() -> Result<()> {
+        for recent in [Recent::Candidate, Recent::Forced] {
+            kernel_matches(&KernelCase {
+                qpos: (0..4).map(|i| 16000 + i * 3).collect(),
+                top_k: 64,
+                quantize: None,
+                seed: 0x67,
+                strata: strata(1024, 300, recent),
+                prompt_blocks: 100,
+                prompt_spread: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Which pass a launch runs: a launch of a few rows splits every row across
+    /// blocks, and one of `SPLIT_BLOCKS` rows or more never splits — so the
+    /// wide cases below are the single pass's, on any device.
+    fn split_parts(rows: usize, cand_max: usize, strata: &Strata, top_k: usize) -> i32 {
+        unsafe {
+            qsa_topk_split_parts(
+                rows as i32,
+                cand_max as i32,
+                strata.window_blocks as i32,
+                top_k as i32,
+                4,
+            )
+        }
+    }
+
+    #[test]
+    fn a_narrow_launch_splits_and_a_wide_one_does_not() -> Result<()> {
+        let Some(_device) = cuda() else { return Ok(()) };
+        assert!(split_parts(4, 188, &strata(32, 12, Recent::Forced), 8) > 0);
+        assert!(split_parts(4, 4000, &Strata::WHOLE, 64) > 1);
+        assert_eq!(split_parts(512, 188, &strata(32, 12, Recent::Forced), 8), 0);
+        assert_eq!(split_parts(512, 4000, &Strata::WHOLE, 64), 0);
+        Ok(())
+    }
+
+    /// The prompt overlapping everything a pool is cut from. Row r's prompt is
+    /// `3r` blocks against 15–30 candidates, so across the rows it ends inside
+    /// a window, inside the recent span (the R∩W∩P term), at or past the forced
+    /// span (R2's clip), and past the row itself (the clamp to the row).
+    #[test]
+    fn a_prompt_overlapping_the_recent_and_forced_spans_matches_the_definition() -> Result<()> {
+        let narrow: Vec<usize> = (0..16).map(|i| 60 + i * 4).collect();
+        // The same rows repeated past `SPLIT_BLOCKS`, so the single pass runs
+        // them too.
+        let wide: Vec<usize> = (0..512).map(|i| 60 + (i % 16) * 4).collect();
+        for (qpos, spread) in [(narrow, 3), (wide, 0)] {
+            for recent in [Recent::Candidate, Recent::Forced] {
+                for (quantize, seed) in [(None, 0x81), (Some(0.5), 0x82)] {
+                    kernel_matches(&KernelCase {
+                        qpos: qpos.clone(),
+                        top_k: 8,
+                        quantize,
+                        seed,
+                        strata: strata(8, 12, recent),
+                        prompt_blocks: if spread == 0 { 20 } else { 0 },
+                        prompt_spread: spread,
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Many narrow windows on a few rows: each window runs as one block of its
+    /// own, unsplit, and the merge only gathers them.
+    #[test]
+    fn windows_run_side_by_side_and_merge_to_the_definition() -> Result<()> {
+        let few: Vec<usize> = (0..4).map(|i| 200 + i * 37).collect();
+        let narrow = strata(4, 6, Recent::Candidate);
+        let Some(_device) = cuda() else { return Ok(()) };
+        // The deepest row, qpos 311, has 78 candidates.
+        assert_eq!(split_parts(4, 78, &narrow, 8), 1);
+        for (recent, quantize, seed) in [
+            (Recent::Candidate, None, 0x77),
+            (Recent::Candidate, Some(0.5), 0x78),
+            (Recent::Forced, Some(0.5), 0x79),
+        ] {
+            kernel_matches(&KernelCase {
+                qpos: few.clone(),
+                top_k: 8,
+                quantize,
+                seed,
+                strata: strata(4, 6, recent),
+                prompt_blocks: 5,
+                prompt_spread: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_single_pass_matches_the_definition_whole_and_stratified() -> Result<()> {
+        let wide: Vec<usize> = (0..512).map(|i| 200 + i).collect();
+        for (strata, quantize, seed) in [
+            (Strata::WHOLE, None, 0x71),
+            (Strata::WHOLE, Some(0.5), 0x72),
+            (strata(32, 12, Recent::Candidate), None, 0x73),
+            (strata(32, 12, Recent::Candidate), Some(0.5), 0x74),
+            (strata(32, 12, Recent::Forced), Some(0.5), 0x75),
+        ] {
+            kernel_matches(&KernelCase {
+                qpos: wide.clone(),
+                top_k: 8,
+                quantize,
+                seed,
+                strata,
+                prompt_blocks: 5,
+                prompt_spread: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The single pass at the released budget — 513 survivors a window, past
+    /// half the buffer, so every chunk past the first few trims.
+    #[test]
+    fn the_single_pass_matches_at_the_released_budget() -> Result<()> {
+        let wide: Vec<usize> = (0..512).map(|i| 65_536 + i * 3).collect();
+        for strata in [Strata::WHOLE, strata(4096, 512, Recent::Forced)] {
+            kernel_matches(&KernelCase {
+                qpos: wide.clone(),
+                top_k: 2048,
+                quantize: None,
+                seed: 0x76,
+                strata,
+                prompt_blocks: 500,
+                prompt_spread: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The deployed geometry at the depth that motivated it: the released
+    /// budget of 2048 positions at ratio 4, ~294K positions deep, cut into
+    /// 128K-position windows with an 8K recent span and a 2K-block prompt.
+    #[test]
+    fn stratified_selection_kernel_matches_at_the_deployed_depth() -> Result<()> {
+        for recent in [Recent::Candidate, Recent::Forced] {
+            kernel_matches(&KernelCase {
+                qpos: (0..4).map(|i| 294_000 + i * 5).collect(),
+                top_k: 2048,
+                quantize: None,
+                seed: 0x68,
+                strata: strata(32_768, 2048, recent),
+                prompt_blocks: 2000,
+                prompt_spread: 0,
+            })?;
         }
         Ok(())
     }
@@ -2842,6 +3379,7 @@ mod tests {
                 n_heads: 2,
                 head_dim: 16,
                 top_k: 8,
+                strata: Strata::WHOLE,
             };
             let (ratio, hidden, eps) = (4usize, 12usize, 1e-6);
             let w = IndexerWeights {
@@ -2947,12 +3485,30 @@ mod tests {
             let cand = cache.score_rows(
                 &q, qpos, &self.cfg, self.ratio, &self.rope, 0, &scores, widest, 0, None,
             )?;
-            let mut table = SelectionTable::new(t, self.ratio, self.cfg.top_k, &self.device, None)?;
+            let mut table = SelectionTable::new(
+                t,
+                self.ratio,
+                self.cfg.top_k,
+                widest,
+                &self.cfg.strata,
+                &self.device,
+                None,
+            )?;
             let tail: Vec<u32> = qpos
                 .iter()
                 .map(|&p| cache.tail_len(p, self.ratio))
                 .collect();
-            table.fill_rows(&scores, &cand, qpos, &tail, self.ratio, self.cfg.top_k, 0)?;
+            let prompt = vec![cache.prompt_blocks(self.ratio) as u32; t];
+            table.fill_rows(
+                &scores,
+                &cand,
+                qpos,
+                &tail,
+                &prompt,
+                self.ratio,
+                self.cfg.top_k,
+                0,
+            )?;
             (0..t).map(|r| table.row_to_host(r)).collect()
         }
     }
@@ -3543,6 +4099,7 @@ mod tests {
             n_heads: 2,
             head_dim: 16,
             top_k: 8,
+            strata: Strata::WHOLE,
         };
         let (ratio, hidden, eps) = (4usize, 12usize, 1e-6);
         let t = 64usize;
@@ -3617,14 +4174,16 @@ mod tests {
             eps,
             None,
         )?;
-        let mut table = SelectionTable::new(t, ratio, cfg.top_k, &device, None)?;
         let widest = t.div_ceil(ratio).max(1);
+        let mut table =
+            SelectionTable::new(t, ratio, cfg.top_k, widest, &cfg.strata, &device, None)?;
         let scores = Tensor::empty((t, widest), DType::F32, &device)?;
         let cand = cache.score_rows(
             &q_all, &qpos, &cfg, ratio, &rope_gpu, 0, &scores, widest, 0, None,
         )?;
         let tail: Vec<u32> = qpos.iter().map(|&p| cache.tail_len(p, ratio)).collect();
-        table.fill_rows(&scores, &cand, &qpos, &tail, ratio, cfg.top_k, 0)?;
+        let prompt = vec![0u32; t];
+        table.fill_rows(&scores, &cand, &qpos, &tail, &prompt, ratio, cfg.top_k, 0)?;
 
         // Oracle: the additive mask, from the same weights on the CPU.
         let w_cpu = w(&Device::Cpu)?;

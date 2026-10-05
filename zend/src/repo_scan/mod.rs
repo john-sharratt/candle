@@ -1478,6 +1478,135 @@ mod tests {
         );
     }
 
+    /// The tool-call demonstration is emitted after `system_close`, so anything
+    /// it frames as a user turn IS one — sitting where the conversation's own
+    /// first exchange would, which made a chat quote the demonstration when asked
+    /// for its own first question. It must carry NO user turn: the request is a
+    /// system turn, and the exchange still ends at the assistant's bare call,
+    /// which is the half the model copies.
+    #[test]
+    fn the_tool_call_demonstration_holds_no_user_turn() {
+        let builder = bundled_builder();
+        let demo = builder
+            .schema()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                projection::SystemPromptItem::SectionTree(tree) => tree
+                    .nodes
+                    .iter()
+                    .find(|node| node.name == "tool_call_example"),
+                _ => None,
+            })
+            .expect("projection.yaml declares tool_call_example");
+        let present = demo
+            .options
+            .iter()
+            .find(|option| option.id == "present")
+            .expect("tool_call_example has a present option");
+
+        assert!(
+            !present.content.contains("<|im_start|>user"),
+            "a user turn here is the conversation's own first exchange: {:?}",
+            present.content,
+        );
+        assert!(
+            present.content.starts_with("<|im_start|>system\n"),
+            "the request is a system turn: {:?}",
+            present.content,
+        );
+        assert!(
+            present
+                .content
+                .trim_end()
+                .ends_with("</tool_call><|im_end|>"),
+            "the exchange must stop at the call — teaching the round-trip teaches \
+             answering from memory: {:?}",
+            present.content,
+        );
+    }
+
+    /// The working set places both ingest layers' units ahead of the dialogue as
+    /// whole exchanges, request turn included, so `history_stance` must disown
+    /// both request forms — and it must disown them **in the words they really
+    /// open with**.
+    ///
+    /// This asserts against the renderers, not against a copy of their output:
+    /// every opener below is read off a freshly rendered request, so rewording
+    /// either ingest's prompt fails this test instead of silently leaving the
+    /// section disowning a form that no longer occurs. Two earlier revisions of
+    /// the section quoted forms written from memory — one of them naming a
+    /// "folder" that a repository-root unit never says — and a chat asked for its
+    /// own first question quoted exactly the unit the carve-out had missed.
+    #[test]
+    fn history_stance_disowns_the_real_placed_request_openers() {
+        let builder = bundled_builder();
+        let stance = builder
+            .schema()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                projection::SystemPromptItem::Section(s) if s.name == "history_stance" => {
+                    Some(s.content.clone())
+                }
+                _ => None,
+            })
+            .expect("projection.yaml declares history_stance");
+
+        // The block is hard-wrapped for readability, so a quoted opener spans
+        // whatever line break the authored text happens to fall on. Match the
+        // wording, not the wrapping.
+        let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // One real request per placed unit kind: a file, a folder, and a
+        // repository root — the root being the one whose request says no "folder".
+        let file = crate::code_read::opening_prompt("candle/src/lib.rs", 120);
+        let folder = render::render_request(&unit("candle/zend/src/"));
+        let root = render::render_request(&unit("candle/"));
+
+        for (what, request, opener) in [
+            ("a file", &file, "Read the entire contents of"),
+            ("a folder", &folder, "Summarize"),
+            ("a repository root", &root, "Summarize"),
+        ] {
+            assert!(
+                request.starts_with(opener),
+                "{what}'s request no longer opens {opener:?}, so history_stance \
+                 disowns a form that does not occur: {request:?}",
+            );
+            assert!(
+                stance.contains(opener),
+                "history_stance must disown {what}'s request by its real opener \
+                 {opener:?}: {stance:?}",
+            );
+        }
+
+        assert!(
+            stance.contains("never read one as the turn you are continuing"),
+            "a tool round's look-back is the failure this section prevents: {stance:?}",
+        );
+        assert!(
+            stance.contains("never count one as something you were asked"),
+            "a reading request must not answer \"what was I asked\": {stance:?}",
+        );
+        // The priming chain's links are inherited INTO `primary_conversation` and
+        // sit as the conversation's earliest turns, so a section that spoke only of
+        // content "placed ahead of the conversation" did not reach them. The split
+        // has to be reading vs conversation.
+        assert!(
+            stance.contains("descends from"),
+            "the section must own the lineage it descends from, not only placed \
+             content: {stance:?}",
+        );
+        assert!(
+            stance.contains("the turns that are not reading"),
+            "the model needs the rule that separates its dialogue from its reading: \
+             {stance:?}",
+        );
+    }
+
     /// `repo_map` finds a unit's conversations by `dir`, `code_read` by `path`.
     /// If they shared a key, each layer's plan would take the other's
     /// conversations for its own (a folder is never a file unit, and vice
